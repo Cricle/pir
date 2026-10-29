@@ -1,0 +1,50 @@
+// node:test/reporters — throws tier. The reporter classes drive the test
+// runner's event stream, which this runtime cannot host (see node:test);
+// each reporter exists for link compatibility and throws the unified error
+// on construction.
+function reportersUnsupported(api) {
+  const error = new Error("node:test/reporters." + api + " is not supported by the pir extension runtime (no test-runner host)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+class SpecReporter {
+  constructor(..._args) {
+    throw reportersUnsupported("spec");
+  }
+}
+
+class TapReporter {
+  constructor(..._args) {
+    throw reportersUnsupported("tap");
+  }
+}
+
+class DotReporter {
+  constructor(..._args) {
+    throw reportersUnsupported("dot");
+  }
+}
+
+class JunitReporter {
+  constructor(..._args) {
+    throw reportersUnsupported("junit");
+  }
+}
+
+class LcovReporter {
+  constructor(..._args) {
+    throw reportersUnsupported("lcov");
+  }
+}
+
+const reporters = {
+  spec: SpecReporter,
+  tap: TapReporter,
+  dot: DotReporter,
+  junit: JunitReporter,
+  lcov: LcovReporter,
+};
+
+export default reporters;
+export { SpecReporter as spec, TapReporter as tap, DotReporter as dot, JunitReporter as junit, LcovReporter as lcov };

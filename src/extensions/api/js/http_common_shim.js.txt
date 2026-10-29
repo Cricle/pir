@@ -1,0 +1,85 @@
+// node:_http_common — private HTTP parser internals. The pure value/logic
+// surfaces are real (method table, wire constants, the token/header-char
+// checks); the parser state machine itself is hosted by the node:http shim
+// world, so HTTPParser construction throws the unified error.
+import { METHODS } from "@node/http";
+
+function httpCommonUnsupported(api) {
+  const error = new Error("node:_http_common." + api + " is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+// Real wire constants (same values as Node's C++ layer).
+const chunkExpression = /(?:\r\n)?[\t ]+/;
+const continueExpression = /(?:\r\n)?100-continue/i;
+const CRLF = "\r\n";
+
+// Real RFC 7230 token / header-value character checks.
+const TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const INVALID_HEADER_CHAR_RE = /[^\t\x20-\x7e\x80-\xff]/;
+
+function _checkIsHttpToken(val) {
+  return TOKEN_RE.test(String(val));
+}
+
+function _checkInvalidHeaderChar(val) {
+  return INVALID_HEADER_CHAR_RE.test(String(val));
+}
+
+class HTTPParser {
+  constructor(..._args) {
+    throw httpCommonUnsupported("HTTPParser");
+  }
+}
+
+function freeParser(..._args) {
+  // No parser pool exists in this runtime: releasing is a no-op.
+}
+
+function isLenient(_flag) {
+  return false;
+}
+
+function calculateLenientFlags(_parser) {
+  return 0;
+}
+
+function prepareError(_err) {
+  return undefined;
+}
+
+// Standalone references for the named-export surface.
+const methods = METHODS;
+const parsers = {
+  frees: [],
+  freeCount: 0,
+  totalParsedCount: 0,
+};
+
+const kIncomingMessage = Symbol("kIncomingMessage");
+const kSkipPendingData = Symbol("kSkipPendingData");
+
+const httpCommon = {
+  _checkInvalidHeaderChar: _checkInvalidHeaderChar,
+  _checkIsHttpToken: _checkIsHttpToken,
+  chunkExpression: chunkExpression,
+  continueExpression: continueExpression,
+  CRLF: CRLF,
+  freeParser: freeParser,
+  HTTPParser: HTTPParser,
+  isLenient: isLenient,
+  calculateLenientFlags: calculateLenientFlags,
+  prepareError: prepareError,
+  methods: METHODS,
+  parsers: parsers,
+  kIncomingMessage: kIncomingMessage,
+  kSkipPendingData: kSkipPendingData,
+};
+
+export default httpCommon;
+export {
+  _checkInvalidHeaderChar, _checkIsHttpToken, chunkExpression, continueExpression,
+  CRLF, freeParser, HTTPParser, isLenient, calculateLenientFlags, prepareError,
+  methods, parsers, kIncomingMessage, kSkipPendingData,
+};

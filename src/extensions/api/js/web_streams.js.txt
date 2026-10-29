@@ -1,0 +1,317 @@
+
+// ReadableStream / WritableStream / TransformStream — minimal Web-streams
+// surface for the global fetch body plumbing (LLRT tier: minimal, same tier
+// as the node:stream pad). LIMITS (documented, not accidental): no true
+// backpressure or highWaterMark accounting, no byte streams/BYOB readers, no
+// tee/pipeThrough fidelity (pipeTo is a simple read/write loop), `pull` is
+// only invoked when a reader is waiting, and queuing strategies are ignored.
+// Installed only when the engine has no such global.
+
+(function () {
+  class PirReadableStreamDefaultController {
+    constructor(stream) {
+      this.__stream = stream;
+      this.__queue = [];
+    }
+    get desiredSize() {
+      const stream = this.__stream;
+      if (stream.__errored !== undefined) return null;
+      if (stream.__closed) return 0;
+      return Math.max(0, 16 - this.__queue.length); // fixed pseudo HWM
+    }
+    enqueue(chunk) {
+      const stream = this.__stream;
+      if (stream.__closed) throw new TypeError("Cannot enqueue on a closed stream");
+      if (stream.__errored !== undefined) throw stream.__errored;
+      stream.__queue.push(chunk);
+      const pending = stream.__pendingReads;
+      while (pending.length > 0 && stream.__queue.length > 0) {
+        pending.shift().ok(stream.__queue.shift());
+      }
+    }
+    close() {
+      const stream = this.__stream;
+      if (stream.__closed || stream.__errored !== undefined) return;
+      stream.__closed = true;
+      const pending = stream.__pendingReads;
+      while (pending.length > 0) {
+        const entry = pending.shift();
+        if (stream.__queue.length > 0) entry.ok(stream.__queue.shift());
+        else entry.done();
+      }
+      if (stream.__closeWaiters) {
+        const waiters = stream.__closeWaiters;
+        stream.__closeWaiters = [];
+        for (let i = 0; i < waiters.length; i++) waiters[i]();
+      }
+    }
+    error(reason) {
+      const stream = this.__stream;
+      if (stream.__closed || stream.__errored !== undefined) return;
+      stream.__errored = reason;
+      const pending = stream.__pendingReads;
+      while (pending.length > 0) pending.shift().fail(reason);
+      if (stream.__closeWaiters) {
+        const waiters = stream.__closeWaiters;
+        stream.__closeWaiters = [];
+        for (let i = 0; i < waiters.length; i++) waiters[i]();
+      }
+    }
+  }
+
+  class PirReadableStreamDefaultReader {
+    constructor(stream) {
+      this.__stream = stream;
+      this.__closed = false;
+      this.closed = new Promise((resolve) => {
+        this.__resolveClosed = resolve;
+      });
+    }
+    read() {
+      const stream = this.__stream;
+      // A closed stream still drains its queue before reporting done.
+      if (stream.__errored !== undefined) return Promise.reject(stream.__errored);
+      if (stream.__queue.length > 0) {
+        pirPump(stream);
+        return Promise.resolve({ value: stream.__queue.shift(), done: false });
+      }
+      if (this.__closed || stream.__closed) {
+        return Promise.resolve({ value: undefined, done: true });
+      }
+      return new Promise((resolve, reject) => {
+        stream.__pendingReads.push({
+          ok: (chunk) => resolve({ value: chunk, done: false }),
+          done: () => resolve({ value: undefined, done: true }),
+          fail: reject,
+        });
+        pirPump(stream);
+      });
+    }
+    cancel(reason) {
+      const stream = this.__stream;
+      if (this.__closed) return Promise.resolve();
+      this.__closed = true;
+      return pirCancelStream(stream, reason);
+    }
+    releaseLock() {
+      this.__closed = true;
+      const stream = this.__stream;
+      if (stream.__reader === this) stream.__reader = null;
+    }
+  }
+
+  function pirCancelStream(stream, reason) {
+    if (stream.__closed) return Promise.resolve();
+    stream.__closed = true;
+    const pending = stream.__pendingReads;
+    while (pending.length > 0) {
+      pending.shift().fail(new TypeError("Reader was cancelled"));
+    }
+    const source = stream.__source;
+    if (source && typeof source.cancel === "function") {
+      try {
+        return Promise.resolve(source.cancel(reason)).then(() => undefined);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    }
+    return Promise.resolve();
+  }
+
+  // Drive `pull` while readers wait and the source can produce more.
+  function pirPump(stream) {
+    if (stream.__pullPending || stream.__closed || stream.__errored !== undefined) return;
+    if (stream.__pendingReads.length === 0 && stream.__queue.length > 0) return;
+    if (stream.__pendingReads.length === 0) return;
+    const source = stream.__source;
+    if (!source || typeof source.pull !== "function") return;
+    stream.__pullPending = true;
+    Promise.resolve()
+      .then(() => source.pull(stream.__controller))
+      .then(
+        () => {
+          stream.__pullPending = false;
+          pirPump(stream);
+        },
+        (error) => {
+          stream.__pullPending = false;
+          stream.__controller.error(error);
+        }
+      );
+  }
+
+  class PirReadableStream {
+    constructor(underlyingSource, strategy) {
+      if (underlyingSource && underlyingSource.type === "bytes") {
+        throw new TypeError("Byte streams (BYOB) are not supported by the pir extension runtime");
+      }
+      this.__source = underlyingSource || {};
+      this.__controller = new PirReadableStreamDefaultController(this);
+      this.__queue = [];
+      this.__pendingReads = [];
+      this.__closeWaiters = [];
+      this.__closed = false;
+      this.__errored = undefined;
+      this.__pullPending = false;
+      this.__reader = null;
+      this.locked = false;
+      const controller = this.__controller;
+      const source = this.__source;
+      if (typeof source.start === "function") {
+        Promise.resolve()
+          .then(() => source.start(controller))
+          .then(
+            () => pirPump(this),
+            (error) => controller.error(error)
+          );
+      }
+      void strategy;
+    }
+    getReader() {
+      if (this.locked) {
+        throw new TypeError("ReadableStream is already locked to a reader");
+      }
+      this.locked = true;
+      this.__reader = new PirReadableStreamDefaultReader(this);
+      return this.__reader;
+    }
+    cancel(reason) {
+      if (this.locked && this.__reader && !this.__reader.__closed) {
+        return this.__reader.cancel(reason);
+      }
+      return pirCancelStream(this, reason);
+    }
+    pipeTo(destination) {
+      // Minimal pipe: read from this stream, write every chunk to the
+      // destination writer. No backpressure, no piped signal propagation.
+      const writer = destination.getWriter();
+      return new Promise((resolve, reject) => {
+        const step = () => {
+          const reader = this.__reader || this.getReader();
+          reader
+            .read()
+            .then((result) => {
+              if (result.done) {
+                return writer.close().then(resolve, reject);
+              }
+              return writer.write(result.value).then(step, reject);
+            }, reject);
+        };
+        step();
+      });
+    }
+    pipeThrough(transform) {
+      this.pipeTo(transform.writable);
+      return transform.readable;
+    }
+    tee() {
+      throw new TypeError("ReadableStream.tee is not supported by the pir extension runtime");
+    }
+  }
+
+  class PirWritableStreamDefaultWriter {
+    constructor(stream) {
+      this.__stream = stream;
+    }
+    write(chunk) {
+      const stream = this.__stream;
+      if (stream.__closed || stream.__closing) {
+        return Promise.reject(new TypeError("WritableStream is closed"));
+      }
+      if (stream.__errored !== undefined) return Promise.reject(stream.__errored);
+      const sink = stream.__sink;
+      // Chain writes so the sink sees them in order.
+      stream.__lastWrite = (stream.__lastWrite || Promise.resolve()).then(
+        () => (typeof sink.write === "function" ? sink.write(chunk) : undefined),
+        (error) => {
+          throw error === undefined ? stream.__errored : error;
+        }
+      );
+      return stream.__lastWrite.then(() => undefined, (error) => {
+        throw error;
+      });
+    }
+    close() {
+      const stream = this.__stream;
+      if (stream.__closed) return Promise.resolve();
+      stream.__closing = true;
+      const finish = () => {
+        stream.__closed = true;
+        const sink = stream.__sink;
+        if (typeof sink.close === "function") return Promise.resolve(sink.close());
+      };
+      return (stream.__lastWrite || Promise.resolve()).then(finish, (error) => {
+        stream.__closed = true;
+        throw error;
+      });
+    }
+    abort(reason) {
+      const stream = this.__stream;
+      if (stream.__closed) return Promise.resolve();
+      stream.__closed = true;
+      const sink = stream.__sink;
+      if (typeof sink.abort === "function") return Promise.resolve(sink.abort(reason));
+      return Promise.resolve();
+    }
+  }
+
+  class PirWritableStream {
+    constructor(sink) {
+      this.__sink = sink || {};
+      this.__closed = false;
+      this.__closing = false;
+      this.__errored = undefined;
+      this.__lastWrite = null;
+      this.locked = false;
+    }
+    getWriter() {
+      if (this.locked) {
+        throw new TypeError("WritableStream is already locked to a writer");
+      }
+      this.locked = true;
+      return new PirWritableStreamDefaultWriter(this);
+    }
+    abort(reason) {
+      this.__errored = reason;
+      this.__closed = true;
+      return Promise.resolve();
+    }
+  }
+
+  class PirTransformStream {
+    constructor(transformer) {
+      transformer = transformer || {};
+      const controller = { enqueue: undefined, close: undefined };
+      const readable = new PirReadableStream({
+        start(c) {
+          controller.enqueue = (chunk) => c.enqueue(chunk);
+          controller.close = () => c.close();
+          controller.__c = c;
+        },
+      });
+      const writable = new PirWritableStream({
+        write(chunk) {
+          if (typeof transformer.transform !== "function") {
+            controller.enqueue(chunk);
+            return undefined;
+          }
+          return Promise.resolve(
+            transformer.transform(chunk, controller, transformer)
+          );
+        },
+        close() {
+          if (typeof transformer.flush === "function") {
+            return Promise.resolve(transformer.flush(controller));
+          }
+          return undefined;
+        },
+      });
+      this.readable = readable;
+      this.writable = writable;
+    }
+  }
+
+  globalThis.ReadableStream ?? (globalThis.ReadableStream = PirReadableStream);
+  globalThis.WritableStream ?? (globalThis.WritableStream = PirWritableStream);
+  globalThis.TransformStream ?? (globalThis.TransformStream = PirTransformStream);
+})();

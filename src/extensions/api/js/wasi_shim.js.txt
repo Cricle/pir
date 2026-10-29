@@ -1,0 +1,29 @@
+// node:wasi — throws tier. No WASI host is built into the runtime; the
+// entry point exists for link compatibility and throws the unified error.
+function wasiUnsupported() {
+  const error = new Error("node:wasi.WASI is not supported by the pir extension runtime (no WASI host)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+class WASI {
+  constructor(..._args) {
+    throw wasiUnsupported();
+  }
+  getImportObject() {
+    throw wasiUnsupported();
+  }
+  instantiate(_wasmModule) {
+    return Promise.reject(wasiUnsupported());
+  }
+  start(_instance) {
+    throw wasiUnsupported();
+  }
+}
+
+const wasi = {
+  WASI: WASI,
+};
+
+export default wasi;
+export { WASI };

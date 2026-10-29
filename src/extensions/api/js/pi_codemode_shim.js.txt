@@ -1,0 +1,1146 @@
+// @earendil-works/pi-codemode virtual shim. The pure-JS surfaces (source
+// parsing, identifier conversion, JSON-Schema→TypeScript declaration
+// rendering) are faithful ports of upstream packages/codemode/src — they are
+// deterministic functions the sandbox never gates. The engine-backed faces
+// (CodemodeSandbox.execute, loadQuickJSWasm, serveCodemodeRemote, the wasm
+// module) throw: pir runs codemode as a builtin plugin over the host's own
+// QuickJS (`src/plugins/codemode.rs`), so a second sandbox stack has nothing
+// to stand on. This one module serves every subpath entry (`/declarations`,
+// `/source`, `/worker`, `/portable`, `/cloudflare`): the subpath import lists
+// are strict subsets of the package surface below. ES2020 only.
+
+// ---------------------------------------------------------------------------
+// identifier.ts
+// ---------------------------------------------------------------------------
+
+/** The identifier a script uses for a tool: invalid characters become `_`. */
+export function toCodemodeIdentifier(name) {
+  let identifier = "";
+  for (const char of String(name)) {
+    const valid =
+      identifier === "" ? /^[A-Za-z_$]$/.test(char) : /^[A-Za-z0-9_$]$/.test(char);
+    identifier += valid ? char : "_";
+  }
+  return identifier === "" ? "_" : identifier;
+}
+
+// ---------------------------------------------------------------------------
+// source.ts — the `// @options:` first-line grammar
+// ---------------------------------------------------------------------------
+
+export const CODEMODE_OPTIONS_PREFIX = "// @options:";
+
+const SUPPORTED_FIELDS = ["max_output_tokens", "timeout_ms"];
+const SUPPORTED_FIELDS_TEXT = "`max_output_tokens` and `timeout_ms`";
+/** Largest delay `setTimeout` supports, which bounds `timeout_ms`. */
+const MAX_TIMEOUT_MS = 2147483647;
+
+export const CODEMODE_SOURCE_GRAMMAR = String.raw`
+start: options_source | plain_source
+options_source: OPTIONS_LINE NEWLINE SOURCE
+plain_source: SOURCE
+
+OPTIONS_LINE: /[ \t]*\/\/ @options:[^\r\n]*/
+NEWLINE: /\r?\n/
+SOURCE: /[\s\S]+/
+`;
+
+export class CodemodeSourceError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "CodemodeSourceError";
+  }
+}
+
+function isSafeInteger(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function parseOptions(directive) {
+  if (directive === "") {
+    throw new CodemodeSourceError(
+      "@options must be a JSON object with supported fields " + SUPPORTED_FIELDS_TEXT,
+    );
+  }
+  let value;
+  try {
+    value = JSON.parse(directive);
+  } catch (error) {
+    throw new CodemodeSourceError(
+      "@options must be valid JSON with supported fields " + SUPPORTED_FIELDS_TEXT + ": " +
+        (error instanceof Error ? error.message : String(error)),
+    );
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new CodemodeSourceError(
+      "@options must be a JSON object with supported fields " + SUPPORTED_FIELDS_TEXT,
+    );
+  }
+  for (const key of Object.keys(value)) {
+    if (!SUPPORTED_FIELDS.includes(key)) {
+      throw new CodemodeSourceError(
+        "@options only supports " + SUPPORTED_FIELDS_TEXT + "; got `" + key + "`",
+      );
+    }
+  }
+  const options = {};
+  const { max_output_tokens, timeout_ms } = value;
+  if (max_output_tokens !== undefined) {
+    if (!isSafeInteger(max_output_tokens)) {
+      throw new CodemodeSourceError(
+        "@options field `max_output_tokens` must be a non-negative safe integer",
+      );
+    }
+    options.maxOutputTokens = max_output_tokens;
+  }
+  if (timeout_ms !== undefined) {
+    if (!isSafeInteger(timeout_ms) || timeout_ms === 0 || timeout_ms > MAX_TIMEOUT_MS) {
+      throw new CodemodeSourceError(
+        "@options field `timeout_ms` must be a positive integer up to " + MAX_TIMEOUT_MS,
+      );
+    }
+    options.timeoutMs = timeout_ms;
+  }
+  return options;
+}
+
+/** Split an optional first-line `// @options: {...}` from the script. */
+export function parseCodemodeSource(input) {
+  if (String(input).trim() === "") {
+    throw new CodemodeSourceError(
+      'Expected JavaScript source text (non-empty). Provide JS only, optionally with a first line `// @options: {"max_output_tokens": 1000}`.',
+    );
+  }
+  const text = String(input);
+  const lines = text.split("\n");
+  // Upstream `b6d505cd1` (DRIFT D13): an options line anywhere but the first
+  // line was silently ignored, which dropped its timeout/output budget.
+  const misplaced = lines.findIndex(
+    (line, index) => index > 0 && line.trimStart().startsWith(CODEMODE_OPTIONS_PREFIX),
+  );
+  if (misplaced !== -1) {
+    throw new CodemodeSourceError(
+      "The " + CODEMODE_OPTIONS_PREFIX +
+        " line must be the first line of the input; found one on line " + (misplaced + 1),
+    );
+  }
+  const newline = text.indexOf("\n");
+  const trimmed = lines[0].replace(/\r$/, "").trimStart();
+  if (!trimmed.startsWith(CODEMODE_OPTIONS_PREFIX)) return { code: text, options: {} };
+  const code = newline === -1 ? "" : text.slice(newline);
+  if (code.trim() === "") {
+    throw new CodemodeSourceError(
+      "The @options line must be followed by JavaScript source on subsequent lines",
+    );
+  }
+  return { code, options: parseOptions(trimmed.slice(CODEMODE_OPTIONS_PREFIX.length).trim()) };
+}
+
+// ---------------------------------------------------------------------------
+// declarations.ts — JSON-Schema → TypeScript declaration rendering
+// (upstream `8a9c051f8`: constraints the type cannot express become `@` tags
+// in property comments, and an over-budget type is re-rendered without tags
+// before it becomes `unknown`; `24382bedd`/`c661bc574`: no MCP shapes here —
+// output schemas render as their own types.)
+// ---------------------------------------------------------------------------
+
+const IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const INDENT = "  ";
+/** Largest rendered input type, in characters, before it becomes `unknown`. */
+export const DEFAULT_INPUT_SCHEMA_MAX_CHARS = 16000;
+/** Local `$ref` expansions per rendered schema, so shared definitions cannot blow up the output. */
+const MAX_REF_EXPANSIONS = 32;
+/** JSON Schema keywords with a number or string value shown as `@keyword value` property tags. */
+const TAG_KEYWORDS = [
+  "minimum",
+  "exclusiveMinimum",
+  "maximum",
+  "exclusiveMaximum",
+  "multipleOf",
+  "minLength",
+  "maxLength",
+  "pattern",
+  "format",
+  "minItems",
+  "maxItems",
+];
+/** Tag keywords whose values all hold at once, so only the largest (lower) or smallest (upper) matters. */
+const LOWER_BOUNDS = new Set(["minimum", "exclusiveMinimum", "minLength", "minItems"]);
+const UPPER_BOUNDS = new Set(["maximum", "exclusiveMaximum", "maxLength", "maxItems"]);
+/** Longest property tag; longer ones (large defaults, long patterns) are left out. */
+const MAX_TAG_CHARS = 80;
+/** Characters that end a `//` comment. */
+const LINE_TERMINATORS = /[\r\n\u2028\u2029]/g;
+
+function isObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function union(types) {
+  const unique = [...new Set(types)];
+  if (unique.includes("unknown")) return "unknown";
+  return unique.length === 0 ? "never" : unique.join(" | ");
+}
+
+function propertyKey(name) {
+  return IDENTIFIER_RE.test(name) ? name : JSON.stringify(name);
+}
+
+function descriptionOf(property) {
+  const description = (property ?? {})?.description;
+  return typeof description === "string" ? description.trim() : "";
+}
+
+function docComment(description, indent) {
+  const text = description === undefined || description === null ? "" : String(description).trim();
+  if (!text) return "";
+  const lines = text.replaceAll("*/", "*\\/").split(/\r?\n/);
+  if (lines.length === 1) return indent + "/** " + lines[0] + " */\n";
+  return (
+    indent + "/**\n" +
+    lines.map((line) => indent + " *" + (line ? " " + line : "")).join("\n") +
+    "\n" + indent + " */\n"
+  );
+}
+
+function resolveRef(ref, root) {
+  if (ref !== "#" && !ref.startsWith("#/")) return undefined;
+  let current = root;
+  for (const segment of ref.slice(2).split("/").filter(Boolean)) {
+    const key = decodeURIComponent(segment).replaceAll("~1", "/").replaceAll("~0", "~");
+    if (!isObject(current) || !(key in current)) return undefined;
+    current = current[key];
+  }
+  return typeof current === "boolean" || isObject(current) ? current : undefined;
+}
+
+/**
+ * Constraints of a property that its TypeScript type cannot express, as JSDoc-style tags:
+ * `@integer @minimum 1 @maximum 100 @default 20`. Empty when there are none.
+ */
+function constraintTags(schema) {
+  if (!isObject(schema)) return "";
+  const property = schema;
+  // Optional fields such as Pydantic's `int | None` keep their constraints in the non-null branch.
+  // The branch's constraints apply together with the property's, so both are read.
+  const variants = Array.isArray(property.anyOf) ? property.anyOf : property.oneOf;
+  const nonNull = Array.isArray(variants)
+    ? variants.filter((variant) => (variant ?? {})?.type !== "null")
+    : [];
+  const branch = nonNull.length === 1 ? nonNull[0] : undefined;
+  const branches = isObject(branch) ? [property, branch] : [property];
+  // Draft-04 and OpenAPI 3.0 make `minimum`/`maximum` exclusive with a boolean
+  // `exclusiveMinimum`/`exclusiveMaximum`.
+  const schemas = branches.map((schema) => ({
+    ...schema,
+    ...(schema.exclusiveMinimum === true ? { minimum: undefined, exclusiveMinimum: schema.minimum } : {}),
+    ...(schema.exclusiveMaximum === true ? { maximum: undefined, exclusiveMaximum: schema.maximum } : {}),
+  }));
+
+  const tags = [];
+  const isInteger = (type) => type === "integer" || (Array.isArray(type) && type.includes("integer"));
+  if (schemas.some((schema) => isInteger(schema.type))) tags.push("@integer");
+  for (const keyword of TAG_KEYWORDS) {
+    const values = schemas.map((schema) => schema[keyword]);
+    if (LOWER_BOUNDS.has(keyword) || UPPER_BOUNDS.has(keyword)) {
+      const numbers = values.filter((value) => typeof value === "number");
+      if (numbers.length === 0) continue;
+      tags.push(
+        "@" + keyword + " " +
+          (LOWER_BOUNDS.has(keyword) ? Math.max(...numbers) : Math.min(...numbers)),
+      );
+      continue;
+    }
+    for (const value of new Set(values)) {
+      if (typeof value === "number" || typeof value === "string") tags.push("@" + keyword + " " + value);
+    }
+  }
+  if (schemas.some((schema) => schema.uniqueItems === true)) tags.push("@uniqueItems");
+  // Annotations, unlike constraints, come from the property itself.
+  if (property.default !== undefined && property.default !== null) {
+    tags.push("@default " + JSON.stringify(property.default));
+  }
+  if (property.deprecated === true) tags.push("@deprecated");
+  return tags
+    .filter((tag) => tag.length <= MAX_TAG_CHARS)
+    .map((tag) =>
+      tag.replace(LINE_TERMINATORS, (char) =>
+        "\\u" + char.charCodeAt(0).toString(16).padStart(4, "0"),
+      ),
+    )
+    .join(" ");
+}
+
+function toType(schema, context) {
+  if (schema === true) return "unknown";
+  if (schema === false) return "never";
+  if (!isObject(schema)) return "unknown";
+  if (typeof schema.$ref === "string") {
+    const ref = schema.$ref;
+    if (context.resolving.has(ref) || context.expansions >= MAX_REF_EXPANSIONS) return "unknown";
+    const target = resolveRef(ref, context.root);
+    if (target === undefined) return "unknown";
+    context.expansions += 1;
+    context.resolving.add(ref);
+    try {
+      return toType(target, context);
+    } finally {
+      context.resolving.delete(ref);
+    }
+  }
+
+  if ("const" in schema) return JSON.stringify(schema.const) ?? "unknown";
+  if (Array.isArray(schema.enum)) {
+    return union(schema.enum.map((value) => JSON.stringify(value) ?? "unknown"));
+  }
+
+  const variants = Array.isArray(schema.anyOf)
+    ? schema.anyOf
+    : Array.isArray(schema.oneOf)
+      ? schema.oneOf
+      : undefined;
+  if (variants) return union(variants.map((variant) => toType(variant, context)));
+  if (Array.isArray(schema.allOf)) {
+    const parts = schema.allOf
+      .map((part) => toType(part, context))
+      .filter((part) => part !== "unknown");
+    if (parts.length === 0) return "unknown";
+    return parts.map((part) => (part.includes(" | ") ? "(" + part + ")" : part)).join(" & ");
+  }
+
+  const type = schema.type;
+  if (Array.isArray(type)) {
+    return union(type.map((entry) => toType({ ...schema, type: entry }, context)));
+  }
+  switch (type) {
+    case "string":
+      return "string";
+    case "number":
+    case "integer":
+      return "number";
+    case "boolean":
+      return "boolean";
+    case "null":
+      return "null";
+    case "array":
+      return arrayType(schema, context);
+    case "object":
+      return objectType(schema, context);
+    case undefined:
+      if ("properties" in schema || "additionalProperties" in schema || "required" in schema) {
+        return objectType(schema, context);
+      }
+      if ("items" in schema || "prefixItems" in schema) return arrayType(schema, context);
+      return "unknown";
+    default:
+      return "unknown";
+  }
+}
+
+function arrayType(schema, context) {
+  if (schema.items !== undefined && !Array.isArray(schema.items)) {
+    return "Array<" + toType(schema.items, context) + ">";
+  }
+  const tuple = Array.isArray(schema.prefixItems)
+    ? schema.prefixItems
+    : Array.isArray(schema.items)
+      ? schema.items
+      : [];
+  if (tuple.length > 0) {
+    return "[" + tuple.map((item) => toType(item, context)).join(", ") + "]";
+  }
+  return "unknown[]";
+}
+
+function objectType(schema, context) {
+  const properties = isObject(schema.properties) ? schema.properties : {};
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+  const names = Object.keys(properties).sort();
+  const members = names.map((name) => {
+    const optional = required.has(name) ? "" : "?";
+    return propertyKey(name) + optional + ": " + toType(properties[name], context) + ";";
+  });
+  const additional = schema.additionalProperties;
+  if (additional !== undefined && additional !== false) {
+    const type = additional === true ? "unknown" : toType(additional, context);
+    members.push("[key: string]: " + type + ";");
+  } else if (additional === undefined && names.length === 0) {
+    members.push("[key: string]: unknown;");
+  }
+  if (members.length === 0) return "{}";
+  const comments = names.map((name) => {
+    const lines = descriptionOf(properties[name])
+      .split(LINE_TERMINATORS)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const tags = context.tags ? constraintTags(properties[name]) : "";
+    return tags ? [...lines, tags] : lines;
+  });
+  if (!comments.some((comment) => comment.length > 0)) return "{ " + members.join(" ") + " }";
+
+  const lines = ["{"];
+  comments.forEach((comment, index) => {
+    for (const line of comment) lines.push(INDENT + "// " + line);
+    lines.push(INDENT + members[index].replaceAll("\n", "\n" + INDENT));
+  });
+  for (const member of members.slice(names.length)) lines.push(INDENT + member);
+  lines.push("}");
+  return lines.join("\n");
+}
+
+/**
+ * Convert a JSON Schema to a TypeScript type expression. A result longer than
+ * `maxChars` is rendered again without the constraint tags, and renders as
+ * `unknown` if it is still too long.
+ */
+export function schemaToType(schema, options = {}) {
+  const render = (tags) => toType(schema, { root: schema, resolving: new Set(), expansions: 0, tags });
+  const type = render(true);
+  if (options.maxChars === undefined || type.length <= options.maxChars) return type;
+  const untagged = render(false);
+  return untagged.length <= options.maxChars ? untagged : "unknown";
+}
+
+/** The type a tool call resolves to: the output schema's type, and `unknown` without a schema. */
+export function renderToolOutputType(schema) {
+  return schema === undefined ? "unknown" : schemaToType(schema);
+}
+
+/** One tool as a member of the `tools` object. */
+export function renderToolSignature(tool, options = {}) {
+  const input =
+    tool.inputSchema === undefined
+      ? "unknown"
+      : schemaToType(tool.inputSchema, {
+          maxChars: options.inputMaxChars ?? DEFAULT_INPUT_SCHEMA_MAX_CHARS,
+        });
+  return (
+    toCodemodeIdentifier(tool.name) +
+    "(args: " + input + "): Promise<" + renderToolOutputType(tool.outputSchema) + ">;"
+  );
+}
+
+/** A tool's sample: the description followed by the tool's declaration. */
+export function renderToolSample(tool, options = {}) {
+  const declaration = "declare const tools: { " + renderToolSignature(tool, options) + " };";
+  const description = tool.description === undefined || tool.description === null
+    ? ""
+    : String(tool.description).trim();
+  return (
+    description + "\n\ncodemode tool declaration:\n```ts\n" + declaration + "\n```"
+  );
+}
+
+function renderGlobal(head, global_, indent) {
+  if (global_.signature !== undefined) {
+    return docComment(global_.description, indent) + indent + head + global_.signature + ";";
+  }
+  const input = global_.inputSchema === undefined ? "unknown" : schemaToType(global_.inputSchema);
+  const output = global_.outputSchema === undefined ? "unknown" : schemaToType(global_.outputSchema);
+  return (
+    docComment(global_.description, indent) + indent + head +
+    "(args: " + input + "): Promise<" + output + ">;"
+  );
+}
+
+/** Render TypeScript declarations for the script-visible API. */
+export function renderDeclarations(options = {}) {
+  const sections = [];
+  const tools = options.tools ?? [];
+  if (tools.length > 0) {
+    const members = tools.map(
+      (tool) => docComment(tool.description, INDENT) + INDENT + renderToolSignature(tool),
+    );
+    sections.push("declare const tools: {\n" + members.join("\n") + "\n};");
+  }
+  const namespaces = new Map();
+  for (const global_ of options.globals ?? []) {
+    const dot = global_.name.indexOf(".");
+    if (dot === -1) {
+      sections.push(renderGlobal("declare function " + global_.name, global_, ""));
+      continue;
+    }
+    const namespace = global_.name.slice(0, dot);
+    const members = namespaces.get(namespace) ?? [];
+    if (members.length === 0) namespaces.set(namespace, members);
+    members.push(renderGlobal(global_.name.slice(dot + 1), global_, INDENT));
+  }
+  for (const [namespace, members] of namespaces) {
+    sections.push("declare const " + namespace + ": {\n" + members.join("\n") + "\n};");
+  }
+  return sections.join("\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// runtime — the engine-backed faces route to the host codemode executor
+//
+// DRIFT §2.3 item 2 / D28: `CodemodeSandbox` and `InlineCodemodeSandbox` run
+// their scripts on the HOST codemode sandbox (`src/plugins/codemode.rs`, the
+// engine the builtin `codemode` tool uses) instead of a second (wasm) VM
+// stack. The host owns the VM, the deadline, the output and the call
+// records; this module answers the script's calls through the
+// `__pir_host.codemode*` pull protocol (start / poll / deliver / abort) and
+// hands back the upstream `CodemodeResult` object.
+//
+// Documented residuals of the route (all on the `execute()`/`start()` faces,
+// none on the pure-JS surfaces):
+// - the VM is the host's native QuickJS, not a wasm module, so
+//   `loadQuickJSWasm` still throws and the `wasm`/`workerUrl` options are
+//   ignored;
+// - a script that calls a tool the sandbox did not declare resolves against
+//   the host session's in-flight tool set (the builtin codemode tool's model)
+//   when exactly one extension tool call is running, else it fails with
+//   upstream's `Unknown tool "..."`;
+// - `start()`'s deterministic replay covers the clock (`Date.now` reads
+//   `startedAt` then each delivered `now`), the seeded `Math.random()`, the
+//   caller-answered call protocol and the `during` face; the fingerprint is
+//   the engine + protocol version rather than a wasm hash, and `new Date()`
+//   and friends still read the host clock.
+// ---------------------------------------------------------------------------
+
+function codemodeRuntimeUnavailable(api) {
+  const error = new Error(
+    api + " is not supported by the pir extension runtime (codemode runs as a builtin tool on the host engine)",
+  );
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+export const MAX_STORE_VALUE_CHARS = 256 * 1024;
+export const MAX_STORE_TOTAL_CHARS = 1024 * 1024;
+export const MAX_OUTPUT_CHARS = 16 * 1024 * 1024;
+export const MAX_OUTPUT_ITEMS = 100000;
+
+/** Interrupt polls an in-thread VM may use before it fails with `kind: "timeout"` (upstream value). */
+export const DEFAULT_INTERRUPT_BUDGET = 100000;
+
+/** Default VM memory limit of {@link CodemodeSandboxDurableObject} (upstream value). */
+export const DEFAULT_REMOTE_MEMORY_LIMIT_BYTES = 32 * 1024 * 1024;
+
+/** Global names a declared tool/global may not shadow (upstream prelude). */
+const RESERVED_GLOBALS = new Set([
+  "tools", "ALL_TOOLS", "console", "text", "image", "exit", "globalThis", "store", "load",
+]);
+const GLOBAL_IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+/** Upstream `CodemodeSandboxBase` `DEFAULT_TIMEOUT_MS`. */
+const DEFAULT_TIMEOUT_MS = 300000;
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** The host bridge, or `null` in a runtime that does not carry it. */
+function codemodeHost() {
+  const host = typeof __pir_host === "object" && __pir_host !== null ? __pir_host : null;
+  if (
+    host === null ||
+    typeof host.codemodeStart !== "function" ||
+    typeof host.codemodePoll !== "function" ||
+    typeof host.codemodeDeliver !== "function"
+  ) {
+    return null;
+  }
+  return host;
+}
+
+/** Validate declared globals (upstream `checkGlobals`). */
+function checkGlobals(globals) {
+  const names = new Set();
+  const namespaces = new Set();
+  for (const global_ of globals) {
+    const parts = String(global_.name).split(".");
+    if (
+      parts.length > 2 ||
+      !parts.every((part) => GLOBAL_IDENTIFIER.test(part)) ||
+      RESERVED_GLOBALS.has(parts[0])
+    ) {
+      throw new Error('Invalid global name "' + global_.name + '"');
+    }
+    if (names.has(global_.name)) throw new Error('Global "' + global_.name + '" is already registered');
+    if (parts.length === 2) namespaces.add(parts[0]);
+    names.add(global_.name);
+  }
+  for (const name of namespaces) {
+    if (names.has(name)) throw new Error('Global "' + name + '" conflicts with the namespace "' + name + '"');
+  }
+}
+
+function codemodeError(kind, message, name) {
+  const error = { kind, message };
+  if (name !== undefined) error.name = name;
+  return error;
+}
+
+/** A `CodemodeResult` failure with an empty tail (upstream's launcher failures). */
+function failureResult(kind, message) {
+  return { ok: false, error: codemodeError(kind, message), output: [], calls: [] };
+}
+
+/**
+ * One host-backed run. Returns `{ ok: true, result, deliver, abort, finished }`
+ * or `{ ok: false, error }` when the run could not start.
+ *
+ * `options.answer(event, session)` runs one call the script made and returns
+ * the delivery payload; `options.onCall/onIdle/onStarted` are the `start()`
+ * observers; `options.signal` is the caller's abort signal.
+ */
+function startHostRun(options) {
+  const host = codemodeHost();
+  if (host === null) {
+    return { ok: false, error: codemodeRuntimeUnavailable(options.unavailableApi) };
+  }
+  let started;
+  try {
+    started = JSON.parse(host.codemodeStart(JSON.stringify(options.payload)));
+  } catch (error) {
+    return { ok: false, error: new Error("the codemode host bridge failed: " + errorMessage(error)) };
+  }
+  if (started === null || typeof started !== "object") {
+    return { ok: false, error: new Error("the codemode host bridge returned an unreadable reply") };
+  }
+  if (started.error !== undefined) {
+    return { ok: false, error: new Error(String(started.error)) };
+  }
+  const runId = String(started.id);
+
+  const state = {
+    finished: false,
+    aborted: false,
+    abortMessage: undefined,
+    resolve: null,
+    pendingDeliveries: new Map(),
+    nextSeq: 1,
+    controller: typeof AbortController === "function" ? new AbortController() : null,
+  };
+  const result = new Promise((resolve) => {
+    state.resolve = resolve;
+  });
+  const settle = (value) => {
+    if (state.finished) return;
+    state.finished = true;
+    if (state.controller !== null) {
+      try { state.controller.abort(); } catch { /* the signal is best-effort */ }
+    }
+    state.resolve(value);
+  };
+  const abort = (message) => {
+    if (state.finished) return;
+    state.aborted = true;
+    if (message !== undefined) state.abortMessage = message;
+    try { host.codemodeAbort(runId); } catch { /* best-effort */ }
+  };
+  if (options.signal !== undefined && options.signal !== null) {
+    const signal = options.signal;
+    // The reason is read at abort time (`signal.reason` is undefined until
+    // then), so the caller's own text wins over the host's fixed one.
+    const onAbort = () => {
+      const reason = signal.reason;
+      abort(reason instanceof Error ? reason.message : "Execution aborted");
+    };
+    if (signal.aborted) onAbort();
+    else if (typeof signal.addEventListener === "function") {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+
+  const answer = async (event) => {
+    // No responder: the call simply stays unanswered (upstream's
+    // `forwardCall` with no `onCall`), so the run can only end by deadline or
+    // abort — never by a silently wrong answer.
+    if (typeof options.answer !== "function") return;
+    let payload;
+    try {
+      payload = await options.answer(event, {
+        aborted: state.aborted,
+        signal: state.controller === null ? undefined : state.controller.signal,
+        runId,
+      });
+    } catch (error) {
+      payload = { ok: false, message: errorMessage(error) };
+    }
+    if (state.finished) return;
+    if (payload !== null && typeof payload === "object" && payload.handledByHost === true) {
+      // The answer ran the call itself (the session-call hop delivers its own
+      // outcome), so there is nothing left to deliver.
+      return;
+    }
+    try {
+      // The host refuses an answer the run no longer waits for (it settled or
+      // was aborted); nothing can consume it then, so the reply is dropped.
+      host.codemodeDeliver(runId, String(event.id), JSON.stringify(payload));
+    } catch { /* the run is gone; the result already settled */ }
+  };
+
+  const loop = (async () => {
+    for (;;) {
+      let event;
+      try {
+        event = JSON.parse(await host.codemodePoll(runId));
+      } catch (error) {
+        return settle(
+          state.aborted
+            ? failureResult("aborted", state.abortMessage ?? "Execution aborted")
+            : failureResult("sandbox", "the codemode host bridge failed: " + errorMessage(error)),
+        );
+      }
+      if (event === null || typeof event !== "object") {
+        return settle(failureResult("sandbox", "the codemode host bridge returned an unreadable event"));
+      }
+      if (event.type === "error") {
+        return settle(
+          state.aborted
+            ? failureResult("aborted", state.abortMessage ?? "Execution aborted")
+            : failureResult("sandbox", String(event.message ?? "the codemode run ended unexpectedly")),
+        );
+      }
+      if (event.type === "started") {
+        try {
+          if (typeof options.onStarted === "function") options.onStarted(event.fingerprint);
+        } catch (error) {
+          return settle(failureResult("sandbox", "Sandbox host failed: " + errorMessage(error)));
+        }
+        continue;
+      }
+      if (event.type === "idle") {
+        try {
+          if (typeof options.onIdle === "function") options.onIdle(event.seq, event.issued);
+        } catch (error) {
+          return settle(failureResult("sandbox", "Sandbox host failed: " + errorMessage(error)));
+        }
+        continue;
+      }
+      if (event.type === "call") {
+        if (typeof options.onCall === "function") {
+          // A caller-controlled run: hand the call out; the caller answers it
+          // through `deliver` (upstream `CodemodeRunOptions.onCall`).
+          try {
+            options.onCall({
+              id: event.id,
+              target: event.target === "global" ? "global" : "tool",
+              name: event.name,
+              args: event.args,
+            });
+          } catch (error) {
+            return settle(failureResult("sandbox", "Sandbox host failed: " + errorMessage(error)));
+          }
+          continue;
+        }
+        // Calls run concurrently (the script's `Promise.all` shape): the poll
+        // loop keeps draining while an answer is computed.
+        void answer(event);
+        continue;
+      }
+      if (event.type === "done") {
+        const result_ = event.result;
+        if (result_ !== null && typeof result_ === "object") {
+          // `undefined` rides a marker (JSON cannot carry the difference
+          // between `exit()` and `return null`); restore the upstream value.
+          if (result_.undefined === true) {
+            result_.value = undefined;
+            delete result_.undefined;
+          }
+          if (result_.ok === false && result_.error !== null && typeof result_.error === "object" &&
+              result_.error.kind === "aborted" && state.abortMessage !== undefined) {
+            // The caller's own abort reason wins over the host's fixed text
+            // (upstream `errorMessage(signal.reason)`).
+            result_.error.message = state.abortMessage;
+          }
+        }
+        return settle(result_);
+      }
+    }
+  })();
+
+  const deliver = (seq, now, id, outcome) => {
+    if (state.finished) return;
+    if (!Number.isFinite(now)) throw new Error("The clock value of result " + seq + " is not a finite number");
+    if (!Number.isInteger(seq) || seq < 1 || state.pendingDeliveries.has(seq) || seq < state.nextSeq) {
+      throw new Error("Result number " + seq + " is not a positive integer used once");
+    }
+    if (outcome !== null && typeof outcome === "object" && !outcome.ok && outcome.properties !== undefined) {
+      const properties = outcome.properties;
+      if (typeof properties !== "object" || properties === null || Array.isArray(properties)) {
+        throw new Error("The properties of result " + seq + " are not an object");
+      }
+    }
+    // Serialized before anything is recorded, so a value JSON cannot hold
+    // (a function, a symbol) resolves `undefined` like upstream's
+    // `outcome.value === undefined ? undefined : JSON.stringify(...)`.
+    let payload;
+    if (outcome.ok) {
+      const value = outcome.value === undefined ? undefined : JSON.stringify(outcome.value);
+      payload = value === undefined ? { ok: true } : { ok: true, value };
+    } else {
+      payload = { ok: false, message: String(outcome.message) };
+      if (outcome.properties !== undefined) payload.properties = outcome.properties;
+    }
+    payload.clock = now;
+    state.pendingDeliveries.set(seq, { id, payload });
+    flushDeliveries();
+  };
+
+  // The VM applies results strictly in `seq` order, whatever order they
+  // arrive in (upstream `Execution.deliver`); the host only ever sees the
+  // ordered prefix.
+  function flushDeliveries() {
+    const host_ = codemodeHost();
+    while (state.pendingDeliveries.has(state.nextSeq)) {
+      const entry = state.pendingDeliveries.get(state.nextSeq);
+      state.pendingDeliveries.delete(state.nextSeq);
+      state.nextSeq += 1;
+      if (host_ === null || state.finished) continue;
+      const reply = JSON.parse(host_.codemodeDeliver(runId, String(entry.id), JSON.stringify(entry.payload)));
+      if (reply !== null && typeof reply === "object" && reply.error !== undefined && !state.finished) {
+        throw new Error(String(reply.error));
+      }
+    }
+  }
+
+  // A failure anywhere in the loop that no branch classified still settles
+  // the run (upstream `receive()`'s catch-all: `Sandbox host failed: ...`).
+  loop.catch((error) => {
+    settle(failureResult("sandbox", "Sandbox host failed: " + errorMessage(error)));
+  });
+  return {
+    ok: true,
+    runId,
+    result,
+    deliver,
+    abort,
+    get finished() {
+      return state.finished;
+    },
+  };
+}
+
+/** The JSON payload one host run is started with. */
+function hostRunPayload(mode, code, tools, globals, store, timeoutMs, deterministic) {
+  const payload = {
+    mode,
+    code: String(code),
+    tools: tools.map((tool) => ({
+      name: tool.name,
+      jsName: tool.jsName ?? toCodemodeIdentifier(tool.name),
+      description: tool.description === undefined ? "" : String(tool.description),
+    })),
+    globals: globals.map((global_) => ({ name: global_.name, spread: global_.spread === true })),
+    store: store ?? {},
+  };
+  if (timeoutMs !== undefined && timeoutMs !== null) payload.timeoutMs = timeoutMs;
+  if (deterministic !== undefined) {
+    payload.startedAt = deterministic.startedAt;
+    payload.seed = deterministic.seed;
+  }
+  return payload;
+}
+
+/**
+ * Host side of one execution (upstream's `CodemodeSandboxBase`): the tool and
+ * global registries are real bookkeeping and the engine-backed faces route to
+ * the host codemode executor (see the section header).
+ */
+export class CodemodeSandboxBase {
+  /**
+   * `options` is the upstream `CodemodeSandboxBaseOptions`; the launcher
+   * argument is accepted for API-shape compatibility and ignored (the host
+   * decides where the VM runs).
+   */
+  constructor(options = {}, _launch) {
+    this.options = options ?? {};
+    this.timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.memoryLimitBytes = this.options.memoryLimitBytes;
+    this.toolsByName = new Map();
+    this.globalsByName = new Map();
+    this.closed = false;
+    /** In-flight runs (`execute()` promises and `start()` handles). */
+    this.running = new Set();
+    for (const tool of this.options.tools ?? []) this.registerTool(tool);
+    const globals = this.options.globals ?? [];
+    checkGlobals(globals);
+    for (const global_ of globals) this.globalsByName.set(global_.name, global_);
+  }
+
+  /** Throws if a tool with the same name is already registered. */
+  registerTool(tool) {
+    if (this.toolsByName.has(tool.name)) {
+      throw new Error('Tool "' + tool.name + '" is already registered');
+    }
+    this.toolsByName.set(tool.name, tool);
+  }
+
+  unregisterTool(name) {
+    return this.toolsByName.delete(name);
+  }
+
+  get tools() {
+    return [...this.toolsByName.values()];
+  }
+
+  get globals() {
+    return [...this.globalsByName.values()];
+  }
+
+  /**
+   * `code` is an async function body: `return` and top-level `await` work.
+   * Never rejects for script failures; those come back as `{ ok: false }`.
+   * The script can use `store(key, value)` and `load(key)` on `options.store`.
+   */
+  execute(code, options = {}) {
+    if (this.closed) return Promise.reject(new Error("Sandbox is closed"));
+    const executeOptions = options ?? {};
+    const tools = [...this.toolsByName.values()];
+    const globals = [...this.globalsByName.values()];
+    const declared = new Map();
+    for (const tool of tools) {
+      declared.set(tool.name, tool);
+      declared.set(tool.jsName ?? toCodemodeIdentifier(tool.name), tool);
+    }
+    const declaredGlobals = new Map();
+    for (const global_ of globals) declaredGlobals.set(global_.name, global_);
+    const timeoutMs = executeOptions.timeoutMs ?? this.timeoutMs;
+    const handle = startHostRun({
+      unavailableApi: this.constructor.name + ".execute",
+      payload: hostRunPayload(
+        "execute",
+        code,
+        tools,
+        globals,
+        executeOptions.store,
+        Number.isFinite(timeoutMs) ? timeoutMs : undefined,
+        undefined,
+      ),
+      signal: executeOptions.signal,
+      answer: async (event, session) => {
+        // A call the sandbox did not declare resolves against the running
+        // session's tool set: the host runs it inside this host function's
+        // future (the nested-call pipeline needs the extension runtime's task
+        // context) and delivers the outcome itself.
+        if (event.session === true) {
+          const bridge = codemodeHost();
+          if (bridge === null || typeof bridge.codemodeSessionCall !== "function") {
+            return { ok: false, message: 'Unknown tool "' + event.name + '"' };
+          }
+          await bridge.codemodeSessionCall(
+            session.runId,
+            String(event.id),
+            event.name,
+            JSON.stringify(event.args === undefined ? {} : event.args),
+          );
+          return { handledByHost: true };
+        }
+        // `execute()` runs the sandbox's own tools/globals: the host routes
+        // declared calls here and answers everything else itself (the host
+        // session's tool set) or fails it with upstream's `Unknown tool`.
+        const global_ = event.target === "global" ? declaredGlobals.get(event.name) : undefined;
+        const tool = global_ === undefined ? declared.get(event.name) : undefined;
+        const declaredEntry = global_ ?? tool;
+        if (declaredEntry === undefined || typeof declaredEntry.execute !== "function") {
+          return {
+            ok: false,
+            message: (event.target === "global" ? 'Unknown global "' : 'Unknown tool "') + event.name + '"',
+          };
+        }
+        if (session.aborted) return { ok: false, message: "aborted" };
+        // Upstream context: the signal aborts when the script finishes, the
+        // execution times out, the caller aborts, or the sandbox closes.
+        // A spread global receives the whole argument list as its first
+        // argument (upstream `caller("global", name, spread)`).
+        const value = await declaredEntry.execute(event.args, { signal: session.signal });
+        if (value === undefined) return { ok: true };
+        const json = JSON.stringify(value);
+        if (json === undefined) return { ok: true };
+        return { ok: true, value: json };
+      },
+    });
+    if (!handle.ok) return Promise.reject(handle.error);
+    this.running.add(handle);
+    return handle.result.finally(() => this.running.delete(handle));
+  }
+
+  /**
+   * Run `code` deterministically, with the caller answering its calls: the
+   * same script, start time, seed, tools, globals, and store, answered with
+   * the same results in the same `seq` order, makes the same calls with the
+   * same arguments and produces the same output (upstream contract; the
+   * residuals of the host route are listed in the section header).
+   *
+   * The sandbox's own tools and globals are not used: the run declares its
+   * own, and every call goes to `options.onCall`.
+   */
+  start(code, options) {
+    if (this.closed) throw new Error("Sandbox is closed");
+    const runOptions = options ?? {};
+    if (!Number.isFinite(runOptions.startedAt) || runOptions.startedAt < 0) {
+      throw new Error("startedAt must be a non-negative number of milliseconds since the epoch");
+    }
+    if (!Number.isInteger(runOptions.seed) || runOptions.seed < 0 || runOptions.seed > 0xffffffff) {
+      throw new Error("seed must be a 32-bit unsigned integer");
+    }
+    const tools = runOptions.tools ?? [];
+    if (new Set(tools.map((tool) => tool.name)).size !== tools.length) {
+      throw new Error("Tool names must be unique");
+    }
+    const scriptNames = tools.map((tool) => tool.jsName ?? toCodemodeIdentifier(tool.name));
+    if (new Set(scriptNames).size !== tools.length) throw new Error("Tool script names must be unique");
+    const globals = runOptions.globals ?? [];
+    checkGlobals(globals);
+    const handle = startHostRun({
+      unavailableApi: this.constructor.name + ".start",
+      payload: hostRunPayload(
+        "start",
+        code,
+        tools,
+        globals,
+        runOptions.store,
+        Number.isFinite(runOptions.timeoutMs) ? runOptions.timeoutMs : undefined,
+        { startedAt: runOptions.startedAt, seed: runOptions.seed },
+      ),
+      signal: runOptions.signal,
+      // A deterministic run's calls belong to the caller: it answers them
+      // through `deliver` (upstream `CodemodeRunOptions.onCall`).
+      onCall: (call) => {
+        if (typeof runOptions.onCall === "function") runOptions.onCall(call);
+      },
+      onStarted: runOptions.onStarted,
+      onIdle: runOptions.onIdle,
+    });
+    if (!handle.ok) throw handle.error;
+    this.running.add(handle);
+    handle.result.then(
+      () => this.running.delete(handle),
+      () => this.running.delete(handle),
+    );
+    return {
+      result: handle.result,
+      deliver: handle.deliver,
+      get finished() {
+        return handle.finished;
+      },
+    };
+  }
+
+  /** Aborts in-flight executions (they resolve with `kind: "aborted"`) and rejects new ones. */
+  async close() {
+    this.closed = true;
+    const runs = [...this.running];
+    for (const handle of runs) handle.abort("Sandbox closed");
+    await Promise.all(runs.map((handle) => handle.result.catch(() => undefined)));
+  }
+}
+
+/**
+ * Runs JavaScript in a QuickJS VM (upstream: a separate wasm instance in a
+ * worker thread). On pir the script runs on the host codemode sandbox —
+ * keyed off the extension runtime's thread, with the host's own interrupt
+ * deadline — so no worker thread or wasm module is involved; `wasm` and
+ * `workerUrl` are accepted and ignored (see the runtime section header).
+ */
+export class CodemodeSandbox extends CodemodeSandboxBase {
+  constructor(options = {}) {
+    super(options);
+  }
+}
+
+/**
+ * Upstream runs each execution's VM on the calling thread, with an interrupt
+ * budget as the only bound on a script that never awaits. pir routes the same
+ * code to the same host sandbox as {@link CodemodeSandbox}: the host's
+ * interrupt handler + deadline provide the bound, so `interruptBudget` is
+ * accepted and ignored (upstream's `DEFAULT_INTERRUPT_BUDGET` is still
+ * exported for API compatibility).
+ */
+export class InlineCodemodeSandbox extends CodemodeSandboxBase {
+  constructor(options = {}) {
+    super(options);
+  }
+}
+
+/**
+ * Upstream runs scripts in another isolate reached over RPC, served by
+ * `serveCodemodeRemote`. pir hosts no second isolate, so both keep throwing
+ * (the unified `ERR_NOT_SUPPORTED` text); DRIFT §2.3 records the decision.
+ */
+export class RemoteCodemodeSandbox extends CodemodeSandboxBase {
+  execute() {
+    throw codemodeRuntimeUnavailable("RemoteCodemodeSandbox.execute");
+  }
+
+  start() {
+    throw codemodeRuntimeUnavailable("RemoteCodemodeSandbox.start");
+  }
+}
+
+/** The remote end of `RemoteCodemodeSandbox`; pir has no remote isolate to serve. */
+export function serveCodemodeRemote(_request, _exchange, _options) {
+  throw codemodeRuntimeUnavailable("serveCodemodeRemote");
+}
+
+/**
+ * Upstream loads `quickjs-wasi/quickjs.wasm`. pir's sandbox runs the host's
+ * native QuickJS (compiled into the host binary; no wasm engine anywhere), so
+ * there is no module to load; §2.3 records this as a deliberate deviation.
+ */
+export async function loadQuickJSWasm() {
+  throw codemodeRuntimeUnavailable("loadQuickJSWasm");
+}
+
+/**
+ * `InlineCodemodeSandbox` with the QuickJS module the bundler supplied
+ * (upstream `cloudflare.ts`). The sandbox itself is real — it routes to the
+ * host engine — so the module is dropped: the execution does not depend on
+ * the wasm build.
+ */
+export function createInlineCodemodeSandbox(options = {}) {
+  return new InlineCodemodeSandbox(options ?? {});
+}
+
+/** `quickjs-wasi/quickjs.wasm` compiled by Cloudflare's Wrangler; pir has no wasm engine. */
+function cloudflareWasmUnavailable() {
+  const message =
+    "cloudflareQuickJSWasm is not supported by the pir extension runtime (no QuickJS WebAssembly module)";
+  return new Proxy({}, {
+    get() { throw new Error(message); },
+  });
+}
+
+export const cloudflareQuickJSWasm = cloudflareWasmUnavailable();
+
+/** Cloudflare Durable Object base class; the `cloudflare:workers` runtime is not available here. */
+export class CodemodeSandboxDurableObject {
+  constructor() {
+    throw codemodeRuntimeUnavailable("CodemodeSandboxDurableObject");
+  }
+
+  execute(_request, _exchange) {
+    throw codemodeRuntimeUnavailable("CodemodeSandboxDurableObject.execute");
+  }
+}
+
+export default {
+  toCodemodeIdentifier,
+  CODEMODE_OPTIONS_PREFIX,
+  CODEMODE_SOURCE_GRAMMAR,
+  CodemodeSourceError,
+  parseCodemodeSource,
+  DEFAULT_INPUT_SCHEMA_MAX_CHARS,
+  renderToolOutputType,
+  renderToolSignature,
+  renderToolSample,
+  renderDeclarations,
+  schemaToType,
+  MAX_STORE_VALUE_CHARS,
+  MAX_STORE_TOTAL_CHARS,
+  MAX_OUTPUT_CHARS,
+  MAX_OUTPUT_ITEMS,
+  DEFAULT_INTERRUPT_BUDGET,
+  DEFAULT_REMOTE_MEMORY_LIMIT_BYTES,
+  CodemodeSandboxBase,
+  CodemodeSandbox,
+  InlineCodemodeSandbox,
+  RemoteCodemodeSandbox,
+  serveCodemodeRemote,
+  loadQuickJSWasm,
+  createInlineCodemodeSandbox,
+  cloudflareQuickJSWasm,
+  CodemodeSandboxDurableObject,
+};

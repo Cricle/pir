@@ -1,0 +1,272 @@
+// node:diagnostics_channel — real tier (pure JS; no host surface needed).
+// Mirrors the observable Node v24 semantics: a registry keyed by name
+// (strings and symbols; the name keeps its identity and reaches subscribers
+// as-is), snapshot subscriber lists, `publish` fan-out whose subscriber errors
+// are deferred to an uncaught exception instead of escaping the publisher, and
+// `Channel#runStores` store wrapping with Node's `wrapStoreRun` contract (the
+// last bound store is the outermost wrapper; a throwing transform is reported
+// on next tick and the run continues without entering that store).
+//
+// Known degradation (async_hooks, later wave): store entry rides
+// node:async_hooks' single-slot AsyncLocalStorage approximation, so with two
+// stores bound to one channel every `getStore()` inside the callback observes
+// the innermost store's value. Node's per-store context needs a real ALS; see
+// scripts/node_tests/REPORT.md (diagnostics-channel-bind-store).
+
+// ---------------------------------------------------------------------------
+// Node's argument validation (internal/errors shapes)
+// ---------------------------------------------------------------------------
+
+/// Node's internal errors stringify as `TypeError [ERR_INVALID_ARG_TYPE]: …`
+/// while `err.name` stays bare (`TypeError`), so regex-style assertions
+/// (`assert.throws(fn, /ERR_INVALID_ARG_TYPE/)`) only match when the instance
+/// carries this `toString`.
+function pirCodedError(Ctor, code, message) {
+  const error = new Ctor(message);
+  error.code = code;
+  Object.defineProperty(error, "toString", {
+    value: function () { return this.name + " [" + String(this.code) + "]: " + this.message; },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return error;
+}
+
+/// `util.inspect`-lite for the primitives the validation messages carry.
+function pirPrimitiveText(value) {
+  if (typeof value === "string") {
+    return "'" + value.replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "'";
+  }
+  if (typeof value === "bigint") return String(value) + "n";
+  return String(value);
+}
+
+/// `determineSpecificType`'s counterpart: the `Received …` tail Node appends
+/// to every ERR_INVALID_ARG_TYPE message.
+function pirReceivedText(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  const type = typeof value;
+  if (type === "function") return "function " + (value.name || "");
+  if (type === "object") {
+    const ctor = value.constructor;
+    if (ctor && typeof ctor.name === "string" && ctor.name !== "") {
+      return "an instance of " + ctor.name;
+    }
+    return String(value);
+  }
+  let inspected = pirPrimitiveText(value);
+  if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+  return "type " + type + " (" + inspected + ")";
+}
+
+function pirInvalidArgType(name, expected, value) {
+  return pirCodedError(TypeError, "ERR_INVALID_ARG_TYPE",
+    'The "' + name + '" argument must be ' + expected + ". Received " + pirReceivedText(value));
+}
+
+// ---------------------------------------------------------------------------
+// Deferred error reporting
+// ---------------------------------------------------------------------------
+
+/// Node's `triggerUncaughtException(err, false)`: subscriber and store
+/// transform errors never escape `publish`/`runStores`, they surface as an
+/// uncaught exception on the next tick (with a listener attached the event is
+/// emitted; otherwise the rethrow reaches the runtime's fatal path).
+function pirReportErrorLater(error) {
+  process.nextTick(() => {
+    const listeners = typeof process.listenerCount === "function"
+      ? process.listenerCount("uncaughtException")
+      : 0;
+    if (listeners > 0 && typeof process.emit === "function") {
+      process.emit("uncaughtException", error, "uncaughtException");
+      return;
+    }
+    throw error;
+  });
+}
+
+function pirDefaultTransform(data) { return data; }
+
+/// Node's `wrapStoreRun`: transform errors are deferred and the run continues
+/// as if the store had not been bound.
+function pirWrapStoreRun(store, data, next, transform = pirDefaultTransform) {
+  return () => {
+    let context;
+    try {
+      context = transform(data);
+    } catch (error) {
+      pirReportErrorLater(error);
+      return next();
+    }
+    return store.run(context, next);
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Channels
+// ---------------------------------------------------------------------------
+
+class Channel {
+  constructor(name) {
+    // Node keeps the name value itself (a symbol stays a symbol and is what
+    // subscribers receive as their second argument).
+    this.name = name;
+    this._subscribers = [];
+    this._stores = new Map();
+  }
+  get hasSubscribers() {
+    return this._subscribers.length > 0;
+  }
+  subscribe(subscription) {
+    if (typeof subscription !== "function") {
+      throw pirInvalidArgType("subscription", "of type function", subscription);
+    }
+    // Node appends unconditionally: subscribing the same function twice makes
+    // it run twice.
+    this._subscribers.push(subscription);
+  }
+  unsubscribe(subscription) {
+    const index = this._subscribers.indexOf(subscription);
+    if (index === -1) return false;
+    this._subscribers.splice(index, 1);
+    return true;
+  }
+  publish(message) {
+    const subscribers = this._subscribers.slice();
+    for (const subscriber of subscribers) {
+      try {
+        subscriber(message, this.name);
+      } catch (error) {
+        // Node isolates subscriber errors from the published-to code path.
+        pirReportErrorLater(error);
+      }
+    }
+  }
+  // Stores are keyed by store object (node uses a Map, so re-binding replaces
+  // the transform and `unbindStore` reports whether it removed one).
+  bindStore(store, transform) {
+    this._stores.set(store, transform);
+  }
+  unbindStore(store) {
+    if (!this._stores.has(store)) return false;
+    this._stores.delete(store);
+    return true;
+  }
+  runStores(data, fn, thisArg, ...args) {
+    // node's contract: the context is published first, then the callback runs
+    // inside every bound store (`store.run(transform(data), next)`), in bind
+    // order — the last bound store is the outermost wrapper.
+    let run = () => {
+      this.publish(data);
+      return Reflect.apply(fn, thisArg, args);
+    };
+    for (const [store, transform] of this._stores) {
+      const next = run;
+      run = pirWrapStoreRun(store, data, next, transform);
+    }
+    return run();
+  }
+}
+
+// The registry is keyed by the name value itself: symbols keep identity, and a
+// name that is neither a string nor a symbol is rejected before insertion.
+const channels = new Map();
+
+function channel(name) {
+  const existing = channels.get(name);
+  if (existing !== undefined) return existing;
+  if (typeof name !== "string" && typeof name !== "symbol") {
+    throw pirInvalidArgType("channel", "one of type string or symbol", name);
+  }
+  const created = new Channel(name);
+  channels.set(name, created);
+  return created;
+}
+
+function hasSubscribers(name) {
+  const found = channels.get(name);
+  return found !== undefined && found.hasSubscribers;
+}
+
+function subscribe(name, subscription) {
+  return channel(name).subscribe(subscription);
+}
+
+function unsubscribe(name, subscription) {
+  return channel(name).unsubscribe(subscription);
+}
+
+// tracingChannel(events): the start/end/asyncStart/asyncEnd/success/error
+// channel fan-out with the same event names Node emits. `runStores` runs the
+// callback between the start and end publishes.
+class TracingChannel {
+  constructor(nameOrChannels) {
+    const names = Array.isArray(nameOrChannels) ? nameOrChannels : [nameOrChannels];
+    this.start = channel("tracing:" + names[0] + ":start");
+    this.end = channel("tracing:" + names[0] + ":end");
+    this.asyncStart = channel("tracing:" + names[0] + ":asyncStart");
+    this.asyncEnd = channel("tracing:" + names[0] + ":asyncEnd");
+    this.error = channel("tracing:" + names[0] + ":error");
+    this.start._displayName = String(names[0]);
+  }
+  get name() {
+    return this.start._displayName;
+  }
+  get hasSubscribers() {
+    return this.start.hasSubscribers || this.end.hasSubscribers || this.asyncStart.hasSubscribers || this.asyncEnd.hasSubscribers || this.error.hasSubscribers;
+  }
+  publish(message) {
+    this.start.publish(message);
+  }
+  subscribe(handlers) {
+    if (handlers.start) this.start.subscribe(handlers.start);
+    if (handlers.end) this.end.subscribe(handlers.end);
+    if (handlers.asyncStart) this.asyncStart.subscribe(handlers.asyncStart);
+    if (handlers.asyncEnd) this.asyncEnd.subscribe(handlers.asyncEnd);
+    if (handlers.error) this.error.subscribe(handlers.error);
+  }
+  unsubscribe(handlers) {
+    let ok = true;
+    if (handlers.start) ok = this.start.unsubscribe(handlers.start) && ok;
+    if (handlers.end) ok = this.end.unsubscribe(handlers.end) && ok;
+    if (handlers.asyncStart) ok = this.asyncStart.unsubscribe(handlers.asyncStart) && ok;
+    if (handlers.asyncEnd) ok = this.asyncEnd.unsubscribe(handlers.asyncEnd) && ok;
+    if (handlers.error) ok = this.error.unsubscribe(handlers.error) && ok;
+    return ok;
+  }
+  runStores(context, fn, thisArg, ...args) {
+    // pir extension: node's v24 TracingChannel carries no store surface, so
+    // this keeps the start/end/error fan-out around the callback.
+    if (typeof fn !== "function") {
+      throw new TypeError("The run callback must be a function");
+    }
+    const wrappedContext = context === undefined || context === null ? {} : context;
+    this.start.publish(wrappedContext);
+    try {
+      const result = fn.apply(thisArg, args);
+      this.end.publish(wrappedContext);
+      return result;
+    } catch (error) {
+      this.error.publish({ ...wrappedContext, error });
+      throw error;
+    }
+  }
+}
+
+function tracingChannel(nameOrChannels) {
+  return new TracingChannel(nameOrChannels);
+}
+
+const diagnosticsChannelModule = {
+  channel: channel,
+  hasSubscribers: hasSubscribers,
+  subscribe: subscribe,
+  unsubscribe: unsubscribe,
+  Channel: Channel,
+  tracingChannel: tracingChannel,
+};
+
+export default diagnosticsChannelModule;
+export { channel, hasSubscribers, subscribe, unsubscribe, Channel, tracingChannel };

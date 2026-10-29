@@ -1,0 +1,126 @@
+
+export * from "@earendil-works/pi-coding-agent";
+
+// Phase 4c: `Agent` stub. Construction succeeds (options are stored and the
+// identity state is exposed) so extensions can register/typecheck with it;
+// actually running an agent is out of scope for the pir extension runtime —
+// prompt/run/continue throw with a clear message, while lifecycle no-ops
+// (abort/waitForIdle/subscribe/unsubscribe) stay safe to call.
+export class Agent {
+  constructor(options) {
+    this.options = options ?? {};
+    this._state = this.options.initialState ?? { messages: [] };
+    this.convertToLlm = this.options.convertToLlm;
+    this.streamFunction = this.options.streamFn;
+    this.steeringQueue = [];
+    this.followUpQueue = [];
+  }
+
+  get state() {
+    return this._state;
+  }
+
+  get signal() {
+    return undefined;
+  }
+
+  steer(message) { this.steeringQueue.push(message); }
+
+  followUp(message) { this.followUpQueue.push(message); }
+
+  clearSteeringQueue() { this.steeringQueue = []; }
+
+  clearFollowUpQueue() { this.followUpQueue = []; }
+
+  clearAllQueues() { this.clearSteeringQueue(); this.clearFollowUpQueue(); }
+
+  hasQueuedMessages() { return this.steeringQueue.length > 0 || this.followUpQueue.length > 0; }
+
+  peekQueuedMessages() {
+    return this.steeringQueue.length > 0 ? this.steeringQueue : this.followUpQueue;
+  }
+
+  abort() {
+    // Nothing is running in this runtime; abort stays a safe no-op.
+  }
+
+  waitForIdle() { return Promise.resolve(); }
+
+  subscribe(_listener) { return () => {}; }
+
+  async prompt() { pirAgentUnavailable(); }
+
+  async run() { pirAgentUnavailable(); }
+
+  async continue() { pirAgentUnavailable(); }
+
+  reset() {
+    const initial = this.options.initialState;
+    this._state = initial ? { ...initial } : { messages: [] };
+    this.clearAllQueues();
+  }
+}
+
+function pirAgentUnavailable() {
+  throw new Error("Agent execution is not available in the pir extension runtime");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4f: the remaining upstream `@earendil-works/pi-agent-core` value
+// surface. The loop runners execute turns against a model runtime, which is
+// host-side in pir; every entry point fails with one clear error instead of
+// half-running. `setDefaultStreamFn` is an inert setter (stored, never
+// executed) — the pir `Agent` stub does not consume it.
+// ---------------------------------------------------------------------------
+
+function pirAgentRuntimeUnavailable(name) {
+  throw new Error(String(name) + " is not available in the pir extension runtime (agent execution is host-side)");
+}
+
+let pirDefaultStreamFn;
+
+/** Configure the fallback used by Agent and low-level loops when callers omit streamFn. */
+export function setDefaultStreamFn(streamFn) {
+  pirDefaultStreamFn = streamFn;
+}
+
+/** Start an agent loop with a new prompt message (agent execution is host-side). */
+export function agentLoop() {
+  pirAgentRuntimeUnavailable("agentLoop");
+}
+
+/** Continue an agent loop from the current context (agent execution is host-side). */
+export function agentLoopContinue() {
+  pirAgentRuntimeUnavailable("agentLoopContinue");
+}
+
+/** Low-level agent loop runner (agent execution is host-side). */
+export function runAgentLoop() {
+  pirAgentRuntimeUnavailable("runAgentLoop");
+}
+
+/** Low-level agent loop continue runner (agent execution is host-side). */
+export function runAgentLoopContinue() {
+  pirAgentRuntimeUnavailable("runAgentLoopContinue");
+}
+
+/** Execute one tool call (agent execution is host-side). */
+export function runToolCall() {
+  pirAgentRuntimeUnavailable("runToolCall");
+}
+
+/** Proxy streaming through a server (agent execution is host-side). */
+export function streamProxy() {
+  pirAgentRuntimeUnavailable("streamProxy");
+}
+
+export default {
+  Agent,
+  agentLoop,
+  agentLoopContinue,
+  runAgentLoop,
+  runAgentLoopContinue,
+  runToolCall,
+  setDefaultStreamFn,
+  streamProxy,
+};

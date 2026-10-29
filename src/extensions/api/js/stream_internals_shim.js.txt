@@ -1,0 +1,117 @@
+// node:_stream_duplex / _stream_readable / _stream_writable — private
+// stream internals. `from` aliases the stream shim's factory; the web
+// interop pair (`fromWeb`/`toWeb`) cannot be served by the minimal stream
+// pad and throws the unified error; the internal state classes are inert
+// skeletons; `_fromList`/`wrap` are documented-minimal helpers.
+import { Duplex, Readable, Writable } from "@node/stream";
+
+function streamInternalUnsupported(api) {
+  const error = new Error("node:_stream_" + api + " is not supported by the pir extension runtime (minimal stream pad)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+// Internal state holders: inert skeletons with the real field names.
+class ReadableState {
+  constructor(stream, options) {
+    this.stream = stream;
+    this.highWaterMark = options && typeof options.highWaterMark === "number" ? options.highWaterMark : 16384;
+    this.buffer = [];
+    this.length = 0;
+    this.ended = false;
+    this.endedEmitted = false;
+    this.reading = false;
+    this.flowing = null;
+  }
+}
+
+class WritableState {
+  constructor(stream, options) {
+    this.stream = stream;
+    this.highWaterMark = options && typeof options.highWaterMark === "number" ? options.highWaterMark : 16384;
+    this.buffered = [];
+    this.bufferedIndex = 0;
+    this.length = 0;
+    this.ended = false;
+    this.finished = false;
+    this.writing = false;
+  }
+}
+
+// Minimal `_fromList`: returns the first buffered chunk (the real one drains
+// n bytes across buffers; the minimal pad buffers whole chunks).
+function _fromList(_n, state) {
+  if (state && Array.isArray(state.buffer) && state.buffer.length > 0) {
+    return state.buffer.shift();
+  }
+  return null;
+}
+
+// `Readable.from(iterable)` — minimal real: drains the (sync or async)
+// iterator through the pad's push surface on microtasks.
+function from(iterable) {
+  const readable = new Readable();
+  if (iterable === undefined || iterable === null || typeof iterable[Symbol.asyncIterator] !== "function" && typeof iterable[Symbol.iterator] !== "function") {
+    globalThis.__pirMicrotask(() => readable.destroy(new TypeError("The list argument must be an iterable")));
+    return readable;
+  }
+  const iterator = typeof iterable[Symbol.asyncIterator] === "function"
+    ? iterable[Symbol.asyncIterator]()
+    : iterable[Symbol.iterator]();
+  const step = () => {
+    let result;
+    try {
+      result = iterator.next();
+    } catch (error) {
+      readable.destroy(error);
+      return;
+    }
+    Promise.resolve(result).then(({ done, value }) => {
+      if (done) {
+        readable.push(null);
+        return;
+      }
+      readable.push(value);
+      globalThis.__pirMicrotask(step);
+    }, (error) => {
+      readable.destroy(error);
+    });
+  };
+  globalThis.__pirMicrotask(step);
+  return readable;
+}
+
+// `wrap` adapts an old-style (event-only) stream; the minimal pad returns
+// the input as-is (it already exposes the event surface).
+function wrap(stream) {
+  return stream;
+}
+
+// The Web-streams interop pair landed on the stream pad itself
+// (`Duplex.fromWeb`/`Duplex.toWeb`, node's own statics); the private specifiers
+// delegate instead of throwing now that the pad can serve them.
+function fromWeb(pair, options) {
+  return Duplex.fromWeb(pair, options);
+}
+
+function toWeb(stream, options) {
+  return Duplex.toWeb(stream, options);
+}
+
+// Aggregated namespace: each _stream_* specifier maps to the same source and
+// keeps the union of the real private surfaces (documented superset).
+const streamInternals = {
+  Duplex: Duplex,
+  Readable: Readable,
+  Writable: Writable,
+  from: from,
+  fromWeb: fromWeb,
+  toWeb: toWeb,
+  ReadableState: ReadableState,
+  WritableState: WritableState,
+  _fromList: _fromList,
+  wrap: wrap,
+};
+
+export default streamInternals;
+export { Duplex, Readable, Writable, from, fromWeb, toWeb, ReadableState, WritableState, _fromList, wrap };

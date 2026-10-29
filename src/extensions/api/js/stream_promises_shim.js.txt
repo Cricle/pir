@@ -1,0 +1,59 @@
+
+function finished(stream, options) {
+  if (!stream || typeof stream.on !== "function") {
+    throw new TypeError("The \"stream\" argument must be a stream");
+  }
+  return new Promise((resolve, reject) => {
+    if (stream.readableEnded || stream.writableEnded || stream.finished) {
+      resolve();
+      return;
+    }
+    const cleanup = () => {
+      stream.removeListener("end", onEnd);
+      stream.removeListener("finish", onFinish);
+      stream.removeListener("close", onClose);
+      stream.removeListener("error", onError);
+    };
+    const settle = (error) => {
+      cleanup();
+      if (error === undefined) resolve();
+      else reject(error);
+    };
+    const onEnd = () => settle();
+    const onFinish = () => settle();
+    const onClose = () => settle();
+    const onError = (error) => settle(error === undefined ? new Error("stream error") : error);
+    stream.on("end", onEnd);
+    stream.on("finish", onFinish);
+    stream.on("close", onClose);
+    stream.on("error", onError);
+  });
+}
+
+function pipeline(...args) {
+  let callback;
+  if (typeof args[args.length - 1] === "function") callback = args.pop();
+  if (args.length === 0) {
+    throw new TypeError("pipeline requires at least one stream");
+  }
+  for (let i = 0; i + 1 < args.length; i++) {
+    args[i].pipe(args[i + 1]);
+  }
+  const settled = new Promise((resolve, reject) => {
+    let done = false;
+    const fail = (error) => {
+      if (!done) { done = true; reject(error); }
+    };
+    for (const stream of args) stream.on("error", fail);
+    finished(args[args.length - 1]).then(() => {
+      if (!done) { done = true; resolve(); }
+    }, fail);
+  });
+  if (callback) {
+    settled.then(() => callback(null), (error) => callback(error));
+  }
+  return settled;
+}
+
+export default { finished: finished, pipeline: pipeline };
+export { finished, pipeline };

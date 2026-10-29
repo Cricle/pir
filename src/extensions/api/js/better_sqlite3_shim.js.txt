@@ -1,0 +1,408 @@
+
+// better-sqlite3 — virtual package shim. The real package is a native NAPI
+// addon (permanent runtime boundary); this shim re-creates its API surface on
+// top of the host SQLite bridge via the `node:sqlite` DatabaseSync real
+// implementation, so consumers like context-mode load and run.
+//
+// Coverage decision (consumption-driven, from the only in-matrix consumer —
+// context-mode's db-base.js SQLiteBase): Database(filename[, options]),
+// prepare(sql) → Statement{run/get/all/iterate}, exec, pragma, transaction(fn)
+// (+ .deferred/.immediate/.exclusive), close, inTransaction/open properties,
+// defaultSafeIntegers, verbose(). Unconsumed better-sqlite3 API (function/
+// aggregate/table/loadExtension/backup, Statement pluck/raw/expand with
+// non-default modes) throws the standard runtime wording.
+//
+// Differences from native better-sqlite3 (documented, not hidden): iterate()
+// materializes the result set first; pragma() mirrors better-sqlite3's
+// return-value shape (scalar for single-row single-column results, array of
+// row objects otherwise) but not its low-level statement reuse; timeouts use
+// the host busy_timeout.
+import { DatabaseSync } from "node:sqlite";
+
+(() => {
+  function pirSqliteUnsupported(what) {
+    const error = new Error(what + " is not supported by the pir extension runtime (better-sqlite3 native surface is unavailable; the virtual shim covers the core database/statement API)");
+    error.code = "ERR_NOT_SUPPORTED";
+    return error;
+  }
+
+  function errInvalidState(message) {
+    const error = new Error(message);
+    error.code = "ERR_INVALID_STATE";
+    return error;
+  }
+
+  const BIG = "$pirBig";
+  const BLOB = "$pirBlob";
+
+  // Decode one tagged cell the way better-sqlite3 would hand it back
+  // (numbers unless safe-integers mode; blobs as Uint8Array/Buffer).
+  function decodeCell(value, readBigInts) {
+    if (value === null) return null;
+    if (Array.isArray(value)) {
+      const out = new Array(value.length);
+      for (let i = 0; i < value.length; i++) out[i] = decodeCell(value[i], readBigInts);
+      return out;
+    }
+    if (typeof value === "object") {
+      if (typeof value[BIG] === "string") {
+        if (!readBigInts) {
+          const asNumber = Number(value[BIG]);
+          if (!Number.isSafeInteger(asNumber)) {
+            const error = new RangeError(
+              "Value is too large to be represented as a JavaScript number: " + value[BIG]
+            );
+            error.code = "ERR_OUT_OF_RANGE";
+            throw error;
+          }
+          return asNumber;
+        }
+        return BigInt(value[BIG]);
+      }
+      if (typeof value[BLOB] === "string") {
+        return Buffer.from(value[BLOB], "base64");
+      }
+      const out = Object.create(null);
+      for (const key of Object.keys(value)) {
+        out[key] = decodeCell(value[key], readBigInts);
+      }
+      return out;
+    }
+    return value;
+  }
+
+  // better-sqlite3 accepts a single array argument and spreads it across the
+  // positional parameters (documented binding style).
+  function spreadArgs(args) {
+    if (args.length === 1 && Array.isArray(args[0])) return args[0];
+    return args;
+  }
+
+  class Statement {
+    constructor(db, sync) {
+      this._pirDb = db;
+      this._pirSync = sync;
+      this._pirPluck = false;
+      this._pirRaw = false;
+      this._pirExpand = false;
+      this._pirReadBigInts = db._pirSafeIntegers === true;
+      sync.setReadBigInts(this._pirReadBigInts);
+    }
+
+    // Row post-processing, better-sqlite3 modes.
+    _pirShapeRow(row) {
+      if (this._pirExpand && row !== undefined && row !== null) {
+        const out = Object.create(null);
+        for (const key of Object.keys(row)) {
+          const dot = key.indexOf(".");
+          if (dot === -1) {
+            out[key] = row[key];
+          } else {
+            const table = key.slice(0, dot);
+            const column = key.slice(dot + 1);
+            if (!out[table] || typeof out[table] !== "object") {
+              out[table] = Object.create(null);
+            }
+            out[table][column] = row[key];
+          }
+        }
+        return out;
+      }
+      if (this._pirRaw && Array.isArray(row) === false && row !== undefined && row !== null) {
+        return Object.values(row);
+      }
+      return row;
+    }
+
+    _pirPostprocess(value) {
+      if (value === undefined || value === null) return value;
+      if (Array.isArray(value)) {
+        return value.map((item) => this._pirShapeRow(item));
+      }
+      return this._pirShapeRow(value);
+    }
+
+    _pirApplyModes(row) {
+      const shaped = this._pirPostprocess(row);
+      if (this._pirPluck && shaped !== undefined && shaped !== null) {
+        if (Array.isArray(shaped)) {
+          return shaped.map((item) => {
+            const keys = Object.keys(item);
+            return keys.length > 0 ? item[keys[0]] : undefined;
+          });
+        }
+        const keys = Object.keys(shaped);
+        return keys.length > 0 ? shaped[keys[0]] : undefined;
+      }
+      return shaped;
+    }
+
+    run(...args) {
+      const info = this._pirSync.run(...spreadArgs(args));
+      return {
+        changes: this._pirReadBigInts ? info.changes : Number(info.changes),
+        lastInsertRowid: this._pirReadBigInts
+          ? info.lastInsertRowid
+          : Number(info.lastInsertRowid),
+      };
+    }
+
+    get(...args) {
+      const row = this._pirSync.get(...spreadArgs(args));
+      if (row === undefined) return undefined;
+      return this._pirApplyModes(row);
+    }
+
+    all(...args) {
+      const rows = this._pirSync.all(...spreadArgs(args));
+      return this._pirApplyModes(rows);
+    }
+
+    iterate(...args) {
+      const rows = this.all(...args);
+      let index = 0;
+      const iterator = {
+        [Symbol.iterator]() { return iterator; },
+        next() {
+          if (index < rows.length) {
+            return { value: rows[index++], done: false };
+          }
+          return { value: undefined, done: true };
+        },
+        return(value) {
+          return { value: value, done: true };
+        },
+      };
+      return iterator;
+    }
+
+    columns() {
+      return this._pirSync.columns();
+    }
+
+    pluck(state) {
+      this._pirPluck = state === undefined ? true : state === true;
+      if (this._pirPluck) this._pirRaw = false;
+      return this;
+    }
+
+    raw(state) {
+      this._pirRaw = state === undefined ? true : state === true;
+      if (this._pirRaw) this._pirPluck = false;
+      return this;
+    }
+
+    expand(state) {
+      this._pirExpand = state === undefined ? true : state === true;
+      return this;
+    }
+
+    setReadBigInts(enabled) {
+      this._pirReadBigInts = enabled === true;
+      this._pirSync.setReadBigInts(enabled);
+      return this;
+    }
+
+    get sourceSQL() {
+      return this._pirSync.sourceSQL;
+    }
+
+    get expandedSQL() {
+      return this._pirSync.expandedSQL;
+    }
+
+    get reader() {
+      return true;
+    }
+  }
+
+  // better-sqlite3 pragma(): executes `PRAGMA <source>`; a single-row
+  // single-column result collapses to the scalar value, any other result is
+  // the array of row objects, no rows → undefined.
+  function pragmaRows(db, source) {
+    const rows = db.prepare("PRAGMA " + source).all();
+    if (rows.length === 0) return undefined;
+    if (rows.length === 1) {
+      const values = Object.values(rows[0]);
+      if (values.length === 1) return values[0];
+    }
+    return rows;
+  }
+
+  class Database {
+    constructor(filename, options) {
+      if (typeof filename !== "string") {
+        const error = new TypeError("The `filename` argument must be of type string");
+        error.code = "ERR_INVALID_ARG_TYPE";
+        throw error;
+      }
+      const opts = options || {};
+      if (filename !== ":memory:" && filename !== "" && !opts.readonly && opts.fileMustExist) {
+        // fileMustExist: fail like SQLite's CANTOPEN before creating.
+        if (!globalThis.__pirNodeCall("fs", "exists", { path: filename })) {
+          const error = new Error("SQLITE_CANTOPEN: unable to open database file");
+          error.code = "ERR_SQLITE_ERROR";
+          throw error;
+        }
+      }
+      this._pirSync = new DatabaseSync(filename, {
+        readOnly: opts.readonly === true,
+        // better-sqlite3 keeps SQLite's default (FK off) — the host enables
+        // FK by default for node:sqlite parity, so opt out explicitly.
+        enableForeignKeyConstraints: false,
+        timeout: typeof opts.timeout === "number" ? opts.timeout : 0,
+      });
+      this._pirSafeIntegers = false;
+      this._pirClosed = false;
+      if (typeof opts.verbose === "function") {
+        try { opts.verbose.call(this, filename + " opened"); } catch { /* user hook */ }
+      }
+    }
+
+    prepare(sql) {
+      if (this._pirClosed) throw errInvalidState("The database connection is not open");
+      return new Statement(this, this._pirSync.prepare(sql));
+    }
+
+    exec(sql) {
+      if (this._pirClosed) throw errInvalidState("The database connection is not open");
+      this._pirSync.exec(sql);
+      return this;
+    }
+
+    pragma(source, options) {
+      if (this._pirClosed) throw errInvalidState("The database connection is not open");
+      const rows = pragmaRows(this, source);
+      if (options && options.simple === true) {
+        if (rows === undefined) return undefined;
+        if (Array.isArray(rows)) {
+          const first = rows[0];
+          const values = Object.values(first);
+          return values.length > 0 ? values[0] : undefined;
+        }
+        return rows;
+      }
+      return rows;
+    }
+
+    // transaction(fn) → wrapped fn; nested invocations (a transaction body
+    // that calls another wrapped transaction) use SAVEPOINTs like native
+    // better-sqlite3.
+    transaction(fn) {
+      const db = this;
+      const makeWrapped = (begin) => {
+        const wrapped = function (...args) {
+          if (db._pirClosed) throw errInvalidState("The database connection is not open");
+          if (db.inTransaction) {
+            // Nested: savepoint pair instead of BEGIN/COMMIT.
+            const name = "pir_sp_" + (db._pirSavepointSeq = (db._pirSavepointSeq || 0) + 1);
+            db.exec("SAVEPOINT " + name);
+            try {
+              const result = fn(...args);
+              db.exec("RELEASE " + name);
+              return result;
+            } catch (error) {
+              try { db.exec("ROLLBACK TO " + name); db.exec("RELEASE " + name); } catch { /* already rolled back */ }
+              throw error;
+            }
+          }
+          db.exec(begin);
+          try {
+            const result = fn(...args);
+            db.exec("COMMIT");
+            return result;
+          } catch (error) {
+            try { db.exec("ROLLBACK"); } catch { /* connection may be unusable */ }
+            throw error;
+          }
+        };
+        return wrapped;
+      };
+      const base = makeWrapped("BEGIN");
+      base.deferred = makeWrapped("BEGIN DEFERRED");
+      base.immediate = makeWrapped("BEGIN IMMEDIATE");
+      base.exclusive = makeWrapped("BEGIN EXCLUSIVE");
+      return base;
+    }
+
+    get open() {
+      return !this._pirClosed;
+    }
+
+    get inTransaction() {
+      if (this._pirClosed) return false;
+      return this._pirSync.isTransaction;
+    }
+
+    get isTransaction() {
+      return this.inTransaction;
+    }
+
+    close() {
+      if (this._pirClosed) return;
+      this._pirSync.close();
+      this._pirClosed = true;
+    }
+
+    openNew() {
+      throw pirSqliteUnsupported("Database.prototype.openNew");
+    }
+
+    checkpoint(..._args) {
+      // WAL checkpoints run fine through pragma("wal_checkpoint(...)").
+      throw pirSqliteUnsupported("Database.prototype.checkpoint");
+    }
+
+    defaultSafeIntegers(state) {
+      this._pirSafeIntegers = state === undefined ? true : state === true;
+      return this;
+    }
+
+    function(..._args) {
+      throw pirSqliteUnsupported("Database.prototype.function (custom SQL functions)");
+    }
+
+    aggregate(..._args) {
+      throw pirSqliteUnsupported("Database.prototype.aggregate (custom aggregates)");
+    }
+
+    table(..._args) {
+      throw pirSqliteUnsupported("Database.prototype.table (virtual tables)");
+    }
+
+    loadExtension(..._args) {
+      throw pirSqliteUnsupported("Database.prototype.loadExtension (runtime extensions)");
+    }
+
+    backup(..._args) {
+      throw pirSqliteUnsupported("Database.prototype.backup");
+    }
+
+    get maxWriteBufferedBytes() {
+      return 0;
+    }
+  }
+
+  // verbose(): Node's debugging wrapper. The shim has no native layer to
+  // trace, so it returns the same Database with a no-op debug passthrough
+  // (callers only use the return value's `.Database`).
+  function verbose() {
+    const wrapped = Database;
+    wrapped.Database = Database;
+    wrapped.default = Database;
+    return wrapped;
+  }
+
+  const betterSqlite3 = Database;
+  betterSqlite3.default = Database;
+  betterSqlite3.Database = Database;
+  betterSqlite3.verbose = verbose;
+
+  globalThis.__pirBetterSqlite3Shim = betterSqlite3;
+})();
+
+const betterSqlite3 = globalThis.__pirBetterSqlite3Shim;
+
+export default betterSqlite3;
+export const Database = betterSqlite3.Database;
+export const verbose = betterSqlite3.verbose;

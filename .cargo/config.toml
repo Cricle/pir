@@ -1,0 +1,19 @@
+# Faster dev-loop linker (rust-lld instead of MSVC link.exe / GNU ld).
+# Measured: cargo test --no-run 237s -> 158s; per-link 16.9s -> 5.5s
+# (scripts/test_select.ps1 measures/report; see scripts/lld-config.toml.example).
+# Disable: delete this file. Full test_fast was verified green with this linker
+# (139 test targets at the time: 7 merged harnesses + 131 standalone targets +
+# the lib unit target). The current tree has 270 cargo test targets: 269
+# integration targets (9 merged harnesses + 260 standalone tests/*.rs) + the
+# lib unit target.
+#
+# The local Windows toolchain in this environment is
+# `stable-x86_64-pc-windows-gnu` (see tools/mingw and target/build-release.bat),
+# so the GNU target needs the same linker override. `rustc -C linker=rust-lld`
+# resolves to the rust-lld bundled with the toolchain and links COFF directly.
+
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
+
+[target.x86_64-pc-windows-gnu]
+linker = "rust-lld"

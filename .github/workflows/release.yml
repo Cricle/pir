@@ -1,0 +1,325 @@
+name: Release
+
+# The only release entry point: tags starting with `v` (v0.0.1, v0.1.0-rc.1).
+# The tag must equal Cargo.toml's `[package].version` (checked by the `version`
+# job); the remaining jobs still run `cargo set-version` to keep generated
+# Cargo.lock/package metadata consistent inside the ephemeral runner.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+# Least privilege: only the `release` job needs write access to publish the
+# GitHub Release; build/test/publish only read the checked-out tree.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  # Deep in-process nesting in the agent tests needs the larger stack; the
+  # release `test` job runs the same suite as CI.
+  RUST_MIN_STACK: "8388608"
+  # The crates.io *package* name. It is `pir-sdk`, not `pir`: the `pir` name is
+  # owned by an unrelated 2022 project (0.1.0, "A Private Information Retrieval
+  # module", verified 2026-10-27). The crate is still imported as `pir`
+  # ([lib] name) and the executable is still `pir` ([[bin]] name). This value
+  # must match `[package].name` exactly for `cargo publish -p "$CRATE_NAME"`.
+  CRATE_NAME: pir-sdk
+
+jobs:
+  # Single source of truth for the version. Fails before any toolchain work if
+  # the tag does not derive a clean semver version.
+  version:
+    name: Derive version from tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+      tag: ${{ steps.derive.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate ${{ github.ref_name }} as semver
+        id: derive
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          tag="$TAG_NAME"
+          case "$tag" in
+            v*) ;;
+            *)
+              echo "::error title=Not a release tag::$tag does not start with 'v'"
+              exit 1
+              ;;
+          esac
+          version="${tag#v}"
+          # Strict semver (no build metadata: `cargo set-version` and crates.io
+          # both drop/ignore `+build`, so a tag carrying it would silently
+          # become a different version).
+          if ! printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
+            echo "::error title=Invalid release tag::$tag does not derive a semver version (expected vMAJOR.MINOR.PATCH[-PRERELEASE])"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release version: $version (tag $tag)"
+
+      - name: Verify version is the checked-in version
+        shell: bash
+        run: |
+          version="${{ steps.derive.outputs.version }}"
+          manifest="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          migration="$(sed -n 's/^pir_version=//p' .migration-info | head -n 1)"
+          if [ "$manifest" != "$version" ]; then
+            echo "::error title=Version mismatch::Cargo.toml has $manifest but tag says $version; bump Cargo.toml before tagging."
+            exit 1
+          fi
+          if [ "$migration" != "$version" ]; then
+            echo "::error title=Version mismatch::.migration-info pir_version is $migration but tag says $version."
+            exit 1
+          fi
+          echo "Cargo.toml and .migration-info agree on $version"
+
+  ci:
+    name: CI (reusable)
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: [version, ci]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: macos-universal
+            os: macos-latest
+            target: universal-apple-darwin
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
+      # Static musl Linux artifact. The target is musl (not glibc); musl-gcc
+      # builds the bundled C dependencies (SQLite, zstd) against musl too.
+      # openssl-sys' vendored feature is selected by the target-specific
+      # dependency in Cargo.toml; OPENSSL_STATIC keeps the final link static.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      OPENSSL_STATIC: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install musl toolchain
+        if: matrix.name == 'linux-x86_64'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.name }}
+          cache-on-failure: true
+          # Tag builds are one-shot: saving three release-* caches would eat
+          # the repository's 10 GB cache budget (and can evict the priority
+          # linux-stable-test cache). Restore-only.
+          save-if: false
+
+      - uses: taiki-e/install-action@cargo-edit
+
+      # The version baked into the binary, `--version`, User-Agent, MCP client
+      # and crash logs comes from Cargo.toml at compile time; applying the tag
+      # version here (and in `test`/`publish`) is what makes the tag the source
+      # of truth. `--locked` below then builds against the Cargo.lock that
+      # cargo-edit just updated.
+      - name: Apply tag version
+        shell: bash
+        run: |
+          cargo set-version "$VERSION"
+          applied="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          if [ "$applied" != "$VERSION" ]; then
+            echo "::error title=Version not applied::cargo set-version left Cargo.toml at $applied, expected $VERSION"
+            exit 1
+          fi
+          echo "Cargo.toml version = $applied"
+
+      - name: Add Rust targets (macOS universal)
+        if: matrix.name == 'macos-universal'
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Add Rust target
+        if: matrix.name != 'macos-universal'
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (macOS universal)
+        if: matrix.name == 'macos-universal'
+        run: |
+          cargo build --release --locked --bin pir --target x86_64-apple-darwin
+          cargo build --release --locked --bin pir --target aarch64-apple-darwin
+          lipo -create \
+            target/x86_64-apple-darwin/release/pir \
+            target/aarch64-apple-darwin/release/pir \
+            -output pir
+
+      - name: Build
+        if: matrix.name != 'macos-universal'
+        run: cargo build --release --locked --bin pir --target ${{ matrix.target }}
+
+      - name: Package (Linux)
+        if: matrix.name == 'linux-x86_64'
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/pir" dist/pir
+          cp README.md dist/
+          chmod +x dist/pir
+          tar -czf "pir-${TAG}-linux-x86_64-musl.tar.gz" -C dist pir README.md
+
+      - name: Package (macOS universal)
+        if: matrix.name == 'macos-universal'
+        run: |
+          mkdir -p dist
+          cp pir dist/pir
+          cp README.md dist/
+          chmod +x dist/pir
+          tar -czf "pir-${TAG}-macos-universal.tar.gz" -C dist pir README.md
+
+      - name: Package (Windows)
+        if: matrix.name == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/pir.exe" dist/
+          Copy-Item README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath "pir-${env:TAG}-windows-x86_64.zip"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pir-${{ matrix.name }}
+          path: pir-${{ needs.version.outputs.tag }}-*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    # CI runs first as a reusable workflow; release never repeats lint/test/doctest.
+    needs: [version, ci, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # Runs last and on its own: publishing to crates.io is irreversible, so it
+  # waits for the build, the test gate AND the GitHub Release to exist.
+  publish:
+    name: Publish to crates.io
+    needs: [version, ci, build, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # No rust-cache here: `cargo publish`'s verification build happens in
+      # `target/package/<crate>-<version>/`, a fresh target dir that the
+      # workspace cache cannot seed.
+      - uses: taiki-e/install-action@cargo-edit
+
+      - name: Apply tag version
+        shell: bash
+        run: |
+          cargo set-version "$VERSION"
+          applied="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          if [ "$applied" != "$VERSION" ]; then
+            echo "::error title=Version not applied::cargo set-version left Cargo.toml at $applied, expected $VERSION"
+            exit 1
+          fi
+
+      # Idempotency: re-running a release (or re-tagging a version that was
+      # published by an earlier attempt) must not fail the run.
+      - name: Check whether this version is already on crates.io
+        id: probe
+        shell: bash
+        run: |
+          url="https://crates.io/api/v1/crates/${CRATE_NAME}/${VERSION}"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -A "${GITHUB_REPOSITORY} release workflow (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY})" \
+            "$url")"
+          case "$code" in
+            200)
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "::notice title=Already published::${CRATE_NAME} ${VERSION} is already on crates.io; skipping the upload."
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              echo "${CRATE_NAME} ${VERSION} is not on crates.io yet; it will be published."
+              ;;
+            *)
+              echo "::error title=crates.io probe failed::GET ${url} returned HTTP ${code}"
+              exit 1
+              ;;
+          esac
+
+      - name: Package size guard
+        if: steps.probe.outputs.exists == 'false'
+        shell: bash
+        # Cheap pre-flight of the same archive `cargo publish` will build:
+        # crates.io rejects a .crate at or above 10,000,000 bytes.
+        run: |
+          cargo package --no-verify --allow-dirty --locked
+          crate_file="target/package/${CRATE_NAME}-${VERSION}.crate"
+          if [ ! -f "$crate_file" ]; then
+            echo "::error title=Unexpected package filename::$crate_file was not produced"
+            exit 1
+          fi
+          bytes=$(stat -c%s "$crate_file")
+          echo "crate: $crate_file ($bytes bytes)"
+          if [ "$bytes" -ge 10000000 ]; then
+            echo "::error title=Crate too large::$crate_file is $bytes bytes; the crates.io limit is 10,000,000"
+            exit 1
+          fi
+
+      - name: cargo publish
+        if: steps.probe.outputs.exists == 'false'
+        shell: bash
+        # The token is read from the environment only. `--token` is required by
+        # the task contract; GitHub masks secret values in logs, and the value
+        # is never written to a file. `--locked` publishes the Cargo.lock that
+        # cargo-edit updated from the tag version.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error title=Missing token::the CARGO_REGISTRY_TOKEN secret is not set"
+            exit 1
+          fi
+          cargo publish -p "$CRATE_NAME" --locked --allow-dirty --token "$CARGO_REGISTRY_TOKEN"

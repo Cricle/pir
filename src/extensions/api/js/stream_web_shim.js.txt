@@ -1,0 +1,230 @@
+// node:stream/web — minimal tier over the engine's Web streams globals
+// (installed by `web_streams.js.txt` at bootstrap, `??`-guarded). The three
+// primary classes re-export the global implementations; the strategy pairs
+// are real (pure JS); the controller/reader classes are the difference
+// surface: the ones the engine's streams construct internally are surfaced
+// via delegation, and the byte-level internals the minimal engine
+// implementation cannot model are documented skeleton classes.
+const EngineReadableStream = globalThis.ReadableStream;
+const EngineWritableStream = globalThis.WritableStream;
+const EngineTransformStream = globalThis.TransformStream;
+
+function webUnsupported(api) {
+  const error = new Error("node:stream/web." + api + " is not supported by the pir extension runtime (minimal Web streams pad)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+// Real: the queue-length strategies are plain value logic.
+class ByteLengthQueuingStrategy {
+  constructor({ highWaterMark } = {}) {
+    this.highWaterMark = highWaterMark;
+  }
+  size(chunk) {
+    return chunk && chunk.byteLength !== undefined ? chunk.byteLength : 0;
+  }
+}
+
+class CountQueuingStrategy {
+  constructor({ highWaterMark } = {}) {
+    this.highWaterMark = highWaterMark;
+  }
+  size() {
+    return 1;
+  }
+}
+
+// Reader/writer surfaces delegate to the engine streams' own getters (the
+// constructor-returns-object form keeps `new ReadableStreamDefaultReader(s)`
+// call-compatible with the Web semantics).
+class ReadableStreamDefaultReader {
+  constructor(stream) {
+    if (stream === undefined || stream === null || typeof stream.getReader !== "function") {
+      throw new TypeError("The stream argument must be a ReadableStream");
+    }
+    return stream.getReader();
+  }
+}
+
+class WritableStreamDefaultWriter {
+  constructor(stream) {
+    if (stream === undefined || stream === null || typeof stream.getWriter !== "function") {
+      throw new TypeError("The stream argument must be a WritableStream");
+    }
+    return stream.getWriter();
+  }
+}
+
+// Byte-level and controller internals: the engine pad has no BYOB or direct
+// controller construction — documented skeletons with the right names.
+class ReadableStreamBYOBReader {
+  constructor(_stream) {
+    throw webUnsupported("ReadableStreamBYOBReader");
+  }
+}
+
+class ReadableStreamBYOBRequest {
+  constructor() {
+    throw webUnsupported("ReadableStreamBYOBRequest");
+  }
+}
+
+class ReadableByteStreamController {
+  constructor() {
+    throw webUnsupported("ReadableByteStreamController");
+  }
+}
+
+class ReadableStreamDefaultController {
+  constructor() {
+    throw webUnsupported("ReadableStreamDefaultController (controllers are created by the stream constructor)");
+  }
+}
+
+class WritableStreamDefaultController {
+  constructor() {
+    throw webUnsupported("WritableStreamDefaultController (controllers are created by the stream constructor)");
+  }
+}
+
+class TransformStreamDefaultController {
+  constructor() {
+    throw webUnsupported("TransformStreamDefaultController (controllers are created by the TransformStream constructor)");
+  }
+}
+
+function readableStreamTee(stream) {
+  // Tee semantics via one source reader and an eager pump into both branch
+  // controllers — minimal tier, no backpressure (documented).
+  const reader = stream.getReader();
+  let controller1;
+  let controller2;
+  let pumping = false;
+  const pump = () => {
+    if (pumping) return;
+    pumping = true;
+    const step = () => {
+      reader.read().then((result) => {
+        if (result.done) {
+          pumping = false;
+          controller1.close();
+          controller2.close();
+          return;
+        }
+        controller1.enqueue(result.value);
+        controller2.enqueue(result.value);
+        step();
+      }, (error) => {
+        pumping = false;
+        controller1.error(error);
+        controller2.error(error);
+      });
+    };
+    step();
+  };
+  const branch1 = new EngineReadableStream({
+    start(controller) {
+      controller1 = controller;
+    },
+    pull() {
+      pump();
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  const branch2 = new EngineReadableStream({
+    start(controller) {
+      controller2 = controller;
+      pump();
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  return [branch1, branch2];
+}
+
+// codec streams over the engine TextEncoder/TextDecoder globals (real logic,
+// one chunk in flight — the minimal-tier transform pad has no backpressure
+// accounting, so interleaved chunk boundaries are preserved but not paced).
+class TextEncoderStream {
+  constructor() {
+    const encoder = new globalThis.TextEncoder();
+    const transform = new EngineTransformStream({
+      transform(chunk, controller) {
+        controller.enqueue(encoder.encode(typeof chunk === "string" ? chunk : String(chunk)));
+      },
+    });
+    this.readable = transform.readable;
+    this.writable = transform.writable;
+  }
+}
+
+class TextDecoderStream {
+  constructor(label, options) {
+    const decoder = new globalThis.TextDecoder(label, options);
+    const transform = new EngineTransformStream({
+      transform(chunk, controller) {
+        controller.enqueue(decoder.decode(chunk, { stream: true }));
+      },
+      flush(controller) {
+        const tail = decoder.decode();
+        if (tail) controller.enqueue(tail);
+      },
+    });
+    this.readable = transform.readable;
+    this.writable = transform.writable;
+  }
+}
+
+class CompressionStream {
+  constructor(_format) {
+    // No compression host op behind the Web-streams facade (node:zlib serves
+    // the Buffer surface): documented skeleton.
+    throw webUnsupported("CompressionStream (use node:zlib)");
+  }
+}
+
+class DecompressionStream {
+  constructor(_format) {
+    throw webUnsupported("DecompressionStream (use node:zlib)");
+  }
+}
+
+const streamWeb = {
+  ReadableStream: EngineReadableStream,
+  WritableStream: EngineWritableStream,
+  TransformStream: EngineTransformStream,
+  ReadableStreamTee: readableStreamTee,
+  ReadableStreamDefaultReader: ReadableStreamDefaultReader,
+  ReadableStreamBYOBReader: ReadableStreamBYOBReader,
+  ReadableStreamBYOBRequest: ReadableStreamBYOBRequest,
+  ReadableByteStreamController: ReadableByteStreamController,
+  ReadableStreamDefaultController: ReadableStreamDefaultController,
+  WritableStreamDefaultWriter: WritableStreamDefaultWriter,
+  WritableStreamDefaultController: WritableStreamDefaultController,
+  TransformStreamDefaultController: TransformStreamDefaultController,
+  ByteLengthQueuingStrategy: ByteLengthQueuingStrategy,
+  CountQueuingStrategy: CountQueuingStrategy,
+  TextEncoderStream: TextEncoderStream,
+  TextDecoderStream: TextDecoderStream,
+  CompressionStream: CompressionStream,
+  DecompressionStream: DecompressionStream,
+};
+
+// Standalone references for the named-export surface.
+const ReadableStream = EngineReadableStream;
+const WritableStream = EngineWritableStream;
+const TransformStream = EngineTransformStream;
+const ReadableStreamTee = readableStreamTee;
+
+export default streamWeb;
+export {
+  ReadableStream, WritableStream, TransformStream, ReadableStreamTee,
+  ReadableStreamDefaultReader, ReadableStreamBYOBReader, ReadableStreamBYOBRequest,
+  ReadableByteStreamController, ReadableStreamDefaultController,
+  WritableStreamDefaultWriter, WritableStreamDefaultController,
+  TransformStreamDefaultController, ByteLengthQueuingStrategy, CountQueuingStrategy,
+  TextEncoderStream, TextDecoderStream, CompressionStream, DecompressionStream,
+};

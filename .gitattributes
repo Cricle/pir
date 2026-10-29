@@ -1,0 +1,16 @@
+# Keep text files LF on every runner: the embedded catalog manifest hashes
+# raw JSON bytes, and a CRLF checkout would make Windows CI disagree with the
+# committed manifest. Batch files stay CRLF for cmd.exe.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.wasm binary
+*.deflate binary

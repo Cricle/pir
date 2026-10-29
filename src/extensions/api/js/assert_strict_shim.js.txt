@@ -1,0 +1,40 @@
+
+// node:assert/strict — Node's module is literally `require("assert").strict`:
+// a callable (the `strict` ok) carrying the whole method surface, where the
+// loose aliases point at their strict counterparts (`equal === strictEqual`,
+// `deepEqual === deepStrictEqual`, ...). Re-export that exact shape.
+
+import assert from "@node/assert";
+
+const strict = assert.strict;
+
+// `require("assert/strict")` must hand out the callable, not a plain copy of
+// this namespace (see `__pirRequireFrom`).
+if (globalThis.__pirBuiltinRequireCache &&
+    typeof globalThis.__pirBuiltinRequireCache.set === "function") {
+  globalThis.__pirBuiltinRequireCache.set("assert/strict", strict);
+}
+
+export default strict;
+export { strict };
+export const ok = strict.ok;
+export const equal = strict.equal;
+export const notEqual = strict.notEqual;
+export const deepEqual = strict.deepEqual;
+export const notDeepEqual = strict.notDeepEqual;
+export const deepStrictEqual = strict.deepStrictEqual;
+export const notDeepStrictEqual = strict.notDeepStrictEqual;
+export const strictEqual = strict.strictEqual;
+export const notStrictEqual = strict.notStrictEqual;
+export const partialDeepStrictEqual = strict.partialDeepStrictEqual;
+export const fail = strict.fail;
+export const throws = strict.throws;
+export const doesNotThrow = strict.doesNotThrow;
+export const rejects = strict.rejects;
+export const doesNotReject = strict.doesNotReject;
+export const ifError = strict.ifError;
+export const match = strict.match;
+export const doesNotMatch = strict.doesNotMatch;
+export const AssertionError = strict.AssertionError;
+export const Assert = strict.Assert;
+export const CallTracker = strict.CallTracker;

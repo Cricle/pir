@@ -1,0 +1,756 @@
+
+// sqlite3 — virtual package shim. The real `sqlite3` npm package is a NAPI
+// native addon (`node_sqlite3.node`, loaded through `bindings`/prebuild), so
+// it can never load in this runtime; this shim re-creates its API surface on
+// top of the host SQLite bridge via the `node:sqlite` DatabaseSync real
+// implementation (rusqlite bundled SQLite, FTS5 included), the same backend
+// the `better-sqlite3` virtual package uses.
+//
+// Shape fidelity notes (probed against sqlite3 6.0.1 on Node v24):
+//   - module surface: Database / Statement / Backup / cached / verbose() and
+//     the OPEN_*, LIMIT_* and result-code constants (values copied from the
+//     real binding's exports). The native module's `path` field (where the
+//     .node lives) has no virtual analogue and is not exported.
+//   - `new Database(filename[, mode][, callback])`: `mode` is the OPEN_* flag
+//     bitmask; the callback sees `(err)` with `this === db` and 'open' is
+//     emitted. The host open is synchronous, so every queued statement that
+//     follows a constructor call already sees an open database — stricter
+//     ordering than the native worker-thread queue, never looser.
+//   - `db.run/get/all/each/map(sql[, params][, cb])` accept the documented
+//     argument shapes: spread positionals, one array (spread), or one plain
+//     object (named parameters, `$a`-style keys like the native addon — bare
+//     names are additionally accepted). Bind coercion matches the addon's
+//     sqlite3_bind_* path: undefined/null → NULL, booleans → 0/1, Dates and
+//     other objects → their numeric value, Buffer/Uint8Array → BLOB.
+//   - `run` callbacks run with `this` = a Statement carrying `lastID` and
+//     `changes`; `get`/`all` callbacks run with a row / row array whose
+//     BLOBs are Buffers and whose objects are plain (Object.prototype).
+//   - errors: callbacks receive an `Error` with `code = "SQLITE_*"`,
+//     `errno`, and the native `"<CODE>: <sqlite message>"` wording. When a
+//     statement fails with *no* callback, the shim raises the error
+//     synchronously instead of emitting an unhandled 'error' event (the
+//     native addon's asynchronous emit crashes the process; a catchable
+//     throw is the honest stand-in) — unless an 'error' listener is
+//     registered, in which case the event is emitted.
+//   - 'trace' / 'profile' events are real (emitted around every statement);
+//     'change' is emitted for INSERT/UPDATE/DELETE with the table name
+//     parsed from the statement and `rowid` from lastID (0 when unknown) —
+//     an approximation of the addon's sqlite3_update_hook payload.
+//   - VERSION is the host rusqlite bundle's SQLite (3.45.0, read from the
+//     vendored amalgamation) and SOURCE_ID mirrors it; the host bridge does
+//     not carry sqlite3_sourceid(). `db.configure("limit", ...)`,
+//     `db.backup(...)` and `db.loadExtension(...)` are unsupported (the
+//     first two throw the standard runtime wording, the extension load
+//     reports through its callback like the addon does).
+import { DatabaseSync } from "node:sqlite";
+import { EventEmitter } from "node:events";
+import path from "node:path";
+
+(() => {
+  function pirSqlite3Unsupported(what) {
+    const error = new Error(
+      what +
+        " is not supported by the pir extension runtime (sqlite3's native surface is unavailable; the virtual shim covers the database/statement API)"
+    );
+    error.code = "ERR_NOT_SUPPORTED";
+    return error;
+  }
+
+  function errInvalidState(message) {
+    const error = new Error(message);
+    error.code = "ERR_INVALID_STATE";
+    return error;
+  }
+
+  // OPEN_* / result codes / limits: the real binding's export values.
+  const OPEN_READONLY = 1;
+  const OPEN_READWRITE = 2;
+  const OPEN_CREATE = 4;
+  const OPEN_URI = 64;
+  const OPEN_FULLMUTEX = 65536;
+  const OPEN_SHAREDCACHE = 131072;
+  const OPEN_PRIVATECACHE = 262144;
+
+  const RESULT_CODES = {
+    OK: 0, ERROR: 1, INTERNAL: 2, PERM: 3, ABORT: 4, BUSY: 5, LOCKED: 6,
+    NOMEM: 7, READONLY: 8, INTERRUPT: 9, IOERR: 10, CORRUPT: 11,
+    NOTFOUND: 12, FULL: 13, CANTOPEN: 14, PROTOCOL: 15, EMPTY: 16,
+    SCHEMA: 17, TOOBIG: 18, CONSTRAINT: 19, MISMATCH: 20, MISUSE: 21,
+    NOLFS: 22, AUTH: 23, FORMAT: 24, RANGE: 25, NOTADB: 26,
+  };
+
+  const LIMITS = {
+    LIMIT_LENGTH: 0, LIMIT_SQL_LENGTH: 1, LIMIT_COLUMN: 2,
+    LIMIT_EXPR_DEPTH: 3, LIMIT_COMPOUND_SELECT: 4, LIMIT_VDBE_OP: 5,
+    LIMIT_FUNCTION_ARG: 6, LIMIT_ATTACHED: 7, LIMIT_LIKE_PATTERN_LENGTH: 8,
+    LIMIT_VARIABLE_NUMBER: 9, LIMIT_TRIGGER_DEPTH: 10, LIMIT_WORKER_THREADS: 11,
+  };
+
+  const VERSION = "3.45.0";
+  const VERSION_NUMBER = 3045000;
+
+  // --- error shaping ------------------------------------------------------
+  // The host bridge reports ERR_SQLITE_ERROR for every SQLite failure; the
+  // SQLITE_* code the addon exposes is recovered from SQLite's own stable
+  // message wording.
+  const CODE_BY_MESSAGE = [
+    ["UNIQUE constraint failed", "CONSTRAINT", 19],
+    ["NOT NULL constraint failed", "CONSTRAINT", 19],
+    ["CHECK constraint failed", "CONSTRAINT", 19],
+    ["FOREIGN KEY constraint failed", "CONSTRAINT", 19],
+    ["constraint failed", "CONSTRAINT", 19],
+    ["database table is locked", "LOCKED", 6],
+    ["database is locked", "BUSY", 5],
+    ["unable to open database file", "CANTOPEN", 14],
+    ["attempt to write a readonly database", "READONLY", 8],
+    ["disk I/O error", "IOERR", 10],
+    ["database disk image is malformed", "CORRUPT", 11],
+    ["interrupted", "INTERRUPT", 9],
+  ];
+
+  function sqlite3Error(error) {
+    if (!error || error.code !== "ERR_SQLITE_ERROR") return error;
+    const message = String(error.message || "");
+    let name = "ERROR";
+    let errno = 1;
+    for (const [needle, code, number] of CODE_BY_MESSAGE) {
+      if (message.indexOf(needle) >= 0) {
+        name = code;
+        errno = number;
+        break;
+      }
+    }
+    const shaped = new Error("SQLITE_" + name + ": " + message);
+    shaped.code = "SQLITE_" + name;
+    shaped.errno = errno;
+    return shaped;
+  }
+
+  // Unknown named parameters surface from the node:sqlite layer with its own
+  // wording; the addon reports SQLITE_RANGE for the same condition.
+  function sqlite3BindError(error) {
+    if (error && typeof error.message === "string" && error.message.indexOf("Unknown named parameter") === 0) {
+      const shaped = new Error("SQLITE_RANGE: column index out of range");
+      shaped.code = "SQLITE_RANGE";
+      shaped.errno = 25;
+      return shaped;
+    }
+    return error;
+  }
+
+  // --- argument handling --------------------------------------------------
+  function isPlainObject(value) {
+    if (value === null || typeof value !== "object") return false;
+    if (Array.isArray(value)) return false;
+    if (value instanceof Uint8Array) return false;
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  }
+
+  // sqlite3's bind coercion (the addon's ToNumber/IsDate/IsBuffer fan-out).
+  function coerceParam(value) {
+    if (value === undefined || value === null) return null;
+    const type = typeof value;
+    if (type === "boolean") return value ? 1 : 0;
+    if (type === "number" || type === "string" || type === "bigint") return value;
+    if (value instanceof Uint8Array) return value;
+    if (type === "object") return Number(value);
+    throw new TypeError("SQLITE_MISUSE: cannot bind a " + type + " value");
+  }
+
+  // `[a, b]` is the documented "array of parameters" form; the addon binds a
+  // single plain object by name (positional extras after it still bind, so
+  // they take the same value coercion).
+  function normalizeParams(params) {
+    let list = params;
+    if (list.length === 1 && Array.isArray(list[0])) list = list[0];
+    if (list.length > 0 && isPlainObject(list[0])) {
+      const out = list.slice();
+      for (let i = 1; i < out.length; i++) out[i] = coerceParam(out[i]);
+      return out;
+    }
+    const out = new Array(list.length);
+    for (let i = 0; i < list.length; i++) out[i] = coerceParam(list[i]);
+    return out;
+  }
+
+  function splitCallback(args) {
+    if (args.length > 0 && typeof args[args.length - 1] === "function") {
+      return { params: args.slice(0, args.length - 1), callback: args[args.length - 1] };
+    }
+    return { params: args, callback: null };
+  }
+
+  function toPlainRow(row) {
+    if (row === null || row === undefined) return row;
+    const out = {};
+    for (const key of Object.keys(row)) {
+      const value = row[key];
+      out[key] = value instanceof Uint8Array ? Buffer.from(value) : value;
+    }
+    return out;
+  }
+
+  const CHANGE_TYPES = { INSERT: "insert", UPDATE: "update", DELETE: "delete" };
+
+  function changeTypeOf(sql) {
+    const match = /^\s*(?:--[^\n]*\n|\/\*[\s\S]*?\*\/)*\s*(insert|update|delete)/i.exec(sql);
+    return match ? CHANGE_TYPES[match[1].toUpperCase()] : null;
+  }
+
+  function tableOf(sql) {
+    const match = /(?:insert\s+into|update|delete\s+from)\s+["'`\[]?([A-Za-z0-9_$]+)/i.exec(sql);
+    return match ? match[1] : "";
+  }
+
+  // --- Statement ----------------------------------------------------------
+  class Statement extends EventEmitter {
+    // `runResult` mints the lightweight object the addon passes as `this` to
+    // a Database#run callback (a Statement carrying lastID/changes).
+    constructor(db, sql, runResult) {
+      super();
+      this._pirDb = db;
+      this._pirSql = sql;
+      this.sql = sql;
+      this._pirBound = null;
+      this._pirFinalized = false;
+      if (runResult) {
+        this._pirStateless = true;
+        this.lastID = runResult.lastID;
+        this.changes = runResult.changes;
+        return;
+      }
+      this._pirSync = db._pirSync.prepare(sql);
+    }
+
+    _pirEnsureLive() {
+      if (this._pirStateless) {
+        throw errInvalidState("This object is a statement run result, not a compiled statement");
+      }
+      if (this._pirFinalized) {
+        throw errInvalidState("The statement has been finalized");
+      }
+    }
+
+    _pirParams(args) {
+      const normalized = normalizeParams(args);
+      if (normalized.length === 0 && this._pirBound !== null) return this._pirBound;
+      return normalized;
+    }
+
+    _pirRun(verb, params) {
+      this._pirEnsureLive();
+      return this._pirDb._pirInvoke(this, verb, params);
+    }
+
+    bind(...args) {
+      this._pirEnsureLive();
+      const { params, callback } = splitCallback(args);
+      if (params.length > 0) this._pirBound = normalizeParams(params);
+      if (callback) globalThis.__pirMicrotask(() => callback.call(this, null));
+      return this;
+    }
+
+    reset(...args) {
+      this._pirEnsureLive();
+      const callback = typeof args[args.length - 1] === "function" ? args[args.length - 1] : null;
+      if (callback) globalThis.__pirMicrotask(() => callback.call(this, null));
+      return this;
+    }
+
+    finalize(...args) {
+      const callback = typeof args[args.length - 1] === "function" ? args[args.length - 1] : null;
+      this._pirFinalized = true;
+      if (callback) globalThis.__pirMicrotask(() => callback.call(this, null));
+      return this._pirDb;
+    }
+
+    run(...args) {
+      const { params, callback } = splitCallback(args);
+      const info = this._pirRun("run", this._pirParams(params));
+      const changes = typeof info.changes === "bigint" ? Number(info.changes) : info.changes;
+      const lastID = typeof info.lastInsertRowid === "bigint" ? Number(info.lastInsertRowid) : info.lastInsertRowid;
+      this.lastID = lastID;
+      this.changes = changes;
+      this._pirDb._pirEmitChange(this._pirSql, lastID);
+      if (callback) globalThis.__pirMicrotask(() => callback.call(this, null));
+      return this;
+    }
+
+    get(...args) {
+      const { params, callback } = splitCallback(args);
+      const row = this._pirRun("get", this._pirParams(params));
+      const value = row === undefined || row === null ? undefined : toPlainRow(row);
+      if (callback) globalThis.__pirMicrotask(() => callback.call(this, null, value));
+      return this;
+    }
+
+    all(...args) {
+      const { params, callback } = splitCallback(args);
+      const rows = this._pirRun("all", this._pirParams(params));
+      const out = new Array(rows.length);
+      for (let i = 0; i < rows.length; i++) out[i] = toPlainRow(rows[i]);
+      if (callback) globalThis.__pirMicrotask(() => callback.call(this, null, out));
+      return this;
+    }
+
+    each(...args) {
+      // each([params], rowCallback[, completeCallback])
+      let complete = null;
+      if (typeof args[args.length - 1] === "function") complete = args.pop();
+      const rowCallback = typeof args[args.length - 1] === "function" ? args.pop() : null;
+      const rows = this._pirRun("all", this._pirParams(args));
+      globalThis.__pirMicrotask(() => {
+        let count = 0;
+        for (const row of rows) {
+          count++;
+          if (rowCallback) {
+            try {
+              rowCallback.call(this, null, toPlainRow(row));
+            } catch (error) {
+              if (complete) complete.call(this, error, count);
+              return;
+            }
+          }
+        }
+        if (complete) complete.call(this, null, count);
+      });
+      return this;
+    }
+
+    map(...args) {
+      const { params, callback } = splitCallback(args);
+      const rows = this._pirRun("all", this._pirParams(params));
+      if (callback) globalThis.__pirMicrotask(() => callback.call(this, null, mapRows(rows)));
+      return this;
+    }
+  }
+
+  // Statement#map / Database#map body: key rows by their first column, with
+  // the row itself (3+ columns) or the second column (2 columns) as value.
+  function mapRows(rows) {
+    const result = {};
+    if (rows.length === 0) return result;
+    const keys = Object.keys(rows[0]);
+    const key = keys[0];
+    if (keys.length > 2) {
+      for (const row of rows) result[toPlainRow(row)[key]] = toPlainRow(row);
+    } else {
+      const value = keys[1];
+      for (const row of rows) {
+        const plain = toPlainRow(row);
+        result[plain[key]] = plain[value];
+      }
+    }
+    return result;
+  }
+
+  // --- Database -----------------------------------------------------------
+  class Database extends EventEmitter {
+    constructor(filename, mode, callback) {
+      super();
+      let flags = mode;
+      let done = callback;
+      if (typeof mode === "function") {
+        done = mode;
+        flags = undefined;
+      }
+      this.filename = filename;
+      this._pirClosed = false;
+      this._pirOpenError = null;
+      const options = {};
+      if (typeof flags === "number") {
+        // OPEN_READONLY without OPEN_READWRITE/OPEN_CREATE is the read-only
+        // open; the host bridge fences write-capable opens to the sandbox
+        // roots (the only observable difference from the addon).
+        options.readOnly = (flags & OPEN_READWRITE) === 0 && (flags & OPEN_CREATE) === 0;
+      }
+      try {
+        this._pirSync = new DatabaseSync(filename, options);
+      } catch (error) {
+        this._pirOpenError = sqlite3Error(error);
+        this._pirSync = null;
+        if (typeof done === "function") {
+          globalThis.__pirMicrotask(() => done.call(this, this._pirOpenError));
+        } else if (this.listenerCount("error") > 0) {
+          const failure = this._pirOpenError;
+          globalThis.__pirMicrotask(() => this.emit("error", failure));
+        }
+        return;
+      }
+      if (typeof done === "function") {
+        globalThis.__pirMicrotask(() => done.call(this, null));
+      }
+      globalThis.__pirMicrotask(() => this.emit("open"));
+    }
+
+    get open() {
+      return !this._pirClosed && this._pirSync !== null;
+    }
+
+    get inTransaction() {
+      if (!this.open) return false;
+      return this._pirSync.isTransaction === true;
+    }
+
+    _pirEmitTrace(sql) {
+      if (this.listenerCount("trace") > 0) this.emit("trace", sql);
+    }
+
+    _pirEmitProfile(sql, elapsed) {
+      if (this.listenerCount("profile") > 0) this.emit("profile", sql, elapsed);
+    }
+
+    _pirEmitChange(sql, rowid) {
+      if (this.listenerCount("change") === 0) return;
+      const type = changeTypeOf(sql);
+      if (type === null) return;
+      this.emit("change", type, "main", tableOf(sql), rowid || 0);
+    }
+
+    // Deliver a failure the way the addon does when the caller passed no
+    // callback: to an 'error' listener when there is one, otherwise thrown
+    // (see the header note).
+    _pirFail(error) {
+      if (this.listenerCount("error") > 0) {
+        globalThis.__pirMicrotask(() => this.emit("error", error));
+        return;
+      }
+      throw error;
+    }
+
+    _pirStatement(sql) {
+      if (this._pirClosed) throw errInvalidState("The database connection is not open");
+      if (this._pirSync === null) throw this._pirOpenError;
+      return new Statement(this, sql);
+    }
+
+    _pirExec(sql) {
+      const started = Date.now();
+      this._pirEmitTrace(sql);
+      try {
+        this._pirSync.exec(sql);
+      } catch (error) {
+        this._pirEmitProfile(sql, Date.now() - started);
+        throw sqlite3Error(error);
+      }
+      this._pirEmitProfile(sql, Date.now() - started);
+      this._pirEmitChange(sql, 0);
+    }
+
+    // One statement invocation with the 'trace'/'profile' events around it and
+    // the error shape normalized (both the Statement methods and the
+    // Database one-shot methods route through here).
+    _pirInvoke(statement, verb, params) {
+      const started = Date.now();
+      this._pirEmitTrace(statement._pirSql);
+      try {
+        const value = statement._pirSync[verb].apply(statement._pirSync, params);
+        this._pirEmitProfile(statement._pirSql, Date.now() - started);
+        return value;
+      } catch (error) {
+        this._pirEmitProfile(statement._pirSql, Date.now() - started);
+        throw sqlite3BindError(sqlite3Error(error));
+      }
+    }
+
+    run(sql, ...args) {
+      const { params, callback } = splitCallback(args);
+      try {
+        const statement = this._pirStatement(sql);
+        const info = this._pirInvoke(statement, "run", normalizeParams(params));
+        const changes = typeof info.changes === "bigint" ? Number(info.changes) : info.changes;
+        const lastID = typeof info.lastInsertRowid === "bigint" ? Number(info.lastInsertRowid) : info.lastInsertRowid;
+        this._pirEmitChange(sql, lastID);
+        if (callback) {
+          const result = new Statement(this, sql, { lastID: lastID, changes: changes });
+          globalThis.__pirMicrotask(() => callback.call(result, null));
+        }
+      } catch (error) {
+        const failure = sqlite3BindError(sqlite3Error(error));
+        if (callback) globalThis.__pirMicrotask(() => callback.call(this, failure));
+        else this._pirFail(failure);
+      }
+      return this;
+    }
+
+    get(sql, ...args) {
+      const { params, callback } = splitCallback(args);
+      try {
+        const statement = this._pirStatement(sql);
+        const row = this._pirInvoke(statement, "get", normalizeParams(params));
+        const value = row === undefined || row === null ? undefined : toPlainRow(row);
+        if (callback) globalThis.__pirMicrotask(() => callback.call(statement, null, value));
+      } catch (error) {
+        const failure = sqlite3BindError(sqlite3Error(error));
+        if (callback) globalThis.__pirMicrotask(() => callback.call(this, failure));
+        else this._pirFail(failure);
+      }
+      return this;
+    }
+
+    all(sql, ...args) {
+      const { params, callback } = splitCallback(args);
+      try {
+        const statement = this._pirStatement(sql);
+        const rows = this._pirInvoke(statement, "all", normalizeParams(params));
+        const out = new Array(rows.length);
+        for (let i = 0; i < rows.length; i++) out[i] = toPlainRow(rows[i]);
+        if (callback) globalThis.__pirMicrotask(() => callback.call(statement, null, out));
+      } catch (error) {
+        const failure = sqlite3BindError(sqlite3Error(error));
+        if (callback) globalThis.__pirMicrotask(() => callback.call(this, failure));
+        else this._pirFail(failure);
+      }
+      return this;
+    }
+
+    each(sql, ...args) {
+      // each(sql, [params], rowCallback[, completeCallback])
+      let complete = null;
+      if (typeof args[args.length - 1] === "function") complete = args.pop();
+      const rowCallback = typeof args[args.length - 1] === "function" ? args.pop() : null;
+      let statement = null;
+      let rows;
+      try {
+        statement = this._pirStatement(sql);
+        rows = this._pirInvoke(statement, "all", normalizeParams(args));
+      } catch (error) {
+        const failure = sqlite3BindError(sqlite3Error(error));
+        if (complete) {
+          globalThis.__pirMicrotask(() => complete.call(this, failure, undefined));
+          return this;
+        }
+        this._pirFail(failure);
+        return this;
+      }
+      globalThis.__pirMicrotask(() => {
+        let count = 0;
+        for (const row of rows) {
+          count++;
+          if (rowCallback) {
+            try {
+              rowCallback.call(statement, null, toPlainRow(row));
+            } catch (error) {
+              if (complete) complete.call(statement, error, count);
+              return;
+            }
+          }
+        }
+        if (complete) complete.call(statement, null, count);
+      });
+      return this;
+    }
+
+    map(sql, ...args) {
+      const { params, callback } = splitCallback(args);
+      try {
+        const statement = this._pirStatement(sql);
+        const rows = this._pirInvoke(statement, "all", normalizeParams(params));
+        if (callback) globalThis.__pirMicrotask(() => callback.call(statement, null, mapRows(rows)));
+      } catch (error) {
+        const failure = sqlite3BindError(sqlite3Error(error));
+        if (callback) globalThis.__pirMicrotask(() => callback.call(this, failure));
+        else this._pirFail(failure);
+      }
+      return this;
+    }
+
+    exec(sql, callback) {
+      try {
+        this._pirExec(sql);
+        if (typeof callback === "function") globalThis.__pirMicrotask(() => callback.call(this, null));
+      } catch (error) {
+        if (typeof callback === "function") globalThis.__pirMicrotask(() => callback.call(this, error));
+        else this._pirFail(error);
+      }
+      return this;
+    }
+
+    prepare(sql, ...args) {
+      const { params, callback } = splitCallback(args);
+      let statement;
+      try {
+        statement = this._pirStatement(sql);
+        if (params.length > 0) statement._pirBound = normalizeParams(params);
+      } catch (error) {
+        const failure = sqlite3BindError(sqlite3Error(error));
+        if (callback) globalThis.__pirMicrotask(() => callback.call(this, failure));
+        else this._pirFail(failure);
+        return undefined;
+      }
+      if (callback) globalThis.__pirMicrotask(() => callback.call(statement, null));
+      return statement;
+    }
+
+    // The host executes statements synchronously on the calling thread, so
+    // there is never a queue to serialize: both hooks run their callback
+    // immediately (the addon's callbacks are asynchronous, but every
+    // statement in between already ran here).
+    serialize(callback) {
+      if (typeof callback === "function") callback.call(this);
+    }
+
+    parallelize(callback) {
+      if (typeof callback === "function") callback.call(this);
+    }
+
+    configure(option, value) {
+      if (option === "busyTimeout") {
+        // Real support through SQLite itself (the addon sets the busy handler
+        // through the C API).
+        const timeout = Number(value);
+        if (typeof value === "number" && timeout > 0) {
+          this._pirExec("PRAGMA busy_timeout = " + Math.floor(timeout));
+        }
+        return;
+      }
+      throw pirSqlite3Unsupported("Database#configure('" + option + "')");
+    }
+
+    loadExtension(...args) {
+      const failure = pirSqlite3Unsupported("Database#loadExtension (runtime extensions)");
+      const callback = typeof args[args.length - 1] === "function" ? args[args.length - 1] : null;
+      if (callback) globalThis.__pirMicrotask(() => callback.call(this, failure));
+      else this._pirFail(failure);
+      return this;
+    }
+
+    close(callback) {
+      if (!this._pirClosed) {
+        this._pirClosed = true;
+        if (this._pirSync !== null) this._pirSync.close();
+      }
+      if (typeof callback === "function") globalThis.__pirMicrotask(() => callback.call(this, null));
+      globalThis.__pirMicrotask(() => this.emit("close"));
+    }
+
+    wait(callback) {
+      if (typeof callback === "function") globalThis.__pirMicrotask(() => callback.call(this, null));
+      return this;
+    }
+
+    interrupt() {
+      // Everything runs synchronously on the calling thread: no statement can
+      // be in flight when JS reaches this call.
+    }
+
+    backup(..._args) {
+      throw pirSqlite3Unsupported("Database#backup");
+    }
+  }
+
+  // `verbose()`: the addon patches its prototypes to augment stack traces of
+  // failed statements; the shim's callbacks already carry real stack traces,
+  // so the same module object is returned (callers use the return value).
+  function verbose() {
+    return sqlite3;
+  }
+
+  class Backup extends EventEmitter {
+    constructor(..._args) {
+      super();
+      throw pirSqlite3Unsupported("new Backup (online backup API)");
+    }
+  }
+
+  const sqlite3 = {
+    Database: Database,
+    Statement: Statement,
+    Backup: Backup,
+    verbose: verbose,
+    cached: {
+      objects: {},
+      Database: function (file, mode, callback) {
+        if (file === "" || file === ":memory:") {
+          return new Database(file, mode, callback);
+        }
+        const key = path.resolve(file);
+        const existing = sqlite3.cached.objects[key];
+        if (existing !== undefined) {
+          const done = typeof mode === "function" ? mode : callback;
+          if (typeof done === "function") {
+            const db = existing;
+            globalThis.__pirMicrotask(() => done.call(db, null));
+          }
+          return existing;
+        }
+        const db = new Database(file, mode, callback);
+        sqlite3.cached.objects[key] = db;
+        return db;
+      },
+    },
+    OPEN_READONLY: OPEN_READONLY,
+    OPEN_READWRITE: OPEN_READWRITE,
+    OPEN_CREATE: OPEN_CREATE,
+    OPEN_URI: OPEN_URI,
+    OPEN_FULLMUTEX: OPEN_FULLMUTEX,
+    OPEN_SHAREDCACHE: OPEN_SHAREDCACHE,
+    OPEN_PRIVATECACHE: OPEN_PRIVATECACHE,
+    VERSION: VERSION,
+    VERSION_NUMBER: VERSION_NUMBER,
+    SOURCE_ID: VERSION,
+  };
+  for (const name of Object.keys(RESULT_CODES)) sqlite3[name] = RESULT_CODES[name];
+  for (const name of Object.keys(LIMITS)) sqlite3[name] = LIMITS[name];
+
+  globalThis.__pirSqlite3Shim = sqlite3;
+})();
+
+const sqlite3 = globalThis.__pirSqlite3Shim;
+
+export default sqlite3;
+export const Database = sqlite3.Database;
+export const Statement = sqlite3.Statement;
+export const Backup = sqlite3.Backup;
+export const verbose = sqlite3.verbose;
+export const cached = sqlite3.cached;
+export const OPEN_READONLY = sqlite3.OPEN_READONLY;
+export const OPEN_READWRITE = sqlite3.OPEN_READWRITE;
+export const OPEN_CREATE = sqlite3.OPEN_CREATE;
+export const OPEN_URI = sqlite3.OPEN_URI;
+export const OPEN_FULLMUTEX = sqlite3.OPEN_FULLMUTEX;
+export const OPEN_SHAREDCACHE = sqlite3.OPEN_SHAREDCACHE;
+export const OPEN_PRIVATECACHE = sqlite3.OPEN_PRIVATECACHE;
+export const VERSION = sqlite3.VERSION;
+export const VERSION_NUMBER = sqlite3.VERSION_NUMBER;
+export const SOURCE_ID = sqlite3.SOURCE_ID;
+export const OK = sqlite3.OK;
+export const ERROR = sqlite3.ERROR;
+export const INTERNAL = sqlite3.INTERNAL;
+export const PERM = sqlite3.PERM;
+export const ABORT = sqlite3.ABORT;
+export const BUSY = sqlite3.BUSY;
+export const LOCKED = sqlite3.LOCKED;
+export const NOMEM = sqlite3.NOMEM;
+export const READONLY = sqlite3.READONLY;
+export const INTERRUPT = sqlite3.INTERRUPT;
+export const IOERR = sqlite3.IOERR;
+export const CORRUPT = sqlite3.CORRUPT;
+export const NOTFOUND = sqlite3.NOTFOUND;
+export const FULL = sqlite3.FULL;
+export const CANTOPEN = sqlite3.CANTOPEN;
+export const PROTOCOL = sqlite3.PROTOCOL;
+export const EMPTY = sqlite3.EMPTY;
+export const SCHEMA = sqlite3.SCHEMA;
+export const TOOBIG = sqlite3.TOOBIG;
+export const CONSTRAINT = sqlite3.CONSTRAINT;
+export const MISMATCH = sqlite3.MISMATCH;
+export const MISUSE = sqlite3.MISUSE;
+export const NOLFS = sqlite3.NOLFS;
+export const AUTH = sqlite3.AUTH;
+export const FORMAT = sqlite3.FORMAT;
+export const RANGE = sqlite3.RANGE;
+export const NOTADB = sqlite3.NOTADB;
+export const LIMIT_LENGTH = sqlite3.LIMIT_LENGTH;
+export const LIMIT_SQL_LENGTH = sqlite3.LIMIT_SQL_LENGTH;
+export const LIMIT_COLUMN = sqlite3.LIMIT_COLUMN;
+export const LIMIT_EXPR_DEPTH = sqlite3.LIMIT_EXPR_DEPTH;
+export const LIMIT_COMPOUND_SELECT = sqlite3.LIMIT_COMPOUND_SELECT;
+export const LIMIT_VDBE_OP = sqlite3.LIMIT_VDBE_OP;
+export const LIMIT_FUNCTION_ARG = sqlite3.LIMIT_FUNCTION_ARG;
+export const LIMIT_ATTACHED = sqlite3.LIMIT_ATTACHED;
+export const LIMIT_LIKE_PATTERN_LENGTH = sqlite3.LIMIT_LIKE_PATTERN_LENGTH;
+export const LIMIT_VARIABLE_NUMBER = sqlite3.LIMIT_VARIABLE_NUMBER;
+export const LIMIT_TRIGGER_DEPTH = sqlite3.LIMIT_TRIGGER_DEPTH;
+export const LIMIT_WORKER_THREADS = sqlite3.LIMIT_WORKER_THREADS;

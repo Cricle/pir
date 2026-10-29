@@ -1,0 +1,556 @@
+
+// node:sqlite — real implementation (phase: sqlite wave). Backed by the host
+// SQLite bridge (`__pir_host.node("sqlite", ...)`, rusqlite bundled SQLite
+// with FTS5). Semantics probed against Node v24 `node:sqlite`:
+//   - DatabaseSync(path[, options]): options `open`, `readOnly`,
+//     `enableForeignKeyConstraints` (default true), `timeout` (busy
+//     timeout ms); unknown options are ignored like Node does.
+//   - exec(sql): multi-statement, returns undefined.
+//   - prepare(sql) → StatementSync: run/get/all/iterate/columns, named
+//     parameters (@a / :a / $a + bare keys, unknown names throw unless
+//     `setAllowUnknownNamedParameters(true)`), positional binding by
+//     parameter index, `setReadBigInts` / `setReturnArrays`.
+//   - run() → { changes, lastInsertRowid }; get() → null-prototype row or
+//     undefined; BLOB cells ⇄ Uint8Array; INTEGER cells beyond the f64 safe
+//     range raise RangeError ERR_OUT_OF_RANGE unless BigInt reads are on.
+// Not implemented (throw the standard runtime wording): backup, Session,
+// createSession/applyChangeset, function/aggregate, loadExtension,
+// serialize/deserialize/setAuthorizer, limits, location metadata.
+(() => {
+  const call = (op, payload) => globalThis.__pirNodeCall("sqlite", op, payload);
+
+  function pirSqliteUnsupported(what) {
+    const error = new Error(what + " is not supported by the pir extension runtime (SQLite session/extension/authorizer surface is unavailable)");
+    error.code = "ERR_NOT_SUPPORTED";
+    return error;
+  }
+
+  function errInvalidState(message) {
+    const error = new Error(message);
+    error.code = "ERR_INVALID_STATE";
+    return error;
+  }
+
+  function errInvalidArg(message) {
+    const error = new TypeError(message);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    return error;
+  }
+
+  function errRange(code, message) {
+    const error = new RangeError(message);
+    error.code = code;
+    return error;
+  }
+
+  // --- SQL parameter scanner -------------------------------------------
+  // Enumerates SQLite parameters in index order: `?NNN` explicit, plain `?`
+  // anonymous (next index after the highest so far), `@name`/`:name`/`$name`
+  // named (index by first appearance). String literals, quoted identifiers,
+  // bracket identifiers and comments are skipped.
+  function scanParams(sql) {
+    const params = [];
+    const byName = new Map();
+    let maxIndex = 0;
+    let i = 0;
+    const n = sql.length;
+    const isIdent = (ch) =>
+      (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") ||
+      (ch >= "0" && ch <= "9") || ch === "_" || ch === "$" ||
+      ch.charCodeAt(0) > 0x7f;
+    while (i < n) {
+      const ch = sql[i];
+      if (ch === "'" || ch === '"' || ch === "`") {
+        i++;
+        while (i < n) {
+          if (sql[i] === ch) {
+            if (sql[i + 1] === ch) { i += 2; continue; }
+            i++; break;
+          }
+          i++;
+        }
+        continue;
+      }
+      if (ch === "[") {
+        i++;
+        while (i < n && sql[i] !== "]") i++;
+        i++;
+        continue;
+      }
+      if (ch === "-" && sql[i + 1] === "-") {
+        while (i < n && sql[i] !== "\n") i++;
+        continue;
+      }
+      if (ch === "/" && sql[i + 1] === "*") {
+        i += 2;
+        while (i < n && !(sql[i] === "*" && sql[i + 1] === "/")) i++;
+        i += 2;
+        continue;
+      }
+      if (ch === "?") {
+        i++;
+        let digits = "";
+        while (i < n && sql[i] >= "0" && sql[i] <= "9") { digits += sql[i]; i++; }
+        let index;
+        if (digits) {
+          index = parseInt(digits, 10);
+        } else {
+          index = maxIndex + 1;
+        }
+        if (index > maxIndex) maxIndex = index;
+        params.push({ name: null, bare: null, index: index });
+        continue;
+      }
+      if (ch === "@" || ch === ":" || ch === "$") {
+        let j = i + 1;
+        while (j < n && isIdent(sql[j])) j++;
+        if (j > i + 1) {
+          const name = ch + sql.slice(i + 1, j);
+          const bare = sql.slice(i + 1, j);
+          let index;
+          if (byName.has(name)) {
+            index = byName.get(name);
+          } else {
+            index = maxIndex + 1;
+            maxIndex = index;
+            byName.set(name, index);
+          }
+          params.push({ name: name, bare: bare, index: index });
+          i = j;
+          continue;
+        }
+      }
+      i++;
+    }
+    return params;
+  }
+
+  // --- bind/value codecs -------------------------------------------------
+  // JSON bridge tagging: BigInt → {"$pirBig":digits}; TypedArray/Buffer →
+  // {"$pirBlob":base64}. Decoded symmetrically on the host.
+  function tagBind(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === "bigint") return { $pirBig: value.toString() };
+    if (typeof value === "number") {
+      if (!isFinite(value)) {
+        throw errRange("ERR_OUT_OF_RANGE", "The value of a bound parameter must be finite");
+      }
+      return value;
+    }
+    if (typeof value === "string") return value;
+    if (value instanceof Uint8Array) {
+      // Read-only base64: encode a Buffer in place / view the same bytes a
+      // `Buffer.from(value)` copy would carry (buffer_global.js.txt's fromView).
+      const buffer = Buffer.isBuffer(value)
+        ? value
+        : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+      return { $pirBlob: buffer.toString("base64") };
+    }
+    throw errInvalidArg(
+      "Invalid argument: bound parameters must be null, number, bigint, string or Uint8Array"
+    );
+  }
+
+  function decodeCell(value, readBigInts) {
+    if (value === null) return null;
+    if (Array.isArray(value)) {
+      const out = new Array(value.length);
+      for (let i = 0; i < value.length; i++) out[i] = decodeCell(value[i], readBigInts);
+      return out;
+    }
+    if (typeof value === "object") {
+      if (typeof value.$pirBig === "string") {
+        if (!readBigInts) {
+          const asNumber = Number(value.$pirBig);
+          if (!Number.isSafeInteger(asNumber)) {
+            throw errRange(
+              "ERR_OUT_OF_RANGE",
+              "Value is too large to be represented as a JavaScript number: " + value.$pirBig
+            );
+          }
+          return asNumber;
+        }
+        return BigInt(value.$pirBig);
+      }
+      if (typeof value.$pirBlob === "string") {
+        return Buffer.from(value.$pirBlob, "base64");
+      }
+      const out = Object.create(null);
+      for (const key of Object.keys(value)) {
+        out[key] = decodeCell(value[key], readBigInts);
+      }
+      return out;
+    }
+    return value;
+  }
+
+  function isPlainObject(value) {
+    if (value === null || typeof value !== "object") return false;
+    if (Array.isArray(value)) return false;
+    if (value instanceof Uint8Array) return false;
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  }
+
+  function stripParamPrefix(key) {
+    return key.length > 0 && (key[0] === "@" || key[0] === ":" || key[0] === "$")
+      ? key.slice(1)
+      : key;
+  }
+
+  // Build the host `binds` payload for one execution of a statement. Named
+  // mode when the first argument is a plain object; trailing positional
+  // arguments fill the anonymous slots in order (Node semantics).
+  function buildBinds(stmt, args) {
+    const binds = [];
+    if (args.length > 0 && isPlainObject(args[0])) {
+      const named = args[0];
+      const anonymous = [];
+      for (let i = 1; i < args.length; i++) anonymous.push(tagBind(args[i]));
+      let anonIndex = 0;
+      const matched = new Set();
+      for (const param of stmt._pirParams) {
+        if (param.name === null) {
+          if (anonIndex < anonymous.length) {
+            binds.push({ index: param.index, value: anonymous[anonIndex++] });
+          }
+          continue;
+        }
+        let value;
+        if (Object.prototype.hasOwnProperty.call(named, param.name)) {
+          value = named[param.name];
+        } else if (Object.prototype.hasOwnProperty.call(named, param.bare)) {
+          value = named[param.bare];
+        } else {
+          // Unbound named parameters stay NULL (Node runs them as NULL too).
+          continue;
+        }
+        matched.add(param.bare);
+        binds.push({ index: param.index, value: tagBind(value) });
+      }
+      if (!stmt._pirAllowUnknown) {
+        for (const key of Object.keys(named)) {
+          const bare = stripParamPrefix(key);
+          if (!stmt._pirBareNames.has(bare)) {
+            throw errInvalidState("Unknown named parameter '" + bare + "'");
+          }
+        }
+      }
+    } else {
+      for (let i = 0; i < args.length; i++) {
+        binds.push({ index: i + 1, value: tagBind(args[i]) });
+      }
+    }
+    return binds;
+  }
+
+  // --- StatementSync ------------------------------------------------------
+  // Real Node forbids direct construction ("Illegal constructor"); only
+  // `DatabaseSync.prepare` mints instances (marked by the private symbol).
+  const STATEMENT_MARK = Symbol("pirSqliteStatement");
+  class StatementSync {
+    constructor(...args) {
+      if (args[0] !== STATEMENT_MARK) {
+        const error = new Error("Illegal constructor");
+        error.code = "ERR_ILLEGAL_CONSTRUCTOR";
+        throw error;
+      }
+      const dbId = args[1];
+      const sql = args[2];
+      const params = args[3];
+      this._pirDbId = dbId;
+      this.sourceSQL = sql;
+      // Best-effort: the host does not carry sqlite3_expanded_sql; the
+      // source text is the honest stand-in.
+      this.expandedSQL = sql;
+      this._pirParams = params;
+      this._pirBareNames = new Set();
+      for (const param of params) {
+        if (param.name !== null) this._pirBareNames.add(param.bare);
+      }
+      this._pirReadBigInts = false;
+      this._pirReturnArrays = false;
+      this._pirAllowUnknown = false;
+    }
+
+    run(...args) {
+      const result = call("run", {
+        id: this._pirDbId,
+        sql: this.sourceSQL,
+        binds: buildBinds(this, args),
+        readBigInts: this._pirReadBigInts,
+      });
+      return {
+        changes: decodeCell(result.changes, this._pirReadBigInts),
+        lastInsertRowid: decodeCell(result.lastInsertRowid, this._pirReadBigInts),
+      };
+    }
+
+    get(...args) {
+      const row = call("get", {
+        id: this._pirDbId,
+        sql: this.sourceSQL,
+        binds: buildBinds(this, args),
+        readBigInts: this._pirReadBigInts,
+        returnArrays: this._pirReturnArrays,
+      });
+      return row === null ? undefined : decodeCell(row, this._pirReadBigInts);
+    }
+
+    all(...args) {
+      const rows = call("all", {
+        id: this._pirDbId,
+        sql: this.sourceSQL,
+        binds: buildBinds(this, args),
+        readBigInts: this._pirReadBigInts,
+        returnArrays: this._pirReturnArrays,
+      });
+      const out = new Array(rows.length);
+      for (let i = 0; i < rows.length; i++) out[i] = decodeCell(rows[i], this._pirReadBigInts);
+      return out;
+    }
+
+    iterate(...args) {
+      // Materialized iteration (the query runs once, then streams the rows);
+      // Node's lazy cursor is not observable through this bridge.
+      const rows = this.all(...args);
+      let index = 0;
+      const iterator = {
+        [Symbol.iterator]() { return iterator; },
+        next() {
+          if (index < rows.length) {
+            return { value: rows[index++], done: false };
+          }
+          return { value: undefined, done: true };
+        },
+        return(value) {
+          return { value: value, done: true };
+        },
+      };
+      return iterator;
+    }
+
+    columns() {
+      return call("columns", { id: this._pirDbId, sql: this.sourceSQL });
+    }
+
+    setReadBigInts(enabled) {
+      this._pirReadBigInts = enabled === true;
+    }
+
+    setReturnArrays(enabled) {
+      this._pirReturnArrays = enabled === true;
+    }
+
+    setAllowBareNamedParameters(enabled) {
+      // Bare-name matching is always on (Node's default); disabling would
+      // need a host-side name key distinction nothing consumes.
+    }
+
+    setAllowUnknownNamedParameters(enabled) {
+      this._pirAllowUnknown = enabled === true;
+    }
+  }
+
+  // --- DatabaseSync --------------------------------------------------------
+  class DatabaseSync {
+    constructor(path, options) {
+      if (typeof path !== "string") {
+        throw errInvalidArg("The `path` argument must be of type string");
+      }
+      const opts = options || {};
+      this._pirPath = path;
+      this._pirOpen = false;
+      this._pirId = undefined;
+      if (opts.open === false) {
+        // Deferred open; `open()` performs the host call.
+        this._pirOptions = opts;
+        return;
+      }
+      this._pirDoOpen(opts);
+    }
+
+    _pirDoOpen(opts) {
+      const payload = {
+        path: this._pirPath,
+        readOnly: opts.readOnly === true,
+      };
+      if (opts.enableForeignKeyConstraints !== undefined) {
+        payload.enableForeignKeyConstraints = opts.enableForeignKeyConstraints === true;
+      }
+      if (typeof opts.timeout === "number") {
+        payload.timeout = opts.timeout;
+      }
+      const result = call("open", payload);
+      this._pirId = result.id;
+      this._pirOpen = true;
+    }
+
+    get isOpen() {
+      return this._pirOpen === true;
+    }
+
+    get isTransaction() {
+      if (!this._pirOpen) return false;
+      return call("status", { id: this._pirId }).autocommit === false;
+    }
+
+    get location() {
+      return this._pirPath === "" ? "" : this._pirPath;
+    }
+
+    open() {
+      if (this._pirOpen) {
+        throw errInvalidState("database is already open");
+      }
+      this._pirDoOpen(this._pirOptions || {});
+    }
+
+    close() {
+      if (!this._pirOpen) {
+        throw errInvalidState("database is not open");
+      }
+      call("close", { id: this._pirId });
+      this._pirOpen = false;
+      this._pirId = undefined;
+    }
+
+    exec(sql) {
+      if (!this._pirOpen) {
+        throw errInvalidState("database is not open");
+      }
+      if (typeof sql !== "string") {
+        throw errInvalidArg("The `sql` argument must be of type string");
+      }
+      call("exec", { id: this._pirId, sql: sql });
+    }
+
+    prepare(sql) {
+      if (!this._pirOpen) {
+        throw errInvalidState("database is not open");
+      }
+      if (typeof sql !== "string") {
+        throw errInvalidArg("The `sql` argument must be of type string");
+      }
+      // Validate now so bad SQL throws at prepare time (Node behavior); the
+      // host's statement cache makes the later executions reuse the compile.
+      call("prepare", { id: this._pirId, sql: sql });
+      return new StatementSync(STATEMENT_MARK, this._pirId, sql, scanParams(sql));
+    }
+
+    function(..._args) {
+      throw pirSqliteUnsupported("DatabaseSync.prototype.function (custom SQL functions)");
+    }
+
+    aggregate(..._args) {
+      throw pirSqliteUnsupported("DatabaseSync.prototype.aggregate (custom aggregates)");
+    }
+
+    createSession(..._args) {
+      throw pirSqliteUnsupported("DatabaseSync.prototype.createSession (changesets)");
+    }
+
+    applyChangeset(..._args) {
+      throw pirSqliteUnsupported("DatabaseSync.prototype.applyChangeset (changesets)");
+    }
+
+    loadExtension(..._args) {
+      throw pirSqliteUnsupported("DatabaseSync.prototype.loadExtension (runtime extensions)");
+    }
+
+    enableLoadExtension(..._args) {
+      throw pirSqliteUnsupported("DatabaseSync.prototype.enableLoadExtension (runtime extensions)");
+    }
+
+    serialize(..._args) {
+      throw pirSqliteUnsupported("DatabaseSync.prototype.serialize");
+    }
+
+    deserialize(..._args) {
+      throw pirSqliteUnsupported("DatabaseSync.prototype.deserialize");
+    }
+
+    setAuthorizer(..._args) {
+      throw pirSqliteUnsupported("DatabaseSync.prototype.setAuthorizer");
+    }
+  }
+
+  const constants = {
+    SQLITE_CHANGESET_ABORT: 2,
+    SQLITE_CHANGESET_DATA: 4,
+    SQLITE_CHANGESET_CONFLICT: 5,
+    SQLITE_CHANGESET_CONSTRAINT: 6,
+    SQLITE_CHANGESET_FOREIGN_KEY: 7,
+    SQLITE_CHANGESET_NOTFOUND: 3,
+    SQLITE_CHANGESET_OMIT: 0,
+    SQLITE_CHANGESET_REPLACE: 1,
+    SQLITE_OK: 0,
+    SQLITE_ERROR: 1,
+    SQLITE_INTERNAL: 2,
+    SQLITE_PERM: 3,
+    SQLITE_ABORT: 4,
+    SQLITE_BUSY: 5,
+    SQLITE_LOCKED: 6,
+    SQLITE_NOMEM: 7,
+    SQLITE_READONLY: 8,
+    SQLITE_INTERRUPT: 9,
+    SQLITE_IOERR: 10,
+    SQLITE_CORRUPT: 11,
+    SQLITE_NOTFOUND: 12,
+    SQLITE_FULL: 13,
+    SQLITE_CANTOPEN: 14,
+    SQLITE_PROTOCOL: 15,
+    SQLITE_EMPTY: 16,
+    SQLITE_SCHEMA: 17,
+    SQLITE_TOOBIG: 18,
+    SQLITE_CONSTRAINT: 19,
+    SQLITE_MISMATCH: 20,
+    SQLITE_MISUSE: 21,
+    SQLITE_NOLFS: 22,
+    SQLITE_AUTH: 23,
+    SQLITE_FORMAT: 24,
+    SQLITE_RANGE: 25,
+    SQLITE_NOTADB: 26,
+    SQLITE_ROW: 100,
+    SQLITE_DONE: 101,
+  };
+
+  function backup(..._args) {
+    throw pirSqliteUnsupported("node:sqlite backup");
+  }
+
+  class Session {
+    constructor(..._args) {
+      throw pirSqliteUnsupported("node:sqlite Session");
+    }
+  }
+
+  const sqlite = {
+    DatabaseSync: DatabaseSync,
+    StatementSync: StatementSync,
+    Session: Session,
+    constants: constants,
+    backup: backup,
+  };
+
+  globalThis.__pirSqliteShim = sqlite;
+})();
+
+const {
+  DatabaseSync,
+  StatementSync,
+  Session,
+  constants,
+  backup,
+} = globalThis.__pirSqliteShim;
+
+const sqlite = globalThis.__pirSqliteShim;
+
+export default sqlite;
+export {
+  DatabaseSync,
+  StatementSync,
+  Session,
+  constants,
+  backup,
+};

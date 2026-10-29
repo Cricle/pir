@@ -1,0 +1,358 @@
+
+import EventEmitter from "@node/events";
+
+// ---------------------------------------------------------------------------
+// worker_threads: real in-process workers.
+//
+// Node semantics are "one isolate per Worker"; pir's equivalent is one OS
+// thread + one independent QuickJS runtime per Worker (host-backed, see
+// `runtime/host_functions/worker_fns.rs` + the worker boot overlay
+// `worker_boot.js.txt`). The main thread stays `isMainThread: true` with a
+// null `parentPort`; inside a worker the boot overlay flips these bindings
+// through `__pirWorkerThreadsApply` (module `let` bindings stay live for the
+// namespace + default object getters below).
+//
+// Data crosses the boundary as JSON (structured-clone-minimal): plain
+// objects/arrays/primitives pass, functions/symbols/class instances/cycles
+// throw DataCloneError, and prototype chains are not preserved — Node's
+// full structuredClone (Date/Map/Set/TypedArray/transferList) is out of
+// scope for the message bridge.
+// ---------------------------------------------------------------------------
+
+let isMainThread = true;
+let parentPort = null;
+let workerData = null;
+let threadId = 0;
+
+// Wire state for THIS runtime; mutated only by the worker boot overlay.
+const workerRuntime = { workerId: 0, applied: false };
+
+globalThis.__pirWorkerThreadsApply ?? (globalThis.__pirWorkerThreadsApply = (state) => {
+  isMainThread = false;
+  threadId = state.threadId;
+  workerData = state.workerData;
+  workerRuntime.workerId = state.workerId;
+  workerRuntime.applied = true;
+  const port = new EventEmitter();
+  port.postMessage = (value) => {
+    // Wrap in the control-record envelope the parent pump dispatches on
+    // (`kind: "msg"`), keeping the clone validation of the inner value.
+    const wire = toWireJson(value);
+    __pir_host.worker("workerSend", JSON.stringify({
+      id: state.workerId,
+      data: JSON.stringify({ kind: "msg", data: JSON.parse(wire) }),
+    }));
+  };
+  port.start = () => {};
+  port.close = () => {};
+  port.ref = () => port;
+  port.unref = () => port;
+  port.hasRef = () => true;
+  port.addEventListener = (type, listener) => {
+    if (type === "message" && typeof listener === "function") port.on("message", listener);
+    return port;
+  };
+  port.removeEventListener = (type, listener) => {
+    if (type === "message") port.off("message", listener);
+    return port;
+  };
+  parentPort = port;
+  return port;
+});
+
+// --- structured-clone-minimal (JSON bridge) --------------------------------
+
+const cloneUnsupported = (value) => {
+  const label = value === null ? "null" : typeof value;
+  const error = new Error("worker_threads message value (" + label + ") could not be cloned by pir's JSON message bridge.");
+  error.name = "DataCloneError";
+  error.code = 25; // DOM DATA_CLONE_ERR, like Node's structured clone failure
+  return error;
+};
+
+const assertClonable = (value, seen) => {
+  if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") return;
+  if (typeof value !== "object" && typeof value !== "function") throw cloneUnsupported(value);
+  if (typeof value === "function" || typeof value === "symbol") throw cloneUnsupported(value);
+  if (seen.has(value)) throw cloneUnsupported(value); // cycles
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) assertClonable(item, seen);
+  } else {
+    // Class instances (non-plain prototypes) would silently lose their
+    // prototype through the JSON bridge — refuse them instead.
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) throw cloneUnsupported(value);
+    for (const key of Object.keys(value)) assertClonable(value[key], seen);
+  }
+};
+
+const toWireJson = (value) => {
+  if (value === undefined) return "null";
+  assertClonable(value, new Set());
+  let json;
+  try { json = JSON.stringify(value); } catch { throw cloneUnsupported(value); }
+  return json === undefined ? "null" : json;
+};
+
+const hostWorker = (op, payload) => JSON.parse(__pir_host.worker(op, JSON.stringify(payload)));
+
+// --- Worker (main thread) ---------------------------------------------------
+
+class Worker extends EventEmitter {
+  constructor(filename, options) {
+    super();
+    if (typeof filename !== "string" || !filename) {
+      throw new TypeError('The "filename" argument must be a string' + (options && options.eval ? " containing the worker source (eval: true)" : ""));
+    }
+    options = options || {};
+    this.filename = filename;
+    this.threadId = -1;
+    this.stdin = null;
+    this.stdout = null;
+    this.stderr = null;
+    this.performance = { eventLoopUtilization: () => ({ idle: 0, active: 0, utilization: 0 }) };
+    this._id = null;
+    this._exited = false;
+    this._exitCode = null;
+
+    const workerDataValue = options.workerData === undefined ? null : options.workerData;
+    const dataJson = toWireJson(workerDataValue);
+    const startResult = hostWorker("start", {
+      eval: options.eval === true,
+      code: options.eval === true ? filename : "",
+      filename: options.eval === true ? "" : filename,
+      workerData: dataJson,
+    });
+    if (!startResult.ok) {
+      // Node fails an unloadable worker through the async `error` event
+      // (construction itself stays silent).
+      globalThis.__pirMicrotask(() => {
+        const error = new Error(startResult.message || "Worker failed to start");
+        if (startResult.code) error.code = startResult.code;
+        this.emit("error", error);
+        this._settleExit(1);
+      });
+      return;
+    }
+    this._id = startResult.value.id;
+    this.threadId = startResult.value.threadId;
+    this._pump();
+  }
+
+  _settleExit(code) {
+    if (this._exited) return;
+    this._exited = true;
+    this._exitCode = code;
+    this.emit("exit", code);
+    if (this._id !== null) {
+      try { hostWorker("release", { id: this._id }); } catch { /* registry entry may already be gone */ }
+    }
+  }
+
+  // Drain the worker -> parent mailbox into `message`/`error`/`exit` events
+  // until the worker is done, terminated, or self-exited. The poll is an
+  // awaited host future (notify + timer fallback), so timers, in-flight
+  // fetches and other JS keep running between polls.
+  async _pump() {
+    for (;;) {
+      let res;
+      try {
+        res = JSON.parse(await __pir_host.workerRecvPoll(this._id, 250, "parent"));
+      } catch { break; }
+      if (res.messages && res.messages.length > 0) {
+        for (const raw of res.messages) {
+          let record;
+          try { record = JSON.parse(raw); } catch { continue; }
+          if (record.kind === "msg") {
+            this.emit("message", record.data);
+          } else if (record.kind === "error") {
+            const error = new Error(record.message || "Worker failed");
+            if (record.stack) error.stack = record.stack;
+            this.emit("error", error);
+          } else if (record.kind === "exit") {
+            this._settleExit(record.code);
+          }
+        }
+      }
+      if (res.done) {
+        this._settleExit(res.exitCode === null || res.exitCode === undefined ? 1 : res.exitCode);
+        break;
+      }
+      if (res.stop) {
+        // Terminated from this side: terminate() reports the exit below; a
+        // worker self-exit carries its recorded code.
+        if (typeof res.exitCode === "number") this._settleExit(res.exitCode);
+        break;
+      }
+    }
+  }
+
+  postMessage(value) {
+    if (this._exited || this._id === null) return;
+    const dataJson = toWireJson(value);
+    try { hostWorker("parentSend", { id: this._id, data: dataJson }); } catch { /* worker gone: drop */ }
+  }
+
+  async terminate() {
+    if (this._exited) return this._exitCode === null ? 1 : this._exitCode;
+    if (this._id === null) {
+      // Failed start already settled the error path.
+      return 1;
+    }
+    // Node resolves with the worker's exit code once the thread stops. The
+    // op waits at most 200ms per call; loop with executor yields between
+    // calls (bounded, ~20s) so a wedged worker cannot hang the parent.
+    for (let attempt = 0; attempt < 100; attempt++) {
+      let res;
+      try { res = hostWorker("terminate", { id: this._id, waitMs: 200 }); } catch { break; }
+      if (res.value && res.value.done) {
+        this._settleExit(res.value.exitCode === null ? 1 : res.value.exitCode);
+        return this._exitCode === null ? 1 : this._exitCode;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    this._settleExit(1);
+    return 1;
+  }
+
+  ref() {
+    return this;
+  }
+
+  unref() {
+    // pir workers are always ref'd (a live worker keeps the parent runtime's
+    // idle drain pending, like Node); unref is accepted as a no-op.
+    return this;
+  }
+}
+
+// --- environment data (host-backed: shared across worker runtimes) ---------
+
+function getEnvironmentData(key) {
+  const res = hostWorker("envGet", { key: String(key) });
+  return res.ok ? res.value : undefined;
+}
+
+function setEnvironmentData(key, value) {
+  const wire = toWireJson(value);
+  hostWorker("envSet", { key: String(key), value: JSON.parse(wire) });
+}
+
+// --- surface completion (unchanged names, main-thread semantics) -----------
+
+const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
+const isInternalThread = false;
+const threadName = "";
+
+function markAsUntransferable(_object) {}
+function markAsUncloneable(_object) {}
+function isMarkedAsUntransferable(_object) {
+  return false;
+}
+
+// Inert message-port pad: ports exist, move no data (single-thread runtime),
+// and close asynchronously like a drained port.
+class MessagePort {
+  constructor() {
+    this.onmessage = null;
+    this.onmessageerror = null;
+    this._started = false;
+  }
+  postMessage(_value, _transferList) {}
+  start() {
+    this._started = true;
+  }
+  close() {}
+  ref() {}
+  unref() {}
+  hasRef() {
+    return false;
+  }
+  addEventListener() {}
+  removeEventListener() {}
+  getEventListener() {
+    return [];
+  }
+}
+
+class MessageChannel {
+  constructor() {
+    this.port1 = new MessagePort();
+    this.port2 = new MessagePort();
+  }
+}
+
+class BroadcastChannel {
+  constructor(_name) {
+    this.onmessage = null;
+    this.onmessageerror = null;
+  }
+  postMessage(_message) {}
+  close() {}
+  ref() {}
+  unref() {}
+}
+
+function receiveMessageOnPort(_port) {
+  return undefined;
+}
+
+function moveMessagePortToContext(_port, _context) {
+  const error = new Error("worker_threads.moveMessagePortToContext is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  throw error;
+}
+
+function postMessageToThread(_threadId, _value, _timeout) {
+  const error = new Error("worker_threads.postMessageToThread is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  throw error;
+}
+
+const resourceLimits = Object.freeze({
+  maxYoungGenerationSizeMb: 0,
+  maxOldGenerationSizeMb: 0,
+  codeRangeSizeMb: 0,
+  stackSizeMb: 0,
+});
+
+const locks = Object.freeze({
+  request(_name, _mode, fn) {
+    if (typeof fn === "function") return Promise.resolve(fn({}));
+    return Promise.resolve();
+  },
+  query() {
+    return Promise.resolve({ held: [], pending: [] });
+  },
+});
+
+export default {
+  get isMainThread() { return isMainThread; },
+  get isInternalThread() { return isInternalThread; },
+  get threadName() { return threadName; },
+  get resourceLimits() { return resourceLimits; },
+  get SHARE_ENV() { return SHARE_ENV; },
+  get BroadcastChannel() { return BroadcastChannel; },
+  get MessageChannel() { return MessageChannel; },
+  get MessagePort() { return MessagePort; },
+  get locks() { return locks; },
+  get markAsUncloneable() { return markAsUncloneable; },
+  get markAsUntransferable() { return markAsUntransferable; },
+  get isMarkedAsUntransferable() { return isMarkedAsUntransferable; },
+  get moveMessagePortToContext() { return moveMessagePortToContext; },
+  get postMessageToThread() { return postMessageToThread; },
+  get receiveMessageOnPort() { return receiveMessageOnPort; },
+  get parentPort() { return parentPort; },
+  get workerData() { return workerData; },
+  get threadId() { return threadId; },
+  get Worker() { return Worker; },
+  get getEnvironmentData() { return getEnvironmentData; },
+  get setEnvironmentData() { return setEnvironmentData; },
+};
+export {
+  isMainThread, parentPort, workerData, threadId, Worker, getEnvironmentData, setEnvironmentData,
+  SHARE_ENV, isInternalThread, threadName, resourceLimits, BroadcastChannel, MessageChannel,
+  MessagePort, locks, markAsUncloneable, markAsUntransferable, isMarkedAsUntransferable,
+  moveMessagePortToContext, postMessageToThread, receiveMessageOnPort,
+};

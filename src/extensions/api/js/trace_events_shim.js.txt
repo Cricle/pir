@@ -1,0 +1,32 @@
+// node:trace_events — throws tier. No system trace host exists; the
+// entry points exist for link compatibility and throw the unified error.
+function traceEventsUnsupported(api) {
+  const error = new Error("node:trace_events." + api + " is not supported by the pir extension runtime (no trace host)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+class Tracing {
+  constructor(..._args) {
+    throw traceEventsUnsupported("createTracing");
+  }
+  enable() {}
+  disable() {}
+}
+
+function createTracing(..._args) {
+  throw traceEventsUnsupported("createTracing");
+}
+
+function getEnabledCategories() {
+  // No trace categories are ever enabled in this runtime.
+  return "";
+}
+
+const traceEvents = {
+  createTracing: createTracing,
+  getEnabledCategories: getEnabledCategories,
+};
+
+export default traceEvents;
+export { Tracing, createTracing, getEnabledCategories };

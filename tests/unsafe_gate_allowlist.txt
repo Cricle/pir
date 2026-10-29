@@ -1,0 +1,47 @@
+# Unsafe-code inventory for tests/unsafe_gate.rs (U2 gate).
+#
+# Each line caps one file under src/ at the reviewed number of unsafe
+# constructs. The gate counts real `unsafe {`, `unsafe fn` and
+# `unsafe impl`/`unsafe trait` tokens only (comments and string/char/raw
+# literals are ignored), and compares component-wise:
+#
+#   - a file with unsafe but no entry here fails (new unsafe surface);
+#   - a count above the ceiling fails and prints `src/<file>:<line>` for every
+#     current site in that file;
+#   - a count below the ceiling passes and asks for this file to be tightened.
+#
+# Every ceiling below is the exact current count, not headroom: there are no
+# unused slots for a future block to hide in. The trailing comment names the
+# reviewed platform/FFI boundary that justifies the file.
+#
+# Raising a ceiling is only for a reviewed platform/FFI boundary, together
+# with a `// SAFETY:` note at the site. Do not widen a module/file
+# `#[allow(unsafe_code)]` to cover a new block: this gate counts blocks.
+#
+# Regenerate the data lines with:
+#   cargo test --test unsafe_gate -- --ignored --nocapture print_current_unsafe_allowlist
+# The helper prints bare counts; re-add each per-entry boundary comment during
+# review (they are part of the reviewed inventory, not decoration).
+coding_agent/tools/bash.rs 4 0 0  # Win32 Job Object FFI; Unix killpg on the shell's process group
+coding_agent/tools/confine.rs 27 0 0  # Unix openat/mkdirat/fstatat/renameat/unlinkat; Win32 reparse-point-aware open
+coding_agent/tools/shell_pool.rs 28 1 0  # Win32 Job Object/console FFI, Unix geteuid; one unsafe fn (ACL check)
+coding_agent/tools/spill.rs 16 0 0  # Win32 security-descriptor/ACL + CreateFileW FFI
+env_daemon/pty.rs 9 0 0  # ConPTY and Unix pty/termios FFI
+env_daemon/sys/unix.rs 5 0 0  # libc process/session/filesystem FFI
+env_daemon/sys/windows.rs 10 0 0  # Win32 process/console/filesystem FFI
+env_daemon/watch.rs 2 0 0  # libc statfs/name-to-handle watcher FFI
+extensions/runtime/exec.rs 1 0 0  # libc::kill on a child this process spawned
+extensions/runtime/host_functions/buffer_ops.rs 3 0 0  # QuickJS raw typed-array accessors
+# child_fns: one reviewed Unix block (`libc::kill`). The Windows
+# `WaitForSingleObject` block was removed in favour of safe `Child::try_wait`
+# polling; keep this ceiling at 1, do not raise it for that block again.
+extensions/runtime/host_functions/child_fns.rs 1 0 0  # libc::kill on a child this process spawned
+extensions/runtime/host_functions/node_fns.rs 3 0 0  # Win32 GetProcessTimes + libc getrusage out-parameters
+mcp/stdio.rs 1 0 0  # libc::killpg on the spawned MCP server's process group
+plugins/builtin/phone/session.rs 1 0 0  # libc::kill on the phone session's child process group
+session_manager/tail_page.rs 1 0 0  # memmap2 read-only map of an append-only session file
+tui/stdin_buffer.rs 3 0 0  # Win32 console input + Unix termios FFI
+tui/terminal.rs 1 0 0  # libc::raise(SIGTSTP) for terminal suspend
+tui/theme/osc11.rs 5 0 0  # libc fcntl/poll/read on the process' own stdin
+
+# total: 18 file(s), 121 unsafe block(s), 1 unsafe fn, 0 unsafe impl/trait

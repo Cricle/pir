@@ -1,0 +1,1820 @@
+import { EventEmitter } from "@node/events";
+import { fileURLToPath as pirFileUrlToPath } from "@node/url";
+
+const Buffer = globalThis.Buffer;
+const call = globalThis.__pirNodeCall;
+
+// ---------------------------------------------------------------------------
+// Node's argument validation (internal/errors shapes)
+// ---------------------------------------------------------------------------
+
+/// Node's internal errors stringify as `TypeError [ERR_INVALID_ARG_TYPE]: …`
+/// while `err.name` stays bare (`TypeError`), so regex-style assertions
+/// (`assert.throws(fn, /TypeError \[ERR_INVALID_ARG_TYPE\]/)`) only match when
+/// the instance carries this `toString`.
+function pirCodedError(Ctor, code, message) {
+  const error = new Ctor(message);
+  error.code = code;
+  Object.defineProperty(error, "toString", {
+    value: function () { return this.name + " [" + String(this.code) + "]: " + this.message; },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return error;
+}
+
+/// `util.inspect`-lite for the primitives the validation messages carry.
+function pirPrimitiveText(value) {
+  if (typeof value === "string") {
+    return "'" + value.replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "'";
+  }
+  if (typeof value === "bigint") return String(value) + "n";
+  return String(value);
+}
+
+/// `common.invalidArgTypeHelper`'s counterpart: the `Received …` tail Node
+/// appends to every ERR_INVALID_ARG_TYPE message.
+function pirReceivedText(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  const type = typeof value;
+  if (type === "function") return "function " + (value.name || "");
+  if (type === "object") {
+    const ctor = value.constructor;
+    if (ctor && typeof ctor.name === "string" && ctor.name !== "") {
+      return "an instance of " + ctor.name;
+    }
+    return String(value);
+  }
+  let inspected = pirPrimitiveText(value);
+  if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+  return "type " + type + " (" + inspected + ")";
+}
+
+function pirInvalidArgType(name, expected, value) {
+  return pirCodedError(TypeError, "ERR_INVALID_ARG_TYPE",
+    'The "' + name + '" argument must be ' + expected + ". Received " + pirReceivedText(value));
+}
+
+function pirInvalidArgTypeProperty(name, expected, value) {
+  return pirCodedError(TypeError, "ERR_INVALID_ARG_TYPE",
+    'The "' + name + '" property must be ' + expected + ". Received " + pirReceivedText(value));
+}
+
+function pirOutOfRange(name, range, value) {
+  return pirCodedError(RangeError, "ERR_OUT_OF_RANGE",
+    'The value of "' + name + '" is out of range. It must be ' + range + ". Received " + pirPrimitiveText(value));
+}
+
+const kPathExpectation = "of type string or an instance of Buffer or URL";
+
+function pirIsFileUrl(value) {
+  // Duck-typed so the shim does not depend on which URL class the caller
+  // used (globals vs the url module are the same class today, but a
+  // Buffer-backed subclass must keep working).
+  return value !== null && typeof value === "object" &&
+    typeof value.href === "string" && typeof value.protocol === "string";
+}
+
+/// Node's `getValidatedPath`: accepts string / Buffer-like / URL, rejects
+/// everything else with ERR_INVALID_ARG_TYPE before any host call happens.
+function pirPathArg(value, name) {
+  const argName = name === undefined ? "path" : name;
+  if (typeof value === "string") return value;
+  if (value instanceof Uint8Array) return Buffer.from(value).toString();
+  if (value instanceof globalThis.URL || pirIsFileUrl(value)) {
+    return String(pirFileUrlToPath(value));
+  }
+  throw pirInvalidArgType(argName, kPathExpectation, value);
+}
+
+/// `parseFileMode`: an octal string is accepted, the result must be a uint32.
+function pirParseMode(value, name) {
+  let mode = value;
+  if (typeof mode === "string") mode = parseInt(mode, 8);
+  if (typeof mode !== "number") throw pirInvalidArgType(name, "of type number", value);
+  if (!Number.isInteger(mode)) throw pirOutOfRange(name, "an integer", mode);
+  if (mode < 0 || mode > 4294967295) throw pirOutOfRange(name, ">= 0 && <= 4294967295", mode);
+  return mode;
+}
+
+function pirCheckCallback(callback) {
+  if (typeof callback !== "function") {
+    throw pirInvalidArgType("callback", "of type function", callback);
+  }
+  return callback;
+}
+
+/// Node's `validateInteger` (argument wording).
+function pirValidateInteger(value, name, min, max) {
+  if (typeof value !== "number") {
+    throw pirInvalidArgType(name, "of type number", value);
+  }
+  if (!Number.isInteger(value)) {
+    throw pirOutOfRange(name, "an integer", value);
+  }
+  if (value < min || value > max) {
+    throw pirOutOfRange(name, ">= " + min + " && <= " + max, value);
+  }
+  return value;
+}
+
+/// The same check for an options field (Node words these "property").
+function pirValidateIntegerProperty(value, name, min, max) {
+  if (typeof value !== "number") {
+    throw pirInvalidArgTypeProperty(name, "of type number", value);
+  }
+  if (!Number.isInteger(value)) {
+    throw pirOutOfRange(name, "an integer", value);
+  }
+  if (value < min || value > max) {
+    throw pirOutOfRange(name, ">= " + min + " && <= " + max, value);
+  }
+  return value;
+}
+
+// Node deduplicates warnings by code (or by message when there is none), so
+// the deprecated `fs.F_OK` family and the mkdtemp template warning each fire
+// once per process.
+const pirEmittedWarnings = new Set();
+
+function pirEmitWarningOnce(key, message, options) {
+  if (pirEmittedWarnings.has(key)) return;
+  pirEmittedWarnings.add(key);
+  const proc = globalThis.process;
+  if (proc && typeof proc.emitWarning === "function") {
+    // Node's `emitWarning(warning, options)` form: the code travels in the
+    // options object (`expectWarning` asserts both name and code).
+    proc.emitWarning(message, {
+      type: options === undefined ? "Warning" : options.type,
+      code: options === undefined ? undefined : options.code,
+    });
+  }
+}
+
+// Full fs.constants table (values captured from the real Node v24 win32
+// table; the deprecated `constants` module re-merges this with the crypto
+// and os tables). Node builds it with a null prototype and the tests check
+// exactly that, so the literal is re-parented below.
+const constants = Object.assign(Object.create(null), {
+    COPYFILE_EXCL: 1,
+  COPYFILE_FICLONE: 2,
+  COPYFILE_FICLONE_FORCE: 4,
+  F_OK: 0,
+  O_APPEND: 8,
+  O_CREAT: 256,
+  O_EXCL: 1024,
+  O_RDONLY: 0,
+  O_RDWR: 2,
+  O_TRUNC: 512,
+  O_WRONLY: 1,
+  R_OK: 4,
+  S_IFCHR: 8192,
+  S_IFDIR: 16384,
+  S_IFIFO: 4096,
+  S_IFLNK: 40960,
+  S_IFMT: 61440,
+  S_IFREG: 32768,
+  S_IRUSR: 256,
+  S_IWUSR: 128,
+  UV_DIRENT_BLOCK: 7,
+  UV_DIRENT_CHAR: 6,
+  UV_DIRENT_DIR: 2,
+  UV_DIRENT_FIFO: 4,
+  UV_DIRENT_FILE: 1,
+  UV_DIRENT_LINK: 3,
+  UV_DIRENT_SOCKET: 5,
+  UV_DIRENT_UNKNOWN: 0,
+  UV_FS_COPYFILE_EXCL: 1,
+  UV_FS_COPYFILE_FICLONE: 2,
+  UV_FS_COPYFILE_FICLONE_FORCE: 4,
+  UV_FS_O_FILEMAP: 536870912,
+  UV_FS_SYMLINK_DIR: 1,
+  UV_FS_SYMLINK_JUNCTION: 2,
+  W_OK: 2,
+  X_OK: 1,
+});
+
+function fileOptions(options) {
+  if (options === undefined || options === null) return {};
+  if (typeof options === "string") return { encoding: options };
+  if (typeof options === "object") {
+    return {
+      encoding: options.encoding === undefined || options.encoding === null ? undefined : options.encoding,
+      flag: options.flag,
+    };
+  }
+  return {};
+}
+
+function dataToBase64(data, encoding) {
+  if (typeof data === "string") {
+    return Buffer.from(data, encoding === undefined ? "utf8" : encoding).toString("base64");
+  }
+  // Read-only base64: a Buffer encodes in place, and a view encodes the same
+  // bytes `Buffer.from(data)` would copy (buffer_global.js.txt's fromView).
+  if (Buffer.isBuffer(data)) return data.toString("base64");
+  if (data instanceof Uint8Array) {
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("base64");
+  }
+  // `Buffer.from(ArrayBuffer)` is already a no-copy view (viewOver); wrapping
+  // it in `new Uint8Array(data)` only made the encode copy it.
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("base64");
+  return Buffer.from(data).toString("base64");
+}
+
+// Unpaired surrogate code unit anywhere in `text`.
+function pirHasLoneSurrogate(text) {
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        i++; // a well-formed pair encodes as one character
+        continue;
+      }
+      return true;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
+
+// Can this write payload ride the text channel (`dataText`) instead of the
+// base64 `data`? Only when its bytes are exactly its UTF-8 encoding: the
+// encoding argument must resolve to utf8 (Buffer.from's default; a
+// non-string/empty encoding is utf8 there too, buffer_global.js.txt's
+// normalizeEncodingOptional) and the data itself must carry no lone surrogate
+// (UTF-8 substitutes U+FFFD for one, while the JSON text channel would have
+// JSON.stringify escape it and the host's `json!` payload parser reject the
+// escape). Every rejected payload keeps the base64 channel, byte-identical to
+// what it always sent.
+function pirWriteTextEncodable(data, encoding) {
+  if (typeof data !== "string") return false;
+  if (typeof encoding === "string" && encoding.length !== 0) {
+    const normalized = encoding.toLowerCase();
+    if (normalized !== "utf8" && normalized !== "utf-8") return false;
+  }
+  return !pirHasLoneSurrogate(data);
+}
+
+/// Stamp the write-data channel fields onto a host payload: `dataText` for
+/// plain-text writes (the host turns it back into the exact UTF-8 bytes, no
+/// base64 round trip on either leg), base64 `data` for everything else
+/// (Buffer/typed array, non-utf8 encoding, lone surrogate).
+function pirWriteData(payload, data, encoding) {
+  if (pirWriteTextEncodable(data, encoding)) payload.dataText = data;
+  else payload.data = dataToBase64(data, encoding);
+  return payload;
+}
+
+class Stats {
+  constructor(raw) {
+    this._raw = raw;
+    this.size = raw.size;
+    // Node's `mode`: permission bits plus the file-type bits (0o100000 for a
+    // regular file, 0o40000 for a directory) as libuv reports them on the
+    // host platform (Windows: 0o444 read-only / 0o666 writable).
+    this.mode = Number(raw.mode) || 0;
+    this.mtimeMs = raw.mtimeMs;
+    this.birthtimeMs = raw.birthtimeMs;
+    this.mtime = new Date(raw.mtimeMs);
+    this.birthtime = new Date(raw.birthtimeMs);
+  }
+  isFile() { return !!this._raw.isFile; }
+  isDirectory() { return !!this._raw.isDirectory; }
+  isSymbolicLink() { return !!this._raw.isSymbolicLink; }
+  isBlockDevice() { return false; }
+  isCharacterDevice() { return false; }
+  isFIFO() { return false; }
+  isSocket() { return false; }
+}
+
+class Dirent {
+  constructor(raw, parentPath) {
+    this._raw = raw;
+    this.name = raw.name;
+    // Node stamps the directory the entry came from onto every dirent.
+    this.parentPath = parentPath === undefined ? null : parentPath;
+  }
+  isFile() { return !!this._raw.isFile; }
+  isDirectory() { return !!this._raw.isDirectory; }
+  isSymbolicLink() { return !!this._raw.isSymbolicLink; }
+  isBlockDevice() { return false; }
+  isCharacterDevice() { return false; }
+  isFIFO() { return false; }
+  isSocket() { return false; }
+}
+
+/// Read the whole descriptor; Node's `readFile` uses the same loop.
+function pirReadFdFully(fd) {
+  const total = fstatSync(fd).size;
+  const out = Buffer.alloc(total);
+  let done = 0;
+  while (done < total) {
+    const count = readSync(fd, out, done, total - done, done);
+    if (count <= 0) break;
+    done += count;
+  }
+  return out.slice(0, done);
+}
+
+function readFileSync(path, options) {
+  const opts = fileOptions(options);
+  let buffer;
+  if (typeof path === "number") {
+    // Node also accepts a descriptor instead of a path.
+    buffer = pirReadFdFully(path);
+  } else {
+    const target = pirPathArg(path, "path");
+    const flag = pirOpenFlags(opts.flag);
+    if (pirFlagsPureRead(flag)) {
+      buffer = Buffer.from(call("fs", "readFile", { path: target }), "base64");
+    } else {
+      // Anything else can create the file (`a+`) or refuse to touch it when
+      // it exists (`ax+`), which the whole-file host read cannot express:
+      // route it through the fd family instead.
+      const fd = openSync(target, flag);
+      try {
+        buffer = pirReadFdFully(fd);
+      } finally {
+        closeSync(fd);
+      }
+    }
+  }
+  return opts.encoding === undefined ? buffer : buffer.toString(opts.encoding);
+}
+
+function writeFileSync(path, data, options) {
+  const opts = fileOptions(options);
+  const append = pirFlagsAppend(opts.flag);
+  call("fs", "writeFile", pirWriteData({ path: String(path), append: append }, data, opts.encoding));
+}
+
+function appendFileSync(path, data, options) {
+  const opts = fileOptions(options);
+  call("fs", "writeFile", pirWriteData({ path: String(path), append: true }, data, opts.encoding));
+}
+
+function existsSync(path) {
+  // Node answers `false` for anything `getValidatedPath` rejects.
+  let target;
+  try {
+    target = pirPathArg(path, "path");
+  } catch {
+    return false;
+  }
+  try {
+    return call("fs", "exists", { path: target }) === true;
+  } catch {
+    return false;
+  }
+}
+
+function statSync(path) {
+  return new Stats(call("fs", "stat", { path: pirPathArg(path, "path") }));
+}
+
+function lstatSync(path) {
+  return new Stats(call("fs", "lstat", { path: pirPathArg(path, "path") }));
+}
+
+function readdirSync(path, options) {
+  const withFileTypes = !!(options && typeof options === "object" && options.withFileTypes);
+  const target = pirPathArg(path, "path");
+  const entries = call("fs", "readdir", { path: target, dirents: withFileTypes });
+  return withFileTypes ? entries.map((raw) => new Dirent(raw, target)) : entries;
+}
+
+function mkdirSync(path, options) {
+  const recursive = options === true || !!(options && typeof options === "object" && options.recursive);
+  call("fs", "mkdir", { path: pirPathArg(path, "path"), recursive: recursive });
+}
+
+function rmSync(path, options) {
+  const opts = options === undefined || options === null || typeof options !== "object" ? {} : options;
+  call("fs", "rm", { path: pirPathArg(path, "path"), recursive: !!opts.recursive, force: !!opts.force });
+}
+
+function unlinkSync(path) {
+  call("fs", "unlink", { path: pirPathArg(path, "path") });
+}
+
+function renameSync(from, to) {
+  call("fs", "rename", { from: pirPathArg(from, "oldPath"), to: pirPathArg(to, "newPath") });
+}
+
+function copyFileSync(from, to) {
+  call("fs", "copyFile", { from: pirPathArg(from, "src"), to: pirPathArg(to, "dest") });
+}
+
+function realpathSync(path) {
+  return call("fs", "realpath", { path: pirPathArg(path, "path") });
+}
+
+function accessSync(path, mode) {
+  call("fs", "access", { path: pirPathArg(path, "path"), mode: mode === undefined ? 0 : mode });
+}
+
+function readlinkSync(path) {
+  return call("fs", "readlink", { path: pirPathArg(path, "path") });
+}
+
+// ---- fd family ------------------------------------------------------------
+
+/// Node's `stringToFlags`: a number is an int32 `fs.constants` mask (node
+/// range-checks it and so does this shim), `null`/`undefined` mean `O_RDONLY`,
+/// a string keeps its own validation (the host rejects unknown flag strings
+/// with node's `ERR_INVALID_ARG_VALUE`) and anything else raises node's
+/// argument error. The host bridge accepts both forms.
+function pirOpenFlags(flags) {
+  if (typeof flags === "number") {
+    return pirValidateInteger(flags, "flags", -2147483648, 2147483647);
+  }
+  if (flags === undefined || flags === null) return constants.O_RDONLY;
+  if (typeof flags === "string") return flags;
+  throw pirCodedError(TypeError, "ERR_INVALID_ARG_VALUE",
+    "The argument 'flags' is invalid. Received " + pirFlagsReceived(flags));
+}
+
+/// `util.inspect`-lite for the `Received …` tail of the flags error.
+function pirFlagsReceived(value) {
+  if (typeof value === "object" && value !== null) {
+    try {
+      const keys = Object.keys(value);
+      if (keys.length === 0) return Array.isArray(value) ? "[]" : "{}";
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return pirPrimitiveText(value);
+}
+
+/// Whether the flags read the file and nothing else (a `O_RDONLY` access mode
+/// with no create/truncate/append bit): the whole-file host read needs exactly
+/// that, every other flag routes through the fd family.
+function pirFlagsPureRead(flags) {
+  if (typeof flags === "number") {
+    return flags === constants.O_RDONLY;
+  }
+  return flags === "r" || flags === "rs" || flags === "sr";
+}
+
+/// Whether the flags append (a string `a`/`a+` or a numeric `O_APPEND` bit).
+function pirFlagsAppend(flags) {
+  if (typeof flags === "number") return (flags & constants.O_APPEND) !== 0;
+  return flags === "a" || flags === "a+";
+}
+
+function openSync(path, flags, mode) {
+  return call("fs", "open", {
+    path: pirPathArg(path, "path"),
+    flags: pirOpenFlags(flags),
+    mode: mode === undefined || mode === null ? 0o666 : mode | 0,
+  });
+}
+
+function readSync(fd, buffer, offset, length, position) {
+  if (offset !== null && typeof offset === "object") {
+    // fs.readSync(fd, buffer, options) form
+    const options = offset;
+    offset = options.offset;
+    length = options.length;
+    position = options.position;
+  }
+  offset = offset === undefined ? 0 : offset | 0;
+  length = length === undefined ? buffer.length - offset : length | 0;
+  const payload = { fd: fd | 0, length: length };
+  if (typeof position === "number" && position >= 0) payload.position = Math.trunc(position);
+  const bytes = Buffer.from(call("fs", "read", payload), "base64");
+  for (let i = 0; i < bytes.length; i++) buffer[offset + i] = bytes[i];
+  return bytes.length;
+}
+
+function writeSync(fd, data, offsetOrPosition, lengthOrEncoding, position) {
+  let bytes;
+  let at;
+  let encoding;
+  if (typeof data === "string") {
+    // fs.writeSync(fd, string[, position[, encoding]])
+    at = typeof offsetOrPosition === "number" ? Math.trunc(offsetOrPosition) : undefined;
+    encoding = "utf8";
+    if (typeof offsetOrPosition === "string") encoding = offsetOrPosition;
+    else if (typeof lengthOrEncoding === "string") encoding = lengthOrEncoding;
+  } else {
+    // fs.writeSync(fd, buffer[, offset[, length[, position]]])
+    const source = data instanceof ArrayBuffer
+      ? Buffer.from(new Uint8Array(data))
+      : (data instanceof Uint8Array ? Buffer.from(data) : Buffer.from(data));
+    const start = typeof offsetOrPosition === "number" ? Math.trunc(offsetOrPosition) : 0;
+    const size = typeof lengthOrEncoding === "number" ? Math.trunc(lengthOrEncoding) : source.length - start;
+    bytes = source.subarray(start, start + size);
+    at = typeof position === "number" ? Math.trunc(position) : undefined;
+  }
+  // A string write rides the text channel (`dataText`) when its bytes are
+  // exactly its UTF-8 encoding; byte writes and every other string keep the
+  // base64 `data` channel, byte-for-byte as before.
+  const payload = { fd: fd | 0 };
+  if (typeof data === "string") pirWriteData(payload, data, encoding);
+  else payload.data = bytes.toString("base64");
+  if (at !== undefined && at >= 0) payload.position = at;
+  return call("fs", "write", payload);
+}
+
+function closeSync(fd) {
+  call("fs", "close", { fd: fd | 0 });
+}
+
+function fstatSync(fd) {
+  return new Stats(call("fs", "fstat", { fd: fd | 0 }));
+}
+
+function fsyncSync(fd) {
+  call("fs", "fsync", { fd: fd | 0 });
+}
+
+function fchmodSync(fd, mode) {
+  call("fs", "fchmod", { fd: fd | 0, mode: pirParseMode(mode, "mode") });
+}
+
+// ---- misc surface ---------------------------------------------------------
+
+/// mkdtemp's prefix argument: a validated path plus Node's once-per-process
+/// warning for templates that end with `X` (the random suffix replaces `XXXXXX`
+/// only when the prefix already ends with one).
+function pirMkdtempPrefix(prefix) {
+  const target = pirPathArg(prefix, "prefix");
+  if (target.endsWith("X")) {
+    pirEmitWarningOnce(
+      "mkdtemp-template-X",
+      "mkdtemp() templates ending with X are not portable. " +
+        "For details see: https://nodejs.org/api/fs.html",
+      { type: "Warning" },
+    );
+  }
+  return target;
+}
+
+function chmodSync(path, mode) {
+  call("fs", "chmod", { path: pirPathArg(path, "path"), mode: pirParseMode(mode, "mode") });
+}
+
+function cpSync(from, to, options) {
+  const opts = options === undefined || options === null || typeof options !== "object" ? {} : options;
+  call("fs", "cp", { from: pirPathArg(from, "src"), to: pirPathArg(to, "dest"), recursive: !!opts.recursive });
+}
+
+function mkdtempSync(prefix) {
+  const target = pirMkdtempPrefix(prefix);
+  return String(call("fs", "mkdtemp", { prefix: target }));
+}
+
+function rmdirSync(path, options) {
+  const recursive = options === true || !!(options && typeof options === "object" && options.recursive);
+  call("fs", "rmdir", { path: pirPathArg(path, "path"), recursive: recursive });
+}
+
+function symlinkSync(target, path, type) {
+  call("fs", "symlink", {
+    target: String(target),
+    path: pirPathArg(path, "path"),
+    kind: type === undefined || type === null ? "file" : String(type),
+  });
+}
+
+function microtask(run) {
+  // fs callbacks never run synchronously in Node; a microtask preserves that
+  // ordering without introducing timers.
+  globalThis.__pirMicrotask(run);
+}
+
+function readFile(path, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  microtask(() => {
+    let value;
+    try { value = readFileSync(path, options); } catch (error) { callback(error); return; }
+    callback(null, value);
+  });
+}
+
+function writeFile(path, data, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  microtask(() => {
+    try { writeFileSync(path, data, options); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function appendFile(path, data, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  microtask(() => {
+    try { appendFileSync(path, data, options); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function readdir(path, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  microtask(() => {
+    let value;
+    try { value = readdirSync(path, options); } catch (error) { callback(error); return; }
+    callback(null, value);
+  });
+}
+
+function stat(path, callback) {
+  microtask(() => {
+    let value;
+    try { value = statSync(path); } catch (error) { callback(error); return; }
+    callback(null, value);
+  });
+}
+
+function lstat(path, callback) {
+  microtask(() => {
+    let value;
+    try { value = lstatSync(path); } catch (error) { callback(error); return; }
+    callback(null, value);
+  });
+}
+
+function mkdir(path, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  microtask(() => {
+    try { mkdirSync(path, options); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function rm(path, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  microtask(() => {
+    try { rmSync(path, options); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function unlink(path, callback) {
+  microtask(() => {
+    try { unlinkSync(path); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function rename(from, to, callback) {
+  microtask(() => {
+    try { renameSync(from, to); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function copyFile(from, to, callback) {
+  microtask(() => {
+    try { copyFileSync(from, to); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function chmod(path, mode, callback) {
+  // Node validates synchronously, before the operation is queued.
+  const target = pirPathArg(path, "path");
+  const parsedMode = pirParseMode(mode, "mode");
+  microtask(() => {
+    try { chmodSync(target, parsedMode); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function rmdir(path, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  microtask(() => {
+    try { rmdirSync(path, options); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function mkdtemp(prefix, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  pirCheckCallback(callback);
+  const target = pirMkdtempPrefix(prefix);
+  microtask(() => {
+    let value;
+    try { value = String(call("fs", "mkdtemp", { prefix: target })); } catch (error) { callback(error); return; }
+    callback(null, value);
+  });
+}
+
+function symlink(target, path, type, callback) {
+  if (typeof type === "function") { callback = type; type = undefined; }
+  microtask(() => {
+    try { symlinkSync(target, path, type); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+/// Promise-side handle for `fs.promises.open`: every method routes through
+/// the fd family, so read/write positions and sequential offsets behave
+/// exactly like the sync surface.
+class FileHandle {
+  constructor(fd) {
+    this.fd = fd;
+  }
+  async read(buffer, offset, length, position) {
+    return { bytesRead: readSync(this.fd, buffer, offset, length, position), buffer: buffer };
+  }
+  async write(data, position, encoding) {
+    if (typeof data === "string") {
+      const enc = encoding === undefined ? "utf8" : encoding;
+      return { bytesWritten: writeSync(this.fd, data, position, enc), buffer: Buffer.from(data, enc) };
+    }
+    const view = data instanceof Uint8Array ? data : Buffer.from(data);
+    return { bytesWritten: writeSync(this.fd, view, 0, view.length, position), buffer: view };
+  }
+  async readFile(options) {
+    const encoding = typeof options === "string" ? options : (options && options.encoding);
+    const total = fstatSync(this.fd).size;
+    const out = Buffer.alloc(total);
+    let done = 0;
+    while (done < total) {
+      const n = readSync(this.fd, out, done, total - done, done);
+      if (n <= 0) break;
+      done += n;
+    }
+    return encoding === undefined || encoding === null ? out.slice(0, done) : out.toString(encoding, 0, done);
+  }
+  async writeFile(data, options) {
+    const encoding = typeof options === "string" ? options : (options && options.encoding);
+    if (typeof data === "string") writeSync(this.fd, data, undefined, encoding === undefined || encoding === null ? "utf8" : encoding);
+    else writeSync(this.fd, data);
+  }
+  async stat() { return fstatSync(this.fd); }
+  async sync() { fsyncSync(this.fd); }
+  async close() { closeSync(this.fd); }
+}
+
+/// Directory handle behind `fs.opendir`, `fs.opendirSync` and
+/// `fs.promises.opendir` — Node exposes one `Dir` class with both the sync and
+/// the callback/promise surface. The entries are listed once up front (the
+/// host readdir is synchronous), then walked one by one.
+class Dir {
+  constructor(path, bufferSize) {
+    this._path = path;
+    this._bufferSize = bufferSize === undefined ? 32 : bufferSize;
+    this._entries = readdirSync(path, { withFileTypes: true });
+    this._index = 0;
+    this._closed = false;
+    // In-flight async reads; Node refuses synchronous work while any exist.
+    this._pending = 0;
+  }
+  _next() {
+    if (this._index >= this._entries.length) return null;
+    return this._entries[this._index++];
+  }
+  _checkClosed() {
+    if (this._closed) {
+      return pirCodedError(Error, "ERR_DIR_CLOSED", "Directory handle was closed");
+    }
+    return null;
+  }
+  _checkConcurrent() {
+    if (this._pending > 0) {
+      return pirCodedError(Error, "ERR_DIR_CONCURRENT_OPERATION",
+        "Cannot do synchronous work on directory handle with concurrent asynchronous operations");
+    }
+    return null;
+  }
+  readSync() {
+    const closed = this._checkClosed();
+    if (closed) throw closed;
+    const concurrent = this._checkConcurrent();
+    if (concurrent) throw concurrent;
+    return this._next();
+  }
+  closeSync() {
+    const closed = this._checkClosed();
+    if (closed) throw closed;
+    const concurrent = this._checkConcurrent();
+    if (concurrent) throw concurrent;
+    this._closed = true;
+  }
+  read(callback) {
+    if (callback !== undefined && typeof callback !== "function") {
+      throw pirInvalidArgType("callback", "of type function", callback);
+    }
+    const dir = this;
+    const promise = new Promise((resolve, reject) => {
+      const closed = dir._checkClosed();
+      if (closed) { reject(closed); return; }
+      dir._pending++;
+      microtask(() => {
+        dir._pending--;
+        resolve(dir._next());
+      });
+    });
+    if (typeof callback === "function") {
+      promise.then((entry) => callback(null, entry), (error) => callback(error));
+      return undefined;
+    }
+    return promise;
+  }
+  close(callback) {
+    if (callback !== undefined && typeof callback !== "function") {
+      throw pirInvalidArgType("callback", "of type function", callback);
+    }
+    const dir = this;
+    const promise = new Promise((resolve, reject) => {
+      microtask(() => {
+        const closed = dir._checkClosed();
+        if (closed) { reject(closed); return; }
+        dir._closed = true;
+        resolve();
+      });
+    });
+    if (typeof callback === "function") {
+      promise.then(() => callback(null), (error) => callback(error));
+      return undefined;
+    }
+    return promise;
+  }
+  [Symbol.asyncIterator]() {
+    const dir = this;
+    return {
+      next() {
+        return dir.read().then((entry) => {
+          if (entry === null) {
+            // Node closes the handle when the iterator runs dry.
+            dir._closed = true;
+            return { value: undefined, done: true };
+          }
+          return { value: entry, done: false };
+        });
+      },
+      return() {
+        // `break` / `return` / a throw inside `for await` closes the handle.
+        // Node awaits `dir.close()` here; QuickJS's for-await flushes the
+        // iterator's `return()` *without* awaiting it on the abrupt (throw)
+        // path, so the handle is marked closed synchronously — the observable
+        // contract (a later read() rejects ERR_DIR_CLOSED) then holds on both
+        // engine behaviours.
+        dir._closed = true;
+        return Promise.resolve({ value: undefined, done: true });
+      },
+      [Symbol.asyncIterator]() { return this; },
+    };
+  }
+}
+
+// `dir.path` is a prototype accessor in Node: reading it off the prototype
+// object itself (no Dir receiver) is an ERR_INVALID_THIS, which the tests
+// check explicitly.
+Object.defineProperty(Dir.prototype, "path", {
+  get() {
+    if (!(this instanceof Dir)) {
+      throw pirCodedError(TypeError, "ERR_INVALID_THIS", 'Value of "this" must be of type Dir');
+    }
+    return this._path;
+  },
+  set(value) {
+    if (!(this instanceof Dir)) {
+      throw pirCodedError(TypeError, "ERR_INVALID_THIS", 'Value of "this" must be of type Dir');
+    }
+    this._path = value;
+  },
+  enumerable: false,
+  configurable: true,
+});
+
+/// Node's `options.bufferSize` validation for `opendir`: the host readdir has
+/// no buffer, but the argument contract (and its error codes) is observable.
+function pirOpendirBufferSize(options) {
+  if (options === undefined || options === null || typeof options !== "object") return undefined;
+  const size = options.bufferSize;
+  if (size === undefined) return undefined;
+  return pirValidateIntegerProperty(size, "options.bufferSize", 1, 4294967295);
+}
+
+function access(path, mode, callback) {
+  if (typeof mode === "function") { callback = mode; mode = undefined; }
+  microtask(() => {
+    try { accessSync(path, mode); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+// ---- truncate / utimes / fd extras ----------------------------------------
+
+function truncateSync(path, len) {
+  call("fs", "truncate", {
+    path: pirPathArg(path, "path"),
+    len: len === undefined || len === null ? 0 : Math.trunc(len),
+  });
+}
+
+function truncate(path, len, callback) {
+  if (typeof len === "function") { callback = len; len = 0; }
+  microtask(() => {
+    try { truncateSync(path, len); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+// Node accepts seconds (number) or a Date for the time arguments.
+function utimesMs(value) {
+  if (value instanceof Date) return value.getTime();
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) {
+    throw new TypeError("The time argument must be a number or an instance of Date");
+  }
+  return seconds * 1000;
+}
+
+function utimesSync(path, atime, mtime) {
+  call("fs", "utimes", { path: pirPathArg(path, "path"), atimeMs: utimesMs(atime), mtimeMs: utimesMs(mtime) });
+}
+
+function utimes(path, atime, mtime, callback) {
+  microtask(() => {
+    try { utimesSync(path, atime, mtime); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function ftruncateSync(fd, len) {
+  call("fs", "ftruncate", { fd: fd | 0, len: len === undefined || len === null ? 0 : Math.trunc(len) });
+}
+
+function ftruncate(fd, len, callback) {
+  if (typeof len === "function") { callback = len; len = 0; }
+  microtask(() => {
+    try { ftruncateSync(fd, len); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function fdatasyncSync(fd) {
+  call("fs", "fdatasync", { fd: fd | 0 });
+}
+
+function fdatasync(fd, callback) {
+  microtask(() => {
+    try { fdatasyncSync(fd); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+// `fs.exists` never surfaces an error: the callback gets one boolean.
+function exists(path, callback) {
+  microtask(() => callback(existsSync(path)));
+}
+
+// ---- callback wrappers for the remaining sync surface ----------------------
+
+function close(fd, callback) {
+  microtask(() => {
+    try { closeSync(fd); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function fstat(fd, callback) {
+  microtask(() => {
+    let value;
+    try { value = fstatSync(fd); } catch (error) { callback(error); return; }
+    callback(null, value);
+  });
+}
+
+function fsync(fd, callback) {
+  microtask(() => {
+    try { fsyncSync(fd); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function fchmod(fd, mode, callback) {
+  const parsedMode = pirParseMode(mode, "mode");
+  microtask(() => {
+    try { fchmodSync(fd, parsedMode); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function open(path, flags, mode, callback) {
+  if (typeof mode === "function") { callback = mode; mode = undefined; }
+  microtask(() => {
+    let value;
+    try { value = openSync(path, flags, mode); } catch (error) { callback(error); return; }
+    callback(null, value);
+  });
+}
+
+function read(fd, buffer, offset, length, position, callback) {
+  if (typeof offset === "function") { callback = offset; offset = undefined; length = undefined; position = undefined; }
+  else if (typeof length === "function") { callback = length; length = undefined; position = undefined; }
+  else if (typeof position === "function") { callback = position; position = undefined; }
+  microtask(() => {
+    let count;
+    try { count = readSync(fd, buffer, offset, length, position); } catch (error) { callback(error); return; }
+    callback(null, count, buffer);
+  });
+}
+
+function write(fd, data, offsetOrPosition, lengthOrEncoding, position, callback) {
+  // Node shapes: write(fd, buffer[, off[, len[, pos]]], cb) and
+  // write(fd, string[, pos[, enc]], cb) — the tail function is the callback.
+  const args = Array.prototype.slice.call(arguments);
+  const cb = typeof args[args.length - 1] === "function" ? args.pop() : undefined;
+  const payload = args.slice(1);
+  microtask(() => {
+    let count;
+    try {
+      count = writeSync.apply(null, [fd].concat(payload));
+    } catch (error) {
+      if (cb) { cb(error); return; }
+      throw error;
+    }
+    if (cb) cb(null, count, typeof data === "string" ? undefined : data);
+  });
+}
+
+// readv/writev over the sync core (descriptor-forwarded vectored IO; no
+// batching across the host boundary).
+function readvSync(fd, buffers, position) {
+  let total = 0;
+  let at = typeof position === "number" ? position : undefined;
+  for (const buffer of buffers) {
+    const count = readSync(fd, buffer, 0, buffer.length, at);
+    total += count;
+    if (at !== undefined) at += count;
+    if (count < buffer.length) break;
+  }
+  return total;
+}
+
+function writevSync(fd, buffers, position) {
+  let total = 0;
+  let at = typeof position === "number" ? position : undefined;
+  for (const buffer of buffers) {
+    const count = writeSync(fd, buffer, 0, buffer.length, at);
+    total += count;
+    if (at !== undefined) at += count;
+  }
+  return total;
+}
+
+function readv(fd, buffers, position, callback) {
+  if (typeof position === "function") { callback = position; position = undefined; }
+  microtask(() => {
+    let count;
+    try { count = readvSync(fd, buffers, position); } catch (error) { callback(error); return; }
+    callback(null, count, buffers);
+  });
+}
+
+function writev(fd, buffers, position, callback) {
+  if (typeof position === "function") { callback = position; position = undefined; }
+  microtask(() => {
+    let count;
+    try { count = writevSync(fd, buffers, position); } catch (error) { callback(error); return; }
+    callback(null, count, buffers);
+  });
+}
+
+// ---- opendirSync (the same Dir handle, synchronous entry points) -----------
+
+function opendirSync(path, options) {
+  const target = pirPathArg(path, "path");
+  const bufferSize = pirOpendirBufferSize(options);
+  return new Dir(target, bufferSize);
+}
+
+// ---- legacy timestamp helper ----------------------------------------------
+
+// Node's legacy coercion: Date -> integer seconds, numeric string -> number,
+// number -> number, everything else throws (Node produces NaN).
+function _toUnixTimestamp(time) {
+  if (typeof time === "object" && time !== null && typeof time.getTime === "function") {
+    return Math.floor(time.getTime() / 1000);
+  }
+  if (typeof time === "string" && String(Number(time)) === time && time !== "") return Number(time);
+  if (typeof time === "number") return time;
+  throw new TypeError("Cannot parse time: " + time);
+}
+
+// ---------------------------------------------------------------------------
+// watch / watchFile: real FSWatcher (host watcher threads) + StatWatcher
+// ---------------------------------------------------------------------------
+
+// `fs.watch` rides a dedicated host entry (`__pir_host.fsWatch`, see
+// `fs_watch_fns.rs`): a snapshot-diff watcher thread per watcher (the TUI
+// git-branch watcher's portable polling pattern) queueing Node's two event
+// types; the JS pump drains the queue on a short timer. Events carry the
+// Node listener shape: `("change" | "rename", filename|null)`.
+function pirFsWatchCall(op, payload) {
+  const host = globalThis.__pir_host;
+  if (!host || typeof host.fsWatch !== "function") {
+    const error = new Error("fs.watch is not supported by the pir extension runtime (no fsWatch host bridge)");
+    error.code = "ENOSYS";
+    throw error;
+  }
+  const raw = host.fsWatch(op, JSON.stringify(payload === undefined ? {} : payload));
+  let response;
+  try {
+    response = JSON.parse(raw);
+  } catch (error) {
+    const parseError = new Error("__pir_host.fsWatch returned invalid JSON: " + op);
+    parseError.code = "EIO";
+    throw parseError;
+  }
+  if (!response || response.ok !== true) {
+    const error = new Error((response && response.message) || ("__pir_host.fsWatch failed: " + op));
+    if (response && response.code !== undefined) error.code = response.code;
+    throw error;
+  }
+  return response.value;
+}
+
+class FSWatcher extends EventEmitter {
+  constructor(filename, options, listener) {
+    if (typeof options === "function") {
+      listener = options;
+      options = undefined;
+    }
+    super();
+    this._filename = pirResolveWatchPath(filename);
+    this._options = options || {};
+    this.closed = false;
+    this._id = 0;
+    this._timer = undefined;
+    if (typeof listener === "function") this.on("change", listener);
+    let value;
+    try {
+      value = pirFsWatchCall("watchStart", {
+        path: this._filename,
+        recursive: Boolean(this._options.recursive),
+      });
+    } catch (error) {
+      // Host start failure surfaces async like Node's watcher error path.
+      const self = this;
+      globalThis.setTimeout(function () {
+        if (!self.closed) self.emit("error", error);
+      }, 0);
+      return;
+    }
+    this._id = value.id;
+    const self = this;
+    this._timer = globalThis.setInterval(function () {
+      self._pirPump();
+    }, 30);
+  }
+  _pirPump() {
+    if (this.closed || this._id === 0) return;
+    let value;
+    try {
+      value = pirFsWatchCall("watchPoll", { id: this._id });
+    } catch (error) {
+      this.close();
+      this.emit("error", error);
+      return;
+    }
+    const events = value.events || [];
+    for (const event of events) {
+      this.emit("change", event.type, event.filename === undefined ? null : event.filename);
+    }
+  }
+  ref() { return this; }
+  unref() { return this; }
+  close() {
+    if (this.closed) return this;
+    this.closed = true;
+    if (this._timer !== undefined) {
+      globalThis.clearInterval(this._timer);
+      this._timer = undefined;
+    }
+    if (this._id !== 0) {
+      try {
+        pirFsWatchCall("watchStop", { id: this._id });
+      } catch (error) {}
+      this._id = 0;
+    }
+    return this;
+  }
+}
+
+/// polling StatWatcher: re-stats on the Node default cadence (5007 ms) so a
+/// file that changes between polls surfaces a real `change` event. The
+/// documented deviation: Node uses the OS watch service, this is a timer.
+class StatWatcher extends EventEmitter {
+  constructor(filename, options, listener) {
+    super();
+    this._filename = String(filename);
+    this._options = options || {};
+    this._interval = Number(this._options.interval) > 0 ? Math.trunc(this._options.interval) : 5007;
+    this._timer = undefined;
+    this._listener = typeof listener === "function" ? listener : undefined;
+    this._last = null;
+    this._stopped = false;
+    if (this._listener) this.on("change", this._listener);
+    this.start();
+  }
+  start() {
+    if (this._stopped || this._timer !== undefined) return this;
+    try {
+      this._last = statSync(this._filename);
+    } catch {
+      this._last = null;
+    }
+    this._timer = globalThis.setInterval(() => this._poll(), this._interval);
+    return this;
+  }
+  stop() {
+    if (this._timer !== undefined) {
+      globalThis.clearInterval(this._timer);
+      this._timer = undefined;
+    }
+    this._stopped = true;
+    return this;
+  }
+  _poll() {
+    if (this._stopped) return;
+    let current;
+    try {
+      current = statSync(this._filename);
+    } catch {
+      current = null;
+    }
+    if (current !== null && this._last !== null &&
+        (current.mtimeMs !== this._last.mtimeMs || current.size !== this._last.size)) {
+      const previous = this._last;
+      this._last = current;
+      this.emit("change", current, previous);
+      return;
+    }
+    this._last = current;
+  }
+  ref() { return this.start(); }
+  unref() {
+    if (this._timer !== undefined) {
+      globalThis.clearInterval(this._timer);
+      this._timer = undefined;
+      this._stopped = false;
+    }
+    return this;
+  }
+}
+
+const watchedFiles = new Map();
+
+// The fsWatch host bridge runs watcher threads without runtime-cwd context,
+// so a relative watch target must resolve to an absolute path here — Node
+// resolves fs.watch filenames against process.cwd() exactly like this.
+function pirResolveWatchPath(p) {
+  const text = String(p);
+  if (/^(?:[a-zA-Z]:[\\/]|\\\\|\/)/.test(text)) return text;
+  const cwd =
+    typeof process === "object" && process !== null && typeof process.cwd === "function"
+      ? process.cwd()
+      : "";
+  if (!cwd) return text;
+  return cwd.endsWith("\\") || cwd.endsWith("/") ? cwd + text : cwd + "/" + text;
+}
+
+function watch(filename, options, listener) {
+  if (typeof options === "function") { listener = options; options = undefined; }
+  return new FSWatcher(filename, options, listener);
+}
+
+function watchFile(filename, options, listener) {
+  if (typeof options === "function") { listener = options; options = undefined; }
+  const key = String(filename);
+  const existing = watchedFiles.get(key);
+  if (existing !== undefined) {
+    if (typeof listener === "function") existing.on("change", listener);
+    return existing;
+  }
+  const watcher = new StatWatcher(filename, options, listener);
+  watchedFiles.set(key, watcher);
+  return watcher;
+}
+
+function unwatchFile(filename, listener) {
+  const key = String(filename);
+  const watcher = watchedFiles.get(key);
+  if (watcher === undefined) return;
+  if (typeof listener === "function") {
+    watcher.removeListener("change", listener);
+    const remaining = watcher.listeners("change");
+    if (remaining.length > 0) return;
+  }
+  watcher.stop();
+  watchedFiles.delete(key);
+}
+
+// ---------------------------------------------------------------------------
+// createReadStream / createWriteStream: buffered whole-file minimal streams
+// ---------------------------------------------------------------------------
+
+// LIMIT (documented): these are not byte-faithful streams. The readable side
+// reads the whole file up front and then emits it as highWaterMark-sized
+// chunks within one microtask; the writable side buffers every write and
+// lands the file with a single host write at end(). Enough for the
+// collect/append patterns extensions use, not a fidelity streaming layer.
+
+const kDefaultChunkSize = 64 * 1024;
+
+/// `options.start` / `options.end` on the fs streams: Node accepts only
+/// non-negative safe integers.
+function pirStreamBound(options, name) {
+  const value = options[name];
+  if (value === undefined) return undefined;
+  return pirValidateInteger(value, name, 0, Number.MAX_SAFE_INTEGER);
+}
+
+class ReadStream extends EventEmitter {
+  constructor(path, options) {
+    super();
+    this.path = String(path);
+    this._options = options === undefined || options === null ? {} : options;
+    // Node validates the byte range up front (the official
+    // test-fs-non-number-arguments-throw.js asserts the TypeError) and the
+    // window is inclusive on both ends.
+    this._start = pirStreamBound(this._options, "start");
+    this._end = pirStreamBound(this._options, "end");
+    this.start = this._start;
+    this.bytesRead = 0;
+    this.readableEnded = false;
+    this.destroyed = false;
+    this.closed = false;
+    this.pending = true;
+    this._started = false;
+  }
+  _ensureStarted() {
+    if (this._started || this.destroyed) return;
+    this._started = true;
+    globalThis.__pirMicrotask(() => this._pump());
+  }
+  on(event, listener) {
+    const result = super.on(event, listener);
+    if (event === "data" || event === "readable") this._ensureStarted();
+    return result;
+  }
+  resume() { this._ensureStarted(); return this; }
+  pause() { return this; }
+  read() { return null; }
+  _pump() {
+    if (this.destroyed) return;
+    let bytes;
+    try {
+      bytes = Buffer.from(call("fs", "readFile", { path: this.path }), "base64");
+    } catch (error) {
+      this.emit("error", error);
+      return;
+    }
+    // The `start`/`end` byte window (inclusive), like Node's ReadStream.
+    const from = this._start === undefined ? 0 : Math.min(this._start, bytes.length);
+    const to = this._end === undefined ? bytes.length - 1 : Math.min(this._end, bytes.length - 1);
+    bytes = from > to ? bytes.subarray(0, 0) : bytes.subarray(from, to + 1);
+    this.pending = false;
+    this.emit("open", undefined);
+    const chunkSize = Number(this._options.highWaterMark) > 0
+      ? Math.trunc(this._options.highWaterMark)
+      : kDefaultChunkSize;
+    for (let offset = 0; offset < bytes.length && !this.destroyed; offset += chunkSize) {
+      const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
+      this.bytesRead += chunk.length;
+      this.emit("data", chunk);
+    }
+    if (!this.destroyed) {
+      this.readableEnded = true;
+      this.emit("end");
+      this.emit("close");
+      this.closed = true;
+    }
+  }
+  pipe(destination, options) {
+    this._ensureStarted();
+    this.on("data", (chunk) => destination.write(chunk));
+    this.on("end", () => {
+      if (!options || options.end !== false) destination.end();
+    });
+    return destination;
+  }
+  close(callback) {
+    this.destroy();
+    if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+  }
+  destroy(error) {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    this.closed = true;
+    if (error) this.emit("error", error);
+    this.emit("close");
+    return this;
+  }
+}
+
+class WriteStream extends EventEmitter {
+  constructor(path, options) {
+    super();
+    this.path = String(path);
+    this._options = options === undefined || options === null ? {} : options;
+    // Start is validated like the readable side; `end` is not an option the
+    // writable stream acts on (Node ignores it rather than rejecting it).
+    this.start = pirStreamBound(this._options, "start");
+    this._chunks = [];
+    // Parallel text view of `_chunks`: string chunks whose bytes are exactly
+    // their UTF-8 encoding land here too, and `end` sends them as `dataText`
+    // (no base64 round trip). Any chunk that is not (Buffer/typed array,
+    // non-utf8 encoding, lone surrogate) drops `_pirTextOk` for the whole
+    // stream and the aggregate goes out as base64 `data`, byte-identical to
+    // before.
+    this._pirText = [];
+    this._pirTextOk = true;
+    this.bytesWritten = 0;
+    this.writableEnded = false;
+    this.destroyed = false;
+    this.closed = false;
+    this.pending = true;
+    globalThis.__pirMicrotask(() => {
+      if (!this.destroyed) {
+        this.pending = false;
+        this.emit("open", undefined);
+      }
+    });
+  }
+  write(chunk, encoding, callback) {
+    if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+    if (this.writableEnded || this.destroyed) {
+      const error = new Error("write after end");
+      error.code = "ERR_STREAM_WRITE_AFTER_END";
+      if (typeof callback === "function") { globalThis.__pirMicrotask(() => callback(error)); return false; }
+      throw error;
+    }
+    const bytes = typeof chunk === "string"
+      ? Buffer.from(chunk, encoding === undefined ? "utf8" : encoding)
+      : Buffer.from(chunk);
+    this._chunks.push(bytes);
+    if (this._pirTextOk) {
+      if (pirWriteTextEncodable(chunk, encoding)) this._pirText.push(chunk);
+      else this._pirTextOk = false;
+    }
+    this.bytesWritten += bytes.length;
+    if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+    return true;
+  }
+  end(chunk, encoding, callback) {
+    if (typeof chunk === "function") { callback = chunk; chunk = undefined; encoding = undefined; }
+    else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+    if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+    this.writableEnded = true;
+    try {
+      const append = pirFlagsAppend(this._options.flags);
+      // Pure-text stream: `dataText` carries the exact UTF-8 image of the
+      // bytes the base64 aggregate would decode to (every chunk passed
+      // `pirWriteTextEncodable`), so the host skips the base64 round trip.
+      // Everything else keeps the byte channel, byte-for-byte as before.
+      const text = this._pirTextOk ? this._pirText.join("") : "";
+      const payload = { path: this.path, append: append };
+      if (text.length > 0) payload.dataText = text;
+      else payload.data = Buffer.concat(this._chunks).toString("base64");
+      call("fs", "writeFile", payload);
+    } catch (error) {
+      this.emit("error", error);
+      return this;
+    }
+    this.emit("finish");
+    this.emit("close");
+    this.closed = true;
+    if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+    return this;
+  }
+  close(callback) {
+    this.destroy();
+    if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+  }
+  destroy(error) {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    this.closed = true;
+    if (error) this.emit("error", error);
+    this.emit("close");
+    return this;
+  }
+}
+
+class FileReadStream extends ReadStream {}
+class FileWriteStream extends WriteStream {}
+
+function createReadStream(path, options) {
+  return new ReadStream(path, options);
+}
+
+function createWriteStream(path, options) {
+  return new WriteStream(path, options);
+}
+
+// ---------------------------------------------------------------------------
+// unsupported-but-present surfaces
+// ---------------------------------------------------------------------------
+
+function pirFsUnsupported(api) {
+  const error = new Error(api + " is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+function pirFsThrower(api) {
+  return function () { throw pirFsUnsupported(api); };
+}
+
+/// Promise-flavored unsupported surface: `fs/promises` functions reject
+/// (they never throw synchronously), matching Node's promise contract.
+function pirReject(api) {
+  return function () { return Promise.reject(pirFsUnsupported(api)); };
+}
+
+const chown = pirFsThrower("fs.chown");
+const chownSync = pirFsThrower("fs.chownSync");
+const fchown = pirFsThrower("fs.fchown");
+const fchownSync = pirFsThrower("fs.fchownSync");
+const futimes = pirFsThrower("fs.futimes");
+const futimesSync = pirFsThrower("fs.futimesSync");
+const lchown = pirFsThrower("fs.lchown");
+const lchownSync = pirFsThrower("fs.lchownSync");
+const link = pirFsThrower("fs.link");
+const linkSync = pirFsThrower("fs.linkSync");
+const lutimes = pirFsThrower("fs.lutimes");
+const lutimesSync = pirFsThrower("fs.lutimesSync");
+const glob = pirFsThrower("fs.glob");
+const globSync = pirFsThrower("fs.globSync");
+const mkdtempDisposableSync = pirFsThrower("fs.mkdtempDisposableSync");
+const openAsBlob = pirFsThrower("fs.openAsBlob");
+const statfs = pirFsThrower("fs.statfs");
+const statfsSync = pirFsThrower("fs.statfsSync");
+
+// `fs.lchmod` exists only on the platforms whose libuv implements it (macOS).
+// Everywhere else Node still publishes the *name* (`Object.keys(fs)` contains
+// it) with the value `undefined`, which is what Node's own fs tests key off:
+// `test-fs-chmod.js` skips its lchmod branch through `if (fs.lchmod)`, and the
+// Windows symlink that branch needs is exactly what fails without
+// SeCreateSymbolicLinkPrivilege. So the host check is the platform, not the
+// thrower.
+const pirHasLchmod = globalThis.__pirPlatform === "darwin";
+const lchmod = pirHasLchmod ? pirFsThrower("fs.lchmod") : undefined;
+const lchmodSync = pirHasLchmod ? pirFsThrower("fs.lchmodSync") : undefined;
+
+class Utf8Stream {
+  constructor(..._args) {
+    throw pirFsUnsupported("fs.Utf8Stream");
+  }
+}
+
+function realpath(path, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  microtask(() => {
+    let value;
+    try { value = realpathSync(path, options); } catch (error) { callback(error); return; }
+    callback(null, value);
+  });
+}
+
+const promises = {
+  readFile: async (path, options) => readFileSync(path, options),
+  writeFile: async (path, data, options) => { writeFileSync(path, data, options); },
+  appendFile: async (path, data, options) => { appendFileSync(path, data, options); },
+  readdir: async (path, options) => readdirSync(path, options),
+  stat: async (path) => statSync(path),
+  lstat: async (path) => lstatSync(path),
+  mkdir: async (path, options) => { mkdirSync(path, options); },
+  rm: async (path, options) => { rmSync(path, options); },
+  unlink: async (path) => { unlinkSync(path); },
+  rename: async (from, to) => { renameSync(from, to); },
+  copyFile: async (from, to) => { copyFileSync(from, to); },
+  realpath: async (path) => realpathSync(path),
+  access: async (path, mode) => { accessSync(path, mode); },
+  readlink: async (path) => readlinkSync(path),
+  open: async (path, flags, mode) => new FileHandle(openSync(path, flags, mode)),
+  opendir: async (path, options) => {
+    const target = pirPathArg(path, "path");
+    const bufferSize = pirOpendirBufferSize(options);
+    return new Dir(target, bufferSize);
+  },
+  mkdtemp: async (prefix) => mkdtempSync(prefix),
+  chmod: async (path, mode) => { chmodSync(path, mode); },
+  cp: async (from, to, options) => { cpSync(from, to, options); },
+  rmdir: async (path, options) => { rmdirSync(path, options); },
+  symlink: async (target, path, type) => { symlinkSync(target, path, type); },
+  truncate: async (path, len) => { truncateSync(path, len); },
+  utimes: async (path, atime, mtime) => { utimesSync(path, atime, mtime); },
+  constants: constants,
+  chown: pirReject("fs.promises.chown"),
+  // Node keeps `fs.promises.lchmod` as a function even where libuv has no
+  // lchmod: it rejects with ERR_METHOD_NOT_IMPLEMENTED (the sync twins do not
+  // exist at all there).
+  lchmod: pirHasLchmod
+    ? pirReject("fs.promises.lchmod")
+    : () => Promise.reject(pirCodedError(Error, "ERR_METHOD_NOT_IMPLEMENTED", "The lchmod() method is not implemented")),
+  lchown: pirReject("fs.promises.lchown"),
+  link: pirReject("fs.promises.link"),
+  lutimes: pirReject("fs.promises.lutimes"),
+  glob: pirReject("fs.promises.glob"),
+  mkdtempDisposable: pirReject("fs.promises.mkdtempDisposable"),
+  statfs: pirReject("fs.promises.statfs"),
+  watch: async function* () {
+    // No notification source exists (see FSWatcher): the async iterator
+    // stays idle; awaiting a first event waits forever, exactly like
+    // watching a file that never changes.
+  },
+};
+
+const fs = {
+  readFileSync: readFileSync,
+  writeFileSync: writeFileSync,
+  appendFileSync: appendFileSync,
+  existsSync: existsSync,
+  statSync: statSync,
+  lstatSync: lstatSync,
+  readdirSync: readdirSync,
+  mkdirSync: mkdirSync,
+  rmSync: rmSync,
+  unlinkSync: unlinkSync,
+  renameSync: renameSync,
+  copyFileSync: copyFileSync,
+  realpathSync: realpathSync,
+  accessSync: accessSync,
+  readlinkSync: readlinkSync,
+  openSync: openSync,
+  readSync: readSync,
+  writeSync: writeSync,
+  closeSync: closeSync,
+  fstatSync: fstatSync,
+  fsyncSync: fsyncSync,
+  fchmodSync: fchmodSync,
+  chmodSync: chmodSync,
+  cpSync: cpSync,
+  mkdtempSync: mkdtempSync,
+  rmdirSync: rmdirSync,
+  symlinkSync: symlinkSync,
+  readFile: readFile,
+  writeFile: writeFile,
+  appendFile: appendFile,
+  readdir: readdir,
+  stat: stat,
+  lstat: lstat,
+  mkdir: mkdir,
+  rm: rm,
+  unlink: unlink,
+  rename: rename,
+  copyFile: copyFile,
+  realpath: realpath,
+  access: access,
+  chmod: chmod,
+  rmdir: rmdir,
+  mkdtemp: mkdtemp,
+  symlink: symlink,
+  truncate: truncate,
+  utimes: utimes,
+  ftruncate: ftruncate,
+  fdatasync: fdatasync,
+  exists: exists,
+  close: close,
+  fstat: fstat,
+  fsync: fsync,
+  fchmod: fchmod,
+  open: open,
+  read: read,
+  write: write,
+  readv: readv,
+  writev: writev,
+  watch: watch,
+  watchFile: watchFile,
+  unwatchFile: unwatchFile,
+  createReadStream: createReadStream,
+  createWriteStream: createWriteStream,
+  truncateSync: truncateSync,
+  utimesSync: utimesSync,
+  ftruncateSync: ftruncateSync,
+  fdatasyncSync: fdatasyncSync,
+  opendirSync: opendirSync,
+  readvSync: readvSync,
+  writevSync: writevSync,
+  _toUnixTimestamp: _toUnixTimestamp,
+  chown: chown,
+  chownSync: chownSync,
+  fchown: fchown,
+  fchownSync: fchownSync,
+  futimes: futimes,
+  futimesSync: futimesSync,
+  lchmod: lchmod,
+  lchmodSync: lchmodSync,
+  lchown: lchown,
+  lchownSync: lchownSync,
+  link: link,
+  linkSync: linkSync,
+  lutimes: lutimes,
+  lutimesSync: lutimesSync,
+  glob: glob,
+  globSync: globSync,
+  mkdtempDisposableSync: mkdtempDisposableSync,
+  openAsBlob: openAsBlob,
+  statfs: statfs,
+  statfsSync: statfsSync,
+  promises: promises,
+  constants: constants,
+  Stats: Stats,
+  Dirent: Dirent,
+  FileHandle: FileHandle,
+  Dir: Dir,
+  SyncDir: Dir,
+  FSWatcher: FSWatcher,
+  StatWatcher: StatWatcher,
+  cp: cp,
+  opendir: opendir,
+  readlink: readlink,
+  ReadStream: ReadStream,
+  WriteStream: WriteStream,
+  FileReadStream: FileReadStream,
+  FileWriteStream: FileWriteStream,
+  Utf8Stream: Utf8Stream,
+};
+
+
+// --- surface completion: the remaining callback forms ------------------------
+
+function cp(from, to, options, callback) {
+  if (typeof options === 'function') { callback = options; options = undefined; }
+  microtask(() => {
+    try { cpSync(from, to, options); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function opendir(pathArg, options, callback) {
+  if (typeof options === 'function') { callback = options; options = undefined; }
+  // Node validates the callback and the path before queueing: the synchronous
+  // throw is part of the contract the official test asserts.
+  pirCheckCallback(callback);
+  const target = pirPathArg(pathArg, "path");
+  const bufferSize = pirOpendirBufferSize(options);
+  microtask(() => {
+    let dir;
+    try { dir = new Dir(target, bufferSize); } catch (error) { callback(error); return; }
+    callback(null, dir);
+  });
+}
+
+function readlink(pathArg, options, callback) {
+  if (typeof options === 'function') { callback = options; options = undefined; }
+  microtask(() => {
+    let value;
+    try {
+      value = readlinkSync(pathArg);
+      if (options && options.encoding === 'buffer') value = Buffer.from(value, 'utf8');
+    } catch (error) { callback(error); return; }
+    callback(null, value);
+  });
+}
+
+// Node aliases: realpathSync.native === realpathSync (same entry point);
+// pi-subagents computes project roots via fs.realpathSync.native.
+realpathSync.native = realpathSync;
+realpath.native = realpath;
+
+// The single-letter permission constants also live on `fs` itself as
+// deprecated getters (Node: non-enumerable, non-configurable, no setter):
+// reading one emits DEP0176 (deduplicated by code, so only the first read
+// warns — that is what Node's own warning machinery does), and
+// `fs.F_OK = …` is a strict-mode TypeError.
+for (const name of ["F_OK", "R_OK", "W_OK", "X_OK"]) {
+  Object.defineProperty(fs, name, {
+    get() {
+      pirEmitWarningOnce("DEP0176",
+        name + " is deprecated, use fs.constants." + name + " instead",
+        { type: "DeprecationWarning", code: "DEP0176" });
+      return constants[name];
+    },
+    enumerable: false,
+    configurable: false,
+  });
+}
+
+export default fs;
+export {
+  readFileSync, writeFileSync, appendFileSync, existsSync, statSync, lstatSync, readdirSync,
+  mkdirSync, rmSync, unlinkSync, renameSync, copyFileSync, realpathSync, accessSync, readlinkSync,
+  openSync, readSync, writeSync, closeSync, fstatSync, fsyncSync, fchmodSync,
+  chmodSync, cpSync, mkdtempSync, rmdirSync, symlinkSync,
+  truncateSync, utimesSync, ftruncateSync, fdatasyncSync, ftruncate, fdatasync, opendirSync, readvSync, writevSync,
+  _toUnixTimestamp, createReadStream, createWriteStream, watch, watchFile, unwatchFile,
+  chown, chownSync, fchown, fchownSync, futimes, futimesSync, lchmod, lchmodSync, lchown,
+  lchownSync, link, linkSync, lutimes, lutimesSync, glob, globSync, mkdtempDisposableSync,
+  openAsBlob, statfs, statfsSync, exists, close, fstat, fsync, fchmod, open, read, write,
+  readv, writev,
+  readFile, writeFile, appendFile, readdir, stat, lstat, mkdir, rm, unlink, rename, copyFile,
+  realpath, access,
+  chmod, rmdir, mkdtemp, symlink, truncate, utimes, cp, opendir, readlink,
+  promises, constants, Stats, Dirent, FileHandle, Dir, FSWatcher, StatWatcher,
+  ReadStream, WriteStream, FileReadStream, FileWriteStream, Utf8Stream,
+};

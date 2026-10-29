@@ -1,0 +1,41 @@
+// node:sea — throws tier with one real value: `isSea()` is honestly false —
+// the extension runtime is not a single-executable application, and every
+// consumer of this module asks exactly that question. Asset access throws
+// the unified error (no SEA assets are embedded).
+function seaUnsupported(api) {
+  const error = new Error("node:sea." + api + " is not supported by the pir extension runtime (not a single-executable application)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+function isSea() {
+  return false;
+}
+
+function getAsset(_key) {
+  throw seaUnsupported("getAsset");
+}
+
+function getRawAsset(_key) {
+  throw seaUnsupported("getRawAsset");
+}
+
+function getAssetAsBlob(_key, _options) {
+  throw seaUnsupported("getAssetAsBlob");
+}
+
+function getAssetKeys() {
+  // No embedded assets exist; an empty generator is the honest iteration.
+  return (function* () {})();
+}
+
+const sea = {
+  isSea: isSea,
+  getAsset: getAsset,
+  getRawAsset: getRawAsset,
+  getAssetAsBlob: getAssetAsBlob,
+  getAssetKeys: getAssetKeys,
+};
+
+export default sea;
+export { isSea, getAsset, getRawAsset, getAssetAsBlob, getAssetKeys };

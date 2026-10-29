@@ -1,0 +1,51 @@
+---
+source: tests/ai_request_snapshots.rs
+expression: canonical(&body)
+---
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Hello"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "parts": [
+        {
+          "text": "Pondering the question.",
+          "thought": true,
+          "thoughtSignature": "AAAAAAAAAAAAAAAAAAAAAA=="
+        },
+        {
+          "text": "Here you go."
+        }
+      ],
+      "role": "model"
+    },
+    {
+      "parts": [
+        {
+          "text": "Thanks"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 512,
+    "thinkingConfig": {
+      "includeThoughts": true,
+      "thinkingBudget": 24576
+    }
+  },
+  "systemInstruction": {
+    "parts": [
+      {
+        "text": "You are helpful."
+      }
+    ]
+  }
+}

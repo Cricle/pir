@@ -1,0 +1,32 @@
+---
+source: tests/ai_request_snapshots.rs
+expression: canonical(&body)
+---
+{
+  "max_completion_tokens": 2048,
+  "messages": [
+    {
+      "content": "You are helpful.",
+      "role": "developer"
+    },
+    {
+      "content": "Weather in Paris?",
+      "role": "user"
+    },
+    {
+      "content": "Let me check the forecast.",
+      "role": "assistant"
+    },
+    {
+      "content": "Thanks",
+      "role": "user"
+    }
+  ],
+  "model": "test",
+  "reasoning_effort": "medium",
+  "store": false,
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  }
+}

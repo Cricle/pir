@@ -1,0 +1,212 @@
+
+// Event / EventTarget / AbortSignal / AbortController — the minimal Web
+// primitive set the global fetch surface needs (LLRT tier: real-but-minimal).
+// Installed only when the engine has no such global (the `?? (` guards never
+// shadow an existing global). ES2020 only.
+//
+// Documented limits vs the full Web spec: dispatch is synchronous with a
+// flat listener list (the `capture` flag is recorded but capture/bubble
+// phases are not modeled), exceptions in listeners are swallowed so one bad
+// handler cannot break a dispatch, and `Event`/`CustomEvent` subclasses the
+// engine would provide are left untouched.
+
+(function () {
+  if (typeof globalThis.Event === "function" && typeof globalThis.EventTarget === "function") {
+    // Engine already ships the event pair: only patch in the abort family.
+    installAbortFamily();
+    return;
+  }
+
+  class Event {
+    constructor(type, options) {
+      options = options || {};
+      type = String(type === undefined ? "" : type);
+      this.type = type;
+      this.bubbles = options.bubbles === true;
+      this.cancelable = options.cancelable === true;
+      this.composed = options.composed === true;
+      this.defaultPrevented = false;
+      this.target = null;
+      this.currentTarget = null;
+      this.eventPhase = 0;
+      this.timeStamp = Date.now();
+      this.isTrusted = false;
+    }
+    preventDefault() {
+      if (this.cancelable) this.defaultPrevented = true;
+    }
+    stopPropagation() {}
+    stopImmediatePropagation() {}
+  }
+
+  const LISTENERS = new WeakMap();
+
+  class EventTarget {
+    constructor() {
+      LISTENERS.set(this, []);
+    }
+    addEventListener(type, listener, options) {
+      if (typeof listener !== "function" && !(listener && typeof listener.handleEvent === "function")) {
+        return;
+      }
+      const opts = options === true ? { capture: true } : options || {};
+      const list = LISTENERS.get(this);
+      if (!list) return;
+      for (let i = 0; i < list.length; i++) {
+        const entry = list[i];
+        if (entry.type === type && entry.listener === listener && entry.capture === (opts.capture === true)) {
+          return; // duplicate registration is a no-op (Web semantics)
+        }
+      }
+      list.push({
+        type: String(type),
+        listener: listener,
+        capture: opts.capture === true,
+        once: opts.once === true,
+      });
+    }
+    removeEventListener(type, listener, options) {
+      const opts = options === true ? { capture: true } : options || {};
+      const list = LISTENERS.get(this);
+      if (!list) return;
+      for (let i = 0; i < list.length; i++) {
+        const entry = list[i];
+        if (entry.type === String(type) && entry.listener === listener && entry.capture === (opts.capture === true)) {
+          list.splice(i, 1);
+          return;
+        }
+      }
+    }
+    dispatchEvent(event) {
+      if (!event || typeof event.type !== "string") {
+        throw new TypeError("dispatchEvent requires an Event with a string type");
+      }
+      const list = (LISTENERS.get(this) || []).slice();
+      event.target = event.target === null || event.target === undefined ? this : event.target;
+      event.currentTarget = this;
+      event.eventPhase = 2;
+      const call = (entry) => {
+        if (entry.once) this.removeEventListener(entry.type, entry.listener, entry.capture);
+        try {
+          if (typeof entry.listener === "function") entry.listener.call(this, event);
+          else if (entry.listener && typeof entry.listener.handleEvent === "function") {
+            entry.listener.handleEvent(event);
+          }
+        } catch (error) {
+          // A throwing listener must not break the dispatch (minimal tier:
+          // swallow instead of routing to a global error report).
+        }
+      };
+      // The capture flag is recorded but phases are not modeled (documented).
+      for (let i = 0; i < list.length; i++) {
+        if (list[i].type === event.type && !list[i].capture) call(list[i]);
+      }
+      for (let i = 0; i < list.length; i++) {
+        if (list[i].type === event.type && list[i].capture) call(list[i]);
+      }
+      const handler = this["on" + event.type];
+      if (typeof handler === "function") {
+        try {
+          handler.call(this, event);
+        } catch (error) {}
+      }
+      event.currentTarget = null;
+      return !(event.cancelable && event.defaultPrevented);
+    }
+  }
+
+  globalThis.Event ?? (globalThis.Event = Event);
+  globalThis.EventTarget ?? (globalThis.EventTarget = EventTarget);
+  installAbortFamily();
+
+  function installAbortFamily() {
+    if (typeof globalThis.AbortSignal === "function" && typeof globalThis.AbortController === "function") {
+      return;
+    }
+    const kInternal = Symbol("pirAbortInternal");
+    const kAborted = Symbol("pirAborted");
+    const kReason = Symbol("pirReason");
+    const Base = globalThis.EventTarget;
+
+    class AbortSignal extends Base {
+      constructor(...args) {
+        if (args[0] !== kInternal) throw new TypeError("Illegal constructor");
+        super();
+        this[kAborted] = false;
+        this[kReason] = undefined;
+      }
+      get aborted() {
+        return this[kAborted] === true;
+      }
+      get reason() {
+        return this[kReason];
+      }
+      throwIfAborted() {
+        if (this[kAborted]) throw this[kReason];
+      }
+      static abort(reason) {
+        const signal = new AbortSignal(kInternal);
+        signalAbort(signal, reason === undefined ? pirAbortError() : reason);
+        return signal;
+      }
+      static timeout(ms) {
+        const signal = new AbortSignal(kInternal);
+        globalThis.setTimeout(function () {
+          if (!signal.aborted) {
+            const error = pirAbortError("The operation was aborted due to timeout");
+            error.name = "TimeoutError";
+            signalAbort(signal, error);
+          }
+        }, ms);
+        return signal;
+      }
+      static any(signals) {
+        const combined = new AbortSignal(kInternal);
+        const list = Array.isArray(signals) ? signals : [];
+        for (let i = 0; i < list.length; i++) {
+          const source = list[i];
+          if (!source || typeof source.addEventListener !== "function") continue;
+          if (source.aborted) {
+            signalAbort(combined, source.reason);
+            return combined;
+          }
+          source.addEventListener("abort", function () {
+            if (!combined.aborted) signalAbort(combined, source.reason);
+          });
+        }
+        return combined;
+      }
+    }
+
+    function pirAbortError(message) {
+      const error = new Error(message === undefined ? "This operation was aborted" : message);
+      error.name = "AbortError";
+      error.code = "ABORT_ERR"; // node:errors codes.AbortErr (the DOM name stays "AbortError")
+      return error;
+    }
+
+    function signalAbort(signal, reason) {
+      if (signal[kAborted]) return;
+      signal[kAborted] = true;
+      signal[kReason] = reason;
+      signal.dispatchEvent(new globalThis.Event("abort"));
+    }
+
+    class AbortController {
+      constructor() {
+        this.__pirSignal = new AbortSignal(kInternal);
+      }
+      get signal() {
+        return this.__pirSignal;
+      }
+      abort(reason) {
+        if (this.__pirSignal[kAborted]) return;
+        signalAbort(this.__pirSignal, reason === undefined ? pirAbortError() : reason);
+      }
+    }
+
+    globalThis.AbortSignal ?? (globalThis.AbortSignal = AbortSignal);
+    globalThis.AbortController ?? (globalThis.AbortController = AbortController);
+    globalThis.__pirAbortError = globalThis.__pirAbortError || pirAbortError;
+  }
+})();

@@ -1,0 +1,19 @@
+// node:_http_incoming — private internals: IncomingMessage is aliased from
+// the node:http shim; the backpressure pair is a real no-op (the shim's
+// message surface never pauses).
+import { IncomingMessage } from "@node/http";
+
+function readStart(_socket) {
+  // The shimmed message surface is always readable.
+}
+
+function readStop(_socket) {}
+
+const httpIncoming = {
+  IncomingMessage: IncomingMessage,
+  readStart: readStart,
+  readStop: readStop,
+};
+
+export default httpIncoming;
+export { IncomingMessage, readStart, readStop };

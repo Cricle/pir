@@ -1,0 +1,398 @@
+
+import { inspect as pirInspect } from "@node/util";
+import { AsyncResource as PirAsyncResource } from "@node/async_hooks";
+
+function arrayClone(arr) {
+  const copy = new Array(arr.length);
+  for (let i = 0; i < arr.length; i++) copy[i] = arr[i];
+  return copy;
+}
+
+function EventEmitter() {
+  this._events = Object.create(null);
+  this._maxListeners = undefined;
+}
+
+EventEmitter.defaultMaxListeners = 10;
+
+function pirOnceWrapper(emitter, type, listener) {
+  let fired = false;
+  function wrapper(...args) {
+    if (!fired) {
+      fired = true;
+      emitter.removeListener(type, wrapper);
+      listener.apply(emitter, args);
+    }
+  }
+  wrapper.listener = listener;
+  return wrapper;
+}
+
+EventEmitter.prototype._addListener = function _addListener(type, listener, prepend, wrapOnce) {
+  if (typeof listener !== "function") {
+    throw new TypeError("The \"listener\" argument must be of type function. Received type " + typeof listener);
+  }
+  // Lazy per-instance state: the classic `util.inherits(Child, EventEmitter)`
+  // + constructor-that-never-calls-super pattern (yazl and a large tail of
+  // older packages) produces instances without `_events` (`_maxListeners`
+  // needs no init — `undefined` already means "use defaultMaxListeners").
+  if (this._events === undefined) this._events = Object.create(null);
+  const list = this._events[type];
+  const wrapped = wrapOnce ? pirOnceWrapper(this, type, listener) : listener;
+  if (list === undefined) {
+    this._events[type] = [wrapped];
+  } else if (prepend) {
+    list.unshift(wrapped);
+  } else {
+    list.push(wrapped);
+  }
+  return this;
+};
+
+EventEmitter.prototype.addListener = function addListener(type, listener) {
+  return this._addListener(type, listener, false, false);
+};
+EventEmitter.prototype.on = EventEmitter.prototype.addListener;
+
+EventEmitter.prototype.prependListener = function prependListener(type, listener) {
+  return this._addListener(type, listener, true, false);
+};
+
+EventEmitter.prototype.once = function once(type, listener) {
+  return this._addListener(type, listener, false, true);
+};
+
+EventEmitter.prototype.prependOnceListener = function prependOnceListener(type, listener) {
+  return this._addListener(type, listener, true, true);
+};
+
+EventEmitter.prototype.removeListener = function removeListener(type, listener) {
+  const list = this._events === undefined ? undefined : this._events[type];
+  if (list === undefined || typeof listener !== "function") return this;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i] === listener || list[i].listener === listener) {
+      list.splice(i, 1);
+      break;
+    }
+  }
+  if (list.length === 0) delete this._events[type];
+  return this;
+};
+EventEmitter.prototype.off = EventEmitter.prototype.removeListener;
+
+EventEmitter.prototype.removeAllListeners = function removeAllListeners(type) {
+  if (type === undefined) {
+    this._events = Object.create(null);
+    return this;
+  }
+  delete this._events[type];
+  return this;
+};
+
+EventEmitter.prototype.emit = function emit(type, ...args) {
+  const list = this._events === undefined ? undefined : this._events[type];
+  if (list === undefined || list.length === 0) {
+    if (type === "error") {
+      const er = args[0];
+      if (er instanceof Error) throw er;
+      // lib/events.js: the argument is `util.inspect`ed for the message and the
+      // raw value is exposed as `err.context`; an inspect that throws (a user
+      // inspect.custom that raises, for instance) falls back to the value
+      // itself, which then stringifies as `[object Object]`
+      // (test-event-emitter-errors.js pins all three shapes).
+      let stringifiedEr;
+      try {
+        stringifiedEr = pirInspect(er);
+      } catch {
+        stringifiedEr = er;
+      }
+      const err = new Error("Unhandled error. (" + String(stringifiedEr) + ")");
+      err.context = er;
+      err.code = "ERR_UNHANDLED_ERROR";
+      throw err;
+    }
+    return false;
+  }
+  const snapshot = arrayClone(list);
+  for (let i = 0; i < snapshot.length; i++) {
+    snapshot[i].apply(this, args);
+  }
+  return true;
+};
+
+EventEmitter.prototype.rawListeners = function rawListeners(type) {
+  const list = this._events === undefined ? undefined : this._events[type];
+  return list === undefined ? [] : arrayClone(list);
+};
+
+EventEmitter.prototype.listeners = function listeners(type) {
+  const raw = this.rawListeners(type);
+  const out = new Array(raw.length);
+  for (let i = 0; i < raw.length; i++) {
+    out[i] = raw[i].listener !== undefined ? raw[i].listener : raw[i];
+  }
+  return out;
+};
+
+EventEmitter.prototype.listenerCount = function listenerCount(type) {
+  const list = this._events === undefined ? undefined : this._events[type];
+  return list === undefined ? 0 : list.length;
+};
+
+EventEmitter.prototype.eventNames = function eventNames() {
+  return Reflect.ownKeys(this._events === undefined ? {} : this._events);
+};
+
+EventEmitter.prototype.setMaxListeners = function setMaxListeners(n) {
+  if (typeof n !== "number" || Number.isNaN(n) || n < 0) {
+    throw new RangeError("The value of \"n\" is out of range. It must be a non-negative number. Received " + n);
+  }
+  this._maxListeners = n;
+  return this;
+};
+
+EventEmitter.prototype.getMaxListeners = function getMaxListeners() {
+  return this._maxListeners === undefined ? EventEmitter.defaultMaxListeners : this._maxListeners;
+};
+
+// Node's class carries itself (`require("events").EventEmitter === require("events")`).
+EventEmitter.EventEmitter = EventEmitter;
+
+// --- module-level static surface --------------------------------------------
+
+const errorMonitor = Symbol.for("events.errorMonitor");
+const captureRejectionSymbol = Symbol.for("events.captureRejection");
+const captureRejections = false; // per-emitter opt-in; module value is the default
+const defaultMaxListeners = EventEmitter.defaultMaxListeners;
+const usingDomains = false; // deprecated no-op flag
+
+function init(emitter) {
+  // Legacy constructor hook: Node's events.init ran per-instance setup; the
+  // shim constructor already does the work, so this validates and returns.
+  if (!emitter || typeof emitter.emit !== "function") {
+    throw new TypeError("The \"emitter\" argument must be an EventEmitter");
+  }
+  return emitter;
+}
+
+function listenerCount(emitter, type) {
+  if (!emitter || typeof emitter.listenerCount !== "function") {
+    throw new TypeError("The \"emitter\" argument must be an EventEmitter");
+  }
+  return emitter.listenerCount(type);
+}
+
+function getEventListeners(emitterOrTarget, type) {
+  if (emitterOrTarget && typeof emitterOrTarget.addEventListener === "function" && !emitterOrTarget.setMaxListeners) {
+    // An EventTarget: listeners are not introspectable without getEventListeners
+    // support; return empty (documented).
+    return [];
+  }
+  if (!emitterOrTarget || typeof emitterOrTarget.rawListeners !== "function") {
+    throw new TypeError("The \"emitter\" argument must be an EventEmitter");
+  }
+  return emitterOrTarget.rawListeners(type);
+}
+
+function getMaxListeners(emitter) {
+  if (emitter && typeof emitter.getMaxListeners === "function") {
+    return emitter.getMaxListeners();
+  }
+  return EventEmitter.defaultMaxListeners;
+}
+
+function setMaxListeners(n, ...eventEmitters) {
+  if (typeof n !== "number" || Number.isNaN(n) || n < 0) {
+    throw new RangeError("The value of \"n\" is out of range. It must be a non-negative number. Received " + n);
+  }
+  if (eventEmitters.length === 0) {
+    EventEmitter.defaultMaxListeners = n;
+    return eventEmitters;
+  }
+  for (const emitter of eventEmitters) {
+    if (emitter && typeof emitter.setMaxListeners === "function") emitter.setMaxListeners(n);
+  }
+  return eventEmitters;
+}
+
+function addAbortListener(signal, listener) {
+  if (typeof listener !== "function") {
+    throw new TypeError("The \"listener\" argument must be of type function");
+  }
+  if (!signal || typeof signal.addEventListener !== "function") {
+    throw new TypeError("The \"signal\" argument must be an AbortSignal");
+  }
+  signal.addEventListener("abort", listener, { once: true });
+  return {
+    [Symbol.for("nodejs.dispose")]() {
+      signal.removeEventListener("abort", listener);
+    },
+    unsubscribe() {
+      signal.removeEventListener("abort", listener);
+    },
+    [Symbol.dispose === undefined ? "pirDispose" : Symbol.dispose]() {
+      signal.removeEventListener("abort", listener);
+    },
+  };
+}
+
+function once(emitter, name) {
+  return new Promise((resolve, reject) => {
+    if (!emitter || typeof emitter.once !== "function") {
+      reject(new TypeError("The \"emitter\" argument must be an EventEmitter"));
+      return;
+    }
+    const errorListener = (error) => {
+      emitter.removeListener(name, resolver);
+      reject(error);
+    };
+    const resolver = (...args) => {
+      emitter.removeListener("error", errorListener);
+      resolve(args.length === 0 ? [] : args.length === 1 ? [args[0]] : args);
+    };
+    emitter.once(name, resolver);
+    emitter.on("error", errorListener);
+  });
+}
+
+async function* on(emitter, name, options) {
+  if (!emitter || typeof emitter.on !== "function") {
+    throw new TypeError("The \"emitter\" argument must be an EventEmitter");
+  }
+  const queue = [];
+  const push = (...args) => queue.push({ value: args });
+  const errors = [];
+  const onError = (error) => errors.push(error);
+  emitter.on(name, push);
+  emitter.on("error", onError);
+  try {
+    while (true) {
+      if (errors.length > 0) throw errors.shift();
+      if (queue.length > 0) {
+        yield queue.shift().value;
+      } else {
+        // The minimal pad cannot await new events without a real scheduler;
+        // yield the drained buffer and stop (Node's iterator stays live).
+        break;
+      }
+    }
+  } finally {
+    emitter.removeListener(name, push);
+    emitter.removeListener("error", onError);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// EventEmitterAsyncResource (lib/events.js + async_hooks'
+// EventEmitterReferencingAsyncResource)
+// ---------------------------------------------------------------------------
+//
+// Node hangs the async resource off a `#asyncResource` private field and runs
+// every `emit()` through that resource's `runInAsyncScope`, so an enabled
+// async_hooks hook sees init(for the constructor's type)/before/after per emit
+// and destroy at `emitDestroy()` — test-eventemitter-asyncresource.js pins the
+// whole sequence, including `asyncResource.eventEmitter === this`.
+//
+// Private state is a symbol-keyed slot here; reading it off a receiver that is
+// not an instance raises the engine's private-member TypeError verbatim (the
+// test asserts the message for `emit`/`emitDestroy` and, for the three
+// getters, that the thrown stack carries the `at get <name>` frame).
+const kPirEventEmitterAsyncResource = Symbol("kPirEventEmitterAsyncResource");
+const kPirEventEmitterRef = Symbol("kPirEventEmitterRef");
+
+function pirAsyncResourceError() {
+  return new TypeError(
+    "Cannot read private member #asyncResource from an object whose class did not declare it");
+}
+
+function pirAsyncResourceOf(self) {
+  const slot = self === null || self === undefined
+    ? undefined
+    : self[kPirEventEmitterAsyncResource];
+  if (slot === undefined) throw pirAsyncResourceError();
+  return slot;
+}
+
+/// async_hooks' `EventEmitterReferencingAsyncResource`: the AsyncResource the
+/// emitter is bound to, carrying the back-reference.
+class EventEmitterReferencingAsyncResource extends PirAsyncResource {
+  constructor(eventEmitter, name, options) {
+    super(name, options);
+    Object.defineProperty(this, kPirEventEmitterRef, {
+      value: eventEmitter, writable: false, enumerable: false, configurable: false,
+    });
+  }
+  get eventEmitter() {
+    return this[kPirEventEmitterRef];
+  }
+}
+
+class EventEmitterAsyncResource extends EventEmitter {
+  constructor(options) {
+    let name;
+    if (typeof options === "string") {
+      name = options;
+      options = undefined;
+    } else {
+      // Node validates `options.name` only for a direct construction; a
+      // subclass falls back to `new.target.name`.
+      if (new.target === EventEmitterAsyncResource) {
+        const given = options === undefined || options === null ? undefined : options.name;
+        if (typeof given !== "string") {
+          const error = new TypeError(
+            'The "options.name" argument must be of type string. Received ' +
+            (given === undefined ? "undefined" : "type " + typeof given));
+          error.code = "ERR_INVALID_ARG_TYPE";
+          throw error;
+        }
+      }
+      name = (options !== undefined && options !== null && options.name) || new.target.name;
+    }
+    super(options);
+    Object.defineProperty(this, kPirEventEmitterAsyncResource, {
+      value: new EventEmitterReferencingAsyncResource(this, name, options),
+      writable: false, enumerable: false, configurable: false,
+    });
+  }
+  emit(event, ...args) {
+    // Read the slot first: node's private-field access throws before any
+    // dispatch, so `EventEmitterAsyncResource.prototype.emit()` is a TypeError
+    // rather than an emit on the prototype object.
+    const asyncResource = pirAsyncResourceOf(this);
+    return asyncResource.runInAsyncScope(EventEmitter.prototype.emit, this, event, ...args);
+  }
+  emitDestroy() {
+    pirAsyncResourceOf(this).emitDestroy();
+  }
+  get asyncId() {
+    return pirAsyncResourceOf(this).asyncId();
+  }
+  get triggerAsyncId() {
+    return pirAsyncResourceOf(this).triggerAsyncId();
+  }
+  get asyncResource() {
+    return pirAsyncResourceOf(this);
+  }
+}
+
+EventEmitter.errorMonitor = errorMonitor;
+EventEmitter.captureRejectionSymbol = captureRejectionSymbol;
+EventEmitter.captureRejections = captureRejections;
+EventEmitter.defaultMaxListeners = defaultMaxListeners;
+EventEmitter.usingDomains = usingDomains;
+EventEmitter.init = init;
+EventEmitter.listenerCount = listenerCount;
+EventEmitter.getEventListeners = getEventListeners;
+EventEmitter.getMaxListeners = getMaxListeners;
+EventEmitter.setMaxListeners = setMaxListeners;
+EventEmitter.addAbortListener = addAbortListener;
+EventEmitter.once = once;
+EventEmitter.on = on;
+EventEmitter.EventEmitterAsyncResource = EventEmitterAsyncResource;
+
+export default EventEmitter;
+export {
+  EventEmitter, errorMonitor, captureRejectionSymbol, captureRejections, defaultMaxListeners,
+  usingDomains, init, listenerCount, getEventListeners, getMaxListeners, setMaxListeners,
+  addAbortListener, once, on, EventEmitterAsyncResource,
+};

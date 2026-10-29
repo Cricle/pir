@@ -1,0 +1,107 @@
+name: CI
+
+# Two workflows only: CI (below) and Release (tag-only).
+# CI runs ONE gate definition on a two-entry OS matrix: fmt, clippy, doctests
+# and the full test groups must pass on both Windows and Linux. Advisory/MSRV/
+# bench smoke checks stay local dependency-bump checks; they made CI slow and
+# failed on registry advisories unrelated to the code change.
+on:
+  push:
+    branches: [master]
+    tags-ignore: ["v*"]
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "LICENSE*"
+      - ".gitignore"
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_MIN_STACK: "8388608"
+
+jobs:
+  gate:
+    name: ${{ matrix.name }} full gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux
+            cache-key: linux-full
+          - os: windows-latest
+            name: Windows
+            cache-key: windows-full
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use a short temp directory (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p /c/tmp
+          echo "TEMP=C:\\tmp" >> "$GITHUB_ENV"
+          echo "TMP=C:\\tmp" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.cache-key }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Doctests
+        run: cargo test --doc --locked
+      - name: Install nextest
+        uses: taiki-e/install-action@cargo-nextest
+      - name: Tests (eight sequential groups; per-group binary cleanup)
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for shard in 1 2 3 4 5 6 7 8; do
+            args=()
+            if [ "$shard" -eq 1 ]; then args+=("--lib" "--bins"); fi
+            i=0
+            for f in tests/*.rs; do
+              name="$(basename "$f" .rs)"
+              if [ $((i % 8)) -eq $((shard - 1)) ]; then
+                args+=("--test" "$name")
+              fi
+              i=$((i + 1))
+            done
+            echo "test group ${shard}/8: ${#args[@]} selectors over ${i} files"
+            if ! cargo nextest run --locked --profile ci "${args[@]}"; then
+              status=1
+              break
+            fi
+            # Each group links ~10 GiB of test binaries. Drop only THIS group's
+            # linked executables; keep the pir-sdk rlib and shared dependency
+            # artifacts, which are identical for every group.
+            i=0
+            for f in tests/*.rs; do
+              name="$(basename "$f" .rs)"
+              if [ $((i % 8)) -eq $((shard - 1)) ]; then
+                rm -f "target/debug/deps/${name}-"* "target/debug/deps/${name}.d"
+              fi
+              i=$((i + 1))
+            done
+          done
+          exit "$status"

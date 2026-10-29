@@ -1,0 +1,62 @@
+---
+source: tests/ai_request_snapshots.rs
+expression: canonical(&body)
+---
+{
+  "max_completion_tokens": 8192,
+  "messages": [
+    {
+      "content": "Weather in Paris?",
+      "role": "user"
+    },
+    {
+      "content": null,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"city\":\"Paris\"}",
+            "name": "get_weather"
+          },
+          "id": "call_1",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "Sunny, 22C",
+      "role": "tool",
+      "tool_call_id": "call_1"
+    },
+    {
+      "content": "Thanks",
+      "role": "user"
+    }
+  ],
+  "model": "test",
+  "store": false,
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "tools": [
+    {
+      "function": {
+        "description": "Get the current weather for a city.",
+        "name": "get_weather",
+        "parameters": {
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

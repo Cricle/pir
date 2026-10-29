@@ -1,0 +1,85 @@
+
+// pir worker-thread boot overlay: evaluated by the worker host
+// (`worker_fns.rs`) on the worker's own QuickJS runtime AFTER the standard
+// boot (globals + prelude + node builtin sweep). Node semantics are "one
+// isolate per Worker"; here each worker is one OS thread + one full runtime,
+// so this overlay only wires the worker-specific surface:
+//   - worker_threads module state (isMainThread=false, threadId, workerData,
+//     parentPort) through the shim's apply hook;
+//   - process.exit(n): records the exit code with the host and unwinds ONLY
+//     this worker's runtime (the sentinel is caught by __pirWorkerRunStart);
+//   - __pirWorkerRunStart: runs the worker source as a CommonJS module body
+//     (Node's `eval: true` compiles worker code as CJS too) with a full
+//     `require` rooted at the worker's directory/cwd;
+//   - __pirWorkerPump: the message pump draining the parent -> worker
+//     mailbox into `parentPort` "message" events until shutdown.
+// Placeholders are replaced by the host with JSON literals before eval.
+(() => {
+  const workerId = __PIR_WORKER_ID__;
+  const threadId = __PIR_WORKER_THREAD_ID__;
+  const workerData = JSON.parse(__PIR_WORKER_DATA__);
+  const workerDir = __PIR_WORKER_DIR__;
+
+  // The worker_threads shim registers this hook at boot and returns the
+  // live parentPort (an EventEmitter whose postMessage reaches the parent).
+  const parentPort = globalThis.__pirWorkerThreadsApply({
+    isMainThread: false,
+    threadId: threadId,
+    workerData: workerData,
+    workerId: workerId,
+  });
+
+  const proc = globalThis.process;
+  // Sentinel thrown by process.exit to unwind the worker code; the CJS
+  // runner below treats it as a clean exit, everything else as a failure.
+  const workerExitSignal = { __pirWorkerExit: true };
+  proc.exit = (code) => {
+    let exitCode = proc.exitCode ?? 0;
+    if (code !== undefined && code !== null) exitCode = Number(code);
+    if (typeof exitCode !== "number" || Number.isNaN(exitCode)) exitCode = 0;
+    exitCode = Math.trunc(exitCode);
+    proc.exitCode = exitCode;
+    try { proc.emit("exit", exitCode); } catch { /* listener errors die with us */ }
+    try { __pir_host.worker("workerExit", JSON.stringify({ id: workerId, code: exitCode })); } catch { /* best-effort */ }
+    throw workerExitSignal;
+  };
+
+  globalThis.__pirWorkerRunStart = (payload) => {
+    try {
+      const code = payload.code;
+      const filename = payload.filename || "[worker " + threadId + "]";
+      const fromDir = payload.fromDir || workerDir;
+      // Wrapper head on the source's first line: keeps eval'd positions
+      // aligned with the worker script's own line/column numbering.
+      const fn = (0, eval)(
+        "(function (module, exports, require, __filename, __dirname) {" + code + "\n})"
+      );
+      const module = { exports: {} };
+      fn(module, module.exports, globalThis.__pirMakeRequire(fromDir), filename, fromDir);
+      return JSON.stringify({ ok: true });
+    } catch (error) {
+      if (error === workerExitSignal) return JSON.stringify({ ok: true, exited: true });
+      const message = error && error.message !== undefined ? String(error.message) : String(error);
+      const rawStack = error && error.stack ? String(error.stack) : "";
+      const stack = rawStack.indexOf(message) >= 0 ? rawStack : message + (rawStack ? "\n" + rawStack : "");
+      return JSON.stringify({ ok: false, message: message, stack: stack });
+    }
+  };
+
+  globalThis.__pirWorkerPump = async () => {
+    for (;;) {
+      let res;
+      try {
+        res = JSON.parse(await __pir_host.workerRecvPoll(workerId, 250, "worker"));
+      } catch { return; }
+      if (res.messages && res.messages.length > 0) {
+        for (const raw of res.messages) {
+          let data;
+          try { data = JSON.parse(raw); } catch { continue; }
+          try { parentPort.emit("message", data); } catch { /* listener errors die with us */ }
+        }
+      }
+      if (res.stop || res.done) return;
+    }
+  };
+})();

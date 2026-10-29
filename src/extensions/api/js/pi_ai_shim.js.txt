@@ -1,0 +1,3174 @@
+
+import { Type } from "typebox";
+export * from "@earendil-works/pi-coding-agent";
+export { Type };
+
+// ---------------------------------------------------------------------------
+// Phase 4f: pi-ai value-export surface mirror.
+//
+// The canonical `@earendil-works/pi-ai` module keeps its three historical
+// exports (StringEnum/uuidv7 live at the bottom with the default object) and
+// adds the upstream value surface that used to be unreachable:
+//   - data / pure utilities (text, transcript, retry, overflow, json-parse,
+//     diagnostics, model metadata, event streams, message frames, auth helpers,
+//     credential/model stores, session resources, tool validation) are real
+//     ports of the upstream logic;
+//   - `createProvider` keeps its compositional dispatch (it only calls the
+//     caller-supplied stream implementations);
+//   - `createModels` is a registry skeleton: pure lookup methods are real,
+//     provider execution / auth paths throw a clear host-side error;
+//   - `faux*` is the upstream scripted test double, ported in full (it never
+//     touches the network).
+// ---------------------------------------------------------------------------
+
+const PIR_PROVIDER_EXECUTION_SUFFIX =
+  " is not available in the pir extension runtime (provider execution is host-side)";
+
+function pirProviderUnavailable(name) {
+  throw new Error(String(name) + PIR_PROVIDER_EXECUTION_SUFFIX);
+}
+
+// structuredClone is not guaranteed on the QuickJS extension realm.
+function pirClone(value) {
+  if (typeof structuredClone === "function") {
+    try { return structuredClone(value); } catch { /* fall through */ }
+  }
+  if (value === undefined) return undefined;
+  try { return JSON.parse(JSON.stringify(value)); } catch { return value; }
+}
+
+const pirHasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+
+const pirMicrotask = typeof queueMicrotask === "function"
+  ? queueMicrotask
+  : (fn) => { Promise.resolve().then(fn); };
+
+const pirNow = () =>
+  (typeof performance === "object" && performance !== null && typeof performance.now === "function")
+    ? performance.now()
+    : Date.now();
+
+function pirAbortCheck(signal) {
+  if (!signal) return;
+  if (typeof signal.throwIfAborted === "function") {
+    signal.throwIfAborted();
+    return;
+  }
+  if (signal.aborted) {
+    throw signal.reason !== undefined ? signal.reason : new Error("The operation was aborted");
+  }
+}
+
+function pirOperationSignal(signal) {
+  if (signal) return signal;
+  if (typeof AbortController === "function") return new AbortController().signal;
+  return {
+    aborted: false,
+    reason: undefined,
+    addEventListener() {},
+    removeEventListener() {},
+    throwIfAborted() {},
+  };
+}
+
+function pirAbortReason(signal) {
+  if (signal && signal.reason !== undefined) return signal.reason;
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function pirRaceWithAbortSignal(operation, signal) {
+  if (signal.aborted) {
+    void operation.catch(() => {});
+    return Promise.reject(pirAbortReason(signal));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(pirAbortReason(signal));
+    };
+    const cleanup = () => {
+      if (typeof signal.removeEventListener === "function") signal.removeEventListener("abort", onAbort);
+    };
+    if (typeof signal.addEventListener === "function") signal.addEventListener("abort", onAbort, { once: true });
+    void operation.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      },
+    );
+    if (signal.aborted) onAbort();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// utils/text.ts
+// ---------------------------------------------------------------------------
+
+/** Extract and join text from message content. */
+export function contentText(content, separator = "\n") {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block) => block && block.type === "text")
+    .map((block) => block.text)
+    .join(separator);
+}
+
+/** Render a system message as a complete prompt: its content followed by its sections. */
+export function getSystemMessageText(message) {
+  const parts = [contentText(message && message.content)];
+  const sections = (message && message.sections) || {};
+  for (const text of Object.values(sections)) {
+    if (text !== null && text !== undefined) parts.push(text);
+  }
+  return parts.filter((part) => part.length > 0).join("\n\n");
+}
+
+/** Render a later system message for APIs that accept mid-conversation system messages. */
+export function renderSystemMessageUpdate(message) {
+  const parts = [];
+  const text = contentText(message && message.content);
+  if (text.length > 0) parts.push(text);
+  const sections = (message && message.sections) || {};
+  for (const [name, value] of Object.entries(sections)) {
+    parts.push(
+      value === null || value === undefined
+        ? `Removed system prompt section "${name}".`
+        : `Updated system prompt section "${name}":\n\n${value}`,
+    );
+  }
+  return parts.join("\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// utils/transcript.ts
+// ---------------------------------------------------------------------------
+
+function pirCreateInitialSystemMessage(systemPrompt, tools) {
+  const hasSystemPrompt = systemPrompt !== undefined && systemPrompt.length > 0;
+  const hasTools = tools !== undefined && tools.length > 0;
+  if (!hasSystemPrompt && !hasTools) return undefined;
+  return {
+    role: "system",
+    content: systemPrompt !== undefined ? systemPrompt : "",
+    ...(hasTools ? { toolsAdded: tools } : {}),
+    timestamp: 0,
+  };
+}
+
+/** Build the leading system message for a prompt and tool set. */
+export function createInitialSystemMessage(systemPrompt, tools) {
+  return pirCreateInitialSystemMessage(systemPrompt, tools);
+}
+
+/** Fold `Context.systemPrompt` and `Context.tools` into a leading system message. */
+export function normalizeContext(context) {
+  const initialMessage = pirCreateInitialSystemMessage(context.systemPrompt, context.tools);
+  const messages = initialMessage ? [initialMessage, ...context.messages] : context.messages;
+  return { messages };
+}
+
+function pirIsSystemMessage(message) {
+  return message !== null && typeof message === "object" && message.role === "system";
+}
+
+/** Return the leading system message, if the transcript starts with one. */
+export function getInitialSystemMessage(messages) {
+  const first = messages[0];
+  return first && pirIsSystemMessage(first) ? first : undefined;
+}
+
+/** Drop the leading system message for APIs that carry the prompt outside the message list. */
+export function withoutInitialSystemMessage(messages) {
+  return getInitialSystemMessage(messages) ? messages.slice(1) : messages;
+}
+
+/** Resolve the tools available after applying every transcript delta in order. */
+export function getCurrentTools(messages) {
+  const tools = new Map();
+  for (const message of messages) {
+    if (!pirIsSystemMessage(message)) continue;
+    for (const tool of message.toolsRemoved || []) tools.delete(tool.name);
+    for (const tool of message.toolsAdded || []) tools.set(tool.name, tool);
+  }
+  return [...tools.values()];
+}
+
+/** Replay every system message into one leading system message holding the current prompt and tools. */
+export function getCurrentSystemMessage(messages) {
+  const content = [];
+  const sections = new Map();
+  let timestamp;
+  for (const message of messages) {
+    if (!pirIsSystemMessage(message)) continue;
+    if (timestamp === undefined) timestamp = message.timestamp;
+    const text = contentText(message.content);
+    if (text.length > 0) content.push(text);
+    for (const [name, value] of Object.entries(message.sections || {})) {
+      if (value === null || value === undefined) sections.delete(name);
+      else sections.set(name, value);
+    }
+  }
+  const tools = getCurrentTools(messages);
+  if (timestamp === undefined && tools.length === 0) return undefined;
+  return {
+    role: "system",
+    content: content.join("\n\n"),
+    ...(sections.size > 0 ? { sections: Object.fromEntries(sections) } : {}),
+    ...(tools.length > 0 ? { toolsAdded: tools } : {}),
+    timestamp: timestamp !== undefined ? timestamp : 0,
+  };
+}
+
+/** Render the current system prompt text after replaying every system message. */
+export function getCurrentSystemPrompt(messages) {
+  const message = getCurrentSystemMessage(messages);
+  return message ? getSystemMessageText(message) : "";
+}
+
+/** Rebuild the transcript for APIs without mid-conversation system messages. */
+export function collapseSystemMessages(context) {
+  const head = getCurrentSystemMessage(context.messages);
+  const messages = context.messages.filter((message) => message.role !== "system");
+  return { messages: head ? [head, ...messages] : messages };
+}
+
+/** Keep later system messages in place when the model accepts them; otherwise collapse them. */
+export function resolveTranscript(context, supportsMidConvoSystemMessages) {
+  return supportsMidConvoSystemMessages ? context : collapseSystemMessages(context);
+}
+
+/** Strip executable and display-only fields from a tool before transcript comparison or persistence. */
+export function toToolDeclaration(tool) {
+  return {
+    name: tool.name,
+    description: tool.description,
+    parameters: JSON.parse(JSON.stringify(tool.parameters)),
+    ...(tool.constrainedSampling === undefined ? {} : { constrainedSampling: tool.constrainedSampling }),
+  };
+}
+
+/** Whether two tools declare the same interface to the model. */
+export function declarationsEqual(left, right) {
+  return JSON.stringify(toToolDeclaration(left)) === JSON.stringify(toToolDeclaration(right));
+}
+
+/** Compare two complete tool states. A changed definition is a removal followed by an addition. */
+export function getToolStateChanges(previous, current) {
+  const previousTools = new Map(previous.map((tool) => [tool.name, tool]));
+  const currentTools = new Map(current.map((tool) => [tool.name, tool]));
+  return {
+    toolsAdded: current
+      .filter((tool) => {
+        const previousTool = previousTools.get(tool.name);
+        return previousTool === undefined || !declarationsEqual(previousTool, tool);
+      })
+      .map(toToolDeclaration),
+    toolsRemoved: previous
+      .filter((tool) => {
+        const currentTool = currentTools.get(tool.name);
+        return currentTool === undefined || !declarationsEqual(tool, currentTool);
+      })
+      .map((tool) => ({ name: tool.name })),
+  };
+}
+
+/** Every definition referenced by transcript tool state, in first-declaration order. */
+export function getDeclaredTools(messages) {
+  const definitions = new Map();
+  for (const message of messages) {
+    if (!pirIsSystemMessage(message)) continue;
+    for (const tool of message.toolsAdded || []) definitions.set(tool.name, tool);
+  }
+  return [...definitions.values()];
+}
+
+/** Whether a tool name was declared twice with different definitions. */
+export function hasToolRedefinitions(messages) {
+  const declared = new Map();
+  for (const message of messages) {
+    if (!pirIsSystemMessage(message)) continue;
+    for (const tool of message.toolsAdded || []) {
+      const previous = declared.get(tool.name);
+      if (previous !== undefined && !declarationsEqual(previous, tool)) return true;
+      declared.set(tool.name, tool);
+    }
+  }
+  return false;
+}
+
+/** Whether tool history contains a removal or same-name redeclaration. */
+export function hasNonAdditiveToolChanges(messages) {
+  const declared = new Set();
+  for (const message of messages) {
+    if (!pirIsSystemMessage(message)) continue;
+    if ((message.toolsRemoved || []).length > 0) return true;
+    for (const tool of message.toolsAdded || []) {
+      if (declared.has(tool.name)) return true;
+      declared.add(tool.name);
+    }
+  }
+  return false;
+}
+
+/** Split tool declarations between the top-level request field and in-place additions. */
+export function resolveTranscriptTools(messages, supportsToolAdditions) {
+  const anchorsAdditions = supportsToolAdditions && !hasNonAdditiveToolChanges(messages);
+  return {
+    requestTools: anchorsAdditions
+      ? ((getInitialSystemMessage(messages) || {}).toolsAdded || [])
+      : getCurrentTools(messages),
+    anchorsAdditions,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// utils/retry.ts
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_MAX_AGENT_RETRY_DELAY_MS = 60000;
+
+export function retryDelayMs(policy, attempt) {
+  const delay = policy.baseDelayMs * 2 ** Math.max(0, attempt - 1);
+  const safeDelay = Number.isSafeInteger(delay) ? delay : Number.MAX_SAFE_INTEGER;
+  return Math.min(safeDelay, policy.maxAgentDelayMs ?? DEFAULT_MAX_AGENT_RETRY_DELAY_MS);
+}
+
+const PIR_NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN =
+  /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing|subscription_sharing_usage_limit_exceeded/i;
+
+const PIR_RETRYABLE_PROVIDER_ERROR_PATTERN =
+  /overloaded|server_busy|servers are currently busy|currently experiencing high demand|model is at capacity|rate.?limit|too many requests|429|500|502|503|504|520|524|service.?unavailable|server.?error|internal.?error|provider.?returned.?error|exceeded request buffer limit while retrying upstream|network.?error|connection.?error|connection.?refused|connection.?lost|other side closed|fetch failed|getaddrinfo|ENOTFOUND|EAI_AGAIN|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|websocket.?closed|websocket.?error|ended without|stream ended before message_stop|stream ended before a terminal response event|http2 request did not get a response|pending stream has been canceled|retry delay|you can retry your request|try your request again|please retry your request|ResourceExhausted|subscription_sharing_usage_unavailable|subscription_sharing_user_unavailable/i;
+
+/** Classifies whether a failed assistant message looks like a transient provider or transport error. */
+export function isRetryableAssistantError(message) {
+  if (message.stopReason !== "error" || !message.errorMessage) return false;
+  const errorMessage = message.errorMessage;
+  if (PIR_NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
+  return PIR_RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
+}
+
+class PirRetrySleepAbortError extends Error {
+  constructor() {
+    super("Aborted");
+  }
+}
+
+function pirSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      reject(new PirRetrySleepAbortError());
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    if (signal && typeof signal.addEventListener === "function") {
+      signal.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          reject(new PirRetrySleepAbortError());
+        },
+        { once: true },
+      );
+    }
+  });
+}
+
+/** Run a single assistant-producing call with bounded retry on transient errors. */
+export async function retryAssistantCall(produce, policy, signal, callbacks) {
+  const maxAttempts = policy && policy.enabled ? policy.maxRetries : 0;
+
+  let attempt = 0;
+  let lastRetry;
+  for (;;) {
+    const response = await produce();
+
+    if (response.stopReason === "aborted") {
+      if (lastRetry && callbacks) await callbacks.onRetryFinished?.(false, lastRetry.attempt);
+      return response;
+    }
+
+    if (response.stopReason !== "error") {
+      if (lastRetry && callbacks) await callbacks.onRetryFinished?.(true, lastRetry.attempt);
+      return response;
+    }
+
+    if (attempt >= maxAttempts || !isRetryableAssistantError(response)) {
+      if (lastRetry && callbacks) await callbacks.onRetryFinished?.(false, lastRetry.attempt, response.errorMessage);
+      return response;
+    }
+
+    attempt++;
+    lastRetry = { attempt, errorMessage: response.errorMessage || "Unknown error" };
+    const delayMs = retryDelayMs(policy, attempt);
+    if (callbacks) await callbacks.onRetryScheduled?.(attempt, maxAttempts, delayMs, lastRetry.errorMessage);
+
+    try {
+      await pirSleep(delayMs, signal);
+    } catch (error) {
+      if (callbacks) await callbacks.onRetryFinished?.(false, attempt, lastRetry.errorMessage);
+      if (error instanceof PirRetrySleepAbortError) {
+        const { errorMessage: _errorMessage, ...rest } = response;
+        return { ...rest, stopReason: "aborted" };
+      }
+      throw error;
+    }
+    if (callbacks) await callbacks.onRetryAttemptStart?.();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// utils/overflow.ts
+// ---------------------------------------------------------------------------
+
+const PIR_OVERFLOW_PATTERNS = [
+  /prompt (?:is )?too long/i,
+  /prompt exceeds max length/i,
+  /request_too_large/i,
+  /input is too long for requested model/i,
+  /exceeds the context window/i,
+  /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i,
+  /input token count.*exceeds the maximum/i,
+  /maximum prompt length is \d+/i,
+  /reduce the length of the messages/i,
+  /maximum context length is \d+ tokens/i,
+  /exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?/i,
+  /input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)/i,
+  /exceeds the limit of \d+/i,
+  /exceeds the available context size/i,
+  /greater than the context length/i,
+  /context window exceeds limit/i,
+  /exceeded model token limit/i,
+  /too large for model with \d+ maximum context length/i,
+  /prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?/i,
+  /model_context_window_exceeded/i,
+  /prompt too long; exceeded (?:max )?context length/i,
+  /range of input length should be/i,
+  /context[_ ]length[_ ]exceeded/i,
+  /too many tokens/i,
+  /token limit exceeded/i,
+];
+
+const PIR_CEREBRAS_BODYLESS_OVERFLOW_PATTERN = /^4(?:00|13)\s*(?:status code)?\s*\(no body\)/i;
+
+const PIR_NON_OVERFLOW_PATTERNS = [
+  /^(Throttling error|Service unavailable):/i,
+  /rate limit/i,
+  /too many requests/i,
+];
+
+/** Check if an assistant message represents a context overflow error. */
+export function isContextOverflow(message, contextWindow) {
+  if (message.stopReason === "error" && message.errorMessage) {
+    const isNonOverflow = PIR_NON_OVERFLOW_PATTERNS.some((pattern) => pattern.test(message.errorMessage));
+    if (!isNonOverflow) {
+      if (PIR_OVERFLOW_PATTERNS.some((pattern) => pattern.test(message.errorMessage))) {
+        return true;
+      }
+      if (message.provider === "cerebras" && PIR_CEREBRAS_BODYLESS_OVERFLOW_PATTERN.test(message.errorMessage)) {
+        return true;
+      }
+    }
+  }
+
+  if (contextWindow && message.stopReason === "stop") {
+    const inputTokens = message.usage.input + message.usage.cacheRead;
+    if (inputTokens > contextWindow) return true;
+  }
+
+  if (contextWindow && message.stopReason === "length" && message.usage.output === 0) {
+    const inputTokens = message.usage.input + message.usage.cacheRead;
+    if (inputTokens >= contextWindow * 0.99) return true;
+  }
+
+  return false;
+}
+
+/** Check whether a length stop ended below the caller or model's intended output limit. */
+export function isRecoverableLength(message, desiredMaxOutput) {
+  return message.stopReason === "length" && desiredMaxOutput > 0 && message.usage.output < desiredMaxOutput;
+}
+
+/** Get the overflow patterns for testing purposes. */
+export function getOverflowPatterns() {
+  return [...PIR_OVERFLOW_PATTERNS];
+}
+
+// ---------------------------------------------------------------------------
+// utils/json-parse.ts
+// ---------------------------------------------------------------------------
+
+const PIR_VALID_JSON_ESCAPES = new Set(['"', "\\", "/", "b", "f", "n", "r", "t", "u"]);
+
+function pirIsControlCharacter(char) {
+  const codePoint = char.codePointAt(0);
+  return codePoint !== undefined && codePoint >= 0x00 && codePoint <= 0x1f;
+}
+
+function pirEscapeControlCharacter(char) {
+  switch (char) {
+    case "\b":
+      return "\\b";
+    case "\f":
+      return "\\f";
+    case "\n":
+      return "\\n";
+    case "\r":
+      return "\\r";
+    case "\t":
+      return "\\t";
+    default: {
+      const hex = char.codePointAt(0);
+      return "\\u" + (hex === undefined ? "0000" : hex.toString(16).padStart(4, "0"));
+    }
+  }
+}
+
+/** Repairs malformed JSON string literals (raw control chars, invalid escapes). */
+export function repairJson(json) {
+  let repaired = "";
+  let inString = false;
+
+  for (let index = 0; index < json.length; index++) {
+    const char = json[index];
+
+    if (!inString) {
+      repaired += char;
+      if (char === '"') inString = true;
+      continue;
+    }
+
+    if (char === '"') {
+      repaired += char;
+      inString = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      const nextChar = json[index + 1];
+      if (nextChar === undefined) {
+        repaired += "\\\\";
+        continue;
+      }
+
+      if (nextChar === "u") {
+        const unicodeDigits = json.slice(index + 2, index + 6);
+        if (/^[0-9a-fA-F]{4}$/.test(unicodeDigits)) {
+          repaired += "\\u" + unicodeDigits;
+          index += 5;
+          continue;
+        }
+      }
+
+      if (PIR_VALID_JSON_ESCAPES.has(nextChar)) {
+        repaired += "\\" + nextChar;
+        index += 1;
+        continue;
+      }
+
+      repaired += "\\\\";
+      continue;
+    }
+
+    repaired += pirIsControlCharacter(char) ? pirEscapeControlCharacter(char) : char;
+  }
+
+  return repaired;
+}
+
+/** Parse JSON, repairing malformed string literals when the strict parse fails. */
+export function parseJsonWithRepair(json) {
+  try {
+    return JSON.parse(json);
+  } catch (error) {
+    const repairedJson = repairJson(json);
+    if (repairedJson !== json) {
+      return JSON.parse(repairedJson);
+    }
+    throw error;
+  }
+}
+
+// Tolerant partial-JSON reader for streaming tool arguments. Reads the longest
+// well-formed prefix of the document and silently drops an incomplete tail
+// (unterminated keys, dangling separators, half-written literals). Documented
+// approximation of the upstream `partial-json` dependency.
+function pirPartialJsonParse(text) {
+  const STOP = {};
+  let i = 0;
+  let sawEof = false;
+  const isWs = (char) => char === " " || char === "\t" || char === "\n" || char === "\r";
+
+  function skipWs() {
+    while (i < text.length && isWs(text[i])) i++;
+  }
+
+  function parseString() {
+    i++; // opening quote
+    let out = "";
+    while (i < text.length) {
+      const char = text[i];
+      if (char === "\\") {
+        const next = text[i + 1];
+        if (next === undefined) {
+          i++;
+          sawEof = true;
+          return out;
+        }
+        const simple = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+        if (pirHasOwn(simple, next)) {
+          out += simple[next];
+          i += 2;
+          continue;
+        }
+        if (next === "u") {
+          const hex = text.slice(i + 2, i + 6);
+          if (hex.length < 4 || !/^[0-9a-fA-F]{4}$/.test(hex)) {
+            i = text.length;
+            sawEof = true;
+            return out;
+          }
+          out += String.fromCharCode(parseInt(hex, 16));
+          i += 6;
+          continue;
+        }
+        out += next;
+        i += 2;
+        continue;
+      }
+      if (char === '"') {
+        i++;
+        return out;
+      }
+      out += char;
+      i++;
+    }
+    sawEof = true;
+    return out;
+  }
+
+  function parseNumber() {
+    const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(text.slice(i));
+    if (match) {
+      i += match[0].length;
+      return Number(match[0]);
+    }
+    const partial = /^-?(?:0|[1-9]\d*)(?:\.\d*)?/.exec(text.slice(i)) || /^-/.exec(text.slice(i));
+    const token = partial ? partial[0] : "";
+    i += token.length;
+    sawEof = true;
+    const cleaned = token.endsWith(".") ? token.slice(0, -1) : token;
+    const value = cleaned === "" || cleaned === "-" ? 0 : Number(cleaned);
+    return Number.isNaN(value) ? 0 : value;
+  }
+
+  function parseObject() {
+    i++; // '{'
+    const object = {};
+    for (;;) {
+      skipWs();
+      if (i >= text.length) {
+        sawEof = true;
+        return object;
+      }
+      if (text[i] === "}") {
+        i++;
+        return object;
+      }
+      if (text[i] === ",") {
+        i++;
+        continue;
+      }
+      if (text[i] !== '"') {
+        sawEof = true;
+        return object;
+      }
+      const key = parseString();
+      if (sawEof) return object;
+      skipWs();
+      if (text[i] !== ":") {
+        sawEof = true;
+        return object;
+      }
+      i++;
+      const value = parseValue();
+      if (value === STOP) return object;
+      object[key] = value;
+      skipWs();
+      if (text[i] === ",") {
+        i++;
+        continue;
+      }
+      if (text[i] === "}") {
+        i++;
+        return object;
+      }
+      if (i >= text.length) {
+        sawEof = true;
+        return object;
+      }
+      sawEof = true;
+      return object;
+    }
+  }
+
+  function parseArray() {
+    i++; // '['
+    const array = [];
+    for (;;) {
+      skipWs();
+      if (i >= text.length) {
+        sawEof = true;
+        return array;
+      }
+      if (text[i] === "]") {
+        i++;
+        return array;
+      }
+      if (text[i] === ",") {
+        i++;
+        continue;
+      }
+      const value = parseValue();
+      if (value === STOP) return array;
+      array.push(value);
+      skipWs();
+      if (text[i] === ",") {
+        i++;
+        continue;
+      }
+      if (text[i] === "]") {
+        i++;
+        return array;
+      }
+      if (i >= text.length) {
+        sawEof = true;
+        return array;
+      }
+      sawEof = true;
+      return array;
+    }
+  }
+
+  function parseValue() {
+    skipWs();
+    if (i >= text.length) {
+      sawEof = true;
+      return STOP;
+    }
+    const char = text[i];
+    if (char === '"') return parseString();
+    if (char === "{") return parseObject();
+    if (char === "[") return parseArray();
+    if (char === "-" || (char >= "0" && char <= "9")) return parseNumber();
+    for (const [word, value] of [["true", true], ["false", false], ["null", null]]) {
+      if (text.startsWith(word, i)) {
+        i += word.length;
+        return value;
+      }
+    }
+    const rest = text.slice(i).trimEnd();
+    if (rest.length > 0 && ["true", "false", "null"].some((word) => word.startsWith(rest))) {
+      sawEof = true;
+      return STOP;
+    }
+    sawEof = true;
+    return STOP;
+  }
+
+  const value = parseValue();
+  return value === STOP ? {} : value;
+}
+
+/** Attempts to parse potentially incomplete JSON during streaming. Always returns a valid value. */
+export function parseStreamingJson(partialJson) {
+  if (partialJson === undefined || partialJson === null || String(partialJson).trim() === "") {
+    return {};
+  }
+  try {
+    return parseJsonWithRepair(partialJson);
+  } catch {
+    try {
+      const result = pirPartialJsonParse(partialJson);
+      return result === undefined || result === null ? {} : result;
+    } catch {
+      return {};
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// utils/diagnostics.ts
+// ---------------------------------------------------------------------------
+
+export function formatThrownValue(value) {
+  if (value instanceof Error) return value.message || value.name;
+  if (typeof value === "string") return value;
+  return String(value);
+}
+
+export function extractDiagnosticError(error) {
+  if (!(error instanceof Error)) return { name: "ThrownValue", message: formatThrownValue(error) };
+  const code = error.code;
+  return {
+    name: error.name || undefined,
+    message: error.message || error.name,
+    stack: error.stack,
+    code: typeof code === "string" || typeof code === "number" ? code : undefined,
+  };
+}
+
+export function createAssistantMessageDiagnostic(type, error, details) {
+  return { type, timestamp: Date.now(), error: extractDiagnosticError(error), details };
+}
+
+export function appendAssistantMessageDiagnostic(message, diagnostic) {
+  message.diagnostics = [...(message.diagnostics ?? []), diagnostic];
+}
+
+// ---------------------------------------------------------------------------
+// models error + model metadata (models.ts surface)
+// ---------------------------------------------------------------------------
+
+export class ModelsError extends Error {
+  constructor(code, message, options) {
+    super(pirModelsErrorWithCauseDetail(message, options && options.cause));
+    this.name = "ModelsError";
+    this.code = code;
+    if (options && options.cause !== undefined) {
+      try { this.cause = options.cause; } catch { /* immutable in some engines */ }
+    }
+  }
+}
+
+/** Callers surface `error.message` only, so keep the underlying reason in it. */
+function pirModelsErrorWithCauseDetail(message, cause) {
+  if (cause === undefined || cause === null) return message;
+  const detail = formatThrownValue(cause).trim();
+  if (!detail || message.includes(detail)) return message;
+  return message + ": " + detail;
+}
+
+/** The type of a model. Models without `type` are chat models. */
+export function getModelType(model) {
+  return model.type ?? "chat";
+}
+
+/** Runtime-checked model type narrowing, including legacy chat models without `type`. */
+export function isModelType(model, type) {
+  return getModelType(model) === type;
+}
+
+/** Non-chat models never match, even when their api id equals `api`. */
+export function hasApi(model, api) {
+  return isModelType(model, "chat") && model.api === api;
+}
+
+export function calculateCost(model, usage) {
+  const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+  let rates = model.cost;
+  let matchedThreshold = -1;
+  for (const tier of model.cost.tiers || []) {
+    if (inputTokens > tier.inputTokensAbove && tier.inputTokensAbove > matchedThreshold) {
+      rates = tier;
+      matchedThreshold = tier.inputTokensAbove;
+    }
+  }
+
+  // Anthropic charges 2x base input for 1h cache writes.
+  const longWrite = usage.cacheWrite1h ?? 0;
+  const shortWrite = usage.cacheWrite - longWrite;
+  usage.cost.input = (rates.input / 1000000) * usage.input;
+  usage.cost.output = (rates.output / 1000000) * usage.output;
+  usage.cost.cacheRead = (rates.cacheRead / 1000000) * usage.cacheRead;
+  usage.cost.cacheWrite = (rates.cacheWrite * shortWrite + rates.input * 2 * longWrite) / 1000000;
+  usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+  return usage.cost;
+}
+
+const PIR_EXTENDED_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+export function getSupportedThinkingLevels(model) {
+  if (!model.reasoning) return ["off"];
+
+  return PIR_EXTENDED_THINKING_LEVELS.filter((level) => {
+    const mapped = (model.thinkingLevelMap || {})[level];
+    if (mapped === null) return false;
+    if (level === "xhigh" || level === "max") return mapped !== undefined;
+    return true;
+  });
+}
+
+export function clampThinkingLevel(model, level) {
+  const availableLevels = getSupportedThinkingLevels(model);
+  if (availableLevels.includes(level)) return level;
+
+  const requestedIndex = PIR_EXTENDED_THINKING_LEVELS.indexOf(level);
+  if (requestedIndex === -1) return availableLevels[0] ?? "off";
+
+  for (let index = requestedIndex; index < PIR_EXTENDED_THINKING_LEVELS.length; index++) {
+    const candidate = PIR_EXTENDED_THINKING_LEVELS[index];
+    if (availableLevels.includes(candidate)) return candidate;
+  }
+  for (let index = requestedIndex - 1; index >= 0; index--) {
+    const candidate = PIR_EXTENDED_THINKING_LEVELS[index];
+    if (availableLevels.includes(candidate)) return candidate;
+  }
+  return availableLevels[0] ?? "off";
+}
+
+/** Check if two models are equal by comparing their type, id, and provider. */
+export function modelsAreEqual(a, b) {
+  if (!a || !b) return false;
+  return getModelType(a) === getModelType(b) && a.id === b.id && a.provider === b.provider;
+}
+
+// ---------------------------------------------------------------------------
+// utils/event-stream.ts
+// ---------------------------------------------------------------------------
+
+class PirFifoQueue {
+  constructor() {
+    this.incoming = [];
+    this.outgoing = [];
+  }
+
+  get length() {
+    return this.incoming.length + this.outgoing.length;
+  }
+
+  enqueue(value) {
+    this.incoming.push(value);
+  }
+
+  dequeue() {
+    if (this.outgoing.length === 0) {
+      while (this.incoming.length > 0) this.outgoing.push(this.incoming.pop());
+    }
+    return this.outgoing.pop();
+  }
+}
+
+/** Generic event stream class for async iteration. */
+export class EventStream {
+  constructor(isComplete, extractResult) {
+    this._pirQueue = new PirFifoQueue();
+    this._pirWaiting = new PirFifoQueue();
+    this._pirDone = false;
+    this._pirFinalResultPromise = new Promise((resolve) => {
+      this._pirResolveFinalResult = resolve;
+    });
+    this._pirIsComplete = isComplete;
+    this._pirExtractResult = extractResult;
+  }
+
+  push(event) {
+    if (this._pirDone) return;
+
+    if (this._pirIsComplete(event)) {
+      this._pirDone = true;
+      this._pirResolveFinalResult(this._pirExtractResult(event));
+    }
+
+    const waiter = this._pirWaiting.dequeue();
+    if (waiter) {
+      waiter({ value: event, done: false });
+    } else {
+      this._pirQueue.enqueue(event);
+    }
+  }
+
+  end(result) {
+    this._pirDone = true;
+    if (result !== undefined) this._pirResolveFinalResult(result);
+    while (this._pirWaiting.length > 0) {
+      const waiter = this._pirWaiting.dequeue();
+      waiter({ value: undefined, done: true });
+    }
+  }
+
+  [Symbol.asyncIterator]() {
+    const self = this;
+    return {
+      next() {
+        if (self._pirQueue.length > 0) {
+          return Promise.resolve({ value: self._pirQueue.dequeue(), done: false });
+        }
+        if (self._pirDone) {
+          return Promise.resolve({ value: undefined, done: true });
+        }
+        return new Promise((resolve) => self._pirWaiting.enqueue(resolve));
+      },
+      return() {
+        return Promise.resolve({ value: undefined, done: true });
+      },
+    };
+  }
+
+  result() {
+    return this._pirFinalResultPromise;
+  }
+}
+
+/** Event stream of one assistant response (times the final message with durationMs). */
+export class AssistantMessageEventStream extends EventStream {
+  constructor() {
+    super(
+      (event) => event.type === "done" || event.type === "error",
+      (event) => {
+        if (event.type === "done") {
+          return event.message;
+        } else if (event.type === "error") {
+          return event.error;
+        }
+        throw new Error("Unexpected event type for final result");
+      },
+    );
+    this._pirStartedAt = Date.now();
+    this._pirStartedAtMonotonic = pirNow();
+  }
+
+  push(event) {
+    if (event.type === "done") this._pirTime(event.message);
+    else if (event.type === "error") this._pirTime(event.error);
+    super.push(event);
+  }
+
+  end(result) {
+    if (result !== undefined) this._pirTime(result);
+    super.end(result);
+  }
+
+  _pirTime(message) {
+    if (this._pirDone || !message || message.durationMs !== undefined || message.timestamp < this._pirStartedAt) return;
+    message.durationMs = Math.max(0, Math.round(pirNow() - this._pirStartedAtMonotonic));
+  }
+}
+
+/** Factory function for AssistantMessageEventStream (for use in extensions). */
+export function createAssistantMessageEventStream() {
+  return new AssistantMessageEventStream();
+}
+
+// ---------------------------------------------------------------------------
+// api/lazy.ts
+// ---------------------------------------------------------------------------
+
+function pirCreateSetupErrorMessage(model, error, timestamp) {
+  return {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "error",
+    errorMessage: error instanceof Error ? error.message : String(error),
+    timestamp,
+  };
+}
+
+function pirHasResult(source) {
+  return source !== null && typeof source === "object" && typeof source.result === "function";
+}
+
+async function pirForwardStream(target, source) {
+  const iterator = source[Symbol.asyncIterator]();
+  for (;;) {
+    const step = await iterator.next();
+    if (step.done) break;
+    target.push(step.value);
+  }
+  target.end(pirHasResult(source) ? await source.result() : undefined);
+}
+
+/** Returns a stream synchronously while running async setup behind it. */
+export function lazyStream(model, setup) {
+  const startedAt = Date.now();
+  const outer = new AssistantMessageEventStream();
+
+  setup()
+    .then((inner) => pirForwardStream(outer, inner))
+    .catch((error) => {
+      const message = pirCreateSetupErrorMessage(model, error, startedAt);
+      outer.push({ type: "error", reason: "error", error: message });
+      outer.end(message);
+    });
+
+  return outer;
+}
+
+/** Wraps a dynamically imported API implementation module as `ProviderStreams`. */
+export function lazyApi(load, capabilities) {
+  const api = {
+    stream: (model, context, options) =>
+      lazyStream(model, async () => (await load()).stream(model, context, options)),
+    streamSimple: (model, context, options) =>
+      lazyStream(model, async () => (await load()).streamSimple(model, context, options)),
+  };
+
+  if (capabilities && capabilities.fetchDeferred) {
+    api.fetchDeferred = (model, handle, options) =>
+      lazyStream(model, async () => {
+        const implementation = await load();
+        if (!implementation.fetchDeferred) throw new Error("API does not support deferred responses");
+        return implementation.fetchDeferred(model, handle, options);
+      });
+  }
+  if (capabilities && capabilities.cancelDeferred) {
+    api.cancelDeferred = async (model, handle, options) => {
+      const implementation = await load();
+      if (!implementation.cancelDeferred) throw new Error("API cannot cancel deferred responses");
+      await implementation.cancelDeferred(model, handle, options);
+    };
+  }
+
+  return api;
+}
+
+// ---------------------------------------------------------------------------
+// auth/context.ts + auth/helpers.ts (no network; credential-store /
+// models-store; session-resources)
+// ---------------------------------------------------------------------------
+
+function pirGetProcessEnv() {
+  const proc = typeof process !== "undefined" ? process : undefined;
+  return proc && proc.env ? proc.env : undefined;
+}
+
+/** Default auth context: env vars from `process.env` (undefined in browsers), file existence false. */
+export function defaultProviderAuthContext() {
+  return {
+    async env(name) {
+      const environment = pirGetProcessEnv();
+      const value = environment ? environment[name] : undefined;
+      return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+    },
+
+    async fileExists(_path) {
+      // No filesystem access on the pir extension realm (upstream browsers
+      // behave the same way: node:fs import fails and existence is false).
+      return false;
+    },
+  };
+}
+
+/** Standard api-key auth: a stored credential key wins, otherwise the first set env var resolves. */
+export function envApiKeyAuth(name, envVars) {
+  return {
+    name,
+    login: async (interaction) => {
+      pirAbortCheck(interaction.signal);
+      const key = await interaction.prompt({ type: "secret", message: "Enter " + name });
+      pirAbortCheck(interaction.signal);
+      return { type: "api_key", key };
+    },
+    resolve: async ({ ctx, credential, signal }) => {
+      pirAbortCheck(signal);
+      if (credential && credential.key) {
+        return { auth: { apiKey: credential.key }, env: credential.env, source: "stored credential" };
+      }
+      for (const envVar of envVars) {
+        const value = await ctx.env(envVar);
+        pirAbortCheck(signal);
+        if (value) return { auth: { apiKey: value }, source: envVar };
+      }
+      return undefined;
+    },
+  };
+}
+
+/** Wraps a dynamically imported `OAuthAuth` so provider definitions can advertise OAuth without importing it. */
+export function lazyOAuth(input) {
+  let promise;
+  const loaded = () => {
+    if (promise === undefined) promise = input.load();
+    return promise;
+  };
+  return {
+    name: input.name,
+    isSubscription: input.isSubscription,
+    loginLabel: input.loginLabel,
+    login: async (interaction, options) => (await loaded()).login(interaction, options),
+    refresh: async (credential, signal) => (await loaded()).refresh(credential, signal),
+    toAuth: async (credential) => (await loaded()).toAuth(credential),
+  };
+}
+
+/** Default in-memory credential store, keyed by `Provider.id`, writes serialized per provider. */
+export class InMemoryCredentialStore {
+  constructor() {
+    this._pirCredentials = new Map();
+    this._pirChains = new Map();
+  }
+
+  _pirEnqueue(providerId, task, options) {
+    const signal = pirOperationSignal(options && options.signal);
+    const previous = this._pirChains.get(providerId) ?? Promise.resolve();
+    const queued = (async () => {
+      await previous.catch(() => {});
+      pirAbortCheck(signal);
+      return task();
+    })();
+    const tail = queued.catch(() => {});
+    this._pirChains.set(providerId, tail);
+    const self = this;
+    void tail.then(() => {
+      if (self._pirChains.get(providerId) === tail) self._pirChains.delete(providerId);
+    });
+    return pirRaceWithAbortSignal(queued, signal);
+  }
+
+  async read(providerId, options) {
+    pirAbortCheck(options && options.signal);
+    return this._pirCredentials.get(providerId);
+  }
+
+  async list(options) {
+    pirAbortCheck(options && options.signal);
+    return [...this._pirCredentials].map(([providerId, credential]) => ({
+      providerId,
+      type: credential.type,
+    }));
+  }
+
+  modify(providerId, fn, options) {
+    const self = this;
+    return this._pirEnqueue(
+      providerId,
+      async () => {
+        const current = self._pirCredentials.get(providerId);
+        const next = await fn(current);
+        pirAbortCheck(options && options.signal);
+        if (next !== undefined) self._pirCredentials.set(providerId, next);
+        return next ?? current;
+      },
+      options,
+    );
+  }
+
+  delete(providerId, options) {
+    const self = this;
+    return this._pirEnqueue(
+      providerId,
+      async () => {
+        self._pirCredentials.delete(providerId);
+      },
+      options,
+    );
+  }
+}
+
+/** Persistent model catalogs keyed by provider ID (in-memory). */
+export class InMemoryModelsStore {
+  constructor() {
+    this._pirEntries = new Map();
+  }
+
+  async read(providerId, options) {
+    pirAbortCheck(options && options.signal);
+    const entry = this._pirEntries.get(providerId);
+    return entry ? pirClone(entry) : undefined;
+  }
+
+  async write(providerId, entry, options) {
+    pirAbortCheck(options && options.signal);
+    this._pirEntries.set(providerId, pirClone(entry));
+  }
+
+  async delete(providerId, options) {
+    pirAbortCheck(options && options.signal);
+    this._pirEntries.delete(providerId);
+  }
+}
+
+const PIR_SESSION_RESOURCE_CLEANUPS = new Set();
+
+export function registerSessionResourceCleanup(cleanup) {
+  PIR_SESSION_RESOURCE_CLEANUPS.add(cleanup);
+  return () => {
+    PIR_SESSION_RESOURCE_CLEANUPS.delete(cleanup);
+  };
+}
+
+export function cleanupSessionResources(sessionId) {
+  const errors = [];
+  for (const cleanup of PIR_SESSION_RESOURCE_CLEANUPS) {
+    try {
+      cleanup(sessionId);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length > 0) {
+    const message = "Failed to cleanup session resources";
+    if (typeof AggregateError === "function") throw new AggregateError(errors, message);
+    const error = new Error(message);
+    error.errors = errors;
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// models.ts: createProvider (real compositional dispatch) + createModels
+// (registry skeleton; provider execution is host-side)
+// ---------------------------------------------------------------------------
+
+function pirImageErrorResult(model, error, aborted) {
+  return {
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    output: [],
+    stopReason: aborted ? "aborted" : "error",
+    errorMessage: error instanceof Error ? error.message : String(error),
+    timestamp: Date.now(),
+  };
+}
+
+function pirClassifierErrorResult(model, error, aborted) {
+  return {
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    answers: {},
+    stopReason: aborted ? "aborted" : "error",
+    errorMessage: error instanceof Error ? error.message : String(error),
+    timestamp: Date.now(),
+  };
+}
+
+/** Builds a provider from parts (upstream createProvider). */
+export function createProvider(input) {
+  const single =
+    input.api && typeof input.api.stream === "function" ? input.api : undefined;
+  const byApi = single || !input.api ? undefined : input.api;
+  const images = input.images;
+  const classifiers = input.classifiers;
+  const streams = single ? [single] : Object.values(byApi ?? {}).filter((entry) => entry !== undefined);
+  const imageImplementations = Object.values(images ?? {}).filter((entry) => entry !== undefined);
+  const classifierImplementations = Object.values(classifiers ?? {}).filter((entry) => entry !== undefined);
+  if (streams.length === 0 && imageImplementations.length === 0 && classifierImplementations.length === 0) {
+    throw new Error('Provider ' + input.id + ': at least one of "api", "images", or "classifiers" is required.');
+  }
+
+  const baselineModels = input.models;
+  let dynamicModels = [];
+  const fetchModels = input.fetchModels;
+  const currentModels = () => {
+    const merged = [...baselineModels];
+    for (const model of dynamicModels) {
+      const index = merged.findIndex(
+        (entry) => getModelType(entry) === getModelType(model) && entry.id === model.id,
+      );
+      if (index >= 0) merged[index] = model;
+      else merged.push(model);
+    }
+    return merged;
+  };
+  const apiFor = (model) => single ?? (byApi ? byApi[model.api] : undefined);
+
+  const dispatch = (model, run) => {
+    const streams2 = apiFor(model);
+    if (!streams2) {
+      return lazyStream(model, async () => {
+        throw new ModelsError("stream", 'Provider ' + input.id + ' has no API implementation for "' + model.api + '"');
+      });
+    }
+    return run(streams2);
+  };
+
+  const provider = {
+    id: input.id,
+    name: input.name ?? input.id,
+    baseUrl: input.baseUrl,
+    headers: input.headers,
+    auth: input.auth,
+    getModels: () => currentModels().filter((model) => isModelType(model, "chat")),
+    getAllModels: currentModels,
+    refreshModels: fetchModels
+      ? async (context) => {
+          if (context.stored) {
+            const restored = context.stored.models
+              .filter((model) => model.provider === input.id)
+              .map((model) => model);
+            if (
+              !(await context.publish({
+                update: () => {
+                  dynamicModels = restored;
+                },
+              }))
+            ) {
+              return;
+            }
+          }
+          if (!context.allowNetwork || context.signal.aborted) return;
+          const fetched = await fetchModels(context);
+          if (context.signal.aborted) return;
+          const refreshed = fetched.filter((model) => model && typeof model === "object");
+          await context.publish({
+            persist: { models: refreshed, checkedAt: Date.now() },
+            update: () => {
+              dynamicModels = refreshed;
+            },
+          });
+        }
+      : undefined,
+    filterModels: input.filterModels,
+    filterAllModels: input.filterAllModels,
+    stream: (model, context, options) => dispatch(model, (streams2) => streams2.stream(model, context, options)),
+    streamSimple: (model, context, options) =>
+      dispatch(model, (streams2) => streams2.streamSimple(model, context, options)),
+  };
+
+  if (streams.some((entry) => entry.fetchDeferred !== undefined)) {
+    provider.fetchDeferred = (model, handle, options) =>
+      lazyStream(model, async () => {
+        const implementation = apiFor(model);
+        if (!implementation || !implementation.fetchDeferred) {
+          throw new ModelsError(
+            "provider",
+            'Provider ' + input.id + ' does not support deferred responses for "' + model.api + '"',
+          );
+        }
+        return implementation.fetchDeferred(model, handle, options);
+      });
+  }
+  if (streams.some((entry) => entry.cancelDeferred !== undefined)) {
+    provider.cancelDeferred = async (model, handle, options) => {
+      const implementation = apiFor(model);
+      if (!implementation || !implementation.cancelDeferred) {
+        throw new ModelsError(
+          "provider",
+          'Provider ' + input.id + ' cannot cancel deferred responses for "' + model.api + '"',
+        );
+      }
+      await implementation.cancelDeferred(model, handle, options);
+    };
+  }
+  if (images && imageImplementations.length > 0) {
+    provider.generateImages = async (model, context, options) => {
+      const implementation = images[model.api];
+      if (!implementation) {
+        return pirImageErrorResult(
+          model,
+          new ModelsError("provider", 'Provider ' + input.id + ' has no image generation implementation for "' + model.api + '"'),
+        );
+      }
+      return implementation.generateImages(model, context, options);
+    };
+  }
+  if (classifiers && classifierImplementations.length > 0) {
+    provider.classify = async (model, context, options) => {
+      const implementation = classifiers[model.api];
+      if (!implementation) {
+        return pirClassifierErrorResult(
+          model,
+          new ModelsError("provider", 'Provider ' + input.id + ' has no classifier implementation for "' + model.api + '"'),
+        );
+      }
+      return implementation.classify(model, context, options);
+    };
+  }
+
+  return provider;
+}
+
+// `createModels` (like the whole provider/auth execution pipeline) is
+// host-side in the pir extension runtime: registry reads are real, execution
+// and auth faces throw one clear error per call.
+class PirModelsImpl {
+  constructor(options) {
+    this._pirOptions = options ?? {};
+    this._credentialStore = (options && options.credentials) ?? new InMemoryCredentialStore();
+    this._modelsStore = (options && options.modelsStore) ?? new InMemoryModelsStore();
+    this._authContext = (options && options.authContext) ?? defaultProviderAuthContext();
+    this._providers = new Map();
+  }
+
+  getProviders() {
+    return [...this._providers.values()];
+  }
+
+  getProvider(id) {
+    return this._providers.get(id);
+  }
+
+  setProvider(provider) {
+    if (!provider || typeof provider !== "object" || typeof provider.id !== "string") {
+      throw new TypeError("setProvider requires a Provider with a string id");
+    }
+    this._providers.set(provider.id, provider);
+  }
+
+  deleteProvider(id) {
+    this._providers.delete(id);
+  }
+
+  clearProviders() {
+    this._providers.clear();
+  }
+
+  _pirSelectedProviders(provider) {
+    if (provider === undefined) return [...this._providers.values()];
+    const single = this._providers.get(provider);
+    return single ? [single] : [];
+  }
+
+  getModels(provider) {
+    const out = [];
+    for (const entry of this._pirSelectedProviders(provider)) {
+      try {
+        out.push(...(entry.getModels() ?? []));
+      } catch {
+        // Best-effort: a provider whose getModels() throws yields no models.
+      }
+    }
+    return out;
+  }
+
+  getModel(provider, id) {
+    return this.getModels(provider).find((model) => model.id === id);
+  }
+
+  getModelsOfType(type, provider) {
+    const out = [];
+    for (const entry of this._pirSelectedProviders(provider)) {
+      let models;
+      try {
+        models = entry.getAllModels ? entry.getAllModels() : entry.getModels();
+      } catch {
+        continue;
+      }
+      for (const model of models ?? []) {
+        if (getModelType(model) === type) out.push(model);
+      }
+    }
+    return out;
+  }
+
+  getModelOfType(type, provider, id) {
+    return this.getModelsOfType(type, provider).find((model) => model.id === id);
+  }
+
+  getAllModels(provider) {
+    const out = [];
+    for (const entry of this._pirSelectedProviders(provider)) {
+      try {
+        out.push(...((entry.getAllModels ? entry.getAllModels() : entry.getModels()) ?? []));
+      } catch {
+        // Best-effort read.
+      }
+    }
+    return out;
+  }
+
+  refresh() { pirProviderUnavailable("Models.refresh"); }
+
+  checkAuth() { pirProviderUnavailable("Models.checkAuth"); }
+
+  getAvailable() { pirProviderUnavailable("Models.getAvailable"); }
+
+  getAvailableOfType() { pirProviderUnavailable("Models.getAvailableOfType"); }
+
+  getAllAvailable() { pirProviderUnavailable("Models.getAllAvailable"); }
+
+  getAuth() { pirProviderUnavailable("Models.getAuth"); }
+
+  login() { pirProviderUnavailable("Models.login"); }
+
+  logout() { pirProviderUnavailable("Models.logout"); }
+
+  stream() { pirProviderUnavailable("Models.stream"); }
+
+  complete() { pirProviderUnavailable("Models.complete"); }
+
+  streamSimple() { pirProviderUnavailable("Models.streamSimple"); }
+
+  completeSimple() { pirProviderUnavailable("Models.completeSimple"); }
+
+  streamDeferred() { pirProviderUnavailable("Models.streamDeferred"); }
+
+  fetchDeferred() { pirProviderUnavailable("Models.fetchDeferred"); }
+
+  cancelDeferred() { pirProviderUnavailable("Models.cancelDeferred"); }
+
+  generateImages() { pirProviderUnavailable("Models.generateImages"); }
+
+  classify() { pirProviderUnavailable("Models.classify"); }
+}
+
+export function createModels(options) {
+  return new PirModelsImpl(options);
+}
+
+// ---------------------------------------------------------------------------
+// utils/validation.ts (backed by the host JSON-Schema subset validator)
+// ---------------------------------------------------------------------------
+
+function pirSchemaValidate(schema, value) {
+  if (typeof globalThis.__pir_schemaValidate === "function") {
+    return globalThis.__pir_schemaValidate(schema, value);
+  }
+  // No validator prelude (standalone module use): accept rather than fake a failure.
+  return { valid: true, errors: [] };
+}
+
+function pirSubSchemaValid(schema, value) {
+  try {
+    return pirSchemaValidate(schema, value).valid;
+  } catch {
+    return true;
+  }
+}
+
+function pirNormalizeOptionalNulls(value, schema) {
+  if (Array.isArray(value)) {
+    if (Array.isArray(schema.items)) {
+      for (let index = 0; index < value.length; index++) {
+        const itemSchema = schema.items[index];
+        if (itemSchema) pirNormalizeOptionalNulls(value[index], itemSchema);
+      }
+    } else if (schema.items) {
+      for (const item of value) pirNormalizeOptionalNulls(item, schema.items);
+    }
+    return;
+  }
+  if (typeof value !== "object" || value === null || !schema.properties) return;
+
+  const object = value;
+  const required = new Set(schema.required ?? []);
+  for (const [key, propertySchema] of Object.entries(schema.properties)) {
+    if (!(key in object)) continue;
+    if (
+      object[key] === null &&
+      !required.has(key) &&
+      typeof propertySchema.$ref !== "string" &&
+      pirSubSchemaValid(propertySchema, null) === false
+    ) {
+      delete object[key];
+    } else {
+      pirNormalizeOptionalNulls(object[key], propertySchema);
+    }
+  }
+}
+
+function pirFormatValidationPath(error) {
+  const path = String(error.path || "").replace(/^\//, "").replace(/\//g, ".").replace(/^\./, "");
+  return path || "root";
+}
+
+/** Validates tool call arguments against the tool's (JSON) schema. */
+export function validateToolArguments(tool, toolCall) {
+  const args = pirClone(toolCall.arguments);
+  const schema = tool && tool.parameters && typeof tool.parameters === "object" ? tool.parameters : {};
+  if (args !== null && typeof args === "object") {
+    pirNormalizeOptionalNulls(args, schema);
+  }
+
+  const check = pirSchemaValidate(schema, args);
+  if (check.valid) return args;
+
+  const errors =
+    check.errors.map((error) => "  - " + pirFormatValidationPath(error) + ": " + error.message).join("\n") ||
+    "Unknown validation error";
+
+  throw new Error(
+    'Validation failed for tool "' +
+      toolCall.name +
+      '":\n' +
+      errors +
+      "\n\nReceived arguments:\n" +
+      JSON.stringify(toolCall.arguments, null, 2),
+  );
+}
+
+/** Finds a tool by name and validates the tool call arguments against its schema. */
+export function validateToolCall(tools, toolCall) {
+  const tool = (tools ?? []).find((entry) => entry.name === toolCall.name);
+  if (!tool) {
+    throw new Error('Tool "' + toolCall.name + '" not found');
+  }
+  return validateToolArguments(tool, toolCall);
+}
+
+// ---------------------------------------------------------------------------
+// utils/assistant-message-frame.ts
+// ---------------------------------------------------------------------------
+
+function pirCloneTextContent(content) {
+  return {
+    type: "text",
+    text: content.text,
+    ...(content.textSignature === undefined ? {} : { textSignature: content.textSignature }),
+  };
+}
+
+function pirCloneThinkingContent(content) {
+  return {
+    type: "thinking",
+    thinking: content.thinking,
+    ...(content.thinkingSignature === undefined ? {} : { thinkingSignature: content.thinkingSignature }),
+    ...(content.redacted === undefined ? {} : { redacted: content.redacted }),
+  };
+}
+
+function pirCloneToolCall(toolCall) {
+  return {
+    type: "toolCall",
+    id: toolCall.id,
+    name: toolCall.name,
+    arguments: pirClone(toolCall.arguments),
+    ...(toolCall.thoughtSignature === undefined ? {} : { thoughtSignature: toolCall.thoughtSignature }),
+    ...(toolCall.namespace === undefined ? {} : { namespace: toolCall.namespace }),
+  };
+}
+
+function pirCloneStartMessage(message) {
+  return {
+    role: "assistant",
+    content: [],
+    api: message.api,
+    provider: message.provider,
+    model: message.model,
+    ...(message.responseModel === undefined ? {} : { responseModel: message.responseModel }),
+    ...(message.responseId === undefined ? {} : { responseId: message.responseId }),
+    ...(message.providerThinkingLevel === undefined
+      ? {}
+      : { providerThinkingLevel: message.providerThinkingLevel }),
+    ...(message.diagnostics === undefined ? {} : { diagnostics: pirClone(message.diagnostics) }),
+    usage: pirClone(message.usage),
+    stopReason: "pending",
+    timestamp: message.timestamp,
+  };
+}
+
+function pirAssertContentIndex(contentIndex) {
+  if (!Number.isSafeInteger(contentIndex) || contentIndex < 0) {
+    throw new Error("Invalid assistant message frame contentIndex: " + contentIndex);
+  }
+}
+
+function pirEventBlock(event) {
+  pirAssertContentIndex(event.contentIndex);
+  const block = event.partial.content[event.contentIndex];
+  if (!block) {
+    throw new Error(event.type + " event has no content block at index " + event.contentIndex);
+  }
+  return block;
+}
+
+function pirSerializedArguments(argumentsValue) {
+  const serialized = JSON.stringify(argumentsValue);
+  if (serialized === undefined) throw new Error("Tool-call arguments are not JSON-serializable");
+  return serialized;
+}
+
+const PIR_EMPTY_PARSED_TOOL_ARGUMENTS = pirSerializedArguments(parseStreamingJson(""));
+
+function pirIsJsonPrefix(snapshot, current) {
+  if (typeof snapshot === "string") return typeof current === "string" && current.startsWith(snapshot);
+  if (Array.isArray(snapshot)) {
+    return (
+      Array.isArray(current) &&
+      snapshot.length <= current.length &&
+      snapshot.every((value, index) => pirIsJsonPrefix(value, current[index]))
+    );
+  }
+  if (typeof snapshot !== "object" || snapshot === null) return Object.is(snapshot, current);
+  if (typeof current !== "object" || current === null || Array.isArray(current)) return false;
+  return Object.entries(snapshot).every(
+    ([key, value]) => pirHasOwn(current, key) && pirIsJsonPrefix(value, current[key]),
+  );
+}
+
+/** Encodes one assistant stream into compact, replayable frames. */
+export class AssistantMessageFrameEncoder {
+  constructor() {
+    this._pirStarted = false;
+    this._pirTerminal = false;
+    this._pirBlocks = new Map();
+  }
+
+  encode(event) {
+    if (this._pirTerminal) {
+      throw new Error("Assistant message event " + event.type + " follows a terminal event");
+    }
+
+    switch (event.type) {
+      case "start":
+        if (this._pirStarted) throw new Error("Assistant message stream contains more than one start event");
+        this._pirStarted = true;
+        return { type: "start", partial: pirCloneStartMessage(event.partial) };
+      case "done":
+        if (!this._pirStarted) throw new Error("Assistant message done event appears before start");
+        this._pirTerminal = true;
+        return undefined;
+      case "error":
+        this._pirTerminal = true;
+        return undefined;
+    }
+
+    if (!this._pirStarted) throw new Error("Assistant message " + event.type + " event appears before start");
+
+    switch (event.type) {
+      case "text_start": {
+        const content = pirEventBlock(event);
+        if (content.type !== "text") {
+          throw new Error("text_start event points to " + content.type + " block at index " + event.contentIndex);
+        }
+        this._pirStartBlock(event.contentIndex, {
+          kind: "text",
+          coveredChars: content.text.length,
+          deltaChars: 0,
+        });
+        return { type: "text_start", contentIndex: event.contentIndex, content: pirCloneTextContent(content) };
+      }
+      case "text_delta":
+        return this._pirEncodeTextDelta(event.contentIndex, event.delta, "text");
+      case "text_end": {
+        const content = pirEventBlock(event);
+        if (content.type !== "text") {
+          throw new Error("text_end event points to " + content.type + " block at index " + event.contentIndex);
+        }
+        this._pirEndBlock(event.contentIndex, "text");
+        return {
+          type: "text_end",
+          contentIndex: event.contentIndex,
+          content: event.content,
+          ...(content.textSignature === undefined ? {} : { textSignature: content.textSignature }),
+        };
+      }
+      case "thinking_start": {
+        const content = pirEventBlock(event);
+        if (content.type !== "thinking") {
+          throw new Error(
+            "thinking_start event points to " + content.type + " block at index " + event.contentIndex,
+          );
+        }
+        this._pirStartBlock(event.contentIndex, {
+          kind: "thinking",
+          coveredChars: content.thinking.length,
+          deltaChars: 0,
+        });
+        return {
+          type: "thinking_start",
+          contentIndex: event.contentIndex,
+          content: pirCloneThinkingContent(content),
+        };
+      }
+      case "thinking_delta":
+        return this._pirEncodeTextDelta(event.contentIndex, event.delta, "thinking");
+      case "thinking_end": {
+        const content = pirEventBlock(event);
+        if (content.type !== "thinking") {
+          throw new Error("thinking_end event points to " + content.type + " block at index " + event.contentIndex);
+        }
+        this._pirEndBlock(event.contentIndex, "thinking");
+        return {
+          type: "thinking_end",
+          contentIndex: event.contentIndex,
+          content: event.content,
+          ...(content.thinkingSignature === undefined ? {} : { thinkingSignature: content.thinkingSignature }),
+          ...(content.redacted === undefined ? {} : { redacted: content.redacted }),
+        };
+      }
+      case "toolcall_start": {
+        const content = pirEventBlock(event);
+        if (content.type !== "toolCall") {
+          throw new Error(
+            "toolcall_start event points to " + content.type + " block at index " + event.contentIndex,
+          );
+        }
+        const snapshotArguments = pirSerializedArguments(content.arguments);
+        const caughtUp = snapshotArguments === PIR_EMPTY_PARSED_TOOL_ARGUMENTS;
+        this._pirStartBlock(event.contentIndex, {
+          kind: "toolCall",
+          caughtUp,
+          catchupJson: "",
+          snapshotArguments: caughtUp ? "" : snapshotArguments,
+        });
+        return { type: "toolcall_start", contentIndex: event.contentIndex, toolCall: pirCloneToolCall(content) };
+      }
+      case "toolcall_delta": {
+        const state = this._pirBlock(event.contentIndex, "toolCall");
+        if (state.kind !== "toolCall") throw new Error("Unreachable tool-call encoder state");
+        if (state.caughtUp) {
+          return event.delta.length === 0
+            ? undefined
+            : { type: "toolcall_delta", contentIndex: event.contentIndex, delta: event.delta };
+        }
+        state.catchupJson += event.delta;
+        const argumentsValue = parseStreamingJson(state.catchupJson);
+        if (pirSerializedArguments(argumentsValue) !== state.snapshotArguments) {
+          const snapshotArguments = parseStreamingJson(state.snapshotArguments);
+          if (!pirIsJsonPrefix(snapshotArguments, argumentsValue)) return undefined;
+        }
+        state.caughtUp = true;
+        state.snapshotArguments = "";
+        const json = state.catchupJson;
+        state.catchupJson = "";
+        return json.length === 0
+          ? undefined
+          : { type: "toolcall_checkpoint", contentIndex: event.contentIndex, json };
+      }
+      case "toolcall_end": {
+        const content = pirEventBlock(event);
+        if (content.type !== "toolCall") {
+          throw new Error("toolcall_end event points to " + content.type + " block at index " + event.contentIndex);
+        }
+        if (!event.toolCall || event.toolCall.type !== "toolCall") {
+          throw new Error("toolcall_end event has invalid tool call at index " + event.contentIndex);
+        }
+        this._pirEndBlock(event.contentIndex, "toolCall");
+        return {
+          type: "toolcall_end",
+          contentIndex: event.contentIndex,
+          id: event.toolCall.id,
+          name: event.toolCall.name,
+          arguments: pirClone(event.toolCall.arguments),
+          ...(event.toolCall.thoughtSignature === undefined
+            ? {}
+            : { thoughtSignature: event.toolCall.thoughtSignature }),
+          ...(event.toolCall.namespace === undefined ? {} : { namespace: event.toolCall.namespace }),
+        };
+      }
+    }
+  }
+
+  _pirStartBlock(contentIndex, state) {
+    pirAssertContentIndex(contentIndex);
+    if (this._pirBlocks.has(contentIndex)) {
+      throw new Error("Assistant message block " + contentIndex + " starts more than once");
+    }
+    this._pirBlocks.set(contentIndex, state);
+  }
+
+  _pirBlock(contentIndex, kind) {
+    pirAssertContentIndex(contentIndex);
+    const state = this._pirBlocks.get(contentIndex);
+    if (state === undefined) throw new Error("Assistant message " + kind + " block " + contentIndex + " has not started");
+    if (state.kind !== kind) {
+      throw new Error("Assistant message block " + contentIndex + " is " + state.kind + ", not " + kind);
+    }
+    return state;
+  }
+
+  _pirEndBlock(contentIndex, kind) {
+    this._pirBlock(contentIndex, kind);
+    this._pirBlocks.delete(contentIndex);
+  }
+
+  _pirEncodeTextDelta(contentIndex, delta, kind) {
+    const state = this._pirBlock(contentIndex, kind);
+    if (state.kind === "toolCall") throw new Error("Unreachable text encoder state");
+    const deltaStart = state.deltaChars;
+    state.deltaChars += delta.length;
+    const covered = Math.max(0, state.coveredChars - deltaStart);
+    if (covered >= delta.length) return undefined;
+    const uncovered = covered === 0 ? delta : delta.slice(covered);
+    return kind === "text"
+      ? { type: "text_delta", contentIndex, delta: uncovered }
+      : { type: "thinking_delta", contentIndex, delta: uncovered };
+  }
+}
+
+function pirAppendBlock(message, states, contentIndex, block, state) {
+  pirAssertContentIndex(contentIndex);
+  if (contentIndex !== message.content.length) {
+    const reason = contentIndex < message.content.length ? "already exists" : "would leave a gap";
+    throw new Error("Cannot start assistant message block at index " + contentIndex + ": " + reason);
+  }
+  message.content.push(pirClone(block));
+  states.set(contentIndex, state);
+}
+
+function pirActiveBlock(message, states, contentIndex, expectedKind, frameType) {
+  pirAssertContentIndex(contentIndex);
+  const state = states.get(contentIndex);
+  const block = message.content[contentIndex];
+  if (!state || !block) {
+    throw new Error(frameType + " frame has no started block at index " + contentIndex);
+  }
+  if (state.kind !== expectedKind || block.type !== expectedKind) {
+    throw new Error(
+      frameType + " frame expected " + expectedKind + " block at index " + contentIndex + ", found " + block.type,
+    );
+  }
+  if (state.ended) {
+    throw new Error(frameType + " frame follows the end of block at index " + contentIndex);
+  }
+  return { block, state };
+}
+
+/** Replay compact frames without mutating them. Returns `undefined` when there is no start frame. */
+export function reduceAssistantMessageFrames(frames) {
+  let message;
+  let frameBeforeStart;
+  const states = new Map();
+
+  for (const frame of frames) {
+    if (frame.type === "start") {
+      if (message) throw new Error("Assistant message frame sequence contains more than one start frame");
+      if (frameBeforeStart !== undefined) {
+        throw new Error(frameBeforeStart + " frame appears before the start frame");
+      }
+      message = pirClone(frame.partial);
+      continue;
+    }
+    if (!message) {
+      if (frameBeforeStart === undefined) frameBeforeStart = frame.type;
+      continue;
+    }
+
+    switch (frame.type) {
+      case "text_start":
+        if (frame.content.type !== "text") {
+          throw new Error("text_start frame contains " + frame.content.type + " content");
+        }
+        pirAppendBlock(message, states, frame.contentIndex, frame.content, { kind: "text", ended: false });
+        break;
+      case "text_delta": {
+        const { block } = pirActiveBlock(message, states, frame.contentIndex, "text", frame.type);
+        if (block.type !== "text") throw new Error("Unreachable text frame state");
+        block.text += frame.delta;
+        break;
+      }
+      case "text_end": {
+        const { block, state } = pirActiveBlock(message, states, frame.contentIndex, "text", frame.type);
+        if (block.type !== "text") throw new Error("Unreachable text frame state");
+        block.text = frame.content;
+        delete block.textSignature;
+        if (frame.textSignature !== undefined) block.textSignature = frame.textSignature;
+        state.ended = true;
+        break;
+      }
+      case "thinking_start":
+        if (frame.content.type !== "thinking") {
+          throw new Error("thinking_start frame contains " + frame.content.type + " content");
+        }
+        pirAppendBlock(message, states, frame.contentIndex, frame.content, { kind: "thinking", ended: false });
+        break;
+      case "thinking_delta": {
+        const { block } = pirActiveBlock(message, states, frame.contentIndex, "thinking", frame.type);
+        if (block.type !== "thinking") throw new Error("Unreachable thinking frame state");
+        block.thinking += frame.delta;
+        break;
+      }
+      case "thinking_end": {
+        const { block, state } = pirActiveBlock(message, states, frame.contentIndex, "thinking", frame.type);
+        if (block.type !== "thinking") throw new Error("Unreachable thinking frame state");
+        block.thinking = frame.content;
+        delete block.thinkingSignature;
+        delete block.redacted;
+        if (frame.thinkingSignature !== undefined) block.thinkingSignature = frame.thinkingSignature;
+        if (frame.redacted !== undefined) block.redacted = frame.redacted;
+        state.ended = true;
+        break;
+      }
+      case "toolcall_start":
+        if (frame.toolCall.type !== "toolCall") {
+          throw new Error("toolcall_start frame contains " + frame.toolCall.type + " content");
+        }
+        pirAppendBlock(message, states, frame.contentIndex, frame.toolCall, {
+          kind: "toolCall",
+          ended: false,
+          json: "",
+        });
+        break;
+      case "toolcall_checkpoint": {
+        const { block, state } = pirActiveBlock(message, states, frame.contentIndex, "toolCall", frame.type);
+        if (block.type !== "toolCall" || state.kind !== "toolCall") {
+          throw new Error("Unreachable tool-call checkpoint state");
+        }
+        state.json = frame.json;
+        block.arguments = parseStreamingJson(frame.json);
+        break;
+      }
+      case "toolcall_delta": {
+        const { block, state } = pirActiveBlock(message, states, frame.contentIndex, "toolCall", frame.type);
+        if (block.type !== "toolCall" || state.kind !== "toolCall") {
+          throw new Error("Unreachable tool-call frame state");
+        }
+        state.json += frame.delta;
+        break;
+      }
+      case "toolcall_end": {
+        const { block, state } = pirActiveBlock(message, states, frame.contentIndex, "toolCall", frame.type);
+        if (block.type !== "toolCall") throw new Error("Unreachable tool-call frame state");
+        block.id = frame.id;
+        block.name = frame.name;
+        block.arguments = pirClone(frame.arguments);
+        delete block.thoughtSignature;
+        delete block.namespace;
+        if (frame.thoughtSignature !== undefined) block.thoughtSignature = frame.thoughtSignature;
+        if (frame.namespace !== undefined) block.namespace = frame.namespace;
+        state.ended = true;
+        break;
+      }
+    }
+  }
+
+  if (!message) return undefined;
+  for (const [contentIndex, state] of states) {
+    if (state.kind !== "toolCall" || state.ended || state.json.length === 0) continue;
+    const block = message.content[contentIndex];
+    if (!block || block.type !== "toolCall") throw new Error("Unreachable tool-call frame state");
+    block.arguments = parseStreamingJson(state.json);
+  }
+
+  return message;
+}
+
+// ---------------------------------------------------------------------------
+// providers/faux.ts (scripted test double; never touches the network)
+// ---------------------------------------------------------------------------
+
+const PIR_FAUX_DEFAULT_API = "faux";
+const PIR_FAUX_DEFAULT_PROVIDER = "faux";
+const PIR_FAUX_DEFAULT_MODEL_ID = "faux-1";
+const PIR_FAUX_DEFAULT_MODEL_NAME = "Faux Model";
+const PIR_FAUX_DEFAULT_BASE_URL = "http://localhost:0";
+const PIR_FAUX_DEFAULT_MIN_TOKEN_SIZE = 3;
+const PIR_FAUX_DEFAULT_MAX_TOKEN_SIZE = 5;
+
+const PIR_FAUX_DEFAULT_USAGE = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+export function fauxText(text) {
+  return { type: "text", text };
+}
+
+export function fauxThinking(thinking) {
+  return { type: "thinking", thinking };
+}
+
+function pirFauxRandomId(prefix) {
+  return prefix + ":" + Date.now() + ":" + Math.random().toString(36).slice(2);
+}
+
+export function fauxToolCall(name, arguments_, options = {}) {
+  return {
+    type: "toolCall",
+    id: options.id ?? pirFauxRandomId("tool"),
+    name,
+    arguments: arguments_,
+  };
+}
+
+function pirNormalizeFauxAssistantContent(content) {
+  if (typeof content === "string") return [fauxText(content)];
+  return Array.isArray(content) ? content : [content];
+}
+
+export function fauxAssistantMessage(content, options = {}) {
+  return {
+    role: "assistant",
+    content: pirNormalizeFauxAssistantContent(content),
+    api: PIR_FAUX_DEFAULT_API,
+    provider: PIR_FAUX_DEFAULT_PROVIDER,
+    model: PIR_FAUX_DEFAULT_MODEL_ID,
+    usage: PIR_FAUX_DEFAULT_USAGE,
+    stopReason: options.stopReason ?? "stop",
+    ...(options.deferred === undefined ? {} : { deferred: options.deferred }),
+    ...(options.errorMessage === undefined ? {} : { errorMessage: options.errorMessage }),
+    ...(options.responseId === undefined ? {} : { responseId: options.responseId }),
+    timestamp: options.timestamp ?? Date.now(),
+  };
+}
+
+function pirFauxEstimateTokens(text) {
+  return Math.ceil(text.length / 4);
+}
+
+function pirFauxContentToText(content) {
+  if (typeof content === "string") return content;
+  return content
+    .map((block) => {
+      if (block.type === "text") return block.text;
+      return "[image:" + block.mimeType + ":" + block.data.length + "]";
+    })
+    .join("\n");
+}
+
+function pirFauxAssistantContentToText(content) {
+  return content
+    .map((block) => {
+      if (block.type === "text") return block.text;
+      if (block.type === "thinking") return block.thinking;
+      return block.name + ":" + JSON.stringify(block.arguments);
+    })
+    .join("\n");
+}
+
+function pirFauxToolResultToText(message) {
+  return [message.toolName, ...message.content.map((block) => pirFauxContentToText([block]))].join("\n");
+}
+
+function pirFauxMessageToText(message) {
+  if (message.role === "system") {
+    return [
+      getSystemMessageText(message),
+      ...((message.toolsRemoved || []).map((tool) => "tool-:" + JSON.stringify(tool))),
+      ...((message.toolsAdded || []).map((tool) => "tool+:" + JSON.stringify(tool))),
+    ]
+      .filter((part) => part.length > 0)
+      .join("\n");
+  }
+  if (message.role === "user") return pirFauxContentToText(message.content);
+  if (message.role === "assistant") return pirFauxAssistantContentToText(message.content);
+  return pirFauxToolResultToText(message);
+}
+
+function pirFauxJoinedLength(messages, count) {
+  const n = count === undefined ? messages.length : count;
+  let length = n > 0 ? (n - 1) * 2 : 0;
+  for (let index = 0; index < n; index++) length += messages[index].length;
+  return length;
+}
+
+function pirFauxCommonPrefixLength(a, b) {
+  const length = Math.min(a.length, b.length);
+  let index = 0;
+  while (index < length && a[index] === b[index]) index++;
+  return index;
+}
+
+function pirFauxCommonPromptPrefixLength(previous, current) {
+  let index = 0;
+  while (index < previous.length && index < current.length && previous[index] === current[index]) index++;
+  const rest = (messages) =>
+    index === messages.length ? "" : (index > 0 ? "\n\n" : "") + messages.slice(index).join("\n\n");
+  return pirFauxJoinedLength(previous, index) + pirFauxCommonPrefixLength(rest(previous), rest(current));
+}
+
+function pirFauxWithUsageEstimate(message, context, options, promptCache) {
+  const prompt = context.messages.map((entry) => entry.role + ":" + pirFauxMessageToText(entry));
+  const promptLength = pirFauxJoinedLength(prompt);
+  const promptTokens = Math.ceil(promptLength / 4);
+  const outputTokens = pirFauxEstimateTokens(pirFauxAssistantContentToText(message.content));
+  let input = promptTokens;
+  let cacheRead = 0;
+  let cacheWrite = 0;
+  const sessionId = options ? options.sessionId : undefined;
+
+  if (sessionId && (!options || options.cacheRetention !== "none")) {
+    const previousPrompt = promptCache.get(sessionId);
+    if (previousPrompt) {
+      const cachedChars = pirFauxCommonPromptPrefixLength(previousPrompt, prompt);
+      cacheRead = Math.ceil(cachedChars / 4);
+      cacheWrite = Math.ceil((promptLength - cachedChars) / 4);
+      input = Math.max(0, promptTokens - cacheRead);
+    } else {
+      cacheWrite = promptTokens;
+    }
+    promptCache.set(sessionId, prompt);
+  }
+
+  return {
+    ...message,
+    usage: {
+      input,
+      output: outputTokens,
+      cacheRead,
+      cacheWrite,
+      totalTokens: input + outputTokens + cacheRead + cacheWrite,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+  };
+}
+
+function pirFauxSplitStringByTokenSize(text, minTokenSize, maxTokenSize) {
+  const chunks = [];
+  let index = 0;
+  while (index < text.length) {
+    const tokenSize = minTokenSize + Math.floor(Math.random() * (maxTokenSize - minTokenSize + 1));
+    const charSize = Math.max(1, tokenSize * 4);
+    chunks.push(text.slice(index, index + charSize));
+    index += charSize;
+  }
+  return chunks.length > 0 ? chunks : [""];
+}
+
+function pirFauxCloneMessage(message, api, provider, modelId) {
+  const cloned = pirClone(message);
+  return {
+    ...cloned,
+    api,
+    provider,
+    model: modelId,
+    timestamp: cloned.timestamp ?? Date.now(),
+    usage: cloned.usage ?? PIR_FAUX_DEFAULT_USAGE,
+  };
+}
+
+function pirFauxCreateDeferredMessage(model, handle) {
+  return {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: PIR_FAUX_DEFAULT_USAGE,
+    stopReason: "deferred",
+    deferred: handle,
+    timestamp: Date.now(),
+  };
+}
+
+function pirFauxCreateErrorMessage(error, api, provider, modelId) {
+  return {
+    role: "assistant",
+    content: [],
+    api,
+    provider,
+    model: modelId,
+    usage: PIR_FAUX_DEFAULT_USAGE,
+    stopReason: "error",
+    errorMessage: error instanceof Error ? error.message : String(error),
+    timestamp: Date.now(),
+  };
+}
+
+function pirFauxCreateAbortedMessage(partial) {
+  return {
+    ...partial,
+    stopReason: "aborted",
+    errorMessage: "Request was aborted",
+    timestamp: Date.now(),
+  };
+}
+
+function pirFauxScheduleChunk(chunk, tokensPerSecond) {
+  if (!tokensPerSecond || tokensPerSecond <= 0) {
+    return new Promise((resolve) => pirMicrotask(resolve));
+  }
+  const delayMs = (pirFauxEstimateTokens(chunk) / tokensPerSecond) * 1000;
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function pirFauxStreamWithDeltas(stream, message, minTokenSize, maxTokenSize, tokensPerSecond, signal) {
+  const partial = { ...message, content: [], stopReason: "pending" };
+  if (signal && signal.aborted) {
+    const aborted = pirFauxCreateAbortedMessage(partial);
+    stream.push({ type: "error", reason: "aborted", error: aborted });
+    stream.end(aborted);
+    return;
+  }
+
+  stream.push({ type: "start", partial: { ...partial } });
+
+  for (let index = 0; index < message.content.length; index++) {
+    if (signal && signal.aborted) {
+      const aborted = pirFauxCreateAbortedMessage(partial);
+      stream.push({ type: "error", reason: "aborted", error: aborted });
+      stream.end(aborted);
+      return;
+    }
+
+    const block = message.content[index];
+
+    if (block.type === "thinking") {
+      partial.content = [...partial.content, { type: "thinking", thinking: "" }];
+      stream.push({ type: "thinking_start", contentIndex: index, partial: { ...partial } });
+      for (const chunk of pirFauxSplitStringByTokenSize(block.thinking, minTokenSize, maxTokenSize)) {
+        await pirFauxScheduleChunk(chunk, tokensPerSecond);
+        if (signal && signal.aborted) {
+          const aborted = pirFauxCreateAbortedMessage(partial);
+          stream.push({ type: "error", reason: "aborted", error: aborted });
+          stream.end(aborted);
+          return;
+        }
+        partial.content[index].thinking += chunk;
+        stream.push({ type: "thinking_delta", contentIndex: index, delta: chunk, partial: { ...partial } });
+      }
+      stream.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: { ...partial } });
+      continue;
+    }
+
+    if (block.type === "text") {
+      partial.content = [...partial.content, { type: "text", text: "" }];
+      stream.push({ type: "text_start", contentIndex: index, partial: { ...partial } });
+      for (const chunk of pirFauxSplitStringByTokenSize(block.text, minTokenSize, maxTokenSize)) {
+        await pirFauxScheduleChunk(chunk, tokensPerSecond);
+        if (signal && signal.aborted) {
+          const aborted = pirFauxCreateAbortedMessage(partial);
+          stream.push({ type: "error", reason: "aborted", error: aborted });
+          stream.end(aborted);
+          return;
+        }
+        partial.content[index].text += chunk;
+        stream.push({ type: "text_delta", contentIndex: index, delta: chunk, partial: { ...partial } });
+      }
+      stream.push({ type: "text_end", contentIndex: index, content: block.text, partial: { ...partial } });
+      continue;
+    }
+
+    partial.content = [...partial.content, { type: "toolCall", id: block.id, name: block.name, arguments: {} }];
+    stream.push({ type: "toolcall_start", contentIndex: index, partial: { ...partial } });
+    for (const chunk of pirFauxSplitStringByTokenSize(JSON.stringify(block.arguments), minTokenSize, maxTokenSize)) {
+      await pirFauxScheduleChunk(chunk, tokensPerSecond);
+      if (signal && signal.aborted) {
+        const aborted = pirFauxCreateAbortedMessage(partial);
+        stream.push({ type: "error", reason: "aborted", error: aborted });
+        stream.end(aborted);
+        return;
+      }
+      stream.push({ type: "toolcall_delta", contentIndex: index, delta: chunk, partial: { ...partial } });
+    }
+    partial.content[index].arguments = block.arguments;
+    stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: { ...partial } });
+  }
+
+  if (message.stopReason === "pending") {
+    throw new Error("Faux response ended without a stop reason");
+  }
+  if (message.stopReason === "error" || message.stopReason === "aborted") {
+    stream.push({ type: "error", reason: message.stopReason, error: message });
+    stream.end(message);
+    return;
+  }
+
+  stream.push({ type: "done", reason: message.stopReason, message });
+  stream.end(message);
+}
+
+/** Scripted in-memory provider core (upstream createFauxCore). */
+export function createFauxCore(options) {
+  const api = options.api ?? pirFauxRandomId(PIR_FAUX_DEFAULT_API);
+  const provider = options.provider ?? PIR_FAUX_DEFAULT_PROVIDER;
+  const minTokenSize = Math.max(
+    1,
+    Math.min(options.tokenSize?.min ?? PIR_FAUX_DEFAULT_MIN_TOKEN_SIZE, options.tokenSize?.max ?? PIR_FAUX_DEFAULT_MAX_TOKEN_SIZE),
+  );
+  const maxTokenSize = Math.max(minTokenSize, options.tokenSize?.max ?? PIR_FAUX_DEFAULT_MAX_TOKEN_SIZE);
+  let pendingResponses = [];
+  const tokensPerSecond = options.tokensPerSecond;
+  const state = { callCount: 0, deferredFetchCount: 0, cancelledDeferred: [] };
+  const promptCache = new Map();
+  const deferredResponses = new Map();
+
+  const modelDefinitions = options.models && options.models.length
+    ? options.models
+    : [
+        {
+          id: PIR_FAUX_DEFAULT_MODEL_ID,
+          name: PIR_FAUX_DEFAULT_MODEL_NAME,
+          reasoning: false,
+          input: ["text", "image"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 128000,
+          maxTokens: 16384,
+        },
+      ];
+  const models = modelDefinitions.map((definition) => ({
+    id: definition.id,
+    name: definition.name ?? definition.id,
+    api,
+    provider,
+    baseUrl: PIR_FAUX_DEFAULT_BASE_URL,
+    reasoning: definition.reasoning ?? false,
+    input: definition.input ?? ["text", "image"],
+    inputLimits: definition.inputLimits,
+    cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: definition.contextWindow ?? 128000,
+    maxTokens: definition.maxTokens ?? 16384,
+  }));
+
+  const resolveResponse = async (step, context, streamOptions, requestModel) => {
+    const resolved = typeof step === "function" ? await step(context, streamOptions, state, requestModel) : step;
+    return pirFauxWithUsageEstimate(
+      pirFauxCloneMessage(resolved, api, provider, requestModel.id),
+      context,
+      streamOptions,
+      promptCache,
+    );
+  };
+
+  const stream = (requestModel, context, streamOptions) => {
+    const outer = createAssistantMessageEventStream();
+    const step = pendingResponses.shift();
+    state.callCount++;
+
+    pirMicrotask(async () => {
+      try {
+        await streamOptions?.onResponse?.({ status: 200, headers: {} }, requestModel);
+        if (!step) {
+          let message = pirFauxCreateErrorMessage(
+            new Error("No more faux responses queued"),
+            api,
+            provider,
+            requestModel.id,
+          );
+          message = pirFauxWithUsageEstimate(message, context, streamOptions, promptCache);
+          outer.push({ type: "error", reason: "error", error: message });
+          outer.end(message);
+          return;
+        }
+
+        if (streamOptions && streamOptions.deferred) {
+          const handle = {
+            provider: requestModel.provider,
+            modelId: requestModel.id,
+            api: requestModel.api,
+            id: pirFauxRandomId("deferred"),
+            ...(options.deferred?.pollAfterMs !== undefined ? { pollAfterMs: options.deferred.pollAfterMs } : {}),
+          };
+          deferredResponses.set(handle.id, {
+            handle,
+            step,
+            context,
+            options: streamOptions,
+            model: requestModel,
+            pendingFetches: Math.max(0, Math.floor(options.deferred?.pendingFetches ?? 0)),
+            cancelled: false,
+          });
+          await pirFauxStreamWithDeltas(
+            outer,
+            pirFauxCreateDeferredMessage(requestModel, handle),
+            minTokenSize,
+            maxTokenSize,
+            tokensPerSecond,
+            streamOptions.signal,
+          );
+          return;
+        }
+
+        const message = await resolveResponse(step, context, streamOptions, requestModel);
+        await pirFauxStreamWithDeltas(outer, message, minTokenSize, maxTokenSize, tokensPerSecond, streamOptions?.signal);
+      } catch (error) {
+        const message = pirFauxCreateErrorMessage(error, api, provider, requestModel.id);
+        outer.push({ type: "error", reason: "error", error: message });
+        outer.end(message);
+      }
+    });
+
+    return outer;
+  };
+
+  const streamSimple = (streamModel, context, streamOptions) => stream(streamModel, context, streamOptions);
+
+  const fetchDeferred = (requestModel, handle, fetchOptions) => {
+    const outer = createAssistantMessageEventStream();
+    state.deferredFetchCount++;
+
+    pirMicrotask(async () => {
+      try {
+        await fetchOptions?.onResponse?.({ status: 200, headers: {} }, requestModel);
+        const entry = deferredResponses.get(handle.id);
+        if (
+          !entry ||
+          entry.handle.provider !== handle.provider ||
+          entry.handle.modelId !== handle.modelId ||
+          entry.handle.api !== handle.api
+        ) {
+          throw new Error("Unknown faux deferred response: " + handle.id);
+        }
+        if (entry.cancelled) throw new Error("Faux deferred response was cancelled: " + handle.id);
+
+        if (entry.pendingFetches > 0) {
+          entry.pendingFetches--;
+          await pirFauxStreamWithDeltas(
+            outer,
+            pirFauxCreateDeferredMessage(requestModel, entry.handle),
+            minTokenSize,
+            maxTokenSize,
+            tokensPerSecond,
+            fetchOptions?.signal,
+          );
+          return;
+        }
+
+        if (!entry.final) {
+          const { deferred: _deferred, signal: _submissionSignal, onResponse: _submissionOnResponse, ...submissionOptions } =
+            entry.options ?? {};
+          try {
+            entry.final = await resolveResponse(entry.step, entry.context, submissionOptions, entry.model);
+          } catch (error) {
+            entry.final = pirFauxCreateErrorMessage(error, api, provider, entry.model.id);
+          }
+        }
+        await pirFauxStreamWithDeltas(
+          outer,
+          entry.final,
+          minTokenSize,
+          maxTokenSize,
+          tokensPerSecond,
+          fetchOptions?.signal,
+        );
+      } catch (error) {
+        const message = pirFauxCreateErrorMessage(error, api, provider, requestModel.id);
+        outer.push({ type: "error", reason: "error", error: message });
+        outer.end(message);
+      }
+    });
+
+    return outer;
+  };
+
+  const cancelDeferred = async (requestModel, handle, cancelOptions) => {
+    state.cancelledDeferred.push(pirClone(handle));
+    const entry = deferredResponses.get(handle.id);
+    if (entry) entry.cancelled = true;
+    await cancelOptions?.onResponse?.({ status: 200, headers: {} }, requestModel);
+  };
+
+  const getModel = (requestedModelId) => {
+    if (!requestedModelId) return models[0];
+    return models.find((candidate) => candidate.id === requestedModelId);
+  };
+
+  return {
+    api,
+    provider,
+    models,
+    stream,
+    streamSimple,
+    fetchDeferred,
+    cancelDeferred,
+    getModel,
+    state,
+    setResponses(responses) {
+      pendingResponses = [...responses];
+    },
+    appendResponses(responses) {
+      pendingResponses.push(...responses);
+    },
+    getPendingResponseCount() {
+      return pendingResponses.length;
+    },
+  };
+}
+
+/** Faux provider for tests built on explicit `Models` collections. */
+export function fauxProvider(options = {}) {
+  const core = createFauxCore(options);
+  const provider = createProvider({
+    id: core.provider,
+    auth: { apiKey: { name: "Faux", resolve: async () => ({ auth: {} }) } },
+    models: core.models,
+    api: {
+      stream: core.stream,
+      streamSimple: core.streamSimple,
+      fetchDeferred: core.fetchDeferred,
+      cancelDeferred: core.cancelDeferred,
+    },
+  });
+  return {
+    provider,
+    api: core.api,
+    models: core.models,
+    getModel: core.getModel,
+    state: core.state,
+    setResponses: core.setResponses,
+    appendResponses: core.appendResponses,
+    getPendingResponseCount: core.getPendingResponseCount,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// compat.ts surface (`@earendil-works/pi-ai/compat` maps to this module)
+//
+// Ported in two tiers:
+// - real: the API-provider registry bookkeeping, the env-key discovery
+//   helpers (pure data + process.env reads), `complete`/`completeSimple`
+//   (trivial stream-drains), and the legacy per-API stream aliases (which
+//   dispatch through the same registry);
+// - throws: everything that would run provider network execution or needs
+//   the generated model/image catalogs — those are host-side in pir.
+// ---------------------------------------------------------------------------
+
+export const ANTHROPIC_AUTH_TOKEN_ENV = "ANTHROPIC_AUTH_TOKEN";
+export const ANTHROPIC_OAUTH_TOKEN_ENV = "ANTHROPIC_OAUTH_TOKEN";
+export const ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY";
+export const ANTHROPIC_FEDERATION_RULE_ID_ENV = "ANTHROPIC_FEDERATION_RULE_ID";
+export const ANTHROPIC_ORGANIZATION_ID_ENV = "ANTHROPIC_ORGANIZATION_ID";
+export const ANTHROPIC_SERVICE_ACCOUNT_ID_ENV = "ANTHROPIC_SERVICE_ACCOUNT_ID";
+export const ANTHROPIC_IDENTITY_TOKEN_FILE_ENV = "ANTHROPIC_IDENTITY_TOKEN_FILE";
+export const ANTHROPIC_WORKSPACE_ID_ENV = "ANTHROPIC_WORKSPACE_ID";
+
+// env-api-keys.ts: provider -> the single env var carrying its API key
+// (anthropic is special-cased: multiple candidates in discovery order).
+function pirApiKeyEnvVars(provider) {
+  if (provider === "anthropic") {
+    return [ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_OAUTH_TOKEN_ENV, ANTHROPIC_API_KEY_ENV];
+  }
+  const envMap = {
+    "ant-ling": "ANT_LING_API_KEY",
+    "qwen-token-plan": "QWEN_TOKEN_PLAN_API_KEY",
+    "qwen-token-plan-cn": "QWEN_TOKEN_PLAN_CN_API_KEY",
+    "qwen-token-plan-individual": "QWEN_TOKEN_PLAN_API_KEY",
+    openai: "OPENAI_API_KEY",
+    azure: "AZURE_OPENAI_API_KEY",
+    nvidia: "NVIDIA_API_KEY",
+    deepseek: "DEEPSEEK_API_KEY",
+    google: "GEMINI_API_KEY",
+    "google-vertex": "GOOGLE_CLOUD_API_KEY",
+    groq: "GROQ_API_KEY",
+    cerebras: "CEREBRAS_API_KEY",
+    xai: "XAI_API_KEY",
+    typesafe: "TYPESAFE_API_KEY",
+    radius: "RADIUS_API_KEY",
+    openrouter: "OPENROUTER_API_KEY",
+    "vercel-ai-gateway": "AI_GATEWAY_API_KEY",
+    zai: "ZAI_API_KEY",
+    "zai-coding-cn": "ZAI_CODING_CN_API_KEY",
+    mistral: "MISTRAL_API_KEY",
+    minimax: "MINIMAX_API_KEY",
+    "minimax-cn": "MINIMAX_CN_API_KEY",
+    moonshotai: "MOONSHOT_API_KEY",
+    "moonshotai-cn": "MOONSHOT_API_KEY",
+    huggingface: "HF_TOKEN",
+    fireworks: "FIREWORKS_API_KEY",
+    together: "TOGETHER_API_KEY",
+    baseten: "BASETEN_API_KEY",
+    opencode: "OPENCODE_API_KEY",
+    "opencode-go": "OPENCODE_API_KEY",
+    "kimi-coding": "KIMI_API_KEY",
+    meta: "META_API_KEY",
+    "cloudflare-workers-ai": "CLOUDFLARE_API_KEY",
+    "cloudflare-ai-gateway": "CLOUDFLARE_API_KEY",
+    xiaomi: "XIAOMI_API_KEY",
+    "xiaomi-token-plan-cn": "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+    "xiaomi-token-plan-ams": "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+    "xiaomi-token-plan-sgp": "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+  };
+  const envVar = envMap[provider];
+  return envVar ? [envVar] : undefined;
+}
+
+// utils/provider-env.ts: scoped overrides first, then process.env (the Bun
+// /proc/self/environ fallback is not applicable in this runtime).
+export function getProviderEnvValue(name, env) {
+  if (env && env[name]) return env[name];
+  if (typeof process !== "undefined" && process.env && process.env[name]) return process.env[name];
+  return undefined;
+}
+
+export function findEnvKeys(provider, env) {
+  const envVars = pirApiKeyEnvVars(provider);
+  if (!envVars) return undefined;
+  const found = envVars.filter((envVar) => !!getProviderEnvValue(envVar, env));
+  return found.length > 0 ? found : undefined;
+}
+
+// Real for the env-var path; the ambient credential probes (Vertex ADC files,
+// Bedrock instance profiles) need fs/os host access upstream and are skipped —
+// those providers report no env key here.
+export function getEnvApiKey(provider, env) {
+  const envKeys = findEnvKeys(provider, env);
+  if (envKeys && envKeys[0]) {
+    const apiKeyEnv = provider === "anthropic"
+      ? envKeys.find((key) => key !== ANTHROPIC_AUTH_TOKEN_ENV)
+      : envKeys[0];
+    if (apiKeyEnv) return getProviderEnvValue(apiKeyEnv, env);
+  }
+  return undefined;
+}
+
+// --- API provider registry (compat.ts bookkeeping, real) --------------------
+
+const pirApiProviderRegistry = new Map();
+
+// Upstream wraps the stream functions with an api-mismatch guard; kept.
+function pirWrapApiEntry(entry, sourceId) {
+  return {
+    api: entry.api,
+    sourceId: sourceId,
+    stream: (model, context, options) => {
+      if (model && model.api !== entry.api) {
+        throw new Error("Mismatched api: " + model.api + " expected " + entry.api);
+      }
+      return entry.stream(model, context, options);
+    },
+    streamSimple: (model, context, options) => {
+      if (model && model.api !== entry.api) {
+        throw new Error("Mismatched api: " + model.api + " expected " + entry.api);
+      }
+      return entry.streamSimple(model, context, options);
+    },
+  };
+}
+
+export function registerApiProvider(provider, sourceId) {
+  if (!provider || typeof provider.api !== "string" || typeof provider.stream !== "function" || typeof provider.streamSimple !== "function") {
+    throw new TypeError('An API provider requires string "api" plus "stream" and "streamSimple" implementations');
+  }
+  pirApiProviderRegistry.set(provider.api, pirWrapApiEntry(provider, sourceId));
+}
+
+export function getApiProvider(api) {
+  const entry = pirApiProviderRegistry.get(api);
+  return entry === undefined ? undefined : { api: entry.api, stream: entry.stream, streamSimple: entry.streamSimple };
+}
+
+export function getApiProviders() {
+  return Array.from(pirApiProviderRegistry.values(), (entry) => ({
+    api: entry.api,
+    stream: entry.stream,
+    streamSimple: entry.streamSimple,
+  }));
+}
+
+export function unregisterApiProviders(sourceId) {
+  for (const [api, entry] of pirApiProviderRegistry) {
+    if (entry.sourceId === sourceId) pirApiProviderRegistry.delete(api);
+  }
+}
+
+export function registerBuiltInApiProviders() {
+  // Upstream eagerly registers the ten builtin provider implementations; in
+  // pir those execute through the host model runtime, so nothing registers
+  // here and dispatch falls through to a clear error.
+}
+
+export function resetApiProviders() {
+  pirApiProviderRegistry.clear();
+}
+
+export function registerFauxProvider(options) {
+  const core = createFauxCore(options || {});
+  const sourceId = "faux-provider-" + Math.random().toString(36).slice(2, 10);
+  registerApiProvider({ api: core.api, stream: core.stream, streamSimple: core.streamSimple }, sourceId);
+  return {
+    api: core.api,
+    models: core.models,
+    getModel: core.getModel,
+    state: core.state,
+    setResponses: core.setResponses,
+    appendResponses: core.appendResponses,
+    getPendingResponseCount: core.getPendingResponseCount,
+    unregister() {
+      unregisterApiProviders(sourceId);
+    },
+  };
+}
+
+function pirRequireApiProvider(model, method) {
+  const api = model && model.api;
+  const entry = pirApiProviderRegistry.get(api);
+  if (!entry) {
+    throw new ModelsError(method, 'No API provider registered for "' + api + '" in the pir extension runtime');
+  }
+  return entry;
+}
+
+export function stream(model, context, options) {
+  return pirRequireApiProvider(model, "stream").stream(model, context, options);
+}
+
+export function streamSimple(model, context, options) {
+  return pirRequireApiProvider(model, "streamSimple").streamSimple(model, context, options);
+}
+
+export async function complete(model, context, options) {
+  const s = stream(model, context, options);
+  return s.result();
+}
+
+export async function completeSimple(model, context, options) {
+  const s = streamSimple(model, context, options);
+  return s.result();
+}
+
+// --- legacy per-API stream aliases (legacy-api-aliases.ts) -------------------
+// Same registry dispatch as the generic stream/streamSimple; each alias pins
+// the api id like the upstream generated aliases do.
+
+function pirLegacyAlias(api, method) {
+  return (model, context, options) => {
+    if (model && model.api !== api) {
+      throw new Error("Mismatched api: " + model.api + " expected " + api);
+    }
+    return pirRequireApiProvider(model, method)[method](model, context, options);
+  };
+}
+
+export const streamAnthropic = pirLegacyAlias("anthropic-messages", "stream");
+export const streamSimpleAnthropic = pirLegacyAlias("anthropic-messages", "streamSimple");
+export const streamAzureOpenAIResponses = pirLegacyAlias("azure-openai-responses", "stream");
+export const streamSimpleAzureOpenAIResponses = pirLegacyAlias("azure-openai-responses", "streamSimple");
+export const streamGoogle = pirLegacyAlias("google-generative-ai", "stream");
+export const streamSimpleGoogle = pirLegacyAlias("google-generative-ai", "streamSimple");
+export const streamGoogleVertex = pirLegacyAlias("google-vertex", "stream");
+export const streamSimpleGoogleVertex = pirLegacyAlias("google-vertex", "streamSimple");
+export const streamMistral = pirLegacyAlias("mistral-conversations", "stream");
+export const streamSimpleMistral = pirLegacyAlias("mistral-conversations", "streamSimple");
+export const streamOpenAICodexResponses = pirLegacyAlias("openai-codex-responses", "stream");
+export const streamSimpleOpenAICodexResponses = pirLegacyAlias("openai-codex-responses", "streamSimple");
+export const streamOpenAICompletions = pirLegacyAlias("openai-completions", "stream");
+export const streamSimpleOpenAICompletions = pirLegacyAlias("openai-completions", "streamSimple");
+export const streamOpenAIResponses = pirLegacyAlias("openai-responses", "stream");
+export const streamSimpleOpenAIResponses = pirLegacyAlias("openai-responses", "streamSimple");
+
+// The upstream lazy api factories (`anthropicMessagesApi()` etc.) hand out
+// the raw builtin implementations; those are host-side here.
+function pirApiFactoryUnavailable(name) {
+  return function () {
+    throw new Error(name + "() is not available in the pir extension runtime (provider execution is host-side)");
+  };
+}
+
+export const anthropicMessagesApi = pirApiFactoryUnavailable("anthropicMessagesApi");
+export const azureOpenAIResponsesApi = pirApiFactoryUnavailable("azureOpenAIResponsesApi");
+export const bedrockConverseStreamApi = pirApiFactoryUnavailable("bedrockConverseStreamApi");
+export const googleGenerativeAIApi = pirApiFactoryUnavailable("googleGenerativeAIApi");
+export const googleVertexApi = pirApiFactoryUnavailable("googleVertexApi");
+export const mistralConversationsApi = pirApiFactoryUnavailable("mistralConversationsApi");
+export const openAICodexResponsesApi = pirApiFactoryUnavailable("openAICodexResponsesApi");
+export const openAICompletionsApi = pirApiFactoryUnavailable("openAICompletionsApi");
+export const openAIResponsesApi = pirApiFactoryUnavailable("openAIResponsesApi");
+export const piMessagesApi = pirApiFactoryUnavailable("piMessagesApi");
+
+// --- builtin model/image catalogs (generated upstream; not shipped here) ----
+
+function pirCatalogUnavailable(name) {
+  return function () {
+    throw new Error(name + " is not available in the pir extension runtime (the builtin model catalog is host-side)");
+  };
+}
+
+export const getModel = pirCatalogUnavailable("getModel");
+export const getModels = pirCatalogUnavailable("getModels");
+export const getProviders = pirCatalogUnavailable("getProviders");
+
+// --- images (images.ts / image-models.ts / images-api-registry.ts) ----------
+
+const pirImagesApiRegistry = new Map();
+
+export function registerImagesApiProvider(provider) {
+  if (!provider || typeof provider.api !== "string" || typeof provider.generateImages !== "function") {
+    throw new TypeError('An images API provider requires string "api" and a "generateImages" implementation');
+  }
+  pirImagesApiRegistry.set(provider.api, provider);
+}
+
+export function getImagesApiProvider(api) {
+  return pirImagesApiRegistry.get(api);
+}
+
+export function registerBuiltInImagesApiProviders() {
+  // Builtin image providers execute host-side; nothing to register (see
+  // registerBuiltInApiProviders).
+}
+
+export const getImageModel = pirCatalogUnavailable("getImageModel");
+export const getImageModels = pirCatalogUnavailable("getImageModels");
+export const getImageProviders = pirCatalogUnavailable("getImageProviders");
+
+export function generateImages(model, prompt, options) {
+  const provider = pirImagesApiRegistry.get(model && model.api);
+  if (!provider) {
+    throw new Error('generateImages: no images API provider registered for "' + (model && model.api) + '" in the pir extension runtime');
+  }
+  return provider.generateImages(model, prompt, options);
+}
+
+export const generateImagesOpenRouter = generateImages;
+
+// bedrock lazy module injection (upstream compat setter); accepted and stored.
+let pirBedrockProviderModule = undefined;
+export function setBedrockProviderModule(module) {
+  pirBedrockProviderModule = module;
+}
+
+// Upstream `@earendil-works/pi-ai/bedrock-provider`: the Bedrock provider
+// module (stream/streamSimple) the CLI injects through the setter above.
+// Provider execution is host-side in pir, so both faces throw when called.
+export const bedrockProviderModule = {
+  stream: pirApiFactoryUnavailable("bedrockProviderModule.stream"),
+  streamSimple: pirApiFactoryUnavailable("bedrockProviderModule.streamSimple"),
+};
+
+// Upstream `@earendil-works/pi-ai/bun-oauth`: registers the OAuth flows a Bun
+// compiled binary embeds. pir resolves provider auth through the host, so
+// there is nothing to register; the call is a no-op returning void.
+export function registerBunOAuthFlows() {}
+
+// ---------------------------------------------------------------------------
+// Historical pir exports (phase before phase 4f)
+// ---------------------------------------------------------------------------
+
+export function StringEnum(values, opts) {
+  return { type: "string", enum: values, ...(opts ?? {}) };
+}
+
+export function uuidv7() {
+  const bytes = new Uint8Array(16);
+  const cryptoObj = globalThis.crypto;
+  if (cryptoObj && typeof cryptoObj.getRandomValues === "function") {
+    cryptoObj.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  const ts = Date.now();
+  bytes[0] = (ts / 2 ** 40) & 0xff;
+  bytes[1] = (ts / 2 ** 32) & 0xff;
+  bytes[2] = (ts / 2 ** 24) & 0xff;
+  bytes[3] = (ts / 2 ** 16) & 0xff;
+  bytes[4] = (ts / 2 ** 8) & 0xff;
+  bytes[5] = ts & 0xff;
+  bytes[6] = (bytes[6] & 0x0f) | 0x70;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+export default {
+  Type,
+  StringEnum,
+  uuidv7,
+  ANTHROPIC_API_KEY_ENV,
+  ANTHROPIC_AUTH_TOKEN_ENV,
+  ANTHROPIC_FEDERATION_RULE_ID_ENV,
+  ANTHROPIC_IDENTITY_TOKEN_FILE_ENV,
+  ANTHROPIC_OAUTH_TOKEN_ENV,
+  ANTHROPIC_ORGANIZATION_ID_ENV,
+  ANTHROPIC_SERVICE_ACCOUNT_ID_ENV,
+  ANTHROPIC_WORKSPACE_ID_ENV,
+  AssistantMessageEventStream,
+  AssistantMessageFrameEncoder,
+  DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
+  EventStream,
+  InMemoryCredentialStore,
+  InMemoryModelsStore,
+  ModelsError,
+  appendAssistantMessageDiagnostic,
+  calculateCost,
+  clampThinkingLevel,
+  cleanupSessionResources,
+  collapseSystemMessages,
+  complete,
+  completeSimple,
+  contentText,
+  findEnvKeys,
+  generateImages,
+  generateImagesOpenRouter,
+  getApiProvider,
+  getApiProviders,
+  getEnvApiKey,
+  getImageModel,
+  getImageModels,
+  getImageProviders,
+  getImagesApiProvider,
+  getModel,
+  getModels,
+  getProviderEnvValue,
+  getProviders,
+  registerApiProvider,
+  registerBuiltInApiProviders,
+  registerBuiltInImagesApiProviders,
+  registerFauxProvider,
+  registerImagesApiProvider,
+  resetApiProviders,
+  setBedrockProviderModule,
+  bedrockProviderModule,
+  registerBunOAuthFlows,
+  stream,
+  streamAnthropic,
+  streamAzureOpenAIResponses,
+  streamGoogle,
+  streamGoogleVertex,
+  streamMistral,
+  streamOpenAICompletions,
+  streamOpenAICodexResponses,
+  streamOpenAIResponses,
+  streamSimple,
+  streamSimpleAnthropic,
+  streamSimpleAzureOpenAIResponses,
+  streamSimpleGoogle,
+  streamSimpleGoogleVertex,
+  streamSimpleMistral,
+  streamSimpleOpenAICompletions,
+  streamSimpleOpenAICodexResponses,
+  streamSimpleOpenAIResponses,
+  createAssistantMessageDiagnostic,
+  createAssistantMessageEventStream,
+  createFauxCore,
+  createInitialSystemMessage,
+  createModels,
+  createProvider,
+  declarationsEqual,
+  defaultProviderAuthContext,
+  envApiKeyAuth,
+  extractDiagnosticError,
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxText,
+  fauxThinking,
+  fauxToolCall,
+  formatThrownValue,
+  getCurrentSystemMessage,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  getDeclaredTools,
+  getInitialSystemMessage,
+  getModelType,
+  getOverflowPatterns,
+  getSupportedThinkingLevels,
+  getSystemMessageText,
+  getToolStateChanges,
+  hasApi,
+  hasNonAdditiveToolChanges,
+  hasToolRedefinitions,
+  isContextOverflow,
+  isModelType,
+  isRecoverableLength,
+  isRetryableAssistantError,
+  lazyApi,
+  lazyOAuth,
+  lazyStream,
+  modelsAreEqual,
+  normalizeContext,
+  parseJsonWithRepair,
+  parseStreamingJson,
+  reduceAssistantMessageFrames,
+  registerSessionResourceCleanup,
+  renderSystemMessageUpdate,
+  repairJson,
+  resolveTranscript,
+  resolveTranscriptTools,
+  retryAssistantCall,
+  retryDelayMs,
+  toToolDeclaration,
+  unregisterApiProviders,
+  anthropicMessagesApi,
+  azureOpenAIResponsesApi,
+  bedrockConverseStreamApi,
+  googleGenerativeAIApi,
+  googleVertexApi,
+  mistralConversationsApi,
+  openAICodexResponsesApi,
+  openAICompletionsApi,
+  openAIResponsesApi,
+  piMessagesApi,
+  validateToolArguments,
+  validateToolCall,
+  withoutInitialSystemMessage,
+};

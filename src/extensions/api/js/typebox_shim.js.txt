@@ -1,0 +1,208 @@
+
+const OPTIONAL = "__pir_optional__";
+
+function applyFormat(schema, opts) {
+  // Upstream TypeBox copies every own option (constraints like minimum/
+  // maxLength as well as metadata like description/default).
+  if (opts && typeof opts === "object") {
+    for (const key of Object.keys(opts)) {
+      schema[key] = opts[key];
+    }
+  }
+  return schema;
+}
+
+function prim(type) {
+  return (opts) => applyFormat({ type }, opts);
+}
+
+function stripOptional(value) {
+  if (value && typeof value === "object" && OPTIONAL in value) {
+    const { [OPTIONAL]: _drop, ...rest } = value;
+    return rest;
+  }
+  return value;
+}
+
+// ─── default/clean walkers (chord 1.2.0 contract) ────────────────────────────
+//
+// Upstream typebox implements both operators by walking the *type*: `Default`
+// patches missing object properties from their `default` annotation (mutating
+// the value it is handed), `Clean` drops properties the type does not declare.
+// The pir shim previously returned `schema.default` for `Default` — which drops
+// the value itself — and cleaned only one level. `@earendil-works/chord`'s
+// `normalize()` is `Value.Clean(schema, Value.Default(schema, Value.Clone(input)))`,
+// so the old behavior rejected every contract input ("invalid/input: ...
+// expected object"). Both walkers now recurse through object properties and
+// array items; a level whose schema declares no `properties` is left alone.
+// Kept in sync with `typebox_value_shim.js.txt`.
+
+function cloneDefault(value) {
+  return value && typeof value === "object" ? JSON.parse(JSON.stringify(value)) : value;
+}
+
+function itemSchemas(schema) {
+  if (!schema || typeof schema !== "object") return undefined;
+  const items = schema.items;
+  if (Array.isArray(items)) return items;
+  return items && typeof items === "object" ? [items, undefined] : undefined;
+}
+
+function applyDefaults(schema, value) {
+  if (value === null || typeof value !== "object") return value;
+  const branches = schema && typeof schema === "object" && Array.isArray(schema.anyOf) ? schema.anyOf : undefined;
+  if (branches !== undefined) {
+    for (const branch of branches) {
+      // Fill defaults from the branch the value already satisfies.
+      if (branch && typeof branch === "object" && __pir_schemaValidate(branch, value).valid) {
+        return applyDefaults(branch, value);
+      }
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const items = itemSchemas(schema);
+    if (items === undefined) return value;
+    for (let index = 0; index < value.length; index++) {
+      value[index] = applyDefaults(items[index] !== undefined ? items[index] : items[0], value[index]);
+    }
+    return value;
+  }
+  const properties =
+    schema && typeof schema === "object" && schema.properties && typeof schema.properties === "object"
+      ? schema.properties
+      : undefined;
+  if (properties === undefined) return value;
+  for (const key of Object.keys(properties)) {
+    const property = properties[key];
+    if (property === null || typeof property !== "object") continue;
+    if (!(key in value)) {
+      if ("default" in property) value[key] = cloneDefault(property.default);
+      continue;
+    }
+    value[key] = applyDefaults(property, value[key]);
+  }
+  return value;
+}
+
+function cleanValue(schema, value) {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) {
+    const items = itemSchemas(schema);
+    if (items === undefined) return value;
+    return value.map((item, index) => cleanValue(items[index] !== undefined ? items[index] : items[0], item));
+  }
+  const properties =
+    schema && typeof schema === "object" && schema.properties && typeof schema.properties === "object"
+      ? schema.properties
+      : undefined;
+  if (properties === undefined) return value;
+  const out = {};
+  for (const key of Object.keys(value)) {
+    // `undefined` values are dropped with the property, as upstream does (the
+    // strict-JSON contract of the consumers this shim serves forbids them).
+    if (key in properties && value[key] !== undefined) out[key] = cleanValue(properties[key], value[key]);
+  }
+  return out;
+}
+
+/**
+ * Upstream `Type.Record(K, V)` is a keyed object whose key pattern comes from
+ * `K`: `Type.String()` -> `^(.*)$` (`^.*$` in the emitted schema), a numeric key
+ * schema -> the number pattern, a `pattern`/`const`/`enum` key -> its own
+ * pattern. The previous shim treated `V` as the *options* object, so
+ * `Type.Record(Type.String(), Type.Boolean())` came out as
+ * `{ type: "object", patternProperties: { type: "string" }, type: "boolean" }`
+ * — `applyFormat` copied the value schema's `type` over the object's, and every
+ * such record then validated as a boolean (chord's `flags` cells and its frame
+ * schema use `Type.Record`).
+ */
+function keyPattern(key) {
+  if (!key || typeof key !== "object") return undefined;
+  if (typeof key.pattern === "string") return key.pattern;
+  if (key.type === "string") return "^.*$";
+  if (key.type === "number" || key.type === "integer") return "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$";
+  if ("const" in key) return "^" + String(key.const).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$";
+  if (Array.isArray(key.enum)) {
+    const alternatives = key.enum.map((item) => String(item).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    return "^(?:" + alternatives.join("|") + ")$";
+  }
+  return undefined;
+}
+
+export const Type = {
+  String: prim("string"),
+  Number: prim("number"),
+  Integer: prim("integer"),
+  Boolean: prim("boolean"),
+  Null: prim("null"),
+  /** Upstream `Type.Void()` is `{ type: "void" }`; no value validates against it. */
+  Void: prim("void"),
+  Never: () => ({ not: {} }),
+  Unknown: () => ({}),
+  Any: () => ({}),
+  Unsafe: (schema) => schema,
+  Literal: (value, opts) => applyFormat({ const: value }, opts),
+  Enum: (values, opts) => applyFormat({ enum: values }, opts),
+  Union: (anyOf, opts) => applyFormat({ anyOf }, opts),
+  /** Upstream `Type.Intersect()` is `{ allOf: [...] }`. */
+  Intersect: (types, opts) => applyFormat({ allOf: types }, opts),
+  Optional: (schema) => ({ ...schema, [OPTIONAL]: true }),
+  Readonly: (schema) => schema,
+  /** Upstream `Type.Immutable()` is the identity over the schema (readonly `Type.Array` lists in chord's wire.ts). */
+  Immutable: (schema) => schema,
+  Array: (items, opts) => applyFormat({ type: "array", items }, opts),
+  /** Upstream `Type.Function()` carries parameters/returnType (`schema.ts` `fits`). */
+  Function: (parameters, returnType, opts) =>
+    applyFormat({ type: "function", parameters, returnType }, opts),
+  Record: (keySchema, valueSchema, opts) => {
+    const pattern = keyPattern(keySchema);
+    const schema =
+      pattern === undefined
+        ? { type: "object", additionalProperties: valueSchema === undefined ? true : valueSchema }
+        : { type: "object", patternProperties: { [pattern]: valueSchema } };
+    return applyFormat(schema, opts);
+  },
+  Object: (properties, opts) => {
+    const schema = { type: "object", properties: {}, required: [] };
+    for (const [key, value] of Object.entries(properties ?? {})) {
+      const stripped = stripOptional(value);
+      schema.properties[key] = stripped;
+      if (stripped === value) schema.required.push(key);
+    }
+    if (schema.required.length === 0) delete schema.required;
+    return applyFormat(schema, opts);
+  },
+};
+
+export function Compile(schema) {
+  return {
+    schema,
+    Code: () => (value) => __pir_schemaValidate(schema, value).valid,
+    Check: (value) => __pir_schemaValidate(schema, value).valid,
+    Errors: (value) => __pir_schemaValidate(schema, value).errors,
+    Decode: (value) => value,
+    Encode: (value) => value,
+  };
+}
+
+export const Value = {
+  Check: (schema, value) => __pir_schemaValidate(schema, value).valid,
+  Errors: (schema, value) => __pir_schemaValidate(schema, value).errors,
+  Parse: (schema, value) => {
+    const check = __pir_schemaValidate(schema, value);
+    if (!check.valid) {
+      const detail = check.errors.map((e) => `${e.path || "(root)"}: ${e.message}`).join("; ");
+      throw new Error(`Value does not match the schema: ${detail}`);
+    }
+    return value;
+  },
+  Convert: (schema, value) => value,
+  /** TypeBox semantics: patch missing properties from their `default` annotation. */
+  Default: (schema, value) => applyDefaults(schema, value),
+  Clone: (value) => (value && typeof value === "object" ? JSON.parse(JSON.stringify(value)) : value),
+  /** TypeBox semantics: drop properties the schema does not declare, recursively. */
+  Clean: (schema, value) => cleanValue(schema, value),
+};
+
+export default Type;

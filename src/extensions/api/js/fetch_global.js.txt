@@ -1,0 +1,653 @@
+
+// global fetch + Request / Response / Headers — the Web HTTP surface over the
+// `__pir_host.http` bridge (LLRT tier: fetch/Headers/Request/Response = real
+// for the common shape; see the documented limits below). Depends on the
+// globals installed by abort_global (AbortSignal) and web_streams
+// (ReadableStream), which are injected before this snippet.
+//
+// Data flow: `fetch` validates the URL, aggregates the request body (a plain
+// string body rides the text channel `bodyText`, every other init the byte
+// channel `bodyB64`), asks the host for a fetch id, then polls (`fetchPoll`)
+// until the response headers arrive; `Response.body` is a ReadableStream whose
+// `pull` drains one poll window per read and closes on the host `done` flag. `arrayBuffer()/text()/
+// json()` aggregate through the same reader. An aborted AbortSignal calls
+// `fetchAbort` (the host tears the request down via a CancellationToken) and
+// rejects with an `AbortError`-shaped Error.
+//
+// Documented limits vs the full fetch spec: no CORS/opaques responses, no
+// cache/integrity/keepalive options, request bodies cannot stream (they are
+// aggregated before send), no `Response.formData()`, and redirect handling is
+// the client's default (follow, up to 10). ES2020 only.
+
+(function () {
+  const STATUS_TEXT = {
+    100: "Continue", 101: "Switching Protocols", 102: "Processing",
+    200: "OK", 201: "Created", 202: "Accepted", 203: "Non-Authoritative Information",
+    204: "No Content", 205: "Reset Content", 206: "Partial Content",
+    300: "Multiple Choices", 301: "Moved Permanently", 302: "Found",
+    303: "See Other", 304: "Not Modified", 307: "Temporary Redirect", 308: "Permanent Redirect",
+    400: "Bad Request", 401: "Unauthorized", 402: "Payment Required", 403: "Forbidden",
+    404: "Not Found", 405: "Method Not Allowed", 406: "Not Acceptable",
+    408: "Request Timeout", 409: "Conflict", 410: "Gone", 411: "Length Required",
+    412: "Precondition Failed", 413: "Payload Too Large", 414: "URI Too Long",
+    415: "Unsupported Media Type", 416: "Range Not Satisfiable", 417: "Expectation Failed",
+    418: "I'm a teapot", 422: "Unprocessable Entity", 426: "Upgrade Required",
+    429: "Too Many Requests", 431: "Request Header Fields Too Large", 451: "Unavailable For Legal Reasons",
+    500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway",
+    503: "Service Unavailable", 504: "Gateway Timeout", 505: "HTTP Version Not Supported",
+  };
+
+  function pirAssertHttpUrl(input) {
+    const text = String(input);
+    const match = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//.exec(text);
+    if (!match) {
+      throw new TypeError("Failed to parse URL: not an absolute URL");
+    }
+    const scheme = match[1].toLowerCase();
+    if (scheme !== "http" && scheme !== "https") {
+      throw new TypeError(
+        "fetch is not supported by the pir extension runtime for scheme '" + scheme + ":' (http/https only)"
+      );
+    }
+    const rest = text.slice(match[0].length);
+    const hostEnd = rest.search(/[\/?#]/);
+    const host = hostEnd === -1 ? rest : rest.slice(0, hostEnd);
+    if (host.length === 0) {
+      throw new TypeError("Failed to parse URL: missing host");
+    }
+    if (/[\s]/.test(text)) {
+      throw new TypeError("Failed to parse URL: invalid characters");
+    }
+    return text;
+  }
+
+  function pirHeaderEntries(init) {
+    const entries = [];
+    if (!init) return entries;
+    if (init instanceof Headers) {
+      init.forEach(function (value, name) {
+        entries.push([name, value]);
+      });
+      return entries;
+    }
+    if (Array.isArray(init)) {
+      for (let i = 0; i < init.length; i++) {
+        const pair = init[i];
+        if (!Array.isArray(pair) || pair.length < 2) {
+          throw new TypeError("Header pairs must be [name, value] arrays");
+        }
+        entries.push([String(pair[0]), String(pair[1])]);
+      }
+      return entries;
+    }
+    if (typeof init === "object") {
+      for (const name of Object.keys(init)) {
+        entries.push([name, String(init[name])]);
+      }
+      return entries;
+    }
+    throw new TypeError("Headers constructor input must be a Headers object, an array of pairs, or a record");
+  }
+
+  class Headers {
+    constructor(init) {
+      this.__map = new Map(); // lowercase name -> array of values
+      const entries = pirHeaderEntries(init);
+      for (let i = 0; i < entries.length; i++) {
+        this.append(entries[i][0], entries[i][1]);
+      }
+    }
+    __normalize(name) {
+      const text = String(name).toLowerCase();
+      if (/[^!#$%&'*+.^_`|~0-9a-z-]/.test(text)) {
+        throw new TypeError("Invalid header name: '" + name + "'");
+      }
+      return text;
+    }
+    append(name, value) {
+      const key = this.__normalize(name);
+      const values = this.__map.get(key);
+      if (values) values.push(String(value));
+      else this.__map.set(key, [String(value)]);
+    }
+    set(name, value) {
+      this.__map.set(this.__normalize(name), [String(value)]);
+    }
+    has(name) {
+      return this.__map.has(this.__normalize(name));
+    }
+    get(name) {
+      const values = this.__map.get(this.__normalize(name));
+      return values ? values.join(", ") : null;
+    }
+    getSetCookie() {
+      const values = this.__map.get("set-cookie");
+      return values ? values.slice() : [];
+    }
+    delete(name) {
+      this.__map.delete(this.__normalize(name));
+    }
+    forEach(callback, thisArg) {
+      const entries = [];
+      this.__map.forEach(function (values, name) {
+        for (let i = 0; i < values.length; i++) entries.push([name, values[i]]);
+      });
+      for (let i = 0; i < entries.length; i++) {
+        callback.call(thisArg, entries[i][1], entries[i][0], this);
+      }
+    }
+    *entries() {
+      const collected = [];
+      this.__map.forEach(function (values, name) {
+        for (let i = 0; i < values.length; i++) collected.push([name, values[i]]);
+      });
+      for (let i = 0; i < collected.length; i++) yield collected[i];
+    }
+    *keys() {
+      const collected = [];
+      this.__map.forEach(function (_values, name) {
+        collected.push(name);
+      });
+      for (let i = 0; i < collected.length; i++) yield collected[i];
+    }
+    *values() {
+      const collected = [];
+      this.__map.forEach(function (values) {
+        for (let i = 0; i < values.length; i++) collected.push(values[i]);
+      });
+      for (let i = 0; i < collected.length; i++) yield collected[i];
+    }
+    [Symbol.iterator]() {
+      return this.entries();
+    }
+  }
+
+  // Body helpers -----------------------------------------------------------
+
+  function pirBodyToBytes(body) {
+    // Synchronous byte extraction for the request side (streams are handled
+    // by the async wrapper). Returns {bytes, promise} — exactly one side set.
+    if (body === undefined || body === null) return { bytes: null };
+    if (typeof body === "string") return { bytes: new TextEncoder().encode(body) };
+    if (body instanceof ReadableStream) return { promise: pirConsumeStream(body) };
+    if (typeof ArrayBuffer !== "undefined" && body instanceof ArrayBuffer) {
+      return { bytes: new Uint8Array(body.slice(0)) };
+    }
+    if (ArrayBuffer.isView(body)) {
+      return {
+        bytes: new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength)),
+      };
+    }
+    if (typeof URLSearchParams === "function" && body instanceof URLSearchParams) {
+      return { bytes: new TextEncoder().encode(body.toString()) };
+    }
+    if (typeof body.toString === "function") {
+      return { bytes: new TextEncoder().encode(String(body)) };
+    }
+    throw new TypeError("Unsupported request body type");
+  }
+
+  function pirConsumeStream(stream) {
+    // Aggregate a ReadableStream into one Uint8Array (the fetch
+    // arrayBuffer/text/json path).
+    return new Promise(function (resolve, reject) {
+      const reader = stream.getReader();
+      const chunks = [];
+      let total = 0;
+      const step = function () {
+        reader.read().then(function (result) {
+          if (result.done) {
+            const out = new Uint8Array(total);
+            let offset = 0;
+            for (let i = 0; i < chunks.length; i++) {
+              out.set(chunks[i], offset);
+              offset += chunks[i].length;
+            }
+            resolve(out);
+            return;
+          }
+          const value = result.value instanceof Uint8Array
+            ? result.value
+            : new TextEncoder().encode(String(result.value));
+          chunks.push(value);
+          total += value.length;
+          step();
+        }, reject);
+      };
+      step();
+    });
+  }
+
+  function pirBytesToStream(bytes) {
+    return new ReadableStream({
+      start: function (controller) {
+        if (bytes && bytes.length > 0) controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+  }
+
+  function pirB64ToBytes(b64) {
+    if (!b64) return new Uint8Array(0);
+    return Buffer.from(b64, "base64");
+  }
+
+  function pirBytesToB64(bytes) {
+    // Request bodies arrive as typed arrays (TextEncoder output, ArrayBuffer
+    // slices, the stream aggregation) and are read-only here: view the same
+    // bytes instead of paying a `Buffer.from` copy (fromView).
+    if (bytes instanceof Uint8Array) {
+      return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
+    }
+    return Buffer.from(bytes).toString("base64");
+  }
+
+  // Unpaired surrogate code unit anywhere in `text`.
+  function pirHasLoneSurrogate(text) {
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = text.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          i++; // a well-formed pair encodes as one character
+          continue;
+        }
+        return true;
+      }
+      if (code >= 0xdc00 && code <= 0xdfff) return true;
+    }
+    return false;
+  }
+
+  // A plain string body may ride the text channel (`bodyText`): the host takes
+  // it as the UTF-8 image of the body, skipping the base64 round trip. Only a
+  // string whose bytes are exactly its UTF-8 encoding qualifies — for a lone
+  // surrogate the byte path (TextEncoder) would write U+FFFD, while the JSON
+  // text channel would have JSON.stringify escape it and the host's payload
+  // parser reject the escape. Every other body init (typed arrays, streams,
+  // URLSearchParams, ...) keeps the byte channel unchanged.
+  function pirTextBody(body) {
+    if (typeof body !== "string") return null;
+    if (pirHasLoneSurrogate(body)) return null;
+    return body;
+  }
+
+  function pirAbortFailure(reason) {
+    const error = reason !== undefined && reason !== null
+      ? (reason instanceof Error ? reason : new Error(String(reason)))
+      : (globalThis.__pirAbortError ? globalThis.__pirAbortError() : new Error("This operation was aborted"));
+    if (!error.name) error.name = "AbortError";
+    return error;
+  }
+
+  // Request ----------------------------------------------------------------
+
+  class Request {
+    constructor(input, init) {
+      let url;
+      let baseMethod = "GET";
+      let baseHeaders = undefined;
+      let baseBody = undefined;
+      let baseSignal = undefined;
+      if (input instanceof Request) {
+        url = input.url;
+        baseMethod = input.method;
+        baseHeaders = input.headers;
+        baseBody = input.__bodyInit;
+        baseSignal = input.signal;
+      } else {
+        url = pirAssertHttpUrl(input);
+      }
+      init = init || {};
+      const method = String(init.method !== undefined ? init.method : baseMethod).toUpperCase();
+      this.url = url;
+      this.method = method;
+      this.headers = new Headers(init.headers !== undefined ? init.headers : baseHeaders);
+      this.signal = init.signal !== undefined ? init.signal : baseSignal;
+      this.destination = "";
+      this.referrer = "about:client";
+      this.referrerPolicy = "";
+      this.mode = "cors";
+      this.credentials = "same-origin";
+      this.cache = "default";
+      this.redirect = "follow";
+      this.integrity = "";
+      this.keepalive = false;
+      this.isReloadNavigation = false;
+      this.isHistoryNavigation = false;
+      const bodyInit = init.body !== undefined ? init.body : baseBody;
+      if (method === "GET" || method === "HEAD") {
+        if (bodyInit !== undefined && bodyInit !== null) {
+          throw new TypeError("Request with GET/HEAD method cannot have body");
+        }
+        this.__bodyInit = null;
+        this.body = null;
+      } else {
+        this.__bodyInit = bodyInit === undefined ? null : bodyInit;
+        const extracted = pirBodyToBytes(this.__bodyInit);
+        this.body = extracted.promise
+          ? null // streaming request body: materialized lazily (see pirFetch)
+          : (extracted.bytes === null ? null : pirBytesToStream(extracted.bytes));
+      }
+      this.bodyUsed = false;
+    }
+    clone() {
+      throw new TypeError("Request.clone is not supported by the pir extension runtime");
+    }
+    arrayBuffer() {
+      return pirBodyBytesOf(this).then(function (bytes) {
+        return bytes ? bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) : new ArrayBuffer(0);
+      });
+    }
+    text() {
+      return pirBodyBytesOf(this).then(function (bytes) {
+        return bytes ? new TextDecoder().decode(bytes) : "";
+      });
+    }
+    json() {
+      return this.text().then(function (text) {
+        return JSON.parse(text);
+      });
+    }
+  }
+
+  function pirBodyBytesOf(target) {
+    if (target.bodyUsed) return Promise.reject(new TypeError("Body is unusable: Body has already been read"));
+    target.bodyUsed = true;
+    if (!target.body) return Promise.resolve(null);
+    return pirConsumeStream(target.body);
+  }
+
+  // Response ---------------------------------------------------------------
+
+  class Response {
+    constructor(body, init) {
+      init = init || {};
+      const status = init.status === undefined || init.status === null ? 200 : Number(init.status);
+      if (!Number.isInteger(status) || status < 200 || status > 599) {
+        throw new RangeError("The status provided (" + init.status + ") is outside the range [200, 599].");
+      }
+      this.status = status;
+      this.statusText = init.statusText !== undefined ? String(init.statusText) : (STATUS_TEXT[status] || "");
+      this.headers = new Headers(init.headers);
+      this.ok = status >= 200 && status < 300;
+      this.redirected = false;
+      this.type = "basic";
+      this.url = "";
+      this.bodyUsed = false;
+      if (body === null || body === undefined) {
+        this.body = null;
+        this.__rawBody = null;
+      } else if (body instanceof ReadableStream) {
+        this.body = body;
+        this.__rawBody = null;
+      } else {
+        const extracted = pirBodyToBytes(body);
+        this.__rawBody = extracted.bytes;
+        this.body = extracted.bytes === null ? null : pirBytesToStream(extracted.bytes);
+      }
+    }
+    arrayBuffer() {
+      return pirBodyBytesOf(this).then(function (bytes) {
+        return bytes ? bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) : new ArrayBuffer(0);
+      });
+    }
+    text() {
+      return pirBodyBytesOf(this).then(function (bytes) {
+        return bytes ? new TextDecoder().decode(bytes) : "";
+      });
+    }
+    json() {
+      return this.text().then(function (text) {
+        return JSON.parse(text);
+      });
+    }
+    blob() {
+      // Minimal Blob: a plain value holder, not the platform Blob type.
+      return pirBodyBytesOf(this).then(function (bytes) {
+        const buffer = bytes
+          ? bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+          : new ArrayBuffer(0);
+        return {
+          size: bytes ? bytes.length : 0,
+          type: "",
+          arrayBuffer: function () {
+            return Promise.resolve(buffer);
+          },
+        };
+      });
+    }
+    static json(data, init) {
+      init = init || {};
+      const headers = new Headers(init.headers);
+      if (!headers.has("content-type")) headers.set("content-type", "application/json");
+      return new Response(JSON.stringify(data), {
+        status: init.status,
+        statusText: init.statusText,
+        headers: headers,
+      });
+    }
+    static error() {
+      const response = new Response(null, { status: 200 });
+      response.status = 0;
+      response.ok = false;
+      response.type = "error";
+      return response;
+    }
+    static redirect(url, status) {
+      if (status === undefined) status = 302;
+      if (status !== 301 && status !== 302 && status !== 303 && status !== 307 && status !== 308) {
+        throw new RangeError("Invalid redirect status code " + status);
+      }
+      const headers = new Headers();
+      headers.set("Location", String(url));
+      return new Response(null, { status: status, headers: headers });
+    }
+  }
+
+  // fetch ------------------------------------------------------------------
+
+  function pirHostValue(raw, op) {
+    const res = JSON.parse(raw);
+    if (!res || res.ok !== true) {
+      const error = new Error((res && res.message) || ("__pir_host.http failed: " + op));
+      if (res && res.code !== undefined) error.code = res.code;
+      throw error;
+    }
+    return res.value;
+  }
+
+  function pirFetchFailure(hostError) {
+    // Network-level failure: fetch rejects with TypeError("fetch failed"),
+    // the underlying cause carried as `.cause` (ES2020-safe assignment).
+    const error = new TypeError("fetch failed");
+    error.cause = hostError instanceof Error
+      ? hostError
+      : new Error((hostError && hostError.message) || "fetch failed");
+    if (hostError && hostError.code) error.code = hostError.code;
+    return error;
+  }
+
+  function pirTruncatedFailure() {
+    // The host's body window had to drop bytes (its defensive
+    // single-chunk-over-window case, reported as `truncated` on the wire).
+    // Loud on purpose: the reader must never hand the caller a silently short
+    // body ("bounded queues never silently drop user-facing data").
+    return new TypeError(
+      "fetch body window overflowed: the host dropped part of the response body " +
+      "(a single transport chunk exceeded the 8 MiB window)"
+    );
+  }
+
+  function pirPollOnce(id) {
+    const host = globalThis.__pir_host;
+    const raw = host.http("fetchPoll", JSON.stringify({ id: id, waitMs: 40 }));
+    return pirHostValue(raw, "fetchPoll");
+  }
+
+  function pirDelay(ms) {
+    return new Promise(function (resolve) {
+      globalThis.setTimeout(resolve, ms);
+    });
+  }
+
+  async function pirPollHeaders(id, signal, stash) {
+    for (;;) {
+      if (signal && signal.aborted) throw pirAbortFailure(signal.reason);
+      const state = pirPollOnce(id);
+      if (state.error) throw pirFetchFailure(state.error);
+      if (state.truncated) throw pirTruncatedFailure();
+      // The poll window is consume-once: keep any body bytes it carried so
+      // the body reader can serve them later.
+      if (state.body && stash) {
+        stash.push({ body: state.body, done: state.done, truncated: Boolean(state.truncated) });
+      }
+      if (state.ready) return state;
+      await pirDelay(10);
+    }
+  }
+
+  function pirMakeBodyReader(id, signal, stash) {
+    let doneSeen = false;
+    return new ReadableStream({
+      pull: function (controller) {
+        let state;
+        try {
+          if (stash.length > 0) {
+            // Bytes the header-poll loop drained while waiting: serve them
+            // before polling again (the host window is consume-once).
+            const stashed = stash.shift();
+            state = {
+              body: stashed.body,
+              done: stashed.done,
+              truncated: stashed.truncated,
+              aborted: false,
+              error: null,
+            };
+          } else {
+            state = pirPollOnce(id);
+          }
+        } catch (error) {
+          controller.error(pirFetchFailure(error));
+          return;
+        }
+        if (state.error) {
+          controller.error(pirFetchFailure(state.error));
+          return;
+        }
+        if (state.aborted) {
+          controller.error(pirAbortFailure(signal ? signal.reason : undefined));
+          return;
+        }
+        if (state.truncated) {
+          // The host dropped bytes of this response body: fail loudly instead
+          // of handing the consumer a silently short body.
+          controller.error(pirTruncatedFailure());
+          return;
+        }
+        const chunk = pirB64ToBytes(state.body);
+        if (chunk.length > 0) controller.enqueue(chunk);
+        if (state.done) doneSeen = true;
+        if (doneSeen && stash.length === 0) {
+          controller.close();
+          try {
+            globalThis.__pir_host.http("fetchEnd", JSON.stringify({ id: id }));
+          } catch (error) {}
+          return;
+        }
+        // Nothing to deliver and no terminal state: the host poll already
+        // waited its window slice, but that wait ran INSIDE the JS thread, so
+        // this pull must still hand control back to the host — `pirDelay(0)`
+        // suspends on the timer primitive, which lets the caller's tokio task
+        // yield and its driver turn. A pump that re-armed itself on microtasks
+        // only (the shape before this yield) kept the JS thread busy for as
+        // long as the consumer waited, so every host timer — the fixture's own
+        // guard, the dispatch deadline's tokio side — froze, and a stalled
+        // consumer could only ever end in the engine's opaque interrupt.
+        if (chunk.length === 0) return pirDelay(0);
+      },
+      cancel: function () {
+        try {
+          globalThis.__pir_host.http("fetchAbort", JSON.stringify({ id: id }));
+        } catch (error) {}
+      },
+    });
+  }
+
+  async function pirFetch(input, init) {
+    const host = globalThis.__pir_host;
+    if (!host || typeof host.http !== "function") {
+      throw new TypeError("fetch is not supported by the pir extension runtime (no http host bridge)");
+    }
+    const request = new Request(input, init);
+    const signal = request.signal;
+    if (signal && signal.aborted) throw pirAbortFailure(signal.reason);
+
+    // Aggregate the (possibly streaming) request body before the host call:
+    // the bridge sends the body in one shot with the request. A plain string
+    // body skips byte extraction entirely and rides `bodyText`.
+    let bytes = null;
+    let bodyText = null;
+    if (request.__bodyInit !== null && request.__bodyInit !== undefined) {
+      bodyText = pirTextBody(request.__bodyInit);
+      if (bodyText === null) {
+        const extracted = pirBodyToBytes(request.__bodyInit);
+        bytes = extracted.promise ? await extracted.promise : extracted.bytes;
+        if (signal && signal.aborted) throw pirAbortFailure(signal.reason);
+      }
+    }
+
+    const headerEntries = [];
+    request.headers.forEach(function (value, name) {
+      headerEntries.push([name, value]);
+    });
+    const payload = {
+      url: request.url,
+      method: request.method,
+      headers: headerEntries,
+    };
+    if (bodyText !== null) payload.bodyText = bodyText;
+    else if (bytes !== null) payload.bodyB64 = pirBytesToB64(bytes);
+
+    const value = pirHostValue(host.http("fetchStart", JSON.stringify(payload)), "fetchStart");
+    const id = value.id;
+
+    let responseReady = false;
+    const onAbort = function () {
+      if (!responseReady) return; // header polling checks the signal itself
+      try {
+        host.http("fetchAbort", JSON.stringify({ id: id }));
+      } catch (error) {}
+    };
+    if (signal) signal.addEventListener("abort", onAbort);
+
+    try {
+      const stash = [];
+      const state = await pirPollHeaders(id, signal, stash);
+      const headers = new Headers(state.headers || []);
+      const bodyStream = pirMakeBodyReader(id, signal, stash);
+      responseReady = true;
+      const response = new Response(bodyStream, {
+        status: state.status,
+        statusText: undefined,
+        headers: headers,
+      });
+      response.url = state.url || request.url;
+      response.redirected = response.url !== request.url;
+      return response;
+    } catch (error) {
+      // Teardown: headers never arrived (or the poll failed) — kill the
+      // request and drop the registry entry.
+      try {
+        host.http("fetchAbort", JSON.stringify({ id: id }));
+        host.http("fetchEnd", JSON.stringify({ id: id }));
+      } catch (cleanupError) {}
+      throw error;
+    }
+  }
+
+  globalThis.Headers ?? (globalThis.Headers = Headers);
+  globalThis.Request ?? (globalThis.Request = Request);
+  globalThis.Response ?? (globalThis.Response = Response);
+  globalThis.fetch ?? (globalThis.fetch = pirFetch);
+})();

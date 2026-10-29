@@ -1,0 +1,137 @@
+// @earendil-works/pi-durable — throws tier (images, testing, Cloudflare storage).
+//
+// Five upstream subpath entries have no counterpart in the pir extension host.
+// Every exported value throws the runtime's standard unsupported error (unified
+// wording + `code` = `ERR_NOT_SUPPORTED`) at first use, so an extension that
+// imports one of these entries still links and fails with a nameable error
+// instead of at load time. `/images`, `/images/node` and `/images/cloudflare`
+// are here because pir already ships an image pipeline (`image` 0.25 +
+// the read tool's image path): a second Photon-wasm implementation would be a
+// duplicate, and `/images/node` needs a worker thread over
+// `@silvia-odwyer/photon`'s `.wasm` plus `createRequire`. `/testing` is here
+// because it is a vitest-bound conformance registrar (pir's counterpart is the
+// Rust-side suite in tests/). `/storage/sqlite/cloudflare` is here because it
+// targets Durable Object SQL bindings; pir is a local CLI with no Workers
+// target. `createPhotonImages` is the one entry point whose parameter is the
+// caller's own wasm bytes: it still throws, because the wasm itself
+// (`@silvia-odwyer/photon`, Rust→wasm) is not part of this port.
+//
+// `durableUnsupported` mirrors the facade wording of
+// `pi_durable_shim.js.txt`; the two files are independent modules.
+
+/** The standard unsupported error of this runtime (unified wording + `code`). */
+function durableUnsupported(api, why) {
+  const error = new Error(
+    api +
+      " is not supported by the pir extension runtime (" +
+      why +
+      "); wave D4 ports the durable SDK thin surface (tools, env, tool-search, codemode, storage, session), not the harness engine (D5)",
+  );
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+const IMAGES_WHY = "pir ships its own image pipeline (image 0.25 + the read tool's image path); the Photon wasm module and its worker-thread wrapper are not part of this port";
+
+/** A value that throws on every use (property access, call, construction): data and class exports below. */
+function durableFacade(api, why) {
+  const fail = (what) => {
+    throw durableUnsupported(what, why);
+  };
+  const target = function () {
+    fail(api);
+  };
+  return new Proxy(target, {
+    apply: () => fail(api),
+    construct: () => fail(api),
+    get(_target, property) {
+      // Reading any member is first use too (`Harness.open`, and a data export
+      // such as `STORAGE_MEMORY_SCALES.length`), so it throws with that name.
+      if (property === "name") return api;
+      if (property === "prototype") return target.prototype;
+      if (property === Symbol.toPrimitive || property === "toString" || property === "valueOf") return () => api;
+      fail(api + "." + String(property));
+    },
+  });
+}
+
+/** Upstream `/images` `createPhotonImages(wasm)`: an ImageProcessor over Photon's compiled Rust wasm. */
+export function createPhotonImages() {
+  throw durableUnsupported("@earendil-works/pi-durable/images.createPhotonImages", IMAGES_WHY);
+}
+
+/** Upstream `/images/node` `createNodePhotonImages(options)`: reads photon_rs_bg.wasm and runs it in a worker thread. */
+export function createNodePhotonImages() {
+  throw durableUnsupported("@earendil-works/pi-durable/images/node.createNodePhotonImages", IMAGES_WHY);
+}
+
+/** Upstream `/images/cloudflare` `createCloudflarePhotonImages()`: Wrangler's CompiledWasm module import. */
+export function createCloudflarePhotonImages() {
+  throw durableUnsupported("@earendil-works/pi-durable/images/cloudflare.createCloudflarePhotonImages", IMAGES_WHY);
+}
+
+const TESTING_WHY = "the upstream conformance registrars bind to vitest; pir's counterparts are the Rust-side suites (tests/) over the same contracts";
+
+/** Upstream `/testing` `createExpectAssertions`/`createEnvConformance`/`createStorageConformance`. */
+export function createExpectAssertions() {
+  throw durableUnsupported("@earendil-works/pi-durable/testing.createExpectAssertions", TESTING_WHY);
+}
+export function createEnvConformance() {
+  throw durableUnsupported("@earendil-works/pi-durable/testing.createEnvConformance", TESTING_WHY);
+}
+export function createStorageConformance() {
+  throw durableUnsupported("@earendil-works/pi-durable/testing.createStorageConformance", TESTING_WHY);
+}
+
+/** Upstream `/testing` `registerEnvConformance`/`registerStorageConformance`. */
+export function registerEnvConformance() {
+  throw durableUnsupported("@earendil-works/pi-durable/testing.registerEnvConformance", TESTING_WHY);
+}
+export function registerStorageConformance() {
+  throw durableUnsupported("@earendil-works/pi-durable/testing.registerStorageConformance", TESTING_WHY);
+}
+
+/** Upstream `/testing` storage-benchmark fixtures (`seedStorageBenchmark`, `seedStorageWriteBenchmark`, `storageBenchmarkPrimaryRecordCount`). */
+export function seedStorageBenchmark() {
+  throw durableUnsupported("@earendil-works/pi-durable/testing.seedStorageBenchmark", TESTING_WHY);
+}
+export function seedStorageWriteBenchmark() {
+  throw durableUnsupported("@earendil-works/pi-durable/testing.seedStorageWriteBenchmark", TESTING_WHY);
+}
+export function storageBenchmarkPrimaryRecordCount() {
+  throw durableUnsupported("@earendil-works/pi-durable/testing.storageBenchmarkPrimaryRecordCount", TESTING_WHY);
+}
+
+/** Upstream `/testing` `STORAGE_MEMORY_SCALES`: the benchmark scale list. */
+export const STORAGE_MEMORY_SCALES = durableFacade(
+  "@earendil-works/pi-durable/testing.STORAGE_MEMORY_SCALES",
+  TESTING_WHY,
+);
+/** Upstream `/testing` `STORAGE_READ_BENCHMARKS`: the read benchmark descriptions. */
+export const STORAGE_READ_BENCHMARKS = durableFacade(
+  "@earendil-works/pi-durable/testing.STORAGE_READ_BENCHMARKS",
+  TESTING_WHY,
+);
+/** Upstream `/testing` `STORAGE_WRITE_BENCHMARKS`: the write benchmark descriptions. */
+export const STORAGE_WRITE_BENCHMARKS = durableFacade(
+  "@earendil-works/pi-durable/testing.STORAGE_WRITE_BENCHMARKS",
+  TESTING_WHY,
+);
+/** Upstream `/testing` `TIMING_SCALE`: the benchmark timing scale. */
+export const TIMING_SCALE = durableFacade("@earendil-works/pi-durable/testing.TIMING_SCALE", TESTING_WHY);
+
+const CF_SQL_WHY = "the adapter targets Durable Object SQL bindings; pir is a local CLI with no Workers target (openNodeSqliteStorage is the real SQLite entry here)";
+
+/** Upstream `/storage/sqlite/cloudflare` `openDurableObjectSqliteStorage(storage)`. */
+export function openDurableObjectSqliteStorage() {
+  throw durableUnsupported(
+    "@earendil-works/pi-durable/storage/sqlite/cloudflare.openDurableObjectSqliteStorage",
+    CF_SQL_WHY,
+  );
+}
+
+/** Upstream `/storage/sqlite/cloudflare` `DurableObjectSqliteDatabase`. */
+export const DurableObjectSqliteDatabase = durableFacade(
+  "@earendil-works/pi-durable/storage/sqlite/cloudflare.DurableObjectSqliteDatabase",
+  CF_SQL_WHY,
+);

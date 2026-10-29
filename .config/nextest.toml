@@ -1,0 +1,65 @@
+# cargo-nextest configuration. `cargo nextest run` picks up this file from
+# .config/nextest.toml automatically.
+#
+# Equivalence with the previous CI gate (`cargo test --all-targets`):
+# nextest builds and runs every unit + integration test target of the lib,
+# bins and tests/ directories. `cargo test --all-targets` never ran doctests
+# (doctests only run without target selection); the CI `test` job runs
+# `cargo test --doc` explicitly. Bench compilation is no longer a CI step: the
+# criterion bench is type-checked by `cargo clippy --all-targets` and is not
+# part of any shipped artifact.
+[profile.default]
+# Run the full suite even after an early failure, so one red test does not
+# hide failures elsewhere in the same run.
+fail-fast = false
+
+[profile.default.slow-timeout]
+period = "60s"        # a test still running after 60s is flagged as slow
+terminate-after = 2   # ... and killed/failed after 2 periods (120s)
+
+# Local profile (`cargo nextest run --profile local`, also used by
+# `scripts/test_parallel.ps1 -UseNextest`).
+#
+# Same "run everything, report everything" semantics as `ci`, sized for a
+# developer machine instead of the 4-vCPU GitHub runner:
+#   - fail-fast = false: one red test must not hide failures in the rest of
+#     the shard (nextest has no libtest `--no-fail-fast` flag; this is its
+#     equivalent).
+#   - test-threads = "num-cpus": nextest's default, pinned so a direct
+#     `cargo nextest run --profile local` uses every CPU. The parallel runner
+#     overrides it per shard with NEXTEST_TEST_THREADS (env > config), which
+#     avoids N shards each spawning num-cpus test threads.
+#   - 120s/3: a slow test gets 360s before it is killed, matching the CI bound
+#     while leaving room for a loaded local machine. Raise the period for a
+#     known-slow suite instead of deleting the bound.
+[profile.local]
+fail-fast = false
+test-threads = "num-cpus"
+retries = 0
+
+[profile.local.slow-timeout]
+period = "120s"
+terminate-after = 3
+
+# CI profile (`cargo nextest run --profile ci`).
+#
+# The tree has 281 integration test targets (9 merged g_* harnesses + 272
+# standalone tests/*.rs); the lib unit target has no tests and the bin unit
+# harness is a separate cargo target. 6.3k test functions; many spawn bash
+# processes or bind local sockets, so under contention a real-timer test can
+# look slow.
+# The CI timings are deliberately looser than the local defaults (a slow test
+# gets 360s, not 120s) while still bounding a genuine hang: without a bound,
+# one wedged test would hold the whole 90-minute job.
+[profile.ci]
+fail-fast = false
+# Run tests in parallel inside each group. Four workers keeps real-timer
+# socket/steering fixtures deterministic on the 4-vCPU GitHub runner; the
+# local dev loop uses 16-way concurrency separately.
+test-threads = 4
+# No automatic retries: a flaky test must be visible, not papered over.
+retries = 0
+
+[profile.ci.slow-timeout]
+period = "120s"
+terminate-after = 3

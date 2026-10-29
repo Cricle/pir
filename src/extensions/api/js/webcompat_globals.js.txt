@@ -1,0 +1,382 @@
+// Web-compat globals (P0 residual pad): every install is `??`-guarded so an
+// engine- or prelude-provided global is never shadowed. Runs after the
+// Buffer backfill in the same bootstrap eval, so `globalThis.Buffer` exists.
+//
+// Tier notes (documented, not hidden):
+// - structuredClone: minimal deep clone — primitives, Array, plain objects,
+//   Date, RegExp, Error(+subclasses with message/code), Map, Set, ArrayBuffer,
+//   Typed arrays, DataView, Blob. NOT supported: functions/symbols (throw per
+//   the spec's DataCloneError), shared/transferable buffers, prototypes,
+//   circular references (breadth recursion would need a WeakMap edge table —
+//   cycles throw DataCloneError like unsupported types).
+// - queueMicrotask: real semantics over the engine's `__pirMicrotask`
+//   (definition in node_call_helper.js.txt); synchronous TypeError for a
+//   non-function callback.
+// - atob/btoa: the same shared Buffer base64 codec the node:buffer module
+//   exports, installed globally.
+// - performance: millisecond wall-clock pair (same source as perf_hooks).
+// - Blob/File: the buffer module's value holders, installed globally.
+// - URL/URLSearchParams: installed by the url shim at the builtin bootstrap
+//   sweep (first thing that runs before any extension body); no second
+//   definition here on purpose — a duplicate parser would fork behavior.
+// - global: the Node global alias — thousands of older npm packages read a
+//   bare `global` (graceful-fs, fs-extra, fast-glob, shelljs, pump, …). It is
+//   just another name for the global object; install is an alias, never a
+//   shadow.
+// - crypto: the WebCrypto-shaped global (true Node exposes WebCrypto here,
+//   NOT the node:crypto module surface). randomUUID + getRandomValues are
+//   built directly over the host entropy bridge; `subtle` is a lazy view onto
+//   the crypto shim's WebCrypto pad (digest/importKey/generateKey), which is
+//   the same object shape Node has — there, `globalThis.crypto` IS
+//   `require("node:crypto").webcrypto` and `crypto.subtle` is the identical
+//   object. The indirection exists because the builtin module table is
+//   populated after this globals pass runs.
+// - MessagePort/MessageChannel: minimal two-endpoint skeleton (undici's
+//   webidl brand checks only need the globals to exist). Delivery is a direct
+//   microtask hop between the two ports of one channel: no structured clone
+//   (values pass through as-is), no transfer lists, no external
+//   postMessage targets.
+// - setImmediate/clearImmediate: Node globals the timers layer (prelude)
+//   never provided. Minimal tier: scheduled on the microtask queue, so
+//   ordering against real macrotask timers is not modeled; ids are plain
+//   numbers and clearImmediate cancels before the microtask fires.
+
+(function installWebCompatGlobals() {
+  // --- queueMicrotask -----------------------------------------------------
+  globalThis.queueMicrotask = globalThis.queueMicrotask || function queueMicrotask(callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError("queueMicrotask callback must be a function");
+    }
+    globalThis.__pirMicrotask(callback);
+  };
+
+  // --- structuredClone ----------------------------------------------------
+  globalThis.structuredClone = globalThis.structuredClone || function structuredClone(value) {
+    function cloneNode(node, seen) {
+      if (node === null || typeof node !== "object") {
+        return node;
+      }
+      if (typeof node === "function") {
+        const e = new Error("function could not be cloned.");
+        e.name = "DataCloneError";
+        throw e;
+      }
+      if (node instanceof Date) {
+        return new Date(node.getTime());
+      }
+      if (node instanceof RegExp) {
+        const flags = (node.global ? "g" : "") + (node.ignoreCase ? "i" : "") + (node.multiline ? "m" : "") + (node.dotAll ? "s" : "") + (node.unicode ? "u" : "") + (node.sticky ? "y" : "");
+        return new RegExp(node.source, flags);
+      }
+      if (node instanceof Error) {
+        const copy = new node.constructor(node.message);
+        copy.stack = node.stack;
+        if (node.code !== undefined) copy.code = node.code;
+        if (node.name !== undefined) copy.name = node.name;
+        return copy;
+      }
+      if (node instanceof ArrayBuffer) {
+        const copy = new ArrayBuffer(node.byteLength);
+        new Uint8Array(copy).set(new Uint8Array(node));
+        return copy;
+      }
+      if (ArrayBuffer.isView(node)) {
+        if (node instanceof DataView) {
+          const bufferCopy = cloneNode(node.buffer, seen);
+          return new DataView(bufferCopy, node.byteOffset, node.byteLength);
+        }
+        const inner = cloneNode(node.buffer, seen);
+        return new node.constructor(inner, node.byteOffset, node.length);
+      }
+      if (node instanceof Map) {
+        const copy = new Map();
+        seen.set(node, copy);
+        for (const [key, val] of node.entries()) {
+          copy.set(cloneNode(key, seen), cloneNode(val, seen));
+        }
+        return copy;
+      }
+      if (node instanceof Set) {
+        const copy = new Set();
+        seen.set(node, copy);
+        for (const item of node.values()) {
+          copy.add(cloneNode(item, seen));
+        }
+        return copy;
+      }
+      if (typeof globalThis.Blob === "function" && node instanceof globalThis.Blob) {
+        return new globalThis.Blob([node._bytes || node], { type: node.type });
+      }
+      if (Array.isArray(node)) {
+        const copy = [];
+        seen.set(node, copy);
+        for (let i = 0; i < node.length; i++) {
+          if (Object.prototype.hasOwnProperty.call(node, i)) {
+            copy[i] = cloneNode(node[i], seen);
+          }
+        }
+        return copy;
+      }
+      if (seen.has(node)) {
+        const e = new Error("circular reference could not be cloned.");
+        e.name = "DataCloneError";
+        throw e;
+      }
+      const copy = Object.create(Object.getPrototypeOf(node));
+      seen.set(node, copy);
+      for (const key of Object.keys(node)) {
+        copy[key] = cloneNode(node[key], seen);
+      }
+      return copy;
+    }
+    return cloneNode(value, new Map());
+  };
+
+  // --- atob / btoa --------------------------------------------------------
+  if (typeof globalThis.atob !== "function") {
+    globalThis.atob = function atob(input) {
+      const text = String(input).replace(/[\t\n\f\r ]/g, "");
+      if (text.length % 4 === 1 || /[^A-Za-z0-9+/=]/.test(text)) {
+        const error = new Error("Invalid base64 input");
+        error.code = "ERR_INVALID_ARG_VALUE";
+        throw error;
+      }
+      return globalThis.Buffer.from(text, "base64").toString("latin1");
+    };
+  }
+  if (typeof globalThis.btoa !== "function") {
+    globalThis.btoa = function btoa(input) {
+      return globalThis.Buffer.from(String(input), "latin1").toString("base64");
+    };
+  }
+
+  // --- performance --------------------------------------------------------
+  // The pad the perf_hooks shim adopts verbatim (it reparents this object onto
+  // `Performance.prototype`, so `require("perf_hooks").performance` is this
+  // same object). `timeOrigin` is the epoch-ms instant of creation and `now()`
+  // is the elapsed time since then — the same timeline `performance.now()`
+  // uses once the shim has run.
+  if (!globalThis.performance) {
+    const performanceTimeOrigin = Date.now();
+    globalThis.performance = {
+      now: () => Date.now() - performanceTimeOrigin,
+      timeOrigin: performanceTimeOrigin,
+    };
+  }
+
+  // --- Blob / File --------------------------------------------------------
+  // The node:buffer module defines identical value holders; this global pair
+  // serves code that reads `new Blob(...)` without importing node:buffer.
+  if (typeof globalThis.Blob !== "function") {
+    const Buffer = globalThis.Buffer;
+    class Blob {
+      constructor(parts, options) {
+        const chunks = [];
+        let byteLength = 0;
+        if (parts !== undefined && parts !== null) {
+          for (const part of parts) {
+            if (part === undefined || part === null) continue;
+            const bytes = Buffer.isBuffer(part)
+              ? part
+              : typeof part === "string"
+                ? Buffer.from(part, "utf8")
+                : part instanceof ArrayBuffer
+                  ? Buffer.from(new Uint8Array(part))
+                  : ArrayBuffer.isView(part)
+                    ? Buffer.from(part.buffer, part.byteOffset, part.byteLength)
+                    : Buffer.from(String(part), "utf8");
+            chunks.push(bytes);
+            byteLength += bytes.length;
+          }
+        }
+        this._bytes = Buffer.concat(chunks, byteLength);
+        this.type = options && typeof options.type === "string" ? options.type.toLowerCase() : "";
+        this.size = byteLength;
+      }
+      arrayBuffer() {
+        const copy = new ArrayBuffer(this._bytes.length);
+        new Uint8Array(copy).set(this._bytes);
+        return Promise.resolve(copy);
+      }
+      text() {
+        return Promise.resolve(this._bytes.toString("utf8"));
+      }
+      slice(start, end, contentType) {
+        const from = start === undefined ? 0 : start < 0 ? Math.max(0, this._bytes.length + start) : Math.min(start, this._bytes.length);
+        const to = end === undefined ? this._bytes.length : end < 0 ? Math.max(0, this._bytes.length + end) : Math.min(end, this._bytes.length);
+        const blob = new Blob([], { type: contentType });
+        blob._bytes = this._bytes.subarray(from, Math.max(from, to));
+        blob.size = blob._bytes.length;
+        return blob;
+      }
+      stream() {
+        const error = new Error("blob.stream() is not supported by the pir extension runtime");
+        error.code = "ERR_NOT_SUPPORTED";
+        throw error;
+      }
+    }
+    globalThis.Blob = Blob;
+
+    class File extends Blob {
+      constructor(parts, name, options) {
+        super(parts, options);
+        this.name = String(name);
+        this.lastModified = options && typeof options.lastModified === "number" ? options.lastModified : Date.now();
+      }
+    }
+    globalThis.File = File;
+  }
+
+  // --- global (Node alias) --------------------------------------------------
+  globalThis.global ?? (globalThis.global = globalThis);
+
+  // --- crypto (WebCrypto-shaped global) -------------------------------------
+  if (typeof globalThis.crypto === "undefined") {
+    const cryptoGlobal = {
+      getRandomValues(array) {
+        if (!array || !ArrayBuffer.isView(array) || array instanceof DataView) {
+          throw new TypeError("The provided value is not of type '(ArrayBuffer or ArrayBufferView)'");
+        }
+        const bytes = Buffer.from(
+          globalThis.__pirNodeCall("crypto", "randomBytes", { n: array.byteLength }),
+          "base64",
+        );
+        new Uint8Array(array.buffer, array.byteOffset, array.byteLength).set(bytes);
+        return array;
+      },
+      randomUUID() {
+        return String(globalThis.__pirNodeCall("crypto", "randomUUID"));
+      },
+    };
+    // `subtle` resolves to the crypto shim's WebCrypto pad: the builtins are
+    // imported into `__pirNodeModules` after this pass, so the member is a
+    // getter rather than a snapshot, and it stays the *same object* as
+    // `require("node:crypto").subtle` (Node's identity, since there the global
+    // crypto is the webcrypto export itself).
+    Object.defineProperty(cryptoGlobal, "subtle", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        const mod = globalThis.__pirNodeModules && globalThis.__pirNodeModules.crypto;
+        if (mod === undefined) return undefined;
+        const webcrypto = mod.webcrypto || (mod.default && mod.default.webcrypto);
+        return webcrypto === undefined ? undefined : webcrypto.subtle;
+      },
+    });
+    globalThis.crypto = cryptoGlobal;
+  }
+
+  // --- MessagePort / MessageChannel ------------------------------------------
+  if (typeof globalThis.MessagePort !== "function") {
+    class MessagePort extends globalThis.EventTarget {
+      constructor() {
+        super();
+        this._pirPeer = null;
+        this._pirClosed = false;
+        this.onmessage = null;
+        this.onmessageerror = null;
+      }
+      postMessage(data) {
+        if (this._pirClosed) return;
+        const peer = this._pirPeer;
+        if (!peer || peer._pirClosed) return;
+        // Direct microtask hop to the peer (no structured clone: values pass
+        // through as-is, matching the same-realm transfer-free channel).
+        globalThis.__pirMicrotask(() => {
+          if (peer._pirClosed) return;
+          const event = new globalThis.Event("message");
+          event.data = data;
+          peer.dispatchEvent(event);
+        });
+      }
+      start() {}
+      close() {
+        this._pirClosed = true;
+        if (this._pirPeer) this._pirPeer._pirClosed = true;
+      }
+      // Node's MessagePort carries EventEmitter-style aliases on top of the
+      // EventTarget surface.
+      on(type, listener) {
+        this.addEventListener(type, listener);
+        return this;
+      }
+      off(type, listener) {
+        this.removeEventListener(type, listener);
+        return this;
+      }
+      once(type, listener) {
+        this.addEventListener(type, listener, { once: true });
+        return this;
+      }
+      addEventListener(type, listener, options) {
+        // Reading messages requires an explicit start in the spec; the
+        // minimal pad delivers as soon as anyone listens (or onmessage is set).
+        if (type === "message") this.start();
+        super.addEventListener(type, listener, options);
+      }
+    }
+    globalThis.MessagePort = MessagePort;
+  }
+  if (typeof globalThis.MessageChannel !== "function") {
+    class MessageChannel {
+      constructor() {
+        this.port1 = new globalThis.MessagePort();
+        this.port2 = new globalThis.MessagePort();
+        this.port1._pirPeer = this.port2;
+        this.port2._pirPeer = this.port1;
+      }
+    }
+    globalThis.MessageChannel = MessageChannel;
+  }
+
+  // --- setImmediate / clearImmediate -----------------------------------------
+  // Node's setImmediate is a macrotask: it runs in the check phase, after the
+  // turn's microtasks (and after nextTick) and before timers due later. It is
+  // therefore bridged onto the global `setTimeout(..., 0)` — a real host-sleep
+  // timer, see the prelude timer surface — instead of the promise job queue,
+  // which would run it ahead of every microtask.
+  if (typeof globalThis.setImmediate !== "function") {
+    globalThis.setImmediate = function setImmediate(callback, ...args) {
+      if (typeof callback !== "function") {
+        throw new TypeError("setImmediate callback must be a function");
+      }
+      const handle = {
+        _cancelled: false,
+        // Node's Immediate surface. `unref()` cannot make the host sleep
+        // timer drop its liveness (the host owns the timer wheel), so the
+        // process may wait for the pending 0 ms tick; the callback itself is
+        // unaffected.
+        ref() { return this; },
+        unref() { return this; },
+        hasRef() { return true; },
+        refresh() { return this; },
+        [Symbol.toPrimitive]() { return this._timer; },
+      };
+      handle._timer = globalThis.setTimeout(() => {
+        if (handle._cancelled) return;
+        handle._cancelled = true;
+        try {
+          callback(...args);
+        } catch (error) {
+          // The host timer layer swallows callback throws (they are not host
+          // errors), and a silently dropped immediate error would turn a
+          // throwing test into a false pass — surface it as a rejected job,
+          // the way an uncaught immediate exception does in Node.
+          Promise.resolve().then(() => { throw error; });
+        }
+      }, 0);
+      return handle;
+    };
+    globalThis.clearImmediate = function clearImmediate(handle) {
+      if (handle === undefined || handle === null) return;
+      if (handle._cancelled === false) {
+        handle._cancelled = true;
+        if (typeof handle._timer === "number") globalThis.clearTimeout(handle._timer);
+        return;
+      }
+      // A raw timer id from an older pir build (or a passed-through
+      // clearTimeout id): both cancel the same underlying host timer.
+      globalThis.clearTimeout(handle);
+    };
+  }
+})();

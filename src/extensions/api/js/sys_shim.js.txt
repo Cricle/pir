@@ -1,0 +1,7 @@
+// node:sys — the deprecated `util` alias (Node keeps it for compatibility).
+// Pure re-export of the util shim surface; a documented superset is fine (the
+// alias semantics are "same names, deprecation warning in real Node").
+import * as util from "@node/util";
+
+export default util;
+export * from "@node/util";

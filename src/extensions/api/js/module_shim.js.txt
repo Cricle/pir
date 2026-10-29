@@ -1,0 +1,461 @@
+
+import { fileURLToPath } from "@node/url";
+import path from "@node/path";
+
+// Host platform constant (the same `globalThis.__pirPlatform` the other node
+// shims read): `_nodeModulePaths` / `_initPaths` / `_resolveLookupPaths` are
+// separator- and platform-sensitive.
+const __platform = typeof globalThis.__pirPlatform === "string" ? globalThis.__pirPlatform : "linux";
+const isWindows = __platform === "win32";
+
+function requireDirOf(input) {
+  if (input && typeof input === "object" && typeof input.href === "string") {
+    return path.dirname(fileURLToPath(input));
+  }
+  if (typeof input === "string") {
+    return path.dirname(input.startsWith("file:") ? fileURLToPath(input) : input);
+  }
+  throw new TypeError("createRequire: input must be a path string, URL, or file URL string");
+}
+
+export function createRequire(input) {
+  return globalThis.__pirMakeRequire(requireDirOf(input));
+}
+
+// Real Node exposes the scheme-only builtins exclusively as `node:test` and
+// friends: `builtinModules` lists them WITH the scheme and `isBuiltin('test')`
+// is false while `isBuiltin('node:test')` is true (the vendored
+// `test-module-isBuiltin.js` / `test-module-builtin.js` pin exactly that).
+// The host's `__pirBuiltinModuleNames` is a flat key table with the `node:`
+// prefix already stripped (`src/extensions/api/node_shims.rs`), so the two
+// public surfaces are rebuilt here rather than changed at the host boundary.
+const SCHEME_ONLY_BUILTINS = ["sea", "sqlite", "test", "test/reporters"];
+
+const BUILTIN_NAMES = globalThis.__pirBuiltinModuleNames || [];
+
+export const builtinModules = BUILTIN_NAMES
+  .filter((name) => SCHEME_ONLY_BUILTINS.indexOf(name) === -1)
+  .concat(SCHEME_ONLY_BUILTINS.map((name) => "node:" + name));
+
+export function isBuiltin(spec) {
+  if (typeof spec !== "string") return false;
+  if (spec.startsWith("node:")) {
+    // With the scheme every known builtin qualifies — including the
+    // scheme-only ones — while an unknown `node:foo` stays false.
+    return BUILTIN_NAMES.indexOf(spec.slice(5)) !== -1;
+  }
+  return (
+    BUILTIN_NAMES.indexOf(spec) !== -1 &&
+    SCHEME_ONLY_BUILTINS.indexOf(spec) === -1
+  );
+}
+
+
+// ===========================================================================
+// Surface completion: the Module class skeleton and the compile-cache /
+// source-map / registration entries. The runtime's module graph lives in the
+// host (not in JS), so the caching and compile hooks are documented no-ops
+// or throw one clear error each; the pure helpers are real.
+// ===========================================================================
+
+class Module {
+  constructor(id, parent) {
+    this.id = String(id);
+    this.path = path.dirname(String(id));
+    this.exports = {};
+    this.parent = parent === undefined ? undefined : parent;
+    this.filename = null;
+    this.loaded = false;
+    this.children = [];
+  }
+  get export() {
+    return this.exports;
+  }
+  require(specifier) {
+    return globalThis.__pirMakeRequire(path.dirname(String(this.id)))(specifier);
+  }
+}
+
+Module._cache = Object.create(null);
+Module._pathCache = Object.create(null);
+Module._extensions = Object.freeze({
+  ".js": (_module, _filename) => undefined,
+  ".json": (_module, _filename) => undefined,
+  ".node": (_module, _filename) => {
+    const error = new Error("Native addons (.node) are not supported by the pir extension runtime");
+    error.code = "ERR_NOT_SUPPORTED";
+    throw error;
+  },
+});
+Module.globalPaths = [];
+// Static surface real Node carries on the Module class itself (`createRequire`
+// / `isBuiltin` / `builtinModules` are the ones extensions actually reach for).
+Module.createRequire = createRequire;
+Module.isBuiltin = isBuiltin;
+Module.builtinModules = builtinModules;
+Module.wrapper = ["(function (exports, require, module, __filename, __dirname) { ", "\n});"];
+Module.wrap = (script) => Module.wrapper[0] + script + Module.wrapper[1];
+
+Module._debug = function (_set) {
+  // No debugger host: a no-op keeps the call shape.
+};
+
+/// `NODE_PATH`-style search roots, seeded by `_initPaths` and read by
+/// `_resolveLookupPaths` for bare specifiers (Node's internal `modulePaths`).
+let pirSearchPaths = [];
+
+Module._initPaths = function () {
+  // Port of Node's `Module._initPaths()` (lib/internal/modules/cjs/loader.js):
+  // NODE_PATH entries are taken VERBATIM (a trailing separator survives —
+  // the vendored `test-module-globalpaths-nodepath.js` asserts
+  // `globalPaths.includes('C:\\Program Files (x86)\\nodejs\\')`), empty
+  // segments are dropped, and the two home-directory entries sit between the
+  // NODE_PATH block and the install's `lib/node`.
+  const homeDir = isWindows ? process.env.USERPROFILE : process.env.HOME;
+  const nodePath = process.env.NODE_PATH;
+
+  // process.execPath is $PREFIX/bin/node except on Windows, where it is
+  // $PREFIX\node.exe with $PREFIX the Node.js installation root.
+  const prefixDir = isWindows
+    ? path.resolve(process.execPath, "..")
+    : path.resolve(process.execPath, "..", "..");
+
+  const paths = [path.resolve(prefixDir, "lib", "node")];
+
+  if (homeDir) {
+    paths.unshift(path.resolve(homeDir, ".node_libraries"));
+    paths.unshift(path.resolve(homeDir, ".node_modules"));
+  }
+
+  if (nodePath) {
+    paths.unshift(...String(nodePath).split(path.delimiter).filter(Boolean));
+  }
+
+  pirSearchPaths = paths;
+  // Node assigns a fresh array here (`ArrayPrototypeSlice`); the exported
+  // `globalPaths` handles in this shim are captured once (a plain export
+  // object is not Node's live class property), so the update happens in
+  // place and both stay in sync — `mod._initPaths(); mod.globalPaths`
+  // reflects the new NODE_PATH, which is what Node's API promises.
+  Module.globalPaths.length = 0;
+  for (const entry of pirSearchPaths) Module.globalPaths.push(entry);
+};
+
+// Node runs `_initPaths()` during its bootstrap, so `globalPaths` is already
+// populated by the time user code reads it. Guarded: the prelude can evaluate
+// this shim while `process` is still being assembled.
+if (typeof process === "object" && process !== null) {
+  Module._initPaths();
+}
+Module._nodeModulePaths = function (from) {
+  // Port of Node's walk-up algorithm: every ancestor directory contributes a
+  // `<dir>/node_modules` entry, a path segment that already ends in
+  // `node_modules` is skipped, and `D:\` maps to `D:\node_modules`. Node
+  // builds the entries with the host separator (its own `path.sep`), which is
+  // what the vendored `test-module-nodemodulepaths.js` expects.
+  const sep = isWindows ? "\\" : "/";
+  from = path.resolve(String(from));
+
+  // Return root node_modules when the path is a drive root ('D:\').
+  if (
+    from.length >= 2 &&
+    from.charCodeAt(from.length - 1) === (isWindows ? 92 : 47) &&
+    from.charCodeAt(from.length - 2) === 58 /* : */
+  ) {
+    return [from + "node_modules"];
+  }
+  // The POSIX filesystem root: a single '/node_modules'.
+  if (from === "/") {
+    return ["/node_modules"];
+  }
+
+  const nmChars = [
+    115, 101, 108, 117, 100, 111, 109, 95, 101, 100, 111, 110,
+  ]; // 'node_modules' reversed
+  const nmLen = nmChars.length;
+  const paths = [];
+  for (let i = from.length - 1, p = 0, last = from.length; i >= 0; --i) {
+    const code = from.charCodeAt(i);
+    // '\' and '/' separate path segments; ':' is an extra condition so a
+    // drive root ('C:\node_modules') needs no drive-name parsing.
+    if (code === 92 /* \ */ || code === 47 /* / */ || code === 58 /* : */) {
+      if (p !== nmLen) {
+        paths.push(from.slice(0, last) + sep + "node_modules");
+      }
+      last = i;
+      p = 0;
+    } else if (p !== -1) {
+      if (nmChars[p] === code) {
+        ++p;
+      } else {
+        p = -1;
+      }
+    }
+  }
+  // The last boundary: a POSIX absolute path reaches the filesystem root at
+  // index 0 (a Windows drive root is emitted by the ':' branch above), and
+  // `/<root>` is always part of the walk-up chain.
+  if (!isWindows && from.charAt(0) === "/" && paths[paths.length - 1] !== "/node_modules") {
+    paths.push("/node_modules");
+  }
+  return paths;
+};
+Module._preloadModules = function () {
+  // No preload host phase.
+};
+Module._resolveFilename = function (request, _parent) {
+  // The runtime resolves through the host loader; the request passes
+  // through unchanged for the observable string surface.
+  return String(request);
+};
+Module._resolveLookupPaths = function (request, parent) {
+  // Port of Node's helper. A builtin needs no lookup (`null`); a relative
+  // request resolves against the parent's directory (`.` when there is no
+  // parent — the REPL/`-e` shape the vendored
+  // `test-module-relative-lookup.js` pins); a bare request searches the
+  // `NODE_PATH`/home roots `_initPaths` collected.
+  if (isBuiltin(request)) return null;
+
+  if (
+    request.charAt(0) !== "." ||
+    (request.length > 1 &&
+      request.charAt(1) !== "." &&
+      request.charAt(1) !== "/" &&
+      (!isWindows || request.charAt(1) !== "\\"))
+  ) {
+    let paths;
+    if (parent && parent.paths && parent.paths.length) {
+      paths = pirSearchPaths.slice();
+      paths.unshift(...parent.paths);
+    } else {
+      paths = pirSearchPaths;
+    }
+    return paths.length > 0 ? paths.slice() : null;
+  }
+
+  // In the REPL, parent.filename is null: './path/to/foo' still has to work.
+  if (!parent || !parent.id || !parent.filename) {
+    return ["."];
+  }
+  return [path.dirname(parent.filename)];
+};
+Module._findPath = function () {
+  const error = new Error("Module._findPath is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  throw error;
+};
+Module._load = function () {
+  const error = new Error("Module._load is not supported by the pir extension runtime (use require/import)");
+  error.code = "ERR_NOT_SUPPORTED";
+  throw error;
+};
+Module.runMain = function () {
+  const error = new Error("Module.runMain is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  throw error;
+};
+Module.register = function () {
+  const error = new Error("Module.register is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  throw error;
+};
+Module.registerHooks = function () {
+  const error = new Error("Module.registerHooks is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  throw error;
+};
+Module.stripTypeScriptTypes = function () {
+  const error = new Error("Module.stripTypeScriptTypes is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  throw error;
+};
+Module.constants = Object.freeze({
+  compileCacheStatus: {
+    FAILED: "FAILED", ENABLED: "ENABLED", ALREADY_ENABLED: "ALREADY_ENABLED",
+    DISABLED: "DISABLED", UNSUPPORTED: "UNSUPPORTED",
+  },
+});
+Module.enableCompileCache = function (_cacheDir) {
+  // No compile-cache store: the honest status is UNSUPPORTED.
+  return "UNSUPPORTED";
+};
+Module.flushCompileCache = function () {
+  // Nothing cached, nothing to flush.
+};
+Module.getCompileCacheDir = function () {
+  return undefined;
+};
+Module.findPackageJSON = function (specifier, base) {
+  // Walk up from the module path looking for package.json via the host fs.
+  const fsSync = globalThis.__pirNodeModules && globalThis.__pirNodeModules.fs;
+  if (!fsSync || typeof fsSync.existsSync !== "function") return undefined;
+  let start = String(specifier);
+  if (base !== undefined && base !== null) {
+    const baseStr = String(base);
+    const baseDir = typeof baseStr === "string" && baseStr.startsWith("file:") ? fileURLToPath(baseStr) : baseStr;
+    start = baseDir.replace(/[\\/][^\\/]*\.ts$/, "").replace(/[\\/][^\\/]*\.js$/, "");
+  }
+  const stat = fsSync.statSync(start);
+  let dir = stat && stat.isFile ? path.dirname(start) : start;
+  for (let i = 0; i < 64; i++) {
+    const candidate = path.join(dir, "package.json");
+    if (fsSync.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+  return undefined;
+};
+Module.findSourceMap = function (_path, _error) {
+  return undefined;
+};
+// Node's argument-type contract for the source-map switches: a boolean
+// `enabled`/`options.nodeModules`/`options.generatedCode` is required and
+// anything else raises ERR_INVALID_ARG_TYPE (the vendored
+// `test-module-setsourcemapssupport.js` validates the whole rejection table).
+// The flags are recorded rather than applied: this transpiler has no
+// source-map store to rewire, and the load-compatible surface is what
+// callers observe.
+let sourceMapsSupport = { enabled: false, nodeModules: false, generatedCode: false };
+
+function describeValue(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  const kind = typeof value;
+  if (kind === "function") return "function " + (value.name || "");
+  if (kind === "object") {
+    const name = (value.constructor && value.constructor.name) || "Object";
+    return "an instance of " + name;
+  }
+  return "type " + kind + " (" + String(value) + ")";
+}
+
+function invalidArgType(name, kind, value) {
+  const error = new TypeError(
+    `The "${name}" ${kind} must be of type boolean. Received ${describeValue(value)}`,
+  );
+  error.code = "ERR_INVALID_ARG_TYPE";
+  // Node's internal ERR_* errors stringify with the code in brackets
+  // (`TypeError [ERR_INVALID_ARG_TYPE]: …`) even though `name` stays
+  // `TypeError`; `String(err)` and `assert.throws(fn, /ERR_INVALID_ARG_TYPE/)`
+  // observe that form (pir's assert matches the stringified error).
+  error.toString = function () {
+    return `${this.name} [${this.code}]: ${this.message}`;
+  };
+  return error;
+}
+
+function validateBooleanOption(value, name, kind) {
+  if (typeof value !== "boolean") throw invalidArgType(name, kind, value);
+  return value;
+}
+
+Module.getSourceMapsSupport = function () {
+  return {
+    enabled: sourceMapsSupport.enabled,
+    nodeModules: sourceMapsSupport.nodeModules,
+    generatedCode: sourceMapsSupport.generatedCode,
+  };
+};
+Module.setSourceMapsSupport = function (enabled, options) {
+  validateBooleanOption(enabled, "enabled", "argument");
+  const opts = options === undefined ? {} : options;
+  if (opts === null || typeof opts !== "object") {
+    // Node validates `options` as an object (kEmptyObject default).
+    const error = new TypeError(
+      `The "options" argument must be of type object. Received ${describeValue(opts)}`,
+    );
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  const nodeModules = opts.nodeModules === undefined
+    ? false
+    : validateBooleanOption(opts.nodeModules, "options.nodeModules", "property");
+  const generatedCode = opts.generatedCode === undefined
+    ? false
+    : validateBooleanOption(opts.generatedCode, "options.generatedCode", "property");
+  sourceMapsSupport = {
+    enabled: enabled,
+    nodeModules: nodeModules,
+    generatedCode: generatedCode,
+  };
+};
+Module.syncBuiltinESMExports = function () {
+  // The builtin modules are frozen snapshots here; nothing to resync.
+};
+
+class SourceMap {
+  constructor(_payload, _options) {
+    // No source-map store exists; the class keeps the load-compatible shape.
+    const error = new Error("Module.SourceMap is not supported by the pir extension runtime");
+    error.code = "ERR_NOT_SUPPORTED";
+    throw error;
+  }
+}
+Module.SourceMap = SourceMap;
+
+
+export default {
+  createRequire: createRequire,
+  builtinModules: builtinModules,
+  isBuiltin: isBuiltin,
+  Module: Module,
+  SourceMap: Module.SourceMap,
+  _cache: Module._cache,
+  _debug: Module._debug,
+  _extensions: Module._extensions,
+  _findPath: Module._findPath,
+  _initPaths: Module._initPaths,
+  _load: Module._load,
+  _nodeModulePaths: Module._nodeModulePaths,
+  _pathCache: Module._pathCache,
+  _preloadModules: Module._preloadModules,
+  _resolveFilename: Module._resolveFilename,
+  _resolveLookupPaths: Module._resolveLookupPaths,
+  constants: Module.constants,
+  enableCompileCache: Module.enableCompileCache,
+  findPackageJSON: Module.findPackageJSON,
+  findSourceMap: Module.findSourceMap,
+  flushCompileCache: Module.flushCompileCache,
+  getCompileCacheDir: Module.getCompileCacheDir,
+  getSourceMapsSupport: Module.getSourceMapsSupport,
+  globalPaths: Module.globalPaths,
+  register: Module.register,
+  registerHooks: Module.registerHooks,
+  runMain: Module.runMain,
+  setSourceMapsSupport: Module.setSourceMapsSupport,
+  stripTypeScriptTypes: Module.stripTypeScriptTypes,
+  syncBuiltinESMExports: Module.syncBuiltinESMExports,
+};
+
+// Aliases for the Module static surface (named exports of the same values).
+const _cache = Module._cache;
+const _debug = Module._debug;
+const _extensions = Module._extensions;
+const _findPath = Module._findPath;
+const _initPaths = Module._initPaths;
+const _load = Module._load;
+const _nodeModulePaths = Module._nodeModulePaths;
+const _pathCache = Module._pathCache;
+const _preloadModules = Module._preloadModules;
+const _resolveFilename = Module._resolveFilename;
+const _resolveLookupPaths = Module._resolveLookupPaths;
+const constants = Module.constants;
+const enableCompileCache = Module.enableCompileCache;
+const findPackageJSON = Module.findPackageJSON;
+const findSourceMap = Module.findSourceMap;
+const flushCompileCache = Module.flushCompileCache;
+const getCompileCacheDir = Module.getCompileCacheDir;
+const getSourceMapsSupport = Module.getSourceMapsSupport;
+const globalPaths = Module.globalPaths;
+const register = Module.register;
+const registerHooks = Module.registerHooks;
+const runMain = Module.runMain;
+const setSourceMapsSupport = Module.setSourceMapsSupport;
+const stripTypeScriptTypes = Module.stripTypeScriptTypes;
+const syncBuiltinESMExports = Module.syncBuiltinESMExports;
+export { Module, SourceMap, _cache, _debug, _extensions, _findPath, _initPaths };
+export { _load, _nodeModulePaths, _pathCache, _preloadModules, _resolveFilename, _resolveLookupPaths };
+export { constants, enableCompileCache, findPackageJSON, findSourceMap, flushCompileCache };
+export { getCompileCacheDir, getSourceMapsSupport, globalPaths, register, registerHooks };
+export { runMain, setSourceMapsSupport, stripTypeScriptTypes, syncBuiltinESMExports };

@@ -1,0 +1,22 @@
+NAME = "probe_enter"
+OPS = [
+    ("wait_quiet", 2.0),
+    ("log", "probe A: CR"),
+    ("send", b"probeA\r"),
+    ("wait", 1.5),
+    ("snap", "probeA_cr"),
+    ("log", "probe B: LF"),
+    ("send", b"probeB\n"),
+    ("wait", 1.5),
+    ("snap", "probeB_lf"),
+    ("log", "probe C: ESC CR (alt-enter)"),
+    ("send", b"\x1b\r"),
+    ("wait", 1.5),
+    ("snap", "probeC_altcr"),
+    ("log", "probe D: ctrl+enter (0x0a raw / CSI-u)"),
+    ("send", b"\x1b[13;5u"),
+    ("wait", 1.5),
+    ("snap", "probeD_ctrlu"),
+    ("send", b"/quit\r"),
+    ("wait", 1.0),
+]

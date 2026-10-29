@@ -1,0 +1,158 @@
+import { EventEmitter } from "@node/events";
+
+// node:readline load-compatible surface: the Interface skeleton moves
+// whole-line writes through the event surface; the cursor helpers write the
+// real ANSI sequences to the stream; no raw keypress decoding happens (the
+// runtime has no terminal input host).
+
+class Interface extends EventEmitter {
+  constructor(input, output, options) {
+    super();
+    if (input !== undefined && input !== null && typeof input !== "object") {
+      throw new TypeError("The \"input\" argument must be a readable stream");
+    }
+    const opts = options === undefined || options === null ? {} : options;
+    this.input = input;
+    this.output = output !== undefined && output !== null ? output : input;
+    this.terminal = Boolean(opts.terminal);
+    // Stored as `_prompt`: real Node keeps the prompt text off the method
+    // name (`this.prompt` must remain the callable method).
+    this._prompt = opts.prompt !== undefined ? String(opts.prompt) : "> ";
+    this.historySize = typeof opts.historySize === "number" ? opts.historySize : 30;
+    this.history = [];
+    this.line = "";
+    this.cursor = 0;
+    this.closed = false;
+  }
+  getPrompt() {
+    return this._prompt;
+  }
+  setPrompt(prompt) {
+    this._prompt = String(prompt);
+  }
+  prompt(_preserveCursor) {
+    if (this.closed) return;
+    if (this.output && typeof this.output.write === "function") {
+      this.output.write(this._prompt);
+    }
+  }
+  question(query, callback) {
+    if (this.closed) return;
+    this.prompt();
+    if (typeof callback === "function") {
+      // No terminal-input host: the honest answer is the empty line.
+      globalThis.__pirMicrotask(() => callback(""));
+    }
+  }
+  pause() {
+    return this;
+  }
+  resume() {
+    return this;
+  }
+  write(_data, _key) {}
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.emit("close");
+  }
+  refreshLine() {}
+  getCursorPos() {
+    return { rows: 0, cols: this.cursor };
+  }
+}
+
+function createInterface(input, output, options) {
+  if (input !== undefined && input !== null && typeof input === "object" && typeof input.read !== "function") {
+    // (options) single-argument shape.
+    return new Interface(undefined, undefined, input);
+  }
+  if (input !== undefined && input !== null && typeof input === "object" && options === undefined && output !== undefined && output !== null && typeof output === "object" && typeof output.read !== "function") {
+    // (input, options) shape.
+    return new Interface(input, undefined, output);
+  }
+  return new Interface(input, output, options);
+}
+
+// --- ANSI cursor helpers (real writes) -----------------------------------------
+
+function cursorTo(stream, x, y, callback) {
+  if (typeof y === "function") {
+    callback = y;
+    y = undefined;
+  }
+  if (stream && typeof stream.write === "function") {
+    stream.write(y === undefined ? `\u001b[${x + 1}G` : `\u001b[${y + 1};${x + 1}H`);
+  }
+  if (typeof callback === "function") globalThis.__pirMicrotask(() => callback(undefined));
+  return true;
+}
+
+function moveCursor(stream, dx, dy, callback) {
+  if (stream && typeof stream.write === "function") {
+    if (dx > 0) stream.write(`\u001b[${dx}C`);
+    else if (dx < 0) stream.write(`\u001b[${-dx}D`);
+    if (dy > 0) stream.write(`\u001b[${dy}B`);
+    else if (dy < 0) stream.write(`\u001b[${-dy}A`);
+  }
+  if (typeof callback === "function") globalThis.__pirMicrotask(() => callback(undefined));
+  return true;
+}
+
+function clearLine(stream, dir, callback) {
+  if (stream && typeof stream.write === "function") {
+    const dirCode = dir === -1 ? "\u001b[1K" : dir === 1 ? "\u001b[0K" : "\u001b[2K";
+    stream.write(dirCode + "\r");
+  }
+  if (typeof callback === "function") globalThis.__pirMicrotask(() => callback(undefined));
+  return true;
+}
+
+function clearScreenDown(stream, callback) {
+  if (stream && typeof stream.write === "function") {
+    stream.write("\u001b[0J");
+  }
+  if (typeof callback === "function") globalThis.__pirMicrotask(() => callback(undefined));
+  return true;
+}
+
+function emitKeypressEvents(_stream, _interface) {
+  // No raw terminal-input host: keypress decoding never fires here.
+}
+
+// Promise-API module: an Interface whose question resolves via Promise.
+const promises = {
+  Interface: Interface,
+  createInterface(input, output, options) {
+    if (input !== undefined && input !== null && typeof input === "object" && typeof input.read !== "function") {
+      return new PromiseInterface(undefined, undefined, input);
+    }
+    return new PromiseInterface(input, output, options);
+  },
+};
+
+class PromiseInterface extends Interface {
+  question(query, options) {
+    return new Promise((resolve) => {
+      this.prompt();
+      const answer = options && typeof options.signal === "object" && options.signal.aborted
+        ? ""
+        : "";
+      globalThis.__pirMicrotask(() => resolve(answer));
+    });
+  }
+}
+
+const readline = {
+  Interface: Interface,
+  createInterface: createInterface,
+  cursorTo: cursorTo,
+  moveCursor: moveCursor,
+  clearLine: clearLine,
+  clearScreenDown: clearScreenDown,
+  emitKeypressEvents: emitKeypressEvents,
+  promises: promises,
+};
+
+export default readline;
+export { Interface, createInterface, cursorTo, moveCursor, clearLine, clearScreenDown, emitKeypressEvents, promises };

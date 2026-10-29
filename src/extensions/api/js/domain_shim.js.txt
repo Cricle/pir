@@ -1,0 +1,48 @@
+// node:domain — throws tier (deprecated since Node 4; load compatibility
+// only). The runtime hosts no error-domain context tracking; `Domain` and the
+// creation entry points throw the unified error. `active`/`_stack` report the
+// real no-domain values.
+function domainUnsupported(api) {
+  const error = new Error("node:domain." + api + " is not supported by the pir extension runtime (deprecated module)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+class Domain {
+  constructor(..._args) {
+    throw domainUnsupported("Domain");
+  }
+  run(_fn) {}
+  add(_emitter) {}
+  remove(_emitter) {}
+  bind(_cb) {
+    return _cb;
+  }
+  intercept(_cb) {
+    return _cb;
+  }
+  enter() {}
+  exit() {}
+  dispose() {}
+}
+
+function createDomain(..._args) {
+  throw domainUnsupported("createDomain");
+}
+
+const domain = {
+  Domain: Domain,
+  createDomain: createDomain,
+  create: createDomain,
+  // Real no-domain state.
+  active: null,
+  _stack: [],
+};
+
+// Standalone references for the named-export surface.
+const create = createDomain;
+const active = domain.active;
+const _stack = domain._stack;
+
+export default domain;
+export { Domain, createDomain, create, active, _stack };

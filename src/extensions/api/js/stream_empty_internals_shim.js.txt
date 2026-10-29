@@ -1,0 +1,7 @@
+// node:_stream_passthrough / _stream_transform / _stream_wrap — these
+// private specifiers carry zero named exports in real Node (the classes
+// live in the public `stream` surface); the empty default keeps the
+// specifiers resolvable.
+const empty = {};
+
+export default empty;

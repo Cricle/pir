@@ -1,0 +1,41 @@
+// node:_http_outgoing — private internals: the message class and header
+// validators are aliased from the node:http shim; `parseUniqueHeadersOption`
+// is the real pure-logic normalization (array -> Map of lowercased names to
+// Set); the k-symbols keep the internal property names.
+import { OutgoingMessage, validateHeaderName, validateHeaderValue } from "@node/http";
+
+// Real logic (mirrors Node's normalizeListToArray + Map build).
+function parseUniqueHeadersOption(headers) {
+  if (headers === undefined || headers === null) {
+    return false;
+  }
+  if (!Array.isArray(headers)) {
+    throw new TypeError("Header list must be an array");
+  }
+  const uniqueHeaders = new Map();
+  for (const header of headers) {
+    const key = String(header).toLowerCase();
+    let set = uniqueHeaders.get(key);
+    if (set === undefined) {
+      set = new Set();
+      uniqueHeaders.set(key, set);
+    }
+    set.add(String(header));
+  }
+  return uniqueHeaders;
+}
+
+const kHighWaterMark = Symbol("kHighWaterMark");
+const kUniqueHeaders = Symbol("kUniqueHeaders");
+
+const httpOutgoing = {
+  OutgoingMessage: OutgoingMessage,
+  parseUniqueHeadersOption: parseUniqueHeadersOption,
+  validateHeaderName: validateHeaderName,
+  validateHeaderValue: validateHeaderValue,
+  kHighWaterMark: kHighWaterMark,
+  kUniqueHeaders: kUniqueHeaders,
+};
+
+export default httpOutgoing;
+export { OutgoingMessage, parseUniqueHeadersOption, validateHeaderName, validateHeaderValue, kHighWaterMark, kUniqueHeaders };

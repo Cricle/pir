@@ -1,0 +1,1529 @@
+
+// node:http — LLRT-tier REAL client + minimal REAL server, both riding the
+// `__pir_host.http` bridge the Web `fetch` surface uses (http_fns.rs).
+//
+// Client (`http.request`/`http.get` → `ClientRequest` → `IncomingMessage`):
+// the request line/headers/auth are assembled here, the body is AGGREGATED by
+// `write()` and sent in one shot with the request (minimal: the fetch host
+// does not stream request bodies) as `bodyText` when every chunk is plain
+// UTF-8 text and as `bodyB64` otherwise, and the response streams back through
+// `fetchPoll` windows emitting `data`/`end`. Redirects are NOT followed
+// (`noRedirect` host client; Node's own default for node:http). Connection
+// errors surface as `error` events with the transport code (ECONNREFUSED,
+// ENOTFOUND, ...); `destroy()`/AbortSignal tear the request down via
+// `fetchAbort`. Agent is a real option-mirroring class. Client connections DO
+// persist across requests, with Node v19+ semantics: the host reqwest pool
+// keeps the sockets on a process-wide runtime, `http.globalAgent` keeps alive,
+// and `Connection: close` is advertised only when the request's agent cannot
+// reuse the socket (Node's `keepAlive: false` + unbounded `maxSockets` shape;
+// see `ClientRequest`'s constructor).
+//
+// Server (`http.createServer` → `Server`): `serverListen` binds 127.0.0.1
+// (loopback only), the host parses HTTP/1.1 request heads, JS dispatches
+// `request` events and answers through `ServerResponse` (`serverRespond`
+// writes status/headers/body in one shot). Keep-alive is real: HTTP/1.1
+// connections persist across serialized requests (`connection: keep-alive`
+// answers, ~5 s idle close, `server.close()` waits for in-flight requests),
+// and request bodies stream to the handler through `serverBody` windows —
+// chunked uploads surface chunk by chunk, not aggregated.
+//
+// Kept from the throws tier: STATUS_CODES/METHODS tables, validateHeader*,
+// WebSocket/CloseEvent/MessageEvent value holders (http.WebSocket still
+// throws). net.Server stays throws-tier in this runtime, so `Server` extends
+// EventEmitter and mirrors net.Server's event surface instead of extending
+// it. ES2020 only.
+
+import EventEmitter from "@node/events";
+import { Readable as pirReadableBase } from "@node/stream";
+
+// Node's status table subset read by real clients; 426 is the WebSocket
+// upgrade code (ws's pre-upgrade rejection path).
+const STATUS_CODES = {
+  200: "OK", 201: "Created", 202: "Accepted", 204: "No Content",
+  206: "Partial Content", 301: "Moved Permanently", 302: "Found",
+  303: "See Other", 304: "Not Modified", 307: "Temporary Redirect",
+  308: "Permanent Redirect", 400: "Bad Request", 401: "Unauthorized",
+  403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
+  408: "Request Timeout", 409: "Conflict", 413: "Payload Too Large",
+  415: "Unsupported Media Type", 422: "Unprocessable Entity",
+  426: "Upgrade Required", 429: "Too Many Requests",
+  500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway",
+  503: "Service Unavailable", 504: "Gateway Timeout",
+};
+
+// Node's full METHODS array (https://nodejs.org/api/http.html).
+const METHODS = [
+  "ACL", "BIND", "CHECKOUT", "CONNECT", "COPY", "DELETE", "GET", "HEAD",
+  "LINK", "LOCK", "M-SEARCH", "MERGE", "MKACTIVITY", "MKCALENDAR", "MKCOL",
+  "MOVE", "NOTIFY", "OPTIONS", "PATCH", "POST", "PROPFIND", "PROPPATCH",
+  "PURGE", "PUT", "REBIND", "REPORT", "SEARCH", "SOURCE", "SUBSCRIBE",
+  "TRACE", "UNBIND", "UNLINK", "UNLOCK", "UNSUBSCRIBE",
+];
+
+const maxHeaderSize = 16384;
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+const DEFAULT_PORTS = { "http:": 80, "https:": 443 };
+
+function pirHttpHost() {
+  return globalThis.__pir_host;
+}
+
+function pirHostValue(raw, op) {
+  let response;
+  try {
+    response = JSON.parse(raw);
+  } catch (error) {
+    const parseError = new Error("__pir_host.http returned invalid JSON: " + op);
+    parseError.code = "EIO";
+    throw parseError;
+  }
+  if (!response || response.ok !== true) {
+    const error = new Error((response && response.message) || ("__pir_host.http failed: " + op));
+    if (response && response.code !== undefined) error.code = response.code;
+    throw error;
+  }
+  return response.value;
+}
+
+function pirHostCall(op, payload) {
+  const host = pirHttpHost();
+  if (!host || typeof host.http !== "function") {
+    const error = new Error("node:http is not supported by the pir extension runtime (no http host bridge)");
+    error.code = "ENOSYS";
+    throw error;
+  }
+  return pirHostValue(host.http(op, JSON.stringify(payload)), op);
+}
+
+function pirB64ToBytes(base64) {
+  return base64 ? Buffer.from(base64, "base64") : Buffer.alloc(0);
+}
+
+function pirBytesToB64(bytes) {
+  // `Buffer.from(buffer)` copies (buffer_global.js.txt's fromView): encode a
+  // Buffer in place, keep the copy semantics for every other input.
+  return Buffer.isBuffer(bytes) ? bytes.toString("base64") : Buffer.from(bytes).toString("base64");
+}
+
+function pirChunkToBuffer(chunk, encoding) {
+  if (typeof chunk === "string") return Buffer.from(chunk, encoding === undefined ? "utf8" : encoding);
+  if (Buffer.isBuffer(chunk)) return chunk;
+  if (typeof ArrayBuffer !== "undefined" && chunk instanceof ArrayBuffer) return Buffer.from(new Uint8Array(chunk));
+  if (ArrayBuffer.isView(chunk)) {
+    return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  }
+  throw new TypeError("Invalid chunk type: " + typeof chunk);
+}
+
+// Unpaired surrogate code unit anywhere in `text`.
+function pirHasLoneSurrogate(text) {
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        i++; // a well-formed pair encodes as one character
+        continue;
+      }
+      return true;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
+
+// Can this chunk ride the text channel (`bodyText`) instead of `bodyB64`?
+// Only when its bytes are exactly its UTF-8 encoding: the encoding argument
+// must resolve to utf8 (Buffer.from's default; `lookupEncoding` in
+// buffer_global.js.txt is case-insensitive, and a non-string/empty encoding is
+// utf8 there too) and the chunk itself must carry no lone surrogate (UTF-8
+// substitutes U+FFFD for one, while the JSON text channel would have
+// JSON.stringify escape it and the host's `json!` payload parser reject the
+// escape). Every rejected chunk makes the whole request take the byte channel,
+// which is byte-identical to what it always sent.
+function pirTextChunkEncodable(chunk, encoding) {
+  if (typeof chunk !== "string") return false;
+  if (typeof encoding === "string" && encoding.length !== 0) {
+    const normalized = encoding.toLowerCase();
+    if (normalized !== "utf8" && normalized !== "utf-8") return false;
+  }
+  return !pirHasLoneSurrogate(chunk);
+}
+
+function pirAbortError(reason) {
+  const error = reason instanceof Error
+    ? reason
+    : new Error(reason === undefined || reason === null ? "This operation was aborted" : String(reason));
+  if (!error.name || !(reason instanceof Error)) {
+    error.name = "AbortError";
+    error.code = "ABORT_ERR";
+  }
+  return error;
+}
+
+function pirValidateHeaderName(name) {
+  if (typeof name !== "string" || !/^[^:\r\n]*$/.test(name) || /[ \t]/.test(name)) {
+    const error = new TypeError("Invalid header name: " + JSON.stringify(name));
+    error.code = "ERR_INVALID_HTTP_TOKEN";
+    throw error;
+  }
+  return name;
+}
+
+function pirValidateHeaderValue(name, value) {
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "undefined") {
+    const error = new TypeError("Invalid value in \"" + String(name) + "\" header");
+    error.code = "ERR_HTTP_INVALID_CHAR";
+    throw error;
+  }
+  if (typeof value === "string" && /[^\t\x20-\x7e\x80-\xff]/.test(value)) {
+    const error = new TypeError("Invalid character in header content [\"header content\"]");
+    error.code = "ERR_HTTP_INVALID_CHAR";
+    throw error;
+  }
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// Poll-loop pacing
+// ---------------------------------------------------------------------------
+// Every host poll is one JSON round trip (tens of microseconds), so a poll
+// itself is cheap; the *yield* is what costs. This runtime's event-loop drain
+// advances timers on a ~10 ms beat (measured: a chained `setTimeout(..., 0)`
+// costs ~10-13 ms per hop, and so does `setImmediate`), which makes the naive
+// poll-and-retry-on-a-timer shape pay ~10 ms per hop — and a client that
+// starts with a blocking poll pays it twice: a loopback peer inside this same
+// process only runs its handler while the JS thread is back in the event
+// loop, so the first blocking poll simply burns its whole wait before the
+// server can answer.
+//
+// Measured host-level loopback cost with the accept loop probing every 1 ms:
+// ~8 ms from `fetchStart` to the request being queued on a same-process server
+// (worker thread + client build + connect + parse), ~1 ms back. The pacing
+// therefore opens with a bounded no-yield window that covers exactly that:
+//   1. non-blocking polls first, then short blocking slices (the host returns
+//      the moment the state changes, so a slice is never idle latency);
+//   2. every same-process server is stepped between slices (`pirPumpLocalServers`)
+//      — that is what turns the in-process loopback round trip into ~10 ms
+//      instead of ~100 ms, and a dispatch reopens a short window because a
+//      synchronous handler's answer is already on the wire;
+//   3. after the window the loop yields once (so timers, promises and an
+//      asynchronous local handler all get the JS thread back) and then
+//      alternates yield / blocking slice, which is the shape that keeps an
+//      unrelated slow peer from being hammered with polls.
+const PIR_POLL_SPIN_MS = 20;
+// Window reopened when a same-process server dispatched a request.
+const PIR_POLL_PROGRESS_MS = 1;
+// Blocking slice inside the no-yield window.
+const PIR_POLL_SLICE_MS = 2;
+// Steady-state slice with no same-process server registered.
+const PIR_POLL_WAIT_MS = 40;
+// Steady-state slice while a same-process server is registered: short enough
+// that the next local step is never far away.
+const PIR_POLL_LOCAL_WAIT_MS = 10;
+
+// Registered same-process servers (`http.Server` instances that are
+// listening): their non-blocking drain step, called from a client's poll loop.
+const pirServerPumps = [];
+
+function pirRegisterServerPump(pump) {
+  if (pirServerPumps.indexOf(pump) === -1) pirServerPumps.push(pump);
+}
+
+function pirUnregisterServerPump(pump) {
+  const index = pirServerPumps.indexOf(pump);
+  if (index !== -1) pirServerPumps.splice(index, 1);
+}
+
+// Step every same-process server once, without blocking. Returns true when at
+// least one of them dispatched a request.
+function pirPumpLocalServers() {
+  let progressed = false;
+  const pumps = pirServerPumps.slice();
+  for (const pump of pumps) {
+    let moved = false;
+    try {
+      moved = pump() === true;
+    } catch (error) {
+      // A pump never throws outward: a misbehaving local server must not take
+      // the client's poll loop down (the server's own loop reports errors).
+      moved = false;
+    }
+    if (moved) progressed = true;
+  }
+  return progressed;
+}
+
+// Defer to the end of the current job (a microtask): the 'response' callback
+// attaches its listeners synchronously, and no ~10 ms timer hop is paid.
+function pirDefer(fn) {
+  if (typeof globalThis.__pirMicrotask === "function") globalThis.__pirMicrotask(fn);
+  else Promise.resolve().then(fn);
+}
+
+// Sub-millisecond clock for the spin window; `Date.now` (1 ms) is the
+// fallback, where the window is quantised to whole milliseconds.
+function pirNowMs() {
+  const proc = globalThis.process;
+  if (proc !== undefined && proc !== null &&
+      typeof proc.hrtime === "function" && typeof proc.hrtime.bigint === "function") {
+    return Number(proc.hrtime.bigint()) / 1e6;
+  }
+  return Date.now();
+}
+
+// Per-request poll pacing. `nextWaitMs()` returns the wait to hand the host
+// now, or -1 for "yield to the event loop first".
+class PirPoller {
+  constructor() {
+    this.deadline = -1;
+    this.polled = false;
+    this.pendingYield = false;
+  }
+  nextWaitMs() {
+    const now = pirNowMs();
+    if (this.deadline < 0) this.deadline = now + PIR_POLL_SPIN_MS;
+    if (now < this.deadline) {
+      const first = !this.polled;
+      this.polled = true;
+      return first ? 0 : PIR_POLL_SLICE_MS;
+    }
+    if (!this.pendingYield) {
+      this.pendingYield = true;
+      return -1;
+    }
+    this.pendingYield = false;
+    return pirServerPumps.length > 0 ? PIR_POLL_LOCAL_WAIT_MS : PIR_POLL_WAIT_MS;
+  }
+  // A same-process server moved a request into a handler: poll a moment longer
+  // (a synchronous handler's answer is already on the wire), then yield so an
+  // asynchronous handler's timers and promises can run.
+  noteProgress() {
+    this.deadline = pirNowMs() + PIR_POLL_PROGRESS_MS;
+  }
+}
+
+// Minimal absolute-URL parser (the engine may carry no URL global): scheme,
+// optional user:pass, host[:port] (IPv6 bracketed), path?query. Fragments are
+// stripped like Node's outgoing requests.
+function pirParseUrl(text) {
+  const match = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)([/?#].*)?$/.exec(String(text));
+  if (!match) {
+    const error = new TypeError("Failed to parse URL: not an absolute URL: " + String(text));
+    error.code = "ERR_INVALID_URL";
+    throw error;
+  }
+  const scheme = match[1].toLowerCase();
+  if (scheme !== "http" && scheme !== "https") {
+    const error = new TypeError("node:http is not supported by the pir extension runtime for scheme '" + scheme + ":'");
+    error.code = "ERR_INVALID_URL";
+    throw error;
+  }
+  let authority = match[2];
+  let rest = match[3] === undefined ? "" : match[3];
+  let auth;
+  const at = authority.lastIndexOf("@");
+  if (at !== -1) {
+    auth = authority.slice(0, at);
+    authority = authority.slice(at + 1);
+  }
+  let host;
+  let port;
+  if (authority.charAt(0) === "[") {
+    const close = authority.indexOf("]");
+    if (close === -1) {
+      const error = new TypeError("Failed to parse URL: unterminated IPv6 host");
+      error.code = "ERR_INVALID_URL";
+      throw error;
+    }
+    host = authority.slice(0, close + 1);
+    const after = authority.slice(close + 1);
+    if (after.charAt(0) === ":") port = after.slice(1);
+    else if (after !== "") {
+      const error = new TypeError("Failed to parse URL: invalid characters after IPv6 host");
+      error.code = "ERR_INVALID_URL";
+      throw error;
+    }
+  } else {
+    const colon = authority.lastIndexOf(":");
+    if (colon !== -1) {
+      host = authority.slice(0, colon);
+      port = authority.slice(colon + 1);
+    } else {
+      host = authority;
+    }
+  }
+  if (host === "") {
+    const error = new TypeError("Failed to parse URL: missing host");
+    error.code = "ERR_INVALID_URL";
+    throw error;
+  }
+  const hash = rest.indexOf("#");
+  if (hash !== -1) rest = rest.slice(0, hash);
+  if (rest === "") rest = "/";
+  return {
+    protocol: scheme + ":",
+    auth: auth,
+    host: host,
+    port: port === undefined || port === "" ? undefined : Number(port),
+    path: rest,
+  };
+}
+
+// request([url,] [options,] [callback]) argument normalization.
+function pirNormalizeRequestArgs(input, options, callback, defaultProtocol) {
+  if (typeof options === "function") {
+    callback = options;
+    options = undefined;
+  }
+  let fromUrl;
+  let inputIsOptions = false;
+  if (input !== undefined && input !== null) {
+    const text = typeof input === "string"
+      ? input
+      : (typeof input.href === "string" ? input.href : undefined);
+    if (text !== undefined) {
+      fromUrl = pirParseUrl(text);
+    } else if (typeof input === "object" && (options === undefined || options === null)) {
+      // request(options) — options arrived as the first argument
+      inputIsOptions = true;
+    } else if (typeof input !== "object") {
+      fromUrl = pirParseUrl(String(input));
+    }
+  }
+  let opts;
+  if (inputIsOptions) {
+    opts = input;
+  } else if (options === undefined || options === null) {
+    opts = {};
+  } else if (typeof options === "object") {
+    opts = options;
+  } else {
+    const error = new TypeError("Request options must be an object");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  const protocol = String(opts.protocol !== undefined ? opts.protocol : (fromUrl ? fromUrl.protocol : defaultProtocol)).toLowerCase();
+  if (DEFAULT_PORTS[protocol] === undefined) {
+    const error = new TypeError("node:http is not supported by the pir extension runtime for protocol '" + protocol + "'");
+    error.code = "ERR_INVALID_PROTOCOL";
+    throw error;
+  }
+  let host = opts.hostname !== undefined ? String(opts.hostname) : (opts.host !== undefined ? String(opts.host) : (fromUrl ? fromUrl.host : "localhost"));
+  let port = opts.port !== undefined ? Number(opts.port) : (fromUrl && fromUrl.port !== undefined ? fromUrl.port : DEFAULT_PORTS[protocol]);
+  if (Number.isNaN(port) || port < 0 || port > 65535) {
+    const error = new TypeError("Invalid port: " + String(opts.port));
+    error.code = "ERR_SOCKET_BAD_PORT";
+    throw error;
+  }
+  let path = opts.path !== undefined ? String(opts.path) : (fromUrl ? fromUrl.path : "/");
+  // Be permissive like real clients: origin-form paths as given, absolute
+  // (proxy-style) paths as given, anything else anchored at root.
+  if (path.charAt(0) !== "/" && path.indexOf("://") === -1) path = "/" + path;
+  const auth = opts.auth !== undefined ? String(opts.auth) : (fromUrl ? fromUrl.auth : undefined);
+  const method = String(opts.method !== undefined ? opts.method : "GET").toUpperCase();
+  if (/[^A-Z0-9!#$%&'*+.^_`|~-]/.test(method)) {
+    const error = new TypeError("Invalid HTTP method: " + JSON.stringify(opts.method));
+    error.code = "ERR_INVALID_METHOD";
+    throw error;
+  }
+  // Flatten the caller's headers (object of values, arrays as multi-values,
+  // or an array of [name, value] pairs) into ordered wire entries.
+  const headerEntries = [];
+  const raw = opts.headers;
+  if (Array.isArray(raw)) {
+    for (const pair of raw) {
+      if (!Array.isArray(pair) || pair.length < 2) {
+        const error = new TypeError("Headers must be [name, value] arrays");
+        error.code = "ERR_INVALID_ARG_VALUE";
+        throw error;
+      }
+      headerEntries.push([String(pair[0]), String(pair[1])]);
+    }
+  } else if (raw !== undefined && raw !== null) {
+    for (const name of Object.keys(raw)) {
+      const value = raw[name];
+      if (Array.isArray(value)) {
+        for (const item of value) headerEntries.push([name, String(item)]);
+      } else {
+        headerEntries.push([name, String(value)]);
+      }
+    }
+  }
+  return { protocol, host, port, path, auth, method, headerEntries, signal: opts.signal, agent: opts.agent, callback };
+}
+
+// ---------------------------------------------------------------------------
+// Agent — option mirroring is real; the sockets are NOT (they live in the host
+// reqwest pool, which reuses them across requests on its process-wide
+// runtime; these instances carry no sockets of their own).
+// ---------------------------------------------------------------------------
+
+class Agent {
+  constructor(options) {
+    const opts = options === undefined || options === null ? {} : options;
+    this.options = opts;
+    this.defaultPort = 80;
+    this.protocol = "http:";
+    this.keepAlive = Boolean(opts.keepAlive);
+    this.keepAliveMsecs = typeof opts.keepAliveMsecs === "number" ? opts.keepAliveMsecs : 1000;
+    this.maxSockets = typeof opts.maxSockets === "number" ? opts.maxSockets : Infinity;
+    this.maxTotalSockets = typeof opts.maxTotalSockets === "number" ? opts.maxTotalSockets : Infinity;
+    this.maxFreeSockets = typeof opts.maxFreeSockets === "number" ? opts.maxFreeSockets : 256;
+    this.scheduling = typeof opts.scheduling === "string" ? opts.scheduling : "fifo";
+    this.maxSocketsPerHost = 0;
+    this.totalSocketCount = 0;
+    this.freeSockets = {};
+    this.sockets = {};
+    this.requests = {};
+    this._pirName = "http";
+  }
+  createConnection() {
+    const error = new Error("http.Agent.createConnection is not supported by the pir extension runtime (the host pool owns connections)");
+    error.code = "ERR_NOT_SUPPORTED";
+    throw error;
+  }
+  destroy() {}
+  getName(nameArg) {
+    return typeof nameArg === "string" ? nameArg : this._pirName || "http";
+  }
+}
+
+// Node's v19+ default agent: keep-alive on, LIFO free-socket scheduling
+// (`lib/internal/http.js`'s globalAgent; the `timeout: 5000` it also carries is
+// not mirrored — socket timeouts belong to the host client).
+const globalAgent = new Agent({ keepAlive: true, scheduling: "lifo" });
+
+// ---------------------------------------------------------------------------
+// OutgoingMessage — header bookkeeping + write() aggregation base
+// ---------------------------------------------------------------------------
+
+class OutgoingMessage extends EventEmitter {
+  constructor() {
+    super();
+    this.headersSent = false;
+    this.writableEnded = false;
+    this.writableFinished = false;
+    this._pirHeaders = new Map(); // lowercase name -> {name, value}
+  }
+  setHeader(name, value) {
+    pirValidateHeaderName(String(name));
+    pirValidateHeaderValue(String(name), value);
+    this._pirHeaders.set(String(name).toLowerCase(), { name: String(name), value: value });
+    return this;
+  }
+  getHeader(name) {
+    const entry = this._pirHeaders.get(String(name).toLowerCase());
+    return entry === undefined ? undefined : entry.value;
+  }
+  getHeaders() {
+    const out = {};
+    for (const [name, entry] of this._pirHeaders) out[name] = entry.value;
+    return out;
+  }
+  getHeaderNames() {
+    return [...this._pirHeaders.keys()];
+  }
+  hasHeader(name) {
+    return this._pirHeaders.has(String(name).toLowerCase());
+  }
+  removeHeader(name) {
+    this._pirHeaders.delete(String(name).toLowerCase());
+  }
+  // OutgoingMessage sits on the events-shim EventEmitter, which has no
+  // destroy — provide the stream-shim semantics here so ClientRequest's
+  // super.destroy() (and ServerResponse) emit error/close like Node.
+  destroy(error) {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    if (error) {
+      try {
+        this.emit("error", error);
+      } catch (unhandled) {} // no 'error' listener: events-shim throws; Node would crash the process
+    }
+    this.emit("close");
+    return this;
+  }
+  appendHeader(name, value) {
+    pirValidateHeaderName(String(name));
+    const key = String(name).toLowerCase();
+    const entry = this._pirHeaders.get(key);
+    if (entry === undefined) {
+      this._pirHeaders.set(key, { name: String(name), value: value });
+      return this;
+    }
+    const merged = [].concat(entry.value, value);
+    this._pirHeaders.set(key, { name: entry.name, value: merged });
+    return this;
+  }
+  // Base implementations record the writable state; the message classes
+  // override to aggregate/send.
+  write(_chunk, _encoding, callback) {
+    if (typeof callback === "function") callback();
+    this.headersSent = true;
+    return true;
+  }
+  end(_chunk, _encoding, callback) {
+    this.writableEnded = true;
+    this.writableFinished = true;
+    if (typeof callback === "function") callback();
+    return this;
+  }
+  flushHeaders() {}
+}
+
+// ---------------------------------------------------------------------------
+// IncomingMessage — Readable-based message: the pad's push() drives the
+// `data`/`end` events, pause()/resume() gate the pump that feeds it.
+// ---------------------------------------------------------------------------
+
+class IncomingMessage extends pirReadableBase {
+  constructor(meta) {
+    meta = meta === undefined || meta === null ? {} : meta;
+    super();
+    this._pirId = typeof meta.id === "number" ? meta.id : 0;
+    this._pirStash = Array.isArray(meta.stash) ? meta.stash : [];
+    this._pirFinished = false;
+    this._pirPaused = false;
+    this._poller = new PirPoller();
+    // Server-side requests stream their body from the host request slot
+    // (`serverBody` windows) instead of carrying an aggregate.
+    this._pirServerReqId = typeof meta.serverReqId === "number" ? meta.serverReqId : 0;
+    // Status surface: client responses carry statusCode/statusMessage; server
+    // requests carry method/url.
+    this.statusCode = meta.statusCode;
+    // The transport (reqwest) does not expose the reason phrase, so fall
+    // back to the canonical STATUS_CODES text like a minimal client would.
+    this.statusMessage = meta.statusMessage !== undefined && meta.statusMessage !== null
+      ? meta.statusMessage
+      : (STATUS_CODES[this.statusCode] || "");
+    this.httpVersion = typeof meta.httpVersion === "string" ? meta.httpVersion : "1.1";
+    this.method = meta.method;
+    this.url = meta.url;
+    this.complete = false;
+    // headers (lowercased; set-cookie stays an array) + rawHeaders (original
+    // case, flat [name, value, ...]).
+    const headers = Object.create(null);
+    const rawHeaders = [];
+    const setCookie = [];
+    for (const pair of meta.headers || []) {
+      const name = String(pair[0]);
+      const value = String(pair[1]);
+      rawHeaders.push(name, value);
+      const key = name.toLowerCase();
+      if (key === "set-cookie") {
+        setCookie.push(value);
+        continue;
+      }
+      headers[key] = headers[key] === undefined ? value : headers[key] + ", " + value;
+    }
+    if (setCookie.length > 0) headers["set-cookie"] = setCookie;
+    this.headers = headers;
+    this.rawHeaders = rawHeaders;
+    // Server-side requests stream their body through the host slot on the
+    // next tick. A client response carries no aggregate here: its body arrives
+    // through the `_pirPollHeaders` stash/poll loop, which kicks the pump
+    // itself (neither `new IncomingMessage` site passes a body in `meta`).
+    if (this._pirServerReqId !== 0) {
+      const self = this;
+      globalThis.setTimeout(function () {
+        self._pirPump();
+      }, 0);
+    }
+  }
+  pause() {
+    this._pirPaused = true;
+    return this;
+  }
+  resume() {
+    this._pirPaused = false;
+    this._pirPump();
+    return this;
+  }
+  destroy(error) {
+    if (this.destroyed) return this;
+    this._pirFinished = true;
+    this._pirReleaseId();
+    return super.destroy(error);
+  }
+  _pirReleaseId() {
+    if (this._pirId === 0) return;
+    const id = this._pirId;
+    this._pirId = 0;
+    try {
+      pirHttpHost().http("fetchAbort", JSON.stringify({ id: id }));
+      pirHttpHost().http("fetchEnd", JSON.stringify({ id: id }));
+    } catch (error) {}
+  }
+  // Message pump dispatch: server-side request bodies stream from the host
+  // request slot; client-side responses stream from the fetch bridge.
+  _pirPump() {
+    if (this._pirServerReqId !== 0) {
+      this._pirServerBodyPump();
+      return;
+    }
+    if (this.destroyed || this._pirFinished || this._pirPaused || this._pirId === 0) return;
+    // Bytes the header-poll loop already drained (the host window is
+    // consume-once) come first, in their original order; a stashed window
+    // that carried `done` needs no further polling.
+    if (this._pirStash.length > 0) {
+      const stashed = this._pirStash.shift();
+      if (stashed.truncated) {
+        this.destroy(new Error(
+          "response body window overflowed: the host dropped part of the body " +
+          "(a single transport chunk exceeded the 8 MiB window)"
+        ));
+        return;
+      }
+      const stashedBytes = pirB64ToBytes(stashed.body);
+      if (stashedBytes.length > 0) this.push(stashedBytes);
+      if (stashed.done) {
+        this._pirComplete();
+        return;
+      }
+      // A stashed window without `done` leaves the stream live: fall through
+      // and keep polling for the rest (returning here would stall the body
+      // until the consumer happened to resume() the stream).
+    }
+    for (;;) {
+      if (this.destroyed || this._pirFinished || this._pirPaused || this._pirId === 0) return;
+      const waitMs = this._poller.nextWaitMs();
+      if (waitMs === -1) {
+        const self = this;
+        globalThis.setTimeout(function () {
+          self._pirPump();
+        }, 0);
+        return;
+      }
+      let state;
+      try {
+        state = pirHostCall("fetchPoll", { id: this._pirId, waitMs: waitMs });
+      } catch (error) {
+        this.destroy(error);
+        return;
+      }
+      if (state.error) {
+        const error = new Error(state.error.message || "response stream failed");
+        error.code = state.error.code || "EIO";
+        this.destroy(error);
+        return;
+      }
+      if (state.aborted) {
+        this.destroy(pirAbortError());
+        return;
+      }
+      if (state.truncated) {
+        this.destroy(new Error(
+          "response body window overflowed: the host dropped part of the body " +
+          "(a single transport chunk exceeded the 8 MiB window)"
+        ));
+        return;
+      }
+      const chunk = pirB64ToBytes(state.body);
+      if (chunk.length > 0) this.push(chunk);
+      if (state.done) {
+        this._pirComplete();
+        return;
+      }
+      if (pirPumpLocalServers()) this._poller.noteProgress();
+    }
+  }
+  _pirComplete() {
+    this.complete = true;
+    this._pirFinished = true;
+    this._pirReleaseId();
+    this.push(null); // the pad emits 'end'
+  }
+  // Server-request body pump: drain `serverBody` windows into push() until
+  // the host marks the body done (or reaps the request with the connection).
+  _pirServerBodyPump() {
+    if (this.destroyed || this._pirFinished || this._pirPaused || this._pirServerReqId === 0) return;
+    for (;;) {
+      if (this.destroyed || this._pirFinished || this._pirPaused || this._pirServerReqId === 0) return;
+      const waitMs = this._poller.nextWaitMs();
+      if (waitMs === -1) {
+        const self = this;
+        globalThis.setTimeout(function () {
+          self._pirServerBodyPump();
+        }, 0);
+        return;
+      }
+      let state;
+      try {
+        state = pirHostCall("serverBody", { reqId: this._pirServerReqId, waitMs: waitMs });
+      } catch (error) {
+        this.destroy(error);
+        return;
+      }
+      const chunk = pirB64ToBytes(state.body);
+      if (chunk.length > 0) this.push(chunk);
+      if (state.done) {
+        this._pirComplete();
+        return;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ClientRequest
+// ---------------------------------------------------------------------------
+
+class ClientRequest extends OutgoingMessage {
+  constructor(input, options, callback, defaultProtocol) {
+    const normalized = pirNormalizeRequestArgs(input, options, callback, defaultProtocol);
+    super();
+    this.method = normalized.method;
+    this.path = normalized.path;
+    this.protocol = normalized.protocol;
+    this.host = normalized.host;
+    this.hostname = normalized.host;
+    this.port = normalized.port;
+    this.agent = normalized.agent === undefined ? globalAgent : normalized.agent;
+    this.destroyed = false;
+    this.aborted = false;
+    this._pirBody = [];
+    // Parallel text view of `_pirBody`: chunks that are pure UTF-8 text land
+    // here too, and `_pirStart` sends them as `bodyText` (no base64 round
+    // trip). Any chunk that is not (Buffer/typed array, non-utf8 encoding,
+    // lone surrogate) drops `_pirBodyTextOk` for the whole request and the
+    // aggregate goes out as `bodyB64`, byte-identical to before.
+    this._pirBodyText = [];
+    this._pirBodyTextOk = true;
+    this._pirStarted = false;
+    this._pirId = 0;
+    this._pirResponse = undefined;
+    this._poller = new PirPoller();
+    // Wire URL: userinfo rides a Basic Authorization header (Node's behavior);
+    // the explicit port is kept unless it is the scheme default.
+    for (const [name, value] of normalized.headerEntries) this.setHeader(name, value);
+    if (normalized.auth !== undefined && !this.hasHeader("authorization")) {
+      this.setHeader("Authorization", "Basic " + Buffer.from(normalized.auth, "utf8").toString("base64"));
+    }
+    // Node's connection header rule (`_http_client.js`'s shouldKeepAlive /
+    // `_http_outgoing.js`'s _storeHeader): a request with an agent that can
+    // actually reuse the socket advertises `connection: keep-alive`; one whose
+    // agent cannot (`keepAlive: false` with an unbounded `maxSockets` — Node's
+    // `agent: false` shape) advertises `connection: close`. An explicit user
+    // header always wins. The keep-alive is real here: the host reqwest pool
+    // owns the sockets on a process-wide runtime, so a connection outlives the
+    // request that opened it and later requests reuse it.
+    if (!this.hasHeader("connection")) {
+      const agent = this.agent;
+      const willReuse =
+        Boolean(agent) && (Boolean(agent.keepAlive) || Number.isFinite(agent.maxSockets));
+      this.setHeader("connection", willReuse ? "keep-alive" : "close");
+    }
+    const portSuffix = normalized.port === DEFAULT_PORTS[normalized.protocol] ? "" : ":" + normalized.port;
+    this._pirUrl = normalized.protocol + "//" + normalized.host + portSuffix + normalized.path;
+    // The callback may have arrived in the `options` position (the 2-arg
+    // `http.get(url, cb)` form) — pirNormalizeRequestArgs re-homes it, so
+    // always read it from the normalized result.
+    if (typeof normalized.callback === "function") {
+      this.once("response", normalized.callback);
+    } else if (normalized.callback !== undefined) {
+      const error = new TypeError("Request callback must be a function");
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    if (normalized.signal) {
+      if (normalized.signal.aborted) {
+        const reason = normalized.signal.reason;
+        const self = this;
+        globalThis.setTimeout(function () {
+          self.destroy(pirAbortError(reason));
+        }, 0);
+      } else {
+        const self = this;
+        normalized.signal.addEventListener("abort", function () {
+          self.destroy(pirAbortError(normalized.signal.reason));
+        }, { once: true });
+      }
+    }
+  }
+  // minimal: request bodies are aggregated and sent with end()
+  write(chunk, encoding, callback) {
+    if (typeof encoding === "function") {
+      callback = encoding;
+      encoding = undefined;
+    }
+    if (this.writableEnded) {
+      const error = new Error("write after end");
+      error.code = "ERR_STREAM_WRITE_AFTER_END";
+      this.emit("error", error);
+      return false;
+    }
+    const bytes = pirChunkToBuffer(chunk, encoding);
+    this._pirBody.push(bytes);
+    if (this._pirBodyTextOk) {
+      if (pirTextChunkEncodable(chunk, encoding)) this._pirBodyText.push(chunk);
+      else this._pirBodyTextOk = false;
+    }
+    if (typeof callback === "function") callback();
+    return true;
+  }
+  end(chunk, encoding, callback) {
+    if (typeof chunk === "function") {
+      callback = chunk;
+      chunk = undefined;
+      encoding = undefined;
+    } else if (typeof encoding === "function") {
+      callback = encoding;
+      encoding = undefined;
+    }
+    if (this.writableEnded) return this;
+    if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+    this.writableEnded = true;
+    this._pirStart();
+    this.writableFinished = true;
+    this.emit("finish");
+    if (typeof callback === "function") callback();
+    return this;
+  }
+  destroy(error) {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    if (this._pirId !== 0) {
+      const id = this._pirId;
+      this._pirId = 0;
+      try {
+        pirHttpHost().http("fetchAbort", JSON.stringify({ id: id }));
+        pirHttpHost().http("fetchEnd", JSON.stringify({ id: id }));
+      } catch (hostError) {}
+    }
+    if (this._pirResponse !== undefined && !this._pirResponse.destroyed) {
+      this._pirResponse.destroy();
+    }
+    if (error !== undefined && error !== null) {
+      this.aborted = error.code === "ABORT_ERR" || error.name === "AbortError";
+      this.emit("error", error);
+    }
+    this.emit("close");
+    return this;
+  }
+  // node's deprecated `request.abort()`: mark the request aborted, tear the
+  // transport down and report `abort` (node's observable order is `close`
+  // then `abort`, no `error`). node-fetch's `finalize()` calls it on every
+  // fetch failure path, so a missing `abort` surfaced as an
+  // `Unhandled promise rejection: not a function` AFTER the caller's `catch`
+  // had already seen the FetchError.
+  abort() {
+    if (this.aborted) return this;
+    this.aborted = true;
+    this.destroy();
+    this.emit("abort");
+    return this;
+  }
+  // Node's request.setTimeout destroys the request after `timeout` ms of no
+  // activity; minimal: one timer over the whole request lifetime.
+  setTimeout(timeout, callback) {
+    const self = this;
+    globalThis.setTimeout(function () {
+      if (!self.destroyed && self._pirResponse === undefined) {
+        const error = new Error("Request timed out after " + timeout + "ms");
+        error.code = "ETIMEDOUT";
+        self.destroy(error);
+      }
+      if (typeof callback === "function") callback();
+    }, timeout);
+    return this;
+  }
+  _pirStart() {
+    if (this._pirStarted || this.destroyed) return;
+    this._pirStarted = true;
+    const entries = [];
+    this._pirHeaders.forEach(function (entry) {
+      entries.push([entry.name, String(entry.value)]);
+    });
+    const payload = { url: this._pirUrl, method: this.method, headers: entries, noRedirect: true };
+    // Pure-text request body: `bodyText` carries the exact UTF-8 image of the
+    // bytes `bodyB64` would decode to (every chunk passed
+    // `pirTextChunkEncodable`), so the host can skip the base64 round trip and
+    // the byte aggregate is never built. Everything else keeps the byte
+    // channel, byte-for-byte as before.
+    const bodyText = this._pirBodyTextOk ? this._pirBodyText.join("") : "";
+    const chunks = this._pirBody;
+    this._pirBody = [];
+    this._pirBodyText = [];
+    if (bodyText.length > 0) {
+      payload.bodyText = bodyText;
+    } else if (chunks.length > 0) {
+      const body = Buffer.concat(chunks);
+      if (body.length > 0) payload.bodyB64 = pirBytesToB64(body);
+    }
+    let value;
+    try {
+      value = pirHostCall("fetchStart", payload);
+    } catch (error) {
+      this.destroy(error);
+      return;
+    }
+    this._pirId = value.id;
+    this.headersSent = true;
+    this._pirPollHeaders();
+  }
+  _pirPollHeaders() {
+    // destroyed: torn down; _pirId === 0: the response already took over the
+    // fetch id — stale retries scheduled before the handoff must not poll
+    // id 0 (the host reports it aborted and the error path would destroy
+    // the live response).
+    if (this.destroyed || this._pirId === 0) return;
+    for (;;) {
+      const waitMs = this._poller.nextWaitMs();
+      if (waitMs === -1) {
+        // Yield once: a same-process handler (or a microtask it awaits) is
+        // what produces this response in the loopback shape.
+        const self = this;
+        globalThis.setTimeout(function () { self._pirPollHeaders(); }, 0);
+        return;
+      }
+      let state;
+      try {
+        state = pirHostCall("fetchPoll", { id: this._pirId, waitMs: waitMs });
+      } catch (error) {
+        this.destroy(error);
+        return;
+      }
+      if (state.error) {
+        const error = new Error(state.error.message || "request failed");
+        error.code = state.error.code || "EIO";
+        this.destroy(error);
+        return;
+      }
+      if (state.aborted) {
+        this.destroy(pirAbortError());
+        return;
+      }
+      if (state.truncated) {
+        // The host's body window had to drop bytes: fail loudly rather than
+        // emitting a silently short body (the `truncated` wire flag is the
+        // documented defensive single-chunk-over-window case).
+        this.destroy(new Error(
+          "response body window overflowed: the host dropped part of the body " +
+          "(a single transport chunk exceeded the 8 MiB window)"
+        ));
+        return;
+      }
+      if (state.ready) {
+        // Consume-once poll window: hand any body bytes it carried to the
+        // response's pump via the stash.
+        const stash = state.body || state.done
+          ? [{ body: state.body, done: Boolean(state.done), truncated: Boolean(state.truncated) }]
+          : [];
+        const response = new IncomingMessage({
+          id: this._pirId,
+          statusCode: state.status,
+          headers: state.headers || [],
+          url: state.url || this._pirUrl,
+          stash: stash,
+        });
+        this._pirId = 0; // the response pump owns the fetch id now
+        this._pirResponse = response;
+        this.emit("response", response);
+        // First pump at the end of this job (microtask) so the response
+        // handler can attach data/end listeners synchronously before any data
+        // event, without paying a ~10 ms timer hop.
+        pirDefer(function () {
+          if (!response.destroyed) response._pirPump();
+        });
+        return;
+      }
+      // Nothing yet: step a same-process server — its handler may be exactly
+      // what produces this response — and keep the poll loop going.
+      if (pirPumpLocalServers()) this._poller.noteProgress();
+    }
+  }
+}
+
+function createRequestImpl(defaultProtocol) {
+  return function request(input, options, callback) {
+    return new ClientRequest(input, options, callback, defaultProtocol);
+  };
+}
+
+function createGetImpl(requestImpl) {
+  // http.get: request + automatic end() (Node's contract; redirects are not
+  // followed and the response must still be consumed by the caller).
+  return function get(input, options, callback) {
+    const request = requestImpl(input, options, callback);
+    request.end();
+    return request;
+  };
+}
+
+const request = createRequestImpl("http:");
+const get = createGetImpl(request);
+
+// ---------------------------------------------------------------------------
+// ServerResponse + Server (minimal real, loopback)
+// ---------------------------------------------------------------------------
+
+class ServerResponse extends OutgoingMessage {
+  constructor(connId) {
+    super();
+    this._pirConnId = connId;
+    this.statusCode = 200;
+    this.statusMessage = undefined;
+    this._pirBody = [];
+    // Parallel text view of `_pirBody`, the request-side channel mirrored:
+    // chunks that are pure UTF-8 text land here too and `_pirSend` sends them
+    // as `bodyText` (no base64 round trip). Any chunk that is not (Buffer/
+    // typed array, non-utf8 encoding, lone surrogate) drops `_pirBodyTextOk`
+    // and the whole body goes out as `bodyB64`, byte-identical to before.
+    this._pirBodyText = [];
+    this._pirBodyTextOk = true;
+    this._pirResponded = false;
+  }
+  writeHead(statusCode, statusMessage, headers) {
+    if (typeof statusMessage !== "string" && statusMessage !== undefined && statusMessage !== null) {
+      headers = statusMessage;
+      statusMessage = undefined;
+    }
+    if (this.headersSent) {
+      const error = new Error("Cannot write headers after they were sent to the client");
+      error.code = "ERR_HTTP_HEADERS_SENT";
+      throw error;
+    }
+    statusCode = Number(statusCode);
+    if (!Number.isInteger(statusCode) || statusCode < 100 || statusCode > 999) {
+      const error = new TypeError("Invalid status code: " + String(statusCode));
+      error.code = "ERR_HTTP_INVALID_STATUS_CODE";
+      throw error;
+    }
+    this.statusCode = statusCode;
+    if (typeof statusMessage === "string") this.statusMessage = statusMessage;
+    if (Array.isArray(headers)) {
+      for (const pair of headers) this.setHeader(pair[0], pair[1]);
+    } else if (headers !== undefined && headers !== null) {
+      for (const name of Object.keys(headers)) {
+        const value = headers[name];
+        if (Array.isArray(value)) {
+          for (const item of value) this.setHeader(name, item);
+        } else {
+          this.setHeader(name, value);
+        }
+      }
+    }
+    return this;
+  }
+  write(chunk, encoding, callback) {
+    if (typeof encoding === "function") {
+      callback = encoding;
+      encoding = undefined;
+    }
+    if (this.writableEnded) {
+      const error = new Error("write after end");
+      error.code = "ERR_STREAM_WRITE_AFTER_END";
+      this.emit("error", error);
+      return false;
+    }
+    this._pirBody.push(pirChunkToBuffer(chunk, encoding));
+    if (this._pirBodyTextOk) {
+      if (pirTextChunkEncodable(chunk, encoding)) this._pirBodyText.push(chunk);
+      else this._pirBodyTextOk = false;
+    }
+    if (typeof callback === "function") callback();
+    return true;
+  }
+  writeContinue() {
+    // No interim responses in the minimal host: keep the call shape.
+  }
+  end(chunk, encoding, callback) {
+    if (typeof chunk === "function") {
+      callback = chunk;
+      chunk = undefined;
+      encoding = undefined;
+    } else if (typeof encoding === "function") {
+      callback = encoding;
+      encoding = undefined;
+    }
+    if (this.writableEnded) return this;
+    if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+    if (!this._pirResponded) this._pirSend();
+    this.writableEnded = true;
+    this.writableFinished = true;
+    if (typeof callback === "function") callback();
+    return this;
+  }
+  _pirSend() {
+    this._pirResponded = true;
+    this.headersSent = true;
+    const headers = [];
+    this._pirHeaders.forEach(function (entry) {
+      const value = Array.isArray(entry.value) ? entry.value.map(String).join(", ") : String(entry.value);
+      headers.push([entry.name, value]);
+    });
+    // Pure-text response body: `bodyText` carries the exact UTF-8 image of
+    // the bytes `bodyB64` would decode to (every chunk passed
+    // `pirTextChunkEncodable`), so the host can skip the base64 round trip and
+    // the byte aggregate is never built. Everything else keeps the byte
+    // channel, byte-for-byte as before.
+    const bodyText = this._pirBodyTextOk ? this._pirBodyText.join("") : "";
+    const chunks = this._pirBody;
+    this._pirBody = [];
+    this._pirBodyText = [];
+    const payload = {
+      connId: this._pirConnId,
+      serverId: this._pirServerId,
+      status: this.statusCode,
+      statusMessage: this.statusMessage !== undefined ? this.statusMessage : (STATUS_CODES[this.statusCode] || ""),
+      headers: headers,
+    };
+    if (bodyText.length > 0) {
+      payload.bodyText = bodyText;
+    } else if (chunks.length > 0) {
+      const body = Buffer.concat(chunks);
+      if (body.length > 0) payload.bodyB64 = pirBytesToB64(body);
+    }
+    try {
+      pirHostCall("serverRespond", payload);
+    } catch (error) {
+      this.emit("error", error);
+    }
+    this.emit("finish");
+  }
+}
+
+class Server extends EventEmitter {
+  constructor(options, handler) {
+    if (typeof options === "function") {
+      handler = options;
+      options = undefined;
+    }
+    super();
+    this._pirHandler = typeof handler === "function" ? handler : undefined;
+    this._pirServerId = 0;
+    this._pirPort = undefined;
+    this.listening = false;
+    // A client in this same process steps this server through the pump below
+    // (one non-blocking serverPoll round trip) instead of waiting a ~10 ms
+    // timer hop for the server's own loop.
+    this._pirPumpRegistered = false;
+    // The self-pump loop re-arms a host timer, and a host timer always keeps
+    // the process alive, so `unref()` stops the loop instead of merely
+    // flagging it: an unref'd server is still stepped by an in-process client
+    // (`_pirLocalPump` stays registered), it just no longer keeps the event
+    // loop from draining.
+    this._pirPumpActive = false;
+    this._pirUnrefd = false;
+    const self = this;
+    this._pirLocalPump = function () { return self._pirDrainOnce(0); };
+    this.maxHeadersCount = 2000;
+    this.timeout = 0;
+    this.keepAliveTimeout = 5000;
+    this.headersTimeout = 60000;
+    this.requestTimeout = 300000;
+    // NOTE: net.Server stays throws-tier in this runtime, so Server extends
+    // EventEmitter and mirrors net.Server's event surface (listening /
+    // connection / close / error) instead of truly extending it.
+  }
+  _pirRegisterPump() {
+    if (this._pirPumpRegistered) return;
+    this._pirPumpRegistered = true;
+    pirRegisterServerPump(this._pirLocalPump);
+  }
+  _pirUnregisterPump() {
+    if (!this._pirPumpRegistered) return;
+    this._pirPumpRegistered = false;
+    pirUnregisterServerPump(this._pirLocalPump);
+  }
+  // One drain step: `waitMs` 0 for the local-pump path, the loop's slice
+  // otherwise. Returns true when it dispatched at least one request.
+  _pirDrainOnce(waitMs) {
+    if (this._pirServerId === 0 || this.destroyed) return false;
+    let value;
+    try {
+      value = pirHostCall("serverPoll", { id: this._pirServerId, waitMs: waitMs });
+    } catch (error) {
+      if (error.code === "ESRCH") {
+        // The host already released the entry (close/teardown).
+        this._pirServerId = 0;
+        this._pirUnregisterPump();
+        return false;
+      }
+      this.emit("error", error);
+      this._pirServerId = 0;
+      this._pirUnregisterPump();
+      return false;
+    }
+    const requests = value.requests || [];
+    for (const record of requests) this._pirDispatch(record);
+    return requests.length > 0;
+  }
+  // net.Server loop-control surface. `unref()`/`ref()` are real here because
+  // the self-pump loop is this shim's own timer: an unref'd listening server
+  // still serves requests (the host keeps the listener, and an in-process
+  // client's poll loop steps it through `_pirLocalPump`), but it no longer
+  // keeps the pir process alive — the official async-hooks execution-resource
+  // test calls `unref()` and expects the process to drain once its last
+  // response is delivered. `ref()` resumes the loop.
+  unref() {
+    this._pirUnrefd = true;
+    this._pirPumpStop();
+    return this;
+  }
+  ref() {
+    this._pirUnrefd = false;
+    if (this.listening && this._pirServerId !== 0) this._pirPumpLoop();
+    return this;
+  }
+  listen(...args) {
+    // Minimal: listen([port[, host]][, callback]) / listen(options[, cb]) —
+    // numeric ports only; `host` is accepted and ignored (the runtime binds
+    // loopback only).
+    let port = 0;
+    let callback;
+    for (const arg of args) {
+      if (typeof arg === "function") callback = arg;
+      else if (typeof arg === "number") port = arg;
+      else if (typeof arg === "string" && /^\d+$/.test(arg)) port = Number(arg);
+      else if (arg !== undefined && arg !== null && typeof arg === "object") {
+        if (arg.port !== undefined) port = Number(arg.port);
+      }
+    }
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      const error = new TypeError("The \"port\" argument must be a port number");
+      error.code = "ERR_SOCKET_BAD_PORT";
+      throw error;
+    }
+    if (this._pirServerId !== 0) {
+      const error = new Error("Server is already listening");
+      error.code = "ERR_SERVER_ALREADY_LISTEN";
+      throw error;
+    }
+    const value = pirHostCall("serverListen", { port: port });
+    this._pirServerId = value.id;
+    this._pirPort = value.port;
+    this.listening = true;
+    this._pirRegisterPump();
+    const self = this;
+    globalThis.setTimeout(function () {
+      if (!self.destroyed && self._pirServerId !== 0) {
+        if (typeof callback === "function") callback();
+        self.emit("listening");
+      }
+    }, 0);
+    this._pirPumpLoop();
+    return this;
+  }
+  close(callback) {
+    const finish = () => {
+      this.listening = false;
+      this._pirPort = undefined;
+      this._pirServerId = 0;
+      this._pirPumpStop();
+      // A later listen() on the same Server re-registers.
+      this._pirUnregisterPump();
+      if (typeof callback === "function") callback();
+      this.emit("close");
+    };
+    if (this._pirServerId !== 0) {
+      try {
+        pirHostCall("serverClose", { id: this._pirServerId });
+      } catch (error) {}
+      // Node semantics: the callback and the close event wait for in-flight
+      // requests to drain (bounded — a handler that never answers must not
+      // hang the runner). Idle keep-alive sockets exit on their own.
+      const deadline = Date.now() + 10000;
+      const self = this;
+      const drain = function () {
+        if (self._pirServerId === 0) {
+          // The id was cleared by an error path (or the host already released
+          // the entry): the close still has to complete.
+          finish();
+          return;
+        }
+        let active = 0;
+        try {
+          active = pirHostCall("serverWaitIdle", { id: self._pirServerId, waitMs: 30 }).active;
+        } catch (error) {
+          active = 0; // ESRCH: the host already released the entry
+        }
+        if (active === 0 || Date.now() > deadline) {
+          finish();
+          return;
+        }
+        globalThis.setTimeout(drain, 10);
+      };
+      drain();
+    } else {
+      finish();
+    }
+    return this;
+  }
+  address() {
+    return this._pirPort === undefined
+      ? null
+      : { address: "127.0.0.1", family: "IPv4", port: this._pirPort };
+  }
+  setTimeout(_timeout, _callback) {
+    // The host owns connection deadlines; the call shape is kept.
+    return this;
+  }
+  closeAllConnections() {}
+  closeIdleConnections() {}
+  _pirPumpLoop() {
+    if (this._pirUnrefd || this._pirPumpActive) return;
+    this._pirPumpActive = true;
+    const self = this;
+    const step = function () {
+      // `close()`/`unref()` invalidate the scheduled step; the loop then ends
+      // instead of re-arming (the whole point of unref: no timer of ours is
+      // left holding the event loop open).
+      if (!self._pirPumpActive) return;
+      if (self._pirServerId === 0 || self.destroyed) {
+        self._pirPumpActive = false;
+        return;
+      }
+      // 5 ms slices, not 30: a slice parks the JS thread until the host has
+      // something to report, so a long slice delays every other timer in this
+      // runtime (a same-process client polls this server through
+      // `_pirLocalPump` instead, which never blocks).
+      self._pirDrainOnce(5);
+      if (!self._pirPumpActive) return;
+      if (self._pirServerId === 0 || self.destroyed) {
+        self._pirPumpActive = false;
+        return;
+      }
+      globalThis.setTimeout(step, 5);
+    };
+    step();
+  }
+  _pirPumpStop() {
+    this._pirPumpActive = false;
+  }
+  _pirDispatch(record) {
+    const req = new IncomingMessage({
+      method: record.method,
+      url: record.path,
+      httpVersion: typeof record.httpVersion === "string"
+        ? record.httpVersion.replace(/^HTTP\//i, "")
+        : "1.1",
+      headers: record.headers || [],
+      serverReqId: typeof record.reqId === "number" ? record.reqId : 0,
+    });
+    const res = new ServerResponse(record.connId);
+    res._pirServerId = this._pirServerId;
+    const self = this;
+    const dispatch = function () {
+      self.emit("request", req, res);
+      if (self._pirHandler === undefined) return;
+      try {
+        self._pirHandler(req, res);
+      } catch (error) {
+        self.emit("clientError", error, req, res);
+        try {
+          res.statusCode = 500;
+          res.end();
+        } catch (respondError) {}
+      }
+    };
+    // Node runs every request handler inside the request's own async execution
+    // context: the handler reads its resource through
+    // `executionAsyncResource()`, and the timers it starts capture it. The
+    // async_hooks shim installs a fresh resource per dispatch when it is
+    // loaded (its `__pirAsyncHooksRunInContext`); without that module the
+    // dispatch runs bare.
+    const runInContext = globalThis.__pirAsyncHooksRunInContext;
+    if (typeof runInContext === "function") {
+      runInContext("HTTPServerAsyncResource", dispatch);
+    } else {
+      dispatch();
+    }
+  }
+}
+
+function createServer(options, handler) {
+  return new Server(options, handler);
+}
+
+// Node's default 'connection' listener; the runtime hosts no raw sockets, so
+// the private entry keeps the throws-tier error.
+function _connectionListener(..._args) {
+  const error = new Error("http._connectionListener is not supported by the pir extension runtime (no raw sockets)");
+  error.code = "ERR_NOT_SUPPORTED";
+  throw error;
+}
+
+function setMaxIdleHTTPParsers(_max) {
+  // No parser pool exists; a no-op keeps the call shape.
+}
+
+function setGlobalProxyFromEnv(_env) {
+  // The runtime reads no proxy env; a no-op keeps the call shape.
+}
+
+// WebSocket / CloseEvent / MessageEvent: Node re-exports the client surface
+// from `http` (undici-backed); the shim keeps the value-holder shapes.
+class WebSocket {
+  constructor(_address, _protocols, _options) {
+    this.readyState = 0;
+    const error = new Error("http.WebSocket is not supported by the pir extension runtime");
+    error.code = "ERR_NOT_SUPPORTED";
+    throw error;
+  }
+}
+
+class CloseEvent {
+  constructor(type, options) {
+    this.type = String(type);
+    this.wasClean = Boolean(options && options.wasClean);
+    this.code = options && typeof options.code === "number" ? options.code : 0;
+    this.reason = options && typeof options.reason === "string" ? options.reason : "";
+  }
+}
+
+class MessageEvent {
+  constructor(type, options) {
+    this.type = String(type);
+    this.data = options && options.data !== undefined ? options.data : null;
+    this.origin = options && typeof options.origin === "string" ? options.origin : "";
+    this.lastEventId = options && typeof options.lastEventId === "string" ? options.lastEventId : "";
+  }
+}
+
+const http = {
+  createServer: createServer,
+  request: request,
+  get: get,
+  Server: Server,
+  IncomingMessage: IncomingMessage,
+  ServerResponse: ServerResponse,
+  STATUS_CODES: STATUS_CODES,
+  METHODS: METHODS,
+  Agent: Agent,
+  globalAgent: globalAgent,
+  ClientRequest: ClientRequest,
+  OutgoingMessage: OutgoingMessage,
+  _connectionListener: _connectionListener,
+  maxHeaderSize: maxHeaderSize,
+  validateHeaderName: pirValidateHeaderName,
+  validateHeaderValue: pirValidateHeaderValue,
+  setMaxIdleHTTPParsers: setMaxIdleHTTPParsers,
+  setGlobalProxyFromEnv: setGlobalProxyFromEnv,
+  WebSocket: WebSocket,
+  CloseEvent: CloseEvent,
+  MessageEvent: MessageEvent,
+};
+
+// Factories shared with `@node/https` (its request()/get()/ClientRequest are
+// the same implementation with the https: default protocol).
+function _pirCreateRequest(defaultProtocol) {
+  return createRequestImpl(defaultProtocol);
+}
+function _pirCreateGet(requestImpl) {
+  return createGetImpl(requestImpl);
+}
+
+export default http;
+export {
+  createServer, request, get, Server, IncomingMessage, ServerResponse, STATUS_CODES, METHODS,
+  Agent, globalAgent, ClientRequest, OutgoingMessage, _connectionListener,
+  maxHeaderSize, setMaxIdleHTTPParsers, setGlobalProxyFromEnv, WebSocket, CloseEvent, MessageEvent,
+  _pirCreateRequest, _pirCreateGet,
+};
+export { pirValidateHeaderName as validateHeaderName, pirValidateHeaderValue as validateHeaderValue };

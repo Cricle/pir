@@ -1,0 +1,574 @@
+
+// node:async_hooks — the observable Node v24 surface on a runtime that has no
+// engine-level async-resource tracking. Tiers, stated honestly:
+//
+//   * AsyncLocalStorage keeps REAL, nestable, multi-store execution contexts.
+//     A store's value lives in an execution-context *frame* (`Map<store,
+//     value>`), and `run`/`enterWith`/`exit`/`disable` are frame operations —
+//     so two different stores bound to the same call stack (diagnostics_
+//     channel `bindStore`) each read back their own value, and `getStore()` of
+//     a store that is absent from the frame returns `defaultValue`, exactly
+//     like Node v24's AsyncContextFrame implementation. Continuation capture
+//     is exact for the timer family (a callback scheduled inside a context
+//     reads that context back when it fires — see "Continuation capture for
+//     the timer family") and approximated elsewhere: for a promise-returning
+//     callback the frame also stays current until the returned promise
+//     settles, so the awaits inside the callback keep observing the store.
+//   * executionAsyncResource: real per context. The resource lives in the
+//     same frame as the stores, shims that own an async boundary (the http
+//     server dispatching a request) announce it through
+//     `__pirAsyncHooksRunInContext`, and a context with nothing installed
+//     reads the stable root resource.
+//   * createHook: Node's argument validation, running-hook registry and
+//     enable/disable bookkeeping; `init` fires for the timer family (the one
+//     resource creation this shim can observe). before/after/destroy/
+//     promiseResolve have no engine hook source, so they stay silent.
+//   * AsyncResource: Node's constructor validation, `bind` semantics and the
+//     init emission an enabled init hook would observe; ids are shim-local
+//     counters.
+
+// ---------------------------------------------------------------------------
+// Node-shaped errors (the ERR_* code, name and message are the contract the
+// listener/constructor tests assert on)
+// ---------------------------------------------------------------------------
+
+function pirCodedError(Ctor, code, message) {
+  const error = new Ctor(message);
+  error.code = code;
+  // Node's internal errors stringify as `TypeError [ERR_X]: message` while
+  // `err.name` stays bare (`TypeError`), so `assert.throws(fn, /ERR_X/)` and
+  // `String(err)`-based reporting only match when the instance carries this.
+  Object.defineProperty(error, "toString", {
+    value: function () { return this.name + " [" + String(this.code) + "]: " + this.message; },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return error;
+}
+
+/// `util.inspect`-lite for the primitives the validation messages carry.
+function pirPrimitiveText(value) {
+  if (typeof value === "string") {
+    return "'" + value.replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "'";
+  }
+  if (typeof value === "bigint") return String(value) + "n";
+  return String(value);
+}
+
+/// `determineSpecificType`'s counterpart: the `Received …` tail Node appends
+/// to every ERR_INVALID_ARG_TYPE message.
+function pirReceivedText(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  const type = typeof value;
+  if (type === "function") return "function " + (value.name || "");
+  if (type === "object") {
+    const ctor = value.constructor;
+    if (ctor && typeof ctor.name === "string" && ctor.name !== "") {
+      return "an instance of " + ctor.name;
+    }
+    return String(value);
+  }
+  let inspected = pirPrimitiveText(value);
+  if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+  return "type " + type + " (" + inspected + ")";
+}
+
+function pirInvalidArgType(name, expected, value) {
+  return pirCodedError(TypeError, "ERR_INVALID_ARG_TYPE",
+    'The "' + name + '" argument must be ' + expected + ". Received " + pirReceivedText(value));
+}
+
+function pirInvalidArgValue(name, value, reason) {
+  return pirCodedError(TypeError, "ERR_INVALID_ARG_VALUE",
+    "The argument '" + name + "' " + reason + ". Received " + pirReceivedText(value));
+}
+
+function pirAsyncTypeError(type) {
+  // Node v24: `Invalid name for async "type": <type>`.
+  return pirCodedError(TypeError, "ERR_ASYNC_TYPE",
+    'Invalid name for async "type": ' + type);
+}
+
+function pirInvalidAsyncId(name, value) {
+  // Node v24: `Invalid triggerAsyncId value: -4`.
+  return pirCodedError(RangeError, "ERR_INVALID_ASYNC_ID",
+    "Invalid " + name + " value: " + String(value));
+}
+
+// ---------------------------------------------------------------------------
+// Execution-context frames (the AsyncLocalStorage backing)
+// ---------------------------------------------------------------------------
+// One process-wide LIFO frame. `run`/`exit` save the store around the callback
+// and restore it afterwards; because a frame is a *copy* of the frame it was
+// created in, every store keeps its own slot and an inner store's context does
+// not disturb an outer store's value. `disable` removes a store from the
+// current frame (Node's `AsyncContextFrame.disable`), so the store falls back
+// to `defaultValue` until the next `run`/`enterWith`.
+//
+// The frame carries one reserved slot besides the stores: the execution
+// resource of the current context (`executionAsyncResource()`). It rides the
+// frame — not a separate stack — so every frame operation moves the resource
+// with the stores, and a captured continuation (a timer started inside a
+// context) restores both together.
+let pirContextFrame;
+
+const pirExecutionResourceKey = Symbol("pir.executionResource");
+
+function pirFrameSet(store, value) {
+  const frame = pirContextFrame === undefined ? new Map() : new Map(pirContextFrame);
+  frame.set(store, value);
+  pirContextFrame = frame;
+  // A context now exists, so a timer created inside it must be able to capture
+  // the frame when it fires: install the timer wrapper on first use (see
+  // "Continuation capture for the timer family"). Nothing else about the timer
+  // globals changes for processes that never open a context.
+  pirEnsureTimerCapture();
+}
+
+/// The execution resource of the current frame: the frame's reserved slot, or
+/// the stable root resource for the top-level turn (no context installed).
+function pirFrameExecutionResource() {
+  const frame = pirContextFrame;
+  if (frame === undefined) return pirRootExecutionResource;
+  const resource = frame.get(pirExecutionResourceKey);
+  return resource === undefined ? pirRootExecutionResource : resource;
+}
+
+// ---------------------------------------------------------------------------
+// Hook registry
+// ---------------------------------------------------------------------------
+
+let pirNextAsyncId = 1;
+const pirEnabledHooks = [];
+
+function pirInitHooksExist() {
+  for (let i = 0; i < pirEnabledHooks.length; i += 1) {
+    if (typeof pirEnabledHooks[i]._init === "function") return true;
+  }
+  return false;
+}
+
+function pirEmitInit(asyncId, type, triggerAsyncId, resource) {
+  if (pirEnabledHooks.length === 0) return;
+  const hooks = pirEnabledHooks.slice();
+  for (let i = 0; i < hooks.length; i += 1) {
+    const init = hooks[i]._init;
+    if (typeof init === "function") init(asyncId, type, triggerAsyncId, resource);
+  }
+}
+
+function pirEmitBefore(asyncId) {
+  if (pirEnabledHooks.length === 0) return;
+  const hooks = pirEnabledHooks.slice();
+  for (let i = 0; i < hooks.length; i += 1) {
+    const before = hooks[i]._before;
+    if (typeof before === "function") before(asyncId);
+  }
+}
+
+function pirEmitAfter(asyncId) {
+  if (pirEnabledHooks.length === 0) return;
+  const hooks = pirEnabledHooks.slice();
+  for (let i = 0; i < hooks.length; i += 1) {
+    const after = hooks[i]._after;
+    if (typeof after === "function") after(asyncId);
+  }
+}
+
+class AsyncHook {
+  constructor(hooks) {
+    // Node destructures the options bag directly: a non-object primitive is
+    // accepted (property access yields undefined) and null/undefined raise the
+    // engine's destructuring TypeError.
+    const { init, before, after, destroy, promiseResolve, trackPromises } = hooks;
+    if (init !== undefined && typeof init !== "function") {
+      throw pirCodedError(TypeError, "ERR_ASYNC_CALLBACK", "hook.init must be a function");
+    }
+    if (before !== undefined && typeof before !== "function") {
+      throw pirCodedError(TypeError, "ERR_ASYNC_CALLBACK", "hook.before must be a function");
+    }
+    if (after !== undefined && typeof after !== "function") {
+      throw pirCodedError(TypeError, "ERR_ASYNC_CALLBACK", "hook.after must be a function");
+    }
+    if (destroy !== undefined && typeof destroy !== "function") {
+      throw pirCodedError(TypeError, "ERR_ASYNC_CALLBACK", "hook.destroy must be a function");
+    }
+    if (promiseResolve !== undefined && typeof promiseResolve !== "function") {
+      throw pirCodedError(TypeError, "ERR_ASYNC_CALLBACK", "hook.promiseResolve must be a function");
+    }
+    if (trackPromises !== undefined && typeof trackPromises !== "boolean") {
+      throw pirInvalidArgType("trackPromises", "of type boolean", trackPromises);
+    }
+    if (trackPromises === false && promiseResolve !== undefined) {
+      throw pirInvalidArgValue("trackPromises", trackPromises,
+        "must not be false when promiseResolve is enabled");
+    }
+    this._init = init;
+    this._before = before;
+    this._after = after;
+    this._destroy = destroy;
+    this._promiseResolve = promiseResolve;
+    this._enabled = false;
+  }
+
+  enable() {
+    // Node: enabling an already-enabled hook is a no-op, and both directions
+    // return the hook so `createHook(...).enable()` chains.
+    if (!this._enabled) {
+      this._enabled = true;
+      pirEnabledHooks.push(this);
+    }
+    return this;
+  }
+
+  disable() {
+    if (this._enabled) {
+      this._enabled = false;
+      const index = pirEnabledHooks.indexOf(this);
+      if (index !== -1) pirEnabledHooks.splice(index, 1);
+    }
+    return this;
+  }
+}
+
+function createHook(hooks) {
+  return new AsyncHook(hooks);
+}
+
+// ---------------------------------------------------------------------------
+// AsyncLocalStorage (Node v24 AsyncContextFrame model)
+// ---------------------------------------------------------------------------
+
+class AsyncLocalStorage {
+  constructor(options) {
+    const opts = options === undefined ? {} : options;
+    if (opts === null || typeof opts !== "object") {
+      throw pirInvalidArgType("options", "of type object", opts);
+    }
+    this._defaultValue = opts.defaultValue;
+    this._name = opts.name === undefined ? "" : String(opts.name);
+  }
+
+  get name() {
+    return this._name;
+  }
+
+  run(store, callback, ...args) {
+    const prior = this.getStore();
+    // Node short-circuits when the store is already the current one; the
+    // shortcut also forwards a non-callable callback to the engine's own
+    // TypeError (Node validates no callback here).
+    if (Object.is(prior, store)) return Reflect.apply(callback, undefined, args);
+    this.enterWith(store);
+    let result;
+    try {
+      result = Reflect.apply(callback, undefined, args);
+    } catch (error) {
+      this.enterWith(prior);
+      throw error;
+    }
+    if (result !== null &&
+        (typeof result === "object" || typeof result === "function") &&
+        typeof result.then === "function") {
+      // Approximation: the frame stays current until the returned promise
+      // settles so the awaits inside the callback keep seeing the store; Node
+      // captures the frame per async resource and would restore it at the
+      // callback's return. (Node also returns the callback's promise itself;
+      // this returns a derived one.)
+      return result.then(
+        (value) => { this.enterWith(prior); return value; },
+        (error) => { this.enterWith(prior); throw error; }
+      );
+    }
+    this.enterWith(prior);
+    return result;
+  }
+
+  getStore() {
+    const frame = pirContextFrame;
+    if (frame === undefined || !frame.has(this)) return this._defaultValue;
+    return frame.get(this);
+  }
+
+  enterWith(store) {
+    pirFrameSet(this, store);
+  }
+
+  exit(callback, ...args) {
+    // Node v24: `exit` is `run(undefined, …)` — inside the callback the store
+    // is explicitly undefined (not `defaultValue`), and restored afterwards.
+    return this.run(undefined, callback, ...args);
+  }
+
+  disable() {
+    // Node's `AsyncContextFrame.disable`: drop the store from the current
+    // frame. `getStore()` then reports `defaultValue` — a later run/enterWith
+    // re-enables it, exactly like Node.
+    const frame = pirContextFrame;
+    if (frame === undefined || !frame.has(this)) return;
+    const next = new Map(frame);
+    next.delete(this);
+    pirContextFrame = next;
+  }
+
+  static bind(fn) {
+    return AsyncResource.bind(fn);
+  }
+
+  static snapshot() {
+    // snapshot() captures the store at a bind point — an approximation this
+    // runtime cannot honor (there is no per-resource frame to freeze), so it
+    // throws instead of fabricating a frozen context.
+    const error = new Error("AsyncLocalStorage.snapshot is not supported by the pir extension runtime");
+    error.code = "ERR_NOT_SUPPORTED";
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AsyncResource
+// ---------------------------------------------------------------------------
+
+class AsyncResource {
+  constructor(type, opts) {
+    if (typeof type !== "string") {
+      throw pirInvalidArgType("type", "of type string", type);
+    }
+    // Node accepts either the numeric triggerAsyncId shorthand or an options
+    // object; `-1` is the one legal sentinel, anything else non-safe-integer
+    // (including NaN and fractions) is rejected.
+    let triggerAsyncId = opts;
+    if (typeof opts !== "number") {
+      const options = opts === undefined || opts === null ? {} : opts;
+      triggerAsyncId = options.triggerAsyncId === undefined ? 0 : options.triggerAsyncId;
+    }
+    if (typeof triggerAsyncId !== "number" ||
+        !Number.isSafeInteger(triggerAsyncId) ||
+        triggerAsyncId < -1) {
+      throw pirInvalidAsyncId("triggerAsyncId", triggerAsyncId);
+    }
+    this.type = type;
+    this._triggerAsyncId = triggerAsyncId;
+    this._asyncId = pirNextAsyncId;
+    pirNextAsyncId += 1;
+    // Node validates the name only when an init hook would observe it.
+    if (pirInitHooksExist()) {
+      if (type.length === 0) throw pirAsyncTypeError(type);
+      pirEmitInit(this._asyncId, type, triggerAsyncId, this);
+    }
+  }
+
+  runInAsyncScope(callback, thisArg, ...args) {
+    if (pirEnabledHooks.length !== 0) {
+      pirEmitBefore(this._asyncId);
+      try {
+        return Reflect.apply(callback, thisArg, args);
+      } finally {
+        pirEmitAfter(this._asyncId);
+      }
+    }
+    return Reflect.apply(callback, thisArg, args);
+  }
+
+  emitDestroy() {
+    if (pirEnabledHooks.length !== 0) {
+      const hooks = pirEnabledHooks.slice();
+      for (let i = 0; i < hooks.length; i += 1) {
+        const destroy = hooks[i]._destroy;
+        if (typeof destroy === "function") destroy(this._asyncId);
+      }
+    }
+    return this;
+  }
+
+  asyncId() { return this._asyncId; }
+
+  triggerAsyncId() { return this._triggerAsyncId; }
+
+  bind(fn, thisArg) {
+    if (typeof fn !== "function") {
+      throw pirInvalidArgType("fn", "of type function", fn);
+    }
+    const resource = this;
+    const bound = function (...args) {
+      // Node's bound function runs the callback through the resource scope,
+      // with the explicit thisArg when one was given (otherwise the bound
+      // function's own `this`).
+      return resource.runInAsyncScope(fn, thisArg === undefined ? this : thisArg, ...args);
+    };
+    Object.defineProperty(bound, "length", {
+      value: fn.length, configurable: true, enumerable: false, writable: false,
+    });
+    return bound;
+  }
+
+  static bind(fn, type, thisArg) {
+    if (typeof fn !== "function") {
+      throw pirInvalidArgType("fn", "of type function", fn);
+    }
+    let name = type;
+    if (!name) name = fn.name; // Node: `type ||= fn.name`
+    return new AsyncResource(name || "bound-anonymous-fn").bind(fn, thisArg);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Async ids / resources
+// ---------------------------------------------------------------------------
+// No engine-backed resource tracking: the execution-level ids report 0. The
+// execution *resource* is real per context instead of one process-wide object:
+// the context's frame carries it (see `pirFrameExecutionResource`), so a
+// request handler and the continuations it starts read back the resource of
+// their own context while an unrelated context keeps its own, and a context
+// with nothing installed reads the stable root resource Node hands to the
+// top-level turn.
+const pirRootExecutionResource = {};
+
+function executionAsyncId() { return 0; }
+function triggerAsyncId() { return 0; }
+function executionAsyncResource() { return pirFrameExecutionResource(); }
+
+// No engine-backed provider registry: the table is structurally present
+// (Node exposes a name->provider map) but empty here.
+const asyncWrapProviders = Object.freeze({});
+
+// ---------------------------------------------------------------------------
+// Execution-context boundaries owned by other shims
+// ---------------------------------------------------------------------------
+// An async boundary the engine does not report through createHook (the http
+// server dispatching a request is the one this runtime has) still runs inside
+// its own execution context in Node: the handler sees the request's resource
+// and the timers it starts capture it. The owning shim announces the boundary
+// here — `__pirAsyncHooksRunInContext(type, callback, thisArg, args)` installs
+// a fresh resource of `type` for the callback's duration and restores the
+// prior frame afterwards, so concurrent dispatches never share a resource.
+// Without this module loaded there is nothing to install and the dispatch runs
+// bare (the global stays absent).
+function pirRunInContext(type, callback, thisArg, args) {
+  const resource = { type: type, socket: undefined };
+  const prior = pirContextFrame;
+  pirFrameSet(pirExecutionResourceKey, resource);
+  try {
+    return Reflect.apply(callback, thisArg, args === undefined ? [] : args);
+  } finally {
+    pirContextFrame = prior;
+  }
+}
+
+globalThis.__pirAsyncHooksRunInContext ??
+  (globalThis.__pirAsyncHooksRunInContext = pirRunInContext);
+
+// ---------------------------------------------------------------------------
+// init emission for the one resource family this shim can observe
+// ---------------------------------------------------------------------------
+// `setImmediate` is the only async resource whose *creation* the node layer
+// routes through a JS global this module is free to wrap (Node emits `init`
+// when the resource is created, i.e. synchronously inside the setImmediate
+// call). `setTimeout` deliberately reports no init: the `node:timers` shim
+// re-exports the global by identity (`require("timers").setTimeout ===
+// setTimeout`, a contract tests/node_shims.rs pins) and the init count for the
+// immediate bridge is pinned too, so a Timeout neither emits init nor gets a
+// synthesized resource. The timer globals ARE wrapped for execution-context
+// capture — a different concern, installed lazily and invisible when no
+// context is open (see "Continuation capture for the timer family"). Other
+// layers can feed the registry through `globalThis.__pirAsyncHooksEmitInit`.
+const pirEngineSetImmediate = globalThis.setImmediate;
+
+function pirEmitResourceInit(type) {
+  if (!pirInitHooksExist()) return;
+  const asyncId = pirNextAsyncId;
+  pirNextAsyncId += 1;
+  const resource = {
+    asyncId: asyncId,
+    triggerAsyncId: 0,
+    type: type,
+    ref: function () { return this; },
+    unref: function () { return this; },
+    hasRef: function () { return true; },
+    refresh: function () { return this; },
+  };
+  pirEmitInit(asyncId, type, 0, resource);
+}
+
+if (typeof pirEngineSetImmediate === "function") {
+  globalThis.setImmediate = function setImmediate(callback, ...args) {
+    if (pirEnabledHooks.length !== 0) pirEmitResourceInit("Immediate");
+    return pirEngineSetImmediate(callback, ...args);
+  };
+}
+
+// Extension point for other shims that create async resources of their own:
+// call `globalThis.__pirAsyncHooksEmitInit(asyncId, type, triggerAsyncId,
+// resource)` to have an enabled init hook observe the resource.
+globalThis.__pirAsyncHooksEmitInit ?? (globalThis.__pirAsyncHooksEmitInit = pirEmitInit);
+
+// ---------------------------------------------------------------------------
+// Continuation capture for the timer family
+// ---------------------------------------------------------------------------
+// Node snapshots the execution context into every async resource it creates, so
+// a callback scheduled inside `AsyncLocalStorage.run` — or inside an http
+// request handler — reads the same stores and execution resource back when it
+// fires. This runtime has no engine hooks, but the host timer globals are a JS
+// surface this module can wrap: the frame captured at creation is a snapshot
+// (frames are copy-on-write, so the reference never mutates), and the callback
+// installs it for the duration of the call. A timer created with no context
+// installed passes straight through, so the wrapper costs one check for the
+// event loop's own scheduling.
+//
+// The wrapper is installed on first use rather than at module load: a process
+// that never opens a context keeps the untouched globals, and the
+// `require("timers").setTimeout === globalThis.setTimeout` identity the node
+// layer pins stays intact for the (timers-before-async_hooks) load order.
+//
+// Approximation stated: `init` still reports no Timeout (see above), so a
+// timer's `executionAsyncResource()` is the resource of the context that
+// created it, where Node hands the timer its own resource object. The
+// propagation the official test observes — a value stored on the handler's
+// resource read back inside its `setTimeout` — is exact.
+let pirTimerCaptureInstalled = false;
+
+function pirCaptureContext(callback) {
+  const frame = pirContextFrame;
+  if (typeof callback !== "function" || frame === undefined) return callback;
+  return function pirContextBoundCallback(...args) {
+    const prior = pirContextFrame;
+    pirContextFrame = frame;
+    try {
+      return Reflect.apply(callback, this, args);
+    } finally {
+      pirContextFrame = prior;
+    }
+  };
+}
+
+function pirEnsureTimerCapture() {
+  if (pirTimerCaptureInstalled) return;
+  pirTimerCaptureInstalled = true;
+  const engineSetTimeout = globalThis.setTimeout;
+  const engineSetInterval = globalThis.setInterval;
+  if (typeof engineSetTimeout === "function") {
+    globalThis.setTimeout = function setTimeout(callback, ms, ...args) {
+      return engineSetTimeout(pirCaptureContext(callback), ms, ...args);
+    };
+  }
+  if (typeof engineSetInterval === "function") {
+    globalThis.setInterval = function setInterval(callback, ms, ...args) {
+      return engineSetInterval(pirCaptureContext(callback), ms, ...args);
+    };
+  }
+}
+
+const async_hooks = {
+  AsyncLocalStorage: AsyncLocalStorage,
+  asyncWrapProviders: asyncWrapProviders,
+  executionAsyncResource: executionAsyncResource,
+  AsyncResource: AsyncResource,
+  executionAsyncId: executionAsyncId,
+  triggerAsyncId: triggerAsyncId,
+  createHook: createHook,
+};
+
+export default async_hooks;
+export { AsyncLocalStorage, AsyncResource, executionAsyncId, triggerAsyncId, createHook, asyncWrapProviders, executionAsyncResource };

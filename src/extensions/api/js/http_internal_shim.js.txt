@@ -1,0 +1,8 @@
+// node:_http_agent / _http_client / _http_incoming / _http_outgoing /
+// _http_server — the private `node:_http_*` internals, aliased to the
+// corresponding public surface of the node:http shim so internal-require
+// paths (some http stacks require('_http_client') defensively) link.
+import * as httpSurface from "@node/http";
+
+export default httpSurface;
+export * from "@node/http";

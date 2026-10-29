@@ -1,0 +1,308 @@
+
+const call = globalThis.__pirNodeCall;
+const process = globalThis.process;
+const pirPlatformValue = globalThis.__pirPlatform;
+// Real node exposes os.platform as a function; the raw string stays
+// available as the __pirPlatform engine global.
+function platform() { return pirPlatformValue; }
+const EOL = pirPlatformValue === "win32" ? "\r\n" : "\n";
+const devNull = pirPlatformValue === "win32" ? "\\\\.\\nul" : "/dev/null";
+const TOTAL_MEMORY = 17179869184;
+const FREE_MEMORY = 8589934592;
+
+function arch() { return process.arch; }
+
+function type() {
+  if (pirPlatformValue === "win32") return "Windows_NT";
+  if (pirPlatformValue === "darwin") return "Darwin";
+  return "Linux";
+}
+
+function release() { return ""; }
+
+function hostname() { return String(call("os", "hostname")); }
+
+function homedir() { return String(call("os", "homedir")); }
+
+function tmpdir() { return String(call("os", "tmpdir")); }
+
+function cpus() {
+  const count = Number(call("os", "cpus_count")) || 1;
+  const out = [];
+  for (let i = 0; i < count; i++) out.push({ model: "unknown", speed: 0 });
+  return out;
+}
+
+function totalmem() { return TOTAL_MEMORY; }
+function freemem() { return FREE_MEMORY; }
+
+function endianness() {
+  const probe = new Uint8Array(new Uint16Array([1]).buffer);
+  return probe[0] === 1 ? "LE" : "BE";
+}
+
+function userInfo() {
+  const env = call("os", "env");
+  return {
+    uid: -1,
+    gid: -1,
+    username: env.USERNAME || env.USER || "",
+    homedir: homedir(),
+    shell: null,
+  };
+}
+
+function networkInterfaces() { return {}; }
+
+const os = {
+  platform: platform,
+  EOL: EOL,
+  devNull: devNull,
+  arch: arch,
+  type: type,
+  release: release,
+  hostname: hostname,
+  homedir: homedir,
+  tmpdir: tmpdir,
+  cpus: cpus,
+  totalmem: totalmem,
+  freemem: freemem,
+  endianness: endianness,
+  userInfo: userInfo,
+  networkInterfaces: networkInterfaces,
+};
+
+// os.constants sub-tables (captured from real Node v24 win32).
+const OS_ERRNO = {
+  E2BIG: 7,
+  EACCES: 13,
+  EADDRINUSE: 100,
+  EADDRNOTAVAIL: 101,
+  EAFNOSUPPORT: 102,
+  EAGAIN: 11,
+  EALREADY: 103,
+  EBADF: 9,
+  EBADMSG: 104,
+  EBUSY: 16,
+  ECANCELED: 105,
+  ECHILD: 10,
+  ECONNABORTED: 106,
+  ECONNREFUSED: 107,
+  ECONNRESET: 108,
+  EDEADLK: 36,
+  EDESTADDRREQ: 109,
+  EDOM: 33,
+  EEXIST: 17,
+  EFAULT: 14,
+  EFBIG: 27,
+  EHOSTUNREACH: 110,
+  EIDRM: 111,
+  EILSEQ: 42,
+  EINPROGRESS: 112,
+  EINTR: 4,
+  EINVAL: 22,
+  EIO: 5,
+  EISCONN: 113,
+  EISDIR: 21,
+  ELOOP: 114,
+  EMFILE: 24,
+  EMLINK: 31,
+  EMSGSIZE: 115,
+  ENAMETOOLONG: 38,
+  ENETDOWN: 116,
+  ENETRESET: 117,
+  ENETUNREACH: 118,
+  ENFILE: 23,
+  ENOBUFS: 119,
+  ENODATA: 120,
+  ENODEV: 19,
+  ENOENT: 2,
+  ENOEXEC: 8,
+  ENOLCK: 39,
+  ENOLINK: 121,
+  ENOMEM: 12,
+  ENOMSG: 122,
+  ENOPROTOOPT: 123,
+  ENOSPC: 28,
+  ENOSR: 124,
+  ENOSTR: 125,
+  ENOSYS: 40,
+  ENOTCONN: 126,
+  ENOTDIR: 20,
+  ENOTEMPTY: 41,
+  ENOTSOCK: 128,
+  ENOTSUP: 129,
+  ENOTTY: 25,
+  ENXIO: 6,
+  EOPNOTSUPP: 130,
+  EOVERFLOW: 132,
+  EPERM: 1,
+  EPIPE: 32,
+  EPROTO: 134,
+  EPROTONOSUPPORT: 135,
+  EPROTOTYPE: 136,
+  ERANGE: 34,
+  EROFS: 30,
+  ESPIPE: 29,
+  ESRCH: 3,
+  ETIME: 137,
+  ETIMEDOUT: 138,
+  ETXTBSY: 139,
+  EWOULDBLOCK: 140,
+  EXDEV: 18,
+  WSAEINTR: 10004,
+  WSAEBADF: 10009,
+  WSAEACCES: 10013,
+  WSAEFAULT: 10014,
+  WSAEINVAL: 10022,
+  WSAEMFILE: 10024,
+  WSAEWOULDBLOCK: 10035,
+  WSAEINPROGRESS: 10036,
+  WSAEALREADY: 10037,
+  WSAENOTSOCK: 10038,
+  WSAEDESTADDRREQ: 10039,
+  WSAEMSGSIZE: 10040,
+  WSAEPROTOTYPE: 10041,
+  WSAENOPROTOOPT: 10042,
+  WSAEPROTONOSUPPORT: 10043,
+  WSAESOCKTNOSUPPORT: 10044,
+  WSAEOPNOTSUPP: 10045,
+  WSAEPFNOSUPPORT: 10046,
+  WSAEAFNOSUPPORT: 10047,
+  WSAEADDRINUSE: 10048,
+  WSAEADDRNOTAVAIL: 10049,
+  WSAENETDOWN: 10050,
+  WSAENETUNREACH: 10051,
+  WSAENETRESET: 10052,
+  WSAECONNABORTED: 10053,
+  WSAECONNRESET: 10054,
+  WSAENOBUFS: 10055,
+  WSAEISCONN: 10056,
+  WSAENOTCONN: 10057,
+  WSAESHUTDOWN: 10058,
+  WSAETOOMANYREFS: 10059,
+  WSAETIMEDOUT: 10060,
+  WSAECONNREFUSED: 10061,
+  WSAELOOP: 10062,
+  WSAENAMETOOLONG: 10063,
+  WSAEHOSTDOWN: 10064,
+  WSAEHOSTUNREACH: 10065,
+  WSAENOTEMPTY: 10066,
+  WSAEPROCLIM: 10067,
+  WSAEUSERS: 10068,
+  WSAEDQUOT: 10069,
+  WSAESTALE: 10070,
+  WSAEREMOTE: 10071,
+  WSASYSNOTREADY: 10091,
+  WSAVERNOTSUPPORTED: 10092,
+  WSANOTINITIALISED: 10093,
+  WSAEDISCON: 10101,
+  WSAENOMORE: 10102,
+  WSAECANCELLED: 10103,
+  WSAEINVALIDPROCTABLE: 10104,
+  WSAEINVALIDPROVIDER: 10105,
+  WSAEPROVIDERFAILEDINIT: 10106,
+  WSASYSCALLFAILURE: 10107,
+  WSASERVICE_NOT_FOUND: 10108,
+  WSATYPE_NOT_FOUND: 10109,
+  WSA_E_NO_MORE: 10110,
+  WSA_E_CANCELLED: 10111,
+  WSAEREFUSED: 10112,
+};
+
+const OS_SIGNALS = {
+  SIGHUP: 1,
+  SIGINT: 2,
+  SIGQUIT: 3,
+  SIGILL: 4,
+  SIGABRT: 22,
+  SIGFPE: 8,
+  SIGKILL: 9,
+  SIGSEGV: 11,
+  SIGTERM: 15,
+  SIGBREAK: 21,
+  SIGWINCH: 28,
+};
+
+const OS_PRIORITY = {
+  PRIORITY_LOW: 19,
+  PRIORITY_BELOW_NORMAL: 10,
+  PRIORITY_NORMAL: 0,
+  PRIORITY_ABOVE_NORMAL: -7,
+  PRIORITY_HIGH: -14,
+  PRIORITY_HIGHEST: -20,
+};
+
+// os.constants top-level (UV_* / dlopen); win32 has no UV table entry
+const OS_CONSTS = {
+  UV_UDP_REUSEADDR: 4,
+};
+
+// Real fields where the host provides them; loadavg returns Node's win32
+// convention (always zeros), uptime rides the process clock.
+const availableParallelism = () => 1;
+
+function uptime() {
+  // The runtime has no boot-time host op; the clock starts at bootstrap.
+  return Math.floor((Date.now() - (globalThis.__pirBootTime || (globalThis.__pirBootTime = Date.now()))) / 1000);
+}
+
+function loadavg() {
+  return [0, 0, 0];
+}
+
+function machine() {
+  return process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "arm64" : process.arch;
+}
+
+function version() {
+  // The host exposes no OS product string; the honest value is empty.
+  return "";
+}
+
+function getPriority(pid) {
+  if (pid !== undefined && (typeof pid !== "number" || (pid | 0) !== pid)) {
+    throw new TypeError("pid must be an integer");
+  }
+  return 0;
+}
+
+function setPriority(_pid, _priority) {
+  // No scheduling control in the runtime; a valid call is a no-op.
+}
+
+const osConstants = {
+  dlopen: {},
+  errno: OS_ERRNO,
+  signals: OS_SIGNALS,
+  priority: OS_PRIORITY,
+  UV_UDP_REUSEADDR: OS_CONSTS.UV_UDP_REUSEADDR,
+};
+
+const osWithConstants = Object.assign({}, os, {
+  constants: osConstants,
+  availableParallelism: availableParallelism,
+  uptime: uptime,
+  loadavg: loadavg,
+  machine: machine,
+  version: version,
+  getPriority: getPriority,
+  setPriority: setPriority,
+});
+
+// Node publishes `EOL`/`devNull` as non-writable (configurable) data
+// properties: `os.EOL = 123` is a TypeError in strict mode, while
+// `Object.defineProperties(os, { EOL: {...} })` still works. The object
+// literal above made them plain writable properties.
+for (const name of ["EOL", "devNull"]) {
+  Object.defineProperty(osWithConstants, name, {
+    value: name === "EOL" ? EOL : devNull,
+    writable: false,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+export { platform, EOL, devNull, arch, type, release, hostname, homedir, tmpdir, cpus, totalmem, freemem, endianness, userInfo, networkInterfaces };
+export { osConstants as constants, availableParallelism, uptime, loadavg, machine, version, getPriority, setPriority };
+export default osWithConstants;

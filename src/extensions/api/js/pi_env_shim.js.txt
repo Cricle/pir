@@ -1,0 +1,2338 @@
+// @earendil-works/pi-env — virtual module shim.
+//
+// Upstream `packages/env` is "Remote execution environments for Pi Durable":
+// a Rust daemon (`packages/env/daemon`, protocol v1 over stdin/stdout) plus a
+// TypeScript client that deploys and drives it. pir ships the daemon itself
+// (`pir env-daemon serve --token <hex>`, `src/env_daemon/`, upstream code
+// ported verbatim), so this shim is the *client* half: the framing,
+// request/response correlation, cancellation and the `RemoteExecutionEnv`
+// surface, ported statement by statement from
+// `packages/env/src/{connection,errors,list-files,remote-env,watch,terminal,ssh}.ts`
+// (upstream HEAD 7d75a0e3e).
+//
+// Package exports (upstream `package.json` has exactly one entry, `.`):
+//   Connection, isConnectionLost, nodePlatform, RemoteError,
+//   RemoteExecutionEnv, RemoteWatcher, openTerminal/RemoteTerminal,
+//   connectSsh/sshConnection/sshArguments/scanHostKey/acceptHostKey/
+//   forgetHostKey/deployDaemon/detectPlatform/localDaemon/packagedDaemon,
+//   SshError/HostKeyUnknownError/HostKeyChangedError,
+//   LocalExecutionEnv (throws — see below).
+//
+// What is REAL here
+//   * `Connection`: the whole client. Lazy start, `hello` handshake with the
+//     `protocol === 1` check, the 13-byte frame header, request-id matching,
+//     `event` frames routed to `onEvent`, cancel-on-abort, `{mode:"kill"}`,
+//     session pinning for handle requests, the 5 s ping / 30 s silence rules,
+//     the `PI-ENV <token>` sync line, `lost` errors, `close()`.
+//   * `RemoteExecutionEnv`: the whole `ExecutionEnv` surface over that
+//     connection (path resolution with the remote system's rules, readers,
+//     512 KiB writes, readers, listFiles payload decoding, exec with output
+//     windows/spill/timeout/abort, cleanup()).
+//   * `RemoteWatcher` (reconnect + `overflow`), `openTerminal`/`RemoteTerminal`
+//     (Unix daemons answer; Windows daemons refuse pty with `ENOTSUP`, which
+//     the client surfaces as an `unknown` ExecutionError — same as upstream).
+//   * The SSH surface: `sshArguments`, host-key scan/accept/forget,
+//     `detectPlatform`, `deployDaemon` (SHA-256-named, verified before it
+//     runs), `sshConnection`, `connectSsh`, over the system `ssh`.
+//   * `LocalExecutionEnv` (see its own doc): the machine-local environment over
+//     `localDaemon()`.
+//
+// Deviations from upstream (all deliberate; also in the wave report)
+//   * `LocalExecutionEnv` is a `RemoteExecutionEnv` over a local daemon rather
+//     than durable's `NodeExecutionEnv` plus a local daemon: the durable
+//     baseline (`@earendil-works/pi-durable/env/node`) is a different
+//     workstream (D4). It takes upstream's option names (`connection` optional,
+//     `id`, `cwd`, `shellPath`, `shellEnv`, `watch`) and adds `dispose()` for
+//     the connection it creates itself.
+//   * durable's `env` contract values (`ok`, `err`, `FileError`,
+//     `ExecutionError`, `StreamDecoder`) are imported from the
+//     `@earendil-works/pi-durable/env` virtual module (registered by wave D4,
+//     `pi_durable_env_shim.js.txt`): client and daemon-side code share one
+//     contract implementation, and the contract is no longer duplicated here.
+//     (Until D4 this file carried a local CONTRACT FALLBACK block; the
+//     `FileInfo`/`FileListing` shapes are JSDoc-only and stay in the comments.)
+//   * `packagedDaemon()` only has pir to offer: it returns the running pir
+//     image when the remote system matches this build's platform/arch, and
+//     throws otherwise (upstream ships one prebuilt daemon per platform).
+//     `deployDaemon` therefore uploads *the pir image* and starts it as
+//     `<remote path> env-daemon`, which is the same argv shape the local
+//     connection uses; `sshConnection`/`connectSsh` accept upstream's `binary`
+//     (a standalone `pi-env` binary, started as `<path> serve …`) and a
+//     `daemonArgs` override for a pir image passed as `binary`.
+//   * `Connection` uses `_`-prefixed fields instead of TypeScript `#private`
+//     names: same semantics, one less engine feature to lean on. It also
+//     defends against the pir child_process shim's `stdin` being a bare writer
+//     (or null after a failed spawn) where Node always has a stream.
+
+import { spawn } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, posix, win32 } from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
+
+// ===========================================================================
+// durable `env` contract — imported from the pi-durable shim (wave D4)
+// ===========================================================================
+//
+// Upstream this client writes `import { err, FileError, ok, StreamDecoder, … }
+// from "@earendil-works/pi-durable/env"`; the same values now come from that
+// virtual module, so the client and the durable-side `NodeExecutionEnv` share
+// one contract implementation (`Result` = `{ok:true,value}` / `{ok:false,error}`;
+// `FileError` codes `not_found`/`permission_denied`/`not_directory`/
+// `is_directory`/`invalid`/`aborted`/`not_supported`/`unknown`;
+// `ExecutionError` codes `aborted`/`timeout`/`shell_unavailable`/`spawn_error`/
+// `callback_error`/`unknown` with the optional `spillPath`).
+import { err, ExecutionError, FileError, ok, StreamDecoder } from "@earendil-works/pi-durable/env";
+
+// ===========================================================================
+// connection.ts — framing, RemoteError, nodePlatform, Connection
+// ===========================================================================
+
+/** Frame types (docs/protocol.md). */
+const REQUEST = 1;
+const RESULT = 2;
+const ERROR = 3;
+const EVENT = 4;
+const CANCEL = 5;
+const PING = 6;
+
+const MAX_FRAME = 16 * 1024 * 1024;
+const PING_INTERVAL_MS = 5000;
+/** The daemon pings every five seconds; this much silence means the connection is gone. */
+const SILENCE_LIMIT_MS = 30000;
+/** How long starting the daemon and its `hello` may take. */
+const START_TIMEOUT_MS = 60000;
+
+/** A failure reported by the daemon, with its Node-style code. */
+class RemoteError extends Error {
+  constructor(fields) {
+    super(typeof fields.message === "string" ? fields.message : "Remote operation failed");
+    this.name = "RemoteError";
+    this.code = typeof fields.code === "string" ? fields.code : "unknown";
+    if (typeof fields.path === "string") this.path = fields.path;
+    this.fields = fields;
+  }
+}
+
+/**
+ * Node's names for the daemon's system and architecture, which `hello` reports
+ * in Rust's spelling: `windows` is `win32`, `macos` is `darwin`, `x86_64` is
+ * `x64`, `aarch64` is `arm64`, so they compare with `process.platform` and
+ * `process.arch`. Other names are kept.
+ */
+function nodePlatform(info) {
+  const platforms = { windows: "win32", macos: "darwin" };
+  const archs = { x86_64: "x64", aarch64: "arm64", x86: "ia32" };
+  return { platform: platforms[info.os] ?? info.os, arch: archs[info.arch] ?? info.arch };
+}
+
+/** Lone surrogates become U+FFFD, as Node encodes strings for system calls. */
+function wellFormed(_key, value) {
+  return typeof value === "string" && typeof value.toWellFormed === "function"
+    ? value.toWellFormed()
+    : value;
+}
+
+function frame(type, id, json, payload) {
+  const bytes = payload === undefined ? new Uint8Array(0) : payload;
+  const body = Buffer.from(JSON.stringify(json, wellFormed), "utf8");
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(9 + body.length + bytes.length, 0);
+  header.writeUInt8(type, 4);
+  header.writeUInt32BE(id, 5);
+  header.writeUInt32BE(body.length, 9);
+  return Buffer.concat([header, body, Buffer.from(bytes)]);
+}
+
+/** The connection failed or ended; a request may succeed once it is started again. */
+function lost(message) {
+  return new RemoteError({ code: "unknown", message: message, lost: true });
+}
+
+/** Whether an error means the connection was lost, not that the daemon refused the request. */
+function isConnectionLost(error) {
+  return error instanceof RemoteError && error.fields.lost === true;
+}
+
+function closed() {
+  return new RemoteError({ code: "unknown", message: "Connection closed" });
+}
+
+/** One running daemon. */
+class Session {
+  constructor(id, child, token) {
+    this.id = id;
+    this.child = child;
+    this.token = token;
+    this.pending = new Map();
+    /** Received bytes not yet parsed, without concatenating on every chunk. */
+    this.chunks = [];
+    this.buffered = 0;
+    this.synced = false;
+    this.lastSeen = Date.now();
+    this.timer = undefined;
+    this.live = true;
+  }
+
+  /** The first `length` buffered bytes as one buffer, without consuming them. */
+  peek(length) {
+    if (this.chunks[0].length < length) this.chunks = [Buffer.concat(this.chunks)];
+    return this.chunks[0].subarray(0, length);
+  }
+
+  consume(length) {
+    this.buffered -= length;
+    while (length > 0) {
+      const first = this.chunks[0];
+      if (first.length <= length) {
+        this.chunks.shift();
+        length -= first.length;
+      } else {
+        this.chunks[0] = first.subarray(length);
+        length = 0;
+      }
+    }
+  }
+}
+
+/**
+ * One connection to a pi-env daemon: started lazily on the first request and
+ * started again after it is lost. Requests in flight when it is lost fail with
+ * code `unknown`; for mutations their outcome is then unknown.
+ */
+class Connection {
+  constructor(options) {
+    this._options = options;
+    this._session = undefined;
+    this._ready = undefined;
+    this._sessions = 0;
+    this._nextId = 1;
+    this._closed = false;
+  }
+
+  /** Connect if needed and return what the daemon reported about its machine. */
+  async info() {
+    return (await this._connect()).info;
+  }
+
+  /** Connect if needed and return the live session's id. */
+  async session() {
+    return (await this._connect()).session.id;
+  }
+
+  async request(op, json, options) {
+    const opts = options === undefined ? {} : options;
+    if (opts.session !== undefined) {
+      const current = this._session;
+      if (current === undefined || current.id !== opts.session || !current.live) {
+        throw lost("pi-env connection lost");
+      }
+      return this._send(current, op, json, opts);
+    }
+    const started = await this._connect();
+    return this._send(started.session, op, json, opts);
+  }
+
+  /** Stop the daemon; it kills everything it started. */
+  close() {
+    this._closed = true;
+    if (this._session !== undefined) this._teardown(this._session, closed());
+  }
+
+  /** Kill one `exec` without aborting it. */
+  kill(id, session) {
+    const current = this._session;
+    if (current !== undefined && current.id === session && current.live) {
+      this._write(current, frame(CANCEL, id, { mode: "kill" }));
+    }
+  }
+
+  _connect() {
+    if (this._closed) return Promise.reject(closed());
+    if (this._ready === undefined) {
+      const ready = this._start();
+      this._ready = ready;
+      // A failed start is not remembered: the next request tries again.
+      ready.catch(() => {
+        if (this._ready === ready) this._ready = undefined;
+      });
+    }
+    return this._ready;
+  }
+
+  _send(session, op, json, options) {
+    if (!session.live) return Promise.reject(lost("pi-env connection lost"));
+    const id = this._nextId++;
+    const connection = this;
+    return new Promise((resolve, reject) => {
+      const signal = options.signal;
+      const onAbort = () => connection._write(session, frame(CANCEL, id, {}));
+      const done = () => {
+        if (signal !== undefined) signal.removeEventListener("abort", onAbort);
+      };
+      const pending = {
+        resolve: (value) => {
+          done();
+          resolve(value);
+        },
+        reject: (error) => {
+          done();
+          reject(error);
+        },
+      };
+      if (options.onEvent !== undefined) pending.onEvent = options.onEvent;
+      session.pending.set(id, pending);
+      if (signal !== undefined) signal.addEventListener("abort", onAbort, { once: true });
+      if (options.onStart !== undefined) options.onStart(id, session.id);
+      connection._write(session, frame(REQUEST, id, Object.assign({ op: op }, json), options.payload));
+      if (signal !== undefined && signal.aborted) onAbort();
+    });
+  }
+
+  _write(session, data) {
+    if (!session.live) return;
+    // `child.stdin` is null when the spawn itself failed (the pir child_process
+    // shim returns that child and emits `error` asynchronously; Node's
+    // stdio:'pipe' child always has a stream).
+    if (session.child.stdin === null || session.child.stdin === undefined) return;
+    try {
+      session.child.stdin.write(data);
+    } catch {
+      // The daemon's handle is gone (Node would surface an async stdin error):
+      // the child's `exit`/`error` event tears the session down with `lost`.
+    }
+  }
+
+  async _start() {
+    let command;
+    try {
+      const option = this._options.command;
+      command = typeof option === "function" ? await option() : option;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new RemoteError({ code: "spawn_error", message: message, lost: true });
+    }
+    if (this._closed) throw closed();
+    const program = command[0];
+    const args = command.slice(1);
+    if (program === undefined) throw new RemoteError({ code: "spawn_error", message: "No daemon command" });
+    const token = randomBytes(16).toString("hex");
+    const connection = this;
+    const child = spawn(program, args.concat(["serve", "--token", token]), {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const session = new Session(++this._sessions, child, token);
+    this._session = session;
+    let startTimer;
+    const failed = new Promise((_resolve, reject) => {
+      startTimer = setTimeout(
+        () => reject(lost(`pi-env did not answer within ${START_TIMEOUT_MS / 1000} s`)),
+        START_TIMEOUT_MS,
+      );
+      if (startTimer !== undefined && typeof startTimer.unref === "function") startTimer.unref();
+      child.once("error", (error) =>
+        reject(new RemoteError({ code: "spawn_error", message: error.message, lost: true })),
+      );
+      child.once("exit", (code) =>
+        reject(lost(`pi-env exited with code ${code} before it was ready`)),
+      );
+    });
+    failed.catch(() => {});
+    child.stdout.on("data", (chunk) => connection._onData(session, chunk));
+    child.stderr.on("data", (chunk) => {
+      if (connection._options.onLog !== undefined) connection._options.onLog(chunk.toString("utf8"));
+    });
+    child.on("error", () => connection._teardown(session, lost("pi-env connection lost")));
+    child.on("exit", () => connection._teardown(session, lost("pi-env connection lost")));
+    // Node's `child.stdin` is a stream; the pir child_process shim's stdin is a
+    // writer with the three pipe methods only — and it is null when the spawn
+    // failed. The error listener is attached when the surface exists.
+    if (child.stdin !== null && child.stdin !== undefined && typeof child.stdin.on === "function") {
+      child.stdin.on("error", () => {});
+    }
+    session.timer = setInterval(() => {
+      connection._write(session, frame(PING, 0, {}));
+      if (Date.now() - session.lastSeen > SILENCE_LIMIT_MS) {
+        connection._teardown(session, lost("pi-env connection timed out"));
+      }
+    }, PING_INTERVAL_MS);
+    if (session.timer !== undefined && typeof session.timer.unref === "function") session.timer.unref();
+    try {
+      const reply = await Promise.race([this._send(session, "hello", { protocol: 1 }, {}), failed]);
+      const json = reply.json;
+      if (json.protocol !== 1) throw lost(`Unsupported protocol ${json.protocol}`);
+      return { info: json, session: session };
+    } catch (error) {
+      this._teardown(session, error instanceof Error ? error : lost(String(error)));
+      throw error;
+    } finally {
+      clearTimeout(startTimer);
+    }
+  }
+
+  _teardown(session, error) {
+    if (!session.live) return;
+    session.live = false;
+    clearInterval(session.timer);
+    if (this._session === session) {
+      this._session = undefined;
+      this._ready = undefined;
+    }
+    // Null when the spawn never produced a process (see `_write`).
+    if (session.child.stdin !== null && session.child.stdin !== undefined) {
+      session.child.stdin.end();
+    }
+    session.child.kill();
+    const pending = Array.from(session.pending.values());
+    session.pending.clear();
+    for (const request of pending) request.reject(error);
+  }
+
+  _onData(session, chunk) {
+    if (!session.live) return;
+    session.lastSeen = Date.now();
+    session.chunks.push(chunk);
+    session.buffered += chunk.length;
+    if (!session.synced) {
+      // Shell startup files may print before the daemon runs; skip everything before its sync line.
+      const marker = Buffer.from(`PI-ENV ${session.token}\n`, "utf8");
+      const all = session.peek(session.buffered);
+      const index = all.indexOf(marker);
+      if (index === -1) {
+        if (session.buffered > 1024 * 1024) session.consume(session.buffered - marker.length);
+        return;
+      }
+      const noise = all.subarray(0, index).toString("utf8").trim();
+      if (noise !== "" && this._options.onLog !== undefined) this._options.onLog(noise);
+      session.consume(index + marker.length);
+      session.synced = true;
+    }
+    while (session.live && session.buffered >= 4) {
+      const length = session.peek(4).readUInt32BE(0);
+      if (length < 9 || length > MAX_FRAME) {
+        this._teardown(session, lost("Corrupt frame from pi-env"));
+        return;
+      }
+      if (session.buffered < 4 + length) return;
+      const body = session.peek(4 + length).subarray(4);
+      const type = body.readUInt8(0);
+      const id = body.readUInt32BE(1);
+      const jsonLength = body.readUInt32BE(5);
+      let json;
+      try {
+        if (9 + jsonLength > length) throw new Error("JSON length out of range");
+        const parsed = JSON.parse(body.subarray(9, 9 + jsonLength).toString("utf8"));
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          throw new Error("not an object");
+        }
+        json = parsed;
+      } catch {
+        this._teardown(session, lost("Corrupt frame from pi-env"));
+        return;
+      }
+      // A plain Uint8Array copy, like `NodeExecutionEnv`'s reader results, not a view of the receive buffer.
+      const payload = new Uint8Array(body.subarray(9 + jsonLength));
+      session.consume(4 + length);
+      this._dispatch(session, type, id, json, payload);
+    }
+  }
+
+  _dispatch(session, type, id, json, payload) {
+    const pending = session.pending.get(id);
+    if (type === EVENT) {
+      if (pending !== undefined && pending.onEvent !== undefined) pending.onEvent(json, payload);
+      return;
+    }
+    if (type !== RESULT && type !== ERROR) return;
+    if (pending === undefined) return;
+    session.pending.delete(id);
+    if (type === RESULT) pending.resolve({ json: json, payload: payload, session: session.id });
+    else pending.reject(new RemoteError(json));
+  }
+}
+
+// ===========================================================================
+// errors.ts — Node error codes → durable FileError codes
+// ===========================================================================
+
+function abortResult(signal, path) {
+  return signal !== undefined && signal.aborted
+    ? err(new FileError("aborted", "aborted", path))
+    : undefined;
+}
+
+/** `NodeExecutionEnv`'s mapping of Node error codes to `FileError` codes. */
+function toFileError(error, fallbackPath) {
+  if (error instanceof FileError) return error;
+  if (!(error instanceof RemoteError)) {
+    const cause = error instanceof Error ? error : new Error(String(error));
+    return new FileError("unknown", cause.message, fallbackPath, cause);
+  }
+  const path = error.path ?? fallbackPath;
+  switch (error.code) {
+    case "aborted":
+      return new FileError("aborted", error.message, path, error);
+    case "ENOENT":
+      return new FileError("not_found", error.message, path, error);
+    case "EACCES":
+    case "EPERM":
+      return new FileError("permission_denied", error.message, path, error);
+    case "ENOTDIR":
+      return new FileError("not_directory", error.message, path, error);
+    case "EISDIR":
+      return new FileError("is_directory", error.message, path, error);
+    case "EINVAL":
+    case "SYMLINK":
+    case "NOT_REGULAR":
+      return new FileError("invalid", error.message, path, error);
+    default:
+      return new FileError("unknown", error.message, path, error);
+  }
+}
+
+// ===========================================================================
+// list-files.ts — `listFiles` payload decoding
+// ===========================================================================
+
+/** Kind bytes of `listFiles` records: `f`, `d`, `l`. */
+const KINDS = { 102: "file", 100: "directory", 108: "symlink" };
+
+/**
+ * `listFiles` of an absolute path through the daemon: fails with
+ * `not_supported` if the daemon does not list files (a release before
+ * `listFiles`), so callers fall back to their own walk.
+ */
+async function listFilesOver(connection, path, options, context) {
+  for (const key of ["maxEntries", "maxBytes", "timeoutMs"]) {
+    const value = options === undefined ? undefined : options[key];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+      return err(new FileError("invalid", `${key} must be a non-negative safe integer`, path));
+    }
+  }
+  const aborted = abortResult(context.abortSignal, path);
+  if (aborted !== undefined) return aborted;
+  try {
+    const info = await connection.info();
+    if (info.features === undefined || info.features.indexOf("listFiles") === -1) {
+      return err(
+        new FileError("not_supported", "The pi-env daemon does not list files; update it", path),
+      );
+    }
+    const opts = options === undefined ? {} : options;
+    const reply = await connection.request(
+      "listFiles",
+      // Fields left undefined are not sent; the daemon applies the defaults.
+      {
+        path: path,
+        hidden: opts.hidden,
+        gitignore: opts.gitignore,
+        exclude: opts.exclude,
+        maxEntries: opts.maxEntries,
+        maxBytes: opts.maxBytes,
+        timeoutMs: opts.timeoutMs,
+      },
+      context.abortSignal ? { signal: context.abortSignal } : {},
+    );
+    const afterAbort = abortResult(context.abortSignal, path);
+    if (afterAbort !== undefined) return afterAbort;
+    // Records of a kind byte, the UTF-8 path, and a NUL.
+    const entries = [];
+    const bytes = Buffer.from(reply.payload.buffer, reply.payload.byteOffset, reply.payload.length);
+    for (let start = 0; start < bytes.length; ) {
+      const end = bytes.indexOf(0, start);
+      if (end === -1) break;
+      const kind = KINDS[bytes[start]];
+      if (kind !== undefined) entries.push({ path: bytes.toString("utf8", start + 1, end), kind: kind });
+      start = end + 1;
+    }
+    return ok({ entries: entries, truncated: reply.json.truncated === true });
+  } catch (error) {
+    return err(toFileError(error, path));
+  }
+}
+// ===========================================================================
+// remote-env.ts — RemoteExecutionEnv over a Connection
+// ===========================================================================
+
+const MAX_TIMEOUT_MS = 2147483647;
+const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
+/** Bytes per `pread` request of a binary reader; several are in flight at once. */
+const READ_CHUNK = 256 * 1024;
+const READ_DEPTH = 8;
+/** Node's `writeFile` writes at most this much per call and checks for an abort before each. */
+const WRITE_CHUNK = 512 * 1024;
+const WRITE_DEPTH = 8;
+/** Node's `readFile`: chunk of known-size reads, chunk of unknown-size reads, and the largest file it reads. */
+const READ_FILE_CHUNK = 512 * 1024;
+const READ_FILE_UNKNOWN_CHUNK = 64 * 1024;
+const READ_FILE_MAX = Math.pow(2, 31) - 1;
+/** `NodeTextLineReader`'s read size. */
+const LINE_CHUNK = 64 * 1024;
+
+/** Node's path rules of the remote system. */
+async function remotePath(connection) {
+  return nodePlatform(await connection.info()).platform === "win32" ? win32 : posix;
+}
+
+function toInfo(path, remote, paths) {
+  if (remote.kind === "other") return err(new FileError("invalid", "Unsupported file type", path));
+  return ok({
+    name: paths.basename(path),
+    path: path,
+    kind: remote.kind,
+    size: remote.size,
+    mtimeMs: remote.mtimeSec * 1000 + remote.mtimeNsec / 1e6,
+  });
+}
+
+function concat(chunks, total) {
+  if (chunks.length === 1) return chunks[0];
+  const bytes = new Uint8Array(total);
+  let position = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, position);
+    position += chunk.length;
+  }
+  return bytes;
+}
+
+/**
+ * Read `length` bytes from `offset` as consecutive reads of at most `chunk`
+ * bytes, several in flight. Ends early at the end of the file. A short read
+ * continues from where it ended, as sequential reads would. `aborted` is
+ * checked after each read; `undefined` means aborted.
+ */
+async function readRange(read, offset, length, chunk, aborted) {
+  const chunks = [];
+  let total = 0;
+  let next = offset;
+  const inFlight = [];
+  while (total < length) {
+    while (inFlight.length < READ_DEPTH && next < offset + length) {
+      const size = Math.min(offset + length - next, chunk);
+      const bytes = read(next, size);
+      bytes.catch(() => {});
+      inFlight.push({ length: size, bytes: bytes });
+      next += size;
+    }
+    const head = inFlight.shift();
+    const bytes = await head.bytes;
+    if (aborted()) return undefined;
+    if (bytes.length === 0) break;
+    chunks.push(bytes);
+    total += bytes.length;
+    if (bytes.length < head.length) {
+      // Reads already in flight assumed a full read; continue right after this one.
+      inFlight.length = 0;
+      next = offset + total;
+    }
+  }
+  return { chunks: chunks, total: total };
+}
+
+/** A daemon handle: valid only in the session that opened it. */
+class Handle {
+  constructor(env, id, session, path) {
+    this.env = env;
+    this.id = id;
+    this.session = session;
+    this.path = path;
+  }
+
+  request(op, json, options) {
+    return this.env.connection.request(
+      op,
+      Object.assign({ handle: this.id }, json === undefined ? {} : json),
+      Object.assign({ session: this.session }, options === undefined ? {} : options),
+    );
+  }
+
+  async pread(offset, length) {
+    const json = offset === undefined ? { length: length } : { offset: offset, length: length };
+    return (await this.request("pread", json)).payload;
+  }
+
+  async close() {
+    await this.request("close").catch(() => undefined);
+  }
+}
+
+class RemoteBinaryReader {
+  constructor(handle) {
+    this._handle = handle;
+    this._closed = false;
+  }
+
+  get path() {
+    return this._handle.path;
+  }
+
+  _closedResult() {
+    return this._closed
+      ? err(new FileError("invalid", "Binary reader is closed", this.path))
+      : undefined;
+  }
+
+  async info(context) {
+    const early = abortResult(context.abortSignal, this.path) ?? this._closedResult();
+    if (early !== undefined) return early;
+    try {
+      const reply = await this._handle.request("fstat");
+      return toInfo(this.path, reply.json, await remotePath(this._handle.env.connection));
+    } catch (error) {
+      return err(toFileError(error, this.path));
+    }
+  }
+
+  async read(offset, length, context) {
+    const early = abortResult(context.abortSignal, this.path) ?? this._closedResult();
+    if (early !== undefined) return early;
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
+      return err(new FileError("invalid", "Offset and length must be non-negative safe integers", this.path));
+    }
+    try {
+      const read = await readRange(
+        (at, size) => this._handle.pread(at, size),
+        offset,
+        length,
+        READ_CHUNK,
+        () => context.abortSignal !== undefined && context.abortSignal.aborted === true,
+      );
+      if (read === undefined) return err(new FileError("aborted", "aborted", this.path));
+      return ok(concat(read.chunks, read.total));
+    } catch (error) {
+      return err(toFileError(error, this.path));
+    }
+  }
+
+  async scanLines(options, context) {
+    const early = abortResult(context.abortSignal, this.path) ?? this._closedResult();
+    if (early !== undefined) return early;
+    const startLine = options.startLine;
+    const endLine = options.endLine;
+    if (
+      !Number.isSafeInteger(startLine) ||
+      startLine < 0 ||
+      (endLine !== undefined && (!Number.isSafeInteger(endLine) || endLine <= startLine))
+    ) {
+      return err(new FileError("invalid", "Invalid line range", this.path));
+    }
+    try {
+      const json = endLine === undefined ? { startLine: startLine } : { startLine: startLine, endLine: endLine };
+      const reply = await this._handle.request(
+        "scanLines",
+        json,
+        context.abortSignal ? { signal: context.abortSignal } : {},
+      );
+      return ok(reply.json);
+    } catch (error) {
+      return err(toFileError(error, this.path));
+    }
+  }
+
+  async close(_context) {
+    if (this._closed) return;
+    this._closed = true;
+    await this._handle.close();
+  }
+}
+
+class RemoteDirReader {
+  constructor(handle) {
+    this._handle = handle;
+    this._done = false;
+    this._closed = false;
+  }
+
+  async next(maxEntries, context) {
+    const path = this._handle.path;
+    const aborted = abortResult(context.abortSignal, path);
+    if (aborted !== undefined) return aborted;
+    if (this._closed) return err(new FileError("invalid", "Directory reader is closed", path));
+    if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
+      return err(new FileError("invalid", "maxEntries must be a positive safe integer", path));
+    }
+    const entries = [];
+    try {
+      const paths = await remotePath(this._handle.env.connection);
+      // Like `NodeDirReader`, count only entries that are part of the listing.
+      while (!this._done && entries.length < maxEntries) {
+        const reply = await this._handle.request("readdir", { max: maxEntries - entries.length });
+        const loopAbort = abortResult(context.abortSignal, path);
+        if (loopAbort !== undefined) return loopAbort;
+        for (const entry of reply.json.entries) {
+          const entryPath = paths.resolve(path, entry.name);
+          if (entry.error !== undefined) {
+            // Removed between enumeration and lstat: not part of the listing any more.
+            if (entry.error.code === "ENOENT") continue;
+            return err(toFileError(new RemoteError(entry.error), entryPath));
+          }
+          const info = toInfo(entryPath, entry.info, paths);
+          if (info.ok) entries.push(info.value);
+        }
+        this._done = reply.json.done === true;
+      }
+      return ok({ entries: entries, done: this._done });
+    } catch (error) {
+      return err(toFileError(error, path));
+    }
+  }
+
+  async close(_context) {
+    if (this._closed) return;
+    this._closed = true;
+    await this._handle.close();
+  }
+}
+
+/** `NodeTextLineReader`: positional reads of a file opened like `open(path, "r")`. */
+class RemoteTextLineReader {
+  constructor(handle) {
+    this._handle = handle;
+    this._decoder = new StreamDecoder();
+    this._offset = 0;
+    this._buffered = "";
+    this._ended = false;
+    this._closed = false;
+  }
+
+  async readLine(context) {
+    const path = this._handle.path;
+    const aborted = abortResult(context.abortSignal, path);
+    if (aborted !== undefined) return aborted;
+    if (this._closed) return err(new FileError("invalid", "Text line reader is closed", path));
+    try {
+      for (;;) {
+        const newline = this._buffered.indexOf("\n");
+        if (newline !== -1) {
+          const text = this._buffered.slice(0, newline);
+          this._buffered = this._buffered.slice(newline + 1);
+          return ok({ text: text, terminated: true });
+        }
+        if (this._ended) {
+          if (this._buffered.length === 0) return ok(undefined);
+          const text = this._buffered;
+          this._buffered = "";
+          return ok({ text: text, terminated: false });
+        }
+        const bytes = await this._handle.pread(this._offset, LINE_CHUNK);
+        const afterReadAbort = abortResult(context.abortSignal, path);
+        if (afterReadAbort !== undefined) return afterReadAbort;
+        this._offset += bytes.length;
+        if (bytes.length === 0) {
+          this._buffered += this._decoder.decode();
+          this._ended = true;
+        } else {
+          this._buffered += this._decoder.decode(bytes);
+        }
+      }
+    } catch (error) {
+      return err(toFileError(error, path));
+    }
+  }
+
+  async close(_context) {
+    if (this._closed) return;
+    this._closed = true;
+    this._buffered = "";
+    await this._handle.close();
+  }
+}
+
+/**
+ * An `ExecutionEnv` on another machine, reached through a pi-env daemon.
+ * Results match `NodeExecutionEnv` running on that machine: the daemon
+ * performs the system calls, and this class applies Node's path, error, and
+ * result rules.
+ */
+class RemoteExecutionEnv {
+  constructor(options) {
+    this.id = options.id;
+    this.cwd = options.cwd;
+    this.connection = options.connection;
+    this._shellPath = options.shellPath;
+    this._shellEnv = options.shellEnv;
+    this._watchOptions = options.watch ?? {};
+    /** Running commands this environment started, for `cleanup()`. */
+    this._running = new Map();
+  }
+
+  /** Node's `resolvePath` on the remote system, with its home directory and working directories. */
+  async _resolve(path) {
+    const info = await this.connection.info();
+    const windows = nodePlatform(info).platform === "win32";
+    const paths = windows ? win32 : posix;
+    let normalized = path;
+    if (normalized === "~") {
+      normalized = info.home;
+    } else if (normalized.startsWith("~/") || (windows && normalized.startsWith("~\\"))) {
+      normalized = paths.join(info.home, normalized.slice(2));
+    } else if (normalized.startsWith("file://")) {
+      try {
+        normalized = fileURLToPath(normalized);
+        // pir's `fileURLToPath` answers POSIX paths; Node's `{ windows: true }`
+        // spelling is what the remote Windows daemon expects.
+        if (windows && /^\/[A-Za-z]:/.test(normalized)) {
+          normalized = normalized.slice(1).replace(/\//g, "\\");
+        }
+      } catch {
+        // Keep malformed URLs as ordinary paths, as Node does.
+      }
+    }
+    if (paths.isAbsolute(normalized)) return paths.resolve(normalized);
+    if (windows) {
+      // A drive-relative path on another drive: Node on Windows resolves it against that drive's working
+      // directory (`=D:`), else its own working directory if on that drive, else the drive's root.
+      const match = /^([a-zA-Z]:)(?![\\/])/.exec(normalized);
+      const drive = match === null ? undefined : match[1];
+      if (drive !== undefined && drive.toLowerCase() !== this.cwd.slice(0, 2).toLowerCase()) {
+        let base = info.driveCwds[drive.toUpperCase()] ?? info.cwd;
+        if (base.slice(0, 2).toLowerCase() !== drive.toLowerCase() && base[2] === "\\") {
+          base = `${drive}\\`;
+        }
+        return win32.resolve(base, normalized);
+      }
+    }
+    return paths.resolve(this.cwd, normalized);
+  }
+
+  async _fileOp(path, context, run, check) {
+    const mode = check === undefined ? "before" : check;
+    let resolved;
+    try {
+      resolved = await this._resolve(path);
+    } catch (error) {
+      return err(toFileError(error, path));
+    }
+    const aborted = abortResult(context.abortSignal, resolved);
+    if (aborted !== undefined) return aborted;
+    try {
+      const value = await run(resolved);
+      if (mode === "both") {
+        const after = abortResult(context.abortSignal, resolved);
+        if (after !== undefined) return after;
+      }
+      return ok(value);
+    } catch (error) {
+      return err(toFileError(error, resolved));
+    }
+  }
+
+  async _open(resolved, json) {
+    const reply = await this.connection.request("open", Object.assign({ path: resolved }, json));
+    return {
+      handle: new Handle(this, reply.json.handle, reply.session, resolved),
+      json: reply.json,
+    };
+  }
+
+  async absolutePath(path, _context) {
+    try {
+      return ok(await this._resolve(path));
+    } catch (error) {
+      return err(toFileError(error, path));
+    }
+  }
+
+  async joinPath(parts, _context) {
+    try {
+      return ok((await remotePath(this.connection)).join.apply(null, parts));
+    } catch (error) {
+      return err(toFileError(error));
+    }
+  }
+
+  /** Node's `readFile`, with or without UTF-8 decoding, over a file opened like `open(path, "r")`. */
+  async _readFile(path, encoding, context) {
+    const signal = context.abortSignal;
+    return this._fileOp(path, context, async (resolved) => {
+      const opened = await this._open(resolved, { mode: "read" });
+      const handle = opened.handle;
+      const aborted = () => signal !== undefined && signal.aborted === true;
+      const abort = () => new FileError("aborted", "The operation was aborted", resolved);
+      try {
+        if (opened.json.statError !== undefined) throw new RemoteError(opened.json.statError);
+        if (aborted()) throw abort();
+        const stat = opened.json.stat;
+        const size = stat.kind === "file" ? stat.size : 0;
+        if (size > READ_FILE_MAX) {
+          throw new FileError("unknown", `File size (${size}) is greater than 2 GiB`, resolved);
+        }
+        if (size === 0) {
+          // Unknown size: sequential reads until the end, as for FIFOs and devices.
+          const decoder = new StringDecoder("utf8");
+          const chunks = [];
+          let total = 0;
+          let text = "";
+          for (;;) {
+            if (aborted()) throw abort();
+            const bytes = await handle.pread(undefined, READ_FILE_UNKNOWN_CHUNK);
+            if (bytes.length === 0) break;
+            total += bytes.length;
+            chunks.push(bytes);
+            if (encoding) text += decoder.write(Buffer.from(bytes));
+          }
+          if (!encoding) return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total);
+          return total === 0 ? "" : text + decoder.end();
+        }
+        if (!encoding) {
+          // A single read of the whole size, or reads of 512 KiB until the size or the end of the file.
+          if (size <= READ_FILE_CHUNK) return Buffer.from(await handle.pread(0, size));
+          const read = await readRange((at, length) => handle.pread(at, length), 0, size, READ_FILE_CHUNK, aborted);
+          if (read === undefined) throw abort();
+          return Buffer.concat(read.chunks.map((chunk) => Buffer.from(chunk)), read.total);
+        }
+        // Decoding: reads of min(size, 512 KiB) until the size, a short read, or the end of the file.
+        const length = Math.min(size, READ_FILE_CHUNK);
+        const decoder = new StringDecoder("utf8");
+        let text = "";
+        let total = 0;
+        let first = true;
+        const inFlight = [];
+        let next = 0;
+        for (;;) {
+          while (inFlight.length < READ_DEPTH) {
+            const bytes = handle.pread(next, length);
+            bytes.catch(() => {});
+            inFlight.push(bytes);
+            next += length;
+          }
+          const bytes = await inFlight.shift();
+          if (aborted()) throw abort();
+          total += bytes.length;
+          if (bytes.length === 0 || total === size || bytes.length !== length) {
+            return first
+              ? Buffer.from(bytes).toString("utf8")
+              : text + decoder.write(Buffer.from(bytes)) + decoder.end();
+          }
+          text += decoder.write(Buffer.from(bytes));
+          first = false;
+        }
+      } finally {
+        await handle.close();
+      }
+    });
+  }
+
+  async readTextFile(path, context) {
+    return this._readFile(path, true, context);
+  }
+
+  async readBinaryFile(path, context) {
+    return this._readFile(path, false, context);
+  }
+
+  async openBinaryReader(path, options, context) {
+    const noFollow = options !== undefined && options.noFollow === true;
+    const opened = await this._fileOp(path, context, async (resolved) => {
+      return (await this._open(resolved, { noFollow: noFollow })).handle;
+    });
+    if (!opened.ok) return opened;
+    const aborted = abortResult(context.abortSignal, opened.value.path);
+    if (aborted !== undefined) {
+      await opened.value.close();
+      return aborted;
+    }
+    return ok(new RemoteBinaryReader(opened.value));
+  }
+
+  async openTextLineReader(path, context) {
+    const opened = await this._fileOp(path, context, async (resolved) => {
+      return (await this._open(resolved, { mode: "read" })).handle;
+    });
+    if (!opened.ok) return opened;
+    const aborted = abortResult(context.abortSignal, opened.value.path);
+    if (aborted !== undefined) {
+      await opened.value.close();
+      return aborted;
+    }
+    return ok(new RemoteTextLineReader(opened.value));
+  }
+
+  async readTextLines(path, options, context) {
+    const maxLines = options === undefined ? undefined : options.maxLines;
+    if (maxLines !== undefined && maxLines <= 0) return ok([]);
+    const opened = await this.openTextLineReader(path, context);
+    if (!opened.ok) return opened;
+    const lines = [];
+    try {
+      while (maxLines === undefined || lines.length < maxLines) {
+        const line = await opened.value.readLine(context);
+        if (!line.ok) return line;
+        if (line.value === undefined) break;
+        lines.push(line.value.text);
+      }
+      return ok(lines);
+    } finally {
+      await opened.value.close(context);
+    }
+  }
+
+  /**
+   * Node's `writeFile` (abort checked before each 512 KiB write) or
+   * `appendFile` (no checks, one after): the first request creates parents,
+   * opens, and writes the first chunk; later chunks go to the same open file.
+   */
+  async _write(path, content, append, context) {
+    const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : content;
+    const signal = append ? undefined : context.abortSignal;
+    return this._fileOp(
+      path,
+      context,
+      async (resolved) => {
+        const first = bytes.subarray(0, WRITE_CHUNK);
+        const keep = bytes.length > WRITE_CHUNK;
+        const reply = await this.connection.request(
+          "write",
+          { path: resolved, append: append, keep: keep },
+          { payload: first },
+        );
+        if (!keep) return;
+        const handle = new Handle(this, reply.json.handle, reply.session, resolved);
+        const inFlight = [];
+        try {
+          for (let offset = WRITE_CHUNK; offset < bytes.length; offset += WRITE_CHUNK) {
+            if (signal !== undefined && signal.aborted) {
+              // A chunk that failed before this check fails the write, as it would have in sequence.
+              const settled = await Promise.allSettled(inFlight);
+              const failed = settled.find((result) => result.status === "rejected");
+              if (failed !== undefined) throw failed.reason;
+              throw new FileError("aborted", "The operation was aborted", resolved);
+            }
+            const written = handle.request(
+              "writeChunk",
+              {},
+              { payload: bytes.subarray(offset, offset + WRITE_CHUNK) },
+            );
+            written.catch(() => {});
+            inFlight.push(written);
+            if (inFlight.length >= WRITE_DEPTH) await inFlight.shift();
+          }
+          // The first failure; later chunks are refused by the daemon, so the file has no gaps.
+          for (const written of inFlight) await written;
+        } finally {
+          await Promise.allSettled(inFlight);
+          await handle.close();
+        }
+      },
+      append ? "both" : "before",
+    );
+  }
+
+  writeFile(path, content, context) {
+    return this._write(path, content, false, context);
+  }
+
+  appendFile(path, content, context) {
+    return this._write(path, content, true, context);
+  }
+
+  async truncateFile(path, size, context) {
+    return this._fileOp(
+      path,
+      context,
+      async (resolved) => {
+        if (!Number.isSafeInteger(size) || size < 0) {
+          throw new FileError("invalid", "File size must be a non-negative safe integer", resolved);
+        }
+        await this.connection.request("truncate", { path: resolved, size: size });
+      },
+      "both",
+    );
+  }
+
+  flushFile(path, context) {
+    return this._fileOp(
+      path,
+      context,
+      async (resolved) => {
+        await this.connection.request("fsync", { path: resolved });
+      },
+      "both",
+    );
+  }
+
+  async renameFile(sourcePath, destinationPath, context) {
+    let source;
+    let destination;
+    try {
+      source = await this._resolve(sourcePath);
+      destination = await this._resolve(destinationPath);
+    } catch (error) {
+      return err(toFileError(error, sourcePath));
+    }
+    const aborted = abortResult(context.abortSignal, destination);
+    if (aborted !== undefined) return aborted;
+    try {
+      await this.connection.request("rename", { path: source, to: destination });
+      return ok(undefined);
+    } catch (error) {
+      return err(toFileError(error, source));
+    }
+  }
+
+  async fileInfo(path, context) {
+    const result = await this._fileOp(path, context, async (resolved) => {
+      const reply = await this.connection.request("lstat", { path: resolved });
+      return toInfo(resolved, reply.json, await remotePath(this.connection));
+    });
+    return result.ok ? result.value : result;
+  }
+
+  listDir(path, context) {
+    return this._fileOp(path, context, async (resolved) => {
+      const opened = await this._openDir(resolved);
+      const handle = opened.handle;
+      const entries = [];
+      try {
+        for (let done = false; !done; ) {
+          const reply = await handle.request("readdir", { max: 1000 });
+          for (const entry of reply.json.entries) entries.push(entry);
+          done = reply.json.done === true;
+        }
+      } finally {
+        await handle.close();
+      }
+      // Node's `readdir` fails on any entry it cannot lstat. libuv sorts names by their bytes on POSIX; on
+      // Windows it keeps the file system's order, which the daemon reports.
+      const paths = await remotePath(this.connection);
+      if (paths === posix) {
+        const key = (entry) =>
+          Buffer.from(entry.raw !== undefined ? entry.raw : Buffer.from(entry.name, "utf8"));
+        entries.sort((a, b) => Buffer.compare(key(a), key(b)));
+      }
+      const infos = [];
+      for (const entry of entries) {
+        if (context.abortSignal !== undefined && context.abortSignal.aborted) {
+          throw new FileError("aborted", "aborted", resolved);
+        }
+        const entryPath = paths.resolve(resolved, entry.name);
+        if (entry.error !== undefined) throw toFileError(new RemoteError(entry.error), entryPath);
+        const info = toInfo(entryPath, entry.info, paths);
+        if (info.ok) infos.push(info.value);
+      }
+      return infos;
+    });
+  }
+
+  /** Through the daemon; `not_supported` with a daemon released before `listFiles`. */
+  async listFiles(path, options, context) {
+    let resolved;
+    try {
+      resolved = await this._resolve(path);
+    } catch (error) {
+      return err(toFileError(error, path));
+    }
+    return listFilesOver(this.connection, resolved, options, context);
+  }
+
+  async _openDir(resolved) {
+    const reply = await this.connection.request("opendir", { path: resolved });
+    return { handle: new Handle(this, reply.json.handle, reply.session, resolved) };
+  }
+
+  async openDirReader(path, context) {
+    const opened = await this._fileOp(path, context, async (resolved) => (await this._openDir(resolved)).handle);
+    if (!opened.ok) return opened;
+    const aborted = abortResult(context.abortSignal, opened.value.path);
+    if (aborted !== undefined) {
+      await opened.value.close();
+      return aborted;
+    }
+    return ok(new RemoteDirReader(opened.value));
+  }
+
+  canonicalPath(path, context) {
+    return this._fileOp(path, context, async (resolved) => {
+      const reply = await this.connection.request("realpath", { path: resolved });
+      return reply.json.path;
+    });
+  }
+
+  async exists(path, context) {
+    const result = await this.fileInfo(path, context);
+    if (result.ok) return ok(true);
+    if (result.error.code === "not_found") return ok(false);
+    return err(result.error);
+  }
+
+  createDir(path, options, context) {
+    return this._fileOp(path, context, async (resolved) => {
+      await this.connection.request("mkdir", {
+        path: resolved,
+        recursive: options === undefined || options.recursive === undefined ? true : options.recursive,
+      });
+    });
+  }
+
+  remove(path, options, context) {
+    return this._fileOp(path, context, async (resolved) => {
+      await this.connection.request("rm", {
+        path: resolved,
+        recursive: options !== undefined && options.recursive === true,
+        force: options !== undefined && options.force === true,
+      });
+    });
+  }
+
+  async createTempDir(prefix, context) {
+    const aborted = abortResult(context.abortSignal);
+    if (aborted !== undefined) return aborted;
+    try {
+      const info = await this.connection.info();
+      const paths = await remotePath(this.connection);
+      const reply = await this.connection.request("mkdtemp", {
+        path: paths.join(info.tmpdir, prefix ?? "tmp-"),
+      });
+      return ok(reply.json.path);
+    } catch (error) {
+      return err(toFileError(error));
+    }
+  }
+
+  async createTempFile(options, context) {
+    const dir = await this.createTempDir("tmp-", context);
+    if (!dir.ok) return dir;
+    let filePath = "";
+    try {
+      const paths = await remotePath(this.connection);
+      const prefix = options === undefined || options.prefix === undefined ? "" : options.prefix;
+      const suffix = options === undefined || options.suffix === undefined ? "" : options.suffix;
+      filePath = paths.join(dir.value, `${prefix}${randomUUID()}${suffix}`);
+      // Node's `writeFile(filePath, "")`, which does not create parents.
+      await this.connection.request(
+        "write",
+        { path: filePath, append: false, parents: false },
+        { payload: new Uint8Array(0) },
+      );
+      return ok(filePath);
+    } catch (error) {
+      return err(toFileError(error, filePath));
+    }
+  }
+
+  async watch(targets, onChange, context) {
+    const aborted = abortResult(context.abortSignal);
+    if (aborted !== undefined) return aborted;
+    try {
+      const resolved = [];
+      for (const target of targets) {
+        resolved.push(Object.assign({}, target, { path: await this._resolve(target.path) }));
+      }
+      const afterResolve = abortResult(context.abortSignal);
+      if (afterResolve !== undefined) return afterResolve;
+      const watcher = await RemoteWatcher.open(this.connection, resolved, onChange, this._watchOptions);
+      const afterOpen = abortResult(context.abortSignal);
+      if (afterOpen !== undefined) {
+        await watcher.close(context);
+        return afterOpen;
+      }
+      return ok(watcher);
+    } catch (error) {
+      return err(toFileError(error));
+    }
+  }
+
+  async exec(command, options, context) {
+    const opts = options === undefined ? {} : options;
+    const signal = context.abortSignal;
+    if (signal !== undefined && signal.aborted) return err(new ExecutionError("aborted", "aborted"));
+    const timeout = opts.timeout;
+    if (timeout !== undefined) {
+      if (!Number.isFinite(timeout) || timeout <= 0) {
+        return err(new ExecutionError("timeout", "Invalid timeout: must be a finite number of seconds"));
+      }
+      if (timeout * 1000 > MAX_TIMEOUT_MS) {
+        return err(new ExecutionError("timeout", `Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`));
+      }
+    }
+    const inheritEnv = opts.inheritEnv === undefined ? true : opts.inheritEnv;
+    let cwd;
+    try {
+      cwd = opts.cwd ? await this._resolve(opts.cwd) : this.cwd;
+    } catch (error) {
+      return err(new ExecutionError("unknown", error instanceof Error ? error.message : String(error)));
+    }
+    if (signal !== undefined && signal.aborted) return err(new ExecutionError("aborted", "aborted"));
+    const env = {};
+    const merged = inheritEnv ? Object.assign({}, this._shellEnv, opts.env) : Object.assign({}, opts.env);
+    for (const key of Object.keys(merged)) {
+      const value = merged[key];
+      if (value !== undefined) env[key] = value;
+    }
+    let callbackError;
+    let settled = false;
+    let running;
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    if (signal !== undefined) signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      const fields = typeof command === "string" ? { command: command } : { argv: Array.from(command) };
+      fields.cwd = cwd;
+      fields.env = env;
+      fields.inheritEnv = inheritEnv;
+      if (this._shellPath !== undefined) fields.shellPath = this._shellPath;
+      if (timeout !== undefined) fields.timeoutMs = timeout * 1000;
+      if (opts.spill !== undefined) fields.spill = opts.spill;
+      if (opts.window !== undefined) fields.window = opts.window;
+      const requestOptions = {
+        signal: controller.signal,
+        onStart: (requestId, session) => {
+          running = requestId;
+          this._running.set(requestId, session);
+        },
+        onEvent: (event, payload) => {
+          if (settled || callbackError !== undefined || event.kind !== "output") return;
+          const text = Buffer.from(payload.buffer, payload.byteOffset, payload.length).toString("utf8");
+          if (text === "" || opts.onOutput === undefined) return;
+          const info = { stream: event.stream === "stderr" ? "stderr" : "stdout" };
+          if (event.skipped !== undefined) info.skipped = event.skipped;
+          try {
+            opts.onOutput(text, context, info);
+          } catch (error) {
+            const cause = error instanceof Error ? error : new Error(String(error));
+            callbackError = new ExecutionError("callback_error", cause.message, cause);
+            controller.abort();
+          }
+        },
+      };
+      const reply = await this.connection.request("exec", fields, requestOptions);
+      if (callbackError !== undefined) return err(callbackError);
+      const result = { exitCode: reply.json.exitCode };
+      if (typeof reply.json.spillPath === "string") result.spillPath = reply.json.spillPath;
+      return ok(result);
+    } catch (error) {
+      if (callbackError !== undefined) return err(callbackError);
+      if (!(error instanceof RemoteError)) {
+        return err(new ExecutionError("unknown", error instanceof Error ? error.message : String(error)));
+      }
+      let failure;
+      if (error.code === "timeout") failure = new ExecutionError("timeout", `timeout:${timeout}`);
+      else if (error.code === "aborted") failure = new ExecutionError("aborted", "aborted");
+      else if (error.code === "shell_unavailable" || error.code === "spawn_error") {
+        failure = new ExecutionError(error.code, error.message);
+      } else failure = new ExecutionError("unknown", error.message);
+      if (typeof error.fields.spillPath === "string") failure.spillPath = error.fields.spillPath;
+      return err(failure);
+    } finally {
+      settled = true;
+      if (signal !== undefined) signal.removeEventListener("abort", onAbort);
+      if (running !== undefined) this._running.delete(running);
+    }
+  }
+
+  async cleanup(_context) {
+    // Kill without aborting, so the commands settle with their killed status, as `NodeExecutionEnv` does.
+    for (const entry of this._running) this.connection.kill(entry[0], entry[1]);
+    this._running.clear();
+  }
+}
+
+// ===========================================================================
+// watch.ts — RemoteWatcher (the daemon's NodeFileWatcher, driven remotely)
+// ===========================================================================
+
+const RECONNECT_FIRST_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
+
+/**
+ * A watcher running in the daemon (Durable's `NodeFileWatcher` next to the
+ * files). When the connection is lost, it is opened again once the connection
+ * can be started again, and reports `overflow`: changes in between were not
+ * seen.
+ */
+class RemoteWatcher {
+  constructor(connection, targets, onChange, options) {
+    this._connection = connection;
+    this._targets = targets;
+    this._onChange = onChange;
+    this._options = options;
+    this._mode = "native";
+    this._closed = false;
+    this._controller = undefined;
+    this._request = undefined;
+    this._wake = undefined;
+  }
+
+  /** Watch `targets` (resolved paths); fails like `NodeFileWatcher.open` if coverage cannot be established. */
+  static async open(connection, targets, onChange, options) {
+    const watcher = new RemoteWatcher(connection, targets, onChange, options === undefined ? {} : options);
+    await watcher._start();
+    return watcher;
+  }
+
+  get mode() {
+    return this._mode;
+  }
+
+  async close(_context) {
+    if (this._closed) return;
+    this._closed = true;
+    if (this._wake !== undefined) this._wake();
+    if (this._controller !== undefined) this._controller.abort();
+    await this._request;
+  }
+
+  _deliver(change) {
+    if (this._closed) return;
+    try {
+      this._onChange(change);
+    } catch {
+      // A throwing callback must not stop watching.
+    }
+  }
+
+  /** Open the daemon's watcher; resolves once it reports coverage. */
+  _start() {
+    const watcher = this;
+    return new Promise((resolve, reject) => {
+      let ready = false;
+      const controller = new AbortController();
+      watcher._controller = controller;
+      const request = watcher._connection.request(
+        "watch",
+        Object.assign(
+          {
+            targets: watcher._targets.map((target) => ({
+              path: target.path,
+              recursive: target.recursive === true,
+              exclude: {
+                hidden: target.exclude !== undefined && target.exclude.hidden === true,
+                names: Array.from((target.exclude === undefined ? undefined : target.exclude.names) ?? []),
+              },
+            })),
+          },
+          watcher._options,
+        ),
+        {
+          signal: controller.signal,
+          onEvent: (event) => {
+            if (event.kind === "ready") {
+              ready = true;
+              watcher._mode = event.mode === "polling" ? "polling" : "native";
+              resolve();
+            } else if (event.kind === "change") {
+              if (event.mode === "polling") watcher._mode = "polling";
+              if (event.overflow === true) watcher._deliver({ overflow: true });
+              else watcher._deliver({ paths: event.paths });
+            } else if (event.kind === "error") {
+              const code = event.code === "permission_denied" ? "permission_denied" : "invalid";
+              watcher._deliver({ error: new FileError(code, String(event.message)) });
+              watcher._closed = true;
+            }
+          },
+        },
+      );
+      watcher._request = request.then(
+        () => {},
+        (error) => {
+          if (!ready) {
+            reject(error);
+            return;
+          }
+          if (watcher._closed) return;
+          if (isConnectionLost(error)) {
+            void watcher._reconnect();
+            return;
+          }
+          watcher._deliver({ error: toFileError(error) });
+          watcher._closed = true;
+        },
+      );
+    });
+  }
+
+  async _reconnect() {
+    const watcher = this;
+    for (let delay = RECONNECT_FIRST_MS; !watcher._closed; delay = Math.min(delay * 2, RECONNECT_MAX_MS)) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, delay);
+        if (timer !== undefined && typeof timer.unref === "function") timer.unref();
+        watcher._wake = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+      watcher._wake = undefined;
+      if (watcher._closed) return;
+      try {
+        await watcher._start();
+        // Changes while disconnected were not seen.
+        watcher._deliver({ overflow: true });
+        return;
+      } catch (error) {
+        if (isConnectionLost(error)) continue;
+        watcher._deliver({ error: toFileError(error) });
+        watcher._closed = true;
+        return;
+      }
+    }
+  }
+}
+
+// ===========================================================================
+// terminal.ts — openTerminal / RemoteTerminal (pty)
+// ===========================================================================
+
+/** Input larger than this goes to the daemon in several writes; frames are at most 16 MiB. */
+const TERMINAL_WRITE_CHUNK = 1024 * 1024;
+
+/**
+ * A program running in a pseudo-terminal of a pi-env daemon. It ends when the
+ * program exits, `close()` kills it, or the connection is lost (the daemon
+ * then kills it). Windows daemons answer `ENOTSUP`, as upstream's do.
+ */
+class RemoteTerminal {
+  constructor(connection, id, session, pid, exited, abort) {
+    this._connection = connection;
+    this._id = id;
+    this._session = session;
+    this.pid = pid;
+    this.exited = exited;
+    this._abort = abort;
+  }
+
+  /** Send input; once the terminal has ended, input is dropped. */
+  write(data) {
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    for (let offset = 0; offset < bytes.length; offset += TERMINAL_WRITE_CHUNK) {
+      this._request("ptyWrite", {}, bytes.subarray(offset, offset + TERMINAL_WRITE_CHUNK));
+    }
+  }
+
+  /** Change the size; the program receives `SIGWINCH`. */
+  resize(cols, rows) {
+    this._request("ptyResize", { cols: cols, rows: rows });
+  }
+
+  /** Kill the program and everything in its session. */
+  close() {
+    this._abort.abort();
+  }
+
+  /**
+   * The job in the terminal's foreground when it is not the program itself:
+   * what a shell runs, such as an editor. Undefined while the program is in
+   * front (a shell at its prompt). Rejects once the terminal has ended.
+   */
+  async foreground() {
+    const reply = await this._connection.request(
+      "ptyForeground",
+      { target: this._id },
+      { session: this._session },
+    );
+    const foreground = reply.json.foreground;
+    if (!foreground) return undefined;
+    return { pid: foreground.pid, ...(foreground.name ? { name: foreground.name } : {}) };
+  }
+
+  _request(op, json, payload) {
+    const options = { session: this._session };
+    if (payload !== undefined) options.payload = payload;
+    this._connection
+      .request(op, Object.assign({ target: this._id }, json), options)
+      // A terminal that ended or a lost connection: `exited` reports it.
+      .catch(() => {});
+  }
+}
+
+/** Start a program in a new pseudo-terminal of the daemon behind `connection`. */
+function openTerminal(connection, options) {
+  const abort = new AbortController();
+  let resolveStarted;
+  let rejectStarted;
+  const started = new Promise((resolve, reject) => {
+    resolveStarted = resolve;
+    rejectStarted = reject;
+  });
+  let request;
+  const fields = { cwd: options.cwd, cols: options.cols, rows: options.rows };
+  if (options.argv !== undefined) fields.argv = options.argv;
+  if (options.env !== undefined) fields.env = options.env;
+  if (options.inheritEnv !== undefined) fields.inheritEnv = options.inheritEnv;
+  const exited = connection
+    .request("pty", fields, {
+      signal: abort.signal,
+      onStart: (id, session) => {
+        request = { id: id, session: session };
+      },
+      onEvent: (json, payload) => {
+        if (json.kind === "output") options.onData(payload);
+        else if (json.kind === "started" && request !== undefined) {
+          resolveStarted(
+            new RemoteTerminal(connection, request.id, request.session, Number(json.pid), exited, abort),
+          );
+        }
+      },
+    })
+    .then((reply) => Number(reply.json.exitCode));
+  // Failing before it started rejects the open; afterwards, `exited` carries it.
+  exited.catch(rejectStarted);
+  return started;
+}
+
+// ===========================================================================
+// ssh.ts — deploying and starting the daemon over the system `ssh`
+// ===========================================================================
+
+/** A remote system this build can send a daemon to. */
+const REMOTE_PLATFORMS = { win32: "windows", linux: "linux", darwin: "darwin", android: "android" };
+
+/** The remote host's key is not in `knownHostsFile`; `scanHostKey` shows it so the owner can accept it. */
+class HostKeyUnknownError extends Error {}
+
+/** The remote host's key differs from the one in `knownHostsFile`; it is never accepted automatically. */
+class HostKeyChangedError extends Error {}
+
+/** An `ssh` invocation that failed for another reason, with its exit code and diagnostics. */
+class SshError extends Error {
+  constructor(message, exitCode, stderr) {
+    super(message);
+    this.name = "SshError";
+    this.exitCode = exitCode;
+    this.stderr = stderr;
+  }
+}
+
+/** No leading `-` (it would be read as an `ssh` option) and no whitespace or control characters. */
+function checkField(name, value) {
+  if (value === "" || value.startsWith("-") || /[\s\x00-\x1f\x7f]/.test(value)) {
+    throw new Error(`Invalid ${name}: ${JSON.stringify(value)}`);
+  }
+}
+
+/** A path for an `ssh` option that expands `%` tokens: quoted, with `%` literal. */
+function configPath(name, path) {
+  if (path === "" || /["\x00-\x1f\x7f]/.test(path)) throw new Error(`Invalid ${name}: ${JSON.stringify(path)}`);
+  return `"${path.replaceAll("%", "%%")}"`;
+}
+
+/**
+ * Arguments for `ssh` up to the host: no prompts, no forwarding of any kind, no
+ * shared connections, no commands from the configuration, no locale forwarding
+ * (the remote uses its own), and host keys checked strictly against the
+ * application's own file under a fixed alias.
+ */
+function sshArguments(target, strictHostKeys, knownHostsFile) {
+  const strict = strictHostKeys === undefined ? true : strictHostKeys;
+  const knownHosts = knownHostsFile === undefined ? target.knownHostsFile : knownHostsFile;
+  checkField("host", target.host);
+  checkField("host key alias", target.hostKeyAlias);
+  if (target.user !== undefined) checkField("user", target.user);
+  if (target.port !== undefined && (!Number.isInteger(target.port) || target.port < 1 || target.port > 65535)) {
+    throw new Error(`Invalid port: ${target.port}`);
+  }
+  const option = (setting) => ["-o", setting];
+  return [
+    ...(target.configFile === undefined ? [] : ["-F", target.configFile]),
+    "-T",
+    "-a",
+    "-x",
+    ...option("BatchMode=yes"),
+    ...option("ClearAllForwardings=yes"),
+    ...option("ForwardAgent=no"),
+    ...option("ForwardX11=no"),
+    ...option("ControlMaster=no"),
+    ...option("ControlPath=none"),
+    ...option("RemoteCommand=none"),
+    ...option("PermitLocalCommand=no"),
+    ...option("SendEnv=-*"),
+    ...option("ServerAliveInterval=15"),
+    ...option(`StrictHostKeyChecking=${strict ? "yes" : "accept-new"}`),
+    ...option(`UserKnownHostsFile=${configPath("known hosts file", knownHosts)}`),
+    ...option("GlobalKnownHostsFile=none"),
+    ...option("HashKnownHosts=no"),
+    ...option(`HostKeyAlias=${target.hostKeyAlias}`),
+    ...(target.user === undefined ? [] : ["-l", target.user]),
+    ...(target.port === undefined ? [] : ["-p", String(target.port)]),
+    ...(target.identityFile === undefined
+      ? []
+      : [
+          ...option(`IdentityFile=${configPath("identity file", target.identityFile)}`),
+          ...option("IdentitiesOnly=yes"),
+        ]),
+    "--",
+    target.host,
+  ];
+}
+
+/** How long a detection, check or upload over `ssh` may take before it is abandoned. */
+const SSH_TIMEOUT_MS = 60000;
+const UPLOAD_TIMEOUT_MS = 300000;
+
+/** Run one remote command over `ssh`, optionally feeding stdin; resolves with stdout, rejects on failure. */
+function runSsh(target, command, options) {
+  const opts = options === undefined ? {} : options;
+  return new Promise((resolve, reject) => {
+    const args = opts.args ?? sshArguments(target);
+    const child = spawn(target.ssh ?? "ssh", args.concat([command]), { stdio: ["pipe", "pipe", "pipe"] });
+    const timeoutMs = opts.timeoutMs ?? SSH_TIMEOUT_MS;
+    const stdout = [];
+    const stderr = [];
+    const timer = setTimeout(() => {
+      child.kill();
+      const diagnostics = Buffer.concat(stderr.map((chunk) => Buffer.from(chunk))).toString("utf8");
+      reject(
+        new SshError(
+          `ssh ${target.host} did not finish within ${timeoutMs / 1000} s: ${diagnostics.trim()}`,
+          null,
+          diagnostics,
+        ),
+      );
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    // See the note in `Connection._start`: the shim's stdin may be null (failed
+    // spawn) or lack the EventEmitter surface.
+    if (child.stdin !== null && child.stdin !== undefined && typeof child.stdin.on === "function") {
+      child.stdin.on("error", () => {});
+    }
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(new SshError(error.message, null, ""));
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const output = Buffer.concat(stdout.map((chunk) => Buffer.from(chunk))).toString("utf8");
+      const diagnostics = Buffer.concat(stderr.map((chunk) => Buffer.from(chunk))).toString("utf8");
+      if (code === 0) return resolve(output);
+      if (/REMOTE HOST IDENTIFICATION HAS CHANGED/.test(diagnostics)) {
+        return reject(
+          new HostKeyChangedError(`The host key of ${target.host} changed; remove the old key to continue`),
+        );
+      }
+      if (/Host key verification failed|No .* host key is known/.test(diagnostics)) {
+        return reject(new HostKeyUnknownError(`The host key of ${target.host} is not trusted yet`));
+      }
+      reject(new SshError(`ssh ${target.host} failed with exit code ${code}: ${diagnostics.trim()}`, code, diagnostics));
+    });
+    // A failed spawn has no stdin to feed (see the note in `_write`).
+    if (child.stdin !== null && child.stdin !== undefined) {
+      child.stdin.end(opts.stdin ?? new Uint8Array(0));
+    }
+  });
+}
+
+/**
+ * Connect once with `accept-new` against a temporary known-hosts file to
+ * capture the key the host presents, through the same route (`~/.ssh/config`,
+ * jump hosts) as real connections. Returns its known-hosts lines and
+ * fingerprints. Showing a fingerprint is not authentication: compare it with
+ * one obtained out of band before accepting it.
+ */
+async function scanHostKey(target) {
+  const directory = await mkdtemp(join(tmpdir(), "pi-env-hostkey-"));
+  try {
+    const scanned = join(directory, "known_hosts");
+    // Authentication may fail without the key; the key is recorded before authentication.
+    await runSsh(target, "exit 0", { args: sshArguments(target, false, scanned) }).catch((error) => {
+      if (!(error instanceof SshError) && !(error instanceof HostKeyUnknownError)) throw error;
+    });
+    const lines = existsSync(scanned)
+      ? (await readFile(scanned, "utf8")).split("\n").filter((line) => line.trim() !== "")
+      : [];
+    if (lines.length === 0) throw new Error(`No host key received from ${target.host}`);
+    const fingerprints = await new Promise((resolve, reject) => {
+      const child = spawn("ssh-keygen", ["-lf", scanned], { stdio: ["ignore", "pipe", "pipe"] });
+      let output = "";
+      child.stdout.on("data", (chunk) => {
+        output += chunk.toString("utf8");
+      });
+      child.on("error", reject);
+      child.on("close", () => resolve(output.split("\n").filter((line) => line.trim() !== "")));
+    });
+    return { lines: lines, fingerprints: fingerprints };
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+/** A known-hosts line for `alias`: `alias type key [comment]`, no markers, patterns or hashed names. */
+function parseHostKeyLine(alias, line) {
+  const parts = line.trim().split(/\s+/);
+  const host = parts[0];
+  const type = parts[1];
+  const key = parts[2];
+  if (
+    host !== alias ||
+    type === undefined ||
+    key === undefined ||
+    !/^(ssh-[a-z0-9-]+|ecdsa-sha2-[a-z0-9-]+|sk-[a-z0-9@.-]+)$/.test(type) ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(key)
+  ) {
+    throw new Error(`Not a host key line for ${alias}: ${JSON.stringify(line)}`);
+  }
+  return { type: type, key: key };
+}
+
+/** Known-hosts files being changed, so changes to one file happen one at a time. */
+const knownHostsChanges = new Map();
+
+/** Rewrite the known-hosts file one change at a time, atomically. */
+async function changeKnownHosts(file, change) {
+  const previous = knownHostsChanges.get(file) ?? Promise.resolve();
+  const next = previous
+    .catch(() => {})
+    .then(async () => {
+      await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+      const existing = existsSync(file)
+        ? (await readFile(file, "utf8")).split("\n").filter((line) => line !== "")
+        : [];
+      const lines = change(existing);
+      const temporary = `${file}.${randomBytes(6).toString("hex")}.tmp`;
+      await writeFile(temporary, lines.length === 0 ? "" : `${lines.join("\n")}\n`, { mode: 0o600, flag: "wx" });
+      await rename(temporary, file).catch(async (error) => {
+        await rm(temporary, { force: true });
+        throw error;
+      });
+    });
+  knownHostsChanges.set(file, next);
+  try {
+    await next;
+  } finally {
+    if (knownHostsChanges.get(file) === next) knownHostsChanges.delete(file);
+  }
+}
+
+/**
+ * Trust host-key lines from `scanHostKey` by adding them to the target's
+ * known-hosts file. Only plain lines for the target's alias are accepted. A
+ * key that differs from a trusted key of the same type is refused with
+ * `HostKeyChangedError`; `forgetHostKey` must remove the old keys first.
+ */
+async function acceptHostKey(target, lines) {
+  const alias = target.hostKeyAlias;
+  const accepted = lines.map((line) => Object.assign({ line: line.trim() }, parseHostKeyLine(alias, line)));
+  await changeKnownHosts(target.knownHostsFile, (existing) => {
+    const trusted = new Map();
+    for (const line of existing) {
+      const parts = line.trim().split(/\s+/);
+      if (parts[0] === alias && parts[1] !== undefined && parts[2] !== undefined) {
+        trusted.set(parts[1], parts[2]);
+      }
+    }
+    const added = [];
+    for (const entry of accepted) {
+      const known = trusted.get(entry.type);
+      if (known === entry.key) continue;
+      if (known !== undefined) {
+        throw new HostKeyChangedError(`The ${entry.type} host key of ${target.host} changed; forget the old key first`);
+      }
+      trusted.set(entry.type, entry.key);
+      added.push(entry.line);
+    }
+    return [...existing, ...added];
+  });
+}
+
+/** Stop trusting every key stored for the target's alias, e.g. after the owner confirmed a changed host key. */
+async function forgetHostKey(target) {
+  await changeKnownHosts(target.knownHostsFile, (existing) =>
+    existing.filter((line) => line.trim().split(/\s+/)[0] !== target.hostKeyAlias),
+  );
+}
+
+/** POSIX detection, run by the remote login shell; a Windows host answers through PowerShell instead. */
+const POSIX_PROBE = `sh -c 'echo PI-ENV-PROBE; uname -s; uname -m; uname -o 2>/dev/null || echo -; printf "%s\\n" "$HOME" "\${TMPDIR:--}" "\${LD_PRELOAD:--}"'`;
+
+function powershell(script) {
+  return `powershell -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
+}
+
+const WINDOWS_PROBE = powershell(
+  "'PI-ENV-PROBE'; 'Windows'; [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString(); '-'; $HOME; '-'; '-'",
+);
+
+function normalizeArch(machine) {
+  const lower = machine.toLowerCase();
+  if (lower === "x86_64" || lower === "amd64" || lower === "x64") return "x64";
+  if (lower === "aarch64" || lower === "arm64") return "arm64";
+  throw new Error(`Unsupported remote architecture: ${machine}`);
+}
+
+function parseProbe(target, output) {
+  // Login shells may print a banner first.
+  const lines = output.split(/\r?\n/);
+  const start = lines.indexOf("PI-ENV-PROBE");
+  if (start === -1) throw new Error(`Unexpected answer from ${target.host}: ${output.trim()}`);
+  const rest = lines.slice(start + 1);
+  return {
+    system: rest[0] ?? "",
+    machine: rest[1] ?? "",
+    os: rest[2] ?? "",
+    home: rest[3] ?? "",
+    tmpdir: rest[4] ?? "-",
+    preload: rest[5] ?? "-",
+  };
+}
+
+/** Termux works only with its own `TMPDIR` and with `termux-exec`, which makes `#!/usr/bin/env` shebangs work. */
+function termuxWarnings(probe) {
+  const warnings = [];
+  if (probe.tmpdir === "-") warnings.push("TMPDIR is not set; Termux's sshd normally sets it to $PREFIX/tmp.");
+  if (probe.preload.indexOf("termux-exec") === -1) {
+    warnings.push("termux-exec is not loaded (LD_PRELOAD); scripts with #!/usr/bin/env shebangs will fail.");
+  }
+  warnings.push("Android may suspend Termux; run termux-wake-lock on the device to keep the connection alive.");
+  return warnings;
+}
+
+/** Which system the target runs: `uname` through the login shell, or PowerShell on Windows. */
+async function detectPlatform(target) {
+  let probe;
+  try {
+    probe = parseProbe(target, await runSsh(target, POSIX_PROBE));
+  } catch (error) {
+    // cmd.exe or PowerShell as the remote shell: no `sh`, or one that gets the probe's quotes wrong.
+    if (error instanceof HostKeyUnknownError || error instanceof HostKeyChangedError) throw error;
+    probe = parseProbe(target, await runSsh(target, WINDOWS_PROBE));
+  }
+  // Git Bash as Windows' default SSH shell: ask PowerShell for Windows' own architecture and home spelling.
+  if (/^(MINGW|MSYS|CYGWIN)/.test(probe.system)) probe = parseProbe(target, await runSsh(target, WINDOWS_PROBE));
+  const arch = normalizeArch(probe.machine);
+  const system = probe.system;
+  const os = probe.os;
+  const home = probe.home;
+  if (system === "Windows") {
+    // cmd.exe expands %OS%; PowerShell prints it as is.
+    const shell = (await runSsh(target, "echo %OS%")).indexOf("Windows_NT") !== -1 ? "cmd" : "powershell";
+    return { platform: "windows", arch: arch, home: home, shell: shell, warnings: [] };
+  }
+  if (system === "Darwin") return { platform: "darwin", arch: arch, home: home, warnings: [] };
+  if (system === "Linux") {
+    const android = os === "Android";
+    return {
+      platform: android ? "android" : "linux",
+      arch: arch,
+      home: home,
+      warnings: android ? termuxWarnings(probe) : [],
+    };
+  }
+  throw new Error(`Unsupported remote system: ${system}`);
+}
+
+/**
+ * pi's own executable, which is also the daemon: `pir env-daemon` speaks the
+ * same protocol as the packaged `pi-env` binary. `PIR_EXECUTABLE` overrides
+ * the path (hosts that run extensions from a relocated image), then
+ * `process.execPath`, then the bare name `pir`.
+ */
+function localDaemon() {
+  const image = process.env.PIR_EXECUTABLE;
+  if (image !== undefined && image !== "") return [image, "env-daemon"];
+  if (typeof process.execPath === "string" && process.execPath !== "") return [process.execPath, "env-daemon"];
+  return ["pir", "env-daemon"];
+}
+
+/**
+ * The daemon command for a remote system: the pir image when the target runs
+ * the platform this build was compiled for, or `PI_ENV_DAEMON` (a standalone
+ * `pi-env` binary of any version — protocol 1 is the contract). Upstream ships
+ * one prebuilt daemon per platform; pir builds per platform instead, so a
+ * cross-platform deploy is refused rather than guessed.
+ */
+function packagedDaemon(remote) {
+  const override = process.env.PI_ENV_DAEMON;
+  if (override !== undefined && override !== "") return override;
+  const platform = REMOTE_PLATFORMS[process.platform];
+  const arch = normalizeArch(process.arch);
+  if (remote.platform !== platform || remote.arch !== arch) {
+    throw new Error(
+      `No pi-env daemon for ${remote.platform}-${remote.arch}: this pir build is ${platform}-${arch}. ` +
+        "Build pir for that target, or set PI_ENV_DAEMON to a pi-env binary and have it deployed.",
+    );
+  }
+  return process.env.PIR_EXECUTABLE !== undefined && process.env.PIR_EXECUTABLE !== ""
+    ? process.env.PIR_EXECUTABLE
+    : process.execPath;
+}
+
+function quotePosix(text) {
+  return `'${text.replaceAll("'", "'\\''")}'`;
+}
+
+function quotePowerShell(text) {
+  return `'${text.replaceAll("'", "''")}'`;
+}
+
+/** Where a daemon with this content lives on the remote machine: named by its SHA-256, so versions never collide. */
+function daemonPath(remote, sha256) {
+  const name = `pi-env-${sha256.slice(0, 32)}`;
+  return remote.platform === "windows"
+    ? `${remote.home}\\.pi\\mobile\\tools\\${name}.exe`
+    : `${remote.home}/.pi/mobile/tools/${name}`;
+}
+
+const POSIX_HASH = `hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1; elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" | sed 's/.*= //'; else echo none; fi; }`;
+
+/** Whether the remote file has this content: `present`, `missing`, or (POSIX without a hash tool) `nohash`. */
+async function checkDaemon(target, remote, file, sha256) {
+  if (remote.platform === "windows") {
+    const check = powershell(
+      `$f = ${quotePowerShell(file)}; if ((Test-Path -LiteralPath $f) -and ((Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLower() -eq '${sha256}')) { 'present' } else { 'missing' }`,
+    );
+    return (await runSsh(target, check)).trim().endsWith("present") ? "present" : "missing";
+  }
+  const check = `${POSIX_HASH}; f=${quotePosix(file)}; if [ -f "$f" ] && [ "$(hash "$f")" = ${sha256} ]; then echo present; elif [ "$(hash /dev/null)" = none ]; then echo nohash; else echo missing; fi`;
+  const lines = (await runSsh(target, `sh -c ${quotePosix(check)}`)).trim().split("\n");
+  return lines[lines.length - 1] ?? "missing";
+}
+
+/**
+ * Make sure the daemon is on the remote machine, verified by its SHA-256 before
+ * it ever runs, and remove daemons of other contents. The upload goes to a new
+ * temporary file and is renamed into place only once its hash matches. Returns
+ * the remote path of the binary.
+ */
+async function deployDaemon(target, remote, binary) {
+  const file0 = binary ?? packagedDaemon(remote);
+  if (!existsSync(file0)) throw new Error(`No pi-env daemon for ${remote.platform}-${remote.arch} at ${file0}`);
+  const bytes = await readFile(file0);
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const file = daemonPath(remote, sha256);
+  const state = await checkDaemon(target, remote, file, sha256);
+  if (state === "present") return file;
+  if (state === "nohash") throw new Error(`${target.host} has no sha256sum, shasum or openssl to verify pi-env`);
+  if (remote.platform === "windows") {
+    const upload = powershell(
+      [
+        "$ErrorActionPreference = 'Stop'",
+        `$f = ${quotePowerShell(file)}`,
+        "$d = Split-Path -Parent $f",
+        "New-Item -ItemType Directory -Force -Path $d | Out-Null",
+        "$t = Join-Path $d ('.pi-env-' + [guid]::NewGuid().ToString() + '.tmp')",
+        // PowerShell reads redirected stdin itself, as text lines for `$input`, so the binary comes as base64
+        // lines up to an end marker: Windows' sshd may never pass on the end of stdin.
+        "$text = New-Object System.Text.StringBuilder",
+        "foreach ($line in $input) { if ($line -eq 'PI-ENV-END') { break }; [void]$text.Append($line) }",
+        "$bytes = [Convert]::FromBase64String($text.ToString())",
+        "$out = [IO.File]::Open($t, 'CreateNew', 'Write', 'None'); $out.Write($bytes, 0, $bytes.Length); $out.Close()",
+        `if ((Get-FileHash -Algorithm SHA256 -LiteralPath $t).Hash.ToLower() -ne '${sha256}') { Remove-Item -LiteralPath $t; throw 'pi-env upload is corrupt' }`,
+        // A running daemon or a virus scanner can hold the old file for a moment.
+        "for ($i = 0; ; $i++) { try { Move-Item -Force -LiteralPath $t -Destination $f; break } catch { if ($i -ge 20) { throw }; Start-Sleep -Milliseconds 250 } }",
+        // Older daemons; one that is running stays until it exits.
+        "Get-ChildItem -LiteralPath $d -Filter 'pi-env-*.exe' | Where-Object { $_.FullName -ne $f } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -ErrorAction SilentlyContinue }",
+        "'deployed'",
+      ].join("; "),
+    );
+    const lines = bytes.toString("base64").replace(/.{1,76}/g, "$&\n");
+    await runSsh(target, upload, { stdin: Buffer.from(`${lines}PI-ENV-END\n`), timeoutMs: UPLOAD_TIMEOUT_MS });
+    return file;
+  }
+  const upload = [
+    "set -e",
+    POSIX_HASH,
+    `f=${quotePosix(file)}`,
+    'd=$(dirname "$f")',
+    'mkdir -p "$d"',
+    'chmod 700 "$d"',
+    't=$(mktemp "$d/.pi-env.XXXXXX")',
+    'cat > "$t"',
+    `if [ "$(hash "$t")" != ${sha256} ]; then rm -f "$t"; echo "pi-env upload is corrupt" >&2; exit 1; fi`,
+    'chmod 700 "$t"',
+    'mv -f "$t" "$f"',
+    // Older daemons; running ones keep their file open until they exit.
+    'for old in "$d"/pi-env-*; do [ "$old" = "$f" ] || rm -f "$old"; done',
+    "echo deployed",
+  ].join("\n");
+  await runSsh(target, `sh -c ${quotePosix(upload)}`, { stdin: bytes, timeoutMs: UPLOAD_TIMEOUT_MS });
+  return file;
+}
+
+/** The remote command that starts the daemon at `file`, before the `serve` arguments. */
+function launchCommand(remote, file, loginShell) {
+  if (remote.platform === "windows") {
+    // PowerShell runs a quoted path only with the call operator; cmd.exe keeps one pair of quotes around a program.
+    if (remote.shell === "powershell") return `& ${quotePowerShell(file)}`;
+    return file.indexOf(" ") === -1 ? file : `"${file}"`;
+  }
+  // `$0` is the daemon, `"$@"` its arguments; `$SHELL` is the login shell's own name for itself.
+  if (loginShell) return `exec "$SHELL" -lc 'exec "$0" "$@"' ${quotePosix(file)}`;
+  return quotePosix(file);
+}
+
+/**
+ * The arguments between the deployed program and `serve`: a pir image is asked
+ * for its daemon subcommand (`pir env-daemon serve …`), while an upstream
+ * `pi-env` binary takes `serve` directly. `options.binary` means a packaged
+ * pi-env daemon (upstream's contract); pass `daemonArgs: ["env-daemon"]` when
+ * the binary you deploy is a pir image.
+ */
+function daemonArgs(options, binary) {
+  if (options.daemonArgs !== undefined) return options.daemonArgs;
+  return options.binary === undefined && binary === undefined ? ["env-daemon"] : [];
+}
+
+/** A `Connection` whose every start detects the remote system (once), verifies or deploys the daemon, then starts it. */
+function sshConnectionFor(options, state) {
+  return new Connection({
+    command: async () => {
+      if (state.remote === undefined) {
+        const remote = await detectPlatform(options);
+        for (const warning of remote.warnings) {
+          if (options.onLog !== undefined) options.onLog(`${warning}\n`);
+        }
+        state.remote = remote;
+      }
+      // A deployment that just verified the binary counts for the first start.
+      const binary = options.binary;
+      const file = state.verified ?? (await deployDaemon(options, state.remote, binary ?? packagedDaemon(state.remote)));
+      state.verified = undefined;
+      return [
+        options.ssh ?? "ssh",
+        ...sshArguments(options),
+        launchCommand(state.remote, file, options.loginShell === true),
+        ...daemonArgs(options, binary),
+      ];
+    },
+    ...(options.onLog === undefined ? {} : { onLog: options.onLog }),
+  });
+}
+
+/**
+ * A `Connection` to the target that does nothing until its first request. Each
+ * start detects the remote system (the first time), verifies the daemon and
+ * deploys it if it is missing or changed, then starts it over `ssh`. A failure
+ * (no network, an untrusted or changed host key) fails the requests waiting for
+ * that start with code `spawn_error` and the `ssh` diagnostics as message; the
+ * next request tries again. `remote()` is the detected system, once known.
+ */
+function sshConnection(options) {
+  const state = {};
+  return { connection: sshConnectionFor(options, state), remote: () => state.remote };
+}
+
+/**
+ * Detect the remote system and deploy the daemon now, then return a `Connection`
+ * that starts it over `ssh`, like `sshConnection`. Failures reject here: host
+ * keys must already be trusted (`scanHostKey`, `acceptHostKey`), otherwise this
+ * rejects with `HostKeyUnknownError`.
+ */
+async function connectSsh(options) {
+  const remote = await detectPlatform(options);
+  const binary = options.binary ?? packagedDaemon(remote);
+  const verified = await deployDaemon(options, remote, binary);
+  for (const warning of remote.warnings) {
+    if (options.onLog !== undefined) options.onLog(`${warning}\n`);
+  }
+  return {
+    connection: sshConnectionFor(options, { remote: remote, verified: verified }),
+    remote: remote,
+  };
+}
+
+/**
+ * The env of the machine pir runs on. Upstream `LocalExecutionEnv` is durable's
+ * `NodeExecutionEnv` plus `listFiles` through a daemon on the same machine, so
+ * local and remote listings agree; durable's `NodeExecutionEnv` lives in
+ * `@earendil-works/pi-durable/env/node`, which pir does not register yet (D4).
+ *
+ * Rather than fake the missing baseline (or re-implement read/write/edit/bash a
+ * second time — the scope decision recorded in HANDOFF.md §9), this class
+ * is the same machine-local environment **through pir's own daemon**
+ * (`localDaemon()`), which is the documented workaround and exactly what the
+ * daemon is for: it *is* the local `ExecutionEnv` implementation, reached over
+ * stdio instead of through in-process Node calls.
+ *
+ * `options.connection` may be supplied and shared between environments (as
+ * upstream's caller-owned connection); otherwise one is created from
+ * `localDaemon()` and `dispose()` stops it.
+ */
+class LocalExecutionEnv extends RemoteExecutionEnv {
+  constructor(options) {
+    const opts = options === undefined ? {} : options;
+    const onLog = opts.onLog === undefined ? {} : { onLog: opts.onLog };
+    const connection =
+      opts.connection === undefined
+        ? new Connection(Object.assign({ command: localDaemon() }, onLog))
+        : opts.connection;
+    const settings = { connection: connection, id: opts.id ?? "local" };
+    settings.cwd =
+      opts.cwd ?? (typeof process.cwd === "function" ? process.cwd() : "");
+    if (opts.shellPath !== undefined) settings.shellPath = opts.shellPath;
+    if (opts.shellEnv !== undefined) settings.shellEnv = opts.shellEnv;
+    if (opts.watch !== undefined) settings.watch = opts.watch;
+    super(settings);
+    this._ownsConnection = opts.connection === undefined;
+  }
+
+  /** Stop the daemon this environment created; a supplied connection is the caller's to close. */
+  dispose() {
+    if (this._ownsConnection) this.connection.close();
+  }
+}
+
+// ===========================================================================
+// exports (upstream `package.json` has a single `.` entry; `index.ts` surface)
+// ===========================================================================
+
+export {
+  Connection,
+  HostKeyChangedError,
+  HostKeyUnknownError,
+  LocalExecutionEnv,
+  RemoteError,
+  RemoteExecutionEnv,
+  RemoteTerminal,
+  RemoteWatcher,
+  SshError,
+  acceptHostKey,
+  connectSsh,
+  detectPlatform,
+  deployDaemon,
+  forgetHostKey,
+  isConnectionLost,
+  listFilesOver,
+  localDaemon,
+  nodePlatform,
+  openTerminal,
+  packagedDaemon,
+  remotePath,
+  scanHostKey,
+  sshArguments,
+  sshConnection,
+  toFileError,
+  ExecutionError,
+  FileError,
+  StreamDecoder,
+  abortResult,
+  err,
+  ok,
+};
+
+export default {
+  Connection: Connection,
+  HostKeyChangedError: HostKeyChangedError,
+  HostKeyUnknownError: HostKeyUnknownError,
+  LocalExecutionEnv: LocalExecutionEnv,
+  RemoteError: RemoteError,
+  RemoteExecutionEnv: RemoteExecutionEnv,
+  RemoteTerminal: RemoteTerminal,
+  RemoteWatcher: RemoteWatcher,
+  SshError: SshError,
+  acceptHostKey: acceptHostKey,
+  connectSsh: connectSsh,
+  detectPlatform: detectPlatform,
+  deployDaemon: deployDaemon,
+  forgetHostKey: forgetHostKey,
+  isConnectionLost: isConnectionLost,
+  listFilesOver: listFilesOver,
+  localDaemon: localDaemon,
+  nodePlatform: nodePlatform,
+  openTerminal: openTerminal,
+  packagedDaemon: packagedDaemon,
+  remotePath: remotePath,
+  scanHostKey: scanHostKey,
+  sshArguments: sshArguments,
+  sshConnection: sshConnection,
+  toFileError: toFileError,
+  ExecutionError: ExecutionError,
+  FileError: FileError,
+  StreamDecoder: StreamDecoder,
+  abortResult: abortResult,
+  err: err,
+  ok: ok,
+};

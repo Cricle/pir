@@ -1,0 +1,608 @@
+
+// The `process` global — the single source of truth for both the global
+// binding and the `node:process` module namespace (`gen_node_surface.mjs`
+// mirrors this file's own-key surface against real Node v24, where
+// `require("node:process") === process`).
+//
+// Key-surface parity with real Node: event-emitter methods live on the
+// PROTOTYPE (real Node's process is an EventEmitter; `Object.keys(process)`
+// lists only the data members below), so the module shim's named-export list
+// and the global's own keys stay the exact same set. Members the host cannot
+// reach follow the three-tier discipline (HANDOFF.md §2): real where cheap,
+// minimal with a comment, otherwise a function that throws the standard
+// "not supported by the pir extension runtime" with a code.
+
+if (globalThis.process === undefined) {
+  const value = (() => {
+  const unsupported = (api) => {
+    const error = new Error(
+      "process." + api + " is not supported by the pir extension runtime",
+    );
+    error.code = "ERR_NOT_SUPPORTED";
+    return error;
+  };
+  const throws = (api) => () => { throw unsupported(api); };
+
+  // Minimal process event emitter, on the prototype (hand-rolled: importing
+  // the events shim here would be a cycle, the shim loads after this global).
+  // Snapshot-on-emit, once-wrappers unwrapped by listeners(). Deliberate
+  // simplification: an unhandled "error" emit returns false instead of
+  // throwing.
+  const listenersByEvent = new Map();
+  // Armed by the `proc` construction below (the probe needs the emitter and
+  // `process.exitCode`); listeners can only be added after the IIFE ran, so
+  // the hook is never missed in practice.
+  let armBeforeExitProbe = null;
+  const removeProcessListener = function (type, listener) {
+    const list = listenersByEvent.get(type);
+    if (list === undefined) return this;
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i] === listener || list[i].listener === listener) {
+        list.splice(i, 1);
+        break;
+      }
+    }
+    if (list.length === 0) listenersByEvent.delete(type);
+    return this;
+  };
+  const addProcessListener = function (type, listener, once) {
+    if (typeof listener !== "function") {
+      throw new TypeError("The \"listener\" argument must be of type function");
+    }
+    let wrapped = listener;
+    if (once) {
+      wrapped = function (...args) {
+        removeProcessListener.call(this, type, wrapped);
+        listener.apply(this, args);
+      };
+      wrapped.listener = listener;
+    }
+    if (!listenersByEvent.has(type)) listenersByEvent.set(type, []);
+    listenersByEvent.get(type).push(wrapped);
+    // A `beforeExit` listener turns on the loop-idle probe (see below): the
+    // first registration arms it, and every re-registration from an emission
+    // handler re-arms a probe that stopped after the previous emission.
+    if (type === "beforeExit" && armBeforeExitProbe !== null) armBeforeExitProbe(0);
+    return this;
+  };
+  const proto = {
+    on: function (type, listener) { return addProcessListener.call(this, String(type), listener, false); },
+    addListener: function (type, listener) { return addProcessListener.call(this, String(type), listener, false); },
+    once: function (type, listener) { return addProcessListener.call(this, String(type), listener, true); },
+    off: removeProcessListener,
+    removeListener: removeProcessListener,
+    removeAllListeners: function (type) {
+      if (type === undefined) {
+        listenersByEvent.clear();
+      } else {
+        listenersByEvent.delete(String(type));
+      }
+      return this;
+    },
+    emit: function (type, ...args) {
+      const list = listenersByEvent.get(type);
+      if (list === undefined || list.length === 0) return false;
+      const snapshot = list.slice();
+      for (const listener of snapshot) listener.apply(this, args);
+      return true;
+    },
+    listeners: function (type) {
+      const list = listenersByEvent.get(type);
+      return list === undefined
+        ? []
+        : list.map((listener) => (listener.listener !== undefined ? listener.listener : listener));
+    },
+    listenerCount: function (type) {
+      const list = listenersByEvent.get(type);
+      return list === undefined ? 0 : list.length;
+    },
+    prependListener: function (type, listener) {
+      addProcessListener.call(this, String(type), listener, false);
+      const list = listenersByEvent.get(String(type));
+      const wrapped = list.pop();
+      list.unshift(wrapped);
+      return this;
+    },
+    prependOnceListener: function (type, listener) {
+      this.once(type, listener);
+      const list = listenersByEvent.get(String(type));
+      const wrapped = list.pop();
+      list.unshift(wrapped);
+      return this;
+    },
+    eventNames: () => Array.from(listenersByEvent.keys()),
+    getMaxListeners: () => 0,
+    setMaxListeners: function () { return this; },
+  };
+
+  const proc = Object.create(proto);
+  const startedAt = Date.now();
+
+  // --- platform data (phase 1 labels + host snapshot) ----------------------
+  proc.platform = globalThis.__pirPlatform;
+  proc.arch = "__PIR_NODE_ARCH__";
+  // One consistent compat baseline across the surface: the vendored official
+  // tests, `node --version` (js_mode) and this stub all report the pinned
+  // v24.19.0 (a split 22-vs-24 story makes version-gated package code and
+  // plain diagnostics disagree with `node --version`).
+  proc.version = "v24.19.0";
+  proc.versions = { node: "24.19.0" };
+  proc.release = { name: "node", sourceUrl: "", headersUrl: "" };
+  proc.env = {};
+  proc.argv = [];
+  proc.argv0 = "pir";
+  proc.execPath = "pir";
+  proc.execArgv = [];
+  proc.pid = 0;
+  // Host pid of the parent process is not reachable without a new host op;
+  // reported as 0 (minimal).
+  proc.ppid = 0;
+  proc.exitCode = 0;
+  proc.title = "pir";
+  proc.debugPort = 0;
+  proc.config = {}; // minimal: the real build-time config object is not reachable
+  proc.sourceMapsEnabled = false;
+  proc._eval = undefined; // set by real Node only under `node -e`
+  proc._preload_modules = undefined;
+  // EventEmitter internals (real Node process carries the same own keys).
+  proc._events = undefined;
+  proc._eventsCount = 0;
+  proc._maxListeners = undefined;
+  proc.domain = undefined;
+  proc._exiting = false;
+  proc.moduleLoadList = [];
+
+  // --- stdio (minimal) ------------------------------------------------------
+  // stdout/stderr write through the host bridge (verbatim, no newline
+  // added); stdin is a skeleton that throws on use (no readable pump).
+  // The bridge picks its destination per host: an interactive TUI session
+  // routes both streams into its tracing log (<agentDir>/pir.log) instead of
+  // painting the bytes into the frame, while every headless host (pir js,
+  // print, rpc) keeps the real process stdio
+  // (src/extensions/runtime/ext_stdio.rs).
+  proc.stdout = {
+    write: (chunk) => {
+      __pir_host.writeStdout(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    },
+    isTTY: false,
+    hasColors: () => false,
+    columns: undefined,
+    rows: undefined,
+  };
+  proc.stderr = {
+    write: (chunk) => {
+      __pir_host.writeStderr(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    },
+    isTTY: false,
+    hasColors: () => false,
+    columns: undefined,
+    rows: undefined,
+  };
+  proc.stdin = {
+    isTTY: false,
+    on: throws("stdin.on"),
+    read: throws("stdin.read"),
+    destroy: () => proc.stdin,
+  };
+  proc.openStdin = () => proc.stdin;
+
+  // --- timing ---------------------------------------------------------------
+  proc.cwd = () => globalThis.__pirNodeCall("process", "cwd");
+  proc.chdir = () => { throw new Error("process.chdir is not supported"); };
+  proc.uptime = () => (Date.now() - startedAt) / 1000;
+  proc.memoryUsage = throws("memoryUsage"); // host RSS is not reachable without a new op
+  proc.constrainedMemory = throws("constrainedMemory");
+  proc.availableMemory = throws("availableMemory");
+  // Real: the host's process CPU counters (GetProcessTimes on Windows,
+  // getrusage(RUSAGE_SELF) elsewhere), microseconds — the same source
+  // libuv's uv_getrusage feeds Node's process.cpuUsage(). Validation and the
+  // `prevValue` diff mirror internal/process/per_thread.js:
+  //   * a falsy prevValue (undefined / null / 0) returns the raw snapshot;
+  //   * a truthy non-object (or array) is ERR_INVALID_ARG_TYPE on
+  //     "prevValue" with Node's `object` wording;
+  //   * user is checked before system: a non-number is
+  //     ERR_INVALID_ARG_TYPE with the "prevValue.user" *property* wording,
+  //     a number outside [0, +Infinity) (NaN, -1, Infinity) is
+  //     ERR_INVALID_ARG_VALUE "The property 'prevValue.user' is invalid.";
+  //   * the diff is `now - prev` (fractions pass through, Node does not
+  //     round) and the result is a plain {user, system} object.
+  // Node's `determineSpecificType` (internal/errors.js) builds the
+  // "Received …" tail. util.inspect is not reachable while this global is
+  // defined, so it is resolved lazily from the builtin registry at call
+  // time; the fallback keeps the wording for the plain primitive cases.
+  const pirDetermineType = (value) => {
+    if (value === null || value === undefined) return String(value);
+    if (typeof value === "function") return "function " + (value.name || "");
+    if (typeof value === "object") {
+      if (value.constructor && value.constructor.name) {
+        return "an instance of " + value.constructor.name;
+      }
+      const util = globalThis.__pirNodeModules ? globalThis.__pirNodeModules.util : undefined;
+      const inspect = util ? (typeof util.inspect === "function" ? util.inspect
+        : (util.default && typeof util.default.inspect === "function" ? util.default.inspect : null)) : null;
+      return inspect ? String(inspect(value, { depth: -1 })) : String(value);
+    }
+    let inspected;
+    if (typeof value === "string") inspected = "'" + value + "'";
+    else if (typeof value === "bigint") inspected = String(value) + "n";
+    else inspected = String(value);
+    if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+    return "type " + typeof value + " (" + inspected + ")";
+  };
+  const pirInvalidArgType = (name, kind, value) => {
+    const error = new TypeError(
+      'The "' + name + '" ' + kind + " must be of type number. Received " + pirDetermineType(value),
+    );
+    error.code = "ERR_INVALID_ARG_TYPE";
+    return error;
+  };
+  const pirInvalidArgValue = (name, value) => {
+    const error = new RangeError(
+      "The property '" + name + "' is invalid. Received " + String(value),
+    );
+    error.code = "ERR_INVALID_ARG_VALUE";
+    return error;
+  };
+  const pirValidateCpuCounter = (name, value) => {
+    if (typeof value !== "number") throw pirInvalidArgType(name, "property", value);
+    if (!Number.isFinite(value) || value < 0) throw pirInvalidArgValue(name, value);
+  };
+  proc.cpuUsage = (prevValue) => {
+    const now = globalThis.__pirNodeCall("process", "cpu_usage");
+    if (prevValue) {
+      if (typeof prevValue !== "object" || Array.isArray(prevValue)) {
+        const error = new TypeError(
+          'The "prevValue" argument must be of type object. Received ' +
+            pirDetermineType(prevValue),
+        );
+        error.code = "ERR_INVALID_ARG_TYPE";
+        throw error;
+      }
+      pirValidateCpuCounter("prevValue.user", prevValue.user);
+      pirValidateCpuCounter("prevValue.system", prevValue.system);
+      return { user: now.user - prevValue.user, system: now.system - prevValue.system };
+    }
+    return { user: now.user, system: now.system };
+  };
+  proc.threadCpuUsage = throws("threadCpuUsage");
+  proc.resourceUsage = throws("resourceUsage");
+  // nextTick rides the shared priority queue (see `__pirNextTick` in
+  // node_call_helper): Node drains nextTicks before the promise microtask
+  // queue, so a bare `Promise.resolve().then` would put them in the wrong
+  // order. Falls back to a promise job if the helper is absent.
+  proc.nextTick = globalThis.__pirNextTick || ((fn, ...args) => { Promise.resolve().then(() => fn(...args)); });
+  proc.hrtime = (() => {
+    const now = () => { const ms = Date.now(); return [Math.floor(ms / 1000), (ms % 1000) * 1000000]; };
+    // Node's process.hrtime is callable AND carries hrtime.bigint.
+    const hrtime = (prev) => {
+      const cur = now();
+      if (!prev) return cur;
+      let seconds = cur[0] - prev[0];
+      let nanos = cur[1] - prev[1];
+      if (nanos < 0) { seconds -= 1; nanos += 1000000000; }
+      return [seconds, nanos];
+    };
+    hrtime.bigint = () => BigInt(Date.now()) * 1000000n;
+    return hrtime;
+  })();
+  // Main-thread runtime: there is nothing to park, no-op like Node's ref
+  // on an already-referenced handle.
+  proc.ref = () => {};
+  proc.unref = () => {};
+
+  // --- lifecycle ------------------------------------------------------------
+  // exit(): extension mode cannot terminate the shared host process, so the
+  // global records the code and throws; `pir js` script mode overrides this
+  // with the real terminating implementation (script_boot.js.txt).
+  proc.exit = (code) => {
+    proc.exitCode = code === undefined || code === null ? proc.exitCode : Number(code);
+    throw unsupported("exit");
+  };
+  proc.reallyExit = throws("reallyExit");
+  proc.abort = throws("abort");
+  proc.execve = throws("execve");
+  proc.kill = throws("kill"); // no signal semantics across the host bridge
+  proc._kill = throws("_kill");
+  proc._fatalException = throws("_fatalException");
+
+  // --- diagnostics / internal debug hooks (all throws, key parity only) -----
+  proc.binding = throws("binding");
+  proc._linkedBinding = throws("_linkedBinding");
+  proc.dlopen = throws("dlopen");
+  proc._rawDebug = throws("_rawDebug");
+  proc._debugProcess = throws("_debugProcess");
+  proc._debugEnd = throws("_debugEnd");
+  proc._startProfilerIdleNotifier = throws("_startProfilerIdleNotifier");
+  proc._stopProfilerIdleNotifier = throws("_stopProfilerIdleNotifier");
+  proc._tickCallback = throws("_tickCallback");
+  proc.setUncaughtExceptionCaptureCallback = throws("setUncaughtExceptionCaptureCallback");
+  proc.hasUncaughtExceptionCaptureCallback = () => false;
+  proc.setSourceMapsEnabled = throws("setSourceMapsEnabled");
+  proc.report = throws("report");
+  proc.loadEnvFile = throws("loadEnvFile");
+  proc.finalization = {
+    register: throws("finalization.register"),
+    unregister: throws("finalization.unregister"),
+    cleanupSome: throws("finalization.cleanupSome"),
+  };
+
+  // --- misc (real where trivial) ---------------------------------------------
+  proc.allowedNodeEnvironmentFlags = new Set();
+  proc.features = {
+    inspector: false,
+    debug: false,
+    uv: true,
+    ipv6: true,
+    tls_alpn: false,
+    tls_sni: false,
+    tls_ocsp: false,
+    tls: false,
+  };
+  // Windows Node reports 0; there is no host umask op.
+  proc.umask = () => 0;
+  proc.noDeprecation = false;
+  proc.throwDeprecation = false;
+  // Node `process.emitWarning` (internal/process/warning.js): the 'warning'
+  // event is delivered on the next tick (listeners registered right after
+  // the call still see it), a DeprecationWarning honors `noDeprecation`
+  // (suppressed) and `throwDeprecation` (deferred throw -> the nextTick
+  // drain's uncaughtException routing) with both flags read at call time,
+  // and `options.detail`/`code` ride the warning object. The default
+  // stderr printer for the no-listener case is not modeled (not observed by
+  // the vendored tests; the direct `process.emit('warning', <non-Error>)`
+  // path must stay silent).
+  proc.emitWarning = (warning, ...rest) => {
+    const options = typeof rest[rest.length - 1] === "object" && rest[rest.length - 1] !== null
+      ? rest[rest.length - 1]
+      : undefined;
+    const type = typeof rest[0] === "string" && rest[0] !== "" ? rest[0] : (options && options.type) || "Warning";
+    const code = (typeof rest[1] === "string" && rest[1] !== "" ? rest[1] : undefined) || (options && options.code);
+    let warningValue;
+    if (warning instanceof Error) {
+      warningValue = warning;
+    } else {
+      warningValue = new Error(String(warning));
+      warningValue.name = type;
+    }
+    if (code !== undefined) warningValue.code = code;
+    if (options && options.detail !== undefined) warningValue.detail = options.detail;
+    const isDeprecation = warningValue.name === "DeprecationWarning" || type === "DeprecationWarning";
+    if (isDeprecation && proc.noDeprecation === true) return undefined;
+    const shouldThrow = isDeprecation && proc.throwDeprecation === true;
+    const deliver = () => {
+      if (shouldThrow) throw warningValue;
+      if (proc.listenerCount("warning") > 0) {
+        try { proc.emit("warning", warningValue); } catch { /* listener errors don't break the warn */ }
+      }
+    };
+    if (typeof proc.nextTick === "function") proc.nextTick(deliver);
+    else Promise.resolve().then(deliver);
+    return undefined;
+  };
+  // Real: resolves through the preloaded builtin registry (same table the
+  // CJS require path consults).
+  proc.getBuiltinModule = (name) => {
+    const mod = globalThis.__pirNodeModules ? globalThis.__pirNodeModules[String(name)] : undefined;
+    if (mod === undefined) {
+      const error = new Error(
+        "No such builtin module: " + String(name),
+      );
+      error.code = "ERR_INVALID_ARG_VALUE";
+      throw error;
+    }
+    return mod.default !== undefined && mod.default !== null ? mod.default : mod;
+  };
+  // Async-resource tracking is approximate in this runtime (single-slot
+  // AsyncLocalStorage): the active-handle lists are honestly empty.
+  proc._getActiveRequests = () => [];
+  proc._getActiveHandles = () => [];
+  proc.getActiveResourcesInfo = () => [];
+
+  // The host table is registered before this script runs (runtime.rs), so the
+  // snapshot is real; a host failure degrades to phase-1 empty values instead
+  // of breaking extension boot.
+  // --- env ----------------------------------------------------------------
+  // Real Node's process.env is a Proxy over the OS environment, and the
+  // behavior differences are observable: every value is a string (so
+  // `process.env.foo = undefined` stores "undefined"), deleting really
+  // unsets, and symbol keys/values follow the proxy contract — a symbol read
+  // answers undefined, a symbol *write* (key or value, well-known symbols
+  // included) throws TypeError, `in` answers false and `delete` answers
+  // true. The host bridge hands over a snapshot object
+  // (`__pir_host.node("process","env")`), so the surface is rebuilt here as
+  // a proxy over that snapshot: the same data, with Node's trap semantics.
+  const envData = (() => {
+    try { return globalThis.__pirNodeCall("process", "env"); } catch { return {}; }
+  })();
+  const envSymbolTypeError = () => new TypeError("Cannot convert a Symbol value to a string");
+  proc.env = new Proxy(envData, {
+    get(target, key) { return typeof key === "symbol" ? undefined : target[key]; },
+    set(target, key, value) {
+      // Node stringifies both the key and the value (V8's ToString), which is
+      // what turns a symbol into that TypeError.
+      if (typeof key === "symbol" || typeof value === "symbol") throw envSymbolTypeError();
+      Object.defineProperty(target, String(key), {
+        value: String(value), writable: true, enumerable: true, configurable: true,
+      });
+      return true;
+    },
+    has(target, key) { return typeof key === "symbol" ? false : key in target; },
+    deleteProperty(target, key) {
+      if (typeof key !== "symbol") delete target[key];
+      return true;
+    },
+    ownKeys(target) {
+      return Reflect.ownKeys(target).filter((key) => typeof key !== "symbol");
+    },
+    getOwnPropertyDescriptor(target, key) {
+      return typeof key === "symbol" ? undefined : Object.getOwnPropertyDescriptor(target, key);
+    },
+    // Node accepts only a full configurable/writable/enumerable data
+    // descriptor (Object.defineProperty(process.env, k, {value: v}) throws).
+    defineProperty(target, key, descriptor) {
+      if (typeof key === "symbol") throw envSymbolTypeError();
+      if (
+        !descriptor || descriptor.get !== undefined || descriptor.set !== undefined ||
+        descriptor.writable !== true || descriptor.enumerable !== true ||
+        descriptor.configurable !== true || !("value" in descriptor)
+      ) {
+        const error = new TypeError(
+          "'process.env' only accepts a configurable, writable, and enumerable data descriptor",
+        );
+        error.code = "ERR_INVALID_OBJECT_DEFINE_PROPERTY";
+        throw error;
+      }
+      Object.defineProperty(target, key, {
+        value: descriptor.value, writable: true, enumerable: true, configurable: true,
+      });
+      return true;
+    },
+  });
+  try { proc.pid = globalThis.__pirNodeCall("process", "pid"); } catch { proc.pid = 0; }
+
+  // --- beforeExit (loop-idle emission) --------------------------------------
+  // Node emits `beforeExit` (with `process.exitCode`) whenever the event
+  // loop empties, which lets a listener keep the process alive by scheduling
+  // more work; once that work runs out the event is emitted again, while a
+  // nextTick-only handler drains inside the emission and does NOT keep the
+  // loop alive — the official test's final `mustNotCall` listener depends on
+  // exactly that.
+  //
+  // The host drains its loop (rquickjs jobs + the host timer wheel) with no
+  // JS callback at the "loop is empty" point, so the shim detects idleness
+  // itself: the prelude keeps every armed timer in its own map
+  // (`__pirTimers`, a global lexical binding) and everything JS-visible above
+  // the timers is the job queue, which has already drained by the time a
+  // timer callback runs. A probe timer armed on the first `beforeExit`
+  // listener is therefore a faithful idle detector: pending timers re-arm it,
+  // an idle probe emits, and a probe that finds the loop still idle after an
+  // emission stops — Node emits once per idle period (`uv_loop_alive()` is
+  // false right after emitting, so its do-while exits).
+  //
+  // Liveness after an emission is deliberately NOT decided synchronously at
+  // the end of the emit: Node re-checks `uv_loop_alive()` only after the
+  // handler's own callbacks AND their microtask/nextTick drain have run
+  // (src/api/embed_helpers.cc — `EmitProcessBeforeExit`, then
+  // `uv_loop_alive()`). A handler that queues a nextTick whose callback arms
+  // a setImmediate leaves nothing pending at that instant, and that work can
+  // even run to completion before the next probe fires, so the pending count
+  // alone cannot tell "the loop ran after the emission" (the next exhaustion
+  // emits again) from "the loop is dead" (the process exits). The prelude's
+  // timer sequence (`__pirTimerSeq`, bumped by every setTimeout/setInterval
+  // arm and therefore by the immediate bridge) is the completion-proof
+  // witness: any timer armed after the emission proves the loop was alive
+  // after it. The probes this shim arms are subtracted by count, so an idle
+  // probe still stops.
+  //
+  // Residual limits (documented, not hidden):
+  //   * host-side work that is not a prelude timer (an in-flight
+  //     fetch/child/watcher) is invisible here, so `beforeExit` can fire
+  //     while such work is still pending; a fully faithful loop needs a drain
+  //     hook in the runtime (js_mode/runtime.rs), which the shim cannot
+  //     reach;
+  //   * the probe polls (1 ms, backing off to 16 ms while other timers are
+  //     pending), so the emission trails the loop emptying by up to that
+  //     delay and a host without the prelude timer surface never emits.
+  let beforeExitProbeArmed = false;
+  let beforeExitEmitted = false;
+  let beforeExitWaits = 0;
+  // Ids of the probe timers this shim armed and that the prelude has not
+  // retired yet. The prelude deletes a timer's map entry only after its
+  // callback returns, so *two* of our entries can be in the map at once (the
+  // running probe plus a probe armed from inside its own emission); counting
+  // by id is the only correct way to subtract our own liveness from the
+  // "pending work" total.
+  const beforeExitProbeIds = new Set();
+  // Window for the sequence witness: `beforeExitSeqBase`/`...SelfArmsAtBase`
+  // are re-snapshotted when an emission ends and whenever a probe concludes
+  // the loop was alive, so "timer armed since" counts exactly the arms after
+  // the last such point. A self-arm can never be mistaken for foreign work:
+  // the prelude assigns ids in increasing order, so every arm this shim makes
+  // after the snapshot is one of the arms counted by the difference.
+  let beforeExitSeqBase = -1;
+  let beforeExitSelfArms = 0;
+  let beforeExitSelfArmsAtBase = 0;
+  const beforeExitTimerSeq = () =>
+    (typeof __pirTimerSeq === "number" ? __pirTimerSeq : -1);
+  const beforeExitRebase = () => {
+    beforeExitSelfArmsAtBase = beforeExitSelfArms;
+    beforeExitSeqBase = beforeExitTimerSeq();
+  };
+  const beforeExitArmedSinceBase = () => {
+    const seq = beforeExitTimerSeq();
+    if (seq < 0 || beforeExitSeqBase < 0) return 0; // no prelude timer surface
+    return Math.max(seq - beforeExitSeqBase - (beforeExitSelfArms - beforeExitSelfArmsAtBase), 0);
+  };
+  const beforeExitPending = () => {
+    // `typeof` on a global lexical binding is safe even when the prelude's
+    // timer surface is absent.
+    const map = typeof __pirTimers === "object" && __pirTimers !== null ? __pirTimers : null;
+    if (map === null) return 0;
+    let own = 0;
+    for (const id of beforeExitProbeIds) {
+      if (map.has(id)) own += 1;
+      else beforeExitProbeIds.delete(id);
+    }
+    return Math.max(map.size - own, 0);
+  };
+  armBeforeExitProbe = (delay) => {
+    if (beforeExitProbeArmed) return; // one probe at a time
+    if (typeof globalThis.setTimeout !== "function") return; // no host timers
+    if (proc.listenerCount("beforeExit") === 0) return; // nobody to emit to
+    beforeExitProbeArmed = true;
+    const id = globalThis.setTimeout(beforeExitProbe, delay);
+    beforeExitSelfArms += 1;
+    if (typeof id === "number") beforeExitProbeIds.add(id);
+  };
+  const beforeExitProbe = () => {
+    const pending = beforeExitPending(); // still counts the running probe
+    const armed = beforeExitArmedSinceBase();
+    beforeExitProbeArmed = false;
+    if (proc.listenerCount("beforeExit") === 0) return;
+    if (pending > 0 || armed > 0) {
+      // Work is outstanding, or was armed and ran to completion since the
+      // last emission: the loop was alive, so the next time it empties is a
+      // fresh idle period that emits again. The window restarts here, or the
+      // same arms would keep resetting the latch forever.
+      beforeExitEmitted = false;
+      beforeExitRebase();
+      beforeExitWaits += 1;
+      armBeforeExitProbe(Math.min(1 << Math.min(beforeExitWaits, 4), 16));
+      return;
+    }
+    beforeExitWaits = 0;
+    if (beforeExitEmitted) return; // one emission per idle period
+    beforeExitEmitted = true;
+    try {
+      proc.emit(
+        "beforeExit",
+        proc.exitCode === undefined || proc.exitCode === null ? 0 : proc.exitCode,
+      );
+    } finally {
+      // Work the handlers armed synchronously is visible here and the loop is
+      // alive again; a bare nextTick (and anything it may arm) is not — the
+      // follow-up probe re-judges that against the sequence window. A
+      // handler that scheduled nothing keeps the latch set and the process
+      // exits, which is what stops a second emission.
+      if (beforeExitPending() > 0) beforeExitEmitted = false;
+      beforeExitRebase();
+      if (proc.listenerCount("beforeExit") > 0) armBeforeExitProbe(0);
+    }
+  };
+  return proc;
+  })();
+  // Real Node exposes `process` as an accessor whose setter stores the
+  // assigned value, non-enumerable and configurable. A plain assignment
+  // instead reads back as a writable data property, so
+  // `getOwnPropertyDescriptor(globalThis, "process").writable` would be
+  // `true` where Node reports `undefined`.
+  let current = value;
+  Object.defineProperty(globalThis, "process", {
+    get() { return current; },
+    set(next) { current = next; },
+    enumerable: false,
+    configurable: true,
+  });
+}

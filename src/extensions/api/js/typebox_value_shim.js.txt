@@ -1,0 +1,214 @@
+// `typebox/value` (+ `@sinclair/typebox/value`) — dedicated subpath shim.
+//
+// Upstream this entry is its own module: it re-exports the Value operators as
+// bare top-level names (`Check`, `Errors`, `Parse`, `Clone`, `Assert`, ...)
+// and additionally exposes the `Value` namespace and `AssertError`/`ParseError`
+// classes. Serving the root shim here meant `import { Check } from
+// "typebox/value"` died at ESM link time with "Could not find export 'Check'",
+// which rejects the whole extension (pi-mcp-adapter, @tintinweb/pi-subagents,
+// pi-fabric, @moyai/pi-session-hoarder).
+//
+// Every check below is backed by the host JSON-Schema subset validator
+// (`globalThis.__pir_schemaValidate`, defined in the extension prelude) — the
+// same engine the root shim uses, so validity/error results stay identical.
+
+/** Thrown by `Assert`; upstream typebox exports the same name from the assert entry. */
+export class AssertError extends Error {
+  constructor(message, errors) {
+    super(message);
+    this.name = "AssertError";
+    this.errors = errors;
+  }
+}
+
+/** Thrown by `Parse`; carries the error list next to the message. */
+export class ParseError extends Error {
+  constructor(message, errors) {
+    super(message);
+    this.name = "ParseError";
+    this.errors = errors;
+  }
+}
+
+function pirValueCheck(schema, value) {
+  return __pir_schemaValidate(schema, value);
+}
+
+// Upstream `ValueError` carries `instancePath` (a JSON Pointer) alongside the
+// message; the host validator emits `path`. Alias instead of re-walking:
+// pi-fabric and @tintinweb/pi-subagents format messages from `instancePath`.
+function pirValueErrors(errors) {
+  return (errors || []).map((error) => {
+    if (!error || typeof error !== "object" || error.instancePath !== undefined) {
+      return error;
+    }
+    return { ...error, instancePath: typeof error.path === "string" ? error.path : "" };
+  });
+}
+
+function pirValueDetail(errors) {
+  return errors.map((e) => `${e.instancePath || "(root)"}: ${e.message}`).join("; ");
+}
+
+export function Check(schema, value) {
+  return pirValueCheck(schema, value).valid;
+}
+
+export function Errors(schema, value) {
+  return pirValueErrors(pirValueCheck(schema, value).errors);
+}
+
+export function Parse(schema, value) {
+  const check = pirValueCheck(schema, value);
+  if (!check.valid) {
+    const errors = pirValueErrors(check.errors);
+    throw new ParseError(`Value does not match the schema: ${pirValueDetail(errors)}`, errors);
+  }
+  return value;
+}
+
+export function Assert(schema, value) {
+  const check = pirValueCheck(schema, value);
+  if (!check.valid) {
+    const errors = pirValueErrors(check.errors);
+    throw new AssertError(`Value does not match the schema: ${pirValueDetail(errors)}`, errors);
+  }
+}
+
+export function Clone(value) {
+  return value && typeof value === "object" ? JSON.parse(JSON.stringify(value)) : value;
+}
+
+/** Type coercion is not implemented; the value is passed through unchanged. */
+export function Convert(_schema, value) {
+  return value;
+}
+
+// ─── default/clean walkers (chord 1.2.0 contract) ────────────────────────────
+//
+// Upstream typebox walks the *type* for both operators: `Default` patches
+// missing object properties from their `default` annotation, `Clean` drops
+// properties the type does not declare. The previous `Default(schema)` returned
+// `schema.default`, which discards the value — `@earendil-works/chord`'s
+// `normalize()` (`Value.Clean(schema, Value.Default(schema, Value.Clone(input)))`)
+// then saw `undefined` and rejected every contract input, so the walkers now
+// recurse through object properties and array items. A level whose schema
+// declares no `properties` is left alone. Kept in sync with
+// `typebox_shim.js.txt` (the root entry's `Value` namespace).
+
+function pirateCloneDefault(value) {
+  return value && typeof value === "object" ? JSON.parse(JSON.stringify(value)) : value;
+}
+
+function pirateItemSchemas(schema) {
+  if (!schema || typeof schema !== "object") return undefined;
+  const items = schema.items;
+  if (Array.isArray(items)) return items;
+  return items && typeof items === "object" ? [items, undefined] : undefined;
+}
+
+function pirateApplyDefaults(schema, value) {
+  if (value === null || typeof value !== "object") return value;
+  const branches = schema && typeof schema === "object" && Array.isArray(schema.anyOf) ? schema.anyOf : undefined;
+  if (branches !== undefined) {
+    for (const branch of branches) {
+      if (branch && typeof branch === "object" && pirValueCheck(branch, value).valid) {
+        return pirateApplyDefaults(branch, value);
+      }
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const items = pirateItemSchemas(schema);
+    if (items === undefined) return value;
+    for (let index = 0; index < value.length; index++) {
+      value[index] = pirateApplyDefaults(items[index] !== undefined ? items[index] : items[0], value[index]);
+    }
+    return value;
+  }
+  const properties =
+    schema && typeof schema === "object" && schema.properties && typeof schema.properties === "object"
+      ? schema.properties
+      : undefined;
+  if (properties === undefined) return value;
+  for (const key of Object.keys(properties)) {
+    const property = properties[key];
+    if (property === null || typeof property !== "object") continue;
+    if (!(key in value)) {
+      if ("default" in property) value[key] = pirateCloneDefault(property.default);
+      continue;
+    }
+    value[key] = pirateApplyDefaults(property, value[key]);
+  }
+  return value;
+}
+
+function pirateCleanValue(schema, value) {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) {
+    const items = pirateItemSchemas(schema);
+    if (items === undefined) return value;
+    return value.map((item, index) => pirateCleanValue(items[index] !== undefined ? items[index] : items[0], item));
+  }
+  const properties =
+    schema && typeof schema === "object" && schema.properties && typeof schema.properties === "object"
+      ? schema.properties
+      : undefined;
+  if (properties === undefined) return value;
+  const out = {};
+  for (const key of Object.keys(value)) {
+    if (key in properties && value[key] !== undefined) out[key] = pirateCleanValue(properties[key], value[key]);
+  }
+  return out;
+}
+
+/** Drop object properties the schema does not declare (recursively, like upstream). */
+export function Clean(schema, value) {
+  return pirateCleanValue(schema, value);
+}
+
+/** Patch missing properties from their `default` annotation (upstream semantics). */
+export function Default(schema, value) {
+  return pirateApplyDefaults(schema, value);
+}
+
+/** Codec faces are identity here (mirrors the root shim's `Compile` codec). */
+export function Decode(_schema, value) {
+  return value;
+}
+
+export function Encode(_schema, value) {
+  return value;
+}
+
+/**
+ * Superset of upstream: `typebox/value` has no `Compile`, but consumers reach
+ * for it here, and the root shim's compiled-validator shape is exactly what
+ * they need. Kept in sync with `typebox_shim.js.txt`.
+ */
+export function Compile(schema) {
+  return {
+    schema,
+    Code: () => (value) => pirValueCheck(schema, value).valid,
+    Check: (value) => pirValueCheck(schema, value).valid,
+    Errors: (value) => pirValueErrors(pirValueCheck(schema, value).errors),
+    Decode: (value) => value,
+    Encode: (value) => value,
+  };
+}
+
+/** The `Value` namespace object the subpath also exports (`export * as Value`). */
+export const Value = {
+  Check,
+  Errors,
+  Parse,
+  Assert,
+  Clone,
+  Convert,
+  Clean,
+  Default,
+  Decode,
+  Encode,
+};
+
+export default Value;

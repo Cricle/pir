@@ -1,0 +1,142 @@
+
+const CATALOG_UNAVAILABLE =
+  "the generated built-in model catalog is not bundled in the pir runtime";
+
+function catalogUnavailable(what) {
+  throw new Error(what + " is not available: " + CATALOG_UNAVAILABLE);
+}
+
+// Placeholder for the built-in provider objects: any access or call fails
+// loudly (no fake provider is ever handed out).
+function unavailableExport(what) {
+  const message = what + " is not available: built-in provider implementations are not bundled in the pir runtime";
+  return new Proxy(function () { throw new Error(message); }, {
+    get() { throw new Error(message); },
+    apply() { throw new Error(message); },
+    construct() { throw new Error(message); },
+  });
+}
+
+export function getBuiltinModel() { return catalogUnavailable("getBuiltinModel"); }
+export function getBuiltinImageModel() { return catalogUnavailable("getBuiltinImageModel"); }
+export function getBuiltinClassifierModel() { return catalogUnavailable("getBuiltinClassifierModel"); }
+export function getBuiltinModels() { return catalogUnavailable("getBuiltinModels"); }
+export function getBuiltinImageModels() { return catalogUnavailable("getBuiltinImageModels"); }
+export function getBuiltinClassifierModels() { return catalogUnavailable("getBuiltinClassifierModels"); }
+export function getAllBuiltinModels() { return catalogUnavailable("getAllBuiltinModels"); }
+export function builtinProviders() { return catalogUnavailable("builtinProviders"); }
+export function builtinModels() { return catalogUnavailable("builtinModels"); }
+
+// Upstream `getBuiltinProviders(): BuiltinProvider[]` returns `Object.keys(MODELS)`
+// — the catalog provider **id strings**, not provider objects. The ids are
+// exactly the manifest's catalog file names without the `.json` suffix (the
+// same 42 built-in catalog ids the Rust host registers), so this is a real
+// read, not a placeholder. Provider *objects* stay unavailable: the
+// implementations live in the Rust host (`builtinProviders()` below throws).
+export function getBuiltinProviders() {
+  return Object.keys(getBuiltinModelDataManifest().files).map((file) => file.replace(/\.json$/, ""));
+}
+
+// The built-in catalog's generation manifest, pinned to the Rust host's
+// `ai::providers::catalog` module. Upstream imports the same object from
+// `src/providers/data/.manifest.json` (`scripts/model-data.ts`):
+//   schemaVersion — `MODEL_DATA_SCHEMA_VERSION`
+//   generatedAt   — catalog refresh timestamp (ISO-8601)
+//   structureHash — SHA-256 over provider -> "<type>:<id>" -> api
+//   files         — catalog file name -> SHA-256 of its bytes
+// `pir::ai::providers::catalog::builtin_catalog_manifest()` and
+// `builtin_catalog_version()` are the Rust counterparts; the tests in
+// `tests/suites/catalog_units.rs` and `tests/ai_shims.rs` fail if these
+// literals drift from them.
+const PIR_BUILTIN_MODEL_DATA_MANIFEST_JSON = `{
+  "schemaVersion": 6,
+  "generatedAt": "2026-10-25T00:00:00.000Z",
+  "structureHash": "2ed3dbf07782cc96275367b02fdcfbd22f92427ef2051ac447356426c9f320fc",
+  "files": {
+    "amazon-bedrock.json": "91e6ac138f1274720788af67cd7518b6dc05869f6f64b4e32d5fbdb3d14d11f0",
+    "ant-ling.json": "a13ffcfc4da96be48049c5a521390747b4eec1966f3039d02cbaf8ec53aba47f",
+    "anthropic.json": "07955a0ee22ff6b3bb0dc421e9084a9986cf0364348faee4e49754e37662eef1",
+    "azure.json": "df618edbebaa9071f69af29b32abb93a5bc036a1bf7d87584d5cee5ff348c100",
+    "baseten.json": "29ca5f31f63e5d6f1e2a6d4c1ea573145f9042351edfaaeb6efc3a2b52edd762",
+    "cerebras.json": "d0dacd9dcbeaa26a1b0d37d822f3efed24ec8874ec2c820a43a7fa2d00b95641",
+    "cloudflare-ai-gateway.json": "3eb831ad61768aeea204bb974e920c805b89760688ee8a03b58d3a25841c4926",
+    "cloudflare-workers-ai.json": "915eb65008ab57afe2eeea747c216f0f678e19b7f7416b01434a8ccf97404020",
+    "deepseek.json": "77c64ca04d89fdc87e956e985d1572feaa30ecfb51ed8bcfa45adb6e0d827009",
+    "fireworks.json": "885a181a468ab3b4b532a60acf1aea2a3a8df72701e2d9d60214da2e114b5ace",
+    "github-copilot.json": "909f7c1baa75f18944e6790fc44e9960496987ba9a74a326de891350d02884b4",
+    "google-vertex.json": "c4b174a6d41e2cd064c5e6aeb3dd99fd21ba62c0900672682effc89e18d62a71",
+    "google.json": "c6665bf3e1b46f1d667946c011ccf6d81fb9d780f7229253304a0ab8b55e5492",
+    "groq.json": "967a985ec41d9dadc6618959a40bcf59f5328cd92118721edb8abeb8c0c6619e",
+    "huggingface.json": "c204bec6d0b870190b750cee4b49b3d47b8f367c7183e144e31379f7f4a73719",
+    "kimi-coding.json": "34c1aef8d06612c004469ae437bb3f9d5942b51334f6e19c50409c263c249707",
+    "meta.json": "bdf589573860f4143f78af2cea21700c1c1865e8bb0206a79eba90e97a7334ec",
+    "minimax-cn.json": "c4e4d093abb5727162ebc0d129ae5c050ebb62cebfa7dabdb35bfce135e41d1a",
+    "minimax.json": "9f29d07bba3c148bd8e2d487d030d99efe9109571cff0c1b6aaa3d6906c6289f",
+    "mistral.json": "612a11bdc468738991014327053eaf87c0707cc4f2f1a04bddff8781a4652def",
+    "moonshotai-cn.json": "e773cb478d7731a6024b0f004894a04bc11e30df41ef7ec81d58d9e88abb844a",
+    "moonshotai.json": "4116350aada4dc9c1ee07b2cc0be7c5ef54eb0c11be9ed96580d27a32b734c05",
+    "nvidia.json": "76846a933e91c726bb54ebd0cf397d093357b1ab2a08db34ec8ace11bfcc111b",
+    "openai-codex.json": "ffd499fc12034c5b24695b8bfbb6cab77c5167e16d0c7862ff4d6e5b009b9877",
+    "openai.json": "39a39ce10e3c4444bd8815cacc2b16d4a53ef689e0163aeed3f62e61f3af4f0c",
+    "opencode-go.json": "c10e24dd681b54768eccc509f29d14fbdea87c6d50384747e7b98efacbc9109c",
+    "opencode.json": "14e95cd5b8a99ace32fe78f36d78b49264960c0c0be8edc8218324e62b827889",
+    "openrouter.json": "617c4e5878278b85e9a811e7b0cb0f9e013fd4783b60125f90671a27d8f432e6",
+    "qwen-token-plan-cn.json": "b5a751dedaf5e51d74cb45a2151aa6c513f0e73020cd947589839c9225fc31e1",
+    "qwen-token-plan-individual.json": "c4c2b8ced5b34e26348b5db89619860c2dd9aa806c87e3b33fd2d45b9b21faf1",
+    "qwen-token-plan.json": "04d603b0bbbc11b210a7bee8c9804ca4a4f8687049e5120c5950cd88393310e3",
+    "radius.json": "0d9967f601ce4f17546093c1611a8cbc5f64541e2fdf0004f61d5a2b252315ab",
+    "together.json": "4e401934fb0d2d17564f4cc22ec95cf4466f1e12d0bef3d818f89106a18d916f",
+    "typesafe.json": "781e4c91cf1bdd0b2ded38c7960dd4b52c8cead9075934144567b853c439d707",
+    "vercel-ai-gateway.json": "2d87f5deb64503c910b355a79a2aed08979659e010331e7013a6a81a32362e41",
+    "xai.json": "49127949e49a73da3bdfea017bef92557eb7d629e507c296b6f2c9fdf45d2cf5",
+    "xiaomi-token-plan-ams.json": "dc97c0e48a21c35cd2bd7cf943c29f0c49fd2b0cb3fb75d404035c15a5c7561a",
+    "xiaomi-token-plan-cn.json": "e6c0954aa83c4bde4244a2de2574829715ad061bafe38f4507a46d2d381727bb",
+    "xiaomi-token-plan-sgp.json": "4ec21492c5f84cca8fa206bf84247a7050dfe0e1803e5e947c741bd1d30ed91d",
+    "xiaomi.json": "414519058bb7668fb271957b1d3445a881a9d64267a16f7241559bbd2fb9832d",
+    "zai-coding-cn.json": "c0bd97fc6e930fded3c2f3cd1e9bcc0b40ae91140cd52a177e6283309d1a0c03",
+    "zai.json": "42fd005697df6edfb945f4b94407e0057fc10599f1491e89fb08e885f80b784f"
+  }
+}`;
+
+// FNV-1a 64 content fingerprint of every embedded catalog resource
+// (`builtin_catalog_version()`, same value as `getBuiltinModelDataVersion`).
+const PIR_BUILTIN_MODEL_DATA_VERSION = "c1625812d2db0645";
+
+/** Upstream `getBuiltinModelDataGeneratedAt`: `generatedAt` in Unix ms. */
+export function getBuiltinModelDataGeneratedAt() {
+  const generatedAt = Date.parse(JSON.parse(PIR_BUILTIN_MODEL_DATA_MANIFEST_JSON).generatedAt);
+  return Number.isNaN(generatedAt) ? undefined : generatedAt;
+}
+
+/**
+ * The catalog generation manifest, in the upstream `ModelDataManifest` shape
+ * (`schemaVersion` / `generatedAt` / `structureHash` / `files`). A fresh object
+ * is returned so callers cannot mutate the pinned metadata.
+ */
+export function getBuiltinModelDataManifest() {
+  return JSON.parse(PIR_BUILTIN_MODEL_DATA_MANIFEST_JSON);
+}
+
+/** pir's catalog content version (`builtin_catalog_version`, lowercase hex). */
+export function getBuiltinModelDataVersion() { return PIR_BUILTIN_MODEL_DATA_VERSION; }
+
+// Upstream exports the radius provider object (providers/radius.ts); the
+// implementation cannot be faked, so any use fails with a clear error.
+export const radiusProvider = unavailableExport("radiusProvider");
+
+export default {
+  getBuiltinModel,
+  getBuiltinImageModel,
+  getBuiltinClassifierModel,
+  getBuiltinModels,
+  getBuiltinImageModels,
+  getBuiltinClassifierModels,
+  getAllBuiltinModels,
+  builtinProviders,
+  builtinModels,
+  getBuiltinProviders,
+  getBuiltinModelDataGeneratedAt,
+  getBuiltinModelDataManifest,
+  getBuiltinModelDataVersion,
+  radiusProvider,
+};

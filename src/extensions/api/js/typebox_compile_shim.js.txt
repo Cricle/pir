@@ -1,0 +1,18 @@
+// `typebox/compile` (+ `@sinclair/typebox/compile`) — dedicated subpath shim.
+//
+// Upstream this entry is its own module whose value exports are
+// `Compile` (top-level, also the default export) plus `Code`/`Validator`, and
+// whose `Compile(schema)` returns a compiled validator. The extension runtime
+// already implements that validator shape in the root `typebox` shim, so this
+// module is a re-export: `Compile` (top-level + default) with `Type`/`Value`
+// carried along for consumers that import them from the subpath
+// (tests/suites/extensions_events.rs imports `{ Compile, Value }` from here).
+//
+// Root-shim re-export keeps both specifiers on one module instance, so
+// `Type` built through `typebox` validates through `typebox/compile` unchanged.
+
+import { Type, Compile, Value } from "typebox";
+
+export { Type, Compile, Value };
+
+export default Compile;

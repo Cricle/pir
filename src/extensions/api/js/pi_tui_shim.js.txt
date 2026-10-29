@@ -1,0 +1,4803 @@
+
+import EventEmitter from "@node/events";
+
+// Surface mirror of upstream @earendil-works/pi-tui (packages/tui/src). Phase
+// 4f adds the full value-export surface: pure helpers are real ports, render
+// components are minimal shapes, and the host-bound pieces (ProcessTerminal,
+// getNativeClipboard) are inert skeletons. Slices, width accounting and
+// compositing share this module's code-point column convention (wide CJK and
+// emoji count as 1 column, unlike upstream's grapheme width table).
+
+// Length of the ANSI/OSC/APC escape sequence starting at `pos`, or 0 when
+// there is none. Terminators mirror upstream utils.ts: CSI final byte
+// 0x40..0x7e, OSC/APC closed by BEL or ST.
+function pirAnsiCodeLength(str, pos) {
+  if (pos >= str.length || str[pos] !== "\u001b") return 0;
+  const next = str[pos + 1];
+  if (next === "[") {
+    for (let j = pos + 2; j < str.length; j++) {
+      const code = str.charCodeAt(j);
+      if (code >= 0x40 && code <= 0x7e) return j + 1 - pos;
+    }
+    return 0;
+  }
+  if (next === "]" || next === "_") {
+    for (let j = pos + 2; j < str.length; j++) {
+      if (str[j] === "\x07") return j + 1 - pos;
+      if (str[j] === "\u001b" && str[j + 1] === "\\") return j + 2 - pos;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+export function visibleWidth(str) {
+  const text = String(str === undefined || str === null ? "" : str);
+  let width = 0;
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === "\u001b") {
+      const length = pirAnsiCodeLength(text, i);
+      if (length > 0) {
+        i += length;
+        continue;
+      }
+    }
+    const code = text.codePointAt(i);
+    i += code > 0xffff ? 2 : 1;
+    width += 1; // code-point column: wide CJK/emoji are 1 here (no width table)
+  }
+  return width;
+}
+
+// Keep up to `max` visible columns; escape sequences ride along without
+// counting and `styled` reports whether any were emitted.
+function takeColumns(text, max) {
+  let out = "";
+  let columns = 0;
+  let styled = false;
+  let i = 0;
+  while (i < text.length && columns < max) {
+    if (text[i] === "\u001b") {
+      const length = pirAnsiCodeLength(text, i);
+      if (length > 0) {
+        out += text.slice(i, i + length);
+        styled = true;
+        i += length;
+        continue;
+      }
+    }
+    const code = text.codePointAt(i);
+    out += String.fromCodePoint(code);
+    i += code > 0xffff ? 2 : 1;
+    columns += 1;
+  }
+  return { text: out, styled: styled };
+}
+
+export function truncateToWidth(str, width, ellipsis) {
+  const text = String(str === undefined || str === null ? "" : str);
+  const marker = ellipsis === undefined ? "..." : String(ellipsis);
+  const max = Math.floor(width);
+  if (max <= 0) return "";
+  if (visibleWidth(text) <= max) return text;
+  const markerWidth = visibleWidth(marker);
+  if (markerWidth >= max) return takeColumns(marker, max).text;
+  const kept = takeColumns(text, max - markerWidth);
+  // A truncated styled prefix must not leak its SGR state into the marker.
+  return kept.styled ? kept.text + "\u001b[0m" + marker : kept.text + marker;
+}
+
+export function wrapTextWithAnsi(text, width) {
+  const max = Math.max(1, Math.floor(width));
+  const out = [];
+  const lines = String(text === undefined || text === null ? "" : text)
+    .replace(/\t/g, "   ")
+    .split(/\r?\n/);
+  for (const line of lines) {
+    if (visibleWidth(line) <= max) {
+      out.push(line);
+      continue;
+    }
+    // Space-delimited word wrap; a word wider than the line hard-splits.
+    let current = "";
+    for (const word of line.split(" ")) {
+      if (current === "") {
+        current = word;
+      } else if (visibleWidth(current) + 1 + visibleWidth(word) <= max) {
+        current += " " + word;
+      } else {
+        out.push(current);
+        current = word;
+      }
+      while (visibleWidth(current) > max) {
+        const kept = takeColumns(current, max);
+        out.push(kept.text);
+        current = current.slice(kept.text.length);
+      }
+    }
+    out.push(current);
+  }
+  return out;
+}
+
+export class Text {
+  constructor(text = "", paddingX = 1, paddingY = 1, customBgFn) {
+    this.text = String(text === undefined || text === null ? "" : text);
+    this.paddingX = paddingX;
+    this.paddingY = paddingY;
+    this.customBgFn = typeof customBgFn === "function" ? customBgFn : undefined;
+  }
+
+  setText(text) {
+    this.text = String(text === undefined || text === null ? "" : text);
+  }
+
+  getText() {
+    return this.text;
+  }
+
+  setPaddingX(paddingX) {
+    this.paddingX = paddingX;
+  }
+
+  setCustomBgFn(customBgFn) {
+    this.customBgFn = typeof customBgFn === "function" ? customBgFn : undefined;
+  }
+
+  invalidate() {
+    // The minimal pad keeps no render cache, so there is nothing to drop.
+  }
+
+  render(width) {
+    if (!this.text || this.text.trim() === "") return [];
+    const padX = Math.min(this.paddingX, Math.max(0, Math.floor((width - 1) / 2)));
+    const contentWidth = Math.max(1, width - padX * 2);
+    const left = " ".repeat(padX);
+    const right = " ".repeat(padX);
+    const content = [];
+    for (const line of wrapTextWithAnsi(this.text, contentWidth)) {
+      const withMargins = left + line + right;
+      const padded = withMargins + " ".repeat(Math.max(0, width - visibleWidth(withMargins)));
+      content.push(this.customBgFn ? this.customBgFn(padded) : padded);
+    }
+    const blank = " ".repeat(Math.max(0, width));
+    const result = [];
+    for (let i = 0; i < this.paddingY; i++) result.push(this.customBgFn ? this.customBgFn(blank) : blank);
+    for (const line of content) result.push(line);
+    for (let i = 0; i < this.paddingY; i++) result.push(this.customBgFn ? this.customBgFn(blank) : blank);
+    return result.length > 0 ? result : [""];
+  }
+}
+
+export class Container {
+  constructor() {
+    this.children = [];
+  }
+
+  addChild(component) {
+    this.children.push(component);
+  }
+
+  removeChild(component) {
+    const index = this.children.indexOf(component);
+    if (index !== -1) this.children.splice(index, 1);
+  }
+
+  clear() {
+    this.children = [];
+  }
+
+  invalidate() {
+    for (const child of this.children) {
+      if (child && typeof child.invalidate === "function") child.invalidate();
+    }
+  }
+
+  render(width) {
+    const out = [];
+    for (const child of this.children) {
+      out.push(...child.render(width));
+    }
+    return out;
+  }
+}
+
+export class Box {
+  constructor(paddingX = 1, paddingY = 1, bgFn) {
+    this.children = [];
+    this.paddingX = paddingX;
+    this.paddingY = paddingY;
+    this.bgFn = typeof bgFn === "function" ? bgFn : undefined;
+  }
+
+  addChild(component) {
+    this.children.push(component);
+  }
+
+  removeChild(component) {
+    const index = this.children.indexOf(component);
+    if (index !== -1) this.children.splice(index, 1);
+  }
+
+  clear() {
+    this.children = [];
+  }
+
+  setBgFn(bgFn) {
+    this.bgFn = typeof bgFn === "function" ? bgFn : undefined;
+  }
+
+  setPaddingX(paddingX) {
+    this.paddingX = paddingX;
+  }
+
+  invalidate() {
+    for (const child of this.children) {
+      if (child && typeof child.invalidate === "function") child.invalidate();
+    }
+  }
+
+  render(width) {
+    const padX = Math.max(0, this.paddingX);
+    const padY = Math.max(0, this.paddingY);
+    const inner = Math.max(1, width - padX * 2);
+    const left = " ".repeat(padX);
+    const lines = [];
+    for (const child of this.children) {
+      for (const line of child.render(inner)) {
+        const withMargins = left + line;
+        const padded = withMargins + " ".repeat(Math.max(0, width - visibleWidth(withMargins)));
+        lines.push(this.bgFn ? this.bgFn(padded) : padded);
+      }
+    }
+    const blank = " ".repeat(Math.max(0, width));
+    const result = [];
+    for (let i = 0; i < padY; i++) result.push(this.bgFn ? this.bgFn(blank) : blank);
+    for (const line of lines) result.push(line);
+    for (let i = 0; i < padY; i++) result.push(this.bgFn ? this.bgFn(blank) : blank);
+    return result;
+  }
+}
+
+export class Spacer {
+  constructor(lines = 1) {
+    this.lines = lines;
+  }
+
+  setLines(lines) {
+    this.lines = lines;
+  }
+
+  invalidate() {
+    // No cached state to invalidate currently.
+  }
+
+  render(_width) {
+    const result = [];
+    for (let i = 0; i < this.lines; i++) result.push("");
+    return result;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Key handling (phase 4c). Upstream parses every terminal protocol; this is a
+// documented subset: legacy sequences + CSI-u/modifyOtherKeys sequences, no
+// live kitty-protocol session state (setKittyProtocolActive is inert).
+// ---------------------------------------------------------------------------
+
+const PIR_MODIFIERS = { shift: 1, alt: 2, ctrl: 4, super: 8 };
+const PIR_LOCK_MASK = 192;
+
+export const Key = {
+  escape: "escape",
+  esc: "esc",
+  enter: "enter",
+  return: "return",
+  tab: "tab",
+  space: "space",
+  backspace: "backspace",
+  delete: "delete",
+  insert: "insert",
+  clear: "clear",
+  home: "home",
+  end: "end",
+  pageUp: "pageUp",
+  pageDown: "pageDown",
+  up: "up",
+  down: "down",
+  left: "left",
+  right: "right",
+  f1: "f1", f2: "f2", f3: "f3", f4: "f4", f5: "f5", f6: "f6",
+  f7: "f7", f8: "f8", f9: "f9", f10: "f10", f11: "f11", f12: "f12",
+  backtick: "`", hyphen: "-", equals: "=", leftbracket: "[",
+  rightbracket: "]", backslash: "\\", semicolon: ";", quote: "'",
+  comma: ",", period: ".", slash: "/", exclamation: "!", at: "@",
+  hash: "#", dollar: "$", percent: "%", caret: "^", ampersand: "&",
+  asterisk: "*", leftparen: "(", rightparen: ")", underscore: "_",
+  plus: "+", pipe: "|", tilde: "~", leftbrace: "{", rightbrace: "}",
+  colon: ":", lessthan: "<", greaterthan: ">", question: "?",
+  ctrl: (key) => `ctrl+${key}`,
+  shift: (key) => `shift+${key}`,
+  alt: (key) => `alt+${key}`,
+  super: (key) => `super+${key}`,
+  ctrlShift: (key) => `ctrl+shift+${key}`,
+  shiftCtrl: (key) => `shift+ctrl+${key}`,
+  ctrlAlt: (key) => `ctrl+alt+${key}`,
+  altCtrl: (key) => `alt+ctrl+${key}`,
+  shiftAlt: (key) => `shift+alt+${key}`,
+  altShift: (key) => `alt+shift+${key}`,
+  ctrlSuper: (key) => `ctrl+super+${key}`,
+  superCtrl: (key) => `super+ctrl+${key}`,
+  shiftSuper: (key) => `shift+super+${key}`,
+  superShift: (key) => `super+shift+${key}`,
+  altSuper: (key) => `alt+super+${key}`,
+  superAlt: (key) => `super+alt+${key}`,
+  ctrlShiftAlt: (key) => `ctrl+shift+alt+${key}`,
+  ctrlShiftSuper: (key) => `ctrl+shift+super+${key}`,
+};
+
+const PIR_SYMBOL_KEYS = new Set([
+  "`", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/",
+  "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "_",
+  "+", "|", "~", "{", "}", ":", "<", ">", "?",
+]);
+
+const PIR_LEGACY_KEY_SEQUENCES = {
+  up: ["\x1b[A", "\x1bOA"],
+  down: ["\x1b[B", "\x1bOB"],
+  right: ["\x1b[C", "\x1bOC"],
+  left: ["\x1b[D", "\x1bOD"],
+  home: ["\x1b[H", "\x1bOH", "\x1b[1~", "\x1b[7~"],
+  end: ["\x1b[F", "\x1bOF", "\x1b[4~", "\x1b[8~"],
+  insert: ["\x1b[2~"],
+  delete: ["\x1b[3~"],
+  pageUp: ["\x1b[5~", "\x1b[[5~"],
+  pageDown: ["\x1b[6~", "\x1b[[6~"],
+  clear: ["\x1b[E", "\x1bOE"],
+  f1: ["\x1bOP", "\x1b[11~", "\x1b[[A"],
+  f2: ["\x1bOQ", "\x1b[12~", "\x1b[[B"],
+  f3: ["\x1bOR", "\x1b[13~", "\x1b[[C"],
+  f4: ["\x1bOS", "\x1b[14~", "\x1b[[D"],
+  f5: ["\x1b[15~", "\x1b[[E"],
+  f6: ["\x1b[17~"],
+  f7: ["\x1b[18~"],
+  f8: ["\x1b[19~"],
+  f9: ["\x1b[20~"],
+  f10: ["\x1b[21~"],
+  f11: ["\x1b[23~"],
+  f12: ["\x1b[24~"],
+};
+
+const PIR_LEGACY_SHIFT_SEQUENCES = {
+  up: ["\x1b[a"], down: ["\x1b[b"], right: ["\x1b[c"], left: ["\x1b[d"],
+  clear: ["\x1b[e"], insert: ["\x1b[2$"], delete: ["\x1b[3$"],
+  pageUp: ["\x1b[5$"], pageDown: ["\x1b[6$"], home: ["\x1b[7$"], end: ["\x1b[8$"],
+};
+
+const PIR_LEGACY_CTRL_SEQUENCES = {
+  up: ["\x1bOa"], down: ["\x1bOb"], right: ["\x1bOc"], left: ["\x1bOd"],
+  clear: ["\x1bOe"], insert: ["\x1b[2^"], delete: ["\x1b[3^"],
+  pageUp: ["\x1b[5^"], pageDown: ["\x1b[6^"], home: ["\x1b[7^"], end: ["\x1b[8^"],
+};
+
+const PIR_FUNCTIONAL_CODEPOINTS = {
+  delete: -10, insert: -11, pageUp: -12, pageDown: -13, home: -14, end: -15,
+};
+
+const PIR_ARROW_CODEPOINTS = { up: -1, down: -2, right: -3, left: -4 };
+
+// Headless runtime: no terminal handshake ever enables the kitty protocol.
+export function setKittyProtocolActive(_active) {}
+
+export function isKittyProtocolActive() {
+  return false;
+}
+
+// Bracketed-paste content never counts as a release (upstream guards against
+// colons inside pasted text, e.g. MAC addresses).
+export function isKeyRelease(data) {
+  const text = String(data ?? "");
+  if (text.includes("\x1b[200~")) return false;
+  return (
+    text.includes(":3u") || text.includes(":3~") || text.includes(":3A") ||
+    text.includes(":3B") || text.includes(":3C") || text.includes(":3D") ||
+    text.includes(":3H") || text.includes(":3F")
+  );
+}
+
+function pirParseKeyId(keyId) {
+  let key = String(keyId ?? "").toLowerCase();
+  const modifiers = new Set();
+  for (;;) {
+    const names = ["shift", "alt", "ctrl", "super"];
+    const modifier = names.find((name) => key.startsWith(name + "+"));
+    if (!modifier) break;
+    if (modifiers.has(modifier)) return null;
+    modifiers.add(modifier);
+    key = key.slice(modifier.length + 1);
+  }
+  if (!key || (key.includes("+") && key !== "+")) return null;
+  return {
+    key,
+    ctrl: modifiers.has("ctrl"),
+    shift: modifiers.has("shift"),
+    alt: modifiers.has("alt"),
+    super: modifiers.has("super"),
+  };
+}
+
+function pirNormalizeShiftedLetter(codepoint, modifier) {
+  const effective = modifier & ~PIR_LOCK_MASK;
+  if ((effective & PIR_MODIFIERS.shift) !== 0 && codepoint >= 65 && codepoint <= 90) {
+    return codepoint + 32;
+  }
+  return codepoint;
+}
+
+// CSI-u / arrow / functional / home-end kitty sequences (flag 1 + 2 subset).
+function pirParseKittySequence(data) {
+  let match = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/.exec(data);
+  if (match) {
+    return {
+      codepoint: parseInt(match[1], 10),
+      shiftedKey: match[2] && match[2].length > 0 ? parseInt(match[2], 10) : undefined,
+      baseLayoutKey: match[3] ? parseInt(match[3], 10) : undefined,
+      modifier: (match[4] ? parseInt(match[4], 10) : 1) - 1,
+    };
+  }
+  match = /^\x1b\[1;(\d+)(?::(\d+))?([ABCDHF])$/.exec(data);
+  if (match) {
+    const arrows = { A: -1, B: -2, C: -3, D: -4, H: -14, F: -15 };
+    return { codepoint: arrows[match[3]], modifier: parseInt(match[1], 10) - 1 };
+  }
+  match = /^\x1b\[(\d+)(?:;(\d+))?(?::(\d+))?~$/.exec(data);
+  if (match) {
+    const functional = { 2: -11, 3: -10, 5: -12, 6: -13, 7: -14, 8: -15 };
+    const codepoint = functional[parseInt(match[1], 10)];
+    if (codepoint !== undefined) {
+      return { codepoint, modifier: (match[2] ? parseInt(match[2], 10) : 1) - 1 };
+    }
+  }
+  return null;
+}
+
+function pirMatchesKittySequence(data, expectedCodepoint, expectedModifier) {
+  const parsed = pirParseKittySequence(data);
+  if (!parsed) return false;
+  const actualMod = parsed.modifier & ~PIR_LOCK_MASK;
+  const expectedMod = expectedModifier & ~PIR_LOCK_MASK;
+  const actual = pirNormalizeShiftedLetter(parsed.codepoint, parsed.modifier);
+  const expected = pirNormalizeShiftedLetter(expectedCodepoint, expectedModifier);
+  if (actualMod === expectedMod && actual === expected) return true;
+  // Logical shifted symbols: kitty reports "+" as Shift + the "=" key, and
+  // the shiftedKey field names the produced symbol; consume that Shift.
+  if (
+    parsed.shiftedKey !== undefined &&
+    (actualMod & PIR_MODIFIERS.shift) !== 0 &&
+    (actualMod & ~PIR_MODIFIERS.shift) === expectedMod &&
+    parsed.shiftedKey === expectedCodepoint
+  ) {
+    return true;
+  }
+  // Alternate match: base layout key for non-Latin layouts (only when the
+  // reported codepoint is not already a Latin letter or known symbol).
+  if (parsed.baseLayoutKey !== undefined && actualMod === expectedMod && parsed.baseLayoutKey === expectedCodepoint) {
+    const isLatinLetter = actual >= 97 && actual <= 122;
+    const isKnownSymbol = PIR_SYMBOL_KEYS.has(String.fromCharCode(actual));
+    if (!isLatinLetter && !isKnownSymbol) return true;
+  }
+  return false;
+}
+
+function pirParseModifyOtherKeys(data) {
+  const match = /^\x1b\[27;(\d+);(\d+)~$/.exec(data);
+  return match
+    ? { modifier: parseInt(match[1], 10) - 1, codepoint: parseInt(match[2], 10) }
+    : null;
+}
+
+function pirMatchesModifyOtherKeys(data, expectedKeycode, expectedModifier) {
+  const parsed = pirParseModifyOtherKeys(data);
+  return !!parsed && parsed.codepoint === expectedKeycode && parsed.modifier === expectedModifier;
+}
+
+function pirMatchesLegacySequence(data, sequences) {
+  return sequences.includes(data);
+}
+
+// - as _ (same physical key on US keyboards), matching upstream rawCtrlChar.
+function pirRawCtrlChar(key) {
+  const char = key.toLowerCase();
+  const code = char.charCodeAt(0);
+  if ((code >= 97 && code <= 122) || char === "[" || char === "\\" || char === "]" || char === "_") {
+    return String.fromCharCode(code & 0x1f);
+  }
+  if (char === "-") return String.fromCharCode(31);
+  return null;
+}
+
+function pirMatchesLegacyModifierSequence(data, key, modifier) {
+  if (modifier === PIR_MODIFIERS.shift) {
+    const sequences = PIR_LEGACY_SHIFT_SEQUENCES[key];
+    return !!sequences && sequences.includes(data);
+  }
+  if (modifier === PIR_MODIFIERS.ctrl) {
+    const sequences = PIR_LEGACY_CTRL_SEQUENCES[key];
+    return !!sequences && sequences.includes(data);
+  }
+  return false;
+}
+
+function pirMatchesRawBackspace(data, expectedModifier) {
+  if (data === "\x7f") return expectedModifier === 0;
+  if (data !== "\x08") return false;
+  // Windows Terminal sends raw 0x08 for Ctrl+Backspace; elsewhere it is a
+  // plain Backspace (upstream heuristic, guarded for runtime-less hosts).
+  const env = typeof process !== "undefined" && process && process.env ? process.env : {};
+  const isWindowsTerminal = !!env.WT_SESSION && !env.SSH_CONNECTION && !env.SSH_CLIENT && !env.SSH_TTY;
+  return isWindowsTerminal ? expectedModifier === PIR_MODIFIERS.ctrl : expectedModifier === 0;
+}
+
+export function matchesKey(data, keyId) {
+  const parsed = pirParseKeyId(keyId);
+  if (!parsed) return false;
+  const { key, ctrl, shift, alt, super: superModifier } = parsed;
+  let modifier = 0;
+  if (shift) modifier |= PIR_MODIFIERS.shift;
+  if (alt) modifier |= PIR_MODIFIERS.alt;
+  if (ctrl) modifier |= PIR_MODIFIERS.ctrl;
+  if (superModifier) modifier |= PIR_MODIFIERS.super;
+
+  switch (key) {
+    case "escape":
+    case "esc":
+      if (modifier !== 0) return false;
+      return data === "\x1b" || pirMatchesKittySequence(data, 27, 0) || pirMatchesModifyOtherKeys(data, 27, 0);
+
+    case "space":
+      if (modifier === 0) {
+        return data === " " || pirMatchesKittySequence(data, 32, 0) || pirMatchesModifyOtherKeys(data, 32, 0);
+      }
+      if (modifier === PIR_MODIFIERS.ctrl && data === "\x00") return true;
+      if (modifier === PIR_MODIFIERS.alt && data === "\x1b ") return true;
+      return pirMatchesKittySequence(data, 32, modifier) || pirMatchesModifyOtherKeys(data, 32, modifier);
+
+    case "tab":
+      if (modifier === PIR_MODIFIERS.shift) {
+        return data === "\x1b[Z" || pirMatchesKittySequence(data, 9, PIR_MODIFIERS.shift) ||
+          pirMatchesModifyOtherKeys(data, 9, PIR_MODIFIERS.shift);
+      }
+      if (modifier === 0) return data === "\t" || pirMatchesKittySequence(data, 9, 0);
+      return pirMatchesKittySequence(data, 9, modifier) || pirMatchesModifyOtherKeys(data, 9, modifier);
+
+    case "enter":
+    case "return":
+      if (modifier === PIR_MODIFIERS.shift) {
+        return pirMatchesKittySequence(data, 13, PIR_MODIFIERS.shift) ||
+          pirMatchesModifyOtherKeys(data, 13, PIR_MODIFIERS.shift);
+      }
+      if (modifier === PIR_MODIFIERS.alt) {
+        return pirMatchesKittySequence(data, 13, PIR_MODIFIERS.alt) ||
+          pirMatchesModifyOtherKeys(data, 13, PIR_MODIFIERS.alt) ||
+          data === "\x1b\r";
+      }
+      if (modifier === 0) {
+        return data === "\r" || data === "\n" || data === "\x1bOM" ||
+          pirMatchesKittySequence(data, 13, 0) || pirMatchesKittySequence(data, 57414, 0);
+      }
+      return pirMatchesKittySequence(data, 13, modifier) || pirMatchesModifyOtherKeys(data, 13, modifier);
+
+    case "backspace":
+      if (modifier === PIR_MODIFIERS.alt) {
+        if (data === "\x1b\x7f" || data === "\x1b\b") return true;
+        return pirMatchesKittySequence(data, 127, PIR_MODIFIERS.alt) ||
+          pirMatchesModifyOtherKeys(data, 127, PIR_MODIFIERS.alt);
+      }
+      if (modifier === PIR_MODIFIERS.ctrl) {
+        return pirMatchesRawBackspace(data, PIR_MODIFIERS.ctrl) ||
+          pirMatchesKittySequence(data, 127, PIR_MODIFIERS.ctrl) ||
+          pirMatchesModifyOtherKeys(data, 127, PIR_MODIFIERS.ctrl);
+      }
+      if (modifier === 0) {
+        return pirMatchesRawBackspace(data, 0) || pirMatchesKittySequence(data, 127, 0) ||
+          pirMatchesModifyOtherKeys(data, 127, 0);
+      }
+      return pirMatchesKittySequence(data, 127, modifier) || pirMatchesModifyOtherKeys(data, 127, modifier);
+
+    case "insert":
+    case "delete":
+    case "home":
+    case "end": {
+      const codepoint = PIR_FUNCTIONAL_CODEPOINTS[key];
+      if (modifier === 0) {
+        return pirMatchesLegacySequence(data, PIR_LEGACY_KEY_SEQUENCES[key]) ||
+          pirMatchesKittySequence(data, codepoint, 0);
+      }
+      if (pirMatchesLegacyModifierSequence(data, key, modifier)) return true;
+      return pirMatchesKittySequence(data, codepoint, modifier);
+    }
+
+    case "clear":
+      if (modifier === 0) return pirMatchesLegacySequence(data, PIR_LEGACY_KEY_SEQUENCES.clear);
+      return pirMatchesLegacyModifierSequence(data, "clear", modifier);
+
+    case "pageup":
+    case "pagedown": {
+      const keyName = key === "pageup" ? "pageUp" : "pageDown";
+      const codepoint = PIR_FUNCTIONAL_CODEPOINTS[keyName];
+      if (modifier === 0) {
+        return pirMatchesLegacySequence(data, PIR_LEGACY_KEY_SEQUENCES[keyName]) ||
+          pirMatchesKittySequence(data, codepoint, 0);
+      }
+      if (pirMatchesLegacyModifierSequence(data, keyName, modifier)) return true;
+      return pirMatchesKittySequence(data, codepoint, modifier);
+    }
+
+    case "up":
+    case "down":
+    case "left":
+    case "right": {
+      const codepoint = PIR_ARROW_CODEPOINTS[key];
+      if (modifier === PIR_MODIFIERS.alt) {
+        if (key === "up" && data === "\x1bp") return true;
+        if (key === "down" && data === "\x1bn") return true;
+        if (key === "left" && (data === "\x1b[1;3D" || data === "\x1bB" || data === "\x1bb")) return true;
+        if (key === "right" && (data === "\x1b[1;3C" || data === "\x1bF" || data === "\x1bf")) return true;
+        return pirMatchesKittySequence(data, codepoint, PIR_MODIFIERS.alt);
+      }
+      if (modifier === PIR_MODIFIERS.ctrl) {
+        if (key === "left" && data === "\x1b[1;5D") return true;
+        if (key === "right" && data === "\x1b[1;5C") return true;
+        return pirMatchesLegacyModifierSequence(data, key, PIR_MODIFIERS.ctrl) ||
+          pirMatchesKittySequence(data, codepoint, PIR_MODIFIERS.ctrl);
+      }
+      if (modifier === 0) {
+        return pirMatchesLegacySequence(data, PIR_LEGACY_KEY_SEQUENCES[key]) ||
+          pirMatchesKittySequence(data, codepoint, 0);
+      }
+      if (pirMatchesLegacyModifierSequence(data, key, modifier)) return true;
+      return pirMatchesKittySequence(data, codepoint, modifier);
+    }
+
+    case "f1": case "f2": case "f3": case "f4": case "f5": case "f6":
+    case "f7": case "f8": case "f9": case "f10": case "f11": case "f12":
+      if (modifier !== 0) return false;
+      return pirMatchesLegacySequence(data, PIR_LEGACY_KEY_SEQUENCES[key]);
+  }
+
+  // Single letter / digit / symbol keys.
+  if (key.length === 1 && ((key >= "a" && key <= "z") || (key >= "0" && key <= "9") || PIR_SYMBOL_KEYS.has(key))) {
+    const codepoint = key.charCodeAt(0);
+    const rawCtrl = pirRawCtrlChar(key);
+    const isLetter = key >= "a" && key <= "z";
+    if (modifier === PIR_MODIFIERS.ctrl + PIR_MODIFIERS.alt && rawCtrl && data === `\x1b${rawCtrl}`) return true;
+    if (modifier === PIR_MODIFIERS.alt && data === `\x1b${key}`) return true;
+    if (modifier === PIR_MODIFIERS.ctrl) {
+      if (rawCtrl && data === rawCtrl) return true;
+      return pirMatchesKittySequence(data, codepoint, PIR_MODIFIERS.ctrl) ||
+        pirMatchesModifyOtherKeys(data, codepoint, PIR_MODIFIERS.ctrl);
+    }
+    if (modifier === PIR_MODIFIERS.shift + PIR_MODIFIERS.ctrl) {
+      return pirMatchesKittySequence(data, codepoint, PIR_MODIFIERS.shift + PIR_MODIFIERS.ctrl) ||
+        pirMatchesModifyOtherKeys(data, codepoint, PIR_MODIFIERS.shift + PIR_MODIFIERS.ctrl);
+    }
+    if (modifier === PIR_MODIFIERS.shift) {
+      if (isLetter && data === key.toUpperCase()) return true;
+      return pirMatchesKittySequence(data, codepoint, PIR_MODIFIERS.shift) ||
+        pirMatchesModifyOtherKeys(data, codepoint, PIR_MODIFIERS.shift);
+    }
+    if (modifier !== 0) {
+      return pirMatchesKittySequence(data, codepoint, modifier) ||
+        pirMatchesModifyOtherKeys(data, codepoint, modifier);
+    }
+    return data === key || pirMatchesKittySequence(data, codepoint, 0) ||
+      pirMatchesModifyOtherKeys(data, codepoint, 0);
+  }
+
+  return false;
+}
+
+// Subsequence fuzzy matching, ported from upstream fuzzy.ts (same scoring and
+// the alphanumeric token swap). fuzzyFilter returns the matched items sorted
+// best-first, exactly like upstream.
+export function fuzzyMatch(query, text) {
+  const queryLower = String(query ?? "").toLowerCase();
+  const textLower = String(text ?? "").toLowerCase();
+
+  const matchQuery = (normalizedQuery) => {
+    if (normalizedQuery.length === 0) return { matches: true, score: 0 };
+    if (normalizedQuery.length > textLower.length) return { matches: false, score: 0 };
+    let queryIndex = 0;
+    let score = 0;
+    let lastMatchIndex = -1;
+    let consecutiveMatches = 0;
+    while (queryIndex < normalizedQuery.length) {
+      const i = textLower.indexOf(normalizedQuery[queryIndex], lastMatchIndex + 1);
+      if (i === -1) break;
+      const isWordBoundary = i === 0 || /[\s\-_./:]/.test(textLower[i - 1]);
+      if (lastMatchIndex === i - 1) {
+        consecutiveMatches++;
+        score -= consecutiveMatches * 5;
+      } else {
+        consecutiveMatches = 0;
+        if (lastMatchIndex >= 0) score += (i - lastMatchIndex - 1) * 2;
+      }
+      if (isWordBoundary) score -= 10;
+      score += i * 0.1;
+      lastMatchIndex = i;
+      queryIndex++;
+    }
+    if (queryIndex < normalizedQuery.length) return { matches: false, score: 0 };
+    if (normalizedQuery === textLower) score -= 100;
+    return { matches: true, score };
+  };
+
+  const primary = matchQuery(queryLower);
+  if (primary.matches) return primary;
+  const alphaNumeric = /^([a-z]+)([0-9]+)$/.exec(queryLower);
+  const numericAlpha = /^([0-9]+)([a-z]+)$/.exec(queryLower);
+  const swapped = alphaNumeric
+    ? `${alphaNumeric[2]}${alphaNumeric[1]}`
+    : numericAlpha
+      ? `${numericAlpha[2]}${numericAlpha[1]}`
+      : "";
+  if (!swapped) return primary;
+  const swappedMatch = matchQuery(swapped);
+  if (!swappedMatch.matches) return primary;
+  return { matches: true, score: swappedMatch.score + 5 };
+}
+
+export function fuzzyFilter(items, query, getText) {
+  const list = Array.isArray(items) ? items : [];
+  const rawQuery = String(query ?? "");
+  if (!rawQuery.trim()) return list;
+  const tokens = rawQuery.trim().split(/[\s/]+/).filter((token) => token.length > 0);
+  if (tokens.length === 0) return list;
+  const textOf = typeof getText === "function" ? getText : (item) => String(item ?? "");
+  const results = [];
+  for (const item of list) {
+    const text = String(textOf(item) ?? "");
+    let totalScore = 0;
+    let allMatch = true;
+    for (const token of tokens) {
+      const match = fuzzyMatch(token, text);
+      if (match.matches) totalScore += match.score;
+      else { allMatch = false; break; }
+    }
+    if (allMatch) results.push({ item, totalScore });
+  }
+  results.sort((a, b) => a.totalScore - b.totalScore);
+  return results.map((entry) => entry.item);
+}
+
+// LIMITS (documented): single-line state machine without kill-ring/undo,
+// grapheme-accurate cursor movement, horizontal scrolling or cursor rendering.
+export class Input {
+  constructor(options = {}) {
+    this.prompt = options.prompt ?? "> ";
+    this.placeholder = options.placeholder ?? "";
+    this.placeholderStyle = typeof options.placeholderStyle === "function" ? options.placeholderStyle : (text) => text;
+    this.focused = false;
+    this.value = "";
+    this.cursor = 0;
+    this.onSubmit = undefined;
+    this.onEscape = undefined;
+    this.onChange = undefined;
+  }
+
+  getValue() {
+    return this.value;
+  }
+
+  setValue(value) {
+    this.value = String(value ?? "");
+    this.cursor = Math.min(this.cursor, this.value.length);
+    this.pirChanged();
+  }
+
+  pirChanged() {
+    if (typeof this.onChange === "function") this.onChange(this.value);
+  }
+
+  pirInsert(text) {
+    if (!text) return;
+    this.value = this.value.slice(0, this.cursor) + text + this.value.slice(this.cursor);
+    this.cursor += text.length;
+    this.pirChanged();
+  }
+
+  handleInput(data) {
+    const text = String(data ?? "");
+    // Bracketed paste: keep the payload (single line, so newlines become
+    // spaces), drop the markers.
+    if (text.includes("\x1b[200~")) {
+      const inner = text.replace(/^\x1b\[200~/, "").replace(/\x1b\[201~$/, "");
+      this.pirInsert(inner.replace(/\r\n?/g, "\n").replace(/\n/g, " "));
+      return;
+    }
+    if (matchesKey(text, "enter")) {
+      if (typeof this.onSubmit === "function") this.onSubmit(this.value);
+      return;
+    }
+    if (matchesKey(text, "escape")) {
+      if (typeof this.onEscape === "function") this.onEscape();
+      return;
+    }
+    if (matchesKey(text, "backspace")) {
+      if (this.cursor > 0) {
+        this.value = this.value.slice(0, this.cursor - 1) + this.value.slice(this.cursor);
+        this.cursor -= 1;
+        this.pirChanged();
+      }
+      return;
+    }
+    if (matchesKey(text, "delete")) {
+      if (this.cursor < this.value.length) {
+        this.value = this.value.slice(0, this.cursor) + this.value.slice(this.cursor + 1);
+        this.pirChanged();
+      }
+      return;
+    }
+    if (matchesKey(text, "left")) { this.cursor = Math.max(0, this.cursor - 1); return; }
+    if (matchesKey(text, "right")) { this.cursor = Math.min(this.value.length, this.cursor + 1); return; }
+    if (matchesKey(text, "home") || matchesKey(text, "ctrl+a")) { this.cursor = 0; return; }
+    if (matchesKey(text, "end") || matchesKey(text, "ctrl+e")) { this.cursor = this.value.length; return; }
+    if (matchesKey(text, "ctrl+u")) {
+      this.value = this.value.slice(this.cursor);
+      this.cursor = 0;
+      this.pirChanged();
+      return;
+    }
+    if (matchesKey(text, "ctrl+k")) {
+      this.value = this.value.slice(0, this.cursor);
+      this.pirChanged();
+      return;
+    }
+    if (matchesKey(text, "ctrl+w")) {
+      const before = this.value.slice(0, this.cursor);
+      const trimmed = before.replace(/\s*\S*$/, "");
+      if (trimmed.length !== before.length) {
+        this.value = trimmed + this.value.slice(this.cursor);
+        this.cursor = trimmed.length;
+        this.pirChanged();
+      }
+      return;
+    }
+    // Swallow other navigation/handled keys; insert printable input only.
+    if (text.length > 0 && !text.startsWith("\x1b") && text.charCodeAt(0) >= 32) {
+      this.pirInsert(text);
+    }
+  }
+
+  render(width) {
+    const showPlaceholder = this.value.length === 0 && this.placeholder.length > 0;
+    const text = showPlaceholder
+      ? this.prompt + this.placeholderStyle(this.placeholder)
+      : this.prompt + this.value;
+    return [truncateToWidth(text, Math.max(1, Math.floor(width)), "")];
+  }
+}
+
+// LIMITS: no mouse/filter input field, truncation of long labels keeps the
+// upstream window behaviour (selectedIndex stays visible), themes fall back
+// to passthrough when a slot is missing.
+export class SelectList {
+  constructor(items = [], maxVisible = 5, theme, layout = {}) {
+    this.items = Array.isArray(items) ? items : [];
+    this.filteredItems = [...this.items];
+    this.selectedIndex = 0;
+    this.maxVisible = maxVisible > 0 ? maxVisible : 5;
+    this.theme = theme && typeof theme === "object" ? theme : {};
+    this.layout = layout ?? {};
+    this.onSelect = undefined;
+    this.onCancel = undefined;
+    this.onSelectionChange = undefined;
+  }
+
+  pirThemeFn(name) {
+    const fn = this.theme ? this.theme[name] : undefined;
+    return typeof fn === "function" ? fn.bind(this.theme) : (text) => String(text);
+  }
+
+  setFilter(filter) {
+    const needle = String(filter ?? "").toLowerCase();
+    this.filteredItems = this.items.filter((item) =>
+      String(item && item.value !== undefined ? item.value : "").toLowerCase().startsWith(needle));
+    this.selectedIndex = 0;
+    this.pirNotify();
+  }
+
+  setSelectedIndex(index) {
+    this.selectedIndex = Math.max(0, Math.min(index, this.filteredItems.length - 1));
+    this.pirNotify();
+  }
+
+  getSelectedItem() {
+    return this.filteredItems[this.selectedIndex] ?? null;
+  }
+
+  pirNotify() {
+    if (typeof this.onSelectionChange === "function") {
+      const item = this.getSelectedItem();
+      if (item) this.onSelectionChange(item);
+    }
+  }
+
+  handleInput(keyData) {
+    if (matchesKey(keyData, "up")) {
+      if (this.filteredItems.length === 0) return;
+      this.selectedIndex = this.selectedIndex === 0 ? this.filteredItems.length - 1 : this.selectedIndex - 1;
+      this.pirNotify();
+    } else if (matchesKey(keyData, "down")) {
+      if (this.filteredItems.length === 0) return;
+      this.selectedIndex = this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1;
+      this.pirNotify();
+    } else if (matchesKey(keyData, "enter") || matchesKey(keyData, "return")) {
+      const item = this.getSelectedItem();
+      if (item && typeof this.onSelect === "function") this.onSelect(item);
+    } else if (matchesKey(keyData, "escape")) {
+      if (typeof this.onCancel === "function") this.onCancel();
+    }
+  }
+
+  render(width) {
+    const widthN = Math.max(1, Math.floor(width));
+    const lines = [];
+    if (this.filteredItems.length === 0) {
+      lines.push(truncateToWidth(this.pirThemeFn("noMatch")("  No matching commands"), widthN, ""));
+      return lines;
+    }
+    const half = Math.floor(this.maxVisible / 2);
+    const startIndex = Math.max(0, Math.min(this.selectedIndex - half, this.filteredItems.length - this.maxVisible));
+    const endIndex = Math.min(startIndex + this.maxVisible, this.filteredItems.length);
+    for (let i = startIndex; i < endIndex; i++) {
+      const item = this.filteredItems[i];
+      const selected = i === this.selectedIndex;
+      const label = String(item && item.label !== undefined ? item.label : item && item.value);
+      const prefix = selected ? this.pirThemeFn("selectedPrefix")("→ ") : "  ";
+      const text = selected ? this.pirThemeFn("selectedText")(label) : label;
+      const description = item && item.description
+        ? "  " + this.pirThemeFn("description")(String(item.description))
+        : "";
+      lines.push(truncateToWidth(prefix + text + description, widthN, ""));
+    }
+    if (startIndex > 0 || endIndex < this.filteredItems.length) {
+      lines.push(this.pirThemeFn("scrollInfo")(`  (${this.selectedIndex + 1}/${this.filteredItems.length})`));
+    }
+    return lines;
+  }
+}
+
+// LIMITS (documented): a paragraph/heading/list/code-fence renderer, not the
+// upstream marked-based pipeline — no tables, images, latex, nested lists or
+// link references. Inline `code`/*italic*/**bold**/~~strike~~ and [links]
+// are style-stripped; word wrapping reuses the module's wrapTextWithAnsi.
+export class Markdown {
+  constructor(text, paddingX = 0, paddingY = 0, theme, defaultTextStyle, options) {
+    // Upstream signature is (text, paddingX, paddingY, theme, ...); accept a
+    // lone theme object in the second slot so both call shapes work.
+    if (paddingX !== null && typeof paddingX === "object") {
+      theme = paddingX;
+      paddingX = 0;
+      paddingY = 0;
+    }
+    this.text = String(text === undefined || text === null ? "" : text);
+    this.paddingX = Number.isFinite(paddingX) ? paddingX : 0;
+    this.paddingY = Number.isFinite(paddingY) ? paddingY : 0;
+    this.theme = theme && typeof theme === "object" ? theme : null;
+    // defaultTextStyle / options are accepted and ignored in this subset.
+    this.defaultTextStyle = defaultTextStyle;
+    this.options = options;
+    this.cachedText = undefined;
+    this.cachedWidth = undefined;
+    this.cachedLines = null;
+  }
+
+  setText(text) {
+    this.text = String(text === undefined || text === null ? "" : text);
+    this.invalidate();
+  }
+
+  invalidate() {
+    this.cachedText = undefined;
+    this.cachedWidth = undefined;
+    this.cachedLines = null;
+  }
+
+  pirThemeFn(name) {
+    const fn = this.theme ? this.theme[name] : undefined;
+    return typeof fn === "function" ? fn.bind(this.theme) : (text) => String(text);
+  }
+
+  pirInline(line) {
+    let out = line.replace(/\[([^\]]*)\]\(([^)]*)\)/g, (_match, label, url) =>
+      this.pirThemeFn("link")(label) + " (" + this.pirThemeFn("linkUrl")(url) + ")");
+    out = out.replace(/`([^`]*)`/g, (_match, code) => this.pirThemeFn("code")(code));
+    out = out.replace(/\*\*([^*]+)\*\*/g, (_match, strong) => this.pirThemeFn("bold")(strong));
+    out = out.replace(/\*([^*]+)\*/g, (_match, em) => this.pirThemeFn("italic")(em));
+    out = out.replace(/~~([^~]+)~~/g, (_match, strike) => this.pirThemeFn("strikethrough")(strike));
+    return out;
+  }
+
+  pirRenderLine(line) {
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) return this.pirThemeFn("heading")(this.pirInline(heading[2]));
+    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line.trim())) return this.pirThemeFn("hr")("─".repeat(24));
+    const quote = /^>\s?(.*)$/.exec(line);
+    if (quote) {
+      return this.pirThemeFn("quoteBorder")("│ ") + this.pirThemeFn("quote")(this.pirInline(quote[1]));
+    }
+    const bullet = /^(\s*)[-*+]\s+(.*)$/.exec(line);
+    if (bullet) {
+      return bullet[1] + this.pirThemeFn("listBullet")("• ") + this.pirInline(bullet[2]);
+    }
+    const ordered = /^(\s*)(\d+)[.)]\s+(.*)$/.exec(line);
+    if (ordered) {
+      return ordered[1] + this.pirThemeFn("listBullet")(ordered[2] + ". ") + this.pirInline(ordered[3]);
+    }
+    return this.pirInline(line);
+  }
+
+  render(width) {
+    const widthN = Math.max(1, Math.floor(width));
+    if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === widthN) {
+      return this.cachedLines;
+    }
+    if (!this.text || this.text.trim() === "") {
+      this.cachedText = this.text;
+      this.cachedWidth = widthN;
+      this.cachedLines = [];
+      return [];
+    }
+    const contentWidth = Math.max(1, widthN - this.paddingX * 2);
+    const left = " ".repeat(Math.max(0, this.paddingX));
+    const lines = [];
+    let inCodeBlock = false;
+    for (const rawLine of this.text.replace(/\t/g, "   ").split(/\r?\n/)) {
+      if (/^\s*```/.test(rawLine)) {
+        inCodeBlock = !inCodeBlock;
+        continue;
+      }
+      const rendered = inCodeBlock
+        ? this.pirThemeFn("codeBlock")(rawLine)
+        : this.pirRenderLine(rawLine);
+      for (const wrapped of wrapTextWithAnsi(rendered, contentWidth)) {
+        const padded = left + wrapped + " ".repeat(Math.max(0, widthN - Math.floor(this.paddingX) - visibleWidth(wrapped)));
+        lines.push(padded);
+      }
+    }
+    const blank = " ".repeat(widthN);
+    const result = [];
+    for (let i = 0; i < this.paddingY; i++) result.push(blank);
+    for (const line of lines) result.push(line);
+    for (let i = 0; i < this.paddingY; i++) result.push(blank);
+    this.cachedText = this.text;
+    this.cachedWidth = widthN;
+    this.cachedLines = result;
+    return result;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Constants and focus/viewport helpers (upstream tui.ts)
+// ---------------------------------------------------------------------------
+
+/** Zero-width APC cursor marker components emit where the hardware cursor belongs. */
+export const CURSOR_MARKER = "\x1b_pi:c\x07";
+/** Fake cursor markers: zero-width APC sequences around text drawn as the cursor. */
+export const FAKE_CURSOR_START = "\x1b_pi:fc\x07";
+export const FAKE_CURSOR_END = "\x1b_pi:/fc\x07";
+
+/** Wrap text in fake cursor markers. */
+export function renderFakeCursor(text) {
+  return FAKE_CURSOR_START + String(text === undefined || text === null ? "" : text) + FAKE_CURSOR_END;
+}
+
+/** Type guard: a component that can receive focus and show the hardware cursor. */
+export function isFocusable(component) {
+  return (
+    component !== null &&
+    component !== undefined &&
+    (typeof component === "object" || typeof component === "function") &&
+    "focused" in component
+  );
+}
+
+const PIR_VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
+
+/** Whether a TUI is the alternate-screen viewport implementation. */
+export function isViewportTUI(tui) {
+  return !!tui && tui[PIR_VIEWPORT_TUI] === true;
+}
+
+// ---------------------------------------------------------------------------
+// utils.ts: sliceByColumn / stripTerminalSequences / getOsc8LinkAtColumn
+// ---------------------------------------------------------------------------
+
+/** Like upstream sliceWithWidth: extract visible columns, ANSI codes ride along. */
+function pirSliceWithWidth(line, startCol, length, strict) {
+  if (length <= 0) return { text: "", width: 0 };
+  const endCol = startCol + length;
+  let result = "";
+  let resultWidth = 0;
+  let currentCol = 0;
+  let pendingAnsi = "";
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] === "\u001b") {
+      const ansiLength = pirAnsiCodeLength(line, i);
+      if (ansiLength > 0) {
+        const code = line.slice(i, i + ansiLength);
+        if (currentCol >= startCol && currentCol < endCol) {
+          // Codes before the range start must precede codes at the boundary.
+          result += pendingAnsi + code;
+          pendingAnsi = "";
+        } else if (currentCol < startCol) {
+          pendingAnsi += code;
+        }
+        i += ansiLength;
+        continue;
+      }
+    }
+    const codepoint = line.codePointAt(i);
+    const fits = !strict || currentCol + 1 <= endCol;
+    if (currentCol >= startCol && currentCol < endCol && fits) {
+      if (pendingAnsi) {
+        result += pendingAnsi;
+        pendingAnsi = "";
+      }
+      result += String.fromCodePoint(codepoint);
+      resultWidth += 1;
+    }
+    currentCol += 1;
+    i += codepoint > 0xffff ? 2 : 1;
+    if (currentCol >= endCol) break;
+  }
+  return { text: result, width: resultWidth };
+}
+
+/** Extract a range of visible columns from a line. Handles ANSI codes. */
+export function sliceByColumn(line, startCol, length, strict) {
+  return pirSliceWithWidth(String(line === undefined || line === null ? "" : line), startCol, length, strict === true).text;
+}
+
+/** Remove ANSI, OSC, and APC control sequences while preserving visible text. */
+export function stripTerminalSequences(str) {
+  const text = String(str === undefined || str === null ? "" : str);
+  if (text.indexOf("\u001b") === -1) return text;
+  let result = "";
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === "\u001b") {
+      const ansiLength = pirAnsiCodeLength(text, i);
+      if (ansiLength > 0) {
+        i += ansiLength;
+        continue;
+      }
+    }
+    result += text[i];
+    i++;
+  }
+  return result;
+}
+
+/** Return the OSC 8 hyperlink covering a visible terminal column. */
+export function getOsc8LinkAtColumn(line, column) {
+  let activeUrl;
+  let currentCol = 0;
+  let i = 0;
+  const text = String(line === undefined || line === null ? "" : line);
+  while (i < text.length) {
+    if (text[i] === "\u001b") {
+      const ansiLength = pirAnsiCodeLength(text, i);
+      if (ansiLength > 0) {
+        const code = text.slice(i, i + ansiLength);
+        const hyperlink = /^\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)$/.exec(code);
+        if (hyperlink) activeUrl = hyperlink[1] || undefined;
+        i += ansiLength;
+        continue;
+      }
+    }
+    const width = text[i] === "\t" ? 3 : 1;
+    if (column >= currentCol && column < currentCol + width) return activeUrl;
+    currentCol += width;
+    const codepoint = text.codePointAt(i);
+    i += text[i] === "\t" ? 1 : codepoint > 0xffff ? 2 : 1;
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// tui.ts: compositeTuiLine
+// ---------------------------------------------------------------------------
+
+const PIR_SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
+
+/** Composite overlay content into a terminal line at a fixed column. */
+export function compositeTuiLine(baseLine, overlayLine, startCol, overlayWidth, totalWidth) {
+  if (pirIsImageLine(baseLine)) return baseLine;
+  const afterStart = startCol + overlayWidth;
+  const before = pirSliceWithWidth(baseLine, 0, startCol, true);
+  const overlay = pirSliceWithWidth(overlayLine, 0, overlayWidth, true);
+  const afterLength = Math.max(0, totalWidth - afterStart);
+  const after = pirSliceWithWidth(baseLine, afterStart, afterLength, true);
+  const beforePad = Math.max(0, startCol - before.width);
+  const overlayPad = Math.max(0, overlayWidth - overlay.width);
+  const actualBeforeWidth = Math.max(startCol, before.width);
+  const actualOverlayWidth = Math.max(overlayWidth, overlay.width);
+  const afterTarget = Math.max(0, totalWidth - actualBeforeWidth - actualOverlayWidth);
+  const afterPad = Math.max(0, afterTarget - after.width);
+  const result =
+    before.text +
+    " ".repeat(beforePad) +
+    PIR_SEGMENT_RESET +
+    overlay.text +
+    " ".repeat(overlayPad) +
+    PIR_SEGMENT_RESET +
+    after.text +
+    " ".repeat(afterPad);
+  return visibleWidth(result) <= totalWidth ? result : pirSliceWithWidth(result, 0, totalWidth, true).text;
+}
+
+function pirIsImageLine(line) {
+  const text = String(line === undefined || line === null ? "" : line);
+  return text.indexOf("\x1b_G") !== -1 || text.indexOf("\x1b]1337;File=") !== -1;
+}
+
+// ---------------------------------------------------------------------------
+// oklab.ts: Oklab/OKHSL <-> sRGB (full port; Björn Ottosson reference, MIT)
+// ---------------------------------------------------------------------------
+
+const PIR_LINEAR_SRGB_TO_LMS = [
+  [0.4122214694707629, 0.5363325372617349, 0.0514459932675022],
+  [0.2119034958178251, 0.6806995506452344, 0.1073969535369405],
+  [0.0883024591900564, 0.2817188391361215, 0.6299787016738222],
+];
+const PIR_LMS_TO_LAB = [
+  [0.210454268309314, 0.793617774702305, -0.0040720430116193],
+  [1.9779985324311684, -2.42859224204858, 0.450593709617411],
+  [0.0259040424655478, 0.7827717124575296, -0.8086757549230774],
+];
+const PIR_LAB_TO_LMS = [
+  [1, 0.3963377773761749, 0.2158037573099136],
+  [1, -0.1055613458156586, -0.0638541728258133],
+  [1, -0.0894841775298119, -1.2914855480194092],
+];
+const PIR_LMS_TO_LINEAR_SRGB = [
+  [4.0767416360759583, -3.3077115392580629, 0.2309699031821043],
+  [-1.2684379732850315, 2.6097573492876882, -0.341319376002657],
+  [-0.0041960761386756, -0.7034186179359362, 1.7076146940746117],
+];
+const PIR_SATURATION_FIT = [
+  [
+    [-1.8817031, -0.80936501],
+    [1.19086277, 1.76576728, 0.59662641, 0.75515197, 0.56771245],
+  ],
+  [
+    [1.8144408, -1.19445267],
+    [0.73956515, -0.45954404, 0.08285427, 0.12541073, -0.14503204],
+  ],
+  [
+    [0.13110758, 1.81333971],
+    [1.35733652, -0.00915799, -1.1513021, -0.50559606, 0.00692167],
+  ],
+];
+const PIR_OH_K1 = 0.206;
+const PIR_OH_K2 = 0.03;
+const PIR_OH_K3 = (1 + PIR_OH_K1) / (1 + PIR_OH_K2);
+
+function pirMatrixMultiply(m, v) {
+  return m.map((row) => row[0] * v[0] + row[1] * v[1] + row[2] * v[2]);
+}
+
+/** Oklab lightness to OKHSL lightness. */
+export function oklabToOkhslLightness(x) {
+  return 0.5 * (PIR_OH_K3 * x - PIR_OH_K1 + Math.sqrt((PIR_OH_K3 * x - PIR_OH_K1) ** 2 + 4 * PIR_OH_K2 * PIR_OH_K3 * x));
+}
+
+function pirOkhslToOklabLightness(x) {
+  return (x * x + PIR_OH_K1 * x) / (PIR_OH_K3 * (x + PIR_OH_K2));
+}
+
+function pirLinearToSrgb(value) {
+  return value > 0.0031308 ? 1.055 * value ** (1 / 2.4) - 0.055 : 12.92 * value;
+}
+
+function pirSrgbToLinear(value) {
+  return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+}
+
+/** Oklab [L, a, b] to linear sRGB [r, g, b] (0-1, may leave the gamut). */
+function pirOklabToLinearSrgb(lab) {
+  return pirMatrixMultiply(PIR_LMS_TO_LINEAR_SRGB, pirMatrixMultiply(PIR_LAB_TO_LMS, lab).map((value) => value ** 3));
+}
+
+/** sRGB channels (0-255) to Oklab [L, a, b]. */
+function pirRgbToOklab(rgb) {
+  return pirMatrixMultiply(
+    PIR_LMS_TO_LAB,
+    pirMatrixMultiply(PIR_LINEAR_SRGB_TO_LMS, [rgb.r / 255, rgb.g / 255, rgb.b / 255].map(pirSrgbToLinear)).map(Math.cbrt),
+  );
+}
+
+/** Linear sRGB [r, g, b] to sRGB channels (0-255, rounded), clipping out-of-gamut channels. */
+function pirLinearSrgbToRgb(linear) {
+  const channels = linear.map((value) => Math.round(Math.min(1, Math.max(0, pirLinearToSrgb(value))) * 255));
+  return { r: channels[0], g: channels[1], b: channels[2] };
+}
+
+/** Rate of change of each cube-root LMS component along a chroma direction (a, b). */
+function pirLmsSlopes(a, b) {
+  return PIR_LAB_TO_LMS.map((row) => row[1] * a + row[2] * b);
+}
+
+/** Largest saturation (C/L) inside sRGB for hue (a, b): polynomial fit plus one Halley step. */
+function pirMaxSaturation(a, b) {
+  let channel = 0;
+  for (let index = 0; index < PIR_SATURATION_FIT.length; index++) {
+    const fit = PIR_SATURATION_FIT[index][0];
+    if (index === 2 || fit[0] * a + fit[1] * b > 1) {
+      channel = index;
+      break;
+    }
+  }
+  const coefficients = PIR_SATURATION_FIT[channel][1];
+  const weights = PIR_LMS_TO_LINEAR_SRGB[channel];
+  const saturation =
+    coefficients[0] + coefficients[1] * a + coefficients[2] * b + coefficients[3] * a * a + coefficients[4] * a * b;
+
+  const slopes = pirLmsSlopes(a, b);
+  const base = slopes.map((k) => 1 + saturation * k);
+  const dot = (values) => values.reduce((sum, value, index) => sum + weights[index] * value, 0);
+  const f = dot(base.map((value) => value ** 3));
+  const f1 = dot(base.map((value, index) => 3 * slopes[index] * value ** 2));
+  const f2 = dot(base.map((value, index) => 6 * slopes[index] ** 2 * value));
+  return saturation - (f * f1) / (f1 * f1 - 0.5 * f * f2);
+}
+
+/** Oklab lightness and chroma of the most saturated sRGB color of hue (a, b). */
+function pirCusp(a, b) {
+  const saturation = pirMaxSaturation(a, b);
+  const lightness = Math.cbrt(1 / Math.max.apply(null, pirOklabToLinearSrgb([1, saturation * a, saturation * b])));
+  return [lightness, lightness * saturation];
+}
+
+/** Chroma where the constant-lightness line at `lightness` leaves the sRGB gamut. */
+function pirMaxChroma(a, b, lightness, peak) {
+  const cuspL = peak[0];
+  const cuspC = peak[1];
+  if (lightness <= cuspL) return (cuspC * lightness) / cuspL;
+  const t = (cuspC * (lightness - 1)) / (cuspL - 1);
+  const slopes = pirLmsSlopes(a, b);
+  const lms = slopes.map((k) => lightness + t * k);
+  const cubes = lms.map((value) => value ** 3);
+  const first = lms.map((value, index) => 3 * slopes[index] * value ** 2);
+  const second = lms.map((value, index) => 6 * slopes[index] ** 2 * value);
+  const dot = (row, values) => row[0] * values[0] + row[1] * values[1] + row[2] * values[2];
+  let minStep = Number.MAX_VALUE;
+  for (const row of PIR_LMS_TO_LINEAR_SRGB) {
+    const f = dot(row, cubes) - 1;
+    const f1 = dot(row, first);
+    const f2 = dot(row, second);
+    const u = f1 / (f1 * f1 - 0.5 * f * f2);
+    minStep = Math.min(minStep, u >= 0 ? -f * u : Number.MAX_VALUE);
+  }
+  return t + minStep;
+}
+
+/** OKHSL's chroma reference points at lightness L and hue (a, b): [c0, cMid, cMax]. */
+function pirChromaStops(L, a, b) {
+  const peak = pirCusp(a, b);
+  const cMax = pirMaxChroma(a, b, L, peak);
+  const k = cMax / Math.min(L * (peak[1] / peak[0]), (1 - L) * (peak[1] / (1 - peak[0])));
+  const midS =
+    0.11516993 +
+    1 /
+      (7.4477897 +
+        4.1590124 * b +
+        a * (-2.19557347 + 1.75198401 * b + a * (-2.13704948 - 10.02301043 * b + a * (-4.24894561 + 5.38770819 * b + 4.69891013 * a))));
+  const midT =
+    0.11239642 +
+    1 /
+      (1.6132032 -
+        0.68124379 * b +
+        a * (0.40370612 + 0.90148123 * b + a * (-0.27087943 + 0.6122399 * b + a * (0.00299215 - 0.45399568 * b - 0.14661872 * a))));
+  const cMid = 0.9 * k * Math.sqrt(Math.sqrt(1 / (1 / (L * midS) ** 4 + 1 / ((1 - L) * midT) ** 4)));
+  const c0 = Math.sqrt(1 / (1 / (L * 0.4) ** 2 + 1 / ((1 - L) * 0.8) ** 2));
+  return [c0, cMid, cMax];
+}
+
+/** Convert OKHSL to sRGB channels (0-255, rounded), clipping out-of-gamut channels. */
+function pirOkhslToRgb(hue, saturation, lightness) {
+  const L = pirOkhslToOklabLightness(lightness);
+  let lab = [L, 0, 0];
+  if (L > 0 && L < 1 && saturation > 0) {
+    const angle = (2 * Math.PI * (((hue % 360) + 360) % 360)) / 360;
+    const a = Math.cos(angle);
+    const b = Math.sin(angle);
+    const stops = pirChromaStops(L, a, b);
+    const c0 = stops[0];
+    const cMid = stops[1];
+    const cMax = stops[2];
+    let chroma;
+    if (saturation < 0.8) {
+      const t = 1.25 * saturation;
+      const k1 = 0.8 * c0;
+      chroma = (t * k1) / (1 - (1 - k1 / cMid) * t);
+    } else {
+      const t = 5 * (saturation - 0.8);
+      const k1 = (0.2 * cMid ** 2 * 1.25 ** 2) / c0;
+      chroma = cMid + (t * k1) / (1 - (1 - k1 / (cMax - cMid)) * t);
+    }
+    lab = [L, chroma * a, chroma * b];
+  }
+  return pirLinearSrgbToRgb(pirOklabToLinearSrgb(lab));
+}
+
+/** Convert sRGB channels (0-255) to OKHSL (hue degrees, saturation and lightness 0-1). */
+function pirRgbToOkhsl(rgb) {
+  const oklab = pirRgbToOklab(rgb);
+  const L = oklab[0];
+  const labA = oklab[1];
+  const labB = oklab[2];
+  const chroma = Math.hypot(labA, labB);
+  const lightness = oklabToOkhslLightness(L);
+  if (chroma < 1e-9 || lightness <= 0 || lightness >= 1) return { h: 0, s: 0, l: lightness };
+
+  const hue = ((Math.atan2(labB, labA) * 180) / Math.PI + 360) % 360;
+  const stops = pirChromaStops(L, labA / chroma, labB / chroma);
+  const c0 = stops[0];
+  const cMid = stops[1];
+  const cMax = stops[2];
+  let saturation;
+  if (chroma < cMid) {
+    const k1 = 0.8 * c0;
+    saturation = 0.8 * (chroma / (k1 + (1 - k1 / cMid) * chroma));
+  } else {
+    const k1 = (0.2 * cMid ** 2 * 1.25 ** 2) / c0;
+    const offset = chroma - cMid;
+    saturation = 0.8 + 0.2 * (offset / (k1 + (1 - k1 / (cMax - cMid)) * offset));
+  }
+  return { h: hue, s: Math.min(1, Math.max(0, saturation)), l: lightness };
+}
+
+// ---------------------------------------------------------------------------
+// colors.ts: color values, conversion and ANSI styling (full port)
+// ---------------------------------------------------------------------------
+
+/** A concrete color. Every color can be converted to sRGB, so color math never fails. */
+export function indexedColor(index) {
+  if (!Number.isInteger(index) || index < 0 || index > 255) {
+    throw new Error(`ANSI color index must be an integer from 0 to 255: ${index}`);
+  }
+  return Object.freeze({ kind: "indexed", index: index });
+}
+
+export function rgbColor(r, g, b) {
+  const channels = [["r", r], ["g", g], ["b", b]];
+  for (const channel of channels) {
+    const name = channel[0];
+    const value = channel[1];
+    if (!Number.isFinite(value)) throw new Error(`${name} must be finite`);
+    if (value < 0 || value > 255) throw new Error(`${name} must be between 0 and 255: ${value}`);
+  }
+  return Object.freeze({ kind: "rgb", r: r, g: g, b: b });
+}
+
+export function oklchColor(l, c, h) {
+  if (!Number.isFinite(l)) throw new Error("l must be finite");
+  if (!Number.isFinite(c)) throw new Error("c must be finite");
+  if (!Number.isFinite(h)) throw new Error("h must be finite");
+  if (l < 0 || l > 1) throw new Error(`l must be between 0 and 1: ${l}`);
+  if (c < 0) throw new Error(`c must not be negative: ${c}`);
+  return Object.freeze({ kind: "oklch", l: l, c: c, h: ((h % 360) + 360) % 360 });
+}
+
+/** An OKHSL color converted to sRGB: saturation is relative to the sRGB gamut. */
+export function okhslColor(h, s, l) {
+  if (!Number.isFinite(h)) throw new Error("h must be finite");
+  if (!Number.isFinite(s)) throw new Error("s must be finite");
+  if (!Number.isFinite(l)) throw new Error("l must be finite");
+  if (s < 0 || s > 1) throw new Error(`s must be between 0 and 1: ${s}`);
+  if (l < 0 || l > 1) throw new Error(`l must be between 0 and 1: ${l}`);
+  const rgb = pirOkhslToRgb(h, s, l);
+  return rgbColor(rgb.r, rgb.g, rgb.b);
+}
+
+const PIR_COLOR_NUMBER_PATTERN = "[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:e[+-]?\\d+)?";
+const PIR_OKLCH_PATTERN = new RegExp(
+  `^oklch\\(\\s*(${PIR_COLOR_NUMBER_PATTERN})(%)?\\s+(${PIR_COLOR_NUMBER_PATTERN})\\s+(${PIR_COLOR_NUMBER_PATTERN})(?:deg)?\\s*\\)$`,
+  "i",
+);
+const PIR_OKHSL_PATTERN = new RegExp(
+  `^okhsl\\(\\s*(${PIR_COLOR_NUMBER_PATTERN})(?:deg)?\\s+(${PIR_COLOR_NUMBER_PATTERN})(%)?\\s+(${PIR_COLOR_NUMBER_PATTERN})(%)?\\s*\\)$`,
+  "i",
+);
+
+/** Parse "#rgb"/"#rrggbb", "oklch(...)", "okhsl(...)" or an ANSI index into a color. */
+export function parseColor(value) {
+  if (typeof value === "number") return indexedColor(value);
+
+  const hex = /^#([\da-f]{3}|[\da-f]{6})$/i.exec(String(value));
+  if (hex) {
+    const digits =
+      hex[1].length === 3
+        ? hex[1].split("").map((digit) => digit + digit).join("")
+        : hex[1];
+    return rgbColor(
+      Number.parseInt(digits.slice(0, 2), 16),
+      Number.parseInt(digits.slice(2, 4), 16),
+      Number.parseInt(digits.slice(4, 6), 16),
+    );
+  }
+
+  const oklch = PIR_OKLCH_PATTERN.exec(String(value));
+  if (oklch) {
+    const lightness = Number.parseFloat(oklch[1]) / (oklch[2] ? 100 : 1);
+    return oklchColor(lightness, Number.parseFloat(oklch[3]), Number.parseFloat(oklch[4]));
+  }
+
+  const okhsl = PIR_OKHSL_PATTERN.exec(String(value));
+  if (okhsl) {
+    const saturation = Number.parseFloat(okhsl[2]) / (okhsl[3] ? 100 : 1);
+    const lightness = Number.parseFloat(okhsl[4]) / (okhsl[5] ? 100 : 1);
+    return okhslColor(Number.parseFloat(okhsl[1]), saturation, lightness);
+  }
+
+  throw new Error(`Invalid color value: ${value}`);
+}
+
+const PIR_BASIC_COLORS = [
+  { r: 0, g: 0, b: 0 },
+  { r: 128, g: 0, b: 0 },
+  { r: 0, g: 128, b: 0 },
+  { r: 128, g: 128, b: 0 },
+  { r: 0, g: 0, b: 128 },
+  { r: 128, g: 0, b: 128 },
+  { r: 0, g: 128, b: 128 },
+  { r: 192, g: 192, b: 192 },
+  { r: 128, g: 128, b: 128 },
+  { r: 255, g: 0, b: 0 },
+  { r: 0, g: 255, b: 0 },
+  { r: 255, g: 255, b: 0 },
+  { r: 0, g: 0, b: 255 },
+  { r: 255, g: 0, b: 255 },
+  { r: 0, g: 255, b: 255 },
+  { r: 255, g: 255, b: 255 },
+];
+const PIR_CUBE_VALUES = [0, 95, 135, 175, 215, 255];
+const PIR_GRAY_VALUES = Array.from({ length: 24 }, (_value, index) => 8 + index * 10);
+
+function pirIndexedToRgb(index) {
+  if (index < 16) {
+    const basic = PIR_BASIC_COLORS[index];
+    return { r: basic.r, g: basic.g, b: basic.b };
+  }
+  if (index < 232) {
+    const cubeIndex = index - 16;
+    return {
+      r: PIR_CUBE_VALUES[Math.floor(cubeIndex / 36)],
+      g: PIR_CUBE_VALUES[Math.floor((cubeIndex % 36) / 6)],
+      b: PIR_CUBE_VALUES[cubeIndex % 6],
+    };
+  }
+  const gray = 8 + (index - 232) * 10;
+  return { r: gray, g: gray, b: gray };
+}
+
+function pirIsInSrgbGamut(linear) {
+  const epsilon = 1e-7;
+  return linear.every((channel) => channel >= -epsilon && channel <= 1 + epsilon);
+}
+
+function pirOklchToRgb(color) {
+  const radians = (color.h * Math.PI) / 180;
+  const cos = Math.cos(radians);
+  const sin = Math.sin(radians);
+  const atChroma = (chroma) => pirOklabToLinearSrgb([color.l, chroma * cos, chroma * sin]);
+
+  const direct = atChroma(color.c);
+  if (pirIsInSrgbGamut(direct)) return pirLinearSrgbToRgb(direct);
+
+  // Reduce chroma until the color fits; the achromatic color is the fallback.
+  let linear = atChroma(0);
+  let low = 0;
+  let high = color.c;
+  for (let index = 0; index < 20; index++) {
+    const chroma = (low + high) / 2;
+    const candidate = atChroma(chroma);
+    if (pirIsInSrgbGamut(candidate)) {
+      low = chroma;
+      linear = candidate;
+    } else {
+      high = chroma;
+    }
+  }
+  return pirLinearSrgbToRgb(linear);
+}
+
+/** Convert any color to sRGB channels. */
+export function colorToRgb(color) {
+  switch (color.kind) {
+    case "indexed":
+      return pirIndexedToRgb(color.index);
+    case "rgb":
+      return { r: color.r, g: color.g, b: color.b };
+    case "oklch":
+      return pirOklchToRgb(color);
+  }
+  return { r: 0, g: 0, b: 0 };
+}
+
+/** Convert any color to Oklch channels (l 0-1, c chroma, h degrees). */
+export function colorToOklch(color) {
+  if (color.kind === "oklch") return { l: color.l, c: color.c, h: color.h };
+  const oklab = pirRgbToOklab(colorToRgb(color));
+  return { l: oklab[0], c: Math.hypot(oklab[1], oklab[2]), h: ((Math.atan2(oklab[2], oklab[1]) * 180) / Math.PI + 360) % 360 };
+}
+
+/** Convert any color to OKHSL channels. */
+export function colorToOkhsl(color) {
+  return pirRgbToOkhsl(colorToRgb(color));
+}
+
+/** Convert any color to a "#rrggbb" string. */
+export function colorToHex(color) {
+  const rgb = colorToRgb(color);
+  const channel = (value) => Math.round(value).toString(16).padStart(2, "0");
+  return `#${channel(rgb.r)}${channel(rgb.g)}${channel(rgb.b)}`;
+}
+
+/** Mix two colors in "oklch" (default) or "srgb" space. */
+export function mixColors(first, second, amount, space) {
+  if (!Number.isFinite(amount)) throw new Error("amount must be finite");
+  if (amount < 0 || amount > 1) throw new Error(`amount must be between 0 and 1: ${amount}`);
+  const mixSpace = space === undefined ? "oklch" : space;
+
+  if (mixSpace === "srgb") {
+    const a = colorToRgb(first);
+    const b = colorToRgb(second);
+    return rgbColor(a.r + (b.r - a.r) * amount, a.g + (b.g - a.g) * amount, a.b + (b.b - a.b) * amount);
+  }
+
+  const a = colorToOklch(first);
+  const b = colorToOklch(second);
+  const firstHue = a.c < 1e-7 ? b.h : a.h;
+  const secondHue = b.c < 1e-7 ? firstHue : b.h;
+  const hueDelta = ((secondHue - firstHue + 540) % 360) - 180;
+  return oklchColor(a.l + (b.l - a.l) * amount, a.c + (b.c - a.c) * amount, firstHue + hueDelta * amount);
+}
+
+function pirFindClosest(values, target) {
+  let closestIndex = 0;
+  let closestDistance = Infinity;
+  for (let index = 0; index < values.length; index++) {
+    const distance = Math.abs(target - values[index]);
+    if (distance < closestDistance) {
+      closestIndex = index;
+      closestDistance = distance;
+    }
+  }
+  return closestIndex;
+}
+
+function pirColorDistance(first, second) {
+  const dr = first.r - second.r;
+  const dg = first.g - second.g;
+  const db = first.b - second.b;
+  return dr * dr * 0.299 + dg * dg * 0.587 + db * db * 0.114;
+}
+
+function pirRgbToAnsi256(color) {
+  const rIndex = pirFindClosest(PIR_CUBE_VALUES, color.r);
+  const gIndex = pirFindClosest(PIR_CUBE_VALUES, color.g);
+  const bIndex = pirFindClosest(PIR_CUBE_VALUES, color.b);
+  const cubeColor = { r: PIR_CUBE_VALUES[rIndex], g: PIR_CUBE_VALUES[gIndex], b: PIR_CUBE_VALUES[bIndex] };
+  const cubeIndex = 16 + 36 * rIndex + 6 * gIndex + bIndex;
+
+  const gray = Math.round(0.299 * color.r + 0.587 * color.g + 0.114 * color.b);
+  const grayOffset = pirFindClosest(PIR_GRAY_VALUES, gray);
+  const grayValue = PIR_GRAY_VALUES[grayOffset];
+  const spread = Math.max(color.r, color.g, color.b) - Math.min(color.r, color.g, color.b);
+  if (
+    spread < 10 &&
+    pirColorDistance(color, { r: grayValue, g: grayValue, b: grayValue }) < pirColorDistance(color, cubeColor)
+  ) {
+    return 232 + grayOffset;
+  }
+  return cubeIndex;
+}
+
+function pirColorAnsi(color, mode, background) {
+  if (color.kind === "indexed") return `\x1b[${background ? 48 : 38};5;${color.index}m`;
+  const rgb = colorToRgb(color);
+  if (mode === "truecolor") {
+    return `\x1b[${background ? 48 : 38};2;${Math.round(rgb.r)};${Math.round(rgb.g)};${Math.round(rgb.b)}m`;
+  }
+  return `\x1b[${background ? 48 : 38};5;${pirRgbToAnsi256(rgb)}m`;
+}
+
+export function foregroundAnsi(color, mode) {
+  return pirColorAnsi(color, mode, false);
+}
+
+export function backgroundAnsi(color, mode) {
+  return pirColorAnsi(color, mode, true);
+}
+
+/** Style text with colors and attributes, ANSI resets closing in reverse order. */
+export function styleText(text, options, mode) {
+  const opts = options && typeof options === "object" ? options : {};
+  return styleTextWithAnsi(
+    text,
+    opts.fg ? foregroundAnsi(opts.fg, mode) : undefined,
+    opts.bg ? backgroundAnsi(opts.bg, mode) : undefined,
+    opts,
+  );
+}
+
+/** Like styleText with precomputed color escape sequences; colors in options are ignored. */
+export function styleTextWithAnsi(text, fgAnsi, bgAnsi, options) {
+  const opts = options && typeof options === "object" ? options : {};
+  let prefix = "";
+  let suffix = "";
+  if (fgAnsi) {
+    prefix += fgAnsi;
+    suffix = "\x1b[39m";
+  }
+  if (bgAnsi) {
+    prefix += bgAnsi;
+    suffix = `\x1b[49m${suffix}`;
+  }
+  if (opts.bold) prefix += "\x1b[1m";
+  if (opts.dim) prefix += "\x1b[2m";
+  if (opts.bold || opts.dim) suffix = `\x1b[22m${suffix}`;
+  if (opts.italic) {
+    prefix += "\x1b[3m";
+    suffix = `\x1b[23m${suffix}`;
+  }
+  if (opts.underline) {
+    prefix += "\x1b[4m";
+    suffix = `\x1b[24m${suffix}`;
+  }
+  if (opts.inverse) {
+    prefix += "\x1b[7m";
+    suffix = `\x1b[27m${suffix}`;
+  }
+  if (opts.strikethrough) {
+    prefix += "\x1b[9m";
+    suffix = `\x1b[29m${suffix}`;
+  }
+  return `${prefix}${text}${suffix}`;
+}
+
+// ---------------------------------------------------------------------------
+// terminal-image.ts: capabilities, kitty/iterm2 encoding, header parsing
+// ---------------------------------------------------------------------------
+
+let pirCachedCapabilities = null;
+let pirCapabilityOverrides = {};
+
+// Default cell dimensions - updated by TUI when the terminal responds to a query.
+let pirCellDimensions = { widthPx: 9, heightPx: 18 };
+
+export function getCellDimensions() {
+  return pirCellDimensions;
+}
+
+export function setCellDimensions(dims) {
+  pirCellDimensions = dims;
+}
+
+function pirProcessEnv() {
+  try {
+    return typeof process !== "undefined" && process && process.env ? process.env : {};
+  } catch {
+    return {};
+  }
+}
+
+function pirProcessPlatform() {
+  try {
+    return typeof process !== "undefined" && process ? String(process.platform || "") : "";
+  } catch {
+    return "";
+  }
+}
+
+function pirDetectCapabilitiesFromEnvironment(tmuxForwardsHyperlink) {
+  const env = pirProcessEnv();
+  const lower = (value) => String(value || "").toLowerCase();
+  const termProgram = lower(env.TERM_PROGRAM);
+  const terminalEmulator = lower(env.TERMINAL_EMULATOR);
+  const term = lower(env.TERM);
+  const colorTerm = lower(env.COLORTERM);
+  const hasTrueColorHint = colorTerm === "truecolor" || colorTerm === "24bit" || term.endsWith("-direct");
+  const isWindowsConsole = pirProcessPlatform() === "win32";
+
+  // Emit OSC 8 hyperlinks under tmux only when the client forwards them; image
+  // protocols stay off. This runtime has no tmux probe, so the caller decides.
+  if (env.TMUX || term.startsWith("tmux")) {
+    return { images: null, trueColor: hasTrueColorHint, hyperlinks: tmuxForwardsHyperlink() };
+  }
+
+  if (term.startsWith("screen")) {
+    return { images: null, trueColor: hasTrueColorHint, hyperlinks: false };
+  }
+
+  // Herdr forwards OSC 8 hyperlinks and supports the Kitty graphics protocol.
+  if (termProgram === "herdr") {
+    return { images: "kitty", trueColor: hasTrueColorHint, hyperlinks: true };
+  }
+
+  if (env.KITTY_WINDOW_ID || termProgram === "kitty") {
+    return { images: "kitty", trueColor: true, hyperlinks: true };
+  }
+
+  if (termProgram === "ghostty" || term.includes("ghostty") || env.GHOSTTY_RESOURCES_DIR) {
+    return { images: "kitty", trueColor: true, hyperlinks: true };
+  }
+
+  if (env.WEZTERM_PANE || termProgram === "wezterm") {
+    return { images: "kitty", trueColor: true, hyperlinks: true };
+  }
+
+  if (termProgram === "warpterminal" || env.WARP_SESSION_ID || env.WARP_TERMINAL_SESSION_UUID) {
+    return { images: "kitty", trueColor: true, hyperlinks: true };
+  }
+
+  if (env.ITERM_SESSION_ID || termProgram === "iterm.app") {
+    return { images: "iterm2", trueColor: true, hyperlinks: true };
+  }
+
+  if (env.WT_SESSION) {
+    return { images: null, trueColor: true, hyperlinks: true };
+  }
+
+  if (termProgram === "alacritty" || termProgram === "vscode" || termProgram === "zed") {
+    return { images: null, trueColor: true, hyperlinks: true };
+  }
+
+  if (terminalEmulator === "jetbrains-jediterm") {
+    return { images: null, trueColor: true, hyperlinks: false };
+  }
+
+  // Unknown terminal: be conservative about OSC 8 and image protocols.
+  if (isWindowsConsole) {
+    return { images: null, trueColor: true, hyperlinks: false };
+  }
+  return { images: null, trueColor: hasTrueColorHint, hyperlinks: false };
+}
+
+function pirParseBooleanCapabilityOverride(value) {
+  return value === "1" ? true : value === "0" ? false : undefined;
+}
+
+/**
+ * Detect terminal capabilities from the environment. `tmuxForwardsHyperlink`
+ * replaces upstream's execSync tmux probe (no child processes in this
+ * runtime); it defaults to false, the conservative answer.
+ */
+export function detectCapabilities(tmuxForwardsHyperlink) {
+  const env = pirProcessEnv();
+  const probe = typeof tmuxForwardsHyperlink === "function" ? tmuxForwardsHyperlink : () => false;
+  const hyperlinks = pirParseBooleanCapabilityOverride(env.PI_HYPERLINKS);
+  const detected = pirDetectCapabilitiesFromEnvironment(hyperlinks === undefined ? probe : () => hyperlinks);
+  const imageProtocol = typeof env.PI_IMAGE_PROTOCOL === "string" ? env.PI_IMAGE_PROTOCOL.toLowerCase() : undefined;
+  const images =
+    imageProtocol === "kitty" || imageProtocol === "iterm2"
+      ? imageProtocol
+      : imageProtocol === "none" || imageProtocol === "0"
+        ? null
+        : undefined;
+  const trueColor = pirParseBooleanCapabilityOverride(env.PI_TRUE_COLOR);
+  return Object.assign(
+    {},
+    detected,
+    images !== undefined ? { images: images } : {},
+    trueColor !== undefined ? { trueColor: trueColor } : {},
+    hyperlinks !== undefined ? { hyperlinks: hyperlinks } : {},
+  );
+}
+
+export function getCapabilities() {
+  if (!pirCachedCapabilities) {
+    const hyperlinks = pirCapabilityOverrides.hyperlinks;
+    pirCachedCapabilities = Object.assign(
+      {},
+      detectCapabilities(hyperlinks === undefined ? undefined : () => hyperlinks),
+      pirCapabilityOverrides,
+    );
+  }
+  return pirCachedCapabilities;
+}
+
+export function getTerminalColorMode(capabilities) {
+  const caps = capabilities === undefined ? getCapabilities() : capabilities;
+  return caps.trueColor ? "truecolor" : "256color";
+}
+
+export function resetCapabilitiesCache() {
+  pirCachedCapabilities = null;
+}
+
+/** Override selected auto-detected capabilities. */
+export function setCapabilityOverrides(overrides) {
+  const next = overrides && typeof overrides === "object" ? overrides : {};
+  if (
+    pirCapabilityOverrides.images === next.images &&
+    pirCapabilityOverrides.trueColor === next.trueColor &&
+    pirCapabilityOverrides.hyperlinks === next.hyperlinks
+  ) {
+    return;
+  }
+  pirCapabilityOverrides = Object.assign({}, next);
+  pirCachedCapabilities = null;
+}
+
+/** Override the cached capabilities entirely (useful for tests). */
+export function setCapabilities(caps) {
+  pirCachedCapabilities = caps;
+}
+
+/** Generate a random image ID for the Kitty graphics protocol. */
+export function allocateImageId() {
+  return Math.floor(Math.random() * 0xfffffffe) + 1;
+}
+
+/** Encode base64 data as a Kitty graphics protocol transmission, chunked at 4096 bytes. */
+export function encodeKitty(base64Data, options) {
+  const opts = options && typeof options === "object" ? options : {};
+  const CHUNK_SIZE = 4096;
+  const params = ["a=T", "f=100", "q=2"];
+
+  if (opts.moveCursor === false) params.push("C=1");
+  if (opts.columns) params.push(`c=${opts.columns}`);
+  if (opts.rows) params.push(`r=${opts.rows}`);
+  if (opts.imageId) params.push(`i=${opts.imageId}`);
+
+  const data = String(base64Data === undefined || base64Data === null ? "" : base64Data);
+  if (data.length <= CHUNK_SIZE) {
+    return `\x1b_G${params.join(",")};${data}\x1b\\`;
+  }
+
+  const chunks = [];
+  let offset = 0;
+  let isFirst = true;
+  while (offset < data.length) {
+    const chunk = data.slice(offset, offset + CHUNK_SIZE);
+    const isLast = offset + CHUNK_SIZE >= data.length;
+    if (isFirst) {
+      chunks.push(`\x1b_G${params.join(",")},m=1;${chunk}\x1b\\`);
+      isFirst = false;
+    } else if (isLast) {
+      chunks.push(`\x1b_Gm=0;${chunk}\x1b\\`);
+    } else {
+      chunks.push(`\x1b_Gm=1;${chunk}\x1b\\`);
+    }
+    offset += CHUNK_SIZE;
+  }
+  return chunks.join("");
+}
+
+/** Delete a Kitty graphics image by ID (frees the image data). */
+export function deleteKittyImage(imageId) {
+  return `\x1b_Ga=d,d=I,i=${imageId},q=2\x1b\\`;
+}
+
+/** Delete all visible Kitty graphics images and free their data. */
+export function deleteAllKittyImages() {
+  return "\x1b_Ga=d,d=A,q=2\x1b\\";
+}
+
+/** Encode base64 data as an iTerm2 inline image escape sequence. */
+export function encodeITerm2(base64Data, options) {
+  const opts = options && typeof options === "object" ? options : {};
+  const data = String(base64Data === undefined || base64Data === null ? "" : base64Data);
+  let byteLength;
+  try {
+    byteLength = Buffer.byteLength(data, "base64");
+  } catch {
+    byteLength = Math.floor((data.length * 3) / 4);
+  }
+  const params = [`inline=${opts.inline !== false ? 1 : 0}`, `size=${byteLength}`];
+
+  if (opts.width !== undefined) params.push(`width=${opts.width}`);
+  if (opts.height !== undefined) params.push(`height=${opts.height}`);
+  if (opts.name) {
+    let nameBase64 = "";
+    try {
+      nameBase64 = Buffer.from(String(opts.name)).toString("base64");
+    } catch {
+      nameBase64 = "";
+    }
+    params.push(`name=${nameBase64}`);
+  }
+  if (opts.preserveAspectRatio === false) {
+    params.push("preserveAspectRatio=0");
+  }
+
+  return `\x1b]1337;File=${params.join(";")}:${data}\x07`;
+}
+
+function pirChooseLessDistortedCellCount(upperCount, idealCount) {
+  if (upperCount <= 1) return upperCount;
+  const lowerCount = upperCount - 1;
+  const upperDistortion = Math.max(upperCount / idealCount, idealCount / upperCount);
+  const lowerDistortion = Math.max(lowerCount / idealCount, idealCount / lowerCount);
+  return lowerDistortion < upperDistortion ? lowerCount : upperCount;
+}
+
+/** Compute the cell size an image occupies within a cell budget (upstream algorithm). */
+export function calculateImageCellSize(imageDimensions, maxWidthCells, maxHeightCells, cellDimensions, optimizeAspectRatio) {
+  const cells = cellDimensions === undefined ? { widthPx: 9, heightPx: 18 } : cellDimensions;
+  const maxWidth = Math.max(1, Math.floor(maxWidthCells));
+  const maxHeight = maxHeightCells === undefined ? undefined : Math.max(1, Math.floor(maxHeightCells));
+  const imageWidth = Math.max(1, imageDimensions.widthPx);
+  const imageHeight = Math.max(1, imageDimensions.heightPx);
+
+  const widthScale = (maxWidth * cells.widthPx) / imageWidth;
+  const heightScale = maxHeight === undefined ? widthScale : (maxHeight * cells.heightPx) / imageHeight;
+  const scale = Math.min(widthScale, heightScale);
+
+  const scaledWidthPx = imageWidth * scale;
+  const scaledHeightPx = imageHeight * scale;
+  let columns = Math.max(1, Math.min(maxWidth, Math.ceil(scaledWidthPx / cells.widthPx)));
+  const heightRows = scaledHeightPx / cells.heightPx;
+  let rows = Math.max(1, Math.ceil(heightRows));
+  if (maxHeight !== undefined) {
+    rows = Math.min(maxHeight, rows);
+  }
+
+  if (optimizeAspectRatio !== true) {
+    return { columns: columns, rows: rows };
+  }
+
+  if (widthScale <= heightScale) {
+    const idealRows = (columns * cells.widthPx * imageHeight) / (imageWidth * cells.heightPx);
+    rows = pirChooseLessDistortedCellCount(rows, idealRows);
+  } else {
+    const idealColumns = (rows * cells.heightPx * imageWidth) / (imageHeight * cells.widthPx);
+    columns = pirChooseLessDistortedCellCount(columns, idealColumns);
+  }
+
+  return { columns: columns, rows: rows };
+}
+
+/** Number of terminal rows an image occupies at a target width. */
+export function calculateImageRows(imageDimensions, targetWidthCells, cellDimensions) {
+  return calculateImageCellSize(imageDimensions, targetWidthCells, undefined, cellDimensions, false).rows;
+}
+
+function pirBase64ToBytes(base64Data) {
+  try {
+    return Buffer.from(String(base64Data === undefined || base64Data === null ? "" : base64Data), "base64");
+  } catch {
+    return null;
+  }
+}
+
+export function getPngDimensions(base64Data) {
+  const buffer = pirBase64ToBytes(base64Data);
+  if (!buffer || buffer.length < 24) return null;
+  if (buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4e || buffer[3] !== 0x47) return null;
+  const width = buffer[16] * 0x1000000 + (buffer[17] << 16) + (buffer[18] << 8) + buffer[19];
+  const height = buffer[20] * 0x1000000 + (buffer[21] << 16) + (buffer[22] << 8) + buffer[23];
+  return { widthPx: width, heightPx: height };
+}
+
+export function getJpegDimensions(base64Data) {
+  const buffer = pirBase64ToBytes(base64Data);
+  if (!buffer || buffer.length < 2) return null;
+  if (buffer[0] !== 0xff || buffer[1] !== 0xd8) return null;
+
+  let offset = 2;
+  while (offset < buffer.length - 9) {
+    if (buffer[offset] !== 0xff) {
+      offset++;
+      continue;
+    }
+    const marker = buffer[offset + 1];
+    if (marker >= 0xc0 && marker <= 0xc2) {
+      const height = (buffer[offset + 5] << 8) | buffer[offset + 6];
+      const width = (buffer[offset + 7] << 8) | buffer[offset + 8];
+      return { widthPx: width, heightPx: height };
+    }
+    if (offset + 3 >= buffer.length) return null;
+    const length = (buffer[offset + 2] << 8) | buffer[offset + 3];
+    if (length < 2) return null;
+    offset += 2 + length;
+  }
+  return null;
+}
+
+export function getGifDimensions(base64Data) {
+  const buffer = pirBase64ToBytes(base64Data);
+  if (!buffer || buffer.length < 10) return null;
+  let signature = "";
+  for (let i = 0; i < 6; i++) signature += String.fromCharCode(buffer[i]);
+  if (signature !== "GIF87a" && signature !== "GIF89a") return null;
+  const width = buffer[6] | (buffer[7] << 8);
+  const height = buffer[8] | (buffer[9] << 8);
+  return { widthPx: width, heightPx: height };
+}
+
+export function getWebpDimensions(base64Data) {
+  const buffer = pirBase64ToBytes(base64Data);
+  if (!buffer || buffer.length < 30) return null;
+  let riff = "";
+  let webp = "";
+  for (let i = 0; i < 4; i++) riff += String.fromCharCode(buffer[i]);
+  for (let i = 8; i < 12; i++) webp += String.fromCharCode(buffer[i]);
+  if (riff !== "RIFF" || webp !== "WEBP") return null;
+
+  let chunk = "";
+  for (let i = 12; i < 16; i++) chunk += String.fromCharCode(buffer[i]);
+  if (chunk === "VP8 ") {
+    if (buffer.length < 30) return null;
+    const width = (buffer[26] | (buffer[27] << 8)) & 0x3fff;
+    const height = (buffer[28] | (buffer[29] << 8)) & 0x3fff;
+    return { widthPx: width, heightPx: height };
+  }
+  if (chunk === "VP8L") {
+    if (buffer.length < 25) return null;
+    const bits = (buffer[21] | (buffer[22] << 8) | (buffer[23] << 16) | (buffer[24] << 24)) >>> 0;
+    const width = (bits & 0x3fff) + 1;
+    const height = ((bits >>> 14) & 0x3fff) + 1;
+    return { widthPx: width, heightPx: height };
+  }
+  if (chunk === "VP8X") {
+    if (buffer.length < 30) return null;
+    const width = (buffer[24] | (buffer[25] << 8) | (buffer[26] << 16)) + 1;
+    const height = (buffer[27] | (buffer[28] << 8) | (buffer[29] << 16)) + 1;
+    return { widthPx: width, heightPx: height };
+  }
+  return null;
+}
+
+/** Parse image dimensions from a base64 payload given its MIME type. */
+export function getImageDimensions(base64Data, mimeType) {
+  if (mimeType === "image/png") return getPngDimensions(base64Data);
+  if (mimeType === "image/jpeg") return getJpegDimensions(base64Data);
+  if (mimeType === "image/gif") return getGifDimensions(base64Data);
+  if (mimeType === "image/webp") return getWebpDimensions(base64Data);
+  return null;
+}
+
+/**
+ * Render an image using the detected protocol. Returns null when the terminal
+ * has no image support. The Kitty metadata registry upstream keeps for
+ * placement bookkeeping is not mirrored here.
+ */
+export function renderImage(base64Data, imageDimensions, options) {
+  const opts = options && typeof options === "object" ? options : {};
+  const caps = getCapabilities();
+  if (!caps.images) return null;
+
+  const maxWidth = opts.maxWidthCells === undefined ? 80 : opts.maxWidthCells;
+  const size = calculateImageCellSize(
+    imageDimensions,
+    maxWidth,
+    opts.maxHeightCells,
+    getCellDimensions(),
+    caps.images === "kitty",
+  );
+
+  if (caps.images === "kitty") {
+    const sequence = encodeKitty(base64Data, {
+      columns: size.columns,
+      rows: size.rows,
+      imageId: opts.imageId,
+      moveCursor: opts.moveCursor,
+    });
+    return { sequence: sequence, columns: size.columns, rows: size.rows, imageId: opts.imageId };
+  }
+
+  if (caps.images === "iterm2") {
+    const sequence = encodeITerm2(base64Data, {
+      width: size.columns,
+      height: "auto",
+      preserveAspectRatio: opts.preserveAspectRatio === undefined ? true : opts.preserveAspectRatio,
+    });
+    return { sequence: sequence, columns: size.columns, rows: size.rows };
+  }
+
+  return null;
+}
+
+/** Wrap text in an OSC 8 hyperlink sequence. */
+export function hyperlink(text, url) {
+  return `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`;
+}
+
+function pirHomedir() {
+  const env = pirProcessEnv();
+  return env.USERPROFILE || env.HOME || "";
+}
+
+/** Shorten home-prefixed absolute paths to ~/... for compact display. */
+function pirShortenImagePath(filename) {
+  const home = pirHomedir();
+  if (home && (filename === home || filename.indexOf(`${home}/`) === 0 || filename.indexOf(`${home}\\`) === 0)) {
+    return `~${filename.slice(home.length)}`;
+  }
+  return filename;
+}
+
+function pirIsAbsolutePath(filename) {
+  return /^([a-zA-Z]:[\\/]|\\\\|\/)/.test(filename);
+}
+
+function pirPathToFileURL(filename) {
+  const slashed = String(filename).replace(/\\/g, "/");
+  if (/^[a-zA-Z]:/.test(slashed)) return `file:///${slashed}`;
+  return `file://${slashed[0] === "/" ? "" : "/"}${slashed}`;
+}
+
+/** Text fallback when the terminal cannot render inline images. */
+export function imageFallback(mimeType, dimensions, filename) {
+  const parts = [];
+  if (filename) {
+    const name = String(filename);
+    const display = pirShortenImagePath(name);
+    if (getCapabilities().hyperlinks && pirIsAbsolutePath(name)) {
+      parts.push(hyperlink(display, pirPathToFileURL(name)));
+    } else {
+      parts.push(display);
+    }
+  }
+  parts.push(`[${mimeType}]`);
+  if (dimensions) parts.push(`${dimensions.widthPx}x${dimensions.heightPx}`);
+  return `[Image: ${parts.join(" ")}]`;
+}
+
+// ---------------------------------------------------------------------------
+// terminal-colors.ts: terminal color scheme reports
+// ---------------------------------------------------------------------------
+
+const PIR_COLOR_SCHEME_REPORT_PATTERN = /^(?:\x1b\[\?997;(1|2)n)+$/;
+
+/** Parse an OSC 997 color scheme report ("dark" | "light"). */
+export function parseTerminalColorSchemeReport(data) {
+  const match = PIR_COLOR_SCHEME_REPORT_PATTERN.exec(String(data === undefined || data === null ? "" : data));
+  if (!match) return undefined;
+  return match[1] === "2" ? "light" : "dark";
+}
+
+// ---------------------------------------------------------------------------
+// keybindings.ts: global keybinding registry (full port; matches delegates to
+// this module's matchesKey)
+// ---------------------------------------------------------------------------
+
+export const TUI_KEYBINDINGS = {
+  "tui.editor.cursorUp": { defaultKeys: "up", description: "Move cursor up" },
+  "tui.editor.cursorDown": { defaultKeys: "down", description: "Move cursor down" },
+  "tui.editor.historyPrevious": { defaultKeys: [], description: "Select previous prompt history entry" },
+  "tui.editor.historyNext": { defaultKeys: [], description: "Select next prompt history entry" },
+  "tui.editor.cursorLeft": { defaultKeys: ["left", "ctrl+b"], description: "Move cursor left" },
+  "tui.editor.cursorRight": { defaultKeys: ["right", "ctrl+f"], description: "Move cursor right" },
+  "tui.editor.cursorWordLeft": { defaultKeys: ["alt+left", "ctrl+left", "alt+b"], description: "Move cursor word left" },
+  "tui.editor.cursorWordRight": { defaultKeys: ["alt+right", "ctrl+right", "alt+f"], description: "Move cursor word right" },
+  "tui.editor.cursorLineStart": { defaultKeys: ["home", "ctrl+a"], description: "Move to line start" },
+  "tui.editor.cursorLineEnd": { defaultKeys: ["end", "ctrl+e"], description: "Move to line end" },
+  "tui.editor.jumpForward": { defaultKeys: "ctrl+]", description: "Jump forward to character" },
+  "tui.editor.jumpBackward": { defaultKeys: "ctrl+alt+]", description: "Jump backward to character" },
+  "tui.editor.pageUp": { defaultKeys: ["pageUp", "ctrl+pageUp"], description: "Page up" },
+  "tui.editor.pageDown": { defaultKeys: ["pageDown", "ctrl+pageDown"], description: "Page down" },
+  "tui.editor.deleteCharBackward": { defaultKeys: "backspace", description: "Delete character backward" },
+  "tui.editor.deleteCharForward": { defaultKeys: ["delete", "ctrl+d"], description: "Delete character forward" },
+  "tui.editor.deleteWordBackward": { defaultKeys: ["ctrl+w", "alt+backspace"], description: "Delete word backward" },
+  "tui.editor.deleteWordForward": { defaultKeys: ["alt+d", "alt+delete"], description: "Delete word forward" },
+  "tui.editor.deleteToLineStart": { defaultKeys: "ctrl+u", description: "Delete to line start" },
+  "tui.editor.deleteToLineEnd": { defaultKeys: "ctrl+k", description: "Delete to line end" },
+  "tui.editor.yank": { defaultKeys: "ctrl+y", description: "Yank" },
+  "tui.editor.yankPop": { defaultKeys: "alt+y", description: "Yank pop" },
+  "tui.editor.undo": { defaultKeys: "ctrl+-", description: "Undo" },
+  "tui.input.newLine": { defaultKeys: ["shift+enter", "ctrl+j"], description: "Insert newline" },
+  "tui.input.submit": { defaultKeys: "enter", description: "Submit input" },
+  "tui.input.tab": { defaultKeys: "tab", description: "Tab / autocomplete" },
+  "tui.input.copy": { defaultKeys: "ctrl+c", description: "Copy selection" },
+  "tui.select.up": { defaultKeys: "up", description: "Move selection up" },
+  "tui.select.down": { defaultKeys: "down", description: "Move selection down" },
+  "tui.select.pageUp": { defaultKeys: "pageUp", description: "Selection page up" },
+  "tui.select.pageDown": { defaultKeys: "pageDown", description: "Selection page down" },
+  "tui.select.confirm": { defaultKeys: "enter", description: "Confirm selection" },
+  "tui.select.cancel": { defaultKeys: ["escape", "ctrl+c"], description: "Cancel selection" },
+  // These intentionally shadow the unmodified editor bindings in fullscreen mode.
+  "tui.altScreen.pageUp": { defaultKeys: "pageUp", description: "Scroll viewport up one page" },
+  "tui.altScreen.pageDown": { defaultKeys: "pageDown", description: "Scroll viewport down one page" },
+  "tui.altScreen.halfPageUp": { defaultKeys: [], description: "Scroll viewport up half a page" },
+  "tui.altScreen.halfPageDown": { defaultKeys: [], description: "Scroll viewport down half a page" },
+  "tui.altScreen.lineUp": { defaultKeys: [], description: "Scroll viewport up one line" },
+  "tui.altScreen.lineDown": { defaultKeys: [], description: "Scroll viewport down one line" },
+  "tui.altScreen.previousPrompt": { defaultKeys: ["ctrl+shift+up", "ctrl+up"], description: "Jump to previous semantic prompt" },
+  "tui.altScreen.nextPrompt": { defaultKeys: ["ctrl+shift+down", "ctrl+down"], description: "Jump to next semantic prompt" },
+  "tui.altScreen.search": { defaultKeys: "ctrl+shift+f", description: "Search the primary scroll view" },
+  "tui.altScreen.searchNext": { defaultKeys: ["enter", "ctrl+g"], description: "Select the next search match" },
+  "tui.altScreen.searchPrevious": { defaultKeys: ["shift+enter", "ctrl+shift+g"], description: "Select the previous search match" },
+  "tui.altScreen.searchClose": { defaultKeys: "escape", description: "Close transcript search" },
+  "tui.altScreen.top": { defaultKeys: "ctrl+home", description: "Scroll viewport to top" },
+  "tui.altScreen.bottom": { defaultKeys: "ctrl+end", description: "Scroll viewport to bottom" },
+};
+
+function pirNormalizeBindingKeys(keys) {
+  if (keys === undefined) return [];
+  const keyList = Array.isArray(keys) ? keys : [keys];
+  const seen = new Set();
+  const result = [];
+  for (const key of keyList) {
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(key);
+    }
+  }
+  return result;
+}
+
+/** Registry of keybinding definitions with user overrides and conflict tracking. */
+export class KeybindingsManager {
+  constructor(definitions, userBindings) {
+    this.definitions = definitions && typeof definitions === "object" ? definitions : {};
+    this.userBindings = userBindings && typeof userBindings === "object" ? userBindings : {};
+    this.keysById = new Map();
+    this.conflicts = [];
+    this.pirRebuild();
+  }
+
+  pirRebuild() {
+    this.keysById.clear();
+    this.conflicts = [];
+
+    const userClaims = new Map();
+    for (const id of Object.keys(this.userBindings)) {
+      if (!(id in this.definitions)) continue;
+      for (const key of pirNormalizeBindingKeys(this.userBindings[id])) {
+        const claimants = userClaims.get(key) || new Set();
+        claimants.add(id);
+        userClaims.set(key, claimants);
+      }
+    }
+    for (const entry of userClaims) {
+      if (entry[1].size > 1) {
+        this.conflicts.push({ key: entry[0], keybindings: Array.from(entry[1]) });
+      }
+    }
+
+    for (const id of Object.keys(this.definitions)) {
+      const definition = this.definitions[id];
+      const userKeys = this.userBindings[id];
+      const keys = userKeys === undefined ? pirNormalizeBindingKeys(definition.defaultKeys) : pirNormalizeBindingKeys(userKeys);
+      this.keysById.set(id, keys);
+    }
+  }
+
+  matches(data, keybinding) {
+    const keys = this.keysById.get(keybinding) || [];
+    for (const key of keys) {
+      if (matchesKey(data, key)) return true;
+    }
+    return false;
+  }
+
+  getKeys(keybinding) {
+    return (this.keysById.get(keybinding) || []).slice();
+  }
+
+  getDefinition(keybinding) {
+    return this.definitions[keybinding];
+  }
+
+  getConflicts() {
+    return this.conflicts.map((conflict) => ({ key: conflict.key, keybindings: conflict.keybindings.slice() }));
+  }
+
+  setUserBindings(userBindings) {
+    this.userBindings = userBindings && typeof userBindings === "object" ? userBindings : {};
+    this.pirRebuild();
+  }
+
+  getUserBindings() {
+    return Object.assign({}, this.userBindings);
+  }
+
+  getResolvedBindings() {
+    const resolved = {};
+    for (const id of Object.keys(this.definitions)) {
+      const keys = this.keysById.get(id) || [];
+      resolved[id] = keys.length === 1 ? keys[0] : keys.slice();
+    }
+    return resolved;
+  }
+}
+
+let pirGlobalKeybindings = null;
+
+export function setKeybindings(keybindings) {
+  pirGlobalKeybindings = keybindings;
+}
+
+export function getKeybindings() {
+  if (!pirGlobalKeybindings) {
+    pirGlobalKeybindings = new KeybindingsManager(TUI_KEYBINDINGS);
+  }
+  return pirGlobalKeybindings;
+}
+
+// ---------------------------------------------------------------------------
+// keys.ts extras: isKeyRepeat / decodeKittyPrintable / parseKey
+// ---------------------------------------------------------------------------
+
+/** Whether the sequence is a Kitty-protocol key repeat event (flag 2, ":2"). */
+export function isKeyRepeat(data) {
+  const text = String(data === undefined || data === null ? "" : data);
+  // Bracketed paste content never counts as a repeat (MAC addresses etc.).
+  if (text.includes("\x1b[200~")) return false;
+  return (
+    text.includes(":2u") || text.includes(":2~") || text.includes(":2A") ||
+    text.includes(":2B") || text.includes(":2C") || text.includes(":2D") ||
+    text.includes(":2H") || text.includes(":2F")
+  );
+}
+
+const PIR_KITTY_FUNCTIONAL_EQUIVALENTS = new Map([
+  [57399, 48], [57400, 49], [57401, 50], [57402, 51], [57403, 52], [57404, 53],
+  [57405, 54], [57406, 55], [57407, 56], [57408, 57], [57409, 46], [57410, 47],
+  [57411, 42], [57412, 45], [57413, 43], [57415, 61], [57416, 44],
+  [57417, -4], [57418, -3], [57419, -1], [57420, -2],
+  [57421, -12], [57422, -13], [57423, -14], [57424, -15], [57425, -11], [57426, -10],
+]);
+
+function pirNormalizeKittyFunctionalCodepoint(codepoint) {
+  const mapped = PIR_KITTY_FUNCTIONAL_EQUIVALENTS.get(codepoint);
+  return mapped === undefined ? codepoint : mapped;
+}
+
+const PIR_SHIFTED_SYMBOL_KEYS = new Set(["~", "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "_", "+", "|", "{", "}", ":", "<", ">", "?"]);
+
+function pirGetLogicalShiftedSymbolCandidate(codepoint, modifier, allowedSymbols) {
+  if (codepoint === undefined || (modifier & PIR_MODIFIERS.shift) === 0) return undefined;
+  const normalized = pirNormalizeKittyFunctionalCodepoint(codepoint);
+  if (!allowedSymbols.has(String.fromCharCode(normalized))) return undefined;
+  return { codepoint: normalized, modifier: modifier & ~PIR_MODIFIERS.shift };
+}
+
+function pirFormatKeyNameWithModifiers(keyName, modifier) {
+  const mods = [];
+  const effectiveMod = modifier & ~PIR_LOCK_MASK;
+  const supportedModifierMask = PIR_MODIFIERS.shift | PIR_MODIFIERS.ctrl | PIR_MODIFIERS.alt | PIR_MODIFIERS.super;
+  if ((effectiveMod & ~supportedModifierMask) !== 0) return undefined;
+  if (effectiveMod & PIR_MODIFIERS.shift) mods.push("shift");
+  if (effectiveMod & PIR_MODIFIERS.ctrl) mods.push("ctrl");
+  if (effectiveMod & PIR_MODIFIERS.alt) mods.push("alt");
+  if (effectiveMod & PIR_MODIFIERS.super) mods.push("super");
+  return mods.length > 0 ? `${mods.join("+")}+${keyName}` : keyName;
+}
+
+function pirFormatParsedKey(codepoint, modifier, baseLayoutKey) {
+  const normalizedCodepoint = pirNormalizeKittyFunctionalCodepoint(codepoint);
+  const identityCodepoint = pirNormalizeShiftedLetter(normalizedCodepoint, modifier);
+
+  // The base layout key only wins for non-Latin, non-digit, non-symbol keys.
+  const isLatinLetter = identityCodepoint >= 97 && identityCodepoint <= 122;
+  const isDigit = identityCodepoint >= 48 && identityCodepoint <= 57;
+  const isKnownSymbol = PIR_SYMBOL_KEYS.has(String.fromCharCode(identityCodepoint));
+  const effectiveCodepoint =
+    isLatinLetter || isDigit || isKnownSymbol ? identityCodepoint : baseLayoutKey === undefined ? identityCodepoint : baseLayoutKey;
+
+  let keyName;
+  if (effectiveCodepoint === 27) keyName = "escape";
+  else if (effectiveCodepoint === 9) keyName = "tab";
+  else if (effectiveCodepoint === 13 || effectiveCodepoint === 57414) keyName = "enter";
+  else if (effectiveCodepoint === 32) keyName = "space";
+  else if (effectiveCodepoint === 127) keyName = "backspace";
+  else if (effectiveCodepoint === -10) keyName = "delete";
+  else if (effectiveCodepoint === -11) keyName = "insert";
+  else if (effectiveCodepoint === -14) keyName = "home";
+  else if (effectiveCodepoint === -15) keyName = "end";
+  else if (effectiveCodepoint === -12) keyName = "pageUp";
+  else if (effectiveCodepoint === -13) keyName = "pageDown";
+  else if (effectiveCodepoint === -1) keyName = "up";
+  else if (effectiveCodepoint === -2) keyName = "down";
+  else if (effectiveCodepoint === -3) keyName = "right";
+  else if (effectiveCodepoint === -4) keyName = "left";
+  else if (effectiveCodepoint >= 48 && effectiveCodepoint <= 57) keyName = String.fromCharCode(effectiveCodepoint);
+  else if (effectiveCodepoint >= 97 && effectiveCodepoint <= 122) keyName = String.fromCharCode(effectiveCodepoint);
+  else if (PIR_SYMBOL_KEYS.has(String.fromCharCode(effectiveCodepoint))) keyName = String.fromCharCode(effectiveCodepoint);
+
+  if (!keyName) return undefined;
+  return pirFormatKeyNameWithModifiers(keyName, modifier);
+}
+
+// Reverse lookup of the legacy sequence tables used by matchesKey.
+const PIR_LEGACY_SEQUENCE_KEY_IDS = (() => {
+  const map = {};
+  for (const key of Object.keys(PIR_LEGACY_KEY_SEQUENCES)) {
+    for (const sequence of PIR_LEGACY_KEY_SEQUENCES[key]) map[sequence] = key;
+  }
+  for (const key of Object.keys(PIR_LEGACY_SHIFT_SEQUENCES)) {
+    for (const sequence of PIR_LEGACY_SHIFT_SEQUENCES[key]) map[sequence] = `shift+${key}`;
+  }
+  for (const key of Object.keys(PIR_LEGACY_CTRL_SEQUENCES)) {
+    for (const sequence of PIR_LEGACY_CTRL_SEQUENCES[key]) map[sequence] = `ctrl+${key}`;
+  }
+  return map;
+})();
+
+const PIR_KITTY_CSI_U_PRINTABLE_REGEX = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/;
+
+/**
+ * Decode a Kitty CSI-u sequence into a printable character. Only plain or
+ * Shift-modified keys qualify; Ctrl/Alt combinations are keybinding input.
+ */
+export function decodeKittyPrintable(data) {
+  const text = String(data === undefined || data === null ? "" : data);
+  const match = PIR_KITTY_CSI_U_PRINTABLE_REGEX.exec(text);
+  if (!match) return undefined;
+
+  const codepoint = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(codepoint)) return undefined;
+
+  const shiftedKey = match[2] && match[2].length > 0 ? Number.parseInt(match[2], 10) : undefined;
+  const modValue = match[4] ? Number.parseInt(match[4], 10) : 1;
+  const modifier = Number.isFinite(modValue) ? modValue - 1 : 0;
+
+  const allowedModifiers = PIR_MODIFIERS.shift | PIR_LOCK_MASK;
+  if ((modifier & ~allowedModifiers) !== 0) return undefined;
+
+  let effectiveCodepoint = codepoint;
+  if (modifier & PIR_MODIFIERS.shift && typeof shiftedKey === "number") {
+    effectiveCodepoint = shiftedKey;
+  }
+  effectiveCodepoint = pirNormalizeKittyFunctionalCodepoint(effectiveCodepoint);
+  if (!Number.isFinite(effectiveCodepoint) || effectiveCodepoint < 32) return undefined;
+
+  try {
+    return String.fromCodePoint(effectiveCodepoint);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Parse input data into a key identifier ("ctrl+a", "shift+tab", ...), or
+ * undefined when unrecognized. Kitty protocol is never negotiated in this
+ * runtime, so ambiguous legacy sequences keep their non-kitty meaning.
+ */
+export function parseKey(data) {
+  const text = String(data === undefined || data === null ? "" : data);
+
+  const kitty = pirParseKittySequence(text);
+  if (kitty) {
+    const logicalShiftedSymbol = pirGetLogicalShiftedSymbolCandidate(kitty.shiftedKey, kitty.modifier, PIR_SYMBOL_KEYS);
+    return pirFormatParsedKey(
+      logicalShiftedSymbol ? logicalShiftedSymbol.codepoint : kitty.codepoint,
+      logicalShiftedSymbol ? logicalShiftedSymbol.modifier : kitty.modifier,
+      kitty.baseLayoutKey,
+    );
+  }
+
+  const modifyOtherKeys = pirParseModifyOtherKeys(text);
+  if (modifyOtherKeys) {
+    const logicalShiftedSymbol = pirGetLogicalShiftedSymbolCandidate(
+      modifyOtherKeys.codepoint,
+      modifyOtherKeys.modifier,
+      PIR_SHIFTED_SYMBOL_KEYS,
+    );
+    return pirFormatParsedKey(
+      logicalShiftedSymbol ? logicalShiftedSymbol.codepoint : modifyOtherKeys.codepoint,
+      logicalShiftedSymbol ? logicalShiftedSymbol.modifier : modifyOtherKeys.modifier,
+    );
+  }
+
+  const legacySequenceKeyId = PIR_LEGACY_SEQUENCE_KEY_IDS[text];
+  if (legacySequenceKeyId) return legacySequenceKeyId;
+
+  if (text === "\x1b") return "escape";
+  if (text === "\x1c") return "ctrl+\\";
+  if (text === "\x1d") return "ctrl+]";
+  if (text === "\x1f") return "ctrl+-";
+  if (text === "\x1b\x1b") return "ctrl+alt+[";
+  if (text === "\x1b\x1c") return "ctrl+alt+\\";
+  if (text === "\x1b\x1d") return "ctrl+alt+]";
+  if (text === "\x1b\x1f") return "ctrl+alt+-";
+  if (text === "\t") return "tab";
+  if (text === "\r" || text === "\n" || text === "\x1bOM") return "enter";
+  if (text === "\x00") return "ctrl+space";
+  if (text === " ") return "space";
+  if (text === "\x7f") return "backspace";
+  if (text === "\x08") return "backspace";
+  if (text === "\x1b[Z") return "shift+tab";
+  if (text === "\x1b\r") return "alt+enter";
+  if (text === "\x1b ") return "alt+space";
+  if (text === "\x1b\x7f" || text === "\x1b\b") return "alt+backspace";
+  if (text === "\x1bB") return "alt+left";
+  if (text === "\x1bF") return "alt+right";
+  if (text.length === 2 && text[0] === "\x1b") {
+    const code = text.charCodeAt(1);
+    if (code >= 1 && code <= 26) return `ctrl+alt+${String.fromCharCode(code + 96)}`;
+    const key = String.fromCharCode(code);
+    if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57) || PIR_SYMBOL_KEYS.has(key)) return `alt+${key}`;
+  }
+  if (text.length === 1) {
+    const code = text.charCodeAt(0);
+    if (code >= 1 && code <= 26) return `ctrl+${String.fromCharCode(code + 96)}`;
+    if (code >= 32 && code <= 126) return text;
+  }
+
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// program-status.ts: OSC 7501 program status reports
+// ---------------------------------------------------------------------------
+
+const PIR_PROGRAM_STATUS_APP_PATTERN = /^[A-Za-z0-9_.+-]{1,32}$/;
+const PIR_PROGRAM_STATUS_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]+/g;
+const PIR_PROGRAM_STATUS_MAX_MESSAGE_BYTES = 2048;
+
+function pirUtf8ByteLength(text) {
+  try {
+    return Buffer.byteLength(text, "utf8");
+  } catch {
+    let bytes = 0;
+    for (let i = 0; i < text.length; i++) {
+      const code = text.codePointAt(i);
+      if (code > 0xffff) i++;
+      bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+    }
+    return bytes;
+  }
+}
+
+function pirTruncateUtf8(text, maxBytes) {
+  if (pirUtf8ByteLength(text) <= maxBytes) return text;
+  let bytes = 0;
+  let end = 0;
+  for (const char of text) {
+    const size = pirUtf8ByteLength(char);
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    end += char.length;
+  }
+  return text.slice(0, end);
+}
+
+/**
+ * Encode an OSC 7501 program status report. Control characters in the message
+ * become spaces; text over the spec limit is cut on a UTF-8 boundary.
+ */
+export function formatProgramStatus(status) {
+  const source = status && typeof status === "object" ? status : {};
+  const pairs = [`state=${source.state}`];
+  if (source.app !== undefined && PIR_PROGRAM_STATUS_APP_PATTERN.test(source.app)) pairs.push(`app=${source.app}`);
+  if (source.state === "blocked" && source.kind) pairs.push(`kind=${source.kind}`);
+  const message = pirTruncateUtf8(
+    (source.message === undefined ? "" : String(source.message)).replace(PIR_PROGRAM_STATUS_CONTROL_CHARACTERS, " ").trim(),
+    PIR_PROGRAM_STATUS_MAX_MESSAGE_BYTES,
+  );
+  if (message) {
+    let encoded;
+    try {
+      encoded = Buffer.from(message, "utf8").toString("base64");
+    } catch {
+      encoded = "";
+    }
+    pairs.push(`msg=${encoded}`);
+  }
+  return `\x1b]7501;${pairs.join(":")}\x1b\\`;
+}
+
+// ---------------------------------------------------------------------------
+// stdin-buffer.ts: buffered input that emits complete sequences (port; timers
+// only when the host provides setTimeout, otherwise flush() covers the rest)
+// ---------------------------------------------------------------------------
+
+const PIR_ESC = "\x1b";
+const PIR_STDIN_DEFAULT_SEQUENCE_TIMEOUT_MS = 50;
+const PIR_STDIN_DEFAULT_ESCAPE_TIMEOUT_MS = 10;
+const PIR_BRACKETED_PASTE_START = "\x1b[200~";
+const PIR_BRACKETED_PASTE_END = "\x1b[201~";
+
+function pirStdinHasTimerSupport() {
+  return typeof setTimeout === "function" && typeof clearTimeout === "function";
+}
+
+function pirIsCompleteSequence(data) {
+  if (!data.startsWith(PIR_ESC)) return "not-escape";
+  if (data.length === 1) return "incomplete";
+
+  const afterEsc = data.slice(1);
+  if (afterEsc.startsWith("[")) {
+    if (afterEsc.startsWith("[M")) return data.length >= 6 ? "complete" : "incomplete";
+    return pirIsCompleteCsiSequence(data);
+  }
+  if (afterEsc.startsWith("]")) return pirIsCompleteOscSequence(data);
+  if (afterEsc.startsWith("P")) return pirIsCompleteDcsSequence(data);
+  if (afterEsc.startsWith("_")) return pirIsCompleteApcSequence(data);
+  if (afterEsc.startsWith("O")) return afterEsc.length >= 2 ? "complete" : "incomplete";
+  if (afterEsc.length === 1) return "complete";
+  return "complete";
+}
+
+function pirIsCompleteCsiSequence(data) {
+  if (!data.startsWith(`${PIR_ESC}[`)) return "complete";
+  if (data.length < 3) return "incomplete";
+  const payload = data.slice(2);
+  const lastChar = payload[payload.length - 1];
+  const lastCharCode = lastChar.charCodeAt(0);
+  if (lastCharCode >= 0x40 && lastCharCode <= 0x7e) {
+    if (payload.startsWith("<")) {
+      // SGR mouse sequence: ESC[<B;X;Ym
+      if (/^<\d+;\d+;\d+[Mm]$/.test(payload)) return "complete";
+      if (lastChar === "M" || lastChar === "m") {
+        const parts = payload.slice(1, -1).split(";");
+        if (parts.length === 3 && parts.every((part) => /^\d+$/.test(part))) return "complete";
+      }
+      return "incomplete";
+    }
+    return "complete";
+  }
+  return "incomplete";
+}
+
+function pirIsCompleteOscSequence(data) {
+  if (!data.startsWith(`${PIR_ESC}]`)) return "complete";
+  if (data.endsWith(`${PIR_ESC}\\`) || data.endsWith("\x07")) return "complete";
+  return "incomplete";
+}
+
+function pirIsCompleteDcsSequence(data) {
+  if (!data.startsWith(`${PIR_ESC}P`)) return "complete";
+  if (data.endsWith(`${PIR_ESC}\\`)) return "complete";
+  return "incomplete";
+}
+
+function pirIsCompleteApcSequence(data) {
+  if (!data.startsWith(`${PIR_ESC}_`)) return "complete";
+  if (data.endsWith(`${PIR_ESC}\\`)) return "complete";
+  return "incomplete";
+}
+
+function pirParseUnmodifiedKittyPrintableCodepoint(sequence) {
+  const match = sequence.match(/^\x1b\[(\d+)(?::\d*)?(?::\d+)?u$/);
+  if (!match) return undefined;
+  const codepoint = parseInt(match[1], 10);
+  return codepoint >= 32 ? codepoint : undefined;
+}
+
+function pirExtractCompleteSequences(buffer) {
+  const sequences = [];
+  let pos = 0;
+
+  while (pos < buffer.length) {
+    const remaining = buffer.slice(pos);
+
+    if (remaining.startsWith(PIR_ESC)) {
+      let seqEnd = 1;
+      while (seqEnd <= remaining.length) {
+        const candidate = remaining.slice(0, seqEnd);
+        const status = pirIsCompleteSequence(candidate);
+        if (status === "complete") {
+          // WezTerm's concatenated Escape press + Kitty CSI-u release: emit only
+          // the first ESC and restart from the second.
+          if (candidate === "\x1b\x1b") {
+            const nextChar = remaining[seqEnd];
+            if (nextChar === "[" || nextChar === "]" || nextChar === "O" || nextChar === "P" || nextChar === "_") {
+              sequences.push(PIR_ESC);
+              pos += 1;
+              break;
+            }
+          }
+          sequences.push(candidate);
+          pos += seqEnd;
+          break;
+        } else if (status === "incomplete") {
+          seqEnd++;
+        } else {
+          sequences.push(candidate);
+          pos += seqEnd;
+          break;
+        }
+      }
+      if (seqEnd > remaining.length) {
+        return { sequences: sequences, remainder: remaining };
+      }
+    } else {
+      sequences.push(remaining[0]);
+      pos++;
+    }
+  }
+
+  return { sequences: sequences, remainder: "" };
+}
+
+/**
+ * Buffers stdin input and emits complete sequences via the "data" event
+ * (bracketed paste content arrives as the "paste" event). Extends the shared
+ * @node/events EventEmitter, mirroring upstream.
+ */
+export class StdinBuffer extends EventEmitter {
+  constructor(options) {
+    super();
+    const opts = options && typeof options === "object" ? options : {};
+    this.pirBuffer = "";
+    this.pirTimeout = null;
+    this.timeoutMs = opts.timeout === undefined ? PIR_STDIN_DEFAULT_SEQUENCE_TIMEOUT_MS : opts.timeout;
+    this.escapeTimeoutMs = opts.escapeTimeout === undefined ? PIR_STDIN_DEFAULT_ESCAPE_TIMEOUT_MS : opts.escapeTimeout;
+    this.pasteMode = false;
+    this.pasteBuffer = "";
+    this.pendingKittyPrintableCodepoint = undefined;
+  }
+
+  process(data) {
+    if (this.pirTimeout && pirStdinHasTimerSupport()) {
+      clearTimeout(this.pirTimeout);
+      this.pirTimeout = null;
+    }
+
+    let str;
+    if (typeof Buffer !== "undefined" && Buffer.isBuffer && Buffer.isBuffer(data)) {
+      if (data.length === 1 && data[0] > 127) {
+        str = `${PIR_ESC}${String.fromCharCode(data[0] - 128)}`;
+      } else {
+        str = data.toString();
+      }
+    } else {
+      str = String(data === undefined || data === null ? "" : data);
+    }
+
+    if (str.length === 0 && this.pirBuffer.length === 0) {
+      this.pirEmitDataSequence("");
+      return;
+    }
+
+    this.pirBuffer += str;
+
+    if (this.pasteMode) {
+      this.pasteBuffer += this.pirBuffer;
+      this.pirBuffer = "";
+
+      const endIndex = this.pasteBuffer.indexOf(PIR_BRACKETED_PASTE_END);
+      if (endIndex !== -1) {
+        const pastedContent = this.pasteBuffer.slice(0, endIndex);
+        const remaining = this.pasteBuffer.slice(endIndex + PIR_BRACKETED_PASTE_END.length);
+        this.pasteMode = false;
+        this.pasteBuffer = "";
+        this.pendingKittyPrintableCodepoint = undefined;
+        this.emit("paste", pastedContent);
+        if (remaining.length > 0) this.process(remaining);
+      }
+      return;
+    }
+
+    const startIndex = this.pirBuffer.indexOf(PIR_BRACKETED_PASTE_START);
+    if (startIndex !== -1) {
+      if (startIndex > 0) {
+        const beforePaste = this.pirBuffer.slice(0, startIndex);
+        const result = pirExtractCompleteSequences(beforePaste);
+        for (const sequence of result.sequences) this.pirEmitDataSequence(sequence);
+      }
+
+      this.pendingKittyPrintableCodepoint = undefined;
+      this.pirBuffer = this.pirBuffer.slice(startIndex + PIR_BRACKETED_PASTE_START.length);
+      this.pasteMode = true;
+      this.pasteBuffer = this.pirBuffer;
+      this.pirBuffer = "";
+
+      const endIndex = this.pasteBuffer.indexOf(PIR_BRACKETED_PASTE_END);
+      if (endIndex !== -1) {
+        const pastedContent = this.pasteBuffer.slice(0, endIndex);
+        const remaining = this.pasteBuffer.slice(endIndex + PIR_BRACKETED_PASTE_END.length);
+        this.pasteMode = false;
+        this.pasteBuffer = "";
+        this.pendingKittyPrintableCodepoint = undefined;
+        this.emit("paste", pastedContent);
+        if (remaining.length > 0) this.process(remaining);
+      }
+      return;
+    }
+
+    const result = pirExtractCompleteSequences(this.pirBuffer);
+    this.pirBuffer = result.remainder;
+
+    for (const sequence of result.sequences) this.pirEmitDataSequence(sequence);
+
+    if (this.pirBuffer.length > 0 && pirStdinHasTimerSupport()) {
+      const timeoutMs = this.pirBuffer === PIR_ESC ? this.escapeTimeoutMs : this.timeoutMs;
+      this.pirTimeout = setTimeout(() => {
+        const flushed = this.flush();
+        for (const sequence of flushed) this.pirEmitDataSequence(sequence);
+      }, timeoutMs);
+    }
+  }
+
+  pirEmitDataSequence(sequence) {
+    const rawCodepoint = sequence.length === 1 ? sequence.codePointAt(0) : undefined;
+    if (rawCodepoint !== undefined && rawCodepoint === this.pendingKittyPrintableCodepoint) {
+      this.pendingKittyPrintableCodepoint = undefined;
+      return;
+    }
+    this.pendingKittyPrintableCodepoint = pirParseUnmodifiedKittyPrintableCodepoint(sequence);
+    this.emit("data", sequence);
+  }
+
+  flush() {
+    if (this.pirTimeout && pirStdinHasTimerSupport()) {
+      clearTimeout(this.pirTimeout);
+      this.pirTimeout = null;
+    }
+    if (this.pirBuffer.length === 0) return [];
+    const sequences = [this.pirBuffer];
+    this.pirBuffer = "";
+    this.pendingKittyPrintableCodepoint = undefined;
+    return sequences;
+  }
+
+  clear() {
+    if (this.pirTimeout && pirStdinHasTimerSupport()) {
+      clearTimeout(this.pirTimeout);
+      this.pirTimeout = null;
+    }
+    this.pirBuffer = "";
+    this.pasteMode = false;
+    this.pasteBuffer = "";
+    this.pendingKittyPrintableCodepoint = undefined;
+  }
+
+  getBuffer() {
+    return this.pirBuffer;
+  }
+
+  destroy() {
+    this.clear();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// components/stack.ts + v-stack + h-stack: flex-like layout math (port)
+// ---------------------------------------------------------------------------
+
+function pirIsStackEntry(child) {
+  return child !== null && typeof child === "object" && !("render" in child);
+}
+
+function pirNormalizeStackSize(value, fallback) {
+  return value === undefined || !Number.isFinite(value) ? fallback : Math.max(0, Math.floor(value));
+}
+
+class PirStack extends Container {
+  constructor(children, options) {
+    super();
+    const kids = Array.isArray(children) ? children : [];
+    const opts = options && typeof options === "object" ? options : {};
+    this.pirEntries = [];
+    this.gap = pirNormalizeStackSize(opts.gap, 0);
+    this.align = opts.align === undefined ? "stretch" : opts.align;
+    for (const child of kids) {
+      if (pirIsStackEntry(child)) this.addChild(child.component, child);
+      else this.addChild(child);
+    }
+  }
+
+  addChild(component, options) {
+    super.addChild(component);
+    const opts = options && typeof options === "object" ? options : {};
+    const entry = { component: component };
+    if (opts.basis !== undefined) entry.basis = opts.basis;
+    if (opts.grow !== undefined) entry.grow = pirNormalizeStackSize(opts.grow, 0);
+    if (opts.shrink !== undefined) entry.shrink = pirNormalizeStackSize(opts.shrink, 1);
+    if (opts.minSize !== undefined) entry.minSize = pirNormalizeStackSize(opts.minSize, 0);
+    if (opts.maxSize !== undefined) entry.maxSize = pirNormalizeStackSize(opts.maxSize, Number.MAX_SAFE_INTEGER);
+    if (opts.visible !== undefined) entry.visible = opts.visible;
+    this.pirEntries.push(entry);
+  }
+
+  removeChild(component) {
+    super.removeChild(component);
+    const index = this.pirEntries.findIndex((entry) => entry.component === component);
+    if (index !== -1) this.pirEntries.splice(index, 1);
+  }
+
+  clear() {
+    super.clear();
+    this.pirEntries.length = 0;
+  }
+}
+
+function pirVisibleStackEntries(entries, viewport) {
+  return entries.filter((entry) => (typeof entry.visible === "function" ? entry.visible(viewport) : true));
+}
+
+function pirClampSize(size, entry) {
+  const min = Math.max(0, Math.floor(entry.minSize === undefined ? 0 : entry.minSize));
+  const max = Math.max(min, Math.floor(entry.maxSize === undefined ? Number.MAX_SAFE_INTEGER : entry.maxSize));
+  return Math.max(min, Math.min(max, Math.max(0, Math.floor(size))));
+}
+
+function pirDistribute(sizes, entries, amount, mode) {
+  let remaining = amount;
+  while (remaining > 0) {
+    const candidates = [];
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index];
+      if (mode === "grow") {
+        if ((entry.grow || 0) > 0 && sizes[index] < (entry.maxSize === undefined ? Number.MAX_SAFE_INTEGER : entry.maxSize)) {
+          candidates.push(index);
+        }
+      } else if ((entry.shrink === undefined ? 1 : entry.shrink) > 0 && sizes[index] > (entry.minSize || 0)) {
+        candidates.push(index);
+      }
+    }
+    if (candidates.length === 0) return;
+
+    let totalWeight = 0;
+    for (const index of candidates) {
+      const entry = entries[index];
+      totalWeight += mode === "grow" ? entry.grow || 0 : (entry.shrink === undefined ? 1 : entry.shrink) * Math.max(1, sizes[index]);
+    }
+    let distributed = 0;
+    for (const index of candidates) {
+      if (remaining <= 0) break;
+      const entry = entries[index];
+      const weight = mode === "grow" ? entry.grow || 0 : (entry.shrink === undefined ? 1 : entry.shrink) * Math.max(1, sizes[index]);
+      const proposed = Math.max(1, Math.floor((remaining * weight) / totalWeight));
+      const capacity =
+        mode === "grow"
+          ? (entry.maxSize === undefined ? Number.MAX_SAFE_INTEGER : entry.maxSize) - sizes[index]
+          : sizes[index] - (entry.minSize || 0);
+      const delta = Math.min(remaining, proposed, capacity);
+      if (delta <= 0) continue;
+      sizes[index] = sizes[index] + (mode === "grow" ? delta : -delta);
+      remaining -= delta;
+      distributed += delta;
+    }
+    if (distributed === 0) return;
+  }
+}
+
+function pirAllocateStackSizes(entries, intrinsicSizes, availableSize, gap) {
+  const sizes = entries.map((entry, index) =>
+    pirClampSize(entry.basis === undefined || entry.basis === "auto" ? intrinsicSizes[index] || 0 : entry.basis, entry),
+  );
+  if (availableSize === undefined) return sizes;
+
+  const contentSize = Math.max(0, Math.floor(availableSize) - Math.max(0, entries.length - 1) * gap);
+  const total = sizes.reduce((sum, size) => sum + size, 0);
+  if (total < contentSize) pirDistribute(sizes, entries, contentSize - total, "grow");
+  else if (total > contentSize) pirDistribute(sizes, entries, total - contentSize, "shrink");
+  return sizes;
+}
+
+/** Vertical stack of components with gap and flex sizing (upstream layout math). */
+export class VStack extends PirStack {
+  constructor(children, options) {
+    super(children, options);
+  }
+
+  render(width) {
+    const viewport = { width: Math.max(1, width), height: Number.MAX_SAFE_INTEGER };
+    const entries = pirVisibleStackEntries(this.pirEntries, viewport);
+    const rendered = entries.map((entry) => entry.component.render(viewport.width));
+    const sizes = pirAllocateStackSizes(entries, rendered.map((lines) => lines.length), undefined, this.gap);
+    const lines = [];
+    for (let index = 0; index < entries.length; index++) {
+      if (index > 0) {
+        for (let gap = 0; gap < this.gap; gap++) lines.push("");
+      }
+      const childLines = rendered[index].slice(0, sizes[index]);
+      for (const line of childLines) lines.push(line);
+      for (let padding = childLines.length; padding < sizes[index]; padding++) lines.push("");
+    }
+    return lines;
+  }
+}
+
+/** Horizontal stack of components: children render side by side into one block. */
+export class HStack extends PirStack {
+  constructor(children, options) {
+    super(children, options);
+  }
+
+  render(width) {
+    const safeWidth = Math.max(1, width);
+    const viewport = { width: safeWidth, height: Number.MAX_SAFE_INTEGER };
+    const entries = pirVisibleStackEntries(this.pirEntries, viewport);
+    if (entries.length === 0) return [];
+
+    const intrinsicWidths = entries.map((entry) => {
+      const lines = entry.component.render(safeWidth);
+      return lines.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
+    });
+    const widths = pirAllocateStackSizes(entries, intrinsicWidths, safeWidth, this.gap);
+    const rendered = entries.map((entry, index) => (widths[index] === 0 ? [] : entry.component.render(widths[index])));
+    const height = rendered.reduce((max, lines) => Math.max(max, lines.length), 0);
+    const result = Array.from({ length: height }, () => "");
+    let x = 0;
+    for (let index = 0; index < rendered.length; index++) {
+      const lines = rendered[index];
+      const childWidth = widths[index];
+      let offset = 0;
+      if (this.align === "center") offset = Math.floor((height - lines.length) / 2);
+      else if (this.align === "end") offset = height - lines.length;
+      for (let row = 0; row < lines.length; row++) {
+        const target = row + offset;
+        if (target < 0 || target >= result.length) continue;
+        result[target] = compositeTuiLine(result[target], lines[row], x, childWidth, safeWidth);
+      }
+      x += childWidth + this.gap;
+    }
+    return result;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// components/truncated-text.ts: single-line text truncated to the width
+// ---------------------------------------------------------------------------
+
+/** Text component that truncates to fit the viewport width. */
+export class TruncatedText {
+  constructor(text, paddingX, paddingY) {
+    this.text = String(text === undefined || text === null ? "" : text);
+    this.paddingX = paddingX === undefined ? 0 : paddingX;
+    this.paddingY = paddingY === undefined ? 0 : paddingY;
+  }
+
+  invalidate() {
+    // No cached state to invalidate currently.
+  }
+
+  render(width) {
+    const result = [];
+    const emptyLine = " ".repeat(Math.max(0, width));
+
+    for (let i = 0; i < this.paddingY; i++) result.push(emptyLine);
+
+    const availableWidth = Math.max(1, width - this.paddingX * 2);
+    let singleLineText = this.text;
+    const newlineIndex = this.text.indexOf("\n");
+    if (newlineIndex !== -1) singleLineText = this.text.substring(0, newlineIndex);
+
+    const displayText = truncateToWidth(singleLineText, availableWidth);
+    const leftPadding = " ".repeat(Math.max(0, this.paddingX));
+    const lineWithPadding = leftPadding + displayText + leftPadding;
+    const paddingNeeded = Math.max(0, width - visibleWidth(lineWithPadding));
+    result.push(lineWithPadding + " ".repeat(paddingNeeded));
+
+    for (let i = 0; i < this.paddingY; i++) result.push(emptyLine);
+
+    return result;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// components/loader.ts + cancellable-loader.ts
+// ---------------------------------------------------------------------------
+
+const PIR_LOADER_DEFAULT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const PIR_LOADER_DEFAULT_INTERVAL_MS = 80;
+
+/** Loader component that updates with an optional spinning animation. */
+export class Loader extends Text {
+  constructor(ui, spinnerColorFn, messageColorFn, message, indicator) {
+    super("", 1, 0);
+    this.pirUi = ui;
+    this.spinnerColorFn = typeof spinnerColorFn === "function" ? spinnerColorFn : (text) => text;
+    this.messageColorFn = typeof messageColorFn === "function" ? messageColorFn : (text) => text;
+    this.message = message === undefined || message === null ? "Loading..." : String(message);
+    this.frames = PIR_LOADER_DEFAULT_FRAMES.slice();
+    this.intervalMs = PIR_LOADER_DEFAULT_INTERVAL_MS;
+    this.currentFrame = 0;
+    this.intervalId = null;
+    this.renderIndicatorVerbatim = false;
+    this.setIndicator(indicator === undefined || indicator === null ? undefined : indicator);
+  }
+
+  render(width) {
+    return ["", ...super.render(width)];
+  }
+
+  start() {
+    this.pirUpdateDisplay();
+    this.pirRestartAnimation();
+  }
+
+  stop() {
+    if (this.intervalId !== null && typeof clearInterval === "function") {
+      clearInterval(this.intervalId);
+    }
+    this.intervalId = null;
+  }
+
+  setMessage(message) {
+    this.message = String(message === undefined || message === null ? "" : message);
+    this.pirUpdateDisplay();
+  }
+
+  invalidate() {
+    super.invalidate();
+    this.pirUpdateDisplay();
+  }
+
+  setIndicator(indicator) {
+    this.renderIndicatorVerbatim = indicator !== undefined;
+    this.frames =
+      indicator && indicator.frames !== undefined ? Array.from(indicator.frames) : PIR_LOADER_DEFAULT_FRAMES.slice();
+    this.intervalMs =
+      indicator && indicator.intervalMs && indicator.intervalMs > 0 ? indicator.intervalMs : PIR_LOADER_DEFAULT_INTERVAL_MS;
+    this.currentFrame = 0;
+    this.start();
+  }
+
+  pirRestartAnimation() {
+    this.stop();
+    if (this.frames.length <= 1 || typeof setInterval !== "function") return;
+    this.intervalId = setInterval(() => {
+      this.currentFrame = (this.currentFrame + 1) % this.frames.length;
+      this.pirUpdateDisplay();
+    }, this.intervalMs);
+  }
+
+  pirGetRenderedIndicator() {
+    const frame = this.frames[this.currentFrame] || "";
+    return this.renderIndicatorVerbatim ? frame : this.spinnerColorFn(frame);
+  }
+
+  pirUpdateDisplay() {
+    const renderedFrame = this.pirGetRenderedIndicator();
+    const indicator = renderedFrame.length > 0 ? `${renderedFrame} ` : "";
+    this.setText(`${indicator}${this.messageColorFn(this.message)}`);
+    if (this.pirUi && typeof this.pirUi.requestRender === "function") this.pirUi.requestRender();
+  }
+}
+
+function pirCreateAbortController() {
+  if (typeof AbortController === "function") return new AbortController();
+  // Fallback for hosts without AbortController: same observable surface.
+  const listeners = [];
+  const signal = {
+    aborted: false,
+    reason: undefined,
+    addEventListener(_type, listener) {
+      if (typeof listener === "function") listeners.push(listener);
+    },
+    removeEventListener(_type, listener) {
+      const index = listeners.indexOf(listener);
+      if (index !== -1) listeners.splice(index, 1);
+    },
+  };
+  return {
+    signal: signal,
+    abort() {
+      if (signal.aborted) return;
+      signal.aborted = true;
+      for (const listener of listeners.slice()) listener();
+    },
+  };
+}
+
+/** Loader that can be cancelled with Escape; exposes an AbortSignal. */
+export class CancellableLoader extends Loader {
+  constructor(ui, spinnerColorFn, messageColorFn, message, indicator) {
+    super(ui, spinnerColorFn, messageColorFn, message, indicator);
+    this.abortController = pirCreateAbortController();
+    this.onAbort = undefined;
+  }
+
+  get signal() {
+    return this.abortController.signal;
+  }
+
+  get aborted() {
+    return this.abortController.signal.aborted;
+  }
+
+  handleInput(data) {
+    const kb = getKeybindings();
+    if (kb.matches(String(data === undefined || data === null ? "" : data), "tui.select.cancel")) {
+      this.abortController.abort();
+      if (typeof this.onAbort === "function") this.onAbort();
+    }
+  }
+
+  dispose() {
+    this.stop();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// components/scroll-view.ts: single-child scroll container (stateful port;
+// the transient scrollbar fade timer is not mirrored)
+// ---------------------------------------------------------------------------
+
+/** Scroll container with follow-end support around exactly one child. */
+export class ScrollView extends Container {
+  constructor(component, options) {
+    super();
+    const opts = options && typeof options === "object" ? options : {};
+    if (opts.axis !== undefined && opts.axis !== "vertical") {
+      throw new Error(`Unsupported ScrollView axis: ${opts.axis}`);
+    }
+    this.child = component;
+    this.children.push(component);
+    this.followEnd = (opts.follow === undefined ? "none" : opts.follow) === "end";
+    this.followingEnd = this.followEnd;
+    this.primary = opts.primary === true;
+    this.overscroll = opts.overscroll === undefined ? "chain" : opts.overscroll;
+    this.currentScrollbar = opts.scrollbar === undefined ? "hidden" : opts.scrollbar;
+    this.scrollbarTrackStyle = typeof opts.scrollbarTrackStyle === "function" ? opts.scrollbarTrackStyle : (text) => `\x1b[90m${text}\x1b[39m`;
+    this.scrollbarThumbStyle = typeof opts.scrollbarThumbStyle === "function" ? opts.scrollbarThumbStyle : (text) => `\x1b[37m${text}\x1b[39m`;
+    this.scrollbarHideDelayMs = Math.max(0, Math.floor(opts.scrollbarHideDelayMs === undefined ? 1000 : opts.scrollbarHideDelayMs));
+    this.currentScrollTop = 0;
+    this.contentHeight = 0;
+    this.currentViewportHeight = 0;
+    this.followSuppressedAtEnd = false;
+    this.requestRenderCallback = undefined;
+    this.transientScrollbarVisible = false;
+    this.scrollbarActive = false;
+  }
+
+  get scrollTop() {
+    return this.currentScrollTop;
+  }
+
+  get isFollowingEnd() {
+    return this.followingEnd;
+  }
+
+  get viewportHeight() {
+    return this.currentViewportHeight;
+  }
+
+  get scrollbar() {
+    return this.currentScrollbar;
+  }
+
+  get isScrollbarVisible() {
+    if (this.currentScrollbar === "always") return this.currentViewportHeight > 0;
+    return this.currentScrollbar === "auto" && this.contentHeight > this.currentViewportHeight;
+  }
+
+  get isScrollbarActive() {
+    return this.scrollbarActive;
+  }
+
+  setScrollbar(scrollbar) {
+    if (scrollbar === this.currentScrollbar) return;
+    this.currentScrollbar = scrollbar;
+    if (this.requestRenderCallback) this.requestRenderCallback();
+  }
+
+  getContentWidth(width) {
+    return this.currentScrollbar === "always" && width > 1 ? width - 1 : width;
+  }
+
+  setScrollbarActive(active) {
+    if (active === this.scrollbarActive) return;
+    this.scrollbarActive = active;
+    if (this.requestRenderCallback) this.requestRenderCallback();
+  }
+
+  scrollTo(scrollTop, options) {
+    const opts = options && typeof options === "object" ? options : {};
+    const requested = Number.isFinite(scrollTop) ? Math.trunc(scrollTop) : this.currentScrollTop;
+    const maxScrollTop = Math.max(0, this.contentHeight - this.currentViewportHeight);
+    const next = Math.max(0, Math.min(maxScrollTop, requested));
+    const nextFollowSuppressedAtEnd = opts.disableFollow === true && next === maxScrollTop;
+    const nextFollowingEnd = !nextFollowSuppressedAtEnd && this.followEnd && next === maxScrollTop;
+    if (
+      next === this.currentScrollTop &&
+      nextFollowingEnd === this.followingEnd &&
+      nextFollowSuppressedAtEnd === this.followSuppressedAtEnd
+    ) {
+      return;
+    }
+    this.currentScrollTop = next;
+    this.followingEnd = nextFollowingEnd;
+    this.followSuppressedAtEnd = nextFollowSuppressedAtEnd;
+    if (this.requestRenderCallback) this.requestRenderCallback();
+  }
+
+  scrollBy(lines) {
+    const requested = Number.isFinite(lines) ? Math.trunc(lines) : 0;
+    if (requested === 0) return 0;
+    const maxScrollTop = Math.max(0, this.contentHeight - this.currentViewportHeight);
+    const start = this.followingEnd ? maxScrollTop : this.currentScrollTop;
+    const next = Math.max(0, Math.min(maxScrollTop, start + requested));
+    const moved = next - start;
+    this.currentScrollTop = next;
+    this.followingEnd = this.followEnd && next === maxScrollTop;
+    this.followSuppressedAtEnd = false;
+    if (moved !== 0 && this.requestRenderCallback) this.requestRenderCallback();
+    return requested - moved;
+  }
+
+  scrollToStart() {
+    this.currentScrollTop = 0;
+    this.followingEnd = this.followEnd && this.contentHeight <= this.currentViewportHeight;
+    this.followSuppressedAtEnd = false;
+    if (this.requestRenderCallback) this.requestRenderCallback();
+  }
+
+  scrollToEnd() {
+    this.currentScrollTop = Math.max(0, this.contentHeight - this.currentViewportHeight);
+    this.followingEnd = this.followEnd;
+    this.followSuppressedAtEnd = false;
+    if (this.requestRenderCallback) this.requestRenderCallback();
+  }
+
+  updateLayout(contentHeight, viewportHeight, requestRender) {
+    this.contentHeight = Math.max(0, Math.floor(contentHeight));
+    this.currentViewportHeight = Math.max(0, Math.floor(viewportHeight));
+    this.requestRenderCallback = requestRender;
+    const maxScrollTop = Math.max(0, this.contentHeight - this.currentViewportHeight);
+    if (this.followingEnd) this.currentScrollTop = maxScrollTop;
+    else this.currentScrollTop = Math.max(0, Math.min(this.currentScrollTop, maxScrollTop));
+    if (this.currentScrollTop < maxScrollTop) this.followSuppressedAtEnd = false;
+    if (this.followEnd && this.currentScrollTop === maxScrollTop && !this.followSuppressedAtEnd) {
+      this.followingEnd = true;
+    }
+  }
+
+  addChild(_component) {
+    throw new Error("ScrollView has exactly one child");
+  }
+
+  removeChild(_component) {
+    throw new Error("ScrollView child cannot be removed");
+  }
+
+  clear() {
+    throw new Error("ScrollView child cannot be cleared");
+  }
+
+  render(width) {
+    const contentWidth = this.getContentWidth(width);
+    const lines = this.child.render(contentWidth);
+    return contentWidth === width ? lines : lines.map((line) => `${line} `);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// components/editor.ts: prompt editor subset. LIMITS (documented): plain text
+// state machine without upstream's kill-ring, undo stack, word navigation,
+// paste markers and autocomplete menus; history is line-based.
+// ---------------------------------------------------------------------------
+
+/** Prompt editor with multi-line text, history and submit. */
+export class Editor {
+  constructor(tui, theme, options) {
+    const opts = options && typeof options === "object" ? options : {};
+    this.tui = tui;
+    this.theme = theme && typeof theme === "object" ? theme : {};
+    this.borderColor = typeof this.theme.borderColor === "function" ? this.theme.borderColor : (text) => text;
+    this.paddingX = Number.isFinite(opts.paddingX) ? Math.max(0, Math.floor(opts.paddingX)) : 0;
+    this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
+    this.focused = false;
+    this.history = [];
+    this.historyIndex = -1;
+    this.historyDraft = null;
+    this.onSubmit = undefined;
+    this.onChange = undefined;
+    this.disableSubmit = false;
+  }
+
+  pirNormalizeText(text) {
+    return String(text).replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\t/g, "    ");
+  }
+
+  pirFireChange() {
+    if (typeof this.onChange === "function") this.onChange(this.getText());
+  }
+
+  pirRequestRender() {
+    if (this.tui && typeof this.tui.requestRender === "function") this.tui.requestRender();
+  }
+
+  getText() {
+    return this.state.lines.join("\n");
+  }
+
+  /** Text with paste markers expanded; this subset stores pastes verbatim. */
+  getExpandedText() {
+    return this.getText();
+  }
+
+  getLines() {
+    return this.state.lines.slice();
+  }
+
+  getCursor() {
+    return { line: this.state.cursorLine, col: this.state.cursorCol };
+  }
+
+  addToHistory(text) {
+    const trimmed = String(text === undefined || text === null ? "" : text).trim();
+    if (!trimmed) return;
+    if (this.history.length > 0 && this.history[0] === trimmed) return;
+    this.history.unshift(trimmed);
+    if (this.history.length > 100) this.history.pop();
+  }
+
+  setText(text) {
+    const normalized = this.pirNormalizeText(text === undefined || text === null ? "" : text);
+    const lines = normalized.split("\n");
+    this.state = {
+      lines: lines.length === 0 ? [""] : lines,
+      cursorLine: Math.max(0, lines.length - 1),
+      cursorCol: (lines[lines.length - 1] || "").length,
+    };
+    this.historyIndex = -1;
+    this.historyDraft = null;
+    this.pirFireChange();
+    this.pirRequestRender();
+  }
+
+  /** Insert text at the cursor (multi-line aware, normalized like upstream). */
+  insertTextAtCursor(text) {
+    if (!text) return;
+    const normalized = this.pirNormalizeText(text);
+    const insertedLines = normalized.split("\n");
+    const currentLine = this.state.lines[this.state.cursorLine] || "";
+    const beforeCursor = currentLine.slice(0, this.state.cursorCol);
+    const afterCursor = currentLine.slice(this.state.cursorCol);
+
+    if (insertedLines.length === 1) {
+      this.state.lines[this.state.cursorLine] = beforeCursor + normalized + afterCursor;
+      this.state.cursorCol = this.state.cursorCol + normalized.length;
+    } else {
+      this.state.lines = [
+        ...this.state.lines.slice(0, this.state.cursorLine),
+        beforeCursor + insertedLines[0],
+        ...insertedLines.slice(1, -1),
+        insertedLines[insertedLines.length - 1] + afterCursor,
+        ...this.state.lines.slice(this.state.cursorLine + 1),
+      ];
+      this.state.cursorLine += insertedLines.length - 1;
+      this.state.cursorCol = (insertedLines[insertedLines.length - 1] || "").length;
+    }
+    this.pirFireChange();
+    this.pirRequestRender();
+  }
+
+  pirSubmit() {
+    const result = this.getText().trim();
+    this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
+    this.historyIndex = -1;
+    this.historyDraft = null;
+    if (typeof this.onChange === "function") this.onChange("");
+    if (typeof this.onSubmit === "function") this.onSubmit(result);
+    this.pirRequestRender();
+  }
+
+  pirNavigateHistory(direction) {
+    if (this.history.length === 0) return;
+    const newIndex = this.historyIndex - direction;
+    if (newIndex < -1 || newIndex >= this.history.length) return;
+    if (this.historyIndex === -1 && newIndex >= 0) {
+      this.historyDraft = { lines: this.state.lines.slice(), cursorLine: this.state.cursorLine, cursorCol: this.state.cursorCol };
+    }
+    this.historyIndex = newIndex;
+    let text;
+    if (this.historyIndex === -1) {
+      const draft = this.historyDraft;
+      this.historyDraft = null;
+      text = draft ? draft.lines.join("\n") : "";
+    } else {
+      text = this.history[this.historyIndex] || "";
+    }
+    const normalized = this.pirNormalizeText(text);
+    const lines = normalized.split("\n");
+    this.state = { lines: lines, cursorLine: lines.length - 1, cursorCol: (lines[lines.length - 1] || "").length };
+    this.pirFireChange();
+    this.pirRequestRender();
+  }
+
+  handleInput(data) {
+    const text = String(data === undefined || data === null ? "" : data);
+
+    // Bracketed paste: keep the payload, drop the markers.
+    if (text.includes("\x1b[200~")) {
+      const inner = text.replace(/^\x1b\[200~/, "").replace(/\x1b\[201~$/, "");
+      this.insertTextAtCursor(inner);
+      return;
+    }
+
+    const kb = getKeybindings();
+    if (kb.matches(text, "tui.input.newLine")) {
+      this.insertTextAtCursor("\n");
+      return;
+    }
+    if (kb.matches(text, "tui.input.submit")) {
+      if (!this.disableSubmit) this.pirSubmit();
+      return;
+    }
+    if (matchesKey(text, "backspace")) {
+      if (this.state.cursorCol > 0) {
+        const line = this.state.lines[this.state.cursorLine] || "";
+        this.state.lines[this.state.cursorLine] = line.slice(0, this.state.cursorCol - 1) + line.slice(this.state.cursorCol);
+        this.state.cursorCol -= 1;
+        this.pirFireChange();
+      } else if (this.state.cursorLine > 0) {
+        const line = this.state.lines[this.state.cursorLine] || "";
+        const previous = this.state.lines[this.state.cursorLine - 1] || "";
+        this.state.lines.splice(this.state.cursorLine - 1, 2, previous + line);
+        this.state.cursorLine -= 1;
+        this.state.cursorCol = previous.length;
+        this.pirFireChange();
+      }
+      return;
+    }
+    if (matchesKey(text, "delete")) {
+      const line = this.state.lines[this.state.cursorLine] || "";
+      if (this.state.cursorCol < line.length) {
+        this.state.lines[this.state.cursorLine] = line.slice(0, this.state.cursorCol) + line.slice(this.state.cursorCol + 1);
+        this.pirFireChange();
+      } else if (this.state.cursorLine < this.state.lines.length - 1) {
+        this.state.lines.splice(this.state.cursorLine, 2, line + (this.state.lines[this.state.cursorLine + 1] || ""));
+        this.pirFireChange();
+      }
+      return;
+    }
+    if (matchesKey(text, "left")) {
+      if (this.state.cursorCol > 0) this.state.cursorCol -= 1;
+      else if (this.state.cursorLine > 0) {
+        this.state.cursorLine -= 1;
+        this.state.cursorCol = (this.state.lines[this.state.cursorLine] || "").length;
+      }
+      return;
+    }
+    if (matchesKey(text, "right")) {
+      const line = this.state.lines[this.state.cursorLine] || "";
+      if (this.state.cursorCol < line.length) this.state.cursorCol += 1;
+      else if (this.state.cursorLine < this.state.lines.length - 1) {
+        this.state.cursorLine += 1;
+        this.state.cursorCol = 0;
+      }
+      return;
+    }
+    if (matchesKey(text, "up")) {
+      if (this.historyIndex !== -1 || this.state.lines.length === 1) {
+        this.pirNavigateHistory(-1);
+      } else if (this.state.cursorLine > 0) {
+        this.state.cursorLine -= 1;
+        this.state.cursorCol = Math.min(this.state.cursorCol, (this.state.lines[this.state.cursorLine] || "").length);
+      }
+      return;
+    }
+    if (matchesKey(text, "down")) {
+      if (this.historyIndex !== -1) {
+        this.pirNavigateHistory(1);
+      } else if (this.state.cursorLine < this.state.lines.length - 1) {
+        this.state.cursorLine += 1;
+        this.state.cursorCol = Math.min(this.state.cursorCol, (this.state.lines[this.state.cursorLine] || "").length);
+      }
+      return;
+    }
+    if (matchesKey(text, "home") || matchesKey(text, "ctrl+a")) {
+      this.state.cursorCol = 0;
+      return;
+    }
+    if (matchesKey(text, "end") || matchesKey(text, "ctrl+e")) {
+      this.state.cursorCol = (this.state.lines[this.state.cursorLine] || "").length;
+      return;
+    }
+    if (matchesKey(text, "ctrl+u")) {
+      const line = this.state.lines[this.state.cursorLine] || "";
+      this.state.lines[this.state.cursorLine] = line.slice(this.state.cursorCol);
+      this.state.cursorCol = 0;
+      this.pirFireChange();
+      return;
+    }
+    if (matchesKey(text, "ctrl+k")) {
+      const line = this.state.lines[this.state.cursorLine] || "";
+      this.state.lines[this.state.cursorLine] = line.slice(0, this.state.cursorCol);
+      this.pirFireChange();
+      return;
+    }
+
+    // Printable input: Kitty CSI-u sequences first, then raw text.
+    const printable = decodeKittyPrintable(text);
+    if (printable !== undefined) {
+      this.insertTextAtCursor(printable);
+      return;
+    }
+    if (text.length > 0 && !text.startsWith("\x1b") && text.charCodeAt(0) >= 32) {
+      this.insertTextAtCursor(text);
+    }
+  }
+
+  render(width) {
+    const widthN = Math.max(1, Math.floor(width));
+    const maxPadding = Math.max(0, Math.floor((widthN - 1) / 2));
+    const paddingX = Math.min(this.paddingX, maxPadding);
+    const contentWidth = Math.max(1, widthN - paddingX * 2);
+    const left = " ".repeat(paddingX);
+
+    const result = [];
+    result.push(this.borderColor("─".repeat(widthN)));
+    for (const line of this.state.lines) {
+      const display = truncateToWidth(line, contentWidth, "");
+      const padded = left + display + " ".repeat(Math.max(0, contentWidth - visibleWidth(display))) + left;
+      result.push(padded);
+    }
+    result.push(this.borderColor("─".repeat(widthN)));
+    return result;
+  }
+
+  invalidate() {
+    // No cached state to invalidate currently.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// components/settings-list.ts: keyboard setting list (structurally ported)
+// ---------------------------------------------------------------------------
+
+/** Keyboard-navigable list of settings with cycling values and submenus. */
+export class SettingsList {
+  constructor(items, maxVisible, theme, onChange, onCancel, options) {
+    this.items = Array.isArray(items) ? items : [];
+    this.filteredItems = this.items;
+    this.maxVisible = maxVisible > 0 ? maxVisible : 5;
+    this.theme = theme && typeof theme === "object" ? theme : {};
+    this.onChange = typeof onChange === "function" ? onChange : () => {};
+    this.onCancel = typeof onCancel === "function" ? onCancel : () => {};
+    this.selectedIndex = 0;
+    this.searchEnabled = !!(options && options.enableSearch);
+    this.searchInput = this.searchEnabled ? new Input() : undefined;
+    this.submenuComponent = null;
+    this.submenuItemIndex = null;
+    this.navigateAfterClose = null;
+  }
+
+  pirThemeFn(name) {
+    const fn = this.theme ? this.theme[name] : undefined;
+    return typeof fn === "function" ? fn.bind(this.theme) : (text) => String(text);
+  }
+
+  updateValue(id, newValue) {
+    const item = this.items.find((candidate) => candidate.id === id);
+    if (item) item.currentValue = newValue;
+  }
+
+  selectItem(id) {
+    const items = this.pirGetDisplayItems();
+    const index = items.findIndex((candidate) => candidate.id === id);
+    if (index !== -1) this.selectedIndex = index;
+  }
+
+  invalidate() {
+    if (this.submenuComponent && typeof this.submenuComponent.invalidate === "function") this.submenuComponent.invalidate();
+  }
+
+  pirGetDisplayItems() {
+    return this.searchEnabled ? this.filteredItems : this.items;
+  }
+
+  pirGetVisibleRange(displayItems) {
+    const startIndex = Math.max(
+      0,
+      Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), displayItems.length - this.maxVisible),
+    );
+    return { startIndex: startIndex, endIndex: Math.min(startIndex + this.maxVisible, displayItems.length) };
+  }
+
+  pirActivateItem() {
+    const item = this.pirGetDisplayItems()[this.selectedIndex];
+    if (!item) return;
+    if (typeof item.submenu === "function") {
+      const self = this;
+      this.submenuItemIndex = this.selectedIndex;
+      this.submenuComponent = item.submenu(item.currentValue, function done(selectedValue, options) {
+        if (selectedValue !== undefined) {
+          item.currentValue = selectedValue;
+          self.onChange(item.id, selectedValue);
+        }
+        if (options && options.navigateTo) self.navigateAfterClose = options.navigateTo;
+        self.pirCloseSubmenu();
+      });
+    } else if (item.values && item.values.length > 0) {
+      const currentIndex = item.values.indexOf(item.currentValue);
+      const nextIndex = (currentIndex + 1) % item.values.length;
+      const newValue = item.values[nextIndex];
+      item.currentValue = newValue;
+      this.onChange(item.id, newValue);
+    }
+  }
+
+  pirCloseSubmenu() {
+    this.submenuComponent = null;
+    if (this.navigateAfterClose !== null) {
+      const id = this.navigateAfterClose;
+      this.navigateAfterClose = null;
+      this.submenuItemIndex = null;
+      this.selectItem(id);
+      this.pirActivateItem();
+    } else if (this.submenuItemIndex !== null) {
+      this.selectedIndex = this.submenuItemIndex;
+      this.submenuItemIndex = null;
+    }
+  }
+
+  pirApplyFilter(query) {
+    this.filteredItems = fuzzyFilter(this.items, query, (item) => item.label);
+    this.selectedIndex = 0;
+  }
+
+  handleInput(data) {
+    if (this.submenuComponent) {
+      if (typeof this.submenuComponent.handleInput === "function") this.submenuComponent.handleInput(data);
+      return;
+    }
+    const kb = getKeybindings();
+    const displayItems = this.pirGetDisplayItems();
+    if (kb.matches(data, "tui.select.up")) {
+      if (displayItems.length === 0) return;
+      this.selectedIndex = this.selectedIndex === 0 ? displayItems.length - 1 : this.selectedIndex - 1;
+    } else if (kb.matches(data, "tui.select.down")) {
+      if (displayItems.length === 0) return;
+      this.selectedIndex = this.selectedIndex === displayItems.length - 1 ? 0 : this.selectedIndex + 1;
+    } else if (
+      kb.matches(data, "tui.select.confirm") ||
+      (data === " " && (!this.searchEnabled || (this.searchInput && this.searchInput.getValue().length === 0)))
+    ) {
+      this.pirActivateItem();
+    } else if (kb.matches(data, "tui.select.cancel")) {
+      this.onCancel();
+    } else if (this.searchEnabled && this.searchInput) {
+      this.searchInput.handleInput(data);
+      this.pirApplyFilter(this.searchInput.getValue());
+    }
+  }
+
+  pirAddHintLine(lines, width) {
+    lines.push("");
+    lines.push(
+      truncateToWidth(
+        this.pirThemeFn("hint")(
+          this.searchEnabled
+            ? "  Type to search · Enter/Space to change · Esc to cancel"
+            : "  Enter/Space to change · Esc to cancel",
+        ),
+        width,
+      ),
+    );
+  }
+
+  render(width) {
+    if (this.submenuComponent) return this.submenuComponent.render(width);
+
+    const lines = [];
+    if (this.searchEnabled && this.searchInput) {
+      lines.push(...this.searchInput.render(width));
+      lines.push("");
+    }
+
+    if (this.items.length === 0) {
+      lines.push(this.pirThemeFn("hint")("  No settings available"));
+      if (this.searchEnabled) this.pirAddHintLine(lines, width);
+      return lines;
+    }
+
+    const displayItems = this.pirGetDisplayItems();
+    if (displayItems.length === 0) {
+      lines.push(truncateToWidth(this.pirThemeFn("hint")("  No matching settings"), width));
+      this.pirAddHintLine(lines, width);
+      return lines;
+    }
+
+    const range = this.pirGetVisibleRange(displayItems);
+    const maxLabelWidth = Math.min(
+      36,
+      Math.max(...this.items.map((item) => visibleWidth(item.label))),
+    );
+
+    for (let i = range.startIndex; i < range.endIndex; i++) {
+      const item = displayItems[i];
+      if (!item) continue;
+      const isSelected = i === this.selectedIndex;
+      const cursorText = typeof this.theme.cursor === "string" ? this.theme.cursor : "> ";
+      const prefix = isSelected ? cursorText : "  ";
+      const labelPadded = item.label + " ".repeat(Math.max(0, maxLabelWidth - visibleWidth(item.label)));
+      const labelText = this.pirThemeFn("label")(labelPadded, isSelected);
+
+      const separator = "  ";
+      const usedWidth = visibleWidth(prefix) + maxLabelWidth + separator.length;
+      const valueMaxWidth = width - usedWidth - 2;
+      const valueText = this.pirThemeFn("value")(truncateToWidth(item.currentValue, valueMaxWidth, ""), isSelected);
+
+      lines.push(truncateToWidth(prefix + labelText + separator + valueText, width));
+    }
+
+    if (range.startIndex > 0 || range.endIndex < displayItems.length) {
+      const scrollText = `  (${this.selectedIndex + 1}/${displayItems.length})`;
+      lines.push(this.pirThemeFn("hint")(truncateToWidth(scrollText, width - 2, "")));
+    }
+
+    const selectedItem = displayItems[this.selectedIndex];
+    if (selectedItem && selectedItem.description) {
+      lines.push("");
+      for (const line of wrapTextWithAnsi(selectedItem.description, width - 4)) {
+        lines.push(this.pirThemeFn("description")(`  ${line}`));
+      }
+    }
+
+    this.pirAddHintLine(lines, width);
+    return lines;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// components/mouse-region.ts: adds mouse handling to a child component
+// ---------------------------------------------------------------------------
+
+/** Adds mouse handling to an existing component without changing its rendering. */
+export class MouseRegion {
+  constructor(child, onMouse) {
+    this.child = child;
+    this.onMouse = typeof onMouse === "function" ? onMouse : () => undefined;
+  }
+
+  render(width) {
+    return this.child.render(width);
+  }
+
+  handleMouse(event) {
+    const childResult = this.child && typeof this.child.handleMouse === "function" ? this.child.handleMouse(event) : undefined;
+    return childResult === undefined ? this.onMouse(event) : childResult;
+  }
+
+  invalidate() {
+    if (this.child && typeof this.child.invalidate === "function") this.child.invalidate();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// components/image.ts: inline image component (terminal-image backed)
+// ---------------------------------------------------------------------------
+
+let pirImageTranscoder;
+
+/** Register the converter used for non-PNG images on Kitty-protocol terminals. */
+export function setImageTranscoder(transcoder) {
+  pirImageTranscoder = typeof transcoder === "function" ? transcoder : undefined;
+}
+
+/** Image component: renders via the detected protocol or a text fallback. */
+export class Image {
+  constructor(base64Data, mimeType, theme, options, dimensions) {
+    this.base64Data = String(base64Data === undefined || base64Data === null ? "" : base64Data);
+    this.mimeType = String(mimeType === undefined || mimeType === null ? "" : mimeType);
+    this.theme = theme && typeof theme === "object" ? theme : {};
+    this.options = options && typeof options === "object" ? options : {};
+    this.dimensions =
+      dimensions || getImageDimensions(this.base64Data, this.mimeType) || { widthPx: 800, heightPx: 600 };
+    this.imageId = this.options.imageId;
+    this.cachedLines = undefined;
+    this.cachedWidth = undefined;
+  }
+
+  getImageId() {
+    return this.imageId;
+  }
+
+  invalidate() {
+    this.cachedLines = undefined;
+    this.cachedWidth = undefined;
+  }
+
+  render(width) {
+    if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
+
+    const maxWidth = Math.max(1, Math.min(width - 2, this.options.maxWidthCells === undefined ? 60 : this.options.maxWidthCells));
+    const cellDimensions = getCellDimensions();
+    const defaultMaxHeight = Math.max(1, Math.ceil((maxWidth * cellDimensions.widthPx) / cellDimensions.heightPx));
+    const maxHeight = this.options.maxHeightCells === undefined ? defaultMaxHeight : this.options.maxHeightCells;
+
+    const caps = getCapabilities();
+    let data = this.base64Data;
+    let dimensions = this.dimensions;
+    if (caps.images === "kitty" && this.mimeType !== "image/png") {
+      // Transcoding is synchronous in this runtime; failures keep the fallback.
+      data = (pirImageTranscoder ? pirImageTranscoder(this.base64Data, this.mimeType) : null) || null;
+      if (data) dimensions = getPngDimensions(data) || dimensions;
+    }
+    let lines;
+
+    const fallbackLine = () => {
+      const fallback = imageFallback(this.mimeType, this.dimensions, this.options.filename);
+      return [truncateToWidth(this.pirFallbackColor(fallback), width)];
+    };
+
+    if (caps.images && data) {
+      if (caps.images === "kitty" && this.imageId === undefined) this.imageId = allocateImageId();
+      const result = renderImage(data, dimensions, {
+        maxWidthCells: maxWidth,
+        maxHeightCells: maxHeight,
+        imageId: this.imageId,
+        moveCursor: false,
+      });
+      if (result) {
+        if (result.imageId) this.imageId = result.imageId;
+        lines = [result.sequence];
+        for (let i = 0; i < result.rows - 1; i++) lines.push("");
+      } else {
+        lines = fallbackLine();
+      }
+    } else {
+      lines = fallbackLine();
+    }
+
+    this.cachedLines = lines;
+    this.cachedWidth = width;
+    return lines;
+  }
+
+  pirFallbackColor(text) {
+    return typeof this.theme.fallbackColor === "function" ? this.theme.fallbackColor(text) : text;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// tui-alt-screen.ts / tui-main-screen.ts: inert TUI containers. The
+// renderer, terminal I/O, overlays and viewport engine are host features this
+// runtime does not have; these classes keep the upstream shape (constructor,
+// children, mode, lifecycle no-ops) so extensions can type/extend/instantiate.
+// ---------------------------------------------------------------------------
+
+class PirTuiBase extends Container {
+  constructor(terminal, showHardwareCursor, logDirectory) {
+    super();
+    this.terminal = terminal;
+    this.pirShowHardwareCursor = showHardwareCursor === true;
+    this.pirClearOnShrink = false;
+    this.pirFocusedComponent = null;
+    this.pirInputListeners = new Set();
+    // Overlays are a stack, like upstream TUI's overlay stack: `hideOverlay()`
+    // removes the topmost one, while a handle's `hide()` removes exactly the
+    // overlay it was returned for (upstream #10648/#10999).
+    this.pirOverlayStack = [];
+    this.pirStarted = false;
+    this.pirReadonlyLogDirectory = logDirectory;
+    this.onDebug = undefined;
+  }
+
+  getShowHardwareCursor() {
+    return this.pirShowHardwareCursor;
+  }
+
+  setShowHardwareCursor(enabled) {
+    this.pirShowHardwareCursor = enabled === true;
+  }
+
+  getClearOnShrink() {
+    return this.pirClearOnShrink;
+  }
+
+  setClearOnShrink(enabled) {
+    this.pirClearOnShrink = enabled === true;
+  }
+
+  setFocus(component) {
+    this.pirFocusedComponent = component || null;
+  }
+
+  // The topmost overlay (internal surface; the stack is the source of truth).
+  get pirOverlay() {
+    const top = this.pirOverlayStack[this.pirOverlayStack.length - 1];
+    return top ? top.component : null;
+  }
+
+  get pirOverlayOptions() {
+    const top = this.pirOverlayStack[this.pirOverlayStack.length - 1];
+    return top ? top.options : undefined;
+  }
+
+  showOverlay(component, options) {
+    const self = this;
+    const entry = {
+      component,
+      options: options || {},
+      hidden: false,
+      focused: true,
+    };
+    this.pirOverlayStack.push(entry);
+    return {
+      hide() {
+        // Remove THIS overlay, not the topmost one: another overlay may have
+        // opened above it (upstream #10648: done() closed the wrong overlay,
+        // leaving the finished one stuck on screen and the dialog promise
+        // unresolved).
+        const index = self.pirOverlayStack.indexOf(entry);
+        if (index !== -1) self.pirOverlayStack.splice(index, 1);
+      },
+      setHidden(value) {
+        entry.hidden = value === true;
+      },
+      isHidden() {
+        return entry.hidden;
+      },
+      focus() {
+        entry.focused = true;
+      },
+      unfocus() {
+        entry.focused = false;
+      },
+      isFocused() {
+        return entry.focused && !entry.hidden;
+      },
+      getBounds() {
+        return entry.hidden ? undefined : { x: 0, y: 0, width: 0, height: 0 };
+      },
+    };
+  }
+
+  hideOverlay() {
+    // Upstream `hideOverlay()` removes the topmost overlay.
+    this.pirOverlayStack.pop();
+  }
+
+  hasOverlay() {
+    return this.pirOverlayStack.length > 0;
+  }
+
+  // Lifecycle is inert: there is no real terminal to take over.
+  start() {
+    this.pirStarted = true;
+  }
+
+  stop(_options) {
+    this.pirStarted = false;
+  }
+
+  renderNow(_force) {
+    // No differential renderer in this runtime.
+  }
+
+  requestRender(_force) {
+    // No differential renderer in this runtime.
+  }
+
+  addInputListener(listener) {
+    if (listener) this.pirInputListeners.add(listener);
+    const self = this;
+    return () => {
+      self.pirInputListeners.delete(listener);
+    };
+  }
+
+  removeInputListener(listener) {
+    this.pirInputListeners.delete(listener);
+  }
+
+  onTerminalColorSchemeChange(_listener) {
+    return () => {};
+  }
+
+  setTerminalColorSchemeNotifications(_enabled) {
+    // No terminal I/O in this runtime.
+  }
+
+  queryTerminalColors(_options) {
+    return Promise.resolve({});
+  }
+
+  render(width) {
+    const out = [];
+    for (const child of this.children) out.push(...child.render(width));
+    return out;
+  }
+}
+
+/** Alternate-screen TUI (inert): container shape plus viewport markers. */
+export class TuiAltScreen extends PirTuiBase {
+  constructor(terminal, showHardwareCursor, logDirectory, options) {
+    super(terminal, showHardwareCursor, logDirectory);
+    this.options = options && typeof options === "object" ? options : {};
+    this.pirCopyOnSelect = this.options.copyOnSelect === undefined ? true : this.options.copyOnSelect === true;
+  }
+
+  get mode() {
+    return "fullscreen";
+  }
+
+  get viewportTop() {
+    return 0;
+  }
+
+  get isFollowingOutput() {
+    return true;
+  }
+
+  setWheelScrollLines(_lines) {
+    // No wheel input in this runtime.
+  }
+
+  getCopyOnSelect() {
+    return this.pirCopyOnSelect;
+  }
+
+  setCopyOnSelect(enabled) {
+    this.pirCopyOnSelect = enabled === true;
+  }
+
+  hasActiveSelection() {
+    return false;
+  }
+
+  copyActiveSelectionToClipboard() {
+    return Promise.resolve(false);
+  }
+
+  resetTextSelection() {
+    // No text selection in this runtime.
+  }
+
+  getScreenLines() {
+    return [];
+  }
+
+  setLayoutRoot(_component) {
+    // The layout engine is not mirrored; children render directly.
+  }
+}
+
+/** Main-screen TUI (inert): container shape plus regular-mode marker. */
+export class TuiMainScreen extends PirTuiBase {
+  constructor(terminal, showHardwareCursor, logDirectory) {
+    super(terminal, showHardwareCursor, logDirectory);
+    this.pirRenderState = {
+      previousLines: [],
+      previousWidth: 0,
+      previousHeight: 0,
+      cursorRow: 0,
+      hardwareCursorRow: 0,
+      maxLinesRendered: 0,
+      previousViewportTop: 0,
+    };
+  }
+
+  get mode() {
+    return "regular";
+  }
+
+  captureRenderState() {
+    const state = this.pirRenderState;
+    return {
+      previousLines: state.previousLines.slice(),
+      previousWidth: state.previousWidth,
+      previousHeight: state.previousHeight,
+      cursorRow: state.cursorRow,
+      hardwareCursorRow: state.hardwareCursorRow,
+      maxLinesRendered: state.maxLinesRendered,
+      previousViewportTop: state.previousViewportTop,
+    };
+  }
+
+  restoreRenderState(state) {
+    if (!state || typeof state !== "object") return;
+    this.pirRenderState = {
+      previousLines: Array.isArray(state.previousLines) ? state.previousLines.slice() : [],
+      previousWidth: state.previousWidth || 0,
+      previousHeight: state.previousHeight || 0,
+      cursorRow: state.cursorRow || 0,
+      hardwareCursorRow: state.hardwareCursorRow || 0,
+      maxLinesRendered: state.maxLinesRendered || 0,
+      previousViewportTop: state.previousViewportTop || 0,
+    };
+  }
+}
+
+// VIEWPORT marker so isViewportTUI() classifies the alternate screen.
+Object.defineProperty(TuiAltScreen.prototype, PIR_VIEWPORT_TUI, { value: true });
+
+// ---------------------------------------------------------------------------
+// autocomplete.ts: CombinedAutocompleteProvider. LIMITS (documented): slash
+// command and argument completion only; @-file and path completion need the
+// filesystem/fd and return null here.
+// ---------------------------------------------------------------------------
+
+/** Slash-command autocomplete provider (fuzzy command matching). */
+export class CombinedAutocompleteProvider {
+  constructor(commands, basePath, fdPath) {
+    this.commands = Array.isArray(commands) ? commands : [];
+    this.basePath = basePath;
+    this.fdPath = fdPath === undefined ? null : fdPath;
+    this.triggerCharacters = ["@"];
+  }
+
+  async getSuggestions(lines, cursorLine, cursorCol, options) {
+    const opts = options && typeof options === "object" ? options : {};
+    const currentLine = (lines && lines[cursorLine]) || "";
+    const textBeforeCursor = String(currentLine).slice(0, cursorCol);
+    const commandText = textBeforeCursor.trimStart();
+
+    if (!opts.force && commandText.startsWith("/")) {
+      const spaceIndex = commandText.indexOf(" ");
+
+      if (spaceIndex === -1) {
+        const prefix = commandText.slice(1);
+        const commandItems = this.commands.map((command) => {
+          const name = "name" in command ? command.name : command.value;
+          const hint = "argumentHint" in command && command.argumentHint ? command.argumentHint : undefined;
+          const desc = command.description === undefined ? "" : command.description;
+          const fullDesc = hint ? (desc ? `${hint} — ${desc}` : hint) : desc;
+          return { name: name, label: name, description: fullDesc || undefined };
+        });
+
+        const bareNameMatches = fuzzyFilter(commandItems, prefix, (item) =>
+          item.name.startsWith("skill:") ? item.name.slice("skill:".length) : item.name,
+        );
+        const bareNameMatchSet = new Set(bareNameMatches);
+        const fullNameOnlyMatches = fuzzyFilter(
+          commandItems.filter((item) => item.name.startsWith("skill:") && !bareNameMatchSet.has(item)),
+          prefix,
+          (item) => item.name,
+        );
+        const filtered = [...bareNameMatches, ...fullNameOnlyMatches].map((item) => {
+          const entry = { value: item.name, label: item.label };
+          if (item.description) entry.description = item.description;
+          return entry;
+        });
+
+        if (filtered.length === 0) return null;
+        return { items: filtered, prefix: commandText };
+      }
+
+      const commandName = commandText.slice(1, spaceIndex);
+      const argumentText = commandText.slice(spaceIndex + 1);
+      const command = this.commands.find((candidate) => {
+        const name = "name" in candidate ? candidate.name : candidate.value;
+        return name === commandName;
+      });
+      if (!command || typeof command.getArgumentCompletions !== "function") return null;
+
+      const argumentSuggestions = await command.getArgumentCompletions(argumentText);
+      if (!Array.isArray(argumentSuggestions) || argumentSuggestions.length === 0) return null;
+      return { items: argumentSuggestions, prefix: argumentText };
+    }
+
+    // File/attachment completion needs the filesystem; not mirrored here.
+    return null;
+  }
+
+  applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+    const currentLine = (lines && lines[cursorLine]) || "";
+    const beforePrefix = currentLine.slice(0, cursorCol - prefix.length);
+    const afterCursor = currentLine.slice(cursorCol);
+
+    const isSlashCommand = prefix.startsWith("/") && beforePrefix.trim() === "" && !prefix.slice(1).includes("/");
+    const newLines = Array.isArray(lines) ? lines.slice() : [];
+    if (isSlashCommand) {
+      newLines[cursorLine] = `${beforePrefix}/${item.value} ${afterCursor}`;
+      return { lines: newLines, cursorLine: cursorLine, cursorCol: beforePrefix.length + item.value.length + 2 };
+    }
+
+    const isAttachment = prefix.startsWith("@");
+    const suffix = isAttachment && item.label.endsWith("/") ? "" : " ";
+    newLines[cursorLine] = `${beforePrefix + item.value}${suffix}${afterCursor}`;
+    return { lines: newLines, cursorLine: cursorLine, cursorCol: beforePrefix.length + item.value.length + suffix.length };
+  }
+
+  shouldTriggerFileCompletion(_lines, _cursorLine, _cursorCol) {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// marked: the upstream package's Marked classes, wrapped around this module's
+// Markdown renderer. LIMITS (documented): parse() returns the rendered
+// terminal lines (joined with "\n"), not HTML; lexer() is not implemented.
+// ---------------------------------------------------------------------------
+
+const PIR_MARKED_WIDTH = 80;
+
+/** Minimal Marked: parses markdown through this module's Markdown renderer. */
+export class Marked {
+  constructor(options) {
+    this.defaults = {};
+    this.options = options && typeof options === "object" ? options : {};
+  }
+
+  setOptions(options) {
+    this.options = options && typeof options === "object" ? options : {};
+    return this;
+  }
+
+  use(_plugin) {
+    return this;
+  }
+
+  lexer(_source) {
+    // Tokenization is not mirrored; the renderer parses source lines itself.
+    return [];
+  }
+
+  parse(source) {
+    const text = String(source === undefined || source === null ? "" : source);
+    const lines = new Markdown(text, 0, 0, null).render(PIR_MARKED_WIDTH);
+    return lines.join("\n");
+  }
+
+  parseInline(source) {
+    return String(source === undefined || source === null ? "" : source);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// latex.ts: renderLatex subset. LIMITS (documented): plain text, greek/symbol
+// commands, \frac, \sqrt, wrapper commands (\mathrm etc.), \left/\right and
+// ^/_ scripts (with a small unicode map) render; any other construct returns
+// undefined, upstream's contract for unsupported or malformed syntax.
+// ---------------------------------------------------------------------------
+
+const PIR_LATEX_SYMBOLS = {
+  alpha: "α", beta: "β", gamma: "γ", delta: "δ", epsilon: "ε", varepsilon: "ε", zeta: "ζ",
+  eta: "η", theta: "θ", vartheta: "ϑ", iota: "ι", kappa: "κ", lambda: "λ", mu: "μ", nu: "ν",
+  xi: "ξ", pi: "π", varpi: "ϖ", rho: "ρ", sigma: "σ", tau: "τ", upsilon: "υ", phi: "φ",
+  varphi: "φ", chi: "χ", psi: "ψ", omega: "ω",
+  Gamma: "Γ", Delta: "Δ", Theta: "Θ", Lambda: "Λ", Xi: "Ξ", Pi: "Π", Sigma: "Σ", Phi: "Φ",
+  Psi: "Ψ", Omega: "Ω",
+  infty: "∞", partial: "∂", nabla: "∇", times: "×", cdot: "·", pm: "±", mp: "∓", div: "÷",
+  leq: "≤", le: "≤", geq: "≥", ge: "≥", neq: "≠", ne: "≠", approx: "≈", equiv: "≡",
+  rightarrow: "→", to: "→", leftarrow: "←", Rightarrow: "⇒", Leftarrow: "⇐", leftrightarrow: "↔",
+  sum: "∑", prod: "∏", int: "∫", np: "ℕ", cup: "∪", cap: "∩", in: "∈", forall: "∀", exists: "∃",
+  ldots: "…", dots: "…", quad: " ", qquad: "  ", space: " ", ",": " ", ";": " ",
+};
+
+const PIR_LATEX_SUPERSCRIPT = {
+  "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷",
+  "8": "⁸", "9": "⁹", "+": "⁺", "-": "⁻", "=": "⁼", "(": "⁽", ")": "⁾", "n": "ⁿ", "i": "ⁱ", "x": "ˣ",
+};
+const PIR_LATEX_SUBSCRIPT = {
+  "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅", "6": "₆", "7": "₇",
+  "8": "₈", "9": "₉", "+": "₊", "-": "₋", "=": "₌", "(": "₍", ")": "₎",
+  "a": "ₐ", "e": "ₑ", "i": "ᵢ", "j": "ⱼ", "o": "ₒ", "x": "ₓ", "n": "ₙ", "r": "ᵣ", "s": "ₛ", "t": "ₜ", "u": "ᵤ", "v": "ᵥ",
+};
+const PIR_LATEX_WRAPPERS = new Set(["mathrm", "mathbf", "mathit", "text", "operatorname", "displaystyle", "textstyle", "scriptstyle"]);
+
+function pirLatexReadGroup(source, start) {
+  // start points at "{"; returns { content, next } or null when unbalanced.
+  if (source[start] !== "{") return null;
+  let depth = 1;
+  let index = start + 1;
+  while (index < source.length) {
+    if (source[index] === "\\") {
+      index += 2;
+      continue;
+    }
+    if (source[index] === "{") depth++;
+    else if (source[index] === "}") {
+      depth--;
+      if (depth === 0) return { content: source.slice(start + 1, index), next: index + 1 };
+    }
+    index++;
+  }
+  return null;
+}
+
+function pirLatexReadArgument(source, start) {
+  // A script/command argument: braced group or a single character.
+  if (source[start] === "{") {
+    const group = pirLatexReadGroup(source, start);
+    return group ? { content: group.content, next: group.next } : null;
+  }
+  if (start >= source.length) return null;
+  return { content: source[start], next: start + 1 };
+}
+
+function pirLatexRender(source, depth) {
+  if (depth > 8) return undefined;
+  let out = "";
+  let index = 0;
+  while (index < source.length) {
+    const char = source[index];
+
+    if (char === "\\") {
+      const match = /^\\([a-zA-Z]+|.)/.exec(source.slice(index));
+      if (!match) return undefined;
+      const name = match[1];
+      index += match[0].length;
+
+      if (Object.prototype.hasOwnProperty.call(PIR_LATEX_SYMBOLS, name)) {
+        out += PIR_LATEX_SYMBOLS[name];
+        continue;
+      }
+      if (name === "frac") {
+        const numerator = pirLatexReadArgument(source, index);
+        if (!numerator) return undefined;
+        const denominator = pirLatexReadArgument(source, numerator.next);
+        if (!denominator) return undefined;
+        const top = pirLatexRender(numerator.content, depth + 1);
+        const bottom = pirLatexRender(denominator.content, depth + 1);
+        if (top === undefined || bottom === undefined) return undefined;
+        out += `${top}/${bottom}`;
+        index = denominator.next;
+        continue;
+      }
+      if (name === "sqrt") {
+        const argument = pirLatexReadArgument(source, index);
+        if (!argument) return undefined;
+        const radicand = pirLatexRender(argument.content, depth + 1);
+        if (radicand === undefined) return undefined;
+        out += `√${radicand}`;
+        index = argument.next;
+        continue;
+      }
+      if (PIR_LATEX_WRAPPERS.has(name)) {
+        const argument = pirLatexReadArgument(source, index);
+        if (!argument) return undefined;
+        const wrapped = pirLatexRender(argument.content, depth + 1);
+        if (wrapped === undefined) return undefined;
+        out += wrapped;
+        index = argument.next;
+        continue;
+      }
+      if (name === "left" || name === "right") {
+        // Size prefixes like \left( are dropped; the delimiter itself follows.
+        continue;
+      }
+      return undefined;
+    }
+
+    if (char === "^" || char === "_") {
+      const argument = pirLatexReadArgument(source, index + 1);
+      if (!argument) return undefined;
+      const script = pirLatexRender(argument.content, depth + 1);
+      if (script === undefined) return undefined;
+      const table = char === "^" ? PIR_LATEX_SUPERSCRIPT : PIR_LATEX_SUBSCRIPT;
+      let mapped = "";
+      for (const scriptChar of script) {
+        const replacement = table[scriptChar];
+        if (replacement === undefined) return undefined;
+        mapped += replacement;
+      }
+      out += mapped;
+      index = argument.next;
+      continue;
+    }
+
+    if (char === "{") {
+      const group = pirLatexReadGroup(source, index);
+      if (!group) return undefined;
+      const rendered = pirLatexRender(group.content, depth + 1);
+      if (rendered === undefined) return undefined;
+      out += rendered;
+      index = group.next;
+      continue;
+    }
+
+    if (char === "}") return undefined;
+
+    out += char;
+    index++;
+  }
+  return out;
+}
+
+/**
+ * Render a LaTeX math expression as terminal-friendly Unicode text, or
+ * undefined when the construct is outside the supported subset.
+ */
+export function renderLatex(source, options) {
+  const text = String(source === undefined || source === null ? "" : source);
+  const opts = options && typeof options === "object" ? options : {};
+  void opts; // display mode affects upstream layout only; the subset is inline.
+  if (text.trim() === "") return "";
+  const rendered = pirLatexRender(text, 0);
+  if (rendered === undefined) return undefined;
+  return rendered.replace(/\s+/g, " ").trim();
+}
+
+// ---------------------------------------------------------------------------
+// terminal.ts: ProcessTerminal skeleton (inert; this runtime owns no TTY) and
+// isAppleTerminalSession
+// ---------------------------------------------------------------------------
+
+export function isAppleTerminalSession() {
+  return pirProcessPlatform() === "darwin" && pirProcessEnv().TERM_PROGRAM === "Apple_Terminal";
+}
+
+/**
+ * Terminal skeleton. Construction is safe so extensions can instantiate it;
+ * every I/O method is a documented no-op because this runtime has no TTY.
+ */
+export class ProcessTerminal {
+  constructor() {
+    this.pirInputHandler = undefined;
+    this.pirResizeHandler = undefined;
+    this.pirStarted = false;
+  }
+
+  get columns() {
+    try {
+      if (typeof process !== "undefined" && process && process.stdout && Number.isFinite(process.stdout.columns)) {
+        return process.stdout.columns;
+      }
+    } catch {
+      // Fall through to the default.
+    }
+    return 80;
+  }
+
+  get rows() {
+    try {
+      if (typeof process !== "undefined" && process && process.stdout && Number.isFinite(process.stdout.rows)) {
+        return process.stdout.rows;
+      }
+    } catch {
+      // Fall through to the default.
+    }
+    return 24;
+  }
+
+  get kittyProtocolActive() {
+    return false;
+  }
+
+  start(onInput, onResize) {
+    // Inert: raw mode and terminal handshakes are host features.
+    this.pirInputHandler = onInput;
+    this.pirResizeHandler = onResize;
+    this.pirStarted = true;
+  }
+
+  stop() {
+    // Inert: nothing was acquired.
+    this.pirStarted = false;
+  }
+
+  drainInput(_maxMs, _idleMs) {
+    // Inert: there is no stdin to drain.
+    return Promise.resolve();
+  }
+
+  write(_data) {
+    // Inert: this runtime has no terminal output stream.
+  }
+
+  moveBy(_lines) {
+    // Inert.
+  }
+
+  hideCursor() {
+    // Inert.
+  }
+
+  showCursor() {
+    // Inert.
+  }
+
+  clearLine() {
+    // Inert.
+  }
+
+  clearFromCursor() {
+    // Inert.
+  }
+
+  clearScreen() {
+    // Inert.
+  }
+
+  setTitle(_title) {
+    // Inert.
+  }
+
+  setProgress(_active) {
+    // Inert.
+  }
+
+  setProgramStatus(_status) {
+    // Inert.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// native-platform.ts: native clipboard helper (unavailable by design)
+// ---------------------------------------------------------------------------
+
+export function getNativeClipboard() {
+  throw new Error(
+    "getNativeClipboard is not available in the pir extension runtime (no native clipboard helper)",
+  );
+}
+
+export default {
+  Text: Text,
+  Container: Container,
+  Box: Box,
+  Spacer: Spacer,
+  Input: Input,
+  SelectList: SelectList,
+  Markdown: Markdown,
+  Key: Key,
+  matchesKey: matchesKey,
+  isKeyRelease: isKeyRelease,
+  setKittyProtocolActive: setKittyProtocolActive,
+  isKittyProtocolActive: isKittyProtocolActive,
+  fuzzyMatch: fuzzyMatch,
+  fuzzyFilter: fuzzyFilter,
+  truncateToWidth: truncateToWidth,
+  visibleWidth: visibleWidth,
+  wrapTextWithAnsi: wrapTextWithAnsi,
+  // Phase 4f mirror surface.
+  CURSOR_MARKER: CURSOR_MARKER,
+  FAKE_CURSOR_START: FAKE_CURSOR_START,
+  FAKE_CURSOR_END: FAKE_CURSOR_END,
+  renderFakeCursor: renderFakeCursor,
+  isFocusable: isFocusable,
+  isViewportTUI: isViewportTUI,
+  sliceByColumn: sliceByColumn,
+  stripTerminalSequences: stripTerminalSequences,
+  getOsc8LinkAtColumn: getOsc8LinkAtColumn,
+  compositeTuiLine: compositeTuiLine,
+  oklabToOkhslLightness: oklabToOkhslLightness,
+  indexedColor: indexedColor,
+  rgbColor: rgbColor,
+  oklchColor: oklchColor,
+  okhslColor: okhslColor,
+  parseColor: parseColor,
+  colorToRgb: colorToRgb,
+  colorToOklch: colorToOklch,
+  colorToOkhsl: colorToOkhsl,
+  colorToHex: colorToHex,
+  mixColors: mixColors,
+  foregroundAnsi: foregroundAnsi,
+  backgroundAnsi: backgroundAnsi,
+  styleText: styleText,
+  styleTextWithAnsi: styleTextWithAnsi,
+  getCellDimensions: getCellDimensions,
+  setCellDimensions: setCellDimensions,
+  detectCapabilities: detectCapabilities,
+  getCapabilities: getCapabilities,
+  getTerminalColorMode: getTerminalColorMode,
+  resetCapabilitiesCache: resetCapabilitiesCache,
+  setCapabilityOverrides: setCapabilityOverrides,
+  setCapabilities: setCapabilities,
+  allocateImageId: allocateImageId,
+  encodeKitty: encodeKitty,
+  deleteKittyImage: deleteKittyImage,
+  deleteAllKittyImages: deleteAllKittyImages,
+  encodeITerm2: encodeITerm2,
+  calculateImageCellSize: calculateImageCellSize,
+  calculateImageRows: calculateImageRows,
+  getPngDimensions: getPngDimensions,
+  getJpegDimensions: getJpegDimensions,
+  getGifDimensions: getGifDimensions,
+  getWebpDimensions: getWebpDimensions,
+  getImageDimensions: getImageDimensions,
+  renderImage: renderImage,
+  hyperlink: hyperlink,
+  imageFallback: imageFallback,
+  parseTerminalColorSchemeReport: parseTerminalColorSchemeReport,
+  TUI_KEYBINDINGS: TUI_KEYBINDINGS,
+  KeybindingsManager: KeybindingsManager,
+  setKeybindings: setKeybindings,
+  getKeybindings: getKeybindings,
+  isKeyRepeat: isKeyRepeat,
+  decodeKittyPrintable: decodeKittyPrintable,
+  parseKey: parseKey,
+  formatProgramStatus: formatProgramStatus,
+  StdinBuffer: StdinBuffer,
+  VStack: VStack,
+  HStack: HStack,
+  TruncatedText: TruncatedText,
+  Loader: Loader,
+  CancellableLoader: CancellableLoader,
+  ScrollView: ScrollView,
+  Editor: Editor,
+  SettingsList: SettingsList,
+  MouseRegion: MouseRegion,
+  setImageTranscoder: setImageTranscoder,
+  Image: Image,
+  TuiAltScreen: TuiAltScreen,
+  TuiMainScreen: TuiMainScreen,
+  CombinedAutocompleteProvider: CombinedAutocompleteProvider,
+  Marked: Marked,
+  renderLatex: renderLatex,
+  isAppleTerminalSession: isAppleTerminalSession,
+  ProcessTerminal: ProcessTerminal,
+  getNativeClipboard: getNativeClipboard,
+};

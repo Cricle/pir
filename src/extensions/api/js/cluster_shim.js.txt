@@ -1,0 +1,76 @@
+// node:cluster — throws tier. No process-orchestration host exists (the
+// runtime is single-process by contract). The module-level state values are
+// the real primary-process values (isWorker=false/isPrimary=true/empty
+// workers), so code probing "am I a worker" gets the honest answer; the
+// fork/setup entry points throw the unified error.
+function clusterUnsupported(api) {
+  const error = new Error("node:cluster." + api + " is not supported by the pir extension runtime (single-process runtime)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+class Worker {
+  constructor(..._args) {
+    throw clusterUnsupported("Worker");
+  }
+  disconnect(_callback) {}
+  kill(_signal) {}
+}
+
+const SCHED_NONE = 1;
+const SCHED_RR = 2;
+
+function setupPrimary(..._args) {
+  throw clusterUnsupported("setupPrimary");
+}
+
+function setupMaster(..._args) {
+  throw clusterUnsupported("setupMaster");
+}
+
+function fork(..._args) {
+  throw clusterUnsupported("fork");
+}
+
+function disconnect(..._args) {
+  throw clusterUnsupported("disconnect");
+}
+
+const cluster = {
+  Worker: Worker,
+  setupPrimary: setupPrimary,
+  setupMaster: setupMaster,
+  fork: fork,
+  disconnect: disconnect,
+  // Real primary-process state: this runtime is never a worker.
+  isWorker: false,
+  isPrimary: true,
+  isMaster: true,
+  workers: {},
+  settings: {},
+  SCHED_NONE: SCHED_NONE,
+  SCHED_RR: SCHED_RR,
+  schedulingPolicy: SCHED_NONE,
+  _events: {},
+  _eventsCount: 0,
+  _maxListeners: 0,
+};
+
+// Standalone references for the named-export surface.
+const _events = cluster._events;
+const _eventsCount = cluster._eventsCount;
+const _maxListeners = cluster._maxListeners;
+const isWorker = cluster.isWorker;
+const isPrimary = cluster.isPrimary;
+const isMaster = cluster.isMaster;
+const workers = cluster.workers;
+const settings = cluster.settings;
+const schedulingPolicy = cluster.schedulingPolicy;
+
+export default cluster;
+export {
+  Worker, setupPrimary, setupMaster, fork, disconnect,
+  isWorker, isPrimary, isMaster, workers, settings,
+  SCHED_NONE, SCHED_RR, schedulingPolicy,
+  _events, _eventsCount, _maxListeners,
+};

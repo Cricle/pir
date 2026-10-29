@@ -1,0 +1,98 @@
+# cargo-deny configuration. CI runs this via EmbarkStudios/cargo-deny-action
+# (see .github/workflows/ci.yml, job `deny`). Kept deliberately
+# permissive-but-explicit: the list below is the allow-list that makes the
+# current tree pass; anything not justified by the tree stays commented rather
+# than pre-enabled.
+
+[graph]
+# All targets are only needed if we ever lint cross-platform deps in CI; the
+# default (current host target) matches the ubuntu-only CI runners.
+# all-targets = true
+
+[licenses]
+# Allow list grounded in Cargo.lock (684 package entries, Cargo.lock v4,
+# verified with cargo-deny 0.20.2 on 2026-10-29):
+# - MIT / Apache-2.0: the overwhelming majority, including every dual-licensed
+#   crate ("MIT OR Unlicense": ripgrep's grep-*/ignore/walkdir/memchr/
+#   aho-corasick/bstr; "Apache-2.0 OR BSL-1.0": ryu; serde/tokio/clap/hyper/
+#   reqwest/swc*/image/rsa/rmcp/criterion/insta/proptest/...).
+# - Apache-2.0 WITH LLVM-exception: wasi, wasip2, wit-bindgen,
+#   ar_archive_writer (getrandom's wasm backend + LLVM-derived code).
+# - Unicode-3.0: icu_* / idna_adapter / litemap / tinystr / writeable /
+#   zerovec family (idna via url/reqwest), unicode-width 0.2, and
+#   unicode-ident which is (MIT OR Apache-2.0) AND Unicode-3.0.
+# - Unicode-DFS-2016: older unicode-* crates, kept as insurance.
+# - BSD-3-Clause: subtle (via rsa), also an option in rustix's triple.
+# - Zlib / BSL-1.0: OR-clause options of miniz_oxide/bytemuck and ryu.
+# - Unlicense: OR-clause option of the ripgrep-family crates above.
+# - ISC / CDLA-Permissive-2.0: required by the project policy; CDLA ships
+#   with Google-authored crates if any appear in the tree later.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+    "BSL-1.0",
+    "Unlicense",
+    # notify 8.2.0 (+ notify-types): the native file watcher behind
+    # `pir env-daemon`'s `watch` operation (src/env_daemon/watch.rs) — the same
+    # crate the upstream pi-env daemon uses. Both are CC0-1.0: a public-domain
+    # dedication whose §3 fallback license is granted even where a dedication
+    # is not effective, i.e. strictly more permissive than the MIT/Apache
+    # entries above (no copyleft, no attribution requirement).
+    "CC0-1.0",
+    # rustpython-doc 0.3.0 / rustpython-pylib 0.4.0 carry no SPDX expression in
+    # Cargo.toml; cargo-deny reads their LICENSE / Lib/PSF-LICENSE files as
+    # Python-2.0.1. The PSF license is permissive, OSI-approved and
+    # GPL-compatible; both crates ship only embedded Python docs/stdlib.
+    "Python-2.0.1",
+    # terminfo 0.9.0 (via brush-core 0.5's embedded-shell feature) is WTFPL, a
+    # permissive public-domain-equivalent license.
+    "WTFPL",
+    # rustpython-vm 0.4 bigint backend (malachite) — the embedded python tool
+    # is an explicit pir feature; LGPL terms apply to the library itself only
+    "LGPL-3.0-only",
+    # rpds 1.2 (persistent data structures) — a brush-core 0.5 dependency of
+    # the optional `brush` feature (the embedded shell). MPL-2.0 is file-level
+    # copyleft: it imposes nothing on pir's own sources, only on modified
+    # copies of rpds' files, which this tree never makes.
+    "MPL-2.0",
+]
+# Held in reserve if a copyleft-but-fine crate shows up; uncomment
+# deliberately, never preemptively.
+# unused-allowed-license = "allow"
+
+[advisories]
+# Defaults kept: vulnerability = deny, unmaintained/yanked = warn. The only
+# pinned ignore is the known unpatched advisory we already ship past:
+ignore = [
+    # RUSTSEC-2023-0071 — rsa: Marvin timing side channel; no fix released on
+    # the 0.9 line. Our use signs locally-generated Vertex service-account
+    # JWTs with a private key held in-process (no remote signing oracle),
+    # so the practical exposure is out of scope. Re-evaluate when rsa 0.10
+    # ships.
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack: no fix on the 0.9 line; our keys sign local JWTs only" },
+]
+# Known warn-level (non-blocking) noise, accepted as-is: serde_yaml is
+# deprecated/unmaintained (RUSTSEC-2024-0436) and nu-ansi-term is
+# unmaintained; both are warn-by-default kinds, not vulnerabilities.
+
+[bans]
+# Default: multiple-versions = "warn". The tree has benign duplicates
+# (hashbrown 0.14/0.17, getrandom x3, miniz_oxide 0.8/0.9, windows-sys x2,
+# rand x2); warn keeps visibility without red-barring CI. Tighten to "deny"
+# plus explicit skip lists only when someone volunteers to curate them.
+multiple-versions = "warn"
+
+[sources]
+# Only crates.io; no git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

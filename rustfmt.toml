@@ -1,0 +1,7 @@
+# Minimal rustfmt config. The codebase was formatted with rustfmt defaults
+# (4-space indent, max_width 100, small heuristics), so every entry below is
+# the current default, spelled out explicitly as documentation. Keeping the
+# config minimal avoids any large-scale reformatting of the existing tree.
+edition = "2021"
+max_width = 100
+use_small_heuristics = "Default"

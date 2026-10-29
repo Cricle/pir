@@ -1,0 +1,210 @@
+
+globalThis.Intl ?? (globalThis.Intl = (function () {
+  // Host fast path (§6.5 host-first policy): `__pirIntlFormat` (rquickjs
+  // C-ABI, see src/extensions/runtime/host_functions/buffer_ops.rs) backs
+  // the NumberFormat/DateTimeFormat hot paths. Ops return `undefined` when
+  // the native side would diverge from `String(n)` semantics (exponent
+  // notation) and throw the same RangeError for invalid dates — the JS
+  // implementations below are the automatic fallback in every case.
+  const pirIntlFormat = typeof globalThis.__pirIntlFormat === "function" ? globalThis.__pirIntlFormat : null;
+
+  class Segmenter {
+    constructor(locales, options) {
+      this.granularity = (options && options.granularity) || "grapheme";
+    }
+
+    resolvedOptions() {
+      return { granularity: this.granularity, locale: "en" };
+    }
+
+    segment(input) {
+      const text = String(input === undefined || input === null ? "" : input);
+      const items = [];
+      let index = 0;
+      for (const point of text) {
+        items.push({ segment: point, index: index, input: text });
+        index += point.length;
+      }
+      return {
+        [Symbol.iterator]() {
+          return items[Symbol.iterator]();
+        },
+        containing(position) {
+          const at = Number(position);
+          for (const item of items) {
+            if (at >= item.index && at < item.index + item.segment.length) return item;
+          }
+          return undefined;
+        },
+      };
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Formatter family (minimal tier): constructible skeletons so ecosystem
+  // feature checks (`typeof Intl.NumberFormat === "function"`, got's
+  // @sindresorhus/is probes, pi extension formatting) do not crash on load.
+  // Deliberate gaps vs real Intl: no locale data (every locale formats the
+  // same), no options-driven calendar/numbering systems, no unit/currency
+  // styling beyond the basics documented per class.
+  // ---------------------------------------------------------------------------
+
+  // Shared locale/options bookkeeping: the first string locale is recorded,
+  // options are normalized to a plain object (used verbatim by
+  // resolvedOptions, like the real formatters).
+  function pirLocaleOf(locales) {
+    if (Array.isArray(locales)) {
+      for (const item of locales) {
+        if (typeof item === "string" && item.length > 0) return item;
+      }
+      return undefined;
+    }
+    return typeof locales === "string" && locales.length > 0 ? locales : undefined;
+  }
+
+  function pirFormatOptions(options) {
+    return options === undefined || options === null || typeof options !== "object" ? {} : options;
+  }
+
+  // Intl.ListFormat: unit-style join. `type: "disjunction"` uses " or "
+  // (en), `unit`/`conjunction` use " and "; anything else joins with ", ".
+  class ListFormat {
+    constructor(locales, options) {
+      this._locale = pirLocaleOf(locales);
+      this._options = pirFormatOptions(options);
+      const type = this._options.type === "disjunction" ? "disjunction" : this._options.type === "unit" ? "unit" : "conjunction";
+      const style = this._options.style === "narrow" || this._options.style === "short" ? this._options.style : "long";
+      this._type = type;
+      this._style = style;
+    }
+    format(list) {
+      const items = Array.from(list === undefined || list === null ? [] : list).map((item) => String(item));
+      if (items.length === 0) return "";
+      if (items.length === 1) return items[0];
+      const tail = this._type === "disjunction" ? " or " : this._type === "unit" ? " " : " and ";
+      const separator = this._style === "long" ? ", " : " ";
+      return items.slice(0, -1).join(separator) + tail + items[items.length - 1];
+    }
+    formatToParts(list) {
+      const text = this.format(list);
+      return text.length === 0 ? [] : [{ type: "element", value: text }];
+    }
+    resolvedOptions() {
+      return {
+        locale: this._locale || "en",
+        type: this._type,
+        style: this._style,
+        numeric: this._options.numeric !== false,
+      };
+    }
+  }
+
+  // Intl.DateTimeFormat: ISO approximation ("YYYY-MM-DD HH:mm:ss" in UTC).
+  // No timezone/locale data — every option combination renders the same UTC
+  // shape; dateStyle/timeStyle are accepted and ignored.
+  class DateTimeFormat {
+    constructor(locales, options) {
+      this._locale = pirLocaleOf(locales);
+      this._options = pirFormatOptions(options);
+    }
+    format(date) {
+      const value = date === undefined || date === null ? Date.now() : date instanceof Date ? date.getTime() : Number(date);
+      if (pirIntlFormat) {
+        try {
+          const text = pirIntlFormat("date", value);
+          if (typeof text === "string") return text;
+        } catch (error) {
+          // The native side throws the same RangeError("Invalid time value")
+          // as the JS path; either way rethrow through the JS fallback to
+          // keep one code shape.
+        }
+      }
+      if (!Number.isFinite(value)) {
+        throw new RangeError("Invalid time value");
+      }
+      const d = new Date(value);
+      const p2 = (n) => (n < 10 ? "0" : "") + n;
+      return (
+        d.getUTCFullYear() + "-" + p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) +
+        " " + p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes()) + ":" + p2(d.getUTCSeconds())
+      );
+    }
+    resolvedOptions() {
+      return {
+        locale: this._locale || "en",
+        calendar: "gregory",
+        numberingSystem: "latn",
+        timeZone: "UTC",
+        year: this._options.year || "numeric",
+        month: this._options.month || "numeric",
+        day: this._options.day || "numeric",
+        hour: this._options.hour || "numeric",
+        minute: this._options.minute || "numeric",
+        second: this._options.second || "numeric",
+      };
+    }
+  }
+
+  // Intl.NumberFormat: decimal grouping (thousands separators). Styling
+  // beyond decimal/currency-digit options is not modeled; fraction digits
+  // follow the number itself clamped to the options window.
+  class NumberFormat {
+    constructor(locales, options) {
+      this._locale = pirLocaleOf(locales);
+      this._options = pirFormatOptions(options);
+      const min = this._options.minimumFractionDigits;
+      const max = this._options.maximumFractionDigits;
+      this._minFrac = typeof min === "number" && Number.isFinite(min) ? Math.max(0, Math.min(100, Math.trunc(min))) : 0;
+      this._maxFrac = typeof max === "number" && Number.isFinite(max) ? Math.max(this._minFrac, Math.min(100, Math.trunc(max))) : 3;
+    }
+    format(value) {
+      const n = Number(value);
+      if (pirIntlFormat) {
+        try {
+          const text = pirIntlFormat("number", n, this._minFrac, this._maxFrac);
+          if (typeof text === "string") return text;
+        } catch (error) { /* fall through to the JS formatter */ }
+      }
+      if (!Number.isFinite(n)) return String(n);
+      let text = n < 0 ? String(-n) : String(n);
+      const negative = n < 0;
+      let fraction = "";
+      const dot = text.indexOf(".");
+      if (dot !== -1) {
+        fraction = text.slice(dot + 1);
+        text = text.slice(0, dot);
+      }
+      if (fraction.length > this._maxFrac) fraction = fraction.slice(0, this._maxFrac);
+      while (fraction.length < this._minFrac) fraction += "0";
+      let grouped = "";
+      for (let i = 0; i < text.length; i++) {
+        if (i > 0 && (text.length - i) % 3 === 0) grouped += ",";
+        grouped += text[i];
+      }
+      return (negative ? "-" : "") + grouped + (fraction.length > 0 ? "." + fraction : "");
+    }
+    formatToParts(value) {
+      const text = this.format(value);
+      return [{ type: "integer", value: text }];
+    }
+    resolvedOptions() {
+      return {
+        locale: this._locale || "en",
+        style: this._options.style === "currency" || this._options.style === "percent" || this._options.style === "unit" ? this._options.style : "decimal",
+        minimumFractionDigits: this._minFrac,
+        maximumFractionDigits: this._maxFrac,
+        useGrouping: this._options.useGrouping !== false,
+      };
+    }
+  }
+
+  return {
+    Segmenter: Segmenter,
+    ListFormat: ListFormat,
+    DateTimeFormat: DateTimeFormat,
+    NumberFormat: NumberFormat,
+    getCanonicalLocales: () => [],
+    supportedValuesOf: () => [],
+  };
+})());
+

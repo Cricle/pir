@@ -1,0 +1,49 @@
+# Rust
+/target/
+/target-lane-*/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local build/test artifacts (never stage; the eval harness owns target/)
+/target-alt/
+/target-exp-*/
+/target-release-*/
+/scripts/tui_conpty/out/
+/.pi/
+/AGENT.md
+
+# Environment / credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+**/auth.json
+
+# Logs
+*.log
+logs/
+pi.log
+
+# Sessions / data
+sessions/
+*.db
+*.db-shm
+*.db-wal
+
+# Node (forbidden artifacts that must never appear in the pure-Rust repo)
+node_modules/
+package.json
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+*.ts
+*.tsx
+*.js
+# Built-in phone web assets are intentional source (embedded with include_bytes),
+# not Node build artifacts.
+!src/plugins/builtin/phone/assets/**
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,22 @@
+NAME = "probe2"
+OPS = [
+    ("wait_quiet", 2.0),
+    ("log", "A: text+CR"),
+    ("send", b"acc3_probeA\r"),
+    ("wait", 1.2),
+    ("snap", "acc3_probeA_cr"),
+    ("log", "B: text+LF"),
+    ("send", b"acc3_probeB\n"),
+    ("wait", 1.2),
+    ("snap", "acc3_probeB_lf"),
+    ("log", "C: text+CSI-u shift+enter"),
+    ("send", b"acc3_probeC\x1b[13;2u"),
+    ("wait", 1.2),
+    ("snap", "acc3_probeC_shift"),
+    ("log", "D: text+CSI-u plain enter"),
+    ("send", b"acc3_probeD\x1b[13u"),
+    ("wait", 1.2),
+    ("snap", "acc3_probeD_csiu"),
+    ("send", b"/quit\r"),
+    ("wait", 1.0),
+]

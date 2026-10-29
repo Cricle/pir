@@ -1,0 +1,86 @@
+
+// node:https — the CLIENT face shares the node:http implementation: the
+// `__pir_host.http` fetch bridge speaks https natively (native-tls), so
+// request()/get()/ClientRequest/IncomingMessage are the same code with the
+// `https:` default protocol (port 443). The TLS *server* face stays
+// throws-tier (the runtime hosts no certificate stack): https.Server /
+// https.createServer keep the unified not-supported error. STATUS_CODES,
+// METHODS, the message classes and the validation helpers are re-exports of
+// @node/http. ES2020 only.
+
+import {
+  IncomingMessage, ServerResponse, STATUS_CODES, METHODS, OutgoingMessage,
+  ClientRequest as HttpClientRequest, Agent as HttpAgent, maxHeaderSize,
+  validateHeaderName, validateHeaderValue, setMaxIdleHTTPParsers,
+  setGlobalProxyFromEnv, WebSocket, CloseEvent, MessageEvent,
+  _pirCreateRequest, _pirCreateGet,
+} from "@node/http";
+
+class Agent extends HttpAgent {
+  constructor(options) {
+    super(options);
+    const opts = options === undefined || options === null ? {} : options;
+    this.defaultPort = typeof opts.defaultPort === "number" ? opts.defaultPort : 443;
+    this.protocol = "https:";
+    this._pirName = "https";
+  }
+}
+
+// Direct `new https.ClientRequest(...)` keeps the https: default protocol.
+class ClientRequest extends HttpClientRequest {
+  constructor(input, options, callback) {
+    super(input, options, callback, "https:");
+  }
+}
+
+const httpsUnsupported = function (api) {
+  const error = new Error("node:https." + api + " is not supported by the pir extension runtime (the runtime hosts no TLS server)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+};
+
+class Server {
+  constructor(..._args) {
+    throw httpsUnsupported("Server");
+  }
+}
+
+function createServer(..._args) {
+  throw httpsUnsupported("createServer");
+}
+
+const request = _pirCreateRequest("https:");
+const get = _pirCreateGet(request);
+
+const globalAgent = new Agent();
+
+const https = {
+  createServer: createServer,
+  request: request,
+  get: get,
+  Server: Server,
+  IncomingMessage: IncomingMessage,
+  ServerResponse: ServerResponse,
+  STATUS_CODES: STATUS_CODES,
+  METHODS: METHODS,
+  Agent: Agent,
+  globalAgent: globalAgent,
+  ClientRequest: ClientRequest,
+  OutgoingMessage: OutgoingMessage,
+  maxHeaderSize: maxHeaderSize,
+  validateHeaderName: validateHeaderName,
+  validateHeaderValue: validateHeaderValue,
+  setMaxIdleHTTPParsers: setMaxIdleHTTPParsers,
+  setGlobalProxyFromEnv: setGlobalProxyFromEnv,
+  WebSocket: WebSocket,
+  CloseEvent: CloseEvent,
+  MessageEvent: MessageEvent,
+};
+
+export default https;
+export {
+  createServer, request, get, Server, IncomingMessage, ServerResponse, STATUS_CODES, METHODS,
+  Agent, globalAgent, ClientRequest, OutgoingMessage, maxHeaderSize, validateHeaderName,
+  validateHeaderValue, setMaxIdleHTTPParsers, setGlobalProxyFromEnv, WebSocket, CloseEvent,
+  MessageEvent,
+};

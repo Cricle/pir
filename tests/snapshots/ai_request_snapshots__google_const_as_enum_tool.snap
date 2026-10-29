@@ -1,0 +1,51 @@
+---
+source: tests/ai_request_snapshots.rs
+expression: canonical(&body)
+---
+{
+  "contents": [],
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "description": "Choose a mode and retry count.",
+          "name": "choose_mode",
+          "parametersJsonSchema": {
+            "properties": {
+              "kept": {
+                "const": "kept",
+                "enum": [
+                  "kept",
+                  "other"
+                ],
+                "type": "string"
+              },
+              "literal": {
+                "default": {
+                  "const": "not-a-schema"
+                },
+                "type": "string"
+              },
+              "mode": {
+                "enum": [
+                  "fast"
+                ],
+                "type": "string"
+              },
+              "retries": {
+                "enum": [
+                  2
+                ],
+                "type": "number"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ]
+}

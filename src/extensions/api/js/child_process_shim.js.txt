@@ -1,0 +1,495 @@
+
+import EventEmitter from "@node/events";
+import { Readable } from "@node/stream";
+
+const Buffer = globalThis.Buffer;
+const call = globalThis.__pirNodeCall;
+
+// Pump cadence: each tick hands the host a bounded wait (it never blocks the
+// runtime for longer) and delivers whatever the readers buffered since.
+const POLL_INTERVAL_MS = 25;
+const POLL_WAIT_MS = 20;
+
+// nextTick rides the shared priority queue (node_call_helper.js.txt) so
+// 'end'/'close' ordering holds even when a nextTick was registered before
+// them; the promise queue is the shim-only fallback.
+function pirTick(fn) {
+  const tick = globalThis.__pirNextTick;
+  if (typeof tick === "function") {
+    tick(fn);
+    return;
+  }
+  Promise.resolve().then(fn);
+}
+
+function toChunkBuffer(value, encoding) {
+  if (value instanceof Uint8Array) return Buffer.from(value);
+  return Buffer.from(String(value), encoding === undefined ? "utf8" : encoding);
+}
+
+function stripBom(text) {
+  // Node's string output of captured process output carries no UTF-8 BOM.
+  return text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text;
+}
+
+function decodeOutput(buffer, encoding) {
+  if (encoding === undefined || encoding === "buffer") return buffer;
+  return stripBom(buffer.toString(encoding));
+}
+
+// Node semantics: a provided `env` REPLACES the child's environment wholesale
+// (values are stringified; null/undefined entries are dropped).
+function encodeEnv(env) {
+  if (env === undefined || env === null) return undefined;
+  const out = {};
+  for (const key of Object.keys(env)) {
+    const value = env[key];
+    if (value === undefined || value === null) continue;
+    out[key] = String(value);
+  }
+  return out;
+}
+
+function shellOption(shell) {
+  if (shell === undefined || shell === null || shell === false) return undefined;
+  if (shell === true) return true;
+  return String(shell);
+}
+
+// Node's `stdio` option, the three-element form (the only one that maps onto
+// this runtime's three descriptors — extra entries are ignored):
+//   "pipe" (default)   — a host pipe, the JS-visible `child.stdin/stdout/stderr`
+//   "ignore"           — the child gets the null device; no JS stream
+//   "inherit"          — the child shares this process's descriptor
+//   a number           — a parent fd from `fs.openSync` (the detached-runner
+//                        shape: `stdio: ["ignore", fdOut, fdErr]` sends the
+//                        child's output straight into the caller's log file)
+//   a stream object    — accepted when it carries a numeric `.fd`
+//                        (`fs.createWriteStream`/socket style), rejected
+//                        otherwise
+//   "overlapped"       — Node's Windows-only flag; the host's pipes are
+//                        synchronous, so the slot resolves to a plain pipe
+// The string form (`stdio: "ignore"`) applies to all three descriptors.
+// Validation is synchronous, like Node's argument checking.
+function normalizeStdioSlot(value, index) {
+  if (value === undefined || value === null || value === "pipe") return "pipe";
+  if (value === "ignore" || value === "inherit") return value;
+  // Node's Windows-only "overlapped" asks for an overlapped handle; the host's
+  // pipes are synchronous, so the slot resolves to an ordinary pipe.
+  if (value === "overlapped") return "pipe";
+  if (typeof value === "number") {
+    if (!Number.isInteger(value) || value < 0) {
+      const error = new TypeError("Invalid fd in the stdio option: " + String(value));
+      error.code = "ERR_OUT_OF_RANGE";
+      throw error;
+    }
+    return value;
+  }
+  if (typeof value === "object") {
+    // An fd-backed stream: the descriptor is what the host needs.
+    if (typeof value.fd === "number" && Number.isInteger(value.fd) && value.fd >= 0) {
+      return value.fd;
+    }
+    const error = new TypeError(
+      "In the \"stdio\" option, only \"pipe\", \"ignore\", \"inherit\", a file descriptor number, or an fd-backed stream is supported at index " + index,
+    );
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+  const error = new TypeError("Invalid stdio option value at index " + index + ": " + String(value));
+  error.code = "ERR_INVALID_ARG_VALUE";
+  throw error;
+}
+
+function normalizeStdio(stdio) {
+  if (stdio === undefined || stdio === null) return undefined; // host default: three pipes
+  if (typeof stdio === "string") {
+    if (stdio === "overlapped") return ["pipe", "pipe", "pipe"];
+    if (stdio !== "pipe" && stdio !== "ignore" && stdio !== "inherit") {
+      const error = new TypeError("Invalid stdio option value: " + String(stdio));
+      error.code = "ERR_INVALID_ARG_VALUE";
+      throw error;
+    }
+    return [stdio, stdio, stdio];
+  }
+  if (!Array.isArray(stdio)) {
+    const error = new TypeError("The \"stdio\" option must be a string or an array");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  const out = [];
+  for (let index = 0; index < 3; index++) out.push(normalizeStdioSlot(stdio[index], index));
+  return out;
+}
+
+// The child's capture streams are real Readables from the stream pad: npm code
+// and the runtime's own consumers (the durable `NodeExecutionEnv`) drive them
+// with `setEncoding`/`readableEncoding`, `pause`/`resume` and `destroy`, all of
+// which the pad already implements. The host hands each poll sample over as
+// base64; a chunk nobody consumed yet stays buffered (node's contract for an
+// unread child pipe) instead of being dropped.
+class ChildPipe extends Readable {
+  _deliver(base64) {
+    if (!base64) return;
+    this.push(Buffer.from(base64, "base64"));
+  }
+
+  // The host's final sample: end the readable so the pad emits 'end' (and
+  // auto-destroys, closing the pipe) exactly like a socket reaching EOF.
+  _endOfStream() {
+    this.push(null);
+  }
+}
+
+class ChildProcess extends EventEmitter {
+  constructor() {
+    super();
+    this.pid = undefined;
+    this.killed = false;
+    this.exitCode = null;
+    this.signalCode = null;
+    this.spawnfile = undefined;
+    this.spawnargs = [];
+    this.stdin = null;
+    this.stdout = new ChildPipe();
+    this.stderr = new ChildPipe();
+    // Set once the host dropped output past its 8 MiB stream cap.
+    this.truncated = false;
+    this._id = undefined;
+    this._timer = undefined;
+    this._polling = false;
+    this._pollErrors = 0;
+  }
+
+  kill(signal) {
+    if (this._id === undefined) return false;
+    try {
+      call("child", "spawnKill", { id: this._id });
+    } catch (error) {
+      return false;
+    }
+    this.killed = true;
+    return true;
+  }
+
+  // Both streams are always flowing pipes here, so ref/unref have nothing to
+  // toggle; they exist for API shape only.
+  ref() { return this; }
+  unref() { return this; }
+
+  _stopPolling() {
+    if (this._timer !== undefined) {
+      globalThis.clearInterval(this._timer);
+      this._timer = undefined;
+    }
+  }
+}
+
+function pumpChild(child) {
+  if (child._polling || child._id === undefined) return;
+  child._polling = true;
+  let sample;
+  try {
+    sample = call("child", "spawnPoll", { id: child._id, waitMs: POLL_WAIT_MS });
+  } catch (error) {
+    // ESRCH is definitive: the host entry is gone, so nothing more can be
+    // reported. Any other host error is transient; keep the interval armed
+    // (bounded) so one hiccup cannot suppress the child's exit forever.
+    child._polling = false;
+    child._pollErrors += 1;
+    const code = error && (error.code || error.name);
+    if (code === "ESRCH" || child._pollErrors > 100) child._stopPolling();
+    return;
+  }
+  child._polling = false;
+  child._pollErrors = 0;
+  // A slot the host does not pipe into JS ("ignore"/"inherit"/parent fd) has
+  // no stream object: Node reports `null` there, and no data/end is emitted.
+  if (child.stdout) child.stdout._deliver(sample.stdout);
+  if (child.stderr) child.stderr._deliver(sample.stderr);
+  if (sample.truncated) child.truncated = true;
+  if (!sample.exited || !sample.done) return;
+  // `done` marks the host's final sample: every byte the pipe readers
+  // captured was delivered above, so exit/close trail the data events.
+  child._stopPolling();
+  if (typeof sample.exitCode === "number") child.exitCode = sample.exitCode;
+  if (sample.signal) child.signalCode = sample.signal;
+  child.emit("exit", child.exitCode, child.signalCode);
+  // Pipe 'end' trails 'exit' and precedes the child's 'close' (node's order:
+  // exit -> stdio 'end' -> 'close'). `push(null)` makes the pad emit 'end' on
+  // the next tick, so 'close' is deferred one tick to stay behind it. A pipe
+  // nobody reads cannot end here — node leaves its 'end' to the first reader —
+  // so it does not hold 'close' back.
+  if (child.stdout) child.stdout._endOfStream();
+  if (child.stderr) child.stderr._endOfStream();
+  pirTick(() => child.emit("close", child.exitCode, child.signalCode));
+}
+
+// Node's `child.stdin` is a Socket (a Duplex): this pad keeps the host pipe
+// core (write/end/destroy stay synchronous host round trips — dropping the
+// host-side stdin handle is what a reader child sees as EOF) and adds the
+// call surface npm code and the runtime's shell paths use: the EventEmitter
+// base (`stdin.on("error", …)`) and `setDefaultEncoding`.
+class ChildStdin extends EventEmitter {
+  constructor(id) {
+    super();
+    this._id = id;
+    this._defaultEncoding = undefined;
+  }
+
+  setDefaultEncoding(encoding) {
+    this._defaultEncoding = encoding;
+    return this;
+  }
+
+  write(data, encoding, callback) {
+    if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+    const buffer = toChunkBuffer(data, encoding === undefined ? this._defaultEncoding : encoding);
+    call("child", "spawnWrite", { id: this._id, data: buffer.toString("base64") });
+    if (typeof callback === "function") callback();
+    return true;
+  }
+
+  end(data, encoding, callback) {
+    if (typeof data === "function") { callback = data; data = undefined; encoding = undefined; }
+    else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+    if (data !== undefined && data !== null) this.write(data, encoding);
+    // A real host op: dropping the host-side stdin handle closes the pipe,
+    // so a reader child (`cat`, `findstr`) sees the EOF it waits for.
+    call("child", "spawnEnd", { id: this._id });
+    if (typeof callback === "function") callback();
+    return this;
+  }
+
+  destroy() {
+    try {
+      call("child", "spawnEnd", { id: this._id });
+    } catch (error) {
+      // Already closed or the child is gone.
+    }
+  }
+}
+
+function childStdin(id) {
+  return new ChildStdin(id);
+}
+
+function spawn(command, args, options) {
+  if (args !== undefined && !Array.isArray(args)) {
+    options = args;
+    args = undefined;
+  }
+  const opts = options === undefined || options === null ? {} : options;
+  const argv = (args || []).map((value) => String(value));
+  // Argument validation is synchronous (Node throws here too); a *spawn*
+  // failure stays asynchronous below.
+  const stdio = normalizeStdio(opts.stdio);
+  const child = new ChildProcess();
+  child.spawnfile = String(command);
+  child.spawnargs = [String(command)].concat(argv);
+  let started;
+  try {
+    started = call("child", "spawnStart", {
+      cmd: String(command),
+      args: argv,
+      cwd: typeof opts.cwd === "string" ? opts.cwd : undefined,
+      env: encodeEnv(opts.env),
+      shell: shellOption(opts.shell),
+      windowsHide: opts.windowsHide === true,
+      stdio: stdio,
+    });
+  } catch (error) {
+    // Node reports a failed spawn as an asynchronous 'error' event (never a
+    // synchronous throw); the returned process object stays inert.
+    globalThis.__pirMicrotask(() => child.emit("error", error));
+    return child;
+  }
+  child._id = started.id;
+  child.pid = started.pid;
+  // The host echoes the resolved slots back: only a piped slot has a stream.
+  const slots = Array.isArray(started.stdio) ? started.stdio : ["pipe", "pipe", "pipe"];
+  child.stdin = slots[0] === "pipe" ? childStdin(started.id) : null;
+  if (slots[1] !== "pipe") child.stdout = null;
+  if (slots[2] !== "pipe") child.stderr = null;
+  child._timer = globalThis.setInterval(() => pumpChild(child), POLL_INTERVAL_MS);
+  return child;
+}
+
+function fork(modulePath) {
+  throw new Error("child_process.fork is not supported in the pir runtime (no Node child process with IPC): " + String(modulePath));
+}
+
+function execWithCallback(command, args, opts, callback) {
+  const child = spawn(command, args, opts);
+  const stdoutChunks = [];
+  const stderrChunks = [];
+  const encoding = opts.encoding === undefined ? "utf8" : opts.encoding;
+  let settled = false;
+  const settle = (error) => {
+    if (settled) return;
+    settled = true;
+    const stdout = decodeOutput(Buffer.concat(stdoutChunks), encoding);
+    const stderr = decodeOutput(Buffer.concat(stderrChunks), encoding);
+    if (error) {
+      if (error.stdout === undefined) error.stdout = stdout;
+      if (error.stderr === undefined) error.stderr = stderr;
+      if (error.cmd === undefined) error.cmd = child.spawnargs.join(" ");
+      if (error.killed === undefined) error.killed = child.killed;
+    }
+    if (typeof callback === "function") callback(error, stdout, stderr);
+  };
+  // Only a piped slot has a stream (a caller-supplied `stdio` can turn either
+  // capture stream off); the callback then reports what was captured.
+  if (child.stdout) child.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
+  if (child.stderr) child.stderr.on("data", (chunk) => stderrChunks.push(chunk));  child.on("error", (error) => settle(error));
+  child.on("close", (code, signal) => {
+    if (code !== 0 || signal) {
+      const error = new Error("Command failed: " + child.spawnargs.join(" "));
+      error.code = code;
+      error.signal = signal === null ? undefined : signal;
+      settle(error);
+      return;
+    }
+    settle(null);
+  });
+  return child;
+}
+
+function exec(command, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = undefined;
+  }
+  const opts = options === undefined || options === null ? {} : options;
+  const merged = Object.assign({}, opts);
+  merged.shell = opts.shell === undefined ? true : opts.shell;
+  return execWithCallback(String(command), [], merged, callback);
+}
+
+function execFile(file, args, options, callback) {
+  if (typeof args === "function") {
+    callback = args;
+    args = undefined;
+    options = undefined;
+  } else if (typeof options === "function") {
+    callback = options;
+    options = undefined;
+  }
+  const opts = options === undefined || options === null ? {} : options;
+  return execWithCallback(String(file), args || [], opts, callback);
+}
+
+function spawnSync(command, args, options) {
+  if (args !== undefined && !Array.isArray(args)) {
+    options = args;
+    args = undefined;
+  }
+  const opts = options === undefined || options === null ? {} : options;
+  const argv = (args || []).map((value) => String(value));
+  // spawnSync defaults to Buffer output; its exec*Sync wrappers default to
+  // utf8 (handled there).
+  const encoding = opts.encoding === undefined ? "buffer" : opts.encoding;
+  // Argument validation is synchronous (Node throws here too, before the
+  // child is spawned). The host resolves the same stdio table `spawn` uses.
+  const stdio = normalizeStdio(opts.stdio);
+  let input;
+  if (opts.input !== undefined && opts.input !== null && opts.input !== "") {
+    input = toChunkBuffer(opts.input, opts.inputEncoding).toString("base64");
+  }
+  let result;
+  try {
+    result = call("child", "spawnSync", {
+      cmd: String(command),
+      args: argv,
+      cwd: typeof opts.cwd === "string" ? opts.cwd : undefined,
+      env: encodeEnv(opts.env),
+      shell: shellOption(opts.shell),
+      windowsHide: opts.windowsHide === true,
+      stdio: stdio,
+      input: input,
+    });
+  } catch (error) {
+    // Node reports a spawn failure in-band (`error` field), not as a throw.
+    return { pid: 0, output: [null, null, null], stdout: null, stderr: null, status: null, signal: null, error: error };
+  }
+  // A slot the call did not pipe (`ignore`/`inherit`/parent fd) reports null,
+  // exactly like Node; only a piped slot carries captured bytes.
+  const stdout = result.stdout === null || result.stdout === undefined
+    ? null
+    : decodeOutput(Buffer.from(result.stdout, "base64"), encoding);
+  const stderr = result.stderr === null || result.stderr === undefined
+    ? null
+    : decodeOutput(Buffer.from(result.stderr, "base64"), encoding);
+  return {
+    pid: result.pid,
+    output: [null, stdout, stderr],
+    stdout: stdout,
+    stderr: stderr,
+    status: result.status === undefined ? null : result.status,
+    signal: result.signal === undefined ? null : result.signal,
+    error: undefined,
+  };
+}
+
+function syncFailure(result, command, args) {
+  if (result.error) return result.error;
+  if (result.status !== 0 || result.signal) {
+    const printout = [command].concat(args || []).join(" ");
+    const error = new Error("Command failed: " + printout);
+    error.status = result.status;
+    error.signal = result.signal;
+    error.stdout = result.stdout;
+    error.stderr = result.stderr;
+    error.pid = result.pid;
+    error.cmd = printout;
+    return error;
+  }
+  return null;
+}
+
+function execSync(command, options) {
+  const opts = options === undefined || options === null ? {} : options;
+  const merged = Object.assign({}, opts);
+  merged.shell = opts.shell === undefined ? true : opts.shell;
+  if (merged.encoding === undefined) merged.encoding = "utf8";
+  const result = spawnSync(String(command), [], merged);
+  const error = syncFailure(result, String(command), []);
+  if (error) throw error;
+  return result.stdout;
+}
+
+function execFileSync(file, args, options) {
+  if (args !== undefined && !Array.isArray(args)) {
+    options = args;
+    args = undefined;
+  }
+  const opts = options === undefined || options === null ? {} : options;
+  const merged = Object.assign({}, opts);
+  if (merged.encoding === undefined) merged.encoding = "utf8";
+  const argv = (args || []).map((value) => String(value));
+  const result = spawnSync(String(file), argv, merged);
+  const error = syncFailure(result, String(file), argv);
+  if (error) throw error;
+  return result.stdout;
+}
+
+// Internal fork plumbing for the IPC channel; the runtime hosts no IPC pipe,
+// so the entry exists for link compatibility and throws on call.
+function _forkChild(_modulePath, _options) {
+  const error = new Error("child_process._forkChild is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  throw error;
+}
+
+export default {
+  _forkChild: _forkChild,
+  spawn: spawn,
+  exec: exec,
+  execFile: execFile,
+  execSync: execSync,
+  execFileSync: execFileSync,
+  spawnSync: spawnSync,
+  fork: fork,
+  ChildProcess: ChildProcess,
+};
+export { spawn, exec, execFile, execSync, execFileSync, spawnSync, fork, ChildProcess, _forkChild };

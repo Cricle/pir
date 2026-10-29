@@ -1,0 +1,1 @@
+{"name":"TypeSafe","baseUrl":"https://api.typesafe.ai/v1","models":{"classifier:jev-latest":{"id":"jev-latest","name":"Jev","type":"classifier","api":"typesafe-system-one","input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":64000}}}

@@ -1,0 +1,23 @@
+// node:_tls_common / _tls_wrap — private TLS internals, aliased to the
+// corresponding node:tls shim surface (the same classes real Node re-uses).
+import { SecureContext, createSecureContext, TLSSocket, Server, connect, createServer } from "@node/tls";
+
+// Minimal pass-through: the real translation normalizes the peer
+// certificate shape; the shim surface never produces certificates to
+// translate, so the identity keeps call compatibility honestly.
+function translatePeerCertificate(certificate) {
+  return certificate;
+}
+
+const tlsCommon = {
+  SecureContext: SecureContext,
+  createSecureContext: createSecureContext,
+  translatePeerCertificate: translatePeerCertificate,
+  TLSSocket: TLSSocket,
+  Server: Server,
+  connect: connect,
+  createServer: createServer,
+};
+
+export default tlsCommon;
+export { SecureContext, createSecureContext, translatePeerCertificate, TLSSocket, Server, connect, createServer };

@@ -1,0 +1,296 @@
+
+// bcrypt — virtual package shim. The real `bcrypt` npm package is a NAPI
+// native addon (`bcrypt.node`, prebuilds via node-gyp-build), so it can never
+// load in this runtime; this shim re-creates its API surface on top of the
+// host EksBlowfish backend (`__pir_host.node("bcrypt", ...)`,
+// `host_functions/bcrypt_fns.rs`).
+//
+// The JS face mirrors bcrypt 6.0.0's `bcrypt.js` line for line: the same
+// argument validation and Error wordings, the same callback-vs-Promise
+// contract (`hash`/`compare`/`genSalt` return a Promise when no callback is
+// given, reject with "cb must be a function or null to return a Promise" when
+// the callback is present but not callable), the same `(rounds, minor)`
+// handling in genSaltSync/genSalt, and the same `$2a$`/`$2b$` version
+// behavior — `hashSync(data, rounds)` mints a `$2b$` salt, `hashSync(data,
+// "$2a$...")` keeps the caller's version, and a `$2y$` salt is accepted (the
+// host folds it into the same EksBlowfish construction).
+//
+// Everything below the argument checks is host-side: password UTF-8/raw
+// bytes (72-byte truncation, terminating NUL), the salt's bcrypt-base64
+// decode, the `2^cost` key schedule and the 31-char digest encoding.
+//
+// Documented differences from the native addon:
+//   - errors thrown by the host (bad salt shape, bad rounds) surface as plain
+//     `Error`s with the addon's wording, without the bridge's own `.code`.
+//   - `getRounds(hash)` accepts any 2-digit cost, like the addon's C parser.
+import { Buffer } from "node:buffer";
+
+(() => {
+  const DEFAULTS = { rounds: 10, minor: "b" };
+
+  function hostCall(op, payload) {
+    try {
+      return globalThis.__pirNodeCall("bcrypt", op, payload);
+    } catch (error) {
+      // The host already speaks the reference wording.
+      throw new Error(error && error.message ? String(error.message) : String(error));
+    }
+  }
+
+  function defer(callback) {
+    globalThis.__pirMicrotask(callback);
+  }
+
+  function promiseOf(executor) {
+    return new Promise(executor);
+  }
+
+  function passwordPayload(data) {
+    if (typeof data === "string") return { password: data };
+    return { password: { $pirBlob: Buffer.from(data).toString("base64") } };
+  }
+
+  function checkRounds(rounds) {
+    if (!rounds) return DEFAULTS.rounds;
+    if (typeof rounds !== "number") throw new Error("rounds must be a number");
+    return rounds;
+  }
+
+  function checkMinor(minor) {
+    if (!minor) return DEFAULTS.minor;
+    if (minor !== "b" && minor !== "a") {
+      throw new Error('minor must be either "a" or "b"');
+    }
+    return minor;
+  }
+
+  function genSaltSync(rounds, minor) {
+    const checkedRounds = checkRounds(rounds);
+    const checkedMinor = checkMinor(minor);
+    return hostCall("genSaltSync", { rounds: checkedRounds, minor: checkedMinor });
+  }
+
+  function genSalt(rounds, minor, callback) {
+    let done = callback;
+    if (typeof rounds === "function") {
+      done = rounds;
+      rounds = DEFAULTS.rounds;
+      minor = DEFAULTS.minor;
+    } else if (typeof minor === "function") {
+      done = minor;
+      minor = DEFAULTS.minor;
+    }
+
+    if (!done) {
+      return promiseOf((resolve, reject) => {
+        genSalt(rounds, minor, (error, salt) => {
+          if (error) reject(error);
+          else resolve(salt);
+        });
+      });
+    }
+
+    let error = null;
+    try {
+      rounds = checkRounds(rounds);
+      minor = checkMinor(minor);
+    } catch (thrown) {
+      error = thrown;
+    }
+    if (error) {
+      defer(() => done(error));
+      return undefined;
+    }
+    try {
+      const salt = genSaltSync(rounds, minor);
+      defer(() => done(null, salt));
+    } catch (thrown) {
+      defer(() => done(thrown));
+    }
+    return undefined;
+  }
+
+  function hashSync(data, salt) {
+    if (data == null || salt == null) {
+      throw new Error("data and salt arguments required");
+    }
+    if (
+      !(typeof data === "string" || data instanceof Buffer) ||
+      (typeof salt !== "string" && typeof salt !== "number")
+    ) {
+      throw new Error(
+        "data must be a string or Buffer and salt must either be a salt string or a number of rounds"
+      );
+    }
+    if (typeof salt === "number") salt = genSaltSync(salt);
+    const payload = passwordPayload(data);
+    payload.salt = salt;
+    return hostCall("hashSync", payload);
+  }
+
+  function hash(data, salt, callback) {
+    let done = callback;
+    if (typeof data === "function") {
+      const error = new Error(
+        "data must be a string or Buffer and salt must either be a salt string or a number of rounds"
+      );
+      defer(() => data(error));
+      return undefined;
+    }
+    if (typeof salt === "function") {
+      const error = new Error(
+        "data must be a string or Buffer and salt must either be a salt string or a number of rounds"
+      );
+      defer(() => salt(error));
+      return undefined;
+    }
+    if (done && typeof done !== "function") {
+      return promiseOf((_resolve, reject) => {
+        reject(new Error("cb must be a function or null to return a Promise"));
+      });
+    }
+    if (!done) {
+      return promiseOf((resolve, reject) => {
+        hash(data, salt, (error, value) => {
+          if (error) reject(error);
+          else resolve(value);
+        });
+      });
+    }
+
+    if (data == null || salt == null) {
+      const error = new Error("data and salt arguments required");
+      defer(() => done(error));
+      return undefined;
+    }
+    if (
+      !(typeof data === "string" || data instanceof Buffer) ||
+      (typeof salt !== "string" && typeof salt !== "number")
+    ) {
+      const error = new Error(
+        "data must be a string or Buffer and salt must either be a salt string or a number of rounds"
+      );
+      defer(() => done(error));
+      return undefined;
+    }
+
+    if (typeof salt === "number") {
+      return genSalt(salt, (error, generated) => {
+        if (error) {
+          done(error);
+          return;
+        }
+        const payload = passwordPayload(data);
+        payload.salt = generated;
+        try {
+          done(null, hostCall("hashSync", payload));
+        } catch (thrown) {
+          done(thrown);
+        }
+      });
+    }
+
+    const payload = passwordPayload(data);
+    payload.salt = salt;
+    try {
+      const value = hostCall("hashSync", payload);
+      defer(() => done(null, value));
+    } catch (thrown) {
+      defer(() => done(thrown));
+    }
+    return undefined;
+  }
+
+  function compareSync(data, hashValue) {
+    if (data == null || hashValue == null) {
+      throw new Error("data and hash arguments required");
+    }
+    if (!(typeof data === "string" || data instanceof Buffer) || typeof hashValue !== "string") {
+      throw new Error("data must be a string or Buffer and hash must be a string");
+    }
+    const payload = passwordPayload(data);
+    payload.hash = hashValue;
+    return hostCall("compareSync", payload);
+  }
+
+  function compare(data, hashValue, callback) {
+    let done = callback;
+    if (typeof data === "function") {
+      const error = new Error("data and hash arguments required");
+      defer(() => data(error));
+      return undefined;
+    }
+    if (typeof hashValue === "function") {
+      const error = new Error("data and hash arguments required");
+      defer(() => hashValue(error));
+      return undefined;
+    }
+    if (done && typeof done !== "function") {
+      return promiseOf((_resolve, reject) => {
+        reject(new Error("cb must be a function or null to return a Promise"));
+      });
+    }
+    if (!done) {
+      return promiseOf((resolve, reject) => {
+        compare(data, hashValue, (error, matched) => {
+          if (error) reject(error);
+          else resolve(matched);
+        });
+      });
+    }
+
+    if (data == null || hashValue == null) {
+      const error = new Error("data and hash arguments required");
+      defer(() => done(error));
+      return undefined;
+    }
+    if (!(typeof data === "string" || data instanceof Buffer) || typeof hashValue !== "string") {
+      const error = new Error("data and hash must be strings");
+      defer(() => done(error));
+      return undefined;
+    }
+
+    const payload = passwordPayload(data);
+    payload.hash = hashValue;
+    try {
+      const matched = hostCall("compareSync", payload);
+      defer(() => done(null, matched));
+    } catch (thrown) {
+      defer(() => done(thrown));
+    }
+    return undefined;
+  }
+
+  function getRounds(hashValue) {
+    if (hashValue == null) {
+      throw new Error("hash argument required");
+    }
+    if (typeof hashValue !== "string") {
+      throw new Error("hash must be a string");
+    }
+    return hostCall("getRounds", { hash: hashValue });
+  }
+
+  const bcrypt = {
+    genSaltSync: genSaltSync,
+    genSalt: genSalt,
+    hashSync: hashSync,
+    hash: hash,
+    compareSync: compareSync,
+    compare: compare,
+    getRounds: getRounds,
+  };
+
+  globalThis.__pirBcryptShim = bcrypt;
+})();
+
+const bcrypt = globalThis.__pirBcryptShim;
+
+export default bcrypt;
+export const genSaltSync = bcrypt.genSaltSync;
+export const genSalt = bcrypt.genSalt;
+export const hashSync = bcrypt.hashSync;
+export const hash = bcrypt.hash;
+export const compareSync = bcrypt.compareSync;
+export const compare = bcrypt.compare;
+export const getRounds = bcrypt.getRounds;

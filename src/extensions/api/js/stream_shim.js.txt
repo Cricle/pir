@@ -1,0 +1,2060 @@
+// node:stream — the classic stream pad (Readable / Writable / Duplex /
+// Transform / PassThrough), rebuilt around an observable-semantics state
+// machine.
+//
+// Tier: minimal-with-fidelity. Node's real machinery (BufferList, backpressure
+// pacing, cork batching, pipe await-drain, `_writev` coalescing) is NOT
+// reproduced; what IS reproduced is every observable contract the vendored
+// official tests and the other pir shims (node:http IncomingMessage,
+// stream/promises, stream/consumers) actually depend on:
+//
+//   * constructor options land on the instance exactly as in node:
+//     `write`/`writev`/`final`/`destroy`/`construct` on the writable side,
+//     `read`/`destroy`/`construct`/`encoding` on the readable side,
+//     `transform`/`flush` on Transform — as OWN properties (node assigns
+//     `this._write = ...`), which is what `new Writable({ write(...) })`
+//     (and Console) needs;
+//   * async `_construct` + the `constructed` gate: writes are buffered until
+//     construct completes, `destroy()` waits for it, a double callback is
+//     ERR_MULTIPLE_CALLBACK, a construct error is emitted as 'error';
+//   * `write()` returns false past the high-water mark and 'drain' is
+//     emitted (edge-triggered, suppressed while `ending`), so
+//     `while (stream.write(...))` loops and pump-style consumers behave;
+//   * the readable buffer + `read()`/`readableFlowing`/`setEncoding` (real
+//     StringDecoder) + flowing/paused modes, including node's sync flag that
+//     decides between a direct 'data' emit and a buffered one, and the
+//     hasFlowing/readableListening bookkeeping resume() depends on;
+//   * 'end' / 'finish' / 'close' ordering with `autoDestroy`/`emitClose`,
+//     'error' before 'close' on destroy, ERR_MULTIPLE_CALLBACK on a second
+//     write callback;
+//   * `Duplex.fromWeb`/`toWeb` over the engine's Web streams (the byte-stream
+//     branch is a pad: the engine has no BYOB support, see below).
+//
+// Documented deviations (kept deliberately, not faked):
+//   * backpressure is accounting-only. `write()` returns the node value and
+//     `pipe()` pauses on a false return, but an unread source never stalls a
+//     producer: there is no cross-pad await-drain handshake.
+//   * byte-mode `read(n)` is buffer-granular: a partial read slices the head
+//     buffer, multi-buffer reads concatenate; there is no BufferList.
+//   * the default `_read` is a no-op instead of node's
+//     ERR_METHOD_NOT_IMPLEMENTED destroy — node:http's IncomingMessage
+//     extends this pad without defining `_read`, and destroying it on the
+//     first read would break the real client/server paths.
+//   * `push()` after EOF returns false (node raises ERR_STREAM_PUSH_AFTER_EOF
+//     through 'error'); the http body pumps can race a socket close and an
+//     unhandled 'error' there would be a crash, not a test failure.
+//   * `_writev` is used only when two or more writes are buffered behind a
+//     cork/construct gate; node also coalesces the flush path.
+
+import EventEmitter from "@node/events";
+import { StringDecoder } from "@node/string_decoder";
+
+// ---------------------------------------------------------------------------
+// primitives
+// ---------------------------------------------------------------------------
+
+// Node drains nextTick before promise jobs; the runtime exposes the shared
+// queue as `__pirNextTick` (node_call_helper.js.txt). Promise jobs are the
+// fallback when the helper is not loaded yet (shim-only unit tests).
+function pirTick(fn, ...args) {
+  const tick = globalThis.__pirNextTick;
+  if (typeof tick === "function") {
+    tick(fn, ...args);
+    return;
+  }
+  Promise.resolve().then(() => fn(...args));
+}
+
+function pirOptions(options) {
+  return options === undefined || options === null || typeof options !== "object" ? {} : options;
+}
+
+function pirError(code, message, Ctor) {
+  const error = new (Ctor || Error)(message);
+  error.code = code;
+  return error;
+}
+
+function pirUnsupported(message) {
+  return pirError("ERR_NOT_SUPPORTED", message);
+}
+
+const isUint8Array = (value) => value instanceof Uint8Array;
+const isArrayBufferView = (value) => typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(value);
+const isBuffer = (value) => typeof globalThis.Buffer === "function" && globalThis.Buffer.isBuffer(value);
+
+// A Uint8Array (not a Buffer) is re-viewed as a Buffer, like node's
+// `_uint8ArrayToBuffer`; anything else is returned unchanged.
+function _uint8ArrayToBuffer(value) {
+  return isUint8Array(value) && !isBuffer(value)
+    ? globalThis.Buffer.from(value.buffer, value.byteOffset, value.byteLength)
+    : value;
+}
+
+// Writable objects constructed by this pad, for Writable's own
+// `Symbol.hasInstance` (see the Writable class). Module-local: nothing is
+// written onto the instances or their prototypes.
+const pirWritableInstances = new WeakSet();
+
+// node's stream constructors are callable without `new` (`Duplex() instanceof
+// Duplex` — test-stream-duplex.js). A `class` is not, so each exported binding
+// is this thin callable form: the class stays the implementation (the `extends`
+// links and prototype chains below are untouched), the wrapper shares the
+// class prototype, and `new` is forwarded so both call styles build the same
+// object. `Stream` itself stays a plain class — node's `Stream()` throws too.
+function pirCallableCtor(impl) {
+  const callable = function (...args) {
+    return new.target === undefined ? new impl(...args) : Reflect.construct(impl, args, new.target);
+  };
+  callable.prototype = impl.prototype;
+  impl.prototype.constructor = callable;
+  Object.defineProperty(callable, "name", { value: impl.name, configurable: true });
+  Object.defineProperty(callable, "length", { value: impl.length, configurable: true });
+  return callable;
+}
+
+// ---------------------------------------------------------------------------
+// construct / destroy (node's internal/streams/destroy.js + construct.js)
+// ---------------------------------------------------------------------------
+//
+// `_construct` is opt-in and asynchronous: the constructors schedule it on a
+// tick, every I/O path is gated on it, and `destroy()` waits for it so a
+// stream destroyed mid-construction still runs `_construct` before 'close'
+// (test-stream-construct.js testDestroy). The state lives on a non-enumerable
+// per-stream record so Object.keys()/inspect are unaffected.
+
+function pirConstructInfo(stream) {
+  let info = stream._pirConstructInfo;
+  if (info === undefined) {
+    info = {
+      started: false,
+      done: typeof stream._construct !== "function",
+      error: null,
+      callbacks: [],
+    };
+    Object.defineProperty(stream, "_pirConstructInfo", {
+      value: info,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  return info;
+}
+
+function pirConstructed(stream) {
+  return pirConstructInfo(stream).done;
+}
+
+function pirStartConstruct(stream) {
+  if (typeof stream._construct !== "function") return;
+  const info = pirConstructInfo(stream);
+  if (info.started) return;
+  info.started = true;
+  info.done = false;
+  pirTick(() => {
+    let called = false;
+    const onConstruct = (error) => {
+      if (called) {
+        pirErrorOrDestroy(stream, pirError("ERR_MULTIPLE_CALLBACK", "Callback called multiple times"), true);
+        return;
+      }
+      called = true;
+      info.done = true;
+      info.error = error === undefined ? null : error;
+      if (stream._readableState) stream._readableState.constructed = true;
+      if (stream._writableState) stream._writableState.constructed = true;
+      const pending = info.callbacks;
+      info.callbacks = [];
+      if (!stream.destroyed && info.error) pirErrorOrDestroy(stream, info.error, true);
+      for (const callback of pending) callback(info.error);
+      if (stream.destroyed) return;
+      // node's kOnConstructed: flush the writes buffered behind the gate,
+      // then let a pending end() finish.
+      const w = stream._writableState;
+      if (w !== undefined && w !== null) {
+        pirClearBuffer(stream, w);
+        if (w.ending) pirFinishMaybe(stream, w);
+      }
+      const r = stream._readableState;
+      if (r !== undefined && r !== null && r.needReadable) pirMaybeReadMore(stream, r);
+    };
+    try {
+      stream._construct(onConstruct);
+    } catch (error) {
+      onConstruct(error);
+    }
+  });
+}
+
+function pirWhenConstructed(stream, callback) {
+  const info = pirConstructInfo(stream);
+  if (info.done) {
+    callback();
+    return;
+  }
+  info.callbacks.push(callback);
+}
+
+function pirEmitError(stream, error) {
+  const r = stream._readableState;
+  const w = stream._writableState;
+  if ((w && w.errorEmitted) || (r && r.errorEmitted)) return;
+  if (w) w.errorEmitted = true;
+  if (r) r.errorEmitted = true;
+  stream.emit("error", error);
+}
+
+function pirEmitClose(stream) {
+  const r = stream._readableState;
+  const w = stream._writableState;
+  if (w) w.closeEmitted = true;
+  if (r) r.closeEmitted = true;
+  if ((w && w.emitClose) || (r && r.emitClose)) stream.emit("close");
+}
+
+// `errorOrDestroy`: with autoDestroy (the default) the error destroys the
+// stream — 'error' then 'close' on the next tick; without it the error is
+// emitted on the stream and the stream stays usable.
+function pirErrorOrDestroy(stream, error, sync) {
+  const r = stream._readableState;
+  const w = stream._writableState;
+  if ((w && w.destroyed) || (r && r.destroyed)) return;
+  if ((r && r.autoDestroy) || (w && w.autoDestroy)) {
+    stream.destroy(error);
+    return;
+  }
+  if (!error) return;
+  if (w && !w.errored) w.errored = error;
+  if (r && !r.errored) r.errored = error;
+  if (sync) pirTick(() => pirEmitError(stream, error));
+  else pirEmitError(stream, error);
+}
+
+function pirDestroy(stream, error, callback) {
+  const r = stream._readableState;
+  const w = stream._writableState;
+  if ((w && w.destroyed) || (r && r.destroyed)) {
+    if (typeof callback === "function") callback();
+    return stream;
+  }
+  const err = error === undefined ? null : error;
+  if (err) {
+    if (w && !w.errored) w.errored = err;
+    if (r && !r.errored) r.errored = err;
+  }
+  if (w) w.destroyed = true;
+  if (r) r.destroyed = true;
+
+  const finish = (destroyError) => {
+    const finalError = destroyError === undefined ? null : destroyError;
+    if (finalError) {
+      if (w && !w.errored) w.errored = finalError;
+      if (r && !r.errored) r.errored = finalError;
+    }
+    if (w) w.closed = true;
+    if (r) r.closed = true;
+    if (typeof callback === "function") callback(finalError);
+    if (finalError) {
+      pirTick(() => {
+        pirEmitError(stream, finalError);
+        pirEmitClose(stream);
+      });
+    } else {
+      pirTick(() => pirEmitClose(stream));
+    }
+  };
+
+  const run = () => {
+    try {
+      stream._destroy(err, finish);
+    } catch (thrown) {
+      finish(thrown);
+    }
+  };
+
+  // Still constructing: node registers on the internal kDestroy event and
+  // runs `_destroy` once construct settles.
+  if (typeof stream._construct === "function" && !pirConstructed(stream)) {
+    pirWhenConstructed(stream, run);
+    return stream;
+  }
+  run();
+  return stream;
+}
+
+// ---------------------------------------------------------------------------
+// Readable
+// ---------------------------------------------------------------------------
+
+// node's getHighWaterMark: a side-specific option wins over the generic one,
+// which wins over the objectMode default.
+function pirHighWaterMark(options, side, objectMode) {
+  const value = options[side] !== undefined ? options[side] : options.highWaterMark;
+  if (value === undefined || value === null) return objectMode ? 16 : 16384;
+  return value;
+}
+
+class ReadableState {
+  constructor(options, stream) {
+    const objectMode = Boolean(options.objectMode || options.readableObjectMode);
+    this.objectMode = objectMode;
+    this.highWaterMark = pirHighWaterMark(options, "readableHighWaterMark", objectMode);
+    this.readable = options.readable !== false;
+    // Whole-chunk FIFO. node's BufferList is chunk-granular here (documented):
+    // byte reads slice the head buffer and concatenate when they span several.
+    this.buffer = [];
+    this.length = 0;
+    this.pipes = [];
+    this.flowing = null;
+    this.hasFlowing = false;
+    this.paused = false;
+    this.ended = !this.readable;
+    this.endEmitted = !this.readable;
+    this.reading = false;
+    this.sync = true;
+    this.needReadable = false;
+    this.emittedReadable = false;
+    this.readableListening = false;
+    this.resumeScheduled = false;
+    this.readingMore = false;
+    this.dataEmitted = false;
+    this.destroyed = false;
+    this.errored = null;
+    this.errorEmitted = false;
+    this.closed = false;
+    this.closeEmitted = false;
+    this.constructed = typeof stream._construct !== "function";
+    this.emitClose = options.emitClose !== false;
+    this.autoDestroy = options.autoDestroy !== false;
+    this.defaultEncoding = options.defaultEncoding || "utf8";
+    this.encoding = null;
+    this.decoder = null;
+    this.awaitDrainWriters = null;
+    if (options.encoding) {
+      this.decoder = new StringDecoder(options.encoding);
+      this.encoding = options.encoding;
+    }
+  }
+}
+
+function pirCanPushMore(state) {
+  return !state.ended && (state.length < state.highWaterMark || state.length === 0);
+}
+
+function pirAddChunk(stream, state, chunk, addToFront) {
+  if (state.flowing && !state.sync && stream.listenerCount("data") > 0 && state.length === 0) {
+    state.awaitDrainWriters = null;
+    state.dataEmitted = true;
+    stream.emit("data", chunk);
+  } else {
+    state.length += state.objectMode ? 1 : chunk.length;
+    if (addToFront) state.buffer.unshift(chunk);
+    else state.buffer.push(chunk);
+    if (state.needReadable) pirEmitReadable(stream);
+  }
+  pirMaybeReadMore(stream, state);
+}
+
+// node's push() byte-mode branch: string chunks are encoded unless they
+// already match the decoder's encoding; the decoder produces the observable
+// chunk at push time (so objectMode + `encoding` yields decoded units).
+function pirPushByteMode(stream, state, chunk, encoding) {
+  if (chunk === null) {
+    state.reading = false;
+    pirOnEofChunk(stream, state);
+    return false;
+  }
+  if (typeof chunk === "string") {
+    encoding = encoding || state.defaultEncoding;
+    if (state.encoding !== encoding) {
+      chunk = globalThis.Buffer.from(chunk, encoding);
+      encoding = "";
+    }
+  } else if (isBuffer(chunk)) {
+    encoding = "";
+  } else if (isArrayBufferView(chunk)) {
+    chunk = _uint8ArrayToBuffer(chunk);
+    encoding = "";
+  } else if (chunk !== undefined) {
+    pirErrorOrDestroy(stream, pirError(
+      "ERR_INVALID_ARG_TYPE",
+      "The \"chunk\" argument must be of type string or an instance of Buffer, TypedArray, or DataView",
+      TypeError,
+    ));
+    return false;
+  }
+
+  if (!chunk || chunk.length <= 0) {
+    state.reading = false;
+    pirMaybeReadMore(stream, state);
+    return pirCanPushMore(state);
+  }
+  if (state.ended) return false;
+  if (state.destroyed || state.errored) return false;
+
+  state.reading = false;
+  if (state.decoder !== null && !encoding) {
+    chunk = state.decoder.write(chunk);
+    if (chunk.length === 0) {
+      pirMaybeReadMore(stream, state);
+      return pirCanPushMore(state);
+    }
+  }
+  pirAddChunk(stream, state, chunk, false);
+  return pirCanPushMore(state);
+}
+
+function pirPushObjectMode(stream, state, chunk, encoding) {
+  if (chunk === null) {
+    state.reading = false;
+    pirOnEofChunk(stream, state);
+    return false;
+  }
+  if (state.ended) return false;
+  if (state.destroyed || state.errored) return false;
+  state.reading = false;
+  if (state.decoder !== null && !encoding) chunk = state.decoder.write(chunk);
+  pirAddChunk(stream, state, chunk, false);
+  return pirCanPushMore(state);
+}
+
+function pirOnEofChunk(stream, state) {
+  if (state.ended) return;
+  if (state.decoder !== null) {
+    const tail = state.decoder.end();
+    if (tail && tail.length) {
+      state.buffer.push(tail);
+      state.length += state.objectMode ? 1 : tail.length;
+    }
+  }
+  state.ended = true;
+  if (state.sync) {
+    pirEmitReadable(stream);
+  } else {
+    state.needReadable = false;
+    state.emittedReadable = true;
+    pirEmitReadableNow(stream);
+  }
+}
+
+function pirEmitReadable(stream) {
+  const state = stream._readableState;
+  state.needReadable = false;
+  if (!state.emittedReadable) {
+    state.emittedReadable = true;
+    pirTick(() => pirEmitReadableNow(stream));
+  }
+}
+
+function pirEmitReadableNow(stream) {
+  const state = stream._readableState;
+  if (!state.destroyed && !state.errored && (state.length > 0 || state.ended)) {
+    stream.emit("readable");
+    state.emittedReadable = false;
+  }
+  if (!state.flowing && !state.ended && state.length <= state.highWaterMark) state.needReadable = true;
+  pirFlow(stream);
+}
+
+// node's pre-emptive read: keep pulling while the consumer still wants data
+// (below hwm, or flowing and empty). Also the hook that restarts a stream whose
+// `_read` was gated by a pending `_construct` (test-stream-construct.js: the
+// stream must not read during construction, but must read right after).
+function pirMaybeReadMore(stream, state) {
+  if (state.readingMore || state.reading || !state.constructed || state.destroyed || state.errored) return;
+  if (!state.needReadable && !(state.flowing && state.length === 0) && state.length >= state.highWaterMark) return;
+  state.readingMore = true;
+  pirTick(() => {
+    const s = stream._readableState;
+    s.readingMore = false;
+    while (!s.reading && !s.ended && !s.destroyed &&
+           (s.length < s.highWaterMark || (s.flowing && s.length === 0))) {
+      const length = s.length;
+      stream.read(0);
+      if (length === s.length) break; // no progress: stop spinning
+    }
+  });
+}
+
+function pirFlow(stream) {
+  const state = stream._readableState;
+  while (state.flowing && stream.read() !== null);
+}
+
+function pirHowMuchToRead(n, state) {
+  if (n <= 0 || (state.length === 0 && state.ended)) return 0;
+  if (state.objectMode) return 1;
+  if (n !== n) {
+    // read() with no argument: one buffered chunk while flowing (node only
+    // flows one buffer at a time), the whole buffer otherwise.
+    if (state.flowing && state.length) return state.buffer[0].length;
+    return state.length;
+  }
+  if (n <= state.length) return n;
+  return state.ended ? state.length : 0;
+}
+
+// Consumes up to n bytes/objects. The caller (`pirRead`) subtracts n from
+// state.length afterwards, so this must account for the remainder only when it
+// leaves bytes behind.
+function pirFromList(n, state) {
+  if (n <= 0) return null;
+  const buffer = state.buffer;
+  if (state.objectMode) {
+    return buffer.length > 0 ? buffer.shift() : null;
+  }
+  if (buffer.length === 0) return null;
+  const head = buffer[0];
+  if (typeof head === "string") {
+    if (head.length >= n) {
+      if (head.length === n) return buffer.shift();
+      buffer[0] = head.slice(n);
+      return head.slice(0, n);
+    }
+    // Decoded chunks are strings; node's BufferList read concatenates them.
+    let text = "";
+    let count = 0;
+    while (count < buffer.length && text.length < n) {
+      const part = buffer[count];
+      text += typeof part === "string" ? part : globalThis.Buffer.from(part).toString("utf8");
+      count++;
+    }
+    buffer.splice(0, count);
+    if (text.length > n) {
+      buffer.unshift(text.slice(n));
+      return text.slice(0, n);
+    }
+    return text;
+  }
+  if (head.length >= n) {
+    if (head.length === n) return buffer.shift();
+    buffer[0] = head.slice(n);
+    return head.slice(0, n);
+  }
+  let total = 0;
+  let count = 0;
+  while (count < buffer.length && total < n) {
+    total += buffer[count].length;
+    count++;
+  }
+  const parts = count === 1 ? [buffer.shift()] : buffer.splice(0, count);
+  const joined = globalThis.Buffer.concat(parts.map((part) => (isBuffer(part) ? part : globalThis.Buffer.from(part))));
+  if (joined.length === n) return joined;
+  buffer.unshift(joined.slice(n));
+  return joined.slice(0, n);
+}
+
+function pirRead(stream, n) {
+  const state = stream._readableState;
+  if (!state.readable || state.destroyed) return null;
+  if (n === undefined || n === null) n = NaN;
+  else if (typeof n !== "number" || !Number.isInteger(n)) n = parseInt(n, 10);
+  if (n > state.highWaterMark) state.highWaterMark = n;
+  const nOrig = n;
+  if (n !== 0) state.emittedReadable = false;
+
+  if (n === 0 && state.needReadable &&
+      ((state.highWaterMark !== 0 ? state.length >= state.highWaterMark : state.length > 0) || state.ended)) {
+    if (state.length === 0 && state.ended) pirEndReadable(stream);
+    else pirEmitReadable(stream);
+    return null;
+  }
+
+  n = pirHowMuchToRead(n, state);
+  if (n === 0 && state.ended) {
+    if (state.length === 0) pirEndReadable(stream);
+    return null;
+  }
+
+  let doRead = state.needReadable;
+  if (state.length === 0 || state.length - n < state.highWaterMark) doRead = true;
+  if (state.reading || state.ended || state.destroyed || state.errored || !state.constructed) {
+    doRead = false;
+  } else if (doRead) {
+    state.reading = true;
+    state.sync = true;
+    if (state.length === 0) state.needReadable = true;
+    try {
+      stream._read(state.highWaterMark);
+    } catch (error) {
+      pirErrorOrDestroy(stream, error);
+    }
+    state.sync = false;
+    // A synchronous push() cleared `reading`; re-evaluate what is returnable.
+    if (!state.reading) n = pirHowMuchToRead(nOrig, state);
+  }
+
+  let ret = null;
+  if (n > 0) ret = pirFromList(n, state);
+  if (ret === null) {
+    if (state.length <= state.highWaterMark) state.needReadable = true;
+    n = 0;
+  } else {
+    state.length -= n;
+    state.awaitDrainWriters = null;
+  }
+
+  if (state.length === 0) {
+    if (!state.ended) state.needReadable = true;
+    if (nOrig !== n && state.ended) pirEndReadable(stream);
+  }
+
+  if (ret !== null && !state.errorEmitted && !state.closeEmitted) {
+    state.dataEmitted = true;
+    stream.emit("data", ret);
+  }
+  return ret;
+}
+
+function pirEndReadable(stream) {
+  const state = stream._readableState;
+  if (state.endEmitted) return;
+  state.ended = true;
+  pirTick(() => {
+    const s = stream._readableState;
+    if (s.destroyed || s.errored || s.closeEmitted || s.endEmitted) return;
+    if (s.length !== 0) return;
+    s.endEmitted = true;
+    stream.emit("end");
+    if (stream.writable && stream.allowHalfOpen === false) {
+      pirTick(() => {
+        if (stream.writable && !stream.writableEnded && !stream.destroyed) stream.end();
+      });
+      return;
+    }
+    if (s.autoDestroy) {
+      const w = stream._writableState;
+      const auto = !w || (w.autoDestroy && (w.finished || w.writable === false));
+      if (auto) stream.destroy();
+    }
+  });
+}
+
+// Storage half of the listener entry points: pir's events pad exposes the
+// private `_addListener(type, listener, prepend, wrapOnce)`; node's EventEmitter
+// reaches the same storage through the public methods (used by the node-side
+// differential harness of this shim).
+function pirEmitterAddListener(emitter, type, listener, prepend, wrapOnce) {
+  const impl = EventEmitter.prototype._addListener;
+  if (typeof impl === "function") return impl.call(emitter, type, listener, prepend, wrapOnce);
+  if (wrapOnce) return EventEmitter.prototype.once.call(emitter, type, listener);
+  if (prepend) return EventEmitter.prototype.prependListener.call(emitter, type, listener);
+  return EventEmitter.prototype.on.call(emitter, type, listener);
+}
+
+// The pad's own resume: a subclass may override the public `resume()` (the
+// node:http IncomingMessage pad does, to drive its host pump), and the 'data'
+// listener path must still put *this* pad into flowing mode or pushed chunks
+// would sit in the buffer forever.
+function pirResumeReadable(stream) {
+  const state = stream._readableState;
+  if (state === undefined || state === null) return;
+  if (!state.flowing) {
+    state.hasFlowing = true;
+    // node: only flow when nothing is listening for 'readable'.
+    state.flowing = !state.readableListening;
+    if (!state.resumeScheduled) {
+      state.resumeScheduled = true;
+      pirTick(() => {
+        const s = stream._readableState;
+        s.resumeScheduled = false;
+        if (!s.reading) stream.read(0);
+        stream.emit("resume");
+        pirFlow(stream);
+        if (s.flowing && !s.reading) stream.read(0);
+      });
+    }
+  }
+  state.paused = false;
+}
+
+// Readable listener bookkeeping: node's Readable.prototype.on special-cases
+// 'data' (start flowing) and 'readable' (switch to the readable-pull mode).
+function pirReadableListenerAdded(stream, event, result) {
+  const state = stream._readableState;
+  if (state === undefined || state === null) return result;
+  if (event === "data") {
+    state.readableListening = stream.listenerCount("readable") > 0;
+    // node: resume unless the stream was explicitly paused after flowing.
+    if (!(state.hasFlowing && !state.flowing)) pirResumeReadable(stream);
+  } else if (event === "readable") {
+    if (!state.endEmitted && !state.readableListening) {
+      state.readableListening = true;
+      state.needReadable = true;
+      state.hasFlowing = true;
+      state.flowing = false;
+      state.emittedReadable = false;
+      if (state.length > 0) pirEmitReadable(stream);
+      else if (!state.reading) {
+        pirTick(() => {
+          if (!state.reading && !state.ended && !state.destroyed) stream.read(0);
+        });
+      }
+    }
+  }
+  return result;
+}
+
+const readableMethods = {
+  _read() {
+    // Documented deviation: node destroys with ERR_METHOD_NOT_IMPLEMENTED
+    // here; the pad must stay usable as a base class for streams that drive
+    // themselves through push() (node:http IncomingMessage).
+  },
+  push(chunk, encoding) {
+    const state = this._readableState;
+    return state.objectMode
+      ? pirPushObjectMode(this, state, chunk, encoding)
+      : pirPushByteMode(this, state, chunk, encoding);
+  },
+  unshift(chunk, encoding) {
+    const state = this._readableState;
+    if (chunk === null || chunk === undefined) return true;
+    if (state.objectMode) {
+      state.length += 1;
+      state.buffer.unshift(chunk);
+    } else if (typeof chunk === "string") {
+      const buffer = globalThis.Buffer.from(chunk, encoding || state.defaultEncoding);
+      state.length += buffer.length;
+      state.buffer.unshift(buffer);
+    } else {
+      const buffer = _uint8ArrayToBuffer(chunk);
+      state.length += buffer.length;
+      state.buffer.unshift(buffer);
+    }
+    if (state.needReadable || state.length >= state.highWaterMark) pirEmitReadable(this);
+    return true;
+  },
+  read(n) {
+    return pirRead(this, n);
+  },
+  setEncoding(encoding) {
+    // node: the decoder's normalized label becomes state.encoding, and chunks
+    // already buffered are re-decoded in place (`setEncoding(null)` -> utf8).
+    const state = this._readableState;
+    const decoder = new StringDecoder(encoding);
+    state.decoder = decoder;
+    state.encoding = decoder.encoding;
+    let content = "";
+    for (const chunk of state.buffer.slice()) {
+      content += decoder.write(chunk);
+    }
+    state.buffer.length = 0;
+    if (content !== "") state.buffer.push(content);
+    state.length = content.length;
+    return this;
+  },
+  resume() {
+    pirResumeReadable(this);
+    return this;
+  },
+  pause() {
+    const state = this._readableState;
+    if (state.flowing !== false) {
+      state.hasFlowing = true;
+      state.flowing = false;
+      this.emit("pause");
+    }
+    state.paused = true;
+    return this;
+  },
+  isPaused() {
+    const state = this._readableState;
+    return state.paused === true || (state.hasFlowing && !state.flowing);
+  },
+  // Every listener entry point funnels through `pirEmitterAddListener` (the
+  // private `_addListener` in both node and pir's events pad), so the readable
+  // bookkeeping runs for on/addListener/once/prepend* alike: `once('data')`
+  // starts flowing exactly like `on('data')` does.
+  _addListener(type, listener, prepend, wrapOnce) {
+    return pirReadableListenerAdded(this, type, pirEmitterAddListener(this, type, listener, prepend, wrapOnce));
+  },
+  addListener(type, listener) {
+    return pirReadableListenerAdded(this, type, pirEmitterAddListener(this, type, listener, false, false));
+  },
+  on(type, listener) {
+    return pirReadableListenerAdded(this, type, pirEmitterAddListener(this, type, listener, false, false));
+  },
+  once(type, listener) {
+    return pirReadableListenerAdded(this, type, pirEmitterAddListener(this, type, listener, false, true));
+  },
+  prependListener(type, listener) {
+    return pirReadableListenerAdded(this, type, pirEmitterAddListener(this, type, listener, true, false));
+  },
+  prependOnceListener(type, listener) {
+    return pirReadableListenerAdded(this, type, pirEmitterAddListener(this, type, listener, true, true));
+  },
+  removeListener(event, listener) {
+    const result = EventEmitter.prototype.removeListener.call(this, event, listener);
+    const state = this._readableState;
+    if (event === "readable" && state !== undefined && state !== null) {
+      if (this.listenerCount("readable") > 0) {
+        state.readableListening = true;
+      } else {
+        state.readableListening = false;
+        // node's updateReadableListening: clearing the last 'readable'
+        // listener drops the flow state entirely when nothing else needs it,
+        // which is what makes a later on('data') start flowing.
+        if (this.listenerCount("data") === 0 && !state.resumeScheduled) {
+          state.hasFlowing = false;
+          state.flowing = null;
+        }
+      }
+    }
+    return result;
+  },
+  pipe(destination, options) {
+    const state = this._readableState;
+    const source = this;
+    const proc = globalThis.process;
+    const doEnd = (!options || options.end !== false) &&
+      !(proc && (destination === proc.stdout || destination === proc.stderr));
+    state.pipes.push(destination);
+    let ondrain = null;
+    const ondata = (chunk) => {
+      let ret;
+      try {
+        ret = destination.write(chunk);
+      } catch (error) {
+        destination.destroy(error);
+        return;
+      }
+      // Accounting-only backpressure: pause the source and resume it on the
+      // destination's 'drain' (no cross-pad await-drain handshake).
+      if (ret === false) {
+        source.pause();
+        state.awaitDrainWriters = destination;
+        if (ondrain === null) {
+          ondrain = () => {
+            state.awaitDrainWriters = null;
+            if (source.readable && !source.destroyed) source.resume();
+          };
+          destination.on("drain", ondrain);
+        }
+      }
+    };
+    const onend = () => {
+      if (doEnd) destination.end();
+    };
+    const onerror = (error) => {
+      source.unpipe(destination);
+      destination.removeListener("error", onerror);
+      if (destination.listenerCount("error") === 0) {
+        const destState = destination._writableState || destination._readableState;
+        if (destState && !destState.errorEmitted) pirErrorOrDestroy(destination, error);
+      }
+    };
+    const onclose = () => source.unpipe(destination);
+    const onfinish = () => source.unpipe(destination);
+
+    if (state.endEmitted) pirTick(onend);
+    else source.once("end", onend);
+    destination.on("error", onerror);
+    destination.on("close", onclose);
+    destination.on("finish", onfinish);
+    source.on("data", ondata);
+    this.emit("pipe", destination);
+    return destination;
+  },
+  unpipe(destination) {
+    const state = this._readableState;
+    if (destination === undefined) {
+      for (const pipe of state.pipes.slice()) this.unpipe(pipe);
+      return this;
+    }
+    const index = state.pipes.indexOf(destination);
+    if (index === -1) return this;
+    state.pipes.splice(index, 1);
+    const emitUnpipe = () => destination.emit("unpipe", this, { hasUnpiped: false });
+    if (destination.listenerCount("unpipe") > 0) emitUnpipe();
+    else pirTick(emitUnpipe);
+    return this;
+  },
+  destroy(error, callback) {
+    return pirDestroy(this, error, callback);
+  },
+  _destroy(error, callback) {
+    callback(error);
+  },
+  [Symbol.asyncIterator]() {
+    // Drain the readable through 'data'/'end' into an async iterator:
+    // `for await (const chunk of stream)` (stream/consumers, ecosystem pumps).
+    const stream = this;
+    let done = false;
+    let error = null;
+    const queue = [];
+    let notify = null;
+    const wake = () => {
+      const fn = notify;
+      notify = null;
+      if (fn !== null) fn();
+    };
+    const onData = (chunk) => {
+      queue.push(chunk);
+      wake();
+    };
+    const onEnd = () => {
+      done = true;
+      wake();
+    };
+    const onError = (err) => {
+      error = err === undefined ? new Error("stream error") : err;
+      done = true;
+      wake();
+    };
+    stream.on("data", onData);
+    stream.once("end", onEnd);
+    stream.once("error", onError);
+    const cleanup = () => {
+      stream.removeListener("data", onData);
+      stream.removeListener("end", onEnd);
+      stream.removeListener("error", onError);
+    };
+    return {
+      next() {
+        if (queue.length > 0) return Promise.resolve({ value: queue.shift(), done: false });
+        if (error !== null) {
+          cleanup();
+          const failure = error;
+          error = null;
+          return Promise.reject(failure);
+        }
+        if (done) {
+          cleanup();
+          return Promise.resolve({ value: undefined, done: true });
+        }
+        return new Promise((resolve, reject) => {
+          notify = () => {
+            if (queue.length > 0) resolve({ value: queue.shift(), done: false });
+            else if (error !== null) {
+              cleanup();
+              const failure = error;
+              error = null;
+              reject(failure);
+            } else {
+              cleanup();
+              resolve({ value: undefined, done: true });
+            }
+          };
+        });
+      },
+      return() {
+        cleanup();
+        if (!stream.destroyed) stream.destroy();
+        return Promise.resolve({ value: undefined, done: true });
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  },
+};
+
+const readableGetters = {
+  readable: (state) => state.readable,
+  readableEnded: (state) => state.endEmitted,
+  readableAborted: (state) => Boolean(state.readable !== false && (state.destroyed || state.errored) && !state.endEmitted),
+  readableFlowing: (state) => state.flowing,
+  readableLength: (state) => state.length,
+  readableHighWaterMark: (state) => state.highWaterMark,
+  readableObjectMode: (state) => state.objectMode,
+  readableDidRead: (state) => state.dataEmitted,
+  readableEncoding: (state) => state.encoding,
+  destroyed: (state, stream) => state.destroyed || (stream._writableState !== undefined && stream._writableState.destroyed),
+  errored: (state, stream) => (stream._writableState !== undefined ? (state.errored || stream._writableState.errored) : state.errored),
+  closed: (state, stream) => state.closed && (stream._writableState === undefined || stream._writableState.closed),
+};
+
+function pirDefineAccessors(prototype, getters) {
+  for (const name of Object.keys(getters)) {
+    if (Object.prototype.hasOwnProperty.call(prototype, name)) continue;
+    const getter = getters[name];
+    Object.defineProperty(prototype, name, {
+      get() {
+        const state = this._readableState;
+        if (state === undefined) return undefined;
+        return getter(state, this);
+      },
+      enumerable: false,
+      configurable: true,
+    });
+  }
+}
+
+function pirDefineMethods(prototype, methods) {
+  for (const name of Object.keys(methods)) {
+    if (Object.prototype.hasOwnProperty.call(prototype, name)) continue;
+    Object.defineProperty(prototype, name, {
+      value: methods[name], writable: true, enumerable: false, configurable: true,
+    });
+  }
+}
+
+// node's `readableFlowing`/`destroyed` have setters (user-managed state is
+// legal); every other accessor is read-only.
+function pirDefineReadableAccessors(prototype) {
+  pirDefineAccessors(prototype, readableGetters);
+  if (!Object.prototype.hasOwnProperty.call(prototype, "readableFlowing")) {
+    Object.defineProperty(prototype, "readableFlowing", {
+      get() {
+        return this._readableState === undefined ? undefined : this._readableState.flowing;
+      },
+      set(value) {
+        if (this._readableState === undefined) return;
+        this._readableState.flowing = value;
+        this._readableState.hasFlowing = value !== null && value !== undefined;
+      },
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  if (!Object.prototype.hasOwnProperty.call(prototype, "destroyed")) {
+    Object.defineProperty(prototype, "destroyed", {
+      get() {
+        const r = this._readableState;
+        const w = this._writableState;
+        return Boolean((r && r.destroyed) || (w && w.destroyed));
+      },
+      set(value) {
+        if (this._readableState !== undefined) this._readableState.destroyed = Boolean(value);
+        if (this._writableState !== undefined) this._writableState.destroyed = Boolean(value);
+      },
+      enumerable: false,
+      configurable: true,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Writable
+// ---------------------------------------------------------------------------
+
+class WritableState {
+  constructor(options, stream) {
+    const objectMode = Boolean(options.objectMode || options.writableObjectMode);
+    this.objectMode = objectMode;
+    this.highWaterMark = pirHighWaterMark(options, "writableHighWaterMark", objectMode);
+    this.decodeStrings = options.decodeStrings !== false;
+    this.defaultEncoding = options.defaultEncoding || "utf8";
+    this.length = 0;
+    this.writing = false;
+    this.writecb = null;
+    this.writelen = 0;
+    this.expectWriteCb = false;
+    this.corked = 0;
+    this.needDrain = false;
+    this.ending = false;
+    this.ended = false;
+    this.finished = false;
+    this.prefinished = false;
+    this.finalCalled = false;
+    this.sync = true;
+    this.destroyed = false;
+    this.errored = null;
+    this.errorEmitted = false;
+    this.closed = false;
+    this.closeEmitted = false;
+    this.constructed = typeof stream._construct !== "function";
+    this.emitClose = options.emitClose !== false;
+    this.autoDestroy = options.autoDestroy !== false;
+    this.writable = options.writable !== false;
+    this.buffered = [];
+    this.bufferedIndex = 0;
+    this.pendingcb = 0;
+    this.onFinished = [];
+  }
+}
+
+function pirFinish(stream, state) {
+  if (state.finished) return;
+  state.finished = true;
+  const callbacks = state.onFinished;
+  state.onFinished = [];
+  stream.emit("finish");
+  for (const callback of callbacks) callback(null);
+  if (state.autoDestroy) {
+    const r = stream._readableState;
+    const auto = !r || (r.autoDestroy && (r.endEmitted || r.readable === false));
+    if (auto) stream.destroy();
+  }
+}
+
+function pirNeedFinish(state) {
+  return state.ending && !state.destroyed && state.constructed && !state.finished &&
+    !state.writing && !state.errored && state.buffered.length <= state.bufferedIndex && state.length === 0;
+}
+
+function pirPrefinish(stream, state) {
+  if (state.prefinished || state.finalCalled) return;
+  state.finalCalled = true;
+  if (typeof stream._final === "function" && !state.destroyed) {
+    let called = false;
+    const onFinish = (error) => {
+      if (called) {
+        pirErrorOrDestroy(stream, pirError("ERR_MULTIPLE_CALLBACK", "Callback called multiple times"), true);
+        return;
+      }
+      called = true;
+      if (error) {
+        const callbacks = state.onFinished;
+        state.onFinished = [];
+        for (const callback of callbacks) callback(error);
+        pirErrorOrDestroy(stream, error, state.sync);
+        return;
+      }
+      state.prefinished = true;
+      stream.emit("prefinish");
+      // node's onFinish: 'finish' lands on the next tick (a listener added
+      // after end() still sees it, and a Transform's readable 'end' precedes
+      // the writable 'finish').
+      state.pendingcb++;
+      pirTick(() => {
+        state.pendingcb--;
+        if (!state.finished && pirNeedFinish(state)) pirFinish(stream, state);
+      });
+    };
+    state.sync = true;
+    try {
+      stream._final(onFinish);
+    } catch (error) {
+      onFinish(error);
+    }
+    state.sync = false;
+    return;
+  }
+  // node's no-`_final` prefinish only announces; `finishMaybe` schedules
+  // 'finish' on a tick.
+  state.prefinished = true;
+  stream.emit("prefinish");
+}
+
+function pirFinishMaybe(stream, state) {
+  if (!pirNeedFinish(state)) return false;
+  pirPrefinish(stream, state);
+  if (!state.finished && state.prefinished) {
+    pirTick(() => {
+      if (!state.finished && pirNeedFinish(state)) pirFinish(stream, state);
+    });
+  }
+  return true;
+}
+
+function pirDoWrite(stream, state, writev, len, chunk, encoding, callback) {
+  state.writelen = len;
+  state.writecb = callback;
+  state.expectWriteCb = true;
+  state.writing = true;
+  state.sync = true;
+  const onwrite = (error) => {
+    pirOnwrite(stream, error);
+  };
+  if (state.destroyed) onwrite(pirError("ERR_STREAM_DESTROYED", "Cannot call write after a stream was destroyed"));
+  else if (writev) stream._writev(chunk, onwrite);
+  else stream._write(chunk, encoding, onwrite);
+  state.sync = false;
+}
+
+function pirClearBuffer(stream, state) {
+  if (state.destroyed || state.corked || !state.constructed || state.errored) return;
+  const buffered = state.buffered;
+  const pending = buffered.length - state.bufferedIndex;
+  if (pending === 0 || state.writing) return;
+  if (pending > 1 && typeof stream._writev === "function") {
+    const chunks = buffered.slice(state.bufferedIndex);
+    state.buffered = [];
+    state.bufferedIndex = 0;
+    pirDoWrite(stream, state, true, state.length, chunks, "", (error) => {
+      for (const entry of chunks) {
+        if (typeof entry.callback === "function") entry.callback(error);
+      }
+    });
+    return;
+  }
+  while (state.bufferedIndex < state.buffered.length && !state.writing) {
+    const entry = state.buffered[state.bufferedIndex];
+    state.buffered[state.bufferedIndex] = null;
+    state.bufferedIndex++;
+    const len = state.objectMode ? 1 : entry.chunk.length;
+    pirDoWrite(stream, state, false, len, entry.chunk, entry.encoding, entry.callback);
+  }
+  if (state.bufferedIndex === state.buffered.length) {
+    state.buffered = [];
+    state.bufferedIndex = 0;
+  }
+}
+
+function pirAfterWrite(stream, state, callback) {
+  // node: the drain edge fires only when the stream is neither ending nor
+  // destroyed (test-stream-write-drain: "Don't emit 'drain' if ended").
+  if (state.needDrain && !state.ending && !state.destroyed && state.length === 0) {
+    state.needDrain = false;
+    stream.emit("drain");
+  }
+  if (typeof callback === "function") callback(null);
+  if (state.destroyed) return;
+  if (state.ending) pirFinishMaybe(stream, state);
+}
+
+function pirOnwriteError(stream, state, error, callback) {
+  if (typeof callback === "function") callback(error);
+  // Writes buffered behind the failing one are rejected with the same error.
+  if (state.buffered.length > state.bufferedIndex) {
+    const buffered = state.buffered;
+    for (let i = state.bufferedIndex; i < buffered.length; i++) {
+      const entry = buffered[i];
+      state.length -= state.objectMode ? 1 : entry.chunk.length;
+      if (typeof entry.callback === "function") entry.callback(state.errored || error);
+    }
+    state.buffered = [];
+    state.bufferedIndex = 0;
+  }
+  pirErrorOrDestroy(stream, error);
+}
+
+function pirOnwrite(stream, er) {
+  const state = stream._writableState;
+  if (!state.expectWriteCb) {
+    pirErrorOrDestroy(stream, pirError("ERR_MULTIPLE_CALLBACK", "Callback called multiple times"), true);
+    return;
+  }
+  state.expectWriteCb = false;
+  const sync = state.sync;
+  const callback = state.writecb;
+  state.writecb = null;
+  state.writing = false;
+  state.length -= state.writelen;
+  state.writelen = 0;
+
+  if (er) {
+    if (!state.errored) state.errored = er;
+    const r = stream._readableState;
+    if (r && !r.errored) r.errored = er;
+    if (sync) pirTick(() => pirOnwriteError(stream, state, er, callback));
+    else pirOnwriteError(stream, state, er, callback);
+    return;
+  }
+  if (state.buffered.length > state.bufferedIndex) pirClearBuffer(stream, state);
+  if (sync) pirTick(() => pirAfterWrite(stream, state, callback));
+  else pirAfterWrite(stream, state, callback);
+}
+
+function pirWriteOrBuffer(stream, state, chunk, encoding, callback) {
+  const len = state.objectMode ? 1 : chunk.length;
+  state.length += len;
+  if (state.writing || state.corked || !state.constructed || state.errored) {
+    state.buffered.push({ chunk, encoding, callback });
+  } else {
+    pirDoWrite(stream, state, false, len, chunk, encoding, callback);
+  }
+  const ret = state.length < state.highWaterMark || state.length === 0;
+  if (!ret) state.needDrain = true;
+  return ret && !state.destroyed && !state.errored;
+}
+
+function pirWritableWrite(stream, chunk, encoding, callback) {
+  const state = stream._writableState;
+  if (typeof encoding === "function") {
+    callback = encoding;
+    encoding = null;
+  }
+  if (typeof callback !== "function") callback = null;
+  if (chunk === null) {
+    throw pirError("ERR_STREAM_NULL_VALUES", "May not write null values to stream", TypeError);
+  }
+  if (!state.objectMode) {
+    if (!encoding) encoding = state.defaultEncoding;
+    else if (encoding !== "buffer" && !globalThis.Buffer.isEncoding(encoding)) {
+      throw pirError("ERR_UNKNOWN_ENCODING", "Unknown encoding: " + encoding, TypeError);
+    }
+    if (typeof chunk === "string") {
+      if (state.decodeStrings) {
+        chunk = globalThis.Buffer.from(chunk, encoding);
+        encoding = "buffer";
+      }
+    } else if (isBuffer(chunk)) {
+      encoding = "buffer";
+    } else if (isArrayBufferView(chunk)) {
+      chunk = _uint8ArrayToBuffer(chunk);
+      encoding = "buffer";
+    } else {
+      throw pirError(
+        "ERR_INVALID_ARG_TYPE",
+        "The \"chunk\" argument must be of type string or an instance of Buffer, TypedArray, or DataView",
+        TypeError,
+      );
+    }
+  }
+  let error = null;
+  if (state.ending) error = pirError("ERR_STREAM_WRITE_AFTER_END", "write after end");
+  else if (state.destroyed) error = pirError("ERR_STREAM_DESTROYED", "Cannot call write after a stream was destroyed");
+  if (error) {
+    pirTick(() => {
+      if (callback) callback(error);
+    });
+    pirErrorOrDestroy(stream, error, true);
+    return false;
+  }
+  return pirWriteOrBuffer(stream, state, chunk, encoding, callback);
+}
+
+const writableMethods = {
+  _write(chunk, encoding, callback) {
+    // node's default: forward to `_writev` for the single-chunk form when a
+    // `writev` option was supplied; otherwise the pad accepts and drops the
+    // chunk (node throws ERR_METHOD_NOT_IMPLEMENTED — the pad's Writable is
+    // usable as a bare sink).
+    if (typeof this._writev === "function") {
+      this._writev([{ chunk, encoding }], callback);
+      return;
+    }
+    if (typeof callback === "function") callback();
+  },
+  _writev: null,
+  _final: null,
+  write(chunk, encoding, callback) {
+    return pirWritableWrite(this, chunk, encoding, callback);
+  },
+  end(chunk, encoding, callback) {
+    const state = this._writableState;
+    if (typeof chunk === "function") {
+      callback = chunk;
+      chunk = null;
+      encoding = null;
+    } else if (typeof encoding === "function") {
+      callback = encoding;
+      encoding = null;
+    }
+    let error = null;
+    if (chunk !== undefined && chunk !== null) {
+      const ret = pirWritableWrite(this, chunk, encoding);
+      if (ret instanceof Error) error = ret;
+    }
+    if (state.corked) {
+      state.corked = 1;
+      this.uncork();
+    }
+    if (error) {
+      // write-after-end: the error is already flowing through write().
+    } else if (!state.ending && !state.errored) {
+      state.ending = true;
+      pirFinishMaybe(this, state);
+      state.ended = true;
+    } else if (state.finished) {
+      error = pirError("ERR_STREAM_ALREADY_FINISHED", "Cannot call end after a stream was finished");
+    } else if (state.destroyed) {
+      error = pirError("ERR_STREAM_DESTROYED", "Cannot call end after a stream was destroyed");
+    }
+    if (typeof callback === "function") {
+      if (error) pirTick(callback, error);
+      else if (state.errored) pirTick(callback, state.errored);
+      else if (state.finished) pirTick(callback, null);
+      else state.onFinished.push(callback);
+    }
+    return this;
+  },
+  cork() {
+    this._writableState.corked++;
+  },
+  uncork() {
+    const state = this._writableState;
+    if (state.corked) {
+      state.corked--;
+      if (!state.corked && !state.writing) pirClearBuffer(this, state);
+    }
+  },
+  setDefaultEncoding(encoding) {
+    if (typeof encoding === "string") encoding = encoding.toLowerCase();
+    if (!globalThis.Buffer.isEncoding(encoding)) {
+      throw pirError("ERR_UNKNOWN_ENCODING", "Unknown encoding: " + encoding, TypeError);
+    }
+    this._writableState.defaultEncoding = encoding;
+    return this;
+  },
+  destroy(error, callback) {
+    return pirDestroy(this, error, callback);
+  },
+  _destroy(error, callback) {
+    callback(error);
+  },
+};
+
+const writableGetters = {
+  writable: (state) => state.writable,
+  writableEnded: (state) => state.ending,
+  writableFinished: (state) => state.finished,
+  writableAborted: (state) => Boolean(state.destroyed && !state.finished && state.errored !== null),
+  writableLength: (state) => state.length,
+  writableHighWaterMark: (state) => state.highWaterMark,
+  writableObjectMode: (state) => state.objectMode,
+  writableCorked: (state) => state.corked,
+  writableNeedDrain: (state) => !state.destroyed && !state.ending && state.needDrain,
+  destroyed: (state, stream) => state.destroyed || (stream._readableState !== undefined && stream._readableState.destroyed),
+  errored: (state, stream) => (stream._readableState !== undefined ? (state.errored || stream._readableState.errored) : state.errored),
+  closed: (state, stream) => state.closed && (stream._readableState === undefined || stream._readableState.closed),
+};
+
+function pirDefineWritableAccessors(prototype) {
+  for (const name of Object.keys(writableGetters)) {
+    if (Object.prototype.hasOwnProperty.call(prototype, name)) continue;
+    const getter = writableGetters[name];
+    Object.defineProperty(prototype, name, {
+      get() {
+        const state = this._writableState;
+        if (state === undefined) return undefined;
+        return getter(state, this);
+      },
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  if (!Object.prototype.hasOwnProperty.call(prototype, "destroyed")) {
+    Object.defineProperty(prototype, "destroyed", {
+      get() {
+        const w = this._writableState;
+        const r = this._readableState;
+        return Boolean((w && w.destroyed) || (r && r.destroyed));
+      },
+      set(value) {
+        if (this._writableState !== undefined) this._writableState.destroyed = Boolean(value);
+        if (this._readableState !== undefined) this._readableState.destroyed = Boolean(value);
+      },
+      enumerable: false,
+      configurable: true,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stream base
+// ---------------------------------------------------------------------------
+
+class Stream extends EventEmitter {
+  pipe(destination, options) {
+    // Minimal base pipe: the Readable pad carries the real one; this stays for
+    // plain Stream subclasses (node's Stream.prototype.pipe is what legacy
+    // duck-typed sources inherit).
+    this.on("data", (chunk) => destination.write(chunk));
+    this.on("end", () => {
+      if (!options || options.end !== false) destination.end();
+    });
+    return destination;
+  }
+}
+
+class Readable extends Stream {
+  constructor(options) {
+    super();
+    options = pirOptions(options);
+    if (typeof options.read === "function") this._read = options.read;
+    if (typeof options.destroy === "function") this._destroy = options.destroy;
+    if (typeof options.construct === "function") this._construct = options.construct;
+    this._readableState = new ReadableState(options, this);
+    if (options.signal) addAbortSignal(options.signal, this);
+    pirStartConstruct(this);
+  }
+}
+// Object.keys() does not enumerate symbols, so the async iterator (node's
+// `for await (const chunk of readable)`) is defined separately.
+const pirAsyncIterator = readableMethods[Symbol.asyncIterator];
+
+Object.defineProperty(Readable.prototype, "constructor", { value: Readable, writable: true, configurable: true });
+pirDefineMethods(Readable.prototype, readableMethods);
+Object.defineProperty(Readable.prototype, Symbol.asyncIterator, {
+  value: pirAsyncIterator, writable: true, enumerable: false, configurable: true,
+});
+pirDefineReadableAccessors(Readable.prototype);
+
+class Writable extends Stream {
+  constructor(options) {
+    super();
+    options = pirOptions(options);
+    if (typeof options.write === "function") this._write = options.write;
+    if (typeof options.writev === "function") this._writev = options.writev;
+    if (typeof options.destroy === "function") this._destroy = options.destroy;
+    if (typeof options.final === "function") this._final = options.final;
+    if (typeof options.construct === "function") this._construct = options.construct;
+    this._writableState = new WritableState(options, this);
+    if (options.signal) addAbortSignal(options.signal, this);
+    pirWritableInstances.add(this);
+    pirStartConstruct(this);
+  }
+}
+pirDefineMethods(Writable.prototype, writableMethods);
+pirDefineWritableAccessors(Writable.prototype);
+
+// ---------------------------------------------------------------------------
+// Duplex
+// ---------------------------------------------------------------------------
+
+class Duplex extends Readable {
+  constructor(options) {
+    super(options);
+    options = pirOptions(options);
+    this.allowHalfOpen = options.allowHalfOpen !== false;
+    if (options.readable === false) {
+      this._readableState.readable = false;
+      this._readableState.ended = true;
+      this._readableState.endEmitted = true;
+    }
+    if (typeof options.write === "function") this._write = options.write;
+    if (typeof options.writev === "function") this._writev = options.writev;
+    if (typeof options.destroy === "function") this._destroy = options.destroy;
+    if (typeof options.final === "function") this._final = options.final;
+    if (typeof options.construct === "function") this._construct = options.construct;
+    this._writableState = new WritableState(options, this);
+    pirWritableInstances.add(this);
+    pirStartConstruct(this);
+  }
+}
+Object.defineProperty(Duplex.prototype, "constructor", { value: Duplex, writable: true, configurable: true });
+pirDefineMethods(Duplex.prototype, readableMethods);
+Object.defineProperty(Duplex.prototype, Symbol.asyncIterator, {
+  value: pirAsyncIterator, writable: true, enumerable: false, configurable: true,
+});
+pirDefineReadableAccessors(Duplex.prototype);
+pirDefineMethods(Duplex.prototype, writableMethods);
+pirDefineWritableAccessors(Duplex.prototype);
+
+// --- Web-streams interop ---------------------------------------------------
+// node:stream/web is served by the engine's Web streams globals (minimal tier:
+// no byte streams — `web_streams.js.txt` rejects `type: "bytes"`). fromWeb
+// adapts a { readable, writable } pair onto a Duplex; toWeb wraps a node
+// Duplex in a Web pair. The BYOB branch is a pad over the pad: a byte-stream
+// facade with a real single-shot byob read, because the engine cannot build
+// one (see the header).
+
+function pirWebWriter(writable) {
+  if (writable === undefined || writable === null || typeof writable.getWriter !== "function") {
+    throw new TypeError("The \"writable\" argument must be an instance of WritableStream");
+  }
+  return writable.getWriter();
+}
+
+function pirWebReader(readable) {
+  if (readable === undefined || readable === null || typeof readable.getReader !== "function") {
+    throw new TypeError("The \"readable\" argument must be an instance of ReadableStream");
+  }
+  return readable.getReader();
+}
+
+function pirDuplexFromWeb(pair, options) {
+  options = pirOptions(options);
+  if (pair === undefined || pair === null) {
+    throw new TypeError("The \"pair\" argument must be an object");
+  }
+  const objectMode = Boolean(options.objectMode);
+  const duplex = new Duplex({
+    objectMode,
+    writableObjectMode: objectMode,
+    readableObjectMode: objectMode,
+    decodeStrings: !objectMode,
+    read() {},
+  });
+  const reader = pair.readable === undefined || pair.readable === null ? null : pirWebReader(pair.readable);
+  const writer = pair.writable === undefined || pair.writable === null ? null : pirWebWriter(pair.writable);
+
+  duplex._write = function (chunk, _encoding, callback) {
+    if (writer === null) {
+      callback();
+      return;
+    }
+    let result;
+    try {
+      result = writer.write(chunk);
+    } catch (error) {
+      callback(error);
+      return;
+    }
+    Promise.resolve(result).then(() => callback(), (error) => callback(error));
+  };
+  duplex._final = function (callback) {
+    if (writer === null) {
+      callback();
+      return;
+    }
+    Promise.resolve(writer.close()).then(() => callback(), () => callback());
+  };
+
+  if (reader !== null) {
+    const pump = () => {
+      reader.read().then((result) => {
+        if (duplex.destroyed) return;
+        if (result.done) {
+          duplex.push(null);
+          return;
+        }
+        duplex.push(result.value);
+        pump();
+      }, (error) => duplex.destroy(error));
+    };
+    pump();
+  }
+  return duplex;
+}
+
+// Byte-mode facade: enough of ReadableStream for `getReader({ mode: "byob" })`
+// plus a single read into the caller's view.
+function pirToWebReadable(stream, byteMode) {
+  const state = { done: false, chunks: [], error: null, waiters: [] };
+  const settle = () => {
+    const waiters = state.waiters;
+    state.waiters = [];
+    for (const waiter of waiters) waiter();
+  };
+  stream.on("data", (chunk) => {
+    state.chunks.push(chunk);
+    settle();
+  });
+  stream.on("end", () => {
+    state.done = true;
+    settle();
+  });
+  stream.on("error", (error) => {
+    state.error = error;
+    state.done = true;
+    settle();
+  });
+
+  const take = () => {
+    if (state.chunks.length > 0) return state.chunks.shift();
+    return state.done ? null : undefined;
+  };
+  const byteReader = {
+    read(view) {
+      const target = view === undefined || view === null ? null : view;
+      const chunk = take();
+      if (chunk === undefined) {
+        return new Promise((resolve, reject) => {
+          state.waiters.push(() => {
+            byteReader.read(target).then(resolve, reject);
+          });
+        });
+      }
+      if (chunk === null) return Promise.resolve({ value: undefined, done: true });
+      const bytes = isBuffer(chunk) || isUint8Array(chunk) ? chunk : globalThis.Buffer.from(String(chunk));
+      if (target === null) return Promise.resolve({ value: globalThis.Buffer.from(bytes), done: false });
+      const count = Math.min(target.byteLength, bytes.length);
+      new Uint8Array(target.buffer, target.byteOffset, count).set(bytes.subarray(0, count));
+      if (bytes.length > count) state.chunks.unshift(bytes.subarray(count));
+      return Promise.resolve({ value: new Uint8Array(target.buffer, target.byteOffset, count), done: false });
+    },
+    cancel() {
+      return Promise.resolve();
+    },
+    releaseLock() {},
+    closed: Promise.resolve(),
+  };
+  const defaultReader = {
+    read() {
+      const chunk = take();
+      if (chunk === undefined) {
+        return new Promise((resolve, reject) => {
+          state.waiters.push(() => {
+            defaultReader.read().then(resolve, reject);
+          });
+        });
+      }
+      if (chunk === null) return Promise.resolve({ value: undefined, done: true });
+      return Promise.resolve({ value: chunk, done: false });
+    },
+    cancel() {
+      return Promise.resolve();
+    },
+    releaseLock() {},
+    closed: Promise.resolve(),
+  };
+  return {
+    getReader(options) {
+      const mode = options && options.mode;
+      if (mode === "byob") {
+        if (!byteMode) throw new TypeError("This ReadableStream does not support BYOB readers");
+        return byteReader;
+      }
+      if (mode !== undefined && mode !== null) throw new TypeError("Invalid reader mode");
+      return defaultReader;
+    },
+    cancel() {
+      return Promise.resolve();
+    },
+    tee() {
+      throw pirUnsupported("ReadableStream.tee is not supported by the Duplex.toWeb pad");
+    },
+    get locked() {
+      return false;
+    },
+  };
+}
+
+function pirToWebWritable(stream) {
+  return new globalThis.WritableStream({
+    write(chunk) {
+      if (stream.destroyed) {
+        return Promise.reject(pirError("ERR_STREAM_DESTROYED", "Cannot call write after a stream was destroyed"));
+      }
+      return new Promise((resolve, reject) => {
+        stream.write(chunk, (error) => (error ? reject(error) : resolve()));
+      });
+    },
+    close() {
+      return new Promise((resolve) => {
+        if (stream.writableFinished) {
+          resolve();
+          return;
+        }
+        stream.end(() => resolve());
+      });
+    },
+    abort(reason) {
+      stream.destroy(reason);
+      return Promise.resolve();
+    },
+  });
+}
+
+function pirDuplexToWeb(stream, options) {
+  options = pirOptions(options);
+  if (stream === undefined || stream === null || typeof stream.on !== "function") {
+    throw new TypeError("The \"stream\" argument must be a stream");
+  }
+  const type = options.readableType !== undefined ? options.readableType : options.type;
+  return {
+    readable: pirToWebReadable(stream, type === "bytes"),
+    writable: pirToWebWritable(stream),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Transform / PassThrough
+// ---------------------------------------------------------------------------
+
+class Transform extends Duplex {
+  constructor(options) {
+    options = pirOptions(options);
+    // node's Transform: with a zero readable high-water mark the writable side
+    // buffers nothing, so a Transform buffers at most hwm elements in total.
+    let effective = options;
+    const readableHighWaterMark = pirHighWaterMark(options, "readableHighWaterMark", Boolean(options.objectMode || options.readableObjectMode));
+    if (readableHighWaterMark === 0) {
+      effective = Object.create(options);
+      effective.highWaterMark = undefined;
+      effective.readableHighWaterMark = 0;
+      effective.writableHighWaterMark = options.writableHighWaterMark === undefined ? 0 : options.writableHighWaterMark;
+    }
+    super(effective);
+    // node unsets the sync guard for Transforms: the data is pushed from the
+    // writable side, so `push()` must be able to emit 'data' straight away.
+    this._readableState.sync = false;
+    this._transformCallback = null;
+    if (typeof options.transform === "function") this._transform = options.transform;
+    if (typeof options.flush === "function") this._flush = options.flush;
+  }
+  // node's subclass hook: `_transform(chunk, encoding, callback)`. A subclass
+  // either pushes itself and calls `callback()`, or hands the data out through
+  // `callback(null, data)` — both idioms are supported here.
+  //
+  // The base hook is node's: an unimplemented Transform throws rather than
+  // silently passing data through (node's ERR_METHOD_NOT_IMPLEMENTED).
+  _transform(_chunk, _encoding, _callback) {
+    const error = new Error("The _transform() method is not implemented");
+    error.code = "ERR_METHOD_NOT_IMPLEMENTED";
+    throw error;
+  }
+  // node's Transform backpressure handshake: while the readable side is at or
+  // over its high-water mark the write callback is parked here and released by
+  // `_read` when the consumer pulls (test-stream-passthrough-drain asserts the
+  // write stays in flight with hwm 0 until read()).
+  _read() {
+    if (this._transformCallback !== null && this._transformCallback !== undefined) {
+      const callback = this._transformCallback;
+      this._transformCallback = null;
+      callback();
+    }
+  }
+  _flush(callback) {
+    if (typeof callback === "function") callback();
+  }
+  _write(chunk, encoding, callback) {
+    if (Array.isArray(chunk)) {
+      // Buffered multi-chunk flush in writev form: transform each entry.
+      let index = 0;
+      const next = (error) => {
+        if (error || index >= chunk.length) {
+          callback(error);
+          return;
+        }
+        const entry = chunk[index++];
+        this._transform(entry.chunk, entry.encoding, next);
+      };
+      next();
+      return;
+    }
+    const rState = this._readableState;
+    const wState = this._writableState;
+    const length = rState.length;
+    this._transform(chunk, encoding, (error, value) => {
+      if (error) {
+        callback(error);
+        return;
+      }
+      if (value !== null && value !== undefined) this.push(value);
+      if (rState.ended) {
+        // push(null) was already called: delay so the new state propagates.
+        pirTick(callback);
+      } else if (wState.ended || length === rState.length || rState.length < rState.highWaterMark) {
+        callback();
+      } else {
+        this._transformCallback = callback;
+      }
+    });
+  }
+  _final(callback) {
+    // node's `final`: flush, push the tail, then end the readable side.
+    if (typeof this._flush === "function" && !this.destroyed) {
+      this._flush((error, data) => {
+        if (error) {
+          if (typeof callback === "function") callback(error);
+          else this.destroy(error);
+          return;
+        }
+        if (data !== null && data !== undefined) this.push(data);
+        this.push(null);
+        if (typeof callback === "function") callback();
+      });
+      return;
+    }
+    this.push(null);
+    if (typeof callback === "function") callback();
+  }
+}
+
+// PassThrough IS a Transform in node (PassThrough -> Transform -> Duplex ->
+// Readable -> Stream); it only overrides the pass-through hook.
+class PassThrough extends Transform {
+  // Explicit so the constructor keeps node's arity (PassThrough.length === 1).
+  constructor(options) {
+    super(options);
+  }
+  _transform(chunk, encoding, callback) {
+    this.push(chunk);
+    if (typeof callback === "function") callback();
+  }
+}
+
+// --- the callable (node-shaped) forms of the constructors -------------------
+const ReadableCtor = pirCallableCtor(Readable);
+const WritableCtor = pirCallableCtor(Writable);
+const DuplexCtor = pirCallableCtor(Duplex);
+const TransformCtor = pirCallableCtor(Transform);
+const PassThroughCtor = pirCallableCtor(PassThrough);
+
+// Own, non-writable/non-enumerable/non-configurable, exactly as in node (the
+// compat probe reads the own symbol off the constructor).
+Object.defineProperty(WritableCtor, Symbol.hasInstance, {
+  value: function (object) {
+    if (Function.prototype[Symbol.hasInstance].call(this, object)) return true;
+    if (this !== WritableCtor) return false;
+    return pirWritableInstances.has(object);
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+
+// `Duplex.fromWeb` / `Duplex.toWeb` are statics in node. `Readable.from`
+// adapts an iterable through the pad's push surface, with node's own two
+// shapes (lib/internal/streams/readable.js `from`):
+//   * a string or a Buffer is pushed WHOLE, once, by an objectMode Readable —
+//     the generic branch would iterate the value instead, and a Buffer's
+//     iterator yields byte NUMBERS, so a byte-mode pad rejects the first
+//     chunk (ERR_INVALID_ARG_TYPE: `The "chunk" argument must be of type
+//     string or an instance of Buffer, TypedArray, or DataView`). node-fetch's
+//     Body constructor routes every Buffer body through `Readable.from`;
+//   * every other iterable yields its elements, in objectMode
+//     (`{objectMode: true, highWaterMark: 1, ...options}`).
+DuplexCtor.fromWeb = pirDuplexFromWeb;
+DuplexCtor.toWeb = pirDuplexToWeb;
+ReadableCtor.from = function from(iterable, options) {
+  options = pirOptions(options);
+  if (typeof iterable === "string" || isBuffer(iterable)) {
+    const readable = new Readable({ ...options, objectMode: true });
+    pirTick(() => {
+      readable.push(iterable);
+      readable.push(null);
+    });
+    return readable;
+  }
+  if (iterable === undefined || iterable === null ||
+      (typeof iterable[Symbol.asyncIterator] !== "function" && typeof iterable[Symbol.iterator] !== "function")) {
+    throw pirError("ERR_INVALID_ARG_TYPE", "The \"iterable\" argument must be an instance of Iterable", TypeError);
+  }
+  const readable = new Readable({ objectMode: true, highWaterMark: 1, ...options });
+  const iterator = typeof iterable[Symbol.asyncIterator] === "function"
+    ? iterable[Symbol.asyncIterator]()
+    : iterable[Symbol.iterator]();
+  const step = () => {
+    let result;
+    try {
+      result = iterator.next();
+    } catch (error) {
+      readable.destroy(error);
+      return;
+    }
+    Promise.resolve(result).then(({ done, value }) => {
+      if (done) {
+        readable.push(null);
+        return;
+      }
+      readable.push(value);
+      pirTick(step);
+    }, (error) => readable.destroy(error));
+  };
+  pirTick(step);
+  return readable;
+};
+
+// ---------------------------------------------------------------------------
+// static surface completion
+// ---------------------------------------------------------------------------
+
+const _isArrayBufferView = (value) => isArrayBufferView(value);
+const _isUint8Array = (value) => isUint8Array(value);
+
+function addAbortSignal(signal, stream) {
+  if (signal && typeof signal.addEventListener === "function" && stream && typeof stream.destroy === "function") {
+    signal.addEventListener("abort", () => stream.destroy(signal.reason === undefined ? new Error("The operation was aborted") : signal.reason), { once: true });
+  }
+  return stream;
+}
+
+function compose(_streams) {
+  throw pirUnsupported("stream.compose is not supported by the pir extension runtime");
+}
+
+function destroy(stream, error) {
+  if (stream && typeof stream.destroy === "function") stream.destroy(error);
+  return stream;
+}
+
+function duplexPair() {
+  throw pirUnsupported("stream.duplexPair is not supported by the pir extension runtime");
+}
+
+const defaultHighWaterMarks = { objectMode: 16, nonObject: 16384 };
+
+function getDefaultHighWaterMark(objectMode) {
+  return objectMode === true ? defaultHighWaterMarks.objectMode : defaultHighWaterMarks.nonObject;
+}
+
+function setDefaultHighWaterMark(objectMode, value) {
+  if (objectMode !== true && objectMode !== false) {
+    throw new TypeError("objectMode must be a boolean");
+  }
+  if (typeof value !== "number" || value < 0) {
+    throw new TypeError("value must be a non-negative number");
+  }
+  defaultHighWaterMarks[objectMode ? "objectMode" : "nonObject"] = value;
+}
+// The getter reads the live table so setters take effect.
+getDefaultHighWaterMark._pirTable = defaultHighWaterMarks;
+
+const isDestroyed = (stream) => Boolean(stream && stream.destroyed);
+const isDisturbed = (stream) => Boolean(stream && (stream.readableDidRead || (stream._readableState && stream._readableState.dataEmitted)));
+const isErrored = (stream) => Boolean(stream && typeof stream.errored === "object" && stream.errored !== null);
+const isReadable = (stream) => Boolean(stream && stream.readable !== false && !stream.destroyed);
+const isWritable = (stream) => Boolean(stream && stream.writable !== false && !stream.destroyed);
+
+// Node's `node:stream` default export IS the Stream constructor (with the
+// classes as properties); the named exports mirror it. The properties carry the
+// callable forms, which is what `require("stream").Duplex()` relies on.
+Stream.Stream = Stream;
+Stream.Readable = ReadableCtor;
+Stream.Writable = WritableCtor;
+Stream.Duplex = DuplexCtor;
+Stream.PassThrough = PassThroughCtor;
+Stream.Transform = TransformCtor;
+Stream._isArrayBufferView = _isArrayBufferView;
+Stream._isUint8Array = _isUint8Array;
+Stream._uint8ArrayToBuffer = _uint8ArrayToBuffer;
+Stream.addAbortSignal = addAbortSignal;
+Stream.compose = compose;
+Stream.destroy = destroy;
+Stream.duplexPair = duplexPair;
+Stream.getDefaultHighWaterMark = getDefaultHighWaterMark;
+Stream.setDefaultHighWaterMark = setDefaultHighWaterMark;
+Stream.isDestroyed = isDestroyed;
+Stream.isDisturbed = isDisturbed;
+Stream.isErrored = isErrored;
+Stream.isReadable = isReadable;
+Stream.isWritable = isWritable;
+
+export default Stream;
+export {
+  Stream,
+  ReadableCtor as Readable,
+  WritableCtor as Writable,
+  DuplexCtor as Duplex,
+  PassThroughCtor as PassThrough,
+  TransformCtor as Transform,
+};
+export {
+  _isArrayBufferView, _isUint8Array, _uint8ArrayToBuffer, addAbortSignal, compose, destroy,
+  duplexPair, getDefaultHighWaterMark, setDefaultHighWaterMark, isDestroyed, isDisturbed,
+  isErrored, isReadable, isWritable,
+};
+import * as streamPromises from "@node/stream/promises";
+Stream.promises = streamPromises;
+export const promises = streamPromises;
+Stream.finished = streamPromises.finished;
+
+// node's callback-form `stream.pipeline(source[, ...transforms], destination,
+// callback)`. Two contracts matter and neither is the promises module's:
+//   * it RETURNS the destination stream, not a promise — node-fetch's
+//     `let body = pump(response_, new PassThrough(), cb)` (index.js:253) takes
+//     that return value as the response body and consumes it with
+//     `for await (const chunk of body)`; handing it a Promise (what aliasing
+//     `node:stream/promises` onto `node:stream` did) breaks the body stream
+//     deliverable, and the promise is then stringified into a bogus body
+//     (`Buffer.from(String(promise))`) whose Buffer is `Readable.from`-iterated;
+//   * the callback is REQUIRED (node's `popCallback` validates the trailing
+//     argument) and fires exactly once with null or the first error.
+// `node:stream/promises` keeps the promise-returning form.
+function pirPipeline(...args) {
+  let callback;
+  if (typeof args[args.length - 1] === "function") {
+    callback = args.pop();
+  } else {
+    throw pirError(
+      "ERR_INVALID_ARG_TYPE",
+      "The \"streams[stream.length - 1]\" property must be of type function. Received " + pirDescribeArgument(args[args.length - 1]),
+      TypeError,
+    );
+  }
+  if (args.length === 0) {
+    throw pirError("ERR_MISSING_ARGS", "The \"streams\" argument must be specified", TypeError);
+  }
+  for (let i = 0; i + 1 < args.length; i++) args[i].pipe(args[i + 1]);
+  let done = false;
+  const settle = (error) => {
+    if (done) return;
+    done = true;
+    callback(error === undefined || error === null ? null : error);
+  };
+  for (const stream of args) stream.on("error", settle);
+  streamPromises.finished(args[args.length - 1]).then(() => settle(null), settle);
+  return args[args.length - 1];
+}
+
+function pirDescribeArgument(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (Array.isArray(value)) return "an instance of Array";
+  if (typeof value.constructor === "function" && typeof value.constructor.name === "string" && value.constructor.name.length > 0) {
+    return "an instance of " + value.constructor.name;
+  }
+  return "type " + typeof value;
+}
+
+Stream.pipeline = pirPipeline;
+export { pirPipeline as pipeline };
+export { finished } from "@node/stream/promises";

@@ -1,0 +1,89 @@
+
+// node:process — the namespace mirrors the global `process` object's own-key
+// surface exactly (real Node: `require("node:process") === process`; the
+// own-key list is pinned by scripts/gen_node_surface.mjs against real Node
+// v24). Named exports are snapshots of the global's members; `exit` is a
+// thin live-delegation wrapper (script boot swaps in the real terminating
+// implementation after this module was evaluated) and `argv` stays live
+// through the in-place splice in script_boot.js.txt.
+const process = globalThis.process;
+export default process;
+export const version = process.version;
+export const versions = process.versions;
+export const arch = process.arch;
+export const platform = process.platform;
+export const release = process.release;
+export const _rawDebug = process._rawDebug;
+export const moduleLoadList = process.moduleLoadList;
+export const binding = process.binding;
+export const _linkedBinding = process._linkedBinding;
+export const _events = process._events;
+export const _eventsCount = process._eventsCount;
+export const _maxListeners = process._maxListeners;
+export const domain = process.domain;
+export const _exiting = process._exiting;
+export const exitCode = process.exitCode;
+export const config = process.config;
+export const dlopen = process.dlopen;
+export const uptime = process.uptime;
+export const _getActiveRequests = process._getActiveRequests;
+export const _getActiveHandles = process._getActiveHandles;
+export const getActiveResourcesInfo = process.getActiveResourcesInfo;
+export const reallyExit = process.reallyExit;
+export const _kill = process._kill;
+export const loadEnvFile = process.loadEnvFile;
+export const cpuUsage = process.cpuUsage;
+export const threadCpuUsage = process.threadCpuUsage;
+export const resourceUsage = process.resourceUsage;
+export const memoryUsage = process.memoryUsage;
+export const constrainedMemory = process.constrainedMemory;
+export const availableMemory = process.availableMemory;
+export const kill = process.kill;
+// Live-delegation wrapper: script boot swaps in the real terminating exit.
+export const exit = (code) => process.exit(code);
+export const execve = process.execve;
+export const ref = process.ref;
+export const unref = process.unref;
+export const finalization = process.finalization;
+export const hrtime = process.hrtime;
+export const openStdin = process.openStdin;
+export const allowedNodeEnvironmentFlags = process.allowedNodeEnvironmentFlags;
+export const features = process.features;
+export const _fatalException = process._fatalException;
+export const setUncaughtExceptionCaptureCallback = process.setUncaughtExceptionCaptureCallback;
+export const hasUncaughtExceptionCaptureCallback = process.hasUncaughtExceptionCaptureCallback;
+export const emitWarning = process.emitWarning;
+export const nextTick = process.nextTick;
+export const _tickCallback = process._tickCallback;
+export const sourceMapsEnabled = process.sourceMapsEnabled;
+export const setSourceMapsEnabled = process.setSourceMapsEnabled;
+export const getBuiltinModule = process.getBuiltinModule;
+export const _debugProcess = process._debugProcess;
+export const _debugEnd = process._debugEnd;
+export const _startProfilerIdleNotifier = process._startProfilerIdleNotifier;
+export const _stopProfilerIdleNotifier = process._stopProfilerIdleNotifier;
+export const stdout = process.stdout;
+export const stdin = process.stdin;
+export const stderr = process.stderr;
+export const abort = process.abort;
+export const umask = process.umask;
+export const chdir = process.chdir;
+export const cwd = process.cwd;
+export const env = process.env;
+export const title = process.title;
+// Live ref: `pir js` script boot mutates this array in place (splice), so the
+// snapshot the boot-time module evaluation took stays the real argv.
+export const argv = process.argv;
+// Divergence note: script boot replaces `process.argv0`/`process.execPath`
+// with primitives after this module was evaluated, so these named snapshots
+// keep the boot-time values ("pir"); read `process.argv0`/`process.execPath`
+// off the default export for the live values.
+export const argv0 = process.argv0;
+export const execPath = process.execPath;
+export const execArgv = process.execArgv;
+export const pid = process.pid;
+export const ppid = process.ppid;
+export const debugPort = process.debugPort;
+export const _eval = process._eval;
+export const _preload_modules = process._preload_modules;
+export const report = process.report;

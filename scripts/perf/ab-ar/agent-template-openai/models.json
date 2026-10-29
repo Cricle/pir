@@ -1,0 +1,29 @@
+{
+  "providers": {
+    "openai": {
+      "name": "OpenAI",
+      "baseUrl": "https://api.openai.com",
+      "api": "anthropic-messages",
+      "authHeader": true,
+      "apiKey": "${PIR_AB_API_KEY}",
+      "models": [
+        {
+          "id": "gpt-5",
+          "name": "OpenAI Coding",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 1000000,
+          "maxTokens": 65536,
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,38 @@
+// node:_http_server — private internals: the server classes/status table and
+// the connection listener are aliased from the node:http shim; the server
+// lifecycle helpers are real no-ops (the shimmed server never starts).
+import { Server, ServerResponse, STATUS_CODES, _connectionListener } from "@node/http";
+
+function setupConnectionsTracking(_server) {
+  // No connection registry exists in this runtime.
+}
+
+function storeHTTPOptions(_server) {
+  // The shimmed server stores no native options.
+}
+
+function httpServerPreClose(_server) {
+  // Nothing to pre-close in this runtime.
+}
+
+const kServerResponse = Symbol("kServerResponse");
+const kConnectionsCheckingInterval = Symbol("kConnectionsCheckingInterval");
+
+const httpServer = {
+  Server: Server,
+  ServerResponse: ServerResponse,
+  STATUS_CODES: STATUS_CODES,
+  _connectionListener: _connectionListener,
+  setupConnectionsTracking: setupConnectionsTracking,
+  storeHTTPOptions: storeHTTPOptions,
+  httpServerPreClose: httpServerPreClose,
+  kServerResponse: kServerResponse,
+  kConnectionsCheckingInterval: kConnectionsCheckingInterval,
+};
+
+export default httpServer;
+export {
+  Server, ServerResponse, STATUS_CODES, _connectionListener,
+  setupConnectionsTracking, storeHTTPOptions, httpServerPreClose,
+  kServerResponse, kConnectionsCheckingInterval,
+};

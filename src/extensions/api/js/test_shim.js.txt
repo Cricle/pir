@@ -1,0 +1,142 @@
+// node:test — throws tier. The runtime cannot host the test-runner event
+// model (no TAP output host, no subprocess isolation); the runner entries
+// exist for link compatibility and throw the unified error when invoked.
+// `assert` is the node:assert surface (the same object real Node wires in),
+// `mock`/`snapshot` keep their real key shapes.
+import * as assertSurface from "@node/assert";
+
+function testUnsupported(api) {
+  const error = new Error("node:test." + api + " is not supported by the pir extension runtime (no test-runner host)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+class TestContext {}
+class SuiteContext {}
+
+function test(..._args) {
+  throw testUnsupported("test");
+}
+
+function describe(..._args) {
+  throw testUnsupported("describe");
+}
+
+function it(..._args) {
+  throw testUnsupported("it");
+}
+
+function suite(..._args) {
+  throw testUnsupported("suite");
+}
+
+function run(..._args) {
+  throw testUnsupported("run");
+}
+
+function before(..._args) {
+  throw testUnsupported("before");
+}
+
+function beforeEach(..._args) {
+  throw testUnsupported("beforeEach");
+}
+
+function after(..._args) {
+  throw testUnsupported("after");
+}
+
+function afterEach(..._args) {
+  throw testUnsupported("afterEach");
+}
+
+function only(..._args) {
+  throw testUnsupported("only");
+}
+
+function skip(..._args) {
+  throw testUnsupported("skip");
+}
+
+function todo(..._args) {
+  throw testUnsupported("todo");
+}
+
+function expectFailure(..._args) {
+  throw testUnsupported("expectFailure");
+}
+
+function getTestContext() {
+  throw testUnsupported("getTestContext");
+}
+
+function getSuiteContext() {
+  throw testUnsupported("getSuiteContext");
+}
+
+// `mock` keeps the real key shape (methods live on the prototype in real
+// Node, so Object.keys is empty); invoking any method throws.
+const mockPrototype = {
+  fn() {
+    throw testUnsupported("mock.fn");
+  },
+  method() {
+    throw testUnsupported("mock.method");
+  },
+  getter() {
+    throw testUnsupported("mock.getter");
+  },
+  setter() {
+    throw testUnsupported("mock.setter");
+  },
+  reset() {
+    throw testUnsupported("mock.reset");
+  },
+  restoreAll() {
+    throw testUnsupported("mock.restoreAll");
+  },
+  resetAll() {
+    throw testUnsupported("mock.resetAll");
+  },
+  timers() {
+    throw testUnsupported("mock.timers");
+  },
+};
+const mock = Object.create(mockPrototype);
+
+const snapshot = {
+  setDefaultSnapshotSerializers(..._args) {
+    throw testUnsupported("snapshot.setDefaultSnapshotSerializers");
+  },
+  setResolveSnapshotPath(..._args) {
+    throw testUnsupported("snapshot.setResolveSnapshotPath");
+  },
+};
+
+const nodeTest = {
+  test: test,
+  describe: describe,
+  it: it,
+  suite: suite,
+  run: run,
+  before: before,
+  beforeEach: beforeEach,
+  after: after,
+  afterEach: afterEach,
+  only: only,
+  skip: skip,
+  todo: todo,
+  expectFailure: expectFailure,
+  getTestContext: getTestContext,
+  getSuiteContext: getSuiteContext,
+  mock: mock,
+  snapshot: snapshot,
+  assert: assertSurface,
+};
+
+export default nodeTest;
+export {
+  test, describe, it, suite, run, before, beforeEach, after, afterEach,
+  only, skip, todo, expectFailure, getTestContext, getSuiteContext,
+  mock, snapshot, assertSurface as assert,
+};

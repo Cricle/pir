@@ -1,0 +1,10 @@
+repo=https://github.com/earendil-works/pi
+commit=3daa20280f6a7c7cbe0935680c9a38fdc3863005
+date=2026-10-13
+target_repo=pir
+migration_status=in_progress
+pending_drift=74 commits / 305 files / +24,126 -9,375 (3daa20280..2ec55d808, 2026-10-19); see docs/STATUS.md
+
+# Version map: upstream pi -> pir. pir has its own semver.
+upstream_pi_version=1.4.0
+pir_version=0.0.1

@@ -1,0 +1,2982 @@
+
+// node:assert — Node v24 parity surface (callable module).
+//
+// Shape (verified against Node v24.19.0):
+//   * `require("assert")` / `import assert from "node:assert"` IS the callable
+//     `ok` function: `assert.ok === assert`, `assert.name === "ok"`,
+//     `assert.length === 0`, and every assertion hangs off it as an own
+//     property (same key order as Node).
+//   * `assert.strict` / `assert/strict` is a second callable (`strict`) that
+//     shares the strict aliases: `strict.ok === assert`,
+//     `strict.strictEqual === assert.strictEqual`, `strict.strict === strict`,
+//     `equal -> strictEqual`, `deepEqual -> deepStrictEqual`,
+//     `notEqual -> notStrictEqual`, `notDeepEqual -> notDeepStrictEqual`.
+//   * `assert.AssertionError` keeps `name === "AssertionError"` and
+//     `code === "ERR_ASSERTION"`; `String(err)` and the stack head read
+//     "AssertionError [ERR_ASSERTION]: <message>" like Node, and the frames of
+//     this module are dropped from it the way `ErrorCaptureStackTrace(this,
+//     stackStartFn)` does (see pirRewriteAssertStack).
+//
+// Messages reproduce Node's templates (kReadableOperator + createErrDiff and
+// the Myers diff ported from internal/assert/myers_diff.js), the argument
+// validation errors follow internal/errors.js (ERR_INVALID_ARG_TYPE with its
+// `of type … / an instance of … / Received …` phrasing, ERR_INVALID_ARG_VALUE,
+// ERR_AMBIGUOUS_ARGUMENT, ERR_MISSING_ARGS), and Values render through the
+// shared `@node/util` inspect, exactly like Node's assert
+// (internal/assert/assertion_error inspectValue), so the diff blocks stay
+// consistent with util.inspect. Colour escapes are never emitted: Node's
+// assertion messages are colourless unless stderr is a TTY (the harness runs
+// with NO_COLOR=1 and piped stdio), so the colour branches are dropped.
+//
+// Deep equality is a full port of Node v24 lib/internal/util/comparisons.js —
+// all three modes (loose `deepEqual`, strict `deepStrictEqual`,
+// `partialDeepStrictEqual`), internal-slot branding included.
+//
+// Known gaps:
+//   * Generated messages from code whose source is not retrievable (a direct
+//     `eval` string) fall back to the operator template: quickjs does not
+//     retain eval-script sources, and direct eval cannot be wrapped without
+//     changing its scope semantics. `new Function` bodies ARE covered — the
+//     prelude records their text and the frame's function object links to it.
+//   * KeyObject / CryptoKey comparisons miss the opaque-handle branch: neither
+//     class is reachable from this module, so their own enumerable properties
+//     are compared instead of the key material.
+
+import { inspect as pirInspect } from "@node/util";
+import { readFileSync as pirReadFileSync } from "@node/fs";
+
+// ---------------------------------------------------------------------------
+// value rendering (Node: internal/assert/assertion_error inspectValue)
+// ---------------------------------------------------------------------------
+
+const kInspectOptions = {
+  compact: false,
+  customInspect: false,
+  depth: 1000,
+  maxArrayLength: Infinity,
+  showHidden: false,
+  showProxy: false,
+  sorted: true,
+  getters: true,
+};
+
+const kInspectCustom = Symbol.for("nodejs.util.inspect.custom");
+
+// Local renderer kept as a safety net: values that make util's inspect throw
+// still have to reach the message (assert must never fail while reporting).
+function pirFallbackShow(value) {
+  if (typeof value === "string") return "'" + value + "'";
+  if (typeof value === "bigint") return String(value) + "n";
+  if (typeof value === "function") return "[Function" + (value.name ? " " + value.name : "") + "]";
+  if (value === null || typeof value !== "object") return String(value);
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? "Invalid Date" : value.toISOString();
+  if (value instanceof RegExp) return String(value);
+  if (value instanceof Error) return value.name + ": " + value.message;
+  if (value instanceof Map) return "Map(" + value.size + ")";
+  if (value instanceof Set) return "Set(" + value.size + ")";
+  try {
+    const json = JSON.stringify(value);
+    return json === undefined ? String(value) : json;
+  } catch {
+    return String(value);
+  }
+}
+
+function pirShow(value) {
+  try {
+    const rendered = pirInspect(value, kInspectOptions);
+    if (typeof rendered === "string") return rendered;
+  } catch {
+    // fall through to the local renderer
+  }
+  return pirFallbackShow(value);
+}
+
+// The message templates Node builds with a plain `inspect(value)` — the
+// throws/rejects mismatch reports and ifError — as opposed to the diff blocks'
+// `inspectValue`.
+function pirInspectDefault(value, options) {
+  try {
+    const rendered = pirInspect(value, options);
+    if (typeof rendered === "string") return rendered;
+  } catch {
+    // fall through to the local renderer
+  }
+  return pirFallbackShow(value);
+}
+
+// ---------------------------------------------------------------------------
+// message templates + diff (Node: internal/assert/assertion_error)
+// ---------------------------------------------------------------------------
+
+const kReadableOperator = {
+  deepStrictEqual: "Expected values to be strictly deep-equal:",
+  partialDeepStrictEqual: "Expected values to be partially and strictly deep-equal:",
+  strictEqual: "Expected values to be strictly equal:",
+  strictEqualObject: "Expected \"actual\" to be reference-equal to \"expected\":",
+  deepEqual: "Expected values to be loosely deep-equal:",
+  notDeepStrictEqual: "Expected \"actual\" not to be strictly deep-equal to:",
+  notStrictEqual: "Expected \"actual\" to be strictly unequal to:",
+  notStrictEqualObject: "Expected \"actual\" not to be reference-equal to \"expected\":",
+  notDeepEqual: "Expected \"actual\" not to be loosely deep-equal to:",
+  notIdentical: "Values have same structure but are not reference-equal:",
+  notDeepEqualUnequal: "Expected values not to be loosely deep-equal:",
+};
+
+const kMaxShortStringLength = 12;
+const kMaxLongStringLength = 512;
+// Runtime guard: Node's Myers diff clones a trace row per diff level (O(n^2)
+// memory on large inputs). Bigger inputs get a plain stacked diff instead.
+const kMaxDiffLines = 1500;
+
+const kMethodsWithCustomMessageDiff = {
+  deepStrictEqual: true,
+  strictEqual: true,
+  partialDeepStrictEqual: true,
+};
+
+// Two objects/functions compared with strictEqual wanted reference equality.
+function pirCheckOperator(actual, expected, operator) {
+  if (
+    operator === "strictEqual" &&
+    ((typeof actual === "object" && actual !== null &&
+      typeof expected === "object" && expected !== null) ||
+      (typeof actual === "function" && typeof expected === "function"))
+  ) {
+    return "strictEqualObject";
+  }
+  return operator;
+}
+
+function pirStackedDiff(actual, expected) {
+  let message = "\n+ " + actual + "\n- " + expected;
+  // Non-TTY column width, as in Node (`process.stderr.isTTY ? columns : 80`).
+  const maxTerminalLength = 80;
+  if (actual.length + expected.length <= maxTerminalLength) {
+    let indicatorIdx = -1;
+    for (let i = 0; i < actual.length; i++) {
+      if (actual[i] !== expected[i]) {
+        // Skip the indicator for the first 2 characters (3 to account for
+        // the quotes): the difference is immediately apparent there.
+        if (i >= 3) indicatorIdx = i;
+        break;
+      }
+    }
+    if (indicatorIdx !== -1) {
+      message += "\n" + " ".repeat(indicatorIdx + 2) + "^";
+    }
+  }
+  return { message: message };
+}
+
+function pirSimpleDiff(originalActual, actual, originalExpected, expected) {
+  let stringsLen = actual.length + expected.length;
+  // Account for the quotes wrapping strings.
+  if (typeof originalActual === "string") stringsLen -= 2;
+  if (typeof originalExpected === "string") stringsLen -= 2;
+  if (stringsLen <= kMaxShortStringLength && (originalActual !== 0 || originalExpected !== 0)) {
+    return { message: actual + " !== " + expected, header: "" };
+  }
+  return pirStackedDiff(actual, expected);
+}
+
+function pirIsSimpleDiff(actual, inspectedActual, expected, inspectedExpected) {
+  if (inspectedActual.length > 1 || inspectedExpected.length > 1) return false;
+  return typeof actual !== "object" || actual === null ||
+    typeof expected !== "object" || expected === null;
+}
+
+// Node: internal/assert/myers_diff.js (plain arrays stand in for Int32Array;
+// out-of-range lookups read `undefined` in both).
+const kOperations = { DELETE: -1, NOP: 0, INSERT: 1 };
+const kNopLinesToCollapse = 5;
+
+function pirLinesEqual(actual, expected, checkCommaDisparity) {
+  if (actual === expected) return true;
+  if (checkCommaDisparity) {
+    return (actual + ",") === expected || actual === (expected + ",");
+  }
+  return false;
+}
+
+function pirMyersDiff(actual, expected, checkCommaDisparity) {
+  const actualLength = actual.length;
+  const expectedLength = expected.length;
+  const max = actualLength + expectedLength;
+  const v = new Array(2 * max + 1).fill(0);
+  const trace = [];
+
+  for (let diffLevel = 0; diffLevel <= max; diffLevel++) {
+    trace.push(v.slice());
+    for (let diagonalIndex = -diffLevel; diagonalIndex <= diffLevel; diagonalIndex += 2) {
+      const offset = diagonalIndex + max;
+      const previousOffset = v[offset - 1];
+      const nextOffset = v[offset + 1];
+      let x = diagonalIndex === -diffLevel ||
+        (diagonalIndex !== diffLevel && previousOffset < nextOffset) ?
+        nextOffset : previousOffset + 1;
+      let y = x - diagonalIndex;
+
+      while (
+        x < actualLength && y < expectedLength &&
+        pirLinesEqual(actual[x], expected[y], checkCommaDisparity)
+      ) {
+        x++;
+        y++;
+      }
+
+      v[offset] = x;
+      if (x >= actualLength && y >= expectedLength) {
+        return pirBacktrack(trace, actual, expected, checkCommaDisparity);
+      }
+    }
+  }
+  return [];
+}
+
+function pirBacktrack(trace, actual, expected, checkCommaDisparity) {
+  const actualLength = actual.length;
+  const expectedLength = expected.length;
+  const max = actualLength + expectedLength;
+  let x = actualLength;
+  let y = expectedLength;
+  const result = [];
+
+  for (let diffLevel = trace.length - 1; diffLevel >= 0; diffLevel--) {
+    const v = trace[diffLevel];
+    const diagonalIndex = x - y;
+    const offset = diagonalIndex + max;
+    let prevDiagonalIndex;
+    if (
+      diagonalIndex === -diffLevel ||
+      (diagonalIndex !== diffLevel && v[offset - 1] < v[offset + 1])
+    ) {
+      prevDiagonalIndex = diagonalIndex + 1;
+    } else {
+      prevDiagonalIndex = diagonalIndex - 1;
+    }
+
+    const prevX = v[prevDiagonalIndex + max];
+    const prevY = prevX - prevDiagonalIndex;
+
+    while (x > prevX && y > prevY) {
+      const actualItem = actual[x - 1];
+      const value = checkCommaDisparity && !String(actualItem).endsWith(",") ?
+        expected[y - 1] : actualItem;
+      result.push([kOperations.NOP, value]);
+      x--;
+      y--;
+    }
+
+    if (diffLevel > 0) {
+      if (x > prevX) {
+        result.push([kOperations.INSERT, actual[--x]]);
+      } else {
+        result.push([kOperations.DELETE, expected[--y]]);
+      }
+    }
+  }
+  return result;
+}
+
+function pirPrintMyersDiff(diff) {
+  let message = "";
+  let skipped = false;
+  let nopCount = 0;
+
+  for (let diffIdx = diff.length - 1; diffIdx >= 0; diffIdx--) {
+    const operation = diff[diffIdx][0];
+    const value = diff[diffIdx][1];
+    const previousOperation = diffIdx < diff.length - 1 ? diff[diffIdx + 1][0] : null;
+
+    // Avoid grouping when only one line would have been grouped otherwise.
+    if (previousOperation === kOperations.NOP && operation !== previousOperation) {
+      if (nopCount === kNopLinesToCollapse + 1) {
+        message += "  " + diff[diffIdx + 1][1] + "\n";
+      } else if (nopCount === kNopLinesToCollapse + 2) {
+        message += "  " + diff[diffIdx + 2][1] + "\n";
+        message += "  " + diff[diffIdx + 1][1] + "\n";
+      } else if (nopCount >= kNopLinesToCollapse + 3) {
+        message += "...\n";
+        message += "  " + diff[diffIdx + 1][1] + "\n";
+        skipped = true;
+      }
+      nopCount = 0;
+    }
+
+    if (operation === kOperations.INSERT) {
+      message += "+ " + value + "\n";
+    } else if (operation === kOperations.DELETE) {
+      message += "- " + value + "\n";
+    } else if (operation === kOperations.NOP) {
+      if (nopCount < kNopLinesToCollapse) message += "  " + value + "\n";
+      nopCount++;
+    }
+  }
+
+  return { message: "\n" + message.replace(/\s+$/, ""), skipped: skipped };
+}
+
+function pirGetErrorMessage(operator, message) {
+  return message || kReadableOperator[operator];
+}
+
+function pirCreateErrDiff(actual, expected, operator, customMessage, diffType) {
+  operator = pirCheckOperator(actual, expected, operator);
+
+  let skipped = false;
+  let message = "";
+  const inspectedActual = pirShow(actual);
+  const inspectedExpected = pirShow(expected);
+  const inspectedSplitActual = inspectedActual.split("\n");
+  const inspectedSplitExpected = inspectedExpected.split("\n");
+  const showSimpleDiff = pirIsSimpleDiff(actual, inspectedSplitActual, expected, inspectedSplitExpected);
+  let header = "+ actual - expected";
+
+  if (showSimpleDiff) {
+    const simpleDiff = pirSimpleDiff(actual, inspectedSplitActual[0], expected, inspectedSplitExpected[0]);
+    message = simpleDiff.message;
+    if (simpleDiff.header !== undefined) header = simpleDiff.header;
+  } else if (inspectedActual === inspectedExpected) {
+    // Structurally the same, but not reference-equal.
+    operator = "notIdentical";
+    if (inspectedSplitActual.length > 50 && diffType !== "full") {
+      message = inspectedSplitActual.slice(0, 50).join("\n") + "\n...}";
+      skipped = true;
+    } else {
+      message = inspectedSplitActual.join("\n");
+    }
+    header = "";
+  } else if (inspectedSplitActual.length + inspectedSplitExpected.length > kMaxDiffLines) {
+    message = "+ " + inspectedActual + "\n- " + inspectedExpected;
+  } else {
+    const checkCommaDisparity = actual !== null && actual !== undefined && typeof actual === "object";
+    const diff = pirMyersDiff(inspectedSplitActual, inspectedSplitExpected, checkCommaDisparity);
+    const printed = pirPrintMyersDiff(diff);
+    message = printed.message;
+    if (printed.skipped) skipped = true;
+  }
+
+  const headerMessage = pirGetErrorMessage(operator, customMessage) + "\n" + header;
+  const skippedMessage = skipped ? "\n... Skipped lines" : "";
+  return headerMessage + skippedMessage + "\n" + message + "\n";
+}
+
+// Node's generated-message selection outside the diff paths: the
+// notStrictEqual / notDeepStrictEqual "show one value" branches and the
+// loose `deepEqual` / "A == B" templates.
+function pirGeneratedMessage(actual, expected, operator, diffType) {
+  if (operator === "notDeepStrictEqual" || operator === "notStrictEqual") {
+    let base = kReadableOperator[operator];
+    const res = pirShow(actual).split("\n");
+
+    if (operator === "notStrictEqual" &&
+        ((typeof actual === "object" && actual !== null) || typeof actual === "function")) {
+      base = kReadableOperator.notStrictEqualObject;
+    }
+
+    if (res.length > 50 && diffType !== "full") {
+      res[46] = "...";
+      while (res.length > 47) res.pop();
+    }
+
+    if (res.length === 1) {
+      return base + (res[0].length > 5 ? "\n\n" : " ") + res[0];
+    }
+    return base + "\n\n" + res.join("\n") + "\n";
+  }
+
+  let res = pirShow(actual);
+  let other = pirShow(expected);
+  const knownOperator = kReadableOperator[operator];
+  if (operator === "notDeepEqual" && res === other) {
+    res = knownOperator + "\n\n" + res;
+    if (res.length > 1024 && diffType !== "full") res = res.slice(0, 1021) + "...";
+    return res;
+  }
+
+  if (res.length > kMaxLongStringLength && diffType !== "full") res = res.slice(0, 509) + "...";
+  if (other.length > kMaxLongStringLength && diffType !== "full") other = other.slice(0, 509) + "...";
+
+  if (operator === "deepEqual") {
+    res = knownOperator + "\n\n" + res + "\n\nshould loosely deep-equal\n\n";
+  } else {
+    const newOp = kReadableOperator[operator + "Unequal"];
+    if (newOp) {
+      res = newOp + "\n\n" + res + "\n\nshould not loosely deep-equal\n\n";
+    } else {
+      // Node's no-source `ok` fallback lands here: `false == true`.
+      other = " " + operator + " " + other;
+    }
+  }
+  return res + other;
+}
+
+// Node: assertion_error copyError — duplicate an Error before diffing it so
+// the two stacks do not drown the diff.
+function pirCopyError(source) {
+  const target = Object.assign(Object.create(Object.getPrototypeOf(source)), source);
+  Object.defineProperty(target, "message", { __proto__: null, value: source.message });
+  if (Object.prototype.hasOwnProperty.call(source, "cause")) {
+    const cause = source.cause;
+    Object.defineProperty(target, "cause", {
+      __proto__: null,
+      value: pirIsError(cause) ? pirCopyError(cause) : cause,
+    });
+  }
+  return target;
+}
+
+// Long strings should not be fully inspected: Node's AssertionError
+// [inspect.custom] trims `actual` / `expected` before delegating to inspect
+// (assertion_error.js addEllipsis — the string slice is deliberate: it keeps
+// the *tail* once over kMaxLongStringLength).
+function pirAddEllipsis(string) {
+  const lines = string.split("\n", 11);
+  if (lines.length > 10) {
+    lines.length = 10;
+    return lines.join("\n") + "\n...";
+  } else if (string.length > kMaxLongStringLength) {
+    return string.slice(kMaxLongStringLength) + "...";
+  }
+  return string;
+}
+
+// Node's `ErrorCaptureStackTrace(this, stackStartFn)` cannot be delegated:
+// QuickJS's Error.captureStackTrace ignores its constructorOpt argument, and
+// its `stack` getter rebuilds the head from the live `name` on every access.
+// Both halves are reproduced by materializing the stack while `name` still is
+// the code-qualified form and then dropping the frames above the caller:
+//   * `stackStartFn` (or the older `stackStartFunction`) owns a frame — V8 and
+//     now this shim drop up to and including it;
+//   * otherwise the leading frames that belong to this module (the
+//     AssertionError constructor, the innerFail/expectsError helpers and the
+//     engine's call/apply bridge frames) are dropped, keeping the deepest one
+//     when an async continuation has no caller frame left at all.
+function pirRewriteAssertStack(error, stackStartFn, stackStartFunction) {
+  try {
+    const stack = error.stack;
+    if (typeof stack !== "string") return;
+    const lines = stack.split("\n");
+    // QuickJS terminates the stack with an empty line; it must not count as a
+    // frame (or the trim below would keep it and drop the real one).
+    while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
+    // The head is the whole message (it can span lines) up to the first frame.
+    let frameStart = 0;
+    while (frameStart < lines.length && !/^\s+at /.test(lines[frameStart])) frameStart++;
+
+    const handle = stackStartFn !== undefined ? stackStartFn : stackStartFunction;
+    let keepFrom = frameStart;
+    if (handle !== undefined && frameStart < lines.length) {
+      const name = typeof handle === "function" ? handle.name : undefined;
+      let matched = -1;
+      if (typeof name === "string" && name !== "") {
+        for (let i = frameStart; i < lines.length; i++) {
+          if (pirFrameFunctionName(lines[i]) === name) {
+            matched = i;
+            break;
+          }
+        }
+      }
+      if (matched !== -1) {
+        keepFrom = matched + 1;
+        if (keepFrom >= lines.length) {
+          // Nothing below the handle's frame: V8 keeps the async parent chain
+          // here, so keep the deepest frame instead of emptying the stack.
+          keepFrom = lines.length - 1;
+        }
+      } else {
+        // The handle has no frame of its own (a native callback, a re-entrant
+        // call the engine does not name): fall back to this module's frames.
+        let first = frameStart;
+        while (first < lines.length && pirIsAssertInternalFrame(lines[first])) first++;
+        if (first >= lines.length) first = lines.length - 1;
+        keepFrom = first;
+      }
+    }
+
+    Object.defineProperty(error, "stack", {
+      __proto__: null,
+      value: lines.slice(0, frameStart).concat(lines.slice(keepFrom)).join("\n"),
+      writable: true,
+      configurable: true,
+    });
+  } catch {
+    // Stack rewriting is cosmetic; the AssertionError itself is what matters.
+  }
+}
+
+// The function name of a stack frame (`    at foo (file:1:2)` → "foo").
+function pirFrameFunctionName(line) {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("at ")) return "";
+  let rest = trimmed.slice(3);
+  const paren = rest.indexOf(" (");
+  if (paren !== -1) rest = rest.slice(0, paren);
+  return rest;
+}
+
+function pirIsAssertInternalFrame(line) {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("at ")) return false;
+  if (trimmed.indexOf("(@node/assert") !== -1) return true;
+  return /^at (call|apply|construct|eval) \(native\)$/.test(trimmed) ||
+    trimmed === "at captureStackTrace (native)";
+}
+
+// ---------------------------------------------------------------------------
+// Generated-message source expression (Node: internal/errors/error_source).
+//
+// When an `ok`/`assert` message is generated, Node slices the first
+// expression out of the *source line* of the call site. The engine reports
+// the same positions V8's getErrorSourcePositions does through the structured
+// CallSite (line, and a 1-based column pointing at the callee), so the line
+// text is read from the file the frame names and the expression is cut with a
+// token scan equivalent to acorn's for the labels the algorithm tests. An
+// empty result leaves the message unset — the AssertionError then falls back
+// to the operator template (`false == true`), exactly like Node when no
+// source is available.
+// ---------------------------------------------------------------------------
+
+const pirEscapeSequencesRegExp = /[\x00-\x08\x0b\x0c\x0e-\x1f]/g;
+const pirEscapeMeta = [
+  "\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005", "\\u0006",
+  "\\u0007", "\\b", "\t", "\n", "\\u000b", "\\f", "\r", "\\u000e", "\\u000f",
+  "\\u0010", "\\u0011", "\\u0012", "\\u0013", "\\u0014", "\\u0015", "\\u0016",
+  "\\u0017", "\\u0018", "\\u0019", "\\u001a", "\\u001b", "\\u001c", "\\u001d",
+  "\\u001e", "\\u001f",
+];
+const pirEscapeFn = (str) => pirEscapeMeta[str.charCodeAt(0)];
+
+const pirMemberAccessTokens = { ".": true, "?.": true, "[": true, "]": true };
+const pirMemberNameTokens = { name: true, string: true, num: true };
+// Source-visible callee names for each assert entry point whose `ok` path
+// generates a message (`assert(x)`, `assert.ok(x)` and `strict.ok(x)` all run
+// the same `ok` function).
+const pirOkCalleeNames = ["ok", "assert"];
+const pirStrictCalleeNames = ["strict"];
+// Engine placeholder script names: a module body is eval'd, so its frames
+// report `<input>` (the shim bundle reports `eval_script`). Such a frame is
+// attributed to the nearest named frame below it — the loader's
+// `pir-ext:<path>` wrapper — mirroring util's getCallSites rule.
+const pirPlaceholderScripts = {
+  "<input>": true, "<anonymous>": true, "<eval>": true, "eval_script": true, "": true,
+};
+const pirRegexKeywordSet = {
+  return: true, typeof: true, instanceof: true, in: true, of: true, new: true,
+  delete: true, void: true, case: true, do: true, else: true, yield: true,
+  await: true, throw: true,
+};
+const pirPunctSet = new Set([
+  ">>>=", "===", "!==", "**=", "<<=", ">>=", "&&=", "||=", "??=", "...",
+  ">>>", "?.", "=>", "==", "!=", "<=", ">=", "&&", "||", "??", "++", "--",
+  "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "**", "<<", ">>",
+  "(", ")", "[", "]", "{", "}", ";", ",", ".", "<", ">", "+", "-", "*",
+  "/", "%", "&", "|", "^", "!", "~", "?", ":", "=", "@", "#",
+]);
+
+const pirIsIdentStart = (ch) =>
+  (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || ch === "_" || ch === "$" ||
+  ch.charCodeAt(0) > 0x7f;
+const pirIsIdentPart = (ch) => pirIsIdentStart(ch) || (ch >= "0" && ch <= "9");
+const pirIsDigit = (ch) => ch >= "0" && ch <= "9";
+const pirIsSpace = (ch) =>
+  ch === " " || ch === "\t" || ch === "\u000b" || ch === "\f" || ch === "\u00a0" ||
+  ch === "\ufeff" || ch === "\r" || ch === "\n";
+
+// Token scan over one source line. Labels mirror the acorn labels the Node
+// algorithm tests (`name` / `string` / `num` / punctuator text); everything
+// else just has to be a non-member, non-name label. Template literals are one
+// token: an interpolation's own parentheses are balanced, so skipping them
+// does not change the algorithm's paren accounting.
+function* pirLineTokens(code) {
+  const len = code.length;
+  let i = 0;
+  let lastLabel = null;
+  let lastText = "";
+  const emit = (label, start, end, text) => {
+    lastLabel = label;
+    lastText = text === undefined ? code.slice(start, end) : text;
+    return { label, start, end };
+  };
+  while (i < len) {
+    const ch = code[i];
+    if (pirIsSpace(ch)) { i += 1; continue; }
+    if (ch === "/" && code[i + 1] === "/") {
+      const nl = code.indexOf("\n", i);
+      i = nl === -1 ? len : nl + 1;
+      continue;
+    }
+    if (ch === "/" && code[i + 1] === "*") {
+      const end = code.indexOf("*/", i + 2);
+      i = end === -1 ? len : end + 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const start = i;
+      const quote = ch;
+      i += 1;
+      while (i < len) {
+        if (code[i] === "\\") { i += 2; continue; }
+        if (code[i] === quote) { i += 1; break; }
+        i += 1;
+      }
+      yield emit("string", start, i);
+      continue;
+    }
+    if (ch === "`") {
+      const start = i;
+      i += 1;
+      let depth = 0;
+      while (i < len) {
+        const c = code[i];
+        if (c === "\\") { i += 2; continue; }
+        if (depth === 0) {
+          if (c === "`") { i += 1; break; }
+          if (c === "$" && code[i + 1] === "{") { depth = 1; i += 2; continue; }
+        } else if (c === "{") { depth += 1; }
+        else if (c === "}") { depth -= 1; }
+        i += 1;
+      }
+      yield emit("template", start, i);
+      continue;
+    }
+    if (pirIsDigit(ch) || (ch === "." && pirIsDigit(code[i + 1]))) {
+      const start = i;
+      if (ch === "0" && (code[i + 1] === "x" || code[i + 1] === "X" || code[i + 1] === "o" ||
+        code[i + 1] === "O" || code[i + 1] === "b" || code[i + 1] === "B")) {
+        i += 2;
+        while (i < len && (pirIsIdentPart(code[i]) || code[i] === "_")) i += 1;
+      } else {
+        while (i < len && (pirIsDigit(code[i]) || code[i] === "_" || code[i] === ".")) i += 1;
+        if (i < len && (code[i] === "e" || code[i] === "E")) {
+          i += 1;
+          if (i < len && (code[i] === "+" || code[i] === "-")) i += 1;
+          while (i < len && pirIsDigit(code[i])) i += 1;
+        }
+        if (i < len && code[i] === "n") i += 1;
+      }
+      yield emit("num", start, i);
+      continue;
+    }
+    if (pirIsIdentStart(ch)) {
+      const start = i;
+      i += 1;
+      while (i < len && pirIsIdentPart(code[i])) i += 1;
+      yield emit("name", start, i);
+      continue;
+    }
+    if (ch === "/" && (lastLabel === null ||
+      (lastLabel === "name" && pirRegexKeywordSet[lastText] === true) ||
+      (lastLabel.length === 1 && lastLabel !== ")" && lastLabel !== "]" && lastLabel !== "}"))) {
+      const start = i;
+      i += 1;
+      let inClass = false;
+      while (i < len) {
+        const c = code[i];
+        if (c === "\\") { i += 2; continue; }
+        if (c === "[") inClass = true;
+        else if (c === "]") inClass = false;
+        else if (c === "/" && !inClass) { i += 1; break; }
+        i += 1;
+      }
+      while (i < len && pirIsIdentPart(code[i])) i += 1;
+      yield emit("regexp", start, i);
+      continue;
+    }
+    let matched;
+    for (const width of [4, 3, 2, 1]) {
+      const candidate = code.substr(i, width);
+      if (pirPunctSet.has(candidate)) { matched = candidate; break; }
+    }
+    if (matched !== undefined) {
+      yield emit(matched, i, i + matched.length);
+      i += matched.length;
+      continue;
+    }
+    yield emit(ch, i, i + 1);
+    i += 1;
+  }
+}
+
+// Node's getFirstExpression: walk the tokens to the call's start column, memo
+// the member-access prefix before it (`assert` in `assert.ok(`), then cut at
+// the first paren that closes the call (or at a semicolon).
+function pirFirstExpression(code, startColumn) {
+  let lastToken = null;
+  let firstMemberAccessNameToken = null;
+  let terminatingCol;
+  let parenLvl = 0;
+  for (const token of pirLineTokens(code)) {
+    if (token.start < startColumn) {
+      if (token.label === ";") {
+        firstMemberAccessNameToken = null;
+        lastToken = token;
+        continue;
+      }
+      if (pirMemberAccessTokens[token.label] === true && lastToken !== null &&
+        lastToken.label === "name") {
+        if (firstMemberAccessNameToken === null) firstMemberAccessNameToken = lastToken;
+      } else if (pirMemberAccessTokens[token.label] !== true &&
+        pirMemberNameTokens[token.label] !== true) {
+        firstMemberAccessNameToken = null;
+      }
+      lastToken = token;
+      continue;
+    }
+    if (token.label === "(") { parenLvl += 1; continue; }
+    if (token.label === ")") {
+      parenLvl -= 1;
+      if (parenLvl === 0) {
+        terminatingCol = token.start + 1;
+        break;
+      }
+      continue;
+    }
+    if (token.label === ";") {
+      terminatingCol = token.start;
+      break;
+    }
+  }
+  const start = firstMemberAccessNameToken !== null ? firstMemberAccessNameToken.start : startColumn;
+  return code.slice(start, terminatingCol);
+}
+
+const pirSourceFileCache = new Map();
+const pirEvalEntryCache = new Map();
+
+/// Entry record (lines, joined text, line starts, tokens) for a source text.
+function pirEntryFromText(raw) {
+  const lines = raw.split(/\r?\n/);
+  const text = lines.join("\n");
+  const starts = new Array(lines.length);
+  let pos = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    starts[i] = pos;
+    pos += lines[i].length + 1;
+  }
+  const tokens = [];
+  for (const token of pirLineTokens(text)) tokens.push(token);
+  return { lines, text, starts, tokens };
+}
+
+/// One cached record per file. The token list backs the call-site resolution
+/// below; files are small and a generated message is rare, so tokenizing once
+/// per file is cheap.
+function pirReadSourceFile(file) {
+  let entry = pirSourceFileCache.get(file);
+  if (entry === undefined) {
+    let raw;
+    try {
+      raw = pirReadFileSync(file, "utf8");
+    } catch {
+      raw = undefined;
+    }
+    if (typeof raw === "string") {
+      entry = pirEntryFromText(raw);
+      if (pirSourceFileCache.size >= 16) pirSourceFileCache.clear();
+    } else {
+      entry = null;
+    }
+    pirSourceFileCache.set(file, entry);
+  }
+  return entry;
+}
+
+/// Entry record for a `new Function` body recorded by the prelude (frames in
+/// dynamically constructed functions have no file to read).
+function pirEvalSourceEntry(source) {
+  let entry = pirEvalEntryCache.get(source);
+  if (entry === undefined) {
+    entry = pirEntryFromText(source);
+    if (pirEvalEntryCache.size >= 16) pirEvalEntryCache.clear();
+    pirEvalEntryCache.set(source, entry);
+  }
+  return entry;
+}
+
+function pirOffsetOf(entry, line, col0) {
+  if (line < 1 || line > entry.lines.length || col0 < 0 || col0 > entry.lines[line - 1].length) {
+    return -1;
+  }
+  return entry.starts[line - 1] + col0;
+}
+
+function pirLineColOf(entry, offset) {
+  let lo = 0;
+  let hi = entry.starts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (entry.starts[mid] <= offset) lo = mid;
+    else hi = mid - 1;
+  }
+  return { line: lo + 1, col: offset - entry.starts[lo] };
+}
+
+const pirCallableToken = { name: true, ")": true, "]": true };
+
+/// Line index (1-based) of a token, via its start offset.
+function pirTokenLine(entry, idx) {
+  const token = entry.tokens[idx];
+  if (token === undefined) return -1;
+  return pirLineColOf(entry, token.start).line;
+}
+
+/// Indices of the callee chain ending at token `idx`, innermost first, last
+/// entry = the chain head (`a.b.c` -> [c, b, a]; `a['b']` -> [b, a]). The walk
+/// never crosses a line break: node tokenizes a single source line, so a
+/// callee split from its receiver (`assert\n  .ok(x)`) starts at `ok`.
+function pirCalleeChain(entry, idx) {
+  const tokens = entry.tokens;
+  const chain = [];
+  let c = idx;
+  for (let guard = 0; guard < 32; guard += 1) {
+    const token = tokens[c];
+    if (token === undefined) break;
+    const line = pirTokenLine(entry, c);
+    chain.push(c);
+    if (token.label === "]") {
+      let depth = 0;
+      let m = c;
+      for (; m >= 0; m -= 1) {
+        if (tokens[m].label === "]") depth += 1;
+        else if (tokens[m].label === "[") {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+      }
+      if (m < 0 || pirTokenLine(entry, m) !== line) break;
+      const key = tokens[m + 1];
+      if (key !== undefined && m + 2 === c &&
+        (key.label === "string" || key.label === "name")) {
+        chain.push(m + 1);
+      }
+      const base = tokens[m - 1];
+      if (base !== undefined && pirCallableToken[base.label] === true &&
+        pirTokenLine(entry, m - 1) === line) {
+        c = m - 1;
+        continue;
+      }
+      break;
+    }
+    const dot = tokens[c - 1];
+    const base = tokens[c - 2];
+    if (dot !== undefined && (dot.label === "." || dot.label === "?.") && base !== undefined &&
+      pirCallableToken[base.label] === true && pirTokenLine(entry, base) === line) {
+      c -= 2;
+      continue;
+    }
+    break;
+  }
+  return chain;
+}
+
+/// The identifier a chain token contributes (`name` text, or a `'name'`
+/// string member's content — the empty string for anything else).
+function pirChainTokenName(entry, idx) {
+  const token = entry.tokens[idx];
+  if (token === undefined) return "";
+  if (token.label === "name") return entry.text.slice(token.start, token.end);
+  if (token.label === "string") {
+    const raw = entry.text.slice(token.start, token.end);
+    return raw.length >= 2 ? raw.slice(1, -1) : "";
+  }
+  return "";
+}
+
+/// Does the callee chain name an assert entry point? The directly-called
+/// member decides (`chain[0]`), peeling reflective members first —
+/// `assert.ok` and `assert['ok']["apply"]` match "ok", while `assert.throws`
+/// does not, so an enclosing call cannot be mistaken for the frame's call.
+function pirChainMatches(entry, chain, calleeNames) {
+  for (let i = 0; i < chain.length; i += 1) {
+    const name = pirChainTokenName(entry, chain[i]);
+    if (name === "") continue;
+    if (calleeNames.indexOf(name) !== -1) return true;
+    if (name === "apply" || name === "call" || name === "bind") continue;
+    return false;
+  }
+  return false;
+}
+
+/// quickjs-ng's suspended-frame position lands on the last evaluated
+/// sub-expression of the call's argument list for some operands (a `null`
+/// literal, the operands of a binary expression, an invoked arrow's body), not
+/// on the callee the way V8's does. Recover the call the frame was making: the
+/// innermost enclosing call paren whose callee chain names the invoked assert
+/// function. When no candidate is named that way (an alias like
+/// `const fn = assert.ok`), the innermost callable candidate is used instead.
+function pirFindCallStart(entry, offset, calleeNames) {
+  const tokens = entry.tokens;
+  let k = 0;
+  while (k < tokens.length && tokens[k].start < offset) k += 1;
+  // The engine reports the V8-style callee position for some operands (plain
+  // numbers among them): a name directly followed by `(` is the frame's own
+  // call, and the position already is its callee head.
+  const at = tokens[k];
+  let unnamed = -1;
+  if (at !== undefined && at.label === "name" && tokens[k + 1] !== undefined &&
+    tokens[k + 1].label === "(") {
+    const chain = pirCalleeChain(entry, k);
+    if (pirChainMatches(entry, chain, calleeNames)) {
+      return tokens[chain[chain.length - 1]].start;
+    }
+    unnamed = tokens[chain[chain.length - 1]].start;
+  }
+  let depth = 0;
+  for (let j = k - 1; j >= 0; j -= 1) {
+    const label = tokens[j].label;
+    if (label === ")") {
+      depth += 1;
+      continue;
+    }
+    if (label !== "(") continue;
+    if (depth > 0) {
+      depth -= 1;
+      continue;
+    }
+    const prev = tokens[j - 1];
+    if (prev === undefined || pirCallableToken[prev.label] !== true) continue;
+    const chain = pirCalleeChain(entry, j - 1);
+    if (pirChainMatches(entry, chain, calleeNames)) {
+      return tokens[chain[chain.length - 1]].start;
+    }
+    if (unnamed < 0) unnamed = tokens[chain[chain.length - 1]].start;
+  }
+  return unnamed;
+}
+
+/// The `pir js` entry script, when there is one. Callbacks invoked by a
+/// required module (the node:test shim runs tests from its own scheduling
+/// context) carry no named script ancestor in the stack, so the entry script
+/// is the only candidate file left for their frames; the callee-name match in
+/// `pirFindCallStart` is what keeps a mis-attributed frame from fabricating an
+/// expression.
+function pirEntryScriptFile() {
+  try {
+    const proc = globalThis.process;
+    const argv = proc === undefined || proc === null ? undefined : proc.argv;
+    if (argv !== undefined && argv !== null && typeof argv[1] === "string" && argv[1] !== "") {
+      return argv[1];
+    }
+  } catch {
+    // No process global (extension contexts): nothing to fall back to.
+  }
+  return undefined;
+}
+
+// The caller's frame, with this module's own frames and native bridge frames
+// skipped (frame *names* are matched, so an engine whose captureStackTrace
+// ignores its constructorOpt argument is handled the same way).
+function pirCallerSourceFrame() {
+  const savedPrepare = Error.prepareStackTrace;
+  const savedLimit = Error.stackTraceLimit;
+  let sites;
+  try {
+    Error.prepareStackTrace = (_error, list) => list;
+    try {
+      if (typeof savedLimit === "number" && savedLimit < 32) Error.stackTraceLimit = 32;
+    } catch {
+      // Not writable (or no such property): the capture may be truncated; the
+      // frame sweep below copes with whatever arrived.
+    }
+    const holder = {};
+    Error.captureStackTrace(holder, pirCallerSourceFrame);
+    sites = holder.stack;
+  } catch {
+    sites = undefined;
+  }
+  Error.prepareStackTrace = savedPrepare;
+  try {
+    Error.stackTraceLimit = savedLimit;
+  } catch {
+    // Same as above: restoring is best-effort.
+  }
+  if (!Array.isArray(sites)) return undefined;
+  for (let i = 0; i < sites.length; i += 1) {
+    const site = sites[i];
+    if (site === null || site === undefined) continue;
+    const raw = typeof site.getFileName === "function" ? site.getFileName() : null;
+    if (raw === null || raw === undefined) continue; // native frame
+    let file = raw;
+    let fromEntry = false;
+    if (pirPlaceholderScripts[raw] === true) {
+      let named;
+      for (let j = i + 1; j < sites.length; j += 1) {
+        const outer = sites[j];
+        const name = outer !== null && outer !== undefined &&
+          typeof outer.getFileName === "function" ? outer.getFileName() : null;
+        if (name !== null && name !== undefined && pirPlaceholderScripts[name] !== true) {
+          named = name;
+          break;
+        }
+      }
+      if (named === undefined || named === "@node/assert") {
+        // Either no named ancestor at all, or the frame was *called by* the
+        // assert module (a callback handed to assert.throws): the frame
+        // belongs to a module body, so the entry script is the candidate.
+        const entry = pirEntryScriptFile();
+        if (entry === undefined) continue;
+        file = entry;
+        fromEntry = true;
+      } else {
+        file = named;
+      }
+    } else if (file === "@node/assert") {
+      continue;
+    }
+    const line = typeof site.getLineNumber === "function" ? site.getLineNumber() : null;
+    if (line === null || line === undefined || line < 1) continue;
+    const column = typeof site.getColumnNumber === "function" ? site.getColumnNumber() : null;
+    let evalSource;
+    try {
+      const registry = globalThis.__pirEvalSources;
+      const fn = typeof site.getFunction === "function" ? site.getFunction() : undefined;
+      if (registry !== undefined && registry !== null && fn !== undefined && fn !== null) {
+        const recorded = registry.get(fn);
+        if (recorded !== null && typeof recorded === "object" &&
+          typeof recorded.body === "string") {
+          // Frame positions in a `new Function` body index the synthesized
+          // function text, the same shape V8 compiles and node reports from.
+          evalSource = "function anonymous(" + (recorded.params || []).join(",") +
+            "\n) {\n" + recorded.body + "\n}";
+        }
+      }
+    } catch {
+      // Source lookup is best-effort: the file path below still applies.
+    }
+    return {
+      file: file.indexOf("pir-ext:") === 0 ? file.slice(8) : file,
+      line,
+      column: column === null || column === undefined ? 0 : column,
+      fromEntry,
+      evalSource,
+    };
+  }
+  return undefined;
+}
+
+function pirErrMessage(calleeNames) {
+  // Message generation must never break the assertion itself: any failure
+  // degrades to the operator template below.
+  try {
+    const frame = pirCallerSourceFrame();
+    if (frame === undefined) return undefined;
+    const entry = typeof frame.evalSource === "string"
+      ? pirEvalSourceEntry(frame.evalSource)
+      : pirReadSourceFile(frame.file);
+    if (entry === null) return undefined;
+    let line = frame.line;
+    let col0 = frame.column > 0 ? frame.column - 1 : 0;
+    const offset = pirOffsetOf(entry, line, col0);
+    let callStart = -1;
+    if (offset >= 0 && calleeNames !== undefined) {
+      callStart = pirFindCallStart(entry, offset, calleeNames);
+      if (callStart >= 0) {
+        const pos = pirLineColOf(entry, callStart);
+        line = pos.line;
+        col0 = pos.col;
+      }
+    }
+    if (line < 1 || line > entry.lines.length) return undefined;
+    // A frame attributed to the entry script without a named ancestor may
+    // belong to another module's eval script: only trust it when the callee
+    // match confirms a call of this assert function sits at that position.
+    const source = pirFirstExpression(entry.lines[line - 1], col0);
+    if (frame.fromEntry === true && callStart < 0) return undefined;
+    if (source === undefined || source === "") return undefined;
+    return "The expression evaluated to a falsy value:\n\n  " +
+      source.replace(pirEscapeSequencesRegExp, pirEscapeFn) + "\n";
+  } catch {
+    return undefined;
+  }
+}
+
+class AssertionError extends Error {
+  constructor(options) {
+    // Node: validateObject(options, 'options') — a non-object is a
+    // ERR_INVALID_ARG_TYPE TypeError before anything else happens.
+    if (options === null || Array.isArray(options) || typeof options !== "object") {
+      throw pirInvalidArgType("options", "Object", options);
+    }
+    const opts = options;
+    let actual = opts.actual;
+    let expected = opts.expected;
+    const operator = opts.operator;
+    const message = opts.message;
+    const diffType = opts.diff;
+    let text;
+
+    if (message !== undefined && message !== null) {
+      if (kMethodsWithCustomMessageDiff[operator] === true) {
+        text = pirCreateErrDiff(actual, expected, operator, message, diffType);
+      } else {
+        text = String(message);
+      }
+    } else {
+      // Duplicate compared Errors so their stacks stay out of the diff (Node
+      // does this before every generated message, custom ones excluded).
+      if (typeof actual === "object" && actual !== null &&
+          typeof expected === "object" && expected !== null &&
+          "stack" in actual && actual instanceof Error &&
+          "stack" in expected && expected instanceof Error) {
+        actual = pirCopyError(actual);
+        expected = pirCopyError(expected);
+      }
+      if (kMethodsWithCustomMessageDiff[operator] === true) {
+        text = pirCreateErrDiff(actual, expected, operator, undefined, diffType);
+      } else {
+        text = pirGeneratedMessage(actual, expected, operator, diffType);
+      }
+    }
+
+    super(text);
+
+    this.generatedMessage = message === undefined || message === null;
+    this.code = "ERR_ASSERTION";
+    if (opts.details) {
+      this.actual = undefined;
+      this.expected = undefined;
+      this.operator = undefined;
+      for (let i = 0; i < opts.details.length; i++) {
+        this["message " + i] = opts.details[i].message;
+        this["actual " + i] = opts.details[i].actual;
+        this["expected " + i] = opts.details[i].expected;
+        this["operator " + i] = opts.details[i].operator;
+        this["stack trace " + i] = opts.details[i].stack;
+      }
+    } else {
+      this.actual = actual;
+      this.expected = expected;
+      this.operator = operator;
+    }
+    this.diff = diffType === undefined ? "simple" : diffType;
+    // Node formats the stack while `name` is the code-qualified form and
+    // resets it afterwards; reproduce both observable halves.
+    // `__proto__: null` matters: a plain descriptor would pick up
+    // Object.prototype.get (test-assert-fail.js "Object prototype get").
+    Object.defineProperty(this, "name", {
+      __proto__: null,
+      value: "AssertionError [ERR_ASSERTION]",
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    pirRewriteAssertStack(this, opts.stackStartFn, opts.stackStartFunction);
+    this.name = "AssertionError";
+  }
+
+  toString() {
+    return this.name + " [" + this.code + "]: " + this.message;
+  }
+
+  // Node's AssertionError[inspect.custom]: long strings must not be inspected
+  // in full, and the compared values are limited to depth 0 (the message
+  // already contains the combined diff).
+  [kInspectCustom](recurseTimes, ctx) {
+    const actual = this.actual;
+    const expected = this.expected;
+    if (typeof this.actual === "string") this.actual = pirAddEllipsis(this.actual);
+    if (typeof this.expected === "string") this.expected = pirAddEllipsis(this.expected);
+
+    const result = pirInspect(this, Object.assign({}, ctx, {
+      customInspect: false,
+      depth: 0,
+    }));
+
+    if (typeof this.actual === "string") this.actual = actual;
+    if (typeof this.expected === "string") this.expected = expected;
+    return result;
+  }
+}
+
+function pirInnerFail(obj) {
+  if (obj.message instanceof Error) throw obj.message;
+  throw new AssertionError(obj);
+}
+
+// ---------------------------------------------------------------------------
+// argument validation errors (Node: internal/errors codes)
+// ---------------------------------------------------------------------------
+
+// Node internal/errors.js determineSpecificType: the `Received ...` half of
+// ERR_INVALID_ARG_TYPE / ERR_INVALID_RETURN_VALUE.
+function pirTypeDescription(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+
+  const type = typeof value;
+  switch (type) {
+    case "bigint":
+      return "type bigint (" + value + "n)";
+    case "number":
+      if (value === 0) return 1 / value === -Infinity ? "type number (-0)" : "type number (0)";
+      if (value !== value) return "type number (NaN)";
+      if (value === Infinity) return "type number (Infinity)";
+      if (value === -Infinity) return "type number (-Infinity)";
+      return "type number (" + value + ")";
+    case "boolean":
+      return "type boolean (" + value + ")";
+    case "symbol":
+      return "type symbol (" + String(value) + ")";
+    case "function":
+      return "function " + value.name;
+    case "object": {
+      let name;
+      try {
+        name = value.constructor && value.constructor.name;
+      } catch {
+        // Proxy traps may throw; the inspected fallback below stays.
+      }
+      if (name) return "an instance of " + name;
+      return pirInspect(value, { depth: -1 });
+    }
+    case "string": {
+      let text = value;
+      if (text.length > 28) text = text.slice(0, 25) + "...";
+      if (text.indexOf("'") === -1) return "type string ('" + text + "')";
+      return "type string (" + JSON.stringify(text) + ")";
+    }
+    default: {
+      let inspected = pirInspect(value, { colors: false });
+      if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+      return "type " + type + " (" + inspected + ")";
+    }
+  }
+}
+
+// Expected types are formatted as Node's ERR_INVALID_ARG_TYPE does: primitives
+// ("of type function"), class names ("an instance of Promise") and literal
+// strings (Node's assert passes e.g. 'a function or an instance of Promise').
+function pirFormatInvalidArgTypeExpected(expected) {
+  const list = Array.isArray(expected) ? expected : [expected];
+  const kTypes = ["string", "function", "number", "object", "Function", "Object",
+    "boolean", "bigint", "symbol"];
+  const classRegExp = /^[A-Z][a-zA-Z0-9]*$/;
+  const types = [];
+  const instances = [];
+  const other = [];
+
+  for (const value of list) {
+    if (kTypes.indexOf(value) !== -1) types.push(value.toLowerCase());
+    else if (classRegExp.test(value)) instances.push(value);
+    else other.push(value);
+  }
+
+  // "object" together with instances outlines the difference between them.
+  if (instances.length > 0) {
+    const pos = types.indexOf("object");
+    if (pos !== -1) {
+      types.splice(pos, 1);
+      instances.push("Object");
+    }
+  }
+
+  let msg = "";
+  if (types.length > 0) {
+    msg += (types.length > 1 ? "one of type " : "of type ") + pirFormatList(types, "or");
+    if (instances.length > 0 || other.length > 0) msg += " or ";
+  }
+  if (instances.length > 0) {
+    msg += "an instance of " + pirFormatList(instances, "or");
+    if (other.length > 0) msg += " or ";
+  }
+  if (other.length > 0) {
+    if (other.length > 1) msg += "one of " + pirFormatList(other, "or");
+    else {
+      if (other[0].toLowerCase() !== other[0]) msg += "an ";
+      msg += other[0];
+    }
+  }
+  return msg;
+}
+
+function pirFormatList(array, type) {
+  switch (array.length) {
+    case 1: return String(array[0]);
+    case 2: return array[0] + " " + type + " " + array[1];
+    default: {
+      let result = "";
+      for (let i = 0; i < array.length - 1; i++) result += array[i] + ", ";
+      return result + type + " " + array[array.length - 1];
+    }
+  }
+}
+
+function pirInvalidArgType(name, expected, value) {
+  let msg = "The ";
+  if (name.endsWith(" argument")) {
+    msg += name + " ";
+  } else {
+    const type = name.includes(".") ? "property" : "argument";
+    msg += "\"" + name + "\" " + type + " ";
+  }
+  msg += "must be " + pirFormatInvalidArgTypeExpected(expected);
+  msg += ". Received " + pirTypeDescription(value);
+
+  const error = new TypeError(msg);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function pirMissingArgs() {
+  const error = new TypeError("The \"actual\" and \"expected\" arguments must be specified");
+  error.code = "ERR_MISSING_ARGS";
+  return error;
+}
+
+function pirInvalidArgValue(name, value, reason) {
+  let inspected = pirInspect(value);
+  if (inspected.length > 128) inspected = inspected.slice(0, 128) + "...";
+  const type = name.includes(".") ? "property" : "argument";
+  const error = new TypeError("The " + type + " '" + name + "' " + reason + ". Received " + inspected);
+  error.code = "ERR_INVALID_ARG_VALUE";
+  return error;
+}
+
+function pirInvalidReturnValue(expected, name, value) {
+  const error = new TypeError("Expected " + expected + " to be returned from the \"" + name +
+    "\" function but got " + pirTypeDescription(value) + ".");
+  error.code = "ERR_INVALID_RETURN_VALUE";
+  return error;
+}
+
+function pirAmbiguousArgument(name, message) {
+  const error = new TypeError("The \"" + name + "\" argument is ambiguous. " + message);
+  error.code = "ERR_AMBIGUOUS_ARGUMENT";
+  return error;
+}
+
+function pirIsError(value) {
+  return value instanceof Error ||
+    (value !== null && typeof value === "object" &&
+     typeof value.message === "string" && typeof value.name === "string");
+}
+
+// Node: ObjectPrototypeIsPrototypeOf(Error, expected) — is the Error
+// constructor in `expected`'s prototype chain (RangeError, subclasses, ...)?
+function pirIsErrorConstructor(expected) {
+  return typeof expected === "function" && Object.prototype.isPrototypeOf.call(Error, expected);
+}
+
+// ---------------------------------------------------------------------------
+// deep equality — port of nodejs/node v24.19.0 lib/internal/util/comparisons.js
+//
+// The same file backs `util.isDeepStrictEqual` and every `assert.*Equal`, so it
+// carries the three modes: `kLoose` (the legacy `assert.deepEqual` / `notDeepEqual`),
+// `kStrict` / `kStrictWithoutPrototypes` (`deepStrictEqual`, `notDeepStrictEqual`)
+// and `kPartial` (`partialDeepStrictEqual`).
+//
+// Type detection goes through the spec's internal-slot methods instead of
+// `instanceof` (what Node reads from `internalBinding('types')`): swapping a
+// prototype or forging `Symbol.toStringTag` must not change what a value *is*
+// — test-assert-deep.js "Verify object types being identical on both sides"
+// and test-assert-partial-deep-equal.js both pin that.
+//
+// Unlike Node's `detectCycles` (compare without cycle bookkeeping first,
+// retry after the stack overflows) the cycle-safe path is taken directly: only
+// the retry's result is observable.
+// ---------------------------------------------------------------------------
+
+function pirBrand(value, probe) {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
+  try {
+    probe(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const pirNumberValueOf = Number.prototype.valueOf;
+const pirStringValueOf = String.prototype.valueOf;
+const pirBooleanValueOf = Boolean.prototype.valueOf;
+const pirBigIntValueOf = BigInt.prototype.valueOf;
+const pirSymbolValueOf = Symbol.prototype.valueOf;
+const pirDateGetTime = Date.prototype.getTime;
+const pirRegExpSource = Object.getOwnPropertyDescriptor(RegExp.prototype, "source").get;
+const pirMapHas = Map.prototype.has;
+const pirSetHas = Set.prototype.has;
+const pirWeakMapHas = WeakMap.prototype.has;
+const pirWeakSetHas = WeakSet.prototype.has;
+const pirArrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+const pirSharedArrayBufferByteLength = typeof SharedArrayBuffer === "function" ?
+  Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength").get : undefined;
+const pirDataViewByteLength = typeof DataView === "function" ?
+  Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get : undefined;
+
+// TypedArrayPrototypeGetSymbolToStringTag: the pristine
+// %TypedArray%.prototype[@@toStringTag] getter reads the [[TypedArrayName]]
+// internal slot, ignoring any own property of the same name.
+const pirTypedArrayTag = (() => {
+  for (const ctor of [typeof Uint8Array === "function" ? Uint8Array : undefined,
+    typeof Int8Array === "function" ? Int8Array : undefined]) {
+    if (ctor === undefined) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(ctor.prototype), Symbol.toStringTag);
+    if (descriptor !== undefined && typeof descriptor.get === "function") return descriptor.get;
+  }
+  return undefined;
+})();
+
+function pirTypedArrayName(value) {
+  if (pirTypedArrayTag === undefined || value === null || typeof value !== "object") return undefined;
+  try {
+    const name = pirTypedArrayTag.call(value);
+    return typeof name === "string" ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const pirIsNumberObject = (value) => pirBrand(value, (v) => pirNumberValueOf.call(v));
+const pirIsStringObject = (value) => pirBrand(value, (v) => pirStringValueOf.call(v));
+const pirIsBooleanObject = (value) => pirBrand(value, (v) => pirBooleanValueOf.call(v));
+const pirIsBigIntObject = (value) => pirBrand(value, (v) => pirBigIntValueOf.call(v));
+const pirIsSymbolObject = (value) => pirBrand(value, (v) => pirSymbolValueOf.call(v));
+const pirIsBoxedPrimitive = (value) => pirIsNumberObject(value) || pirIsStringObject(value) ||
+  pirIsBooleanObject(value) || pirIsBigIntObject(value) || pirIsSymbolObject(value);
+const pirIsDate = (value) => pirBrand(value, (v) => pirDateGetTime.call(v));
+const pirIsRegExp = (value) => pirBrand(value, (v) => pirRegExpSource.call(v));
+const pirIsMap = (value) => pirBrand(value, (v) => pirMapHas.call(v, undefined));
+const pirIsSet = (value) => pirBrand(value, (v) => pirSetHas.call(v, undefined));
+const pirIsWeakMap = (value) => pirBrand(value, (v) => pirWeakMapHas.call(v, undefined));
+const pirIsWeakSet = (value) => pirBrand(value, (v) => pirWeakSetHas.call(v, undefined));
+const pirIsArrayBuffer = (value) => pirBrand(value, (v) => pirArrayBufferByteLength.call(v));
+const pirIsSharedArrayBuffer = (value) => pirSharedArrayBufferByteLength !== undefined &&
+  pirBrand(value, (v) => pirSharedArrayBufferByteLength.call(v));
+const pirIsAnyArrayBuffer = (value) => pirIsArrayBuffer(value) || pirIsSharedArrayBuffer(value);
+const pirIsDataView = (value) => pirDataViewByteLength !== undefined &&
+  pirBrand(value, (v) => pirDataViewByteLength.call(v));
+const pirIsArrayBufferView = (value) => typeof ArrayBuffer === "function" && ArrayBuffer.isView(value);
+const pirIsPromise = (value) => value instanceof Promise;
+// `isError`: a native error of any realm (V8's slot-based check). The
+// `[object Error]` tag is the closest reachable equivalent — it is consulted
+// only after every internal-slot predicate, and the tests that forge the tag
+// expect the own-key comparison to reject the pair anyway.
+const pirIsErrorValue = (value) => value instanceof Error ||
+  (value !== null && typeof value === "object" && Object.prototype.toString.call(value) === "[object Error]");
+const pirIsURLValue = (value) => value !== null && typeof value === "object" &&
+  Boolean(value.href && value.protocol && value.auth === undefined && value.path === undefined);
+
+const pirWellKnownConstructors = new Set([
+  Array, ArrayBuffer, BigInt, Boolean, DataView, Date, Error, Function, Map,
+  Number, Object, Promise, RegExp, Set, String, Symbol, WeakMap, WeakSet,
+]);
+for (const name of ["BigInt64Array", "BigUint64Array", "Float16Array", "Float32Array",
+  "Float64Array", "Int16Array", "Int32Array", "Int8Array", "Uint16Array",
+  "Uint32Array", "Uint8Array", "Uint8ClampedArray"]) {
+  if (typeof globalThis[name] === "function") pirWellKnownConstructors.add(globalThis[name]);
+}
+if (typeof Buffer === "function") pirWellKnownConstructors.add(Buffer);
+
+const kLoose = 0;
+const kPartial = 1;
+const kStrict = 2;
+const kStrictWithoutPrototypes = 3;
+
+const kNoIterator = 0;
+const kIsArray = 1;
+const kIsSet = 2;
+const kIsMap = 3;
+
+// getOwnNonIndexProperties filters.
+const kOnlyEnumerable = 0;
+const kOnlyEnumerableSkipSymbols = 1;
+
+function pirHasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function pirHasEnumerable(value, key) {
+  return Object.prototype.propertyIsEnumerable.call(value, key);
+}
+
+function pirIsArrayIndex(key) {
+  if (typeof key !== "string") return false;
+  if (!/^(0|[1-9][0-9]*)$/.test(key)) return false;
+  const index = Number(key);
+  return index >= 0 && index <= 4294967294;
+}
+
+// Node's getOwnNonIndexProperties(value, filter): own non-index keys, always
+// restricted to the enumerable ones, minus the symbols for the legacy loose
+// mode (ONLY_ENUMERABLE | SKIP_SYMBOLS).
+function pirGetOwnNonIndexProperties(value, filter) {
+  const keys = [];
+  for (const name of Object.getOwnPropertyNames(value)) {
+    if (pirIsArrayIndex(name) || !pirHasEnumerable(value, name)) continue;
+    keys.push(name);
+  }
+  if (filter !== kOnlyEnumerableSkipSymbols) {
+    for (const symbol of Object.getOwnPropertySymbols(value)) {
+      if (pirHasEnumerable(value, symbol)) keys.push(symbol);
+    }
+  }
+  return keys;
+}
+
+function pirIsEnumerableOrIdentical(val1, val2, prop, mode, memos) {
+  return pirHasEnumerable(val2, prop) || // This is handled by Object.keys()
+    (mode === kPartial && (val2[prop] === undefined || (prop === "message" && val2[prop] === ""))) ||
+    pirInnerDeepEqual(val1[prop], val2[prop], mode, memos);
+}
+
+function pirInnerDeepEqual(val1, val2, mode, memos) {
+  // All identical values are equivalent, as determined by ===.
+  if (val1 === val2) {
+    return val1 !== 0 || Object.is(val1, val2) || mode === kLoose;
+  }
+
+  if (mode !== kLoose) {
+    if (typeof val1 === "number") return val1 !== val1 && val2 !== val2; // NaN
+    if (typeof val2 !== "object" || typeof val1 !== "object" || val1 === null || val2 === null) {
+      return false;
+    }
+  } else {
+    if (val1 === null || typeof val1 !== "object") {
+      // eslint-disable-next-line eqeqeq
+      return (val2 === null || typeof val2 !== "object") && (val1 == val2 || (val1 !== val1 && val2 !== val2));
+    }
+    if (val2 === null || typeof val2 !== "object") return false;
+  }
+  return pirObjectComparisonStart(val1, val2, mode, memos);
+}
+
+function pirHasUnequalTag(val1, val2) {
+  return val1[Symbol.toStringTag] !== val2[Symbol.toStringTag];
+}
+
+function pirSlowHasUnequalTag(val1Tag, val1, val2) {
+  if (val1[Symbol.toStringTag] !== undefined && val2[Symbol.toStringTag] !== undefined) {
+    return val1[Symbol.toStringTag] !== val2[Symbol.toStringTag];
+  }
+  return val1Tag !== Object.prototype.toString.call(val2);
+}
+
+function pirObjectComparisonStart(val1, val2, mode, memos) {
+  if (mode === kStrict) {
+    if (pirWellKnownConstructors.has(val1.constructor) ||
+        (val1.constructor !== undefined && !pirHasOwn(val1, "constructor"))) {
+      if (val1.constructor !== val2.constructor) return false;
+    } else if (Object.getPrototypeOf(val1) !== Object.getPrototypeOf(val2)) {
+      return false;
+    }
+  }
+
+  const looseFilter = mode !== kLoose ? kOnlyEnumerable : kOnlyEnumerableSkipSymbols;
+
+  if (Array.isArray(val1)) {
+    if (!Array.isArray(val2) ||
+        (val1.length !== val2.length && (mode !== kPartial || val1.length < val2.length)) ||
+        pirHasUnequalTag(val1, val2)) {
+      return false;
+    }
+    const keys2 = pirGetOwnNonIndexProperties(val2, looseFilter);
+    if (mode !== kPartial &&
+        keys2.length !== pirGetOwnNonIndexProperties(val1, looseFilter).length) {
+      return false;
+    }
+    return pirKeyCheck(val1, val2, mode, memos, kIsArray, keys2);
+  }
+
+  let val1Tag;
+  if (val1[Symbol.toStringTag] === undefined &&
+      (val1Tag = Object.prototype.toString.call(val1)) === "[object Object]") {
+    if (pirSlowHasUnequalTag(val1Tag, val1, val2)) return false;
+    return pirKeyCheck(val1, val2, mode, memos, kNoIterator);
+  } else if (pirIsSet(val1)) {
+    if (!pirIsSet(val2) ||
+        (val1.size !== val2.size && (mode !== kPartial || val1.size < val2.size)) ||
+        pirHasUnequalTag(val1, val2)) {
+      return false;
+    }
+    return pirKeyCheck(val1, val2, mode, memos, kIsSet);
+  } else if (pirIsMap(val1)) {
+    if (!pirIsMap(val2) ||
+        (val1.size !== val2.size && (mode !== kPartial || val1.size < val2.size)) ||
+        pirHasUnequalTag(val1, val2)) {
+      return false;
+    }
+    return pirKeyCheck(val1, val2, mode, memos, kIsMap);
+  } else if (pirIsArrayBufferView(val1)) {
+    if (pirTypedArrayName(val1) !== pirTypedArrayName(val2)) return false;
+    if (mode === kPartial && val1.byteLength !== val2.byteLength) {
+      if (!pirIsPartialArrayBufferView(val1, val2)) return false;
+    } else if (mode === kLoose && pirIsFloatArray(val1)) {
+      if (!pirAreSimilarFloatArrays(val1, val2)) return false;
+    } else if (!pirAreSimilarTypedArrays(val1, val2)) {
+      return false;
+    }
+    // Buffer.compare returns true, so val1.length === val2.length. If they
+    // both only contain numeric keys, only the symbols can still differ.
+    const keys2 = pirGetOwnNonIndexProperties(val2, looseFilter);
+    if (mode !== kPartial &&
+        keys2.length !== pirGetOwnNonIndexProperties(val1, looseFilter).length) {
+      return false;
+    }
+    return pirKeyCheck(val1, val2, mode, memos, kNoIterator, keys2);
+  } else if (pirIsDate(val1)) {
+    if (!pirIsDate(val2) || pirHasUnequalTag(val1, val2)) return false;
+    const time1 = pirDateGetTime.call(val1);
+    const time2 = pirDateGetTime.call(val2);
+    if (time1 !== time2 && (time1 === time1 || time2 === time2)) return false;
+  } else if (pirIsRegExp(val1)) {
+    if (!pirIsRegExp(val2) || !pirAreSimilarRegExps(val1, val2) || pirHasUnequalTag(val1, val2)) {
+      return false;
+    }
+  } else if (pirIsAnyArrayBuffer(val1)) {
+    if (!pirIsAnyArrayBuffer(val2) || pirHasUnequalTag(val1, val2)) return false;
+    if (mode !== kPartial || val1.byteLength === val2.byteLength) {
+      if (!pirAreEqualArrayBuffers(val1, val2)) return false;
+    } else if (!pirIsPartialUint8Array(new Uint8Array(val1), new Uint8Array(val2))) {
+      return false;
+    }
+  } else if (pirSlowHasUnequalTag(val1Tag !== undefined ? val1Tag : Object.prototype.toString.call(val1), val1, val2) ||
+            Array.isArray(val2) ||
+            pirIsArrayBufferView(val2) ||
+            pirIsSet(val2) ||
+            pirIsMap(val2) ||
+            pirIsDate(val2) ||
+            pirIsRegExp(val2) ||
+            pirIsAnyArrayBuffer(val2)) {
+    return false;
+  } else if (pirIsErrorValue(val1)) {
+    // Do not compare the stack as it might differ even though the error itself
+    // is otherwise identical.
+    if (!pirIsErrorValue(val2) ||
+        !pirIsEnumerableOrIdentical(val1, val2, "message", mode, memos) ||
+        !pirIsEnumerableOrIdentical(val1, val2, "name", mode, memos) ||
+        !pirIsEnumerableOrIdentical(val1, val2, "cause", mode, memos) ||
+        !pirIsEnumerableOrIdentical(val1, val2, "errors", mode, memos)) {
+      return false;
+    }
+    const hasOwnVal2Cause = pirHasOwn(val2, "cause");
+    if (hasOwnVal2Cause !== pirHasOwn(val1, "cause") && (mode !== kPartial || hasOwnVal2Cause)) {
+      return false;
+    }
+  } else if (pirIsBoxedPrimitive(val1)) {
+    if (!pirIsEqualBoxedPrimitive(val1, val2)) return false;
+  } else if (pirIsURLValue(val1)) {
+    if (!pirIsURLValue(val2) || val1.href !== val2.href) return false;
+  } else if (pirIsBoxedPrimitive(val2) ||
+      pirIsErrorValue(val2) ||
+      val2 instanceof Error ||
+      pirIsWeakMap(val1) ||
+      pirIsWeakSet(val1) ||
+      pirIsPromise(val1)) {
+    return false;
+  }
+
+  return pirKeyCheck(val1, val2, mode, memos, kNoIterator);
+}
+
+function pirPartialSymbolEquiv(val1, val2, keys2) {
+  const symbolKeys = Object.getOwnPropertySymbols(val2);
+  if (symbolKeys.length !== 0) {
+    for (const key of symbolKeys) {
+      if (pirHasEnumerable(val2, key)) keys2.push(key);
+    }
+  }
+  return true;
+}
+
+function pirKeyCheck(val1, val2, mode, memos, iterationType, keys2) {
+  // For all remaining Object pairs, equivalence means: the same number of own
+  // enumerable properties, the same set of keys (any order), equivalent values
+  // for every corresponding key and — for Sets and Maps — equal contents.
+  const isArrayLikeObject = keys2 !== undefined;
+  if (keys2 === undefined) keys2 = Object.keys(val2);
+  let keys1;
+
+  if (!isArrayLikeObject) {
+    if (mode === kPartial) {
+      if (!pirPartialSymbolEquiv(val1, val2, keys2)) return false;
+    } else if (keys2.length !== (keys1 = Object.keys(val1)).length) {
+      return false;
+    } else if (mode === kStrict || mode === kStrictWithoutPrototypes) {
+      for (const key of Object.getOwnPropertySymbols(val1)) {
+        if (pirHasEnumerable(val1, key)) keys1.push(key);
+      }
+      for (const key of Object.getOwnPropertySymbols(val2)) {
+        if (pirHasEnumerable(val2, key)) keys2.push(key);
+      }
+      if (keys1.length !== keys2.length) return false;
+    }
+  }
+
+  if (keys2.length === 0 &&
+      (iterationType === kNoIterator ||
+        (iterationType === kIsArray && val2.length === 0) ||
+        val2.size === 0)) {
+    return true;
+  }
+
+  if (memos === null) {
+    return pirObjEquiv(val1, val2, mode, keys1, keys2, memos, iterationType);
+  }
+  return pirHandleCycles(val1, val2, mode, keys1, keys2, memos, iterationType);
+}
+
+function pirHandleCycles(val1, val2, mode, keys1, keys2, memos, iterationType) {
+  // Use memos to handle cycles.
+  if (memos === undefined) {
+    memos = { set: undefined, a: val1, b: val2, c: undefined, d: undefined, deep: false };
+    return pirObjEquiv(val1, val2, mode, keys1, keys2, memos, iterationType);
+  }
+
+  if (memos.set === undefined) {
+    if (memos.deep === false) {
+      if (memos.a === val1) return memos.b === val2;
+      if (memos.b === val2) return false;
+      memos.c = val1;
+      memos.d = val2;
+      memos.deep = true;
+      const result = pirObjEquiv(val1, val2, mode, keys1, keys2, memos, iterationType);
+      memos.deep = false;
+      if (memos.set !== undefined) {
+        memos.set.delete(memos.c);
+        memos.set.delete(memos.d);
+      }
+      return result;
+    }
+    memos.set = new Set();
+    memos.set.add(memos.a);
+    memos.set.add(memos.b);
+    memos.set.add(memos.c);
+    memos.set.add(memos.d);
+  }
+
+  const set = memos.set;
+  const originalSize = set.size;
+  set.add(val1);
+  set.add(val2);
+  if (originalSize !== set.size - 2) return originalSize === set.size;
+
+  const areEq = pirObjEquiv(val1, val2, mode, keys1, keys2, memos, iterationType);
+  set.delete(val1);
+  set.delete(val2);
+  return areEq;
+}
+
+// See lib/internal/util/comparisons.js: loose equality cannot detect the
+// corresponding value of a string/number/bigint/boolean key, so those fall
+// back to the primitive's loose counterpart.
+function pirFindLooseMatchingPrimitives(prim) {
+  switch (typeof prim) {
+    case "undefined":
+      return null;
+    case "object": // Only pass in null as object!
+      return undefined;
+    case "symbol":
+      return false;
+    case "string":
+      prim = +prim;
+      // Falls through: loose-equal entries exist only for numeric strings.
+    case "number":
+      if (prim !== prim) return false; // NaN
+  }
+  return true;
+}
+
+function pirSetMightHaveLoosePrim(a, b, prim) {
+  const altValue = pirFindLooseMatchingPrimitives(prim);
+  if (altValue != null) return altValue;
+  return !b.has(altValue) && a.has(altValue);
+}
+
+function pirMapMightHaveLoosePrim(a, b, prim, item2, memo) {
+  const altValue = pirFindLooseMatchingPrimitives(prim);
+  if (altValue != null) return altValue;
+  const item1 = a.get(altValue);
+  if ((item1 === undefined && !a.has(altValue)) ||
+      !pirInnerDeepEqual(item1, item2, kLoose, memo)) {
+    return false;
+  }
+  return !b.has(altValue) && pirInnerDeepEqual(item1, item2, kLoose, memo);
+}
+
+function pirArrayHasEqualElement(array, val1, mode, memo, comparator, start, end) {
+  for (let i = end - 1; i >= start; i--) {
+    if (comparator(val1, array[i], mode, memo)) {
+      // Move the matching element so it is not checked again.
+      array[i] = array[end];
+      return true;
+    }
+  }
+  return false;
+}
+
+function pirPartialObjectSetEquiv(array, a, b, mode, memo) {
+  let aPos = 0;
+  let direction = 1;
+  let start = 0;
+  let end = array.length - 1;
+  for (const val1 of a) {
+    aPos++;
+    if (!b.has(val1)) {
+      let innerStart = start;
+      if (direction === 1) {
+        if (pirInnerDeepEqual(val1, array[start], mode, memo)) {
+          if (start === end) return true;
+          start += 1;
+          continue;
+        }
+        if (start === end) {
+          // The last element of set b might match a later element in set a.
+          continue;
+        }
+        direction = -1;
+        innerStart += 1;
+      }
+      let matched = true;
+      if (!pirInnerDeepEqual(val1, array[end], mode, memo)) {
+        direction = 1;
+        matched = pirArrayHasEqualElement(array, val1, mode, memo, pirInnerDeepEqual, innerStart, end);
+      }
+      if (matched) {
+        if (start === end) return true;
+        end -= 1;
+      }
+    }
+    if (a.size - aPos <= end - start) return false;
+  }
+  return false;
+}
+
+function pirSetObjectEquiv(array, a, b, mode, memo) {
+  let direction = 1;
+  let start = 0;
+  let end = array.length - 1;
+  const comparator = mode !== kLoose ? pirObjectComparisonStart : pirInnerDeepEqual;
+  const extraChecks = mode === kLoose || array.length !== a.size;
+
+  for (const val1 of a) {
+    if (extraChecks) {
+      if (typeof val1 === "object") {
+        if (b.has(val1)) continue;
+      } else if (b.has(val1)) {
+        continue;
+      } else if (mode !== kLoose) {
+        return false;
+      }
+    }
+
+    let innerStart = start;
+    if (direction === 1) {
+      if (comparator(val1, array[start], mode, memo)) {
+        start += 1;
+        continue;
+      }
+      if (start === end) return false;
+      direction = -1;
+      innerStart += 1;
+    }
+    if (!comparator(val1, array[end], mode, memo)) {
+      direction = 1;
+      if (!pirArrayHasEqualElement(array, val1, mode, memo, comparator, innerStart, end)) {
+        return false;
+      }
+    }
+    end -= 1;
+  }
+  return true;
+}
+
+function pirCompareSmallSets(a, b, val, iteratorB, mode, memo) {
+  const iteratorA = a.values();
+  const firstA = iteratorA.next().value;
+  const first = pirInnerDeepEqual(firstA, val, mode, memo);
+  if (first) {
+    if (b.size === 1) return true; // Partial mode: b.size !== a.size
+    const secondA = iteratorA.next().value;
+    return b.has(secondA) || pirInnerDeepEqual(secondA, iteratorB.next().value, mode, memo);
+  }
+  return a.size !== 1 && pirInnerDeepEqual(iteratorA.next().value, val, mode, memo) && (
+    b.size === 1 || // Partial mode
+    b.has(firstA) ||
+    pirInnerDeepEqual(firstA, iteratorB.next().value, mode, memo)
+  );
+}
+
+function pirSetEquiv(a, b, mode, memo) {
+  // Lazily built list of b entries that have to be compared pairwise.
+  let array;
+
+  const iteratorB = b.values();
+  for (const val of iteratorB) {
+    if (!a.has(val)) {
+      if ((typeof val !== "object" || val === null) &&
+          (mode !== kLoose || !pirSetMightHaveLoosePrim(a, b, val))) {
+        return false;
+      }
+
+      if (array === undefined) {
+        if (a.size < 3) return pirCompareSmallSets(a, b, val, iteratorB, mode, memo);
+        array = [];
+      }
+      // Not in `a` by identity: find a deep-equal element in the a-copy.
+      array.push(val);
+    }
+  }
+
+  if (array === undefined) return true;
+  if (mode === kPartial) return pirPartialObjectSetEquiv(array, a, b, mode, memo);
+  return pirSetObjectEquiv(array, a, b, mode, memo);
+}
+
+function pirArrayHasEqualMapElement(array, key1, item1, b, mode, memo, comparator, start, end) {
+  for (let i = end - 1; i >= start; i--) {
+    const key2 = array[i];
+    if (comparator(key1, key2, mode, memo) &&
+        pirInnerDeepEqual(item1, b.get(key2), mode, memo)) {
+      array[i] = array[end];
+      return true;
+    }
+  }
+  return false;
+}
+
+function pirPartialObjectMapEquiv(array, a, b, mode, memo) {
+  let aPos = 0;
+  let direction = 1;
+  let start = 0;
+  let end = array.length - 1;
+  for (const entry of a) {
+    const key1 = entry[0];
+    const item1 = entry[1];
+    aPos++;
+    if (typeof key1 === "object" && key1 !== null) {
+      let innerStart = start;
+      if (direction === 1) {
+        const key2 = array[start];
+        if (pirObjectComparisonStart(key1, key2, mode, memo) &&
+            pirInnerDeepEqual(item1, b.get(key2), mode, memo)) {
+          if (start === end) return true;
+          start += 1;
+          continue;
+        }
+        if (start === end) {
+          // The last element of map b might match a later element in map a.
+          continue;
+        }
+        direction = -1;
+        innerStart += 1;
+      }
+      let matched = true;
+      const key2 = array[end];
+      if (!pirObjectComparisonStart(key1, key2, mode, memo) ||
+          !pirInnerDeepEqual(item1, b.get(key2), mode, memo)) {
+        direction = 1;
+        matched = pirArrayHasEqualMapElement(array, key1, item1, b, mode, memo,
+          pirObjectComparisonStart, innerStart, end);
+      }
+      if (matched) {
+        if (start === end) return true;
+        end -= 1;
+      }
+    }
+    if (a.size - aPos <= end - start) return false;
+  }
+  return false;
+}
+
+function pirMapObjectEquiv(array, a, b, mode, memo) {
+  let direction = 1;
+  let start = 0;
+  let end = array.length - 1;
+  const comparator = mode !== kLoose ? pirObjectComparisonStart : pirInnerDeepEqual;
+  const extraChecks = mode === kLoose || array.length !== a.size;
+
+  for (const entry of a) {
+    const key1 = entry[0];
+    const item1 = entry[1];
+    if (extraChecks && (typeof key1 !== "object" || key1 === null)) {
+      if (b.has(key1)) {
+        if (mode !== kLoose || pirInnerDeepEqual(item1, b.get(key1), mode, memo)) continue;
+      } else if (mode !== kLoose) {
+        return false;
+      }
+    }
+
+    let innerStart = start;
+    if (direction === 1) {
+      const key2 = array[start];
+      if (comparator(key1, key2, mode, memo) && pirInnerDeepEqual(item1, b.get(key2), mode, memo)) {
+        start += 1;
+        continue;
+      }
+      if (start === end) return false;
+      direction = -1;
+      innerStart += 1;
+    }
+    const key2 = array[end];
+    if (!comparator(key1, key2, mode, memo) || !pirInnerDeepEqual(item1, b.get(key2), mode, memo)) {
+      direction = 1;
+      if (!pirArrayHasEqualMapElement(array, key1, item1, b, mode, memo, comparator, innerStart, end)) {
+        return false;
+      }
+    }
+    end -= 1;
+  }
+  return true;
+}
+
+function pirMapEquiv(a, b, mode, memo) {
+  let array;
+
+  for (const entry of b) {
+    const key2 = entry[0];
+    const item2 = entry[1];
+    if (typeof key2 === "object" && key2 !== null) {
+      if (array === undefined) {
+        if (a.size === 1) {
+          const firstA = a.entries().next().value;
+          return pirInnerDeepEqual(firstA[0], key2, mode, memo) &&
+            pirInnerDeepEqual(firstA[1], item2, mode, memo);
+        }
+        array = [];
+      }
+      array.push(key2);
+    } else {
+      // Reading the value directly avoids a second a.has(key2) check in almost
+      // all cases.
+      const item1 = a.get(key2);
+      if ((item1 === undefined && !a.has(key2)) || !pirInnerDeepEqual(item1, item2, mode, memo)) {
+        if (mode !== kLoose) return false;
+        // Fast path to detect missing string, symbol, undefined and null keys.
+        if (!pirMapMightHaveLoosePrim(a, b, key2, item2, memo)) return false;
+        if (array === undefined) array = [];
+        array.push(key2);
+      }
+    }
+  }
+
+  if (array === undefined) return true;
+  if (mode === kPartial) return pirPartialObjectMapEquiv(array, a, b, mode, memo);
+  return pirMapObjectEquiv(array, a, b, mode, memo);
+}
+
+function pirPartialSparseArrayEquiv(a, b, mode, memos, startA, startB) {
+  let aPos = startA;
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  const lenA = keysA.length - startA;
+  const lenB = keysB.length - startB;
+  if (lenA < lenB) return false;
+  for (let i = 0; i < lenB; i++) {
+    const keyB = keysB[startB + i];
+    while (!pirInnerDeepEqual(a[keysA[aPos]], b[keyB], mode, memos)) {
+      aPos++;
+      if (aPos > keysA.length - lenB + i) return false;
+    }
+    aPos++;
+  }
+  return true;
+}
+
+function pirPartialArrayEquiv(a, b, mode, memos) {
+  let aPos = 0;
+  for (let i = 0; i < b.length; i++) {
+    let isSparse = b[i] === undefined && !pirHasOwn(b, i);
+    if (isSparse) return pirPartialSparseArrayEquiv(a, b, mode, memos, aPos, i);
+    while (!(isSparse = a[aPos] === undefined && !pirHasOwn(a, aPos)) &&
+           !pirInnerDeepEqual(a[aPos], b[i], mode, memos)) {
+      aPos++;
+      if (aPos > a.length - b.length + i) return false;
+    }
+    if (isSparse) return pirPartialSparseArrayEquiv(a, b, mode, memos, aPos, i);
+    aPos++;
+  }
+  return true;
+}
+
+function pirSparseArrayEquiv(a, b, mode, memos, i) {
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  for (; i < keysB.length; i++) {
+    const key = keysB[i];
+    if ((a[key] === undefined && !pirHasOwn(a, key)) ||
+        !pirInnerDeepEqual(a[key], b[key], mode, memos)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function pirObjEquiv(a, b, mode, keys1, keys2, memos, iterationType) {
+  // Every corresponding key must have an equivalent value.
+  if (keys2.length > 0) {
+    let i = 0;
+    // Ordered keys first.
+    if (keys1 !== undefined) {
+      for (; i < keys2.length; i++) {
+        const key = keys2[i];
+        if (keys1[i] !== key) break;
+        if (!pirInnerDeepEqual(a[key], b[key], mode, memos)) return false;
+      }
+    }
+    // The remaining keys in any order.
+    for (; i < keys2.length; i++) {
+      const key = keys2[i];
+      const descriptor = Object.getOwnPropertyDescriptor(a, key);
+      if (descriptor === undefined || descriptor.enumerable !== true) return false;
+      const value = descriptor.writable !== undefined ? descriptor.value : a[key];
+      if (!pirInnerDeepEqual(value, b[key], mode, memos)) return false;
+    }
+  }
+
+  if (iterationType === kIsArray) {
+    if (mode === kPartial) return pirPartialArrayEquiv(a, b, mode, memos);
+    for (let i = 0; i < a.length; i++) {
+      if (b[i] === undefined) {
+        if (!pirHasOwn(b, i)) return pirSparseArrayEquiv(a, b, mode, memos, i);
+        if ((a[i] !== undefined || !pirHasOwn(a, i)) && (mode !== kLoose || a[i] !== null)) {
+          return false;
+        }
+      } else if ((a[i] === undefined || !pirInnerDeepEqual(a[i], b[i], mode, memos)) &&
+                 (mode !== kLoose || b[i] !== null)) {
+        return false;
+      }
+    }
+  } else if (iterationType === kIsSet) {
+    if (!pirSetEquiv(a, b, mode, memos)) return false;
+  } else if (iterationType === kIsMap) {
+    if (!pirMapEquiv(a, b, mode, memos)) return false;
+  }
+
+  return true;
+}
+
+function pirAreSimilarRegExps(a, b) {
+  return a.source === b.source && a.flags === b.flags && a.lastIndex === b.lastIndex;
+}
+
+function pirIsPartialUint8Array(a, b) {
+  const lenA = a.byteLength;
+  const lenB = b.byteLength;
+  if (lenA < lenB) return false;
+  let offsetA = 0;
+  for (let offsetB = 0; offsetB < lenB; offsetB++) {
+    while (a[offsetA] !== b[offsetB]) {
+      offsetA++;
+      if (offsetA > lenA - lenB + offsetB) return false;
+    }
+    offsetA++;
+  }
+  return true;
+}
+
+function pirIsPartialArrayBufferView(a, b) {
+  if (a.byteLength < b.byteLength) return false;
+  return pirIsPartialUint8Array(
+    new Uint8Array(a.buffer, a.byteOffset, a.byteLength),
+    new Uint8Array(b.buffer, b.byteOffset, b.byteLength));
+}
+
+function pirIsFloatArray(value) {
+  const name = pirTypedArrayName(value);
+  return name === "Float32Array" || name === "Float64Array" || name === "Float16Array";
+}
+
+function pirAreSimilarFloatArrays(a, b) {
+  const len = a.byteLength;
+  if (len !== b.byteLength) return false;
+  for (let offset = 0; offset < len; offset++) {
+    if (a[offset] !== b[offset]) return false;
+  }
+  return true;
+}
+
+function pirCompareBytes(a, b) {
+  if (a.length !== b.length) return a.length < b.length ? -1 : 1;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+function pirByteView(value) {
+  return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+}
+
+function pirAreSimilarTypedArrays(a, b) {
+  if (a.byteLength !== b.byteLength) return false;
+  return pirCompareBytes(pirByteView(a), pirByteView(b)) === 0;
+}
+
+function pirAreEqualArrayBuffers(buf1, buf2) {
+  return buf1.byteLength === buf2.byteLength &&
+    pirCompareBytes(new Uint8Array(buf1), new Uint8Array(buf2)) === 0;
+}
+
+function pirIsEqualBoxedPrimitive(val1, val2) {
+  if (pirIsNumberObject(val1)) {
+    return pirIsNumberObject(val2) && Object.is(pirNumberValueOf.call(val1), pirNumberValueOf.call(val2));
+  }
+  if (pirIsStringObject(val1)) {
+    return pirIsStringObject(val2) && pirStringValueOf.call(val1) === pirStringValueOf.call(val2);
+  }
+  if (pirIsBooleanObject(val1)) {
+    return pirIsBooleanObject(val2) && pirBooleanValueOf.call(val1) === pirBooleanValueOf.call(val2);
+  }
+  if (pirIsBigIntObject(val1)) {
+    return pirIsBigIntObject(val2) && pirBigIntValueOf.call(val1) === pirBigIntValueOf.call(val2);
+  }
+  if (pirIsSymbolObject(val1)) {
+    return pirIsSymbolObject(val2) && pirSymbolValueOf.call(val1) === pirSymbolValueOf.call(val2);
+  }
+  return false;
+}
+
+function pirIsDeepEqual(val1, val2) {
+  return pirInnerDeepEqual(val1, val2, kLoose, undefined);
+}
+
+function pirIsDeepStrictEqual(val1, val2, skipPrototype) {
+  return pirInnerDeepEqual(val1, val2,
+    skipPrototype ? kStrictWithoutPrototypes : kStrict, undefined);
+}
+
+function pirIsPartialStrictEqual(val1, val2) {
+  return pirInnerDeepEqual(val1, val2, kPartial, undefined);
+}
+
+// ---------------------------------------------------------------------------
+// shared helpers for Assert.prototype methods
+// ---------------------------------------------------------------------------
+
+const kOptions = Symbol("options");
+
+// `Assert.prototype` methods read `this?.[kOptions]?.diff`, so they stay
+// callable when destructured off the module (Node does the same).
+function pirDiffOption(receiver) {
+  if (receiver === undefined || receiver === null) return undefined;
+  const opts = receiver[kOptions];
+  return opts === undefined ? undefined : opts.diff;
+}
+
+// `AssertOptions.skipPrototype`: forwarded to deepStrictEqual /
+// notDeepStrictEqual only (Node assert.js).
+function pirSkipPrototypeOption(receiver) {
+  if (receiver === undefined || receiver === null) return undefined;
+  const opts = receiver[kOptions];
+  return opts === undefined ? undefined : opts.skipPrototype;
+}
+
+function pirInnerOk(fn, argLen, value, message, calleeNames) {
+  if (!value) {
+    let generatedMessage = false;
+
+    if (argLen === 0) {
+      generatedMessage = true;
+      message = "No value argument passed to `assert.ok()`";
+    } else if (message === undefined || message === null) {
+      generatedMessage = true;
+      // Node inserts the call's source expression here; `undefined` (no
+      // source available) leaves the operator-template fallback in place.
+      message = pirErrMessage(calleeNames);
+    } else if (message instanceof Error) {
+      throw message;
+    }
+
+    const error = new AssertionError({
+      actual: value,
+      expected: true,
+      message: message,
+      operator: "==",
+      stackStartFn: fn,
+    });
+    error.generatedMessage = generatedMessage;
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Assert.prototype values (the module surface copies these, as Node does)
+// ---------------------------------------------------------------------------
+
+function pirFail(receiver, actual, expected, message, operator, stackStartFn, argsLen) {
+  let internalMessage = false;
+  if ((actual === null || actual === undefined) && argsLen <= 1) {
+    internalMessage = true;
+    message = "Failed";
+  } else if (argsLen === 1) {
+    message = actual;
+    actual = undefined;
+  } else if (argsLen === 2) {
+    // assert.fail() with more than one argument is deprecated in Node
+    // (DEP0094); the warning itself is not emitted here, the shape is.
+    operator = "!=";
+  }
+
+  if (message instanceof Error) throw message;
+
+  const error = new AssertionError({
+    actual: actual,
+    expected: expected,
+    operator: operator === undefined ? "fail" : operator,
+    stackStartFn: stackStartFn || Assert.prototype.fail,
+    message: message,
+    diff: pirDiffOption(receiver),
+  });
+  if (internalMessage) error.generatedMessage = true;
+  throw error;
+}
+
+class AssertImpl {
+  constructor(options) {
+    const opts = Object.assign({ strict: true, skipPrototype: false }, options);
+    this.AssertionError = AssertionError;
+    Object.defineProperty(this, kOptions, {
+      __proto__: null,
+      value: opts,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+
+    if (opts.strict) {
+      this.equal = this.strictEqual;
+      this.deepEqual = this.deepStrictEqual;
+      this.notEqual = this.notStrictEqual;
+      this.notDeepEqual = this.notDeepStrictEqual;
+    }
+  }
+
+  fail(actual, expected, message, operator, stackStartFn) {
+    pirFail(this, actual, expected, message, operator, stackStartFn, arguments.length);
+  }
+
+  ok() {
+    pirInnerOk(ok, arguments.length, arguments[0], arguments[1], pirOkCalleeNames);
+  }
+
+  equal(actual, expected, message) {
+    if (arguments.length < 2) throw pirMissingArgs();
+    if (actual != expected && (!Number.isNaN(actual) || !Number.isNaN(expected))) {
+      pirInnerFail({
+        actual: actual,
+        expected: expected,
+        message: message,
+        operator: "==",
+        stackStartFn: Assert.prototype.equal,
+        diff: pirDiffOption(this),
+      });
+    }
+  }
+
+  notEqual(actual, expected, message) {
+    if (arguments.length < 2) throw pirMissingArgs();
+    if (actual == expected || (Number.isNaN(actual) && Number.isNaN(expected))) {
+      pirInnerFail({
+        actual: actual,
+        expected: expected,
+        message: message,
+        operator: "!=",
+        stackStartFn: Assert.prototype.notEqual,
+        diff: pirDiffOption(this),
+      });
+    }
+  }
+
+  deepEqual(actual, expected, message) {
+    if (arguments.length < 2) throw pirMissingArgs();
+    if (!pirIsDeepEqual(actual, expected)) {
+      pirInnerFail({
+        actual: actual,
+        expected: expected,
+        message: message,
+        operator: "deepEqual",
+        stackStartFn: Assert.prototype.deepEqual,
+        diff: pirDiffOption(this),
+      });
+    }
+  }
+
+  notDeepEqual(actual, expected, message) {
+    if (arguments.length < 2) throw pirMissingArgs();
+    if (pirIsDeepEqual(actual, expected)) {
+      pirInnerFail({
+        actual: actual,
+        expected: expected,
+        message: message,
+        operator: "notDeepEqual",
+        stackStartFn: Assert.prototype.notDeepEqual,
+        diff: pirDiffOption(this),
+      });
+    }
+  }
+
+  deepStrictEqual(actual, expected, message) {
+    if (arguments.length < 2) throw pirMissingArgs();
+    if (!pirIsDeepStrictEqual(actual, expected, pirSkipPrototypeOption(this))) {
+      pirInnerFail({
+        actual: actual,
+        expected: expected,
+        message: message,
+        operator: "deepStrictEqual",
+        stackStartFn: Assert.prototype.deepStrictEqual,
+        diff: pirDiffOption(this),
+      });
+    }
+  }
+
+  notDeepStrictEqual(actual, expected, message) {
+    if (arguments.length < 2) throw pirMissingArgs();
+    if (pirIsDeepStrictEqual(actual, expected, pirSkipPrototypeOption(this))) {
+      pirInnerFail({
+        actual: actual,
+        expected: expected,
+        message: message,
+        operator: "notDeepStrictEqual",
+        stackStartFn: Assert.prototype.notDeepStrictEqual,
+        diff: pirDiffOption(this),
+      });
+    }
+  }
+
+  strictEqual(actual, expected, message) {
+    if (arguments.length < 2) throw pirMissingArgs();
+    if (!Object.is(actual, expected)) {
+      pirInnerFail({
+        actual: actual,
+        expected: expected,
+        message: message,
+        operator: "strictEqual",
+        stackStartFn: Assert.prototype.strictEqual,
+        diff: pirDiffOption(this),
+      });
+    }
+  }
+
+  notStrictEqual(actual, expected, message) {
+    if (arguments.length < 2) throw pirMissingArgs();
+    if (Object.is(actual, expected)) {
+      pirInnerFail({
+        actual: actual,
+        expected: expected,
+        message: message,
+        operator: "notStrictEqual",
+        stackStartFn: Assert.prototype.notStrictEqual,
+        diff: pirDiffOption(this),
+      });
+    }
+  }
+
+  partialDeepStrictEqual(actual, expected, message) {
+    if (arguments.length < 2) throw pirMissingArgs();
+    if (!pirIsPartialStrictEqual(actual, expected)) {
+      pirInnerFail({
+        actual: actual,
+        expected: expected,
+        message: message,
+        operator: "partialDeepStrictEqual",
+        stackStartFn: Assert.prototype.partialDeepStrictEqual,
+        diff: pirDiffOption(this),
+      });
+    }
+  }
+
+  throws(promiseFn) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    pirExpectsError.apply(this, [this, Assert.prototype.throws, pirGetActual(promiseFn)].concat(args));
+  }
+
+  async rejects(promiseFn) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    const actual = await pirWaitForActual(promiseFn);
+    pirExpectsError.apply(this, [this, Assert.prototype.rejects, actual].concat(args));
+  }
+
+  doesNotThrow(fn) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    pirExpectsNoError.apply(this, [this, Assert.prototype.doesNotThrow, pirGetActual(fn)].concat(args));
+  }
+
+  async doesNotReject(fn) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    const actual = await pirWaitForActual(fn);
+    pirExpectsNoError.apply(this, [this, Assert.prototype.doesNotReject, actual].concat(args));
+  }
+
+  ifError(err) {
+    if (err === null || err === undefined) return;
+
+    let message = "ifError got unwanted exception: ";
+    if (typeof err === "object" && typeof err.message === "string") {
+      if (err.message.length === 0 && err.constructor) message += err.constructor.name;
+      else message += err.message;
+    } else {
+      message += pirInspectDefault(err);
+    }
+
+    const newError = new AssertionError({
+      actual: err,
+      expected: null,
+      operator: "ifError",
+      message: message,
+      stackStartFn: Assert.prototype.ifError,
+      diff: pirDiffOption(this),
+    });
+
+    // Keep the original error's frames, dropping the ones already taken by
+    // this call (Node's ifError stack splice).
+    try {
+      const origStack = err.stack;
+      if (typeof origStack === "string") {
+        const origStackStart = origStack.indexOf("\n    at");
+        if (origStackStart !== -1) {
+          const originalFrames = origStack.slice(origStackStart + 1).split("\n");
+          let newFrames = String(newError.stack).split("\n");
+          for (const errFrame of originalFrames) {
+            const pos = newFrames.indexOf(errFrame);
+            if (pos !== -1) {
+              newFrames = newFrames.slice(0, pos);
+              break;
+            }
+          }
+          newError.stack = newFrames.join("\n") + "\n" + originalFrames.join("\n");
+        }
+      }
+    } catch {
+      // Stack rewriting is cosmetic; the AssertionError is what matters.
+    }
+
+    throw newError;
+  }
+
+  match(string, regexp, message) {
+    pirInternalMatch(this, string, regexp, message, Assert.prototype.match);
+  }
+
+  doesNotMatch(string, regexp, message) {
+    pirInternalMatch(this, string, regexp, message, Assert.prototype.doesNotMatch);
+  }
+}
+
+// Node's `Assert` is a plain constructor function that rejects a call without
+// `new` with ERR_CONSTRUCT_CALL_REQUIRED; a class body cannot intercept that
+// (the engine throws first), so the public constructor delegates. Everything
+// lives on the shared prototype, keeping `Assert.prototype.*` identical to
+// the module surface (as in Node).
+function Assert(options) {
+  if (new.target === undefined) {
+    const error = new TypeError("Class constructor Assert cannot be invoked without `new`");
+    error.code = "ERR_CONSTRUCT_CALL_REQUIRED";
+    throw error;
+  }
+  return new AssertImpl(options);
+}
+Assert.prototype = AssertImpl.prototype;
+Object.defineProperty(AssertImpl.prototype, "constructor", {
+  value: Assert,
+  enumerable: false,
+  writable: true,
+  configurable: true,
+});
+
+// ---------------------------------------------------------------------------
+// throws / doesNotThrow / rejects / doesNotReject (Node: lib/assert.js)
+// ---------------------------------------------------------------------------
+
+const kNoExceptionSentinel = {};
+
+function pirGetActual(fn) {
+  if (typeof fn !== "function") {
+    throw pirInvalidArgType("fn", "Function", fn);
+  }
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  return kNoExceptionSentinel;
+}
+
+function pirCheckIsPromise(obj) {
+  return obj !== null && typeof obj === "object" &&
+    typeof obj.then === "function" && typeof obj.catch === "function";
+}
+
+async function pirWaitForActual(promiseFn) {
+  let resultPromise;
+  if (typeof promiseFn === "function") {
+    resultPromise = promiseFn();
+    if (!pirCheckIsPromise(resultPromise)) {
+      throw pirInvalidReturnValue("instance of Promise", "promiseFn", resultPromise);
+    }
+  } else if (pirCheckIsPromise(promiseFn)) {
+    resultPromise = promiseFn;
+  } else {
+    throw pirInvalidArgType("promiseFn", ["Function", "Promise"], promiseFn);
+  }
+
+  try {
+    await resultPromise;
+  } catch (error) {
+    return error;
+  }
+  return kNoExceptionSentinel;
+}
+
+function pirHasMatchingError(actual, expected) {
+  if (typeof expected !== "function") {
+    if (expected instanceof RegExp) return expected.test(String(actual));
+    throw pirInvalidArgType("expected", ["Function", "RegExp"], expected);
+  }
+  // Guard instanceof against arrow functions (no prototype).
+  if (expected.prototype !== undefined && actual instanceof expected) return true;
+  if (pirIsErrorConstructor(expected)) return false;
+  return expected.call({}, actual) === true;
+}
+
+// Placeholder wrappers that carry only the keys under comparison, so the diff
+// shows those keys under a recognizable constructor name (Node's Comparison).
+class Comparison {
+  constructor(obj, keys, actual) {
+    for (const key of keys) {
+      if (key in obj) {
+        if (actual !== undefined && typeof actual[key] === "string" &&
+            obj[key] instanceof RegExp && obj[key].test(actual[key])) {
+          this[key] = actual[key];
+        } else {
+          this[key] = obj[key];
+        }
+      }
+    }
+  }
+}
+
+function pirCompareExceptionKey(receiver, actual, expected, key, message, keys, fn) {
+  if (!(key in actual) || !pirIsDeepStrictEqual(actual[key], expected[key])) {
+    if (!message) {
+      const error = new AssertionError({
+        actual: new Comparison(actual, keys),
+        expected: new Comparison(expected, keys, actual),
+        operator: "deepStrictEqual",
+        stackStartFn: fn,
+        diff: pirDiffOption(receiver),
+      });
+      error.actual = actual;
+      error.expected = expected;
+      error.operator = fn.name;
+      throw error;
+    }
+    pirInnerFail({
+      actual: actual,
+      expected: expected,
+      message: message,
+      operator: fn.name,
+      stackStartFn: fn,
+      diff: pirDiffOption(receiver),
+    });
+  }
+}
+
+function pirExpectedException(receiver, actual, expected, message, fn) {
+  let generatedMessage = false;
+  let throwError = false;
+
+  if (typeof expected !== "function") {
+    // Regular expressions.
+    if (expected instanceof RegExp) {
+      const str = String(actual);
+      if (expected.test(str)) return;
+      if (!message) {
+        generatedMessage = true;
+        message = "The input did not match the regular expression " +
+          pirInspectDefault(expected) + ". Input:\n\n" + pirInspectDefault(str) + "\n";
+      }
+      throwError = true;
+    } else if (typeof actual !== "object" || actual === null) {
+      // Primitives thrown are only matchable by value.
+      const error = new AssertionError({
+        actual: actual,
+        expected: expected,
+        message: message,
+        operator: "deepStrictEqual",
+        stackStartFn: fn,
+        diff: pirDiffOption(receiver),
+      });
+      error.operator = fn.name;
+      throw error;
+    } else {
+      // Validation objects.
+      const keys = Object.keys(expected);
+      // Errors compare the name and message as well.
+      if (expected instanceof Error) keys.push("name", "message");
+      else if (keys.length === 0) throw pirInvalidArgValue("error", expected, "may not be an empty object");
+      for (const key of keys) {
+        if (typeof actual[key] === "string" &&
+            expected[key] instanceof RegExp && expected[key].test(actual[key])) {
+          continue;
+        }
+        pirCompareExceptionKey(receiver, actual, expected, key, message, keys, fn);
+      }
+      return;
+    }
+  } else if (expected.prototype !== undefined && actual instanceof expected) {
+    return;
+  } else if (pirIsErrorConstructor(expected)) {
+    if (!message) {
+      generatedMessage = true;
+      message = "The error is expected to be an instance of \"" + expected.name + "\". Received ";
+      if (pirIsError(actual)) {
+        const name = (actual.constructor && actual.constructor.name) || actual.name;
+        if (expected.name === name) {
+          message += "an error with identical name but a different prototype.";
+        } else {
+          message += "\"" + name + "\"";
+        }
+        if (actual.message) message += "\n\nError message:\n\n" + actual.message;
+      } else {
+        message += "\"" + pirInspectDefault(actual, { depth: -1 }) + "\"";
+      }
+    }
+    throwError = true;
+  } else {
+    // Validation functions.
+    const res = expected.call({}, actual);
+    if (res !== true) {
+      if (!message) {
+        generatedMessage = true;
+        const name = expected.name ? "\"" + expected.name + "\" " : "";
+        message = "The " + name + "validation function is expected to return \"true\". Received " +
+          pirInspectDefault(res);
+        if (pirIsError(actual)) message += "\n\nCaught error:\n\n" + actual;
+      }
+      throwError = true;
+    }
+  }
+
+  if (throwError) {
+    const error = new AssertionError({
+      actual: actual,
+      expected: expected,
+      message: message,
+      operator: fn.name,
+      stackStartFn: fn,
+      diff: pirDiffOption(receiver),
+    });
+    error.generatedMessage = generatedMessage;
+    throw error;
+  }
+}
+
+function pirExpectsError(receiver, stackStartFn, actual, error, message) {
+  if (typeof error === "string") {
+    if (arguments.length === 5) {
+      throw pirInvalidArgType("error", ["Object", "Error", "Function", "RegExp"], error);
+    }
+    if (typeof actual === "object" && actual !== null) {
+      if (actual.message === error) {
+        throw pirAmbiguousArgument("error/message",
+          "The error message \"" + actual.message + "\" is identical to the message.");
+      }
+    } else if (actual === error) {
+      throw pirAmbiguousArgument("error/message",
+        "The error \"" + actual + "\" is identical to the message.");
+    }
+    message = error;
+    error = undefined;
+  } else if (error !== null && error !== undefined &&
+             typeof error !== "object" && typeof error !== "function") {
+    throw pirInvalidArgType("error", ["Object", "Error", "Function", "RegExp"], error);
+  }
+
+  if (actual === kNoExceptionSentinel) {
+    let details = "";
+    if (error && error.name) details += " (" + error.name + ")";
+    details += message ? ": " + message : ".";
+    const fnType = stackStartFn === Assert.prototype.rejects ? "rejection" : "exception";
+    pirInnerFail({
+      actual: undefined,
+      expected: error,
+      operator: stackStartFn.name,
+      message: "Missing expected " + fnType + details,
+      stackStartFn: stackStartFn,
+      diff: pirDiffOption(receiver),
+    });
+  }
+
+  if (!error) return;
+
+  pirExpectedException(receiver, actual, error, message, stackStartFn);
+}
+
+function pirExpectsNoError(receiver, stackStartFn, actual, error, message) {
+  if (actual === kNoExceptionSentinel) return;
+
+  if (typeof error === "string") {
+    message = error;
+    error = undefined;
+  }
+
+  if (!error || pirHasMatchingError(actual, error)) {
+    const details = message ? ": " + message : ".";
+    const fnType = stackStartFn === Assert.prototype.doesNotReject ? "rejection" : "exception";
+    pirInnerFail({
+      actual: actual,
+      expected: error,
+      operator: stackStartFn.name,
+      message: "Got unwanted " + fnType + details + "\n" +
+        "Actual message: \"" +
+        (actual === null || actual === undefined ? undefined : actual.message) + "\"",
+      stackStartFn: stackStartFn,
+      diff: pirDiffOption(receiver),
+    });
+  }
+  throw actual;
+}
+
+function pirInternalMatch(receiver, string, regexp, message, fn) {
+  if (!(regexp instanceof RegExp)) {
+    throw pirInvalidArgType("regexp", "RegExp", regexp);
+  }
+  const match = fn === Assert.prototype.match;
+  if (typeof string !== "string" || (regexp.exec(string) !== null) !== match) {
+    if (message instanceof Error) throw message;
+
+    const generatedMessage = !message;
+    if (!message) {
+      message = typeof string !== "string" ?
+        "The \"string\" argument must be of type string. Received type " +
+          typeof string + " (" + pirInspectDefault(string) + ")" :
+        (match ?
+          "The input did not match the regular expression " :
+          "The input was expected to not match the regular expression ") +
+          pirInspectDefault(regexp) + ". Input:\n\n" + pirInspectDefault(string) + "\n";
+    }
+    const error = new AssertionError({
+      actual: string,
+      expected: regexp,
+      message: message,
+      operator: fn.name,
+      stackStartFn: fn,
+      diff: pirDiffOption(receiver),
+    });
+    error.generatedMessage = generatedMessage;
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CallTracker (deprecated in Node; kept as a working tracker)
+// ---------------------------------------------------------------------------
+
+class CallTracker {
+  constructor() {
+    this._calls = [];
+  }
+
+  track(fn, expected) {
+    const self = this;
+    const tracker = function tracked(...args) {
+      tracker.actual += 1;
+      return fn.apply(this, args);
+    };
+    tracker.expected = expected === undefined ? 1 : expected;
+    tracker.actual = 0;
+    self._calls.push(tracker);
+    return tracker;
+  }
+
+  verify() {
+    for (const tracker of this._calls) {
+      if (tracker.actual !== tracker.expected) {
+        throw new AssertionError({
+          message: "Expected the function to be called " + tracker.expected +
+            " time(s), got " + tracker.actual,
+          actual: tracker.actual,
+          expected: tracker.expected,
+          operator: "strictEqual",
+        });
+      }
+    }
+    return undefined;
+  }
+
+  report() {
+    return this._calls.map((tracker) => ({
+      message: tracker.toString(),
+      actual: tracker.actual,
+      expected: tracker.expected,
+      operator: "strictEval",
+      stack: [],
+    }));
+  }
+
+  reset(fn) {
+    if (fn === undefined) this._calls = [];
+    else this._calls = this._calls.filter((tracker) => tracker !== fn);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// public surface (Node's assignment order; `assert` IS the callable `ok`)
+// ---------------------------------------------------------------------------
+
+function ok() {
+  pirInnerOk(ok, arguments.length, arguments[0], arguments[1], pirOkCalleeNames);
+}
+
+function strict() {
+  pirInnerOk(strict, arguments.length, arguments[0], arguments[1], pirStrictCalleeNames);
+}
+
+const assert = ok;
+
+assert.AssertionError = AssertionError;
+assert.CallTracker = CallTracker;
+assert.ok = assert;
+
+const kSurfaceNames = [
+  "fail", "equal", "notEqual", "deepEqual", "notDeepEqual",
+  "deepStrictEqual", "notDeepStrictEqual", "strictEqual",
+  "notStrictEqual", "partialDeepStrictEqual", "match", "doesNotMatch",
+  "throws", "rejects", "doesNotThrow", "doesNotReject", "ifError",
+];
+for (const name of kSurfaceNames) {
+  assert[name] = Assert.prototype[name];
+}
+
+assert.strict = Object.assign(strict, assert, {
+  equal: assert.strictEqual,
+  notEqual: assert.notStrictEqual,
+  deepEqual: assert.deepStrictEqual,
+  notDeepEqual: assert.notDeepStrictEqual,
+});
+assert.strict.Assert = Assert;
+assert.strict.strict = assert.strict;
+assert.Assert = Assert;
+
+// The CJS require bridge hands out a plain copy of a builtin's ESM namespace
+// (see `__pirRequireFrom`); for assert that would flatten the callable module
+// into an object. Seed the bridge's per-builtin cache so `require("assert")`
+// keeps the callable identity Node exposes (`assert/strict` seeds its own
+// key in assert_strict_shim).
+if (globalThis.__pirBuiltinRequireCache &&
+    typeof globalThis.__pirBuiltinRequireCache.set === "function") {
+  globalThis.__pirBuiltinRequireCache.set("assert", assert);
+}
+
+export default assert;
+export { ok, strict, Assert, AssertionError, CallTracker };
+export const fail = assert.fail;
+export const equal = assert.equal;
+export const notEqual = assert.notEqual;
+export const deepEqual = assert.deepEqual;
+export const notDeepEqual = assert.notDeepEqual;
+export const deepStrictEqual = assert.deepStrictEqual;
+export const notDeepStrictEqual = assert.notDeepStrictEqual;
+export const strictEqual = assert.strictEqual;
+export const notStrictEqual = assert.notStrictEqual;
+export const partialDeepStrictEqual = assert.partialDeepStrictEqual;
+export const match = assert.match;
+export const doesNotMatch = assert.doesNotMatch;
+export const throws = assert.throws;
+export const rejects = assert.rejects;
+export const doesNotThrow = assert.doesNotThrow;
+export const doesNotReject = assert.doesNotReject;
+export const ifError = assert.ifError;

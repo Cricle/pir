@@ -1,0 +1,168 @@
+
+globalThis.__pirCjsRegistry ?? (globalThis.__pirCjsRegistry = new Map());
+
+// Plain-object copies of builtin module namespaces handed out by require()
+// (see __pirRequireFrom): one per builtin, so `require("x") === require("x")`
+// keeps holding like in Node.
+globalThis.__pirBuiltinRequireCache ?? (globalThis.__pirBuiltinRequireCache = new Map());
+
+globalThis.__pirCjsLoad ?? (globalThis.__pirCjsLoad = function (absPath) {
+  // Windows path spelling: the ESM interop wrapper embeds forward-slashed
+  // absolute paths (loader.rs `cjs_interop_wrapper`), while the host resolver
+  // hands require() back backslashed ones. One file must map to exactly one
+  // module instance (module identity, and a cycle reached from both sides
+  // otherwise re-executes the body), so normalize the registry key — and
+  // every derived name (`__filename`, `require.cache`, `module.id`) — to
+  // forward slashes. The host read op accepts both spellings on Windows.
+  const key = String(absPath).replace(/\\/g, "/");
+  const registry = globalThis.__pirCjsRegistry;
+  const cached = registry.get(key);
+  if (cached !== undefined) return cached;
+  // Register before running the body so a cyclic require observes the
+  // partially filled exports object (Node semantics).
+  const module = { exports: {}, loaded: false, id: key };
+  registry.set(key, module);
+  const slash = Math.max(key.lastIndexOf("/"), key.lastIndexOf("\\"));
+  const dir = slash === -1 ? "" : key.slice(0, slash);
+  try {
+    // `asCjs` asks the host to rewrite ESM sources to a CommonJS body
+    // (require(esm), Node 22+): the returned `kind` stays "esm" so the
+    // namespace marker below is only applied to transformed modules.
+    const source = globalThis.__pirNodeCall("npm", "readSource", { path: key, asCjs: true });
+    if (source.kind === "json") {
+      module.exports = JSON.parse(source.source);
+    } else {
+      // The wrapper head stays on the source's first line (Node's own
+      // `Module.wrap` shape) so every eval'd position — line and column —
+      // lands where the file has it.
+      const fn = (0, eval)(
+        "(function (module, exports, require, __filename, __dirname) {" +
+        source.source + "\n})"
+      );
+      fn(module, module.exports, globalThis.__pirMakeRequire(dir), key, dir);
+      if (source.kind === "esm") {
+        // Mark the namespace for the interop helpers and Node's
+        // default-unwrap rule at the require boundary. Non-enumerable so
+        // `export *` re-exports and Object.keys never leak it.
+        Object.defineProperty(module.exports, "__pirEsmNamespace", {
+          value: true, enumerable: false, configurable: true, writable: true,
+        });
+      }
+    }
+    module.loaded = true;
+    return module;
+  } catch (error) {
+    // Node evicts a failed module so a later require retries it.
+    registry.delete(key);
+    if (error && typeof error === "object" && typeof error.message === "string") {
+      error.message = key + ": " + error.message;
+    }
+    throw error;
+  }
+});
+
+globalThis.__pirResolveRequest ?? (globalThis.__pirResolveRequest = function (fromDir, spec, mode) {
+  const res = globalThis.__pirNodeCall("npm", "resolve", {
+    dir: String(fromDir), spec: String(spec), mode: mode,
+  });
+  if (res.kind === "missing") {
+    const error = new Error(res.message);
+    error.code = "MODULE_NOT_FOUND";
+    throw error;
+  }
+  if (res.kind === "error") {
+    const error = new Error(res.message);
+    error.code = res.code || "ERR_MODULE_NOT_FOUND";
+    throw error;
+  }
+  return res;
+});
+
+globalThis.__pirRequireFrom ?? (globalThis.__pirRequireFrom = function (fromDir, spec) {
+  const res = globalThis.__pirResolveRequest(fromDir, spec, "require");
+  if (res.kind === "builtin") {
+    const mod = globalThis.__pirNodeModules[res.name];
+    if (mod === undefined) throw new Error("builtin '" + res.name + "' is not available");
+    // Node's require("events") IS the EventEmitter class; every other builtin
+    // keeps handing out the module namespace object, as before.
+    // Same callable-module rule for bare-package virtual shims whose real
+    // npm form is `module.exports = Class` (better-sqlite3: consumers do
+    // `new (require("better-sqlite3"))(...)`).
+    if (res.name === "events") return mod.default || mod;
+    if (res.name === "better-sqlite3") return mod.default || mod;
+    // require("node:stream") is the Stream class itself (Node); consumers do
+    // `class X extends require("stream")` and `new (require("stream"))()`.
+    if (res.name === "stream") return mod.default || mod;
+    // require("node:path") IS the active namespace object in Node (on Windows
+    // that is path.win32 itself: `require("path") === require("path").win32`).
+    if (res.name === "path") return mod.default || mod;
+    // require("node:process") is the global process object itself (Node).
+    if (res.name === "process") return mod.default || mod;
+    // require("node:util/types") IS require("node:util").types in Node (the
+    // same object), and `util/types`'s default export is exactly that object.
+    // The plain-copy path below would hand out an unequal copy with an extra
+    // `default` key, and `require("util").types === require("util/types")`
+    // has to hold for feature-detection code.
+    if (res.name === "util/types") return mod.default || mod;
+    // require("node:console") IS globalThis.console in Node (lib/console.js
+    // re-exports internal/console/global's singleton), and the console shim
+    // builds that same object — test-console-instance.js asserts the identity,
+    // so the namespace wrapper must not be handed out here.
+    if (res.name === "console") return mod.default || mod;
+    // `require("fs")` / `require("os")`: the property *attributes* of these two
+    // module objects are observable — the deprecated `fs.F_OK`-family getters
+    // (no setter, so a strict-mode write is a TypeError and a read emits
+    // DEP0176 once) and the non-writable `os.EOL`/`os.devNull`. The plain-copy
+    // path below flattens every descriptor into a writable data property, so
+    // these two keep the module object itself: a plain object with
+    // Object.prototype, exactly like Node's own.
+    if (res.name === "fs" || res.name === "os") return mod.default || mod;
+    // require() hands out the CJS module.exports: a plain-prototype object.
+    // ES module namespaces have a null prototype, which kills the
+    // `obj.hasOwnProperty(...)` / `for..in` idiom old packages rely on
+    // (safer-buffer's safer.js does both over require("buffer")). Materialize
+    // a cached plain copy per builtin, merging the default export when it is
+    // a plain object so both `require("buffer").Buffer` and `.default` resolve.
+    const cache = globalThis.__pirBuiltinRequireCache;
+    let plain = cache.get(res.name);
+    if (plain === undefined) {
+      plain = Object.assign(Object.create(Object.prototype), mod);
+      const dflt = mod.default;
+      if (dflt !== undefined && dflt !== null && typeof dflt === "object") {
+        Object.assign(plain, dflt);
+      }
+      cache.set(res.name, plain);
+    }
+    return plain;
+  }
+  if (res.moduleKind === "esm") {
+    // require(esm): the host rewrote the module to a CommonJS body, so it
+    // evaluates synchronously like Node 22+ requires(esm). When the
+    // namespace holds only `default`, Node unwraps and returns that value
+    // directly.
+    const loaded = globalThis.__pirCjsLoad(res.path);
+    const exports = loaded.exports;
+    if (
+      exports !== null && typeof exports === "object" &&
+      exports.__pirEsmNamespace === true
+    ) {
+      const keys = Object.keys(exports);
+      if (keys.length === 1 && keys[0] === "default") return exports.default;
+    }
+    return exports;
+  }
+  return globalThis.__pirCjsLoad(res.path).exports;
+});
+
+globalThis.__pirRequireResolve ?? (globalThis.__pirRequireResolve = function (fromDir, spec) {
+  const res = globalThis.__pirResolveRequest(fromDir, spec, "require");
+  return res.kind === "builtin" ? res.name : res.path;
+});
+
+globalThis.__pirMakeRequire ?? (globalThis.__pirMakeRequire = function (fromDir) {
+  const dir = String(fromDir === undefined || fromDir === null ? "" : fromDir);
+  const require = function (spec) { return globalThis.__pirRequireFrom(dir, spec); };
+  require.resolve = function (spec) { return globalThis.__pirRequireResolve(dir, spec); };
+  require.cache = globalThis.__pirCjsRegistry;
+  return require;
+});

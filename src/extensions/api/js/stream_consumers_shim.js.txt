@@ -1,0 +1,85 @@
+// node:stream/consumers — real tier (pure JS over the engine stream pad):
+// drain a Web ReadableStream / node-style readable into the common value
+// shapes. Node also accepts Blob/ArrayBuffer inputs directly — passed through
+// via the same conversion helpers.
+import { Blob } from "@node/buffer";
+
+function isNodeReadable(value) {
+  return value !== undefined && value !== null && typeof value === "object" && typeof value.on === "function" && typeof value[Symbol.asyncIterator] === "function";
+}
+
+function isWebReadable(value) {
+  return value !== undefined && value !== null && typeof value === "object" && typeof value.getReader === "function";
+}
+
+// Collect chunks from either stream shape into the shared Buffer.
+async function collectChunks(source) {
+  const Buffer = globalThis.Buffer;
+  const chunks = [];
+  if (isWebReadable(source)) {
+    const reader = source.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+  } else if (isNodeReadable(source)) {
+    for await (const chunk of source) {
+      chunks.push(chunk);
+    }
+  } else if (source instanceof ArrayBuffer) {
+    chunks.push(new Uint8Array(source));
+  } else if (ArrayBuffer.isView(source)) {
+    chunks.push(new Uint8Array(source.buffer, source.byteOffset, source.byteLength));
+  } else if (source instanceof Blob) {
+    chunks.push(Buffer.from(await source.arrayBuffer()));
+  } else if (typeof source === "string") {
+    chunks.push(Buffer.from(source, "utf8"));
+  } else {
+    throw new TypeError("The stream argument must be a readable stream");
+  }
+  return Buffer.concat(chunks.map((chunk) => (Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))));
+}
+
+async function arrayBuffer(source) {
+  const buffer = await collectChunks(source);
+  const copy = new ArrayBuffer(buffer.length);
+  new Uint8Array(copy).set(buffer);
+  return copy;
+}
+
+async function text(source) {
+  const buffer = await collectChunks(source);
+  return buffer.toString("utf8");
+}
+
+async function json(source) {
+  return JSON.parse(await text(source));
+}
+
+async function bytes(source) {
+  return new Uint8Array(await arrayBuffer(source));
+}
+
+async function bufferValue(source) {
+  return collectChunks(source);
+}
+
+async function blob(source) {
+  const buffer = await collectChunks(source);
+  const copy = new ArrayBuffer(buffer.length);
+  new Uint8Array(copy).set(buffer);
+  return new Blob([copy], { type: "text/plain" });
+}
+
+const streamConsumers = {
+  arrayBuffer: arrayBuffer,
+  blob: blob,
+  buffer: bufferValue,
+  bytes: bytes,
+  text: text,
+  json: json,
+};
+
+export default streamConsumers;
+export { arrayBuffer, blob, bufferValue as buffer, bytes, text, json };

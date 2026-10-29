@@ -1,0 +1,887 @@
+// node:console — faithful port of nodejs/node v24.19.0's console surface:
+// lib/internal/console/constructor.js (the `Console` class) plus
+// lib/internal/console/global.js (the global console, which IS the module:
+// in Node `require("console") === globalThis.console`).
+//
+// Ported as-is where the runtime allows: the constructor's options
+// normalization (both the positional `stdout, stderr, ignoreErrors` form and
+// the object form), the stdout/stderr writability checks with their
+// ERR_CONSOLE_WRITABLE_STREAM code, colorMode/groupIndentation/inspectOptions
+// validation with node's exact messages, the per-instance binding of the
+// prototype methods (why `[1, 2, 3].forEach(console.log)` works, why
+// `new console.log()` throws, and why each method's `.name` is its own key —
+// test-console-instance.js / test-console-methods.js), the count map, the
+// group-indent string, the separate stdout/stderr util.format paths, the
+// `console.<method>` diagnostics-channel publish, and `Console`'s
+// Symbol.hasInstance fixup for the global console.
+//
+// Documented deviations (engine/host limits, minimal tier):
+//   * `table` lays rows out as `key  value` text lines instead of
+//     internal/cli_table's column grid (no cli_table module here).
+//   * `profile`/`profileEnd`/`timeStamp` are no-ops (no inspector host);
+//     `createTask` throws the unified not-supported error; `context()`
+//     returns the console itself (no per-async-context output routing).
+//   * `clear()` never emits ANSI cursor codes (no readline cursor host).
+//   * `countReset`'s "does not exist" path goes through process.emitWarning
+//     (real) instead of internal trace events (no trace host); the TypeError
+//     for a Symbol label is preserved (the template literal still coerces).
+//
+// Write routing. Node writes every line through `this._stdout`/`this._stderr`.
+// pir has two hosts: `pir js` script mode (real process stdio) and the
+// extension/TUI host, where `process.stdout.write` — the `__pir_host.
+// writeStdout` bridge — would paint raw bytes onto the TUI terminal. The
+// global console therefore resolves its default streams' write target per
+// write:
+//   * a stream whose `write` was replaced after boot always wins (the
+//     official tests observe output by hijacking `process.stdout.write` via
+//     test/common/hijackstdio.js; user code overriding it is the same case) —
+//     node semantics for whichever stream object the console was built on;
+//   * in `pir js` script mode (flag set by script_boot.js.txt) the write goes
+//     through process.stdout / process.stderr, i.e. the real stdio bridge;
+//   * in the extension host it falls back to the prelude console's notify
+//     path, which the TUI drains.
+// A Console built with an explicit stream always writes to exactly that
+// stream, as in node.
+import { formatWithOptions, inspect } from "@node/util";
+
+// ---------------------------------------------------------------------------
+// Error factories — node internal/errors.js message templates, restricted to
+// the codes the console surface raises. `determineSpecificType` is kept
+// byte-identical to upstream because test/common/index.js's
+// invalidArgTypeHelper re-derives the same " Received …" tail on the caller's
+// side (test-console-instance.js compares the full message).
+// ---------------------------------------------------------------------------
+
+function codedError(ErrorCtor, code, message) {
+  const error = new ErrorCtor(message);
+  error.code = code;
+  return error;
+}
+
+// E('ERR_CONSOLE_WRITABLE_STREAM', 'Console expects a writable stream
+// instance for %s', TypeError) — internal/errors.js.
+function errConsoleWritableStream(which) {
+  return codedError(
+    TypeError,
+    "ERR_CONSOLE_WRITABLE_STREAM",
+    "Console expects a writable stream instance for " + which,
+  );
+}
+
+function determineSpecificType(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  const type = typeof value;
+  switch (type) {
+    case "bigint":
+      return "type bigint (" + value + "n)";
+    case "number":
+      if (value === 0) return 1 / value === -Infinity ? "type number (-0)" : "type number (0)";
+      if (value !== value) return "type number (NaN)";
+      if (value === Infinity) return "type number (Infinity)";
+      if (value === -Infinity) return "type number (-Infinity)";
+      return "type number (" + value + ")";
+    case "boolean":
+      return value ? "type boolean (true)" : "type boolean (false)";
+    case "symbol":
+      return "type symbol (" + String(value) + ")";
+    case "function":
+      return "function " + value.name;
+    case "object":
+      if (value.constructor && "name" in value.constructor) {
+        return "an instance of " + value.constructor.name;
+      }
+      return String(inspect(value, { depth: -1 }));
+    case "string": {
+      let text = value;
+      if (text.length > 28) text = text.slice(0, 25) + "...";
+      if (!text.includes("'")) return "type string ('" + text + "')";
+      return "type string (" + JSON.stringify(text) + ")";
+    }
+    default: {
+      let text = String(inspect(value, { colors: false }));
+      if (text.length > 28) text = text.slice(0, 25) + "...";
+      return "type " + type + " (" + text + ")";
+    }
+  }
+}
+
+// node's kTypes (internal/errors.js): these expected strings are lowercased in
+// the message, everything else (class names) is used verbatim.
+const KNOWN_ARG_TYPES = [
+  "string", "function", "number", "object", "Function", "Object", "boolean", "bigint", "symbol",
+];
+
+function errInvalidArgType(name, expected, actual) {
+  const kind = name.includes(".") ? "property" : "argument";
+  const expectedText = KNOWN_ARG_TYPES.includes(expected)
+    ? expected.toLowerCase()
+    : expected;
+  return codedError(
+    TypeError,
+    "ERR_INVALID_ARG_TYPE",
+    'The "' + name + '" ' + kind + " must be of type " + expectedText +
+      ". Received " + determineSpecificType(actual),
+  );
+}
+
+function errInvalidArgValue(name, value, reason) {
+  return codedError(
+    TypeError,
+    "ERR_INVALID_ARG_VALUE",
+    "The argument '" + name + "' " + reason + ". Received " + String(inspect(value)),
+  );
+}
+
+function errOutOfRange(name, range, value) {
+  const received = typeof value === "bigint" ? String(value) + "n" : String(inspect(value));
+  return codedError(
+    RangeError,
+    "ERR_OUT_OF_RANGE",
+    'The value of "' + name + '" is out of range. It must be ' + range +
+      ". Received " + received,
+  );
+}
+
+// node internal/validators.js, the four the console constructor uses.
+function validateNumber(value, name) {
+  if (typeof value !== "number") throw errInvalidArgType(name, "number", value);
+}
+
+function validateInteger(value, name, min, max) {
+  validateNumber(value, name);
+  if (!Number.isInteger(value)) throw errOutOfRange(name, "an integer", value);
+  if (value < min || value > max) throw errOutOfRange(name, ">= " + min + " && <= " + max, value);
+}
+
+function validateObject(value, name) {
+  if (value === null || typeof value !== "object") throw errInvalidArgType(name, "Object", value);
+}
+
+function validateOneOf(value, name, oneOf) {
+  if (oneOf.includes(value)) return;
+  const reason = "must be one of: " + oneOf
+    .map((entry) => (typeof entry === "string" ? "'" + entry + "'" : String(entry)))
+    .join(", ");
+  throw errInvalidArgValue(name, value, reason);
+}
+
+// ---------------------------------------------------------------------------
+// Output routing (see the header). Captured at module evaluation, i.e. after
+// the node globals + prelude are in place and before any user code runs.
+// ---------------------------------------------------------------------------
+
+const preludeConsole = globalThis.console;
+const bootProcess = globalThis.process;
+const bootStdoutWrite = bootProcess && bootProcess.stdout ? bootProcess.stdout.write : undefined;
+const bootStderrWrite = bootProcess && bootProcess.stderr ? bootProcess.stderr.write : undefined;
+
+// The process stream the *default* console routes to, or null when the write
+// should fall back to the host notify path.
+function resolvedHostStream(kind) {
+  const proc = globalThis.process;
+  const stream = proc ? proc[kind] : undefined;
+  if (!stream || typeof stream.write !== "function") return null;
+  const bootWrite = kind === "stdout" ? bootStdoutWrite : bootStderrWrite;
+  if (stream.write !== bootWrite) return stream; // overridden after boot: it wins
+  if (globalThis.__pirRealStdio === true) return stream; // `pir js`: real process stdio
+  return null; // extension host: the bridge targets the TUI terminal, use notify
+}
+
+// Prelude console fallback: level names are the prelude's own methods
+// (`log` -> notify "debug", `warn` -> "warning", `error` -> "error"), which is
+// the routing the extension host had before this port.
+function notifyFallback(level, text) {
+  const host = preludeConsole;
+  const method = host && typeof host[level] === "function" ? level : "log";
+  try {
+    if (host && typeof host[method] === "function") host[method](text);
+  } catch { /* notify is best-effort */ }
+  return true;
+}
+
+function writeDefaultStream(kind, level, chunk, callback) {
+  const stream = resolvedHostStream(kind);
+  if (stream !== null) return stream.write(chunk, callback);
+  return notifyFallback(level, chunk);
+}
+
+// The stable stream objects the global console binds to (node's
+// `kBindStreamsLazy` caches the object, so the resolution has to happen in
+// `write`/`isTTY`, not in the getter).
+function makeDefaultStream(kind) {
+  return {
+    get isTTY() {
+      const stream = resolvedHostStream(kind);
+      return stream !== null && stream.isTTY === true;
+    },
+    hasColors: () => false,
+    columns: undefined,
+    rows: undefined,
+    write(chunk, callback, level) {
+      return writeDefaultStream(kind, level || "log", chunk, callback);
+    },
+  };
+}
+
+const defaultStdout = makeDefaultStream("stdout");
+const defaultStderr = makeDefaultStream("stderr");
+const defaultStreamSource = {
+  get stdout() { return defaultStdout; },
+  get stderr() { return defaultStderr; },
+};
+
+// ---------------------------------------------------------------------------
+// Console (lib/internal/console/constructor.js)
+// ---------------------------------------------------------------------------
+
+const kMaxGroupIndentation = 1000;
+const kColorInspectOptions = { colors: true };
+const kNoColorInspectOptions = {};
+
+const kIsConsole = Symbol("kIsConsole");
+const kColorMode = Symbol("kColorMode");
+const kCounts = Symbol("kCounts");
+const kGroupIndentationWidth = Symbol("kGroupIndentationWidth");
+const kGroupIndentationString = Symbol("kGroupIndentationString");
+const kUseStdout = Symbol("kUseStdout");
+const kUseStderr = Symbol("kUseStderr");
+const kBindStreamsEager = Symbol("kBindStreamsEager");
+const kBindStreamsLazy = Symbol("kBindStreamsLazy");
+const kBindProperties = Symbol("kBindProperties");
+const kWriteToConsole = Symbol("kWriteToConsole");
+const kGetInspectOptions = Symbol("kGetInspectOptions");
+const kFormatForStdout = Symbol("kFormatForStdout");
+const kFormatForStderr = Symbol("kFormatForStderr");
+const kInspectOptionsMap = Symbol("kInspectOptionsMap");
+
+const consolePropAttributes = {
+  writable: true,
+  enumerable: false,
+  configurable: true,
+};
+
+function Console(options /* or: stdout, stderr, ignoreErrors = true */) {
+  // `new.target` is tested instead of using a class so that the constructor is
+  // callable without `new` (test-console-instance.js) — node does the same and
+  // defines a custom `instanceof` to accommodate the global console.
+  if (new.target === undefined) {
+    return Reflect.construct(Console, arguments);
+  }
+
+  if (!options || typeof options.write === "function") {
+    options = {
+      stdout: options,
+      stderr: arguments[1],
+      ignoreErrors: arguments[2],
+    };
+  }
+
+  const {
+    stdout,
+    stderr = stdout,
+    ignoreErrors = true,
+    colorMode = "auto",
+    inspectOptions,
+    groupIndentation,
+  } = options;
+
+  if (!stdout || typeof stdout.write !== "function") {
+    throw errConsoleWritableStream("stdout");
+  }
+  if (!stderr || typeof stderr.write !== "function") {
+    throw errConsoleWritableStream("stderr");
+  }
+
+  validateOneOf(colorMode, "colorMode", ["auto", true, false]);
+
+  if (groupIndentation !== undefined) {
+    validateInteger(groupIndentation, "groupIndentation", 0, kMaxGroupIndentation);
+  }
+
+  if (inspectOptions !== undefined) {
+    validateObject(inspectOptions, "options.inspectOptions");
+
+    const inspectOptionsMap = inspectOptions instanceof Map
+      ? inspectOptions
+      : new Map([[stdout, inspectOptions], [stderr, inspectOptions]]);
+
+    for (const entry of inspectOptionsMap.values()) {
+      if (entry.colors !== undefined && options.colorMode !== undefined) {
+        const error = new TypeError(
+          'The "options.colorMode" and "options.inspectOptions.color" options are mutually exclusive.',
+        );
+        error.code = "ERR_INCOMPATIBLE_OPTION_PAIR";
+        throw error;
+      }
+    }
+    this[kInspectOptionsMap] = inspectOptionsMap;
+  }
+
+  // Bind the prototype functions to this Console instance. Binding is taken
+  // from the instance (not the prototype) so a subclass can override them
+  // from its own prototype chain, and the bound function's `name` is restored
+  // to the key — `bind` would report "bound log" (test-console-methods.js).
+  for (const key of Object.keys(Console.prototype)) {
+    this[key] = this[key].bind(this);
+    Object.defineProperty(this[key], "name", { value: key, configurable: true });
+  }
+
+  this[kBindStreamsEager](stdout, stderr);
+  this[kBindProperties](ignoreErrors, colorMode, groupIndentation);
+}
+
+Object.defineProperties(Console.prototype, {
+  [kBindStreamsEager]: {
+    ...consolePropAttributes,
+    // Eager version for the Console constructor.
+    value: function (stdout, stderr) {
+      Object.defineProperties(this, {
+        "_stdout": { ...consolePropAttributes, value: stdout },
+        "_stderr": { ...consolePropAttributes, value: stderr },
+      });
+    },
+  },
+  [kBindStreamsLazy]: {
+    ...consolePropAttributes,
+    // Lazily load the stdout and stderr from an object so the stdio streams
+    // are not created when they are not even accessed (the global console).
+    value: function (object) {
+      let stdout;
+      let stderr;
+      Object.defineProperties(this, {
+        "_stdout": {
+          enumerable: false,
+          configurable: true,
+          get() { return stdout || (stdout = object.stdout); },
+          set(value) { stdout = value; },
+        },
+        "_stderr": {
+          enumerable: false,
+          configurable: true,
+          get() { return stderr || (stderr = object.stderr); },
+          set(value) { stderr = value; },
+        },
+      });
+    },
+  },
+  [kBindProperties]: {
+    ...consolePropAttributes,
+    value: function (ignoreErrors, colorMode, groupIndentation = 2) {
+      Object.defineProperties(this, {
+        "_stdoutErrorHandler": {
+          ...consolePropAttributes,
+          value: createWriteErrorHandler(this, kUseStdout),
+        },
+        "_stderrErrorHandler": {
+          ...consolePropAttributes,
+          value: createWriteErrorHandler(this, kUseStderr),
+        },
+        "_ignoreErrors": {
+          ...consolePropAttributes,
+          value: Boolean(ignoreErrors),
+        },
+        "_times": { ...consolePropAttributes, value: new Map() },
+        // https://console.spec.whatwg.org/#count-map
+        [kCounts]: { ...consolePropAttributes, value: new Map() },
+        [kColorMode]: { ...consolePropAttributes, value: colorMode },
+        [kIsConsole]: { ...consolePropAttributes, value: true },
+        [kGroupIndentationWidth]: {
+          ...consolePropAttributes,
+          value: groupIndentation,
+        },
+        [kGroupIndentationString]: { ...consolePropAttributes, value: "" },
+        [Symbol.toStringTag]: {
+          writable: false,
+          enumerable: false,
+          configurable: true,
+          value: "console",
+        },
+      });
+    },
+  },
+  [kWriteToConsole]: {
+    ...consolePropAttributes,
+    value: function (streamSymbol, string, notifyLevel = "log") {
+      const ignoreErrors = this._ignoreErrors;
+      const groupIndent = this[kGroupIndentationString];
+
+      const useStdout = streamSymbol === kUseStdout;
+      const stream = useStdout ? this._stdout : this._stderr;
+      const errorHandler = useStdout
+        ? this._stdoutErrorHandler
+        : this._stderrErrorHandler;
+
+      if (groupIndent.length !== 0) {
+        if (string.includes("\n")) {
+          string = string.replace(/\n/g, "\n" + groupIndent);
+        }
+        string = groupIndent + string;
+      }
+      string += "\n";
+
+      // The default streams carry the host-routing decision (see the header);
+      // an explicit stream is written to directly, as in node.
+      const isDefault = stream === defaultStdout || stream === defaultStderr;
+      const write = isDefault
+        ? (text) => stream.write(text, undefined, notifyLevel)
+        : ignoreErrors === false
+          ? (text) => stream.write(text)
+          : (text) => stream.write(text, errorHandler);
+
+      if (ignoreErrors === false) return write(string);
+
+      // There may be an error occurring synchronously or asynchronously (pipe
+      // writes), so handle both situations — but never swallow a stack
+      // overflow, which node rethrows (test-console-no-swallow-stack-overflow).
+      try {
+        if (!isDefault && typeof stream.once === "function" &&
+            typeof stream.listenerCount === "function" &&
+            stream.listenerCount("error") === 0) {
+          stream.once("error", noop);
+        }
+
+        write(string);
+      } catch (error) {
+        // Console is a debugging utility, so it swallowing errors is not
+        // desirable even in edge cases such as low stack space.
+        if (isStackOverflowError(error)) throw error;
+      } finally {
+        if (!isDefault && typeof stream.removeListener === "function") {
+          try { stream.removeListener("error", noop); } catch { /* minimal stream */ }
+        }
+      }
+      return undefined;
+    },
+  },
+  [kGetInspectOptions]: {
+    ...consolePropAttributes,
+    value: function (stream) {
+      let color = this[kColorMode];
+      if (color === "auto") {
+        // node asks lazyUtilColors().shouldColorize(stream); the inspect
+        // surface here has no color-depth probe, so the honest equivalent is
+        // the TTY check the colorizer itself starts from.
+        color = stream && stream.isTTY === true && process.env.TERM !== "dumb" &&
+          process.env.NO_COLOR === undefined;
+      }
+
+      const inspectOptionsMap = this[kInspectOptionsMap];
+      const options = inspectOptionsMap ? inspectOptionsMap.get(stream) : undefined;
+      if (options) {
+        if (options.colors === undefined) {
+          options.colors = color;
+        }
+        return options;
+      }
+
+      return color ? kColorInspectOptions : kNoColorInspectOptions;
+    },
+  },
+  [kFormatForStdout]: {
+    ...consolePropAttributes,
+    value: function (args) {
+      if (args.length === 1 && typeof args[0] === "string") {
+        // Fast path: single string, don't call format.
+        return args[0];
+      }
+      const opts = this[kGetInspectOptions](this._stdout);
+      args.unshift(opts);
+      return formatWithOptions.apply(null, args);
+    },
+  },
+  [kFormatForStderr]: {
+    ...consolePropAttributes,
+    value: function (args) {
+      if (args.length === 1 && typeof args[0] === "string") {
+        return args[0];
+      }
+      const opts = this[kGetInspectOptions](this._stderr);
+      args.unshift(opts);
+      return formatWithOptions.apply(null, args);
+    },
+  },
+});
+
+// Make a function that can serve as the callback passed to `stream.write()`.
+function createWriteErrorHandler(instance, streamSymbol) {
+  return (err) => {
+    // This conditional evaluates to true if and only if there was an error
+    // that was not already emitted (which happens when the `_write` callback
+    // is invoked asynchronously).
+    const stream = streamSymbol === kUseStdout ? instance._stdout : instance._stderr;
+    if (err !== null && stream && stream._writableState && !stream._writableState.errorEmitted) {
+      if (typeof stream.listenerCount === "function" && typeof stream.once === "function" &&
+          stream.listenerCount("error") === 0) {
+        stream.once("error", noop);
+      }
+    }
+  };
+}
+
+function noop() {}
+
+function isStackOverflowError(error) {
+  return error instanceof RangeError && /call stack|stack overflow/i.test(String(error.message));
+}
+
+// --- timing (node internal/util/debuglog.js: time/timeLog/timeEnd) ---------
+
+const kSecond = 1000;
+const kMinute = 60 * kSecond;
+const kHour = 60 * kMinute;
+
+function pad(value) {
+  return String(value).padStart(2, "0");
+}
+
+function formatTime(ms) {
+  let hours = 0;
+  let minutes = 0;
+  let seconds = 0;
+
+  if (ms >= kSecond) {
+    if (ms >= kMinute) {
+      if (ms >= kHour) {
+        hours = Math.floor(ms / kHour);
+        ms = ms % kHour;
+      }
+      minutes = Math.floor(ms / kMinute);
+      ms = ms % kMinute;
+    }
+    seconds = ms / kSecond;
+  }
+
+  if (hours !== 0 || minutes !== 0) {
+    const parts = seconds.toFixed(3).split(".");
+    seconds = parts[0];
+    ms = parts[1];
+    const res = hours !== 0 ? hours + ":" + pad(minutes) : minutes;
+    return res + ":" + pad(seconds) + "." + ms + " (" + (hours !== 0 ? "h:m" : "") + "m:ss.mmm)";
+  }
+
+  if (seconds !== 0) return seconds.toFixed(3) + "s";
+  return Number(ms.toFixed(3)) + "ms";
+}
+
+function timerDuration(startedAt) {
+  const duration = process.hrtime(startedAt);
+  return duration[0] * 1000 + duration[1] / 1e6;
+}
+
+function timeLogImpl(consoleRef, label, formatted, args) {
+  if (args === undefined) {
+    consoleRef.log("%s: %s", label, formatted);
+  } else {
+    consoleRef.log("%s: %s", label, formatted, ...args);
+  }
+}
+
+// --- the console methods (node's consoleMethods object) --------------------
+
+const consoleMethods = {
+  log(...args) {
+    publishDiagnostic("log", args);
+    this[kWriteToConsole](kUseStdout, this[kFormatForStdout](args), "log");
+  },
+
+  info(...args) {
+    publishDiagnostic("info", args);
+    this[kWriteToConsole](kUseStdout, this[kFormatForStdout](args), "log");
+  },
+
+  debug(...args) {
+    publishDiagnostic("debug", args);
+    this[kWriteToConsole](kUseStdout, this[kFormatForStdout](args), "log");
+  },
+
+  warn(...args) {
+    publishDiagnostic("warn", args);
+    this[kWriteToConsole](kUseStderr, this[kFormatForStderr](args), "warn");
+  },
+
+  error(...args) {
+    publishDiagnostic("error", args);
+    this[kWriteToConsole](kUseStderr, this[kFormatForStderr](args), "error");
+  },
+
+  dir(object, options) {
+    this[kWriteToConsole](kUseStdout, inspect(object, {
+      customInspect: false,
+      ...this[kGetInspectOptions](this._stdout),
+      ...options,
+    }), "log");
+  },
+
+  time(label = "default") {
+    if (this._times.has(label)) {
+      process.emitWarning("Label '" + label + "' already exists for console.time()");
+      return;
+    }
+    this._times.set(label, process.hrtime());
+  },
+
+  timeEnd(label = "default") {
+    const startedAt = this._times.get(label);
+    if (startedAt === undefined) {
+      process.emitWarning("No such label '" + label + "' for console.timeEnd()");
+      return;
+    }
+    this._times.delete(label);
+    timeLogImpl(this, label, formatTime(timerDuration(startedAt)), undefined);
+  },
+
+  timeLog(label = "default", ...data) {
+    const startedAt = this._times.get(label);
+    if (startedAt === undefined) {
+      process.emitWarning("No such label '" + label + "' for console.timeLog()");
+      return;
+    }
+    timeLogImpl(this, label, formatTime(timerDuration(startedAt)), data);
+  },
+
+  trace: function trace(...args) {
+    const err = {
+      name: "Trace",
+      message: this[kFormatForStderr](args),
+    };
+    if (typeof Error.captureStackTrace === "function") {
+      Error.captureStackTrace(err, trace);
+    } else if (err.stack === undefined) {
+      err.stack = err.name + ": " + err.message;
+    }
+    this.error(err.stack);
+  },
+
+  // https://console.spec.whatwg.org/#assert
+  assert(expression, ...args) {
+    if (!expression) {
+      if (args.length && typeof args[0] === "string") {
+        args[0] = "Assertion failed: " + args[0];
+      } else {
+        args.unshift("Assertion failed");
+      }
+      // The arguments are formatted in warn().
+      this.warn(...args);
+    }
+  },
+
+  // https://console.spec.whatwg.org/#clear
+  clear() {
+    // Only meaningful for a TTY; the ANSI cursor pair needs a readline host,
+    // which this runtime does not carry.
+  },
+
+  // https://console.spec.whatwg.org/#count
+  count(label = "default") {
+    // Ensures that label is a string, and only things that can be coerced to
+    // strings — a Symbol throws here (test-console-count.js).
+    label = `${label}`;
+    const counts = this[kCounts];
+    let count = counts.get(label);
+    if (count === undefined) {
+      count = 1;
+    } else {
+      count++;
+    }
+    counts.set(label, count);
+    this.log(`${label}: ${count}`);
+  },
+
+  // https://console.spec.whatwg.org/#countreset
+  countReset(label = "default") {
+    const counts = this[kCounts];
+    if (!counts.has(label)) {
+      process.emitWarning(`Count for '${label}' does not exist`);
+      return;
+    }
+    counts.delete(`${label}`);
+  },
+
+  group(...data) {
+    if (data.length > 0) {
+      this.log(...data);
+    }
+
+    let currentIndentation = this[kGroupIndentationString];
+    currentIndentation += " ".repeat(this[kGroupIndentationWidth]);
+    this[kGroupIndentationString] = currentIndentation;
+  },
+
+  groupEnd() {
+    const currentIndentation = this[kGroupIndentationString];
+    this[kGroupIndentationString] = currentIndentation.slice(
+      0,
+      currentIndentation.length - this[kGroupIndentationWidth],
+    );
+  },
+
+  // https://console.spec.whatwg.org/#table (minimal: rows as `key  value`)
+  table(tabularData, properties) {
+    if (properties !== undefined) {
+      if (!Array.isArray(properties)) {
+        throw errInvalidArgType("properties", "Array", properties);
+      }
+    }
+
+    if (tabularData === null || typeof tabularData !== "object") {
+      this.log(tabularData);
+      return;
+    }
+
+    const entries = [];
+    if (tabularData instanceof Map) {
+      for (const [key, value] of tabularData) entries.push([key, value]);
+    } else if (Array.isArray(tabularData)) {
+      for (let i = 0; i < tabularData.length; i++) entries.push([i, tabularData[i]]);
+    } else {
+      for (const key of Object.keys(tabularData)) entries.push([key, tabularData[key]]);
+    }
+
+    for (const [rowKey, value] of entries) {
+      const depth = value !== null && typeof value === "object" &&
+        !Array.isArray(value) && Object.keys(value).length > 2 ? -1 : 0;
+      const options = {
+        depth,
+        maxArrayLength: 3,
+        breakLength: Infinity,
+        ...this[kGetInspectOptions](this._stdout),
+      };
+      if (properties !== undefined && value !== null && typeof value === "object") {
+        for (const column of properties) {
+          this.log(String(column) + "  " + inspect(value[column], options));
+        }
+        continue;
+      }
+      this.log(String(rowKey) + "  " + inspect(value, options));
+    }
+  },
+};
+
+for (const method of Reflect.ownKeys(consoleMethods)) {
+  Console.prototype[method] = consoleMethods[method];
+}
+
+Console.prototype.dirxml = Console.prototype.log;
+Console.prototype.groupCollapsed = Console.prototype.group;
+
+// Fixup global.console instanceof global.console.Console.
+Object.defineProperty(Console, Symbol.hasInstance, {
+  value(instance) {
+    return instance ? instance[kIsConsole] === true : false;
+  },
+});
+
+// --- `console.<method>` diagnostics channels (node does the same publish
+// before formatting, so a subscriber sees — and may mutate — the raw args).
+// Resolved on first use rather than at module evaluation: the console shim is
+// itself imported by the builtin bootstrap sweep, so the registry entry for
+// diagnostics_channel may not exist yet when this module body runs.
+let diagnosticChannels;
+function publishDiagnostic(method, args) {
+  if (diagnosticChannels === undefined) {
+    diagnosticChannels = null;
+    try {
+      const dc = globalThis.__pirNodeModules && globalThis.__pirNodeModules.diagnostics_channel;
+      const channel = dc ? (dc.channel || (dc.default && dc.default.channel)) : undefined;
+      if (typeof channel === "function") {
+        diagnosticChannels = {
+          log: channel("console.log"),
+          info: channel("console.info"),
+          debug: channel("console.debug"),
+          warn: channel("console.warn"),
+          error: channel("console.error"),
+        };
+      }
+    } catch {
+      diagnosticChannels = null;
+    }
+  }
+  if (diagnosticChannels === null) return;
+  const target = diagnosticChannels[method];
+  if (target && target.hasSubscribers) target.publish(args);
+}
+
+// ---------------------------------------------------------------------------
+// The global console (lib/internal/console/global.js): a namespace object
+// whose [[Prototype]] is an empty object, with every Console.prototype member
+// bound to it. `require("console") === globalThis.console` in Node, so this
+// object is the module's export.
+// ---------------------------------------------------------------------------
+
+const globalConsole = { __proto__: {} };
+
+for (const prop of Reflect.ownKeys(Console.prototype)) {
+  if (prop === "constructor") continue;
+  const desc = Object.getOwnPropertyDescriptor(Console.prototype, prop);
+  if (typeof desc.value === "function") {
+    // Fix the receiver; keep the original name (debug/info are aliases of
+    // log, error of warn — test-console-methods.js checks each name).
+    const name = desc.value.name;
+    desc.value = desc.value.bind(globalConsole);
+    Object.defineProperty(desc.value, "name", { value: name, configurable: true });
+  }
+  Object.defineProperty(globalConsole, prop, desc);
+}
+
+globalConsole[kBindStreamsLazy](defaultStreamSource);
+globalConsole[kBindProperties](true, "auto");
+
+// This is a legacy feature — the Console constructor is exposed on the global
+// console instance (and a Console *instance* does not carry these five; node's
+// global console gets them from the inspector console surface).
+globalConsole.Console = Console;
+globalConsole.profile = () => {};
+globalConsole.profileEnd = () => {};
+globalConsole.timeStamp = () => {};
+globalConsole.context = function context() {
+  // No per-async-context output routing: the shared host channel serves all.
+  return globalConsole;
+};
+globalConsole.createTask = () => {
+  const error = new Error("node:console.createTask is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  throw error;
+};
+
+// Install in place of the prelude console. A plain assignment keeps the
+// binding an ordinary writable/configurable property, which
+// test-console-assign-undefined.js relies on (`globalThis.console = 42` must
+// take effect and be reversible).
+globalThis.console = globalConsole;
+
+// ---------------------------------------------------------------------------
+// Module surface: node's lib/console.js re-exports the global console itself.
+// ---------------------------------------------------------------------------
+
+const log = globalConsole.log;
+const info = globalConsole.info;
+const debug = globalConsole.debug;
+const warn = globalConsole.warn;
+const error = globalConsole.error;
+const dir = globalConsole.dir;
+const dirxml = globalConsole.dirxml;
+const trace = globalConsole.trace;
+const assert = globalConsole.assert;
+const clear = globalConsole.clear;
+const count = globalConsole.count;
+const countReset = globalConsole.countReset;
+const group = globalConsole.group;
+const groupCollapsed = globalConsole.groupCollapsed;
+const groupEnd = globalConsole.groupEnd;
+const table = globalConsole.table;
+const time = globalConsole.time;
+const timeEnd = globalConsole.timeEnd;
+const timeLog = globalConsole.timeLog;
+const profile = globalConsole.profile;
+const profileEnd = globalConsole.profileEnd;
+const timeStamp = globalConsole.timeStamp;
+const context = globalConsole.context;
+const createTask = globalConsole.createTask;
+
+export default globalConsole;
+export {
+  Console, log, info, debug, warn, error, dir, dirxml, trace, assert, clear,
+  count, countReset, group, groupCollapsed, groupEnd, table,
+  time, timeEnd, timeLog, profile, profileEnd, timeStamp, context, createTask,
+};

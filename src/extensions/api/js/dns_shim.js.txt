@@ -1,0 +1,232 @@
+import * as dnsPromises from "@node/dns/promises";
+
+// node:dns: the callback form over the promise surface. `lookup` is real
+// (host resolver); the resolve* family throws one clear error each (no
+// c-ares query surface); the error-code/flag tables mirror the real values.
+
+function lookup(...args) {
+  let hostname = args[0];
+  let options = args[1];
+  let callback = args[args.length - 1];
+  if (typeof callback !== "function") {
+    throw new TypeError("The \"callback\" argument must be of type function");
+  }
+  if (typeof options === "function") {
+    options = {};
+  }
+  if (typeof options === "number") {
+    options = { family: options };
+  }
+  if (options === undefined || options === null) options = {};
+  Promise.resolve()
+    .then(() => dnsPromises.lookup(hostname, options))
+    .then(
+      (value) => {
+        if (options.all) callback(null, value);
+        else callback(null, value.address, value.family);
+      },
+      (error) => callback(error)
+    );
+}
+
+// Callback wrappers over the promise family (which rejects with the unified
+// unsupported error).
+function resolve(...args) {
+  const callback = args[args.length - 1];
+  if (typeof callback !== "function") {
+    throw new TypeError("The \"callback\" argument must be of type function");
+  }
+  const rrtype = typeof args[1] === "string" ? args[1] : "A";
+  const dispatch = {
+    A: dnsPromises.resolve4, AAAA: dnsPromises.resolve6, ANY: dnsPromises.resolveAny,
+    CAA: dnsPromises.resolveCaa, CNAME: dnsPromises.resolveCname, MX: dnsPromises.resolveMx,
+    NAPTR: dnsPromises.resolveNaptr, NS: dnsPromises.resolveNs, PTR: dnsPromises.resolvePtr,
+    SOA: dnsPromises.resolveSoa, SRV: dnsPromises.resolveSrv, TLSA: dnsPromises.resolveTlsa,
+    TXT: dnsPromises.resolveTxt,
+  };
+  const handler = dispatch[rrtype] || dnsPromises.resolve;
+  handler(args[0]).then((value) => callback(null, value), (error) => callback(error));
+}
+
+function resolve4(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolve4(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function resolve6(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolve6(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function resolveAny(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolveAny(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function resolveCaa(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolveCaa(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function resolveCname(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolveCname(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function resolveMx(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolveMx(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function resolveNaptr(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolveNaptr(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function resolveNs(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolveNs(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function resolvePtr(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolvePtr(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function resolveSoa(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolveSoa(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function resolveSrv(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolveSrv(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function resolveTlsa(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolveTlsa(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function resolveTxt(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.resolveTxt(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function reverse(hostname, ...rest) {
+  const callback = rest[rest.length - 1];
+  return dnsPromises.reverse(hostname).then((value) => callback(null, value), (error) => callback(error));
+}
+function lookupService(hostname, port, callback) {
+  dnsPromises.lookupService(hostname, port).then((value) => callback(null, value), (error) => callback(error));
+}
+
+function setServers(...args) {
+  const callback = args[args.length - 1];
+  if (typeof callback === "function") {
+    dnsPromises.setServers().catch((error) => callback(error));
+    return;
+  }
+  throw dnsPromises.setServers();
+}
+function getServers() {
+  return dnsPromises.getServers();
+}
+function setDefaultResultOrder(order) {
+  return dnsPromises.setDefaultResultOrder(order);
+}
+function getDefaultResultOrder() {
+  return dnsPromises.getDefaultResultOrder();
+}
+
+// Resolver: inert like the promises Resolver (construction throws).
+class Resolver {
+  constructor() {
+    const error = new Error("dns.Resolver is not supported by the pir extension runtime");
+    error.code = "ERR_NOT_SUPPORTED";
+    throw error;
+  }
+}
+
+const promises = dnsPromises;
+const ADDRCONFIG = dnsPromises.ADDRCONFIG;
+const V4MAPPED = dnsPromises.V4MAPPED;
+const ALL = dnsPromises.ALL;
+const ADDRGETNETWORKPARAMS = dnsPromises.ADDRGETNETWORKPARAMS;
+const BADFAMILY = dnsPromises.BADFAMILY;
+const BADFLAGS = dnsPromises.BADFLAGS;
+const BADHINTS = dnsPromises.BADHINTS;
+const BADNAME = dnsPromises.BADNAME;
+const BADQUERY = dnsPromises.BADQUERY;
+const BADRESP = dnsPromises.BADRESP;
+const BADSTR = dnsPromises.BADSTR;
+const CANCELLED = dnsPromises.CANCELLED;
+const CONNREFUSED = dnsPromises.CONNREFUSED;
+const DESTRUCTION = dnsPromises.DESTRUCTION;
+const EOF = dnsPromises.EOF;
+const FILE = dnsPromises.FILE;
+const FORMERR = dnsPromises.FORMERR;
+const LOADIPHLPAPI = dnsPromises.LOADIPHLPAPI;
+const NODATA = dnsPromises.NODATA;
+const NOMEM = dnsPromises.NOMEM;
+const NONAME = dnsPromises.NONAME;
+const NOTFOUND = dnsPromises.NOTFOUND;
+const NOTIMP = dnsPromises.NOTIMP;
+const NOTINITIALIZED = dnsPromises.NOTINITIALIZED;
+const REFUSED = dnsPromises.REFUSED;
+const SERVFAIL = dnsPromises.SERVFAIL;
+const TIMEOUT = dnsPromises.TIMEOUT;
+
+const dns = {
+  lookup: lookup,
+  lookupService: lookupService,
+  Resolver: Resolver,
+  resolve: resolve,
+  resolve4: resolve4,
+  resolve6: resolve6,
+  resolveAny: resolveAny,
+  resolveCaa: resolveCaa,
+  resolveCname: resolveCname,
+  resolveMx: resolveMx,
+  resolveNaptr: resolveNaptr,
+  resolveNs: resolveNs,
+  resolvePtr: resolvePtr,
+  resolveSoa: resolveSoa,
+  resolveSrv: resolveSrv,
+  resolveTlsa: resolveTlsa,
+  resolveTxt: resolveTxt,
+  reverse: reverse,
+  setServers: setServers,
+  getServers: getServers,
+  setDefaultResultOrder: setDefaultResultOrder,
+  getDefaultResultOrder: getDefaultResultOrder,
+  promises: dnsPromises,
+  ADDRCONFIG: dnsPromises.ADDRCONFIG,
+  V4MAPPED: dnsPromises.V4MAPPED,
+  ALL: dnsPromises.ALL,
+  ADDRGETNETWORKPARAMS: dnsPromises.ADDRGETNETWORKPARAMS,
+  BADFAMILY: dnsPromises.BADFAMILY,
+  BADFLAGS: dnsPromises.BADFLAGS,
+  BADHINTS: dnsPromises.BADHINTS,
+  BADNAME: dnsPromises.BADNAME,
+  BADQUERY: dnsPromises.BADQUERY,
+  BADRESP: dnsPromises.BADRESP,
+  BADSTR: dnsPromises.BADSTR,
+  CANCELLED: dnsPromises.CANCELLED,
+  CONNREFUSED: dnsPromises.CONNREFUSED,
+  DESTRUCTION: dnsPromises.DESTRUCTION,
+  EOF: dnsPromises.EOF,
+  FILE: dnsPromises.FILE,
+  FORMERR: dnsPromises.FORMERR,
+  LOADIPHLPAPI: dnsPromises.LOADIPHLPAPI,
+  NODATA: dnsPromises.NODATA,
+  NOMEM: dnsPromises.NOMEM,
+  NONAME: dnsPromises.NONAME,
+  NOTFOUND: dnsPromises.NOTFOUND,
+  NOTIMP: dnsPromises.NOTIMP,
+  NOTINITIALIZED: dnsPromises.NOTINITIALIZED,
+  REFUSED: dnsPromises.REFUSED,
+  SERVFAIL: dnsPromises.SERVFAIL,
+  TIMEOUT: dnsPromises.TIMEOUT,
+};
+
+export default dns;
+export {
+  lookup, lookupService, Resolver, resolve, resolve4, resolve6, resolveAny, resolveCaa,
+  resolveCname, resolveMx, resolveNaptr, resolveNs, resolvePtr, resolveSoa, resolveSrv,
+  resolveTlsa, resolveTxt, reverse, setServers, getServers, setDefaultResultOrder,
+  getDefaultResultOrder, promises,
+};
+export {
+  ADDRCONFIG, V4MAPPED, ALL, ADDRGETNETWORKPARAMS, BADFAMILY, BADFLAGS, BADHINTS,
+  BADNAME, BADQUERY, BADRESP, BADSTR, CANCELLED, CONNREFUSED, DESTRUCTION, EOF,
+  FILE, FORMERR, LOADIPHLPAPI, NODATA, NOMEM, NONAME, NOTFOUND, NOTIMP,
+  NOTINITIALIZED, REFUSED, SERVFAIL, TIMEOUT,
+};

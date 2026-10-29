@@ -1,0 +1,2352 @@
+// @earendil-works/pi-durable/env (+ /env/node) — virtual module shim.
+//
+// The durable side of the execution-environment contract: `packages/durable`
+// publishes `/env` (the `Result`/`FileError`/`ExecutionError` values, the
+// `FileSystem`/`Shell`/`ExecutionEnv`/`FileInfo`/`LineScan` shapes, the
+// `StreamDecoder` and the `LineScanner`) and `/env/node` (`NodeExecutionEnv`,
+// the local Node implementation: positional readers, a bounded line scanner,
+// `listFiles`, exec with spill/window/abort, and the `node:fs` watcher).
+//
+// This is its own virtual module (not part of `pi_durable_shim.js.txt`) because
+// it is the durable half that `@earendil-works/pi-env` builds on: the pi-env
+// client imports its contract values from here, and this module has no
+// dependency beyond `node:*` builtins, so that import stays cheap and cannot
+// fail on the kernel's npm dependencies. The kernel module carries a second,
+// internal copy of `src/env/index.ts` (its tools/storage/codemode faces import
+// the same contract values) — both copies are generated from the same source.
+//
+// Package entries served by this module:
+//   /env       src/env/index.ts   ok/err/getOrThrow/getOrUndefined/toError,
+//                                 FileError/ExecutionError, rangeDecoder/
+//                                 StreamDecoder/startsWithBom, LineScanner
+//   /env/node  src/env/node.ts    NodeExecutionEnv (upstream /env/node's only
+//                                 value export; the rest of that file is
+//                                 module-private)
+// As elsewhere in this port the surface is the union of the two entries, so a
+// name may link from the "wrong" entry where upstream would refuse.
+//
+// What is REAL here
+//   * The whole contract: `Result` (`{ok:true,value}` / `{ok:false,error}`),
+//     the two error classes with their upstream codes and fields
+//     (`FileError.code`/`path`/`cause`, `ExecutionError.code`/`spillPath`),
+//     `StreamDecoder` (BOM dropped once, U+FFFD instead of throwing, an
+//     incomplete trailing character held back), `LineScanner` and
+//     `rangeDecoder`/`startsWithBom`.
+//   * `NodeExecutionEnv` in full: node:fs/promises + fs handle based positional
+//     reads (`NodeBinaryReader`/`NodeDirReader`/`NodeTextLineReader`), the
+//     512 KiB read chunk, `scanLines`, listFiles with hidden/gitignore/exclude
+//     bounds, `Shell.exec` over `node:child_process.spawn` with spill,
+//     output window and abort, temp files/dirs, and the `node:fs` watcher
+//     (`NodeFileWatcher`, native or polling) behind `watch`.
+//
+// Deviations from upstream: none in the ported code; the `NodeExecutionEnv`
+// module is emitted here through the same mechanical pipeline as the kernel
+// (type-strip + concatenation + private-name renames, listed below).
+//
+// How this file is derived
+//   * `src/env/{index,decode,line-scan,node,node-watch}.ts` are type-stripped
+//     with `node:module` `stripTypeScriptTypes(mode: "strip")` (line and column
+//     positions kept), concatenated in dependency order into one module scope
+//     under `// ══ <path> ══` banners, relative imports/re-exports blanked in
+//     place and the `export ` prefix of local declarations blanked, so only the
+//     published-surface block at the end decides this module's exports.
+//   * One module-private collision is renamed inside the module that lost the
+//     name (nothing else in a module body changes): `isNodeError` keeps its
+//     name in node-watch.ts, and node.ts's copy becomes
+//     `envNodeisNodeError`.
+
+// ── merged upstream imports ────────────────────────────────────────────────
+import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { watch as fsWatch, constants, createWriteStream } from "node:fs";
+import { lstat, readdir, readFile, stat, statfs, access, appendFile, mkdir, mkdtemp, opendir, open as openFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { homedir, constants as osConstants, tmpdir } from "node:os";
+import { dirname, relative, sep, basename, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// ── upstream modules, dependency order ────────────────────────────────────
+
+// ══ src/env/decode.ts ══
+/**
+ * Decoding that matches `new TextDecoder().decode(bytes)` of the whole input when the input arrives in pieces. Node's
+ * streaming decoder with BOM handling can drop a U+FEFF that follows a chunk boundary, not only a leading byte-order
+ * mark, so these decoders turn BOM handling off and drop a leading mark themselves.
+ */
+
+/** A streaming decoder for a byte range; callers that start at the beginning of a file skip a leading mark themselves. */
+       function rangeDecoder()                                   {
+	return new TextDecoder("utf-8", { ignoreBOM: true });
+}
+
+/** Whether decoding the whole input drops its first three bytes as a byte-order mark. */
+       function startsWithBom(firstBytes            )          {
+	return firstBytes[0] === 0xef && firstBytes[1] === 0xbb && firstBytes[2] === 0xbf;
+}
+
+/** Decodes one stream chunk by chunk exactly like decoding all of it at once. */
+       class StreamDecoder {
+	         #decoder = rangeDecoder();
+	#started = false;
+
+	/** Text for `bytes`, holding back an incomplete character; without `bytes`, the end of the stream. */
+	decode(bytes             )         {
+		const text = bytes === undefined ? this.#decoder.decode() : this.#decoder.decode(bytes, { stream: true });
+		if (this.#started || text === "") return text;
+		this.#started = true;
+		// U+FEFF encodes only as EF BB BF, so a leading U+FEFF is exactly a byte-order mark at the stream's start.
+		return text.startsWith("\ufeff") ? text.slice(1) : text;
+	}
+}
+
+// ══ src/env/line-scan.ts ══
+                                                          
+                                           
+
+const NEWLINE = 0x0a;
+const encoder = new TextEncoder();
+
+/** UTF-8 byte length of decoded text. */
+function decodedBytes(text        )         {
+	return text === "" ? 0 : encoder.encode(text).length;
+}
+
+/**
+ * Computes a `LineScan` from a file's bytes fed in order, so an environment can scan any size in bounded memory. Decoded
+ * sizes use the same streaming WHATWG decoder as decoding the whole file at once.
+ */
+       class LineScanner {
+	         #startLine        ;
+	         #endLine        ;
+	#position = 0;
+	#newlines = 0;
+	#lineStart = 0;
+	#start                    ;
+	#end                    ;
+	#firstLineEnd                    ;
+	#lastLineStart                    ;
+	#selectedBytes = 0;
+	#firstLineBytes = 0;
+	#selection                                              ;
+	#firstLine                                              ;
+	/** The first bytes, held until it is known whether they are a byte-order mark. */
+	#head                       = [];
+	#bom = false;
+
+	/** `startLine` and `endLine` must be non-negative integers with `endLine > startLine`; `endLine` absent: to the end. */
+	constructor(startLine        , endLine = Number.POSITIVE_INFINITY) {
+		if (!Number.isSafeInteger(startLine) || startLine < 0 || !(endLine > startLine)) {
+			throw new RangeError("Invalid line range");
+		}
+		if (endLine !== Number.POSITIVE_INFINITY && !Number.isSafeInteger(endLine))
+			throw new RangeError("Invalid line range");
+		this.#startLine = startLine;
+		this.#endLine = endLine;
+		if (startLine === 0) this.#begin(0);
+	}
+
+	push(chunk            )       {
+		if (this.#head !== undefined) {
+			const take = Math.min(3 - this.#head.length, chunk.length);
+			this.#head.push(...chunk.subarray(0, take));
+			if (this.#head.length < 3) return;
+			this.#releaseHead();
+			chunk = chunk.subarray(take);
+		}
+		this.#process(chunk);
+	}
+
+	#releaseHead()       {
+		const head = Uint8Array.from(this.#head ?? []);
+		this.#head = undefined;
+		this.#bom = startsWithBom(head);
+		this.#process(head);
+	}
+
+	#process(chunk            )       {
+		const base = this.#position;
+		let from = 0;
+		for (let index = chunk.indexOf(NEWLINE); index !== -1; index = chunk.indexOf(NEWLINE, index + 1)) {
+			// The newline ends line `this.#newlines`. It belongs to the selection between selected lines only.
+			this.#feed(chunk, base, from, index);
+			const line = this.#newlines;
+			const position = base + index;
+			if (line === this.#startLine) this.#endFirstLine(position);
+			if (line === this.#endLine - 1) this.#endSelection(position);
+			this.#feed(chunk, base, index, index + 1);
+			from = index + 1;
+			this.#newlines++;
+			this.#lineStart = position + 1;
+			if (this.#newlines === this.#startLine) this.#begin(this.#lineStart);
+			if (this.#newlines === this.#endLine - 1) this.#lastLineStart = this.#lineStart;
+		}
+		this.#feed(chunk, base, from, chunk.length);
+		this.#position += chunk.length;
+	}
+
+	finish()           {
+		if (this.#head !== undefined) this.#releaseHead();
+		const size = this.#position;
+		if (this.#start === undefined) {
+			return {
+				newlines: this.#newlines,
+				start: size,
+				end: size,
+				firstLineEnd: size,
+				lastLineStart: size,
+				selectedBytes: 0,
+				firstLineBytes: 0,
+			};
+		}
+		if (this.#firstLineEnd === undefined) this.#endFirstLine(size);
+		if (this.#end === undefined) this.#endSelection(size);
+		return {
+			newlines: this.#newlines,
+			start: this.#start,
+			end: this.#end ?? size,
+			firstLineEnd: this.#firstLineEnd ?? size,
+			// A selection that reaches past the last line ends with the last line.
+			lastLineStart: this.#lastLineStart ?? this.#lineStart,
+			selectedBytes: this.#selectedBytes,
+			firstLineBytes: this.#firstLineBytes,
+		};
+	}
+
+	#begin(start        )       {
+		this.#start = start;
+		if (this.#startLine === this.#endLine - 1) this.#lastLineStart = start;
+		this.#selection = rangeDecoder();
+		this.#firstLine = rangeDecoder();
+	}
+
+	#endFirstLine(position        )       {
+		this.#firstLineEnd = position;
+		if (this.#firstLine !== undefined) this.#firstLineBytes += decodedBytes(this.#firstLine.decode());
+		this.#firstLine = undefined;
+	}
+
+	#endSelection(position        )       {
+		this.#end = position;
+		if (this.#selection !== undefined) this.#selectedBytes += decodedBytes(this.#selection.decode());
+		this.#selection = undefined;
+	}
+
+	/** Feed `chunk[from, to)`, which starts at file offset `base`, to the decoders of the ranges still open. */
+	#feed(chunk            , base        , from        , to        )       {
+		// Decoding the whole file drops a leading byte-order mark.
+		if (this.#bom && base + from < 3) from = Math.min(to, 3 - base);
+		if (to <= from) return;
+		const bytes = chunk.subarray(from, to);
+		if (this.#selection !== undefined) {
+			this.#selectedBytes += decodedBytes(this.#selection.decode(bytes, { stream: true }));
+		}
+		if (this.#firstLine !== undefined) {
+			this.#firstLineBytes += decodedBytes(this.#firstLine.decode(bytes, { stream: true }));
+		}
+	}
+}
+
+// ══ src/env/index.ts ══
+                                                     
+
+/** Result of a fallible operation. Expected failures are returned instead of thrown. */
+                                                                                                
+
+       function ok                (value        )                         {
+	return { ok: true, value };
+}
+
+       function err                (error        )                         {
+	return { ok: false, error };
+}
+
+       function getOrThrow                (result                        )         {
+	if (!result.ok) throw result.error;
+	return result.value;
+}
+
+       function getOrUndefined                               (result                        )                     {
+	return result.ok ? result.value : undefined;
+}
+
+       function toError(error         )        {
+	if (error instanceof Error) return error;
+	if (typeof error === "string") return new Error(error);
+	try {
+		return new Error(JSON.stringify(error));
+	} catch {
+		return new Error(String(error));
+	}
+}
+
+                                                        
+
+                           
+	           
+	             
+	                     
+	                 
+	                
+	           
+	                 
+	            
+
+       class FileError extends Error {
+	       code               ;
+	       path         ;
+
+	constructor(code               , message        , path         , cause        ) {
+		super(message, cause === undefined ? undefined : { cause });
+		this.name = "FileError";
+		this.code = code;
+		this.path = path;
+	}
+}
+
+                                
+	           
+	           
+	                     
+	               
+	                  
+	            
+
+       class ExecutionError extends Error {
+	       code                    ;
+	/** Spill file of a command that timed out or was aborted after its output crossed the spill thresholds. */
+	       spillPath         ;
+
+	constructor(code                    , message        , cause        ) {
+		super(message, cause === undefined ? undefined : { cause });
+		this.name = "ExecutionError";
+		this.code = code;
+	}
+}
+
+                           
+	             
+	             
+	               
+	             
+	                
+ 
+
+                           
+	             
+	                    
+ 
+
+                                 
+	                                                                             
+	                                       
+ 
+
+/** Positional reads from one opened regular file; all calls see the same file even if its path is renamed. */
+                               
+	                                                                       
+	                                                             
+	                                                                   
+	                                                                                               
+	   
+	                                                                                                                       
+	                                                                                                                       
+	                                                                                        
+	   
+	                                                                                                                    
+	                                       
+ 
+
+/** A file or directory to watch. It may be missing; creating it is a change. */
+                              
+	             
+	                                                                                                          
+	                    
+	                                                                                                           
+	                                                          
+ 
+
+/**
+ * What changed:
+ * - `paths`: something at or below each path may have changed (a directory path covers its whole subtree). Calls may be
+ *   spurious; a change is never missed while the watcher is healthy.
+ * - `overflow`: coverage was uncertain for a while (lost events, reconnect); rescan everything that is watched.
+ * - `error`: the watcher stopped, for example because the watched tree grew past the environment's limit; no calls
+ *   follow.
+ */
+                                                                                          
+
+                              
+	   
+	                                                                                                                  
+	                                                                                                                
+	                           
+	   
+	                                    
+	                                                                                
+	                                       
+ 
+
+/** Where lines of a file are, as `BinaryReader.scanLines` found them. */
+                           
+	                                                                    
+	                 
+	   
+	                                                                                                                 
+	                                                                           
+	   
+	              
+	            
+	                                                                               
+	                     
+	                                           
+	                      
+	                                                                        
+	                      
+	                       
+ 
+
+/** Pages of one directory's entries. */
+                            
+	   
+	                                                                                                                    
+	                                                                                                                     
+	                                                                                                                      
+	   
+	                                                                                                               
+	                                       
+ 
+
+/** What `FileSystem.listFiles` lists. */
+                                   
+	   
+	                                                                                                                 
+	                           
+	   
+	                 
+	   
+	                                                                                                                     
+	                                                                                                                       
+	                                                                                                
+	   
+	                    
+	                                                                                   
+	                            
+	                                            
+	                    
+	                                                                                                    
+	                  
+	                                                             
+	                   
+ 
+
+/** One entry of a `FileListing`. */
+                                
+	                                                                             
+	             
+	                                                          
+	               
+ 
+
+                              
+	                                                                                        
+	                         
+	                                                             
+	                   
+ 
+
+/** Portable filesystem capability. Operations return failures rather than throwing. */
+                             
+	   
+	                                                                                                             
+	                                                                        
+	   
+	                    
+	            
+	                                                                                 
+	                                                                                
+	                                                                                 
+	                                                                                               
+	              
+		             
+		                                           
+		                 
+	                                        
+	                                                                                       
+	   
+	                                                                                                                   
+	                                                                                                                     
+	                                                   
+	   
+	                 
+		             
+		                                            
+		                 
+	                                            
+	                                                                                                          
+	                                                                                                           
+	                                                         
+	                                                                                             
+	                                                                                         
+	                                                                            
+	                                                                                                            
+	                                                                               
+	                                                                                
+	   
+	                                                                                                                
+	                                                                                                                    
+	                                                                                                                   
+	                                                                                                          
+	   
+	           
+		             
+		                                      
+		                 
+	                                           
+	                                                                                     
+	   
+	                                                                                                                 
+	                                                                                                                    
+	                                                                                        
+	   
+	      
+		                                
+		                                        
+		                 
+	                                           
+	                                                                                  
+	                                                                            
+	          
+		             
+		                                             
+		                 
+	                                    
+	       
+		             
+		                                                              
+		                 
+	                                    
+	                                                                                                
+	               
+		                                                          
+		                 
+	                                      
+	                                         
+ 
+
+/** Spill the complete output to a temporary file once it exceeds either threshold. */
+                                    
+	                   
+	                                 
+	                   
+ 
+
+                                  
+	                 
+	                                                                                               
+	                   
+ 
+
+                                   
+	             
+	                             
+	                     
+	                 
+	   
+	                                                                                                               
+	                                                                                                              
+	   
+	                                                                           
+	                          
+	   
+	                                                                                                                       
+	                                                           
+	   
+	                           
+ 
+
+/**
+ * The tail of the combined output a caller keeps, and how often it samples it. An environment that transfers output
+ * over a slow link uses it to omit what the caller would drop anyway and to send no faster than the caller commits.
+ */
+                                    
+	                                                                 
+	                 
+	                                           
+	                 
+	                                                                
+	                      
+	                                                                                 
+	                       
+ 
+
+/**
+ * Output an environment omitted, measured on the decoded text `onOutput` would have received: every U+FFFD counts as
+ * three bytes, and no sanitizing is applied.
+ */
+
+// ══ src/env/node-watch.ts ══
+                                         
+                                                                       
+                                                                          
+                                                   
+                                                     
+                                                                                             
+
+/** How `NodeExecutionEnv` watches. */
+                                   
+	   
+	                                                                                                                    
+	                                                                                  
+	   
+	                            
+	                                                                     
+	                        
+	                                                           
+	                        
+ 
+
+                       
+	                      
+	                            
+	                         
+	                                    
+  
+
+/** What a snapshot remembers of one path. Directories and ancestors are compared by identity only. */
+              
+	                                                          
+	                     
+	                     
+	                      
+	                         
+	                       
+  
+
+                                   
+
+/** A native watcher and the identity of what it was installed on: a path replaced by another file needs a new one. */
+                                                                                             
+
+/** A scan: the snapshot, and targets that are symbolic links to files, whose files need their own watchers. */
+                                                                                       
+
+const DEBOUNCE_MS = 50;
+/**
+ * On macOS, `fs.watch` returns before libuv's FSEvents stream is live, and changes in between are never reported
+ * (about 2% of changes made right after the call, none after 100 ms). A rescan this long after installing watchers
+ * catches them.
+ */
+const FSEVENTS_SETTLE_MS = 500;
+const DEFAULT_POLL_MS = 2000;
+const DEFAULT_MAX_DIRECTORIES = 10_000;
+/** In polling mode, recently modified small files are also compared by content: a second write within the file system's
+ * timestamp granularity can keep size and modification time. */
+const HASH_MAX_BYTES = 256 * 1024;
+const HASH_RECENT_MS = 5000;
+
+/** Linux `statfs` magic numbers of file systems that accept watches but do not report changes made elsewhere. */
+const UNRELIABLE_FILE_SYSTEMS = new Set([
+	0x6969, // NFS
+	0x517b, // SMB
+	0xff534d42, // CIFS
+	0xfe534d42, // SMB2
+	0x65735546, // FUSE (sshfs, Android shared storage)
+	0x01021997, // 9P (WSL2 Windows drives)
+	0x0bd00bd0, // Lustre
+	0x47504653, // GPFS
+	0x00c36400, // Ceph
+	0x5346414f, // OpenAFS
+	0x6b414653, // kAFS
+	0x5dca2df5, // sdcardfs
+]);
+
+class BudgetExceeded extends Error {}
+
+function isNodeError(error         )                                 {
+	return error instanceof Error && "code" in error;
+}
+
+function isDenied(error         )          {
+	return isNodeError(error) && (error.code === "EACCES" || error.code === "EPERM");
+}
+
+function entryOf(stats       , hash         )        {
+	const kind = stats.isFile()
+		? "file"
+		: stats.isDirectory()
+			? "directory"
+			: stats.isSymbolicLink()
+				? "symlink"
+				: "other";
+	return {
+		kind,
+		dev: stats.dev,
+		ino: stats.ino,
+		size: kind === "directory" ? 0 : stats.size,
+		mtimeMs: kind === "directory" ? 0 : stats.mtimeMs,
+		...(hash === undefined ? {} : { hash }),
+	};
+}
+
+function sameEntry(a       , b       )          {
+	return (
+		a.kind === b.kind &&
+		a.dev === b.dev &&
+		a.ino === b.ino &&
+		a.size === b.size &&
+		a.mtimeMs === b.mtimeMs &&
+		a.hash === b.hash
+	);
+}
+
+/** Ancestors of `path`, nearest first, up to the root. */
+function ancestorsOf(path        )           {
+	const result           = [];
+	for (let current = dirname(path); ; current = dirname(current)) {
+		result.push(current);
+		if (dirname(current) === current) return result;
+	}
+}
+
+/** Whether `path` is `ancestor` or below it. */
+function isWithin(path        , ancestor        )          {
+	return path === ancestor || path.startsWith(ancestor.endsWith(sep) ? ancestor : ancestor + sep);
+}
+
+function excluded(target                , name        )          {
+	return (target.hidden && name.startsWith(".")) || target.names.has(name);
+}
+
+/**
+ * Watches by snapshots: native events only trigger a debounced rescan, and changes are the difference between
+ * snapshots plus the event paths. A replaced file, a renamed or recreated ancestor, or a directory created with its
+ * contents therefore never depends on which events an operating system sends. New directories get their watchers
+ * before they are scanned again, so nothing written into them before the watcher existed is missed.
+ */
+       class NodeFileWatcher                        {
+	         #targets                           ;
+	         #onChange                               ;
+	         #pollIntervalMs        ;
+	         #maxDirectories        ;
+	         #watchers = new Map                   ();
+	         #events = new Set        ();
+	#mode                      ;
+	#snapshot           = new Map();
+	#timer                                           ;
+	#settleTimer                                           ;
+	#running                           ;
+	#dirty = false;
+	#closed = false;
+
+	        constructor(
+		targets                           ,
+		onChange                               ,
+		mode                      ,
+		options                  ,
+	) {
+		this.#targets = targets;
+		this.#onChange = onChange;
+		this.#mode = mode;
+		this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_MS;
+		this.#maxDirectories = options.maxDirectories ?? DEFAULT_MAX_DIRECTORIES;
+	}
+
+	/** Establish coverage: watchers first, then the snapshot later changes are compared with. */
+	static async open(
+		targets                        ,
+		resolvePath                          ,
+		onChange                               ,
+		options                  ,
+	)                           {
+		const resolved = targets.map((target) => ({
+			path: resolvePath(target.path),
+			recursive: target.recursive === true,
+			hidden: target.exclude?.hidden === true,
+			names: new Set(target.exclude?.names ?? []),
+		}));
+		// Windows refuses to rename a directory while another directory below it is open, and a native watcher keeps
+		// every watched directory open: watching would break renames of their parents, so Windows polls.
+		const mode =
+			options.mode ??
+			(process.platform === "win32" || (await anyUnreliable(resolved.map((target) => target.path)))
+				? "polling"
+				: "native");
+		const watcher = new NodeFileWatcher(resolved, onChange, mode, options);
+		try {
+			await watcher.#sync(false);
+		} catch (error) {
+			watcher.#stop();
+			if (error instanceof BudgetExceeded) throw new FileError("invalid", error.message);
+			throw error;
+		}
+		watcher.#schedulePoll();
+		return watcher;
+	}
+
+	get mode()                       {
+		return this.#mode;
+	}
+
+	async close(_context         )                {
+		if (this.#closed) return;
+		this.#stop();
+		await this.#running;
+	}
+
+	#stop()       {
+		this.#closed = true;
+		clearTimeout(this.#timer);
+		this.#timer = undefined;
+		clearTimeout(this.#settleTimer);
+		this.#settleTimer = undefined;
+		for (const { watcher } of this.#watchers.values()) watcher.close();
+		this.#watchers.clear();
+	}
+
+	#deliver(change             )       {
+		if (this.#closed) return;
+		try {
+			this.#onChange(change);
+		} catch {
+			// A throwing callback must not stop watching.
+		}
+	}
+
+	#schedulePoll()       {
+		if (this.#closed || this.#mode !== "polling") return;
+		this.#timer = setTimeout(() => {
+			this.#timer = undefined;
+			void this.#flush().finally(() => this.#schedulePoll());
+		}, this.#pollIntervalMs);
+	}
+
+	#scheduleFlush()       {
+		if (this.#closed || this.#timer !== undefined) return;
+		this.#timer = setTimeout(() => {
+			this.#timer = undefined;
+			void this.#flush();
+		}, DEBOUNCE_MS);
+	}
+
+	#scheduleSettle()       {
+		if (this.#closed) return;
+		clearTimeout(this.#settleTimer);
+		this.#settleTimer = setTimeout(() => {
+			this.#settleTimer = undefined;
+			void this.#flush();
+		}, FSEVENTS_SETTLE_MS);
+	}
+
+	#flush()                {
+		if (this.#running !== undefined) {
+			this.#dirty = true;
+			return this.#running;
+		}
+		this.#running = (async () => {
+			try {
+				do {
+					this.#dirty = false;
+					const events = [...this.#events];
+					this.#events.clear();
+					const changed = await this.#sync(true);
+					for (const path of events) changed.add(path);
+					if (changed.size > 0) this.#deliver({ paths: [...changed].sort() });
+				} while (this.#dirty && !this.#closed);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				const fileError =
+					error instanceof FileError
+						? error
+						: new FileError(isDenied(error) ? "permission_denied" : "invalid", message);
+				this.#deliver({ error: fileError });
+				this.#stop();
+			} finally {
+				this.#running = undefined;
+			}
+		})();
+		return this.#running;
+	}
+
+	/** Rescan, report differences, and install watchers for new directories, rescanning until none are new. */
+	async #sync(report         )                       {
+		const changed = new Set        ();
+		for (let round = 0; round < 10 && !this.#closed; round++) {
+			const scan = await this.#scan();
+			// Closed during the scan: installing watchers now would leak them.
+			if (this.#closed) break;
+			const next = scan.snapshot;
+			if (report) for (const path of this.#diff(this.#snapshot, next)) changed.add(path);
+			this.#snapshot = next;
+			if (this.#mode === "polling" || !this.#reconcileWatchers(scan)) break;
+			if (process.platform === "darwin") this.#scheduleSettle();
+			// Something written into a new directory before its watcher existed shows up in the next round.
+			report = true;
+		}
+		return changed;
+	}
+
+	#diff(previous          , next          )           {
+		const changed           = [];
+		for (const [path, entry] of next) {
+			const before = previous.get(path);
+			if (before === undefined || !sameEntry(before, entry)) changed.push(this.#reported(path));
+		}
+		for (const path of previous.keys()) if (!next.has(path)) changed.push(this.#reported(path));
+		return changed;
+	}
+
+	/** An ancestor that changed identity moved every target below it; report those targets. */
+	#reported(path        )         {
+		if (this.#targets.some((target) => isWithin(path, target.path))) return path;
+		return this.#targets.find((target) => isWithin(target.path, path))?.path ?? path;
+	}
+
+	async #scan()                {
+		const snapshot           = new Map();
+		const linkedFiles = new Set        ();
+		// Directories are counted once, but traversed once per target: overlapping targets differ in recursion and
+		// exclusions, and an entry recorded for one target must still be descended into for another.
+		const counted = new Set        ();
+		const traversed = new Set        ();
+		/** Kinds of listed entries, not following links: a target that links to a directory is recorded by `stat`, but
+		 * symbolic links below a recursive target are not followed. */
+		const listed = new Map                       ();
+		const countDirectory = (path        )       => {
+			counted.add(path);
+			if (counted.size > this.#maxDirectories) {
+				throw new BudgetExceeded(`Watched paths exceed ${this.#maxDirectories} directories`);
+			}
+		};
+		const record = async (path        , stats       )                => {
+			let hash                    ;
+			if (
+				this.#mode === "polling" &&
+				stats.isFile() &&
+				stats.size <= HASH_MAX_BYTES &&
+				Date.now() - stats.mtimeMs < HASH_RECENT_MS
+			) {
+				hash = await readFile(path).then(
+					(content) => createHash("sha256").update(content).digest("hex"),
+					() => undefined,
+				);
+			}
+			snapshot.set(path, entryOf(stats, hash));
+		};
+		const scanDirectory = async (index        , target                , directory        )                => {
+			const key = `${index}\0${directory}`;
+			if (traversed.has(key)) return;
+			traversed.add(key);
+			let names          ;
+			try {
+				names = await readdir(directory);
+			} catch (error) {
+				// The watched directory itself must be readable; below it, unreadable directories are skipped.
+				if (directory === target.path && isDenied(error)) throw error;
+				if (isNodeError(error) && ["ENOENT", "EACCES", "EPERM", "ENOTDIR"].includes(error.code ?? "")) return;
+				throw error;
+			}
+			for (const name of names) {
+				if (excluded(target, name)) continue;
+				const path = `${directory.endsWith(sep) ? directory : directory + sep}${name}`;
+				let kind = listed.get(path);
+				if (kind === undefined) {
+					const stats = await lstat(path).catch(() => undefined);
+					if (stats === undefined) continue;
+					kind = entryOf(stats).kind;
+					listed.set(path, kind);
+					// A target's own entry (following links) wins over its listing by another target.
+					if (!snapshot.has(path)) await record(path, stats);
+				}
+				if (target.recursive && kind === "directory") {
+					countDirectory(path);
+					await scanDirectory(index, target, path);
+				}
+			}
+		};
+		for (const [index, target] of this.#targets.entries()) {
+			for (const ancestor of ancestorsOf(target.path)) {
+				if (snapshot.has(ancestor)) continue;
+				const stats = await lstat(ancestor).catch(() => undefined);
+				// Identity only: an ancestor's own timestamps change with every unrelated sibling.
+				if (stats !== undefined) snapshot.set(ancestor, { ...entryOf(stats), size: 0, mtimeMs: 0 });
+			}
+			// The target itself may be a symbolic link to what is watched; follow it. A missing target is watched for its
+			// creation; one that cannot be reached for lack of permission fails.
+			let stats       ;
+			try {
+				stats = await stat(target.path);
+			} catch (error) {
+				if (isDenied(error)) throw error;
+				continue;
+			}
+			await record(target.path, stats);
+			if (stats.isFile() && (await lstat(target.path).catch(() => undefined))?.isSymbolicLink()) {
+				linkedFiles.add(target.path);
+			}
+			if (stats.isDirectory()) {
+				countDirectory(target.path);
+				await scanDirectory(index, target, target.path);
+			}
+		}
+		return { snapshot, linkedFiles };
+	}
+
+	/**
+	 * Watch every existing ancestor of each target, each target directory, each target that is a symbolic link to a file
+	 * (changes to that file are not events of the link's directory), and on Linux each directory below a recursive target
+	 * (elsewhere one recursive watcher per target). Returns whether a watcher was added.
+	 */
+	#reconcileWatchers({ snapshot, linkedFiles }      )          {
+		const wanted = new Map                 ();
+		for (const path of linkedFiles) wanted.set(path, false);
+		const perDirectory = process.platform === "linux" || process.platform === "android";
+		for (const target of this.#targets) {
+			for (const ancestor of ancestorsOf(target.path)) {
+				if (snapshot.get(ancestor)?.kind === "directory" && !wanted.has(ancestor)) wanted.set(ancestor, false);
+			}
+			if (snapshot.get(target.path)?.kind !== "directory") continue;
+			const recursiveRoot = target.recursive && !perDirectory;
+			wanted.set(target.path, recursiveRoot);
+			if (target.recursive && perDirectory) {
+				for (const [path, entry] of snapshot) {
+					if (entry.kind === "directory" && path !== target.path && isWithin(path, target.path)) {
+						wanted.set(path, false);
+					}
+				}
+			}
+		}
+		for (const [path, installed] of this.#watchers) {
+			const entry = snapshot.get(path);
+			// Gone, or replaced: a watcher follows the directory it was installed on, not the path.
+			if (!wanted.has(path) || entry === undefined || entry.dev !== installed.dev || entry.ino !== installed.ino) {
+				installed.watcher.close();
+				this.#watchers.delete(path);
+			}
+		}
+		let added = false;
+		for (const [path, recursive] of wanted) {
+			const entry = snapshot.get(path);
+			if (this.#watchers.has(path) || entry === undefined) continue;
+			const linked = linkedFiles.has(path);
+			try {
+				const watcher = fsWatch(path, { recursive, persistent: false }, (_event, filename) =>
+					linked
+						? this.#onLinkedFileEvent(path)
+						: this.#onEvent(path, filename === null ? undefined : String(filename)),
+				);
+				// A watched directory that disappears or fails: rescan, which also replaces the watcher.
+				watcher.on("error", () => {
+					watcher.close();
+					if (this.#watchers.get(path)?.watcher === watcher) this.#watchers.delete(path);
+					this.#scheduleFlush();
+				});
+				this.#watchers.set(path, { watcher, dev: entry.dev, ino: entry.ino });
+				added = true;
+			} catch (error) {
+				// Out of watches or unsupported: compare snapshots from now on, and say coverage was uncertain.
+				if (isNodeError(error) && error.code !== "ENOENT" && error.code !== "EACCES" && error.code !== "EPERM") {
+					this.#switchToPolling();
+					return false;
+				}
+			}
+		}
+		return added;
+	}
+
+	#switchToPolling()       {
+		if (this.#mode === "polling") return;
+		this.#mode = "polling";
+		for (const { watcher } of this.#watchers.values()) watcher.close();
+		this.#watchers.clear();
+		this.#deliver({ overflow: true });
+		clearTimeout(this.#timer);
+		this.#timer = undefined;
+		this.#schedulePoll();
+	}
+
+	#onEvent(directory        , filename                    )       {
+		if (this.#closed) return;
+		const path =
+			filename === undefined ? directory : `${directory.endsWith(sep) ? directory : directory + sep}${filename}`;
+		// Events about unrelated siblings of an ancestor, or about excluded entries, are ignored.
+		const relevant = this.#inScope(path);
+		if (relevant) this.#events.add(this.#reported(path));
+		if (relevant || filename === undefined) this.#scheduleFlush();
+	}
+
+	/** The file a target links to changed: report the target. */
+	#onLinkedFileEvent(target        )       {
+		if (this.#closed) return;
+		this.#events.add(target);
+		this.#scheduleFlush();
+	}
+
+	#inScope(path        )          {
+		for (const target of this.#targets) {
+			if (isWithin(target.path, path)) return true;
+			if (!isWithin(path, target.path) || path === target.path) continue;
+			const components = relative(target.path, path).split(sep);
+			if (!target.recursive && components.length > 1) continue;
+			if (components.some((name) => excluded(target, name))) continue;
+			return true;
+		}
+		return false;
+	}
+}
+
+/** Whether any path, or its nearest existing ancestor, is on a file system that does not report remote changes. */
+async function anyUnreliable(paths                   )                   {
+	if (process.platform !== "linux" && process.platform !== "android") return false;
+	for (const path of paths) {
+		for (const candidate of [path, ...ancestorsOf(path)]) {
+			const info = await statfs(candidate).catch(() => undefined);
+			if (info === undefined) continue;
+			if (UNRELIABLE_FILE_SYSTEMS.has(info.type)) return true;
+			break;
+		}
+	}
+	return false;
+}
+
+// ══ src/env/node.ts ══
+                                                              
+                                         
+                                                                                               
+        
+        
+            
+                 
+       
+       
+         
+         
+                  
+         
+          
+          
+        
+    
+           
+                          
+                                                                    
+                                                                
+                                         
+                                                     
+                                            
+        
+                   
+                
+                   
+                
+     
+           
+               
+               
+                  
+               
+    
+             
+                       
+                      
+                      
+               
+                     
+         
+                  
+                  
+                    
+                                             
+                                                                         
+
+const MAX_TIMEOUT_MS = 2_147_483_647;
+const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
+const EXIT_STDIO_GRACE_MS = 100;
+const SPILL_HIGH_WATER_MARK = 1024 * 1024;
+/** Largest single read of a `BinaryReader`, so a huge `length` allocates only as much as the file yields. */
+const BINARY_READ_CHUNK = 1024 * 1024;
+
+                                      
+
+function resolveTimeoutMs(timeout                    )                                             {
+	if (timeout === undefined) return ok(undefined);
+	if (!Number.isFinite(timeout) || timeout <= 0) {
+		return err(new ExecutionError("timeout", "Invalid timeout: must be a finite number of seconds"));
+	}
+
+	const timeoutMs = timeout * 1000;
+	if (timeoutMs > MAX_TIMEOUT_MS) {
+		return err(new ExecutionError("timeout", `Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`));
+	}
+	return ok(timeoutMs);
+}
+
+function resolvePath(cwd        , path        )         {
+	let normalized = path;
+	if (normalized === "~") {
+		normalized = homedir();
+	} else if (normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\"))) {
+		normalized = join(homedir(), normalized.slice(2));
+	} else if (normalized.startsWith("file://")) {
+		try {
+			normalized = fileURLToPath(normalized);
+		} catch {
+			// Keep malformed URLs as ordinary paths so filesystem methods preserve their non-throwing contract.
+		}
+	}
+	return isAbsolute(normalized) ? resolve(normalized) : resolve(cwd, normalized);
+}
+
+function fileKindFromStats(stats   
+	                  
+	                       
+	                          
+ )                       {
+	if (stats.isFile()) return "file";
+	if (stats.isDirectory()) return "directory";
+	if (stats.isSymbolicLink()) return "symlink";
+	return undefined;
+}
+
+function fileInfoFromStats(
+	path        ,
+	stats                                                                                                         ,
+)                              {
+	const kind = fileKindFromStats(stats);
+	if (!kind) return err(new FileError("invalid", "Unsupported file type", path));
+	return ok({
+		name: basename(path),
+		path,
+		kind,
+		size: stats.size,
+		mtimeMs: stats.mtimeMs,
+	});
+}
+
+function envNodeisNodeError(error         )                                 {
+	return error instanceof Error && "code" in error;
+}
+
+function toFileError(error         , fallbackPath         )            {
+	if (error instanceof FileError) return error;
+	const cause = toError(error);
+	const nodeError = envNodeisNodeError(error) ? error : undefined;
+	const path = typeof nodeError?.path === "string" ? nodeError.path : fallbackPath;
+	if (nodeError) {
+		const message = nodeError.message;
+		switch (nodeError.code) {
+			case "ABORT_ERR":
+				return new FileError("aborted", message, path, cause);
+			case "ENOENT":
+				return new FileError("not_found", message, path, cause);
+			case "EACCES":
+			case "EPERM":
+				return new FileError("permission_denied", message, path, cause);
+			case "ENOTDIR":
+				return new FileError("not_directory", message, path, cause);
+			case "EISDIR":
+				return new FileError("is_directory", message, path, cause);
+			case "EINVAL":
+				return new FileError("invalid", message, path, cause);
+		}
+	}
+	return new FileError("unknown", cause.message, path, cause);
+}
+
+function abortResult        (signal                         , path         )                                        {
+	return signal?.aborted ? err(new FileError("aborted", "aborted", path)) : undefined;
+}
+
+async function pathExists(path        )                   {
+	try {
+		await access(path, constants.F_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function runCommand(
+	command        ,
+	args          ,
+	timeoutMs        ,
+)                                                     {
+	return await new Promise((resolve) => {
+		let stdout = "";
+		let child                          ;
+		try {
+			child = spawn(command, args, {
+				stdio: ["ignore", "pipe", "ignore"],
+				windowsHide: true,
+			});
+		} catch {
+			resolve({ stdout: "", status: null });
+			return;
+		}
+		const timeout = setTimeout(() => {
+			if (child.pid) killProcessTree(child.pid);
+		}, timeoutMs);
+		child.stdout?.setEncoding("utf8");
+		child.stdout?.on("data", (chunk        ) => {
+			stdout += chunk;
+		});
+		child.on("error", () => {
+			clearTimeout(timeout);
+			resolve({ stdout: "", status: null });
+		});
+		child.on("close", (status) => {
+			clearTimeout(timeout);
+			resolve({ stdout, status });
+		});
+	});
+}
+
+async function findBashOnPath()                         {
+	const result =
+		process.platform === "win32"
+			? await runCommand("where", ["bash.exe"], 5000)
+			: await runCommand("which", ["bash"], 5000);
+	if (result.status !== 0 || !result.stdout) return null;
+	const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
+	return firstMatch && (await pathExists(firstMatch)) ? firstMatch : null;
+}
+
+                       
+	              
+	               
+	                                    
+ 
+
+function isLegacyWslBashPath(path        )          {
+	const normalized = path.replace(/\//g, "\\").toLowerCase();
+	return /^[a-z]:\\windows\\(?:system32|sysnative)\\bash\.exe$/.test(normalized);
+}
+
+function getBashShellConfig(shell        )              {
+	return isLegacyWslBashPath(shell) ? { shell, args: ["-s"], commandTransport: "stdin" } : { shell, args: ["-c"] };
+}
+
+async function getShellConfig(customShellPath         )                                               {
+	if (customShellPath) {
+		if (await pathExists(customShellPath)) {
+			return ok(getBashShellConfig(customShellPath));
+		}
+		return err(new ExecutionError("shell_unavailable", `Custom shell path not found: ${customShellPath}`));
+	}
+	if (process.platform === "win32") {
+		const candidates           = [];
+		const programFiles = process.env.ProgramFiles;
+		if (programFiles) candidates.push(`${programFiles}\\Git\\bin\\bash.exe`);
+		const programFilesX86 = process.env["ProgramFiles(x86)"];
+		if (programFilesX86) candidates.push(`${programFilesX86}\\Git\\bin\\bash.exe`);
+		for (const candidate of candidates) {
+			if (await pathExists(candidate)) {
+				return ok(getBashShellConfig(candidate));
+			}
+		}
+		const bashOnPath = await findBashOnPath();
+		if (bashOnPath) {
+			return ok(getBashShellConfig(bashOnPath));
+		}
+		return err(
+			new ExecutionError(
+				"shell_unavailable",
+				`No bash shell found. Options:\n` +
+					`  1. Install Git for Windows: https://git-scm.com/download/win\n` +
+					`  2. Add your bash to PATH (Cygwin, MSYS2, etc.)\n` +
+					"  3. Configure an explicit shellPath\n\n" +
+					`Searched Git Bash in:\n${candidates.map((path) => `  ${path}`).join("\n")}`,
+			),
+		);
+	}
+
+	if (await pathExists("/bin/bash")) {
+		return ok(getBashShellConfig("/bin/bash"));
+	}
+	const bashOnPath = await findBashOnPath();
+	if (bashOnPath) {
+		return ok(getBashShellConfig(bashOnPath));
+	}
+	return ok({ shell: "sh", args: ["-c"] });
+}
+
+function getShellEnv(
+	baseEnv                    ,
+	extraEnv                         ,
+	inheritEnv = true,
+)                    {
+	if (!inheritEnv) return { ...extraEnv };
+	return {
+		...process.env,
+		...baseEnv,
+		...extraEnv,
+	};
+}
+
+function killProcessTree(pid        )       {
+	if (process.platform === "win32") {
+		try {
+			const child = spawn(
+				join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
+				["/F", "/T", "/PID", String(pid)],
+				{
+					stdio: "ignore",
+					detached: true,
+					windowsHide: true,
+				},
+			);
+			// A failed spawn emits "error" asynchronously; consume it to avoid crashing Node.
+			child.once("error", () => {});
+		} catch {
+			// Ignore errors.
+		}
+		return;
+	}
+
+	try {
+		process.kill(-pid, "SIGKILL");
+	} catch {
+		try {
+			process.kill(pid, "SIGKILL");
+		} catch {
+			// Process already dead.
+		}
+	}
+}
+
+function waitForChildProcess(
+	child              ,
+	spillIsDraining               ,
+)                                                                  {
+	return new Promise((resolvePromise, reject) => {
+		let settled = false;
+		let exited = false;
+		let exitCode                = null;
+		let exitSignal                        = null;
+		let postExitTimer                                           ;
+		let stdoutEnded = child.stdout === null;
+		let stderrEnded = child.stderr === null;
+
+		const cleanup = ()       => {
+			if (postExitTimer) clearTimeout(postExitTimer);
+			child.removeListener("error", onError);
+			child.removeListener("exit", onExit);
+			child.removeListener("close", onClose);
+			child.stdout?.removeListener("end", onStdoutEnd);
+			child.stderr?.removeListener("end", onStderrEnd);
+			child.stdout?.removeListener("data", onData);
+			child.stderr?.removeListener("data", onData);
+		};
+		const finalize = ()       => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			resolvePromise({ code: exitCode, signal: exitSignal });
+		};
+		const maybeFinalizeAfterExit = ()       => {
+			if (exited && stdoutEnded && stderrEnded) finalize();
+		};
+		const armIdleTimer = ()       => {
+			if (postExitTimer) clearTimeout(postExitTimer);
+			postExitTimer = setTimeout(() => {
+				if (spillIsDraining()) armIdleTimer();
+				else finalize();
+			}, EXIT_STDIO_GRACE_MS);
+		};
+		const onData = ()       => {
+			if (exited && !settled) armIdleTimer();
+		};
+		const onStdoutEnd = ()       => {
+			stdoutEnded = true;
+			maybeFinalizeAfterExit();
+		};
+		const onStderrEnd = ()       => {
+			stderrEnded = true;
+			maybeFinalizeAfterExit();
+		};
+		const onError = (error       )       => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(error);
+		};
+		const onExit = (code               , signal                       )       => {
+			exited = true;
+			exitCode = code;
+			exitSignal = signal;
+			maybeFinalizeAfterExit();
+			if (!settled) armIdleTimer();
+		};
+		const onClose = (code               , signal                       )       => {
+			exitCode = code;
+			exitSignal = signal;
+			finalize();
+		};
+
+		child.stdout?.once("end", onStdoutEnd);
+		child.stderr?.once("end", onStderrEnd);
+		child.stdout?.on("data", onData);
+		child.stderr?.on("data", onData);
+		child.once("error", onError);
+		child.once("exit", onExit);
+		child.once("close", onClose);
+	});
+}
+
+/** Strict LF reader; Node readline does not report whether its final line was newline-terminated. */
+class NodeTextLineReader                           {
+	                 file                                      ;
+	                 path        ;
+	                 decoder = new StreamDecoder();
+	                 chunk = new Uint8Array(64 * 1024);
+	        byteOffset = 0;
+	        buffered = "";
+	        ended = false;
+	        closed = false;
+
+	constructor(file                                      , path        ) {
+		this.file = file;
+		this.path = path;
+	}
+
+	async readLine(context         )                                                   {
+		const aborted = abortResult                      (context.abortSignal, this.path);
+		if (aborted) return aborted;
+		if (this.closed) return err(new FileError("invalid", "Text line reader is closed", this.path));
+
+		try {
+			while (true) {
+				const newline = this.buffered.indexOf("\n");
+				if (newline !== -1) {
+					const text = this.buffered.slice(0, newline);
+					this.buffered = this.buffered.slice(newline + 1);
+					return ok({ text, terminated: true });
+				}
+				if (this.ended) {
+					if (this.buffered.length === 0) return ok(undefined);
+					const text = this.buffered;
+					this.buffered = "";
+					return ok({ text, terminated: false });
+				}
+
+				// Explicit positions allow an aborted read to be retried without skipping bytes.
+				const { bytesRead } = await this.file.read(this.chunk, 0, this.chunk.length, this.byteOffset);
+				const afterReadAbort = abortResult                      (context.abortSignal, this.path);
+				if (afterReadAbort) return afterReadAbort;
+				this.byteOffset += bytesRead;
+				if (bytesRead === 0) {
+					this.buffered += this.decoder.decode();
+					this.ended = true;
+				} else {
+					this.buffered += this.decoder.decode(this.chunk.subarray(0, bytesRead));
+				}
+			}
+		} catch (error) {
+			return err(toFileError(error, this.path));
+		}
+	}
+
+	async close(_context         )                {
+		if (this.closed) return;
+		this.closed = true;
+		this.buffered = "";
+		try {
+			await this.file.close();
+		} catch {
+			// Closing is best-effort, including after cancellation or an earlier I/O failure.
+		}
+	}
+}
+
+function closedResult        (what        , path        )                            {
+	return err(new FileError("invalid", `${what} is closed`, path));
+}
+
+class NodeBinaryReader                         {
+	                 file            ;
+	                 path        ;
+	        closed = false;
+
+	constructor(file            , path        ) {
+		this.file = file;
+		this.path = path;
+	}
+
+	async info(context         )                                       {
+		const aborted = abortResult          (context.abortSignal, this.path);
+		if (aborted) return aborted;
+		if (this.closed) return closedResult("Binary reader", this.path);
+		try {
+			return fileInfoFromStats(this.path, await this.file.stat());
+		} catch (error) {
+			return err(toFileError(error, this.path));
+		}
+	}
+
+	async read(offset        , length        , context         )                                         {
+		const aborted = abortResult            (context.abortSignal, this.path);
+		if (aborted) return aborted;
+		if (this.closed) return closedResult("Binary reader", this.path);
+		if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
+			return err(new FileError("invalid", "Offset and length must be non-negative safe integers", this.path));
+		}
+		const chunks               = [];
+		let total = 0;
+		try {
+			while (total < length) {
+				const chunk = new Uint8Array(Math.min(length - total, BINARY_READ_CHUNK));
+				const { bytesRead } = await this.file.read(chunk, 0, chunk.length, offset + total);
+				const afterReadAbort = abortResult            (context.abortSignal, this.path);
+				if (afterReadAbort) return afterReadAbort;
+				if (bytesRead === 0) break;
+				chunks.push(bytesRead === chunk.length ? chunk : chunk.subarray(0, bytesRead));
+				total += bytesRead;
+			}
+		} catch (error) {
+			return err(toFileError(error, this.path));
+		}
+		if (chunks.length === 1) return ok(chunks[0] );
+		const bytes = new Uint8Array(total);
+		let position = 0;
+		for (const chunk of chunks) {
+			bytes.set(chunk, position);
+			position += chunk.length;
+		}
+		return ok(bytes);
+	}
+
+	async scanLines(
+		options                                         ,
+		context         ,
+	)                                       {
+		const aborted = abortResult          (context.abortSignal, this.path);
+		if (aborted) return aborted;
+		if (this.closed) return closedResult("Binary reader", this.path);
+		let scanner             ;
+		try {
+			scanner = new LineScanner(options.startLine, options.endLine);
+		} catch {
+			return err(new FileError("invalid", "Invalid line range", this.path));
+		}
+		const chunk = new Uint8Array(64 * 1024);
+		try {
+			for (let position = 0; ; ) {
+				const { bytesRead } = await this.file.read(chunk, 0, chunk.length, position);
+				const afterReadAbort = abortResult          (context.abortSignal, this.path);
+				if (afterReadAbort) return afterReadAbort;
+				if (bytesRead === 0) return ok(scanner.finish());
+				scanner.push(chunk.subarray(0, bytesRead));
+				position += bytesRead;
+			}
+		} catch (error) {
+			return err(toFileError(error, this.path));
+		}
+	}
+
+	async close(_context         )                {
+		if (this.closed) return;
+		this.closed = true;
+		await this.file.close().catch(() => undefined);
+	}
+}
+
+class NodeDirReader                      {
+	                 dir     ;
+	                 path        ;
+	        done = false;
+	        closed = false;
+
+	constructor(dir     , path        ) {
+		this.dir = dir;
+		this.path = path;
+	}
+
+	async next(
+		maxEntries        ,
+		context         ,
+	)                                                                     {
+		const aborted = abortResult                                        (context.abortSignal, this.path);
+		if (aborted) return aborted;
+		if (this.closed) return closedResult("Directory reader", this.path);
+		if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
+			return err(new FileError("invalid", "maxEntries must be a positive safe integer", this.path));
+		}
+		const entries             = [];
+		try {
+			while (!this.done && entries.length < maxEntries) {
+				const entry = await this.dir.read();
+				if (entry === null) {
+					this.done = true;
+					break;
+				}
+				const loopAbort = abortResult                                        (context.abortSignal, this.path);
+				if (loopAbort) return loopAbort;
+				const entryPath = resolve(this.path, entry.name);
+				let stats       ;
+				try {
+					stats = await lstat(entryPath);
+				} catch (error) {
+					// Removed between enumeration and lstat: not part of the listing any more.
+					if (envNodeisNodeError(error) && error.code === "ENOENT") continue;
+					return err(toFileError(error, entryPath));
+				}
+				const info = fileInfoFromStats(entryPath, stats);
+				if (info.ok) entries.push(info.value);
+			}
+			return ok({ entries, done: this.done });
+		} catch (error) {
+			return err(toFileError(error, this.path));
+		}
+	}
+
+	async close(_context         )                {
+		if (this.closed) return;
+		this.closed = true;
+		await this.dir.close().catch(() => undefined);
+	}
+}
+
+function symlinkRefused(path        , cause        )            {
+	return new FileError("invalid", "Refusing to follow a symbolic link", path, cause);
+}
+
+       class NodeExecutionEnv                         {
+	/** Every local environment sees the same files. */
+	         id         = "node:local";
+	cwd        ;
+	        shellPath         ;
+	        shellEnv                    ;
+	        watchOptions                  ;
+	        activeChildPids = new Set        ();
+
+	constructor(options                                                                                             ) {
+		this.cwd = options.cwd;
+		this.shellPath = options.shellPath;
+		this.shellEnv = options.shellEnv;
+		this.watchOptions = options.watch ?? {};
+	}
+
+	async watch(
+		targets                        ,
+		onChange                               ,
+		context         ,
+	)                                          {
+		const aborted = abortResult             (context.abortSignal);
+		if (aborted) return aborted;
+		try {
+			const watcher = await NodeFileWatcher.open(
+				targets,
+				(path) => resolvePath(this.cwd, path),
+				onChange,
+				this.watchOptions,
+			);
+			const afterOpenAbort = abortResult             (context.abortSignal);
+			if (afterOpenAbort) {
+				await watcher.close(context);
+				return afterOpenAbort;
+			}
+			return ok(watcher);
+		} catch (error) {
+			return err(toFileError(error));
+		}
+	}
+
+	async absolutePath(path        , _context         )                                     {
+		return ok(resolvePath(this.cwd, path));
+	}
+
+	async joinPath(parts          , _context         )                                     {
+		return ok(join(...parts));
+	}
+
+	async exec(
+		command                            ,
+		options                              ,
+		context         ,
+	)                                                   {
+		const signal = context.abortSignal;
+		if (signal?.aborted) return err(new ExecutionError("aborted", "aborted"));
+		const timeoutMsResult = resolveTimeoutMs(options?.timeout);
+		if (!timeoutMsResult.ok) return err(timeoutMsResult.error);
+		const timeoutMs = timeoutMsResult.value;
+
+		const cwd = options?.cwd ? resolvePath(this.cwd, options.cwd) : this.cwd;
+		// A string runs through the shell; an argv array runs its program directly, without shell parsing.
+		let program        ;
+		let args                   ;
+		let stdinCommand                    ;
+		if (typeof command === "string") {
+			const shellConfig = await getShellConfig(this.shellPath);
+			if (!shellConfig.ok) return shellConfig;
+			const commandFromStdin = shellConfig.value.commandTransport === "stdin";
+			program = shellConfig.value.shell;
+			args = commandFromStdin ? shellConfig.value.args : [...shellConfig.value.args, command];
+			stdinCommand = commandFromStdin ? command : undefined;
+		} else {
+			const [first, ...rest] = command;
+			if (first === undefined) return err(new ExecutionError("spawn_error", "Empty argv: no program to run"));
+			program = first;
+			args = rest;
+		}
+		try {
+			await access(cwd, constants.F_OK);
+		} catch (error) {
+			const cause = toError(error);
+			return err(
+				new ExecutionError(
+					"spawn_error",
+					`Working directory does not exist: ${cwd}\nCannot execute bash commands.`,
+					cause,
+				),
+			);
+		}
+
+		return await new Promise((resolvePromise) => {
+			let settled = false;
+			let timedOut = false;
+			let callbackError                            ;
+			let spillError                            ;
+			let child                                      ;
+			let timeoutId                                           ;
+			const spillPrefix               = [];
+			let spillPath                    ;
+			const spillQueue               = [];
+			let spillStart                           ;
+			let spillStream                         ;
+			let spillBackpressured = false;
+
+			const onAbort = () => {
+				if (child?.pid) killProcessTree(child.pid);
+			};
+			const failCallback = (error         ) => {
+				if (callbackError !== undefined) return;
+				const cause = toError(error);
+				callbackError = new ExecutionError("callback_error", cause.message, cause);
+				onAbort();
+			};
+			// One decoder per stream, so a character split across chunks of one stream survives interleaving.
+			const stdoutDecoder = new StreamDecoder();
+			const stderrDecoder = new StreamDecoder();
+			// No output reaches the caller after exec() settled, for example from a descendant holding stdio open.
+			const emit = (text        , stream                           )       => {
+				if (settled || text === "" || options?.onOutput === undefined || callbackError !== undefined) return;
+				try {
+					options.onOutput(text, context, { stream });
+				} catch (error) {
+					failCallback(error);
+				}
+			};
+			// Output seen before the spill starts: counted against the thresholds and kept for the spill's prefix.
+			let seenBytes = 0;
+			let seenNewlines = 0;
+
+			const settle = (result                                         ) => {
+				if (settled) return;
+				settled = true;
+				if (timeoutId) clearTimeout(timeoutId);
+				if (signal) signal.removeEventListener("abort", onAbort);
+				if (child?.pid) this.activeChildPids.delete(child.pid);
+				resolvePromise(result);
+			};
+			const pauseOutput = () => {
+				child?.stdout?.pause();
+				child?.stderr?.pause();
+			};
+			const resumeOutput = () => {
+				if (callbackError || spillError || timedOut || signal?.aborted || spillBackpressured) return;
+				child?.stdout?.resume();
+				child?.stderr?.resume();
+			};
+			const failSpill = (error         ) => {
+				if (spillError !== undefined) return;
+				const cause = toError(error);
+				spillError = new ExecutionError(
+					"unknown",
+					`Failed to preserve complete shell output: ${cause.message}`,
+					cause,
+				);
+				spillBackpressured = false;
+				onAbort();
+			};
+			const writeSpill = (chunk            )       => {
+				if (spillStream === undefined || chunk.length === 0) return;
+				if (spillStream.write(chunk) || spillBackpressured) return;
+				spillBackpressured = true;
+				pauseOutput();
+				spillStream.once("drain", () => {
+					spillBackpressured = false;
+					resumeOutput();
+				});
+			};
+			const startSpill = (chunk            )       => {
+				if (spillStream !== undefined) {
+					writeSpill(chunk);
+					return;
+				}
+				spillQueue.push(chunk);
+				if (spillStart !== undefined) return;
+				pauseOutput();
+				spillStart = (async () => {
+					const created = await this.createTempFile({ prefix: "pi-output-", suffix: ".log" }, context);
+					if (!created.ok) throw created.error;
+					spillPath = created.value;
+					spillStream = createWriteStream(spillPath, { flags: "a", highWaterMark: SPILL_HIGH_WATER_MARK });
+					spillStream.on("error", failSpill);
+					for (const queued of spillQueue) writeSpill(queued);
+					spillQueue.length = 0;
+				})()
+					.catch(failSpill)
+					.finally(resumeOutput);
+			};
+			const finishSpill = async ()                => {
+				await spillStart;
+				const stream = spillStream;
+				if (stream === undefined || spillError !== undefined || stream.destroyed) return;
+				await new Promise      ((resolveFinish) => {
+					stream.once("error", () => resolveFinish());
+					stream.once("finish", resolveFinish);
+					stream.end();
+				});
+			};
+
+			try {
+				child = spawn(program, args, {
+					cwd,
+					detached: process.platform !== "win32",
+					env: getShellEnv(this.shellEnv, options?.env, options?.inheritEnv),
+					stdio: [stdinCommand === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+					windowsHide: true,
+				});
+				if (child.pid) this.activeChildPids.add(child.pid);
+				if (stdinCommand !== undefined) {
+					child.stdin?.on("error", () => {});
+					child.stdin?.end(stdinCommand);
+				}
+			} catch (error) {
+				const cause = toError(error);
+				settle(err(new ExecutionError("spawn_error", cause.message, cause)));
+				return;
+			}
+
+			timeoutId =
+				timeoutMs === undefined
+					? undefined
+					: setTimeout(() => {
+							timedOut = true;
+							onAbort();
+						}, timeoutMs);
+
+			if (signal) {
+				if (signal.aborted) onAbort();
+				else signal.addEventListener("abort", onAbort, { once: true });
+			}
+
+			const feed = (source                           , decoder               ) => (chunk            ) => {
+				emit(decoder.decode(chunk), source);
+				const spill = options?.spill;
+				if (spill === undefined || chunk.length === 0) return;
+				if (spillStart !== undefined) {
+					startSpill(chunk);
+					return;
+				}
+				seenBytes += chunk.length;
+				for (let index = chunk.indexOf(0x0a); index !== -1; index = chunk.indexOf(0x0a, index + 1)) seenNewlines++;
+				const lines = seenNewlines + (chunk[chunk.length - 1] === 0x0a ? 0 : 1);
+				if (seenBytes <= spill.afterBytes && lines <= spill.afterLines) {
+					spillPrefix.push(chunk);
+					return;
+				}
+				for (const prefix of spillPrefix) startSpill(prefix);
+				spillPrefix.length = 0;
+				startSpill(chunk);
+			};
+			child.stdout?.on("data", feed("stdout", stdoutDecoder));
+			child.stderr?.on("data", feed("stderr", stderrDecoder));
+
+			void waitForChildProcess(
+				child,
+				() =>
+					spillError === undefined &&
+					spillStart !== undefined &&
+					(spillStream === undefined || spillBackpressured),
+			).then(
+				async ({ code, signal: exitSignal }) => {
+					await finishSpill();
+					emit(stdoutDecoder.decode(), "stdout");
+					emit(stderrDecoder.decode(), "stderr");
+					if (callbackError) {
+						settle(err(callbackError));
+						return;
+					}
+					const interrupted = timedOut
+						? new ExecutionError("timeout", `timeout:${options?.timeout}`)
+						: signal?.aborted
+							? new ExecutionError("aborted", "aborted")
+							: undefined;
+					if (interrupted !== undefined) {
+						if (spillPath !== undefined) interrupted.spillPath = spillPath;
+						settle(err(interrupted));
+						return;
+					}
+					if (spillError) {
+						settle(err(spillError));
+						return;
+					}
+					// A process killed by a signal (e.g. OOM killer) has no exit code; map it
+					// to the conventional 128 + signal number so callers do not mistake it
+					// for a successful exit.
+					const exitCode = code ?? (exitSignal ? 128 + (osConstants.signals[exitSignal] ?? 0) : 1);
+					settle(ok({ exitCode, ...(spillPath === undefined ? {} : { spillPath }) }));
+				},
+				(error       ) => settle(err(new ExecutionError("spawn_error", error.message, error))),
+			);
+		});
+	}
+
+	async openTextLineReader(path        , context         )                                             {
+		const resolved = resolvePath(this.cwd, path);
+		const aborted = abortResult                (context.abortSignal, resolved);
+		if (aborted) return aborted;
+		try {
+			const file = await openFile(resolved, "r");
+			const afterOpenAbort = abortResult                (context.abortSignal, resolved);
+			if (afterOpenAbort) {
+				await file.close().catch(() => undefined);
+				return afterOpenAbort;
+			}
+			return ok(new NodeTextLineReader(file, resolved));
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	async readTextFile(path        , context         )                                     {
+		const resolved = resolvePath(this.cwd, path);
+		const signal = context.abortSignal;
+		const aborted = abortResult        (signal, resolved);
+		if (aborted) return aborted;
+		try {
+			return ok(await readFile(resolved, { encoding: "utf8", signal }));
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	async readTextLines(
+		path        ,
+		options                                   ,
+		context         ,
+	)                                       {
+		if (options?.maxLines !== undefined && options.maxLines <= 0) return ok([]);
+		const opened = await this.openTextLineReader(path, context);
+		if (!opened.ok) return opened;
+		const lines           = [];
+		try {
+			while (options?.maxLines === undefined || lines.length < options.maxLines) {
+				const line = await opened.value.readLine(context);
+				if (!line.ok) return line;
+				if (line.value === undefined) break;
+				lines.push(line.value.text);
+			}
+			return ok(lines);
+		} finally {
+			await opened.value.close(context);
+		}
+	}
+
+	async readBinaryFile(path        , context         )                                         {
+		const resolved = resolvePath(this.cwd, path);
+		const signal = context.abortSignal;
+		const aborted = abortResult            (signal, resolved);
+		if (aborted) return aborted;
+		try {
+			return ok(await readFile(resolved, { signal }));
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	async openBinaryReader(
+		path        ,
+		options                                    ,
+		context         ,
+	)                                           {
+		const resolved = resolvePath(this.cwd, path);
+		const aborted = abortResult              (context.abortSignal, resolved);
+		if (aborted) return aborted;
+		const noFollow = options?.noFollow === true;
+		let file                        ;
+		try {
+			let flags = constants.O_RDONLY;
+			if (process.platform === "win32") {
+				// Windows has no O_NOFOLLOW; check the final component before opening (not race-free).
+				if (noFollow && (await lstat(resolved)).isSymbolicLink()) return err(symlinkRefused(resolved));
+			} else {
+				// Nonblocking, so opening a FIFO does not wait for a writer.
+				flags |= constants.O_NONBLOCK;
+				if (noFollow) flags |= constants.O_NOFOLLOW;
+			}
+			file = await openFile(resolved, flags);
+			const stats = await file.stat();
+			if (!stats.isFile()) {
+				await file.close().catch(() => undefined);
+				return err(
+					stats.isDirectory()
+						? new FileError("is_directory", "EISDIR: illegal operation on a directory, read", resolved)
+						: new FileError("invalid", "Not a regular file", resolved),
+				);
+			}
+			const afterOpenAbort = abortResult              (context.abortSignal, resolved);
+			if (afterOpenAbort) {
+				await file.close().catch(() => undefined);
+				return afterOpenAbort;
+			}
+			return ok(new NodeBinaryReader(file, resolved));
+		} catch (error) {
+			await file?.close().catch(() => undefined);
+			// O_NOFOLLOW reports a final-component symlink as ELOOP (EMLINK on some BSDs).
+			if (noFollow && envNodeisNodeError(error) && (error.code === "ELOOP" || error.code === "EMLINK")) {
+				return err(symlinkRefused(resolved, toError(error)));
+			}
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	async writeFile(path        , content                     , context         )                                   {
+		const resolved = resolvePath(this.cwd, path);
+		const signal = context.abortSignal;
+		const aborted = abortResult      (signal, resolved);
+		if (aborted) return aborted;
+		try {
+			await mkdir(resolve(resolved, ".."), { recursive: true });
+			const afterMkdirAbort = abortResult      (signal, resolved);
+			if (afterMkdirAbort) return afterMkdirAbort;
+			await writeFile(resolved, content, { signal });
+			return ok(undefined);
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	async appendFile(path        , content                     , context         )                                   {
+		const resolved = resolvePath(this.cwd, path);
+		const signal = context.abortSignal;
+		const aborted = abortResult      (signal, resolved);
+		if (aborted) return aborted;
+		try {
+			await mkdir(resolve(resolved, ".."), { recursive: true });
+			const afterMkdirAbort = abortResult      (signal, resolved);
+			if (afterMkdirAbort) return afterMkdirAbort;
+			await appendFile(resolved, content);
+			const afterAppendAbort = abortResult      (signal, resolved);
+			return afterAppendAbort ?? ok(undefined);
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	async truncateFile(path        , size        , context         )                                   {
+		const resolved = resolvePath(this.cwd, path);
+		const signal = context.abortSignal;
+		const aborted = abortResult      (signal, resolved);
+		if (aborted) return aborted;
+		if (!Number.isSafeInteger(size) || size < 0) {
+			return err(new FileError("invalid", "File size must be a non-negative safe integer", resolved));
+		}
+		let file                                                  ;
+		try {
+			file = await openFile(resolved, "r+");
+			await file.truncate(size);
+			const afterTruncateAbort = abortResult      (signal, resolved);
+			return afterTruncateAbort ?? ok(undefined);
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		} finally {
+			await file?.close().catch(() => undefined);
+		}
+	}
+
+	async flushFile(path        , context         )                                   {
+		const resolved = resolvePath(this.cwd, path);
+		const signal = context.abortSignal;
+		const aborted = abortResult      (signal, resolved);
+		if (aborted) return aborted;
+		let file                                                  ;
+		try {
+			file = await openFile(resolved, "r+");
+			// POSIX refuses to open a directory for writing; Windows opens it, so check explicitly.
+			if ((await file.stat()).isDirectory()) return err(new FileError("is_directory", "Is a directory", resolved));
+			await file.sync();
+			const afterSyncAbort = abortResult      (signal, resolved);
+			return afterSyncAbort ?? ok(undefined);
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		} finally {
+			await file?.close().catch(() => undefined);
+		}
+	}
+
+	async renameFile(sourcePath        , destinationPath        , context         )                                   {
+		const source = resolvePath(this.cwd, sourcePath);
+		const destination = resolvePath(this.cwd, destinationPath);
+		const aborted = abortResult      (context.abortSignal, destination);
+		if (aborted) return aborted;
+		try {
+			await rename(source, destination);
+			return ok(undefined);
+		} catch (error) {
+			return err(toFileError(error, source));
+		}
+	}
+
+	async fileInfo(path        , context         )                                       {
+		const resolved = resolvePath(this.cwd, path);
+		const aborted = abortResult          (context.abortSignal, resolved);
+		if (aborted) return aborted;
+		try {
+			return fileInfoFromStats(resolved, await lstat(resolved));
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	async listDir(path        , context         )                                         {
+		const resolved = resolvePath(this.cwd, path);
+		const signal = context.abortSignal;
+		const aborted = abortResult            (signal, resolved);
+		if (aborted) return aborted;
+		try {
+			const entries = await readdir(resolved, { withFileTypes: true });
+			const infos             = [];
+			for (const entry of entries) {
+				const loopAbort = abortResult            (signal, resolved);
+				if (loopAbort) return loopAbort;
+				const entryPath = resolve(resolved, entry.name);
+				try {
+					const info = fileInfoFromStats(entryPath, await lstat(entryPath));
+					if (info.ok) infos.push(info.value);
+				} catch (error) {
+					return err(toFileError(error, entryPath));
+				}
+			}
+			return ok(infos);
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	async openDirReader(path        , context         )                                        {
+		const resolved = resolvePath(this.cwd, path);
+		const aborted = abortResult           (context.abortSignal, resolved);
+		if (aborted) return aborted;
+		try {
+			const dir = await opendir(resolved);
+			const afterOpenAbort = abortResult           (context.abortSignal, resolved);
+			if (afterOpenAbort) {
+				await dir.close().catch(() => undefined);
+				return afterOpenAbort;
+			}
+			return ok(new NodeDirReader(dir, resolved));
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	async canonicalPath(path        , context         )                                     {
+		const resolved = resolvePath(this.cwd, path);
+		const aborted = abortResult        (context.abortSignal, resolved);
+		if (aborted) return aborted;
+		try {
+			return ok(await realpath(resolved));
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	async exists(path        , context         )                                      {
+		const result = await this.fileInfo(path, context);
+		if (result.ok) return ok(true);
+		if (result.error.code === "not_found") return ok(false);
+		return err(result.error);
+	}
+
+	async createDir(
+		path        ,
+		options                                     ,
+		context         ,
+	)                                   {
+		const resolved = resolvePath(this.cwd, path);
+		const aborted = abortResult      (context.abortSignal, resolved);
+		if (aborted) return aborted;
+		try {
+			await mkdir(resolved, { recursive: options?.recursive ?? true });
+			return ok(undefined);
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	async remove(
+		path        ,
+		options                                                      ,
+		context         ,
+	)                                   {
+		const resolved = resolvePath(this.cwd, path);
+		const aborted = abortResult      (context.abortSignal, resolved);
+		if (aborted) return aborted;
+		try {
+			await rm(resolved, { recursive: options?.recursive ?? false, force: options?.force ?? false });
+			return ok(undefined);
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	async createTempDir(prefix                    , context         )                                     {
+		const aborted = abortResult        (context.abortSignal);
+		if (aborted) return aborted;
+		try {
+			prefix ??= "tmp-";
+			return ok(await mkdtemp(join(tmpdir(), prefix)));
+		} catch (error) {
+			return err(toFileError(error));
+		}
+	}
+
+	async createTempFile(
+		options                                                  ,
+		context         ,
+	)                                     {
+		const dir = await this.createTempDir("tmp-", context);
+		if (!dir.ok) return dir;
+		const filePath = join(dir.value, `${options?.prefix ?? ""}${randomUUID()}${options?.suffix ?? ""}`);
+		try {
+			await writeFile(filePath, "");
+			return ok(filePath);
+		} catch (error) {
+			return err(toFileError(error, filePath));
+		}
+	}
+
+	async cleanup(_context         )                {
+		for (const pid of this.activeChildPids) killProcessTree(pid);
+		this.activeChildPids.clear();
+	}
+}
+
+// ── published surface ─────────────────────────────────────────────────────
+
+export {
+	ExecutionError as ExecutionError,
+	FileError as FileError,
+	LineScanner as LineScanner,
+	NodeExecutionEnv as NodeExecutionEnv,
+	StreamDecoder as StreamDecoder,
+	err as err,
+	getOrThrow as getOrThrow,
+	getOrUndefined as getOrUndefined,
+	ok as ok,
+	rangeDecoder as rangeDecoder,
+	startsWithBom as startsWithBom,
+	toError as toError,
+};

@@ -1,0 +1,142 @@
+
+// Ops whose host backend lives on the primary table (`__pir_host.node`)
+// rather than the legacy `nodeExt` one: the raw-DEFLATE zlib pair added in
+// the node-surface wave (the gzip/deflate family stays on nodeExt).
+globalThis.__pirNodePrimaryOps ?? (globalThis.__pirNodePrimaryOps = {
+  zlib: { deflateRawSync: true, inflateRawSync: true },
+});
+
+globalThis.__pirNodeCall ?? (globalThis.__pirNodeCall = function (module, op, payload) {
+  const body = JSON.stringify(payload === undefined ? {} : payload);
+  const primary = globalThis.__pirNodePrimaryOps;
+  const onLegacy = (module === "child" || module === "zlib") &&
+    !(primary[module] && primary[module][op]);
+  const raw = onLegacy
+    ? __pir_host.nodeExt(module, op, body)
+    : __pir_host.node(module, op, body);
+  const res = JSON.parse(raw);
+  if (!res || res.ok !== true) {
+    const err = new Error((res && res.message) || ("__pir_host.node failed: " + module + "." + op));
+    if (res) {
+      if (res.code !== undefined) err.code = res.code;
+      if (res.syscall !== undefined) err.syscall = res.syscall;
+      if (res.path !== undefined) err.path = res.path;
+      // Node's libuv-backed errors carry the negative OS/libuv errno
+      // (ENOENT: -2 on Linux, -4058 on Windows); the host omits the key when
+      // the failure has no OS errno, exactly like Node.
+      if (res.errno !== undefined) err.errno = res.errno;
+    }
+    throw err;
+  }
+  return res.value;
+});
+
+// Callback deferral primitive: promise jobs are the one microtask source the
+// engine is guaranteed to have (no queueMicrotask dependency).
+globalThis.__pirMicrotask ?? (globalThis.__pirMicrotask = function (fn) {
+  Promise.resolve().then(fn);
+});
+
+// ---------------------------------------------------------------------------
+// process.nextTick priority
+// ---------------------------------------------------------------------------
+// Node drains its nextTick queue *before* the promise microtask queue; the
+// engine has a single FIFO job queue, so ordering is otherwise registration
+// order. This keeps a nextTick queue whose drain job is enqueued ahead of the
+// turn's microtasks: every `queueMicrotask` call parks the drain first (a
+// no-op job when nothing is pending), so a nextTick registered later in the
+// same turn still runs before those microtasks.
+//
+// Known residual, documented rather than hidden: a nextTick that arrives with
+// no `queueMicrotask` call before it in the turn is enqueued at its own
+// position, so it can trail microtasks registered earlier. That half needs a
+// host-side drain hook (call into JS before draining the job queue), which the
+// runtime does not have. The ordering that libraries actually depend on —
+// nextTick before timers, I/O and setImmediate — holds either way.
+globalThis.__pirTicks ?? (globalThis.__pirTicks = (function () {
+  const queue = [];
+  let head = 0;
+  let queued = false;
+
+  // Node's nextTick contract: an exception escaping a tick callback is an
+  // *uncaught exception*, not a promise rejection. With a listener installed
+  // the event is emitted and the remaining ticks still run; without one the
+  // throw is re-raised (it escapes the drain job, so the host's fatal path
+  // reports it and the process exits non-zero — the same crash surface a
+  // genuinely unhandled rejection has, which is where the reason text comes
+  // from; js_mode's label is the documented residual).
+  function handleTickError(error) {
+    const proc = globalThis.process;
+    if (proc !== undefined && proc !== null &&
+        typeof proc.listenerCount === "function" &&
+        typeof proc.emit === "function" &&
+        proc.listenerCount("uncaughtException") > 0) {
+      proc.emit("uncaughtException", error, "uncaughtException");
+      return;
+    }
+    throw error;
+  }
+
+  function drain() {
+    queued = false;
+    let processed = 0;
+    while (head < queue.length) {
+      if (processed >= 100000) {
+        // Node processes a bounded batch per turn and yields to the loop
+        // rather than starving it.
+        schedule();
+        return;
+      }
+      const job = queue[head];
+      head += 1;
+      processed += 1;
+      try {
+        job.fn(...job.args);
+      } catch (error) {
+        handleTickError(error);
+      }
+    }
+    queue.length = 0;
+    head = 0;
+  }
+
+  function schedule() {
+    if (queued) return;
+    queued = true;
+    Promise.resolve().then(drain);
+  }
+
+  return {
+    push: function (fn, args) {
+      queue.push({ fn: fn, args: args });
+      schedule();
+    },
+    // Park the drain ahead of the microtask about to be scheduled.
+    ahead: function () {
+      schedule();
+    },
+  };
+}()));
+
+globalThis.__pirNextTick ?? (globalThis.__pirNextTick = function (fn, ...args) {
+  if (typeof fn !== "function") {
+    const error = new TypeError(
+      'The "callback" argument must be of type function. Received type ' + typeof fn
+    );
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  globalThis.__pirTicks.push(fn, args);
+});
+
+if (typeof globalThis.queueMicrotask === "function") {
+  const engineQueueMicrotask = globalThis.queueMicrotask;
+  const pirQueueMicrotask = function queueMicrotask(fn) {
+    globalThis.__pirTicks.ahead();
+    return engineQueueMicrotask(fn);
+  };
+  // Same arity/length shape as the engine's own, so feature detection and
+  // `.length` checks keep working.
+  Object.defineProperty(pirQueueMicrotask, "length", { value: engineQueueMicrotask.length });
+  globalThis.queueMicrotask = pirQueueMicrotask;
+}

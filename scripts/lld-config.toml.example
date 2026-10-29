@@ -1,0 +1,52 @@
+# scripts/lld-config.toml.example — optional, faster dev-loop linker (Windows/MSVC).
+#
+# WHY: `cargo test --no-run` links ~97 test binaries against one ~250 MB
+# rlib, so any src/ (or shim .js.txt) edit re-links all of them; the link
+# phase dominates the edit->result latency. rustc ships an LLVM linker
+# (`rust-lld.exe`) inside the toolchain, and pointing the MSVC target at it
+# cuts per-link time measurably (see scripts/../MEASUREMENTS below).
+#
+# HOW TO ENABLE (one of):
+#   1. Repo-scoped:  copy this file to  <repo>/.cargo/config.toml
+#   2. User-scoped:  append the two lines to  %USERPROFILE%\.cargo\config.toml
+#      (applies to every local project — more intrusive)
+#   3. Per-invocation (no file):
+#        set RUSTFLAGS=-Clinker=rust-lld      (then cargo test --no-run)
+#
+# No absolute path is needed: rustc resolves the bare name `rust-lld` to
+# <sysroot>\lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe, which is NOT
+# on PATH by default. Verified: `-C linker=rust-lld` and the config key below
+# both produce a binary whose PE MinorLinkerVersion is 0 (lld) instead of 51
+# (link.exe 14.51).
+#
+# To DISABLE: delete the file (or the two lines). Nothing else depends on it.
+
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
+
+# ---------------------------------------------------------------------------
+# What this does NOT do
+#   * It only affects rustc's own link step. Build scripts that invoke a
+#     linker themselves (e.g. the `cc` crate compiling SQLite for
+#     libsqlite3-sys) still use cl.exe/link.exe from the VS install.
+#   * It does not make the *lib compile* faster — the lib is still one big
+#     crate; a src/ edit still recompiles it (~30-40 s here). Use
+#     scripts/test_select.ps1 to skip the ~94 unrelated test links.
+#   * Linking is still one process per binary; the win is per-link, not a
+#     parallelism change. Combine with test_select for the big win.
+#
+# Risks to keep in mind (measured, see report)
+#   * Debugging: with [profile.dev] debug = 0 there is no line info either
+#     way, but the PDB flavour differs (lld writes its own). If a crash needs
+#     symbolized frames, raise debug = 1 *and* re-check the backtrace under
+#     lld before trusting the line numbers.
+#   * Anything that consumes the .pdb (WinDbg/dumpbin-driven tooling, some
+#     profilers) should be spot-checked once; lld is not link.exe.
+#   * MSVC CRT/SDK import libraries are located by rustc exactly as before
+#     (it passes /LIBPATH: from its VS-install discovery), so running cargo
+#     from a shell without vcvars keeps working — this repo already builds
+#     that way.
+#   * A wrong value here breaks EVERY build in scope, including CI on a
+#     machine without that rustc layout. Prefer the per-invocation
+#     RUSTFLAGS form if you only want it locally.
+# ---------------------------------------------------------------------------

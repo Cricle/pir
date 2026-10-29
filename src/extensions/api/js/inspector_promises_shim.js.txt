@@ -1,0 +1,66 @@
+// node:inspector/promises — the promise surface of the inspector module:
+// identical names, `Session.post` rejects instead of throwing, `open`/`close`
+// return rejected promises. See the sync module for the tier notes.
+import { EventEmitter } from "@node/events";
+
+function inspectorUnsupported(api) {
+  const error = new Error("node:inspector.promises." + api + " is not supported by the pir extension runtime (no V8 inspector protocol host)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+class Session extends EventEmitter {
+  constructor() {
+    super();
+    this._connected = false;
+  }
+  connect() {
+    this._connected = false;
+    throw inspectorUnsupported("Session.connect");
+  }
+  connectToMainThread() {
+    throw inspectorUnsupported("Session.connectToMainThread");
+  }
+  disconnect() {
+    this._connected = false;
+  }
+  post(method, _params) {
+    return Promise.reject(inspectorUnsupported("Session.post(\"" + String(method) + "\")"));
+  }
+}
+
+const consoleFace = globalThis.console;
+const network = new EventEmitter();
+const domStorage = new EventEmitter();
+const networkResources = new Map();
+
+function open(..._args) {
+  return Promise.reject(inspectorUnsupported("open"));
+}
+
+function close(..._args) {
+  return Promise.reject(inspectorUnsupported("close"));
+}
+
+function url() {
+  return undefined;
+}
+
+function waitForDebugger() {
+  return Promise.resolve(0);
+}
+
+const inspectorPromises = {
+  Session: Session,
+  console: consoleFace,
+  Network: network,
+  NetworkResources: networkResources,
+  DOMStorage: domStorage,
+  open: open,
+  close: close,
+  url: url,
+  waitForDebugger: waitForDebugger,
+};
+
+export default inspectorPromises;
+export { Session, consoleFace as console, network as Network, networkResources as NetworkResources, domStorage as DOMStorage, open, close, url, waitForDebugger };

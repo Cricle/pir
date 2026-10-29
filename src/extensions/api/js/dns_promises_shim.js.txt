@@ -1,0 +1,178 @@
+
+const call = globalThis.__pirNodeCall;
+
+function pirDnsNotFound(host) {
+  const error = new Error("getaddrinfo ENOTFOUND " + host);
+  error.code = "ENOTFOUND";
+  error.syscall = "getaddrinfo";
+  error.hostname = host;
+  return error;
+}
+
+function pirDnsUnsupported(api) {
+  // The async faces reject (Node's dns/promises never throws synchronously);
+  // one clear code/message per unsupported query surface.
+  return function () {
+    const error = new Error("dns.promises." + api + " is not supported by the pir extension runtime");
+    error.code = "ERR_NOT_SUPPORTED";
+    return Promise.reject(error);
+  };
+}
+
+// Real lookup over the host resolver: single {address, family} (or the full
+// array with `all: true`), family-filtered, ENOTFOUND when nothing matches.
+function lookup(hostname, options) {
+  const host = String(hostname);
+  const opts = options === undefined || options === null ? {} : options;
+  try {
+    const resolved = call("dns", "lookup", { host: host });
+    const wanted = opts.family === 4 || opts.family === 6 ? opts.family : 0;
+    const addresses = (resolved.addresses || []).filter((entry) => wanted === 0 || entry.family === wanted);
+    if (addresses.length === 0) throw pirDnsNotFound(host);
+    if (opts.all) return Promise.resolve(addresses);
+    return Promise.resolve({ address: addresses[0].address, family: addresses[0].family });
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+class Resolver {
+  constructor() {
+    // Construction throws synchronously: an inert Resolver instance would
+    // silently swallow every later query.
+    const error = new Error("dns.promises.Resolver is not supported by the pir extension runtime");
+    error.code = "ERR_NOT_SUPPORTED";
+    throw error;
+  }
+}
+
+const resolve = pirDnsUnsupported("resolve");
+const resolve4 = pirDnsUnsupported("resolve4");
+const resolve6 = pirDnsUnsupported("resolve6");
+const resolveAny = pirDnsUnsupported("resolveAny");
+const resolveCaa = pirDnsUnsupported("resolveCaa");
+const resolveCname = pirDnsUnsupported("resolveCname");
+const resolveMx = pirDnsUnsupported("resolveMx");
+const resolveNaptr = pirDnsUnsupported("resolveNaptr");
+const resolveNs = pirDnsUnsupported("resolveNs");
+const resolvePtr = pirDnsUnsupported("resolvePtr");
+const resolveSoa = pirDnsUnsupported("resolveSoa");
+const resolveSrv = pirDnsUnsupported("resolveSrv");
+const resolveTxt = pirDnsUnsupported("resolveTxt");
+const reverse = pirDnsUnsupported("reverse");
+const setServers = pirDnsUnsupported("setServers");
+const getServers = pirDnsUnsupported("getServers");
+
+
+// --- surface completion -------------------------------------------------------
+
+// c-ares error codes + lookup flags (captured from the real Node v24 table).
+const ADDRCONFIG = 1024;
+const V4MAPPED = 2048;
+const ALL = 256;
+const ADDRGETNETWORKPARAMS = "EADDRGETNETWORKPARAMS";
+const BADFAMILY = "EBADFAMILY";
+const BADFLAGS = "EBADFLAGS";
+const BADHINTS = "EBADHINTS";
+const BADNAME = "EBADNAME";
+const BADQUERY = "EBADQUERY";
+const BADRESP = "EBADRESP";
+const BADSTR = "EBADSTR";
+const CANCELLED = "ECANCELLED";
+const CONNREFUSED = "ECONNREFUSED";
+const DESTRUCTION = "EDESTRUCTION";
+const EOF = "EOF";
+const FILE = "EFILE";
+const FORMERR = "FORMERR";
+const LOADIPHLPAPI = "ELOADIPHLPAPI";
+const NODATA = "ENODATA";
+const NOMEM = "ENOMEM";
+const NONAME = "ENONAME";
+const NOTFOUND = "ENOTFOUND";
+const NOTIMP = "ENOTIMP";
+const NOTINITIALIZED = "ENOTINITIALIZED";
+const REFUSED = "EREFUSED";
+const SERVFAIL = "SERVFAIL";
+const TIMEOUT = "ETIMEOUT";
+
+const resultOrderState = { order: "ipv4first" };
+
+function getDefaultResultOrder() {
+  return resultOrderState.order;
+}
+
+function setDefaultResultOrder(order) {
+  if (order !== "ipv4first" && order !== "verbatim") {
+    throw new TypeError("The \"order\" argument must be ipv4first or verbatim");
+  }
+  resultOrderState.order = order;
+}
+
+const lookupService = pirDnsUnsupported("lookupService");
+const resolveTlsa = pirDnsUnsupported("resolveTlsa");
+
+const dnsPromises = {
+  lookup: lookup,
+  Resolver: Resolver,
+  resolve: resolve,
+  resolve4: resolve4,
+  resolve6: resolve6,
+  resolveAny: resolveAny,
+  resolveCaa: resolveCaa,
+  resolveCname: resolveCname,
+  resolveMx: resolveMx,
+  resolveNaptr: resolveNaptr,
+  resolveNs: resolveNs,
+  resolvePtr: resolvePtr,
+  resolveSoa: resolveSoa,
+  resolveSrv: resolveSrv,
+  resolveTxt: resolveTxt,
+  reverse: reverse,
+  setServers: setServers,
+  getServers: getServers,
+  lookupService: lookupService,
+  resolveTlsa: resolveTlsa,
+  getDefaultResultOrder: getDefaultResultOrder,
+  setDefaultResultOrder: setDefaultResultOrder,
+  ADDRCONFIG: ADDRCONFIG,
+  V4MAPPED: V4MAPPED,
+  ALL: ALL,
+  ADDRGETNETWORKPARAMS: ADDRGETNETWORKPARAMS,
+  BADFAMILY: BADFAMILY,
+  BADFLAGS: BADFLAGS,
+  BADHINTS: BADHINTS,
+  BADNAME: BADNAME,
+  BADQUERY: BADQUERY,
+  BADRESP: BADRESP,
+  BADSTR: BADSTR,
+  CANCELLED: CANCELLED,
+  CONNREFUSED: CONNREFUSED,
+  DESTRUCTION: DESTRUCTION,
+  EOF: EOF,
+  FILE: FILE,
+  FORMERR: FORMERR,
+  LOADIPHLPAPI: LOADIPHLPAPI,
+  NODATA: NODATA,
+  NOMEM: NOMEM,
+  NONAME: NONAME,
+  NOTFOUND: NOTFOUND,
+  NOTIMP: NOTIMP,
+  NOTINITIALIZED: NOTINITIALIZED,
+  REFUSED: REFUSED,
+  SERVFAIL: SERVFAIL,
+  TIMEOUT: TIMEOUT,
+};
+
+export default dnsPromises;
+export {
+  lookup, Resolver, resolve, resolve4, resolve6, resolveAny, resolveCaa,
+  resolveCname, resolveMx, resolveNaptr, resolveNs, resolvePtr, resolveSoa,
+  resolveSrv, resolveTxt, reverse, setServers, getServers,
+  lookupService, resolveTlsa, getDefaultResultOrder, setDefaultResultOrder,
+};
+export {
+  ADDRCONFIG, V4MAPPED, ALL, ADDRGETNETWORKPARAMS, BADFAMILY, BADFLAGS, BADHINTS,
+  BADNAME, BADQUERY, BADRESP, BADSTR, CANCELLED, CONNREFUSED, DESTRUCTION, EOF,
+  FILE, FORMERR, LOADIPHLPAPI, NODATA, NOMEM, NONAME, NOTFOUND, NOTIMP,
+  NOTINITIALIZED, REFUSED, SERVFAIL, TIMEOUT,
+};

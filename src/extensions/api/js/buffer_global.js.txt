@@ -1,0 +1,1764 @@
+
+globalThis.Buffer ?? (globalThis.Buffer = (function () {
+  const HEX_CHARS = "0123456789abcdef";
+  const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  // ---------------------------------------------------------------------------
+  // Node error shapes. Every Buffer validation error carries Node's `code` and
+  // reproduces Node's message verbatim (including the `Received ...` clause),
+  // because the official test suite compares both. Kept local to the shim: the
+  // inspect calls below are the only outward dependency and are lazy/optional.
+  // ---------------------------------------------------------------------------
+  let pirUtilInspect = null;
+  let pirUtilInspectProbed = false;
+  function pirInspect(value, options) {
+    if (!pirUtilInspectProbed) {
+      pirUtilInspectProbed = true;
+      try {
+        if (typeof globalThis.__pirRequireFrom === "function") {
+          const util = globalThis.__pirRequireFrom("", "util");
+          if (util && typeof util.inspect === "function") pirUtilInspect = util.inspect;
+        }
+      } catch (error) { pirUtilInspect = null; }
+    }
+    if (typeof pirUtilInspect === "function") {
+      try { return pirUtilInspect(value, options); } catch (error) { /* fall through */ }
+    }
+    return pirFallbackInspect(value, options);
+  }
+
+  function pirFallbackInspect(value, options) {
+    const depthOne = options && options.depth === -1;
+    if (value !== null && typeof value === "object") {
+      if (depthOne && Object.getPrototypeOf(value) === null) return "[Object: null prototype] {}";
+      return "{}";
+    }
+    if (typeof value === "string") return depthOne ? value : "'" + value + "'";
+    return String(value);
+  }
+
+  // Node's `invalidArgTypeHelper` (test/common/index.js) / internal/errors
+  // "Received ..." clause for ERR_INVALID_ARG_TYPE.
+  function pirReceivedDetail(value) {
+    if (value === null || value === undefined) return " Received " + String(value);
+    const type = typeof value;
+    if (type === "function") return " Received function " + (value.name || "");
+    if (type === "object") {
+      const ctor = value.constructor;
+      const name = ctor && typeof ctor.name === "string" ? ctor.name : "";
+      if (name) return " Received an instance of " + name;
+      return " Received " + pirInspect(value, { depth: -1 });
+    }
+    let inspected = pirInspect(value, { colors: false });
+    if (typeof inspected !== "string") inspected = String(inspected);
+    if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+    return " Received type " + type + " (" + inspected + ")";
+  }
+
+  // Node ERR_OUT_OF_RANGE received-value formatting: magnitudes above 2**32 get
+  // "_" every three characters counted from the END of the decimal string
+  // (Node's formatValue quirk — it groups the raw `String(value)`, exponent and
+  // fractional forms included).
+  function pirGroupDigits(text) {
+    let out = "";
+    for (let i = 0; i < text.length; i++) {
+      if (i > 0 && (text.length - i) % 3 === 0) out += "_";
+      out += text[i];
+    }
+    return out;
+  }
+
+  function pirFormatReceived(value) {
+    if (typeof value === "number") {
+      if (Math.abs(value) > 4294967296) return pirGroupDigits(String(value));
+      return String(value);
+    }
+    if (typeof value === "bigint") {
+      const magnitude = value < 0n ? -value : value;
+      return (magnitude > 4294967296n ? pirGroupDigits(String(value)) : String(value)) + "n";
+    }
+    return String(value);
+  }
+
+  function pirError(Type, code, message) {
+    const error = new Type(message);
+    if (code) error.code = code;
+    return error;
+  }
+
+  function errInvalidArgType(name, expected, value) {
+    return pirError(TypeError, "ERR_INVALID_ARG_TYPE",
+      'The "' + name + '" argument must be ' + expected + "." + pirReceivedDetail(value));
+  }
+
+  // Node renders raw bytes as `<Buffer 61 62 63>` in its internal inspect (and
+  // truncates at INSPECT_MAX_BYTES with "… N more bytes"); the shared util
+  // shim renders Buffers differently, so error values get the Node form here.
+  function pirInspectBufferLike(buffer, tag) {
+    const max = 50;
+    let out = "<" + (tag === undefined ? "Buffer" : tag) + " ";
+    const count = Math.min(buffer.byteLength, max);
+    for (let i = 0; i < count; i++) {
+      if (i > 0) out += " ";
+      out += (buffer[i] < 16 ? "0" : "") + buffer[i].toString(16);
+    }
+    if (buffer.byteLength > max) {
+      const rest = buffer.byteLength - max;
+      out += " ... " + rest + " more byte" + (rest === 1 ? "" : "s");
+    }
+    return out + ">";
+  }
+
+  // node's Buffer inspect tag is the instance's constructor name when it has
+  // one on the constructor itself (`Buffer` for a plain buffer, a subclass's
+  // own name otherwise).
+  function pirBufferInspectTag(buffer) {
+    try {
+      const ctor = buffer.constructor;
+      if (typeof ctor === "function" && Object.prototype.hasOwnProperty.call(ctor, "name")) {
+        return ctor.name;
+      }
+    } catch (error) { /* keep the default tag */ }
+    return "Buffer";
+  }
+
+  function errInvalidArgValue(value) {
+    const rendered = value instanceof Uint8Array
+      ? pirInspectBufferLike(value)
+      : pirInspect(value, { depth: 0 });
+    return pirError(TypeError, "ERR_INVALID_ARG_VALUE",
+      "The argument 'value' is invalid. Received " + rendered);
+  }
+
+  function errUnknownEncoding(encoding) {
+    // Node renders -0 as "-0" here (String(-0) would lose the sign).
+    const text = typeof encoding === "number" && Object.is(encoding, -0)
+      ? "-0"
+      : String(encoding);
+    return pirError(TypeError, "ERR_UNKNOWN_ENCODING", "Unknown encoding: " + text);
+  }
+
+  function errValueOutOfRange(name, range, value) {
+    return pirError(RangeError, "ERR_OUT_OF_RANGE",
+      'The value of "' + name + '" is out of range. It must be ' + range + ". Received " + pirFormatReceived(value));
+  }
+
+  function errBufferOutOfBounds(name) {
+    return pirError(RangeError, "ERR_BUFFER_OUT_OF_BOUNDS", '"' + name + '" is outside of buffer bounds');
+  }
+
+  function errBufferOutOfBoundsAccess() {
+    return pirError(RangeError, "ERR_BUFFER_OUT_OF_BOUNDS", "Attempt to access memory outside buffer bounds");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Encodings (Node's table: ascii is latin1, ucs2 is utf16le, base64url is
+  // base64 with the URL-safe alphabet and no padding).
+  // ---------------------------------------------------------------------------
+  const PIR_ENCODINGS = {
+    utf8: "utf8", "utf-8": "utf8",
+    utf16le: "utf16le", "utf-16le": "utf16le", ucs2: "utf16le", "ucs-2": "utf16le",
+    latin1: "latin1", binary: "latin1", ascii: "latin1",
+    base64: "base64", base64url: "base64url",
+    hex: "hex",
+  };
+
+  function lookupEncoding(encoding) {
+    if (typeof encoding !== "string") return null;
+    return PIR_ENCODINGS[encoding.toLowerCase()] || null;
+  }
+
+  // toString/write: a missing encoding means utf8, anything else that is not a
+  // known encoding NAME (null, a number, an unknown string) throws.
+  function normalizeEncoding(encoding) {
+    if (encoding === undefined) return "utf8";
+    const enc = lookupEncoding(encoding);
+    if (enc === null) throw errUnknownEncoding(encoding);
+    return enc;
+  }
+
+  // from()/write()-input semantics: non-string encodings fall back to utf8
+  // (Node only validates the encoding when it IS a string).
+  function normalizeEncodingOptional(encoding) {
+    if (typeof encoding !== "string" || encoding.length === 0) return "utf8";
+    const enc = lookupEncoding(encoding);
+    if (enc === null) throw errUnknownEncoding(encoding);
+    return enc;
+  }
+
+  function hexNibble(code) {
+    if (code >= 48 && code <= 57) return code - 48;
+    if (code >= 97 && code <= 102) return code - 87;
+    if (code >= 65 && code <= 70) return code - 55;
+    return -1;
+  }
+
+  function utf8Bytes(str) {
+    const out = [];
+    for (let i = 0; i < str.length; i++) {
+      let cp = str.codePointAt(i);
+      if (cp > 0xffff) i++;
+      // Lone surrogates encode as U+FFFD (WHATWG/Node parity).
+      if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
+      if (cp < 0x80) out.push(cp);
+      else if (cp < 0x800) out.push(0xc0 | (cp >> 6), 0x80 | (cp & 63));
+      else if (cp < 0x10000) out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+      else out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+    }
+    return out;
+  }
+
+  function utf8Decode(bytes) {
+    let out = "";
+    let i = 0;
+    while (i < bytes.length) {
+      const b0 = bytes[i];
+      if (b0 < 0x80) { out += String.fromCharCode(b0); i += 1; continue; }
+      let need;
+      if (b0 >= 0xc2 && b0 <= 0xdf) need = 1;
+      else if (b0 >= 0xe0 && b0 <= 0xef) need = 2;
+      else if (b0 >= 0xf0 && b0 <= 0xf4) need = 3;
+      else { out += "\uFFFD"; i += 1; continue; }
+      if (i + need >= bytes.length) {
+        // Truncated trailing sequence: one replacement for the maximal subpart.
+        out += "\uFFFD";
+        i += 1;
+        while (i < bytes.length && bytes[i] >= 0x80 && bytes[i] <= 0xbf) i += 1;
+        continue;
+      }
+      let valid = true;
+      for (let k = 1; k <= need; k++) {
+        const cont = bytes[i + k];
+        if (cont < 0x80 || cont > 0xbf) { valid = false; break; }
+      }
+      if (!valid) { out += "\uFFFD"; i += 1; continue; }
+      let cp;
+      if (need === 1) cp = ((b0 & 0x1f) << 6) | (bytes[i + 1] & 0x3f);
+      else if (need === 2) cp = ((b0 & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f);
+      else cp = ((b0 & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) | ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
+      out += String.fromCodePoint(cp);
+      i += need + 1;
+    }
+    return out;
+  }
+
+  function latin1Bytes(str) {
+    const out = [];
+    for (let i = 0; i < str.length; i++) out.push(str.charCodeAt(i) & 0xff);
+    return out;
+  }
+
+  function latin1Decode(bytes) {
+    let out = "";
+    for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+    return out;
+  }
+
+  function utf16leBytes(str) {
+    const out = [];
+    for (let i = 0; i < str.length; i++) {
+      const code = str.charCodeAt(i);
+      out.push(code & 0xff, (code >> 8) & 0xff);
+    }
+    return out;
+  }
+
+  function utf16leDecode(bytes) {
+    let out = "";
+    for (let i = 0; i + 1 < bytes.length; i += 2) {
+      out += String.fromCharCode(bytes[i] | (bytes[i + 1] << 8));
+    }
+    return out;
+  }
+
+  function hexBytes(str) {
+    const out = [];
+    for (let i = 0; i + 1 < str.length; i += 2) {
+      const hi = hexNibble(str.charCodeAt(i));
+      const lo = hexNibble(str.charCodeAt(i + 1));
+      if (hi < 0 || lo < 0) break; // Node stops at the first invalid pair
+      out.push((hi << 4) | lo);
+    }
+    return out;
+  }
+
+  function hexEncode(bytes) {
+    let out = "";
+    for (let i = 0; i < bytes.length; i++) {
+      out += HEX_CHARS[bytes[i] >> 4] + HEX_CHARS[bytes[i] & 15];
+    }
+    return out;
+  }
+
+  function base64Bytes(str) {
+    const out = [];
+    let acc = 0;
+    let bits = 0;
+    for (let i = 0; i < str.length; i++) {
+      const code = str.charCodeAt(i);
+      if (code === 61) break; // '=' padding ends the payload
+      // Node's decoder table takes the URL-safe alphabet in both modes
+      // (`Buffer.from('__--_--_--__', 'base64')` decodes like base64url).
+      const value = code === 45 ? 62 : code === 95 ? 63 : B64_CHARS.indexOf(str[i]);
+      if (value < 0) continue; // whitespace/invalid characters are skipped (Node parity)
+      acc = (acc << 6) | value;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out.push((acc >> bits) & 0xff);
+      }
+    }
+    return out;
+  }
+
+  function base64Encode(bytes) {
+    let out = "";
+    for (let i = 0; i < bytes.length; i += 3) {
+      const b0 = bytes[i];
+      const b1 = i + 1 < bytes.length ? bytes[i + 1] : undefined;
+      const b2 = i + 2 < bytes.length ? bytes[i + 2] : undefined;
+      out += B64_CHARS[b0 >> 2];
+      out += B64_CHARS[((b0 & 3) << 4) | ((b1 === undefined ? 0 : b1) >> 4)];
+      out += b1 === undefined ? "=" : B64_CHARS[((b1 & 15) << 2) | ((b2 === undefined ? 0 : b2) >> 6)];
+      out += b2 === undefined ? "=" : B64_CHARS[b2 & 63];
+    }
+    return out;
+  }
+
+  // base64url: the URL-safe alphabet with the padding dropped on encode, and
+  // translated back on decode (Node: `//++/++` and `__--_--__` decode alike).
+  function base64urlBytes(str) {
+    return base64Bytes(String(str).replace(/-/g, "+").replace(/_/g, "/"));
+  }
+
+  function base64urlEncode(bytes) {
+    return base64Encode(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  // Node's base64ByteLength: strip up to two trailing '=' and scale by 3/4.
+  function base64ByteLength(str) {
+    let bytes = str.length;
+    if (bytes === 0) return 0;
+    if (str.charCodeAt(bytes - 1) === 61) bytes -= 1;
+    if (bytes > 1 && str.charCodeAt(bytes - 1) === 61) bytes -= 1;
+    return (bytes * 3) >>> 2;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Host fast path (§6.5 host-first policy): when the pir extension runtime
+  // registered its native codec (`__pirBufferCodec`, a rquickjs C-ABI
+  // dispatcher — see src/extensions/runtime/host_functions/buffer_ops.rs),
+  // the string/bytes state machines above are overridden by native
+  // implementations with identical semantics. A native string-input op
+  // returns `undefined` when the input cannot cross the host bridge (e.g. a
+  // lone surrogate), and any unexpected native failure is caught — in both
+  // cases the JS state machine below is the automatic fallback, so behavior
+  // never changes. Direct reassignment (not ??=) is intentional: native must
+  // win when present. Buffer.from/toString/fill/indexOf/byteLength all route
+  // through these helpers, so they pick the native path with no changes.
+  // ---------------------------------------------------------------------------
+  const pirNativeCodec = typeof globalThis.__pirBufferCodec === "function" ? globalThis.__pirBufferCodec : null;
+  // Search kernel binding: null until the native dispatcher registers it (the
+  // JS scan loops in pirBidirectionalIndexOf stay the fallback).
+  let pirSearchKernel = null;
+  // Variadic (1..6 byte) LE/BE integer kernel binding: null keeps the JS BigInt
+  // implementation of writeVariadicInteger/readVariadicInteger as the tier.
+  let pirVariadicKernel = null;
+  if (pirNativeCodec) {
+    const jsUtf8Bytes = utf8Bytes;
+    const jsUtf8Decode = utf8Decode;
+    const jsLatin1Bytes = latin1Bytes;
+    const jsLatin1Decode = latin1Decode;
+    const jsUtf16leBytes = utf16leBytes;
+    const jsUtf16leDecode = utf16leDecode;
+    const jsHexBytes = hexBytes;
+    const jsHexEncode = hexEncode;
+    const jsBase64Bytes = base64Bytes;
+    const jsBase64Encode = base64Encode;
+    const nativeCodec = pirNativeCodec;
+    utf8Bytes = function (str) {
+      try {
+        const bytes = nativeCodec("utf8Bytes", str);
+        if (bytes !== undefined) return bytes;
+      } catch (error) { /* native cannot handle it: fall through */ }
+      return jsUtf8Bytes(str);
+    };
+    utf8Decode = function (bytes) {
+      try {
+        const text = nativeCodec("utf8Decode", bytes);
+        if (typeof text === "string") return text;
+      } catch (error) { /* fall through */ }
+      return jsUtf8Decode(bytes);
+    };
+    latin1Bytes = function (str) {
+      try {
+        const bytes = nativeCodec("latin1Bytes", str);
+        if (bytes !== undefined) return bytes;
+      } catch (error) { /* fall through */ }
+      return jsLatin1Bytes(str);
+    };
+    latin1Decode = function (bytes) {
+      try {
+        const text = nativeCodec("latin1Decode", bytes);
+        if (typeof text === "string") return text;
+      } catch (error) { /* fall through */ }
+      return jsLatin1Decode(bytes);
+    };
+    utf16leBytes = function (str) {
+      try {
+        const bytes = nativeCodec("utf16leBytes", str);
+        if (bytes !== undefined) return bytes;
+      } catch (error) { /* fall through */ }
+      return jsUtf16leBytes(str);
+    };
+    utf16leDecode = function (bytes) {
+      try {
+        const text = nativeCodec("utf16leDecodeChunk", bytes);
+        if (typeof text === "object" && text !== null) return text.text;
+      } catch (error) { /* fall through */ }
+      return jsUtf16leDecode(bytes);
+    };
+    hexBytes = function (str) {
+      try {
+        const bytes = nativeCodec("hexBytes", str);
+        if (bytes !== undefined) return bytes;
+      } catch (error) { /* fall through */ }
+      return jsHexBytes(str);
+    };
+    hexEncode = function (bytes) {
+      try {
+        const text = nativeCodec("hexEncode", bytes);
+        if (typeof text === "string") return text;
+      } catch (error) { /* fall through */ }
+      return jsHexEncode(bytes);
+    };
+    base64Bytes = function (str) {
+      try {
+        const bytes = nativeCodec("base64Bytes", str);
+        if (bytes !== undefined) return bytes;
+      } catch (error) { /* fall through */ }
+      return jsBase64Bytes(str);
+    };
+    base64Encode = function (bytes) {
+      try {
+        const text = nativeCodec("base64Encode", bytes);
+        if (typeof text === "string") return text;
+      } catch (error) { /* fall through */ }
+      return jsBase64Encode(bytes);
+    };
+    // The scan loop of pirBidirectionalIndexOf: the offset/needle/encoding
+    // resolution above it (and its Node error shapes) stays in JS, and the
+    // native op answers `undefined` for a receiver or needle the Rust kernel
+    // cannot read (a non-Uint8Array receiver, a detached view), so the JS loop
+    // below runs instead.
+    pirSearchKernel = function (buffer, needle, start, backwards, align) {
+      try {
+        const found = nativeCodec("indexOfBytes", buffer, backwards, align === 2, needle, start);
+        if (typeof found === "number") return found;
+      } catch (error) { /* fall through */ }
+      return undefined;
+    };
+    // writeVariadicInteger/readVariadicInteger byte arithmetic. The Rust op
+    // packs offset and byteLength into one number (`offset * 8 + byteLength`);
+    // it accepts only byteLength 1..6, an in-bounds offset and a plain finite
+    // value, and answers `undefined` otherwise so the JS kernel keeps every
+    // validation-adjacent edge.
+    pirVariadicKernel = function (op, buffer, bigEndian, signed, value, packed) {
+      try {
+        const result = nativeCodec(op, buffer, bigEndian, signed, value, packed);
+        if (typeof result === "number") return result;
+      } catch (error) { /* fall through */ }
+      return undefined;
+    };
+  }
+
+  // Encode to bytes with an encoding that is already one of the normalized names.
+  function encodeToBytesWith(value, enc) {
+    if (enc === "utf8") return utf8Bytes(value);
+    if (enc === "latin1") return latin1Bytes(value);
+    if (enc === "utf16le") return utf16leBytes(value);
+    if (enc === "hex") return hexBytes(value);
+    if (enc === "base64url") return base64urlBytes(value);
+    return base64Bytes(value);
+  }
+
+  // How many of `bytes` fit in `limit` without splitting a character: utf16le
+  // writes whole 16-bit units and utf8 refuses to cut a multi-byte sequence
+  // (Node: `write('ыы', 3, 'ucs2')` on a 4-byte buffer writes nothing).
+  function writableByteCount(bytes, enc, limit) {
+    if (!(limit > 0)) return 0;
+    if (enc === "utf16le") return limit & ~1;
+    if (enc !== "utf8") return Math.min(limit, bytes.length);
+    let written = 0;
+    while (written < limit && written < bytes.length) {
+      const lead = bytes[written];
+      let size = 1;
+      if (lead >= 0xf0) size = 4;
+      else if (lead >= 0xe0) size = 3;
+      else if (lead >= 0xc0) size = 2;
+      if (written + size > limit || written + size > bytes.length) break;
+      written += size;
+    }
+    return written;
+  }
+
+  // Node's `adjustOffset` for slice/subarray: NaN/undefined are 0, negatives
+  // count from the end (and saturate at 0), overshoot clamps to the length.
+  function pirAdjustOffset(offset, length) {
+    if (offset === undefined || offset === 0) return 0;
+    let value = Math.trunc(Number(offset));
+    if (Number.isNaN(value)) return 0;
+    if (value < 0) {
+      value += length;
+      return value < 0 ? 0 : value;
+    }
+    return value > length ? length : value;
+  }
+
+  // Hex fills accept whitespace and truncate an odd trailing nibble, but any
+  // non-hex character — or a string that leaves no complete byte behind — is
+  // ERR_INVALID_ARG_VALUE (Node rejects what it cannot decode instead of
+  // silently dropping it). An empty string is a no-op, not an error.
+  function pirFillHexBytes(text) {
+    const compact = String(text).replace(/\s+/g, "");
+    if (compact.length === 0) return [];
+    if (/[^0-9a-fA-F]/.test(compact)) throw errInvalidArgValue(text);
+    const usable = compact.length % 2 === 0 ? compact : compact.slice(0, -1);
+    if (usable.length === 0) throw errInvalidArgValue(text);
+    const out = [];
+    for (let i = 0; i < usable.length; i += 2) {
+      out.push(parseInt(usable.substr(i, 2), 16));
+    }
+    return out;
+  }
+
+  // A base64 group of one character can never produce a byte; Node's fill
+  // rejects that shape (a decoder error) rather than filling nothing.
+  function pirCheckBase64Fill(value, text) {
+    const compact = String(text).replace(/\s+/g, "");
+    if (compact.length > 0 && compact.length % 4 === 1) throw errInvalidArgValue(text);
+    return value;
+  }
+
+  function pirRegionEquals(buffer, needle, at) {
+    for (let k = 0; k < needle.length; k++) {
+      if (buffer[at + k] !== needle[k]) return false;
+    }
+    return true;
+  }
+
+  // Node's bidirectionalIndexOf: one offset/needle resolution for both
+  // directions. `dir` is 1 for indexOf, -1 for lastIndexOf.
+  function pirBidirectionalIndexOf(buffer, value, byteOffset, encoding, dir) {
+    const len = buffer.length;
+    let offset;
+    let enc = "utf8";
+    if (typeof byteOffset === "string") {
+      enc = byteOffset;
+      offset = 0;
+    } else if (byteOffset === undefined) {
+      // lastIndexOf starts at the end of the buffer, indexOf at the front.
+      offset = dir === 1 ? 0 : len;
+      if (encoding !== undefined) enc = encoding;
+    } else {
+      offset = Number(byteOffset);
+      if (offset > 0x7fffffff) offset = 0x7fffffff;
+      else if (offset < -0x80000000) offset = -0x80000000;
+      if (Number.isNaN(offset)) offset = dir === 1 ? 0 : len - 1;
+      if (encoding !== undefined) enc = encoding;
+    }
+    if (offset < 0) {
+      offset = len + offset;
+      if (offset < 0) offset = dir === 1 ? 0 : -1;
+    }
+    let needle;
+    let align = 1;
+    if (typeof value === "number") {
+      // Number needles are single bytes: Node never looks at the encoding.
+      needle = [value & 0xff];
+    } else if (typeof value === "string") {
+      const normalized = normalizeEncodingOptional(enc);
+      needle = encodeToBytesWith(value, normalized);
+      // ucs2 searches only line up on 16-bit boundaries (Node's
+      // indexOfStringBidirectional) — an odd offset never matches.
+      if (normalized === "utf16le") align = 2;
+    } else if (value instanceof Uint8Array) {
+      const count = value.byteLength;
+      needle = [];
+      for (let i = 0; i < count; i++) needle.push(value[i] & 0xff);
+      // Node's indexOfBuffer aligns ucs2 searches to 16-bit units and rejects
+      // odd-length ucs2 needles outright.
+      if (normalizeEncodingOptional(enc) === "utf16le") {
+        if (needle.length % 2 !== 0) return -1;
+        align = 2;
+      }
+    } else {
+      throw errInvalidArgType("value",
+        "one of type number or string or an instance of Buffer or Uint8Array", value);
+    }
+    const size = needle.length;
+    if (size === 0) {
+      if (dir === 1) return Math.min(offset, len);
+      if (offset < 0) return 0;
+      return Math.min(offset, len);
+    }
+    if (size > len) return -1;
+    // `byteLength === len` pins the native scan to receivers whose JS-visible
+    // `length` is the view's own byteLength (a spoofed `length` or a plain
+    // indexable object keeps the JS loop, which reads `buffer[i]`).
+    if (dir === 1) {
+      let start = offset < 0 ? 0 : offset;
+      if (align === 2) start += start % 2;
+      if (pirSearchKernel !== null && buffer.byteLength === len) {
+        const found = pirSearchKernel(buffer, needle, start, false, align);
+        if (found !== undefined) return found;
+      }
+      for (let i = start; i + size <= len; i += align) {
+        if (pirRegionEquals(buffer, needle, i)) return i;
+      }
+      return -1;
+    }
+    let start = offset > len - size ? len - size : offset;
+    if (align === 2) start -= start % 2;
+    if (pirSearchKernel !== null && buffer.byteLength === len) {
+      const found = pirSearchKernel(buffer, needle, start, true, align);
+      if (found !== undefined) return found;
+    }
+    for (let i = start; i >= 0; i -= align) {
+      if (pirRegionEquals(buffer, needle, i)) return i;
+    }
+    return -1;
+  }
+
+  function copyViewBytes(view) {
+    // `byteLength`, not `length`: a spoofed own `length` on a typed array must
+    // not change how many bytes are copied (Node reads the internal slot).
+    const count = view.byteLength;
+    const out = [];
+    for (let i = 0; i < count; i++) out.push(view[i] & 0xff);
+    return out;
+  }
+
+  function isAnyArrayBufferLike(value) {
+    if (value instanceof ArrayBuffer) return true;
+    if (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer) return true;
+    // vm.runInNewContext hands out ArrayBuffers from another realm, where
+    // `instanceof` is useless — brand-check through the internal tag instead.
+    if (value !== null && typeof value === "object" && typeof value.byteLength === "number") {
+      const tag = Object.prototype.toString.call(value);
+      return tag === "[object ArrayBuffer]" || tag === "[object SharedArrayBuffer]";
+    }
+    return false;
+  }
+
+  function isUint8ArrayLike(value) {
+    return ArrayBuffer.isView(value) &&
+      Object.prototype.toString.call(value) === "[object Uint8Array]";
+  }
+
+  function fromBytes(bytes) {
+    // A typed-array input (the native codec's answer: `__pirBufferCodec` hands
+    // back a Uint8Array) takes the engine's own memcpy path: `fromView` copies
+    // through `set` and produces the same Buffer-typed copy as the element loop
+    // below, without paying one interpreted iteration per byte — a multi-MB
+    // chunk (the `fetch` body bridge decodes one per poll window) stays a
+    // memcpy instead of ~8M interpreted iterations. Anything else (a plain
+    // Array from the JS codec fallback) keeps the element-wise copy.
+    if (isUint8ArrayLike(bytes)) return fromView(bytes);
+    const buffer = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) buffer[i] = bytes[i] & 0xff;
+    Object.setPrototypeOf(buffer, Buffer.prototype);
+    return buffer;
+  }
+
+  // Copy of a typed-array view through the engine's own memcpy (`set`), for the
+  // large-ArrayBuffer paths where a JS element loop would dominate.
+  function fromView(view) {
+    const buffer = new Uint8Array(view.byteLength);
+    buffer.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+    Object.setPrototypeOf(buffer, Buffer.prototype);
+    return buffer;
+  }
+
+  function fromArrayLike(obj) {
+    // Node's allocate(): a non-positive length is an empty buffer, never an
+    // error (negative `length` inputs must not throw).
+    let length = obj.length;
+    length = typeof length === "number" ? Math.trunc(length) : 0;
+    if (!(length > 0)) return fromBytes([]);
+    const buffer = new Uint8Array(length);
+    for (let i = 0; i < length; i++) buffer[i] = obj[i];
+    Object.setPrototypeOf(buffer, Buffer.prototype);
+    return buffer;
+  }
+
+  // Node's fromArrayBuffer bounds contract: both the offset and the length are
+  // truncated (V8 ToIndex), a negative offset is the engine's own
+  // "Start offset N is outside the bounds of the buffer" RangeError, a
+  // negative remaining length is ERR_BUFFER_OUT_OF_BOUNDS("offset") and an
+  // over-long explicit length is ERR_BUFFER_OUT_OF_BOUNDS("length").
+  function pirArrayBufferArgs(arrayBuffer, byteOffset, length) {
+    let offset = byteOffset === undefined ? 0 : Number(byteOffset);
+    if (Number.isNaN(offset)) offset = 0;
+    if (offset < 0) {
+      throw pirError(RangeError, undefined,
+        "Start offset " + offset + " is outside the bounds of the buffer");
+    }
+    offset = Math.trunc(offset);
+    const maxLength = arrayBuffer.byteLength - offset;
+    if (maxLength < 0) throw errBufferOutOfBounds("offset");
+    let viewLength = maxLength;
+    if (length !== undefined) {
+      viewLength = Number(length);
+      if (Number.isNaN(viewLength) || viewLength < 0) viewLength = 0;
+      viewLength = Math.trunc(viewLength);
+      if (viewLength > maxLength) throw errBufferOutOfBounds("length");
+    }
+    return [offset, viewLength];
+  }
+
+  function viewOver(arrayBuffer, byteOffset, length) {
+    const bounds = pirArrayBufferArgs(arrayBuffer, byteOffset, length);
+    const view = new Uint8Array(arrayBuffer, bounds[0], bounds[1]);
+    Object.setPrototypeOf(view, Buffer.prototype);
+    return view;
+  }
+
+  // Numeric read/write family (real tier): DataView-backed LE/BE accessors
+  // with Node's two-tier bounds errors. buf.length is used (not byteLength)
+  // because every Buffer instance carries a 1:1 backing store here.
+  // Node's fixed-size kernel validators (`checkInt` + `checkBounds`): a
+  // missing offset is 0, a non-number offset is ERR_INVALID_ARG_TYPE, a
+  // non-integer/NaN offset is "It must be an integer", a buffer shorter than
+  // the access itself is ERR_BUFFER_OUT_OF_BOUNDS (Node's `boundsError` tests
+  // `buf.length - size < 0` before the range message), and any other offset
+  // past `length - size` is "It must be >= 0 and <= length - size".
+  function checkNumericOffset(buf, offset, size) {
+    const bound = buf.length - size;
+    if (offset === undefined) return 0;
+    if (typeof offset !== "number") {
+      throw errInvalidArgType("offset", "of type number", offset);
+    }
+    if (!Number.isInteger(offset)) {
+      throw errValueOutOfRange("offset", "an integer", offset);
+    }
+    if (bound < 0) throw errBufferOutOfBoundsAccess();
+    if (offset < 0 || offset > bound) {
+      throw errValueOutOfRange("offset", ">= 0 and <= " + bound, offset);
+    }
+    return offset;
+  }
+
+  function checkNumericValue(value, min, max) {
+    // Node compares loosely (`value > max || value < min`), so strings, boxed
+    // primitives and NaN pass through to the writer's own coercion.
+    const number = Number(value);
+    if (number < min || number > max) {
+      throw errValueOutOfRange("value", ">= " + min + " and <= " + max, value);
+    }
+    return value;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Variadic read/write LE/BE family (1..6 bytes) — Node's `checkInt` /
+  // `checkBounds` split: the byteLength is an integer in [1, 6], a byteLength
+  // longer than the buffer is ERR_BUFFER_OUT_OF_BOUNDS, the offset is an
+  // integer in [0, length - byteLength], and the value range is exclusive at
+  // the 6-byte end (2 ** 48 / 2 ** 47 are out of range there).
+  // ---------------------------------------------------------------------------
+  function checkVariadicByteLength(byteLength) {
+    if (typeof byteLength !== "number" || !Number.isInteger(byteLength)) {
+      throw errValueOutOfRange("byteLength", "an integer", byteLength);
+    }
+    if (byteLength < 1 || byteLength > 6) {
+      throw errValueOutOfRange("byteLength", ">= 1 and <= 6", byteLength);
+    }
+    return byteLength;
+  }
+
+  function checkVariadicOffset(buf, offset, byteLength) {
+    if (typeof offset !== "number") throw errInvalidArgType("offset", "of type number", offset);
+    if (!Number.isInteger(offset)) throw errValueOutOfRange("offset", "an integer", offset);
+    if (byteLength > buf.length) throw errBufferOutOfBoundsAccess();
+    const max = buf.length - byteLength;
+    if (offset < 0 || offset > max) {
+      throw errValueOutOfRange("offset", ">= 0 and <= " + max, offset);
+    }
+    return offset;
+  }
+
+  function checkVariadicUnsigned(value, byteLength) {
+    const number = Number(value);
+    if (byteLength === 6) {
+      if (!(number >= 0) || number >= 281474976710656) {
+        throw errValueOutOfRange("value", ">= 0 and < 2 ** 48", value);
+      }
+      return number;
+    }
+    const max = Math.pow(2, byteLength * 8) - 1;
+    if (!(number >= 0) || number > max) {
+      throw errValueOutOfRange("value", ">= 0 and <= " + max, value);
+    }
+    return number;
+  }
+
+  function checkVariadicSigned(value, byteLength) {
+    const number = Number(value);
+    if (byteLength === 6) {
+      if (!(number >= -140737488355328) || number >= 140737488355328) {
+        throw errValueOutOfRange("value", ">= -(2 ** 47) and < 2 ** 47", value);
+      }
+      return number;
+    }
+    const bound = Math.pow(2, byteLength * 8 - 1);
+    if (!(number >= -bound) || number >= bound) {
+      throw errValueOutOfRange("value", ">= " + (-bound) + " and <= " + (bound - 1), value);
+    }
+    return number;
+  }
+
+  function writeVariadicInteger(buf, offset, byteLength, value, bigEndian) {
+    if (pirVariadicKernel !== null) {
+      const written = pirVariadicKernel(
+        "variadicWrite", buf, bigEndian, false, value, offset * 8 + byteLength
+      );
+      if (written !== undefined) return written;
+    }
+    const bits = BigInt(byteLength * 8);
+    let current = BigInt(Math.trunc(value));
+    if (current < 0n) current += 1n << bits;
+    for (let i = 0; i < byteLength; i++) {
+      const index = bigEndian ? offset + byteLength - 1 - i : offset + i;
+      buf[index] = Number(current & 0xffn);
+      current >>= 8n;
+    }
+    return offset + byteLength;
+  }
+
+  function readVariadicInteger(buf, offset, byteLength, signed, bigEndian) {
+    if (pirVariadicKernel !== null) {
+      const read = pirVariadicKernel(
+        "variadicRead", buf, bigEndian, signed, undefined, offset * 8 + byteLength
+      );
+      if (read !== undefined) return read;
+    }
+    let result = 0n;
+    for (let i = 0; i < byteLength; i++) {
+      const index = bigEndian ? offset + i : offset + byteLength - 1 - i;
+      result = (result << 8n) | BigInt(buf[index]);
+    }
+    if (signed) {
+      const signBit = 1n << BigInt(byteLength * 8 - 1);
+      if (result >= signBit) result -= 1n << BigInt(byteLength * 8);
+    }
+    return Number(result);
+  }
+
+  // Node's BigInt kernels use half-open ranges: `>= 0n and < 2n ** 64n` for the
+  // unsigned pair and `>= -(2n ** 63n) and < 2n ** 63n` for the signed pair.
+  // Non-BigInt inputs fall through to `DataView.setBig*`, which raises the
+  // engine's own "Cannot mix BigInt and other types" TypeError (Node's text).
+  function checkBigIntValue(value, range, min, max) {
+    if (typeof value !== "bigint") {
+      // Node surfaces V8's coercion TypeError, not a RangeError.
+      throw pirError(TypeError, undefined, "Cannot mix BigInt and other types, use explicit conversions");
+    }
+    if (value < min || value >= max) {
+      throw errValueOutOfRange("value", range, value);
+    }
+    return value;
+  }
+
+  // Node's `validateOffset` (lib/buffer.js): the compare family validates its
+  // four range arguments before looking at any byte, and the error shapes are
+  // the generic ERR_INVALID_ARG_TYPE / ERR_OUT_OF_RANGE pair.
+  function pirValidateOffset(value, name, min, max) {
+    if (typeof value !== "number") throw errInvalidArgType(name, "of type number", value);
+    if (!Number.isInteger(value)) throw errValueOutOfRange(name, "an integer", value);
+    if (value < min || value > max) {
+      throw errValueOutOfRange(name, ">= " + min + " && <= " + max, value);
+    }
+    return value;
+  }
+
+  // Node's `_compare`/`compareOffset`: byte-wise lexicographic compare over an
+  // explicit range of each side; a shared prefix that compares equal leaves the
+  // verdict to the range lengths (source longer ⇒ 1). Node's native entry point
+  // orders the arguments (source, target, targetStart, sourceStart, targetEnd,
+  // sourceEnd); the source-first grouping here is the same algorithm with the
+  // two ranges kept next to their buffers.
+  function pirCompareOffset(source, sourceStart, sourceEnd, target, targetStart, targetEnd) {
+    const sourceLength = sourceEnd - sourceStart;
+    const targetLength = targetEnd - targetStart;
+    const len = Math.min(sourceLength, targetLength);
+    for (let i = 0; i < len; i++) {
+      const a = source[sourceStart + i];
+      const b = target[targetStart + i];
+      if (a !== b) return a < b ? -1 : 1;
+    }
+    if (sourceLength === targetLength) return 0;
+    return sourceLength < targetLength ? -1 : 1;
+  }
+
+  // The implementation class is named `Buffer` (the name drives
+  // `constructor.name`, which Node's inspect/assert output and util's Buffer
+  // tag depend on). The global is a *callable* facade over it — Node's Buffer
+  // is a function, so `Buffer(str)` and `Buffer(n)` must work without `new`.
+  const BufferImpl = class Buffer extends Uint8Array {
+    constructor(arg, byteOffset, length) {
+      if (typeof arg === "number") {
+        super(arg);
+      } else if (arg === undefined || arg === null) {
+        super(0);
+      } else if (isAnyArrayBufferLike(arg)) {
+        const bounds = pirArrayBufferArgs(arg, byteOffset, length);
+        super(arg, bounds[0], bounds[1]);
+      } else {
+        // Legacy `new Buffer(string|array)`: copy through the shared codecs.
+        const bytes = BufferImpl.from(arg, byteOffset);
+        super(bytes.length);
+        this.set(bytes);
+      }
+    }
+
+    toString(encoding, start, end) {
+      const enc = normalizeEncoding(encoding);
+      const len = this.length;
+      // Node slowToString range handling: a negative or NaN start is 0, a
+      // negative end is 0 and an end past the buffer is the buffer (NaN is
+      // NOT clamped — it survives into the slice as an empty range).
+      let from = start === undefined || !(start >= 0) ? 0 : Math.trunc(Number(start));
+      if (from > len) from = len;
+      let to = end === undefined || end > len ? len : Math.trunc(Number(end));
+      if (to < 0) to = 0;
+      if (!(to > from)) return "";
+      const view = this.subarray(from, to);
+      if (enc === "utf8") return utf8Decode(view);
+      if (enc === "latin1") return latin1Decode(view);
+      if (enc === "utf16le") return utf16leDecode(view);
+      if (enc === "hex") return hexEncode(view);
+      if (enc === "base64url") return base64urlEncode(view);
+      return base64Encode(view);
+    }
+
+    write(string, offset, length, encoding) {
+      const len = this.length;
+      let start = 0;
+      let max = len;
+      let enc;
+      if (offset === undefined) {
+        enc = "utf8";
+      } else if (length === undefined && typeof offset === "string") {
+        // write(string, encoding)
+        enc = offset;
+      } else {
+        // write(string, offset[, length][, encoding])
+        if (typeof offset !== "number") {
+          throw errInvalidArgType("offset", "of type number", offset);
+        }
+        if (!(offset >= 0) || offset > len) {
+          throw errValueOutOfRange("offset", ">= 0 && <= " + len, offset);
+        }
+        start = Math.trunc(offset);
+        const remaining = len - start;
+        if (length === undefined) { max = remaining; enc = encoding; }
+        else if (typeof length === "string") { max = remaining; enc = length; }
+        else if (typeof length !== "number") {
+          throw errInvalidArgType("length", "of type number", length);
+        } else { max = Math.min(length, remaining); enc = encoding; }
+      }
+      const norm = normalizeEncodingOptional(enc);
+      if (typeof string !== "string") {
+        // Node's raw kernels validate the payload last: a non-string is
+        // ERR_INVALID_ARG_TYPE with V8's terse wording.
+        throw pirError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a string");
+      }
+      const bytes = encodeToBytesWith(string, norm);
+      const limit = Math.max(0, Math.min(max === undefined ? len - start : Math.trunc(Number(max)), bytes.length, len - start));
+      const writable = writableByteCount(bytes, norm, limit);
+      for (let i = 0; i < writable; i++) this[start + i] = bytes[i];
+      return writable;
+    }
+
+    // Raw encoding kernels (Node's `*Write` family): same bounds contract, but
+    // an out-of-range length is ERR_BUFFER_OUT_OF_BOUNDS rather than
+    // ERR_OUT_OF_RANGE, and no offset/length coercion beyond NaN -> 0.
+    pirRawWrite(string, offset, length, enc) {
+      const len = this.length;
+      let start = offset === undefined ? 0 : Number(offset);
+      if (Number.isNaN(start)) start = 0;
+      const count = length === undefined ? len - start : Number(length);
+      if (!(count >= 0) || start < 0 || start + count > len) throw errBufferOutOfBounds("length");
+      const bytes = encodeToBytesWith(String(string), enc);
+      const limit = Math.max(0, Math.min(count, bytes.length));
+      const writable = writableByteCount(bytes, enc, limit);
+      for (let i = 0; i < writable; i++) this[start + i] = bytes[i];
+      return writable;
+    }
+
+    asciiWrite(string, offset, length) { return this.pirRawWrite(string, offset, length, "latin1"); }
+    latin1Write(string, offset, length) { return this.pirRawWrite(string, offset, length, "latin1"); }
+    utf8Write(string, offset, length) { return this.pirRawWrite(string, offset, length, "utf8"); }
+
+    writeUInt8(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 1);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setUint8(offset, checkNumericValue(value, 0, 0xff));
+      return offset + 1;
+    }
+
+    writeInt8(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 1);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setInt8(offset, checkNumericValue(value, -0x80, 0x7f));
+      return offset + 1;
+    }
+
+    writeUInt16LE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 2);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setUint16(offset, checkNumericValue(value, 0, 0xffff), true);
+      return offset + 2;
+    }
+
+    writeUInt16BE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 2);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setUint16(offset, checkNumericValue(value, 0, 0xffff), false);
+      return offset + 2;
+    }
+
+    writeInt16LE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 2);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setInt16(offset, checkNumericValue(value, -0x8000, 0x7fff), true);
+      return offset + 2;
+    }
+
+    writeInt16BE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 2);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setInt16(offset, checkNumericValue(value, -0x8000, 0x7fff), false);
+      return offset + 2;
+    }
+
+    writeUInt32LE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 4);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setUint32(offset, checkNumericValue(value, 0, 0xffffffff), true);
+      return offset + 4;
+    }
+
+    writeUInt32BE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 4);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setUint32(offset, checkNumericValue(value, 0, 0xffffffff), false);
+      return offset + 4;
+    }
+
+    writeInt32LE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 4);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setInt32(offset, checkNumericValue(value, -0x80000000, 0x7fffffff), true);
+      return offset + 4;
+    }
+
+    writeInt32BE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 4);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setInt32(offset, checkNumericValue(value, -0x80000000, 0x7fffffff), false);
+      return offset + 4;
+    }
+
+    writeFloatLE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 4);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat32(offset, value, true);
+      return offset + 4;
+    }
+
+    writeFloatBE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 4);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat32(offset, value, false);
+      return offset + 4;
+    }
+
+    writeDoubleLE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 8);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat64(offset, value, true);
+      return offset + 8;
+    }
+
+    writeDoubleBE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 8);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat64(offset, value, false);
+      return offset + 8;
+    }
+
+    writeBigUInt64LE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 8);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setBigUint64(offset, checkBigIntValue(value, ">= 0n and < 2n ** 64n", 0n, 1n << 64n), true);
+      return offset + 8;
+    }
+
+    writeBigUInt64BE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 8);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setBigUint64(offset, checkBigIntValue(value, ">= 0n and < 2n ** 64n", 0n, 1n << 64n), false);
+      return offset + 8;
+    }
+
+    writeBigInt64LE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 8);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setBigInt64(offset, checkBigIntValue(value, ">= -(2n ** 63n) and < 2n ** 63n", -(1n << 63n), 1n << 63n), true);
+      return offset + 8;
+    }
+
+    writeBigInt64BE(value, offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 8);
+      new DataView(this.buffer, this.byteOffset, this.byteLength).setBigInt64(offset, checkBigIntValue(value, ">= -(2n ** 63n) and < 2n ** 63n", -(1n << 63n), 1n << 63n), false);
+      return offset + 8;
+    }
+
+    writeUIntLE(value, offset, byteLength) {
+      checkVariadicByteLength(byteLength);
+      checkVariadicOffset(this, offset, byteLength);
+      return writeVariadicInteger(this, offset, byteLength, checkVariadicUnsigned(value, byteLength), false);
+    }
+
+    writeUIntBE(value, offset, byteLength) {
+      checkVariadicByteLength(byteLength);
+      checkVariadicOffset(this, offset, byteLength);
+      return writeVariadicInteger(this, offset, byteLength, checkVariadicUnsigned(value, byteLength), true);
+    }
+
+    writeIntLE(value, offset, byteLength) {
+      checkVariadicByteLength(byteLength);
+      checkVariadicOffset(this, offset, byteLength);
+      return writeVariadicInteger(this, offset, byteLength, checkVariadicSigned(value, byteLength), false);
+    }
+
+    writeIntBE(value, offset, byteLength) {
+      checkVariadicByteLength(byteLength);
+      checkVariadicOffset(this, offset, byteLength);
+      return writeVariadicInteger(this, offset, byteLength, checkVariadicSigned(value, byteLength), true);
+    }
+
+    readUInt8(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 1);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint8(offset);
+    }
+
+    readInt8(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 1);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt8(offset);
+    }
+
+    readUInt16LE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 2);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint16(offset, true);
+    }
+
+    readUInt16BE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 2);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint16(offset, false);
+    }
+
+    readInt16LE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 2);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt16(offset, true);
+    }
+
+    readInt16BE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 2);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt16(offset, false);
+    }
+
+    readUInt32LE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 4);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint32(offset, true);
+    }
+
+    readUInt32BE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 4);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint32(offset, false);
+    }
+
+    readInt32LE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 4);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt32(offset, true);
+    }
+
+    readInt32BE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 4);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt32(offset, false);
+    }
+
+    readFloatLE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 4);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat32(offset, true);
+    }
+
+    readFloatBE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 4);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat32(offset, false);
+    }
+
+    readDoubleLE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 8);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat64(offset, true);
+    }
+
+    readDoubleBE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 8);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat64(offset, false);
+    }
+
+    readBigUInt64LE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 8);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getBigUint64(offset, true);
+    }
+
+    readBigUInt64BE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 8);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getBigUint64(offset, false);
+    }
+
+    readBigInt64LE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 8);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getBigInt64(offset, true);
+    }
+
+    readBigInt64BE(offset) {
+      offset = offset === undefined ? 0 : offset;
+      checkNumericOffset(this, offset, 8);
+      return new DataView(this.buffer, this.byteOffset, this.byteLength).getBigInt64(offset, false);
+    }
+
+    readUIntLE(offset, byteLength) {
+      checkVariadicByteLength(byteLength);
+      checkVariadicOffset(this, offset, byteLength);
+      return readVariadicInteger(this, offset, byteLength, false, false);
+    }
+
+    readUIntBE(offset, byteLength) {
+      checkVariadicByteLength(byteLength);
+      checkVariadicOffset(this, offset, byteLength);
+      return readVariadicInteger(this, offset, byteLength, false, true);
+    }
+
+    readIntLE(offset, byteLength) {
+      checkVariadicByteLength(byteLength);
+      checkVariadicOffset(this, offset, byteLength);
+      return readVariadicInteger(this, offset, byteLength, true, false);
+    }
+
+    readIntBE(offset, byteLength) {
+      checkVariadicByteLength(byteLength);
+      checkVariadicOffset(this, offset, byteLength);
+      return readVariadicInteger(this, offset, byteLength, true, true);
+    }
+
+    swap16() {
+      if (this.length % 2 !== 0) {
+        const error = new RangeError("Buffer size must be a multiple of 16-bits");
+        error.code = "ERR_INVALID_BUFFER_SIZE";
+        throw error;
+      }
+      for (let i = 0; i < this.length; i += 2) {
+        const hi = this[i];
+        this[i] = this[i + 1];
+        this[i + 1] = hi;
+      }
+      return this;
+    }
+
+    swap32() {
+      if (this.length % 4 !== 0) {
+        const error = new RangeError("Buffer size must be a multiple of 32-bits");
+        error.code = "ERR_INVALID_BUFFER_SIZE";
+        throw error;
+      }
+      for (let i = 0; i < this.length; i += 4) {
+        const b0 = this[i], b1 = this[i + 1], b2 = this[i + 2];
+        this[i] = this[i + 3];
+        this[i + 1] = this[i + 2];
+        this[i + 2] = b1;
+        this[i + 3] = b0;
+      }
+      return this;
+    }
+
+    swap64() {
+      if (this.length % 8 !== 0) {
+        const error = new RangeError("Buffer size must be a multiple of 64-bits");
+        error.code = "ERR_INVALID_BUFFER_SIZE";
+        throw error;
+      }
+      for (let i = 0; i < this.length; i += 8) {
+        for (let k = 0; k < 4; k++) {
+          const a = this[i + k];
+          this[i + k] = this[i + 7 - k];
+          this[i + 7 - k] = a;
+        }
+      }
+      return this;
+    }
+
+    // node's `Buffer.prototype.inspect` (== its util.inspect custom hook):
+    // `<Buffer 81 a3 …>` with the 50-byte cap and the "N more bytes" tail.
+    inspect() {
+      return pirInspectBufferLike(this, pirBufferInspectTag(this));
+    }
+
+    equals(otherBuffer) {
+      // Node's `validateBuffer(otherBuffer, 'otherBuffer')` — a string is a
+      // TypeError, not a silent Buffer.from conversion.
+      if (!(otherBuffer instanceof Uint8Array)) {
+        throw errInvalidArgType("otherBuffer", "an instance of Buffer or Uint8Array", otherBuffer);
+      }
+      if (this === otherBuffer) return true;
+      if (this.byteLength !== otherBuffer.byteLength) return false;
+      return this.byteLength === 0 || pirCompareOffset(this, 0, this.byteLength, otherBuffer, 0, otherBuffer.byteLength) === 0;
+    }
+
+    compare(target, targetStart, targetEnd, sourceStart, sourceEnd) {
+      if (!(target instanceof Uint8Array)) {
+        throw errInvalidArgType("target", "an instance of Buffer or Uint8Array", target);
+      }
+      // Node's one-argument fast path compares the whole buffers.
+      if (arguments.length === 1) {
+        return pirCompareOffset(this, 0, this.length, target, 0, target.length);
+      }
+      // `validateOffset` ranges mirror Node exactly: the unclamped defaults are
+      // MAX_SAFE_INTEGER for the start offsets and the view length for the end
+      // offsets, and the checks run in this order (target before source).
+      if (targetStart === undefined) targetStart = 0;
+      else pirValidateOffset(targetStart, "targetStart", 0, 9007199254740991);
+
+      if (targetEnd === undefined) targetEnd = target.length;
+      else pirValidateOffset(targetEnd, "targetEnd", 0, target.length);
+
+      if (sourceStart === undefined) sourceStart = 0;
+      else pirValidateOffset(sourceStart, "sourceStart", 0, 9007199254740991);
+
+      if (sourceEnd === undefined) sourceEnd = this.length;
+      else pirValidateOffset(sourceEnd, "sourceEnd", 0, this.length);
+
+      if (sourceStart >= sourceEnd) return targetStart >= targetEnd ? 0 : -1;
+      if (targetStart >= targetEnd) return 1;
+      return pirCompareOffset(this, sourceStart, sourceEnd, target, targetStart, targetEnd);
+    }
+
+    indexOf(value, byteOffset, encoding) {
+      return pirBidirectionalIndexOf(this, value, byteOffset, encoding, 1);
+    }
+
+    includes(value, byteOffset, encoding) {
+      return this.indexOf(value, byteOffset, encoding) !== -1;
+    }
+
+    fill(value, start, end, encoding) {
+      const len = this.length;
+      let from = 0;
+      let to = len;
+      let enc;
+      if (typeof start === "string") enc = start;
+      else {
+        if (start !== undefined) from = start;
+        if (typeof end === "string") enc = end;
+        else if (end !== undefined) to = end;
+        if (encoding !== undefined) enc = encoding;
+      }
+      if (typeof from !== "number") throw errInvalidArgType("offset", "of type number", from);
+      if (Number.isNaN(from)) from = 0;
+      else if (from < 0) throw errValueOutOfRange("offset", ">= 0 && <= 9007199254740991", from);
+      if (typeof to !== "number") throw errInvalidArgType("end", "of type number", to);
+      if (Number.isNaN(to)) to = 0;
+      else if (to < 0 || to > len) throw errValueOutOfRange("end", ">= 0 && <= " + len, to);
+      from = Math.min(Math.trunc(from), len);
+      to = Math.min(Math.trunc(to), len);
+      let norm = "utf8";
+      if (enc !== undefined && enc !== null) {
+        if (typeof enc !== "string") throw errInvalidArgType("encoding", "of type string", enc);
+        norm = normalizeEncoding(enc);
+      }
+      let bytes;
+      if (typeof value === "number") {
+        bytes = [(Math.trunc(value) || 0) & 0xff];
+      } else if (typeof value === "string") {
+        // Node validates hex/base64url fill input (a lone nibble or a lone
+        // base64 character is a decode error, not an empty pattern).
+        if (norm === "hex") bytes = pirFillHexBytes(value);
+        else if (norm === "base64" || norm === "base64url") {
+          bytes = encodeToBytesWith(pirCheckBase64Fill(value, value), norm);
+        } else bytes = encodeToBytesWith(value, norm);
+      } else if (value instanceof Uint8Array) {
+        // An empty view as the fill value is Node's ERR_INVALID_ARG_VALUE.
+        if (value.byteLength === 0) throw errInvalidArgValue(value);
+        bytes = copyViewBytes(value);
+      } else {
+        bytes = [(Math.trunc(Number(value)) || 0) & 0xff];
+      }
+      if (bytes.length === 0 || to <= from) return this;
+      // Native fast paths: a single-byte pattern is the engine's own fill, a
+      // multi-byte pattern is written once and then doubled with copyWithin
+      // (both are memcpy/memset, so 512MiB fills land in milliseconds instead
+      // of the minutes a per-element JS loop takes). Semantics are unchanged:
+      // the pattern repeats from `from`, and a pattern longer than the range
+      // is truncated.
+      const span = to - from;
+      const patternLength = bytes.length;
+      if (patternLength === 1) {
+        Uint8Array.prototype.fill.call(this, bytes[0], from, to);
+        return this;
+      }
+      const first = Math.min(patternLength, span);
+      for (let i = 0; i < first; i++) this[from + i] = bytes[i];
+      if (first < patternLength) return this; // range shorter than the pattern
+      let written = first;
+      while (written < span) {
+        const chunk = Math.min(written, span - written);
+        this.copyWithin(from + written, from, from + chunk);
+        written += chunk;
+      }
+      return this;
+    }
+
+    copy(target, targetStart, sourceStart, sourceEnd) {
+      if (!(target instanceof Uint8Array)) {
+        throw errInvalidArgType("target", "an instance of Buffer or Uint8Array", target);
+      }
+      const len = this.length;
+      if (targetStart !== undefined) {
+        if (typeof targetStart !== "number") throw errInvalidArgType("targetStart", "of type number", targetStart);
+        if (Number.isNaN(targetStart) || targetStart < 0) throw errValueOutOfRange("targetStart", ">= 0", targetStart);
+      }
+      if (sourceStart !== undefined) {
+        if (typeof sourceStart !== "number") throw errInvalidArgType("sourceStart", "of type number", sourceStart);
+        if (Number.isNaN(sourceStart) || sourceStart < 0 || sourceStart > len) {
+          throw errValueOutOfRange("sourceStart", ">= 0 && <= " + len, sourceStart);
+        }
+      }
+      if (sourceEnd !== undefined) {
+        if (typeof sourceEnd !== "number") throw errInvalidArgType("sourceEnd", "of type number", sourceEnd);
+        if (Number.isNaN(sourceEnd) || sourceEnd < 0) throw errValueOutOfRange("sourceEnd", ">= 0", sourceEnd);
+      }
+      const tStart = targetStart === undefined ? 0 : Math.trunc(targetStart);
+      const sStart = sourceStart === undefined ? 0 : Math.trunc(sourceStart);
+      const sEnd = sourceEnd === undefined ? len : Math.min(Math.trunc(sourceEnd), len);
+      const count = Math.max(0, Math.min(sEnd - sStart, target.length - tStart));
+      for (let i = 0; i < count; i++) target[tStart + i] = this[sStart + i];
+      return count;
+    }
+
+    slice(start, end) {
+      // Buffer slice returns a view over the same memory (Node parity; unlike
+      // Uint8Array.prototype.slice, which copies).
+      const len = this.length;
+      const from = pirAdjustOffset(start, len);
+      const to = end === undefined ? len : pirAdjustOffset(end, len);
+      return viewOver(this.buffer, this.byteOffset + from, to > from ? to - from : 0);
+    }
+
+    subarray(start, end) {
+      return this.slice(start, end);
+    }
+
+    toJSON() {
+      return { type: "Buffer", data: Array.prototype.slice.call(this) };
+    }
+
+    static get [Symbol.species]() {
+      // Species ops (map/filter) hand out plain Uint8Arrays instead of
+      // re-entering this constructor with typed-array internals.
+      return Uint8Array;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Callable facade. Node's Buffer is a plain function: `Buffer(str)` and
+  // `Buffer(n)` are valid legacy constructors, and `Buffer.prototype` must stay
+  // the very object the class methods (and the host numeric install) live on.
+  // ---------------------------------------------------------------------------
+  function Buffer(arg, byteOffset, length) {
+    return new BufferImpl(arg, byteOffset, length);
+  }
+  Buffer.prototype = BufferImpl.prototype;
+  Object.setPrototypeOf(Buffer, BufferImpl);
+  Buffer.poolSize = 8192;
+  // Node: `buf.constructor === Buffer` — the class name still renders as
+  // "Buffer" (util.inspect / assert output), so the tag is unaffected.
+  BufferImpl.prototype.constructor = Buffer;
+
+  BufferImpl.from = function from(value, encodingOrOffset, length) {
+    if (typeof value === "string") {
+      return fromBytes(encodeToBytesWith(value, normalizeEncodingOptional(encodingOrOffset)));
+    }
+    if (value !== null && typeof value === "object") {
+      if (isAnyArrayBufferLike(value)) return viewOver(value, encodingOrOffset, length);
+      // Node: whatever `valueOf` produces wins when it is a string or object.
+      let valueOf;
+      try { valueOf = typeof value.valueOf === "function" ? value.valueOf() : undefined; }
+      catch (error) { valueOf = undefined; }
+      if (valueOf !== null && valueOf !== undefined && valueOf !== value &&
+          (typeof valueOf === "string" || typeof valueOf === "object")) {
+        return Buffer.from(valueOf, encodingOrOffset, length);
+      }
+      const objectBytes = fromObject(value);
+      if (objectBytes !== null) return objectBytes;
+      if (typeof value[Symbol.toPrimitive] === "function") {
+        const primitive = value[Symbol.toPrimitive]("string");
+        if (typeof primitive === "string") {
+          return fromBytes(encodeToBytesWith(primitive, normalizeEncodingOptional(encodingOrOffset)));
+        }
+      }
+    }
+    throw pirError(TypeError, "ERR_INVALID_ARG_TYPE",
+      "The first argument must be of type string or an instance of Buffer, ArrayBuffer, " +
+      "or Array or an Array-like Object." + pirReceivedDetail(value));
+  };
+
+  function fromObject(value) {
+    if (isUint8ArrayLike(value)) return fromView(value);
+    if (value.length !== undefined || isAnyArrayBufferLike(value.buffer)) {
+      // An object carrying an ArrayBuffer but no numeric length yields an
+      // empty buffer rather than an error (Node's fromObject).
+      if (typeof value.length !== "number") return fromBytes([]);
+      return fromArrayLike(value);
+    }
+    if (value.type === "Buffer" && Array.isArray(value.data)) return fromArrayLike(value.data);
+    return null;
+  }
+
+  function allocUnsafeImpl(size) {
+    if (typeof size !== "number") {
+      throw errInvalidArgType("size", "of type number", size);
+    }
+    if (Number.isNaN(size) || size < 0 || size > 9007199254740991) {
+      throw errValueOutOfRange("size", ">= 0 && <= 9007199254740991", size);
+    }
+    const count = Math.trunc(size);
+    if (!(count > 0)) return fromBytes([]);
+    // This shim has no pool: every buffer owns an exact-size backing store, so
+    // `parent`/`byteOffset` behave like Node's unpooled allocations. The store
+    // is built with the engine's own typed-array constructor (zero-filled and
+    // native) — `fromBytes` would allocate twice and copy byte by byte, which
+    // is minutes for the 512MiB+ sizes the official suite exercises.
+    const buffer = new Uint8Array(count);
+    Object.setPrototypeOf(buffer, Buffer.prototype);
+    return buffer;
+  }
+
+  BufferImpl.alloc = function alloc(size, fill, encoding) {
+    const buffer = allocUnsafeImpl(size);
+    if (fill !== undefined && fill !== 0 && fill !== null) {
+      buffer.fill(fill, 0, buffer.length, encoding);
+    }
+    return buffer;
+  };
+  BufferImpl.allocUnsafe = function allocUnsafe(size) {
+    return allocUnsafeImpl(size);
+  };
+  Buffer.allocUnsafeSlow = Buffer.allocUnsafe;
+
+  BufferImpl.isBuffer = function isBuffer(value) {
+    return value instanceof BufferImpl;
+  };
+
+  BufferImpl.byteLength = function byteLength(value, encoding) {
+    if (typeof value === "string") {
+      // Unknown encodings fall back to utf8 (Node's byteLength never throws
+      // ERR_UNKNOWN_ENCODING).
+      const enc = lookupEncoding(encoding) || "utf8";
+      if (enc === "hex") return value.length >>> 1;
+      if (enc === "base64" || enc === "base64url") return base64ByteLength(value);
+      if (enc === "latin1") return value.length;
+      if (enc === "utf16le") return value.length * 2;
+      return utf8Bytes(value).length;
+    }
+    if (isAnyArrayBufferLike(value) || ArrayBuffer.isView(value)) return value.byteLength;
+    throw errInvalidArgType("string", "of type string or an instance of Buffer or ArrayBuffer", value);
+  };
+
+  BufferImpl.compare = function compare(buf1, buf2) {
+    // Node validates both operands before comparing; the old
+    // `Buffer.from(a).compare(Buffer.from(b))` silently accepted strings.
+    if (!(buf1 instanceof Uint8Array)) {
+      throw errInvalidArgType("buf1", "an instance of Buffer or Uint8Array", buf1);
+    }
+    if (!(buf2 instanceof Uint8Array)) {
+      throw errInvalidArgType("buf2", "an instance of Buffer or Uint8Array", buf2);
+    }
+    if (buf1 === buf2) return 0;
+    return pirCompareOffset(buf1, 0, buf1.length, buf2, 0, buf2.length);
+  };
+
+  BufferImpl.concat = function concat(list, totalLength) {
+    if (!Array.isArray(list)) {
+      throw errInvalidArgType("list", "an instance of Array", list);
+    }
+    if (list.length === 0) return fromBytes([]);
+    let total = 0;
+    if (totalLength === undefined) {
+      for (let i = 0; i < list.length; i++) {
+        const part = list[i];
+        if (!(part instanceof Uint8Array)) {
+          throw errInvalidArgType("list[" + i + "]", "an instance of Buffer or Uint8Array", part);
+        }
+        total += part.byteLength;
+      }
+    } else {
+      if (typeof totalLength !== "number") {
+        throw errInvalidArgType("length", "of type number", totalLength);
+      }
+      if (!Number.isInteger(totalLength)) {
+        throw errValueOutOfRange("length", "an integer", totalLength);
+      }
+      // Node's `validateOffset(length, 'length')` defaults to MAX_SAFE_INTEGER
+      // (buffer.kMaxLength is 9007199254740991 in Node >= 22, and the official
+      // test reads that same constant to build its expected message).
+      if (totalLength < 0 || totalLength > 9007199254740991) {
+        throw errValueOutOfRange("length", ">= 0 && <= 9007199254740991", totalLength);
+      }
+      total = totalLength;
+    }
+    const out = allocUnsafeImpl(total);
+    let offset = 0;
+    for (let i = 0; i < list.length && offset < total; i++) {
+      const part = list[i];
+      if (!(part instanceof Uint8Array)) {
+        throw errInvalidArgType("list[" + i + "]", "an instance of Buffer or Uint8Array", part);
+      }
+      const take = Math.min(part.byteLength, total - offset);
+      for (let k = 0; k < take; k++) out[offset + k] = part[k];
+      offset += take;
+    }
+    return out;
+  };
+
+  BufferImpl.isEncoding = function isEncoding(encoding) {
+    return typeof encoding === "string" && encoding.length > 0 && lookupEncoding(encoding) !== null;
+  };
+
+  BufferImpl.copyBytesFrom = function copyBytesFrom(view, offset, length) {
+    if (!ArrayBuffer.isView(view) || view instanceof DataView) {
+      throw errInvalidArgType("view", "an instance of TypedArray", view);
+    }
+    if (offset !== undefined) {
+      if (typeof offset !== "number") throw errInvalidArgType("offset", "of type number", offset);
+      if (!Number.isInteger(offset)) throw errValueOutOfRange("offset", "an integer", offset);
+      if (offset < 0) throw errValueOutOfRange("offset", ">= 0", offset);
+    }
+    if (length !== undefined) {
+      if (typeof length !== "number") throw errInvalidArgType("length", "of type number", length);
+      if (!Number.isInteger(length)) throw errValueOutOfRange("length", "an integer", length);
+      if (length < 0) throw errValueOutOfRange("length", ">= 0", length);
+    }
+    const unit = view.BYTES_PER_ELEMENT || 1;
+    const start = offset === undefined ? 0 : offset;
+    const elements = view.length;
+    // A start past the end (or a zero length) yields an empty buffer; building
+    // the view anyway would trip the engine's own offset validation.
+    if (start >= elements) return fromBytes([]);
+    const available = elements - start;
+    const take = length === undefined ? available : Math.min(length, available);
+    if (take <= 0) return fromBytes([]);
+    return fromBytes(copyViewBytes(new Uint8Array(view.buffer, view.byteOffset + start * unit, take * unit)));
+  };
+
+  // Node's `lastIndexOf` is a plain (constructible) prototype method; the test
+  // suite exercises `new Buffer.prototype.lastIndexOf(...)`.
+  Object.defineProperty(BufferImpl.prototype, "lastIndexOf", {
+    configurable: true,
+    writable: true,
+    enumerable: false,
+    value: function lastIndexOf(value, byteOffset, encoding) {
+      if (!(this instanceof Uint8Array)) {
+        throw pirError(TypeError, "ERR_INVALID_ARG_TYPE",
+          'The "buffer" argument must be an instance of Buffer, TypedArray, or DataView.' + pirReceivedDetail(this));
+      }
+      return pirBidirectionalIndexOf(this, value, byteOffset, encoding, -1);
+    },
+  });
+
+  // Node's deprecated `parent`/`offset` accessors: undefined unless the
+  // receiver is a Buffer *instance* — `Buffer.prototype` is itself in the
+  // Uint8Array chain, so the brand check has to be `instanceof Buffer`, not
+  // `instanceof Uint8Array` (the latter reached the engine's native
+  // `TypedArray.prototype.buffer` getter and threw "not a TypedArray").
+  Object.defineProperty(Buffer.prototype, "parent", {
+    configurable: true,
+    enumerable: true,
+    get() { return this instanceof Buffer ? this.buffer : undefined; },
+  });
+  Object.defineProperty(Buffer.prototype, "offset", {
+    configurable: true,
+    enumerable: true,
+    get() { return this instanceof Buffer ? this.byteOffset : undefined; },
+  });
+  Buffer.prototype.toLocaleString = Buffer.prototype.toString;
+
+  // Node parity for the statics' OWNERSHIP: in Node they are own enumerable
+  // properties of the Buffer function itself, and duck-typing consumers
+  // depend on exactly that — `safer-buffer` builds its wrapper with
+  // `for (key in Buffer) if (Buffer.hasOwnProperty(key)) …`, and iconv-lite
+  // then calls `safer.Buffer.isBuffer`. The facade above inherited them from
+  // BufferImpl (the `for..in` sees them, `hasOwnProperty` rejects them), so
+  // re-own every assigned static on the facade.
+  for (const key of Object.keys(BufferImpl)) {
+    Object.defineProperty(Buffer, key, {
+      value: BufferImpl[key],
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Host fast path: native numeric read/write family (rquickjs C-ABI, see
+  // src/extensions/runtime/host_functions/buffer_ops.rs). Overwrites the JS
+  // DataView versions above with identical semantics — same two-tier bounds
+  // errors (`ERR_OUT_OF_RANGE` / `ERR_BUFFER_OUT_OF_BOUNDS`), same return
+  // values. The variadic readUIntLE/BE · writeUIntLE/BE · readIntLE/BE ·
+  // writeIntLE/BE methods keep their JS validation (and error text) but route
+  // their byte arithmetic through the native `variadicWrite`/`variadicRead`
+  // kernels bound above. When
+  // the host global is absent (alternate boots), the JS versions above
+  // remain the fallback and nothing here is load-bearing; a failed install
+  // keeps whatever methods it already replaced (both tiers are correct).
+  // ---------------------------------------------------------------------------
+  if (typeof globalThis.__pirInstallBufferOps === "function") {
+    try {
+      globalThis.__pirInstallBufferOps(Buffer.prototype);
+    } catch (error) {
+      /* native install failed: the JS DataView versions above stay active */
+    }
+    delete globalThis.__pirInstallBufferOps;
+  }
+
+  return Buffer;
+})());

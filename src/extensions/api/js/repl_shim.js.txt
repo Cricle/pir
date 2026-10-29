@@ -1,0 +1,56 @@
+// node:repl — throws tier. No interactive read-eval-print loop is hostable
+// (no terminal input host, and the runtime already is the sandbox); the
+// entries exist for link compatibility and throw the unified error. The
+// REPL_MODE_* symbols mirror real Node v24 (opaque, never used for real
+// mode selection here since `start` throws).
+function replUnsupported(api) {
+  const error = new Error("node:repl." + api + " is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+class Recoverable extends Error {
+  constructor(err) {
+    super(err && err.message !== undefined ? err.message : "Recoverable error");
+    this.err = err;
+  }
+}
+
+class REPLServer {
+  constructor(..._args) {
+    throw replUnsupported("REPLServer");
+  }
+}
+
+function start(..._args) {
+  throw replUnsupported("start");
+}
+
+function writer(_obj) {
+  // Real util.inspect routing would be the writer; without a REPL server
+  // this entry has no caller — the unified error keeps the contract honest.
+  throw replUnsupported("writer");
+}
+
+function isValidSyntax(_code) {
+  // No syntax-checking host op: report the conservative false.
+  return false;
+}
+
+// Real Node v24 exports these as opaque symbols (deprecated aliases kept for
+// link compatibility; they carry no behavior in this runtime).
+const REPL_MODE_SLOPPY = Symbol("repl-sloppy");
+const REPL_MODE_STRICT = Symbol("repl-strict");
+
+const repl = {
+  start: start,
+  writer: writer,
+  REPLServer: REPLServer,
+  REPL_MODE_SLOPPY: REPL_MODE_SLOPPY,
+  REPL_MODE_STRICT: REPL_MODE_STRICT,
+  Recoverable: Recoverable,
+  isValidSyntax: isValidSyntax,
+};
+
+export default repl;
+export { start, writer, REPLServer, REPL_MODE_SLOPPY, REPL_MODE_STRICT, Recoverable, isValidSyntax };

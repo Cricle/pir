@@ -1,0 +1,32 @@
+// node:dgram — throws tier. The runtime owns no UDP stack; every socket
+// entry point exists for link compatibility and throws the unified error.
+function dgramUnsupported(api) {
+  const error = new Error("node:dgram." + api + " is not supported by the pir extension runtime (no UDP stack)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+class Socket {
+  constructor(..._args) {
+    throw dgramUnsupported("Socket");
+  }
+}
+
+class _createSocketHandle {
+  constructor() {
+    throw dgramUnsupported("_createSocketHandle");
+  }
+}
+
+function createSocket(..._args) {
+  throw dgramUnsupported("createSocket");
+}
+
+const dgram = {
+  Socket: Socket,
+  _createSocketHandle: _createSocketHandle,
+  createSocket: createSocket,
+};
+
+export default dgram;
+export { Socket, _createSocketHandle, createSocket };

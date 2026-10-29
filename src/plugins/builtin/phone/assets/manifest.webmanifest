@@ -1,0 +1,18 @@
+{
+  "name": "Pi Phone",
+  "short_name": "Pi Phone",
+  "description": "A phone-friendly remote UI for Pi running on your PC.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#131313",
+  "theme_color": "#131313",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

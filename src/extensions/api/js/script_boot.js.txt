@@ -1,0 +1,71 @@
+
+// pir `js` script-mode boot (`pir js <file> [args...]`): evaluated by the
+// Rust script runner AFTER the standard runtime boot (globals + prelude +
+// builtin sweep) and ONLY in script mode. It overlays the process semantics
+// a spawned child process needs, which the extension-mode defaults cannot
+// provide:
+//   - process.argv / argv0 / execPath: the real spawn values, injected by
+//     the Rust runner as JSON literals (the placeholders below).
+//   - the real-stdio flag the console shim reads (`__pirRealStdio`): the
+//     node:console surface is a full node-semantics Console either way, but
+//     its *default* streams only write to process.stdout/stderr when a script
+//     host is the one draining them; in an extension host the same bridge
+//     would paint raw bytes onto the TUI terminal, so the console shim
+//     falls back to the prelude's notify path there.
+//   - process.exit(n): emit the Node `exit` event, then terminate the
+//     process through the host (`__pir_host.exitProcess`).
+// It also defines the module runner (`__pirScriptRun`) the Rust side calls
+// to import the entry file and surface uncaught module errors.
+(() => {
+  const proc = globalThis.process;
+
+  // --- argv / execPath (injected by the runner as JSON) -------------------
+  // argv is spliced IN PLACE: the node:process module namespace took a
+  // reference snapshot of the array at boot-time module evaluation, and a
+  // named `import { argv }` must observe the real argv.
+  proc.argv.length = 0;
+  for (const arg of __PIR_SCRIPT_ARGV__) proc.argv.push(arg);
+  proc.argv0 = proc.argv.length > 0 ? proc.argv[0] : "pir";
+  proc.execPath = __PIR_SCRIPT_EXEC_PATH__;
+
+  // --- real process stdio for the console --------------------------------
+  // node:console resolves its default streams per write; this flag tells it a
+  // script host is draining process.stdout/stderr (see script_boot's header
+  // and console_shim.js.txt's routing note). No console methods are replaced:
+  // the shim's Console is the node-semantics surface (util.format/inspect,
+  // group indentation, counters) and must stay in charge of formatting.
+  globalThis.__pirRealStdio = true;
+
+  // --- process.exit -------------------------------------------------------
+  // Node semantics: coerce the code, run `exit` listeners synchronously,
+  // then terminate the whole process (pending timers/work included — Node
+  // exits immediately too).
+  proc.exit = (code) => {
+    let exitCode = proc.exitCode ?? 0;
+    if (code !== undefined && code !== null) exitCode = Number(code);
+    if (typeof exitCode !== "number" || Number.isNaN(exitCode)) exitCode = 0;
+    exitCode = Math.trunc(exitCode);
+    proc.exitCode = exitCode;
+    try { proc.emit("exit", exitCode); } catch { /* listener errors die with us */ }
+    __pir_host.exitProcess(exitCode);
+  };
+
+  // --- module runner ------------------------------------------------------
+  // The Rust runner awaits this: import the entry module, then report the
+  // outcome (uncaught module-level errors included) as a JSON string.
+  globalThis.__pirScriptRun = async (moduleName) => {
+    try {
+      await import(moduleName);
+      return JSON.stringify({ ok: true });
+    } catch (error) {
+      const message = error && error.message !== undefined ? String(error.message) : String(error);
+      // QuickJS module stacks do not always carry the `Error: message`
+      // header; the runner prints one block on stderr, so stitch the
+      // message in when the stack omits it.
+      const rawStack = error && error.stack ? String(error.stack) : "";
+      const stack =
+        rawStack.indexOf(message) >= 0 ? rawStack : message + (rawStack ? "\n" + rawStack : "");
+      return JSON.stringify({ ok: false, message: message, stack: stack });
+    }
+  };
+})();

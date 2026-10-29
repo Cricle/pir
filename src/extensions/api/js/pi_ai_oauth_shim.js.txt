@@ -1,0 +1,7 @@
+
+// `@earendil-works/pi-ai/oauth` is a type-only entry point upstream
+// (src/oauth.ts re-exports only OAuth declaration types) — no runtime named
+// exports by design. The default object is likewise empty.
+export {};
+
+export default {};

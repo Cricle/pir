@@ -1,0 +1,65 @@
+// node:readline/promises — the Promise-API module over the readline shim:
+// `Interface.question()` resolves via Promise (re-exported from the readline
+// shim's `promises` object), plus the `Readline` class whose cursor helpers
+// wrap the real ANSI writers in Promises, and the `createInterface` factory.
+import {
+  Interface,
+  createInterface,
+  cursorTo,
+  moveCursor,
+  clearLine,
+  clearScreenDown,
+  promises,
+} from "@node/readline";
+
+// Promise-based cursor helpers (real ANSI writes through the readline shim).
+class Readline {
+  constructor(interfaceRef, options) {
+    this._interface = interfaceRef;
+    this.output = interfaceRef && interfaceRef.output !== undefined ? interfaceRef.output : undefined;
+    this.autoCommit = Boolean(options && options.autoCommit);
+    this._pending = [];
+  }
+  _run(write) {
+    return new Promise((resolve) => {
+      globalThis.__pirMicrotask(() => {
+        write();
+        resolve(undefined);
+      });
+    });
+  }
+  queryCursor() {
+    return Promise.resolve({ rows: 0, cols: this._interface ? this._interface.cursor : 0 });
+  }
+  cursorTo(x, y) {
+    const self = this;
+    return this._run(() => cursorTo(self.output, x, y));
+  }
+  moveCursor(dx, dy) {
+    const self = this;
+    return this._run(() => moveCursor(self.output, dx, dy));
+  }
+  clearLine(dir) {
+    const self = this;
+    return this._run(() => clearLine(self.output, dir));
+  }
+  clearScreenDown() {
+    const self = this;
+    return this._run(() => clearScreenDown(self.output));
+  }
+  commit() {
+    return Promise.resolve(undefined);
+  }
+  rollback() {
+    return Promise.resolve(undefined);
+  }
+}
+
+const readlinePromises = {
+  Interface: promises.Interface,
+  Readline: Readline,
+  createInterface: promises.createInterface,
+};
+
+export default readlinePromises;
+export { Interface, Readline, createInterface };

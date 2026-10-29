@@ -1,0 +1,3093 @@
+
+const kCustomPromisify = Symbol.for("nodejs.util.promisify.custom");
+const kInspectCustom = Symbol.for("nodejs.util.inspect.custom");
+
+// ---------------------------------------------------------------------------
+// Type brand checks. Node's inspect/comparisons read these from
+// internalBinding('types'); the engine exposes no such binding, so each
+// predicate probes the spec's internal-slot methods instead. That stays
+// correct even when Symbol.toStringTag is forged (the boxed-primitive cases in
+// test-util-isDeepStrictEqual.js depend on it).
+// ---------------------------------------------------------------------------
+
+function pirBrand(value, probe) {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
+  try {
+    probe(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const pirNumberValueOf = Number.prototype.valueOf;
+const pirStringValueOf = String.prototype.valueOf;
+const pirBooleanValueOf = Boolean.prototype.valueOf;
+const pirBigIntValueOf = BigInt.prototype.valueOf;
+const pirSymbolValueOf = Symbol.prototype.valueOf;
+const pirDateGetTime = Date.prototype.getTime;
+const pirRegExpSource = Object.getOwnPropertyDescriptor(RegExp.prototype, "source").get;
+const pirMapHas = Map.prototype.has;
+const pirSetHas = Set.prototype.has;
+const pirWeakMapHas = WeakMap.prototype.has;
+const pirWeakSetHas = WeakSet.prototype.has;
+
+const pirIsNumberObject = (value) => pirBrand(value, (v) => pirNumberValueOf.call(v));
+const pirIsStringObject = (value) => pirBrand(value, (v) => pirStringValueOf.call(v));
+const pirIsBooleanObject = (value) => pirBrand(value, (v) => pirBooleanValueOf.call(v));
+const pirIsBigIntObject = (value) => pirBrand(value, (v) => pirBigIntValueOf.call(v));
+const pirIsSymbolObject = (value) => pirBrand(value, (v) => pirSymbolValueOf.call(v));
+const pirIsBoxedPrimitive = (value) => pirIsNumberObject(value) || pirIsStringObject(value) ||
+  pirIsBooleanObject(value) || pirIsBigIntObject(value) || pirIsSymbolObject(value);
+const pirIsDate = (value) => pirBrand(value, (v) => pirDateGetTime.call(v));
+const pirIsRegExp = (value) => pirBrand(value, (v) => pirRegExpSource.call(v));
+const pirIsMap = (value) => pirBrand(value, (v) => pirMapHas.call(v, undefined));
+const pirIsSet = (value) => pirBrand(value, (v) => pirSetHas.call(v, undefined));
+const pirIsWeakMap = (value) => pirBrand(value, (v) => pirWeakMapHas.call(v, undefined));
+const pirIsWeakSet = (value) => pirBrand(value, (v) => pirWeakSetHas.call(v, undefined));
+const pirIsNativeError = (value) => value instanceof Error;
+const pirIsError = (value) => value instanceof Error;
+const pirIsPromise = (value) => value instanceof Promise;
+// node internal/util/inspect isURL: a URL instance with a string href.
+const pirIsURLInstance = (value) => value !== null && typeof value === "object" &&
+  typeof value.href === "string" && typeof URL === "function" && value instanceof URL;
+// The comparison core's URL brand: node's `isURL` reads an internal-slot flag
+// without touching a property, so the check here must not fire a getter (a
+// wrapping Proxy's 'href' trap).
+const pirIsURLObject = (value) => typeof URL === "function" && value instanceof URL;
+// ArrayBuffer / SharedArrayBuffer / DataView branding goes through the
+// spec's internal-slot getters (node reads internalBinding('types')): an
+// object that merely inherits ArrayBuffer.prototype is not an ArrayBuffer,
+// and treating it as one made inspect throw ("ArrayBuffer object expected",
+// test-assert-deep.js "Verify object types being identical on both sides").
+const pirArrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+const pirSharedArrayBufferByteLength = typeof SharedArrayBuffer === "function" ?
+  Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength").get : undefined;
+const pirDataViewByteLength = typeof DataView === "function" ?
+  Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get : undefined;
+const pirIsArrayBuffer = (value) => pirBrand(value, (v) => pirArrayBufferByteLength.call(v));
+const pirIsSharedArrayBuffer = (value) => pirSharedArrayBufferByteLength !== undefined &&
+  pirBrand(value, (v) => pirSharedArrayBufferByteLength.call(v));
+const pirIsAnyArrayBuffer = (value) => pirIsArrayBuffer(value) || pirIsSharedArrayBuffer(value);
+const pirIsDataView = (value) => pirDataViewByteLength !== undefined &&
+  pirBrand(value, (v) => pirDataViewByteLength.call(v));
+const pirIsArrayBufferView = (value) => typeof ArrayBuffer === "function" && ArrayBuffer.isView(value);
+
+const PIR_TYPED_ARRAY_NAMES = [
+  ["Int8Array", typeof Int8Array === "function" ? Int8Array : undefined],
+  ["Uint8Array", typeof Uint8Array === "function" ? Uint8Array : undefined],
+  ["Uint8ClampedArray", typeof Uint8ClampedArray === "function" ? Uint8ClampedArray : undefined],
+  ["Int16Array", typeof Int16Array === "function" ? Int16Array : undefined],
+  ["Uint16Array", typeof Uint16Array === "function" ? Uint16Array : undefined],
+  ["Int32Array", typeof Int32Array === "function" ? Int32Array : undefined],
+  ["Uint32Array", typeof Uint32Array === "function" ? Uint32Array : undefined],
+  ["Float16Array", typeof Float16Array === "function" ? Float16Array : undefined],
+  ["Float32Array", typeof Float32Array === "function" ? Float32Array : undefined],
+  ["Float64Array", typeof Float64Array === "function" ? Float64Array : undefined],
+  ["BigInt64Array", typeof BigInt64Array === "function" ? BigInt64Array : undefined],
+  ["BigUint64Array", typeof BigUint64Array === "function" ? BigUint64Array : undefined],
+];
+
+// %TypedArray%.prototype[@@toStringTag] — the pristine getter reads the
+// [[TypedArrayName]] internal slot, so neither a swapped prototype nor a
+// forged Symbol.toStringTag changes the answer.
+const pirTypedArrayTag = (() => {
+  for (const name of ["Uint8Array", "Int8Array"]) {
+    const ctor = globalThis[name];
+    if (typeof ctor !== "function") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(ctor.prototype), Symbol.toStringTag);
+    if (descriptor !== undefined && typeof descriptor.get === "function") return descriptor.get;
+  }
+  return undefined;
+})();
+
+// Node's TypedArrayPrototypeGetSymbolToStringTag: the typed-array kind, or
+// undefined for anything that is not a typed array (DataView included).
+function pirTypedArrayName(value) {
+  if (pirTypedArrayTag !== undefined) {
+    try {
+      const name = pirTypedArrayTag.call(value);
+      if (typeof name === "string") return name;
+      if (value === null || typeof value !== "object") return undefined;
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+  for (let i = 0; i < PIR_TYPED_ARRAY_NAMES.length; i++) {
+    const ctor = PIR_TYPED_ARRAY_NAMES[i][1];
+    if (ctor !== undefined) {
+      try {
+        if (value instanceof ctor) return PIR_TYPED_ARRAY_NAMES[i][0];
+      } catch { /* exotic instanceof on a revoked proxy */ }
+    }
+  }
+  return undefined;
+}
+
+const pirIsTypedArray = (value) => pirTypedArrayName(value) !== undefined;
+const pirIsArgumentsObject = (value) => Object.prototype.toString.call(value) === "[object Arguments]";
+const pirIsModuleNamespaceObject = (value) => Object.prototype.toString.call(value) === "[object Module]";
+const pirIsMapIterator = (value) => pirIteratorKind(value) === "Map";
+const pirIsSetIterator = (value) => pirIteratorKind(value) === "Set";
+
+// Map/Set iterators carry the spec's @@toStringTag on their (otherwise empty)
+// iterator prototype, so the tag is inherited rather than forged.
+function pirIteratorKind(value) {
+  if (value === null || typeof value !== "object") return "";
+  const tag = Object.prototype.toString.call(value);
+  if (tag === "[object Map Iterator]") return "Map";
+  if (tag === "[object Set Iterator]") return "Set";
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// util.inspect — port of nodejs/node v24.19.0 lib/internal/util/inspect.js.
+// Everything the vendored util tests exercise is ported verbatim: the
+// depth/compact/breakLength layout, showHidden, colors, numeric separators,
+// the circular-reference memo (`<ref *n>` / `[Circular *n]`), boxed
+// primitives, typed arrays, collections and errors.
+//
+// Trimmed, engine introspection the embedded runtime has no equivalent for:
+// proxy internals (showProxy is accepted and ignored), promise state,
+// weak-collection contents and iterator peeking (rendered as
+// `<state unknown>` / `<items unknown>` / `<entries unknown>`), V8's
+// hidden-class constructor backpointer, and the duplicate-stack-frame
+// collapsing of long error stacks.
+// ---------------------------------------------------------------------------
+
+const kObjectType = 0;
+const kArrayType = 1;
+const kArrayExtrasType = 2;
+
+const kMinLineLength = 16;
+
+const pirInspectDefaultOptions = Object.seal({
+  showHidden: false,
+  depth: 2,
+  colors: false,
+  customInspect: true,
+  showProxy: false,
+  maxArrayLength: 100,
+  maxStringLength: 10000,
+  breakLength: 80,
+  compact: 3,
+  sorted: false,
+  getters: false,
+  numericSeparator: false,
+});
+
+/* eslint-disable no-control-regex */
+const pirStrEscapeSequencesRegExp = /[\x00-\x1f\x27\x5c\x7f-\x9f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+const pirStrEscapeSequencesReplacer = /[\x00-\x1f\x27\x5c\x7f-\x9f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+const pirStrEscapeSequencesRegExpSingle = /[\x00-\x1f\x5c\x7f-\x9f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+const pirStrEscapeSequencesReplacerSingle = /[\x00-\x1f\x5c\x7f-\x9f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+/* eslint-enable no-control-regex */
+
+const pirKeyStrRegExp = /^[a-zA-Z_][a-zA-Z_0-9]*$/;
+const pirNumberRegExp = /^(0|[1-9][0-9]*)$/;
+const pirClassRegExp = /^(\s+[^(]*?)\s*{/;
+const pirStripCommentsRegExp = /(\/\/.*?\n)|(\/\*(.|\n)*?\*\/)/g;
+
+// Escaped control characters, the single quote and the backslash.
+const pirMeta = [
+  "\\x00", "\\x01", "\\x02", "\\x03", "\\x04", "\\x05", "\\x06", "\\x07",
+  "\\b", "\\t", "\\n", "\\x0B", "\\f", "\\r", "\\x0E", "\\x0F",
+  "\\x10", "\\x11", "\\x12", "\\x13", "\\x14", "\\x15", "\\x16", "\\x17",
+  "\\x18", "\\x19", "\\x1A", "\\x1B", "\\x1C", "\\x1D", "\\x1E", "\\x1F",
+  "", "", "", "", "", "", "", "\\'", "", "", "", "", "", "", "", "",
+  "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+  "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+  "", "", "", "", "", "", "", "", "", "", "", "", "\\\\", "", "", "",
+  "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+  "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "\\x7F",
+  "\\x80", "\\x81", "\\x82", "\\x83", "\\x84", "\\x85", "\\x86", "\\x87",
+  "\\x88", "\\x89", "\\x8A", "\\x8B", "\\x8C", "\\x8D", "\\x8E", "\\x8F",
+  "\\x90", "\\x91", "\\x92", "\\x93", "\\x94", "\\x95", "\\x96", "\\x97",
+  "\\x98", "\\x99", "\\x9A", "\\x9B", "\\x9C", "\\x9D", "\\x9E", "\\x9F",
+];
+
+// Copied from nodejs/node (chalk's ansi-regex, MIT).
+const pirAnsiRegExp = new RegExp(
+  "[\\u001B\\u009B][[\\]()#;?]*" +
+  "(?:(?:(?:(?:;[-a-zA-Z\\d\\/\\#&.:=?%@~_]+)*" +
+  "|[a-zA-Z\\d]+(?:;[-a-zA-Z\\d\\/\\#&.:=?%@~_]*)*)?" +
+  "(?:\\u0007|\\u001B\\u005C|\\u009C))" +
+  "|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]))", "g",
+);
+
+const pirBuiltInObjects = new Set(
+  Object.getOwnPropertyNames(globalThis).filter((name) => /^[A-Z][a-zA-Z0-9]+$/.test(name)),
+);
+
+// QuickJS does not keep V8's hidden-class constructor backpointer, which is
+// how node names an object whose prototype was detached. Record the name at
+// the moment the prototype is removed so `inspect(Object.setPrototypeOf(new
+// Foo(), null))` can still say `[Foo: null prototype]` like V8 does.
+const pirDetachedConstructorNames = new WeakMap();
+const pirNativeSetPrototypeOf = Object.setPrototypeOf;
+if (typeof pirNativeSetPrototypeOf === "function") {
+  const patched = function setPrototypeOf(target, proto) {
+    if (proto === null && target !== null && typeof target === "object") {
+      try {
+        const ctor = target.constructor;
+        if (typeof ctor === "function" && typeof ctor.name === "string" && ctor.name !== "") {
+          pirDetachedConstructorNames.set(target, ctor.name);
+        }
+      } catch { /* a throwing constructor getter leaves no name */ }
+    }
+    return pirNativeSetPrototypeOf(target, proto);
+  };
+  try {
+    Object.defineProperty(patched, "name", { value: "setPrototypeOf", configurable: true });
+    Object.defineProperty(patched, "length", { value: 2, configurable: true });
+    Object.setPrototypeOf = patched;
+    if (Object.setPrototypeOf !== patched) throw new Error("not installed");
+  } catch {
+    // The runtime owns Object.setPrototypeOf: keep the native one. Only the
+    // null-prototype constructor-name compensation is lost.
+  }
+}
+
+// Node's internalGetConstructorName (C++): the object's internal class name,
+// independent of the prototype chain.
+function pirInternalGetConstructorName(value) {
+  const recorded = pirDetachedConstructorNames.get(value);
+  if (typeof recorded === "string") return recorded;
+  if (Array.isArray(value)) return "Array";
+  if (pirIsError(value)) return "Error";
+  if (pirIsRegExp(value)) return "RegExp";
+  if (pirIsDate(value)) return "Date";
+  if (pirIsMap(value)) return "Map";
+  if (pirIsSet(value)) return "Set";
+  if (pirIsWeakMap(value)) return "WeakMap";
+  if (pirIsWeakSet(value)) return "WeakSet";
+  if (pirIsPromise(value)) return "Promise";
+  if (pirIsAnyArrayBuffer(value)) return pirIsArrayBuffer(value) ? "ArrayBuffer" : "SharedArrayBuffer";
+  if (pirIsDataView(value)) return "DataView";
+  const typedArrayName = pirTypedArrayName(value);
+  if (typedArrayName !== undefined) return typedArrayName;
+  if (typeof value === "function") return "Function";
+  return "Object";
+}
+
+function pirGetStringWidth(str, removeControlChars) {
+  let value = String(str);
+  if (removeControlChars === undefined || removeControlChars) value = pirStripVTControlCharacters(value);
+  return value.length;
+}
+
+function pirRemoveColors(str) {
+  return pirAnsiRegExp.test(str) ? str.replace(pirAnsiRegExp, "") : str;
+}
+
+function pirAddQuotes(str, quotes) {
+  if (quotes === -1) return "\"" + str + "\"";
+  if (quotes === -2) return "`" + str + "`";
+  return "'" + str + "'";
+}
+
+function pirEscapeFn(str) {
+  const charCode = str.charCodeAt(0);
+  return pirMeta.length > charCode ? pirMeta[charCode] : "\\u" + charCode.toString(16);
+}
+
+// ---------------------------------------------------------------------------
+// Host fast path (§6.5 host-first policy): when the runtime registered its
+// native codec dispatcher (`__pirBufferCodec`, a rquickjs C-ABI function — see
+// src/extensions/runtime/host_functions/buffer_ops.rs), the string escaper
+// below runs natively ("strEscape"): the quote choice, the "nothing to escape"
+// fast path and the per-character escape in one call. The native op answers
+// `undefined` when the string cannot cross the host bridge as a Rust string (a
+// lone surrogate) or when the dispatcher is absent, and any unexpected native
+// failure is caught — the JS implementation below is the fallback in every
+// case, so observable behavior never changes.
+// ---------------------------------------------------------------------------
+const pirNativeCodec =
+  typeof globalThis.__pirBufferCodec === "function" ? globalThis.__pirBufferCodec : null;
+let pirNativeStrEscape = null;
+if (pirNativeCodec !== null) {
+  const nativeCodec = pirNativeCodec;
+  pirNativeStrEscape = function (str) {
+    try {
+      const escaped = nativeCodec("strEscape", str);
+      if (typeof escaped === "string") return escaped;
+    } catch (error) { /* fall through to the JS escaper */ }
+    return undefined;
+  };
+}
+
+// Escape control characters, single quotes and the backslash, like JSON
+// stringify escaping.
+function pirStrEscape(str) {
+  if (pirNativeStrEscape !== null && typeof str === "string") {
+    const escaped = pirNativeStrEscape(str);
+    if (escaped !== undefined) return escaped;
+  }
+  let escapeTest = pirStrEscapeSequencesRegExp;
+  let escapeReplace = pirStrEscapeSequencesReplacer;
+  let singleQuote = 39;
+
+  // Pick the quoting character the way node does: prefer double quotes, fall
+  // back to backticks, then to escaped single quotes.
+  if (str.indexOf("'") !== -1) {
+    if (str.indexOf("\"") === -1) {
+      singleQuote = -1;
+    } else if (str.indexOf("`") === -1 && str.indexOf("${") === -1) {
+      singleQuote = -2;
+    }
+    if (singleQuote !== 39) {
+      escapeTest = pirStrEscapeSequencesRegExpSingle;
+      escapeReplace = pirStrEscapeSequencesReplacerSingle;
+    }
+  }
+
+  if (str.length < 5000 && escapeTest.test(str) === false) return pirAddQuotes(str, singleQuote);
+  if (str.length > 100) {
+    str = str.replace(escapeReplace, pirEscapeFn);
+    return pirAddQuotes(str, singleQuote);
+  }
+
+  let result = "";
+  let last = 0;
+  for (let i = 0; i < str.length; i++) {
+    const point = str.charCodeAt(i);
+    if (point === singleQuote || point === 92 || point < 32 || (point > 126 && point < 160)) {
+      if (last === i) result += pirMeta[point];
+      else result += str.slice(last, i) + pirMeta[point];
+      last = i + 1;
+    } else if (point >= 0xd800 && point <= 0xdfff) {
+      if (point <= 0xdbff && i + 1 < str.length) {
+        const next = str.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          i++;
+          continue;
+        }
+      }
+      result += str.slice(last, i) + "\\u" + point.toString(16);
+      last = i + 1;
+    }
+  }
+  if (last !== str.length) result += str.slice(last);
+  return pirAddQuotes(result, singleQuote);
+}
+
+function pirStylizeNoColor(str) {
+  return str;
+}
+
+const pirDefaultFG = 39;
+const pirDefaultBG = 49;
+
+const pirInspectColors = {
+  reset: [0, 0], bold: [1, 22], dim: [2, 22], italic: [3, 23], underline: [4, 24],
+  blink: [5, 25], inverse: [7, 27], hidden: [8, 28], strikethrough: [9, 29],
+  doubleunderline: [21, 24],
+  black: [30, pirDefaultFG], red: [31, pirDefaultFG], green: [32, pirDefaultFG],
+  yellow: [33, pirDefaultFG], blue: [34, pirDefaultFG], magenta: [35, pirDefaultFG],
+  cyan: [36, pirDefaultFG], white: [37, pirDefaultFG],
+  bgBlack: [40, pirDefaultBG], bgRed: [41, pirDefaultBG], bgGreen: [42, pirDefaultBG],
+  bgYellow: [43, pirDefaultBG], bgBlue: [44, pirDefaultBG], bgMagenta: [45, pirDefaultBG],
+  bgCyan: [46, pirDefaultBG], bgWhite: [47, pirDefaultBG],
+  framed: [51, 54], overlined: [53, 55],
+  gray: [90, pirDefaultFG], redBright: [91, pirDefaultFG], greenBright: [92, pirDefaultFG],
+  yellowBright: [93, pirDefaultFG], blueBright: [94, pirDefaultFG],
+  magentaBright: [95, pirDefaultFG], cyanBright: [96, pirDefaultFG],
+  whiteBright: [97, pirDefaultFG],
+  bgGray: [100, pirDefaultBG], bgRedBright: [101, pirDefaultBG],
+  bgGreenBright: [102, pirDefaultBG], bgYellowBright: [103, pirDefaultBG],
+  bgBlueBright: [104, pirDefaultBG], bgMagentaBright: [105, pirDefaultBG],
+  bgCyanBright: [106, pirDefaultBG], bgWhiteBright: [107, pirDefaultBG],
+};
+
+const pirInspectStyles = {
+  special: "cyan", number: "yellow", bigint: "yellow", boolean: "yellow",
+  undefined: "grey", null: "bold", string: "green", symbol: "green",
+  date: "magenta", regexp: "red", module: "underline",
+};
+
+function pirDefineColorAlias(target, alias) {
+  Object.defineProperty(pirInspectColors, alias, {
+    get() { return this[target]; },
+    set(value) { this[target] = value; },
+    configurable: true,
+    enumerable: false,
+  });
+}
+
+pirDefineColorAlias("gray", "grey");
+pirDefineColorAlias("gray", "blackBright");
+pirDefineColorAlias("bgGray", "bgGrey");
+pirDefineColorAlias("bgGray", "bgBlackBright");
+pirDefineColorAlias("dim", "faint");
+pirDefineColorAlias("strikethrough", "crossedout");
+pirDefineColorAlias("strikethrough", "strikeThrough");
+pirDefineColorAlias("strikethrough", "crossedOut");
+pirDefineColorAlias("hidden", "conceal");
+pirDefineColorAlias("inverse", "swapColors");
+pirDefineColorAlias("inverse", "swapcolors");
+pirDefineColorAlias("doubleunderline", "doubleUnderline");
+
+function pirStylizeWithColor(str, styleType) {
+  const style = pirInspectStyles[styleType];
+  if (style !== undefined) {
+    const color = pirInspectColors[style];
+    if (color !== undefined) return "\u001b[" + color[0] + "m" + str + "\u001b[" + color[1] + "m";
+  }
+  return str;
+}
+
+function pirIsInstanceof(object, proto) {
+  try {
+    return object instanceof proto;
+  } catch {
+    return false;
+  }
+}
+
+// Builtin prototypes whose `constructor` property may have been tampered with.
+const pirWellKnownPrototypes = new Map([
+  [Array.prototype, { name: "Array", constructor: Array }],
+  [ArrayBuffer.prototype, { name: "ArrayBuffer", constructor: ArrayBuffer }],
+  [Function.prototype, { name: "Function", constructor: Function }],
+  [Map.prototype, { name: "Map", constructor: Map }],
+  [Set.prototype, { name: "Set", constructor: Set }],
+  [Object.prototype, { name: "Object", constructor: Object }],
+  [RegExp.prototype, { name: "RegExp", constructor: RegExp }],
+  [Date.prototype, { name: "Date", constructor: Date }],
+  [Error.prototype, { name: "Error", constructor: Error }],
+  [RangeError.prototype, { name: "RangeError", constructor: RangeError }],
+  [TypeError.prototype, { name: "TypeError", constructor: TypeError }],
+  [Boolean.prototype, { name: "Boolean", constructor: Boolean }],
+  [Number.prototype, { name: "Number", constructor: Number }],
+  [String.prototype, { name: "String", constructor: String }],
+  [Promise.prototype, { name: "Promise", constructor: Promise }],
+  [WeakMap.prototype, { name: "WeakMap", constructor: WeakMap }],
+  [WeakSet.prototype, { name: "WeakSet", constructor: WeakSet }],
+]);
+
+// The object itself carries no constructor information for objects created by
+// a forged/tampered chain, so also honour the DataView and TypedArray
+// prototypes (node lists both in wellKnownPrototypes).
+if (typeof DataView === "function") {
+  pirWellKnownPrototypes.set(DataView.prototype, { name: "DataView", constructor: DataView });
+}
+if (typeof BigInt64Array === "function") {
+  pirWellKnownPrototypes.set(Object.getPrototypeOf(BigInt64Array.prototype), { name: "TypedArray", constructor: Object.getPrototypeOf(BigInt64Array) });
+}
+
+function pirGetConstructorName(obj, ctx, recurseTimes, protoProps) {
+  let firstProto;
+  const tmp = obj;
+  while (obj) {
+    const known = pirWellKnownPrototypes.get(obj);
+    if (known !== undefined) {
+      if (pirIsInstanceof(tmp, known.constructor)) {
+        if (protoProps !== undefined && firstProto !== obj) {
+          pirAddPrototypeProperties(ctx, tmp, firstProto || tmp, recurseTimes, protoProps);
+        }
+        return known.name;
+      }
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(obj, "constructor");
+    if (descriptor !== undefined &&
+        typeof descriptor.value === "function" &&
+        descriptor.value.name !== "" &&
+        pirIsInstanceof(tmp, descriptor.value)) {
+      if (protoProps !== undefined && (firstProto !== obj || !pirBuiltInObjects.has(descriptor.value.name))) {
+        pirAddPrototypeProperties(ctx, tmp, firstProto || tmp, recurseTimes, protoProps);
+      }
+      return String(descriptor.value.name);
+    }
+    obj = Object.getPrototypeOf(obj);
+    if (firstProto === undefined) firstProto = obj;
+  }
+
+  if (firstProto === null) return null;
+
+  const res = pirInternalGetConstructorName(tmp);
+  if (recurseTimes > ctx.depth && ctx.depth !== null) return res + " <Complex prototype>";
+
+  const protoConstr = pirGetConstructorName(firstProto, ctx, recurseTimes + 1, protoProps);
+  if (protoConstr === null) {
+    return res + " <" + pirInspect(firstProto, Object.assign({}, ctx, { customInspect: false, depth: -1 })) + ">";
+  }
+  return res + " <" + protoConstr + ">";
+}
+
+// Adds prototype properties to `output` (user-defined prototypes only).
+function pirAddPrototypeProperties(ctx, main, obj, recurseTimes, output) {
+  let depth = 0;
+  let keys;
+  let keySet;
+  do {
+    if (depth !== 0 || main === obj) {
+      obj = Object.getPrototypeOf(obj);
+      if (obj === null) return;
+      const descriptor = Object.getOwnPropertyDescriptor(obj, "constructor");
+      if (descriptor !== undefined &&
+          typeof descriptor.value === "function" &&
+          pirBuiltInObjects.has(descriptor.value.name)) {
+        return;
+      }
+    }
+    if (depth === 0) keySet = new Set();
+    else for (const key of keys) keySet.add(key);
+    keys = Reflect.ownKeys(obj);
+    ctx.seen.push(main);
+    for (const key of keys) {
+      if (key === "constructor" ||
+          Object.prototype.hasOwnProperty.call(main, key) ||
+          (depth !== 0 && keySet.has(key))) {
+        continue;
+      }
+      const desc = Object.getOwnPropertyDescriptor(obj, key);
+      if (typeof desc.value === "function") continue;
+      const value = pirFormatProperty(ctx, obj, recurseTimes, key, kObjectType, desc, main);
+      output.push(ctx.colors ? "\u001b[2m" + value + "\u001b[22m" : value);
+    }
+    ctx.seen.pop();
+    // Limit the inspection to three prototype layers.
+  } while (++depth !== 3);
+}
+
+function pirGetPrefix(constructor, tag, fallback, size) {
+  const suffix = size === undefined ? "" : size;
+  if (constructor === null) {
+    if (tag !== "" && fallback !== tag) return "[" + fallback + suffix + ": null prototype] [" + tag + "] ";
+    return "[" + fallback + suffix + ": null prototype] ";
+  }
+  let result = constructor + suffix + " ";
+  if (tag !== "") {
+    const position = constructor.indexOf(tag);
+    if (position === -1) {
+      result += "[" + tag + "] ";
+    } else {
+      const endPos = position + tag.length;
+      if (endPos !== constructor.length && constructor[endPos] === constructor[endPos].toLowerCase()) {
+        result += "[" + tag + "] ";
+      }
+    }
+  }
+  return result;
+}
+
+// Own property keys: Object.keys (+ enumerable symbols), or all own names and
+// symbols when showHidden is set.
+function pirGetKeys(value, showHidden) {
+  let keys;
+  const symbols = Object.getOwnPropertySymbols(value);
+  if (showHidden) {
+    keys = Object.getOwnPropertyNames(value);
+    if (symbols.length !== 0) keys.push(...symbols);
+  } else {
+    keys = Object.keys(value);
+    if (symbols.length !== 0) {
+      for (const symbol of symbols) {
+        if (Object.prototype.propertyIsEnumerable.call(value, symbol)) keys.push(symbol);
+      }
+    }
+  }
+  return keys;
+}
+
+function pirIsArrayIndex(key) {
+  if (typeof key !== "string") return false;
+  if (!/^(0|[1-9][0-9]*)$/.test(key)) return false;
+  const index = Number(key);
+  return index >= 0 && index <= 4294967294;
+}
+
+// Node's getOwnNonIndexProperties(name|symbol keys, filter).
+function pirGetOwnNonIndexProperties(value, allProperties) {
+  const keys = [];
+  const names = allProperties ? Object.getOwnPropertyNames(value) : Object.keys(value);
+  for (const name of names) {
+    if (!pirIsArrayIndex(name)) keys.push(name);
+  }
+  for (const symbol of Object.getOwnPropertySymbols(value)) {
+    if (allProperties || Object.prototype.propertyIsEnumerable.call(value, symbol)) keys.push(symbol);
+  }
+  return keys;
+}
+
+function pirGetCtxStyle(value, constructor, tag) {
+  let fallback = "";
+  if (constructor === null) {
+    fallback = pirInternalGetConstructorName(value);
+    if (fallback === tag) fallback = "Object";
+  }
+  return pirGetPrefix(constructor, tag, fallback);
+}
+
+// A REVOKED proxy: the engine exposes no proxy-internals binding, so the only
+// observable signal is the TypeError every property access on it raises. Node
+// prints `<Revoked Proxy>` for exactly this state (its inspect has the
+// binding); a live proxy is indistinguishable from its target here and
+// formats as the target, which is node's non-`showProxy` behavior anyway.
+function pirIsRevokedProxyError(error) {
+  return error instanceof TypeError && /revoked proxy/i.test(String(error.message));
+}
+
+function pirFormatValue(ctx, value, recurseTimes, typedArray) {
+  if (typeof value !== "object" && typeof value !== "function") {
+    return pirFormatPrimitive(ctx.stylize, value, ctx);
+  }
+  if (value === null) return ctx.stylize("null", "null");
+
+  const context = value;
+
+  // User-specified inspect functions.
+  if (ctx.customInspect) {
+    let maybeCustom;
+    try {
+      maybeCustom = value[kInspectCustom];
+    } catch (error) {
+      if (pirIsRevokedProxyError(error)) return ctx.stylize("<Revoked Proxy>", "special");
+      throw error;
+    }
+    if (typeof maybeCustom === "function" &&
+        maybeCustom !== pirInspect &&
+        (Object.getOwnPropertyDescriptor(value, "constructor") === undefined ||
+         Object.getOwnPropertyDescriptor(value, "constructor").value === undefined ||
+         Object.getOwnPropertyDescriptor(value, "constructor").value.prototype !== value)) {
+      const depth = ctx.depth === null ? null : ctx.depth - recurseTimes;
+      const ret = maybeCustom.call(context, depth, pirGetUserOptions(ctx), pirInspect);
+      if (ret !== context) {
+        if (typeof ret !== "string") return pirFormatValue(ctx, ret, recurseTimes);
+        return ret.split("\n").join("\n" + " ".repeat(ctx.indentationLvl));
+      }
+    }
+  }
+
+  // `seen` only tracks the current inspection path; the depth of the search is
+  // bounded by it and it never grows large.
+  if (ctx.seen.indexOf(value) !== -1) {
+    let index = 1;
+    if (ctx.circular === undefined) {
+      ctx.circular = new Map();
+      ctx.circular.set(value, index);
+    } else {
+      index = ctx.circular.get(value);
+      if (index === undefined) {
+        index = ctx.circular.size + 1;
+        ctx.circular.set(value, index);
+      }
+    }
+    return ctx.stylize("[Circular *" + index + "]", "special");
+  }
+
+  try {
+    return pirFormatRaw(ctx, value, recurseTimes, typedArray);
+  } catch (error) {
+    // Property probes on a revoked proxy throw no matter where they happen
+    // (constructor-name lookup, key enumeration, …).
+    if (pirIsRevokedProxyError(error)) return ctx.stylize("<Revoked Proxy>", "special");
+    throw error;
+  }
+}
+
+function pirGetUserOptions(ctx) {
+  return Object.assign({
+    stylize: ctx.stylize,
+    showHidden: ctx.showHidden,
+    depth: ctx.depth,
+    colors: ctx.colors,
+    customInspect: ctx.customInspect,
+    showProxy: ctx.showProxy,
+    maxArrayLength: ctx.maxArrayLength,
+    maxStringLength: ctx.maxStringLength,
+    breakLength: ctx.breakLength,
+    compact: ctx.compact,
+    sorted: ctx.sorted,
+    getters: ctx.getters,
+    numericSeparator: ctx.numericSeparator,
+  }, ctx.userOptions);
+}
+
+function pirFormatRaw(ctx, value, recurseTimes, typedArray) {
+  let keys;
+  let protoProps;
+  if (ctx.showHidden && (recurseTimes <= ctx.depth || ctx.depth === null)) protoProps = [];
+
+  const constructor = pirGetConstructorName(value, ctx, recurseTimes, protoProps);
+  if (protoProps !== undefined && protoProps.length === 0) protoProps = undefined;
+
+  let tag = "";
+  try {
+    tag = value[Symbol.toStringTag];
+  } catch { /* ignore */ }
+  // Only list the tag if it is non-enumerable / not an own property.
+  if (typeof tag !== "string" ||
+      (tag !== "" && (ctx.showHidden ? Object.prototype.hasOwnProperty : Object.prototype.propertyIsEnumerable).call(value, Symbol.toStringTag))) {
+    tag = "";
+  }
+
+  let base = "";
+  let formatter = null;
+  let braces;
+  let noIterator = true;
+  let i = 0;
+  const allProperties = ctx.showHidden;
+
+  let extrasType = kObjectType;
+  let extraKeys;
+
+  if (Symbol.iterator in value || constructor === null) {
+    noIterator = false;
+    if (Array.isArray(value)) {
+      const prefix = (constructor !== "Array" || tag !== "") ?
+        pirGetPrefix(constructor, tag, "Array", "(" + value.length + ")") : "";
+      keys = pirGetOwnNonIndexProperties(value, allProperties);
+      braces = [prefix + "[", "]"];
+      if (value.length === 0 && keys.length === 0 && protoProps === undefined) return braces[0] + "]";
+      extrasType = kArrayExtrasType;
+      formatter = pirFormatArray;
+    } else if (pirIsSet(value)) {
+      const size = value.size;
+      const prefix = pirGetPrefix(constructor, tag, "Set", "(" + size + ")");
+      keys = pirGetKeys(value, ctx.showHidden);
+      const setValue = value;
+      formatter = (c, v, rt) => pirFormatSet(setValue, c, v, rt);
+      if (size === 0 && keys.length === 0 && protoProps === undefined) return prefix + "{}";
+      braces = [prefix + "{", "}"];
+    } else if (pirIsMap(value)) {
+      const size = value.size;
+      const prefix = pirGetPrefix(constructor, tag, "Map", "(" + size + ")");
+      keys = pirGetKeys(value, ctx.showHidden);
+      const mapValue = value;
+      formatter = (c, v, rt) => pirFormatMap(mapValue, c, v, rt);
+      if (size === 0 && keys.length === 0 && protoProps === undefined) return prefix + "{}";
+      braces = [prefix + "{", "}"];
+    } else if (pirIsTypedArray(value)) {
+      keys = pirGetOwnNonIndexProperties(value, allProperties);
+      const bound = value;
+      // Reconstruct the kind for a null-prototype typed array (node uses
+      // TypedArrayPrototypeGetSymbolToStringTag here).
+      const fallback = constructor === null ? (pirTypedArrayName(value) || "") : "";
+      const size = value.length;
+      const prefix = pirGetPrefix(constructor, tag, fallback, "(" + size + ")");
+      braces = [prefix + "[", "]"];
+      if (value.length === 0 && keys.length === 0 && !ctx.showHidden) return braces[0] + "]";
+      formatter = (c, v, rt) => pirFormatTypedArray(bound, size, c, v, rt);
+      extrasType = kArrayExtrasType;
+      if (ctx.showHidden) {
+        extraKeys = ["BYTES_PER_ELEMENT", "length", "byteLength", "byteOffset", "buffer"];
+        typedArray = true;
+      }
+    } else if (pirIsMapIterator(value) || pirIsSetIterator(value)) {
+      keys = pirGetKeys(value, ctx.showHidden);
+      braces = pirGetIteratorBraces(pirIsMapIterator(value) ? "Map" : "Set", tag);
+      formatter = pirFormatPeeklessIterator;
+    } else {
+      noIterator = true;
+    }
+  }
+  if (noIterator) {
+    keys = pirGetKeys(value, ctx.showHidden);
+    braces = ["{", "}"];
+    if (typeof value === "function") {
+      base = pirGetFunctionBase(ctx, value, constructor, tag);
+      if (keys.length === 0 && protoProps === undefined) return ctx.stylize(base, "special");
+    } else if (constructor === "Object") {
+      if (pirIsArgumentsObject(value)) {
+        braces[0] = "[Arguments] {";
+      } else if (tag !== "") {
+        braces[0] = pirGetPrefix(constructor, tag, "Object") + "{";
+      }
+      if (keys.length === 0 && protoProps === undefined) return braces[0] + "}";
+    } else if (pirIsRegExp(value)) {
+      base = String(constructor !== null ? value : new RegExp(value));
+      const prefix = pirGetPrefix(constructor, tag, "RegExp");
+      if (prefix !== "RegExp ") base = prefix + base;
+      if ((keys.length === 0 && protoProps === undefined) ||
+          (recurseTimes > ctx.depth && ctx.depth !== null)) {
+        return ctx.stylize(base, "regexp");
+      }
+    } else if (pirIsDate(value)) {
+      base = Number.isNaN(value.getTime()) ? String(value) : value.toISOString();
+      const prefix = pirGetPrefix(constructor, tag, "Date");
+      if (prefix !== "Date ") base = prefix + base;
+      if (keys.length === 0 && protoProps === undefined) return ctx.stylize(base, "date");
+    } else if (pirIsError(value)) {
+      base = pirFormatError(value, constructor, tag, ctx, keys);
+      if (keys.length === 0 && protoProps === undefined) return base;
+    } else if (pirIsAnyArrayBuffer(value)) {
+      const arrayType = pirIsArrayBuffer(value) ? "ArrayBuffer" : "SharedArrayBuffer";
+      const prefix = pirGetPrefix(constructor, tag, arrayType);
+      if (typedArray === undefined) {
+        formatter = pirFormatArrayBuffer;
+      } else if (keys.length === 0 && protoProps === undefined) {
+        return prefix + "{ [byteLength]: " + pirFormatNumber(ctx.stylize, value.byteLength, false) + " }";
+      }
+      braces[0] = prefix + "{";
+      extraKeys = ["byteLength"];
+    } else if (pirIsDataView(value)) {
+      braces[0] = pirGetPrefix(constructor, tag, "DataView") + "{";
+      extraKeys = ["byteLength", "byteOffset", "buffer"];
+    } else if (pirIsPromise(value)) {
+      braces[0] = pirGetPrefix(constructor, tag, "Promise") + "{";
+      formatter = pirFormatPromise;
+    } else if (pirIsWeakSet(value)) {
+      braces[0] = pirGetPrefix(constructor, tag, "WeakSet") + "{";
+      formatter = pirFormatWeakCollection;
+    } else if (pirIsWeakMap(value)) {
+      braces[0] = pirGetPrefix(constructor, tag, "WeakMap") + "{";
+      formatter = pirFormatWeakCollection;
+    } else if (pirIsModuleNamespaceObject(value)) {
+      braces[0] = pirGetPrefix(constructor, tag, "Module") + "{";
+      formatter = (c, v, rt) => pirFormatNamespaceObject(keys, c, v, rt);
+    } else if (pirIsBoxedPrimitive(value)) {
+      base = pirGetBoxedBase(value, ctx, keys, constructor, tag);
+      if (keys.length === 0 && protoProps === undefined) return base;
+    } else if (pirIsURLInstance(value) && !(recurseTimes > ctx.depth && ctx.depth !== null)) {
+      // node renders a URL by its href (the parsed parts live in internal
+      // slots there; the shim's URL keeps them as own properties, so the
+      // object braces below still list them).
+      base = value.href;
+      if (keys.length === 0 && protoProps === undefined) return base;
+    } else {
+      if (keys.length === 0 && protoProps === undefined) {
+        return pirGetCtxStyle(value, constructor, tag) + "{}";
+      }
+      braces[0] = pirGetCtxStyle(value, constructor, tag) + "{";
+    }
+  }
+
+  if (recurseTimes > ctx.depth && ctx.depth !== null) {
+    let constructorName = pirGetCtxStyle(value, constructor, tag).slice(0, -1);
+    if (constructor !== null) constructorName = "[" + constructorName + "]";
+    return ctx.stylize(constructorName, "special");
+  }
+  recurseTimes += 1;
+
+  ctx.seen.push(value);
+  ctx.currentDepth = recurseTimes;
+  let output;
+  const indentationLvl = ctx.indentationLvl;
+  try {
+    output = formatter === null ? [] : formatter(ctx, value, recurseTimes);
+    if (extraKeys !== undefined) {
+      for (i = 0; i < extraKeys.length; i++) {
+        output.push(pirFormatExtraProperties(ctx, value, recurseTimes, extraKeys[i], typedArray));
+      }
+    }
+    for (i = 0; i < keys.length; i++) {
+      output.push(pirFormatProperty(ctx, value, recurseTimes, keys[i], extrasType));
+    }
+    if (protoProps !== undefined) output.push(...protoProps);
+  } catch (err) {
+    ctx.seen.pop();
+    if (!(err instanceof RangeError && /stack/i.test(err.message))) throw err;
+    ctx.indentationLvl = indentationLvl;
+    return ctx.stylize("[" + pirGetCtxStyle(value, constructor, tag).slice(0, -1) +
+      ": Inspection interrupted prematurely. Maximum call stack size exceeded.]", "special");
+  }
+  if (ctx.circular !== undefined) {
+    const index = ctx.circular.get(value);
+    if (index !== undefined) {
+      const reference = ctx.stylize("<ref *" + index + ">", "special");
+      // References are always added to the very beginning of the output.
+      if (ctx.compact !== true) base = base === "" ? reference : reference + " " + base;
+      else braces[0] = reference + " " + braces[0];
+    }
+  }
+  ctx.seen.pop();
+
+  if (ctx.sorted) {
+    const comparator = ctx.sorted === true ? undefined : ctx.sorted;
+    if (extrasType === kObjectType) {
+      output.sort(comparator);
+    } else if (keys.length > 1) {
+      const sorted = output.slice(output.length - keys.length).sort(comparator);
+      output.splice(output.length - keys.length, keys.length, ...sorted);
+    }
+  }
+
+  const res = pirReduceToSingleString(ctx, output, base, braces, extrasType, recurseTimes, value);
+  const budget = ctx.budget[ctx.indentationLvl] || 0;
+  const newLength = budget + res.length;
+  ctx.budget[ctx.indentationLvl] = newLength;
+  // Bound the total output: limit further inspection to the minimum.
+  if (newLength > 2 ** 27) ctx.depth = -1;
+  return res;
+}
+
+function pirGetIteratorBraces(type, tag) {
+  let renderedTag = tag;
+  if (renderedTag !== type + " Iterator") {
+    if (renderedTag !== "") renderedTag += "] [";
+    renderedTag += type + " Iterator";
+  }
+  return ["[" + renderedTag + "] {", "}"];
+}
+
+function pirGetBoxedBase(value, ctx, keys, constructor, tag) {
+  let fn;
+  let type;
+  if (pirIsNumberObject(value)) {
+    fn = pirNumberValueOf;
+    type = "Number";
+  } else if (pirIsStringObject(value)) {
+    fn = pirStringValueOf;
+    type = "String";
+    // Drop the 0-n indexed entries of boxed strings: they are redundant.
+    keys.splice(0, value.length);
+  } else if (pirIsBooleanObject(value)) {
+    fn = pirBooleanValueOf;
+    type = "Boolean";
+  } else if (pirIsBigIntObject(value)) {
+    fn = pirBigIntValueOf;
+    type = "BigInt";
+  } else {
+    fn = pirSymbolValueOf;
+    type = "Symbol";
+  }
+  let base = "[" + type;
+  if (type !== constructor) {
+    if (constructor === null) base += " (null prototype)";
+    else base += " (" + constructor + ")";
+  }
+  base += ": " + pirFormatPrimitive(pirStylizeNoColor, fn.call(value), ctx) + "]";
+  if (tag !== "" && tag !== constructor) base += " [" + tag + "]";
+  if (keys.length !== 0 || ctx.stylize === pirStylizeNoColor) return base;
+  return ctx.stylize(base, type.toLowerCase());
+}
+
+function pirGetClassBase(value, constructor, tag) {
+  const hasName = Object.prototype.hasOwnProperty.call(value, "name");
+  const name = (hasName && value.name) || "(anonymous)";
+  let base = "class " + name;
+  if (constructor !== "Function" && constructor !== null) base += " [" + constructor + "]";
+  if (tag !== "" && constructor !== tag) base += " [" + tag + "]";
+  if (constructor !== null) {
+    const superName = Object.getPrototypeOf(value).name;
+    if (superName) base += " extends " + superName;
+  } else {
+    base += " extends [null prototype]";
+  }
+  return "[" + base + "]";
+}
+
+function pirGetFunctionBase(ctx, value, constructor, tag) {
+  const stringified = Function.prototype.toString.call(value);
+  if (stringified.startsWith("class") && stringified[stringified.length - 1] === "}") {
+    const slice = stringified.slice(5, -1);
+    const bracketIndex = slice.indexOf("{");
+    if (bracketIndex !== -1 &&
+        (slice.slice(0, bracketIndex).indexOf("(") === -1 ||
+         pirClassRegExp.exec(slice.replace(pirStripCommentsRegExp, "")) !== null)) {
+      return pirGetClassBase(value, constructor, tag);
+    }
+  }
+  let type = "Function";
+  if (typeof value === "function" && Object.prototype.toString.call(value) === "[object GeneratorFunction]") {
+    type = "Generator" + type;
+  }
+  if (typeof value === "function" && Object.prototype.toString.call(value) === "[object AsyncFunction]") {
+    type = "Async" + type;
+  }
+  let base = "[" + type;
+  if (constructor === null) base += " (null prototype)";
+  if (value.name === "") {
+    base += " (anonymous)";
+  } else {
+    base += ": " + (typeof value.name === "string" ? value.name : pirFormatValue(ctx, value.name));
+  }
+  base += "]";
+  if (constructor !== type && constructor !== null) base += " " + constructor;
+  if (tag !== "" && constructor !== tag) base += " [" + tag + "]";
+  return base;
+}
+
+function pirErrorToString(err) {
+  return Error.prototype.toString.call(err);
+}
+
+// Node's getStackString: err.stack when it is a string, the inspected value
+// underneath the error text when it is not, `Name: message` otherwise.
+function pirGetStackString(ctx, error) {
+  let stack;
+  try {
+    stack = error.stack;
+  } catch { /* a throwing stack getter leaves no stack */ }
+  if (stack) {
+    if (typeof stack === "string") return stack;
+    ctx.seen.push(error);
+    ctx.indentationLvl += 4;
+    const rendered = pirFormatValue(ctx, stack);
+    ctx.indentationLvl -= 4;
+    ctx.seen.pop();
+    return pirErrorToString(error) + "\n    " + rendered;
+  }
+  return pirErrorToString(error);
+}
+
+function pirFormatError(err, constructor, tag, ctx, keys) {
+  let stack;
+  try {
+    stack = pirGetStackString(ctx, err);
+  } catch {
+    return Object.prototype.toString.call(err);
+  }
+
+  let message;
+  try {
+    message = err.message;
+  } catch { /* message getter threw */ }
+  let name;
+  try {
+    name = err.name;
+  } catch { /* name getter threw */ }
+
+  if (!ctx.showHidden && keys.length !== 0) {
+    let index = keys.indexOf("stack");
+    if (index !== -1) keys.splice(index, 1);
+    index = keys.indexOf("message");
+    // Only hide the property when it is part of the rendered error text.
+    if (index !== -1 && (typeof message !== "string" || stack.indexOf(message) !== -1)) {
+      keys.splice(index, 1);
+    }
+    index = keys.indexOf("name");
+    if (index !== -1 && (typeof name !== "string" || stack.indexOf(name) !== -1)) {
+      keys.splice(index, 1);
+    }
+  }
+  if (name === undefined || name === null) name = "Error";
+
+  if (Object.prototype.hasOwnProperty.call(err, "cause") && keys.indexOf("cause") === -1) keys.push("cause");
+  try {
+    const errors = err.errors;
+    if (Array.isArray(errors) && Object.prototype.hasOwnProperty.call(err, "errors") && keys.indexOf("errors") === -1) {
+      keys.push("errors");
+    }
+  } catch { /* throwing errors getter */ }
+
+  stack = pirImproveStack(stack, constructor, name, tag);
+
+  // Wrap in brackets when there is no stack trace to show. The search starts
+  // after the message so that a message containing "\n    at" is not mistaken
+  // for the frame section; a stack that starts with a frame line is already
+  // the frame section (QuickJS builds headerless stacks, node prefixes
+  // "Name: message").
+  let pos = (message && stack.indexOf(message)) || -1;
+  if (pos !== -1) pos += message.length;
+  if (stack.indexOf("\n    at", pos) === -1 && !/^ {4}at /.test(stack)) {
+    stack = "[" + stack + "]";
+  }
+
+  if (ctx.indentationLvl !== 0) {
+    stack = stack.split("\n").join("\n" + " ".repeat(ctx.indentationLvl));
+  }
+  return stack;
+}
+
+// Node's improveStack: rewrite the leading name to match constructor/tag.
+function pirImproveStack(stack, constructor, name, tag) {
+  const nameIsString = typeof name === "string";
+  let len = nameIsString ? name.length : 0;
+  if (!nameIsString) {
+    stack = stack.replace(String(name),
+      String(name) + " [" + pirGetPrefix(constructor, tag, "Error").slice(0, -1) + "]");
+  }
+  if (constructor === null ||
+      (nameIsString &&
+       String(name).endsWith("Error") &&
+       stack.startsWith(String(name)) &&
+       (stack.length === len || stack[len] === ":" || stack[len] === "\n"))) {
+    let fallback = "Error";
+    if (constructor === null) {
+      const start = /^([A-Z][a-z_ A-Z0-9[\]()-]+)(?::|\n {4}at)/.exec(stack) ||
+        /^([a-z_A-Z0-9-]*Error)$/.exec(stack);
+      fallback = (start && start[1]) || "";
+      len = fallback.length;
+      if (fallback === "") fallback = "Error";
+    }
+    const prefix = pirGetPrefix(constructor, tag, fallback).slice(0, -1);
+    if (String(name) !== prefix) {
+      if (prefix.indexOf(String(name)) !== -1) {
+        if (len === 0) stack = prefix + ": " + stack;
+        else stack = prefix + stack.slice(len);
+      } else {
+        stack = prefix + " [" + String(name) + "]" + stack.slice(len);
+      }
+    }
+  }
+  return stack;
+}
+
+function pirGroupArrayElements(ctx, output, value) {
+  let totalLength = 0;
+  let maxLength = 0;
+  let i = 0;
+  let outputLength = output.length;
+  if (ctx.maxArrayLength < output.length) outputLength--;
+  const separatorSpace = 2;
+  const dataLen = new Array(outputLength);
+  for (; i < outputLength; i++) {
+    const len = pirGetStringWidth(output[i], ctx.colors);
+    dataLen[i] = len;
+    totalLength += len + separatorSpace;
+    if (maxLength < len) maxLength = len;
+  }
+  const actualMax = maxLength + separatorSpace;
+  // Group only when at least three entries fit next to each other and the
+  // entries are not wildly different in length.
+  if (actualMax * 3 + ctx.indentationLvl < ctx.breakLength &&
+      (totalLength / actualMax > 5 || maxLength <= 6)) {
+    const approxCharHeights = 2.5;
+    const averageBias = Math.sqrt(actualMax - totalLength / output.length);
+    const biasedMax = Math.max(actualMax - 3 - averageBias, 1);
+    const columns = Math.min(
+      Math.round(Math.sqrt(approxCharHeights * biasedMax * outputLength) / biasedMax),
+      Math.floor((ctx.breakLength - ctx.indentationLvl) / actualMax),
+      ctx.compact * 4,
+      15,
+    );
+    if (columns <= 1) return output;
+    const tmp = [];
+    const maxLineLength = [];
+    for (let i = 0; i < columns; i++) {
+      let lineMaxLength = 0;
+      for (let j = i; j < output.length; j += columns) {
+        if (dataLen[j] > lineMaxLength) lineMaxLength = dataLen[j];
+      }
+      lineMaxLength += separatorSpace;
+      maxLineLength[i] = lineMaxLength;
+    }
+    let order = "padStart";
+    if (value !== undefined) {
+      for (let i = 0; i < output.length; i++) {
+        if (typeof value[i] !== "number" && typeof value[i] !== "bigint") {
+          order = "padEnd";
+          break;
+        }
+      }
+    }
+    const pad = (str, targetLength, padString) => (order === "padStart"
+      ? String(str).padStart(targetLength, padString)
+      : String(str).padEnd(targetLength, padString));
+    for (let i = 0; i < outputLength; i += columns) {
+      const max = Math.min(i + columns, outputLength);
+      let str = "";
+      let j = i;
+      for (; j < max - 1; j++) {
+        const padding = maxLineLength[j - i] + output[j].length - dataLen[j];
+        str += pad(output[j] + ", ", padding, " ");
+      }
+      if (order === "padStart") {
+        const padding = maxLineLength[j - i] + output[j].length - dataLen[j] - separatorSpace;
+        str += String(output[j]).padStart(padding, " ");
+      } else {
+        str += output[j];
+      }
+      tmp.push(str);
+    }
+    if (ctx.maxArrayLength < output.length) tmp.push(output[outputLength]);
+    output = tmp;
+  }
+  return output;
+}
+
+function pirAddNumericSeparator(integerString) {
+  let result = "";
+  let i = integerString.length;
+  const start = integerString[0] === "-" ? 1 : 0;
+  for (; i >= start + 4; i -= 3) {
+    result = "_" + integerString.slice(i - 3, i) + result;
+  }
+  return i === integerString.length ? integerString : integerString.slice(0, i) + result;
+}
+
+function pirAddNumericSeparatorEnd(integerString) {
+  let result = "";
+  let i = 0;
+  for (; i < integerString.length - 3; i += 3) {
+    result += integerString.slice(i, i + 3) + "_";
+  }
+  return i === 0 ? integerString : result + integerString.slice(i);
+}
+
+function pirRemainingText(remaining) {
+  return "... " + remaining + " more item" + (remaining > 1 ? "s" : "");
+}
+
+function pirFormatNumber(fn, number, numericSeparator) {
+  // String(-0) is '0', so check for -0 before any string conversion.
+  if (Object.is(number, -0)) return fn("-0", "number");
+  if (!numericSeparator) return fn(String(number), "number");
+
+  const numberString = String(number);
+  const integer = Math.trunc(number);
+  if (integer === number) {
+    if (!Number.isFinite(number) || numberString.indexOf("e") !== -1) return fn(numberString, "number");
+    return fn(pirAddNumericSeparator(numberString), "number");
+  }
+  if (Number.isNaN(number) || numberString.indexOf("e") !== -1) return fn(numberString, "number");
+
+  const decimalIndex = numberString.indexOf(".");
+  return fn(pirAddNumericSeparator(numberString.slice(0, decimalIndex)) + "." +
+    pirAddNumericSeparatorEnd(numberString.slice(decimalIndex + 1)), "number");
+}
+
+function pirFormatBigInt(fn, bigint, numericSeparator) {
+  const string = String(bigint);
+  if (!numericSeparator) return fn(string + "n", "bigint");
+  return fn(pirAddNumericSeparator(string) + "n", "bigint");
+}
+
+function pirFormatPrimitive(fn, value, ctx) {
+  if (typeof value === "string") {
+    let trailer = "";
+    if (value.length > ctx.maxStringLength) {
+      const remaining = value.length - ctx.maxStringLength;
+      value = value.slice(0, ctx.maxStringLength);
+      trailer = "... " + remaining + " more character" + (remaining > 1 ? "s" : "");
+    }
+    if (ctx.compact !== true &&
+        value.length > kMinLineLength &&
+        value.length > ctx.breakLength - ctx.indentationLvl - 4) {
+      return value.split(/(?<=\n)/).map((line) => fn(pirStrEscape(line), "string")).join(" +\n" + " ".repeat(ctx.indentationLvl + 2)) + trailer;
+    }
+    return fn(pirStrEscape(value), "string") + trailer;
+  }
+  if (typeof value === "number") return pirFormatNumber(fn, value, ctx.numericSeparator);
+  if (typeof value === "bigint") return pirFormatBigInt(fn, value, ctx.numericSeparator);
+  if (typeof value === "boolean") return fn(String(value), "boolean");
+  if (typeof value === "undefined") return fn("undefined", "undefined");
+  return fn(Symbol.prototype.toString.call(value), "symbol");
+}
+
+function pirFormatNamespaceObject(keys, ctx, value, recurseTimes) {
+  const output = new Array(keys.length);
+  for (let i = 0; i < keys.length; i++) {
+    try {
+      output[i] = pirFormatProperty(ctx, value, recurseTimes, keys[i], kObjectType);
+    } catch (err) {
+      if (!pirIsNativeError(err)) throw err;
+      const tmp = {};
+      tmp[keys[i]] = "";
+      output[i] = pirFormatProperty(ctx, tmp, recurseTimes, keys[i], kObjectType);
+      const pos = output[i].lastIndexOf(" ");
+      output[i] = output[i].slice(0, pos + 1) + ctx.stylize("<uninitialized>", "special");
+    }
+  }
+  keys.length = 0;
+  return output;
+}
+
+// Sparse arrays and arrays with extra keys.
+function pirFormatSpecialArray(ctx, value, recurseTimes, maxLength, output, i) {
+  const keys = Object.keys(value);
+  let index = i;
+  for (; i < keys.length && output.length < maxLength; i++) {
+    const key = keys[i];
+    const tmp = +key;
+    if (tmp > 2 ** 32 - 2) break;
+    if (String(index) !== key) {
+      if (pirNumberRegExp.exec(key) === null) break;
+      const emptyItems = tmp - index;
+      const ending = emptyItems > 1 ? "s" : "";
+      output.push(ctx.stylize("<" + emptyItems + " empty item" + ending + ">", "undefined"));
+      index = tmp;
+      if (output.length === maxLength) break;
+    }
+    output.push(pirFormatProperty(ctx, value, recurseTimes, key, kArrayType));
+    index++;
+  }
+  const remaining = value.length - index;
+  if (output.length !== maxLength) {
+    if (remaining > 0) {
+      const ending = remaining > 1 ? "s" : "";
+      output.push(ctx.stylize("<" + remaining + " empty item" + ending + ">", "undefined"));
+    }
+  } else if (remaining > 0) {
+    output.push(pirRemainingText(remaining));
+  }
+  return output;
+}
+
+function pirFormatArrayBuffer(ctx, value) {
+  let bytes;
+  try {
+    bytes = new Uint8Array(value);
+  } catch {
+    return [ctx.stylize("(detached)", "special")];
+  }
+  const length = Math.min(ctx.maxArrayLength, bytes.length);
+  let rawString = "";
+  for (let i = 0; i < length; i++) rawString += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+  let str = "";
+  let i = 0;
+  for (; i < rawString.length - 2; i += 2) str += rawString[i] + rawString[i + 1] + " ";
+  if (rawString.length > 0) str += rawString[i] + rawString[i + 1];
+  const remaining = bytes.length - ctx.maxArrayLength;
+  if (remaining > 0) str += " ... " + remaining + " more byte" + (remaining > 1 ? "s" : "");
+  return [ctx.stylize("[Uint8Contents]", "special") + ": <" + str + ">"];
+}
+
+function pirFormatArray(ctx, value, recurseTimes) {
+  const valLen = value.length;
+  const len = Math.min(Math.max(0, ctx.maxArrayLength), valLen);
+  const remaining = valLen - len;
+  const output = [];
+  for (let i = 0; i < len; i++) {
+    const desc = Object.getOwnPropertyDescriptor(value, i);
+    if (desc === undefined) {
+      // Sparse array.
+      return pirFormatSpecialArray(ctx, value, recurseTimes, len, output, i);
+    }
+    output.push(pirFormatProperty(ctx, value, recurseTimes, i, kArrayType, desc));
+  }
+  if (remaining > 0) output.push(pirRemainingText(remaining));
+  return output;
+}
+
+function pirFormatTypedArray(value, length, ctx) {
+  const maxLength = Math.min(Math.max(0, ctx.maxArrayLength), length);
+  const remaining = value.length - maxLength;
+  const output = new Array(maxLength);
+  const elementFormatter = value.length > 0 && typeof value[0] === "number" ? pirFormatNumber : pirFormatBigInt;
+  for (let i = 0; i < maxLength; ++i) {
+    output[i] = elementFormatter(ctx.stylize, value[i], ctx.numericSeparator);
+  }
+  if (remaining > 0) output[maxLength] = pirRemainingText(remaining);
+  return output;
+}
+
+function pirFormatSet(value, ctx, ignored, recurseTimes) {
+  const length = value.size;
+  const maxLength = Math.min(Math.max(0, ctx.maxArrayLength), length);
+  const remaining = length - maxLength;
+  const output = [];
+  ctx.indentationLvl += 2;
+  let i = 0;
+  for (const entry of value) {
+    if (i >= maxLength) break;
+    output.push(pirFormatValue(ctx, entry, recurseTimes));
+    i++;
+  }
+  if (remaining > 0) output.push(pirRemainingText(remaining));
+  ctx.indentationLvl -= 2;
+  return output;
+}
+
+function pirFormatMap(value, ctx, ignored, recurseTimes) {
+  const length = value.size;
+  const maxLength = Math.min(Math.max(0, ctx.maxArrayLength), length);
+  const remaining = length - maxLength;
+  const output = [];
+  ctx.indentationLvl += 2;
+  let i = 0;
+  for (const entry of value) {
+    if (i >= maxLength) break;
+    output.push(pirFormatValue(ctx, entry[0], recurseTimes) + " => " + pirFormatValue(ctx, entry[1], recurseTimes));
+    i++;
+  }
+  if (remaining > 0) output.push(pirRemainingText(remaining));
+  ctx.indentationLvl -= 2;
+  return output;
+}
+
+function pirFormatWeakCollection(ctx) {
+  return [ctx.stylize("<items unknown>", "special")];
+}
+
+// The engine cannot peek an iterator without consuming it, so the entries are
+// reported as unknown (node uses previewEntries()).
+function pirFormatPeeklessIterator(ctx) {
+  return [ctx.stylize("<entries unknown>", "special")];
+}
+
+function pirFormatPromise(ctx) {
+  return [ctx.stylize("<state unknown>", "special")];
+}
+
+function pirFormatExtraProperties(ctx, value, recurseTimes, key, typedArray) {
+  ctx.indentationLvl += 2;
+  const str = pirFormatValue(ctx, value[key], recurseTimes, typedArray);
+  ctx.indentationLvl -= 2;
+  return ctx.stylize("[" + key + "]", "string") + ": " + str;
+}
+
+function pirFormatProperty(ctx, value, recurseTimes, key, type, desc, original) {
+  let name, str;
+  let extra = " ";
+  const source = original === undefined ? value : original;
+  if (desc === undefined) desc = Object.getOwnPropertyDescriptor(value, key);
+  if (desc.value !== undefined) {
+    const diff = (ctx.compact !== true || type !== kObjectType) ? 2 : 3;
+    ctx.indentationLvl += diff;
+    str = pirFormatValue(ctx, desc.value, recurseTimes);
+    if (diff === 3 && ctx.breakLength < pirGetStringWidth(str, ctx.colors)) {
+      extra = "\n" + " ".repeat(ctx.indentationLvl);
+    }
+    ctx.indentationLvl -= diff;
+  } else if (desc.get !== undefined) {
+    const label = desc.set !== undefined ? "Getter/Setter" : "Getter";
+    const s = ctx.stylize;
+    const sp = "special";
+    if (ctx.getters && (ctx.getters === true ||
+        (ctx.getters === "get" && desc.set === undefined) ||
+        (ctx.getters === "set" && desc.set !== undefined))) {
+      ctx.indentationLvl += 2;
+      try {
+        const tmp = desc.get.call(source);
+        if (tmp === null) str = s("[" + label + ":", sp) + " " + s("null", "null") + s("]", sp);
+        else if (typeof tmp === "object") str = s("[" + label + "]", sp) + " " + pirFormatValue(ctx, tmp, recurseTimes);
+        else str = s("[" + label + ":", sp) + " " + pirFormatPrimitive(s, tmp, ctx) + s("]", sp);
+      } catch (err) {
+        str = s("[" + label + ":", sp) + " " + "<Inspection threw (" + pirFormatValue(ctx, err, recurseTimes) + ")>" + s("]", sp);
+      }
+      ctx.indentationLvl -= 2;
+    } else {
+      str = ctx.stylize("[" + label + "]", sp);
+    }
+  } else if (desc.set !== undefined) {
+    str = ctx.stylize("[Setter]", "special");
+  } else {
+    str = ctx.stylize("undefined", "undefined");
+  }
+  if (type === kArrayType) return str;
+  if (typeof key === "symbol") {
+    name = ctx.stylize(Symbol.prototype.toString.call(key).replace(pirStrEscapeSequencesReplacer, pirEscapeFn), "symbol");
+  } else if (pirKeyStrRegExp.exec(key) !== null) {
+    name = key === "__proto__" ? "['__proto__']" : ctx.stylize(key, "name");
+  } else {
+    name = ctx.stylize(pirStrEscape(key), "string");
+  }
+  if (desc.enumerable === false) name = "[" + name + "]";
+  return name + ":" + extra + str;
+}
+
+function pirIsBelowBreakLength(ctx, output, start, base) {
+  let totalLength = output.length + start;
+  if (totalLength + output.length > ctx.breakLength) return false;
+  for (let i = 0; i < output.length; i++) {
+    totalLength += ctx.colors ? pirRemoveColors(output[i]).length : output[i].length;
+    if (totalLength > ctx.breakLength) return false;
+  }
+  // Never line properties up on a single line when `base` spans lines.
+  return base === "" || base.indexOf("\n") === -1;
+}
+
+function pirReduceToSingleString(ctx, output, base, braces, extrasType, recurseTimes, value) {
+  if (ctx.compact !== true) {
+    if (typeof ctx.compact === "number" && ctx.compact >= 1) {
+      const entries = output.length;
+      if (extrasType === kArrayExtrasType && entries > 6) output = pirGroupArrayElements(ctx, output, value);
+      if (ctx.currentDepth - recurseTimes < ctx.compact && entries === output.length) {
+        const start = output.length + ctx.indentationLvl + braces[0].length + base.length + 10;
+        if (pirIsBelowBreakLength(ctx, output, start, base)) {
+          const joinedOutput = output.join(", ");
+          if (joinedOutput.indexOf("\n") === -1) {
+            return (base ? base + " " : "") + braces[0] + " " + joinedOutput + " " + braces[1];
+          }
+        }
+      }
+    }
+    const indentation = "\n" + " ".repeat(ctx.indentationLvl);
+    return (base ? base + " " : "") + braces[0] + indentation + "  " +
+      output.join("," + indentation + "  ") + indentation + braces[1];
+  }
+  if (pirIsBelowBreakLength(ctx, output, 0, base)) {
+    return braces[0] + (base ? " " + base : "") + " " + output.join(", ") + " " + braces[1];
+  }
+  const indentation = " ".repeat(ctx.indentationLvl);
+  // A large opening brace ("Set {") forces the first item onto its own line.
+  const ln = base === "" && braces[0].length === 1 ? " " : (base ? " " + base : "") + "\n" + indentation + "  ";
+  return braces[0] + ln + output.join(",\n" + indentation + "  ") + " " + braces[1];
+}
+
+function pirHasBuiltInToString(value) {
+  let target = value;
+  let hasOwnToString = Object.prototype.hasOwnProperty;
+  let hasOwnToPrimitive = Object.prototype.hasOwnProperty;
+  const returnFalse = () => false;
+
+  // Objects without `toString` and `Symbol.toPrimitive` count as built-in.
+  if (typeof target.toString !== "function") {
+    if (typeof target[Symbol.toPrimitive] !== "function") {
+      return true;
+    } else if (Object.prototype.hasOwnProperty.call(target, Symbol.toPrimitive)) {
+      return false;
+    }
+    hasOwnToString = returnFalse;
+  } else if (Object.prototype.hasOwnProperty.call(target, "toString")) {
+    return false;
+  } else if (typeof target[Symbol.toPrimitive] !== "function") {
+    hasOwnToPrimitive = returnFalse;
+  } else if (Object.prototype.hasOwnProperty.call(target, Symbol.toPrimitive)) {
+    return false;
+  }
+
+  // Find the object in the prototype chain that owns toString/Symbol.toPrimitive.
+  let pointer = target;
+  do {
+    pointer = Object.getPrototypeOf(pointer);
+  } while (pointer !== null &&
+    !hasOwnToString.call(pointer, "toString") &&
+    !hasOwnToPrimitive.call(pointer, Symbol.toPrimitive));
+
+  if (pointer === null) return true;
+  const descriptor = Object.getOwnPropertyDescriptor(pointer, "constructor");
+  return descriptor !== undefined &&
+    typeof descriptor.value === "function" &&
+    pirBuiltInObjects.has(descriptor.value.name);
+}
+
+const pirFirstErrorLine = (error) => String(error.message).split("\n", 1)[0];
+let pirCircularErrorMessage;
+function pirTryStringify(arg) {
+  try {
+    return JSON.stringify(arg);
+  } catch (err) {
+    if (!pirCircularErrorMessage) {
+      try {
+        const a = {};
+        a.a = a;
+        JSON.stringify(a);
+      } catch (circularError) {
+        pirCircularErrorMessage = pirFirstErrorLine(circularError);
+      }
+    }
+    if (err.name === "TypeError" && pirFirstErrorLine(err) === pirCircularErrorMessage) return "[Circular]";
+    throw err;
+  }
+}
+
+function pirInspect(value, opts) {
+  const ctx = {
+    budget: {},
+    indentationLvl: 0,
+    seen: [],
+    currentDepth: 0,
+    stylize: pirStylizeNoColor,
+    showHidden: pirInspectDefaultOptions.showHidden,
+    depth: pirInspectDefaultOptions.depth,
+    colors: pirInspectDefaultOptions.colors,
+    customInspect: pirInspectDefaultOptions.customInspect,
+    showProxy: pirInspectDefaultOptions.showProxy,
+    maxArrayLength: pirInspectDefaultOptions.maxArrayLength,
+    maxStringLength: pirInspectDefaultOptions.maxStringLength,
+    breakLength: pirInspectDefaultOptions.breakLength,
+    compact: pirInspectDefaultOptions.compact,
+    sorted: pirInspectDefaultOptions.sorted,
+    getters: pirInspectDefaultOptions.getters,
+    numericSeparator: pirInspectDefaultOptions.numericSeparator,
+  };
+  if (arguments.length > 1) {
+    // Legacy signature: inspect(value, showHidden, depth, colors).
+    if (arguments.length > 2) {
+      if (arguments[2] !== undefined) ctx.depth = arguments[2];
+      if (arguments.length > 3 && arguments[3] !== undefined) ctx.colors = arguments[3];
+    }
+    if (typeof opts === "boolean") {
+      ctx.showHidden = opts;
+    } else if (opts) {
+      for (const key of Object.keys(opts)) {
+        if (Object.prototype.hasOwnProperty.call(pirInspectDefaultOptions, key) || key === "stylize") {
+          ctx[key] = opts[key];
+        } else if (ctx.userOptions === undefined) {
+          ctx.userOptions = opts;
+        }
+      }
+    }
+  }
+  if (ctx.colors) ctx.stylize = pirStylizeWithColor;
+  if (ctx.maxArrayLength === null) ctx.maxArrayLength = Infinity;
+  if (ctx.maxStringLength === null) ctx.maxStringLength = Infinity;
+  return pirFormatValue(ctx, value, 0);
+}
+pirInspect.custom = kInspectCustom;
+pirInspect.colors = pirInspectColors;
+pirInspect.styles = pirInspectStyles;
+Object.defineProperty(pirInspect, "defaultOptions", {
+  enumerable: true,
+  configurable: true,
+  get() {
+    return pirInspectDefaultOptions;
+  },
+  set(options) {
+    if (options === null || typeof options !== "object") {
+      throw pirInvalidArgType("options", "Object", options);
+    }
+    Object.assign(pirInspectDefaultOptions, options);
+  },
+});
+
+// ---------------------------------------------------------------------------
+// util.format / util.formatWithOptions — port of nodejs/node v24.19.0
+// formatWithOptionsInternal (lib/internal/util/inspect.js), including the
+// placeholder/argument interleaving quirks (unconsumed placeholders stay
+// literal, invalid specifiers fall through, `%c` consumes silently).
+// ---------------------------------------------------------------------------
+
+function format(...args) {
+  return pirFormatWithOptionsInternal(undefined, args);
+}
+
+function formatWithOptions(inspectOptions, ...args) {
+  if (inspectOptions === null || typeof inspectOptions !== "object") {
+    throw pirInvalidArgType("inspectOptions", "Object", inspectOptions);
+  }
+  return pirFormatWithOptionsInternal(inspectOptions, args);
+}
+
+function pirNumericSeparatorOption(options) {
+  if (options !== undefined && options !== null &&
+      options.numericSeparator !== undefined && options.numericSeparator !== null) {
+    return options.numericSeparator;
+  }
+  return pirInspectDefaultOptions.numericSeparator;
+}
+
+function pirFormatNumberNoColor(number, options) {
+  return pirFormatNumber(pirStylizeNoColor, number, pirNumericSeparatorOption(options));
+}
+
+function pirFormatBigIntNoColor(bigint, options) {
+  return pirFormatBigInt(pirStylizeNoColor, bigint, pirNumericSeparatorOption(options));
+}
+
+function pirFormatWithOptionsInternal(inspectOptions, args) {
+  const first = args[0];
+  let a = 0;
+  let str = "";
+  let join = "";
+
+  if (typeof first === "string") {
+    if (args.length === 1) return first;
+    let tempStr;
+    let lastPos = 0;
+
+    for (let i = 0; i < first.length - 1; i++) {
+      if (first.charCodeAt(i) === 37) { // '%'
+        const nextChar = first.charCodeAt(++i);
+        if (a + 1 !== args.length) {
+          switch (nextChar) {
+            case 115: { // 's'
+              const tempArg = args[++a];
+              if (typeof tempArg === "number") {
+                tempStr = pirFormatNumberNoColor(tempArg, inspectOptions);
+              } else if (typeof tempArg === "bigint") {
+                tempStr = pirFormatBigIntNoColor(tempArg, inspectOptions);
+              } else if (typeof tempArg !== "object" || tempArg === null || !pirHasBuiltInToString(tempArg)) {
+                tempStr = String(tempArg);
+              } else {
+                tempStr = pirInspect(tempArg, Object.assign({}, inspectOptions, { compact: 3, colors: false, depth: 0 }));
+              }
+              break;
+            }
+            case 106: // 'j'
+              tempStr = pirTryStringify(args[++a]);
+              break;
+            case 100: { // 'd'
+              const tempNum = args[++a];
+              if (typeof tempNum === "bigint") {
+                tempStr = pirFormatBigIntNoColor(tempNum, inspectOptions);
+              } else if (typeof tempNum === "symbol") {
+                tempStr = "NaN";
+              } else {
+                tempStr = pirFormatNumberNoColor(Number(tempNum), inspectOptions);
+              }
+              break;
+            }
+            case 79: // 'O'
+              tempStr = pirInspect(args[++a], inspectOptions);
+              break;
+            case 111: // 'o'
+              tempStr = pirInspect(args[++a], Object.assign({}, inspectOptions, {
+                showHidden: true,
+                showProxy: true,
+                depth: 4,
+              }));
+              break;
+            case 105: { // 'i'
+              const tempInteger = args[++a];
+              if (typeof tempInteger === "bigint") {
+                tempStr = pirFormatBigIntNoColor(tempInteger, inspectOptions);
+              } else if (typeof tempInteger === "symbol") {
+                tempStr = "NaN";
+              } else {
+                tempStr = pirFormatNumberNoColor(parseInt(tempInteger), inspectOptions);
+              }
+              break;
+            }
+            case 102: { // 'f'
+              const tempFloat = args[++a];
+              if (typeof tempFloat === "symbol") {
+                tempStr = "NaN";
+              } else {
+                tempStr = pirFormatNumberNoColor(parseFloat(tempFloat), inspectOptions);
+              }
+              break;
+            }
+            case 99: // 'c'
+              a += 1;
+              tempStr = "";
+              break;
+            case 37: // '%'
+              str += first.slice(lastPos, i);
+              lastPos = i + 1;
+              continue;
+            default: // Not a valid placeholder: keep the text as-is.
+              continue;
+          }
+          if (lastPos !== i - 1) str += first.slice(lastPos, i - 1);
+          str += tempStr;
+          lastPos = i + 1;
+        } else if (nextChar === 37) {
+          str += first.slice(lastPos, i);
+          lastPos = i + 1;
+        }
+      }
+    }
+    if (lastPos !== 0) {
+      a++;
+      join = " ";
+      if (lastPos < first.length) str += first.slice(lastPos);
+    }
+  }
+
+  while (a < args.length) {
+    const value = args[a];
+    str += join;
+    str += typeof value !== "string" ? pirInspect(value, inspectOptions) : value;
+    join = " ";
+    a++;
+  }
+  return str;
+}
+
+function promisify(original) {
+  if (typeof original !== "function") {
+    throw new TypeError("The \"original\" argument must be of type function");
+  }
+  const custom = original[kCustomPromisify];
+  if (typeof custom === "function") return custom;
+  function fn(...args) {
+    return new Promise((resolve, reject) => {
+      original.call(this, ...args, (err, value) => {
+        if (err) reject(err);
+        else resolve(value);
+      });
+    });
+  }
+  Object.setPrototypeOf(fn, Object.getPrototypeOf(original));
+  fn[kCustomPromisify] = fn;
+  return fn;
+}
+promisify.custom = kCustomPromisify;
+
+const kCustomCallbackify = Symbol.for("nodejs.util.callbackify.custom");
+
+function callbackify(original) {
+  if (typeof original !== "function") {
+    throw new TypeError("The \"original\" argument must be of type function");
+  }
+  function wrapped(...args) {
+    const callback = args.pop();
+    if (typeof callback !== "function") {
+      throw new TypeError("The last argument must be of type function");
+    }
+    if (original.length >= args.length + 1) {
+      return original.call(this, ...args, callback);
+    }
+    Promise.resolve(original.call(this, ...args)).then(
+      (value) => callback(null, value),
+      (error) => callback(error)
+    );
+  }
+  wrapped[kCustomCallbackify] = wrapped;
+  return wrapped;
+}
+callbackify.custom = kCustomCallbackify;
+
+// ---------------------------------------------------------------------------
+// ERR_INVALID_ARG_TYPE shape (node internal/errors). Only the messages this
+// module raises are covered: a bad inspectOptions, and util.inherits.
+// ---------------------------------------------------------------------------
+
+function pirDescribeReceived(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  const type = typeof value;
+  if (type === "string") return "type string ('" + value + "')";
+  if (type === "symbol") return "type symbol (" + String(value) + ")";
+  if (type === "bigint") return "type bigint (" + String(value) + "n)";
+  if (type === "function") return "function " + (value.name ? value.name : "(anonymous)");
+  if (type === "object") return "an instance of " + pirInternalGetConstructorName(value);
+  return "type " + type + " (" + String(value) + ")";
+}
+
+function pirInvalidArgType(name, expected, value) {
+  const kind = name.indexOf(".") === -1 ? "argument" : "property";
+  const error = new TypeError('The "' + name + '" ' + kind + " must be of type " +
+    expected.toLowerCase() + ". Received " + pirDescribeReceived(value));
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+// node lib/util.js inherits(): same checks, same non-enumerable `super_`.
+function inherits(ctor, superCtor) {
+  if (ctor === undefined || ctor === null) {
+    throw pirInvalidArgType("ctor", "Function", ctor);
+  }
+  if (superCtor === undefined || superCtor === null) {
+    throw pirInvalidArgType("superCtor", "Function", superCtor);
+  }
+  if (superCtor.prototype === undefined) {
+    throw pirInvalidArgType("superCtor.prototype", "Object", superCtor.prototype);
+  }
+  Object.defineProperty(ctor, "super_", {
+    value: superCtor,
+    writable: true,
+    configurable: true,
+  });
+  Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
+}
+
+// node lib/util.js deprecate(): `code` (when supplied) must be a string — it
+// is the deprecation code carried on the emitted warning, and node validates
+// it with ERR_INVALID_ARG_TYPE before the wrapper is built
+// (test-util-deprecate-invalid-code.js asserts the exact message for every
+// non-string value, `undefined` excepted).
+function deprecate(fn, message, code) {
+  if (typeof fn !== "function") {
+    throw new TypeError("The \"fn\" argument must be of type function");
+  }
+  if (code !== undefined && typeof code !== "string") {
+    throw pirInvalidArgType("code", "string", code);
+  }
+  let warned = false;
+  function wrapper(...args) {
+    if (!warned) {
+      warned = true;
+      const proc = globalThis.process;
+      if (proc && typeof proc.emitWarning === "function") {
+        proc.emitWarning(String(message), "DeprecationWarning", code);
+      }
+    }
+    return fn.apply(this, args);
+  }
+  Object.setPrototypeOf(wrapper, Object.getPrototypeOf(fn));
+  return wrapper;
+}
+
+function debuglog(section) {
+  // Phase 1: process.env is empty, so DEBUG namespaces never match; the
+  // returned function keeps Node's shape (callable + `.enabled`).
+  const env = (globalThis.process && globalThis.process.env) || {};
+  const namespaces = String(env.DEBUG || "").split(/[\s,]+/).filter(Boolean);
+  const name = String(section);
+  const enabled = namespaces.indexOf("*") !== -1 || namespaces.indexOf(name) !== -1;
+  const fn = () => {};
+  fn.enabled = enabled;
+  return fn;
+}
+
+const VT_CONTROL_RE = /[\u001B\u009B][[\]()#;?]*(?:(?:(?:(?:;[-a-zA-Z\d\/#&.:=?%@~_]+)*|[a-zA-Z\d]+(?:;[-a-zA-Z\d\/#&.:=?%@~_]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
+
+function stripVTControlCharacters(str) {
+  return String(str).replace(VT_CONTROL_RE, "");
+}
+
+const types = {
+  isAnyArrayBuffer: pirIsAnyArrayBuffer,
+  isArrayBuffer: pirIsArrayBuffer,
+  isAsyncFunction: (v) => typeof v === "function" && Object.prototype.toString.call(v) === "[object AsyncFunction]",
+  isBoxedPrimitive: pirIsBoxedPrimitive,
+  isDate: pirIsDate,
+  isError: pirIsError,
+  isGeneratorFunction: (v) => typeof v === "function" && Object.prototype.toString.call(v) === "[object GeneratorFunction]",
+  isMap: pirIsMap,
+  isNativeError: pirIsNativeError,
+  isPromise: pirIsPromise,
+  isRegExp: pirIsRegExp,
+  isSet: pirIsSet,
+  isTypedArray: pirIsTypedArray,
+  isWeakMap: pirIsWeakMap,
+  isWeakSet: pirIsWeakSet,
+  isArgumentsObject: pirIsArgumentsObject,
+  isArrayBufferView: pirIsArrayBufferView,
+  isBigInt64Array: (v) => typeof BigInt64Array === "function" && v instanceof BigInt64Array,
+  isBigIntObject: pirIsBigIntObject,
+  isBigUint64Array: (v) => typeof BigUint64Array === "function" && v instanceof BigUint64Array,
+  isBooleanObject: pirIsBooleanObject,
+  isCryptoKey: (v) => v !== null && typeof v === "object" && typeof v.type === "string" &&
+    typeof v.algorithm === "object" && typeof v.extractable === "boolean" &&
+    typeof v.usages !== "undefined" && Object.prototype.toString.call(v) !== "[object Object]",
+  isDataView: pirIsDataView,
+  isExternal: () => false,
+  isFloat16Array: (v) => typeof Float16Array === "function" && v instanceof Float16Array,
+  isFloat32Array: (v) => typeof Float32Array === "function" && v instanceof Float32Array,
+  isFloat64Array: (v) => typeof Float64Array === "function" && v instanceof Float64Array,
+  isGeneratorObject: (v) => v !== null && typeof v === "object" && typeof v.next === "function" &&
+    typeof v[Symbol.iterator] === "function" && Object.prototype.toString.call(v) === "[object Generator]",
+  isInt16Array: (v) => typeof Int16Array === "function" && v instanceof Int16Array,
+  isInt32Array: (v) => typeof Int32Array === "function" && v instanceof Int32Array,
+  isInt8Array: (v) => typeof Int8Array === "function" && v instanceof Int8Array,
+  isKeyObject: (v) => v !== null && typeof v === "object" && typeof v.export === "function" &&
+    typeof v.asymmetricKeyType !== "undefined",
+  isMapIterator: pirIsMapIterator,
+  isModuleNamespaceObject: pirIsModuleNamespaceObject,
+  isNumberObject: pirIsNumberObject,
+  isProxy: () => false,
+  isSetIterator: pirIsSetIterator,
+  isSharedArrayBuffer: pirIsSharedArrayBuffer,
+  isStringObject: pirIsStringObject,
+  isSymbolObject: pirIsSymbolObject,
+  isUint16Array: (v) => typeof Uint16Array === "function" && v instanceof Uint16Array,
+  isUint32Array: (v) => typeof Uint32Array === "function" && v instanceof Uint32Array,
+  isUint8Array: (v) => typeof Uint8Array === "function" && v instanceof Uint8Array,
+  isUint8ClampedArray: (v) => typeof Uint8ClampedArray === "function" && v instanceof Uint8ClampedArray,
+};
+
+// ===========================================================================
+// Surface completion: the remaining Node util entries. Pure helpers are real
+// ports; host/engine-coupled ones (TextDecoder full encoding table, the
+// diff Myers implementation, stack introspection) are minimal or throw one
+// documented error each.
+// ===========================================================================
+
+// --- error constructors -----------------------------------------------------
+
+const errnoTable = {
+  E2BIG: 7, EACCES: 13, EADDRINUSE: 100, EADDRNOTAVAIL: 101, EAFNOSUPPORT: 102,
+  EAGAIN: 11, EALREADY: 103, EBADF: 9, EBADMSG: 104, EBUSY: 16, ECANCELED: 105,
+  ECHILD: 10, ECONNABORTED: 106, ECONNREFUSED: 107, ECONNRESET: 108, EDEADLK: 36,
+  EDESTADDRREQ: 109, EDOM: 33, EEXIST: 17, EFAULT: 14, EFBIG: 27, EHOSTUNREACH: 110,
+  EIDRM: 111, EILSEQ: 42, EINPROGRESS: 112, EINTR: 4, EINVAL: 22, EIO: 5,
+  EISCONN: 113, EISDIR: 21, ELOOP: 114, EMFILE: 24, EMLINK: 31, EMSGSIZE: 115,
+  ENAMETOOLONG: 116, ENETDOWN: 117, ENETRESET: 118, ENETUNREACH: 119, ENFILE: 23,
+  ENOBUFS: 120, ENODATA: 61, ENODEV: 19, ENOENT: 2, ENOEXEC: 8, ENOLCK: 37,
+  ENOLINK: 121, ENOMEM: 12, ENOMSG: 122, ENOPROTOOPT: 123, ENOSPC: 28, ENOSR: 124,
+  ENOSTR: 125, ENOSYS: 126, ENOTCONN: 127, ENOTDIR: 20, ENOTEMPTY: 145,
+  ENOTSOCK: 128, ENOTSUP: 129, ENOTTY: 25, ENXIO: 6, EOPNOTSUPP: 130,
+  EOVERFLOW: 132, EPERM: 1, EPIPE: 32, EPROTO: 134, EPROTONOSUPPORT: 135,
+  EPROTOTYPE: 136, ERANGE: 34, EROFS: 30, ESPIPE: 29, ESRCH: 3, ETIME: 137,
+  ETIMEDOUT: 138, ETXTBSY: 139, EWOULDBLOCK: 140, EXDEV: 18,
+};
+
+function getSystemErrorName(errorCode) {
+  for (const name of Object.keys(errnoTable)) {
+    if (errnoTable[name] === errorCode) return name;
+  }
+  return undefined;
+}
+
+function errnoDescription(name) {
+  const descriptions = {
+    EACCES: "permission denied", EADDRINUSE: "address already in use",
+    ECONNREFUSED: "connection refused", ECONNRESET: "connection reset by peer",
+    EEXIST: "file already exists", EINTR: "interrupted system call",
+    EINVAL: "invalid argument", EIO: "i/o error", EISDIR: "illegal operation on a directory",
+    ENOENT: "no such file or directory", ENOMEM: "not enough memory",
+    ENOSPC: "no space left on device", ENOTDIR: "not a directory",
+    ENOTEMPTY: "directory not empty", EPERM: "operation not permitted",
+    EPIPE: "broken pipe", ETIMEDOUT: "connection timed out", EXDEV: "invalid cross-device link",
+  };
+  return descriptions[name];
+}
+
+function getSystemErrorMessage(errorCode) {
+  const name = getSystemErrorName(errorCode);
+  return name === undefined
+    ? "Unknown system error " + errorCode
+    : name + ": " + (errnoDescription(name) || "unknown error " + errorCode);
+}
+
+function getSystemErrorMap() {
+  const map = new Map();
+  for (const name of Object.keys(errnoTable)) {
+    map.set(errnoTable[name], [name, errnoDescription(name) || "unknown error"]);
+  }
+  return map;
+}
+
+function _errnoException(errorCode, syscall, original) {
+  const error = new Error(original && original.message ? String(original.message) : syscall + " " + (getSystemErrorMessage(errorCode) || ""));
+  error.code = getSystemErrorName(errorCode) || String(errorCode);
+  error.errno = errorCode;
+  error.syscall = syscall;
+  return error;
+}
+
+function _exceptionWithHostPort(errorCode, syscall, hostname, port, additional) {
+  const error = _errnoException(errorCode, syscall);
+  error.address = hostname;
+  error.port = port;
+  if (additional !== undefined) error.message = error.message + " " + additional;
+  return error;
+}
+
+// --- misc helpers ------------------------------------------------------------
+
+function _extend(target, source) {
+  if (target === undefined || target === null) {
+    throw new TypeError("Cannot convert undefined or null to object");
+  }
+  const output = Object(target);
+  if (source !== undefined && source !== null) {
+    for (const key of Object.keys(source)) output[key] = source[key];
+  }
+  return output;
+}
+
+const isArray = Array.isArray;
+
+// ---------------------------------------------------------------------------
+// util.isDeepStrictEqual — port of nodejs/node v24.19.0
+// lib/internal/util/comparisons.js (strict modes only; the loose isDeepEqual
+// mode and the partial mode are not part of this shim's surface). Node's fast
+// path compares without cycle bookkeeping and retries with `memos` after a
+// stack overflow; the retry is the only observable behaviour, so the port goes
+// straight to the cycle-aware path.
+// ---------------------------------------------------------------------------
+
+const kDeepStrict = 2;
+const kDeepStrictWithoutPrototypes = 3;
+
+const kNoIterator = 0;
+const kIsArray = 1;
+const kIsSet = 2;
+const kIsMap = 3;
+
+// Constructors whose instances are compared by their own kind instead of by
+// prototype identity (node comparisons.js wellKnownConstructors).
+const pirWellKnownConstructors = new Set([
+  Array, ArrayBuffer, BigInt, Boolean, DataView, Date, Error, Function, Map,
+  Number, Object, Promise, RegExp, Set, String, Symbol, WeakMap, WeakSet,
+]);
+for (const name of ["BigInt64Array", "BigUint64Array", "Float16Array", "Float32Array",
+  "Float64Array", "Int16Array", "Int32Array", "Int8Array", "Uint16Array",
+  "Uint32Array", "Uint8Array", "Uint8ClampedArray"]) {
+  if (typeof globalThis[name] === "function") pirWellKnownConstructors.add(globalThis[name]);
+}
+if (typeof Buffer === "function") pirWellKnownConstructors.add(Buffer);
+
+function pirHasOwnProperty(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function pirHasEnumerable(value, key) {
+  return Object.prototype.propertyIsEnumerable.call(value, key);
+}
+
+function pirAreSimilarRegExps(a, b) {
+  return a.source === b.source && a.flags === b.flags && a.lastIndex === b.lastIndex;
+}
+
+function pirCompareBytes(a, b) {
+  if (a.length !== b.length) return a.length < b.length ? -1 : 1;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+function pirByteView(value) {
+  return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+}
+
+function pirAreSimilarTypedArrays(a, b) {
+  if (a.byteLength !== b.byteLength) return false;
+  return pirCompareBytes(pirByteView(a), pirByteView(b)) === 0;
+}
+
+function pirAreEqualArrayBuffers(buf1, buf2) {
+  return buf1.byteLength === buf2.byteLength &&
+    pirCompareBytes(new Uint8Array(buf1), new Uint8Array(buf2)) === 0;
+}
+
+function pirIsEqualBoxedPrimitive(val1, val2) {
+  if (pirIsNumberObject(val1)) {
+    return pirIsNumberObject(val2) && Object.is(pirNumberValueOf.call(val1), pirNumberValueOf.call(val2));
+  }
+  if (pirIsStringObject(val1)) {
+    return pirIsStringObject(val2) && pirStringValueOf.call(val1) === pirStringValueOf.call(val2);
+  }
+  if (pirIsBooleanObject(val1)) {
+    return pirIsBooleanObject(val2) && pirBooleanValueOf.call(val1) === pirBooleanValueOf.call(val2);
+  }
+  if (pirIsBigIntObject(val1)) {
+    return pirIsBigIntObject(val2) && pirBigIntValueOf.call(val1) === pirBigIntValueOf.call(val2);
+  }
+  if (pirIsSymbolObject(val1)) {
+    return pirIsSymbolObject(val2) && pirSymbolValueOf.call(val1) === pirSymbolValueOf.call(val2);
+  }
+  return false;
+}
+
+function pirIsEnumerableOrIdentical(val1, val2, prop, mode, memos) {
+  return pirHasEnumerable(val2, prop) || pirInnerDeepEqual(val1[prop], val2[prop], mode, memos);
+}
+
+function pirInnerDeepEqual(val1, val2, mode, memos) {
+  // Identical values are equivalent, except for 0 and -0.
+  if (val1 === val2) return val1 !== 0 || Object.is(val1, val2);
+
+  if (typeof val1 === "number") return val1 !== val1 && val2 !== val2; // NaN
+  if (typeof val2 !== "object" || typeof val1 !== "object" || val1 === null || val2 === null) {
+    return false;
+  }
+  return pirObjectComparisonStart(val1, val2, mode, memos);
+}
+
+function pirHasUnequalTag(val1, val2) {
+  return val1[Symbol.toStringTag] !== val2[Symbol.toStringTag];
+}
+
+function pirSlowHasUnequalTag(val1Tag, val1, val2) {
+  if (val1[Symbol.toStringTag] !== undefined && val2[Symbol.toStringTag] !== undefined) {
+    return val1[Symbol.toStringTag] !== val2[Symbol.toStringTag];
+  }
+  return val1Tag !== Object.prototype.toString.call(val2);
+}
+
+function pirObjectComparisonStart(val1, val2, mode, memos) {
+  if (mode === kDeepStrict) {
+    if (pirWellKnownConstructors.has(val1.constructor) ||
+        (val1.constructor !== undefined && !pirHasOwnProperty(val1, "constructor"))) {
+      if (val1.constructor !== val2.constructor) return false;
+    } else if (Object.getPrototypeOf(val1) !== Object.getPrototypeOf(val2)) {
+      return false;
+    }
+  }
+
+  if (Array.isArray(val1)) {
+    if (!Array.isArray(val2) || val1.length !== val2.length || pirHasUnequalTag(val1, val2)) {
+      return false;
+    }
+    const keys2 = pirGetOwnNonIndexProperties(val2, false);
+    if (keys2.length !== pirGetOwnNonIndexProperties(val1, false).length) return false;
+    return pirKeyCheck(val1, val2, mode, memos, kIsArray, keys2);
+  }
+
+  let val1Tag;
+  if (val1[Symbol.toStringTag] === undefined &&
+      (val1Tag = Object.prototype.toString.call(val1)) === "[object Object]") {
+    if (pirSlowHasUnequalTag(val1Tag, val1, val2)) return false;
+    return pirKeyCheck(val1, val2, mode, memos, kNoIterator);
+  } else if (pirIsSet(val1)) {
+    if (!pirIsSet(val2) || val1.size !== val2.size || pirHasUnequalTag(val1, val2)) return false;
+    return pirKeyCheck(val1, val2, mode, memos, kIsSet);
+  } else if (pirIsMap(val1)) {
+    if (!pirIsMap(val2) || val1.size !== val2.size || pirHasUnequalTag(val1, val2)) return false;
+    return pirKeyCheck(val1, val2, mode, memos, kIsMap);
+  } else if (pirIsArrayBufferView(val1)) {
+    if (pirTypedArrayName(val1) !== pirTypedArrayName(val2)) return false;
+    if (!pirAreSimilarTypedArrays(val1, val2)) return false;
+    // Buffer.compare returns true, so the lengths match; only the symbols and
+    // extra properties can still differ.
+    const keys2 = pirGetOwnNonIndexProperties(val2, false);
+    if (keys2.length !== pirGetOwnNonIndexProperties(val1, false).length) return false;
+    return pirKeyCheck(val1, val2, mode, memos, kNoIterator, keys2);
+  } else if (pirIsDate(val1)) {
+    if (!pirIsDate(val2) || pirHasUnequalTag(val1, val2)) return false;
+    const time1 = pirDateGetTime.call(val1);
+    const time2 = pirDateGetTime.call(val2);
+    if (time1 !== time2 && (time1 === time1 || time2 === time2)) return false;
+  } else if (pirIsRegExp(val1)) {
+    if (!pirIsRegExp(val2) || !pirAreSimilarRegExps(val1, val2) || pirHasUnequalTag(val1, val2)) {
+      return false;
+    }
+  } else if (pirIsAnyArrayBuffer(val1)) {
+    if (!pirIsAnyArrayBuffer(val2) || pirHasUnequalTag(val1, val2)) return false;
+    if (!pirAreEqualArrayBuffers(val1, val2)) return false;
+  } else if (pirSlowHasUnequalTag(val1Tag !== undefined ? val1Tag : Object.prototype.toString.call(val1), val1, val2) ||
+            Array.isArray(val2) ||
+            pirIsArrayBufferView(val2) ||
+            pirIsSet(val2) ||
+            pirIsMap(val2) ||
+            pirIsDate(val2) ||
+            pirIsRegExp(val2) ||
+            pirIsAnyArrayBuffer(val2)) {
+    return false;
+  } else if (pirIsError(val1)) {
+    // The stack is not compared: it can differ for otherwise identical errors.
+    if (!pirIsError(val2) ||
+        !pirIsEnumerableOrIdentical(val1, val2, "message", mode, memos) ||
+        !pirIsEnumerableOrIdentical(val1, val2, "name", mode, memos) ||
+        !pirIsEnumerableOrIdentical(val1, val2, "cause", mode, memos) ||
+        !pirIsEnumerableOrIdentical(val1, val2, "errors", mode, memos)) {
+      return false;
+    }
+    if (pirHasOwnProperty(val2, "cause") !== pirHasOwnProperty(val1, "cause")) return false;
+  } else if (pirIsBoxedPrimitive(val1)) {
+    if (!pirIsEqualBoxedPrimitive(val1, val2)) return false;
+  } else if (pirIsURLObject(val1)) {
+    // node's `isURL` branch (internal/util/comparisons): a URL pair is
+    // equivalent only when the hrefs match. URLs carry no enumerable own
+    // properties (node keeps them in private slots), so the generic key check
+    // would treat any two URLs as equal.
+    if (!pirIsURLObject(val2) || val1.href !== val2.href) return false;
+  } else if (pirIsBoxedPrimitive(val2) ||
+      pirIsNativeError(val2) ||
+      val2 instanceof Error ||
+      pirIsWeakMap(val1) ||
+      pirIsWeakSet(val1) ||
+      pirIsPromise(val1)) {
+    return false;
+  }
+
+  return pirKeyCheck(val1, val2, mode, memos, kNoIterator);
+}
+
+function pirKeyCheck(val1, val2, mode, memos, iterationType, keys2) {
+  // For all remaining pairs equivalence means: the same number of owned
+  // enumerable properties, the same set of keys (any order), equivalent values
+  // for every key, and - for Sets and Maps - equal contents.
+  const isArrayLikeObject = keys2 !== undefined;
+  if (keys2 === undefined) keys2 = Object.keys(val2);
+  let keys1;
+
+  if (!isArrayLikeObject) {
+    // The pair must have the same number of owned properties.
+    if (keys2.length !== (keys1 = Object.keys(val1)).length) return false;
+    for (const key of Object.getOwnPropertySymbols(val1)) {
+      if (pirHasEnumerable(val1, key)) keys1.push(key);
+    }
+    for (const key of Object.getOwnPropertySymbols(val2)) {
+      if (pirHasEnumerable(val2, key)) keys2.push(key);
+    }
+    if (keys1.length !== keys2.length) return false;
+  }
+
+  if (keys2.length === 0 &&
+      (iterationType === kNoIterator ||
+        (iterationType === kIsArray && val2.length === 0) ||
+        val2.size === 0)) {
+    return true;
+  }
+
+  return pirHandleCycles(val1, val2, mode, keys1, keys2, memos, iterationType);
+}
+
+function pirHandleCycles(val1, val2, mode, keys1, keys2, memos, iterationType) {
+  // Use memos to handle cycles.
+  if (memos === undefined) {
+    memos = { set: undefined, a: val1, b: val2, c: undefined, d: undefined, deep: false };
+    return pirObjEquiv(val1, val2, mode, keys1, keys2, memos, iterationType);
+  }
+
+  if (memos.set === undefined) {
+    if (memos.deep === false) {
+      if (memos.a === val1) return memos.b === val2;
+      if (memos.b === val2) return false;
+      memos.c = val1;
+      memos.d = val2;
+      memos.deep = true;
+      const result = pirObjEquiv(val1, val2, mode, keys1, keys2, memos, iterationType);
+      memos.deep = false;
+      if (memos.set !== undefined) {
+        memos.set.delete(memos.c);
+        memos.set.delete(memos.d);
+      }
+      return result;
+    }
+    memos.set = new Set();
+    memos.set.add(memos.a);
+    memos.set.add(memos.b);
+    memos.set.add(memos.c);
+    memos.set.add(memos.d);
+  }
+
+  const set = memos.set;
+  const originalSize = set.size;
+  set.add(val1);
+  set.add(val2);
+  if (originalSize !== set.size - 2) return originalSize === set.size;
+
+  const areEq = pirObjEquiv(val1, val2, mode, keys1, keys2, memos, iterationType);
+  set.delete(val1);
+  set.delete(val2);
+  return areEq;
+}
+
+function pirArrayHasEqualElement(array, val1, mode, memo, comparator, start, end) {
+  for (let i = end - 1; i >= start; i--) {
+    if (comparator(val1, array[i], mode, memo)) {
+      // Move the matching element so it is not checked again.
+      array[i] = array[end];
+      return true;
+    }
+  }
+  return false;
+}
+
+function pirSetObjectEquiv(array, a, b, mode, memo) {
+  let direction = 1;
+  let start = 0;
+  let end = array.length - 1;
+  const comparator = pirObjectComparisonStart;
+  const extraChecks = array.length !== a.size;
+
+  for (const val1 of a) {
+    if (extraChecks) {
+      if (b.has(val1)) continue;
+      if (typeof val1 !== "object" || val1 === null) return false;
+    }
+
+    let innerStart = start;
+    if (direction === 1) {
+      if (comparator(val1, array[start], mode, memo)) {
+        start += 1;
+        continue;
+      }
+      if (start === end) return false;
+      direction = -1;
+      innerStart += 1;
+    }
+    if (!comparator(val1, array[end], mode, memo)) {
+      direction = 1;
+      if (!pirArrayHasEqualElement(array, val1, mode, memo, comparator, innerStart, end)) {
+        return false;
+      }
+    }
+    end -= 1;
+  }
+  return true;
+}
+
+function pirCompareSmallSets(a, b, val, iteratorB, mode, memo) {
+  const iteratorA = a.values();
+  const firstA = iteratorA.next().value;
+  const first = pirInnerDeepEqual(firstA, val, mode, memo);
+  if (first) {
+    if (b.size === 1) return true;
+    const secondA = iteratorA.next().value;
+    return b.has(secondA) || pirInnerDeepEqual(secondA, iteratorB.next().value, mode, memo);
+  }
+  return a.size !== 1 && pirInnerDeepEqual(iteratorA.next().value, val, mode, memo) && (
+    b.size === 1 ||
+    b.has(firstA) ||
+    pirInnerDeepEqual(firstA, iteratorB.next().value, mode, memo)
+  );
+}
+
+function pirSetEquiv(a, b, mode, memo) {
+  // Lazily built list of b entries that have to be compared pairwise.
+  let array;
+  const iteratorB = b.values();
+  for (const val of iteratorB) {
+    if (!a.has(val)) {
+      if (typeof val !== "object" || val === null) return false;
+      if (array === undefined) {
+        if (a.size < 3) return pirCompareSmallSets(a, b, val, iteratorB, mode, memo);
+        array = [];
+      }
+      // Not in `a` by identity: find a deep-equal element in the a-copy.
+      array.push(val);
+    }
+  }
+  if (array === undefined) return true;
+  return pirSetObjectEquiv(array, a, b, mode, memo);
+}
+
+function pirArrayHasEqualMapElement(array, key1, item1, b, mode, memo, comparator, start, end) {
+  for (let i = end - 1; i >= start; i--) {
+    const key2 = array[i];
+    if (comparator(key1, key2, mode, memo) && pirInnerDeepEqual(item1, b.get(key2), mode, memo)) {
+      array[i] = array[end];
+      return true;
+    }
+  }
+  return false;
+}
+
+function pirMapObjectEquiv(array, a, b, mode, memo) {
+  let direction = 1;
+  let start = 0;
+  let end = array.length - 1;
+  const comparator = pirObjectComparisonStart;
+  const extraChecks = array.length !== a.size;
+
+  for (const entry of a) {
+    const key1 = entry[0];
+    const item1 = entry[1];
+    if (extraChecks && (typeof key1 !== "object" || key1 === null)) {
+      if (b.has(key1)) {
+        // The values were already compared by pirMapEquiv.
+        continue;
+      }
+      return false;
+    }
+
+    let innerStart = start;
+    if (direction === 1) {
+      const key2 = array[start];
+      if (comparator(key1, key2, mode, memo) && pirInnerDeepEqual(item1, b.get(key2), mode, memo)) {
+        start += 1;
+        continue;
+      }
+      if (start === end) return false;
+      direction = -1;
+      innerStart += 1;
+    }
+    const key2 = array[end];
+    if (!comparator(key1, key2, mode, memo) || !pirInnerDeepEqual(item1, b.get(key2), mode, memo)) {
+      direction = 1;
+      if (!pirArrayHasEqualMapElement(array, key1, item1, b, mode, memo, comparator, innerStart, end)) {
+        return false;
+      }
+    }
+    end -= 1;
+  }
+  return true;
+}
+
+function pirMapEquiv(a, b, mode, memo) {
+  let array;
+
+  for (const entry of b) {
+    const key2 = entry[0];
+    const item2 = entry[1];
+    if (typeof key2 === "object" && key2 !== null) {
+      if (array === undefined) {
+        if (a.size === 1) {
+          const firstA = a.entries().next().value;
+          return pirInnerDeepEqual(firstA[0], key2, mode, memo) &&
+            pirInnerDeepEqual(firstA[1], item2, mode, memo);
+        }
+        array = [];
+      }
+      array.push(key2);
+    } else {
+      // Reading the value directly avoids a second a.has(key2) check.
+      const item1 = a.get(key2);
+      if ((item1 === undefined && !a.has(key2)) || !pirInnerDeepEqual(item1, item2, mode, memo)) {
+        return false;
+      }
+    }
+  }
+
+  if (array === undefined) return true;
+  return pirMapObjectEquiv(array, a, b, mode, memo);
+}
+
+function pirSparseArrayEquiv(a, b, mode, memos, i) {
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  for (; i < keysB.length; i++) {
+    const key = keysB[i];
+    if ((a[key] === undefined && !pirHasOwnProperty(a, key)) ||
+        !pirInnerDeepEqual(a[key], b[key], mode, memos)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function pirObjEquiv(a, b, mode, keys1, keys2, memos, iterationType) {
+  // Every corresponding key must have an equivalent value.
+  if (keys2.length > 0) {
+    let i = 0;
+    // Ordered keys first.
+    if (keys1 !== undefined) {
+      for (; i < keys2.length; i++) {
+        const key = keys2[i];
+        if (keys1[i] !== key) break;
+        if (!pirInnerDeepEqual(a[key], b[key], mode, memos)) return false;
+      }
+    }
+    // The remaining keys in any order.
+    for (; i < keys2.length; i++) {
+      const key = keys2[i];
+      const descriptor = Object.getOwnPropertyDescriptor(a, key);
+      if (descriptor === undefined || descriptor.enumerable !== true) return false;
+      const value = descriptor.writable !== undefined ? descriptor.value : a[key];
+      if (!pirInnerDeepEqual(value, b[key], mode, memos)) return false;
+    }
+  }
+
+  if (iterationType === kIsArray) {
+    for (let i = 0; i < a.length; i++) {
+      if (b[i] === undefined) {
+        if (!pirHasOwnProperty(b, i)) return pirSparseArrayEquiv(a, b, mode, memos, i);
+        if ((a[i] !== undefined || !pirHasOwnProperty(a, i))) return false;
+      } else if (a[i] === undefined || !pirInnerDeepEqual(a[i], b[i], mode, memos)) {
+        return false;
+      }
+    }
+  } else if (iterationType === kIsSet) {
+    if (!pirSetEquiv(a, b, mode, memos)) return false;
+  } else if (iterationType === kIsMap) {
+    if (!pirMapEquiv(a, b, mode, memos)) return false;
+  }
+
+  return true;
+}
+
+function isDeepStrictEqual(val1, val2, skipPrototype) {
+  return pirInnerDeepEqual(val1, val2,
+    skipPrototype ? kDeepStrictWithoutPrototypes : kDeepStrict, undefined);
+}
+
+function aborted(signal, message) {
+  if (signal === undefined || signal === null) return false;
+  if (typeof signal !== "object" || typeof signal.aborted !== "boolean") {
+    throw new TypeError("The \"signal\" argument must be an AbortSignal");
+  }
+  if (!signal.aborted) return false;
+  if (message !== undefined) throw message;
+  return true;
+}
+
+function convertProcessSignalToExitCode(signal) {
+  // Common signal numbers; unknown names return undefined.
+  const signals = {
+    SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6,
+    SIGFPE: 8, SIGKILL: 9, SIGSEGV: 11, SIGPIPE: 13, SIGTERM: 15,
+  };
+  return signals[String(signal)];
+}
+
+function debug(_log) {
+  // No debug host: a no-op keeps the call shape.
+}
+
+function diff(_actual, _expected) {
+  const error = new Error("util.diff is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  throw error;
+}
+
+// ---------------------------------------------------------------------------
+// getCallSites — node's plain-object CallSite list (lib/util.js).
+// ---------------------------------------------------------------------------
+//
+// Node reads V8's structured frame list (never the user's
+// Error.prepareStackTrace — test-util-getcallsites-preparestacktrace.js pins
+// that with `Error.prepareStackTrace = common.mustNotCall()`), then hands back
+// null-prototype objects { functionName, scriptId, scriptName, lineNumber,
+// columnNumber, column }.
+//
+// The engine's own V8-shaped CallSite objects (see prelude.js.txt) are reached
+// through `Error.captureStackTrace` with a temporary prepareStackTrace that
+// returns the structured array; the user's hook is restored before returning
+// and is never called. `Error.stackTraceLimit` is widened for the capture
+// (node's binding ignores the JS-level limit) and restored afterwards.
+//
+// LIMIT: pir evaluates every module body through `eval` (node_cjs_runtime's
+// `(0, eval)(...)` wrapper), so those frames report the placeholder script
+// name `<input>`; the shim bundle they are eval'd from reports `eval_script`.
+// A placeholder frame is attributed to the nearest NAMED frame below it in the
+// same stack — for the loader-entry module that is its `pir-ext:` wrapper,
+// whose path is normalized to the `__filename` spelling. Frames of modules
+// reached through require() share the `<input>` placeholder and therefore
+// follow the same rule (the entry module is the one named exactly). A frame
+// with no file name at all is a native frame and keeps node's empty-string
+// script name.
+const PIR_EVAL_PLACEHOLDERS = {
+  "<input>": true, "<anonymous>": true, "<eval>": true, "eval_script": true, "": true,
+};
+
+function pirCallSiteName(site) {
+  if (site === null || site === undefined) return null;
+  const value = typeof site.getFileName === "function" ? site.getFileName() : null;
+  return value === undefined ? null : value;
+}
+
+function pirCallSiteIsPlaceholder(name) {
+  return name !== null && PIR_EVAL_PLACEHOLDERS[name] === true;
+}
+
+/// `pir-ext:<abs path>` is the loader's module scheme; `__filename` is the bare
+/// path, so the scheme is stripped (forward-slashed, matching
+/// node_cjs_runtime's normalization).
+function pirNormalizeScriptName(name) {
+  if (name === null) return "";
+  if (name.indexOf("pir-ext:") === 0) return name.slice("pir-ext:".length);
+  return name;
+}
+
+function pirCallSiteScriptName(sites, index) {
+  const own = pirCallSiteName(sites[index]);
+  // Native frame (no script at all): node reports ''.
+  if (own === null) return "";
+  if (!pirCallSiteIsPlaceholder(own)) return pirNormalizeScriptName(own);
+  for (let i = index + 1; i < sites.length; i += 1) {
+    const outer = pirCallSiteName(sites[i]);
+    if (outer !== null && !pirCallSiteIsPlaceholder(outer)) return pirNormalizeScriptName(outer);
+  }
+  return own;
+}
+
+function pirCaptureSites(limit) {
+  const prepare = Error.prepareStackTrace;
+  const stackLimit = Error.stackTraceLimit;
+  // The capture is asked for a few frames more than the caller wants: the
+  // script-name resolution below walks *down* the list to the nearest named
+  // frame, and a one-frame request would arrive with no context at all (every
+  // module body is an `<input>` frame here). Only `limit` entries are returned.
+  const wanted = limit + 16;
+  // node's binding ignores the JS-level limit; widen it only when it would
+  // truncate the requested frame count, and restore the exact value after.
+  const widen = typeof stackLimit === "number" && stackLimit < wanted;
+  Error.prepareStackTrace = (_error, sites) => sites;
+  if (widen) Error.stackTraceLimit = wanted;
+  let frames;
+  try {
+    const holder = {};
+    // The second argument is V8's "drop the frames at and above this
+    // function" hook; the leading-name sweep below covers embedders whose
+    // captureStackTrace ignores it.
+    Error.captureStackTrace(holder, pirCaptureSites);
+    frames = holder.stack;
+  } finally {
+    Error.prepareStackTrace = prepare;
+    if (widen) Error.stackTraceLimit = stackLimit;
+  }
+  if (!Array.isArray(frames)) return [];
+  // Skip the capture machinery's own leading frames (the engine's native
+  // `call` frame, the prelude's `captureStackTrace` wrapper, the helper above
+  // and getCallSites itself).
+  let start = 0;
+  while (start < frames.length) {
+    const site = frames[start];
+    const name = site && typeof site.getFunctionName === "function" ? site.getFunctionName() : null;
+    if (name === "call" || name === "captureStackTrace" ||
+        name === "pirCaptureSites" || name === "getCallSites") {
+      start += 1;
+      continue;
+    }
+    break;
+  }
+  return frames.slice(start);
+}
+
+function pirOutOfRange(name, range, value) {
+  const error = new RangeError(
+    "The value of \"" + name + "\" is out of range. It must be " + range +
+    ". Received " + pirShowRangeValue(value),
+  );
+  error.code = "ERR_OUT_OF_RANGE";
+  return error;
+}
+
+/// node's `inspect`-shaped scalar tail for range errors (numbers bare, strings
+/// quoted) — the subset ERR_OUT_OF_RANGE needs here.
+function pirShowRangeValue(value) {
+  return typeof value === "string" ? "'" + value + "'" : String(value);
+}
+
+/// node's internal/validators validateInteger: type, then integrality, then the
+/// [min, max] window, each with its own message.
+function pirValidateInteger(value, name, min, max) {
+  if (typeof value !== "number") throw pirInvalidArgType(name, "number", value);
+  if (!Number.isInteger(value)) throw pirOutOfRange(name, "an integer", value);
+  if (value < min || value > max) {
+    throw pirOutOfRange(name, ">= " + min + " && <= " + max, value);
+  }
+  return value;
+}
+
+function pirValidateObject(value, name) {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+    throw pirInvalidArgType(name, "object", value);
+  }
+  return value;
+}
+
+function getCallSites(frameCount, options) {
+  let count = frameCount;
+  let opts = options;
+  if (opts === undefined) {
+    // lib/util.js: an object first argument is the options object.
+    if (typeof count === "object") {
+      opts = count;
+      pirValidateObject(opts, "options");
+      if (opts.sourceMap !== undefined) {
+        if (typeof opts.sourceMap !== "boolean") {
+          throw pirInvalidArgType("options.sourceMap", "boolean", opts.sourceMap);
+        }
+      }
+      count = 10;
+    } else {
+      opts = {};
+    }
+  } else {
+    pirValidateObject(opts, "options");
+    if (opts.sourceMap !== undefined && typeof opts.sourceMap !== "boolean") {
+      throw pirInvalidArgType("options.sourceMap", "boolean", opts.sourceMap);
+    }
+  }
+  if (count === undefined) count = 10;
+  pirValidateInteger(count, "frameCount", 1, 200);
+  // pirCaptureSites returns context frames below the requested window (for the
+  // script-name resolution); only `count` of them are node's answer.
+  const sites = pirCaptureSites(count);
+  const reported = Math.min(count, sites.length);
+  // Source-map reconstruction (options.sourceMap) is not modeled: pir carries
+  // no source-map cache, and the flag is accepted/validated like node's.
+  const out = [];
+  for (let i = 0; i < reported; i += 1) {
+    const site = sites[i];
+    const fnName = site && typeof site.getFunctionName === "function" ? site.getFunctionName() : null;
+    const line = site && typeof site.getLineNumber === "function" ? site.getLineNumber() : null;
+    const column = site && typeof site.getColumnNumber === "function" ? site.getColumnNumber() : null;
+    const scriptId = site && typeof site.getScriptId === "function" ? site.getScriptId() : null;
+    out.push({
+      __proto__: null,
+      functionName: fnName === null || fnName === undefined ? "" : String(fnName),
+      scriptId: scriptId === null || scriptId === undefined ? "" : String(scriptId),
+      scriptName: pirCallSiteScriptName(sites, i),
+      lineNumber: line === undefined ? null : line,
+      columnNumber: column === undefined ? null : column,
+      column: column === undefined ? null : column,
+    });
+  }
+  return out;
+}
+
+function parseArgs(config) {
+  const cfg = config === undefined || config === null ? {} : config;
+  const args = Array.isArray(cfg.args) ? cfg.args.slice() : process.argv.slice(2);
+  const strict = cfg.strict !== false;
+  const options = cfg.options || {};
+  const result = { values: {}, positionals: [] };
+  const tokens = cfg.tokens;
+  if (strict && !cfg.allowPositionals && tokens !== undefined) {
+    // Strict mode positionals handling is upstream-specific; the runtime
+    // keeps the permissive read-mostly behavior documented here.
+  }
+  for (let i = 0; i < args.length; i++) {
+    const arg = String(args[i]);
+    if (arg === "--") {
+      for (let j = i + 1; j < args.length; j++) result.positionals.push(String(args[j]));
+      break;
+    }
+    if (arg.startsWith("--")) {
+      let name = arg.slice(2);
+      let value;
+      const eq = name.indexOf("=");
+      if (eq !== -1) {
+        value = name.slice(eq + 1);
+        name = name.slice(0, eq);
+      }
+      const option = options[name];
+      if (strict && option === undefined) {
+        throw new TypeError("Unknown option --" + name);
+      }
+      const wantsValue = option !== undefined && (option.type === "string" || option.type === "number");
+      if (value === undefined) {
+        if (wantsValue) {
+          i += 1;
+          if (i >= args.length) throw new TypeError("Option --" + name + " requires a value");
+          value = String(args[i]);
+        } else {
+          value = true;
+        }
+      }
+      if (option !== undefined && option.type === "number") value = Number(value);
+      const multiple = option !== undefined && option.multiple === true;
+      if (multiple) {
+        const list = result.values[name] === undefined ? [] : result.values[name];
+        result.values[name] = [].concat(list, [value]);
+      } else {
+        result.values[name] = value;
+      }
+    } else if (arg.startsWith("-") && arg.length > 1) {
+      let name = arg.slice(1);
+      let value;
+      const eq = name.indexOf("=");
+      if (eq !== -1) {
+        value = name.slice(eq + 1);
+        name = name.slice(0, eq);
+      }
+      const option = options[name];
+      if (strict && option === undefined) {
+        throw new TypeError("Unknown option -" + name);
+      }
+      const wantsValue = option !== undefined && (option.type === "string" || option.type === "number");
+      if (value === undefined) {
+        if (wantsValue) {
+          i += 1;
+          if (i >= args.length) throw new TypeError("Option -" + name + " requires a value");
+          value = String(args[i]);
+        } else {
+          value = true;
+        }
+      }
+      if (option !== undefined && option.type === "number") value = Number(value);
+      const multiple = option !== undefined && option.multiple === true;
+      if (multiple) {
+        const list = result.values[name] === undefined ? [] : result.values[name];
+        result.values[name] = [].concat(list, [value]);
+      } else {
+        result.values[name] = value;
+      }
+    } else {
+      result.positionals.push(arg);
+    }
+  }
+  if (cfg.default && typeof cfg.default === "object") {
+    for (const name of Object.keys(cfg.default)) {
+      if (result.values[name] === undefined) result.values[name] = cfg.default[name];
+    }
+  }
+  return result;
+}
+
+function parseEnv(content) {
+  const result = {};
+  const text = String(content === undefined || content === null ? "" : content);
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+    let value = line.slice(eq + 1);
+    if (value.length >= 2 && ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'")))) {
+      value = value.slice(1, -1);
+    }
+    result[line.slice(0, eq)] = value;
+  }
+  return result;
+}
+
+function setTraceSigInt(_enabled) {
+  // No signal-trace host: a no-op keeps the call shape.
+}
+
+function toUSVString(input) {
+  // Replace lone surrogates with U+FFFD, like the WHATWG USVString cast.
+  return String(input).replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|([\uD800-\uDBFF][\uDC00-\uDFFF])|[\uDC00-\uDFFF]/g, (match, pair) => (pair ? match : "\uFFFD"));
+}
+
+function transferableAbortController(controller) {
+  // The runtime has no structured clone; the controller passes through.
+  return controller;
+}
+
+function transferableAbortSignal(signal) {
+  return signal;
+}
+
+// --- styleText ----------------------------------------------------------------
+
+const PIR_STYLE_CODES = {
+  reset: [0, 0], bold: [1, 22], dim: [2, 22], italic: [3, 23], underline: [4, 24],
+  blink: [5, 25], inverse: [7, 27], hidden: [8, 28], strikethrough: [9, 29],
+  black: [30, 39], red: [31, 39], green: [32, 39], yellow: [33, 39], blue: [34, 39],
+  magenta: [35, 39], cyan: [36, 39], white: [37, 39], gray: [90, 39], grey: [90, 39],
+  blackBright: [90, 39], redBright: [91, 39], greenBright: [92, 39], yellowBright: [93, 39],
+  blueBright: [94, 39], magentaBright: [95, 39], cyanBright: [96, 39], whiteBright: [97, 39],
+  bgBlack: [40, 49], bgRed: [41, 49], bgGreen: [42, 49], bgYellow: [43, 49],
+  bgBlue: [44, 49], bgMagenta: [45, 49], bgCyan: [46, 49], bgWhite: [47, 49],
+  bgGray: [100, 49], bgGrey: [100, 49], bgBlackBright: [100, 49], bgRedBright: [101, 49],
+  bgGreenBright: [102, 49], bgYellowBright: [103, 49], bgBlueBright: [104, 49],
+  bgMagentaBright: [105, 49], bgCyanBright: [106, 49], bgWhiteBright: [107, 49],
+};
+
+function styleText(format, text, options) {
+  if (typeof format !== "string" || PIR_STYLE_CODES[format] === undefined) {
+    throw new TypeError("The \"format\" argument must be a known style name. Received " + String(format));
+  }
+  const validate = !options || options.validate !== false;
+  if (validate && (text === undefined || text === null || text === "")) return "";
+  const pair = PIR_STYLE_CODES[format];
+  return "\u001b[" + pair[0] + "m" + String(text) + "\u001b[" + pair[1] + "m";
+}
+
+// --- MIMEType / MIMEParams ------------------------------------------------------
+
+class MIMEParams {
+  constructor() {
+    this._entries = [];
+  }
+  get(name) {
+    const entry = this._entries.find((entry) => entry[0] === name);
+    return entry === undefined ? null : entry[1];
+  }
+  has(name) {
+    return this._entries.some((entry) => entry[0] === name);
+  }
+  set(name, value) {
+    const existing = this._entries.find((entry) => entry[0] === name);
+    if (existing) existing[1] = String(value);
+    else this._entries.push([String(name), String(value)]);
+  }
+  delete(name) {
+    this._entries = this._entries.filter((entry) => entry[0] !== name);
+  }
+  clear() {
+    this._entries = [];
+  }
+  keys() {
+    return this._entries.map((entry) => entry[0])[Symbol.iterator]();
+  }
+  values() {
+    return this._entries.map((entry) => entry[1])[Symbol.iterator]();
+  }
+  entries() {
+    return this._entries.map((entry) => [entry[0], entry[1]])[Symbol.iterator]();
+  }
+  [Symbol.iterator]() {
+    return this.entries();
+  }
+  toString() {
+    return this._entries.map((entry) => entry[0] + "=" + entry[1]).join("; ");
+  }
+}
+
+class MIMEType {
+  constructor(input) {
+    const text = String(input).trim();
+    const semicolon = text.indexOf(";");
+    const essence = (semicolon === -1 ? text : text.slice(0, semicolon)).trim().toLowerCase();
+    if (!/^[^/]+\/[^/]+$/.test(essence)) {
+      throw new TypeError("Invalid MIME type: " + JSON.stringify(input));
+    }
+    this._type = essence.slice(0, essence.indexOf("/"));
+    this._subtype = essence.slice(essence.indexOf("/") + 1);
+    this._params = new MIMEParams();
+    let rest = semicolon === -1 ? "" : text.slice(semicolon + 1);
+    while (rest.length > 0) {
+      const eq = rest.indexOf("=");
+      if (eq === -1) break;
+      const name = rest.slice(0, eq).trim().toLowerCase();
+      rest = rest.slice(eq + 1).trim();
+      let value;
+      if (rest.startsWith("\"")) {
+        const end = rest.indexOf("\"", 1);
+        value = rest.slice(1, end === -1 ? rest.length : end);
+        rest = end === -1 ? "" : rest.slice(end + 1);
+      } else {
+        const end = rest.indexOf(";");
+        value = end === -1 ? rest : rest.slice(0, end);
+        rest = end === -1 ? "" : rest.slice(end + 1);
+      }
+      rest = rest.trim();
+      if (name !== "") this._params.set(name, value);
+    }
+  }
+  get type() {
+    return this._type;
+  }
+  get subtype() {
+    return this._subtype;
+  }
+  get essence() {
+    return this._type + "/" + this._subtype;
+  }
+  get params() {
+    return this._params;
+  }
+  toString() {
+    const params = this._params.toString();
+    return this.essence + (params === "" ? "" : "; " + params);
+  }
+}
+
+// --- TextEncoder / TextDecoder ---------------------------------------------------
+
+class TextEncoder {
+  get encoding() {
+    return "utf-8";
+  }
+  encode(input) {
+    return new Uint8Array(globalThis.Buffer.from(String(input === undefined ? "" : input), "utf8"));
+  }
+  encodeInto(source, destination) {
+    const bytes = globalThis.Buffer.from(String(source === undefined ? "" : source), "utf8");
+    const count = Math.min(bytes.length, destination.length);
+    destination.set(bytes.subarray(0, count));
+    return { read: count, written: count };
+  }
+}
+
+class TextDecoder {
+  constructor(label, options) {
+    const normalized = String(label === undefined || label === null ? "utf-8" : label).trim().toLowerCase();
+    const utf8 = normalized === "utf-8" || normalized === "utf8" || normalized === "unicode-1-1-utf-8";
+    const latin = normalized === "latin1" || normalized === "iso-8859-1" || normalized === "windows-1252" || normalized === "ascii" || normalized === "us-ascii";
+    if (!utf8 && !latin) {
+      const error = new Error("TextDecoder label \"" + label + "\" is not supported by the pir extension runtime (only utf-8/latin1)");
+      error.code = "ERR_NOT_SUPPORTED";
+      throw error;
+    }
+    this._encoding = utf8 ? "utf-8" : "windows-1252";
+    this._fatal = Boolean(options && options.fatal);
+    this._ignoreBOM = Boolean(options && options.ignoreBOM);
+  }
+  get encoding() {
+    return this._encoding;
+  }
+  get fatal() {
+    return this._fatal;
+  }
+  get ignoreBOM() {
+    return this._ignoreBOM;
+  }
+  decode(input, _options) {
+    const bytes = input instanceof Uint8Array
+      ? input
+      : ArrayBuffer.isView(input)
+        ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+        : input instanceof ArrayBuffer
+          ? new Uint8Array(input)
+          : new Uint8Array(0);
+    // The decode is read-only: encode a view over the same bytes instead of
+    // paying a whole-array `Buffer.from(bytes)` copy (buffer_global.js.txt's
+    // fromView).
+    const view = bytes.length === 0
+      ? null
+      : (globalThis.Buffer.isBuffer(bytes)
+        ? bytes
+        : globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+    let text = view === null ? "" : view.toString(this._encoding === "utf-8" ? "utf8" : "latin1");
+    if (!this._ignoreBOM && text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+    return text;
+  }
+}
+
+export default {
+  promisify: promisify,
+  callbackify: callbackify,
+  inherits: inherits,
+  deprecate: deprecate,
+  debuglog: debuglog,
+  format: format,
+  formatWithOptions: formatWithOptions,
+  inspect: pirInspect,
+  stripVTControlCharacters: stripVTControlCharacters,
+  types: types,
+  MIMEType: MIMEType,
+  MIMEParams: MIMEParams,
+  TextDecoder: TextDecoder,
+  TextEncoder: TextEncoder,
+  _errnoException: _errnoException,
+  _exceptionWithHostPort: _exceptionWithHostPort,
+  _extend: _extend,
+  aborted: aborted,
+  convertProcessSignalToExitCode: convertProcessSignalToExitCode,
+  debug: debug,
+  diff: diff,
+  getCallSites: getCallSites,
+  getSystemErrorMap: getSystemErrorMap,
+  getSystemErrorMessage: getSystemErrorMessage,
+  getSystemErrorName: getSystemErrorName,
+  isArray: isArray,
+  isDeepStrictEqual: isDeepStrictEqual,
+  parseArgs: parseArgs,
+  parseEnv: parseEnv,
+  setTraceSigInt: setTraceSigInt,
+  styleText: styleText,
+  toUSVString: toUSVString,
+  transferableAbortController: transferableAbortController,
+  transferableAbortSignal: transferableAbortSignal,
+};
+export { promisify, callbackify, inherits, deprecate, debuglog, format, formatWithOptions, stripVTControlCharacters };
+export { MIMEType, MIMEParams, TextDecoder, TextEncoder };
+export { _errnoException, _exceptionWithHostPort, _extend, aborted };
+export { convertProcessSignalToExitCode, debug, diff, getCallSites };
+export { getSystemErrorMap, getSystemErrorMessage, getSystemErrorName };
+export { isArray, isDeepStrictEqual, parseArgs, parseEnv };
+export { setTraceSigInt, styleText, toUSVString };
+export { transferableAbortController, transferableAbortSignal };
+export const inspect = pirInspect;
+export { types };

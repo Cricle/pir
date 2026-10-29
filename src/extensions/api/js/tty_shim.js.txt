@@ -1,0 +1,78 @@
+// node:tty load-compatible surface: the runtime runs extensions without a
+// controlling terminal, so `isatty` reports false (the honest verdict for a
+// piped host); the stream classes exist for instanceof/link paths.
+
+import { EventEmitter } from "@node/events";
+
+class ReadStream extends EventEmitter {
+  constructor(fd, options) {
+    super();
+    this.fd = typeof fd === "number" ? fd : 0;
+    this.isRaw = false;
+    this.isTTY = false;
+    this.options = options === undefined || options === null ? {} : options;
+  }
+  setRawMode(mode) {
+    this.isRaw = Boolean(mode);
+    return this;
+  }
+  ref() {
+    return this;
+  }
+  unref() {
+    return this;
+  }
+}
+
+class WriteStream extends EventEmitter {
+  constructor(fd, options) {
+    super();
+    this.fd = typeof fd === "number" ? fd : 1;
+    this.columns = typeof options === "object" && options && typeof options.columns === "number" ? options.columns : 80;
+    this.rows = typeof options === "object" && options && typeof options.rows === "number" ? options.rows : 24;
+    this.isTTY = false;
+  }
+  _refreshSize() {}
+  clearLine(_dir, callback) {
+    if (typeof callback === "function") callback(undefined);
+    return true;
+  }
+  clearScreenDown(callback) {
+    if (typeof callback === "function") callback(undefined);
+    return true;
+  }
+  cursorTo(_x, _y, callback) {
+    if (typeof _y === "function") _y(undefined);
+    if (typeof callback === "function") callback(undefined);
+    return true;
+  }
+  moveCursor(_dx, _dy, callback) {
+    if (typeof callback === "function") callback(undefined);
+    return true;
+  }
+  getColorDepth() {
+    return 1;
+  }
+  hasColors(count) {
+    return (count === undefined ? 16 : count) <= 1;
+  }
+  getWindowSize() {
+    return [this.columns, this.rows];
+  }
+}
+
+function isatty(fd) {
+  // The extension runtime owns no tty (the host process stdio may be one,
+  // but the sandbox surface cannot observe it) — the constant false is the
+  // documented, honest answer.
+  return false;
+}
+
+const tty = {
+  ReadStream: ReadStream,
+  WriteStream: WriteStream,
+  isatty: isatty,
+};
+
+export default tty;
+export { ReadStream, WriteStream, isatty };

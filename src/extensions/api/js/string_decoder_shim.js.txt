@@ -1,0 +1,681 @@
+// node:string_decoder — StringDecoder with Node v24's observable chunk
+// semantics (lib/string_decoder.js + src/string_decoder.cc, reproduced from
+// byte-level differential probes against node v24.19.0):
+//
+// * the constructor is a plain function, NOT a class: Node's is too, and
+//   `StringDecoder.call(decoder2)` must initialize the receiver
+//   (tests/parallel/test-string-decoder.js line 33);
+// * UTF-8 keeps only the trailing incomplete character across writes. Which
+//   bytes to keep is Node's walk-back over the trailing continuation run
+//   (`DecodeData`), and the completed part is decoded with V8's maximal-subpart
+//   rules (`StringBytes::Encode`), so `F1 CC B8` is "\uFFFD\u0338",
+//   `EDA0B5EDB08D` is six U+FFFD, `E08080` is three;
+// * utf16le keeps a split surrogate pair (`data[nread-1] & 0xFC == 0xD8`) or a
+//   lone trailing byte; base64/base64url keep `nread % 3`; hex/latin1/ascii are
+//   stateless;
+// * lastChar/lastNeed/lastTotal are getters over the 4-byte window that holds
+//   the incomplete bytes — stale bytes survive a flush, like the C++ buffer;
+// * the byte-level state machine below is mirrored 1:1 by the Rust op in
+//   `src/extensions/runtime/host_functions/buffer_ops.rs`
+//   (`__pirBufferCodec("stringDecodeChunk")` / `("stringDecodeFlush")`): the
+//   native tier wins when the runtime registered it, and every JS branch here
+//   stays as the automatic fallback (see the "host fast path" section below).
+//
+// Error shapes match node's `internal/errors` codes:
+// ERR_UNKNOWN_ENCODING / ERR_INVALID_ARG_TYPE / ERR_INVALID_THIS /
+// ERR_STRING_TOO_LONG.
+
+// ---------------------------------------------------------------------------
+// errors
+// ---------------------------------------------------------------------------
+
+function pirDescribeValue(value) {
+  if (typeof value === "string") return value;
+  if (value === null) return "null";
+  if (typeof value === "object" || typeof value === "function") {
+    const modules = globalThis.__pirNodeModules;
+    const util = modules && modules.util;
+    const inspect = util && ((util.default && util.default.inspect) || util.inspect);
+    if (typeof inspect === "function") {
+      try { return inspect(value); } catch (error) { /* fall through */ }
+    }
+  }
+  return String(value);
+}
+
+function pirUnknownEncoding(encoding) {
+  const error = new TypeError("Unknown encoding: " + pirDescribeValue(encoding));
+  error.code = "ERR_UNKNOWN_ENCODING";
+  return error;
+}
+
+// internal/errors `determineSpecificType` rendering.
+function pirDescribeReceived(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  const type = typeof value;
+  if (type === "function") return "function " + (value.name || "");
+  if (type === "object") {
+    const ctor = value.constructor;
+    const name = ctor && typeof ctor.name === "string" && ctor.name ? ctor.name : "Object";
+    return "an instance of " + name;
+  }
+  if (type === "string") return "type string ('" + value + "')";
+  if (type === "symbol") return "type symbol (" + String(value) + ")";
+  if (type === "bigint") return "type bigint (" + String(value) + "n)";
+  return "type " + type + " (" + String(value) + ")";
+}
+
+function pirInvalidBufferArg(value) {
+  const error = new TypeError(
+    'The "buf" argument must be an instance of Buffer, TypedArray, or DataView. ' +
+    "Received " + pirDescribeReceived(value)
+  );
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function pirInvalidThis() {
+  const error = new TypeError('Value of "this" must be of type StringDecoder');
+  error.code = "ERR_INVALID_THIS";
+  return error;
+}
+
+function pirStringTooLong() {
+  const error = new Error(
+    "Cannot create a string longer than 0x1fffffe8 characters"
+  );
+  error.code = "ERR_STRING_TOO_LONG";
+  return error;
+}
+
+// ---------------------------------------------------------------------------
+// encoding normalization (internal/util `normalizeEncoding`)
+// ---------------------------------------------------------------------------
+
+// Port of internal/util `normalizeEncoding` + `slowCases`: the dispatch is on
+// `encoding.length`, which is what makes `new StringDecoder(1)` /
+// `new StringDecoder({})` fall through to ERR_UNKNOWN_ENCODING while
+// `new String('utf8')` still resolves (a string object has length 4).
+function pirNormalizeEncoding(encoding) {
+  if (encoding === undefined || encoding === null) return "utf8";
+  if (encoding === "utf8" || encoding === "utf-8") return "utf8";
+  const length = encoding.length;
+  if (length === 4) {
+    if (encoding === "UTF8") return "utf8";
+    if (encoding === "ucs2" || encoding === "UCS2") return "utf16le";
+    const lower = String(encoding).toLowerCase();
+    if (lower === "utf8") return "utf8";
+    if (lower === "ucs2") return "utf16le";
+    return undefined;
+  }
+  if (length === 3) {
+    return String(encoding).toLowerCase() === "hex" ? "hex" : undefined;
+  }
+  if (length === 5) {
+    if (encoding === "ascii") return "ascii";
+    if (encoding === "ucs-2") return "utf16le";
+    if (encoding === "UTF-8") return "utf8";
+    if (encoding === "ASCII") return "ascii";
+    if (encoding === "UCS-2") return "utf16le";
+    const lower = String(encoding).toLowerCase();
+    if (lower === "utf-8") return "utf8";
+    if (lower === "ascii") return "ascii";
+    if (lower === "ucs-2") return "utf16le";
+    return undefined;
+  }
+  if (length === 6) {
+    if (encoding === "base64") return "base64";
+    if (encoding === "latin1" || encoding === "binary") return "latin1";
+    if (encoding === "BASE64") return "base64";
+    if (encoding === "LATIN1" || encoding === "BINARY") return "latin1";
+    const lower = String(encoding).toLowerCase();
+    if (lower === "base64") return "base64";
+    if (lower === "latin1" || lower === "binary") return "latin1";
+    return undefined;
+  }
+  if (length === 7) {
+    return String(encoding).toLowerCase() === "utf16le" ? "utf16le" : undefined;
+  }
+  if (length === 8) {
+    return String(encoding).toLowerCase() === "utf-16le" ? "utf16le" : undefined;
+  }
+  if (length === 9) {
+    return String(encoding).toLowerCase() === "base64url" ? "base64url" : undefined;
+  }
+  if (encoding === "") return "utf8";
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// input plumbing
+// ---------------------------------------------------------------------------
+
+function pirIsView(value) {
+  if (value === null || value === undefined || typeof value !== "object") return false;
+  if (typeof ArrayBuffer !== "undefined" && typeof ArrayBuffer.isView === "function") {
+    try { return ArrayBuffer.isView(value); } catch (error) { /* fall through */ }
+  }
+  if (typeof DataView !== "undefined" && value instanceof DataView) return true;
+  const tag = Object.prototype.toString.call(value);
+  return tag === "[object Uint8Array]" || tag === "[object Int8Array]" ||
+    tag === "[object Uint8ClampedArray]" || tag === "[object Int16Array]" ||
+    tag === "[object Uint16Array]" || tag === "[object Int32Array]" ||
+    tag === "[object Uint32Array]" || tag === "[object Float16Array]" ||
+    tag === "[object Float32Array]" || tag === "[object Float64Array]" ||
+    tag === "[object BigInt64Array]" || tag === "[object BigUint64Array]";
+}
+
+function pirViewLength(view) {
+  if (view.byteLength !== undefined) return view.byteLength;
+  if (view.length !== undefined) return view.length;
+  return 0;
+}
+
+function pirViewToBytes(view) {
+  const buffer = view.buffer;
+  const offset = view.byteOffset === undefined ? 0 : view.byteOffset;
+  const length = pirViewLength(view);
+  const out = new Array(length);
+  if (buffer !== undefined && buffer !== null) {
+    const bytes = new Uint8Array(buffer, offset, length);
+    for (let i = 0; i < length; i++) out[i] = bytes[i];
+    return out;
+  }
+  for (let i = 0; i < length; i++) out[i] = view[i] & 0xff;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Host fast path (§6.5 host-first policy): when the runtime registered its
+// native codec dispatcher (`__pirBufferCodec`, a rquickjs C-ABI function — see
+// src/extensions/runtime/host_functions/buffer_ops.rs), `write`/`end` hand the
+// chunk to the Rust port of this state machine ("stringDecodeChunk" /
+// "stringDecodeFlush"), which reads the `_pirPending`/`_pirNeed`/`_pirWindow`
+// triple off the decoder and returns the decoded text together with the new
+// state in one call. The whole JS algorithm below stays as the fallback: the
+// native op answers `undefined` when the result cannot cross the host bridge
+// as a Rust string (a utf16le lone surrogate) or when the view is not a plain
+// Uint8Array, and any unexpected native failure is caught — the JS state
+// machine then runs unchanged, so observable behavior never changes.
+// ---------------------------------------------------------------------------
+
+const pirNativeCodec =
+  typeof globalThis.__pirBufferCodec === "function" ? globalThis.__pirBufferCodec : null;
+
+function pirNativeChunk(decoder, view) {
+  try {
+    const result = pirNativeCodec("stringDecodeChunk", view, false, false, decoder);
+    if (
+      result === undefined || typeof result.text !== "string" ||
+      typeof result.need !== "number" || !Array.isArray(result.pending) ||
+      !Array.isArray(result.window)
+    ) {
+      return undefined;
+    }
+    decoder._pirPending = result.pending;
+    decoder._pirNeed = result.need;
+    decoder._pirWindow = result.window;
+    return result.text;
+  } catch (error) {
+    return undefined;
+  }
+}
+
+function pirNativeFlush(decoder) {
+  try {
+    const text = pirNativeCodec("stringDecodeFlush", undefined, false, false, decoder);
+    return typeof text === "string" ? text : undefined;
+  } catch (error) {
+    return undefined;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// V8 / WHATWG UTF-8 decoding ("maximal subpart" replacement)
+// ---------------------------------------------------------------------------
+
+function pirUtf8Decode(bytes) {
+  const length = bytes.length;
+  let out = "";
+  let i = 0;
+  while (i < length) {
+    const first = bytes[i];
+    if (first < 0x80) {
+      out += String.fromCharCode(first);
+      i += 1;
+      continue;
+    }
+    let needed;
+    let codePoint;
+    let lower = 0x80;
+    let upper = 0xbf;
+    if (first >= 0xc2 && first <= 0xdf) {
+      needed = 1;
+      codePoint = first & 0x1f;
+    } else if (first >= 0xe0 && first <= 0xef) {
+      needed = 2;
+      codePoint = first & 0x0f;
+      if (first === 0xe0) lower = 0xa0;
+      else if (first === 0xed) upper = 0x9f;
+    } else if (first >= 0xf0 && first <= 0xf4) {
+      needed = 3;
+      codePoint = first & 0x07;
+      if (first === 0xf0) lower = 0x90;
+      else if (first === 0xf4) upper = 0x8f;
+    } else {
+      // 0x80-0xC1 and 0xF5-0xFF can never start a sequence.
+      out += "\ufffd";
+      i += 1;
+      continue;
+    }
+    let seen = 0;
+    let ok = true;
+    while (seen < needed) {
+      const next = i + 1 + seen < length ? bytes[i + 1 + seen] : -1;
+      if (next < lower || next > upper) { ok = false; break; }
+      codePoint = (codePoint << 6) | (next & 0x3f);
+      seen += 1;
+      lower = 0x80;
+      upper = 0xbf;
+    }
+    if (ok) {
+      out += String.fromCodePoint(codePoint);
+      i += needed + 1;
+    } else {
+      // Emit one replacement char for the valid prefix and rescan the byte
+      // that broke the sequence.
+      out += "\ufffd";
+      i += seen + 1;
+    }
+  }
+  return out;
+}
+
+// Node's `DecodeData` walk-back: how many trailing bytes of the buffer form an
+// incomplete UTF-8 character (0 when the tail is complete or undecidable).
+function pirUtf8HoldCount(bytes) {
+  const length = bytes.length;
+  if (length === 0) return 0;
+  const last = bytes[length - 1];
+  if (last < 0x80) return 0; // ASCII tail can never be incomplete
+  let start;
+  if ((last & 0xc0) === 0x80) {
+    start = length - 1;
+    while (start > 0 && (bytes[start - 1] & 0xc0) === 0x80) start -= 1;
+    if (start === 0) return 0; // the run reaches the start: no lead byte
+    start -= 1;
+  } else {
+    start = length - 1;
+  }
+  const lead = bytes[start];
+  let expected;
+  if ((lead & 0xe0) === 0xc0) expected = 2;
+  else if ((lead & 0xf0) === 0xe0) expected = 3;
+  else if ((lead & 0xf8) === 0xf0) expected = 4;
+  else return 0; // not a lead byte: the tail is never carried over
+  const nbuf = length - start;
+  return nbuf < expected ? nbuf : 0;
+}
+
+function pirUtf8NeedFor(bytes) {
+  const hold = pirUtf8HoldCount(bytes);
+  if (hold === 0) return 0;
+  const start = bytes.length - hold;
+  const lead = bytes[start];
+  if ((lead & 0xe0) === 0xc0) return 2 - hold;
+  if ((lead & 0xf0) === 0xe0) return 3 - hold;
+  return 4 - hold;
+}
+
+// ---------------------------------------------------------------------------
+// the remaining encodings
+// ---------------------------------------------------------------------------
+
+function pirUtf16Decode(bytes) {
+  let out = "";
+  let i = 0;
+  for (; i + 1 < bytes.length; i += 2) {
+    out += String.fromCharCode(bytes[i] | (bytes[i + 1] << 8));
+  }
+  return out;
+}
+
+function pirLatin1Decode(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+  return out;
+}
+
+function pirAsciiDecode(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i] & 0x7f);
+  return out;
+}
+
+const PIR_HEX_CHARS = "0123456789abcdef";
+
+function pirHexDecode(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    const byte = bytes[i];
+    out += PIR_HEX_CHARS.charAt(byte >> 4) + PIR_HEX_CHARS.charAt(byte & 0x0f);
+  }
+  return out;
+}
+
+const PIR_BASE64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const PIR_BASE64URL_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+// Encodes whole 3-byte groups; `pad` only ever applies to the flush of a
+// 1- or 2-byte tail (Node pads the flush, never a completed group).
+function pirBase64Encode(bytes, chars, pad) {
+  let out = "";
+  let i = 0;
+  for (; i + 2 < bytes.length; i += 3) {
+    const a = bytes[i];
+    const b = bytes[i + 1];
+    const c = bytes[i + 2];
+    out += chars.charAt(a >> 2) +
+      chars.charAt(((a & 0x03) << 4) | (b >> 4)) +
+      chars.charAt(((b & 0x0f) << 2) | (c >> 6)) +
+      chars.charAt(c & 0x3f);
+  }
+  const rest = bytes.length - i;
+  if (rest === 1) {
+    const a = bytes[i];
+    out += chars.charAt(a >> 2) + chars.charAt((a & 0x03) << 4);
+    if (pad) out += "==";
+  } else if (rest === 2) {
+    const a = bytes[i];
+    const b = bytes[i + 1];
+    out += chars.charAt(a >> 2) +
+      chars.charAt(((a & 0x03) << 4) | (b >> 4)) +
+      chars.charAt((b & 0x0f) << 2);
+    if (pad) out += "=";
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// StringDecoder
+// ---------------------------------------------------------------------------
+
+// The 4-byte window mirrors the C++ `incomplete_char_` buffer: bytes are
+// written at the offset they occupy inside the incomplete character, and
+// positions beyond the character keep their stale value.
+function pirWriteWindow(decoder, bytes, offset) {
+  for (let i = 0; i < bytes.length && offset + i < 4; i++) {
+    decoder._pirWindow[offset + i] = bytes[i];
+  }
+}
+
+function pirSetPending(decoder, bytes, need) {
+  decoder._pirPending = bytes.slice();
+  decoder._pirNeed = need;
+  pirWriteWindow(decoder, bytes, 0);
+}
+
+function pirClearPending(decoder) {
+  decoder._pirPending = [];
+  decoder._pirNeed = 0;
+}
+
+// Decodes one held character once its bytes are complete.
+function pirDecodeHeld(decoder, bytes) {
+  switch (decoder.encoding) {
+    case "utf16le":
+      return pirUtf16Decode(bytes);
+    case "base64":
+      return pirBase64Encode(bytes, PIR_BASE64_CHARS, false);
+    case "base64url":
+      return pirBase64Encode(bytes, PIR_BASE64URL_CHARS, false);
+    default:
+      return pirUtf8Decode(bytes);
+  }
+}
+
+// Node's DecodeData: an incomplete character is filled from the next chunk
+// byte by byte — UTF-8 accepts continuation bytes (0x80-0xBF) only, utf16le and
+// base64 accept any byte — and the character is decoded as soon as it is
+// complete. `heldAll` reports that the chunk was swallowed whole (the character
+// is still incomplete), so the caller has no remainder to process.
+function pirFillPending(decoder, data, continuationOnly) {
+  const need = decoder._pirNeed;
+  let accepted = 0;
+  while (
+    accepted < data.length && accepted < need &&
+    (!continuationOnly || (data[accepted] & 0xc0) === 0x80)
+  ) {
+    accepted += 1;
+  }
+  if (accepted > 0) pirWriteWindow(decoder, data.slice(0, accepted), decoder._pirPending.length);
+  const copied = data.slice(0, accepted);
+  const rest = data.slice(accepted);
+  const missing = need - accepted;
+  if (missing === 0) {
+    // The held character is complete.
+    const out = pirDecodeHeld(decoder, decoder._pirPending.concat(copied));
+    pirClearPending(decoder);
+    return { out: out, rest: rest, heldAll: false };
+  }
+  if (accepted === data.length) {
+    // Still incomplete: every byte of the chunk was a continuation.
+    decoder._pirPending = decoder._pirPending.concat(copied);
+    decoder._pirNeed = missing;
+    return { out: "", rest: rest, heldAll: true };
+  }
+  // Broken by a non-continuation byte: flush the maximal subpart, reprocess
+  // the offending byte as the start of the next character.
+  const out = pirDecodeHeld(decoder, decoder._pirPending.concat(copied));
+  pirClearPending(decoder);
+  return { out: out, rest: rest, heldAll: false };
+}
+
+function pirUtf8Write(decoder, bytes) {
+  let out = "";
+  let data = bytes;
+  if (decoder._pirNeed > 0 && decoder._pirPending.length > 0) {
+    const filled = pirFillPending(decoder, data, true);
+    out += filled.out;
+    if (filled.heldAll) return out;
+    data = filled.rest;
+  }
+  if (data.length === 0) return out;
+  const hold = pirUtf8HoldCount(data);
+  if (hold > 0) {
+    pirSetPending(decoder, data.slice(data.length - hold), pirUtf8NeedFor(data));
+    out += pirUtf8Decode(data.slice(0, data.length - hold));
+  } else {
+    pirClearPending(decoder);
+    out += pirUtf8Decode(data);
+  }
+  return out;
+}
+
+function pirUtf16Write(decoder, bytes) {
+  let out = "";
+  let data = bytes;
+  if (decoder._pirNeed > 0 && decoder._pirPending.length > 0) {
+    // UCS2 fills the held character with raw bytes (no continuation concept).
+    const filled = pirFillPending(decoder, data, false);
+    out += filled.out;
+    data = filled.rest;
+    if (filled.heldAll) return out;
+  }
+  if (data.length === 0) return out;
+  let hold = 0;
+  let missing = 0;
+  if (data.length % 2 === 1) {
+    hold = 1;
+    missing = 1;
+  } else if ((data[data.length - 1] & 0xfc) === 0xd8) {
+    hold = 2;
+    missing = 2;
+  }
+  if (hold > 0) {
+    pirSetPending(decoder, data.slice(data.length - hold), missing);
+    out += pirUtf16Decode(data.slice(0, data.length - hold));
+  } else {
+    pirClearPending(decoder);
+    out += pirUtf16Decode(data);
+  }
+  return out;
+}
+
+function pirBase64Write(decoder, bytes) {
+  let out = "";
+  let data = bytes;
+  if (decoder._pirNeed > 0 && decoder._pirPending.length > 0) {
+    const filled = pirFillPending(decoder, data, false);
+    out += filled.out;
+    data = filled.rest;
+    if (filled.heldAll) return out;
+  }
+  const tail = data.slice(Math.floor(data.length / 3) * 3);
+  const body = data.slice(0, data.length - tail.length);
+  if (tail.length > 0) pirSetPending(decoder, tail, 3 - tail.length);
+  else pirClearPending(decoder);
+  out += pirBase64Encode(
+    body,
+    decoder.encoding === "base64url" ? PIR_BASE64URL_CHARS : PIR_BASE64_CHARS,
+    false
+  );
+  return out;
+}
+
+function pirWriteChunk(decoder, bytes) {
+  switch (decoder.encoding) {
+    case "utf8":
+      return pirUtf8Write(decoder, bytes);
+    case "utf16le":
+      return pirUtf16Write(decoder, bytes);
+    case "base64":
+    case "base64url":
+      return pirBase64Write(decoder, bytes);
+    case "hex":
+      return pirHexDecode(bytes);
+    case "ascii":
+      return pirAsciiDecode(bytes);
+    default:
+      return pirLatin1Decode(bytes);
+  }
+}
+
+function pirFlush(decoder) {
+  const pending = decoder._pirPending;
+  if (pending.length === 0) return "";
+  switch (decoder.encoding) {
+    case "utf8":
+      return pirUtf8Decode(pending);
+    case "utf16le":
+      return pirUtf16Decode(pending);
+    case "base64":
+      return pirBase64Encode(pending, PIR_BASE64_CHARS, true);
+    case "base64url":
+      // base64url never pads (Node's StringBytes BASE64URL).
+      return pirBase64Encode(pending, PIR_BASE64URL_CHARS, false);
+    default:
+      return "";
+  }
+}
+
+// Node's StringDecoder is a plain function: `StringDecoder.call(x)` initializes
+// x (test-string-decoder.js line 34). The decoder state mirrors the C++
+// `kNativeDecoder` buffer and is non-enumerable, so `Object.keys(decoder)` and
+// `inspect(decoder)` show only `encoding`, like Node.
+function StringDecoder(encoding) {
+  this.encoding = pirNormalizeEncoding(encoding);
+  if (this.encoding === undefined) throw pirUnknownEncoding(encoding);
+  Object.defineProperty(this, "_pirPending", {
+    value: [], writable: true, enumerable: false, configurable: true,
+  });
+  Object.defineProperty(this, "_pirWindow", {
+    value: [0, 0, 0, 0], writable: true, enumerable: false, configurable: true,
+  });
+  Object.defineProperty(this, "_pirNeed", {
+    value: 0, writable: true, enumerable: false, configurable: true,
+  });
+}
+
+StringDecoder.prototype.write = function write(buf) {
+  if (typeof buf === "string") return buf;
+  if (!pirIsView(buf)) throw pirInvalidBufferArg(buf);
+  if (this === null || this === undefined || this._pirPending === undefined) {
+    throw pirInvalidThis();
+  }
+  // V8 cannot materialize a longer string: check before touching the bytes
+  // (node raises this from String::NewFromUtf8 for the same input).
+  if (pirViewLength(buf) > 0x1fffffe8) throw pirStringTooLong();
+  if (pirNativeCodec !== null) {
+    const text = pirNativeChunk(this, buf);
+    if (text !== undefined) return text;
+  }
+  return pirWriteChunk(this, pirViewToBytes(buf));
+};
+
+StringDecoder.prototype.end = function end(buf) {
+  if (this === null || this === undefined || this._pirPending === undefined) {
+    throw pirInvalidThis();
+  }
+  const ret = buf === undefined ? "" : this.write(buf);
+  if (this._pirPending.length > 0) {
+    let flushed;
+    if (pirNativeCodec !== null) flushed = pirNativeFlush(this);
+    if (flushed === undefined) flushed = pirFlush(this);
+    pirClearPending(this);
+    return ret + flushed;
+  }
+  return ret;
+};
+
+// Undocumented legacy surface: drop whatever is held and decode the tail.
+StringDecoder.prototype.text = function text(buf, offset) {
+  if (this === null || this === undefined || this._pirPending === undefined) {
+    throw pirInvalidThis();
+  }
+  pirClearPending(this);
+  return this.write(buf.slice(offset));
+};
+
+Object.defineProperties(StringDecoder.prototype, {
+  lastChar: {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (this === null || this === undefined || this._pirWindow === undefined) {
+        return pirBufferFrom([]);
+      }
+      return pirBufferFrom(this._pirWindow);
+    },
+  },
+  lastNeed: {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (this === null || this === undefined || this._pirNeed === undefined) {
+        throw pirInvalidThis();
+      }
+      return this._pirNeed;
+    },
+  },
+  lastTotal: {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (this === null || this === undefined || this._pirPending === undefined) {
+        throw pirInvalidThis();
+      }
+      return this._pirPending.length + this._pirNeed;
+    },
+  },
+});
+
+function pirBufferFrom(bytes) {
+  const BufferCtor = globalThis.Buffer;
+  if (BufferCtor && typeof BufferCtor.from === "function") return BufferCtor.from(bytes);
+  return new Uint8Array(bytes);
+}
+
+export { StringDecoder };
+export default { StringDecoder: StringDecoder };

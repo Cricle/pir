@@ -1,0 +1,1087 @@
+// node:net — minimal real loopback TCP (Server / Socket) for the pir
+// extension runtime.
+//
+// Tier: minimal-real, loopback only. `createServer`/`createConnection` own a
+// REAL TCP socket pair over 127.0.0.1, driven by the `__pir_host.http` net
+// ops (`netListen`/`netAccept`/`netConnect`/`netRead`/`netWrite`/`netEnd`/
+// `netClose`/`netSetNoDelay`/`netServerClose`, see http_fns.rs). The host
+// sockets are non-blocking and the ops are bounded probes, so this shim keeps
+// ONE timer-driven pump for every live handle: each step accepts what the
+// listeners hold, drains what the sockets hold, then re-arms (immediately
+// while it is making progress, on a 5 ms beat when idle). The pump is
+// ref-counted: a listening server or an open socket keeps the process alive
+// like Node's, `unref()` lets go, and a process whose handles are all
+// unref'd/closed exits.
+//
+// What is REAL: createServer/createConnection/connect, listen (port 0
+// ephemeral), close (waits for live connections), address, listening,
+// unref/ref; socket connect (net.Socket + socket.connect), write/end/destroy,
+// pause/resume (pause stops the host reads — real TCP backpressure),
+// setEncoding (the stream pad's StringDecoder), setNoDelay (TCP_NODELAY),
+// setTimeout ('timeout' after that much inactivity), ref/unref; events
+// connect/data/end/close/error/timeout/drain/listening/connection;
+// remoteAddress/remotePort/remoteFamily/localAddress/localPort/localFamily,
+// bytesRead/bytesWritten, pending/connecting, destroyed/readable/writable.
+// Socket IS a real `stream.Duplex`, so pipe/backpressure/async iteration work.
+//
+// Documented deviations (honest gaps, not silent ones):
+//   * loopback ONLY. Any non-loopback host in listen/connect throws
+//     ERR_NOT_SUPPORTED with a clear message; the listener always binds
+//     127.0.0.1 and `address()` always reports {address:"127.0.0.1",
+//     family:"IPv4"} (Node reports `::` on Windows).
+//   * no TLS (see `node:tls`), no Unix-domain sockets (`path`/`listen(path)`
+//     throw ERR_NOT_SUPPORTED), no `allowHalfOpen` server-side auto-end
+//     differences beyond the stream pad's, no `pauseOnConnect`,
+//     `maxConnections`, `drop` counters, `localAddress`/`localPort`/`family`/
+//     `lookup` connect options (ignored), no happy-eyeballs
+//     (`autoSelectFamily` remains a recorded preference only).
+//   * connect is synchronous in the host: the `'connect'` event is still
+//     emitted on a tick (Node's contract for listeners attached after the
+//     call), but a *transport* failure (ECONNREFUSED, ...) is delivered as
+//     Node's asynchronous 'error' + 'close'; argument/host errors throw
+//     synchronously like Node's argument validation does.
+//   * one `write()` is one host round trip with a bounded 5 s drain deadline
+//     (http_fns.rs): a same-thread peer that never reads eventually reports
+//     EAGAIN instead of blocking the runtime forever. Writes before connect
+//     are queued and flushed on connect, like Node.
+//   * socket 'drain' comes from the stream pad's accounting (write past the
+//     high-water mark then empty), not from the kernel's send buffer.
+//   * `server.getConnections` reports the live accepted sockets; `net.BlockList.check`
+//     evaluates `addAddress` rules exactly and returns false for
+//     subnet/range rules (no netmask engine here).
+//   * `bytesRead`/`bytesWritten` count payload bytes this shim moved (the
+//     kernel's retransmissions/keep-alives are invisible).
+
+import EventEmitter from "@node/events";
+import { Duplex } from "@node/stream";
+
+// ---------------------------------------------------------------------------
+// Host bridge
+// ---------------------------------------------------------------------------
+
+/// Connect/argument failures that are thrown synchronously (Node's argument
+/// validation + the loopback-only rule); everything else is a transport
+/// failure and arrives as the socket's asynchronous 'error' event.
+const PIR_NET_SYNC_ERRORS = {
+  ERR_SOCKET_BAD_PORT: true,
+  ERR_INVALID_ARG_TYPE: true,
+  ERR_NOT_SUPPORTED: true,
+  ERR_INVALID_ARG_VALUE: true,
+  EINVAL: true,
+  ENOTFOUND: true,
+};
+
+function pirNetHost() {
+  return globalThis.__pir_host;
+}
+
+function pirNetHostCall(op, payload) {
+  const host = pirNetHost();
+  if (!host || typeof host.http !== "function") {
+    const error = new Error("node:net is not supported by the pir extension runtime (no host bridge)");
+    error.code = "ENOSYS";
+    throw error;
+  }
+  let raw;
+  try {
+    raw = host.http(op, JSON.stringify(payload));
+  } catch (thrown) {
+    const error = new Error("__pir_host.http threw for " + op + ": " + (thrown && thrown.message ? thrown.message : String(thrown)));
+    error.code = "EIO";
+    throw error;
+  }
+  let response;
+  try {
+    response = JSON.parse(raw);
+  } catch (parseError) {
+    const error = new Error("__pir_host.http returned invalid JSON: " + op);
+    error.code = "EIO";
+    throw error;
+  }
+  if (!response || response.ok !== true) {
+    const error = new Error((response && response.message) || ("__pir_host.http failed: " + op));
+    if (response && response.code !== undefined) error.code = response.code;
+    throw error;
+  }
+  return response.value;
+}
+
+function pirBytesToB64(bytes) {
+  // `Buffer.from(buffer)` copies (buffer_global.js.txt's fromView): encode a
+  // Buffer in place, keep the copy semantics for every other input. The only
+  // caller (`_pirWriteNow`, direct or queued replay) is handed a Buffer from
+  // `_write` in every branch.
+  return Buffer.isBuffer(bytes) ? bytes.toString("base64") : Buffer.from(bytes).toString("base64");
+}
+
+function pirB64ToBytes(base64) {
+  return base64 ? Buffer.from(base64, "base64") : Buffer.alloc(0);
+}
+
+function pirNetError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function pirNetUnsupported(message) {
+  return pirNetError("ERR_NOT_SUPPORTED", message);
+}
+
+function pirTick(fn, ...args) {
+  const tick = globalThis.__pirNextTick;
+  if (typeof tick === "function") {
+    tick(fn, ...args);
+    return;
+  }
+  Promise.resolve().then(() => fn(...args));
+}
+
+// ---------------------------------------------------------------------------
+// The pump: one ref-counted timer chain steps every live handle
+// ---------------------------------------------------------------------------
+
+const PIR_NET_TICK_MS = 5;
+/// Largest read window one pump step pulls from a socket (the next step
+/// continues; this is only a bound on one host round trip).
+const PIR_NET_READ_WINDOW = 262144;
+/// Accepted connections handled per server step (a burst is drained over a
+/// few steps instead of one unbounded loop).
+const PIR_NET_ACCEPT_BATCH = 16;
+
+const pirNetLive = new Set();
+let pirNetRefCount = 0;
+let pirNetPumpArmed = false;
+let pirNetPumpTimer = 0;
+
+function pirNetPumpKick(delay) {
+  if (pirNetPumpArmed || pirNetRefCount <= 0) return;
+  pirNetPumpArmed = true;
+  pirNetPumpTimer = globalThis.setTimeout(pirNetPumpTick, delay === undefined ? PIR_NET_TICK_MS : delay);
+}
+
+function pirNetPumpTick() {
+  pirNetPumpArmed = false;
+  pirNetPumpTimer = 0;
+  if (pirNetRefCount <= 0) return;
+  let progressed = false;
+  const handles = Array.from(pirNetLive);
+  for (const handle of handles) {
+    if (handle._pirLive !== true) continue;
+    try {
+      if (handle._pirStep() === true) progressed = true;
+    } catch (error) {
+      // A step never takes the whole loop down; the handle reports it.
+      handle._pirPumpThrew(error);
+    }
+  }
+  if (pirNetRefCount > 0) pirNetPumpKick(progressed ? 0 : PIR_NET_TICK_MS);
+}
+
+function pirNetRefAdd() {
+  pirNetRefCount += 1;
+  pirNetPumpKick(0);
+}
+
+function pirNetRefRelease() {
+  if (pirNetRefCount > 0) pirNetRefCount -= 1;
+  if (pirNetRefCount === 0 && pirNetPumpArmed) {
+    globalThis.clearTimeout(pirNetPumpTimer);
+    pirNetPumpArmed = false;
+    pirNetPumpTimer = 0;
+  }
+}
+
+/// Register a handle with the pump; a ref'd handle starts/keeps the chain.
+function pirNetRegister(handle, refed) {
+  handle._pirLive = true;
+  handle._pirRefed = refed !== false;
+  pirNetLive.add(handle);
+  if (handle._pirRefed) pirNetRefAdd();
+}
+
+/// Drop a handle from the pump (idempotent) and release its ref.
+function pirNetUnregister(handle) {
+  if (handle._pirLive !== true) return;
+  handle._pirLive = false;
+  pirNetLive.delete(handle);
+  if (handle._pirRefed) {
+    handle._pirRefed = false;
+    pirNetRefRelease();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Socket
+// ---------------------------------------------------------------------------
+
+class Socket extends Duplex {
+  constructor(options) {
+    const opts = options === undefined || options === null || typeof options !== "object" ? {} : options;
+    super({
+      allowHalfOpen: opts.allowHalfOpen === undefined ? false : Boolean(opts.allowHalfOpen),
+      // net.Socket hands the raw string to the native write (Node's socket
+      // keeps `decodeStrings: false`); the typecheck for a string with the
+      // internal 'buffer' encoding therefore lands in `_write` and throws
+      // "Second argument must be a buffer", exactly like Node's
+      // stream_base write.
+      decodeStrings: false,
+      readable: opts.readable,
+      writable: opts.writable,
+      readableHighWaterMark: opts.readableHighWaterMark,
+      writableHighWaterMark: opts.writableHighWaterMark,
+    });
+    this._pirHandleId = 0;
+    this._pirLive = false;
+    this._pirRefed = false;
+    this._pirConnected = false;
+    this._pirConnecting = false;
+    this._pirEofSeen = false;
+    this._pirReadable = opts.readable !== false;
+    this._pirWritable = opts.writable !== false;
+    this._pirTimeoutMs = 0;
+    this._pirLastActivity = Date.now();
+    this._pirWriteQueue = [];
+    this._pirOwnerServer = null;
+    this._pirNoDelay = false;
+    this._pirKeepAlive = false;
+    this._pirBytesRead = 0;
+    this._pirBytesWritten = 0;
+
+    this.connecting = false;
+    this.pending = true;
+    this.remoteAddress = undefined;
+    this.remotePort = undefined;
+    this.remoteFamily = undefined;
+    this.localAddress = undefined;
+    this.localPort = undefined;
+    this.localFamily = undefined;
+    this.timeout = 0;
+  }
+
+  get bytesRead() {
+    return this._pirBytesRead;
+  }
+
+  get bytesWritten() {
+    return this._pirBytesWritten;
+  }
+
+  // --- lifecycle -----------------------------------------------------------
+
+  /// Adopt a host socket (client connect result or server accept result).
+  _pirAdopt(info, ownerServer) {
+    this._pirHandleId = info.socketId;
+    this._pirConnected = true;
+    this._pirConnecting = false;
+    this.pending = false;
+    this.connecting = false;
+    this.remoteAddress = info.remoteAddress === undefined ? undefined : info.remoteAddress;
+    this.remotePort = info.remotePort === undefined ? undefined : info.remotePort;
+    this.remoteFamily = info.remoteFamily === undefined ? undefined : info.remoteFamily;
+    this.localAddress = info.localAddress === undefined ? undefined : info.localAddress;
+    this.localPort = info.localPort === undefined ? undefined : info.localPort;
+    this.localFamily = info.localAddress === undefined ? undefined : "IPv4";
+    this._pirOwnerServer = ownerServer === undefined ? null : ownerServer;
+    this._pirLastActivity = Date.now();
+    pirNetRegister(this, true);
+  }
+
+  _pirPumpThrew(error) {
+    if (this.destroyed) return;
+    this.emit("error", error);
+    this.destroy();
+  }
+
+  _pirTransportError(error) {
+    if (this.destroyed) return;
+    this.destroy(error);
+  }
+
+  _pirTouch() {
+    this._pirLastActivity = Date.now();
+  }
+
+  /// Whether the pump should pull bytes from the host right now: an explicit
+  /// pause() holds the reads (real TCP backpressure), and the readable
+  /// high-water mark bounds what the pad buffers for a consumer that is not
+  /// reading yet.
+  _pirReadGateOpen() {
+    if (this._pirHandleId === 0 || this._pirEofSeen) return false;
+    if (this._pirReadable !== true) return false;
+    const state = this._readableState;
+    if (state === undefined || state === null) return false;
+    if (state.paused === true) return false;
+    if (state.readable === false) return false;
+    return state.length < state.highWaterMark;
+  }
+
+  /// One pump step: drain the host read window, deliver EOF, fire the
+  /// inactivity timeout. Returns true when bytes moved.
+  _pirStep() {
+    if (this._pirHandleId === 0 || this.destroyed) return false;
+    let progressed = false;
+    if (this._pirReadGateOpen()) {
+      let info;
+      try {
+        info = pirNetHostCall("netRead", {
+          id: this._pirHandleId,
+          waitMs: 0,
+          maxBytes: PIR_NET_READ_WINDOW,
+        });
+      } catch (error) {
+        this._pirTransportError(error);
+        return false;
+      }
+      if (info.error) {
+        this._pirTransportError(pirNetError(info.error, "read " + info.error));
+        return false;
+      }
+      if (info.data) {
+        const bytes = pirB64ToBytes(info.data);
+        if (bytes.length > 0) {
+          this._pirBytesRead += bytes.length;
+          this._pirTouch();
+          progressed = true;
+          this.push(bytes);
+        }
+      }
+      if (info.eof === true && this._pirEofSeen !== true) {
+        this._pirEofSeen = true;
+        // The pad emits 'end' once the buffered bytes drain (and, with
+        // allowHalfOpen false, ends this side and closes).
+        this.push(null);
+      }
+    }
+    if (this._pirTimeoutMs > 0 && this._pirHandleId !== 0 && !this.destroyed) {
+      const now = Date.now();
+      if (now - this._pirLastActivity >= this._pirTimeoutMs) {
+        this._pirLastActivity = now;
+        this.emit("timeout");
+      }
+    }
+    return progressed;
+  }
+
+  _pirStepDone() {
+    return this._pirHandleId === 0;
+  }
+
+  // --- connect -------------------------------------------------------------
+
+  connect(...args) {
+    const normalized = pirNormalizeConnectArgs(args);
+    if (typeof normalized.callback === "function") this.once("connect", normalized.callback);
+    if (this._pirConnected || this._pirConnecting) {
+      throw pirNetError("ERR_SOCKET_ALREADY_CONNECTED", "Socket is already connected");
+    }
+    const options = normalized.options;
+    if (options.port === undefined || options.port === null) {
+      // `net.connect()`/`socket.connect()` with no target: Node's socket stays
+      // unconnected and reusable (`socket.connect(port)` later).
+      return this;
+    }
+    const port = Number(options.port);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      throw pirNetError("ERR_SOCKET_BAD_PORT", "options.port should be >= 0 and < 65536. Received " + String(options.port) + ".");
+    }
+    this._pirConnecting = true;
+    this.connecting = true;
+    this.pending = true;
+    let info;
+    try {
+      info = pirNetHostCall("netConnect", { port: port, host: options.host });
+    } catch (error) {
+      this.connecting = false;
+      this._pirConnecting = false;
+      this.pending = false;
+      if (PIR_NET_SYNC_ERRORS[error && error.code] === true) throw error;
+      // Node's transport failure shape: 'error' then 'close', asynchronously.
+      pirTick(() => {
+        this.destroy(error);
+      });
+      return this;
+    }
+    this._pirAdopt({
+      socketId: info.socketId,
+      remoteAddress: info.remoteAddress,
+      remotePort: info.remotePort,
+      remoteFamily: info.remoteFamily,
+      localAddress: info.localAddress,
+      localPort: info.localPort,
+    }, null);
+    // The host socket is connected already; 'connect' is still delivered on a
+    // tick (listeners attached after connect() must see it).
+    pirTick(() => {
+      if (this.destroyed) return;
+      this._pirFlushQueuedWrites();
+      this.emit("connect");
+    });
+    return this;
+  }
+
+  // --- writes --------------------------------------------------------------
+
+  _write(chunk, encoding, callback) {
+    if (typeof chunk === "string" && encoding === "buffer") {
+      // Node's native stream_base write rejects a string carrying the
+      // internal "already a buffer" encoding with exactly this shape.
+      const error = new TypeError("Second argument must be a buffer");
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    let bytes;
+    if (typeof chunk === "string") {
+      bytes = Buffer.from(chunk, encoding === undefined || encoding === null ? "utf8" : encoding);
+    } else if (Buffer.isBuffer(chunk)) {
+      bytes = chunk;
+    } else if (ArrayBuffer.isView(chunk)) {
+      bytes = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    } else {
+      const error = new TypeError("The \"chunk\" argument must be of type string or an instance of Buffer or Uint8Array");
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    if (!this._pirConnected || this._pirHandleId === 0) {
+      // Queued until connect (Node buffers writes on a connecting socket).
+      this._pirWriteQueue.push({ bytes: bytes, callback: callback });
+      return;
+    }
+    this._pirWriteNow(bytes, callback);
+  }
+
+  _pirWriteNow(bytes, callback) {
+    if (bytes.length === 0) {
+      if (typeof callback === "function") callback();
+      return;
+    }
+    let info;
+    try {
+      info = pirNetHostCall("netWrite", { id: this._pirHandleId, data: pirBytesToB64(bytes) });
+    } catch (error) {
+      if (typeof callback === "function") callback(error);
+      return;
+    }
+    if (info.bytes > 0) this._pirBytesWritten += info.bytes;
+    this._pirTouch();
+    if (info.blocked === true) {
+      const error = pirNetError("EAGAIN", "socket write stalled: the peer is not reading (wrote " + info.bytes + " of " + bytes.length + " bytes)");
+      if (typeof callback === "function") callback(error);
+      return;
+    }
+    if (typeof callback === "function") callback();
+  }
+
+  _pirFlushQueuedWrites() {
+    if (this._pirWriteQueue.length === 0) return;
+    const queued = this._pirWriteQueue;
+    this._pirWriteQueue = [];
+    for (const entry of queued) this._pirWriteNow(entry.bytes, entry.callback);
+  }
+
+  /// A drained socket that never connected (connect failed while writes were
+  /// queued): fail the first queued callback, which lets the writable
+  /// machinery reject the rest.
+  _pirFailQueuedWrites(error) {
+    if (this._pirWriteQueue.length === 0) return;
+    const queued = this._pirWriteQueue;
+    this._pirWriteQueue = [];
+    const first = queued[0];
+    if (typeof first.callback === "function") first.callback(error);
+  }
+
+  _final(callback) {
+    if (this._pirHandleId !== 0) {
+      try {
+        pirNetHostCall("netEnd", { id: this._pirHandleId });
+      } catch (error) {
+        if (typeof callback === "function") callback(error);
+        return;
+      }
+    }
+    if (typeof callback === "function") callback();
+  }
+
+  _destroy(error, callback) {
+    const id = this._pirHandleId;
+    this._pirHandleId = 0;
+    this._pirEofSeen = true;
+    this.pending = false;
+    this.connecting = false;
+    pirNetUnregister(this);
+    if (this._pirOwnerServer !== null) {
+      this._pirOwnerServer._pirForgetSocket(this);
+      this._pirOwnerServer = null;
+    }
+    if (id !== 0) {
+      try {
+        pirNetHostCall("netClose", { id: id });
+      } catch (ignored) {
+        // The host entry is already gone (server teardown): close is done.
+      }
+    }
+    this._pirFailQueuedWrites(error === undefined || error === null
+      ? pirNetError("ECONNRESET", "Socket was destroyed before the write was sent")
+      : error);
+    if (typeof callback === "function") callback(error === undefined ? null : error);
+  }
+
+  // --- read side -----------------------------------------------------------
+
+  /// The pad pulls through `read()`, but this socket's reader IS the pump: a
+  /// host read here would run with the pad's `sync` flag set, so its push
+  /// would buffer instead of flowing. `_read` therefore only asks the pump to
+  /// come back immediately (the next step lands within a tick).
+  _read(_size) {
+    if (this._pirHandleId === 0 || this.destroyed || this._pirEofSeen) return;
+    if (this._pirReadGateOpen()) pirNetPumpKick(0);
+  }
+
+  pause() {
+    super.pause();
+    return this;
+  }
+
+  resume() {
+    super.resume();
+    // A paused socket stopped its host reads; kick the pump so the first
+    // window lands without waiting for the next beat.
+    if (this._pirHandleId !== 0) pirNetPumpKick(0);
+    return this;
+  }
+
+  isPaused() {
+    const state = this._readableState;
+    return state === undefined ? false : state.paused === true;
+  }
+
+  // --- configuration -------------------------------------------------------
+
+  setTimeout(timeout, callback) {
+    if (typeof callback === "function") this.once("timeout", callback);
+    const ms = Number(timeout);
+    this.timeout = Number.isFinite(ms) && ms > 0 ? ms : 0;
+    this._pirTimeoutMs = this.timeout;
+    this._pirTouch();
+    return this;
+  }
+
+  setNoDelay(noDelay) {
+    const value = noDelay === undefined ? true : Boolean(noDelay);
+    this._pirNoDelay = value;
+    if (this._pirHandleId !== 0) {
+      try {
+        pirNetHostCall("netSetNoDelay", { id: this._pirHandleId, value: value });
+      } catch (error) {
+        if (this.destroyed) return this;
+        throw error;
+      }
+    }
+    return this;
+  }
+
+  setKeepAlive(enable, initialDelay) {
+    // The host socket surface exposes no SO_KEEPALIVE knob; the call shape is
+    // kept (Node's setKeepAlive is a configuration call, not an operation) and
+    // the OS default stays in force.
+    this._pirKeepAlive = enable === undefined ? true : Boolean(enable);
+    if (initialDelay !== undefined && this._pirKeepAlive) this._pirKeepAliveDelay = Number(initialDelay);
+    return this;
+  }
+
+  address() {
+    if (this.localPort === undefined) return null;
+    return { address: this.localAddress, family: this.localFamily || "IPv4", port: this.localPort };
+  }
+
+  ref() {
+    if (this._pirLive === true && this._pirRefed !== true) {
+      this._pirRefed = true;
+      pirNetRefAdd();
+    }
+    return this;
+  }
+
+  unref() {
+    if (this._pirLive === true && this._pirRefed === true) {
+      this._pirRefed = false;
+      pirNetRefRelease();
+    }
+    return this;
+  }
+
+  /// Node 18+ name; same as destroy here (no pending request to flush).
+  resetAndDestroy() {
+    return this.destroy();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+class Server extends EventEmitter {
+  constructor(options, connectionListener) {
+    super();
+    if (typeof options === "function") {
+      connectionListener = options;
+      options = undefined;
+    }
+    const opts = options === undefined || options === null || typeof options !== "object" ? {} : options;
+    this.allowHalfOpen = opts.allowHalfOpen === undefined ? false : Boolean(opts.allowHalfOpen);
+    this._pirHandleId = 0;
+    this._pirLive = false;
+    this._pirRefed = false;
+    this._pirPort = undefined;
+    this._pirAddress = undefined;
+    this._pirFamily = undefined;
+    this._pirConnections = new Set();
+    this._pirClosing = false;
+    this._pirClosePending = false;
+    this.listening = false;
+    this.maxConnections = undefined;
+    if (typeof connectionListener === "function") this.on("connection", connectionListener);
+  }
+
+  listen(...args) {
+    const normalized = pirNormalizeListenArgs(args);
+    if (typeof normalized.callback === "function") this.once("listening", normalized.callback);
+    if (this._pirHandleId !== 0 || this.listening) {
+      throw pirNetError("ERR_SERVER_ALREADY_LISTEN", "Listen method has been called more than once without closing.");
+    }
+    const options = normalized.options;
+    if (options.path !== undefined) {
+      throw pirNetUnsupported("node:net in pir does not support Unix-domain sockets (`path`)");
+    }
+    const port = options.port === undefined ? 0 : Number(options.port);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      throw pirNetError("ERR_SOCKET_BAD_PORT", "options.port should be >= 0 and < 65536. Received " + String(options.port) + ".");
+    }
+    let info;
+    try {
+      info = pirNetHostCall("netListen", { port: port, host: options.host });
+    } catch (error) {
+      this.listening = false;
+      throw error;
+    }
+    this._pirHandleId = info.id;
+    this._pirPort = info.port;
+    this._pirAddress = info.address;
+    this._pirFamily = info.family;
+    this.listening = true;
+    this._pirClosing = false;
+    pirNetRegister(this, true);
+    pirTick(() => {
+      if (this._pirHandleId === 0) return;
+      this.emit("listening");
+    });
+    return this;
+  }
+
+  _pirStep() {
+    if (this._pirHandleId === 0 || this._pirClosing) return false;
+    let progressed = false;
+    for (let i = 0; i < PIR_NET_ACCEPT_BATCH; i++) {
+      let info;
+      try {
+        info = pirNetHostCall("netAccept", { id: this._pirHandleId, waitMs: 0 });
+      } catch (error) {
+        if (error && error.code === "ESRCH") {
+          // The host entry was released (close raced this step).
+          this._pirHandleId = 0;
+          pirNetUnregister(this);
+          return progressed;
+        }
+        this.emit("error", error);
+        return progressed;
+      }
+      if (!info || !info.socketId) break;
+      const socket = new Socket({ allowHalfOpen: this.allowHalfOpen });
+      socket._pirAdopt(info, this);
+      this._pirConnections.add(socket);
+      socket.once("close", () => {
+        this._pirForgetSocket(socket);
+      });
+      this.emit("connection", socket);
+      progressed = true;
+    }
+    return progressed;
+  }
+
+  _pirPumpThrew(error) {
+    this.emit("error", error);
+  }
+
+  _pirForgetSocket(socket) {
+    this._pirConnections.delete(socket);
+    if (this._pirClosing && this._pirConnections.size === 0) this._pirFinishClose();
+  }
+
+  /// `server.close()` waits for the live connections to end (Node's contract);
+  /// the listening socket is released immediately so the port frees up, and the
+  /// server's own ref is dropped at once — after `close()` only the accepted
+  /// sockets hold the loop (Node: the listening handle is gone).
+  close(callback) {
+    if (typeof callback === "function") this.once("close", callback);
+    if (this._pirClosing) return this;
+    this._pirClosing = true;
+    this.listening = false;
+    if (this._pirHandleId !== 0) {
+      const id = this._pirHandleId;
+      this._pirHandleId = 0;
+      try {
+        pirNetHostCall("netServerClose", { id: id });
+      } catch (ignored) {
+        // ESRCH: already released.
+      }
+    }
+    pirNetUnregister(this);
+    if (this._pirConnections.size === 0) {
+      pirTick(() => this._pirFinishClose());
+    }
+    return this;
+  }
+
+  _pirFinishClose() {
+    if (this._pirClosePending) return;
+    this._pirClosePending = true;
+    this._pirClosing = false;
+    this._pirPort = undefined;
+    this._pirAddress = undefined;
+    this._pirFamily = undefined;
+    this.emit("close");
+  }
+
+  /// Node's closeAllConnections (18+): destroy every live accepted socket.
+  closeAllConnections() {
+    for (const socket of Array.from(this._pirConnections)) socket.destroy();
+    return this;
+  }
+
+  /// Node's closeIdleConnections: every connection in this tier is live from
+  /// the kernel's point of view, so the call keeps its shape.
+  closeIdleConnections() {
+    return this;
+  }
+
+  address() {
+    if (this._pirPort === undefined) return null;
+    return { address: this._pirAddress, family: this._pirFamily, port: this._pirPort };
+  }
+
+  getConnections(callback) {
+    if (typeof callback !== "function") {
+      throw pirNetError("ERR_INVALID_ARG_TYPE", "The \"callback\" argument must be of type function");
+    }
+    const count = this._pirConnections.size;
+    pirTick(() => callback(null, count));
+    return this;
+  }
+
+  ref() {
+    if (this._pirLive === true && this._pirRefed !== true) {
+      this._pirRefed = true;
+      pirNetRefAdd();
+    }
+    return this;
+  }
+
+  unref() {
+    if (this._pirLive === true && this._pirRefed === true) {
+      this._pirRefed = false;
+      pirNetRefRelease();
+    }
+    return this;
+  }
+
+  setTimeout(_ms, _callback) {
+    // Connections carry their own timeout in this tier; the server-level call
+    // shape is kept.
+    return this;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Argument normalization
+// ---------------------------------------------------------------------------
+
+/// `connect(port[, host][, cb])` / `connect(options[, cb])`.
+function pirNormalizeConnectArgs(args) {
+  const list = Array.prototype.slice.call(args);
+  let callback = null;
+  if (list.length > 0 && typeof list[list.length - 1] === "function") callback = list.pop();
+  let options = {};
+  if (list.length > 0 && list[0] !== null && typeof list[0] === "object") {
+    options = list[0];
+  } else if (list.length > 0 && (typeof list[0] === "number" || typeof list[0] === "string")) {
+    options = { port: list[0] };
+    if (list.length > 1 && (typeof list[1] === "string" || list[1] === null || list[1] === undefined)) {
+      options.host = list[1];
+    }
+  } else if (list.length > 0) {
+    throw new TypeError("The \"options\" argument must be of type object or a port number");
+  }
+  if (options.path !== undefined) {
+    throw pirNetUnsupported("node:net in pir does not support Unix-domain sockets (`path`)");
+  }
+  return { options: options, callback: callback };
+}
+
+/// `listen(port[, host][, cb])` / `listen(options[, cb])`.
+function pirNormalizeListenArgs(args) {
+  const list = Array.prototype.slice.call(args);
+  let callback = null;
+  if (list.length > 0 && typeof list[list.length - 1] === "function") callback = list.pop();
+  let options = {};
+  if (list.length > 0 && list[0] !== null && typeof list[0] === "object") {
+    options = list[0];
+  } else if (list.length > 0) {
+    options = { port: list[0] };
+    if (list.length > 1 && typeof list[1] === "string") options.host = list[1];
+  }
+  if (options.handle !== undefined || options.fd !== undefined) {
+    throw pirNetUnsupported("node:net in pir does not support listening on an existing handle/fd");
+  }
+  return { options: options, callback: callback };
+}
+
+// ---------------------------------------------------------------------------
+// Module surface
+// ---------------------------------------------------------------------------
+
+function createServer(options, connectionListener) {
+  return new Server(options, connectionListener);
+}
+
+function createConnection(...args) {
+  const socket = new Socket();
+  if (args.length === 0) return socket;
+  return socket.connect(...args);
+}
+
+const connect = createConnection;
+
+// Deprecated aliases of Socket kept for load compatibility.
+const Stream = Socket;
+const BoundSocket = Socket;
+
+// Real isIP semantics: 4/6 for a valid literal, 0 otherwise. Leading zeros
+// in IPv4 octets and bare 7-group IPv6 are rejected like Node's.
+function pirIsIPv4(text) {
+  const parts = text.split(".");
+  if (parts.length !== 4) return false;
+  for (const part of parts) {
+    if (part.length === 0 || part.length > 3) return false;
+    if (part.length > 1 && part.charCodeAt(0) === 48) return false;
+    let value = 0;
+    for (let i = 0; i < part.length; i++) {
+      const code = part.charCodeAt(i);
+      if (code < 48 || code > 57) return false;
+      value = value * 10 + (code - 48);
+    }
+    if (value > 255) return false;
+  }
+  return true;
+}
+
+function pirIsIPv6(text) {
+  if (text.length < 2) return false;
+  // A zone suffix ("%eth0") rides the link-local form; strip before parsing.
+  const zone = text.indexOf("%");
+  if (zone !== -1) {
+    if (zone === 0 || zone === text.length - 1) return false;
+    text = text.slice(0, zone);
+  }
+  const doubleAt = text.indexOf("::");
+  if (doubleAt !== -1 && text.indexOf("::", doubleAt + 2) !== -1) return false;
+  let groups;
+  if (doubleAt !== -1) {
+    const head = text.slice(0, doubleAt);
+    const tail = text.slice(doubleAt + 2);
+    groups = (head === "" ? [] : head.split(":")).concat(tail === "" ? [] : tail.split(":"));
+  } else {
+    groups = text.split(":");
+  }
+  let count = 0;
+  for (let i = 0; i < groups.length; i++) {
+    const group = groups[i];
+    if (group === "") return false;
+    if (i === groups.length - 1 && group.indexOf(".") !== -1) {
+      // Embedded IPv4 tail counts as two groups (::ffff:127.0.0.1).
+      if (!pirIsIPv4(group)) return false;
+      count += 2;
+      continue;
+    }
+    if (group.length > 4) return false;
+    for (let k = 0; k < group.length; k++) {
+      const code = group.charCodeAt(k);
+      const isHex = (code >= 48 && code <= 57) || (code >= 97 && code <= 102) || (code >= 65 && code <= 70);
+      if (!isHex) return false;
+    }
+    count += 1;
+  }
+  if (doubleAt !== -1) return count <= 7;
+  return count === 8;
+}
+
+function isIP(value) {
+  if (typeof value !== "string" || value.length === 0) return 0;
+  if (pirIsIPv4(value)) return 4;
+  if (pirIsIPv6(value)) return 6;
+  return 0;
+}
+
+// Node's SocketAddress holds address/port/family and nothing else.
+class SocketAddress {
+  constructor(options) {
+    const opts = options === undefined || options === null ? {} : options;
+    this.address = opts.address === undefined ? undefined : String(opts.address);
+    this.port = opts.port === undefined ? undefined : Number(opts.port);
+    this.family = opts.family === undefined ? undefined : String(opts.family);
+  }
+
+  static parse(input) {
+    if (input === undefined || input === null) return undefined;
+    if (input instanceof SocketAddress) return input;
+    if (typeof input === "string") {
+      const text = input.trim();
+      // "host:port" / "[v6]:port" / "port".
+      const bracketed = /^\[(.+)\]:(\d+)$/.exec(text);
+      if (bracketed) {
+        return new SocketAddress({ address: bracketed[1], port: Number(bracketed[2]), family: "ipv6" });
+      }
+      if (/^\d+$/.test(text)) {
+        return new SocketAddress({ address: "127.0.0.1", port: Number(text), family: "ipv4" });
+      }
+      const hostPort = /^(.*):(\d+)$/.exec(text);
+      if (hostPort) {
+        const family = pirIsIPv4(hostPort[1]) ? "ipv4" : pirIsIPv6(hostPort[1]) ? "ipv6" : undefined;
+        return new SocketAddress({ address: hostPort[1], port: Number(hostPort[2]), family: family });
+      }
+      const family = pirIsIPv4(text) ? "ipv4" : pirIsIPv6(text) ? "ipv6" : undefined;
+      return new SocketAddress({ address: text, port: undefined, family: family });
+    }
+    if (typeof input === "object") {
+      return new SocketAddress(input);
+    }
+    throw new TypeError("The \"input\" argument must be of type string or an instance of SocketAddress");
+  }
+
+  toJSON() {
+    return { address: this.address, port: this.port, family: this.family };
+  }
+}
+
+class BlockList {
+  constructor() {
+    this._entries = [];
+  }
+
+  addAddress(address, type) {
+    this._entries.push({
+      kind: "address",
+      address: String(address),
+      type: type === undefined ? (isIP(address) === 6 ? "ipv6" : "ipv4") : type,
+    });
+  }
+
+  addSubnet(netPrefix, prefixLength, type) {
+    this._entries.push({
+      kind: "subnet",
+      netPrefix: String(netPrefix),
+      prefixLength: prefixLength,
+      type: type === undefined ? (isIP(netPrefix) === 6 ? "ipv6" : "ipv4") : type,
+    });
+  }
+
+  addRange(start, end, type) {
+    this._entries.push({
+      kind: "range",
+      start: String(start),
+      end: String(end),
+      type: type === undefined ? (isIP(start) === 6 ? "ipv6" : "ipv4") : type,
+    });
+  }
+
+  check(address, type) {
+    const text = String(address);
+    const want = type === undefined ? undefined : String(type);
+    for (const entry of this._entries) {
+      if (entry.kind !== "address") continue;
+      if (entry.address !== text) continue;
+      if (want !== undefined && entry.type !== want) continue;
+      return true;
+    }
+    // Subnet/range rules are recorded but this tier has no netmask engine: an
+    // unresolvable check returns false (documented), never a guess.
+    return false;
+  }
+
+  get rulesCount() {
+    return this._entries.length;
+  }
+}
+
+function _createServerHandle(..._args) {
+  throw pirNetUnsupported("node:net in pir listens through Server#listen only (_createServerHandle is internal)");
+}
+
+function _normalizeArgs(args) {
+  if (args.length === 0) return [{}, null];
+  const list = Array.prototype.slice.call(args);
+  const last = list[list.length - 1];
+  const options = last !== null && typeof last === "object" ? list.pop() : {};
+  return [options, list.length === 0 ? null : list.length === 1 ? list[0] : list];
+}
+
+const defaultAutoSelectFamilyState = { enabled: true, attemptTimeout: 250 };
+
+function getDefaultAutoSelectFamily() {
+  return defaultAutoSelectFamilyState.enabled;
+}
+
+function setDefaultAutoSelectFamily(value) {
+  if (typeof value !== "boolean") {
+    throw new TypeError("The \"value\" argument must be of type boolean");
+  }
+  defaultAutoSelectFamilyState.enabled = value;
+}
+
+function getDefaultAutoSelectFamilyAttemptTimeout() {
+  return defaultAutoSelectFamilyState.attemptTimeout;
+}
+
+function setDefaultAutoSelectFamilyAttemptTimeout(value) {
+  if (typeof value !== "number" || (value | 0) !== value || value <= 0) {
+    throw new TypeError("The \"value\" argument must be a positive integer");
+  }
+  defaultAutoSelectFamilyState.attemptTimeout = value;
+}
+
+const net = {
+  isIP: isIP,
+  isIPv4: pirIsIPv4,
+  isIPv6: pirIsIPv6,
+  Socket: Socket,
+  Server: Server,
+  SocketAddress: SocketAddress,
+  BlockList: BlockList,
+  Stream: Stream,
+  BoundSocket: BoundSocket,
+  _createServerHandle: _createServerHandle,
+  _normalizeArgs: _normalizeArgs,
+  createServer: createServer,
+  createConnection: createConnection,
+  connect: connect,
+  getDefaultAutoSelectFamily: getDefaultAutoSelectFamily,
+  setDefaultAutoSelectFamily: setDefaultAutoSelectFamily,
+  getDefaultAutoSelectFamilyAttemptTimeout: getDefaultAutoSelectFamilyAttemptTimeout,
+  setDefaultAutoSelectFamilyAttemptTimeout: setDefaultAutoSelectFamilyAttemptTimeout,
+};
+
+export default net;
+export { isIP, Socket, Server, SocketAddress, createServer, createConnection, connect };
+export { BlockList, BoundSocket, Stream, _createServerHandle, _normalizeArgs };
+export { getDefaultAutoSelectFamily, setDefaultAutoSelectFamily };
+export { getDefaultAutoSelectFamilyAttemptTimeout, setDefaultAutoSelectFamilyAttemptTimeout };
+export { pirIsIPv4 as isIPv4, pirIsIPv6 as isIPv6 };

@@ -1,0 +1,297 @@
+// node:vm — minimal real via a JS-layer same-realm sandbox approximation.
+//
+// Route decision (HANDOFF.md §2.3): QuickJS realms-within-a-runtime
+// exist, but the shim layer cannot reach them from JS — the host bridge
+// (`__pir_host.node`) is JSON-only, so a second rquickjs Context would
+// serialize every value across the bridge and lose exactly what real vm
+// consumers pass in: function-valued sandbox members (pi-subagents'
+// `emit()`/`console`) and the shared-realm object identity its argument
+// validation relies on (`runInContext("Object.prototype", ctx)`). So the
+// sandbox is approximated in-engine:
+//
+//   `with (sandboxView) { return eval(code) }` compiled in a sloppy runner,
+//   where sandboxView is a Proxy whose `has` only claims names present on
+//   the sandbox, the seeded intrinsic snapshot, or `globalThis`. Unknown
+//   unqualified names fall through to the runner's parameter shield (every
+//   host global name bound to `undefined`), so host globals read as
+//   `undefined` inside the vm — the same observable isolation real Node's
+//   fresh-context intrinsics give.
+//
+// NOT PROVIDED (permanent boundary): true context isolation. This is the
+// same engine realm — seeded builtins are host objects, their constructors
+// (`({}).constructor.constructor`, async-arrow `.constructor`) build host
+// functions, and `codeGeneration.strings` cannot be enforced. Documented
+// divergence from real Node vm:
+//   - top-level `var`/function declarations bind in the runner's transient
+//     scope: they work within a single run but do not materialize on the
+//     sandbox object nor survive to later runInContext calls;
+//   - implicit-global assignment (`x = 1` without declaration) escapes to
+//     the host global instead of the sandbox;
+//   - `let`/`const`/`class` at script top level are scoped to the single
+//     run (Node keeps them in the context's global lexical scope);
+//   - options (`timeout`, `codeGeneration`, `cachedData`, …) are accepted
+//     and ignored — no synchronous interrupt exists in-engine.
+
+function pirVmUnsupported(api) {
+  const error = new Error("node:vm." + api + " is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+// ---------------------------------------------------------------------------
+// The seeded intrinsic snapshot: exactly what real Node exposes in a fresh vm
+// context (audited against Node v24 `Object.getOwnPropertyNames(globalThis)`
+// from inside `runInNewContext`), intersected with what this engine has.
+// Frozen container; values stay host-realm (same realm — by design).
+// ---------------------------------------------------------------------------
+
+var VM_INTRINSIC_NAMES = [
+  "AggregateError", "Array", "ArrayBuffer", "Atomics", "BigInt", "BigInt64Array",
+  "BigUint64Array", "Boolean", "DataView", "Date", "Error", "EvalError",
+  "FinalizationRegistry", "Float16Array", "Float32Array", "Float64Array",
+  "Function", "Infinity", "Int16Array", "Int32Array", "Int8Array", "Intl",
+  "Iterator", "JSON", "Map", "Math", "NaN", "Number", "Object", "Promise",
+  "Proxy", "RangeError", "ReferenceError", "Reflect", "RegExp", "Set",
+  "SharedArrayBuffer", "String", "SuppressedError", "Symbol", "SyntaxError",
+  "TypeError", "URIError", "Uint16Array", "Uint32Array", "Uint8Array",
+  "Uint8ClampedArray", "WeakMap", "WeakRef", "WeakSet", "WebAssembly",
+  "console", "decodeURI", "decodeURIComponent", "encodeURI", "encodeURIComponent",
+  "escape", "eval", "isFinite", "isNaN", "parseFloat", "parseInt", "undefined",
+  "unescape",
+];
+
+var VM_ID_RX = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+function vmSnapshotGlobals() {
+  const seeded = Object.create(null);
+  const host = globalThis;
+  for (let i = 0; i < VM_INTRINSIC_NAMES.length; i++) {
+    const name = VM_INTRINSIC_NAMES[i];
+    if (name === "globalThis") continue; // always shadowed by the view proxy
+    if (name in host) seeded[name] = host[name];
+  }
+  return Object.freeze(seeded);
+}
+
+// ---------------------------------------------------------------------------
+// Context records: sandbox object ↔ view proxy ↔ per-sandbox runner.
+// ---------------------------------------------------------------------------
+
+const contextBySandbox = new WeakMap(); // sandbox -> { seeded, view, run }
+const sandboxByProxy = new WeakMap(); // view proxy -> sandbox
+
+function vmViewProxy(sandbox, seeded) {
+  const handler = {
+    has(_target, key) {
+      return key === "globalThis" || key in sandbox || key in seeded;
+    },
+    get(_target, key) {
+      if (key === Symbol.unscopables) return undefined;
+      if (key === "globalThis") {
+        if (sandbox !== null && typeof sandbox === "object" && "globalThis" in sandbox) return sandbox.globalThis;
+        return view;
+      }
+      if (key in sandbox) return sandbox[key];
+      if (key in seeded) return seeded[key];
+      return undefined;
+    },
+    set(_target, key, value) {
+      sandbox[key] = value;
+      return true;
+    },
+    defineProperty(_target, key, desc) {
+      Object.defineProperty(sandbox, key, desc);
+      return true;
+    },
+    deleteProperty(_target, key) {
+      delete sandbox[key];
+      return true;
+    },
+    getOwnPropertyDescriptor(_target, key) {
+      // Normalized to configurable:true — the (empty) proxy target must not
+      // trip proxy invariants for sandbox properties frozen by the host.
+      const desc = Object.getOwnPropertyDescriptor(sandbox, key);
+      if (!desc) return undefined;
+      const clone = Object.assign({}, desc);
+      clone.configurable = true;
+      return clone;
+    },
+    ownKeys() {
+      return Reflect.ownKeys(sandbox);
+    },
+  };
+  // The `get` trap hands `globalThis` back as the view itself; the closure
+  // below resolves once the proxy exists (traps only fire afterwards).
+  const view = new Proxy(Object.create(null), handler);
+  return view;
+}
+
+function vmMakeRunner(sandbox) {
+  // Parameter shield: every host global name bound to `undefined`, so
+  // unqualified host globals read as undefined inside the vm. The view proxy
+  // claims sandbox/seeded/globalThis names first, so seeded intrinsics keep
+  // their real values.
+  const host = globalThis;
+  const names = Object.getOwnPropertyNames(host);
+  const params = [];
+  for (let i = 0; i < names.length; i++) {
+    if (VM_ID_RX.test(names[i])) params.push(names[i]);
+  }
+  params.push("__pirVmCtx", "__pirVmCode");
+  const args = new Array(params.length);
+  for (let i = 0; i < params.length; i++) args[i] = undefined;
+  // Sloppy function body: `with` is illegal in this module's strict code, so
+  // the runner is built as a Function-constructor body. Direct eval inside a
+  // with-scope resolves unqualified names through the view proxy and returns
+  // the program completion value (real Script semantics).
+  const runner = new Function(
+    params.join(","),
+    "with (__pirVmCtx) {\nreturn eval(__pirVmCode);\n}",
+  );
+  const view = contextBySandbox.get(sandbox).view;
+  return function run(code) {
+    // The last two params are `__pirVmCtx, __pirVmCode` (see params above).
+    const callArgs = args.slice();
+    callArgs[callArgs.length - 2] = view;
+    callArgs[callArgs.length - 1] = code;
+    return runner.apply(view, callArgs);
+  };
+}
+
+const runnerBySandbox = new WeakMap();
+
+function vmRunnerFor(sandbox) {
+  let run = runnerBySandbox.get(sandbox);
+  if (!run) {
+    run = vmMakeRunner(sandbox);
+    runnerBySandbox.set(sandbox, run);
+  }
+  return run;
+}
+
+function createContext(sandbox, options) {
+  if (sandbox === undefined || sandbox === null) sandbox = {};
+  if (typeof sandbox !== "object") {
+    throw new TypeError("vm.createContext: the sandbox argument must be an object");
+  }
+  const existing = contextBySandbox.get(sandbox);
+  if (existing) return sandbox; // real Node re-contextifying is a no-op too
+  const seeded = vmSnapshotGlobals();
+  const view = vmViewProxy(sandbox, seeded);
+  contextBySandbox.set(sandbox, { seeded: seeded, view: view });
+  sandboxByProxy.set(view, sandbox);
+  return sandbox;
+}
+
+function isContext(object) {
+  if (object === null || (typeof object !== "object" && typeof object !== "function")) return false;
+  return contextBySandbox.has(object) || sandboxByProxy.has(object);
+}
+
+function vmResolveContext(contextified) {
+  if (contextified !== null && typeof contextified === "object") {
+    if (contextBySandbox.has(contextified)) return contextified;
+    if (sandboxByProxy.has(contextified)) return sandboxByProxy.get(contextified);
+  }
+  const error = new TypeError(
+    'The "contextifiedObject" argument must be an vm.Context. ' +
+    "Received an instance of " + (contextified === null ? "null" : typeof contextified),
+  );
+  error.code = "ERR_INVALID_ARG_TYPE";
+  throw error;
+}
+
+function runInContext(code, contextified, options) {
+  return vmRunnerFor(vmResolveContext(contextified))(code);
+}
+
+function runInNewContext(code, sandbox, options) {
+  const contextified = createContext(sandbox);
+  return vmRunnerFor(contextified)(code);
+}
+
+function runInThisContext(code, options) {
+  // Real Node semantics: run as a Program in the *current* global. Indirect
+  // eval is the closest same-realm equivalent (completion value included).
+  return (0, eval)(code);
+}
+
+// ---------------------------------------------------------------------------
+// Script / remaining surface.
+// ---------------------------------------------------------------------------
+
+class Script {
+  constructor(code, options) {
+    if (typeof code !== "string") {
+      throw new TypeError("vm.Script: the code argument must be a string");
+    }
+    // Eager syntax validation: a Function-body parse accepts a superset of
+    // the Program grammar (top-level `return`), but every Program
+    // SyntaxError trips here too — good enough for consumers that expect
+    // Script construction to surface syntax errors (pi-subagents).
+    new Function(code); // eslint-disable-line no-new-func
+    this.__pirCode = code;
+    this.__pirFilename = options && typeof options.filename === "string" ? options.filename : undefined;
+  }
+  runInContext(contextified, options) {
+    return runInContext(this.__pirCode, contextified, options);
+  }
+  runInNewContext(sandbox, options) {
+    return runInNewContext(this.__pirCode, sandbox, options);
+  }
+  runInThisContext(options) {
+    return runInThisContext(this.__pirCode, options);
+  }
+}
+
+function createScript(code, options) {
+  return new Script(code, options);
+}
+
+// Minimal real: compiles without sandbox scoping (host function semantics);
+// real Node also exposes no context binding here by default.
+function compileFunction(code, params, options) {
+  const names = Array.isArray(params) ? params.map(String) : [];
+  return new Function(names.join(","), String(code));
+}
+
+// ES-module-in-vm remains a permanent boundary (unenv parity).
+class SourceTextModule {
+  constructor() {
+    throw pirVmUnsupported("SourceTextModule");
+  }
+}
+
+class SyntheticModule {
+  constructor() {
+    throw pirVmUnsupported("SyntheticModule");
+  }
+}
+
+function measureMemory(_options) {
+  return Promise.reject(pirVmUnsupported("measureMemory"));
+}
+
+const constants = Object.freeze({});
+
+const vm = {
+  Script: Script,
+  SourceTextModule: SourceTextModule,
+  SyntheticModule: SyntheticModule,
+  compileFunction: compileFunction,
+  constants: constants,
+  createContext: createContext,
+  createScript: createScript,
+  isContext: isContext,
+  measureMemory: measureMemory,
+  runInContext: runInContext,
+  runInNewContext: runInNewContext,
+  runInThisContext: runInThisContext,
+};
+
+export default vm;
+export {
+  Script, SourceTextModule, SyntheticModule, compileFunction, constants, createContext as createContext,
+  createScript, isContext, measureMemory, runInContext as runInContext, runInNewContext as runInNewContext,
+  runInThisContext as runInThisContext,
+};

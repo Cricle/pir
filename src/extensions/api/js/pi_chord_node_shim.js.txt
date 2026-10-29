@@ -1,0 +1,55 @@
+// @earendil-works/chord/node — throws tier.
+//
+// Upstream `packages/chord/src/node.ts` is the Node-only half of Chord: the
+// facet module loader (`nodeLoader`, `node:module` `registerHooks` + a
+// `chord2-reload` query carrying fresh module copies) and the child-host
+// manager (`forkDriver`/`createHostManager`/`childControl`/`processLock` over
+// `node:child_process` fork + IPC and a net-address kernel lock). pir's
+// extension host is single-process and has no fork/IPC child-host transport, no
+// `registerHooks`, and no net process lock, so these entry points cannot be
+// emulated — and they should not be: upstream's own loader documents that its
+// in-process reload never evicts the old module copies ("they leak until the
+// process exits. TUI plugins need isolation, which this loader does not
+// provide").
+//
+// Every exported value throws the runtime's standard unsupported error (unified
+// wording + `code`), so an extension that imports this entry links successfully
+// and fails with a nameable error at first use instead of at load time.
+// `Facet` objects and `FacetLoader` remain ordinary values in the root entry:
+// `createHost({ loader })` accepts any in-process loader an extension supplies.
+function chordNodeUnsupported(api) {
+  const error = new Error(
+    "@earendil-works/chord/node." +
+      api +
+      " is not supported by the pir extension runtime (the extension host is single-process: no fork/IPC child hosts, no node:module registerHooks, no net process lock)",
+  );
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+/** Upstream `nodeLoader`: re-imports facet modules under a `chord2-reload` query via `registerHooks`. */
+export function nodeLoader() {
+  throw chordNodeUnsupported("nodeLoader");
+}
+
+/** Upstream `processLock(name)`: a kernel lock held for the process lifetime. */
+export async function processLock() {
+  throw chordNodeUnsupported("processLock");
+}
+
+/** Upstream `forkDriver(options)`: spawns detached child hosts and speaks Chord frames over IPC. */
+export function forkDriver() {
+  throw chordNodeUnsupported("forkDriver");
+}
+
+/** Upstream `createHostManager(options)`: supervises one child-host process (status, restarts, shutdown). */
+export function createHostManager() {
+  throw chordNodeUnsupported("createHostManager");
+}
+
+/** Upstream `childControl(process)`: the child side of the manager protocol (`init`/`lock`/`ready`/`fatal`). */
+export function childControl() {
+  throw chordNodeUnsupported("childControl");
+}
+
+export default { nodeLoader, processLock, forkDriver, createHostManager, childControl };

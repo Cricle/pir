@@ -1,0 +1,74 @@
+// node:inspector / node:inspector/promises — minimal tier: the Session
+// skeleton (connect/disconnect are no-ops, `post` throws the unified error —
+// there is no V8 inspector protocol host), and the module-level `console`
+// passes through to the runtime console (inspector consoles are the same
+// output channel here). The promises variant makes `post` reject instead of
+// throwing. `url()`/`waitForDebugger()` report the honest inactive values.
+import { EventEmitter } from "@node/events";
+
+function inspectorUnsupported(api) {
+  const error = new Error("node:inspector." + api + " is not supported by the pir extension runtime (no V8 inspector protocol host)");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
+class Session extends EventEmitter {
+  constructor() {
+    super();
+    this._connected = false;
+  }
+  connect() {
+    this._connected = false;
+    throw inspectorUnsupported("Session.connect");
+  }
+  connectToMainThread() {
+    throw inspectorUnsupported("Session.connectToMainThread");
+  }
+  disconnect() {
+    // Honest no-op when never connected (Node tolerates this too).
+    this._connected = false;
+  }
+  post(method, _params) {
+    throw inspectorUnsupported("Session.post(\"" + String(method) + "\")");
+  }
+}
+
+// The console domain of the module: pass-through to the runtime console.
+const consoleFace = globalThis.console;
+
+// Singletons in real Node (the Network/DOMStorage domains); inert here.
+const network = new EventEmitter();
+const domStorage = new EventEmitter();
+const networkResources = new Map();
+
+function open(..._args) {
+  throw inspectorUnsupported("open");
+}
+
+function close(..._args) {
+  throw inspectorUnsupported("close");
+}
+
+function url() {
+  // Not listening: Node returns undefined in this state.
+  return undefined;
+}
+
+function waitForDebugger() {
+  return 0;
+}
+
+const inspectorModule = {
+  Session: Session,
+  console: consoleFace,
+  Network: network,
+  NetworkResources: networkResources,
+  DOMStorage: domStorage,
+  open: open,
+  close: close,
+  url: url,
+  waitForDebugger: waitForDebugger,
+};
+
+export default inspectorModule;
+export { Session, consoleFace as console, network as Network, networkResources as NetworkResources, domStorage as DOMStorage, open, close, url, waitForDebugger };
