@@ -531,9 +531,7 @@ impl KeyCombo {
         };
         let code_matches = code == combo.code
             || match (code, combo.code) {
-                (KeyCode::Char(left), KeyCode::Char(right)) => {
-                    left.eq_ignore_ascii_case(&right)
-                }
+                (KeyCode::Char(left), KeyCode::Char(right)) => left.eq_ignore_ascii_case(&right),
                 _ => false,
             };
         if !code_matches {

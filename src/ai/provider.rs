@@ -483,8 +483,10 @@ impl ProviderRegistry {
             .dynamic
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dynamic_ids: std::collections::HashSet<String> =
-            dynamic.values().map(|provider| provider.id().to_owned()).collect();
+        let dynamic_ids: std::collections::HashSet<String> = dynamic
+            .values()
+            .map(|provider| provider.id().to_owned())
+            .collect();
         let mut providers = dynamic.values().cloned().collect::<Vec<_>>();
         // A dynamic/extension registration overrides the static catalog entry
         // for the same id; returning both would duplicate every model in

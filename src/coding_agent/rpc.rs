@@ -602,8 +602,8 @@ where
             let Some(payload) = value.0.as_ref() else {
                 continue;
             };
-            let mut line = crate::session_manager::json_depth::write_value_iteratively(payload)
-                .into_bytes();
+            let mut line =
+                crate::session_manager::json_depth::write_value_iteratively(payload).into_bytes();
             line.push(b'\n');
             output.write_all(&line).await?;
             output.flush().await?;
@@ -1008,7 +1008,9 @@ impl RpcServerState {
         // Replacing the session while a prompt run is in flight would let the
         // old run and the new session interleave frames on the same output.
         if self.run_in_flight() {
-            return Err("agent is streaming; wait for agent_settled before attach/create".to_owned());
+            return Err(
+                "agent is streaming; wait for agent_settled before attach/create".to_owned(),
+            );
         }
         // The session's own cwd (the one its storage was opened with) is the
         // directory its prompt templates and skills come from; capture it

@@ -980,9 +980,7 @@ impl ToolContext {
                 // scoped to the call (nested executor rebind included), so
                 // the marks stay visible to this call's descendants but
                 // never to its concurrent siblings.
-                let scoped = executor
-                    .for_call(call_id)
-                    .with_signal(self.signal.clone());
+                let scoped = executor.for_call(call_id).with_signal(self.signal.clone());
                 // `for_call` already returns an owned executor for this call
                 // id; read the shared held-key set before moving it in
                 // instead of cloning the whole executor again.

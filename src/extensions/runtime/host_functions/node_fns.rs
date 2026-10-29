@@ -462,9 +462,7 @@ fn node_call(
         // Real SQLite (rusqlite bundled) behind the `node:sqlite`
         // DatabaseSync shim and the better-sqlite3 / sqlite3 virtual package
         // shims.
-        "sqlite" => {
-            super::sqlite_fns::sqlite_op(state, allowed_roots, generation, op, &payload)
-        }
+        "sqlite" => super::sqlite_fns::sqlite_op(state, allowed_roots, generation, op, &payload),
         // EksBlowfish behind the `bcrypt` virtual package shim (the real
         // package is a NAPI native addon).
         "bcrypt" => super::bcrypt_fns::bcrypt_op(op, &payload),
@@ -672,9 +670,7 @@ fn checked_path(
     // check passes, but the subsequent open/write follows the link and can
     // create a file outside the sandbox. Reject any symlink leaf; the
     // canonical parent check above already covers symlinked directories.
-    if std::fs::symlink_metadata(&path)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(NodeError::denied(syscall, raw));
     }
     Ok(path)

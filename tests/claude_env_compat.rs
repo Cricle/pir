@@ -285,22 +285,15 @@ async fn claude_code_env_compat_end_to_end() {
         .get_model("anthropic", "gpt-5")
         .is_some());
     let (resolved, _, warning) =
-        resolve_cli_model(Some("anthropic"), "gpt-5", &environment.models)
-            .expect("cli model");
-    assert_eq!(
-        resolved.map(|model| model.id),
-        Some("gpt-5".to_string())
-    );
+        resolve_cli_model(Some("anthropic"), "gpt-5", &environment.models).expect("cli model");
+    assert_eq!(resolved.map(|model| model.id), Some("gpt-5".to_string()));
     assert!(warning.is_none());
     // The env primary model fills the default when no explicit default exists.
     assert_eq!(
         environment.settings.default_provider.as_deref(),
         Some("anthropic")
     );
-    assert_eq!(
-        environment.settings.default_model.as_deref(),
-        Some("gpt-5")
-    );
+    assert_eq!(environment.settings.default_model.as_deref(), Some("gpt-5"));
 
     // The print/TUI path streams through `stream_unchecked`; the adapter
     // itself must resolve the bearer token from the environment.
