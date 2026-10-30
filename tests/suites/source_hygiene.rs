@@ -148,7 +148,7 @@ fn src_tree_contains_only_expected_file_kinds() {
 // programming error surfaced immediately rather than a runtime condition.
 // The serde sites serialize the crate's own derive-only message/checkpoint
 // types into memory.
-const EXPECT_SITE_ALLOWLIST: [(&str, u32); 30] = [
+const EXPECT_SITE_ALLOWLIST: [(&str, u32); 27] = [
     ("plugins/tool_repair/grammar.rs", 196),
     ("ai/api/constrained_sampling.rs", 178),
     // These three shifted down when the queue-bounds work added the
@@ -172,13 +172,10 @@ const EXPECT_SITE_ALLOWLIST: [(&str, u32); 30] = [
     // the context-mode / phone tests on first use rather than silently
     // dropping a transform. Same invariant as the grammar.rs entry above.
     ("agent_session/phone_child.rs", 43),
-    ("plugins/builtin/context_mode/fetch.rs", 182),
-    ("plugins/builtin/context_mode/fetch.rs", 188),
-    ("plugins/builtin/context_mode/fetch.rs", 195),
     ("plugins/builtin/context_mode/fetch.rs", 200),
-    ("plugins/builtin/context_mode/fetch.rs", 205),
-    ("plugins/builtin/context_mode/fetch.rs", 212),
-    ("plugins/builtin/context_mode/fetch.rs", 218),
+    ("plugins/builtin/context_mode/fetch.rs", 208),
+    ("plugins/builtin/context_mode/fetch.rs", 213),
+    ("plugins/builtin/context_mode/fetch.rs", 228),
     ("durable/harness/documents.rs", 128),
     ("durable/harness/documents.rs", 145),
     ("durable/harness/generation.rs", 315),

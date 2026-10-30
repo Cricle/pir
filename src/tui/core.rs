@@ -2316,6 +2316,32 @@ impl TuiCore {
         line.push_str(SEGMENT_RESET);
     }
 
+    /// Clamp one row to `width` visible cells (upstream alt-screen's
+    /// `sliceByColumn(line, 0, width, true)`).
+    ///
+    /// A row wider than the terminal wraps onto a second physical line. The
+    /// renderer's next `\r\n` then moves one row too far, so every repaint
+    /// scrolls the viewport — the reported "screen keeps drifting upward".
+    /// No component should emit such a row (they pad/wrap to width), but a
+    /// factory renderer, decorator or a width mis-measurement can; the write
+    /// paths clamp as a guard instead of letting one bad row corrupt the
+    /// whole frame.
+    fn clamp_row_width(line: &mut String, width: usize) {
+        if width == 0 {
+            line.clear();
+            return;
+        }
+        // Image payload rows are escape-sequence framing, not text: their
+        // visible width is meaningless here (upstream skips `isImageLine` in
+        // the same clamp).
+        if super::terminal_image::is_image_line(line) {
+            return;
+        }
+        if ansi::visible_width(line.as_str()) > width {
+            *line = ansi::truncate_to_width(line, width, "");
+        }
+    }
+
     /// Publish a frame branch's written-row count to [`FrameWork::reset_rows`]
     /// (one relaxed add of the branch's locally counted rows).
     fn count_reset_rows(rows: u64) {
@@ -2323,14 +2349,23 @@ impl TuiCore {
     }
 
     /// Append the hardware-cursor sync for one written frame (upstream
-    /// `positionHardwareCursor`, tui-main-screen.ts:624-655): with
-    /// `showHardwareCursor` the cursor moves to the editor cell and becomes
-    /// visible; without it the cursor is hidden (once). Returns the buffer
-    /// row the hard cursor ends on when the sync moved it — callers store
-    /// that as `hardware_cursor_row`. `absolute` addresses the cell with CUP
-    /// (the scrolled path, where the frame IS the screen and the written
-    /// frame's end position is not tracked); otherwise a relative move from
+    /// `positionHardwareCursor`, tui-main-screen.ts:624-655): the cursor is
+    /// ALWAYS moved to the focused component's cell — the terminal's cursor
+    /// is the IME candidate-window anchor even while it is hidden — and
+    /// `showHardwareCursor` only decides whether it is left visible. Returns
+    /// the buffer row the hard cursor ends on when the sync moved it —
+    /// callers store that as `hardware_cursor_row`, keeping the next frame's
+    /// relative moves anchored. `absolute` addresses the cell with CUP (the
+    /// scrolled path, where the frame IS the screen and the written frame's
+    /// end position is not tracked); otherwise a relative move from
     /// `from_row` is used.
+    ///
+    /// This is load-bearing for Windows IME: when the cursor is merely
+    /// hidden and never positioned, the terminal anchors the candidate
+    /// window at the last byte the frame wrote (the footer's end), and any
+    /// cursor movement the IME/terminal performs leaves `hardware_cursor_row`
+    /// stale — the next frame's relative moves then start from the wrong
+    /// row.
     fn append_cursor_sync(
         &mut self,
         out: &mut String,
@@ -2339,37 +2374,40 @@ impl TuiCore {
         viewport_top: usize,
         absolute: bool,
     ) -> Option<usize> {
-        if self.show_hardware_cursor {
-            if let Some((row_in_dock, col)) = self.dock_cursor_cell.as_ref().and_then(|cell| {
-                *cell
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-            }) {
-                // The dock bottoms out the frame; its rows start at
-                // `total - dock_height`. Clamp into the written frame (a
-                // stale dock height on the first frame must not address a
-                // row that was never painted).
-                let dock = self.dock_height.min(total_lines);
-                let target = (total_lines.saturating_sub(dock) + row_in_dock)
-                    .min(total_lines.saturating_sub(1))
-                    .max(viewport_top.min(total_lines.saturating_sub(1)));
-                if absolute {
-                    out.push_str(&format!("\x1b[{};{}H", target + 1, col + 1));
-                } else {
-                    let delta = target as isize - from_row as isize;
-                    if delta > 0 {
-                        out.push_str(&format!("\x1b[{delta}B"));
-                    } else if delta < 0 {
-                        out.push_str(&format!("\x1b[{}A", -delta));
-                    }
-                    out.push_str(&format!("\x1b[{}G", col + 1));
+        if let Some((row_in_dock, col)) = self.dock_cursor_cell.as_ref().and_then(|cell| {
+            *cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }) {
+            // The dock bottoms out the frame; its rows start at
+            // `total - dock_height`. Clamp into the written frame (a
+            // stale dock height on the first frame must not address a
+            // row that was never painted).
+            let dock = self.dock_height.min(total_lines);
+            let target = (total_lines.saturating_sub(dock) + row_in_dock)
+                .min(total_lines.saturating_sub(1))
+                .max(viewport_top.min(total_lines.saturating_sub(1)));
+            if absolute {
+                out.push_str(&format!("\x1b[{};{}H", target + 1, col + 1));
+            } else {
+                let delta = target as isize - from_row as isize;
+                if delta > 0 {
+                    out.push_str(&format!("\x1b[{delta}B"));
+                } else if delta < 0 {
+                    out.push_str(&format!("\x1b[{}A", -delta));
                 }
+                out.push_str(&format!("\x1b[{}G", col + 1));
+            }
+            if self.show_hardware_cursor {
                 if !self.cursor_visible {
                     out.push_str("\x1b[?25h");
                     self.cursor_visible = true;
                 }
-                return Some(target);
+            } else if self.cursor_visible {
+                out.push_str("\x1b[?25l");
+                self.cursor_visible = false;
             }
+            return Some(target);
         }
         if self.cursor_visible {
             out.push_str("\x1b[?25l");
@@ -2552,6 +2590,7 @@ impl TuiCore {
                     out.push_str("\r\n");
                 }
                 out.push_str("\x1b[2K");
+                Self::clamp_row_width(line, width);
                 Self::append_line_reset(line);
                 out.push_str(line);
             }
@@ -2643,6 +2682,26 @@ impl TuiCore {
             self.frame_scratch = new_lines;
             self.previous_viewport_top = prev_viewport_top;
             self.previous_height = height;
+            // Upstream's no-changes branch still calls
+            // `positionHardwareCursor`: the terminal can move the cursor
+            // without producing input (Windows IME composition/candidate UI),
+            // so re-anchor it to the focused cell even when no row changed.
+            // Otherwise the next frame's relative moves start from a stale
+            // `hardware_cursor_row` and the frame drifts.
+            let mut cursor_out = String::new();
+            let moved = self.append_cursor_sync(
+                &mut cursor_out,
+                frame_len.saturating_sub(1),
+                frame_len,
+                prev_viewport_top,
+                false,
+            );
+            if !cursor_out.is_empty() {
+                self.terminal.write_owned(cursor_out);
+            }
+            if let Some(row) = moved {
+                self.hardware_cursor_row = row;
+            }
             self.publish_follow_layout(frame_len);
             return;
         }
@@ -2737,6 +2796,7 @@ impl TuiCore {
         // `clone_from` reuses each baseline row's allocation, so a one-row
         // spinner tick copies one row, not the whole frame.
         for i in first_changed..=render_end {
+            Self::clamp_row_width(&mut new_lines[i], width);
             self.previous_lines[i].clone_from(&new_lines[i]);
             Self::append_line_reset(&mut self.previous_lines[i]);
         }
@@ -2928,6 +2988,13 @@ impl TuiCore {
                 scroll_offset: offset,
             },
         );
+        // The alt screen paints a fixed `height`-row viewport with no scroll
+        // margin: one over-wide row would wrap and scroll every later frame
+        // upward (upstream truncates here before diffing). Clamp after the
+        // decorator so overlays/scrollbars compose into the same guard.
+        for row in painted.iter_mut() {
+            Self::clamp_row_width(row, width);
+        }
         // No whole-window reset pass: the write branches below append the
         // per-line reset to the rows they actually write (see
         // [`TuiCore::append_line_reset`]), and the diff branch keeps the

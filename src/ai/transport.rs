@@ -186,7 +186,12 @@ impl ProviderRequestConfig {
     /// (global scope) first, then `PI_HTTP_PROXY` / `HTTPS_PROXY` /
     /// `HTTP_PROXY` environment fallbacks (upstream applies the setting as
     /// HTTP_PROXY/HTTPS_PROXY).
-    fn env_proxy_url() -> Option<String> {
+    ///
+    /// Public to the crate: every Pi-owned reqwest client must resolve its
+    /// proxy here. reqwest is built with `default-features = false` (no
+    /// `system-proxy`), so a bare `Client::builder()` ignores env/OS proxies;
+    /// a client that skips this helper has no egress behind a proxy.
+    pub(crate) fn env_proxy_url() -> Option<String> {
         if let Some(proxy) = crate::config::settings::current_http_proxy() {
             return Some(proxy);
         }

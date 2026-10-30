@@ -281,6 +281,15 @@ pub(super) async fn run() -> Result<()> {
     if cli.list_models.is_some() && !cli.help_extensions && cli.export.is_none() {
         let agent_dir = pir::coding_agent::context::agent_dir();
         let project_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        // pi-compatible agent-dir bootstrap (upstream `core/auth-storage.ts`
+        // `ensureFileExists` + `core/models-store.ts`): a normal startup leaves
+        // `auth.json` and `models-store.json` as `{}`. Upstream runs the
+        // legacy-credential migration BEFORE the credential store creates
+        // `auth.json` (main.ts `runMigrations` before `createRuntime`), so the
+        // metadata fast path migrates `oauth.json`/settings `apiKeys` first:
+        // a fresh empty `auth.json` would otherwise suppress that migration.
+        pir::config::migrations::migrate_auth_to_auth_json(&agent_dir);
+        pir::coding_agent::agent_bootstrap::bootstrap_agent_dir(&agent_dir);
         let project_trusted = cli.trust_override().unwrap_or_else(|| {
             pir::extensions::project_trust::resolve_project_trust(&project_dir, &agent_dir)
         });
@@ -326,6 +335,15 @@ pub(super) async fn run() -> Result<()> {
     #[cfg_attr(not(feature = "tui"), allow(unused_variables))]
     let migrations = pir::config::migrations::run_migrations(&project_dir);
     benchmark.time("runMigrations");
+
+    // pi-compatible agent-dir bootstrap (upstream `core/auth-storage.ts`
+    // `ensureFileExists` + `core/models-store.ts`): a normal startup leaves
+    // `<agentDir>/auth.json` and `<agentDir>/models-store.json` as `{}`.
+    // Runs AFTER migrations for the same reason upstream does: a fresh
+    // `auth.json` would otherwise suppress the legacy-credential migration.
+    if bootstraps_agent_dir(&cli) {
+        pir::coding_agent::agent_bootstrap::bootstrap_agent_dir(&agent_dir);
+    }
 
     // Fatal-panic persistence (upstream `core/crash-log.ts`): every panic —
     // including the TUI host's, whose hook chains into this one — appends a
@@ -1217,6 +1235,26 @@ pub(super) async fn run() -> Result<()> {
             }
         }
     }
+}
+
+/// Whether this invocation is a normal startup whose upstream pi path creates
+/// the agent-dir files (`auth.json` / `models-store.json`).
+///
+/// `--export` exits before the upstream runtime (`main.ts:640-652`), and the
+/// native helper subcommands (`version`, `grep`, `sed`, `python`) are pir-only
+/// surfaces that never read the pi config. `--version`/`-v` exit in clap
+/// before this module runs at all.
+fn bootstraps_agent_dir(cli: &Cli) -> bool {
+    cli.export.is_none()
+        && !matches!(
+            cli.command,
+            Some(
+                Command::Version
+                    | Command::Grep { .. }
+                    | Command::Sed { .. }
+                    | Command::Python { .. }
+            )
+        )
 }
 
 /// First-run setup (upstream `showFirstTimeSetup`, startup-ui.ts:182-219):

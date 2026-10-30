@@ -387,7 +387,12 @@ function Complete-Finished {
                 Write-Host ("[test_fast] warning: {0} exited but its log handle is still held; continuing" -f (Split-Path -Leaf $running[$i].Exe))
             }
             $exitCode = -1
-            try { $exitCode = $running[$i].Proc.ExitCode } catch { }
+            if ($running[$i].ExitFile -and (Test-Path $running[$i].ExitFile)) {
+                try { $exitCode = [int]((Get-Content -Raw $running[$i].ExitFile).Trim()) } catch { }
+            }
+            if ($exitCode -lt 0) {
+                try { $exitCode = $running[$i].Proc.ExitCode } catch { }
+            }
             [void]$results.Add([pscustomobject]@{
                 Exe  = $running[$i].Exe
                 Log  = $running[$i].Log
@@ -406,12 +411,20 @@ foreach ($exe in $exes) {
     }
     $log = Join-Path $logDir ((Split-Path -Leaf $exe) + ".log")
     $suiteThreads = Get-SuiteThreads $exe
-    $proc = Start-Process -FilePath $exe `
-        -ArgumentList ("--test-threads=" + $suiteThreads) `
-        -NoNewWindow -PassThru `
-        -RedirectStandardOutput $log `
-        -RedirectStandardError ($log + ".err")
-    [void]$running.Add([pscustomobject]@{ Proc = $proc; Exe = $exe; Log = $log })
+    # Start-Process with -RedirectStandardOutput blocks for tens of seconds on
+    # a cold 300 MB test binary (Defender scans the image during CreateProcess),
+    # which serializes the dispatcher and makes the nominal -Concurrency a
+    # fiction. Launch through cmd.exe and redirect inside the child instead:
+    # Process.Start returns immediately, while the shell waits for the test and
+    # records its exit code in a sidecar file for Complete-Finished.
+    $exitFile = $log + ".exit"
+    Remove-Item -Force -ErrorAction SilentlyContinue $exitFile
+    $cmdLine = '""{0}" --test-threads={1} > "{2}" 2> "{3}" & echo %ERRORLEVEL% > "{4}""' -f `
+        $exe, $suiteThreads, $log, ($log + ".err"), $exitFile
+    $proc = Start-Process -FilePath $env:ComSpec `
+        -ArgumentList @('/d', '/s', '/c', $cmdLine) `
+        -NoNewWindow -PassThru
+    [void]$running.Add([pscustomobject]@{ Proc = $proc; Exe = $exe; Log = $log; ExitFile = $exitFile })
 }
 while ($running.Count -gt 0) {
     Complete-Finished $running $results
@@ -482,8 +495,8 @@ if ($failedRuns.Count -gt 0) {
             -NoNewWindow -PassThru `
             -RedirectStandardOutput $retryLog `
             -RedirectStandardError ($retryLog + ".err")
-        if (-not $proc.WaitForExit(60000)) {
-            Write-Host ("  [FAILED]     {0}: serial retry did not exit within 60s" -f $r.Name)
+        if (-not $proc.WaitForExit(180000)) {
+            Write-Host ("  [FAILED]     {0}: serial retry did not exit within 180s" -f $r.Name)
             $realFailures += [pscustomobject]@{ Run = $r; Result = ([pscustomobject]@{ Passed = 0; Failed = 0; Secs = 0.0; Ok = $false; Empty = $false }) }
             continue
         }

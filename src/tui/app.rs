@@ -631,6 +631,34 @@ impl Footer {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
     }
 
+    /// Push a thinking-level change into the footer snapshot immediately.
+    ///
+    /// This is the host's thinking-level funnel: upstream
+    /// `selectThinkingLevel` / `cycleThinkingLevel` call
+    /// `footer.invalidate()` directly, so a level change repaints the two
+    /// footer rows even when no other footer input moved. Mutating the live
+    /// state in place and dropping the memo key is exactly that contract; the
+    /// next render rebuilds from the new level.
+    ///
+    /// Returns whether the level actually changed (a same-level update is a
+    /// no-op and keeps the memo warm).
+    pub fn update_thinking_level(&self, level: &str) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.thinking_level == level {
+            return false;
+        }
+        state.thinking_level = level.to_string();
+        drop(state);
+        self.memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .key = None;
+        true
+    }
+
     /// The memoized rows for `width` under the current state — the same rows
     /// [`render_footer_into`] produces, rebuilt in place only when the key
     /// moved. The guard is returned so callers read the stored rows in place;

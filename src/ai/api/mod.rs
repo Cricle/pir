@@ -32,7 +32,11 @@ pub mod google;
 pub mod google_vertex;
 #[cfg(feature = "provider-mistral")]
 pub mod mistral;
-#[cfg(feature = "provider-openai")]
+// The plain OpenAI-compatible `/chat/completions` adapter is core: the
+// `minimal` profile needs exactly one wire provider, and `reqwest` is already
+// an unconditional dependency. `provider-openai` still gates the
+// Responses/Codex/pi-messages adapters and the catalog auto-construction of
+// every OpenAI-family model.
 pub mod openai;
 /// OpenAI Responses adapters (`openai-responses`, `openai-codex-responses`,
 /// `azure-openai-responses`) plus their shared wire codec.

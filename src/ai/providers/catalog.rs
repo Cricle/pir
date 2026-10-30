@@ -19,6 +19,7 @@
 
 pub mod openrouter;
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
@@ -670,14 +671,37 @@ pub fn load_provider(provider_id: &str) -> AiResult<Option<BuiltinProvider>> {
 /// of those lookups used to re-parse the embedded file (openrouter.json alone
 /// is 244 KB); a `models.json` entry for a builtin provider measured +14 ms on
 /// `--list-models` and +16 ms on `models list` at debug opt-level 0.
-pub fn load_provider_cached(provider_id: &str) -> AiResult<Option<BuiltinProvider>> {
-    if let Some(providers) = PARSED_CATALOG.get() {
-        return Ok(providers
-            .iter()
-            .find(|entry| entry.id == provider_id)
-            .cloned());
+///
+/// Once the parse-once snapshot exists the result borrows it instead of
+/// cloning the whole [`BuiltinProvider`] (all of that provider's models):
+/// composition immediately clones/moves the entries it needs anyway, so the
+/// provider-level deep clone was a second full copy (480 models for
+/// openrouter). The standalone `models list` path, which never initializes
+/// the full snapshot, still pays only one file parse and returns it owned.
+pub fn load_provider_cached(provider_id: &str) -> AiResult<Option<Cow<'static, BuiltinProvider>>> {
+    if let Some(index) = parsed_catalog_by_id() {
+        return Ok(index.get(provider_id).copied().map(Cow::Borrowed));
     }
-    load_provider(provider_id)
+    Ok(load_provider(provider_id)?.map(Cow::Owned))
+}
+
+/// Index into the parse-once catalog snapshot, built at most once. The entries
+/// borrow the immutable `Arc` held by [`PARSED_CATALOG`] for the life of the
+/// process, so `load_provider_cached` can hand out references without cloning.
+static PARSED_CATALOG_BY_ID: OnceLock<BTreeMap<&'static str, &'static BuiltinProvider>> =
+    OnceLock::new();
+
+fn parsed_catalog_by_id() -> Option<&'static BTreeMap<&'static str, &'static BuiltinProvider>> {
+    if let Some(index) = PARSED_CATALOG_BY_ID.get() {
+        return Some(index);
+    }
+    let providers: &'static Arc<Vec<BuiltinProvider>> = PARSED_CATALOG.get()?;
+    Some(PARSED_CATALOG_BY_ID.get_or_init(|| {
+        providers
+            .iter()
+            .map(|provider| (provider.id.as_str(), provider))
+            .collect()
+    }))
 }
 
 /// Look up one `image` catalog model by provider and id (upstream

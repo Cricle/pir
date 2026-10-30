@@ -1097,39 +1097,74 @@ fn truncate_chars(text: &str, max: usize) -> String {
 /// A ~`max_chars` window around the first matching query term (or the head of
 /// the section when nothing matches).
 fn make_snippet(content: &str, terms: &[String], max_chars: usize) -> String {
-    let lowered = content.to_lowercase();
+    let window = max_chars.max(80);
+    // A byte length at or below the window bounds the char count too: the
+    // whole section fits, so skip the char scan entirely (the common case for
+    // ~2 KiB chunks).
+    if content.len() <= window {
+        return content.trim().to_owned();
+    }
+    let chars_len = content.chars().count();
+    if chars_len == 0 {
+        return String::new();
+    }
+    // The whole section fits: no lowercase scan and no second allocation
+    // beyond the trimmed result.
+    if chars_len <= window {
+        return content.trim().to_owned();
+    }
     let mut position = None;
-    for term in terms {
-        let needle = term.to_lowercase();
-        if needle.is_empty() {
-            continue;
+    if !terms.is_empty() {
+        // ASCII is the common case for code/log chunks; `to_ascii_lowercase`
+        // avoids the Unicode case-fold machinery without changing the match
+        // semantics for non-ASCII input (that still uses `to_lowercase`).
+        let lowered = if content.is_ascii() {
+            content.to_ascii_lowercase()
+        } else {
+            content.to_lowercase()
+        };
+        for term in terms {
+            let needle = term.to_lowercase();
+            if needle.is_empty() {
+                continue;
+            }
+            if let Some(byte_index) = lowered.find(&needle) {
+                // Lowercasing can change byte lengths (e.g. 'İ'), so the match
+                // offset is only reusable when it is still a char boundary.
+                position = Some(if content.is_char_boundary(byte_index) {
+                    content[..byte_index].chars().count()
+                } else {
+                    0
+                });
+                break;
+            }
         }
-        if let Some(byte_index) = lowered.find(&needle) {
-            // Lowercasing can change byte lengths (e.g. 'İ'), so the match
-            // offset is only reusable when it is still a char boundary.
-            position = Some(if content.is_char_boundary(byte_index) {
-                content[..byte_index].chars().count()
-            } else {
-                0
-            });
+    }
+    let center = position.unwrap_or(0);
+    let start = center.saturating_sub(window / 3);
+    let end = (start + window).min(chars_len);
+    let start = end.saturating_sub(window);
+    if start == 0 && end == chars_len {
+        return content.trim().to_owned();
+    }
+    // Convert the two char indices to byte offsets in one pass instead of
+    // collecting the whole section into a `Vec<char>` (4 bytes per char).
+    let mut start_byte = content.len();
+    let mut end_byte = content.len();
+    for (char_index, (byte_index, _)) in content.char_indices().enumerate() {
+        if char_index == start {
+            start_byte = byte_index;
+        }
+        if char_index == end {
+            end_byte = byte_index;
             break;
         }
     }
-    let chars: Vec<char> = content.chars().collect();
-    if chars.is_empty() {
-        return String::new();
-    }
-    let window = max_chars.max(80);
-    let center = position.unwrap_or(0);
-    let start = center.saturating_sub(window / 3);
-    let end = (start + window).min(chars.len());
-    let start = end.saturating_sub(window);
-    let mut snippet: String = chars[start..end].iter().collect();
-    snippet = snippet.trim().to_owned();
+    let mut snippet = content[start_byte..end_byte].trim().to_owned();
     if start > 0 {
         snippet.insert(0, '…');
     }
-    if end < chars.len() {
+    if end < chars_len {
         snippet.push('…');
     }
     snippet

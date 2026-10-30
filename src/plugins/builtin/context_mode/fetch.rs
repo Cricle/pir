@@ -53,16 +53,29 @@ async fn fetch_page(url: &str) -> Result<FetchedPage, String> {
     let mut current = reqwest::Url::parse(url)
         .map_err(|error| format!("ctx_fetch_and_index: invalid URL `{url}`: {error}"))?;
     validate_http_scheme(&current, &format!("`{url}`"))?;
-    // Do NOT disable proxies: a process/network-configured egress proxy is
-    // part of the managed environment and must apply. Localhost stays
-    // reachable (no address filtering).
+    // Honor the SAME proxy configuration every other Pi-owned HTTP client
+    // uses (settings `httpProxy`, then PI_HTTP_PROXY / HTTPS_PROXY /
+    // HTTP_PROXY). reqwest is built without its `system-proxy` feature, so a
+    // bare builder would silently bypass the managed egress proxy — the
+    // "context-mode has no network" failure in proxied environments.
+    // Localhost stays reachable: NO_PROXY applies when set.
     //
     // Redirects are followed manually so every hop is scheme-validated and
     // the hop count is capped; reqwest's policy is disabled to keep the
     // per-hop check here.
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(proxy_url) = crate::ai::transport::ProviderRequestConfig::env_proxy_url() {
+        let proxy = reqwest::Proxy::all(&proxy_url).map_err(|_| {
+            "ctx_fetch_and_index: the configured HTTP proxy URL is invalid".to_string()
+        })?;
+        // `NO_PROXY`/`no_proxy` applies to the explicit proxy (reqwest's
+        // automatic system-proxy matcher is what normally reads it).
+        let proxy = proxy.no_proxy(reqwest::NoProxy::from_env());
+        builder = builder.proxy(proxy);
+    }
+    let client = builder
         .build()
         .map_err(|error| format!("ctx_fetch_and_index: HTTP client setup failed: {error}"))?;
 
@@ -143,49 +156,49 @@ async fn fetch_page(url: &str) -> Result<FetchedPage, String> {
         bytes.extend_from_slice(&chunk);
     }
 
+    let byte_len = bytes.len();
     let (body, content_type) = if remote_type.contains("html") {
-        let html = String::from_utf8_lossy(&bytes);
+        let html = decode_body(bytes);
         (html_to_text(&html), "markdown".to_owned())
     } else if remote_type.contains("json") {
-        (
-            String::from_utf8_lossy(&bytes).into_owned(),
-            "json".to_owned(),
-        )
+        (decode_body(bytes), "json".to_owned())
     } else if remote_type.contains("yaml") {
-        (
-            String::from_utf8_lossy(&bytes).into_owned(),
-            "yaml".to_owned(),
-        )
+        (decode_body(bytes), "yaml".to_owned())
     } else {
-        (
-            String::from_utf8_lossy(&bytes).into_owned(),
-            "text".to_owned(),
-        )
+        (decode_body(bytes), "text".to_owned())
     };
 
     Ok(FetchedPage {
         body,
         content_type,
-        bytes: bytes.len(),
+        bytes: byte_len,
         status: status.as_u16(),
     })
 }
 
-fn script_style_re() -> &'static Regex {
+/// UTF-8-decode a response body, consuming the buffer: valid UTF-8 (the
+/// overwhelmingly common case) moves the existing allocation into the
+/// `String`, while invalid bytes still take the documented lossy path.
+fn decode_body(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    }
+}
+
+fn script_comment_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     // The regex crate has no backreferences, so the closing-tag alternation
     // is written out; mismatched nesting is irrelevant for text extraction.
+    // Comments are folded into the same pass: both alternatives are removed
+    // wholesale and cannot affect one another's result, so one document copy
+    // replaces the previous script/style pass + comment pass.
     RE.get_or_init(|| {
         Regex::new(
-            r"(?is)<(script|style|noscript|template)\b[^>]*>.*?</(?:script|style|noscript|template)\s*>",
+            r"(?is)<(script|style|noscript|template)\b[^>]*>.*?</(?:script|style|noscript|template)\s*>|<!--.*?-->",
         )
         .expect("regex")
     })
-}
-
-fn comment_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?s)<!--.*?-->").expect("regex"))
 }
 
 fn heading_re() -> &'static Regex {
@@ -200,49 +213,121 @@ fn tag_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?s)<[^>]+>").expect("regex"))
 }
 
-fn br_re() -> &'static Regex {
+fn line_break_tag_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)<br\s*/?>").expect("regex"))
-}
-
-fn block_break_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
+    // One pass for every remaining tag: `<br>` and block closers become a
+    // newline, `<li>` opens a markdown list item, every other tag is a space.
+    // The specific alternatives precede the generic one, so `<br>`/`<li>`
+    // keep their replacement. This is order-equivalent to the old four
+    // sequential passes (br → block → li → strip) because replacements never
+    // contain tags.
     RE.get_or_init(|| {
-        Regex::new(r"(?i)</(?:p|div|li|tr|section|article|header|footer|blockquote|pre)\s*>")
-            .expect("regex")
+        Regex::new(
+            r"(?i)<br\s*/?>|</(?:p|div|li|tr|section|article|header|footer|blockquote|pre)\s*>|<li\b[^>]*>|<[^>]+>",
+        )
+        .expect("regex")
     })
 }
 
-fn list_item_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)<li\b[^>]*>").expect("regex"))
+/// `<li ...>` opens a list item; `</li>` is a block closer and must not add
+/// the `- ` marker.
+fn is_list_item_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    bytes.len() >= 4
+        && bytes[1..3].eq_ignore_ascii_case(b"li")
+        && matches!(bytes[3], b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// `<br...>` and the block-closing tags the combined regex recognizes.
+fn is_line_break_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    if bytes.len() >= 4 && bytes[1..3].eq_ignore_ascii_case(b"br") {
+        // Only a bare `<br>`/`<br/>`/`<br />` is a line break; `<br class>`
+        // is an unknown tag that the old `br_re` left for `tag_re` (space).
+        let rest = tag[3..].trim_start_matches([' ', '\t', '\n', '\r']);
+        if rest == ">" || rest == "/>" {
+            return true;
+        }
+    }
+    let Some(name) = tag.strip_prefix("</") else {
+        return false;
+    };
+    let name = name
+        .trim_start()
+        .trim_end_matches('>')
+        .trim_end()
+        .trim_end_matches('/');
+    [
+        "p",
+        "div",
+        "li",
+        "tr",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "blockquote",
+        "pre",
+    ]
+    .iter()
+    .any(|closer| name.eq_ignore_ascii_case(closer))
+}
+
+fn replace_line_breaks_and_tags(input: &str) -> std::borrow::Cow<'_, str> {
+    let regex = line_break_tag_re();
+    if !regex.is_match(input) {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    let mut output = String::with_capacity(input.len() + 8);
+    let mut last = 0usize;
+    for matched in regex.find_iter(input) {
+        output.push_str(&input[last..matched.start()]);
+        let tag = matched.as_str();
+        if is_list_item_tag(tag) {
+            output.push_str("\n- ");
+        } else if is_line_break_tag(tag) {
+            output.push('\n');
+        } else {
+            output.push(' ');
+        }
+        last = matched.end();
+    }
+    output.push_str(&input[last..]);
+    std::borrow::Cow::Owned(output)
 }
 
 /// HTML → plain text: scripts/styles/comments removed, headings converted to
 /// markdown headings, block boundaries to newlines, tags stripped, common
 /// entities decoded, whitespace normalized.
 pub(crate) fn html_to_text(html: &str) -> String {
-    let without_scripts = script_style_re().replace_all(html, " ");
-    let without_comments = comment_re().replace_all(&without_scripts, " ");
-    let with_headings =
-        heading_re().replace_all(&without_comments, |captures: &regex::Captures<'_>| {
+    let without_scripts_or_comments = script_comment_re().replace_all(html, " ");
+    let with_headings = heading_re().replace_all(
+        &without_scripts_or_comments,
+        |captures: &regex::Captures<'_>| {
             let level = captures[1].len();
             let inner = tag_re().replace_all(&captures[2], " ");
             let title = decode_entities(inner.trim());
             format!("\n\n{} {}\n\n", "#".repeat(level), title)
-        });
-    let with_breaks = br_re().replace_all(&with_headings, "\n");
-    let with_blocks = block_break_re().replace_all(&with_breaks, "\n");
-    let with_items = list_item_re().replace_all(&with_blocks, "\n- ");
-    let without_tags = tag_re().replace_all(&with_items, " ");
+        },
+    );
+    let without_tags = replace_line_breaks_and_tags(&with_headings);
     let decoded = decode_entities(&without_tags);
 
     // Normalize: one space per run, at most one blank line between lines.
+    // `split_whitespace` streams the words into the output; the old
+    // `collect::<Vec<_>>().join(" ")` allocated a vector per source line.
     let mut output = String::with_capacity(decoded.len().min(MAX_BODY_BYTES));
     let mut blank_run = 0usize;
     for line in decoded.lines() {
-        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        if line.is_empty() {
+        let mut has_word = false;
+        for word in line.split_whitespace() {
+            if has_word {
+                output.push(' ');
+            }
+            output.push_str(word);
+            has_word = true;
+        }
+        if !has_word {
             blank_run += 1;
             if blank_run > 1 {
                 continue;
@@ -250,10 +335,17 @@ pub(crate) fn html_to_text(html: &str) -> String {
         } else {
             blank_run = 0;
         }
-        output.push_str(&line);
         output.push('\n');
     }
-    output.trim().to_owned()
+    // Trim in place (one allocation) instead of `trim().to_owned()` copying
+    // the whole document a second time.
+    let start = output.len() - output.trim_start().len();
+    let end = output.trim_end().len();
+    output.truncate(end);
+    if start < output.len() {
+        output.drain(..start);
+    }
+    output
 }
 
 fn decode_entities(text: &str) -> String {
@@ -263,11 +355,15 @@ fn decode_entities(text: &str) -> String {
         output.push_str(&rest[..index]);
         let tail = &rest[index..];
         // Entities are short; a `;` beyond this window is almost certainly a
-        // literal ampersand in prose.
-        let name_end = tail
-            .find(';')
-            .filter(|end| *end <= 12)
-            .and_then(|end| entity_char(&tail[1..end]).map(|ch| (ch, end)));
+        // literal ampersand in prose. Search only the first 12 bytes: the old
+        // `tail.find(';')` scanned the whole remaining document on every
+        // stray `&` before applying the same window check.
+        let search_end = tail.len().min(13);
+        let entity_end = tail.as_bytes()[1..search_end]
+            .iter()
+            .position(|byte| *byte == b';')
+            .map(|position| position + 1);
+        let name_end = entity_end.and_then(|end| entity_char(&tail[1..end]).map(|ch| (ch, end)));
         match name_end {
             Some((ch, end)) => {
                 output.push(ch);
@@ -293,25 +389,28 @@ fn entity_char(entity: &str) -> Option<char> {
         }
         return numeric.parse::<u32>().ok().and_then(char::from_u32);
     }
-    match entity.to_ascii_lowercase().as_str() {
-        "amp" => Some('&'),
-        "lt" => Some('<'),
-        "gt" => Some('>'),
-        "quot" => Some('"'),
-        "apos" => Some('\''),
-        "nbsp" => Some(' '),
-        "mdash" => Some('—'),
-        "ndash" => Some('–'),
-        "hellip" => Some('…'),
-        "copy" => Some('©'),
-        "reg" => Some('®'),
-        "trade" => Some('™'),
-        "rsquo" => Some('’'),
-        "lsquo" => Some('‘'),
-        "ldquo" => Some('“'),
-        "rdquo" => Some('”'),
-        _ => None,
-    }
+    const NAMED: [(&str, char); 16] = [
+        ("amp", '&'),
+        ("lt", '<'),
+        ("gt", '>'),
+        ("quot", '"'),
+        ("apos", '\''),
+        ("nbsp", ' '),
+        ("mdash", '—'),
+        ("ndash", '–'),
+        ("hellip", '…'),
+        ("copy", '©'),
+        ("reg", '®'),
+        ("trade", '™'),
+        ("rsquo", '’'),
+        ("lsquo", '‘'),
+        ("ldquo", '“'),
+        ("rdquo", '”'),
+    ];
+    NAMED
+        .iter()
+        .find(|(name, _)| entity.eq_ignore_ascii_case(name))
+        .map(|(_, ch)| *ch)
 }
 
 // ---------------------------------------------------------------------------

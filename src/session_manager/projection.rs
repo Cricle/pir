@@ -99,47 +99,76 @@ pub const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
 /// `sessionEntryToContextMessages`, with the custom summary roles rendered as
 /// framed user text per pir's `Message` union).
 pub fn session_entry_to_context_messages(entry: &FileEntry) -> Vec<Message> {
+    let mut messages = Vec::new();
+    visit_entry_context_messages(entry, &mut |message| messages.push(message));
+    messages
+}
+
+/// The projection of one entry, delivered message-by-message: the one
+/// implementation [`session_entry_to_context_messages`] and the aggregate
+/// builders share, so a projection never allocates a throwaway `Vec<Message>`
+/// per entry (thousands of small allocations on a long session).
+fn visit_entry_context_messages(entry: &FileEntry, visit: &mut impl FnMut(Message)) {
     match entry {
         // A `!!` bash record stays in the transcript but not in the model
         // context (upstream `convertToLlm` skips `excludeFromContext`).
         FileEntry::Message(inner) => match &inner.message {
-            StoredMessage::BashExecution(bash) if bash.excluded() => Vec::new(),
-            _ => vec![inner.message.clone().into()],
+            StoredMessage::BashExecution(bash) if bash.excluded() => {}
+            _ => visit(inner.message.clone().into()),
         },
         FileEntry::CustomMessage(inner) => {
-            vec![custom_context_message(&inner.content, entry.timestamp())]
+            visit(custom_context_message(&inner.content, entry.timestamp()))
         }
         FileEntry::BranchSummary(inner) => {
-            if inner.summary.is_empty() {
-                Vec::new()
-            } else {
-                vec![framed_user_message(
+            if !inner.summary.is_empty() {
+                visit(framed_user_message(
                     BRANCH_SUMMARY_PREFIX,
                     &inner.summary,
                     BRANCH_SUMMARY_SUFFIX,
                     entry.timestamp(),
-                )]
+                ));
             }
         }
         FileEntry::Compaction(inner) => {
-            let summary = framed_user_message(
-                COMPACTION_SUMMARY_PREFIX,
-                &inner.summary,
-                COMPACTION_SUMMARY_SUFFIX,
-                entry.timestamp(),
-            );
             // Upstream replays the stored checkpoint system message as-is
             // (`entry.systemMessage`), including its named sections and tool
             // declarations — a resumed session restores its prompt sections
             // and active tool loadout from this entry.
-            match &inner.system_message {
-                Some(system) => vec![system.to_message(), summary],
-                None => vec![summary],
+            if let Some(system) = &inner.system_message {
+                visit(system.to_message());
             }
+            visit(framed_user_message(
+                COMPACTION_SUMMARY_PREFIX,
+                &inner.summary,
+                COMPACTION_SUMMARY_SUFFIX,
+                entry.timestamp(),
+            ));
         }
         // State entries (usage, label, custom, model/thinking changes,
         // session_info, context_edit): no context contribution.
-        _ => Vec::new(),
+        _ => {}
+    }
+}
+
+/// Append one entry's context messages (after its context edit, if any) to an
+/// aggregate list. `replacement: null` omits the entry entirely; a
+/// replacement rewrites each message's editable content exactly like
+/// [`replace_message_content`].
+fn push_context_entry_messages(
+    entry: &FileEntry,
+    edit: Option<&ContextEditEntry>,
+    out: &mut Vec<Message>,
+) {
+    match edit {
+        None => visit_entry_context_messages(entry, &mut |message| out.push(message)),
+        Some(edit) => {
+            let Some(replacement) = &edit.replacement else {
+                return;
+            };
+            visit_entry_context_messages(entry, &mut |message| {
+                out.push(replace_message_content(message, &replacement.content));
+            });
+        }
     }
 }
 
@@ -225,15 +254,17 @@ pub(crate) fn user_text_message(text: &str, timestamp: u64) -> Message {
     })
 }
 
-/// Walk from the leaf to the root, oldest first (upstream `buildSessionPath`).
-/// `entries` holds every parsed non-header entry; an explicit `None` leaf
-/// yields an empty path (upstream `leafId === null`).
+/// Walk from the leaf to the root, oldest first (upstream `buildSessionPath`),
+/// keeping the ORIGINAL container elements in the returned path.
 ///
-/// INVARIANT (shared-view walk): the path BORROWS the entries, so a caller
-/// that already holds them (the session manager's `Arc<FileEntry>` list) walks
-/// them in place — the whole-session deep clone this used to demand on every
-/// projection build is gone. Generic over the container (`E: Borrow<FileEntry>`)
-/// so both `&[FileEntry]` and `&[Arc<FileEntry>]` walk the same code path.
+/// MEMORY SHAPE: returning `&E` (rather than `&FileEntry`) is what lets a
+/// projection builder recover the manager's `Arc<FileEntry>` handle from each
+/// path member instead of deep-cloning the entry into a fresh `Arc`. When the
+/// sole walk projected every element to `&FileEntry`,
+/// `SharedEntry::shared_entry` resolved to the `FileEntry` impl and cloned
+/// every retained entry (message bodies, tool results and all) on every
+/// projection build — the exact copy the `SessionProjection` memory shape is
+/// documented to avoid.
 ///
 /// INVARIANT (header-transparent fallback): the stale-leaf fallback picks the
 /// last NON-header entry, which is exactly what `entries.last()` was over a
@@ -244,30 +275,29 @@ pub(crate) fn user_text_message(text: &str, timestamp: u64) -> Message {
 /// INVARIANT (cycle-safe): the walk stops at the first repeated id, so a
 /// corrupt `parentId` cycle yields a finite path instead of an endless walk
 /// (valid sessions are cycles-free: every entry parents an older one).
-pub fn build_session_path<'a, E: Borrow<FileEntry>>(
+fn build_session_path_entries<'a, E: Borrow<FileEntry>>(
     entries: &'a [E],
     leaf_id: Option<&str>,
-) -> Vec<&'a FileEntry> {
+) -> Vec<&'a E> {
     let Some(leaf_id) = leaf_id else {
         return Vec::new();
     };
-    let index: std::collections::HashMap<&str, &FileEntry> = entries
-        .iter()
-        .filter_map(|entry| {
-            let entry: &FileEntry = entry.borrow();
-            entry.id().map(|id| (id, entry))
-        })
-        .collect();
-    let mut current: Option<&FileEntry> = index.get(leaf_id).copied();
+    let mut index: std::collections::HashMap<&str, &E> =
+        std::collections::HashMap::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(id) = entry.borrow().id() {
+            index.insert(id, entry);
+        }
+    }
+    let mut current: Option<&E> = index.get(leaf_id).copied();
     if current.is_none() {
         // Upstream session-manager.ts:400-404: a leaf id that is not in the
         // index (stale pointer after an external edit) falls back to the last
         // entry instead of yielding an empty path.
-        current = entries
-            .iter()
-            .rev()
-            .map(Borrow::borrow)
-            .find(|entry: &&FileEntry| !entry.is_header());
+        current = entries.iter().rev().find(|entry| {
+            let entry: &FileEntry = (*entry).borrow();
+            !entry.is_header()
+        });
     }
     let mut path = Vec::new();
     // A parent chain that revisits an id is corrupt data, not a branch: every
@@ -277,13 +307,14 @@ pub fn build_session_path<'a, E: Borrow<FileEntry>>(
     // are dropped exactly like the tree builder below drops them.
     let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
     while let Some(entry) = current {
-        if let Some(id) = entry.id() {
+        let entry_ref: &FileEntry = entry.borrow();
+        if let Some(id) = entry_ref.id() {
             if !visited.insert(id) {
                 break;
             }
         }
         path.push(entry);
-        current = entry
+        current = entry_ref
             .parent_id()
             .and_then(|parent| index.get(parent))
             .copied();
@@ -292,11 +323,29 @@ pub fn build_session_path<'a, E: Borrow<FileEntry>>(
     path
 }
 
+/// [`build_session_path_entries`] projected to `&FileEntry` — the public
+/// borrowed view callers that only need entry contents have always used.
+pub fn build_session_path<'a, E: Borrow<FileEntry>>(
+    entries: &'a [E],
+    leaf_id: Option<&str>,
+) -> Vec<&'a FileEntry> {
+    build_session_path_entries(entries, leaf_id)
+        .into_iter()
+        .map(|entry| {
+            let entry: &FileEntry = (*entry).borrow();
+            entry
+        })
+        .collect()
+}
+
 /// Settings tracked on the leaf path (upstream `getSessionContextSettings`).
-pub fn get_session_context_settings(path: &[&FileEntry]) -> (String, Option<(String, String)>) {
+pub fn get_session_context_settings<E: Borrow<FileEntry>>(
+    path: &[&E],
+) -> (String, Option<(String, String)>) {
     let mut thinking_level = "off".to_owned();
     let mut model: Option<(String, String)> = None;
     for entry in path {
+        let entry: &FileEntry = (*entry).borrow();
         match entry {
             FileEntry::ThinkingLevelChange(inner) => {
                 thinking_level = inner.thinking_level.clone();
@@ -328,13 +377,13 @@ fn is_system_message_entry(entry: &FileEntry) -> bool {
 /// REFERENCES into the path.
 ///
 /// INVARIANT (no intermediate copy): this is the one place the retained-entry
-/// selection runs; it never materializes an owned entry list, so a projection
-/// build pays exactly one clone per retained entry (the `source_entry` it must
-/// own) instead of the two it used to pay (a temporary `Vec<FileEntry>` that
-/// was dropped right after being walked).
-fn context_entry_refs<'a>(path: &[&'a FileEntry]) -> Vec<&'a FileEntry> {
+/// selection runs; it never materializes an owned entry list, and it keeps the
+/// caller's container references (`&E`) so an `Arc<FileEntry>` list never pays
+/// a per-entry deep clone just to select its retained range.
+fn context_entry_refs<'a, E: Borrow<FileEntry>>(path: &[&'a E]) -> Vec<&'a E> {
     let mut compaction_index: Option<usize> = None;
     for (index, entry) in path.iter().enumerate() {
+        let entry: &FileEntry = (*entry).borrow();
         if matches!(entry, FileEntry::Compaction(_)) {
             compaction_index = Some(index);
         }
@@ -342,21 +391,22 @@ fn context_entry_refs<'a>(path: &[&'a FileEntry]) -> Vec<&'a FileEntry> {
     let Some(compaction_index) = compaction_index else {
         return path.to_vec();
     };
-    let first_kept_entry_id = match path[compaction_index] {
+    let first_kept_entry_id = match (*path[compaction_index]).borrow() {
         FileEntry::Compaction(inner) => inner.first_kept_entry_id.as_str(),
         // Cannot happen (matched above); treat as no compaction.
         _ => return path.to_vec(),
     };
 
-    let mut context_entries: Vec<&FileEntry> = vec![path[compaction_index]];
+    let mut context_entries: Vec<&E> = vec![path[compaction_index]];
     let mut found_first_kept = false;
     for entry in &path[..compaction_index] {
-        if entry.id() == Some(first_kept_entry_id) {
+        let file: &FileEntry = (*entry).borrow();
+        if file.id() == Some(first_kept_entry_id) {
             found_first_kept = true;
         }
         // The compaction entry carries the system prompt replay, so retained
         // system messages inside the kept range are skipped (upstream).
-        if found_first_kept && !is_system_message_entry(entry) {
+        if found_first_kept && !is_system_message_entry(file) {
             context_entries.push(*entry);
         }
     }
@@ -368,17 +418,61 @@ fn context_entry_refs<'a>(path: &[&'a FileEntry]) -> Vec<&'a FileEntry> {
 /// as an owned list — the public shape, one clone per retained entry. Prefer
 /// [`build_session_projection`], which borrows through the same walk.
 pub fn build_context_entries(entries: &[FileEntry], leaf_id: Option<&str>) -> Vec<FileEntry> {
-    let path = build_session_path(entries, leaf_id);
+    let path = build_session_path_entries(entries, leaf_id);
     context_entry_refs(&path).into_iter().cloned().collect()
 }
 
+/// Latest context edit per target over the retained entries (upstream: later
+/// edits win). Returns `None` when the retained range has no `context_edit`
+/// entry at all — the common case — so projection builds skip a hash map and
+/// every per-entry id lookup entirely.
+fn context_edit_index<'a, E: Borrow<FileEntry>>(
+    context_entries: &[&'a E],
+) -> Option<std::collections::HashMap<String, &'a ContextEditEntry>> {
+    let mut edits: Option<std::collections::HashMap<String, &'a ContextEditEntry>> = None;
+    for entry in context_entries {
+        let entry: &'a FileEntry = (*entry).borrow();
+        if let FileEntry::ContextEdit(edit) = entry {
+            edits
+                .get_or_insert_with(std::collections::HashMap::new)
+                .insert(edit.target_id.clone(), edit);
+        }
+    }
+    edits
+}
+
+/// The edit targeting `entry`, when the retained range carries any edits.
+fn context_edit_for<'a>(
+    entry: &FileEntry,
+    edits: Option<&std::collections::HashMap<String, &'a ContextEditEntry>>,
+) -> Option<&'a ContextEditEntry> {
+    edits.and_then(|edits| entry.id().and_then(|id| edits.get(id).copied()))
+}
+
+/// The leaf path plus its retained context entries and edit index — the one
+/// walk every projection/context reader shares.
+fn retained_context<'a, E: Borrow<FileEntry>>(
+    entries: &'a [E],
+    leaf_id: Option<&str>,
+) -> (
+    Vec<&'a E>,
+    Vec<&'a E>,
+    Option<std::collections::HashMap<String, &'a ContextEditEntry>>,
+) {
+    let path = build_session_path_entries(entries, leaf_id);
+    let context_entries = context_entry_refs(&path);
+    let edits = context_edit_index(&context_entries);
+    (path, context_entries, edits)
+}
+
 /// Number of model-visible messages an entry contributes, computed WITHOUT
-/// materializing them (the count [`project_context_entry`] would produce).
+/// materializing them (the count [`push_context_entry_messages`] produces).
 ///
 /// The counts are the contract between a projection and its metadata twin
 /// ([`crate::compaction::ProjectionEntryMeta`]): `projected_message_count`
-/// must equal `project_context_entry(entry, edit).len()` for every entry. A
-/// test pins the two against a fixture with every entry kind
+/// must equal the number of messages [`push_context_entry_messages`] appends
+/// for every entry. A test pins the two against a fixture with every entry
+/// kind
 /// (`tests/suites/compaction_chunking.rs`).
 pub fn projected_message_count(entry: &FileEntry, edit: Option<&ContextEditEntry>) -> usize {
     let base = match entry {
@@ -418,51 +512,29 @@ pub fn build_projection_entry_meta<E: SharedEntry>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> Vec<crate::compaction::ProjectionEntryMeta> {
-    let path = build_session_path(entries, leaf_id);
-    let context_entries = context_entry_refs(&path);
-
-    let mut edits: std::collections::HashMap<String, &ContextEditEntry> =
-        std::collections::HashMap::new();
-    for entry in &context_entries {
-        let entry: &FileEntry = entry;
-        if let FileEntry::ContextEdit(edit) = entry {
-            edits.insert(edit.target_id.clone(), edit);
-        }
-    }
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id);
 
     let mut metas = Vec::with_capacity(context_entries.len());
-    for (index, source_entry) in context_entries.into_iter().enumerate() {
+    for (index, source_entry) in context_entries.iter().enumerate() {
+        let entry: &FileEntry = (*source_entry).borrow();
         // Only the newest compaction contributes (its summary/checkpoint);
         // older compactions retained inside the kept range contribute nothing
         // (same rule as `build_session_projection`).
-        let is_stale_compaction = matches!(source_entry, FileEntry::Compaction(_)) && index > 0;
-        let edit = source_entry.id().and_then(|id| edits.get(id).copied());
+        let is_stale_compaction = matches!(entry, FileEntry::Compaction(_)) && index > 0;
+        let edit = context_edit_for(entry, edits.as_ref());
         let message_count = if is_stale_compaction {
             0
         } else {
-            projected_message_count(source_entry, edit)
+            projected_message_count(entry, edit)
         };
         metas.push(crate::compaction::ProjectionEntryMeta {
-            source_entry: source_entry.shared_entry(),
+            // `source_entry` here is `&E`; for the manager's `Arc<FileEntry>`
+            // list this is a refcount bump, not an entry clone.
+            source_entry: (*source_entry).shared_entry(),
             message_count,
         });
     }
     metas
-}
-
-fn project_context_entry(entry: &FileEntry, edit: Option<&ContextEditEntry>) -> Vec<Message> {
-    let messages = session_entry_to_context_messages(entry);
-    let Some(edit) = edit else {
-        return messages;
-    };
-    let Some(replacement) = &edit.replacement else {
-        // `replacement: null` omits the target from context entirely.
-        return Vec::new();
-    };
-    messages
-        .into_iter()
-        .map(|message| replace_message_content(message, &replacement.content))
-        .collect()
 }
 
 /// Apply a context-edit replacement to one message (upstream: only
@@ -534,9 +606,9 @@ impl SharedEntry for FileEntry {
 /// built ONCE, the retained context entries are selected from it, and the
 /// conversation is materialized exactly ONCE — into
 /// [`SessionProjection::messages`]. Each projected entry records the message
-/// RANGE it contributed and shares its source `Arc<FileEntry>`, so a
-/// transcript-sized session is never cloned per entry (the former shape held
-/// one `Vec<Message>` per entry plus the aggregate plus a cloned `FileEntry`).
+/// RANGE it contributed and SHARES its source `Arc<FileEntry>` (a refcount
+/// bump when the walk was fed the manager's list), so a transcript-sized
+/// session is never cloned per entry.
 ///
 /// Generic over the entry container (`E: SharedEntry`) so the session
 /// manager projects straight off its `Arc<FileEntry>` list.
@@ -544,19 +616,8 @@ pub fn build_session_projection<E: SharedEntry>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> SessionProjection {
-    let path = build_session_path(entries, leaf_id);
+    let (path, context_entries, edits) = retained_context(entries, leaf_id);
     let (thinking_level, model) = get_session_context_settings(&path);
-    let context_entries = context_entry_refs(&path);
-
-    // Latest context edit per target (upstream: later edits win).
-    let mut edits: std::collections::HashMap<String, &ContextEditEntry> =
-        std::collections::HashMap::new();
-    for entry in &context_entries {
-        let entry: &FileEntry = entry;
-        if let FileEntry::ContextEdit(edit) = entry {
-            edits.insert(edit.target_id.clone(), edit);
-        }
-    }
 
     // One shared handle per retained entry (the source `Arc` when the walk
     // was fed the manager's list, a fresh `Arc` for a borrowed slice) plus the
@@ -572,31 +633,29 @@ pub fn build_session_projection<E: SharedEntry>(
         .iter()
         .enumerate()
         .map(|(index, source_entry)| {
-            if matches!(source_entry, FileEntry::Compaction(_)) && index > 0 {
+            let entry: &FileEntry = (*source_entry).borrow();
+            if matches!(entry, FileEntry::Compaction(_)) && index > 0 {
                 0
             } else {
-                let edit = source_entry.id().and_then(|id| edits.get(id).copied());
-                projected_message_count(source_entry, edit)
+                let edit = context_edit_for(entry, edits.as_ref());
+                projected_message_count(entry, edit)
             }
         })
         .sum();
     let mut messages: Vec<Message> = Vec::with_capacity(message_capacity);
-    for (index, source_entry) in context_entries.into_iter().enumerate() {
+    for (index, source_entry) in context_entries.iter().enumerate() {
+        let entry: &FileEntry = (*source_entry).borrow();
         // buildContextEntries may retain an older compaction entry because
         // its raw id lies inside the newest retained range; only the
         // newest compaction (first entry of the projected list) contributes
         // a checkpoint and summary.
-        let is_stale_compaction = matches!(source_entry, FileEntry::Compaction(_)) && index > 0;
-        let contributes: Vec<Message> = if is_stale_compaction {
-            Vec::new()
-        } else {
-            let edit = source_entry.id().and_then(|id| edits.get(id).copied());
-            project_context_entry(source_entry, edit)
-        };
         let start = messages.len();
-        messages.extend(contributes);
+        if !(matches!(entry, FileEntry::Compaction(_)) && index > 0) {
+            let edit = context_edit_for(entry, edits.as_ref());
+            push_context_entry_messages(entry, edit, &mut messages);
+        }
         projected.push(ProjectedSessionEntry {
-            source_entry: source_entry.shared_entry(),
+            source_entry: (*source_entry).shared_entry(),
             messages: start..messages.len(),
         });
     }
@@ -644,34 +703,25 @@ pub fn current_system_message(messages: &[Message]) -> Option<StoredSystemMessag
 /// replacement path only rewrites user/assistant/toolResult content), so the
 /// only edit that matters here is `replacement: null` (omission), which is
 /// applied exactly like [`build_session_projection`] applies it.
-pub fn current_system_message_from_entries<E: SharedEntry>(
+pub fn current_system_message_from_entries<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> Option<StoredSystemMessage> {
-    let path = build_session_path(entries, leaf_id);
-    let context_entries = context_entry_refs(&path);
-
-    let mut edits: std::collections::HashMap<String, &ContextEditEntry> =
-        std::collections::HashMap::new();
-    for entry in &context_entries {
-        let entry: &FileEntry = entry;
-        if let FileEntry::ContextEdit(edit) = entry {
-            edits.insert(edit.target_id.clone(), edit);
-        }
-    }
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id);
 
     let mut system_messages: Vec<Message> = Vec::new();
-    for (index, source_entry) in context_entries.into_iter().enumerate() {
+    for (index, source_entry) in context_entries.iter().enumerate() {
+        let entry: &FileEntry = (*source_entry).borrow();
         // Only the newest compaction contributes (same rule as the projection).
-        if index > 0 && matches!(source_entry, FileEntry::Compaction(_)) {
+        if index > 0 && matches!(entry, FileEntry::Compaction(_)) {
             continue;
         }
-        if let Some(edit) = source_entry.id().and_then(|id| edits.get(id).copied()) {
+        if let Some(edit) = context_edit_for(entry, edits.as_ref()) {
             if edit.replacement.is_none() {
                 continue;
             }
         }
-        match source_entry {
+        match entry {
             FileEntry::Message(inner) => match &inner.message {
                 // Two wire shapes can carry a system message: the upstream
                 // string-content `StoredSystemMessage`, and a `UserMessage`
@@ -706,32 +756,23 @@ pub fn current_system_message_from_entries<E: SharedEntry>(
 /// projection-based walk returned: the first non-aborted assistant message
 /// decides (an all-whitespace one yields `None`, it does not fall through to
 /// an older message).
-pub fn last_assistant_text_from_entries<E: SharedEntry>(
+pub fn last_assistant_text_from_entries<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> Option<String> {
     use crate::ai::types::StopReason;
 
-    let path = build_session_path(entries, leaf_id);
-    let context_entries = context_entry_refs(&path);
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id);
 
-    let mut edits: std::collections::HashMap<String, &ContextEditEntry> =
-        std::collections::HashMap::new();
-    for entry in &context_entries {
-        let entry: &FileEntry = entry;
-        if let FileEntry::ContextEdit(edit) = entry {
-            edits.insert(edit.target_id.clone(), edit);
-        }
-    }
-
-    for source_entry in context_entries.into_iter().rev() {
-        let FileEntry::Message(inner) = source_entry else {
+    for source_entry in context_entries.iter().rev() {
+        let entry: &FileEntry = (*source_entry).borrow();
+        let FileEntry::Message(inner) = entry else {
             continue;
         };
         let StoredMessage::Assistant(assistant) = &inner.message else {
             continue;
         };
-        let edit = source_entry.id().and_then(|id| edits.get(id).copied());
+        let edit = context_edit_for(entry, edits.as_ref());
         if let Some(edit) = edit {
             if edit.replacement.is_none() {
                 // `replacement: null` omits the target from context.
@@ -740,11 +781,13 @@ pub fn last_assistant_text_from_entries<E: SharedEntry>(
         }
         // A replacement on an assistant message rewrites its content
         // (`replace_message_content`); the text walk must see that content,
-        // not the stored one.
-        let content: Vec<ContentBlock> = match edit.and_then(|edit| edit.replacement.as_ref()) {
-            Some(replacement) => content_blocks(&replacement.content),
-            None => assistant.content.clone(),
-        };
+        // not the stored one. The stored content is read by reference — the
+        // old `assistant.content.clone()` copied the whole message (tool
+        // results included) on every poll just to join its text blocks.
+        let replaced = edit
+            .and_then(|edit| edit.replacement.as_ref())
+            .map(|replacement| content_blocks(&replacement.content));
+        let content: &[ContentBlock] = replaced.as_deref().unwrap_or(&assistant.content);
         if assistant.stop_reason == StopReason::Aborted && content.is_empty() {
             continue;
         }

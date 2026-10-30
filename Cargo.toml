@@ -87,6 +87,16 @@ name = "pir-mock-mcp"
 path = "tests/support/mock_mcp_server.rs"
 required-features = ["mcp"]
 
+# The minimal profile's executable front end. It declares NO required
+# features on purpose: `cargo build --no-default-features` must still produce
+# a runnable agent (`pir::minimal::MinimalAgent` is core, the binary is a thin
+# flag/REPL wrapper). `--features full` also builds it, but the shipped `pir`
+# binary and every existing public API are unchanged.
+[[bin]]
+name = "pir-minimal"
+path = "src/bin/pir-minimal.rs"
+required-features = []
+
 [lib]
 name = "pir"
 path = "src/lib.rs"
@@ -174,7 +184,10 @@ regex = "1.13.1"
 # from the page cache instead of a heap buffer, so opening a 100 MB session
 # never copies the file. 0.9.11 is already in the lock as a transitive dep (the
 # notify/ignore stack), so this introduces no new external crate to compile.
-memmap2 = "0.9"
+# Optional: the only consumer is `session_manager::tail_page`, which itself
+# rides the `session` feature. `--no-default-features` therefore drops it from
+# the graph; the `session` feature re-adds it.
+memmap2 = { version = "0.9", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 # 0.23 shares the tree's single base64 (reqwest/rmcp/swc/hyper-util already
@@ -374,6 +387,8 @@ full = [
     "skills",
     "sdk",
     "client",
+    # Empty profile marker; `full` is still the union of every feature.
+    "minimal",
 ]
 # Default-on optional surfaces (user decision 2026-10-22: "except the agent
 # loop, everything is an optional feature that is on by default"). `session`
@@ -385,8 +400,9 @@ full = [
 # providers + tools + config compilable.
 #   session     — upstream-format JSONL persistence, the tail-page reader and
 #                 session discovery. Off: the agent runs with no transcript
-#                 persistence (in-memory only).
-session = []
+#                 persistence (in-memory only). `memmap2` is optional and only
+#                 this feature pulls it in.
+session = ["dep:memmap2"]
 #   skills      — skill discovery/loading (`src/skills.rs`). Off: skill loading
 #                 reports the documented "disabled" diagnostic; the prompt
 #                 renderer still compiles.
@@ -394,8 +410,21 @@ skills = []
 #   sdk         — the curated embedding facade (`pir::sdk`). Off: the module
 #                 is not compiled (no stub); embedders enable `sdk`.
 sdk = []
-# AI wire adapters: each feature gates one provider family's adapter module and
-# its registry/construction arm. `provider-google` carries the Vertex
+# The zero-optional profile marker. It deliberately enables NOTHING: the
+# runnable minimal agent (`pir::minimal`, the `pir-minimal` bin) and its one
+# OpenAI-compatible provider are core, so `--no-default-features` alone is
+# already runnable. `minimal` exists as the named profile for scripts and
+# consumers (`cargo check --no-default-features --features minimal`); it is a
+# member of `full` (so `full` stays the union of every feature) and enabling
+# it never changes the compiled surface.
+minimal = []
+# AI wire adapters: each feature gates one provider family's adapter and its
+# registry/construction arm. The exception is the plain OpenAI-compatible
+# `/chat/completions` adapter (`ai::api::openai`), which is core because the
+# minimal profile needs exactly one real provider and `reqwest` is an
+# unconditional dependency; `provider-openai` gates the Responses/Codex/
+# pi-messages adapters, catalog auto-construction of OpenAI-family models and
+# the Codex WebSocket transport. `provider-google` carries the Vertex
 # service-account JWT (`rsa`), `provider-bedrock` the SigV4 signing (`hmac`);
 # `extensions` needs both too (node:crypto), so they are shared, not owned.
 provider-openai = ["dep:tokio-tungstenite"]

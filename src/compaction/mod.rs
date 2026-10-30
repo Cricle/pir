@@ -185,35 +185,7 @@ pub struct FileOperations {
 /// `details.nestedCalls.calls` array; read defensively.
 pub fn extract_file_ops_from_messages(messages: &[Message], ops: &mut FileOperations) {
     for message in messages {
-        match message {
-            Message::ToolResult(result) => {
-                if let Some(calls) = result
-                    .details
-                    .as_ref()
-                    .and_then(|details| details.get("nestedCalls"))
-                    .and_then(|nested| nested.get("calls"))
-                    .and_then(JsonValue::as_array)
-                {
-                    for call in calls {
-                        add_file_op(
-                            call.get("name").and_then(JsonValue::as_str).unwrap_or(""),
-                            call.get("arguments"),
-                            ops,
-                        );
-                    }
-                }
-            }
-            Message::Assistant(assistant) => {
-                for block in &assistant.content {
-                    let ContentBlock::ToolCall(call) = block else {
-                        continue;
-                    };
-                    let arguments = serde_json::to_value(&call.arguments).unwrap_or_default();
-                    add_file_op(&call.name, Some(&arguments), ops);
-                }
-            }
-            _ => {}
-        }
+        extract_file_ops_from_message(message, ops);
     }
 }
 
@@ -318,6 +290,164 @@ fn content_text(content: &[ContentBlock]) -> String {
         .join("\n")
 }
 
+/// Character length of [`content_text`] WITHOUT building the joined string —
+/// the weight path only needs the count, never a copy of the message text.
+fn content_text_chars(content: &[ContentBlock]) -> usize {
+    let mut chars = 0usize;
+    let mut blocks = 0usize;
+    for block in content {
+        if let ContentBlock::Text(text) = block {
+            chars = chars.saturating_add(text.text.chars().count());
+            blocks += 1;
+        }
+    }
+    if blocks == 0 {
+        0
+    } else {
+        chars + blocks - 1
+    }
+}
+
+/// Write at most `max_chars` characters of [`content_text`] into `out` and
+/// return the FULL joined length in characters. The part beyond `max_chars`
+/// is counted but never materialized: a multi-megabyte tool result that the
+/// serializer truncates to 2000 characters must not be copied whole first.
+fn write_content_text_limited(
+    out: &mut String,
+    content: &[ContentBlock],
+    max_chars: usize,
+) -> usize {
+    let mut total = 0usize;
+    let mut written = 0usize;
+    let mut first = true;
+    for block in content {
+        let ContentBlock::Text(text) = block else {
+            continue;
+        };
+        if !first {
+            total += 1;
+            if written < max_chars {
+                out.push('\n');
+                written += 1;
+            }
+        }
+        first = false;
+        total = total.saturating_add(text.text.chars().count());
+        if written < max_chars {
+            let mut utf8 = [0u8; 4];
+            for ch in text.text.chars() {
+                if written >= max_chars {
+                    break;
+                }
+                out.push_str(ch.encode_utf8(&mut utf8));
+                written += 1;
+            }
+        }
+    }
+    total
+}
+
+/// Decimal digit count of `value` (for the truncation marker's length).
+fn decimal_digits(value: usize) -> usize {
+    let mut digits = 1usize;
+    let mut remaining = value;
+    while remaining >= 10 {
+        remaining /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// Character length of [`prompts::truncate_for_summary`]'s result for a text
+/// of `total_chars` characters, without building the truncated text.
+fn truncated_summary_chars(total_chars: usize, max_chars: usize) -> usize {
+    if total_chars <= max_chars {
+        return total_chars;
+    }
+    // "\n\n[... " + decimal digits + " more characters truncated]"
+    max_chars + 2 + 5 + decimal_digits(total_chars - max_chars) + 27
+}
+
+/// `(serialized characters, part count)` of ONE message under the exact
+/// [`serialize_message_parts`] rule, without materializing any text. The
+/// chunk splitter and the streaming chunker weigh every message with this
+/// (their peak must be one message, not the span), so it must stay
+/// byte-for-byte equivalent to the serializer — a unit test pins that.
+pub(crate) fn message_parts_chars(message: &Message) -> (usize, usize) {
+    match message {
+        Message::User(user) => {
+            let content = content_text_chars(&user.content);
+            if content == 0 {
+                (0, 0)
+            } else {
+                // "[User]: "
+                (8 + content, 1)
+            }
+        }
+        Message::Assistant(assistant) => {
+            let mut text_chars = 0usize;
+            let mut text_blocks = 0usize;
+            let mut tool_calls_chars = 0usize;
+            let mut tool_calls = 0usize;
+            for block in &assistant.content {
+                match block {
+                    ContentBlock::Text(text) => {
+                        text_chars = text_chars.saturating_add(text.text.chars().count());
+                        text_blocks += 1;
+                    }
+                    ContentBlock::ToolCall(call) => {
+                        let mut args_chars = 0usize;
+                        let mut args = 0usize;
+                        for (key, value) in &call.arguments {
+                            let json = serde_json::to_string(value).unwrap_or_default();
+                            args_chars = args_chars
+                                .saturating_add(key.chars().count() + 1 + json.chars().count());
+                            args += 1;
+                        }
+                        if args > 0 {
+                            args_chars = args_chars.saturating_add(2 * (args - 1));
+                        }
+                        // "name(" + args + ")"
+                        tool_calls_chars = tool_calls_chars
+                            .saturating_add(call.name.chars().count() + 2 + args_chars);
+                        tool_calls += 1;
+                    }
+                    _ => {}
+                }
+            }
+            let mut chars = 0usize;
+            let mut parts = 0usize;
+            if text_blocks > 0 {
+                // "[Assistant]: " + the joined text blocks (empty blocks still
+                // contribute their "\n" separators).
+                chars = chars.saturating_add(13 + text_chars + text_blocks - 1);
+                parts += 1;
+            }
+            if tool_calls > 0 {
+                chars = chars.saturating_add(
+                    // "[Assistant tool calls]: " + calls joined with "; "
+                    24 + tool_calls_chars + 2 * (tool_calls - 1),
+                );
+                parts += 1;
+            }
+            (chars, parts)
+        }
+        Message::ToolResult(result) => {
+            let total = content_text_chars(&result.content);
+            if total == 0 {
+                (0, 0)
+            } else {
+                // "[Tool result]: " + the truncated text
+                (
+                    15 + truncated_summary_chars(total, prompts::TOOL_RESULT_MAX_CHARS),
+                    1,
+                )
+            }
+        }
+        Message::System(_) | Message::Developer(_) => (0, 0),
+    }
+}
+
 /// Serialize ONE message into the part(s) [`serialize_conversation`] would
 /// contribute for it (empty when the message contributes nothing: system and
 /// developer messages, empty content, ...). A message that carries both
@@ -337,29 +467,38 @@ pub(crate) fn serialize_message_parts(message: &Message) -> Vec<String> {
             }
         }
         Message::Assistant(assistant) => {
-            let mut tool_calls: Vec<String> = Vec::new();
+            use std::fmt::Write as _;
 
+            let has_text = assistant
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text(_)));
+            // One `content_text` for the whole message (the old shape scanned
+            // the blocks once for `any` and again inside `content_text`).
+            let text = if has_text {
+                content_text(&assistant.content)
+            } else {
+                String::new()
+            };
+            let mut tool_calls: Vec<String> = Vec::new();
             for block in &assistant.content {
-                if let ContentBlock::ToolCall(call) = block {
-                    let args = call
-                        .arguments
-                        .iter()
-                        .map(|(key, value)| {
-                            format!("{key}={}", serde_json::to_string(value).unwrap_or_default())
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    tool_calls.push(format!("{}({args})", call.name));
+                let ContentBlock::ToolCall(call) = block else {
+                    continue;
+                };
+                let mut args = String::new();
+                for (index, (key, value)) in call.arguments.iter().enumerate() {
+                    if index > 0 {
+                        args.push_str(", ");
+                    }
+                    let _ = write!(args, "{key}=");
+                    args.push_str(&serde_json::to_string(value).unwrap_or_default());
                 }
+                tool_calls.push(format!("{}({args})", call.name));
             }
 
             let mut parts: Vec<String> = Vec::new();
-            if assistant
-                .content
-                .iter()
-                .any(|block| matches!(block, ContentBlock::Text(_)))
-            {
-                parts.push(format!("[Assistant]: {}", content_text(&assistant.content)));
+            if has_text {
+                parts.push(format!("[Assistant]: {text}"));
             }
             if !tool_calls.is_empty() {
                 parts.push(format!("[Assistant tool calls]: {}", tool_calls.join("; ")));
@@ -367,12 +506,26 @@ pub(crate) fn serialize_message_parts(message: &Message) -> Vec<String> {
             parts
         }
         Message::ToolResult(result) => {
-            let content = content_text(&result.content);
-            if content.is_empty() {
+            // Build the (possibly truncated) text directly: the old shape
+            // materialized the WHOLE tool result through `content_text` just
+            // to keep its first 2000 characters.
+            let mut truncated = String::new();
+            let total = write_content_text_limited(
+                &mut truncated,
+                &result.content,
+                prompts::TOOL_RESULT_MAX_CHARS,
+            );
+            if total == 0 {
                 Vec::new()
             } else {
-                let truncated =
-                    prompts::truncate_for_summary(&content, prompts::TOOL_RESULT_MAX_CHARS);
+                if total > prompts::TOOL_RESULT_MAX_CHARS {
+                    use std::fmt::Write as _;
+                    let _ = write!(
+                        truncated,
+                        "\n\n[... {} more characters truncated]",
+                        total - prompts::TOOL_RESULT_MAX_CHARS
+                    );
+                }
                 vec![format!("[Tool result]: {truncated}")]
             }
         }
@@ -400,11 +553,21 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
 /// concatenation) — the single serializer, so a span that lives as references
 /// is serialized exactly like an owned one.
 pub fn serialize_conversation_over<M: MessageSequence + ?Sized>(messages: &M) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    // One output buffer: the old shape collected every part into a `Vec`
+    // (one allocation per part) and `join`ed it into a SECOND full-sized
+    // string, doubling the peak for a transcript-sized span.
+    let mut out = String::new();
+    let mut first = true;
     for index in 0..messages.message_count() {
-        parts.extend(serialize_message_parts(messages.message_at(index)));
+        for part in serialize_message_parts(messages.message_at(index)) {
+            if !first {
+                out.push_str("\n\n");
+            }
+            first = false;
+            out.push_str(&part);
+        }
     }
-    parts.join("\n\n")
+    out
 }
 
 /// Serialize ONE chunk for the summarizer prompt. A normal chunk serializes
@@ -412,7 +575,7 @@ pub fn serialize_conversation_over<M: MessageSequence + ?Sized>(messages: &M) ->
 /// within the cap); an indivisible message that alone exceeds the cap is
 /// truncated with the standard "[... N more characters truncated]" marker, in
 /// message order, so the request can never exceed the budget.
-/// [`serialize_chunk`] into a REUSED buffer: the streaming chunker keeps one
+/// [`write_chunk`] into a REUSED buffer: the streaming chunker keeps one
 /// chunk buffer for the whole run, so a 247-chunk span does not allocate a
 /// fresh chunk-sized string per call. Byte-identical to the allocating twin.
 pub(crate) fn write_chunk<M: MessageSequence + ?Sized>(
@@ -421,20 +584,40 @@ pub(crate) fn write_chunk<M: MessageSequence + ?Sized>(
     chunk: &chunking::SummarizationChunk,
     max_chars: usize,
 ) {
+    let mut first = out.is_empty();
+    write_chunk_body(out, messages, chunk, max_chars, &mut first);
+}
+
+/// [`write_chunk`] for a destination that ALREADY carries the prompt's
+/// framing prefix: the chunk's first part must not be preceded by the
+/// message separator (`out.is_empty()` would be the wrong test).
+fn write_chunk_prefixed<M: MessageSequence + ?Sized>(
+    out: &mut String,
+    messages: &M,
+    chunk: &chunking::SummarizationChunk,
+    max_chars: usize,
+) {
+    let mut first = true;
+    write_chunk_body(out, messages, chunk, max_chars, &mut first);
+}
+
+fn write_chunk_body<M: MessageSequence + ?Sized>(
+    out: &mut String,
+    messages: &M,
+    chunk: &chunking::SummarizationChunk,
+    max_chars: usize,
+    first: &mut bool,
+) {
     let len = messages.message_count();
     let start = chunk.start.min(len);
     let end = chunk.end.min(len);
     if !chunk.oversize {
         for index in start..end {
-            let parts = serialize_message_parts(messages.message_at(index));
-            for part in parts {
-                if !out.is_empty() {
-                    out.push_str(
-                        "
-
-",
-                    );
+            for part in serialize_message_parts(messages.message_at(index)) {
+                if !*first {
+                    out.push_str("\n\n");
                 }
+                *first = false;
                 out.push_str(&part);
             }
         }
@@ -448,14 +631,11 @@ pub(crate) fn write_chunk<M: MessageSequence + ?Sized>(
     let mut used = 0usize;
     for index in start..end {
         for part in serialize_message_parts(messages.message_at(index)) {
-            if !out.is_empty() {
-                out.push_str(
-                    "
-
-",
-                );
+            if !*first {
+                out.push_str("\n\n");
                 used += 2;
             }
+            *first = false;
             let part_chars = part.chars().count();
             if used + part_chars > max_chars {
                 let remaining = max_chars.saturating_sub(used);
@@ -468,17 +648,6 @@ pub(crate) fn write_chunk<M: MessageSequence + ?Sized>(
             out.push_str(&part);
         }
     }
-}
-
-/// The allocating twin of [`write_chunk`] (the resident paths and tests).
-pub(crate) fn serialize_chunk<M: MessageSequence + ?Sized>(
-    messages: &M,
-    chunk: &chunking::SummarizationChunk,
-    max_chars: usize,
-) -> String {
-    let mut out = String::new();
-    write_chunk(&mut out, messages, chunk, max_chars);
-    out
 }
 
 // ============================================================================
@@ -501,38 +670,39 @@ fn summarization_failure(response: &AssistantMessage, label: &str) -> Option<Str
     }
 }
 
-/// Build the summarizer prompt: `<conversation>` + optional
-/// `<previous-summary>` + base format prompt + optional additional focus
-/// (upstream `generateSummaryWithUsage`), over an already-serialized
-/// conversation text — the chunked runner holds each chunk's text (bounded)
-/// instead of the whole span's.
-fn build_summarization_prompt_from_text(
-    conversation_text: &str,
-    previous_summary: Option<&str>,
-    custom_instructions: Option<&str>,
-) -> String {
-    let mut prompt_text = String::new();
-    write_summarization_prompt(
-        &mut prompt_text,
-        conversation_text,
-        previous_summary,
-        custom_instructions,
-    );
-    prompt_text
-}
-
-/// [`build_summarization_prompt_from_text`] into a REUSED buffer: the streaming
-/// chunker keeps one prompt buffer for the whole run, so a 247-chunk span does
-/// not allocate (and retain) a fresh chunk-sized string per call.
-/// Byte-identical to the allocating twin.
+/// Build the summarizer prompt into a REUSED buffer: the streaming chunker
+/// keeps one prompt buffer for the whole run, so a 247-chunk span does not
+/// allocate (and retain) a fresh chunk-sized string per call.
 pub(crate) fn write_summarization_prompt(
     out: &mut String,
     conversation_text: &str,
     previous_summary: Option<&str>,
     custom_instructions: Option<&str>,
 ) {
+    write_summarization_prompt_parts(
+        out,
+        |out| out.push_str(conversation_text),
+        previous_summary,
+        custom_instructions,
+    );
+}
+
+/// [`write_summarization_prompt`] whose conversation body is WRITTEN by
+/// `write_conversation` directly into the prompt buffer. The single-call
+/// compaction path uses this to serialize the chunk straight into the prompt:
+/// the previous shape built the chunk text, copied it into the prompt, and
+/// copied the prompt again into the request (three full copies of the
+/// largest string in the run).
+fn write_summarization_prompt_parts<F>(
+    out: &mut String,
+    write_conversation: F,
+    previous_summary: Option<&str>,
+    custom_instructions: Option<&str>,
+) where
+    F: FnOnce(&mut String),
+{
     out.push_str("<conversation>\n");
-    out.push_str(conversation_text);
+    write_conversation(out);
     out.push_str("\n</conversation>\n\n");
     if let Some(previous) = previous_summary {
         out.push_str("<previous-summary>\n");
@@ -553,32 +723,22 @@ pub(crate) fn write_summarization_prompt(
 /// Write the turn-prefix summarizer prompt (upstream
 /// `generateTurnPrefixSummary`, compaction.ts:1078-1081): `# Conversation` +
 /// `# Instructions` framing around the checkpoint prompt, plus the
-/// `Additional focus:` suffix when custom instructions are present. Without
-/// instructions the output is byte-identical to the framed prompt.
-pub(crate) fn write_turn_prefix_prompt(
+/// `Additional focus:` suffix when custom instructions are present.
+fn write_turn_prefix_prompt_parts<F>(
     out: &mut String,
-    conversation_text: &str,
+    write_conversation: F,
     custom_instructions: Option<&str>,
-) {
+) where
+    F: FnOnce(&mut String),
+{
     out.push_str("# Conversation\n");
-    out.push_str(conversation_text);
+    write_conversation(out);
     out.push_str("\n\n# Instructions\n");
     out.push_str(prompts::TURN_PREFIX_SUMMARIZATION_PROMPT);
     if let Some(instructions) = custom_instructions {
         out.push_str("\n\nAdditional focus: ");
         out.push_str(instructions);
     }
-}
-
-/// [`write_turn_prefix_prompt`] as an allocating build, over an
-/// already-serialized conversation text.
-fn build_turn_prefix_prompt_from_text(
-    conversation_text: &str,
-    custom_instructions: Option<&str>,
-) -> String {
-    let mut prompt_text = String::new();
-    write_turn_prefix_prompt(&mut prompt_text, conversation_text, custom_instructions);
-    prompt_text
 }
 
 /// The model's own output limit (`0` = no model cap; the provider layer keeps
@@ -600,18 +760,9 @@ pub fn turn_prefix_max_tokens(_reserve_tokens: u64, model: &Model) -> u64 {
     model.max_tokens
 }
 
-pub(crate) fn summarizer_context(prompt_text: &str) -> Context {
-    Context {
-        system_prompt: Some(prompts::SUMMARIZATION_SYSTEM_PROMPT.to_string()),
-        messages: vec![user_text_message(prompt_text, now_ms())],
-        tools: None,
-    }
-}
-
-/// [`summarizer_context`] that TAKES ownership of the prompt text (the
-/// streaming chunker's reused buffer): the request's message owns the string
-/// instead of holding a copy of it, so one chunk-sized allocation per call
-/// disappears.
+/// The summarizer request context. It TAKES ownership of the prompt text
+/// (the chunked runners build the prompt in one reusable buffer): the
+/// request's message owns the string instead of holding a copy of it.
 pub(crate) fn summarizer_context_owned(prompt_text: String) -> Context {
     Context {
         system_prompt: Some(prompts::SUMMARIZATION_SYSTEM_PROMPT.to_string()),
@@ -688,42 +839,8 @@ impl SpanFraming<'_> {
         }
     }
 
-    /// The prompt for chunk 0 (the style's own framing).
-    pub(crate) fn opening_prompt(
-        self,
-        conversation_text: &str,
-        previous_summary: Option<&str>,
-        custom_instructions: Option<&str>,
-    ) -> String {
-        match self {
-            Self::History => build_summarization_prompt_from_text(
-                conversation_text,
-                previous_summary,
-                custom_instructions,
-            ),
-            Self::TurnPrefix => {
-                build_turn_prefix_prompt_from_text(conversation_text, custom_instructions)
-            }
-            Self::Branch { instructions } => {
-                format!("<conversation>\n{conversation_text}\n</conversation>\n\n{instructions}")
-            }
-        }
-    }
-
-    /// The prompt for every later chunk: the existing "update" framing folds
-    /// the chunk into the running summary (upstream's iterative compaction
-    /// path is exactly this fold, just for a whole history at once).
-    pub(crate) fn folding_prompt(
-        self,
-        conversation_text: &str,
-        running: Option<&str>,
-        custom_instructions: Option<&str>,
-    ) -> String {
-        build_summarization_prompt_from_text(conversation_text, running, custom_instructions)
-    }
-
-    /// [`Self::opening_prompt`] into a REUSED buffer (the streaming chunker's
-    /// shape; byte-identical output).
+    /// The prompt for chunk 0 (the style's own framing), built into a REUSED
+    /// buffer (the streaming chunker's shape).
     pub(crate) fn write_opening_prompt(
         self,
         out: &mut String,
@@ -731,34 +848,63 @@ impl SpanFraming<'_> {
         previous_summary: Option<&str>,
         custom_instructions: Option<&str>,
     ) {
+        self.write_opening_prompt_parts(
+            out,
+            |out| out.push_str(conversation_text),
+            previous_summary,
+            custom_instructions,
+        );
+    }
+
+    /// [`Self::write_opening_prompt`] with the conversation body written
+    /// straight into the prompt buffer — no intermediate chunk string.
+    pub(crate) fn write_opening_prompt_for_chunk<M: MessageSequence + ?Sized>(
+        self,
+        out: &mut String,
+        messages: &M,
+        chunk: &chunking::SummarizationChunk,
+        max_chars: usize,
+        previous_summary: Option<&str>,
+        custom_instructions: Option<&str>,
+    ) {
+        self.write_opening_prompt_parts(
+            out,
+            |out| write_chunk_prefixed(out, messages, chunk, max_chars),
+            previous_summary,
+            custom_instructions,
+        );
+    }
+
+    fn write_opening_prompt_parts<F>(
+        self,
+        out: &mut String,
+        write_conversation: F,
+        previous_summary: Option<&str>,
+        custom_instructions: Option<&str>,
+    ) where
+        F: FnOnce(&mut String),
+    {
         match self {
-            Self::History => write_summarization_prompt(
+            Self::History => write_summarization_prompt_parts(
                 out,
-                conversation_text,
+                write_conversation,
                 previous_summary,
                 custom_instructions,
             ),
             Self::TurnPrefix => {
-                write_turn_prefix_prompt(out, conversation_text, custom_instructions);
+                write_turn_prefix_prompt_parts(out, write_conversation, custom_instructions);
             }
             Self::Branch { instructions } => {
-                out.push_str(
-                    "<conversation>
-",
-                );
-                out.push_str(conversation_text);
-                out.push_str(
-                    "
-</conversation>
-
-",
-                );
+                out.push_str("<conversation>\n");
+                write_conversation(out);
+                out.push_str("\n</conversation>\n\n");
                 out.push_str(instructions);
             }
         }
     }
 
-    /// [`Self::folding_prompt`] into a REUSED buffer.
+    /// The prompt for every later chunk: the "update" framing folds the chunk
+    /// into the running summary, built into a REUSED buffer.
     pub(crate) fn write_folding_prompt(
         self,
         out: &mut String,
@@ -767,6 +913,26 @@ impl SpanFraming<'_> {
         custom_instructions: Option<&str>,
     ) {
         write_summarization_prompt(out, conversation_text, running, custom_instructions)
+    }
+
+    /// [`Self::write_folding_prompt`] with the conversation body written
+    /// straight into the prompt buffer.
+    pub(crate) fn write_folding_prompt_for_chunk<M: MessageSequence + ?Sized>(
+        self,
+        out: &mut String,
+        messages: &M,
+        chunk: &chunking::SummarizationChunk,
+        max_chars: usize,
+        running: Option<&str>,
+        custom_instructions: Option<&str>,
+    ) {
+        let _ = self;
+        write_summarization_prompt_parts(
+            out,
+            |out| write_chunk_prefixed(out, messages, chunk, max_chars),
+            running,
+            custom_instructions,
+        );
     }
 
     /// Whether an `Aborted` terminal response is a terminal outcome for this
@@ -877,16 +1043,29 @@ async fn summarize_span_chunked<M: MessageSequence + ?Sized>(
 
     if chunks.len() <= 1 {
         // Upstream single-call path, byte for byte: the one chunk is the whole
-        // span (a zero-message span never reaches here).
-        let conversation_text = match chunks.first() {
-            Some(chunk) => serialize_chunk(messages, chunk, budget.chars),
-            None => String::new(),
-        };
-        let prompt_text =
-            framing.opening_prompt(&conversation_text, previous_summary, custom_instructions);
+        // span (a zero-message span never reaches here). The chunk is
+        // serialized straight into the prompt buffer (one allocation), and the
+        // prompt is MOVED into the request instead of being cloned.
+        let mut prompt_text = String::new();
+        match chunks.first() {
+            Some(chunk) => framing.write_opening_prompt_for_chunk(
+                &mut prompt_text,
+                messages,
+                chunk,
+                budget.chars,
+                previous_summary,
+                custom_instructions,
+            ),
+            None => framing.write_opening_prompt(
+                &mut prompt_text,
+                "",
+                previous_summary,
+                custom_instructions,
+            ),
+        }
         tracing::debug!(label, "summarizer call");
         let response =
-            complete_summarization_with_retry(&complete, summarizer_context(&prompt_text))
+            complete_summarization_with_retry(&complete, summarizer_context_owned(prompt_text))
                 .await
                 .map_err(|error| format!("{label} failed: {error}"))?;
         return finish_summarized(response, label, framing.abort_is_terminal());
@@ -906,14 +1085,30 @@ async fn summarize_span_chunked<M: MessageSequence + ?Sized>(
     let mut running: Option<String> = previous_summary.map(str::to_owned);
     let mut total_usage: Option<Usage> = None;
     for (index, chunk) in chunks.iter().enumerate() {
-        let conversation_text = serialize_chunk(messages, chunk, budget.chars);
-        let prompt_text = if index == 0 {
-            framing.opening_prompt(&conversation_text, running.as_deref(), custom_instructions)
+        // Serialize the bounded chunk directly into the prompt buffer and move
+        // the finished prompt into the request (no chunk string, no clone).
+        let mut prompt_text = String::new();
+        if index == 0 {
+            framing.write_opening_prompt_for_chunk(
+                &mut prompt_text,
+                messages,
+                chunk,
+                budget.chars,
+                running.as_deref(),
+                custom_instructions,
+            );
         } else {
-            framing.folding_prompt(&conversation_text, running.as_deref(), custom_instructions)
-        };
+            framing.write_folding_prompt_for_chunk(
+                &mut prompt_text,
+                messages,
+                chunk,
+                budget.chars,
+                running.as_deref(),
+                custom_instructions,
+            );
+        }
         let response =
-            complete_summarization_with_retry(&complete, summarizer_context(&prompt_text))
+            complete_summarization_with_retry(&complete, summarizer_context_owned(prompt_text))
                 .await
                 .map_err(|error| {
                     format!(
@@ -1145,15 +1340,17 @@ pub struct CompactionPreparation {
 /// filter: compaction entries contribute nothing (they are represented by the
 /// previous summary) and system messages are prompt state, replayed by the
 /// compaction entry.
-fn span_message_refs<E: ProjectedEntry>(entry: &E) -> Vec<&Message> {
-    if entry.is_compaction() {
-        return Vec::new();
-    }
+fn span_messages<'a, E: ProjectedEntry>(entry: &'a E) -> impl Iterator<Item = &'a Message> + 'a {
     entry
         .messages()
         .iter()
         .filter(|message| !matches!(message, Message::System(_)))
-        .collect()
+        .filter(move |_| !entry.is_compaction())
+}
+
+/// Whether the entry contributes at least one message to a summarized span.
+fn span_has_messages<E: ProjectedEntry>(entry: &E) -> bool {
+    span_messages(entry).next().is_some()
 }
 
 /// Entry-level index arithmetic of a compaction preparation, shared by the
@@ -1237,12 +1434,14 @@ fn plan_compaction<E: ProjectedEntry, P: PathEntry>(
     };
     let kept_span = cut_point.first_kept_entry_index.min(projected.len())..projected.len();
 
+    // No `Vec<&Message>` per entry: the old shape allocated one just to test
+    // emptiness and another for the file-op scan of every entry.
     let history_empty = projected[history_span.clone()]
         .iter()
-        .all(|entry| span_message_refs(entry).is_empty());
+        .all(|entry| !span_has_messages(entry));
     let turn_prefix_empty = projected[turn_prefix_span.clone()]
         .iter()
-        .all(|entry| span_message_refs(entry).is_empty());
+        .all(|entry| !span_has_messages(entry));
     if history_empty && turn_prefix_empty {
         return None;
     }
@@ -1252,11 +1451,11 @@ fn plan_compaction<E: ProjectedEntry, P: PathEntry>(
     let mut file_ops = FileOperations::default();
     carry_previous_file_ops(previous_details.as_ref(), &mut file_ops);
     for entry in &projected[history_span.clone()] {
-        extract_file_ops_from_message_refs(span_message_refs(entry).as_slice(), &mut file_ops);
+        extract_file_ops_from_entry(entry, &mut file_ops);
     }
     if cut_point.is_split_turn {
         for entry in &projected[turn_prefix_span.clone()] {
-            extract_file_ops_from_message_refs(span_message_refs(entry).as_slice(), &mut file_ops);
+            extract_file_ops_from_entry(entry, &mut file_ops);
         }
     }
 
@@ -1277,35 +1476,49 @@ fn plan_compaction<E: ProjectedEntry, P: PathEntry>(
 /// preparation path clones nothing to scan tool calls).
 pub(crate) fn extract_file_ops_from_message_refs(messages: &[&Message], ops: &mut FileOperations) {
     for message in messages {
-        match message {
-            Message::ToolResult(result) => {
-                if let Some(calls) = result
-                    .details
-                    .as_ref()
-                    .and_then(|details| details.get("nestedCalls"))
-                    .and_then(|nested| nested.get("calls"))
-                    .and_then(JsonValue::as_array)
-                {
-                    for call in calls {
-                        add_file_op(
-                            call.get("name").and_then(JsonValue::as_str).unwrap_or(""),
-                            call.get("arguments"),
-                            ops,
-                        );
-                    }
+        extract_file_ops_from_message(message, ops);
+    }
+}
+
+/// The ONE per-message file-op rule shared by the owned list, the borrowed
+/// list, and the projected-entry scan.
+fn extract_file_ops_from_message(message: &Message, ops: &mut FileOperations) {
+    match message {
+        Message::ToolResult(result) => {
+            if let Some(calls) = result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("nestedCalls"))
+                .and_then(|nested| nested.get("calls"))
+                .and_then(JsonValue::as_array)
+            {
+                for call in calls {
+                    add_file_op(
+                        call.get("name").and_then(JsonValue::as_str).unwrap_or(""),
+                        call.get("arguments"),
+                        ops,
+                    );
                 }
             }
-            Message::Assistant(assistant) => {
-                for block in &assistant.content {
-                    let ContentBlock::ToolCall(call) = block else {
-                        continue;
-                    };
-                    let arguments = serde_json::to_value(&call.arguments).unwrap_or_default();
-                    add_file_op(&call.name, Some(&arguments), ops);
-                }
-            }
-            _ => {}
         }
+        Message::Assistant(assistant) => {
+            for block in &assistant.content {
+                let ContentBlock::ToolCall(call) = block else {
+                    continue;
+                };
+                let arguments = serde_json::to_value(&call.arguments).unwrap_or_default();
+                add_file_op(&call.name, Some(&arguments), ops);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Scan the messages of ONE projected entry in place: the old shape built a
+/// `Vec<&Message>` per entry just to feed [`extract_file_ops_from_message_refs`].
+fn extract_file_ops_from_entry<E: ProjectedEntry>(entry: &E, ops: &mut FileOperations) {
+    for message in entry.messages() {
+        extract_file_ops_from_message(message, ops);
     }
 }
 
@@ -1327,11 +1540,11 @@ pub fn prepare_compaction<E: ProjectedEntry, P: PathEntry>(
     let plan = plan_compaction(projected, path_entries, settings)?;
     let messages_to_summarize: Vec<Message> = projected[plan.history_span.clone()]
         .iter()
-        .flat_map(|entry| span_message_refs(entry).into_iter().cloned())
+        .flat_map(|entry| span_messages(entry).cloned())
         .collect();
     let turn_prefix_messages: Vec<Message> = projected[plan.turn_prefix_span.clone()]
         .iter()
-        .flat_map(|entry| span_message_refs(entry).into_iter().cloned())
+        .flat_map(|entry| span_messages(entry).cloned())
         .collect();
     let kept_messages: Vec<Message> = projected[plan.kept_span.clone()]
         .iter()
@@ -1388,11 +1601,11 @@ pub fn prepare_compaction_refs<'a, E: ProjectedEntry, P: PathEntry>(
     let plan = plan_compaction(projected, path_entries, settings)?;
     let messages_to_summarize: Vec<&Message> = projected[plan.history_span.clone()]
         .iter()
-        .flat_map(span_message_refs)
+        .flat_map(|entry| span_messages(entry))
         .collect();
     let turn_prefix_messages: Vec<&Message> = projected[plan.turn_prefix_span.clone()]
         .iter()
-        .flat_map(span_message_refs)
+        .flat_map(|entry| span_messages(entry))
         .collect();
     let kept_messages: Vec<&Message> = projected[plan.kept_span.clone()]
         .iter()

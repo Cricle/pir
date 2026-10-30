@@ -2,6 +2,9 @@
 //!
 //! Rust equivalent of the upstream `packages/coding-agent/src`.
 
+// Startup bootstrap of the pi-compatible agent directory (`auth.json`,
+// `models-store.json`); see the module docs for the upstream evidence.
+pub mod agent_bootstrap;
 // The `/bug` bundle + Radius upload is driven entirely by the TUI
 // (`src/tui/terminal.rs`); no non-TUI production path calls it.
 #[cfg(feature = "tui")]

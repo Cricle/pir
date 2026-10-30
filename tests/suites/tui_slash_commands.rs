@@ -16,7 +16,7 @@ use pir::tui::autocomplete::builtin_commands;
 use pir::tui::slash::{
     action_quits, builtin_action, copy_last_assistant_message, debug_command_argument,
     last_assistant_text, name_argument, parse_slash_command, run_diagnostics_text, CopyOutcome,
-    DebugArgument, SlashAction,
+    DebugArgument, SlashAction, BUILTIN_ACTION_NAMES, EXTRA_BUILTIN_COMMAND_NAMES,
 };
 
 // ---------------------------------------------------------------------------
@@ -132,6 +132,51 @@ fn autocomplete_exposes_every_routable_builtin() {
             "/{name} is listed but not routable"
         );
     }
+}
+
+/// The autocomplete list must equal the set of commands pir can execute.
+///
+/// Both directions: every name the dispatcher routes (`BUILTIN_ACTION_NAMES`,
+/// plus the pir-only non-action commands such as `/image`) appears in the
+/// popup, and the popup offers nothing that is not executable. This is the
+/// regression for "typing `/` shows only ~30 commands and important builtins
+/// are missing".
+#[test]
+fn autocomplete_matches_the_executable_builtin_set_exactly() {
+    let listed: Vec<String> = builtin_commands()
+        .into_iter()
+        .map(|command| command.name)
+        .collect();
+
+    for name in BUILTIN_ACTION_NAMES {
+        assert!(
+            builtin_action(name).is_some(),
+            "/{name} is in BUILTIN_ACTION_NAMES but does not route"
+        );
+        assert!(
+            listed.iter().any(|entry| entry == name),
+            "autocomplete is missing the routed builtin /{name}: {listed:?}"
+        );
+    }
+    for name in EXTRA_BUILTIN_COMMAND_NAMES {
+        assert!(
+            listed.iter().any(|entry| entry == name),
+            "autocomplete is missing the handled builtin /{name}: {listed:?}"
+        );
+    }
+
+    // No phantom entries: every listed name is executable by one of the two
+    // dispatcher faces.
+    for name in &listed {
+        assert!(
+            builtin_action(name).is_some() || EXTRA_BUILTIN_COMMAND_NAMES.contains(&name.as_str()),
+            "autocomplete offers /{name}, but no handler executes it"
+        );
+    }
+
+    // `/image` is the pir-only command that used to be missing; pin it
+    // explicitly so a future list rewrite cannot drop it silently.
+    assert!(listed.iter().any(|entry| entry == "image"));
 }
 
 // ---------------------------------------------------------------------------

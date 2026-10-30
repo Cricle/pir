@@ -7,6 +7,7 @@
 //! shortcuts/providers/renderers), and merge semantics are identical for
 //! both runtimes because both implement [`AgentPlugin`].
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -401,10 +402,121 @@ impl TerminalInputRegistry {
 // PluginHost
 // ---------------------------------------------------------------------------
 
+/// Precomputed event-interest table for the immutable plugin list.
+///
+/// [`AgentPlugin::events`] is a declaration made when the plugin joins the
+/// host — the same immutability assumption [`PluginHost::build`] already
+/// makes for `native_terminal_input`. Snapshotting it once here removes the
+/// per-event `events()` call (a fresh `Vec<String>` for every `List` plugin)
+/// and the per-plugin JS-adapter downcast from the fan-out paths.
+///
+/// Every list holds plugin indices in ascending (dispatch) order. Native
+/// `All` plugins and the event-specific `List` plugins are separate sorted
+/// lists so a lookup for an unlisted event costs one map probe.
+#[derive(Default)]
+struct NativeEventIndex {
+    /// Non-JS plugins with [`EventInterest::All`].
+    all_native: Vec<usize>,
+    /// Non-JS plugins with a `List` interest, keyed by event name.
+    by_event: HashMap<String, Vec<usize>>,
+    /// The JS adapter positions (each receives every event).
+    js_adapters: Vec<usize>,
+}
+
+impl NativeEventIndex {
+    fn build(plugins: &[Arc<dyn AgentPlugin>]) -> Self {
+        let mut index = Self::default();
+        for (position, plugin) in plugins.iter().enumerate() {
+            if is_js_adapter(plugin) {
+                index.js_adapters.push(position);
+                continue;
+            }
+            match plugin.events() {
+                EventInterest::None => {}
+                EventInterest::All => index.all_native.push(position),
+                EventInterest::List(mut names) => {
+                    // A duplicated name in one declaration must still admit
+                    // the plugin exactly once per event (`matches` semantics).
+                    names.sort();
+                    names.dedup();
+                    for name in names {
+                        index.by_event.entry(name).or_default().push(position);
+                    }
+                }
+            }
+        }
+        index
+    }
+
+    fn has_native_handlers(&self, event: &str) -> bool {
+        !self.all_native.is_empty()
+            || self
+                .by_event
+                .get(event)
+                .is_some_and(|positions| !positions.is_empty())
+    }
+
+    /// Plugin indices to invoke for `event`, in dispatch order. `include_js`
+    /// merges the JS adapter positions (which are handed every event, exactly
+    /// like [`EventInterest::All`] native plugins).
+    fn dispatch_indices(&self, event: &str, include_js: bool) -> DispatchIndices<'_> {
+        DispatchIndices {
+            lists: [
+                self.all_native.as_slice(),
+                self.by_event.get(event).map_or(&[], Vec::as_slice),
+                if include_js {
+                    self.js_adapters.as_slice()
+                } else {
+                    &[]
+                },
+            ],
+            positions: [0; 3],
+            last: None,
+        }
+    }
+}
+
+/// Three-way merge of the sorted index lists in [`NativeEventIndex`],
+/// yielding each plugin index once in ascending order.
+struct DispatchIndices<'a> {
+    lists: [&'a [usize]; 3],
+    positions: [usize; 3],
+    last: Option<usize>,
+}
+
+impl Iterator for DispatchIndices<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            let mut best: Option<(usize, usize)> = None;
+            for (list, position) in self.positions.iter().enumerate() {
+                if let Some(&value) = self.lists[list].get(*position) {
+                    if best.is_none_or(|(current, _)| value < current) {
+                        best = Some((value, list));
+                    }
+                }
+            }
+            let (value, list) = best?;
+            self.positions[list] += 1;
+            // Defensive: an index can only appear in one list today (the
+            // variants are exclusive, and the adapter is excluded from both
+            // native lists), but the merge contract stays a set either way.
+            if self.last == Some(value) {
+                continue;
+            }
+            self.last = Some(value);
+            return Some(value);
+        }
+    }
+}
+
 /// Unified plugin host: ordered plugin list + shared registry + event
 /// dispatch.
 pub struct PluginHost {
     plugins: Vec<Arc<dyn AgentPlugin>>,
+    /// Cached per-event dispatch table over the immutable `plugins` list.
+    native_events: NativeEventIndex,
     /// The JS runtime (also present in `plugins` through the adapter).
     js: Option<ExtensionHandle>,
     /// Whether this host owns the JS runtime lifecycle. `false` only for a
@@ -466,6 +578,11 @@ pub struct PluginHost {
     /// `None` and every read is a no-op.
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     mcp_manager: Option<McpManagerHandle>,
+    /// Position of the surviving `mcp` builtin in `plugins`. The refresh tail
+    /// consults the plugin on every emit; a cached position keeps that an
+    /// O(1) lookup instead of a downcast scan of the whole list.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    mcp_plugin_index: Option<usize>,
     /// One-shot guard for [`PluginHost::shutdown`]: the first call runs every
     /// plugin's `on_shutdown`; later calls (session teardown racing a child
     /// run's own teardown) are no-ops.
@@ -838,13 +955,14 @@ impl PluginHost {
         let (registry, registration_failures) = build_registry(&plugins, &mut diagnostics);
         // The dispatch list keeps only the registry survivors: plugins that
         // failed to load or were omitted as replaceable (upstream
-        // omitReplacedExtensions) never run.
-        let kept: std::collections::BTreeSet<String> = registry
+        // omitReplacedExtensions) never run. Borrowed paths: no per-plugin
+        // `String` clone at startup.
+        let kept: std::collections::HashSet<&str> = registry
             .plugins()
             .iter()
-            .map(|plugin| plugin.info.path.clone())
+            .map(|plugin| plugin.info.path.as_str())
             .collect();
-        plugins.retain(|plugin| kept.contains(&plugin.info().path));
+        plugins.retain(|plugin| kept.contains(plugin.info().path.as_str()));
 
         // Only a SURVIVING mcp builtin owns the host's manager: a replaced
         // one is omitted entirely and must not stay wired in.
@@ -857,6 +975,12 @@ impl PluginHost {
         });
         #[cfg(not(feature = "mcp"))]
         let mcp_manager: Option<McpManagerHandle> = None;
+        #[cfg(feature = "mcp")]
+        let mcp_plugin_index = plugins
+            .iter()
+            .position(|plugin| plugin.as_any().is_some_and(|any| any.is::<McpPlugin>()));
+        #[cfg(not(feature = "mcp"))]
+        let mcp_plugin_index: Option<usize> = None;
         // The definition snapshot the build's registration pass just consumed.
         // It is committed WITHOUT a generation (the probe below is installed
         // only after it), so the first gate check re-reads the defs and latches
@@ -892,12 +1016,18 @@ impl PluginHost {
             None => None,
         };
 
-        let native_terminal_input = plugins
-            .iter()
-            .any(|plugin| !is_js_adapter(plugin) && plugin.events().matches("terminal_input"));
+        // Snapshot the event interests ONCE: the plugin list never changes
+        // after build (the same invariant `native_terminal_input` documents),
+        // so every later fan-out can use the cached table instead of asking
+        // each plugin `events()` per event.
+        let native_events = NativeEventIndex::build(&plugins);
+        // Whether a non-JS plugin declared `terminal_input` interest at build
+        // time — read from the same table the dispatch uses.
+        let native_terminal_input = native_events.has_native_handlers("terminal_input");
 
         let host = Self {
             plugins,
+            native_events,
             js,
             js_owned: AtomicBool::new(true),
             native_dialogs: Arc::new(NativeDialogCell::default()),
@@ -911,6 +1041,7 @@ impl PluginHost {
             js_def_gen,
             js_def_reads: AtomicU64::new(js_def_reads),
             mcp_manager,
+            mcp_plugin_index,
             shut_down: AtomicBool::new(false),
             context: RwLock::new(None),
             session_context: RwLock::new(None),
@@ -1046,13 +1177,8 @@ impl PluginHost {
         // the ordered plugin list (the path plan may put it first). A native
         // consume therefore short-circuits before the JS face runs, matching
         // upstream's single listener list rule for later listeners.
-        for plugin in self.plugins.iter().filter(|plugin| !is_js_adapter(plugin)) {
-            // Same interest contract as the ordered `emit` fan-out: only a
-            // plugin that declares `terminal_input` (through `List` or `All`)
-            // is consulted; `None` admits nothing.
-            if !native_plugin_wants_event(plugin.as_ref(), "terminal_input") {
-                continue;
-            }
+        for index in self.native_events.dispatch_indices("terminal_input", false) {
+            let plugin = &self.plugins[index];
             let outcome = match tokio::time::timeout(
                 handler_timeout,
                 plugin.on_event(PluginEvent::new("terminal_input", &mut payload)),
@@ -1452,9 +1578,11 @@ impl PluginHost {
     /// "consult the runtime" marker, not a handler claim, and its events are
     /// already delivered through the direct handle.
     pub fn has_native_handlers(&self, event: &str) -> bool {
-        self.plugins
-            .iter()
-            .any(|plugin| !is_js_adapter(plugin) && plugin.events().matches(event))
+        // The interest table was snapshotted at build (see
+        // [`NativeEventIndex`]); one map probe replaces the per-plugin
+        // `events()` walk (which allocated a `Vec<String>` per `List`
+        // plugin on every call).
+        self.native_events.has_native_handlers(event)
     }
 
     /// Dispatch one event to the NATIVE (non-JS) plugin fan-out only: every
@@ -1489,10 +1617,8 @@ impl PluginHost {
         if !self.init_hooks_ran() && self.context().is_some() {
             let _ = self.run_init_hooks().await;
         }
-        for plugin in &self.plugins {
-            if is_js_adapter(plugin) || !native_plugin_wants_event(plugin.as_ref(), event) {
-                continue;
-            }
+        for index in self.native_events.dispatch_indices(event, false) {
+            let plugin = &self.plugins[index];
             if let PluginEventOutcome::Error { error } =
                 dispatch_native_event(plugin, event, payload).await
             {
@@ -1522,15 +1648,8 @@ impl PluginHost {
         .then(crate::config::timings::start_phase)
         .flatten();
         let mut acc = MergedEmit::new();
-        for plugin in &self.plugins {
-            // Declaration is the dispatch contract: a `List` admits exactly
-            // its names, `All` admits every event, and the default `None`
-            // admits none — matching `has_native_handlers`, which every gated
-            // caller pre-checks. Filtering happens in list order, so the
-            // relative order of every plugin that does run is unchanged.
-            if !is_js_adapter(plugin) && !native_plugin_wants_event(plugin.as_ref(), event) {
-                continue;
-            }
+        for index in self.native_events.dispatch_indices(event, true) {
+            let plugin = &self.plugins[index];
             let outcome = dispatch_native_event(plugin, event, payload).await;
             acc.merge(event, &plugin.info().path, outcome);
             if acc.stop {
@@ -1601,7 +1720,7 @@ impl PluginHost {
     /// instead — a plugin that wants the event declares it in
     /// [`AgentPlugin::events`](crate::plugins::AgentPlugin::events).
     pub fn has_non_js_plugins(&self) -> bool {
-        self.plugins.iter().any(|plugin| !is_js_adapter(plugin))
+        self.plugins.len() > self.native_events.js_adapters.len()
     }
 
     /// Dispatch an informational event whose handler return value no consumer
@@ -1642,17 +1761,15 @@ impl PluginHost {
         // all. `has_handlers` is consulted once here instead of once per JS
         // plugin in the loop.
         let js_dispatches = if self.js.as_ref().is_some_and(|js| js.has_handlers(event)) {
-            self.plugins
-                .iter()
-                .filter(|plugin| is_js_adapter(plugin))
-                .count()
+            self.native_events.js_adapters.len()
         } else {
             0
         };
         let mut js_seen = 0usize;
         let mut rust_visited = false;
-        for plugin in &self.plugins {
-            if is_js_adapter(plugin) {
+        for index in self.native_events.dispatch_indices(event, true) {
+            let plugin = &self.plugins[index];
+            if self.native_events.js_adapters.binary_search(&index).is_ok() {
                 if js_dispatches == 0 {
                     continue;
                 }
@@ -1675,13 +1792,6 @@ impl PluginHost {
                 if let Err(error) = js.emit_read_only(event, text).await {
                     crate::ext_diag!("[ext] {event} dispatch failed: {error}");
                 }
-                continue;
-            }
-            // Same interest contract as `emit`/`emit_native`: an explicit
-            // list limits the plugin to those events, so an uninterested
-            // plugin is skipped before the payload-presence diagnostic and
-            // does not force a JS re-render of a payload it never saw.
-            if !native_plugin_wants_event(plugin.as_ref(), event) {
                 continue;
             }
             let Some(value) = payload.as_deref_mut() else {
@@ -1965,9 +2075,11 @@ impl PluginHost {
     /// and [`Self::refresh_registry_if_changed`]).
     #[cfg(feature = "mcp")]
     fn mcp_plugin(&self) -> Option<&McpPlugin> {
+        let index = self.mcp_plugin_index?;
         self.plugins
-            .iter()
-            .find_map(|plugin| plugin.as_any()?.downcast_ref::<McpPlugin>())
+            .get(index)?
+            .as_any()?
+            .downcast_ref::<McpPlugin>()
     }
 
     /// First-wins tool definitions across the unified registry.
@@ -2112,11 +2224,9 @@ impl PluginHost {
         name: &str,
         args: &str,
     ) -> anyhow::Result<crate::extensions::CommandOutcome> {
-        let resolved = self
-            .registry()
-            .resolved_commands()
-            .into_iter()
-            .find(|command| command.invocation_name == name || command.def.name == name);
+        // Resolve the one matching command from the build-time table; the old
+        // path materialized and cloned EVERY command just to find it.
+        let resolved = self.registry().find_command(name);
         let Some(command) = resolved else {
             let Some(js) = &self.js else {
                 anyhow::bail!("command `{name}` is not registered by any plugin");
@@ -2149,13 +2259,14 @@ impl PluginHost {
         &self,
         key: &str,
     ) -> anyhow::Result<crate::extensions::CommandOutcome> {
-        let resolved = self
-            .registry()
-            .resolve_shortcuts(&Default::default())
-            .0
-            .into_iter()
-            .find(|shortcut| shortcut.def.key.to_lowercase() == key.to_lowercase());
-        match resolved.and_then(|shortcut| shortcut.backend) {
+        // Borrow the matching registration (last wins, the same answer
+        // `resolve_shortcuts` gives with no reserved-key overrides) instead of
+        // cloning and sorting the whole shortcut set per keypress.
+        let registry = self.registry();
+        let resolved = registry
+            .shortcut(key)
+            .and_then(|(_, backend)| backend.cloned());
+        match resolved {
             Some(ShortcutBackend::Rust(handler)) => Ok(handler().await),
             Some(ShortcutBackend::Js) | None => {
                 let Some(js) = &self.js else {
@@ -2521,42 +2632,17 @@ fn is_js_adapter(plugin: &Arc<dyn AgentPlugin>) -> bool {
         .is_some_and(|any| any.is::<JsExtensionsPlugin>())
 }
 
-/// Whether the native fan-out should invoke `plugin` for `event`.
-///
-/// Interest is the DECLARED [`AgentPlugin::events`] contract, uniformly:
-/// [`EventInterest::List`] admits exactly the listed names, [`EventInterest::All`]
-/// admits every name, and the default [`EventInterest::None`] admits none.
-///
-/// `None` admitting nothing is what makes this predicate agree with
-/// [`PluginHost::has_native_handlers`](Self::has_native_handlers) /
-/// [`PluginHost::has_handlers`](Self::has_handlers), which share
-/// [`EventInterest::matches`] (`None => false`). The two answers must match:
-/// every gated emitter (the agent loop's `emit_extension*`, the session-event
-/// bridge, `session_tree`, the tool-update fan-out, `project_trust`) consults
-/// `has_native_handlers` FIRST and returns before calling `emit_native`, so an
-/// "unfiltered" `None` here was unreachable through those paths and reachable
-/// only through ungated `emit` call sites — the same plugin receiving an event
-/// or not depending on which emitter fired it. A plugin that wants an event
-/// declares it; the default stays a no-handler claim.
+/// Every native fan-out entry (`[`PluginHost::emit`]`, `emit_native`,
+/// `emit_read_only_json`, terminal input) uses this table, so they all agree
+/// with [`PluginHost::has_native_handlers`]: [`EventInterest::List`] admits
+/// exactly the listed names, [`EventInterest::All`] admits every name, and the
+/// default [`EventInterest::None`] admits none.
 ///
 /// The one deliberate exception to the declaration fence is
 /// [`crate::agent::tool_execution::dispatch_hosted_event`] (`tool_call`,
 /// `tool_result`, `user_bash`), which walks every non-JS plugin directly and
 /// must keep doing so: `todo`'s idempotent `tool_result` REPLACE arm is
 /// reachable only through it.
-fn native_plugin_wants_event(plugin: &dyn AgentPlugin, event: &str) -> bool {
-    match plugin.events() {
-        // `EventInterest::None` means "no handlers", the same answer
-        // `EventInterest::matches` gives (see `agent::tool_execution`'s
-        // `dispatch_hosted_event` for the unfiltered path).
-        EventInterest::None => false,
-        interest => interest.matches(event),
-    }
-}
-
-/// The sorted `name` fields of the JS runtime's registered tools (the
-/// dirty-check snapshot [`PluginHost::refresh_registry_if_changed`] compares
-/// against).
 fn js_tool_names(js: &ExtensionHandle) -> Vec<String> {
     let mut names: Vec<String> = js.tool_defs().into_iter().map(|def| def.name).collect();
     names.sort();

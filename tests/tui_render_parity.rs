@@ -34,7 +34,9 @@ use std::sync::Arc;
 use pir::ai::types::{AssistantMessage, ContentBlock, StopReason, TextContent, ThinkingContent};
 use pir::coding_agent::truncate::{truncate_tail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use pir::tui::altscreen_search::viewport_geometry;
-use pir::tui::ansi::{pad_prefixed_to_width, visible_width, wrap_text_with_ansi, BG_RESET};
+use pir::tui::ansi::{
+    pad_prefixed_to_width, truncate_to_width, visible_width, wrap_text_with_ansi, BG_RESET,
+};
 use pir::tui::app::{spinner_frame, ToolPreview};
 use pir::tui::core::{
     BoxContainer, Component, Container, DynamicBorder, FrameDecorateContext,
@@ -639,7 +641,13 @@ fn raw_frame_stays_undecorated_while_painted_frame_is_decorated() {
     assert!(raw.iter().all(|line| !line.starts_with("<D>")));
     assert_eq!(painted.len(), raw.len());
     for (painted_line, raw_line) in painted.iter().zip(raw.iter()) {
-        assert_eq!(*painted_line, format!("<D>{raw_line}{SEGMENT_RESET}"));
+        // The decorator inserts three cells into an already width-padded row;
+        // the write path clamps every painted row to the terminal width (a
+        // wider row would wrap and scroll the frame), so the composed line is
+        // the decorated prefix clipped back to 40 cells.
+        let expected = format!("<D>{raw_line}");
+        let expected = truncate_to_width(&expected, 40, "");
+        assert_eq!(*painted_line, format!("{expected}{SEGMENT_RESET}"));
     }
 
     // An unchanged re-render must not disturb either buffer.

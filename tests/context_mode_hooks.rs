@@ -213,6 +213,21 @@ fn tool_result_payload(tool: &str, input: Value, text: String) -> Value {
     })
 }
 
+async fn search_hits(harness: &Harness, query: &str) -> Vec<Value> {
+    let search = harness
+        .run(CTX_SEARCH_TOOL_NAME, json!({ "query": query }))
+        .await;
+    if search.is_error && search.content.contains("knowledge base is empty") {
+        return Vec::new();
+    }
+    assert!(!search.is_error, "{}", search.content);
+    let value = parse_json(&search);
+    value["queries"][0]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("search results: {value}"))
+        .clone()
+}
+
 // ---------------------------------------------------------------------------
 // tool_call routing (PreToolUse)
 // ---------------------------------------------------------------------------
@@ -506,6 +521,156 @@ async fn index_results_env_knob_suppresses_auto_indexing() {
         "the env switch suppressed indexing: {}",
         search.content
     );
+}
+
+#[tokio::test]
+async fn tool_result_threshold_boundary_is_preserved() {
+    let _env = env_lock().await;
+    let harness = Harness::new("threshold-boundary");
+
+    // The gate is `text.len() <= 20 * 1024` bytes, counted on the joined text.
+    const THRESHOLD: usize = 20 * 1024;
+
+    // Exactly at the threshold: not indexed.
+    let mut at = "a".repeat(THRESHOLD - 1 - "boundary_at".len());
+    at.push_str(" boundary_at");
+    assert_eq!(at.len(), THRESHOLD);
+    let mut payload = tool_result_payload("bash", json!({ "command": "echo at" }), at);
+    assert_unblocked(harness.emit("tool_result", &mut payload).await);
+    assert!(search_hits(&harness, "boundary_at").await.is_empty());
+
+    // An empty first block contributes no separator (the join only inserts
+    // '\n' before a block when the accumulated text is non-empty), so a
+    // second block of exactly THRESHOLD bytes stays at the threshold and must
+    // not be indexed.
+    let mut second = "g".repeat(THRESHOLD - 1 - "empty_first_marker".len());
+    second.push_str(" empty_first_marker");
+    assert_eq!(second.len(), THRESHOLD);
+    let mut payload = json!({
+        "type": "tool_result",
+        "toolCallId": "call-empty-first",
+        "toolName": "bash",
+        "input": { "command": "echo empty-first" },
+        "content": [
+            { "type": "text", "text": "" },
+            { "type": "text", "text": second },
+        ],
+        "isError": false,
+    });
+    assert_unblocked(harness.emit("tool_result", &mut payload).await);
+    assert!(search_hits(&harness, "empty_first_marker").await.is_empty());
+
+    // The same shape one byte over the threshold must be indexed.
+    let mut second = "h".repeat(THRESHOLD + 1 - 1 - "empty_first_over".len());
+    second.push_str(" empty_first_over");
+    assert_eq!(second.len(), THRESHOLD + 1);
+    let mut payload = json!({
+        "type": "tool_result",
+        "toolCallId": "call-empty-first-over",
+        "toolName": "bash",
+        "input": { "command": "echo empty-first-over" },
+        "content": [
+            { "type": "text", "text": "" },
+            { "type": "text", "text": second },
+        ],
+        "isError": false,
+    });
+    assert_unblocked(harness.emit("tool_result", &mut payload).await);
+    assert!(!search_hits(&harness, "empty_first_over").await.is_empty());
+
+    // One byte over: indexed.
+    let mut over = "b".repeat(THRESHOLD + 1 - 1 - "boundary_over".len());
+    over.push_str(" boundary_over");
+    assert_eq!(over.len(), THRESHOLD + 1);
+    let mut payload = tool_result_payload("bash", json!({ "command": "echo over" }), over);
+    assert_unblocked(harness.emit("tool_result", &mut payload).await);
+    assert!(!search_hits(&harness, "boundary_over").await.is_empty());
+
+    // Two blocks: the '\n' separator counts toward the gate. 10 KiB + 1 + 10 KiB
+    // is 20481 bytes, so this must be indexed (a length probe that forgot the
+    // separator would wrongly skip it).
+    let first = format!("{} first_block_marker", "c".repeat(10 * 1024 - 19));
+    let second = format!("{} second_block_marker", "d".repeat(10 * 1024 - 20));
+    assert_eq!(first.len() + 1 + second.len(), THRESHOLD + 1);
+    let mut payload = json!({
+        "type": "tool_result",
+        "toolCallId": "call-multi-over",
+        "toolName": "bash",
+        "input": { "command": "echo multi" },
+        "content": [
+            { "type": "text", "text": first },
+            { "type": "text", "text": second },
+        ],
+        "isError": false,
+    });
+    assert_unblocked(harness.emit("tool_result", &mut payload).await);
+    assert!(!search_hits(&harness, "second_block_marker")
+        .await
+        .is_empty());
+
+    // Two blocks whose joined length (including the separator) is exactly the
+    // threshold: still not indexed.
+    let first = format!("{} third_block_marker", "e".repeat(10 * 1024 - 20));
+    let second = format!("{} fourth_block", "f".repeat(10 * 1024 - 13));
+    assert_eq!(first.len() + 1 + second.len(), THRESHOLD);
+    let mut payload = json!({
+        "type": "tool_result",
+        "toolCallId": "call-multi-at",
+        "toolName": "bash",
+        "input": { "command": "echo multi-at" },
+        "content": [
+            { "type": "text", "text": first },
+            { "type": "text", "text": second },
+        ],
+        "isError": false,
+    });
+    assert_unblocked(harness.emit("tool_result", &mut payload).await);
+    assert!(search_hits(&harness, "third_block_marker").await.is_empty());
+}
+
+#[tokio::test]
+async fn routing_tokenizer_equivalence_edges() {
+    let _env = env_lock().await;
+    let harness = Harness::new("route-edges");
+    let big = harness.cwd.join("big.txt");
+    write_big_file(&big, 70 * 1024);
+
+    // Leading env assignments and wrappers still resolve the real executable.
+    for command in [
+        "A=1 B=2 C=3 D=4 E=5 curl https://example.com/data",
+        "sudo curl https://example.com/data",
+        "cd /tmp && curl https://example.com/data",
+        "A=1 B=2 C=3 D=4 E=5 cat big.txt",
+        "command cat big.txt",
+    ] {
+        let mut payload = tool_call("bash", json!({ "command": command }));
+        let reason = assert_blocked(harness.emit("tool_call", &mut payload).await);
+        assert!(
+            reason.contains("context-mode routing"),
+            "unexpected reason for `{command}`: {reason}"
+        );
+    }
+
+    // A routing-looking word in an argument is not an executable: no block.
+    for command in [
+        "git commit -m concatenate",
+        "rg --files-with-matches head",
+        "cargo test -- --nocapture",
+    ] {
+        let mut payload = tool_call("bash", json!({ "command": command }));
+        assert_unblocked(harness.emit("tool_call", &mut payload).await);
+    }
+
+    // Small files and read-tool calls below the size gate remain untouched.
+    let small = harness.cwd.join("small.txt");
+    std::fs::write(&small, b"tiny").unwrap();
+    for payload in [
+        tool_call("bash", json!({ "command": "cat small.txt" })),
+        tool_call("read", json!({ "path": small.to_string_lossy() })),
+    ] {
+        let mut payload = payload;
+        assert_unblocked(harness.emit("tool_call", &mut payload).await);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -480,7 +480,19 @@ impl StdinBuffer {
 
         // Upstream's high-byte conversion: a lone byte above 127 is the meta
         // (ESC-prefixed) form of the byte minus 128.
-        let chunk: Vec<u8> = if data.len() == 1 && data[0] > 127 {
+        //
+        // pir reads raw bytes, so the rule must not fire for a byte that is
+        // the START of a UTF-8 character (or a continuation byte that belongs
+        // to one already buffered): doing so turns a Windows IME / UTF-8
+        // character split across reads into `ESC` + a garbage metakey. Lead
+        // bytes and their continuations stay in `buffer` until the character
+        // is complete (see `extract_complete_sequences`); a truly lone
+        // high byte (0x80..=0xC1, 0xF5..=0xFF) keeps upstream's conversion.
+        let chunk: Vec<u8> = if data.len() == 1
+            && data[0] > 127
+            && !is_utf8_lead_byte(data[0])
+            && !buffer_holds_partial_utf8(&self.buffer)
+        {
             vec![ESC, data[0] - 128]
         } else {
             data.to_vec()
@@ -646,9 +658,14 @@ fn extract_complete_sequences(buffer: &[u8]) -> (Vec<Vec<u8>>, Vec<u8>) {
     while pos < buffer.len() {
         let remaining = &buffer[pos..];
         if remaining[0] != ESC {
-            // Not an escape sequence: emit one whole character (never a
-            // partial UTF-8 sequence).
-            let len = utf8_char_len(remaining[0]).min(remaining.len());
+            // Not an escape sequence: emit one whole character. A UTF-8
+            // character split across reads is held until its continuation
+            // bytes arrive (never emitted as a partial byte run).
+            let len = utf8_char_len(remaining[0]);
+            if len > 1 && remaining.len() < len {
+                return (sequences, remaining.to_vec());
+            }
+            let len = len.min(remaining.len());
             sequences.push(remaining[..len].to_vec());
             pos += len;
             continue;
@@ -726,6 +743,25 @@ fn utf8_char_len(first: u8) -> usize {
         0xe0..=0xef => 3,
         0xf0..=0xf7 => 4,
         _ => 1,
+    }
+}
+
+/// Whether `byte` can start a multi-byte UTF-8 sequence (`C2..=F4`; C0/C1
+/// are overlong leads and F5.. are invalid, so they are not treated as
+/// partial UTF-8).
+fn is_utf8_lead_byte(byte: u8) -> bool {
+    (0xc2..=0xf4).contains(&byte)
+}
+
+/// Whether the held buffer starts with the lead byte of a UTF-8 character
+/// whose continuation bytes have not all arrived. `extract_complete_sequences`
+/// only leaves such a partial character behind (everything before it is
+/// complete), so a continuation byte arriving next belongs to it rather than
+/// being an 8-bit meta byte.
+fn buffer_holds_partial_utf8(buffer: &[u8]) -> bool {
+    match buffer.first() {
+        Some(&first) if first != ESC => is_utf8_lead_byte(first),
+        _ => false,
     }
 }
 
@@ -2262,6 +2298,17 @@ impl StdinGate {
             out.push(event);
             return out;
         }
+        // A multi-byte character is ONE key event, not a run of single-byte
+        // keys: never feed its UTF-8 bytes into the escape-sequence walk.
+        // A held ESC would turn `ESC` + the first UTF-8 byte into a legacy
+        // meta chord (`decode_legacy_meta`) and the continuation bytes into
+        // further garbage, losing/mangling IME-committed text. Release the
+        // held prefix as its own key(s) and dispatch the character whole.
+        if !self.held.is_empty() && is_multibyte_char_event(&event) {
+            out.extend(self.flush_held());
+            out.push(event);
+            return out;
+        }
         match event_input_bytes(&event) {
             // An already-parsed sequence (arrow, BackTab, mouse, paste, focus)
             // ends the held prefix: upstream splits `ESC ESC [A` into ESC and
@@ -2742,6 +2789,19 @@ fn is_key_release(event: &Event) -> bool {
     matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release)
 }
 
+/// Whether the event is one multi-byte character key press (a CJK character,
+/// an emoji, any non-ASCII text). Such an event is a single logical key: its
+/// UTF-8 bytes must never be treated as a run of one-byte keys by the
+/// escape-sequence machinery (see `StdinGate::push`).
+fn is_multibyte_char_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(key)
+            if key.kind != KeyEventKind::Release
+                && matches!(key.code, KeyCode::Char(c) if !c.is_ascii())
+    )
+}
+
 /// The key code of a key event — the pairing key of the console's per-byte
 /// press/release record synthesis (see `StdinGate::pending_byte_release`).
 fn key_code_of(event: &Event) -> Option<KeyCode> {
@@ -2854,10 +2914,16 @@ fn key_input_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
 /// regardless of its length: the whole run (trailing line break included)
 /// becomes one `Event::Paste`, so a pasted block keeps its newlines instead of
 /// auto-submitting. Every spelling of a line break counts — plain Enter,
-/// `Char('\r')`/`Char('\n')`, the console's `ctrl+j` LF chord (a Windows CRLF
-/// paste delivers a plain Enter followed by this chord), and Tab. A run that
-/// is only line breaks is key repeat, never a paste. ctrl+Enter always
+/// `Char('\r')`/`Char('\n')`, and the console's `ctrl+j` LF chord (a Windows
+/// CRLF paste delivers a plain Enter followed by this chord). A run that is
+/// only line breaks is key repeat, never a paste. ctrl+Enter always
 /// contributes a newline and never acts as a submit.
+///
+/// Tab is paste payload inside such a run but never turns a single-line run
+/// into a paste: `tui.input.tab` is an editor action (accept the autocomplete
+/// item / Tab completion), so a lone Tab or a typed prefix followed by Tab
+/// must stay key events. Coalescing it into `Event::Paste("\t")` bypasses
+/// `handle_key` and types a literal tab instead of accepting the completion.
 pub fn coalesce_paste_burst(queue: &mut VecDeque<Event>) -> bool {
     let mut presses = 0usize;
     let mut printable = 0usize;
@@ -2867,6 +2933,9 @@ pub fn coalesce_paste_burst(queue: &mut VecDeque<Event>) -> bool {
     let mut pending_line_break = false;
     let mut internal_line_break = false;
     let mut saw_line_break = false;
+    // A Tab was part of the run. Inside a real paste it is payload; without a
+    // real line break the run stays ordinary typing (see the final gate).
+    let mut has_tab = false;
     // The previous contributing key was a plain Enter. A following LF chord is
     // the second half of a CRLF pair and must not add a second newline.
     let mut previous_plain_enter = false;
@@ -2933,8 +3002,12 @@ pub fn coalesce_paste_burst(queue: &mut VecDeque<Event>) -> bool {
                         previous_plain_enter = false;
                     }
                     KeyCode::Tab => {
-                        // A tab is paste payload and a separator: a trailing
-                        // Enter after it belongs to the pasted block.
+                        // Inside a real pasted block (the run already has a
+                        // line break) the tab is payload and a separator: a
+                        // trailing Enter after it belongs to the block.
+                        // `has_tab` keeps a single-line run (no real line
+                        // break) as key events so Tab reaches `handle_key`.
+                        has_tab = true;
                         internal_line_break = true;
                         printable += 1;
                         text.push('\t');
@@ -2965,6 +3038,13 @@ pub fn coalesce_paste_burst(queue: &mut VecDeque<Event>) -> bool {
             queue.push_front(Event::Paste(text));
             return true;
         }
+    }
+    // A Tab without a real line break is an editor action key, not paste
+    // payload: a lone Tab or a typed prefix followed by Tab must reach
+    // `handle_key` (`tui.input.tab` → accept the highlighted autocomplete
+    // item / Tab completion), not become `Event::Paste("\t")`.
+    if has_tab && !saw_line_break {
+        return false;
     }
     // A run with a line break is a paste at any length; a single-line run is
     // ordinary typing unless it is a rapid burst.

@@ -390,14 +390,12 @@ fn scan_prefix(path: &std::path::Path, limit: u64) -> Result<PrefixScan, PagedCo
         window.truncate(carried);
         window.extend_from_slice(&buffer[..limit_now]);
         let base = consumed - window.len() as u64;
-        if !find_all(&window, CONTEXT_EDIT_MARKER).is_empty() {
+        if contains_marker(&window, CONTEXT_EDIT_MARKER) {
             has_context_edit = true;
         }
-        compaction_offsets.extend(
-            find_all(&window, COMPACTION_MARKER)
-                .into_iter()
-                .map(|index| base + index as u64),
-        );
+        // Append directly into the one offset list: the old shape allocated a
+        // fresh `Vec<usize>` per read block (twice, for both markers).
+        find_all_into(&window, COMPACTION_MARKER, &mut compaction_offsets, base);
         carried = overlap.saturating_sub(1).min(window.len());
         let keep_from = window.len() - carried;
         window.copy_within(keep_from.., 0);
@@ -440,18 +438,18 @@ fn scan_prefix(path: &std::path::Path, limit: u64) -> Result<PrefixScan, PagedCo
     })
 }
 
-/// The last occurrence of `needle` in `haystack`.
+/// Append every occurrence of `needle` in `haystack` to `found`, as an
+/// absolute offset (`base + index`).
 ///
 /// Tuned for the 1 MiB scan blocks: a byte scan for the marker's first byte
 /// (cheap, early-exit) narrows the candidates, and only those pay a slice
 /// comparison. The naive "compare at every index" form cost ~22 byte
 /// comparisons per input byte, seconds on a 100 MB prefix.
-fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+fn find_all_into(haystack: &[u8], needle: &[u8], found: &mut Vec<u64>, base: u64) {
     if needle.is_empty() || haystack.len() < needle.len() {
-        return Vec::new();
+        return;
     }
     let first = needle[0];
-    let mut found = Vec::new();
     let mut search_from = 0usize;
     while search_from + needle.len() <= haystack.len() {
         let Some(relative) = haystack[search_from..]
@@ -465,11 +463,37 @@ fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
             break;
         }
         if &haystack[index..index + needle.len()] == needle {
-            found.push(index);
+            found.push(base + index as u64);
         }
         search_from = index + 1;
     }
-    found
+}
+
+/// Whether `haystack` contains `needle` (first hit exits; the context-edit
+/// check never needs positions, so it must not allocate a match list).
+fn contains_marker(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    let first = needle[0];
+    let mut search_from = 0usize;
+    while search_from + needle.len() <= haystack.len() {
+        let Some(relative) = haystack[search_from..]
+            .iter()
+            .position(|byte| *byte == first)
+        else {
+            return false;
+        };
+        let index = search_from + relative;
+        if index + needle.len() > haystack.len() {
+            return false;
+        }
+        if &haystack[index..index + needle.len()] == needle {
+            return true;
+        }
+        search_from = index + 1;
+    }
+    false
 }
 
 /// The byte offset of the start of the line containing `offset`.
@@ -618,6 +642,10 @@ fn find_entry_line(
     // Absolute byte offset of `pending[0]`.
     let mut pending_start: u64 = 0;
     let mut consumed = 0u64;
+    // Bytes of `pending` already searched for a newline. Without this, a line
+    // longer than one read block is rescanned from its start on every block
+    // (O(line_len^2 / block) for a multi-megabyte tool result).
+    let mut scanned = 0usize;
     while consumed < limit {
         let read = file.read(&mut buffer).map_err(|error| {
             PagedCompactionError::Failed(format!("cannot read session {}: {error}", path.display()))
@@ -629,8 +657,9 @@ fn find_entry_line(
         pending.extend_from_slice(&buffer[..limit_now]);
         consumed += limit_now as u64;
         let mut offset = 0usize;
-        while let Some(relative) = pending[offset..].iter().position(|byte| *byte == b'\n') {
-            let end = offset + relative;
+        let mut cursor = scanned.min(pending.len());
+        while let Some(relative) = pending[cursor..].iter().position(|byte| *byte == b'\n') {
+            let end = cursor + relative;
             let line = &pending[offset..end];
             if line.windows(needle.len()).any(|window| window == needle) {
                 // Compare the TOP-LEVEL `id` only: the cut point may itself be
@@ -652,9 +681,11 @@ fn find_entry_line(
                 }
             }
             offset = end + 1;
+            cursor = end + 1;
         }
         pending.drain(..offset);
         pending_start += offset as u64;
+        scanned = pending.len();
         if pending.len() > MAX_PREFIX_ENTRY_LINE_BYTES {
             return Err(PagedCompactionError::Failed(format!(
                 "session {} holds an over-long entry line (>{MAX_PREFIX_ENTRY_LINE_BYTES} bytes) before the resident window",
@@ -688,6 +719,9 @@ async fn stream_span_into_chunker(
     let mut header_version: Option<u32> = None;
     let mut previous_id: Option<String> = None;
     let mut consumed = start;
+    // Bytes already searched for a newline (see `find_entry_line`): an entry
+    // line spanning several read blocks is scanned once, not once per block.
+    let mut scanned = 0usize;
     while consumed < limit {
         let read = file.read(&mut buffer).map_err(|error| {
             PagedCompactionError::Failed(format!("cannot read session {}: {error}", path.display()))
@@ -700,10 +734,12 @@ async fn stream_span_into_chunker(
         consumed += limit_now as u64;
         stats.prefix_bytes += limit_now as u64;
         let mut line_start = 0usize;
-        while let Some(relative) = pending[line_start..].iter().position(|byte| *byte == b'\n') {
-            let end = line_start + relative;
+        let mut cursor = scanned.min(pending.len());
+        while let Some(relative) = pending[cursor..].iter().position(|byte| *byte == b'\n') {
+            let end = cursor + relative;
             let text = String::from_utf8_lossy(&pending[line_start..end]);
             line_start = end + 1;
+            cursor = end + 1;
             if text.trim().is_empty() {
                 continue;
             }
@@ -762,6 +798,7 @@ async fn stream_span_into_chunker(
             }
         }
         pending.drain(..line_start);
+        scanned = pending.len();
         if pending.len() > MAX_PREFIX_ENTRY_LINE_BYTES {
             return Err(PagedCompactionError::Failed(format!(
                 "session {} holds an over-long entry line (>{MAX_PREFIX_ENTRY_LINE_BYTES} bytes)",

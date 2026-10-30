@@ -446,12 +446,17 @@ impl AgentSession {
         let rebuilt = compaction::rebuilt_context(&context, &result);
         // Measure before moving the messages out: the rebuilt context is not
         // returned on this path, so its message vec becomes the new history
-        // allocation instead of a full-transcript clone.
+        // allocation instead of a full-transcript clone. Only an ephemeral
+        // session has an in-memory history to replace; a store-backed session
+        // re-reads its projection from the compaction entry and must not keep
+        // a second transcript-sized copy alive here.
         let estimated_tokens_after = compaction::estimate_context_tokens(&rebuilt.messages).tokens;
-        *self
-            .history
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(rebuilt.messages);
+        if self.session.is_none() {
+            *self
+                .history
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(rebuilt.messages);
+        }
         if let Some(plugins) = &self.plugins {
             // Upstream `SessionCompactEvent.compactionEntry` is the persisted
             // `CompactionEntry` (session-manager shape: type/id/parentId/
@@ -858,12 +863,18 @@ impl AgentSession {
                         // projection, never re-extend the stale snapshot.
                         snapshot_stale.store(true, std::sync::atomic::Ordering::SeqCst);
                         let rebuilt = compaction::rebuilt_context(&context, &result);
-                        *history
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Arc::new(rebuilt.messages.clone());
                         let estimated_tokens_after =
                             compaction::estimate_context_tokens(&rebuilt.messages).tokens;
+                        // Ephemeral runs keep the rebuilt transcript in memory;
+                        // a store-backed session re-reads its projection from
+                        // the compaction entry, so retaining a copy here would
+                        // defeat the projection's shared-Arc memory shape.
+                        if session.is_none() {
+                            *history
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Arc::new(rebuilt.messages.clone());
+                        }
                         if let Some(plugins) = &plugins {
                             // Upstream `compactionEntry` rides alongside the
                             // historical `compaction` result field (see the
@@ -1019,12 +1030,16 @@ impl AgentSession {
                 // re-extend the stale pre-compaction snapshot.
                 snapshot_stale.store(true, std::sync::atomic::Ordering::SeqCst);
                 let rebuilt = compaction::rebuilt_context(&context, &compacted);
-                *history
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Arc::new(rebuilt.messages.clone());
                 let estimated_tokens_after =
                     compaction::estimate_context_tokens(&rebuilt.messages).tokens;
+                // See the extension-result branch above: only an ephemeral
+                // session owns an in-memory history.
+                if session.is_none() {
+                    *history
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Arc::new(rebuilt.messages.clone());
+                }
                 if let Some(plugins) = &plugins {
                     // Upstream `compactionEntry` rides alongside the
                     // historical `compaction` result field (see the manual

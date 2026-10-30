@@ -176,6 +176,45 @@ pub fn compact_instructions(args: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Every command name [`builtin_action`] routes, in the order the autocomplete
+/// list presents them. Kept next to the match so a new arm cannot silently
+/// stay out of the popup; `tui_slash_commands` pins both directions.
+pub const BUILTIN_ACTION_NAMES: &[&str] = &[
+    "settings",
+    "model",
+    "thinking",
+    "copy",
+    "name",
+    "session",
+    "sessions",
+    "fork",
+    "clone",
+    "new",
+    "compact",
+    "export",
+    "resume",
+    "clear",
+    "quit",
+    "help",
+    "tree",
+    "scoped-models",
+    "trust",
+    "login",
+    "logout",
+    "changelog",
+    "hotkeys",
+    "reload",
+    "debug",
+    "share",
+    "import",
+    "bug",
+];
+
+/// pir-only built-in names handled outside [`SlashAction`] but still
+/// executable from the editor (`/image`). They belong in the autocomplete
+/// list exactly like the routed actions.
+pub const EXTRA_BUILTIN_COMMAND_NAMES: &[&str] = &["image"];
+
 /// Route a built-in command name to its action. `None` means the name is not a
 /// built-in: the caller falls back to the extension command registry and then
 /// to the unknown-command notice (upstream dispatch order).

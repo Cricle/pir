@@ -271,29 +271,35 @@ impl AgentSession {
                 .map(message_json)
                 .collect();
         };
-        // The projection owns its `Arc<FileEntry>` sources, so the session
-        // lock is released before anything is serialized.
-        let projection = {
+        // Only the projection's per-entry METADATA is needed: this view
+        // re-serializes every retained source entry itself, so materializing
+        // `SessionProjection::messages` would deep-clone the whole
+        // conversation and then drop it unused. The metadata walk applies the
+        // identical leaf-path / retention / context-edit rules and hands back
+        // the manager's `Arc<FileEntry>` handles (a refcount bump each), so
+        // the session lock is released before anything is serialized.
+        let metas = {
             let manager = session.lock().await;
-            manager.build_session_projection()
-        };
-        let Ok(projection) = projection else {
-            return Vec::new();
+            manager.projection_entry_meta()
         };
         // Latest context edit per target, over the same retained entries the
         // projection selected (upstream `buildSessionProjection`).
         let mut edits: std::collections::HashMap<&str, &crate::session_manager::ContextEditEntry> =
             std::collections::HashMap::new();
-        for projected in &projection.entries {
-            if let crate::session_manager::FileEntry::ContextEdit(edit) =
-                projected.source_entry.as_ref()
+        for meta in &metas {
+            if let crate::session_manager::FileEntry::ContextEdit(edit) = meta.source_entry.as_ref()
             {
                 edits.insert(edit.target_id.as_str(), edit);
             }
         }
-        let mut messages: Vec<JsonValue> = Vec::new();
-        for (index, projected) in projection.entries.iter().enumerate() {
-            let entry = projected.source_entry.as_ref();
+        // `message_count` is exactly the number of records
+        // `full_entry_messages` emits for the same entry/edit pair (the
+        // contract `projected_message_count` pins), so this is the exact
+        // capacity — no growth reallocations on a long transcript.
+        let mut messages: Vec<JsonValue> =
+            Vec::with_capacity(metas.iter().map(|meta| meta.message_count).sum());
+        for (index, meta) in metas.iter().enumerate() {
+            let entry = meta.source_entry.as_ref();
             // Only the newest compaction contributes (the stale ones retained
             // inside its kept range contribute nothing), like the projection.
             if index > 0 && matches!(entry, crate::session_manager::FileEntry::Compaction(_)) {

@@ -320,29 +320,6 @@ pub(super) async fn widen_session_off_thread(
     .map_err(|error| anyhow::anyhow!("session widen blocking task failed: {error}"))?
 }
 
-/// Whether the projection contains an assistant message with usage the
-/// prompt-start threshold can inspect — the `_findLastAssistantMessage` gate
-/// upstream applies before the prompt-start compaction check.
-///
-/// Upstream scans backwards for the LAST assistant message; a trailing user
-/// message (for example a resumed transcript that ends on a question) does not
-/// hide the assistant's usage. Walk the projection METADATA (no message
-/// materialization): entries already follow the LEAF path, apply compaction
-/// retention, and apply `context_edit` edits, so an omitted entry
-/// (`message_count == 0`) is skipped exactly like the projection skips it.
-/// Only an assistant `message` entry qualifies (custom messages and summaries
-/// project as user text).
-fn projection_has_assistant_message(entries: &[compaction::ProjectionEntryMeta]) -> bool {
-    use crate::session_manager::{FileEntry, StoredMessage};
-    entries.iter().any(|entry| {
-        entry.message_count > 0
-            && matches!(
-                entry.source_entry.as_ref(),
-                FileEntry::Message(inner) if matches!(inner.message, StoredMessage::Assistant(_))
-            )
-    })
-}
-
 /// Storage shape of one starting message the loop persists at its
 /// `message_end` ([`AgentSession::preamble_persist_fn`]): a regular message
 /// entry, or the custom-message entry a run started by a custom message (and
@@ -864,11 +841,11 @@ impl AgentSession {
         // path (upstream `_findLastAssistantMessage`); a trailing user message
         // does not hide it.
         //
-        // The gate is read off the projection METADATA (leaf path + context
-        // edits, no message materialization). Only a transcript that may
-        // compact builds the projection here, and that projection is REUSED as
-        // the run context below when the hook did not actually compact — the
-        // prompt no longer builds the whole transcript twice.
+        // The projection is REQUIRED as this run's context either way: build
+        // it once here, reuse it below when the gate did not compact (the
+        // prompt therefore never builds the whole transcript twice), and skip
+        // the separate metadata walk the old gate ran first — one leaf-path
+        // index build per prompt instead of two.
         let mut startup_projection: Option<(
             crate::session_manager::SessionProjection,
             Vec<crate::compaction::PathEntryMeta>,
@@ -883,68 +860,57 @@ impl AgentSession {
         if self.compaction_config().is_some() {
             match &self.session {
                 Some(session) => {
-                    let tail_is_assistant = {
-                        let session = session.lock().await;
-                        // Projection metadata, not the raw file tail: the
-                        // leaf path and context-edit omissions decide whether
-                        // an assistant usage record is visible at all.
-                        projection_has_assistant_message(&session.projection_entry_meta())
-                    };
-                    if tail_is_assistant {
-                        if let Ok((mut projection, branch)) =
-                            project_session_off_thread(session).await
+                    if let Ok((mut projection, branch)) = project_session_off_thread(session).await
+                    {
+                        // The MATERIALIZED projection decides whether the gate
+                        // has an assistant usage record to inspect: a context
+                        // edit can omit every assistant entry, and a trailing
+                        // user message does not hide the assistant (upstream
+                        // `_findLastAssistantMessage`).
+                        if projection
+                            .messages
+                            .iter()
+                            .any(|message| matches!(message, Message::Assistant(_)))
                         {
-                            // Defensive re-check against the MATERIALIZED
-                            // projection: a context edit can omit every
-                            // assistant entry. A trailing user message does
-                            // not hide the assistant usage the gate looks at
-                            // (upstream `_findLastAssistantMessage`).
-                            if projection
-                                .messages
-                                .iter()
-                                .any(|message| matches!(message, Message::Assistant(_)))
+                            let pre_messages = std::mem::take(&mut projection.messages);
+                            // Reuse the loop's own threshold hook (same config
+                            // read, threshold basis, `session_before_compact`
+                            // interception, persistence, and session events).
+                            let hook = self.compaction_hook(
+                                Arc::clone(&self.compaction),
+                                None,
+                                Some(self.threshold_model_for(&model)),
+                                Some(Arc::clone(&threshold_gate)),
+                            );
+                            let pre_context = Arc::new(Context {
+                                system_prompt: self.system_prompt_snapshot(),
+                                messages: pre_messages,
+                                tools: None,
+                            });
+                            let returned = hook(Arc::clone(&pre_context)).await;
+                            if threshold_gate
+                                .attempted
+                                .load(std::sync::atomic::Ordering::SeqCst)
                             {
-                                let pre_messages = std::mem::take(&mut projection.messages);
-                                // Reuse the loop's own threshold hook (same
-                                // config read, threshold basis,
-                                // `session_before_compact` interception,
-                                // persistence, and session events).
-                                let hook = self.compaction_hook(
-                                    Arc::clone(&self.compaction),
-                                    None,
-                                    Some(self.threshold_model_for(&model)),
-                                    Some(Arc::clone(&threshold_gate)),
-                                );
-                                let pre_context = Arc::new(Context {
-                                    system_prompt: self.system_prompt_snapshot(),
-                                    messages: pre_messages,
-                                    tools: None,
-                                });
-                                let returned = hook(Arc::clone(&pre_context)).await;
-                                if threshold_gate
-                                    .attempted
-                                    .load(std::sync::atomic::Ordering::SeqCst)
-                                {
-                                    threshold_gate
-                                        .skip_next
-                                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                                }
-                                // The hook returns the SAME context on every
-                                // non-compaction path; a compaction returns a
-                                // rebuilt one (and the prompt-start projection
-                                // is then stale).
-                                if Arc::ptr_eq(&pre_context, &returned) {
-                                    drop(returned);
-                                    if let Some(context) = Arc::into_inner(pre_context) {
-                                        projection.messages = context.messages;
-                                        startup_projection = Some((projection, branch));
-                                    }
-                                }
-                            } else {
-                                // Not a compaction candidate after all, but
-                                // the projection is exactly the run context.
-                                startup_projection = Some((projection, branch));
+                                threshold_gate
+                                    .skip_next
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
                             }
+                            // The hook returns the SAME context on every
+                            // non-compaction path; a compaction returns a
+                            // rebuilt one (and the prompt-start projection is
+                            // then stale).
+                            if Arc::ptr_eq(&pre_context, &returned) {
+                                drop(returned);
+                                if let Some(context) = Arc::into_inner(pre_context) {
+                                    projection.messages = context.messages;
+                                    startup_projection = Some((projection, branch));
+                                }
+                            }
+                        } else {
+                            // Not a compaction candidate, but the projection is
+                            // exactly the run context.
+                            startup_projection = Some((projection, branch));
                         }
                     }
                 }
@@ -997,7 +963,25 @@ impl AgentSession {
         // exactly like upstream's `systemPromptOptions`.
         // The snapshot pushes itself into the runtime (cached by a fingerprint),
         // backing `ctx.getSystemPromptOptions()` and the event below.
-        let prompt_options = self.system_prompt_options_snapshot();
+        //
+        // Only build it when something can read it: a JS runtime (the
+        // `ctx.getSystemPromptOptions()` host op) or a `before_agent_start`
+        // handler (the event payload). A builtin-only plan has no JS consumer,
+        // and the snapshot's context-file/skill discovery was otherwise a
+        // second full discovery pass on the first prompt.
+        let prompt_options = if self
+            .extensions
+            .as_ref()
+            .is_some_and(|extensions| extensions.has_js_runtime())
+            || self
+                .plugins
+                .as_ref()
+                .is_some_and(|plugins| plugins.has_handlers("before_agent_start"))
+        {
+            self.system_prompt_options_snapshot()
+        } else {
+            JsonValue::Null
+        };
         if let Some(plugins) = &self.plugins {
             if plugins.has_handlers("before_agent_start") {
                 let mut payload = match &trigger {

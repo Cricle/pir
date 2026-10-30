@@ -262,6 +262,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand::new("reload", "Reload extensions"),
         SlashCommand::new("debug", "Toggle debug mode and show run timings")
             .with_argument_hint("[enable|disable|last]"),
+        // pir-only built-in handled outside `SlashAction` (`handle_command`'s
+        // `/image` preview arm). It is executable, so it must be offered —
+        // the list is the model's only discovery surface.
+        SlashCommand::new("image", "Preview a local image in the terminal")
+            .with_argument_hint("<path>"),
         SlashCommand::new("quit", "Quit pir"),
         SlashCommand::new("help", "Show available commands"),
     ]

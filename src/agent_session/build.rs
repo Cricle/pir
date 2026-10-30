@@ -314,10 +314,6 @@ impl AgentSession {
             .cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let history = match &config.session {
-            Some(session) => session.build_context_entries().unwrap_or_default(),
-            None => Vec::new(),
-        };
         let (session_id, session_path) = match &config.session {
             Some(session) => (
                 Some(session.id().to_owned()),
@@ -344,29 +340,24 @@ impl AgentSession {
         // can be restored.
         // Paged resume: the tool-loadout record may start in the SKIPPED
         // PREFIX of a tail-first session. `recorded_tool_loadout` reads only
-        // SYSTEM messages, so the prefix's projection system messages (the
-        // compaction replays and declarations) are STREAMED in file order and
-        // put in front of the resident history — the restore then sees the
-        // same record a full load would, without materializing the prefix at
-        // construction time (the cost the paged open exists to avoid).
-        let tool_history: std::borrow::Cow<'_, [crate::ai::types::Message]> = match &config.session
-        {
-            Some(session) if session.is_paged() => {
-                let mut prefix_systems: Vec<crate::ai::types::Message> = Vec::new();
-                let _ = session.for_each_prefix_entry(|entry| {
-                    prefix_systems.extend(
-                        crate::session_manager::projection::session_entry_to_context_messages(
-                            &entry,
-                        )
-                        .into_iter()
-                        .filter(|message| matches!(message, crate::ai::types::Message::System(_))),
-                    );
-                });
-                prefix_systems.extend(history.iter().cloned());
-                std::borrow::Cow::Owned(prefix_systems)
-            }
-            _ => std::borrow::Cow::Borrowed(history.as_slice()),
-        };
+        // SYSTEM messages, so only those are materialized — the prefix's
+        // projection system messages (the compaction replays and declarations)
+        // are STREAMED in file order and the resident window contributes its
+        // system declarations from projection METADATA. The full transcript is
+        // never materialized here: the first prompt builds the one projection
+        // the run needs, and a construction-time copy only doubled it (then
+        // kept it resident in `self.history`, which a persisted session never
+        // reads). An explicit tool selection skips the restore entirely
+        // (`restore_recorded_active_tools` returns it unchanged), so no scan
+        // runs either.
+        let restore_recorded_loadout = tool_selection
+            .as_ref()
+            .is_none_or(|selection| selection.uses_default_tools);
+        let tool_history: Vec<crate::ai::types::Message> =
+            match (&config.session, restore_recorded_loadout) {
+                (Some(session), true) => session_recorded_system_messages(session),
+                _ => Vec::new(),
+            };
         let tool_selection = tools::restore_recorded_active_tools(tool_selection, &tool_history);
         // Context-file injection for hosts that pass no explicit system
         // prompt (RPC mode; the SDK's append-only form, where the addendum is
@@ -602,7 +593,11 @@ impl AgentSession {
             session_path: RwLock::new(session_path),
             session_storage_generation: AtomicU64::new(0),
             session_name: RwLock::new(None),
-            history: Arc::new(RwLock::new(Arc::new(history))),
+            // Ephemeral transcript only. A persisted session's history is the
+            // session projection, built on demand by the run; holding a
+            // construction-time copy here was a full transcript clone that no
+            // reader of a store-backed session ever touched.
+            history: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             compaction: Arc::new(RwLock::new(config.compaction)),
             max_turns: config.max_turns,
             cwd,
@@ -684,7 +679,11 @@ impl AgentSession {
         skills: Vec<crate::skills::SkillInfo>,
         prompt_templates: Vec<crate::coding_agent::prompt_templates::PromptTemplate>,
     ) {
-        Self::set_prompt_resources_shared(self, skills, prompt_templates);
+        // Startup install: the session build read the context files moments
+        // ago, so the prompt re-render reuses those cached inputs instead of
+        // walking the context files a second time. `/reload` keeps the disk
+        // refresh (see `set_prompt_resources_shared`).
+        Self::install_prompt_resources(self, skills, prompt_templates, false);
     }
 
     /// The discovered skills and prompt templates the session currently holds
@@ -719,6 +718,30 @@ impl AgentSession {
         skills: Vec<crate::skills::SkillInfo>,
         prompt_templates: Vec<crate::coding_agent::prompt_templates::PromptTemplate>,
     ) {
+        Self::install_prompt_resources(self, skills, prompt_templates, true);
+    }
+
+    /// Shared body of the two resource-install seams.
+    ///
+    /// `refresh_context_inputs` distinguishes the startup install (reuse the
+    /// context files the build already read) from `/reload` (re-read them: a
+    /// reload is a disk refresh). Whenever the installed skills and the MCP
+    /// section are unchanged and no disk refresh was requested, the live
+    /// prompt already renders exactly these inputs and nothing is rebuilt —
+    /// prompt templates never enter the system prompt.
+    fn install_prompt_resources(
+        &self,
+        skills: Vec<crate::skills::SkillInfo>,
+        prompt_templates: Vec<crate::coding_agent::prompt_templates::PromptTemplate>,
+        refresh_context_inputs: bool,
+    ) {
+        let skills_changed = {
+            let current = self
+                .skills
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *current != skills
+        };
         *self
             .skills
             .write()
@@ -730,104 +753,106 @@ impl AgentSession {
         // The `skills` section of the default structured prompt is built from
         // the same discovered list (upstream `formatSkillsForPrompt`), so a
         // host that installed `--skill` paths must see them there too.
-        if self.context_derived_prompt {
-            let skills = self
-                .skills
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            // D6: the reload rebuilds the prompt from the same DECLARED set the
-            // build used (upstream `_rebuildSystemPrompt` re-runs on every
-            // active-set change), so a `/reload` cannot reintroduce the base
-            // registry's tools or drop the selected plugin tools. The live
-            // registry/active snapshot also carries a `setActiveTools` /
-            // `tool_search` override installed since the session was built.
-            // The hidden declarations are re-derived from the LIVE snapshot
-            // like the build does, so a `/reload` keeps `codemode.mode: "only"`
-            // out of the `<tools>`/`<rules>` sections.
-            let (registry, active) = self.active_tool_snapshot(self.plugins.as_deref());
-            let prompt_tools = declared_tool_infos(registry.as_ref(), &active);
-            let hidden_tools = rust_hidden_declarations(registry.as_ref(), &active);
-            // Ambient inputs: the reload re-reads the context FILES (a reload
-            // is a disk refresh), but it keeps the session's BUILD-TIME
-            // identity — `self.agent_dir` and the once-resolved
-            // `self.package_dir`. Calling the ambient wrapper here would
-            // re-resolve `PIR_AGENT_DIR`/`PI_PACKAGE_DIR` and let a
-            // mid-process change split the prompt off the session (D1). The
-            // skill list itself is the host-installed one.
-            let (rebuilt, inputs) = crate::coding_agent::context::
-                session_system_prompt_with_skills_and_options_and_inputs_and_mcp(
-                    &self.cwd,
-                    &prompt_tools,
-                    &hidden_tools,
-                    &skills,
-                    &crate::coding_agent::context::ContextOptions {
-                        // The `--no-context-files` flag is a process-wide
-                        // toggle, not session identity: like upstream's reload
-                        // re-discovery, it is read fresh.
-                        disabled: !crate::coding_agent::context::context_files_enabled(),
-                        agent_dir: &self.agent_dir,
-                        package_dir: self.package_dir.as_deref(),
-                    },
-                    // A `/reload` re-reads the MCP status snapshot like it
-                    // re-reads the context files (still no connect: the
-                    // section reads the manager's synchronous mirror).
-                    crate::coding_agent::context::mcp_servers_prompt_section(
-                        self.plugins.as_deref(),
-                    ),
-                );
-            // The reload is the new baseline for later active-set rebuilds:
-            // its `(active, hidden)` snapshot and discovery inputs replace the
-            // build-time ones. P7: the reload ALWAYS reinstalls the prompt and
-            // its cache (never `None`), so a reload on a bare workspace cannot
-            // silently drop the base prompt the build installed.
-            //
-            // An SDK `.append_system_prompt(..)` addendum lives only on the
-            // cache (it is not a context input), so the reload must carry it
-            // over or the addendum would disappear after `/reload`.
-            let (append, preamble_override, append_sections) = self
-                .prompt_context
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .map(|cache| {
-                    (
-                        cache.append.clone(),
-                        cache.preamble_override.clone(),
-                        cache.append_sections.clone(),
-                    )
-                })
-                .unwrap_or_default();
-            let rebuilt = if preamble_override.is_some() || !append_sections.is_empty() {
-                crate::coding_agent::context::session_system_prompt_from_inputs_with_overrides(
-                    &self.cwd,
-                    &prompt_tools,
-                    &hidden_tools,
-                    &inputs,
-                    self.package_dir.as_deref(),
-                    preamble_override.as_deref(),
-                    &append_sections,
-                )
-            } else {
-                rebuilt
-            };
-            *self
-                .prompt_context
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PromptContextCache {
-                inputs,
-                active,
-                hidden: hidden_tools.into_iter().collect(),
-                append: append.clone(),
-                preamble_override: preamble_override.clone(),
-                append_sections: append_sections.clone(),
-            });
-            *self
-                .system_prompt
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(with_prompt_addendum(rebuilt, append.as_deref()));
+        if !self.context_derived_prompt {
+            return;
         }
+        let skills = self
+            .skills
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mcp_servers =
+            crate::coding_agent::context::mcp_servers_prompt_section(self.plugins.as_deref());
+        // A repeated install with identical resources has nothing to render.
+        // (`/reload` keeps `refresh_context_inputs` true so an edited context
+        // file still lands even when the discovered skill list is unchanged.)
+        if !refresh_context_inputs {
+            let cache = self
+                .prompt_context
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(cache) = cache.as_ref() else {
+                return;
+            };
+            if !skills_changed
+                && cache.inputs.skills == skills
+                && cache.inputs.mcp_servers == mcp_servers
+            {
+                return;
+            }
+        }
+        // D6: the reload rebuilds the prompt from the same DECLARED set the
+        // build used (upstream `_rebuildSystemPrompt` re-runs on every
+        // active-set change), so a `/reload` cannot reintroduce the base
+        // registry's tools or drop the selected plugin tools. The live
+        // registry/active snapshot also carries a `setActiveTools` /
+        // `tool_search` override installed since the session was built.
+        // The hidden declarations are re-derived from the LIVE snapshot like
+        // the build does, so a `/reload` keeps `codemode.mode: "only"` out of
+        // the `<tools>`/`<rules>` sections.
+        let (registry, active) = self.active_tool_snapshot(self.plugins.as_deref());
+        let prompt_tools = declared_tool_infos(registry.as_ref(), &active);
+        let hidden_tools = rust_hidden_declarations(registry.as_ref(), &active);
+        // Ambient inputs: `refresh_context_inputs` re-reads the context FILES
+        // (a reload is a disk refresh), but both paths keep the session's
+        // BUILD-TIME identity — `self.agent_dir` and the once-resolved
+        // `self.package_dir`. Calling the ambient wrapper here would
+        // re-resolve `PIR_AGENT_DIR`/`PI_PACKAGE_DIR` and let a mid-process
+        // change split the prompt off the session (D1).
+        let mut prompt_context = self
+            .prompt_context
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(cache) = prompt_context.as_mut() else {
+            return;
+        };
+        if refresh_context_inputs {
+            cache.inputs.files = crate::coding_agent::context::resolve_context_files_with(
+                &self.cwd,
+                &crate::coding_agent::context::ContextOptions {
+                    // The `--no-context-files` flag is a process-wide toggle,
+                    // not session identity: like upstream's reload
+                    // re-discovery, it is read fresh.
+                    disabled: !crate::coding_agent::context::context_files_enabled(),
+                    agent_dir: &self.agent_dir,
+                    package_dir: self.package_dir.as_deref(),
+                },
+            );
+        }
+        cache.inputs.skills = skills;
+        cache.inputs.mcp_servers = mcp_servers;
+        // The reload is the new baseline for later active-set rebuilds: its
+        // `(active, hidden)` snapshot and discovery inputs replace the
+        // build-time ones. P7: the rebuild ALWAYS reinstalls the prompt and
+        // its cache (never `None`), so a reload on a bare workspace cannot
+        // silently drop the base prompt the build installed.
+        let rebuilt = if cache.preamble_override.is_some() || !cache.append_sections.is_empty() {
+            crate::coding_agent::context::session_system_prompt_from_inputs_with_overrides(
+                &self.cwd,
+                &prompt_tools,
+                &hidden_tools,
+                &cache.inputs,
+                self.package_dir.as_deref(),
+                cache.preamble_override.as_deref(),
+                &cache.append_sections,
+            )
+        } else {
+            crate::coding_agent::context::session_system_prompt_from_inputs(
+                &self.cwd,
+                &prompt_tools,
+                &hidden_tools,
+                &cache.inputs,
+                self.package_dir.as_deref(),
+            )
+        };
+        let rebuilt = with_prompt_addendum(rebuilt, cache.append.as_deref());
+        cache.active = active;
+        cache.hidden = hidden_tools.into_iter().collect();
+        drop(prompt_context);
+        *self
+            .system_prompt
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rebuilt);
     }
 
     /// Extend the CONTEXT-DERIVED system prompt with caller-supplied addendum
@@ -1481,6 +1506,56 @@ fn with_prompt_addendum(prompt: String, append: Option<&str>) -> String {
         Some(text) if !text.is_empty() => format!("{prompt}\n\n{text}"),
         _ => prompt,
     }
+}
+
+/// The SYSTEM messages of the live projection, in projection order — the only
+/// transcript input [`tools::restore_recorded_active_tools`] reads.
+///
+/// Built from [`SessionManager::projection_entry_meta`] (shared source entries
+/// plus contributed message counts) instead of
+/// [`SessionManager::build_context_entries`], so a resumed session no longer
+/// materializes every stored assistant/tool-result message at construction:
+/// the first prompt builds the projection the run actually consumes, and this
+/// pass only clones the (few) system declarations. The newest compaction
+/// contributes its stored checkpoint system message ahead of its summary (an
+/// older compaction is stale and reports `message_count == 0`), matching
+/// `session_entry_to_context_messages`.
+fn session_recorded_system_messages(session: &SessionManager) -> Vec<Message> {
+    let mut systems: Vec<Message> = Vec::new();
+    if session.is_paged() {
+        let _ = session.for_each_prefix_entry(|entry| {
+            systems.extend(
+                crate::session_manager::projection::session_entry_to_context_messages(&entry)
+                    .into_iter()
+                    .filter(|message| matches!(message, Message::System(_))),
+            );
+        });
+    }
+    for (index, meta) in session.projection_entry_meta().into_iter().enumerate() {
+        if meta.message_count == 0 {
+            continue;
+        }
+        match meta.source_entry.as_ref() {
+            FileEntry::Message(inner) => match &inner.message {
+                crate::session_manager::StoredMessage::System(_) => {
+                    systems.push(inner.message.clone().into());
+                }
+                crate::session_manager::StoredMessage::User(user)
+                    if user.role == crate::ai::types::UserRole::System =>
+                {
+                    systems.push(inner.message.clone().into());
+                }
+                _ => {}
+            },
+            FileEntry::Compaction(inner) if index == 0 => {
+                if let Some(system) = &inner.system_message {
+                    systems.push(system.to_message());
+                }
+            }
+            _ => {}
+        }
+    }
+    systems
 }
 
 /// The tool list the context-derived system prompt renders: the session's

@@ -726,8 +726,21 @@ session does not have"
                 let session = session.lock().await;
                 let cwd_value = Some(session.cwd().to_string());
                 let header = serde_json::to_value(session.header()).unwrap_or(JsonValue::Null);
-                let branch = serde_json::to_value(session.branch_entries(None).unwrap_or_default())
-                    .unwrap_or(JsonValue::Null);
+                // Borrowed branch walk: `branch_entries` is this same path
+                // walk followed by a deep clone of every entry, just so
+                // `to_value` can serialize them. Serializing the borrowed
+                // entries produces identical JSON without the transcript-
+                // sized clone (the manager's `Arc<FileEntry>` list stays
+                // shared).
+                let branch = JsonValue::Array(
+                    crate::session_manager::projection::build_session_path(
+                        session.resident_entries(),
+                        session.leaf_id(),
+                    )
+                    .iter()
+                    .map(|entry| serde_json::to_value(*entry).unwrap_or(JsonValue::Null))
+                    .collect(),
+                );
                 // Labels are read off the BORROWED resident entry list (no
                 // clone — the old code paid a whole-session `entries()`
                 // clone just for this map). `tree()` below internally
@@ -796,15 +809,24 @@ session does not have"
                 // ONCE here; `entries` and `projection.messages` share
                 // that value and each per-entry slice clones the already
                 // built values instead of re-serializing the messages.
-                let projection = session.build_session_projection();
-                let (entries, projection) = match &projection {
+                let (entries, projection) = match session.build_session_projection() {
                     Ok(projection) => {
+                        let crate::session_manager::SessionProjection {
+                            entries: projected_entries,
+                            messages: projected_messages,
+                            ..
+                        } = projection;
                         let message_values =
-                            serde_json::to_value(&projection.messages).unwrap_or(JsonValue::Null);
+                            serde_json::to_value(&projected_messages).unwrap_or(JsonValue::Null);
+                        // The typed conversation has served its only purpose
+                        // (the aggregate JSON above). Dropping it here keeps
+                        // the peak at "JSON snapshots" instead of holding the
+                        // full `Vec<Message>` alongside the three serialized
+                        // copies while the per-entry views are built.
+                        drop(projected_messages);
                         match &message_values {
                             JsonValue::Array(message_items) => {
-                                let entry_views: Vec<JsonValue> = projection
-                                    .entries
+                                let entry_views: Vec<JsonValue> = projected_entries
                                     .iter()
                                     .map(|entry| {
                                         let end = entry.messages.end.min(message_items.len());

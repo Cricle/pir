@@ -2571,21 +2571,10 @@ impl App {
             std::env::current_dir().unwrap_or_default(),
         ));
         // `/model` argument candidates (upstream
-        // `modelCommand.getArgumentCompletions`): the registry's
-        // `provider/id` refs. The scope-aware refresh runs as soon as the
-        // CLI/app scope is installed (and after every scope change).
-        if let Some(configured) = &configured {
-            let pairs: Vec<(String, String)> = configured
-                .registry
-                .get_models()
-                .iter()
-                .map(|model| (model.provider.clone(), model.id.clone()))
-                .collect();
-            autocomplete_provider.set_argument_candidates(
-                "model",
-                super::autocomplete::model_argument_items(&pairs),
-            );
-        }
+        // `modelCommand.getArgumentCompletions`) are installed by the
+        // `refresh_model_completions` call right after construction, which can
+        // reuse the startup environment's model list instead of cloning every
+        // registry model here.
         let autocomplete: Arc<Mutex<Option<AutocompletePopup>>> = Arc::new(Mutex::new(None));
         let footer_state = FooterState {
             cwd: std::env::current_dir()
@@ -4127,10 +4116,18 @@ impl App {
                 configured.model = model;
             }
         }
-        self.refresh_footer_caches();
+        self.footer_changed();
     }
 
     /// Set the thinking level locally (border color + footer state).
+    ///
+    /// Mirrors upstream `selectThinkingLevel`/`cycleThinkingLevel`
+    /// (`interactive-mode.ts:5166-5178`, `4527-4536`): update the level,
+    /// repaint the editor border, then invalidate BOTH footer faces and mark
+    /// the frame dirty. The footer is updated in place through
+    /// [`Footer::update_thinking_level`] (the same host seam a model change
+    /// uses via [`App::footer_changed`]), so a level change can never depend
+    /// on some later, unrelated event to repaint the two status rows.
     fn apply_local_thinking(&self, level: &str) {
         *self
             .thinking_level
@@ -4138,7 +4135,18 @@ impl App {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = level.to_string();
         self.editor
             .set_border_color(with_theme(|theme| theme.thinking_border(level)));
+        self.footer.update_thinking_level(level);
+        self.footer_changed();
+    }
+
+    /// Invalidate every footer cache and request a repaint: the shared tail
+    /// of both local-apply funnels (model and thinking). `dirty` is set on
+    /// input/worker paths already, but the explicit wake makes a change that
+    /// arrives from an out-of-band host path repaint without waiting for an
+    /// unrelated event (the reported stale status rows).
+    fn footer_changed(&self) {
         self.refresh_footer_caches();
+        self.request_ui_refresh();
     }
 
     /// The session storage root for a session-facing command (`/resume`,
@@ -4432,15 +4440,53 @@ fn model_pairs(app: &App) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// The thinking levels the ACTIVE model supports, as wire names in ladder
+/// order (upstream `session.getAvailableThinkingLevels()`).
+///
+/// The thinking selector and `/thinking` must offer/accept exactly these: a
+/// static seven-level ladder offered `medium` on models whose
+/// `thinkingLevelMap` marks it `null`, and `setThinkingLevel` then clamped the
+/// pick to `high` — the reported "selected medium, log shows high".
+///
+/// Falls back to the full ladder only when no model is configured (the
+/// selector must still open so the user can see the levels before `/login`).
+#[doc(hidden)]
+pub fn active_thinking_levels(model: Option<&crate::ai::types::Model>) -> Vec<String> {
+    match model {
+        Some(model) => crate::ai::types::get_supported_thinking_levels(model)
+            .iter()
+            .map(|level| level.wire_key().to_string())
+            .collect(),
+        None => crate::ai::types::EXTENDED_THINKING_LEVELS
+            .iter()
+            .map(|level| level.wire_key().to_string())
+            .collect(),
+    }
+}
+
+fn thinking_levels_for_active_model(app: &App) -> Vec<String> {
+    active_thinking_levels(app.configured.as_ref().map(|configured| &configured.model))
+}
+
 /// Refresh the `/model` argument candidates from the current scope (upstream
 /// `getArgumentCompletions` uses `session.scopedModels` when a scope is
 /// active, the whole catalog otherwise). Called after startup scope install
 /// and after every scope change.
-fn refresh_model_completions(app: &App) {
+///
+/// `startup_pairs` lets the startup call reuse the model list the environment
+/// already materialized; [`model_pairs`] would deep-clone every `Model` out of
+/// the registry again just to keep two strings per entry.
+fn refresh_model_completions(app: &App, startup_pairs: Option<Vec<(String, String)>>) {
     let pairs = if has_model_scope(app) {
-        scoped_model_pairs(app)
+        let registry = startup_pairs.unwrap_or_else(|| model_pairs(app));
+        let scoped = app
+            .scoped_refs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        filter_scoped_pairs(&scoped, &registry)
     } else {
-        model_pairs(app)
+        startup_pairs.unwrap_or_else(|| model_pairs(app))
     };
     if pairs.is_empty() {
         return;
@@ -4461,7 +4507,11 @@ fn scoped_model_pairs(app: &App) -> Vec<(String, String)> {
     if scoped.is_empty() {
         return Vec::new();
     }
-    let registry = model_pairs(app);
+    filter_scoped_pairs(&scoped, &model_pairs(app))
+}
+
+/// Keep only the `scoped_refs` (`provider/id`) entries present in `registry`.
+fn filter_scoped_pairs(scoped: &[String], registry: &[(String, String)]) -> Vec<(String, String)> {
     scoped
         .iter()
         .filter_map(|reference| {
@@ -6638,48 +6688,71 @@ pub fn run(
     // The starting model: CLI flags first (`--provider/--model/--thinking/
     // --api-key/--models`), then the configured/settings default — the same
     // resolution order print mode applies.
-    let mut configured = match crate::ai::providers::load_pi_config_with_settings(settings) {
+    //
+    // The models.json-only snapshot is a fallback for when the full
+    // environment is unavailable or resolves no usable model. Loading it
+    // eagerly composed every models.json provider a second time on every TUI
+    // start even though the resolution below replaced it immediately.
+    let load_configured = || match crate::ai::providers::load_pi_config_with_settings(settings) {
         Ok(configured) => configured,
         Err(error) => {
             eprintln!("pir: {error}");
             None
         }
     };
+    let configured;
+    let mut startup_model_pairs: Option<Vec<(String, String)>> = None;
     let mut scoped_refs_from_cli: Vec<String> = Vec::new();
     let mut resolved_thinking: Option<crate::ai::types::ThinkingLevel> = None;
-    if let Some(environment) = environment.as_ref() {
-        match crate::coding_agent::overrides::resolve_model(
-            &overrides.model,
-            &environment.models,
-            &environment.api_keys,
-            &environment.settings,
-        ) {
-            Ok(selection) => {
-                for diagnostic in &selection.diagnostics {
-                    eprintln!("Warning: {diagnostic}");
+    match environment {
+        Some(environment) => {
+            match crate::coding_agent::overrides::resolve_model(
+                &overrides.model,
+                &environment.models,
+                &environment.api_keys,
+                &environment.settings,
+            ) {
+                Ok(selection) => {
+                    for diagnostic in &selection.diagnostics {
+                        eprintln!("Warning: {diagnostic}");
+                    }
+                    scoped_refs_from_cli =
+                        crate::coding_agent::overrides::scoped_refs(&selection.scoped_models);
+                    // Reuse the environment's materialized model list for the
+                    // `/model` candidates; `registry.get_models()` would deep
+                    // clone every `Model` again just to read provider/id.
+                    startup_model_pairs = Some(
+                        environment
+                            .models
+                            .iter()
+                            .map(|model| (model.provider.clone(), model.id.clone()))
+                            .collect(),
+                    );
+                    // Move the environment fields: resolution is done and the
+                    // TUI only needs this one snapshot.
+                    configured = Some(crate::ai::providers::PiConfiguredModel {
+                        registry: environment.registry,
+                        model: selection.model,
+                        api_key: selection.api_key,
+                        api_keys: environment.api_keys,
+                        settings: environment.settings,
+                    });
+                    // The resolved thinking level is handed to the worker
+                    // through the overrides below (the session build reads it).
+                    resolved_thinking = Some(selection.thinking);
                 }
-                scoped_refs_from_cli =
-                    crate::coding_agent::overrides::scoped_refs(&selection.scoped_models);
-                configured = Some(crate::ai::providers::PiConfiguredModel {
-                    registry: environment.registry.clone(),
-                    model: selection.model,
-                    api_key: selection.api_key,
-                    api_keys: environment.api_keys.clone(),
-                    settings: environment.settings.clone(),
-                });
-                // The resolved thinking level is handed to the worker through
-                // the overrides below (the session build reads it).
-                resolved_thinking = Some(selection.thinking);
-            }
-            Err(error) => {
-                if overrides.model.requested() {
-                    // An explicit CLI selection that cannot be resolved is
-                    // fatal, like print mode: silently falling back would run
-                    // a different model than the user asked for.
-                    return Err(error);
+                Err(error) => {
+                    if overrides.model.requested() {
+                        // An explicit CLI selection that cannot be resolved is
+                        // fatal, like print mode: silently falling back would
+                        // run a different model than the user asked for.
+                        return Err(error);
+                    }
+                    configured = load_configured();
                 }
             }
         }
+        None => configured = load_configured(),
     }
     timings.time("tui.loadConfig");
 
@@ -6979,7 +7052,7 @@ pub fn run(
     }
     // `/model` autocomplete follows the effective scope (upstream
     // `getArgumentCompletions` narrows to `scopedModels` when one is set).
-    refresh_model_completions(&app);
+    refresh_model_completions(&app, startup_model_pairs);
     // `--name`: the session display name (upstream `setSessionName`), applied
     // to the session the worker attaches.
     app.session_name = overrides.session_name.clone();
@@ -7978,6 +8051,14 @@ pub fn run(
                     // resource set and reload the extension runtime.
                     apply_reload_outcome(&mut app, &mut entries, &worker, outcome);
                 }
+                WorkerEvent::ExtensionsReloaded => {
+                    // The extension runtime's command registry may have
+                    // changed: refresh the popup candidates in place
+                    // (upstream rebuilds the provider with the current
+                    // `extensionRunner.getRegisteredCommands()`).
+                    update_autocomplete(&app);
+                    app.request_ui_refresh();
+                }
                 WorkerEvent::ClipboardPaste { result } => {
                     // The pending slot is retired by the reader thread's exit
                     // hook (`spawn_read_paste_with_exit`), not here (same
@@ -8459,6 +8540,16 @@ pub fn run(
                         }),
                     }
                 }
+                WorkerEvent::ThinkingLevelChanged(level) => {
+                    // Effective-level echo from the session (upstream
+                    // `thinking_level_changed` → `footer.invalidate()` +
+                    // `updateEditorBorderColor`): covers the clamp after a
+                    // local apply and changes made through the extension /
+                    // native-plugin / RPC faces, which otherwise left the
+                    // footer showing the previous level until an unrelated
+                    // event refreshed it.
+                    app.apply_local_thinking(&level);
+                }
                 WorkerEvent::ModelCycled(cycle) => {
                     // Upstream `cycleModel` (interactive-mode.ts:4530-4547):
                     // apply the footer/thinking state and show
@@ -8603,6 +8694,10 @@ pub fn run(
                             Arc::new(NativeCommandProvider { commands }) as Arc<dyn CommandProvider>
                         }),
                     );
+                    // The popup may already be open on `/` (typed before the
+                    // worker's first snapshot landed): re-query so the native
+                    // commands appear now instead of on the next keystroke.
+                    update_autocomplete(&app);
                 }
                 WorkerEvent::BranchSummaryAbortHandle(abort) => {
                     // Session latch handoff (see the worker's send site): Esc
@@ -9481,12 +9576,17 @@ pub fn run(
                     *spinner = spinner.wrapping_add(1);
                 }
             }
+            // Publish the dock height for the windowed scroll path AND for
+            // the hardware-cursor sync: the dock component reports its rows
+            // in dock-relative coordinates, so both render modes must hand
+            // the core the dock height to resolve the editor cursor cell
+            // (regular mode included — without it the IME cursor target
+            // falls back to the frame's last row).
+            app.core
+                .set_dock_height(app.dock_height.load(std::sync::atomic::Ordering::Relaxed));
             if app.fullscreen {
-                // Publish the dock height for the windowed scroll path, keep
-                // the search matches in sync with the latest frame, and
+                // Keep the search matches in sync with the latest frame and
                 // expire the flash message.
-                app.core
-                    .set_dock_height(app.dock_height.load(std::sync::atomic::Ordering::Relaxed));
                 let dock_h = app.dock_height.load(std::sync::atomic::Ordering::Relaxed);
                 let frame = app.core.last_frame_lines();
                 let version = app.core.frame_version();
@@ -13107,7 +13207,7 @@ fn handle_overlay_key(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = refs;
                 app.refresh_footer_caches();
-                refresh_model_completions(app);
+                refresh_model_completions(app, None);
                 return;
             }
             if overlay.tree.is_some() {
@@ -13185,7 +13285,7 @@ fn handle_overlay_key(
                 if let Some(level) = selected {
                     // Apply through the worker (persists + affects prompts);
                     // the worker reports the applied level as a status line.
-                    worker.set_thinking(level.clone());
+                    worker.set_thinking(level.clone(), true);
                     app.apply_local_thinking(&level);
                 }
                 app.overlay
@@ -13199,7 +13299,7 @@ fn handle_overlay_key(
                     // `provider/id` reference → apply through the worker and
                     // update the local footer state (upstream setModel).
                     if let Some((provider, model_id)) = model.split_once('/') {
-                        worker.set_model(provider.to_string(), model_id.to_string());
+                        worker.set_model(provider.to_string(), model_id.to_string(), true);
                         app.apply_local_model(provider, model_id);
                     }
                 }
@@ -15261,7 +15361,7 @@ fn run_action(
                 worker.cycle_thinking();
                 return false;
             }
-            let levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+            let levels = thinking_levels_for_active_model(app);
             let next = {
                 let level = app
                     .thinking_level
@@ -15271,11 +15371,11 @@ fn run_action(
                     .iter()
                     .position(|l| *l == level.as_str())
                     .unwrap_or(0);
-                levels[(current + 1) % levels.len()]
+                levels[(current + 1) % levels.len()].clone()
             };
             // Apply locally (border color + footer); the headless fallback
-            // cannot consult the model, so the ladder stays unclamped.
-            app.apply_local_thinking(next);
+            // walks the active model's supported ladder like the worker path.
+            app.apply_local_thinking(&next);
             entries.push(ChatEntry::Notice {
                 kind: super::app::NoticeKind::Status,
                 text: format!("Thinking level: {next}"),
@@ -15309,14 +15409,11 @@ fn run_action(
             false
         }
         Action::ThinkingSelector => {
+            let levels = thinking_levels_for_active_model(app);
             let mut overlay = app
                 .overlay
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let levels: Vec<String> = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
             let current = app
                 .thinking_level
                 .lock()
@@ -15468,12 +15565,21 @@ pub fn should_submit_on_backslash_enter(
             .is_some_and(|line| line.chars().nth(state.cursor_col - 1) == Some('\\'))
 }
 
-/// Apply the selected completion to the editor. Returns the completed
-/// prefix (for the slash-command fall-through decision).
-fn accept_autocomplete(app: &App) -> Option<String> {
+/// Apply the highlighted completion to `editor` and CLOSE the popup.
+///
+/// Upstream accepts with `cancelAutocomplete()` and does NOT re-run
+/// `updateAutocomplete` (`editor.ts:771-810`). Re-querying here reopened the
+/// popup on the text just completed: a slash command completes to
+/// `/model ` (trailing space), whose argument candidates were immediately
+/// offered again, so the menu stayed on screen after Enter/Tab.
+/// Public for the display-layer tests.
+pub fn accept_autocomplete_selection(
+    slot: &Mutex<Option<AutocompletePopup>>,
+    provider: &CombinedAutocompleteProvider,
+    editor: &Editor,
+) -> Option<String> {
     let (popup, prefix) = {
-        let mut guard = app
-            .autocomplete
+        let mut guard = slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let popup = guard.take()?;
@@ -15481,18 +15587,33 @@ fn accept_autocomplete(app: &App) -> Option<String> {
         (popup, prefix)
     };
     let item = popup.selected_item()?.clone();
-    let state = app.editor.state_snapshot();
-    let (lines, cursor_line, cursor_col) = app.autocomplete_provider.apply_completion(
+    let state = editor.state_snapshot();
+    let (lines, cursor_line, cursor_col) = provider.apply_completion(
         &state.lines,
         state.cursor_line,
         state.cursor_col,
         &item,
         &prefix,
     );
-    app.editor.apply_state(lines, cursor_line, cursor_col);
-    app.note_editor_change();
-    update_autocomplete(app);
+    editor.apply_state(lines, cursor_line, cursor_col);
+    // `take()` above already emptied the slot; clear it again so the
+    // post-condition (an accepted completion never leaves a live popup)
+    // stays pinned if this path ever grows a refresh.
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     Some(prefix)
+}
+
+/// App-side wrapper: apply the accept through the shared slot and bump the
+/// editor revision so the extension snapshot republishes the accepted text.
+fn accept_autocomplete(app: &App) -> Option<String> {
+    let accepted =
+        accept_autocomplete_selection(&app.autocomplete, &app.autocomplete_provider, &app.editor);
+    if accepted.is_some() {
+        app.note_editor_change();
+    }
+    accepted
 }
 
 /// Insert clipboard text at the cursor; degradation is graceful (status
@@ -15898,7 +16019,7 @@ fn handle_command(
                 let models = selector_model_pairs(app);
                 match super::slash::resolve_model_argument(args, &models) {
                     super::slash::ModelMatch::Found { provider, model_id } => {
-                        worker.set_model(provider.clone(), model_id.clone());
+                        worker.set_model(provider.clone(), model_id.clone(), true);
                         app.apply_local_model(&provider, &model_id);
                     }
                     super::slash::ModelMatch::Ambiguous(matches) => {
@@ -15960,15 +16081,11 @@ fn handle_command(
         }
         super::slash::SlashAction::Thinking => {
             if args.is_empty() {
+                let levels = thinking_levels_for_active_model(app);
                 let mut overlay = app
                     .overlay
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let levels: Vec<String> =
-                    ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
                 let current = app
                     .thinking_level
                     .lock()
@@ -15983,12 +16100,26 @@ fn handle_command(
                     Some(ThinkingSelector::new(&current, &levels, default.as_deref()));
             } else {
                 // `/thinking <level>`: apply the argument directly (upstream
-                // `handleThinkingCommand`).
+                // `handleThinkingCommand`), validated against the ACTIVE
+                // model's supported ladder — offering/accepting a level the
+                // model maps to null would silently clamp (medium → high).
                 match super::slash::thinking_level_argument(args) {
                     Ok(level) => {
                         let key = level.wire_key();
-                        worker.set_thinking(key.to_string());
-                        app.apply_local_thinking(key);
+                        let levels = thinking_levels_for_active_model(app);
+                        if levels.iter().any(|candidate| candidate == key) {
+                            worker.set_thinking(key.to_string(), true);
+                            app.apply_local_thinking(key);
+                        } else {
+                            entries.push(ChatEntry::Notice {
+                                kind: super::app::NoticeKind::Error,
+                                text: format!(
+                                    "Unknown thinking level \"{}\". Available levels: {}.",
+                                    args.trim(),
+                                    levels.join(", ")
+                                ),
+                            });
+                        }
                     }
                     Err(message) => entries.push(ChatEntry::Notice {
                         kind: super::app::NoticeKind::Error,
@@ -18005,6 +18136,12 @@ fn spawn_ext_dispatcher(
                                     }
                                 }
                             }
+                            // Whether the reload succeeded or failed, the
+                            // registered-command snapshot may have moved (a
+                            // partial load still replaces the runtime state).
+                            // Re-query an open popup so extension command
+                            // candidates reflect the reload immediately.
+                            let _ = events.send(WorkerEvent::ExtensionsReloaded);
                         }
                         ExtRequest::ArgCompletions { .. } | ExtRequest::Suggestions { .. } => {
                             dispatch_completion_request(
@@ -18726,6 +18863,12 @@ fn apply_reload_outcome(
         app.refresh_footer_caches();
         dispatcher.reload_extensions();
     }
+    // Skill/prompt-template commands were just replaced: re-query an open
+    // popup so a removed skill disappears and a new one is offered without
+    // another keystroke. (Extension commands refresh again when the
+    // dispatcher reports the reload finished — see
+    // `WorkerEvent::ExtensionsReloaded`.)
+    update_autocomplete(app);
     entries.push(ChatEntry::Notice {
         kind: super::app::NoticeKind::Status,
         text: "Reloaded keybindings, extensions, skills, prompts, themes, and context files."
@@ -18741,6 +18884,10 @@ enum WorkerEvent {
     /// The UI applies it on the render thread; the heavy settings/theme/
     /// resource reads happened on the helper thread.
     Reloaded(ReloadOutcome),
+    /// The extension dispatcher finished a `/reload` (`ExtRequest::Reload`).
+    /// The registered command list may have moved; the UI re-queries an open
+    /// autocomplete popup so extension commands appear/disappear at once.
+    ExtensionsReloaded,
     /// One off-thread TEXT-ONLY clipboard read finished (alt-screen
     /// right-click paste). `text` is [`super::clipboard::read_text`]'s result
     /// — normalized text, or `None` when the clipboard is unavailable or
@@ -18994,6 +19141,11 @@ enum WorkerEvent {
     /// (`None` = the model does not reason, upstream's "Current model does
     /// not support thinking").
     ThinkingCycled(Option<String>),
+    /// `SessionEvent::ThinkingLevelChanged`: the session's EFFECTIVE level
+    /// moved (local apply clamped it, or an extension/plugin/RPC caller
+    /// changed it out of band). Mirrors upstream `thinking_level_changed` →
+    /// `footer.invalidate()` (interactive-mode.ts:3452).
+    ThinkingLevelChanged(String),
     /// `app.model.cycleForward` / `app.model.cycleBackward` through the
     /// worker (upstream `session.cycleModel`): the applied cycle, or `None`
     /// when the effective model set has fewer than two entries ("Only one
@@ -19236,10 +19388,14 @@ enum WorkerCommand {
     AbortBash,
     /// `/compact [instructions]` — instructions pass through.
     Compact(Option<String>),
-    /// Apply a model selection (upstream `session.setModel`).
+    /// Apply a model selection (upstream `session.setModel`). `persist` also
+    /// writes the global `defaultProvider`/`defaultModel` (upstream
+    /// `setModel(model, { persist: true })`): explicit selector/command
+    /// picks persist, Ctrl+P cycling does not.
     SetModel {
         provider: String,
         model_id: String,
+        persist: bool,
     },
     /// `app.model.cycleForward` / `app.model.cycleBackward` (upstream
     /// `session.cycleModel(direction)`).
@@ -19247,7 +19403,12 @@ enum WorkerCommand {
         forward: bool,
     },
     /// Apply a thinking level (upstream `session.setThinkingLevel`).
-    SetThinking(String),
+    /// `persist` also writes the global `defaultThinkingLevel`; explicit
+    /// selector/command picks persist, Shift+Tab cycling does not.
+    SetThinking {
+        level: String,
+        persist: bool,
+    },
     /// `/export [path]`: render the live session to a self-contained HTML
     /// file (upstream `handleExportCommand` → `exportToHtml`); the outcome is
     /// reported as a Status/Error worker event.
@@ -19562,15 +19723,19 @@ impl WorkerHandle {
         }
     }
 
-    fn set_model(&self, provider: String, model_id: String) {
+    fn set_model(&self, provider: String, model_id: String, persist: bool) {
         if let Some(tx) = &self.submit_tx {
-            let _ = tx.send(WorkerCommand::SetModel { provider, model_id });
+            let _ = tx.send(WorkerCommand::SetModel {
+                provider,
+                model_id,
+                persist,
+            });
         }
     }
 
-    fn set_thinking(&self, level: String) {
+    fn set_thinking(&self, level: String, persist: bool) {
         if let Some(tx) = &self.submit_tx {
-            let _ = tx.send(WorkerCommand::SetThinking(level));
+            let _ = tx.send(WorkerCommand::SetThinking { level, persist });
         }
     }
 
@@ -21500,6 +21665,21 @@ async fn worker_loop(
             }
         }));
     }
+    // `thinking_level_changed` (upstream `AgentSessionEvent` 212 →
+    // interactive-mode.ts:3452 `footer.invalidate()`): the session owns the
+    // EFFECTIVE level (a request may be clamped to the model's supported
+    // ladder, and extensions/RPC/phone can change it out of band). Without
+    // this bridge the TUI footer keeps the last value it applied locally
+    // until some unrelated event refreshes the caches — the reported stale
+    // status rows after selecting a thinking level.
+    {
+        let events = events.clone();
+        session.on_session_event(std::sync::Arc::new(move |event| {
+            if let crate::agent_session::SessionEvent::ThinkingLevelChanged { level } = event {
+                let _ = events.send(WorkerEvent::ThinkingLevelChanged(level));
+            }
+        }));
+    }
     // Background tool completions (`TOOL-BACKGROUND-SCOPE.md` §2.4.5): the
     // batch that started a `background: true` call answered with a placeholder,
     // so its block stays pending while the turn moves on. The real result
@@ -22151,6 +22331,94 @@ async fn run_user_bash(
         images: Vec::new(),
         partial: false,
     });
+}
+
+/// Persist the global default model (`defaultProvider`/`defaultModel`) and,
+/// for a non-empty scope, add it to the session scope + `enabledModels`
+/// (upstream `setModel(model, { persist: true })` →
+/// `_addPersistedDefaultToNonEmptyScope`).
+fn persist_default_model(
+    session: &crate::agent_session::AgentSession,
+    provider: &str,
+    model_id: &str,
+) -> Result<(), String> {
+    let cwd_text = current_cwd_text();
+    let cwd = std::path::Path::new(&cwd_text);
+    let agent_dir = global_agent_dir();
+    let mut manager = crate::config::settings::SettingsManager::load(
+        &agent_dir,
+        &cwd.join(".pi"),
+        cwd,
+        crate::config::trust::resolve_cwd_trust(cwd, &agent_dir),
+    );
+    manager.set_global_field("defaultProvider", serde_json::json!(provider));
+    manager.set_global_field("defaultModel", serde_json::json!(model_id));
+    // Upstream `_addPersistedDefaultToNonEmptyScope`
+    // (agent-session.ts:2499-2511): with a model scope active the saved model
+    // JOINS the session scope, and a non-empty persisted `enabledModels` list
+    // gains the `provider/id` reference (case-insensitive dedupe). An empty
+    // `enabledModels` setting is left empty.
+    let scoped = session.scoped_models();
+    if !scoped.is_empty()
+        && !scoped
+            .iter()
+            .any(|scoped| scoped.model.provider == provider && scoped.model.id == model_id)
+    {
+        if let Some(model) = session.find_model(provider, model_id) {
+            let mut updated = scoped;
+            updated.push(crate::ai::providers::ScopedModel {
+                model,
+                thinking_level: None,
+            });
+            session.set_scoped_models(updated);
+        }
+    }
+    if manager
+        .settings
+        .enabled_models
+        .as_ref()
+        .is_some_and(|models| !models.is_empty())
+    {
+        let reference = format!("{provider}/{model_id}");
+        let mut enabled = manager.settings.enabled_models.clone().unwrap_or_default();
+        if !enabled
+            .iter()
+            .any(|pattern| pattern.eq_ignore_ascii_case(&reference))
+        {
+            enabled.push(reference);
+            manager.set_global_field("enabledModels", serde_json::json!(enabled));
+        }
+    }
+    match manager.drain_errors().first() {
+        Some(error) => Err(format!("Default model not saved: {}", error.message)),
+        None => Ok(()),
+    }
+}
+
+/// Persist the global default thinking level (`defaultThinkingLevel`).
+///
+/// This is the persistence half of an explicit thinking pick (selector
+/// confirm, `/thinking <level>`, ctrl+s). Public as a test seam: the worker
+/// command wrapper is not callable without a live session.
+#[doc(hidden)]
+pub fn persist_default_thinking(level: &str) -> Result<(), String> {
+    let cwd_text = current_cwd_text();
+    let cwd = std::path::Path::new(&cwd_text);
+    let agent_dir = global_agent_dir();
+    let mut manager = crate::config::settings::SettingsManager::load(
+        &agent_dir,
+        &cwd.join(".pi"),
+        cwd,
+        crate::config::trust::resolve_cwd_trust(cwd, &agent_dir),
+    );
+    manager.set_global_field("defaultThinkingLevel", serde_json::json!(level));
+    match manager.drain_errors().first() {
+        Some(error) => Err(format!(
+            "Default thinking level not saved: {}",
+            error.message
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Handle one non-prompt worker command (the session-control surface).
@@ -22882,7 +23150,11 @@ async fn handle_session_command(
                 }
             }
         }
-        WorkerCommand::SetModel { provider, model_id } => {
+        WorkerCommand::SetModel {
+            provider,
+            model_id,
+            persist,
+        } => {
             // Model selector / `/model <term>`: find the model in the
             // registry and apply it (upstream `session.setModel`). This is the
             // arm that matters: the session applies the model to EVERY
@@ -22893,23 +23165,52 @@ async fn handle_session_command(
             // wire").
             let outcome = match session.find_model(&provider, &model_id) {
                 Some(model) => match session.set_model(model.clone()).await {
-                    Ok(()) => Ok(format!("Model: {}", model.id)),
+                    Ok(()) => {
+                        let persisted = if persist {
+                            persist_default_model(session, &provider, &model_id)
+                        } else {
+                            Ok(())
+                        };
+                        match persisted {
+                            Ok(()) => Ok(if persist {
+                                format!("Default model: {provider}/{model_id}")
+                            } else {
+                                format!("Model: {}", model.id)
+                            }),
+                            Err(error) => Err(error),
+                        }
+                    }
                     Err(error) => Err(format!("set model failed: {error}")),
                 },
                 None => Err(format!("Unknown model: {provider}/{model_id}")),
             };
             report_session_outcome(events, outcome);
         }
-        WorkerCommand::SetThinking(level_text) => {
-            // `/thinking <level>` / Shift+Tab / the thinking selector:
-            // apply + persist the level (upstream `session.setThinkingLevel`).
-            match crate::tui::slash::thinking_level_argument(&level_text) {
-                Ok(level) => {
-                    let applied = session.set_thinking_level(level).await;
-                    let _ = events.send(WorkerEvent::Status(format!(
-                        "Thinking level: {}",
-                        applied.wire_key()
-                    )));
+        WorkerCommand::SetThinking { level, persist } => {
+            // Thinking selector / `/thinking <level>`: apply the level
+            // (upstream `session.setThinkingLevel`). An explicit pick also
+            // persists the global default; Shift+Tab cycling does not.
+            match crate::tui::slash::thinking_level_argument(&level) {
+                Ok(requested) => {
+                    let applied = session.set_thinking_level(requested).await;
+                    if persist {
+                        match persist_default_thinking(applied.wire_key()) {
+                            Ok(()) => {
+                                let _ = events.send(WorkerEvent::Status(format!(
+                                    "Default thinking level: {}",
+                                    applied.wire_key()
+                                )));
+                            }
+                            Err(message) => {
+                                let _ = events.send(WorkerEvent::Error(message));
+                            }
+                        }
+                    } else {
+                        let _ = events.send(WorkerEvent::Status(format!(
+                            "Thinking level: {}",
+                            applied.wire_key()
+                        )));
+                    }
                 }
                 Err(message) => {
                     let _ = events.send(WorkerEvent::Error(message));
@@ -23270,85 +23571,41 @@ async fn handle_session_command(
         }
         WorkerCommand::SetDefaultModel { provider, model_id } => {
             // `app.models.save` (upstream `selectModel(model, true)` →
-            // `setModel(model, { persist: true })`): persist the default
-            // model through the global settings store.
-            let cwd_text = current_cwd_text();
-            let cwd = std::path::Path::new(&cwd_text);
-            let agent_dir = global_agent_dir();
-            let mut manager = crate::config::settings::SettingsManager::load(
-                &agent_dir,
-                &cwd.join(".pi"),
-                cwd,
-                crate::config::trust::resolve_cwd_trust(cwd, &agent_dir),
-            );
-            manager.set_global_field("defaultProvider", serde_json::json!(provider));
-            manager.set_global_field("defaultModel", serde_json::json!(model_id));
-            // Upstream `_addPersistedDefaultToNonEmptyScope`
-            // (agent-session.ts:2499-2511): with a model scope active the
-            // saved model JOINS the session scope, and a non-empty persisted
-            // `enabledModels` list gains the `provider/id` reference
-            // (case-insensitive dedupe). An empty `enabledModels` setting is
-            // left empty (upstream returns before the write).
-            let scoped = session.scoped_models();
-            if !scoped.is_empty()
-                && !scoped
-                    .iter()
-                    .any(|scoped| scoped.model.provider == provider && scoped.model.id == model_id)
-            {
-                if let Some(model) = session.find_model(&provider, &model_id) {
-                    let mut updated = scoped;
-                    updated.push(crate::ai::providers::ScopedModel {
-                        model,
-                        thinking_level: None,
-                    });
-                    session.set_scoped_models(updated);
-                }
-            }
-            if manager
-                .settings
-                .enabled_models
-                .as_ref()
-                .is_some_and(|models| !models.is_empty())
-            {
-                let reference = format!("{provider}/{model_id}");
-                let mut enabled = manager.settings.enabled_models.clone().unwrap_or_default();
-                if !enabled
-                    .iter()
-                    .any(|pattern| pattern.eq_ignore_ascii_case(&reference))
-                {
-                    enabled.push(reference);
-                    manager.set_global_field("enabledModels", serde_json::json!(enabled));
-                }
-            }
-            let errors = manager.drain_errors();
-            let _ = events.send(match errors.first() {
-                Some(error) => {
-                    WorkerEvent::Error(format!("Default model not saved: {}", error.message))
-                }
-                None => WorkerEvent::Status(format!("Default model: {provider}/{model_id}")),
-            });
+            // `setModel(model, { persist: true })`): the save chord applies
+            // the model to the live session AND persists it. Persisting alone
+            // left the footer on the new model while every request still ran
+            // the old one.
+            let outcome = match session.find_model(&provider, &model_id) {
+                Some(model) => match session.set_model(model).await {
+                    Ok(()) => persist_default_model(session, &provider, &model_id)
+                        .map(|()| format!("Default model: {provider}/{model_id}")),
+                    Err(error) => Err(format!("set model failed: {error}")),
+                },
+                None => Err(format!("Unknown model: {provider}/{model_id}")),
+            };
+            report_session_outcome(events, outcome);
         }
         WorkerCommand::SetDefaultThinking { level } => {
             // `app.thinking.save` (upstream thinking-selector
-            // `onSelectAsDefault`): persist the default thinking level.
-            let cwd_text = current_cwd_text();
-            let cwd = std::path::Path::new(&cwd_text);
-            let agent_dir = global_agent_dir();
-            let mut manager = crate::config::settings::SettingsManager::load(
-                &agent_dir,
-                &cwd.join(".pi"),
-                cwd,
-                crate::config::trust::resolve_cwd_trust(cwd, &agent_dir),
-            );
-            manager.set_global_field("defaultThinkingLevel", serde_json::json!(level));
-            let errors = manager.drain_errors();
-            let _ = events.send(match errors.first() {
-                Some(error) => WorkerEvent::Error(format!(
-                    "Default thinking level not saved: {}",
-                    error.message
-                )),
-                None => WorkerEvent::Status(format!("Default thinking level: {level}")),
-            });
+            // `onSelectAsDefault`): the save chord applies the level to the
+            // live session AND persists it. Persisting alone left the status
+            // rows showing the picked level while requests kept the previous
+            // one.
+            match crate::tui::slash::thinking_level_argument(&level) {
+                Ok(requested) => {
+                    let applied = session.set_thinking_level(requested).await;
+                    let _ = events.send(match persist_default_thinking(applied.wire_key()) {
+                        Ok(()) => WorkerEvent::Status(format!(
+                            "Default thinking level: {}",
+                            applied.wire_key()
+                        )),
+                        Err(message) => WorkerEvent::Error(message),
+                    });
+                }
+                Err(message) => {
+                    let _ = events.send(WorkerEvent::Error(message));
+                }
+            }
         }
         WorkerCommand::ReloadResources { resources } => {
             // `/reload` hot-refresh (upstream `session.reload` re-discovery):

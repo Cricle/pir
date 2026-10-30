@@ -24,7 +24,7 @@
 //! - a single message that alone exceeds the whole cap is kept whole and
 //!   truncated at prompt-build time with the standard
 //!   "[... N more characters truncated]" marker
-//!   ([`serialize_chunk`](super::serialize_chunk)); the session keeps the
+//!   ([`write_chunk`](super::write_chunk)); the session keeps the
 //!   untruncated message — the summary is lossy by definition.
 //!
 //! The chunk list is a set of **borrowed ranges** ([`SummarizationChunk`]
@@ -164,12 +164,7 @@ fn is_turn_start(message: &Message) -> bool {
 fn serialized_chars(messages: &[Message]) -> usize {
     messages
         .iter()
-        .map(|message| {
-            super::serialize_message_parts(message)
-                .iter()
-                .map(|part| part.chars().count())
-                .sum::<usize>()
-        })
+        .map(|message| super::message_parts_chars(message).0)
         .sum::<usize>()
         + PART_SEPARATOR_CHARS * messages.len().saturating_sub(1)
 }
@@ -201,15 +196,11 @@ impl ChunkWeights {
         prefix_chars.push(0usize);
         prefix_parts.push(0usize);
         for index in 0..count {
-            // Serialize ONE message and drop its text immediately: the peak is
-            // one message, never the span.
-            let parts = super::serialize_message_parts(messages.message_at(index));
-            // Character (not byte) count: the cap uses the same unit
-            // [`truncate_for_summary`](super::prompts::truncate_for_summary)
-            // counts in.
-            let chars: usize = parts.iter().map(|part| part.chars().count()).sum();
-            let part_count = parts.len();
-            drop(parts);
+            // Count ONE message's serialized weight without materializing its
+            // text: the peak is a handful of counters, never a copy of the
+            // message (a 256 KiB tool result used to be copied and truncated
+            // here just to learn its 2 015-character serialized length).
+            let (chars, part_count) = super::message_parts_chars(messages.message_at(index));
             chars_per_message.push(chars);
             prefix_chars.push(prefix_chars[prefix_chars.len() - 1] + chars);
             prefix_parts.push(prefix_parts[prefix_parts.len() - 1] + part_count);
@@ -356,9 +347,10 @@ impl<'a> StreamingChunker<'a> {
                 self.framing.label()
             ));
         }
-        let parts = super::serialize_message_parts(&message);
-        let weight: usize = parts.iter().map(|part| part.chars().count()).sum();
-        drop(parts);
+        // Count-only weight: the message is serialized for real only if it
+        // lands in a chunk that closes (the paged prefix reader parses one
+        // entry at a time; weighting used to copy every parsed tool result).
+        let (weight, _) = super::message_parts_chars(&message);
         let separator = if self.window.is_empty() {
             0
         } else {

@@ -502,7 +502,13 @@ fn read_confined_file(cwd: &Path, raw: &str) -> Result<(PathBuf, String), String
             MAX_FILE_BYTES / (1024 * 1024)
         ));
     }
-    Ok((resolved, String::from_utf8_lossy(&bytes).into_owned()))
+    // Move the buffer into the String when it is valid UTF-8 (the usual
+    // case); only invalid bytes pay the lossy re-encode copy.
+    let content = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    };
+    Ok((resolved, content))
 }
 
 // ---------------------------------------------------------------------------
@@ -768,11 +774,14 @@ async fn execute_batch(
         };
 
         let job = PythonJob {
-            code: script.code.clone(),
+            // Move the source into the job: the summary never reads it again,
+            // so cloning it only duplicated every script's bytes.
+            code: script.code,
             cwd: Some(cwd.clone()),
             eval_first: false,
             globals: Vec::new(),
         };
+        let code_len = job.code.len();
         let outcome = tokio::select! {
             outcome = session.exec(job, timeout) => outcome,
             _ = abort_wait(&signal) => {
@@ -781,9 +790,7 @@ async fn execute_batch(
             }
         };
 
-        state
-            .stats
-            .record_execution(script.code.len(), outcome.stdout.len());
+        state.stats.record_execution(code_len, outcome.stdout.len());
 
         // One index transaction per script. Indexing is what makes the output
         // reachable; a DB failure is a batch-level error (echoing the raw

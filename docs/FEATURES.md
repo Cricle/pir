@@ -4,7 +4,9 @@ Contract, not a measurement log. Current baselines: [`docs/STATUS.md`](STATUS.md
 
 ## 1. Contract
 
-1. The agent loop + direct plumbing are the only always-compiled core; every
+1. The agent loop + direct plumbing are the always-compiled core, plus the
+   `pir::minimal` profile (one OpenAI-compatible adapter, one `read_file`
+   tool, in-memory session) so `--no-default-features` is runnable; every
    other surface is a cargo feature. `default = ["full"]`.
 2. A feature-off build must be usable: the command is absent or returns the
    exact documented off-error (``this build was built without the `X` feature``
@@ -21,17 +23,21 @@ Contract, not a measurement log. Current baselines: [`docs/STATUS.md`](STATUS.md
 
 ## 2. Feature graph
 
-**Core (always compiled):** `agent`, `agent_session`, `ai` (adapters are
-`provider-*`-gated), `config`, `compaction`, `durable`, `diagnostics`,
-`env_client`, `logging`, `plugins` framework, `protocol`, `session_manager`,
-`system_prompt`, `telemetry`, `text`, `coding_agent::json` and tool plumbing
-(with every core-tool leaf off — the seven `tool-*` leaves and `grep-find` —
+**Core (always compiled):** `agent`, `agent_session`, `ai` (the plain
+OpenAI-compatible `/chat/completions` adapter is core; the Responses/Codex/
+`pi-messages` adapters are `provider-*`-gated), `minimal` (the zero-feature
+profile: one provider + one `read_file` tool + in-memory session),
+`config`, `compaction`, `durable`, `diagnostics`, `env_client`, `logging`,
+`plugins` framework, `protocol`, `session_manager`, `system_prompt`,
+`telemetry`, `text`, `coding_agent::json` and tool plumbing (with every
+core-tool leaf off — the seven `tool-*` leaves and `grep-find` —
 `register_core_tools` is a no-op and `CORE_TOOL_NAMES` is empty).
 
 | Feature | Gates |
 |---|---|
-| `default` | `full` (shipped default). `full`'s transitive closure reaches all 39 other selectable features, so the default build and `--all-features` cover the whole surface |
-| `provider-openai` | OpenAI Chat/Responses/Codex/OpenRouter/compatible |
+| `default` | `full` (shipped default). `full`'s transitive closure reaches every other selectable feature, so the default build and `--all-features` cover the whole surface |
+| `provider-openai` | OpenAI Responses/Codex/`pi-messages` adapters + catalog auto-construction. The plain `/chat/completions` adapter is core (the minimal profile needs one real provider) |
+| `minimal` | Zero-dependency profile marker. It enables nothing: `pir::minimal` and the `pir-minimal` binary are core, so `--no-default-features` alone is runnable. Part of `full` (a no-op there) |
 | `provider-anthropic` | Anthropic messages |
 | `provider-google` | Google/Vertex + service-account JWT |
 | `provider-bedrock` | Bedrock + SigV4 |
@@ -61,7 +67,7 @@ Contract, not a measurement log. Current baselines: [`docs/STATUS.md`](STATUS.md
 | `env-daemon` | built-in pi-env protocol-v1 daemon (`pir env-daemon`); implies `env`; `frame`/`decode` stay core |
 | `server` | in-tree `pir server` |
 | `client` | remote client (`pir::client`, `pir client`) |
-| `session` | JSONL persistence, tail-page reader, discovery |
+| `session` | JSONL persistence, tail-page reader (pulls the optional `memmap2`), discovery |
 | `skills` | skill discovery/loading |
 | `sdk` | `pir::sdk` facade |
 | `subagent` | native `subagent` builtin |
@@ -92,12 +98,14 @@ QuickJS, SWC or `node:*`); `--no-extensions` wins if both are given.
 ## 4. Slim profiles
 
 The binary profiles (`no-js`, `tui-slim`) require `cli`; `sdk-headless` is
-library-only. Current binary sizes and opt-level trade-offs live in
-[`STATUS.md`](STATUS.md) and `logs/w18-help/q55/SIZE-TUNE-REPORT.md`.
+library-only; `minimal` is the **zero-feature** executable profile. Current
+binary sizes and opt-level trade-offs live in [`STATUS.md`](STATUS.md) and
+`logs/w18-help/q55/SIZE-TUNE-REPORT.md`.
 
 | Profile | Feature set |
 |---|---|
 | `full` | `default = ["full"]` |
+| `minimal` | `--no-default-features` (the `minimal` marker adds nothing). Builds `pir-minimal`, not the full `pir` CLI: one OpenAI-compatible provider, one `read_file` tool, in-memory session |
 | `no-js` | `cli,tui,env,env-daemon,server,client,subagent,tool-repair,tool-search,todo,python,context-mode,phone,provider-*,tools,grep-find,image-tools,session,skills` |
 | `tui-slim` | `cli,tui,tools,provider-openai,provider-anthropic,session,skills` (no `env-daemon`) |
 | `sdk-headless` | bare + needed `provider-*`/`sdk` |
@@ -105,7 +113,10 @@ library-only. Current binary sizes and opt-level trade-offs live in
 `tui-slim` deliberately omits `env-daemon` (the daemon is ~4.9k lines and
 `env` pulls `ignore`); `pir env-daemon` returns the documented off-error there,
 while `no-js` keeps it. `sdk-headless` is pinned by the `sdk+provider-openai`
-row.
+row. The minimal profile is deliberately narrow: `/chat/completions` only,
+`read_file` only (confined to the session cwd), no persistence/compaction/
+skills/MCP/extensions, and the core dependency graph (tokio, reqwest, serde,
+`memmap2` is now optional and only `session` pulls it in).
 
 ## 5. Off-error policy
 
@@ -126,8 +137,8 @@ row.
 | `sdk` | `pir::sdk` absent (no stub); enable `sdk` |
 | `subagent`/`tool-repair`/`tool-search`/`todo` | `builtin:<name>` reports “not compiled … feature off” |
 | `phone` | builtin absent; default-off even in `full` |
-| `provider-*` | model listed; streaming returns the adapter-missing error |
-| `cli` | no binary (the `[[bin]]` target requires it); the library keeps the shared helpers. A `cli` build is a real toolless binary |
+| `provider-*` | model listed; streaming returns the adapter-missing error. `openai-completions` is the exception: the plain chat adapter is core and always usable |
+| `cli` | no `pir` CLI binary (the `[[bin]]` target requires it); the library keeps the shared helpers, and the separate `pir-minimal` binary still builds with zero features |
 | `print` | `pir print` host absent (module not compiled); `cli` always implies it |
 | `rpc` | JSON-lines RPC host absent (module not compiled); `cli` always implies it |
 | `export-html` | an `rpc`-only build returns `` `export_html` is unavailable … without the `export-html` feature `` before the session is attached |
@@ -154,6 +165,8 @@ a no-`mcp` build. Documented, not claimed correct.
 bash scripts/feature_matrix.sh            # 81 rows
 cargo check --lib --no-default-features --features tool-read   # each feature alone
 cargo check --lib --no-default-features --features grep-find   # independent search leaf
+cargo check --bin pir-minimal --no-default-features            # zero-feature agent
+cargo test --no-default-features --test minimal_profile        # end-to-end mock provider
 cargo check --bin pir --no-default-features --features cli
 cargo check --bin pir --no-default-features --features cli,tool-read
 cargo check --bin pir --no-default-features --features cli,grep-find

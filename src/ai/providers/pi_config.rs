@@ -649,7 +649,7 @@ pub fn merge_pi_config_in(agent_dir: &Path, config: &PiModelsConfig) -> AiResult
     for (provider_id, provider_config) in &config.providers {
         let builtin = super::catalog::load_provider_cached(provider_id)?;
         let (models, _provider_headers) =
-            compose_provider_models(provider_id, provider_config, builtin.as_ref(), agent_dir)?;
+            compose_provider_models(provider_id, provider_config, builtin.as_deref(), agent_dir)?;
         merged.extend(models);
     }
     Ok(merged)
@@ -732,14 +732,11 @@ fn load_pi_config_from(mut pi_settings: Settings) -> AiResult<Option<PiConfigure
     // Per-provider composed lists: built-in catalog seeded, entries upserted,
     // overrides applied (upstream `applyModelsJson`).
     let mut composed: Vec<(String, Vec<Model>)> = Vec::new();
+    let agent_dir = settings::agent_dir();
     for (provider_id, provider_config) in &config.providers {
         let builtin = super::catalog::load_provider_cached(provider_id)?;
-        let (mut models, provider_headers) = compose_provider_models(
-            provider_id,
-            provider_config,
-            builtin.as_ref(),
-            &settings::agent_dir(),
-        )?;
+        let (mut models, provider_headers) =
+            compose_provider_models(provider_id, provider_config, builtin.as_deref(), &agent_dir)?;
         if models.is_empty() {
             // Legacy single-model provider entry (e.g. a local Ollama
             // endpoint) with no model list and no built-in entry: synthesize
@@ -773,7 +770,7 @@ fn load_pi_config_from(mut pi_settings: Settings) -> AiResult<Option<PiConfigure
         }
         let display_name = provider_config.name.clone().unwrap_or_else(|| {
             builtin
-                .as_ref()
+                .as_deref()
                 .map(|builtin| builtin.display_name.clone())
                 .unwrap_or_else(|| provider_id.clone())
         });
@@ -1088,20 +1085,24 @@ fn bootstrap_anthropic_env(
             compose_provider_models(
                 "anthropic",
                 provider_config,
-                builtin.as_ref(),
+                builtin.as_deref(),
                 &settings::agent_dir(),
             )?
             .0
         }
         None => builtin
-            .as_ref()
+            .as_deref()
             .map(|builtin| builtin.models.clone())
             .unwrap_or_default(),
     };
-    let models = apply_claude_code_env(existing, provider_config, builtin.as_ref(), env);
+    let models = apply_claude_code_env(existing, provider_config, builtin.as_deref(), env);
     let display_name = provider_config
         .and_then(|config| config.name.clone())
-        .or_else(|| builtin.as_ref().map(|builtin| builtin.display_name.clone()))
+        .or_else(|| {
+            builtin
+                .as_deref()
+                .map(|builtin| builtin.display_name.clone())
+        })
         .unwrap_or_else(|| "Anthropic".to_string());
     let provider = provider_from_models("anthropic", &display_name, &models, builtin.is_some())?;
     registry.set_provider(provider);
@@ -1172,6 +1173,32 @@ pub fn load_pi_environment_with_settings(
     load_pi_environment_from(manager.settings.clone())
 }
 
+/// Register the built-in catalog except the providers immediately composed
+/// from `models.json` (or the Claude Code anthropic bootstrap) by the caller.
+/// The composed provider overwrites the registration, so building the
+/// intermediate one is a full model-list clone plus adapter construction that
+/// is discarded at once — 480 models for an `openrouter` entry. The registry
+/// is keyed by provider id (`BTreeMap`), so skipping the intermediate entry
+/// cannot change lookup or enumeration order.
+fn register_builtin_catalog_excluding(
+    registry: &mut ProviderRegistry,
+    excluded: impl Fn(&str) -> bool,
+) -> AiResult<()> {
+    let providers = super::catalog::load_all_shared()?;
+    for entry in providers.iter() {
+        if excluded(&entry.id) {
+            continue;
+        }
+        let provider = if entry.id == "radius" {
+            super::radius::RadiusProvider::from_catalog(entry)?
+        } else {
+            super::construction::CatalogProviderEntry::from_catalog(entry)?
+        };
+        registry.set_provider(provider);
+    }
+    Ok(())
+}
+
 fn load_pi_environment_from(mut settings_snapshot: Settings) -> AiResult<PiEnvironment> {
     let models_json = std::fs::read_to_string(pi_models_path())
         .ok()
@@ -1223,16 +1250,29 @@ fn load_pi_environment_from(mut settings_snapshot: Settings) -> AiResult<PiEnvir
     // (upstream `applyModelsJson`): catalog models seed the list, config
     // entries upsert onto it, `modelOverrides` patch the merged list. Only
     // providers without a built-in entry synthesize the localhost default.
+    //
+    // A provider composed below replaces its built-in registration, so skip
+    // building that intermediate provider: for a configured builtin entry
+    // (openrouter: 480 models) `register_builtin_catalog` would deep-clone its
+    // whole model list and construct its adapters only to be overwritten.
+    // `claude_env` bootstraps the anthropic provider the same way.
+    let claude_env = ClaudeCodeEnvConfig::from_process_env();
     let mut registry = auth_backed_registry();
-    super::register_builtin_catalog(&mut registry)?;
+    register_builtin_catalog_excluding(&mut registry, |provider_id| {
+        (claude_env.is_some() && provider_id == "anthropic")
+            || models_json
+                .as_ref()
+                .is_some_and(|config| config.providers.contains_key(provider_id))
+    })?;
+    let agent_dir = settings::agent_dir();
     if let Some(config) = &models_json {
         for (provider_id, provider_config) in &config.providers {
             let builtin = super::catalog::load_provider_cached(provider_id)?;
             let (mut models, provider_headers) = compose_provider_models(
                 provider_id,
                 provider_config,
-                builtin.as_ref(),
-                &settings::agent_dir(),
+                builtin.as_deref(),
+                &agent_dir,
             )?;
             if models.is_empty() {
                 // Legacy single-model provider entry (e.g. a local Ollama
@@ -1267,7 +1307,7 @@ fn load_pi_environment_from(mut settings_snapshot: Settings) -> AiResult<PiEnvir
             }
             let display_name = provider_config.name.clone().unwrap_or_else(|| {
                 builtin
-                    .as_ref()
+                    .as_deref()
                     .map(|builtin| builtin.display_name.clone())
                     .unwrap_or_else(|| provider_id.clone())
             });
@@ -1280,11 +1320,11 @@ fn load_pi_environment_from(mut settings_snapshot: Settings) -> AiResult<PiEnvir
     // Claude Code environment compatibility: bootstrap the anthropic provider
     // from ANTHROPIC_BASE_URL / ANTHROPIC_MODEL / the alias model ids. Explicit
     // models.json values win; the environment only fills gaps.
-    if let Some(env) = ClaudeCodeEnvConfig::from_process_env() {
+    if let Some(env) = &claude_env {
         let empty_config = PiModelsConfig::default();
         let config = models_json.as_ref().unwrap_or(&empty_config);
-        bootstrap_anthropic_env(&mut registry, config, &env)?;
-        if let Some((provider, model)) = claude_env_default(&settings_snapshot, config, &env) {
+        bootstrap_anthropic_env(&mut registry, config, env)?;
+        if let Some((provider, model)) = claude_env_default(&settings_snapshot, config, env) {
             // The environment-selected model is the default only when neither
             // settings.json nor models.json declared one.
             settings_snapshot.default_provider = Some(provider);

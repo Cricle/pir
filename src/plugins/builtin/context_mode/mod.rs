@@ -71,6 +71,7 @@ pub(crate) mod exec;
 pub(crate) mod fetch;
 pub(crate) mod index;
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -145,13 +146,16 @@ pub(crate) fn result_indexing_enabled() -> bool {
 }
 
 fn env_flag(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    }
+    // `var_os` + a borrowed `&str` keeps the per-event switch read
+    // allocation-free; a non-Unicode value cannot spell a disable switch, so
+    // it keeps the default-on behavior `var` (which would error) produced.
+    let Some(value) = std::env::var_os(name) else {
+        return true;
+    };
+    let value = value.to_str().map(str::trim).unwrap_or_default();
+    !["0", "false", "off", "no"]
+        .iter()
+        .any(|disabled| value.eq_ignore_ascii_case(disabled))
 }
 
 /// Default `ctx_execute` / per-script `ctx_batch_execute` deadline (seconds).
@@ -353,9 +357,6 @@ impl ContextModePlugin {
     /// Returns the standard native block outcome only for an unambiguous
     /// violation; every other call is untouched (`None`).
     fn route_tool_call(&self, payload: &JsonValue) -> PluginEventOutcome {
-        if !routing_enabled() {
-            return PluginEventOutcome::None;
-        }
         let Some(tool) = payload.get("toolName").and_then(JsonValue::as_str) else {
             return PluginEventOutcome::None;
         };
@@ -363,16 +364,29 @@ impl ContextModePlugin {
         if tool.starts_with("ctx_") {
             return PluginEventOutcome::None;
         }
+        // Only bash-like and read-like calls can be routed. Checking this
+        // before the environment switch keeps every other tool call (edit,
+        // grep, write, ...) free of an environment lookup.
+        let routable = matches!(
+            tool,
+            "bash" | "shell_command" | "powershell" | "read" | "read_file"
+        );
+        if !routable || !routing_enabled() {
+            return PluginEventOutcome::None;
+        }
         let input = payload.get("input").unwrap_or(&JsonValue::Null);
-        let cwd = self.state.hooks.cwd();
         let reason = match tool {
             "bash" | "shell_command" | "powershell" => input
                 .get("command")
                 .and_then(JsonValue::as_str)
-                .and_then(|command| shell_block_reason(tool, command, cwd.as_deref())),
-            "read" | "read_file" => {
-                read_tool_path(input).and_then(|path| read_block_reason(tool, path, cwd.as_deref()))
-            }
+                .and_then(|command| {
+                    let cwd = self.state.hooks.cwd();
+                    shell_block_reason(tool, command, cwd.as_deref())
+                }),
+            "read" | "read_file" => read_tool_path(input).and_then(|path| {
+                let cwd = self.state.hooks.cwd();
+                read_block_reason(tool, path, cwd.as_deref())
+            }),
             _ => None,
         };
         match reason {
@@ -391,9 +405,6 @@ impl ContextModePlugin {
     /// Auto-index one finalized `tool_result` (upstream PostToolUse). The
     /// payload is only read; the result the model sees is never modified.
     async fn index_tool_result(&self, payload: &JsonValue) {
-        if !result_indexing_enabled() {
-            return;
-        }
         let Some(tool) = payload.get("toolName").and_then(JsonValue::as_str) else {
             return;
         };
@@ -403,13 +414,24 @@ impl ContextModePlugin {
         if tool.starts_with("ctx_") {
             return;
         }
+        // Apply the size gate BEFORE the environment switch: the common case
+        // is a small result, and that path must not pay for an environment
+        // lookup or a text-block copy.
+        let Some(text_len) = tool_result_text_len(payload) else {
+            return;
+        };
+        if text_len <= TOOL_RESULT_INDEX_THRESHOLD_BYTES {
+            return;
+        }
+        if !result_indexing_enabled() {
+            return;
+        }
+        // Only a result that will actually be indexed pays for joining its
+        // text blocks; a single text block stays borrowed from the payload.
         let Some(text) = tool_result_text(payload) else {
             return;
         };
-        if text.len() <= TOOL_RESULT_INDEX_THRESHOLD_BYTES {
-            return;
-        }
-        let bounded = truncate_utf8(&text, TOOL_RESULT_INDEX_MAX_BYTES);
+        let bounded = truncate_utf8(text.as_ref(), TOOL_RESULT_INDEX_MAX_BYTES);
         let source = self
             .state
             .hooks
@@ -440,7 +462,10 @@ impl ContextModePlugin {
 /// `tail`/`less` invocation. Pipelines, redirections, globs and multiple
 /// operands deliberately return `None`: the routing hook only acts on
 /// unambiguous cases.
-fn simple_single_file_read(command: &str) -> Option<(String, String)> {
+///
+/// Takes the already-tokenized command so one `tool_call` never pays for
+/// tokenizing the same shell line twice (downloader probe + file-read probe).
+fn simple_single_file_read(command: &str, segments: Vec<Vec<String>>) -> Option<(String, String)> {
     if command.chars().any(|ch| {
         matches!(
             ch,
@@ -450,7 +475,7 @@ fn simple_single_file_read(command: &str) -> Option<(String, String)> {
     {
         return None;
     }
-    let mut segments = shell_segments(command);
+    let mut segments = segments;
     segments.retain(|segment| !segment.is_empty());
     if segments.len() != 1 {
         return None;
@@ -485,9 +510,70 @@ fn simple_single_file_read(command: &str) -> Option<(String, String)> {
     Some((reader, operands.pop()?))
 }
 
+/// Cheap pre-filter over the first word only: the executable actually matched
+/// by [`blocked_downloader`]/[`simple_single_file_read`] sits at the start of
+/// a segment (after optional wrappers/env assignments). Scanning the whole
+/// command here would cost more than one tokenization on long command lines.
+fn may_be_routing_target(command: &str, powershell: bool) -> bool {
+    let mut words = command.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    // Skip leading `VAR=value` assignments and wrappers with a bounded scan;
+    // the full tokenizer still makes the final decision.
+    let mut candidate = first;
+    for _ in 0..4 {
+        if !(candidate.contains('=') || is_wrapper(candidate)) {
+            break;
+        }
+        let Some(next) = words.next() else {
+            return false;
+        };
+        candidate = next;
+    }
+    // More than four leading assignments/wrappers: fall back to the full
+    // tokenizer rather than risk missing the executable (conservative).
+    if candidate.contains('=') || is_wrapper(candidate) {
+        return true;
+    }
+    const ALWAYS: [&str; 6] = ["curl", "wget", "cat", "head", "tail", "less"];
+    if ALWAYS
+        .iter()
+        .any(|needle| contains_ignore_ascii_case(candidate, needle))
+    {
+        return true;
+    }
+    powershell
+        && ["iwr", "invoke-webrequest", "invoke-restmethod"]
+            .iter()
+            .any(|needle| contains_ignore_ascii_case(candidate, needle))
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack.len() >= needle.len()
+        && haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 fn shell_block_reason(tool: &str, command: &str, cwd: Option<&Path>) -> Option<String> {
     let powershell = tool == "powershell";
-    if let Some(executable) = blocked_downloader(command, powershell) {
+    // A command with no separator can only have its first word as the
+    // executable, so a cheap first-word check can skip tokenization for
+    // `git status`, `cargo test`, etc. Commands containing separators must
+    // still be tokenized: `cd x && curl ...` has a routing target later on.
+    let single_segment = !command.chars().any(|ch| {
+        matches!(
+            ch,
+            '|' | ';' | '&' | '\n' | '\r' | '`' | '(' | ')' | '{' | '}'
+        )
+    });
+    if single_segment && !may_be_routing_target(command, powershell) {
+        return None;
+    }
+    let segments = shell_segments(command);
+    if let Some(executable) = blocked_downloader(&segments, powershell) {
         return Some(format!(
             "context-mode routing: `{executable}` would put the raw downloaded content into the \
              transcript. Use `ctx_fetch_and_index` (fetch + index; the raw page never enters \
@@ -495,7 +581,7 @@ fn shell_block_reason(tool: &str, command: &str, cwd: Option<&Path>) -> Option<S
              output reaches context."
         ));
     }
-    let (reader, path) = simple_single_file_read(command)?;
+    let (reader, path) = simple_single_file_read(command, segments)?;
     let size = file_size_if_over(&path, cwd, ROUTING_FILE_THRESHOLD_BYTES)?;
     Some(format!(
         "context-mode routing: `{reader}` would read {size} bytes from `{path}` into context \
@@ -506,10 +592,10 @@ fn shell_block_reason(tool: &str, command: &str, cwd: Option<&Path>) -> Option<S
 }
 
 /// The first `curl`/`wget` (or PowerShell `iwr`/`Invoke-WebRequest`) command
-/// in a command line, as the canonical name to report.
-fn blocked_downloader(command: &str, powershell: bool) -> Option<String> {
-    for segment in shell_segments(command) {
-        let Some(index) = executable_index(&segment) else {
+/// in a tokenized command line, as the canonical name to report.
+fn blocked_downloader(segments: &[Vec<String>], powershell: bool) -> Option<String> {
+    for segment in segments {
+        let Some(index) = executable_index(segment) else {
             continue;
         };
         let name = executable_basename(&segment[index]);
@@ -669,19 +755,12 @@ fn is_env_assignment(token: &str) -> bool {
 }
 
 fn is_wrapper(token: &str) -> bool {
-    matches!(
-        token.to_ascii_lowercase().as_str(),
-        "sudo"
-            | "env"
-            | "command"
-            | "time"
-            | "nohup"
-            | "nice"
-            | "exec"
-            | "builtin"
-            | "call"
-            | "start"
-    )
+    const WRAPPERS: [&str; 10] = [
+        "sudo", "env", "command", "time", "nohup", "nice", "exec", "builtin", "call", "start",
+    ];
+    WRAPPERS
+        .iter()
+        .any(|wrapper| token.eq_ignore_ascii_case(wrapper))
 }
 
 fn executable_basename(token: &str) -> String {
@@ -700,13 +779,15 @@ fn executable_basename(token: &str) -> String {
 // `tool_result` payload helpers
 // ---------------------------------------------------------------------------
 
-/// Join the text blocks of a `tool_result` payload (the host's wire shape is
-/// `content: [{type: "text", text}]`; a bare string is accepted too).
-fn tool_result_text(payload: &JsonValue) -> Option<String> {
+/// Byte length of the joined text [`tool_result_text`] would produce, without
+/// building it. Used to apply the indexing threshold before any copy/allocation
+/// (most tool results are small and must stay free of payload-sized work).
+fn tool_result_text_len(payload: &JsonValue) -> Option<usize> {
     match payload.get("content")? {
-        JsonValue::String(text) => Some(text.clone()),
+        JsonValue::String(text) => Some(text.len()),
         JsonValue::Array(blocks) => {
-            let mut text = String::new();
+            let mut total = 0usize;
+            let mut has_content = false;
             for block in blocks {
                 if block.get("type").and_then(JsonValue::as_str) != Some("text") {
                     continue;
@@ -714,12 +795,51 @@ fn tool_result_text(payload: &JsonValue) -> Option<String> {
                 let Some(piece) = block.get("text").and_then(JsonValue::as_str) else {
                     continue;
                 };
+                if has_content {
+                    total += 1; // the '\n' separator
+                }
+                total += piece.len();
+                if !piece.is_empty() {
+                    has_content = true;
+                }
+            }
+            has_content.then_some(total)
+        }
+        _ => None,
+    }
+}
+
+/// Join the text blocks of a `tool_result` payload (the host's wire shape is
+/// `content: [{type: "text", text}]`; a bare string is accepted too).
+///
+/// A single text block is returned borrowed: the auto-index threshold check
+/// and the chunker can read it directly from the event payload. Only the
+/// (rare) multi-block case above the threshold pays for the joined string.
+fn tool_result_text(payload: &JsonValue) -> Option<Cow<'_, str>> {
+    match payload.get("content")? {
+        JsonValue::String(text) => Some(Cow::Borrowed(text)),
+        JsonValue::Array(blocks) => {
+            let mut text_blocks = blocks.iter().filter_map(|block| {
+                if block.get("type").and_then(JsonValue::as_str) != Some("text") {
+                    return None;
+                }
+                block.get("text").and_then(JsonValue::as_str)
+            });
+            let first = text_blocks.next()?;
+            let Some(second) = text_blocks.next() else {
+                return (!first.is_empty()).then_some(Cow::Borrowed(first));
+            };
+            let mut text = String::new();
+            for piece in std::iter::once(first)
+                .chain(std::iter::once(second))
+                .chain(text_blocks)
+            {
                 if !text.is_empty() {
                     text.push('\n');
                 }
                 text.push_str(piece);
             }
-            (!text.is_empty()).then_some(text)
+            (!text.is_empty()).then_some(Cow::Owned(text))
         }
         _ => None,
     }

@@ -1,224 +1,167 @@
-# STATUS — pir (current truth, 2026-10-29 evening)
+# STATUS — pir (current truth, 2026-10-30)
 
-One page. Repo state: clean-history `master` snapshot (2026-10-30; the
-15-review fix batch is included). Numbers below were measured on this host
-with the GNU toolchain; the release binary is one source step behind (see
-"Release build").
+Clean-history `master` snapshot; the 15-review fix batch is included. Numbers
+below are from this host with the GNU toolchain.
 
-## Contract (short)
+## Contract
 
-- Rust replacement for the TypeScript `pi`: providers, sessions, extensions,
-  TUI, RPC, print, server/client, SDK, builtins.
-- Agent loop + direct plumbing are always compiled; every other surface is a
-  default-on cargo feature (`default = ["full"]`).
-- Seven `tool-*` leaves + independent `grep-find`; `compaction`/`telemetry`
-  stay core.
+- Rust replacement for TypeScript `pi`: providers, sessions, extensions, TUI,
+  RPC, print, server/client, SDK, builtins.
+- Agent loop + direct plumbing always compile; other surfaces are default-on
+  features (`default = ["full"]`). Seven `tool-*` leaves + `grep-find`;
+  `compaction`/`telemetry` stay core.
 - No `#[cfg]` may change the feature-ON path; off-surfaces return a documented
-  error or are absent. Tests live only under `tests/`.
+  error or are absent. Tests live under `tests/`.
 
 ## Definition of done
 
 | Gate | Status |
 |---|---|
-| Replace pi (parity + real-task battery) | ✅ full local debug suites green on both OSes: **Windows 6,330 passed / 0 failed / 27 ignored**, **Debian WSL 6,284 passed / 0 failed / 41 ignored** (285 targets each); A/B vs upstream pi 1.4.0 5/5 each, pir faster (76.6 s vs 134.9 s) |
-| Feature comprehensiveness (all features / matrix / CI) | ✅ **81/81 matrix rows green** (2026-10-29 rerun); CI is one Linux+Windows matrix gate |
-| SDK usable (packaged `pir-sdk` + external consumer) | ✅ `pir-sdk-0.0.1.crate` 6,184,886 B; unpacked `cargo check --all-targets` and external consumer `cargo check --locked` green |
-| Real-load long soak (flat RSS, crash/reopen) | ✅ release 300-turn (64K) and 400-turn (4K) soak PASS; crash/reopen 10/10 PASS; slope 0.0143–0.0147 MB/turn |
-| Constrained device (1-4 cores, 256 MB-1 GB, idle/wake/RSS) | ✅ 1-core + 256/512/1024 MiB Job-Object matrix 9/9 PASS; idle RSS 34.7 MB, print 41.5 MB peak, soak 77.2 MB peak; commit floors 6/32/34/71 MiB |
-| Rust/resource gates (fmt/clippy/unsafe/MSRV/deny/bench) | ✅ fmt green; clippy `--all-targets --all-features -D warnings` green (57 s warm); doctests 33 passed / 7 ignored; CI keeps Linux+Windows full gates (advisory/MSRV/bench local) |
-| Mode deep optimization & competitive scorecard | ✅ release scorecard: `--version` 12.1 ms, print 84 ms, TUI first frame 58.7 ms, server 40.5 ms, RPC prompt→settled 124.7 ms, phone health 0.6–15.2 ms |
-| Evidence on the final release binary | 🚧 candidate `target-release-final/release/pir.exe` 67,502,080 B / `4a3d3ee3…` built in 20 m 33 s, but predates the last `node_fns.rs` fix; rebuild required before a tag |
+| Replace pi | ✅ Windows **6,364/0** across 290 harnesses (6 empty; 83.5 s parallel); Debian WSL **6,318/0/41** after three load/env flakes re-ran green; A/B vs pi 1.4.0: 5/5 both, **76.6 s vs 134.9 s** |
+| Features / matrix / CI | ✅ **81/81** matrix rows green; CI is one Linux+Windows matrix gate, final run green |
+| SDK | ✅ `pir-sdk-0.0.1.crate` 6,184,886 B; packaged/unpacked checks and external consumer green |
+| Soak | ✅ release 300-turn (64K) + 400-turn (4K); crash/reopen 10/10; slope 0.0143–0.0147 MB/turn |
+| Constrained device | ✅ 1-core × 256/512/1024 MiB matrix 9/9; idle 34.7 MB, print 41.5 MB, soak 77.2 MB peak |
+| Rust/resource gates | ✅ fmt, clippy all-targets/all-features, doctests 33/7; Linux checks in Debian WSL |
+| Scorecard (release) | ✅ version 12.1 ms, print 84 ms, TUI 58.7 ms, server 40.5 ms, RPC 124.7 ms |
+| Final release binary | 🚧 candidate `target-release-final/release/pir.exe` 67,502,080 B (`4a3d3ee3…`), predates the last source fix; rebuild before tag |
 
-## Final verification (2026-10-29)
+## Verification
 
-- Last complete full sweep before the final CI fixes
-  (`scripts/test_fast.ps1 -Concurrency 16 -Threads 4`,
-  `logs/lane-test-mock-final.log`): **281 suites, 6,332 passed / 0 failed**,
-  wall **97.1 s** (build 0.5 s + parallel 96.3 s). 6 empty harnesses ran zero
-  tests and are not counted as passes.
-- Slowest suites in that sweep: `g_agent` 877 / 0 (95.0 s),
-  `mcp_integration` 68 / 0 (71.4 s), `shell_totals_fix` 3 / 0 (51.0 s),
-  `g_tools` 458 / 0 (34.7 s), `g_ai` 760 / 0 (34.1 s),
-  `g_cli_server` 201 / 0 (18.7 s).
-- Linux CI durable-storage fix (real product bug, not just a flaky
-  assertion): `tokio::fs::File` copies writes into an internal buffer and
-  hands the actual write to a blocking task, so `append_file` could return
-  before `main.jsonl`'s marker was visible. `commit` now calls
-  `file.flush().await` before dropping the handle. Reproduced on Debian WSL
-  (`jsonl_rejects_out_of_order_sequences` failed ~1/12 runs before the fix);
-  after the fix, both failing tests pass **200/200 process-level iterations**
-  and the full `durable_storage` binary passes **30/30 runs**. Test fixtures
-  also use timestamped temp dirs and `close()` before manual file edits.
-- Windows CI shim-byte fix: the checked-in `.deflate` blobs had been generated
-  from a CRLF working tree while Linux CI checks out LF. All 90 blobs and the
-  `GOLDEN` hashes are now generated from canonical LF bytes
-  (`scripts/gen_shims_deflate.py`), and the byte-exact test normalizes checkout
-  line endings. The test passes on Windows and on Debian WSL.
-- `cargo fmt --all -- --check`: green.
-- `cargo clippy --all-targets --all-features -- -D warnings`: green on
-  Windows (57 s warm) and on Linux (Debian WSL, rustc 1.99.1, 1 m 50 s).
-- `cargo check --all-targets --all-features --locked` on Linux: green
-  (18.5 s warm, Debian WSL).
-- `cargo test --doc`: 33 passed / 7 ignored.
-- `fs_numeric_open_flags`: Rust reports `EBADF` from `pread` on an `O_WRONLY`
-  descriptor as `Uncategorized`; `io_error_code` now maps raw libc errno 9 to
-  Node's `EBADF` instead of `EIO`. The suite passes 3/3 on Debian WSL.
-- `env_client_e2e` / `env_client_pty`: mock wrappers are written and exec'd
-  immediately; WSL overlayfs could return transient `ETXTBSY` and the
-  oversized-request test's 500 ms silence window could fire during the mock
-  handshake. The wrapper write now settles for 20 ms and the handshake window
-  is 5 s. Both suites pass on Windows and Debian WSL.
-- WSL-only test-environment fixes: TUI tests use the runtime
-  `use_windows_keybindings()` predicate (WSL selects Windows chords); the
-  session-root refresh suite moved to its own process; tool-security temp-root
-  mutations are serialized/restored; root-only tests that rely on Unix mode
-  bits skip under `id -u == 0`; missing-npm/child-process probes use absolute
-  missing paths; Codex WebSocket pooling waits for the producer's release
-  before the second turn.
-- **Debian WSL full debug suite** (`cargo test --tests --no-fail-fast`,
-  4 test threads, `RUST_MIN_STACK=8388608`): **285 targets, 6,284 passed /
-  0 failed / 41 ignored, RC=0** (`/root/full-tests7.log`; repo copy on ext4).
-- **Windows full debug suite** (`cargo test --tests --no-fail-fast`,
-  4 test threads, `RUST_MIN_STACK=8388608`): **285 targets, 6,330 passed /
-  0 failed / 27 ignored, EXIT=0**
-  (`logs/status-final-cargo-test-win2.log`). The affected Windows targets
-  (`g_tools`, `env_client_e2e`, `env_client_pty`, `cli_parity_fixes`,
-  `node_shims`, `tui_snapshot_refresh_w16`) are green.
-- GitHub Actions: one `gate` matrix job over `ubuntu-latest` + `windows-latest`,
-  each running fmt → clippy → doctests → eight sequential nextest groups.
-  The final gate completed **green on Linux and Windows** (all steps and all
-  groups). Earlier runs exposed test flakes (`fs_numeric_open_flags`,
-  `env_client_e2e`, `codex_transport_websocket_pools_without_sending_a_continuation`);
-  they are fixed and verified by the final run.
+- Full debug suites: Windows `test_fast.ps1 -Concurrency 12 -Threads 4
+  -NoBuild` **6,364 passed / 0 failed** across 290 harnesses (6 empty; 83.5 s
+  parallel, 84.2 s wall). Debian WSL (`RUST_MIN_STACK=8 MiB`, 4 threads, 294
+  targets): full sweep **6,315 passed / 3 failed / 41 ignored**; the three
+  were environment/load flakes (`forbidden_files` needs a git worktree,
+  `spill_sweep` and `python_plugin abort` are real-timer tests). With the
+  worktree initialized and the three targets re-run alone: **6,318 passed /
+  0 failed / 41 ignored**.
+- `cargo fmt --all -- --check`, Linux+Windows clippy (`-D warnings`), doctests
+  (33 passed / 7 ignored) and Linux `cargo check --all-targets` green.
+- CI: Linux and Windows `gate` matrix green, including fmt, clippy, doctests
+  and all eight nextest groups.
+- Key fixes in the final batch: durable JSONL `append_file` now flushes Tokio
+  File's internal write before return; shim blobs are canonical LF; Linux
+  `EBADF` maps to Node's code; Codex WS pooling waits for `Lease::release`;
+  CBOR byte strings are rejected before `serde_json` expansion; RPC client
+  Drop/teardown, server detach registry cleanup, and the WSL/CI test fixtures
+  were hardened.
+- Startup bootstrap (pi 1.4 parity): a fresh `HOME`/`PIR_AGENT_DIR` with no
+  `~/.pi` now creates `auth.json` and `models-store.json` as `{}` with the
+  upstream modes (0600 files in a 0700 agent dir); `settings.json`,
+  `models.json` and the sessions tree stay on-demand. Six regression tests in
+  `tests/agent_bootstrap.rs` cover layout, preservation, overrides, IO failure
+  and the `--list-models` repro.
+- TUI/context-mode fixes: thinking selectors now offer only the active
+  model's supported levels (so `medium` cannot clamp to `high`); explicit
+  model/thinking picks apply **and** persist `defaultProvider`/`defaultModel`/
+  `defaultThinkingLevel`; `thinking_level_changed` refreshes both footer rows;
+  autocomplete accept closes the popup, and Tab no longer gets coalesced into
+  a literal-tab paste; `/image` and all dynamic command providers are listed
+  and refreshed on reload; `ctx_fetch_and_index` uses the same
+  `httpProxy`/`PI_HTTP_PROXY`/`HTTPS_PROXY` resolution as provider traffic
+  (Python HTTPS remains a documented embedded-interpreter residual).
+- Zero-feature minimal agent (`pir::minimal` / `pir-minimal`): builds with
+  `--no-default-features`, runs one OpenAI-compatible `/chat/completions`
+  provider, one confined `read_file` tool and an in-memory transcript; mock
+  SSE end-to-end and tool loop are covered by `tests/minimal_profile.rs`.
 
 ## Test speed
 
-The slow-test work is in the tree:
-
-- `g_cli_server` (201 tests) 91.5 s serial → **18.9 s at 4 threads**;
-  one prompt-initialized RPC child teardown ~7 s → **≤250 ms**;
-  `tui_search_whole_history` 8.6 → **7.7 s**;
-  `python_json_fastpath` 9.7 → **2.0 s**.
-- `fs_watch_incremental` 17.37 → **11.27 s (-35.1%)**; `g_agent`
-  43.27 → **35.43 s (-18.1%; best single run 31.25 s)** in isolation;
-  `shell_command_timeout` 12.21 → **10.96 s**; `mcp_integration`
-  24.35 → **18.85 s (-22.6%)** solo. The small `pir-mock-mcp` helper
-  (2.4 MB) replaces the 338 MB test binary as the MCP fixture and is embedded
-  in the MCP tests (`CARGO_BIN_EXE_pir-mock-mcp`).
-- `test_fast.ps1` warms `pir.exe` once and orders suites LPT; `dev_cycle.ps1`
-  warm default four steps **50.6 s** (fmt 6.1 + clippy 16.2 + build 24.2 +
-  tests 4.1), no-change clippy+build+test **6.1 s**, single-file edit
-  test-only **48.5 s**.
-- The full-suite floor is **~97 s**, not 1 minute: the crate is one 23 MB
-  rustc unit and 281 test binaries are ~300 MB each (first load on Windows
-  ~20 s); `g_agent` alone takes ~95 s at 4 libtest workers. Reaching 60 s
-  would need merged test binaries or sharding across runners, both rejected
-  for coverage/CI-cost reasons.
+`g_cli_server` 91.5 → 18.9 s at 4 threads; `g_agent` 43.3 → 35.4 s;
+`mcp_integration` 24.4 → 18.9 s; `fs_watch_incremental` 17.4 → 11.3 s.
+`dev_cycle.ps1` warm four-step loop is **50.6 s**; no-change rerun 6.1 s.
+The full debug suite now runs in **83.5 s parallel / 84.2 s wall**
+(`test_fast.ps1 -Concurrency 12 -Threads 4 -NoBuild`, 6,364 tests): the old
+18-minute stall was not a test sleep but `Start-Process` blocking 10–30 s per
+cold ~300 MB test image under Defender; the runner now launches through
+`cmd.exe` (non-blocking) and records each child's exit code. `cargo nextest`'s
+discovery pass still pays that per-binary cold-start cost, so local full runs
+use `test_fast.ps1`; the longest suites are `http_shims` 25.2 s, `g_agent`
+24.9 s, `g_ai` 17.5 s.
+`pir-mock-mcp` (2.4 MB) replaces the old 338 MB MCP fixture.
 
 ## Large-session RSS (debug)
 
-Paged 100 MB session peaks at **86 MB** (2.8 MB incremental). Widen + resident
+Paged 100 MB session: 86 MB peak (2.8 MB incremental). Widen + resident
 compaction: 100 MB **869.2 → 571.6 MB (-34.2%)**, 50 MB
-**415.2 → 321.1 MB (-22.7%)**; widen + one turn 100 MB
-**981.6 → 915.2 MB (-6.7%)**. The remaining widen peak is the provider request
-`Value` tree + serialized body (outside `session_manager`).
+**415.2 → 321.1 MB (-22.7%)**.
 
-## SWE-bench Verified (local evaluation)
+The 2026-10-30 debug-start pass removed the construction-time transcript
+copies and the remaining hot-path allocations:
 
-- Dataset: **SWE-bench Verified** (500 instances); agent `target/debug/pir.exe`,
-  model `gpt-5` at `https://api.openai.com/v1`, tools
-  read/edit/write/ls/grep/find/bash.
-- **`psf__requests-2317`: resolved=true, F2P 8/8, P2P 133/133** (20 turns,
-  4 m 46 s). **`psf__requests-1142`: resolved=true, F2P 1/1, P2P 5/5**
-  (19 turns, ~3 m 30 s). `psf__requests-1921`: F2P 6/6, P2P 106/107 — one
-  environment/httpbin flake, resolved=false by the strict gate.
-- Six other `psf/requests` patches were produced by the agent; evaluation was
-  blocked by the container-side PyPI install of `httpbin` / Python 2.7
-  resolver (network degradation), not by the agent. Harness:
-  `scripts/swebench/`, results `logs/swebench/BENCHMARK.md`.
-- All **8 `psf/requests` Verified images** are local (8/8 digests verified;
-  10.7 GB). The 300-instance Lite pull continues in the background:
-  **59 pulled + 1 skipped / 300** at 21:30, 240 pending, measured
-  **10.0 images/hour → ETA ~24 h**, Docker 33.86 GB, C: free 508 GiB.
-  Full SWE-bench (2,294 instances) would need ~2.8 TiB of images and is out of
-  scope for this host.
+- projection build on a large session: **16.1 → 7.8 MB**, 48k → 18k
+  allocations, **21.5 → 9.3 ms** (-51% / -62% / -57%);
+- `AgentSession::new` on 40,001 messages: **130 → 56 ms** build time and
+  **238.2 → 129.7 MB** peak RSS (-57% / -45.5%);
+- paged open adopts the tail page's `Arc<FileEntry>` handles (no per-entry
+  deep clone); `/tree` and partial session-list publishes no longer make
+  transcript/summary copies;
+- catalog/startup: `--list-models` -14.9%, `print` -14.5%, TUI first frame
+  -22.2%, TUI peak working set **68.5 → 63.6 MB** (openrouter);
+- compaction: conversation serialize **3.0x**, split **10.6x**, prepare
+  **1.56x** faster (debug);
+- plugin host (1000 synthetic plugins): event-interest lookup -97.5%,
+  `turn_end` emit -52%, `message_update` -80%, tool backend lookup -99%,
+  resolved tools -98%, resolved commands -90%; indexes live with the host
+  snapshot and are replaced on rebuild;
+- context-mode hot path: routing -52–71% (`git status` 3.1→1.5 µs), tool-result
+  weight -14–38% with zero-copy single-block handling, HTML→text 512 KiB
+  -26%; FTS/`ctx_search` unchanged because bm25 dominates.
 
-## Upstream A/B (release pir vs pi 1.4.0)
+TUI refresh research: idle CPU is already event-driven (16 ms active poll is
+dirty-gated; 1 s idle). The remaining cost is that every dirty frame rebuilds
+the whole materialized band/window instead of the visible viewport:
+`TuiCore::frame_lines`/`ChatContainer::render_into` scan all content,
+`Rows::push` compares whole strings, and `TranscriptWindow::sync` rescans up
+to 512 entries' JSON payloads. The proposed fast path is viewport-only render
+plus a window byte-budget cache invalidated by entry revision, and skipping
+`set_entries` when the window and revision are unchanged (not yet landed).
 
-`logs/acc-final/AB-REPORT-PI14.md`: same OpenAI-compatible endpoint/model,
-5 tasks. **pir 5/5, pi 5/5; total 76.6 s vs 134.9 s**; pir uses fewer or equal
-turns on all five tasks. The earlier comparison against pi 0.73.1 was stale
-and is superseded.
+## SWE-bench Verified (local)
 
-## Release build and profile
+`psf__requests-2317` resolved=true (F2P 8/8, P2P 133/133);
+`psf__requests-1142` resolved=true (F2P 1/1, P2P 5/5);
+`psf__requests-1921` F2P 6/6, P2P 106/107 (one httpbin env flake). Six more
+patches were produced; evaluation was blocked by container-side PyPI/httpbin/
+Python 2.7 environment issues. All 8 `psf/requests` images are local
+(10.7 GB). Lite pull: 59 pulled + 1 skipped / 300, ETA ~24 h.
 
-`target/release/pir.exe` **67,392,000 B**, SHA-256
-`d76dff0aa1c5cd29890d71c642b0b34cdfa04d4df195fa88c5f0768a149ea7df`,
-built 2026-10-29 13:35 in 23 m 24 s (fat LTO). It predates the last
-`src/extensions/runtime/host_functions/fs_watch_fns.rs` and
-`src/coding_agent/tools/confine.rs` edits, so its scorecard/soak evidence is
-for the same profile but not the final source; **rebuild before tagging**.
+## Release
 
-Profile study (`logs/lane-release-profile/REPORT.md`): keep
-`opt-level=3, lto="fat", codegen-units=1, panic="unwind", strip="symbols"` —
-fastest and smallest (lab 67,505,152 B). `fat LTO + CGU=4` builds in
-14 m 03 s vs 27 m 00 s (**-48%**) at **+5.7% size** with equal runtime;
-`panic="abort"` is rejected (30+ `catch_unwind` boundaries);
-`-Ctarget-cpu=native` is slower here and not CI-reproducible.
+`target/release/pir.exe` 67,392,000 B, SHA-256
+`d76dff0a…149ea7df`, built in 23 m 24 s (fat LTO). Profile study recommends
+keeping `opt-level=3, lto="fat", codegen-units=1, panic="unwind",
+strip="symbols"`; fat LTO + CGU4 builds 48% faster at +5.7% size.
 
 ## Open residuals
 
-- Core review (`logs/lane-core-review/REPORT.md`, read-only): 4 P1s —
-  CBOR byte-string amplification before schema validation; server session
-  records never reclaimed on create-without-attach/attach-detach; paged
-  compaction failure returns a truncated tail window; paged prefix marker
-  false positives on tool-result text.
-- SDK review (`logs/lane-sdk-simple/REPORT.md`): real-endpoint path ~12 lines;
-  offline mock path 163 lines; 59 `Agent` methods, 33 `SdkEvent` variants; no
-  `sdk::testing` provider. `CreateAgentSessionOptions::max_turns` still
-  defaults to 100 while `AgentBuilder` defaults to 1000 (documented in
-  `docs/sdk.md`); two default mismatches and a proxy/registry overwrite
-  loophole remain.
-- ConPTY: `s14` fixed; `s47`→`s47b` passes in order; **`s33` resume/prompt
-  race remains** (a prompt 0.2 s after Enter is lost).
-- CI test isolation: `session_context_cli` is Windows-only (its fixtures
-  encode Windows path resolution); a few load-sensitive suites are
-  quarantined per OS. These are test gates only — no product `cfg` changes.
-- `cargo-deny`/`cargo-audit` are local checks only; registry advisories made
-  them non-actionable as a blocking CI job. PGO: local GNU target cannot
-  generate profiles (no `libprofiler_builtins`); `-Cprofile-use` works;
-  production path is CI MSVC/Linux (`docs/pgo.md`).
-
-## External follow-ups
-
-- Commit/push is allowed for this session; **tagging and release publishing
-  remain user-only**.
-- Docker Desktop 4.97.0 / engine 29.9.2 works; Docker Hub direct is blocked,
-  `docker.1panel.live` pulls the official namespace (digest-verified;
-  0.55–0.83 MB/s single, 1.48 MiB/s four-stream); `docker.1ms.run` is the
-  fallback. The Lite pull runner is detached and resumable
-  (`scripts/docker/pull_lite_all.ps1`, state in `logs/lane-docker-lite/`).
-- Cloud evaluation (CoreWeave Sandboxes) was evaluated and rejected by user
-  decision; local evaluation remains the path.
-- Real-provider A/B can stall on the test gateway; only stall-free legs are
-  ranked.
+- Core review: the 15-review P1 batch is fixed and covered by regressions
+  (CBOR byte strings, RPC teardown, paged fallback/marker scanning, server
+  detach). Remaining P2s: extension provider/MCP rollback on a failed install,
+  MCP `ConnectionClosed` retry classification, server session-registry
+  TTL/ownership, and the ConPTY `s33` resume race.
+- SDK: raw `CreateAgentSessionOptions` max-turns default is 100 while
+  `AgentBuilder` is 1000; proxy/registry overwrite loophole remains.
+- context-mode: the embedded RustPython build has no `_ssl` (the
+  `rustpython-stdlib` `ssl` feature would pull OpenSSL), so HTTPS from
+  `ctx_execute` Python scripts fails; `ctx_fetch_and_index` is the supported
+  HTTPS path and now honors the configured proxy.
+- `session_context_cli` is Windows-only; a few load-sensitive CI suites are
+  quarantined per OS (test gates only).
+- `cargo-deny`/`cargo-audit` are local checks; PGO profile generation is not
+  available on the local GNU target (`-Cprofile-use` works; CI MSVC/Linux is
+  the production path).
 
 ## Commands
 
 ```bash
-# Foreman (target/)
 cargo fmt --all -- --check
 cargo check --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --doc
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_fast.ps1 -Concurrency 16 -Threads 4
-CARGO_TARGET_DIR=target bash scripts/feature_matrix.sh  # 81 rows
-
-# Inner loop (target-lane-d; check/fmt only for lanes)
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev_cycle.ps1 -Files src/foo.rs
-CARGO_TARGET_DIR=target-lane-d cargo check --tests
+CARGO_TARGET_DIR=target bash scripts/feature_matrix.sh
 ```
-
-## Read next
 
 [`docs/FEATURES.md`](FEATURES.md) · [`MAPPING.md`](../MAPPING.md)

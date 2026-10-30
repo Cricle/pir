@@ -61,6 +61,10 @@
 //   client     — the remote TCP protocol client (`pir::client`, `pir client`).
 //                Off: the module is not compiled (no stub); the command reports
 //                the missing feature at runtime.
+//   minimal    — not a gate but the zero-optional profile: `pir::minimal` and
+//                the `pir-minimal` binary are core, so `--no-default-features`
+//                still yields a runnable agent (one OpenAI-compatible
+//                provider, one `read_file` tool, in-memory session).
 //   full       — default; all of the above (what the `pir` binary needs)
 //
 // The full matrix (providers, the builtin plugins, `cli`, `tools`,
@@ -131,8 +135,14 @@ pub mod extensions;
 // would corrupt the interactive TUI's frame, so they are routed through the
 // host's logging destination (see the module docs).
 pub mod logging;
+// The zero-optional-feature minimal agent profile (`pir-minimal`): core
+// `AgentSession` + one OpenAI-compatible provider + one `read_file` tool +
+// an in-memory transcript. Compiled unconditionally so
+// `--no-default-features` is still a runnable agent, while the default `full`
+// build keeps every existing surface. Design: docs/FEATURES.md §4.
 #[cfg(feature = "mcp")]
 pub mod mcp;
+pub mod minimal;
 // `pir grep` / `pir sed` / `pir python`: the standalone native command surface
 // (its clap subcommands live in `coding_agent::cli`, gated by `cli`).
 #[cfg(feature = "cli")]

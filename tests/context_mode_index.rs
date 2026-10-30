@@ -120,6 +120,17 @@ fn results_of(value: &Value, query_index: usize) -> Vec<Value> {
         .clone()
 }
 
+async fn source_hits(harness: &Harness, query: &str, source: &str) -> Vec<Value> {
+    let search = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "query": query, "source": source }),
+        )
+        .await;
+    assert!(!search.is_error, "{}", search.content);
+    results_of(&parse_json(&search), 0)
+}
+
 // ---------------------------------------------------------------------------
 // Chunking
 // ---------------------------------------------------------------------------
@@ -273,6 +284,108 @@ async fn multi_query_dedupes_chunk_ids_across_queries() {
         .await;
     assert!(!shorthand.is_error, "{}", shorthand.content);
     assert_eq!(results_of(&parse_json(&shorthand), 0).len(), 1);
+}
+
+/// The pre-optimization `make_snippet` (char-window over `Vec<char>`), kept
+/// verbatim as the behavioral oracle for the allocation-free implementation.
+fn reference_snippet(content: &str, terms: &[String], max_chars: usize) -> String {
+    let lowered = content.to_lowercase();
+    let mut position = None;
+    for term in terms {
+        let needle = term.to_lowercase();
+        if needle.is_empty() {
+            continue;
+        }
+        if let Some(byte_index) = lowered.find(&needle) {
+            position = Some(if content.is_char_boundary(byte_index) {
+                content[..byte_index].chars().count()
+            } else {
+                0
+            });
+            break;
+        }
+    }
+    let chars: Vec<char> = content.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    let window = max_chars.max(80);
+    let center = position.unwrap_or(0);
+    let start = center.saturating_sub(window / 3);
+    let end = (start + window).min(chars.len());
+    let start = end.saturating_sub(window);
+    let mut snippet: String = chars[start..end].iter().collect();
+    snippet = snippet.trim().to_owned();
+    if start > 0 {
+        snippet.insert(0, '…');
+    }
+    if end < chars.len() {
+        snippet.push('…');
+    }
+    snippet
+}
+
+/// The term split `build_match_expression` uses (alphanumeric or `_`).
+fn query_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    for ch in query.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            terms.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        terms.push(current);
+    }
+    terms
+}
+
+#[tokio::test]
+async fn snippets_match_the_reference_window_for_ascii_and_unicode() {
+    let harness = Harness::new("snippet-equivalence");
+    let long_prefix = "prefix ".repeat(100);
+    let long_suffix = "suffix ".repeat(100);
+    let mut turkish = "İstanbul öncesi ".repeat(24);
+    turkish.push_str("needle unicode ");
+    turkish.push_str(&"κείμενο ".repeat(50));
+    let mut wide = "é".repeat(620);
+    wide.push_str(" needle wide ");
+    wide.push_str(&"é".repeat(620));
+    let cases = [
+        (
+            format!("{long_prefix}Needle in the middle {long_suffix}"),
+            "needle",
+        ),
+        (turkish, "needle"),
+        (wide, "needle"),
+        (format!("needle {}", "x".repeat(900)), "needle"),
+        (format!("{} needle at the end", "é".repeat(700)), "needle"),
+        (
+            format!("{}UPPER needle here {}", "a".repeat(700), "b".repeat(700)),
+            "needle",
+        ),
+        (
+            format!("{}İ needle boundary{}", "ö".repeat(300), "ü".repeat(300)),
+            "needle",
+        ),
+    ];
+
+    for (index, (content, query)) in cases.iter().enumerate() {
+        let source = format!("snippet-{index}");
+        harness.index(content, &source, Some("text")).await;
+        let results = source_hits(&harness, query, &source).await;
+        assert_eq!(results.len(), 1, "case {index}");
+        // `chunk_plain` stores each source line with a trailing '\n'; the
+        // window math (and therefore the starting char) sees that newline.
+        let stored = format!("{content}\n");
+        let expected = reference_snippet(&stored, &query_terms(query), 500);
+        assert_eq!(
+            results[0]["snippet"], expected,
+            "case {index}: snippet diverged from the reference window"
+        );
+    }
 }
 
 #[tokio::test]
@@ -476,6 +589,10 @@ const PAGE: &str = "<!doctype html><html><head><title>Test Page</title>\
 <script>moreSecret()</script></body></html>";
 
 fn spawn_html_server(requests: Arc<AtomicUsize>) -> String {
+    spawn_html_page(PAGE, requests)
+}
+
+fn spawn_html_page(page: &'static str, requests: Arc<AtomicUsize>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|error| panic!("bind: {error}"));
     let address = listener
         .local_addr()
@@ -491,14 +608,77 @@ fn spawn_html_server(requests: Arc<AtomicUsize>) -> String {
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
                  Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                PAGE.len(),
-                PAGE
+                page.len(),
+                page
             );
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
         }
     });
     format!("http://{address}/page")
+}
+
+const BREAK_PAGE: &str = "<!doctype html><HTML><BODY>\
+<h2>Lists &amp; Breaks</h2>\
+<p>alpha<br>beta<br/>gamma</p>\
+<p>before<br class=\"nope\">after</p>\
+<ul><li>item one<li>item two</ul>\
+<DIV>omega &lt;tag&gt;</DIV>\
+<!-- hiddenneedle -->\
+</BODY></HTML>";
+
+#[tokio::test]
+async fn fetch_preserves_breaks_lists_and_entities() {
+    let harness = Harness::new("fetch-breaks");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let url = spawn_html_page(BREAK_PAGE, Arc::clone(&requests));
+
+    let fetched = harness
+        .run(
+            CTX_FETCH_AND_INDEX_TOOL_NAME,
+            json!({ "url": url, "source": "break-page" }),
+        )
+        .await;
+    assert!(!fetched.is_error, "{}", fetched.content);
+    assert!(!fetched.content.contains("<p>"), "{}", fetched.content);
+
+    let items = source_hits(&harness, "item", "break-page").await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["title"], json!("Lists & Breaks"), "{items:?}");
+    let snippet = items[0]["snippet"].as_str().unwrap();
+    assert!(snippet.contains("- item one"), "{snippet}");
+    assert!(snippet.contains("- item two"), "{snippet}");
+
+    let gamma = source_hits(&harness, "gamma", "break-page").await;
+    assert_eq!(gamma.len(), 1, "{gamma:?}");
+    assert!(gamma[0]["snippet"].as_str().unwrap().contains("gamma"));
+
+    let before = source_hits(&harness, "before", "break-page").await;
+    assert_eq!(before.len(), 1, "{before:?}");
+    assert!(
+        before[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("before after"),
+        "a <br> with attributes is not a line break: {before:?}"
+    );
+
+    let omega = source_hits(&harness, "omega", "break-page").await;
+    assert_eq!(omega.len(), 1, "{omega:?}");
+    assert!(
+        omega[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("omega <tag>"),
+        "entities must be decoded: {omega:?}"
+    );
+
+    assert!(
+        source_hits(&harness, "hiddenneedle", "break-page")
+            .await
+            .is_empty(),
+        "comment text must not be indexed"
+    );
 }
 
 #[tokio::test]

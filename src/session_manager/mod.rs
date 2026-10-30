@@ -1014,9 +1014,14 @@ struct SessionInfoPeek {
 /// valid pretty-printed JSONL must list the same as pir's compact writer.
 /// Text content containing the literal is JSON-escaped (`\"`), so it cannot
 /// produce a false positive.
-fn line_has_message_role(line: &[u8], role: &str) -> bool {
+///
+/// One scan reports both roles: the peek asks "assistant?" and "user?" for
+/// every message line, and the old shape scanned (and allocated a quoted-role
+/// `String`) once per question.
+fn line_message_roles(line: &[u8]) -> (bool, bool) {
     let key = b"\"role\"";
-    let quoted = format!("\"{role}\"");
+    let mut is_assistant = false;
+    let mut is_user = false;
     let mut offset = 0;
     while let Some(found) = line[offset..]
         .windows(key.len())
@@ -1031,13 +1036,15 @@ fn line_has_message_role(line: &[u8], role: &str) -> bool {
             while rest.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
                 rest = &rest[1..];
             }
-            if rest.starts_with(quoted.as_bytes()) {
-                return true;
+            if rest.starts_with(b"\"assistant\"") {
+                is_assistant = true;
+            } else if rest.starts_with(b"\"user\"") {
+                is_user = true;
             }
         }
         offset += found + key.len();
     }
-    false
+    (is_assistant, is_user)
 }
 
 /// The searchable text of one message's content blocks (upstream
@@ -1103,9 +1110,9 @@ fn peek_session_info(reader: &mut impl std::io::BufRead) -> SessionInfoPeek {
         if line_has_entry_type(&line, "message") {
             peek.message_count += 1;
             // Upstream keeps only user/assistant text in `allMessagesText`
-            // (and only a user's text is the first message).
-            let is_assistant = line_has_message_role(&line, "assistant");
-            let is_user = line_has_message_role(&line, "user");
+            // (and only a user's text is the first message). One byte scan
+            // answers both role questions.
+            let (is_assistant, is_user) = line_message_roles(&line);
             if !is_assistant && !is_user {
                 continue;
             }
@@ -1167,7 +1174,7 @@ fn read_session_listing(
         .ok()
         .flatten()?;
     if let Some(reference) = resolved_cwd {
-        if !session_cwd_matches(&Some(header.cwd.clone()), reference) {
+        if !session_cwd_matches(Some(header.cwd.as_str()), reference) {
             return None;
         }
     }
@@ -1221,7 +1228,7 @@ fn read_session_header_listing(
         .ok()
         .flatten()?;
     if let Some(reference) = resolved_cwd {
-        if !session_cwd_matches(&Some(header.cwd.clone()), reference) {
+        if !session_cwd_matches(Some(header.cwd.as_str()), reference) {
             return None;
         }
     }
@@ -1230,10 +1237,11 @@ fn read_session_header_listing(
 }
 
 /// Whether a header cwd matches the reference cwd (upstream
-/// `sessionCwdMatches`: resolved-path comparison).
-fn session_cwd_matches(cwd: &Option<String>, resolved_cwd: &str) -> bool {
-    cwd.as_deref()
-        .filter(|value| !value.is_empty())
+/// `sessionCwdMatches`: resolved-path comparison). Takes the header cwd
+/// borrowed: the listings used to build a `Some(header.cwd.clone())` just to
+/// call this, one `String` copy per candidate file.
+fn session_cwd_matches(cwd: Option<&str>, resolved_cwd: &str) -> bool {
+    cwd.filter(|value| !value.is_empty())
         .is_some_and(|value| resolve_path_str(value) == resolved_cwd)
 }
 
@@ -1265,7 +1273,7 @@ fn find_most_recent_session(session_dir: &Path, cwd: Option<&str>) -> Option<Pat
         read_session_header_for_discovery(path).is_some_and(|header| {
             resolved_cwd
                 .as_deref()
-                .is_none_or(|reference| session_cwd_matches(&Some(header.cwd.clone()), reference))
+                .is_none_or(|reference| session_cwd_matches(Some(header.cwd.as_str()), reference))
         })
     })
 }
@@ -1627,17 +1635,28 @@ impl SessionManager {
 
     fn load_entries(
         &mut self,
-        mut entries: Vec<FileEntry>,
+        entries: Vec<FileEntry>,
+        options: Option<NewSessionOptions>,
+    ) -> crate::Result<()> {
+        let entries: Vec<Arc<FileEntry>> = entries.into_iter().map(Arc::new).collect();
+        self.load_shared_entries(entries, options)
+    }
+
+    /// [`Self::load_entries`] over ALREADY SHARED entries: the paged open
+    /// hands over the tail page's own `Arc<FileEntry>` handles, so loading a
+    /// resident window never deep-clones every stored tool result just to
+    /// wrap the copies in new `Arc`s. Only compaction entries need mutable
+    /// access (for `toolsAdded` interning); `Arc::make_mut` clones at most
+    /// that one entry, never the transcript.
+    fn load_shared_entries(
+        &mut self,
+        mut entries: Vec<Arc<FileEntry>>,
         options: Option<NewSessionOptions>,
     ) -> crate::Result<()> {
         // Upstream `_loadEntries` searches the WHOLE list for the session
         // header (`entries.find((e) => e.type === "session")`), not just the
         // first entry.
-        let header = entries
-            .iter()
-            .find(|entry| entry.is_header())
-            .and_then(FileEntry::as_header)
-            .cloned();
+        let header = entries.iter().find_map(|entry| entry.as_header()).cloned();
         match header {
             Some(header) => {
                 self.session_id = header.id.clone();
@@ -1645,9 +1664,11 @@ impl SessionManager {
                 self.cwd = resolve_path_str(&header.cwd);
                 self.tool_schema_intern.clear();
                 for entry in &mut entries {
-                    self.intern_compaction_tools(entry);
+                    if matches!(entry.as_ref(), FileEntry::Compaction(_)) {
+                        self.intern_compaction_tools(Arc::make_mut(entry));
+                    }
                 }
-                self.file_entries = entries.into_iter().map(Arc::new).collect();
+                self.file_entries = entries;
                 if self.migrate_to_current_version() {
                     // Never erase undeserializable lines: refuse the rewrite
                     // when the file carried any (upstream keeps unknown data;
@@ -1669,9 +1690,11 @@ impl SessionManager {
             None => {
                 self.new_session(options)?;
                 for entry in &mut entries {
-                    self.intern_compaction_tools(entry);
+                    if matches!(entry.as_ref(), FileEntry::Compaction(_)) {
+                        self.intern_compaction_tools(Arc::make_mut(entry));
+                    }
                 }
-                self.file_entries.extend(entries.into_iter().map(Arc::new));
+                self.file_entries.extend(entries);
             }
         }
         self.build_index();
@@ -2261,9 +2284,15 @@ impl SessionManager {
         // to `new_session` — inventing a fresh id/cwd for an existing session.
         // Prepending the real header keeps `header()`, `id()`, `cwd()`, the
         // migration check and the print host's JSON header line correct.
-        let mut entries: Vec<FileEntry> = Vec::with_capacity(page.entries().len() + 1);
+        //
+        // INVARIANT (Arc hand-over): the page's entries are adopted by
+        // reference-count bump. The old shape deep-cloned every resident entry
+        // (`entry.as_ref().clone()`) and then re-wrapped the copies in fresh
+        // `Arc`s, so a paged open of a tool-result-heavy window paid a full
+        // copy of the transcript it had just parsed.
+        let mut entries: Vec<Arc<FileEntry>> = Vec::with_capacity(page.entries().len() + 1);
         match page.file_header() {
-            Some(header) => entries.push(FileEntry::Session(header)),
+            Some(header) => entries.push(Arc::new(FileEntry::Session(header))),
             None => {
                 anyhow::bail!(
                     "Cannot open paged: session file has no header: {}",
@@ -2271,7 +2300,7 @@ impl SessionManager {
                 );
             }
         }
-        entries.extend(page.entries().iter().map(|entry| entry.as_ref().clone()));
+        entries.extend(page.entries().iter().cloned());
         // ARM the paged state and the file path BEFORE loading: the load runs
         // the migration check, and a v1/v2 session wants to REWRITE the file
         // (which would drop the unread prefix). Armed first, that rewrite hits
@@ -2288,7 +2317,7 @@ impl SessionManager {
             parsed_entries: stats.parsed_entries,
         });
         manager.unparsed_raw_lines = page.unparsed_lines().to_vec();
-        manager.load_entries(entries, None)?;
+        manager.load_shared_entries(entries, None)?;
         manager.flushed = true;
         // One INFO line per paged open (a rare, meaningful event): the
         // counters that prove only the tail window was parsed —
@@ -2698,9 +2727,13 @@ impl SessionManager {
                 loaded == 1 || loaded % SESSION_LIST_PUBLISH_INTERVAL == 0 || loaded == total;
             if let Some(progress) = progress.as_deref_mut() {
                 if publish_partial {
-                    let mut partial = sessions.clone();
-                    partial.sort_by_key(|session| std::cmp::Reverse(session.modified));
-                    progress(loaded, total, Some(&partial));
+                    // Sort the live list in place instead of deep-cloning every
+                    // session summary so far (`path` + `all_messages_text`
+                    // strings) for each periodic publish: a directory of N
+                    // sessions paid O(N^2/interval) summary copies during one
+                    // listing. The final order below is the same sort.
+                    sessions.sort_by_key(|session| std::cmp::Reverse(session.modified));
+                    progress(loaded, total, Some(&sessions));
                 } else {
                     progress(loaded, total, None);
                 }
@@ -4036,16 +4069,21 @@ impl SessionManager {
     /// entries should prefer [`Self::for_each_tree_row`], which never builds
     /// the nested chain at all.
     pub fn tree(&self) -> Vec<TreeNode> {
-        let entries = self.entries();
+        // Build straight off the live shared list: the old shape first called
+        // `entries()` (one deep clone of every entry) and then cloned each
+        // entry AGAIN into its `TreeNode`, so one `/tree` paid two full
+        // transcript copies. A node must own its entry, so exactly one deep
+        // clone per node remains (the `Arc` clone that could avoid it would
+        // change the public `TreeNode` shape).
         let mut nodes: BTreeMap<String, TreeNode> = BTreeMap::new();
-        let mut file_order: Vec<String> = Vec::with_capacity(entries.len());
-        for entry in &entries {
+        let mut file_order: Vec<String> = Vec::with_capacity(self.file_entries.len());
+        for entry in self.file_entries.iter().filter(|entry| !entry.is_header()) {
             let id = entry.entry_id().to_owned();
             nodes.insert(
                 id.clone(),
                 TreeNode {
                     id: id.clone(),
-                    entry: entry.clone(),
+                    entry: entry.as_ref().clone(),
                     label: self.labels_by_id.get(entry.entry_id()).cloned(),
                     label_timestamp: self.label_timestamps_by_id.get(entry.entry_id()).cloned(),
                     children: TreeChildren::default(),
@@ -4058,7 +4096,7 @@ impl SessionManager {
         // (orphan) is also a root.
         let mut parent_of: BTreeMap<String, Option<String>> = BTreeMap::new();
         let mut children_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for entry in &entries {
+        for entry in self.file_entries.iter().filter(|entry| !entry.is_header()) {
             let id = entry.entry_id().to_owned();
             let parent = entry
                 .parent_id()

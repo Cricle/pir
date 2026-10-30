@@ -170,7 +170,6 @@ impl MirrorCadence {
 ///
 /// The parser never panics on malformed input (a malformed fragment just
 /// produces no or fewer changes).
-#[cfg(feature = "provider-openai")]
 pub(crate) mod streaming_json {
     use std::collections::BTreeMap;
 
@@ -950,5 +949,4 @@ pub(crate) mod streaming_json {
     }
 }
 
-#[cfg(feature = "provider-openai")]
 pub(crate) use streaming_json::{apply_json_changes, JsonChange, StreamingJsonMirror};

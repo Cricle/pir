@@ -733,7 +733,7 @@ pub fn find_projected_cut_point<E: ProjectedEntry>(
         let entry = &entries[index];
         // Only conversation messages budget the retained tail. System messages
         // are prompt state: they are excluded from the summarized spans
-        // (`span_message_refs`) and replayed by the checkpoint, so charging
+        // (`span_messages`) and replayed by the checkpoint, so charging
         // their (declaration-heavy) size to `keep_recent_tokens` moved the cut
         // past a turn start and turned a plain history checkpoint into a
         // spurious split turn.
