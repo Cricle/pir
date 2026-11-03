@@ -1459,12 +1459,100 @@ async fn plugin_registers_lazily_and_exposes_tools() {
         Some(&pir::mcp::manager::ConnectionState::Connected)
     );
 
-    // Teardown kills the child.
+    // Teardown kills the child. A connected server's discovery task can
+    // publish its state on the shutdown/rebuild boundary, so the assertion
+    // waits (bounded) for the drain instead of sampling the exact instant
+    // `reload()` returns.
     host.reload()
         .await
         .expect("reload triggers plugin shutdown hook");
-    let states = plugin.manager().connection_states().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut states = plugin.manager().connection_states().await;
+    while !states.is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        states = plugin.manager().connection_states().await;
+    }
     assert!(states.is_empty(), "shutdown closes connections: {states:?}");
+}
+
+/// `/reload` is a TEARDOWN, not a first use: the plugin's reload
+/// `session_start {reason: "reload"}` must not rebuild the connections
+/// `McpManager::re_root` just closed, and the retained discovered snapshot
+/// must keep the bridge callable — the next call connects from the reloaded
+/// entry, exactly like every other lazy first use.
+#[tokio::test(flavor = "current_thread")]
+async fn reload_leaves_connections_lazy_and_the_next_call_reconnects() {
+    let _guard = env_guard().await;
+    let dir = TempDir::new("reload-lazy");
+    std::env::set_var("PIR_AGENT_DIR", &dir.0);
+
+    let (command, args) = mock_server_spawn();
+    let plugin = Arc::new(McpPlugin::new());
+    let host = PluginHost::build(None, vec![plugin.clone()]);
+    let config_value = json!({
+        "command": command,
+        "args": args,
+        "env": { "PIR_MOCK_MCP_SERVER": "1" },
+        "timeout": 20,
+    });
+    std::fs::write(
+        dir.0.join("mcp.json"),
+        serde_json::json!({ "mock": config_value }).to_string(),
+    )
+    .expect("write mcp.json");
+    let config: McpServerConfig = serde_json::from_value(config_value).expect("config");
+    plugin.manager().registry().register(McpServerEntry {
+        name: "mock".into(),
+        config,
+        source: pir::mcp::registry::McpServerSource::GlobalConfig(dir.0.join("mcp.json")),
+    });
+
+    let mut payload = json!({ "type": "session_start" });
+    host.emit("session_start", &mut payload)
+        .await
+        .expect("emit");
+    assert_eq!(
+        plugin.manager().connection_states().await.get("mock"),
+        Some(&pir::mcp::manager::ConnectionState::Connected)
+    );
+
+    host.reload().await.expect("reload");
+    let states = plugin.manager().connection_states().await;
+    assert!(
+        states.is_empty(),
+        "reload tears the connections down and leaves servers lazy: {states:?}"
+    );
+    assert!(
+        host.tool_defs()
+            .iter()
+            .any(|def| def.name == "mcp__mock__echo"),
+        "the retained discovered snapshot keeps the bridge registered"
+    );
+
+    // Lazy first use after the reload: the call reconnects from the reloaded
+    // entry instead of failing closed on the torn-down connection.
+    let result = host
+        .call_tool(
+            "mcp__mock__echo",
+            "call-after-reload",
+            &json!({ "text": "again" }),
+        )
+        .await
+        .expect("the lazy call reconnects");
+    assert_eq!(
+        result
+            .content
+            .first()
+            .map(|item| item.text.clone())
+            .unwrap_or_default(),
+        "echo:again"
+    );
+    assert_eq!(
+        plugin.manager().connection_states().await.get("mock"),
+        Some(&pir::mcp::manager::ConnectionState::Connected),
+        "the call rebuilt a live connection"
+    );
+    host.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]

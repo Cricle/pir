@@ -6,8 +6,13 @@
 //!   calls from JS extensions (via the runtime's `mcp_server_defs` surface,
 //!   mirroring the `registerProvider` pattern);
 //! - lazy connections: registering the plugin never starts a server; servers
-//!   connect on first use (session-start discovery, direct tool calls, or
-//!   `pir mcp check`), with per-server timeouts and HTTP retry backoff;
+//!   connect on first use (a fresh `session_start`, direct tool calls, or
+//!   `pir mcp check`), with per-server timeouts and HTTP retry backoff.
+//!   `/reload` is a teardown, not a first use: the `session_start` it emits
+//!   (`reason: "reload"`) leaves every server down, and the retained
+//!   discovered snapshot keeps their bridges callable, so the next call
+//!   reconnects from the reloaded entry. Only an entry the reload's config
+//!   pass added or changed reconnects eagerly (the rebuild tail's reconcile);
 //! - each server tool becomes a registry tool named `mcp__<server>__<tool>`
 //!   (sanitized, hash-suffixed on collision) with the JSON-schema parameters
 //!   from `tools/list`, sequential execution, and results mapped to pir
@@ -1728,31 +1733,53 @@ impl AgentPlugin for McpPlugin {
             if event.name.as_ref() != "session_start" {
                 return PluginEventOutcome::None;
             }
-            // First use: connect the configured servers and refresh the
-            // discovered tool snapshot (the host rebuilds the registry
-            // after this dispatch when the tool set changed). The refresh
-            // tail flushes the `mcp_servers_change` entries queued at host
-            // build, so no flush happens here — a flush inside the dispatch
-            // could not reach the native fan-out (the plugin holds no host
-            // handle) and would split the two faces.
+            // `/reload` is a TEARDOWN, not a first use.
+            // `PluginHost::reload` emits `session_start {reason: "reload"}`
+            // right after the `on_reload` pass, whose `McpManager::re_root`
+            // already ran `McpManager::shutdown`: every connection was closed
+            // precisely so no live transport keeps logging to (or refreshing
+            // credentials from) the directory the reload left behind.
+            // Re-discovering here would rebuild the children that teardown
+            // just killed before anything asked for them, so `reload()` would
+            // hand back a manager whose connections are live again and the
+            // teardown would be unobservable.
             //
-            // BOUNDED (upstream `waitForDirectServers`' 10 s
-            // `DEFAULT_STARTUP_WAIT_MS`, index.ts:93,1157-1174): the first
-            // prompt cannot block on a server that never answers. The
-            // per-server timeout still applies; a server still connecting
-            // when the aggregate budget elapses is cancelled, reported as
-            // pending, and retried by the manager's background continuation.
-            let report = self.manager.discover_all_bounded(self.startup_budget).await;
-            self.report_startup_problems(&report);
-            *self
-                .state
-                .startup_report
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
-            // Upstream `reportProblems` (index.ts:646-659): one warning after
-            // startup listing the servers that need the user, ending in the
-            // exact remedy pointer `Run /mcp to fix.`.
-            self.report_problems().await;
+            // Staying lazy costs nothing: the discovered snapshot survives the
+            // teardown, so the `mcp__*` bridges stay registered and the next
+            // tool call (or wait hook) connects from the reloaded entry. The
+            // ONE case that must reconnect eagerly is an entry the reload's
+            // config pass added or changed: the previous connection was built
+            // from an entry that no longer applies, and the rebuild tail
+            // (`flush_server_changes` -> `reconcile_config_servers`) releases
+            // and re-discovers it.
+            let is_reload_start = event.str_field("reason") == Some("reload");
+            if !is_reload_start {
+                // First use: connect the configured servers and refresh the
+                // discovered tool snapshot (the host rebuilds the registry
+                // after this dispatch when the tool set changed). The refresh
+                // tail flushes the `mcp_servers_change` entries queued at host
+                // build, so no flush happens here — a flush inside the dispatch
+                // could not reach the native fan-out (the plugin holds no host
+                // handle) and would split the two faces.
+                //
+                // BOUNDED (upstream `waitForDirectServers`' 10 s
+                // `DEFAULT_STARTUP_WAIT_MS`, index.ts:93,1157-1174): the first
+                // prompt cannot block on a server that never answers. The
+                // per-server timeout still applies; a server still connecting
+                // when the aggregate budget elapses is cancelled, reported as
+                // pending, and retried by the manager's background continuation.
+                let report = self.manager.discover_all_bounded(self.startup_budget).await;
+                self.report_startup_problems(&report);
+                *self
+                    .state
+                    .startup_report
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
+                // Upstream `reportProblems` (index.ts:646-659): one warning
+                // after startup listing the servers that need the user, ending
+                // in the exact remedy pointer `Run /mcp to fix.`.
+                self.report_problems().await;
+            }
             // The resource tools' exposure is derived from the servers that
             // have resources (upstream `syncResourceTools` on connection
             // changes); refresh before the host's post-dispatch rebuild so
