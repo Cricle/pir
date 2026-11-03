@@ -51,11 +51,14 @@
 //!   the mount and shared through `Arc` with every observer otherwise.
 //! * **The view's containers are copy-on-write.** A publication clones the
 //!   [`ConversationView`] shell (one conversation record, two refcount bumps)
-//!   and replaces only the container it changed: the entry list when an entry
-//!   was written, one document value when a document changed, the map shell
-//!   once per document write. A `pi.live` progress publication therefore
-//!   copies neither the transcript nor the unchanged documents, which is the
-//!   per-publication O(state) clone this module used to pay.
+//!   and replaces only the container it changed: the chunked append-only
+//!   [`EntryList`] when an entry was written, one document value when a
+//!   document changed, the map shell once per document write. Appending one
+//!   entry shares every historical [`EntryRecord`] and copies at most one
+//!   chunk table, so a long transcript no longer pays an O(n) deep clone per
+//!   publication. A `pi.live` progress publication therefore copies neither
+//!   the transcript nor the unchanged documents, which is the per-publication
+//!   O(state) clone this module used to pay.
 //! * **Document deltas are replayed or replaced.** Upstream applies the
 //!   forwarded operations to its shared value. The port applies the
 //!   publication's complete value for the document (the exact adopted
@@ -63,8 +66,11 @@
 //!   cannot desynchronise the mount.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Index;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use serde::ser::SerializeSeq;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 use crate::durable::context::Context;
@@ -87,20 +93,178 @@ use crate::durable::types::{
 /// Page size of a storage scan (upstream `context.ts` `SCAN_PAGE_SIZE`).
 const SCAN_PAGE_SIZE: usize = 256;
 
+/// Entries per chunk of [`EntryList`].
+const ENTRY_CHUNK_SIZE: usize = 256;
+
+/// An append-only list of entry records.
+///
+/// Entries are stored in fixed-size chunks of shared [`Arc`] handles
+/// ([`EntryList`] is itself kept behind one [`Arc`] in
+/// [`ConversationView::entries`]). Appending one entry copies at most one
+/// chunk's pointer table and never an [`EntryRecord`]: every earlier revision
+/// keeps its own chunk list while the records themselves are shared. A head
+/// marker rebuilds the chunk table from the kept suffix (pointer copies only)
+/// and reuses the same record allocations.
+///
+/// The type exposes a slice-like read surface (`len`, `is_empty`, `get`,
+/// `iter`, `to_vec` and indexing) without materializing a contiguous
+/// `Vec<EntryRecord>`.
+#[derive(Clone, Default)]
+pub struct EntryList {
+    /// Immutable chunks; all but the last hold exactly `ENTRY_CHUNK_SIZE`
+    /// records, so `index / ENTRY_CHUNK_SIZE` locates a chunk directly.
+    chunks: Vec<Arc<[Arc<EntryRecord>]>>,
+    len: usize,
+}
+
+impl EntryList {
+    /// Build a list from owned records, wrapping each in one shared handle.
+    #[must_use]
+    pub fn from_vec(entries: Vec<EntryRecord>) -> Self {
+        let items: Vec<Arc<EntryRecord>> = entries.into_iter().map(Arc::new).collect();
+        Self::from_arcs(items)
+    }
+
+    fn from_arcs(items: Vec<Arc<EntryRecord>>) -> Self {
+        let len = items.len();
+        let mut chunks = Vec::with_capacity(len.div_ceil(ENTRY_CHUNK_SIZE));
+        let mut items = items.into_iter();
+        loop {
+            let chunk: Vec<Arc<EntryRecord>> = items.by_ref().take(ENTRY_CHUNK_SIZE).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            chunks.push(Arc::from(chunk));
+        }
+        Self { chunks, len }
+    }
+
+    /// The number of records.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the list is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// One record by position.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&EntryRecord> {
+        if index >= self.len {
+            return None;
+        }
+        let chunk = index / ENTRY_CHUNK_SIZE;
+        let offset = index % ENTRY_CHUNK_SIZE;
+        self.chunks
+            .get(chunk)
+            .and_then(|chunk| chunk.get(offset))
+            .map(Arc::as_ref)
+    }
+
+    /// Iterate the records in order.
+    pub fn iter(&self) -> impl Iterator<Item = &EntryRecord> + '_ {
+        self.chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().map(Arc::as_ref))
+    }
+
+    /// The records as one owned vector (a deep copy, for consumers that need a
+    /// `Vec<EntryRecord>`).
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<EntryRecord> {
+        self.iter().cloned().collect()
+    }
+
+    /// A new revision with `entry` appended.
+    #[must_use]
+    pub fn appended(&self, entry: Arc<EntryRecord>) -> Self {
+        let mut chunks = self.chunks.clone();
+        if let Some(last) = chunks.last_mut() {
+            if last.len() < ENTRY_CHUNK_SIZE {
+                let mut items: Vec<Arc<EntryRecord>> = last.iter().cloned().collect();
+                items.push(entry);
+                *last = Arc::from(items);
+                return Self {
+                    chunks,
+                    len: self.len + 1,
+                };
+            }
+        }
+        chunks.push(Arc::from(vec![entry]));
+        Self {
+            chunks,
+            len: self.len + 1,
+        }
+    }
+
+    /// A new revision with `entry` at the front and the records from `kept`
+    /// on kept (a head marker keeps only the suffix from its `head`).
+    #[must_use]
+    pub fn prefixed(&self, kept: usize, entry: Arc<EntryRecord>) -> Self {
+        let mut items = Vec::with_capacity(self.len.saturating_sub(kept) + 1);
+        items.push(entry);
+        items.extend(self.arcs().skip(kept).cloned());
+        Self::from_arcs(items)
+    }
+
+    fn arcs(&self) -> impl Iterator<Item = &Arc<EntryRecord>> + '_ {
+        self.chunks.iter().flat_map(|chunk| chunk.iter())
+    }
+}
+
+impl Index<usize> for EntryList {
+    type Output = EntryRecord;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("entry index out of bounds")
+    }
+}
+
+impl PartialEq for EntryList {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.iter().eq(other.iter())
+    }
+}
+
+impl std::fmt::Debug for EntryList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl Serialize for EntryList {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.len))?;
+        for entry in self.iter() {
+            seq.serialize_element(entry)?;
+        }
+        seq.end()
+    }
+}
+
 /// One conversation's raw active transcript and built-in documents.
 ///
 /// Both containers are shared copy-on-write ([`Arc`]): cloning a revision is a
 /// refcount bump, and the mount replaces only the container a publication
 /// actually changed. A document delta (the streaming `pi.live` progress path)
 /// therefore leaves the transcript and every unchanged document shared with the
-/// previous revision instead of deep-cloning them.
+/// previous revision instead of deep-cloning them. The transcript itself is a
+/// chunked append-only [`EntryList`], so appending one entry shares every
+/// historical record instead of copying the entries vector.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConversationView {
     /// The immutable conversation record.
     pub conversation: ConversationRecord,
     /// Raw active entries, as `ContextView.entries`: the head marker, then the
     /// non-head entries from its head.
-    pub entries: Arc<Vec<EntryRecord>>,
+    pub entries: Arc<EntryList>,
     /// Built-in conversation documents keyed by kind; absent documents are
     /// absent. A value is shared by every revision that still shows it, so a
     /// write to one document leaves the others where they are.
@@ -116,7 +280,7 @@ pub type MountedDocument = Arc<JsonObject>;
 impl ConversationView {
     /// The raw active entries.
     #[must_use]
-    pub fn entries(&self) -> &[EntryRecord] {
+    pub fn entries(&self) -> &EntryList {
         &self.entries
     }
 
@@ -489,7 +653,7 @@ async fn build_mount(
     Ok(Mount {
         value: Arc::new(ConversationView {
             conversation,
-            entries: Arc::new(entries),
+            entries: Arc::new(EntryList::from_vec(entries)),
             docs: Arc::new(docs),
         }),
         docs: incarnations,
@@ -640,11 +804,12 @@ fn advance_mounts(
 /// copy-on-write next revision.
 ///
 /// `next` starts as a clone of the mounted revision, which shares every
-/// container through `Arc`. Only the containers this publication actually
-/// changes are unshared ([`Arc::make_mut`]), so a delta to one document copies
-/// that document and the (small) map shell, never the transcript or the other
-/// documents. A publication that produces no operation leaves `next` fully
-/// shared and the caller keeps the mounted revision as it is.
+/// container through `Arc`. A document delta unshares only that document and
+/// the (small) map shell ([`Arc::make_mut`]); an entry write replaces the
+/// transcript handle with a new append-only [`EntryList`] revision that shares
+/// every historical record, so neither path copies the transcript. A
+/// publication that produces no operation leaves `next` fully shared and the
+/// caller keeps the mounted revision as it is.
 fn apply_changes(
     mount: &mut Mount,
     next: &mut ConversationView,
@@ -659,39 +824,39 @@ fn apply_changes(
                 let Ok(json) = serde_json::to_value(entry) else {
                     continue;
                 };
-                // One unshare for the whole publication: further entry changes
-                // in the same batch append to the list already owned here.
-                let entries = Arc::make_mut(&mut next.entries);
+                // Every entry change builds a new append-only revision that
+                // shares all historical records; only the new record is
+                // allocated. The mounted revision keeps its own chunk table,
+                // so this is safe even though `next` is a shallow clone of it.
+                let shared = Arc::new(entry.clone());
                 match entry.head {
                     None => {
                         // Entry writes are published in ID order.
                         entry_ops.push(Op::Splice {
                             path: entries_path(),
-                            index: entries.len(),
+                            index: next.entries.len(),
                             remove: 0,
                             items: vec![json],
                         });
-                        entries.push(entry.clone());
+                        next.entries = Arc::new(next.entries.appended(shared));
                     }
                     Some(target) => {
                         // A head marker keeps the non-head entries from its
                         // head, which are always a suffix, and goes in front.
-                        let kept = entries
+                        let kept = next
+                            .entries
                             .iter()
                             .position(|candidate| {
                                 candidate.head.is_none() && candidate.id >= target
                             })
-                            .unwrap_or(entries.len());
+                            .unwrap_or(next.entries.len());
                         entry_ops.push(Op::Splice {
                             path: entries_path(),
                             index: 0,
                             remove: kept,
                             items: vec![json],
                         });
-                        let tail = entries.split_off(kept);
-                        entries.clear();
-                        entries.push(entry.clone());
-                        entries.extend(tail);
+                        next.entries = Arc::new(next.entries.prefixed(kept, shared));
                     }
                 }
             }

@@ -601,20 +601,32 @@ fn convert_tools_lenient(
         .collect()
 }
 
+/// Inputs for one anchored system message's tool changes.
+struct ToolChangeInput<'a> {
+    messages: &'a mut Vec<Value>,
+    system: &'a UserMessage,
+    support: ResponsesToolSupport,
+    instruction_role: &'a str,
+    declared_additional_tools: &'a mut bool,
+    unavailable_tools: &'a mut std::collections::BTreeSet<String>,
+    seed: &'a str,
+    supports_strict_mode: bool,
+}
+
 /// Append the in-place tool items for one anchored system message (upstream
 /// `appendSystemToolAdditions`): `additional_tools` in `changes` mode, a
 /// synthetic tool-search pair in `additions` mode, nothing in `none` mode.
-#[allow(clippy::too_many_arguments)]
-fn append_system_tool_additions(
-    messages: &mut Vec<Value>,
-    system: &UserMessage,
-    support: ResponsesToolSupport,
-    instruction_role: &str,
-    declared_additional_tools: &mut bool,
-    unavailable_tools: &mut std::collections::BTreeSet<String>,
-    seed: &str,
-    supports_strict_mode: bool,
-) {
+fn append_system_tool_additions(input: ToolChangeInput<'_>) {
+    let ToolChangeInput {
+        messages,
+        system,
+        support,
+        instruction_role,
+        declared_additional_tools,
+        unavailable_tools,
+        seed,
+        supports_strict_mode,
+    } = input;
     let tools = system.tools_added.as_deref().unwrap_or(&[]);
     for tool in tools {
         unavailable_tools.remove(&tool.name);
@@ -667,18 +679,8 @@ fn append_system_tool_additions(
 /// `append_system_tool_additions`, and true removals are announced as text
 /// (upstream renders them after this message's additions, before recording the
 /// names as unavailable).
-#[allow(clippy::too_many_arguments)]
-fn apply_anchored_tool_changes(
-    messages: &mut Vec<Value>,
-    system: &UserMessage,
-    support: ResponsesToolSupport,
-    instruction_role: &str,
-    declared_additional_tools: &mut bool,
-    unavailable_tools: &mut std::collections::BTreeSet<String>,
-    seed: &str,
-    supports_strict_mode: bool,
-) -> Vec<String> {
-    append_system_tool_additions(
+fn apply_anchored_tool_changes(input: ToolChangeInput<'_>) -> Vec<String> {
+    let ToolChangeInput {
         messages,
         system,
         support,
@@ -687,7 +689,17 @@ fn apply_anchored_tool_changes(
         unavailable_tools,
         seed,
         supports_strict_mode,
-    );
+    } = input;
+    append_system_tool_additions(ToolChangeInput {
+        messages,
+        system,
+        support,
+        instruction_role,
+        declared_additional_tools,
+        unavailable_tools: &mut *unavailable_tools,
+        seed,
+        supports_strict_mode,
+    });
     // A redefinition is a removal plus an addition of the same name; only true
     // removals are announced.
     let added: std::collections::BTreeSet<&str> = system
@@ -814,16 +826,16 @@ pub fn convert_responses_messages(
             }
             if anchors {
                 if let Message::System(system) = head {
-                    parts.extend(apply_anchored_tool_changes(
-                        &mut messages,
+                    parts.extend(apply_anchored_tool_changes(ToolChangeInput {
+                        messages: &mut messages,
                         system,
                         support,
                         instruction_role,
-                        &mut declared_additional_tools,
-                        &mut unavailable_tools,
-                        "system:0",
-                        options.supports_strict_mode,
-                    ));
+                        declared_additional_tools: &mut declared_additional_tools,
+                        unavailable_tools: &mut unavailable_tools,
+                        seed: "system:0",
+                        supports_strict_mode: options.supports_strict_mode,
+                    }));
                 }
             }
             if options.include_system_prompt {
@@ -853,16 +865,16 @@ pub fn convert_responses_messages(
                     parts.push(base);
                 }
                 if anchors {
-                    parts.extend(apply_anchored_tool_changes(
-                        &mut messages,
+                    parts.extend(apply_anchored_tool_changes(ToolChangeInput {
+                        messages: &mut messages,
                         system,
                         support,
                         instruction_role,
-                        &mut declared_additional_tools,
-                        &mut unavailable_tools,
-                        &format!("system:{msg_index}"),
-                        options.supports_strict_mode,
-                    ));
+                        declared_additional_tools: &mut declared_additional_tools,
+                        unavailable_tools: &mut unavailable_tools,
+                        seed: &format!("system:{msg_index}"),
+                        supports_strict_mode: options.supports_strict_mode,
+                    }));
                 }
                 let text = parts.join("\n\n");
                 if (!is_leading || options.include_system_prompt) && !text.is_empty() {
@@ -1063,10 +1075,62 @@ pub fn is_chatgpt_sign_in(model: &Model, api_key: Option<&str>) -> bool {
         && api_key.is_some_and(|key| !key.starts_with("sk-"))
 }
 
+/// Adapter-specific wire decisions for [`build_responses_params`].
+///
+/// `model_field` is the per-call wire value; the remaining knobs default to
+/// the OpenAI `/responses` behavior ([`OPENAI_TOOL_CALL_PROVIDERS`], no
+/// Sign-in-with-ChatGPT field omission, no configuration-update effort) and
+/// are overridden by the callers that differ.
+pub struct ResponsesWireOptions<'a> {
+    /// Wire `model` value: the model id for OpenAI, the deployment name for
+    /// Azure.
+    pub model_field: &'a str,
+    /// Tool-call provider ids whose tools stay in the request.
+    pub allowed_tool_call_providers: &'a [&'a str],
+    /// Sign in with ChatGPT rejects fields outside the upstream common set.
+    pub omit_unsupported_fields: bool,
+    /// Cache-preserving effort override (upstream
+    /// `getConfigurationUpdateEffort`); `None` when the adapter has no
+    /// configuration-update items.
+    pub configuration_update_effort: Option<&'a str>,
+}
+
+impl<'a> ResponsesWireOptions<'a> {
+    /// OpenAI defaults: OpenAI tool-call providers, no field omission, no
+    /// configuration-update effort.
+    pub fn new(model_field: &'a str) -> Self {
+        Self {
+            model_field,
+            allowed_tool_call_providers: OPENAI_TOOL_CALL_PROVIDERS,
+            omit_unsupported_fields: false,
+            configuration_update_effort: None,
+        }
+    }
+
+    /// Use the adapter's own tool-call provider list (Azure).
+    pub fn with_tool_call_providers(mut self, providers: &'a [&'a str]) -> Self {
+        self.allowed_tool_call_providers = providers;
+        self
+    }
+
+    /// Omit fields the credential's adapter rejects (ChatGPT sign-in).
+    pub fn with_omitted_unsupported_fields(mut self, omit: bool) -> Self {
+        self.omit_unsupported_fields = omit;
+        self
+    }
+
+    /// Carry the cache-preserving configuration-update effort.
+    pub fn with_configuration_update_effort(mut self, effort: Option<&'a str>) -> Self {
+        self.configuration_update_effort = effort;
+        self
+    }
+}
+
 /// Build the `/responses` request body shared by the OpenAI and Azure
 /// variants (upstream `buildParams` in `openai-responses.ts` /
-/// `azure-openai-responses.ts`). `model_field` is the wire `model` value
-/// (model id for OpenAI, deployment name for Azure). Public for tests/.
+/// `azure-openai-responses.ts`). [`ResponsesWireOptions::model_field`] is the
+/// wire `model` value (model id for OpenAI, deployment name for Azure).
+/// Public for tests/.
 ///
 /// Gated with `provider-openai`: it is the one piece of this module that
 /// needs the OpenAI adapter's sampling resolvers and the Responses compat
@@ -1075,18 +1139,19 @@ pub fn is_chatgpt_sign_in(model: &Model, api_key: Option<&str>) -> bool {
 /// stays core so other adapters and the TUI keep compiling without the
 /// feature.
 #[cfg(feature = "provider-openai")]
-// Mirrors the upstream `buildParams` parameter list; public for tests/.
-#[allow(clippy::too_many_arguments)]
 pub fn build_responses_params(
     model: &Model,
     context: &Context,
     options: &StreamOptions,
     compat: &responses_compat::ResponsesCompat,
-    model_field: &str,
-    allowed_tool_call_providers: &[&str],
-    omit_unsupported_fields: bool,
-    configuration_update_effort: Option<&str>,
+    wire: &ResponsesWireOptions<'_>,
 ) -> AiResult<Value> {
+    let ResponsesWireOptions {
+        model_field,
+        allowed_tool_call_providers,
+        omit_unsupported_fields,
+        configuration_update_effort,
+    } = *wire;
     let message_options = ConvertResponsesMessagesOptions {
         include_system_prompt: true,
         supports_mid_convo_system_messages: compat.supports_mid_convo_system_messages,

@@ -22,7 +22,8 @@ use pir::ai::api::openai_responses::codex::{
 };
 use pir::ai::api::openai_responses::shared::{
     build_responses_params, convert_responses_messages, parse_responses_sse,
-    ConvertResponsesMessagesOptions, ResponsesSseParser, OPENAI_TOOL_CALL_PROVIDERS,
+    ConvertResponsesMessagesOptions, ResponsesSseParser, ResponsesWireOptions,
+    OPENAI_TOOL_CALL_PROVIDERS,
 };
 use pir::ai::api::openai_responses::ResponsesCompat;
 use pir::ai::api::tool_args::parse_final_tool_arguments;
@@ -653,10 +654,7 @@ fn responses_min_output_tokens_floor() {
         },
         &options,
         &compat,
-        "gpt-5.5",
-        OPENAI_TOOL_CALL_PROVIDERS,
-        false,
-        None,
+        &ResponsesWireOptions::new("gpt-5.5"),
     )
     .expect("params");
     assert_eq!(params["max_output_tokens"], 16);
@@ -679,10 +677,7 @@ fn responses_long_cache_retention_marker() {
         },
         &options,
         &compat,
-        "gpt-5.5",
-        OPENAI_TOOL_CALL_PROVIDERS,
-        false,
-        None,
+        &ResponsesWireOptions::new("gpt-5.5"),
     )
     .expect("params");
     assert_eq!(params["prompt_cache_retention"], "24h");
@@ -711,10 +706,7 @@ fn responses_configuration_update_carries_effort_items() {
         },
         &options,
         &compat,
-        "gpt-5.5",
-        OPENAI_TOOL_CALL_PROVIDERS,
-        false,
-        Some("high"),
+        &ResponsesWireOptions::new("gpt-5.5").with_configuration_update_effort(Some("high")),
     )
     .expect("params");
     let input = params["input"].as_array().expect("input");
@@ -872,12 +864,14 @@ async fn codex_websocket_sse_fallback_marker_skips_later_attempts() {
     let body = json!({"model": "gpt-5.5-codex", "input": []});
     // Unreachable port: the transport fails, which records the fallback.
     let outcome = codex_ws::try_stream_codex_websocket(
-        "ws://127.0.0.1:9/codex/responses",
-        &body,
-        "acct_1",
-        "token",
-        &model,
-        &options,
+        codex_ws::CodexWsRequest {
+            ws_url: "ws://127.0.0.1:9/codex/responses",
+            body: &body,
+            account_id: "acct_1",
+            token: "token",
+            model: &model,
+            options: &options,
+        },
         &mut parser_for(),
         &sink,
     )
@@ -888,12 +882,14 @@ async fn codex_websocket_sse_fallback_marker_skips_later_attempts() {
     // The second attempt must not even try to connect: a bogus URL would
     // surface as a transport failure but the recorded marker short-circuits.
     let outcome = codex_ws::try_stream_codex_websocket(
-        "ws://127.0.0.1:9/codex/responses",
-        &body,
-        "acct_1",
-        "token",
-        &model,
-        &options,
+        codex_ws::CodexWsRequest {
+            ws_url: "ws://127.0.0.1:9/codex/responses",
+            body: &body,
+            account_id: "acct_1",
+            token: "token",
+            model: &model,
+            options: &options,
+        },
         &mut parser_for(),
         &sink,
     )
@@ -1492,10 +1488,7 @@ fn responses_request_options_override_the_reasoning_summary() {
         &context,
         &options,
         &ResponsesCompat::default(),
-        "gpt-5.5",
-        OPENAI_TOOL_CALL_PROVIDERS,
-        false,
-        None,
+        &ResponsesWireOptions::new("gpt-5.5"),
     )
     .expect("params");
     assert_eq!(

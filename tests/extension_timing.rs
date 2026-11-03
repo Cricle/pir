@@ -15,6 +15,11 @@
 //!
 //! The same command without `PIR_TIMING` must produce the same successful
 //! result and no `pir-timing:` lines.
+//!
+//! Also pins the oversized-timeout clamp end to end: `u64::MAX`
+//! `callTimeoutMs`/`hookTimeoutMs` in the global settings must produce a
+//! warning naming the 24 h clamp and a successful run, not an
+//! `Instant + Duration` panic on Windows/macOS.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -255,6 +260,52 @@ fn run_print_with_extension(
         command.env("PI_TIMING", "1");
     }
     command.output().expect("pir binary should start")
+}
+
+/// `u64::MAX` `extensionLimits.callTimeoutMs` / `hookTimeoutMs` must be
+/// clamped at load time: the runtime boots, dispatches an event, and the run
+/// exits successfully. Before the clamp, arming `Instant::now() + timeout`
+/// panicked on Windows/macOS once the actor dispatched a handler.
+#[test]
+fn oversized_extension_timeouts_are_clamped_and_the_run_succeeds() {
+    let port = spawn_mock_openai();
+    let agent = TempDir::new("clamp-agent");
+    let project = TempDir::new("clamp-project");
+    write_models_json(&agent.0, port);
+    std::fs::write(
+        agent.0.join("settings.json"),
+        r#"{
+  "extensionLimits": {
+    "callTimeoutMs": 18446744073709551615,
+    "hookTimeoutMs": 18446744073709551615,
+    "beforeAgentStartTimeoutMs": 18446744073709551615
+  }
+}"#,
+    )
+    .expect("write settings.json");
+
+    let extension = project.0.join("clamp-timeout.js");
+    std::fs::write(
+        &extension,
+        r#"
+export default function (pi) {
+    pi.on("input", () => ({ action: "continue" }));
+}
+"#,
+    )
+    .expect("write extension fixture");
+
+    let output = run_print_with_extension(&agent.0, &project.0, &extension, false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "an oversized timeout must not fail the run: {}\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("clamped to 24 h"),
+        "the clamp diagnostic must name the 24 h ceiling:\n{stderr}"
+    );
 }
 
 #[test]

@@ -81,10 +81,15 @@ pub(crate) enum Command {
         request: JsonValue,
         reply: oneshot::Sender<Result<JsonValue, String>>,
     },
-    /// Dispatch a slash command (first registration wins).
+    /// Dispatch a slash command. `ext_id` selects one exact JS registration
+    /// when the unified registry deduplicated duplicate names; `None` keeps
+    /// the first-wins scan. `invocation_name` is the resolved name (`dup:2`)
+    /// surfaced to the handler's ctx.
     RunSlash {
         name: String,
         args: String,
+        ext_id: Option<u64>,
+        invocation_name: String,
         reply: oneshot::Sender<anyhow::Result<CommandOutcome>>,
     },
     /// Invoke a registered keyboard shortcut by key combo.

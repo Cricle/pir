@@ -78,7 +78,8 @@ pub struct SessionReloadOutcome {
     /// plan, no extensions).
     pub extensions_reloaded: bool,
     /// The native plugin lifecycle ran (`session_shutdown {reason:"reload"}`,
-    /// every `on_reload` hook, one registry rebuild).
+    /// every `on_reload` hook, `session_start {reason:"reload"}`, one registry
+    /// rebuild).
     pub native_plugins_reloaded: bool,
     /// What the fresh `resources_discover` dispatch installed (and retracted).
     pub resources: crate::extensions::resources::ExtensionResourceReload,
@@ -830,6 +831,38 @@ impl AgentSession {
         self.extensions.as_ref()
     }
 
+    /// The JS runtime used for EVENT dispatch: `None` when this session is a
+    /// subagent child riding its parent's shared handle (see
+    /// [`Self::disable_js_event_dispatch`]). Tool execution, commands,
+    /// providers and definitions still use [`Self::extensions_handle`].
+    pub(crate) fn event_extensions(&self) -> Option<&crate::extensions::ExtensionHandle> {
+        if self
+            .js_event_dispatch
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.extensions.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Stop dispatching this session's events into the attached JS runtime
+    /// while keeping its definitions and tool backend.
+    ///
+    /// Only the subagent child's shared-runtime fallback calls this: without
+    /// a dedicated child runtime the handle belongs to the parent, so the
+    /// child's `session_start` / loop / tool events must not reach the
+    /// parent's `pi.on` handlers. Normal (fresh runtime) children never
+    /// disable dispatch.
+    #[cfg_attr(not(feature = "subagent"), allow(dead_code))]
+    pub(crate) fn disable_js_event_dispatch(&self) {
+        self.js_event_dispatch
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(plugins) = &self.plugins {
+            plugins.disable_js_event_dispatch();
+        }
+    }
+
     /// The unified plugin host (JS adapter + native Rust plugins), when the
     /// session was built with a plugin surface (an extension handle or inline
     /// plugins). Read-only: hosts use it for native-facing queries such as
@@ -962,8 +995,10 @@ impl AgentSession {
     /// `session_shutdown {reason: "reload"}` to the native plugins, every
     /// [`AgentPlugin::on_reload`](crate::plugins::AgentPlugin::on_reload)
     /// hook (the `codemode` settings cache, the `mcp` manager's teardown, the
-    /// `todo` replay cache), then one registry rebuild so the reloaded
-    /// configuration is what the next tool loadout sees.
+    /// `todo` replay cache), `session_start {reason: "reload"}` to the native
+    /// plugins (owned by [`PluginHost::reload_native_plugins`] so direct host
+    /// callers get the same lifecycle), then one registry rebuild so the
+    /// reloaded configuration is what the next tool loadout sees.
     ///
     /// This is the product caller [`PluginHost::reload_native_plugins`] was
     /// missing: the interactive host's `/reload` reaches it through
@@ -1006,7 +1041,9 @@ impl AgentSession {
     ///    composite reload ([`PluginHost::reload`]): native
     ///    `session_shutdown {reason:"reload"}` + every `on_reload` hook, the
     ///    JS runtime rebuild with the extension factories re-executed
-    ///    ([`ExtensionHandle::reload`]), and one registry rebuild. That
+    ///    ([`ExtensionHandle::reload`]), native
+    ///    `session_start {reason:"reload"}` (emitted by the host, exactly
+    ///    once), and one registry rebuild. That
     ///    rebuild is what makes a tool registered by the reloaded extension
     ///    visible to the next run: [`AgentSession::merged_tool_registry`] is
     ///    keyed on the host's registry generation. A host without a JS
@@ -1073,24 +1110,19 @@ impl AgentSession {
         // dispatch below, the next prompt, the withSession callback) reads it.
         let model = self.current_model();
         self.push_session_context(&model).await;
-        // Upstream `reload` emits `session_start {reason: "reload"}` against
-        // the rebuilt runtime, then extends resources from it
-        // (agent-session.ts:3753-3757). A reload is a full lifecycle pass even
-        // when no startup `session_start` fired yet, so mark the lazy startup
-        // block consumed: the next prompt must not deliver a second
-        // session_start.
+        // The reload lifecycle's native `session_start {reason: "reload"}` is
+        // emitted by the host exactly once on both the composite
+        // ([`PluginHost::reload`]) and native-only
+        // ([`PluginHost::reload_native_plugins`]) paths, after `on_reload` and
+        // (when one runs) the JS runtime reload — so a direct SDK/host caller
+        // and this session observe the same lifecycle and this method must not
+        // emit it again. The JS face gets its own copy from the rebuilt
+        // runtime (`ExtensionHandle::reload`).
+        //
+        // A reload is a full lifecycle pass even when no startup
+        // `session_start` fired yet, so mark the lazy startup block consumed:
+        // the next prompt must not deliver a second session_start.
         if let Some(plugins) = &self.plugins {
-            // NATIVE face only: the JS actor's reload lifecycle already
-            // dispatches its own `session_start {reason:"reload"}` to the
-            // rebuilt JS runtime (`ExtensionHandle::reload`), so a second
-            // both-face emit would deliver it twice.
-            if plugins.has_native_handlers("session_start") {
-                let mut payload = serde_json::json!({
-                    "type": "session_start",
-                    "reason": "reload",
-                });
-                plugins.emit_native("session_start", &mut payload).await;
-            }
             // Handlers may have registered providers/models during the reload
             // lifecycle; apply them before the resources pass so the next
             // prompt sees the same state a startup would have produced.
@@ -1415,13 +1447,16 @@ fn phone_tree_json(manager: &SessionManager) -> JsonValue {
         }
         nodes.push(node);
     });
-    let current_path: Vec<JsonValue> = manager
-        .branch_entries(None)
-        .unwrap_or_default()
-        .iter()
-        .filter(|entry| !entry.is_header())
-        .map(|entry| JsonValue::String(entry.entry_id().to_owned()))
-        .collect();
+    // Borrowed path walk: only the entry IDs are read, so cloning the whole
+    // branch (messages included) with `branch_entries` is unnecessary.
+    let current_path: Vec<JsonValue> = crate::session_manager::projection::build_session_path(
+        manager.resident_entries(),
+        manager.leaf_id(),
+    )
+    .iter()
+    .filter(|entry| !entry.is_header())
+    .map(|entry| JsonValue::String(entry.entry_id().to_owned()))
+    .collect();
     serde_json::json!({
         "sessionFile": session_file,
         "currentLeafId": manager.leaf_id(),
@@ -1852,9 +1887,12 @@ impl AgentSession {
             .ok_or_else(|| "Missing rpc command type.".to_owned())?;
         match command_type {
             "get_state" => Ok(HostReply::data(self.phone_state_json().await)),
-            "get_messages" => Ok(HostReply::data(serde_json::json!({
-                "messages": self.transcript_json().await,
-            }))),
+            "get_messages" => {
+                let messages = self.transcript_json().await;
+                let mut data = serde_json::Map::with_capacity(1);
+                data.insert("messages".to_owned(), JsonValue::Array(messages));
+                Ok(HostReply::data(JsonValue::Object(data)))
+            }
             "get_commands" => Ok(HostReply::data(serde_json::json!({
                 "commands": self.phone_command_catalog(),
             }))),
@@ -1873,11 +1911,29 @@ impl AgentSession {
             "get_entries" => {
                 let entries = self
                     .with_session_manager(|manager| {
-                        serde_json::json!({
-                            "entries": serde_json::to_value(manager.entries())
-                                .unwrap_or(JsonValue::Null),
-                            "leafId": manager.leaf_id(),
-                        })
+                        // Borrowed resident entries: `entries()` deep-clones
+                        // every stored message just for `to_value` to copy it
+                        // again. Serializing the borrowed `Arc<FileEntry>`
+                        // views produces the same array with no typed clone.
+                        let entries = JsonValue::Array(
+                            manager
+                                .resident_entries()
+                                .iter()
+                                .filter(|entry| !entry.is_header())
+                                .map(|entry| {
+                                    serde_json::to_value(entry.as_ref()).unwrap_or(JsonValue::Null)
+                                })
+                                .collect(),
+                        );
+                        let mut data = serde_json::Map::with_capacity(2);
+                        data.insert("entries".to_owned(), entries);
+                        data.insert(
+                            "leafId".to_owned(),
+                            manager
+                                .leaf_id()
+                                .map_or(JsonValue::Null, |leaf| JsonValue::String(leaf.to_owned())),
+                        );
+                        JsonValue::Object(data)
                     })
                     .await
                     .ok_or_else(|| "no attached session storage".to_owned())?;

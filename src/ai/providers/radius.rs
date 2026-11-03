@@ -147,12 +147,14 @@ async fn fetch_gateway_config(
     let mut body = Vec::new();
     client
         .request_streaming(
-            reqwest::Method::GET,
-            &url,
-            &headers,
+            crate::ai::transport::StreamingRequest::new(
+                reqwest::Method::GET,
+                &url,
+                &headers,
+                Some(signal),
+                &ProviderStreamHooks::default(),
+            ),
             Vec::new(),
-            Some(signal),
-            &ProviderStreamHooks::default(),
             &mut |chunk| {
                 body.extend_from_slice(chunk);
                 Ok(())
@@ -312,22 +314,24 @@ pub struct RadiusProvider {
 impl RadiusProvider {
     /// Build the provider from its embedded catalog entry (baseline models).
     pub fn from_catalog(entry: &BuiltinProvider) -> AiResult<ProviderBox> {
-        Self::new(&entry.id, &entry.display_name, entry.models.clone(), None)
+        Ok(Arc::new(Self::new(
+            &entry.id,
+            &entry.display_name,
+            entry.models.clone(),
+            None,
+        )?))
     }
 
     /// Build the provider for a provider id, display name, baseline model list
     /// and optional gateway override (upstream `radiusProvider(options)`).
-    // `new` intentionally returns the type-erased `ProviderBox`, matching the
-    // upstream factory helper; callers register the trait object, not `Self`.
-    #[allow(clippy::new_ret_no_self)]
     pub fn new(
         provider_id: &str,
         display_name: &str,
         baseline: Vec<Model>,
         gateway: Option<&str>,
-    ) -> AiResult<ProviderBox> {
+    ) -> AiResult<Self> {
         let dispatch = CatalogProviderEntry::from_models(provider_id, display_name, &baseline)?;
-        Ok(Arc::new(Self {
+        Ok(Self {
             core: Arc::new(RadiusCore {
                 provider_id: provider_id.to_string(),
                 display_name: display_name.to_string(),
@@ -337,7 +341,7 @@ impl RadiusProvider {
                     dispatch,
                 }),
             }),
-        }))
+        })
     }
 }
 

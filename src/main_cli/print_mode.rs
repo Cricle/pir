@@ -1,20 +1,31 @@
 use super::*;
 
-/// Run one print pass with the shared CLI flag surface (the `pir print`
-/// subcommand and the upstream `-p`/auto-print entry shapes).
-// Parameters mirror the shared CLI flag surface one-to-one (split out of
-// `main.rs`; a params struct would churn both call shapes for no gain).
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_print_mode(
-    cli: &Cli,
-    config: &pir::config::Config,
-    settings_manager: &pir::config::settings::SettingsManager,
-    extension_paths: &[std::path::PathBuf],
-    prompts: pir::coding_agent::cli::PrintPrompts,
-    images: Vec<pir::ai::types::ImageContent>,
-    plan: SessionPlan,
-    json_output: bool,
-) -> Result<()> {
+/// One print pass's inputs: the shared CLI flag surface plus the per-run
+/// payload (the `pir print` subcommand and the upstream `-p`/auto-print
+/// entry shapes both build it).
+pub(super) struct PrintModeRequest<'a> {
+    pub cli: &'a Cli,
+    pub config: &'a pir::config::Config,
+    pub settings_manager: &'a pir::config::settings::SettingsManager,
+    pub extension_paths: &'a [std::path::PathBuf],
+    pub prompts: pir::coding_agent::cli::PrintPrompts,
+    pub images: Vec<pir::ai::types::ImageContent>,
+    pub plan: SessionPlan,
+    pub json_output: bool,
+}
+
+/// Run one print pass.
+pub(super) async fn run_print_mode(request: PrintModeRequest<'_>) -> Result<()> {
+    let PrintModeRequest {
+        cli,
+        config,
+        settings_manager,
+        extension_paths,
+        prompts,
+        images,
+        plan,
+        json_output,
+    } = request;
     let outcome = pir::coding_agent::run_print(
         PrintOptions {
             prompt: prompts.initial_message.unwrap_or_default(),

@@ -172,6 +172,14 @@ fn push_context_entry_messages(
     }
 }
 
+/// Append one entry's UNEDITED context messages to an aggregate list — the
+/// push-based form of [`session_entry_to_context_messages`] for callers that
+/// aggregate several entries (paged load-more pages): one shared output Vec
+/// instead of a throwaway per-entry `Vec<Message>` allocation each.
+pub(crate) fn push_entry_context_messages(entry: &FileEntry, out: &mut Vec<Message>) {
+    push_context_entry_messages(entry, None, out);
+}
+
 /// Render a custom-message entry's content (string or text-block array) as
 /// plain text (upstream `contentText`).
 pub(crate) fn custom_message_text(content: &JsonValue) -> String {
@@ -665,6 +673,84 @@ pub fn build_session_projection<E: SharedEntry>(
         thinking_level,
         model,
     }
+}
+
+/// [`build_session_projection`]'s LLM-visible messages serialized to the
+/// upstream `AgentMessage` JSON shape, WITHOUT materializing the aggregate
+/// `Vec<Message>`.
+///
+/// MEMORY SHAPE (pir extension): `AgentSession::transcript_json` (RPC
+/// `get_messages`, the SDK `transcript_json`, `/export`) only needs JSON
+/// values. Building the projection first cloned every message of the resident
+/// transcript, then serialized the clone and dropped it. This walks the same
+/// retained entries and serializes each plain `message` entry straight from
+/// its stored payload (byte-identical JSON: both sides use the same role-tagged
+/// structs), materializing a `Message` only for the entries whose model view
+/// differs from the stored record (bash executions, custom/system messages,
+/// summaries, context edits).
+pub fn build_session_context_json<E: Borrow<FileEntry>>(
+    entries: &[E],
+    leaf_id: Option<&str>,
+) -> Vec<JsonValue> {
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id);
+    // Exact output capacity: the message-count contract the projection and
+    // its metadata twin share. One pass over entries already in cache, no
+    // growth reallocations on a transcript-sized resident window.
+    let capacity: usize = context_entries
+        .iter()
+        .enumerate()
+        .map(|(index, source_entry)| {
+            let entry: &FileEntry = (*source_entry).borrow();
+            if matches!(entry, FileEntry::Compaction(_)) && index > 0 {
+                0
+            } else {
+                projected_message_count(entry, context_edit_for(entry, edits.as_ref()))
+            }
+        })
+        .sum();
+    let mut out: Vec<JsonValue> = Vec::with_capacity(capacity);
+    // Reused scratch for the entries whose model view is not their stored
+    // record: one allocation across the whole walk instead of one per entry.
+    let mut scratch: Vec<Message> = Vec::new();
+    for (index, source_entry) in context_entries.iter().enumerate() {
+        let entry: &FileEntry = (*source_entry).borrow();
+        if matches!(entry, FileEntry::Compaction(_)) && index > 0 {
+            continue;
+        }
+        let edit = context_edit_for(entry, edits.as_ref());
+        if edit.is_some_and(|edit| edit.replacement.is_none()) {
+            continue;
+        }
+        if edit.is_none() {
+            if let FileEntry::Message(inner) = entry {
+                match &inner.message {
+                    // The stored payload IS the upstream message object for
+                    // these roles; serialize it by reference.
+                    StoredMessage::Assistant(_)
+                    | StoredMessage::ToolResult(_)
+                    | StoredMessage::User(_) => {
+                        out.push(message_json_value_from_stored(&inner.message));
+                        continue;
+                    }
+                    // A `!!` bash record stays out of the model context.
+                    StoredMessage::BashExecution(bash) if bash.excluded() => continue,
+                    _ => {}
+                }
+            }
+        }
+        scratch.clear();
+        push_context_entry_messages(entry, edit, &mut scratch);
+        out.extend(scratch.iter().map(message_json_value));
+    }
+    out
+}
+
+fn message_json_value(message: &Message) -> JsonValue {
+    serde_json::to_value(message).unwrap_or(JsonValue::Null)
+}
+
+fn message_json_value_from_stored(message: &StoredMessage) -> JsonValue {
+    serde_json::to_value(message).unwrap_or(JsonValue::Null)
 }
 
 /// The current system message of a message list (upstream

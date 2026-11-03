@@ -323,16 +323,17 @@ fn resolve_sampling_params_falls_back_to_model_level_thinking_map() {
 
 #[test]
 fn construction_model_defaults_to_chat_type() {
-    let model = pir::ai::providers::construction::model(
-        "test",
-        "test-model",
-        "Test Model",
-        "openai-completions",
-        "https://example.test/v1",
-        1_000,
-        100,
-        vec!["text"],
-    );
+    let model =
+        pir::ai::providers::construction::model(pir::ai::providers::construction::ModelSpec {
+            provider: "test",
+            id: "test-model",
+            name: "Test Model",
+            api: "openai-completions",
+            base_url: "https://example.test/v1",
+            context_window: 1_000,
+            max_tokens: 100,
+            input: vec!["text"],
+        });
     assert_eq!(model.model_type, Some(ModelKind::Chat));
     let value = serde_json::to_value(&model).unwrap();
     assert_eq!(value["type"], json!("chat"));

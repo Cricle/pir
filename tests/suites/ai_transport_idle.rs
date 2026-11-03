@@ -164,12 +164,14 @@ async fn stalled_stream_body_hits_the_idle_timeout() {
     let mut delivered = Vec::new();
     let result = client
         .request_streaming(
-            reqwest::Method::GET,
-            &format!("http://{addr}/stream"),
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                reqwest::Method::GET,
+                &format!("http://{addr}/stream"),
+                &BTreeMap::new(),
+                None,
+                &ProviderStreamHooks::default(),
+            ),
             Vec::new(),
-            None,
-            &ProviderStreamHooks::default(),
             &mut |chunk| {
                 delivered.extend_from_slice(chunk);
                 Ok(())
@@ -223,12 +225,14 @@ async fn stalled_response_headers_hit_the_idle_timeout() {
 
     let result = client
         .request_streaming(
-            reqwest::Method::GET,
-            &format!("http://{addr}/stall"),
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                reqwest::Method::GET,
+                &format!("http://{addr}/stall"),
+                &BTreeMap::new(),
+                None,
+                &ProviderStreamHooks::default(),
+            ),
             Vec::new(),
-            None,
-            &ProviderStreamHooks::default(),
             &mut |_| Ok(()),
         )
         .await;
@@ -276,12 +280,14 @@ async fn expired_total_timeout_reports_the_configured_budget_not_the_poll_floor(
     let started = std::time::Instant::now();
     let error = client
         .request_streaming(
-            reqwest::Method::POST,
-            "https://example.invalid/v1/responses",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                reqwest::Method::POST,
+                "https://example.invalid/v1/responses",
+                &BTreeMap::new(),
+                None,
+                &ProviderStreamHooks::default(),
+            ),
             b"{}".to_vec(),
-            None,
-            &ProviderStreamHooks::default(),
             &mut |_chunk: &[u8]| Ok(()),
         )
         .await
@@ -348,12 +354,14 @@ async fn body_read_after_an_exhausted_deadline_reports_the_configured_budget() {
     let mut delivered = Vec::new();
     let error = client
         .request_streaming(
-            reqwest::Method::GET,
-            &format!("http://{addr}/stall-after-chunk"),
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                reqwest::Method::GET,
+                &format!("http://{addr}/stall-after-chunk"),
+                &BTreeMap::new(),
+                None,
+                &ProviderStreamHooks::default(),
+            ),
             Vec::new(),
-            None,
-            &ProviderStreamHooks::default(),
             &mut |chunk| {
                 delivered.extend_from_slice(chunk);
                 Ok(())
@@ -385,8 +393,12 @@ async fn body_read_after_an_exhausted_deadline_reports_the_configured_budget() {
 // ---------------------------------------------------------------------------
 //
 // MEMORY SHAPE: a JSON request body must be materialized once (`reqwest` owns
-// the bytes it sends), and an attempt that must keep the body for a possible
-// retry pays exactly ONE copy for that — never a copy per attempt. The former
+// the bytes it sends). The default reqwest transport MOVES it into one
+// `reqwest::Request` whose reusable `Bytes` body every retry replays via
+// `try_clone` (refcount only) — so even the default two-retry budget pays
+// ZERO body copies on a successful first attempt. The injection seam keeps
+// the historical rule: an attempt that must keep the body for a possible
+// retry pays exactly ONE `Vec` copy, never a copy per attempt. The former
 // shape cloned the whole body unconditionally inside the retry loop, so every
 // request (retried or not) carried a second full-size copy; on the
 // chunked-summarization path that meant a chunk-sized (~0.3 MB) allocation
@@ -523,8 +535,9 @@ async fn a_json_request_without_a_retry_budget_allocates_one_body_and_copies_non
 }
 
 /// A retried request serializes its body ONCE (the retry replays the kept
-/// bytes) and pays exactly one copy for keeping them; both attempts send the
-/// identical body.
+/// bytes) and shares that one body allocation across attempts — the default
+/// reqwest transport replays the request via `try_clone`, so no full-body
+/// copy is ever made; both attempts send the identical body.
 #[tokio::test]
 async fn a_retried_json_request_replays_the_kept_body_and_never_rebuilds_it() {
     let (url, bodies) = spawn_body_server(vec![429, 200]);
@@ -553,8 +566,14 @@ async fn a_retried_json_request_replays_the_kept_body_and_never_rebuilds_it() {
         "the body is serialized ONCE for both attempts: {diagnostics:?}"
     );
     assert_eq!(
-        diagnostics.copies, 1,
-        "exactly one copy keeps the body for the retry: {diagnostics:?}"
+        diagnostics.copies, 0,
+        "the retry shares the one reqwest body allocation (refcount, no copy): \
+         {diagnostics:?}"
+    );
+    assert_eq!(
+        client.payload_bytes_copied(),
+        0,
+        "no request-body bytes may be copied for a retry"
     );
     let bodies = payload_bodies(&bodies);
     assert_eq!(bodies.len(), 2, "two attempts reached the server");
@@ -563,4 +582,54 @@ async fn a_retried_json_request_replays_the_kept_body_and_never_rebuilds_it() {
         "a retry replays the SAME bytes (no re-serialization, no drift)"
     );
     assert_eq!(bodies[0], serde_json::to_vec(&payload).expect("serialize"));
+}
+
+/// R1-L2-003: the DEFAULT two-retry budget must not make a successful first
+/// attempt clone the request body. 1 MB, 10 MB and 50 MB payloads each report
+/// one serialization, zero body copies and zero copied bytes — the body is
+/// moved into one `reqwest` request whose reusable allocation is shared by
+/// any attempt that follows.
+#[tokio::test]
+async fn default_retry_budget_never_copies_a_successful_request_body() {
+    const SIZES: [usize; 3] = [1 << 20, 10 << 20, 50 << 20];
+    let (url, bodies) = spawn_body_server(vec![200; SIZES.len()]);
+    let client = payload_client(2);
+    for size in SIZES {
+        client.reset_payload_diagnostics();
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "z".repeat(size)}],
+        });
+        let result = client
+            .post_json_streaming(
+                &url,
+                &BTreeMap::new(),
+                &payload,
+                None,
+                &ProviderStreamHooks::default(),
+                &mut |_chunk| Ok(()),
+            )
+            .await;
+        assert!(result.is_ok(), "{size}-byte payload: {result:?}");
+        let diagnostics = client.payload_diagnostics();
+        assert_eq!(
+            diagnostics.allocations, 1,
+            "{size}-byte payload: exactly one serialization: {diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostics.copies, 0,
+            "{size}-byte payload: a successful first attempt under the default \
+             retry budget must not clone the body: {diagnostics:?}"
+        );
+        assert_eq!(
+            client.payload_bytes_copied(),
+            0,
+            "{size}-byte payload: no body bytes may be copied"
+        );
+        // Drop the server-side recording before the next, larger payload.
+        bodies
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+    }
 }

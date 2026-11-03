@@ -119,16 +119,18 @@ async fn nested_mutation_on_same_path_does_not_self_deadlock() {
     let sink: pir::agent::nested_tool_calls::NestedEventSink =
         Arc::new(|_event| Box::pin(async {}));
     let shared = pir::agent::nested_tool_calls::NestedShared::new(
-        Arc::new(registry.clone()),
-        scheduler.clone(),
-        None,
-        None,
-        cwd.clone(),
-        Some(AbortSignal::new()),
-        false,
-        sink,
-        None,
-        None,
+        pir::agent::nested_tool_calls::NestedSharedConfig {
+            registry: Arc::new(registry.clone()),
+            scheduler: scheduler.clone(),
+            hooks: None,
+            extensions: None,
+            cwd: cwd.clone(),
+            signal: Some(AbortSignal::new()),
+            sequential: false,
+            sink,
+            session_env: None,
+            callable: None,
+        },
     );
     let executor =
         pir::agent::nested_tool_calls::NestedToolExecutor::root(shared).for_call("call-outer");

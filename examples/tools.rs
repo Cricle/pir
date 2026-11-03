@@ -80,8 +80,17 @@ impl AgentTool for WordCount {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), SdkError> {
+fn main() -> std::process::ExitCode {
+    common::run_big_stack(async {
+        if let Err(error) = run().await {
+            eprintln!("error: {error:?}");
+            return std::process::ExitCode::FAILURE;
+        }
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+async fn run() -> Result<(), SdkError> {
     let (registry, model) = common::ScriptedProvider::registry(vec![
         common::tool_calls_message(&[
             (

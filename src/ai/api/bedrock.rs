@@ -30,7 +30,7 @@ use crate::ai::auth::ApiKeyAuth;
 use crate::ai::error::{AiError, AiResult};
 use crate::ai::event_stream::AssistantMessageEventStream;
 use crate::ai::provider::Provider;
-use crate::ai::transport::ProviderRequestClient;
+use crate::ai::transport::{ProviderRequestClient, StreamingRequest};
 use crate::ai::types::*;
 
 /// Placeholder the Anthropic path uses for empty required text
@@ -273,17 +273,17 @@ async fn bedrock_stream(
                 region = profile_region;
             }
         }
-        let signed = sigv4_sign(
-            "POST",
-            &url,
-            &headers,
-            &payload,
-            &resolved.credentials.access_key_id,
-            &resolved.credentials.secret_access_key,
-            resolved.credentials.session_token.as_deref(),
-            &region,
-            "bedrock",
-        )?;
+        let signed = sigv4_sign(&SigV4Request {
+            method: "POST",
+            url: &url,
+            headers: &headers,
+            payload: &payload,
+            access_key: &resolved.credentials.access_key_id,
+            secret_key: &resolved.credentials.secret_access_key,
+            session_token: resolved.credentials.session_token.as_deref(),
+            region: &region,
+            service: "bedrock",
+        })?;
         for (name, value) in signed {
             headers.insert(name, value);
         }
@@ -319,12 +319,14 @@ async fn bedrock_stream(
         );
         client
             .request_streaming_with(
-                reqwest::Method::POST,
-                &url,
-                &headers,
+                StreamingRequest::new(
+                    reqwest::Method::POST,
+                    &url,
+                    &headers,
+                    options.signal.as_ref(),
+                    &options.hooks,
+                ),
                 payload,
-                options.signal.as_ref(),
-                &options.hooks,
                 &mut on_chunk,
             )
             .await?
@@ -1705,24 +1707,49 @@ fn truncated_header() -> AiError {
 // SigV4 signing
 // ---------------------------------------------------------------------------
 
+/// The inputs of one SigV4-signed request: the HTTP request being signed
+/// (method, URL, caller headers, body) plus the AWS credentials and signing
+/// scope.
+///
+/// Bundling them keeps the two entry points (fresh `x-amz-date` vs. a
+/// caller-supplied one) from repeating the same nine positional parameters.
+pub struct SigV4Request<'a> {
+    /// HTTP method, upper-case.
+    pub method: &'a str,
+    /// Absolute request URL (scheme, authority, path, query).
+    pub url: &'a str,
+    /// Caller headers; every one except `authorization` is signed.
+    pub headers: &'a BTreeMap<String, String>,
+    /// Request body bytes (hashed into the canonical request).
+    pub payload: &'a [u8],
+    /// AWS access key id.
+    pub access_key: &'a str,
+    /// AWS secret access key.
+    pub secret_key: &'a str,
+    /// Optional session token (`x-amz-security-token`).
+    pub session_token: Option<&'a str>,
+    /// AWS region for the credential scope.
+    pub region: &'a str,
+    /// AWS service for the credential scope (`bedrock`, `sts`, ...).
+    pub service: &'a str,
+}
+
 /// AWS SigV4 request signing. Returns the headers to add
 /// (`x-amz-date`, optional `x-amz-security-token`, `authorization`).
 /// All caller headers except `authorization` participate in the signature.
 /// Public for tests/.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn sigv4_sign(
-    method: &str,
-    url: &str,
-    headers: &BTreeMap<String, String>,
-    payload: &[u8],
-    access_key: &str,
-    secret_key: &str,
-    session_token: Option<&str>,
-    region: &str,
-    service: &str,
-) -> AiResult<Vec<(String, String)>> {
+pub(crate) fn sigv4_sign(request: &SigV4Request<'_>) -> AiResult<Vec<(String, String)>> {
     let amz_date = amz_now();
-    sigv4_sign_at(
+    sigv4_sign_at(request, &amz_date)
+}
+
+/// [`sigv4_sign`] with an explicit `x-amz-date` (deterministic signature
+/// vectors). Public for tests/.
+pub fn sigv4_sign_at(
+    request: &SigV4Request<'_>,
+    amz_date: &str,
+) -> AiResult<Vec<(String, String)>> {
+    let SigV4Request {
         method,
         url,
         headers,
@@ -1732,25 +1759,7 @@ pub(crate) fn sigv4_sign(
         session_token,
         region,
         service,
-        &amz_date,
-    )
-}
-
-/// [`sigv4_sign`] with an explicit `x-amz-date` (deterministic signature
-/// vectors). Public for tests/.
-#[allow(clippy::too_many_arguments)]
-pub fn sigv4_sign_at(
-    method: &str,
-    url: &str,
-    headers: &BTreeMap<String, String>,
-    payload: &[u8],
-    access_key: &str,
-    secret_key: &str,
-    session_token: Option<&str>,
-    region: &str,
-    service: &str,
-    amz_date: &str,
-) -> AiResult<Vec<(String, String)>> {
+    } = *request;
     let (host, canonical_uri, canonical_query) = split_url(url)?;
     let payload_hash = sha256_hex(payload);
 

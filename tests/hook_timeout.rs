@@ -17,7 +17,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use pir::extensions::{ExtensionConfig, ExtensionHandle};
+use pir::config::settings::{ExtensionLimitsSettings, Settings};
+use pir::extensions::limits::{ExtensionLimits, MAX_TIMEOUT};
+use pir::extensions::{
+    ExtensionConfig, ExtensionHandle, ENV_BEFORE_AGENT_START_TIMEOUT_MS, ENV_CALL_TIMEOUT_MS,
+    ENV_HOOK_TIMEOUT_MS,
+};
 
 /// Short per-call deadline the tests install via `set_call_timeout`.
 const SHORT_TIMEOUT: Duration = Duration::from_millis(150);
@@ -156,6 +161,77 @@ async fn reserved_route_hook_runs_under_the_long_hook_deadline() {
         elapsed >= Duration::from_millis(HOOK_SLEEP_MS),
         "route hook ran {elapsed:?}; it must complete past the short per-call deadline"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Oversized timeout configuration (u64::MAX): clamp to 24 h, no panic
+// ---------------------------------------------------------------------------
+
+/// `extensionLimits.callTimeoutMs` / `hookTimeoutMs` /
+/// `beforeAgentStartTimeoutMs` at `u64::MAX` clamp to [`MAX_TIMEOUT`] and say
+/// so in the diagnostics; they must never reach `Instant + Duration`.
+#[test]
+fn oversized_settings_timeouts_clamp_to_24h() {
+    let settings = Settings {
+        extension_limits: Some(ExtensionLimitsSettings {
+            call_timeout_ms: Some(u64::MAX),
+            hook_timeout_ms: Some(u64::MAX),
+            before_agent_start_timeout_ms: Some(u64::MAX),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (limits, diagnostics) = ExtensionLimits::from_settings(&settings);
+    assert_eq!(limits.call_timeout, MAX_TIMEOUT);
+    assert_eq!(limits.hook_timeout, MAX_TIMEOUT);
+    assert_eq!(limits.before_agent_start_timeout, MAX_TIMEOUT);
+    assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|line| line.contains("clamped to 24 h")),
+        "{diagnostics:?}"
+    );
+}
+
+/// The `PI_EXT_*_TIMEOUT_MS` environment overrides use the same clamp and
+/// emit the same diagnostics.
+#[test]
+fn oversized_env_timeouts_clamp_to_24h() {
+    let raw = u64::MAX.to_string();
+    let (limits, diagnostics) = ExtensionLimits::default().apply_env(&[
+        (ENV_CALL_TIMEOUT_MS, raw.as_str()),
+        (ENV_HOOK_TIMEOUT_MS, raw.as_str()),
+        (ENV_BEFORE_AGENT_START_TIMEOUT_MS, raw.as_str()),
+    ]);
+    assert_eq!(limits.call_timeout, MAX_TIMEOUT);
+    assert_eq!(limits.hook_timeout, MAX_TIMEOUT);
+    assert_eq!(limits.before_agent_start_timeout, MAX_TIMEOUT);
+    assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|line| line.contains("clamped to 24 h")),
+        "{diagnostics:?}"
+    );
+}
+
+/// `ExtensionHandle::set_call_timeout(Duration::MAX)` stores the 24 h ceiling
+/// (not `Duration::MAX`), and the next dispatch arms the QuickJS deadline
+/// from it and completes instead of panicking.
+#[tokio::test(flavor = "current_thread")]
+async fn duration_max_call_timeout_is_clamped_and_usable() {
+    let (dir, handle) = load_hook_extension("clamp").await;
+    handle.set_call_timeout(Duration::MAX);
+    assert_eq!(handle.call_timeout(), MAX_TIMEOUT);
+
+    let result = handle
+        .call_tool("slowLoadoutTool", "call-clamp", &json!({}))
+        .await
+        .expect("a clamped deadline must not break the dispatch");
+    assert_eq!(result.content[0].text, "ok");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

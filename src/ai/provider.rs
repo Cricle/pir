@@ -333,6 +333,35 @@ pub struct ProviderRegistry {
     /// lookup; see
     /// [`crate::ai::providers::RegisterDynamicProviderShared`].
     pub(crate) dynamic: std::sync::RwLock<BTreeMap<String, ProviderBox>>,
+    /// Session-scoped dynamic overlay (SNAP8 P2-1): each session that shares
+    /// this registry records the dynamic/OAuth providers it built in its own
+    /// slot. A lookup made with that session's [`ProviderSessionKey`] consults
+    /// the slot first, so a subagent child overwriting the process-shared
+    /// `dynamic` map cannot change which provider (and OAuth flow/runtime) the
+    /// parent's `/login`, credential refresh, or model request resolves while
+    /// the child is alive.
+    session_dynamic: std::sync::RwLock<BTreeMap<ProviderSessionKey, SessionDynamicProviders>>,
+    /// Last session that installed each dynamic id into the process-shared
+    /// map, plus the exact allocation it installed. A session-aware lookup
+    /// skips a shared entry whose recorded owner is a DIFFERENT live session
+    /// (and which is still the recorded allocation); entries installed by
+    /// external/registry-wide code (owner record stale, dead, or missing)
+    /// remain visible to every session.
+    session_dynamic_owners: std::sync::RwLock<BTreeMap<String, SessionDynamicOwner>>,
+    /// Typed providers registered by plugins through
+    /// [`crate::plugins::services::ProviderService::register_provider_impl`].
+    ///
+    /// Each registration records the owning binding, so a parent and a child
+    /// session sharing this registry can register the same provider id without
+    /// one session's teardown deleting the other's entry. Entries stack per
+    /// id in registration order; the newest registration wins while it is
+    /// live, and removing it reveals the previous owner's entry.
+    ///
+    /// This table is consulted BEFORE [`Self::dynamic`] and the static map: an
+    /// explicit `Provider` implementation outranks a JSON/config overlay for
+    /// the same id. A JS/plugin JSON definition therefore never silently
+    /// replaces a typed native provider.
+    plugin_owned: std::sync::RwLock<BTreeMap<String, Vec<PluginProviderEntry>>>,
     /// Virtual-model overlay (upstream `ModelRuntime.virtualModels`):
     /// extension-registered catalog entries that route every request to a
     /// physical model. Additive to `providers`/`dynamic`; see
@@ -356,11 +385,156 @@ pub struct ProviderRegistry {
     refresh_state: Arc<std::sync::Mutex<BTreeMap<String, RefreshState>>>,
 }
 
+/// One plugin-owned provider registration.
+#[derive(Clone)]
+struct PluginProviderEntry {
+    /// Process-unique owner binding (the live `ProviderService` that
+    /// registered it). Teardown removes exactly this owner's entries.
+    owner: u64,
+    /// The session whose provider service registered this entry. `None` keeps
+    /// the pre-SNAP8 registry-wide visibility (programmatic registrations that
+    /// do not belong to a session), while a child/service entry is invisible
+    /// to a lookup made for a different session.
+    session: Option<ProviderSessionKey>,
+    provider: ProviderBox,
+}
+
+/// The identity of one `AgentSession` for provider resolution.
+///
+/// The key is scoped by the registry's process-unique id plus the session's
+/// `session_state` allocation. Two sessions sharing a registry (a parent and
+/// its subagent children, or parallel siblings) therefore have distinct keys,
+/// while each session keeps the same key for its whole lifetime. The `Weak`
+/// liveness token lets the registry prune a dead session's overlay instead of
+/// pinning its provider (and extension runtime) forever.
+#[derive(Clone)]
+pub struct ProviderSessionKey {
+    scope: u64,
+    session: std::sync::Weak<std::sync::atomic::AtomicU8>,
+    session_ptr: usize,
+}
+
+impl std::fmt::Debug for ProviderSessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSessionKey")
+            .field("scope", &self.scope)
+            .field("session", &self.session_ptr)
+            .finish()
+    }
+}
+
+impl PartialEq for ProviderSessionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.scope == other.scope && self.session_ptr == other.session_ptr
+    }
+}
+
+impl Eq for ProviderSessionKey {}
+
+impl PartialOrd for ProviderSessionKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ProviderSessionKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.scope, self.session_ptr).cmp(&(other.scope, other.session_ptr))
+    }
+}
+
+impl std::hash::Hash for ProviderSessionKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.scope.hash(state);
+        self.session_ptr.hash(state);
+    }
+}
+
+impl ProviderSessionKey {
+    /// Build the key for `session` in a registry with `scope`.
+    pub(crate) fn new(scope: u64, session: &Arc<std::sync::atomic::AtomicU8>) -> Self {
+        Self {
+            scope,
+            session: Arc::downgrade(session),
+            session_ptr: Arc::as_ptr(session) as usize,
+        }
+    }
+
+    /// Whether the owning session is still alive.
+    pub(crate) fn is_live(&self) -> bool {
+        self.session.strong_count() > 0
+    }
+}
+
+/// A standalone provider-session scope for hosts without an `AgentSession`
+/// (the print host).
+///
+/// Holds the liveness token the key only weakly references, so a key cloned
+/// out of [`Self::key`] stays resolvable for as long as the scope lives. The
+/// key has no overlay of its own: lookups fall through to the shared dynamic
+/// map and the static registry, while entries owned by another live session
+/// are skipped exactly like an `AgentSession` request.
+pub struct ProviderSessionScope {
+    _liveness: Arc<std::sync::atomic::AtomicU8>,
+    key: ProviderSessionKey,
+}
+
+impl ProviderSessionScope {
+    /// The scoped key for [`ProviderRegistry::stream_resolving_auth_for`].
+    pub fn key(&self) -> &ProviderSessionKey {
+        &self.key
+    }
+}
+
+/// One live session's dynamic provider slot.
+#[derive(Clone)]
+struct SessionDynamicProviders {
+    /// Liveness token mirrors the key; a dead session's slot is pruned on the
+    /// next registry access so a provider cannot be pinned after its owner
+    /// session is gone.
+    session: std::sync::Weak<std::sync::atomic::AtomicU8>,
+    providers: BTreeMap<String, ProviderBox>,
+    /// Ids installed by the session's definition sync. Only these are subject
+    /// to the sync's "definition removed" sweep; native service registrations
+    /// sharing the same session overlay must survive a prompt sync that does
+    /// not know about them.
+    sync_ids: std::collections::BTreeSet<String>,
+}
+
+/// The last session that wrote one id into the process-shared dynamic map.
+#[derive(Clone)]
+struct SessionDynamicOwner {
+    session: std::sync::Weak<std::sync::atomic::AtomicU8>,
+    provider: std::sync::Weak<dyn Provider>,
+}
+
+fn retain_live_session_dynamic(
+    overlays: &mut BTreeMap<ProviderSessionKey, SessionDynamicProviders>,
+) {
+    overlays.retain(|key, overlay| key.is_live() && overlay.session.strong_count() > 0);
+}
+
+fn retain_live_session_dynamic_owners(owners: &mut BTreeMap<String, SessionDynamicOwner>) {
+    owners.retain(|_, owner| owner.session.strong_count() > 0);
+}
+
 /// One provider's in-flight refresh bookkeeping.
 #[derive(Clone)]
 struct RefreshState {
     generation: u64,
     controller: crate::ai::types::AbortSignal,
+}
+
+/// Inputs for one [`ProviderRegistry::refresh_context`] phase.
+struct RefreshContextInput<'a> {
+    provider_id: &'a str,
+    provider: &'a ProviderBox,
+    credential: Option<StoredCredential>,
+    stored: Option<ModelsStoreEntry>,
+    allow_network: bool,
+    force: Option<bool>,
+    generation: u64,
+    signal: &'a crate::ai::types::AbortSignal,
 }
 
 impl ProviderRegistry {
@@ -371,6 +545,9 @@ impl ProviderRegistry {
             providers: BTreeMap::new(),
             scope_id: NEXT_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             dynamic: std::sync::RwLock::new(BTreeMap::new()),
+            session_dynamic: std::sync::RwLock::new(BTreeMap::new()),
+            session_dynamic_owners: std::sync::RwLock::new(BTreeMap::new()),
+            plugin_owned: std::sync::RwLock::new(BTreeMap::new()),
             virtual_models: crate::ai::virtual_::VirtualModelRegistry::new(),
             credentials,
             auth_context,
@@ -379,6 +556,39 @@ impl ProviderRegistry {
             identity: None,
             refresh_state: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Create a standalone session scope for a host without an
+    /// [`AgentSession`](crate::agent_session::AgentSession) (print).
+    ///
+    /// The returned scope owns the liveness token; pass
+    /// [`ProviderSessionScope::key`] to [`Self::stream_resolving_auth_for`] so
+    /// a provider entry owned by another live session cannot redirect this
+    /// host's request. Entries with no session owner (print's own shared
+    /// registrations, static providers) stay visible.
+    pub fn standalone_provider_session(&self) -> ProviderSessionScope {
+        let liveness = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        ProviderSessionScope {
+            key: ProviderSessionKey::new(self.scope_id, &liveness),
+            _liveness: liveness,
+        }
+    }
+
+    /// Test seam: install one provider as another live session's shared
+    /// dynamic entry (the shape `AgentSession::sync_plugin_providers` leaves
+    /// behind). Used to pin cross-session request isolation.
+    #[doc(hidden)]
+    pub fn register_session_owned_dynamic_provider_for_test(
+        &self,
+        session: &ProviderSessionKey,
+        id: &str,
+        provider: ProviderBox,
+    ) {
+        self.dynamic
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_owned(), provider.clone());
+        self.note_session_dynamic_owner(session, id, &provider);
     }
 
     /// Attach the catalog store used by [`Self::refresh`] (upstream
@@ -425,18 +635,325 @@ impl ProviderRegistry {
         self.auth_storage.as_ref()
     }
 
-    /// Look up a provider by id: dynamic (extension-registered) entries win
-    /// over statically registered ones.
+    /// Look up a provider by id: plugin-owned typed entries win over dynamic
+    /// (extension JSON) entries, which win over statically registered ones.
+    ///
+    /// With a [`ProviderSessionKey`], the lookup is session-scoped: the
+    /// requester's own dynamic slot wins over entries installed for another
+    /// session (SNAP8 P2-1). Entries that belong to no session (static,
+    /// registry-wide dynamic, or programmatic plugin registrations) keep their
+    /// usual visibility.
     fn provider_box(&self, id: &str) -> Option<ProviderBox> {
+        self.provider_box_for(None, id)
+    }
+
+    /// [`Self::provider_box`] with an optional requester session.
+    fn provider_box_for(
+        &self,
+        session: Option<&ProviderSessionKey>,
+        id: &str,
+    ) -> Option<ProviderBox> {
+        // An explicitly named session whose liveness token is gone resolves
+        // nothing: falling through to the global map would hand a finished
+        // child (or a stale key) another session's provider.
+        let session_requested = session.is_some();
+        let session = session.filter(|session| session.is_live());
+        if session_requested && session.is_none() {
+            return None;
+        }
+        {
+            let plugin_owned = self
+                .plugin_owned
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = plugin_owned.get(id).and_then(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|entry| match (&entry.session, session) {
+                        (None, _) => true,
+                        (Some(owner), Some(requester)) => owner.is_live() && owner == requester,
+                        (Some(owner), None) => owner.is_live(),
+                    })
+            }) {
+                return Some(entry.provider.clone());
+            }
+        }
+        if let Some(session) = session {
+            if let Some(provider) = self.session_dynamic_provider(session, id) {
+                return Some(provider);
+            }
+        }
         if let Some(provider) = self
             .dynamic
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(id)
         {
-            return Some(provider.clone());
+            let foreign = session
+                .is_some_and(|session| self.dynamic_owned_by_other_session(session, id, provider));
+            if !foreign {
+                return Some(provider.clone());
+            }
         }
         self.providers.get(id).cloned()
+    }
+
+    /// Test seam: resolve a provider exactly like the request path
+    /// ([`Self::stream_resolving_auth`]) does. Used to pin that a subagent
+    /// child's teardown restores the parent's dynamic provider for the
+    /// parent's next model request (SNAP6 P1-1).
+    #[doc(hidden)]
+    pub fn provider_box_for_test(&self, id: &str) -> Option<ProviderBox> {
+        self.provider_box(id)
+    }
+
+    /// Test seam: resolve a provider as a specific live session's request /
+    /// `/login` / credential refresh would (SNAP8 P2-1).
+    #[doc(hidden)]
+    pub fn provider_box_for_session_for_test(
+        &self,
+        session: &ProviderSessionKey,
+        id: &str,
+    ) -> Option<ProviderBox> {
+        self.provider_box_for(Some(session), id)
+    }
+
+    /// Record one provider in a session's dynamic overlay. The process-shared
+    /// map is left untouched: the session-aware paths see this entry first,
+    /// while session-aware lookups for other sessions skip the shared entries
+    /// this session owns.
+    pub(crate) fn register_session_dynamic_provider(
+        &self,
+        session: &ProviderSessionKey,
+        id: &str,
+        provider: &ProviderBox,
+    ) {
+        self.register_session_dynamic_provider_inner(session, id, provider, false);
+    }
+
+    /// [`Self::register_session_dynamic_provider`] for the per-prompt
+    /// definition sync. The id is recorded as sync-owned so a later full pass
+    /// can drop it when the definition disappears without touching native
+    /// service entries in the same overlay.
+    pub(crate) fn record_session_sync_dynamic_provider(
+        &self,
+        session: &ProviderSessionKey,
+        id: &str,
+        provider: &ProviderBox,
+    ) {
+        self.register_session_dynamic_provider_inner(session, id, provider, true);
+    }
+
+    fn register_session_dynamic_provider_inner(
+        &self,
+        session: &ProviderSessionKey,
+        id: &str,
+        provider: &ProviderBox,
+        sync_owned: bool,
+    ) {
+        self.note_session_dynamic_owner(session, id, provider);
+        let mut overlays = self
+            .session_dynamic
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retain_live_session_dynamic(&mut overlays);
+        let overlay = overlays
+            .entry(session.clone())
+            .or_insert_with(|| SessionDynamicProviders {
+                session: session.session.clone(),
+                providers: BTreeMap::new(),
+                sync_ids: std::collections::BTreeSet::new(),
+            });
+        overlay.providers.insert(id.to_owned(), provider.clone());
+        if sync_owned {
+            overlay.sync_ids.insert(id.to_owned());
+        }
+    }
+
+    /// Remove one id from a session's dynamic overlay (service/provider
+    /// unregister).
+    /// Remove a session overlay entry only while it is still `installed`.
+    /// A native service unregistering its runtime JSON registration must not
+    /// delete the session sync's own provider for the same id.
+    pub(crate) fn remove_session_dynamic_provider_if_installed(
+        &self,
+        session: &ProviderSessionKey,
+        id: &str,
+        installed: &std::sync::Weak<dyn Provider>,
+    ) {
+        let Some(installed) = installed.upgrade() else {
+            return;
+        };
+        self.remove_session_dynamic_provider_if(session, id, |current| {
+            Arc::ptr_eq(current, &installed)
+        });
+    }
+
+    fn remove_session_dynamic_provider_if(
+        &self,
+        session: &ProviderSessionKey,
+        id: &str,
+        matches: impl FnOnce(&ProviderBox) -> bool,
+    ) {
+        let mut overlays = self
+            .session_dynamic
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retain_live_session_dynamic(&mut overlays);
+        if let Some(overlay) = overlays.get_mut(session) {
+            if overlay.providers.get(id).is_some_and(matches) {
+                overlay.providers.remove(id);
+                overlay.sync_ids.remove(id);
+            }
+            if overlay.providers.is_empty() {
+                overlays.remove(session);
+            }
+        }
+    }
+
+    /// Drop every dynamic overlay entry a session installed (session
+    /// teardown).
+    pub(crate) fn clear_session_dynamic_providers(&self, session: &ProviderSessionKey) {
+        self.clear_session_dynamic_owners(session);
+        let mut overlays = self
+            .session_dynamic
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retain_live_session_dynamic(&mut overlays);
+        overlays.remove(session);
+    }
+
+    /// Keep only the ids a completed sync pass installed. Called after a
+    /// fully-applied non-live pass, so a definition removed from the plugin
+    /// registry no longer shadows the static/global fallback.
+    pub(crate) fn retain_session_dynamic_providers(
+        &self,
+        session: &ProviderSessionKey,
+        keep: &[String],
+    ) {
+        let mut overlays = self
+            .session_dynamic
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retain_live_session_dynamic(&mut overlays);
+        let Some(overlay) = overlays.get_mut(session) else {
+            return;
+        };
+        overlay
+            .providers
+            .retain(|id, _| !overlay.sync_ids.contains(id) || keep.iter().any(|kept| kept == id));
+        overlay
+            .sync_ids
+            .retain(|id| keep.iter().any(|kept| kept == id));
+        if overlay.providers.is_empty() {
+            overlays.remove(session);
+        }
+    }
+
+    /// One session's dynamic provider for `id`, when its overlay is live.
+    pub(crate) fn session_dynamic_provider(
+        &self,
+        session: &ProviderSessionKey,
+        id: &str,
+    ) -> Option<ProviderBox> {
+        let mut overlays = self
+            .session_dynamic
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retain_live_session_dynamic(&mut overlays);
+        overlays
+            .get(session)
+            .and_then(|overlay| overlay.providers.get(id))
+            .cloned()
+    }
+
+    /// Every id this session currently overlays.
+    fn session_dynamic_ids(&self, session: &ProviderSessionKey) -> Vec<String> {
+        let mut overlays = self
+            .session_dynamic
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retain_live_session_dynamic(&mut overlays);
+        overlays
+            .get(session)
+            .map(|overlay| overlay.providers.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Remember that `session` wrote `provider` into the process-shared
+    /// dynamic map. The exact allocation is recorded so a later external
+    /// overwrite invalidates the record instead of hiding that entry.
+    pub(crate) fn note_session_dynamic_owner(
+        &self,
+        session: &ProviderSessionKey,
+        id: &str,
+        provider: &ProviderBox,
+    ) {
+        let mut owners = self
+            .session_dynamic_owners
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retain_live_session_dynamic_owners(&mut owners);
+        owners.insert(
+            id.to_owned(),
+            SessionDynamicOwner {
+                session: session.session.clone(),
+                provider: Arc::downgrade(provider),
+            },
+        );
+    }
+
+    /// Whether the shared dynamic entry for `id` is currently owned by a
+    /// different live session. External/registry-wide overwrites leave the
+    /// owner record stale (dead weak or a different allocation), which keeps
+    /// them visible to every session.
+    fn dynamic_owned_by_other_session(
+        &self,
+        session: &ProviderSessionKey,
+        id: &str,
+        current: &ProviderBox,
+    ) -> bool {
+        let mut owners = self
+            .session_dynamic_owners
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retain_live_session_dynamic_owners(&mut owners);
+        let Some(owner) = owners.get(id) else {
+            return false;
+        };
+        if owner.session.strong_count() == 0
+            || std::sync::Weak::ptr_eq(&owner.session, &session.session)
+        {
+            return false;
+        }
+        owner
+            .provider
+            .upgrade()
+            .is_some_and(|installed| Arc::ptr_eq(&installed, current))
+    }
+
+    fn clear_session_dynamic_owners(&self, session: &ProviderSessionKey) {
+        let mut owners = self
+            .session_dynamic_owners
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners.retain(|_, owner| {
+            owner.session.strong_count() > 0
+                && !std::sync::Weak::ptr_eq(&owner.session, &session.session)
+        });
+    }
+
+    /// The dynamic (extension/JSON) overlay entry currently installed for
+    /// `id`, if any. A session-owned registration captures the allocation it
+    /// is about to displace so teardown can restore it when parent and child
+    /// share this registry (SNAP6's previous-entry pattern).
+    pub(crate) fn dynamic_provider(&self, id: &str) -> Option<ProviderBox> {
+        self.dynamic
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
     }
 
     /// Register a provider (upsert by provider id). An in-flight refresh for
@@ -445,6 +962,109 @@ impl ProviderRegistry {
         let id = provider.id().to_string();
         self.supersede_refresh(&id);
         self.providers.insert(id, provider);
+    }
+
+    /// Register a typed provider owned by one plugin-service binding.
+    ///
+    /// Registrations stack per id: the newest owner wins, and a
+    /// re-registration by the same owner replaces that owner's slot instead of
+    /// growing the stack. Unlike [`Self::set_provider`], this does not touch
+    /// the static map, so a later sibling/parent registration is never
+    /// mistaken for a static catalog entry. The returned box is the exact
+    /// allocation stored in the table.
+    ///
+    /// An in-flight refresh for the same id is superseded, matching the other
+    /// provider-registration paths.
+    pub fn register_plugin_provider(&self, owner: u64, provider: ProviderBox) -> ProviderBox {
+        self.register_plugin_provider_entry(owner, None, provider)
+    }
+
+    /// [`Self::register_plugin_provider`] for a session-owned service binding:
+    /// a lookup made for a different session skips this entry while its owner
+    /// is alive (SNAP8 P2-1: parent and child/siblings never see each other's
+    /// typed providers).
+    pub(crate) fn register_plugin_provider_for_session(
+        &self,
+        owner: u64,
+        session: &ProviderSessionKey,
+        provider: ProviderBox,
+    ) -> ProviderBox {
+        self.register_plugin_provider_entry(owner, Some(session.clone()), provider)
+    }
+
+    fn register_plugin_provider_entry(
+        &self,
+        owner: u64,
+        session: Option<ProviderSessionKey>,
+        provider: ProviderBox,
+    ) -> ProviderBox {
+        let id = provider.id().to_string();
+        self.supersede_refresh(&id);
+        let mut entries = self
+            .plugin_owned
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slots = entries.entry(id).or_default();
+        if let Some(slot) = slots.iter_mut().find(|entry| entry.owner == owner) {
+            slot.session = session;
+            slot.provider = provider.clone();
+        } else {
+            slots.push(PluginProviderEntry {
+                owner,
+                session,
+                provider: provider.clone(),
+            });
+        }
+        provider
+    }
+
+    /// Remove one owner's typed registration for `id`.
+    ///
+    /// Only the named owner's slot is removed: a parent/sibling registration
+    /// of the same id (another owner, or a later re-registration by this
+    /// owner) is left untouched. Returns whether an entry was removed.
+    pub fn unregister_plugin_provider(&self, owner: u64, id: &str) -> bool {
+        let mut entries = self
+            .plugin_owned
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(slots) = entries.get_mut(id) else {
+            return false;
+        };
+        let before = slots.len();
+        slots.retain(|entry| entry.owner != owner);
+        let removed = slots.len() != before;
+        if slots.is_empty() {
+            entries.remove(id);
+        }
+        removed
+    }
+
+    /// Remove every typed registration installed by `owner` (session/service
+    /// teardown). Returns the number of entries removed.
+    pub fn unregister_plugin_provider_owner(&self, owner: u64) -> usize {
+        let mut entries = self
+            .plugin_owned
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut removed = 0;
+        entries.retain(|_, slots| {
+            let before = slots.len();
+            slots.retain(|entry| entry.owner != owner);
+            removed += before - slots.len();
+            !slots.is_empty()
+        });
+        removed
+    }
+
+    /// The typed provider currently winning for `id`, when one is registered.
+    pub fn plugin_provider(&self, id: &str) -> Option<ProviderBox> {
+        self.plugin_owned
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .and_then(|entries| entries.last())
+            .map(|entry| entry.provider.clone())
     }
 
     /// Register a typed native provider-auth hook (login/refresh/logout) for
@@ -477,8 +1097,21 @@ impl ProviderRegistry {
         crate::plugins::services::provider_auth_hook_registry().get(provider_id)
     }
 
-    /// All registered providers (dynamic/extension providers first).
+    /// All registered providers (plugin-owned typed entries first, then
+    /// dynamic/extension providers, then the static catalog).
     pub fn providers(&self) -> Vec<ProviderBox> {
+        let plugin_owned = self
+            .plugin_owned
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let plugin_winners: BTreeMap<String, ProviderBox> = plugin_owned
+            .iter()
+            .filter_map(|(id, entries)| {
+                entries
+                    .last()
+                    .map(|entry| (id.clone(), entry.provider.clone()))
+            })
+            .collect();
         let dynamic = self
             .dynamic
             .read()
@@ -487,15 +1120,23 @@ impl ProviderRegistry {
             .values()
             .map(|provider| provider.id().to_owned())
             .collect();
-        let mut providers = dynamic.values().cloned().collect::<Vec<_>>();
+        let mut providers = plugin_winners.values().cloned().collect::<Vec<_>>();
         // A dynamic/extension registration overrides the static catalog entry
         // for the same id; returning both would duplicate every model in
         // `get_models`/`get_available` and let the stale static entry win some
-        // lookups.
+        // lookups. Plugin-owned typed entries outrank both.
+        providers.extend(
+            dynamic
+                .values()
+                .filter(|provider| !plugin_winners.contains_key(provider.id()))
+                .cloned(),
+        );
         providers.extend(
             self.providers
                 .iter()
-                .filter(|(id, _)| !dynamic_ids.contains(*id))
+                .filter(|(id, _)| {
+                    !plugin_winners.contains_key(id.as_str()) && !dynamic_ids.contains(id.as_str())
+                })
                 .map(|(_, provider)| provider.clone()),
         );
         providers
@@ -524,6 +1165,22 @@ impl ProviderRegistry {
     /// Models from a single provider.
     pub fn get_provider_models(&self, provider_id: &str) -> Vec<Model> {
         match self.provider_box(provider_id) {
+            Some(provider) => provider.get_models(),
+            None => Vec::new(),
+        }
+    }
+
+    /// [`Self::get_provider_models`] for one session: the provider is
+    /// resolved through the session overlay and its session-tagged typed
+    /// entries first, so parent and child registering the same provider id
+    /// with different model ids each see their own catalog (SNAP9
+    /// P2-S8-3).
+    pub(crate) fn get_provider_models_for_session(
+        &self,
+        session: &ProviderSessionKey,
+        provider_id: &str,
+    ) -> Vec<Model> {
+        match self.provider_box_for(Some(session), provider_id) {
             Some(provider) => provider.get_models(),
             None => Vec::new(),
         }
@@ -566,6 +1223,30 @@ impl ProviderRegistry {
             return Some(registration.catalog_model(physical.as_ref()));
         }
         self.get_provider_models(provider_id)
+            .into_iter()
+            .find(|m| m.id == model_id)
+    }
+
+    /// [`Self::get_model`] for one session: the existence/catalog check is
+    /// made against the session's own provider allocation, not the
+    /// process-shared last writer. A native `ProviderService::complete`
+    /// called from the parent must not report the child's different model id
+    /// as "unknown model" (SNAP9 P2-S8-3).
+    pub(crate) fn get_model_for_session(
+        &self,
+        session: &ProviderSessionKey,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Option<Model> {
+        // Virtual models are registry-wide catalog entries (not session
+        // registrations), so keep the same overlay precedence as
+        // `get_model`; only the physical provider lookup is session-scoped.
+        if let Some(registration) = self.virtual_models.get(provider_id, model_id) {
+            let physical =
+                self.get_physical_model(&registration.physical.provider, &registration.physical.id);
+            return Some(registration.catalog_model(physical.as_ref()));
+        }
+        self.get_provider_models_for_session(session, provider_id)
             .into_iter()
             .find(|m| m.id == model_id)
     }
@@ -632,6 +1313,18 @@ impl ProviderRegistry {
         self.resolve_auth(model, None).await
     }
 
+    /// [`Self::get_auth`] for one session: the provider is resolved through
+    /// the session overlay first, so a child/sibling that overwrote the shared
+    /// dynamic map cannot change which OAuth flow (and extension runtime) a
+    /// parent request refreshes (SNAP8 P2-1).
+    pub async fn get_auth_for_session(
+        &self,
+        session: &ProviderSessionKey,
+        model: &Model,
+    ) -> AiResult<Option<crate::ai::types::AuthResult>> {
+        self.resolve_auth_for(Some(session), model, None).await
+    }
+
     /// [`Self::get_auth`] with the request's explicit api-key override
     /// (upstream `AuthResolutionOverrides.apiKey`): an override resolves
     /// through the provider's api-key auth and BYPASSES the stored credential,
@@ -642,7 +1335,18 @@ impl ProviderRegistry {
         model: &Model,
         api_key_override: Option<&str>,
     ) -> AiResult<Option<crate::ai::types::AuthResult>> {
-        let Some(provider) = self.provider_box(&model.provider) else {
+        self.resolve_auth_for(None, model, api_key_override).await
+    }
+
+    /// [`Self::resolve_auth`] with an optional requester session used for
+    /// provider-box resolution.
+    async fn resolve_auth_for(
+        &self,
+        session: Option<&ProviderSessionKey>,
+        model: &Model,
+        api_key_override: Option<&str>,
+    ) -> AiResult<Option<crate::ai::types::AuthResult>> {
+        let Some(provider) = self.provider_box_for(session, &model.provider) else {
             return Err(AiError::UnknownProvider(model.provider.clone()));
         };
         if let Some(key) = api_key_override.filter(|key| !key.trim().is_empty()) {
@@ -895,6 +1599,20 @@ impl ProviderRegistry {
         context: impl Into<Arc<Context>>,
         options: StreamOptions,
     ) -> AssistantMessageEventStream {
+        self.stream_resolving_auth_for(None, model, context, options)
+    }
+
+    /// [`Self::stream_resolving_auth`] for one session: provider lookup and
+    /// the auth-resolution step that may refresh an OAuth credential both use
+    /// the session overlay (SNAP8 P2-1).
+    pub fn stream_resolving_auth_for(
+        &self,
+        session: Option<&ProviderSessionKey>,
+        model: Model,
+        context: impl Into<Arc<Context>>,
+        options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        let session = session.cloned();
         let context = context.into();
         let outer = AssistantMessageEventStream::new();
         let output = outer.producer();
@@ -902,7 +1620,7 @@ impl ProviderRegistry {
         let trace_context = observer
             .as_ref()
             .map(|observer| observer.span.trace_context().clone());
-        let Some(provider) = self.provider_box(&model.provider) else {
+        let Some(provider) = self.provider_box_for(session.as_ref(), &model.provider) else {
             let event = AssistantMessageEventStream::error_event(
                 ErrorReason::Error,
                 error_message(&model, &format!("Unknown provider: {}", model.provider)),
@@ -916,23 +1634,25 @@ impl ProviderRegistry {
         };
         let self_ = self.clone();
         tokio::spawn(async move {
-            let (request_model, options) =
-                match self_.resolve_auth(&model, options.api_key.as_deref()).await {
-                    Ok(Some(auth)) => merge_resolved_auth(model.clone(), options, auth),
-                    Ok(None) => (model.clone(), options),
-                    Err(error) => {
-                        let event = AssistantMessageEventStream::error_event(
-                            ErrorReason::Error,
-                            error_message(&model, &error.user_message()),
-                        );
-                        if let Some(observer) = observer.as_mut() {
-                            observer.observe(&event);
-                            observer.finish();
-                        }
-                        output.push(event);
-                        return;
+            let (request_model, options) = match self_
+                .resolve_auth_for(session.as_ref(), &model, options.api_key.as_deref())
+                .await
+            {
+                Ok(Some(auth)) => merge_resolved_auth(model.clone(), options, auth),
+                Ok(None) => (model.clone(), options),
+                Err(error) => {
+                    let event = AssistantMessageEventStream::error_event(
+                        ErrorReason::Error,
+                        error_message(&model, &error.user_message()),
+                    );
+                    if let Some(observer) = observer.as_mut() {
+                        observer.observe(&event);
+                        observer.finish();
                     }
-                };
+                    output.push(event);
+                    return;
+                }
+            };
             let mut options = options;
             match self_
                 .assemble_dispatch_headers(provider.as_ref(), &request_model, &options, None)
@@ -1208,6 +1928,15 @@ impl ProviderRegistry {
         } else {
             Some(layers)
         };
+        // Extension `before_provider_headers`: run on the caller/model/
+        // provider layers BEFORE auth is applied, so handlers can add proxy or
+        // attribution headers but never observe the resolved API key. This is
+        // the per-request seam shared by prompts, compaction/branch summaries
+        // and print.
+        let headers = match options.hooks.before_provider_headers.as_ref() {
+            Some(hook) => Some(hook(headers.unwrap_or_default()).await),
+            None => headers,
+        };
         let mut headers = apply_auth_header(
             model,
             headers,
@@ -1362,8 +2091,36 @@ impl ProviderRegistry {
         interaction: &dyn AuthInteraction,
         options: &LoginOptions,
     ) -> AiResult<ProviderAuth> {
+        self.login_for_session_impl(None, provider_id, auth_type, interaction, options)
+            .await
+    }
+
+    /// [`Self::login`] for one session: `/login` resolves the provider through
+    /// the session overlay first, so while a subagent child is alive the
+    /// parent never runs the child's OAuth flow (wrong session/cwd), and the
+    /// child never runs the parent's (SNAP8 P2-1).
+    pub async fn login_for_session(
+        &self,
+        session: &ProviderSessionKey,
+        provider_id: &str,
+        auth_type: AuthType,
+        interaction: &dyn AuthInteraction,
+        options: &LoginOptions,
+    ) -> AiResult<ProviderAuth> {
+        self.login_for_session_impl(Some(session), provider_id, auth_type, interaction, options)
+            .await
+    }
+
+    async fn login_for_session_impl(
+        &self,
+        session: Option<&ProviderSessionKey>,
+        provider_id: &str,
+        auth_type: AuthType,
+        interaction: &dyn AuthInteraction,
+        options: &LoginOptions,
+    ) -> AiResult<ProviderAuth> {
         let provider = self
-            .provider_box(provider_id)
+            .provider_box_for(session, provider_id)
             .ok_or_else(|| AiError::UnknownProvider(provider_id.to_string()))?;
         match auth_type {
             AuthType::OAuth => {
@@ -1444,6 +2201,28 @@ impl ProviderRegistry {
     /// result instead of rejecting; static/unknown/unconfigured providers are
     /// skipped.
     pub async fn refresh(&self, options: ModelsRefreshOptions) -> ModelsRefreshResult {
+        self.refresh_for_session_impl(None, options).await
+    }
+
+    /// [`Self::refresh`] for one session. Provider enumeration includes the
+    /// session's own overlay ids and every provider lookup (including the
+    /// OAuth credential refresh inside [`Self::refresh_provider`]) resolves
+    /// through that session first, so a live subagent child cannot redirect
+    /// the parent's credential refresh to its own extension runtime
+    /// (SNAP8 P2-1).
+    pub async fn refresh_for_session(
+        &self,
+        session: &ProviderSessionKey,
+        options: ModelsRefreshOptions,
+    ) -> ModelsRefreshResult {
+        self.refresh_for_session_impl(Some(session), options).await
+    }
+
+    async fn refresh_for_session_impl(
+        &self,
+        session: Option<&ProviderSessionKey>,
+        options: ModelsRefreshOptions,
+    ) -> ModelsRefreshResult {
         let caller_signal = options.signal.clone().unwrap_or_default();
         if caller_signal.is_aborted() {
             return ModelsRefreshResult {
@@ -1460,6 +2239,9 @@ impl ProviderRegistry {
             .iter()
             .map(|provider| provider.id().to_string())
             .collect();
+        if let Some(session) = session {
+            ids.extend(self.session_dynamic_ids(session));
+        }
         ids.sort();
         ids.dedup();
         let refreshable = ids.into_iter().filter_map(|id| {
@@ -1469,7 +2251,7 @@ impl ProviderRegistry {
             {
                 return None;
             }
-            self.provider_box(&id)
+            self.provider_box_for(session, &id)
                 .filter(|provider| provider.supports_refresh())
         });
         let outcomes = futures_util::future::join_all(refreshable.map(|provider| {
@@ -1512,16 +2294,16 @@ impl ProviderRegistry {
                 .map_err(|error| error.user_message())?;
             let stored_credential = self.stored_credential(&id).ok().flatten();
             // Phase 1: restore the cached catalog before any auth/network work.
-            let context = self.refresh_context(
-                &id,
-                &provider,
-                stored_credential.clone(),
-                stored.clone(),
-                false,
-                None,
+            let context = self.refresh_context(RefreshContextInput {
+                provider_id: &id,
+                provider: &provider,
+                credential: stored_credential.clone(),
+                stored: stored.clone(),
+                allow_network: false,
+                force: None,
                 generation,
-                &signal,
-            );
+                signal: &signal,
+            });
             let refresh = provider
                 .refresh_models(context)
                 .ok_or_else(|| format!("provider {id} does not support refresh"))?;
@@ -1536,16 +2318,16 @@ impl ProviderRegistry {
             else {
                 return Ok(());
             };
-            let context = self.refresh_context(
-                &id,
-                &provider,
-                Some(credential),
+            let context = self.refresh_context(RefreshContextInput {
+                provider_id: &id,
+                provider: &provider,
+                credential: Some(credential),
                 stored,
-                true,
-                Some(force),
+                allow_network: true,
+                force: Some(force),
                 generation,
-                &signal,
-            );
+                signal: &signal,
+            });
             let refresh = provider
                 .refresh_models(context)
                 .ok_or_else(|| format!("provider {id} does not support refresh"))?;
@@ -1618,18 +2400,17 @@ impl ProviderRegistry {
     }
 
     /// Build the per-phase refresh context with a generation-checked publisher.
-    #[allow(clippy::too_many_arguments)]
-    fn refresh_context(
-        &self,
-        provider_id: &str,
-        provider: &ProviderBox,
-        credential: Option<StoredCredential>,
-        stored: Option<ModelsStoreEntry>,
-        allow_network: bool,
-        force: Option<bool>,
-        generation: u64,
-        signal: &crate::ai::types::AbortSignal,
-    ) -> RefreshModelsContext {
+    fn refresh_context(&self, input: RefreshContextInput<'_>) -> RefreshModelsContext {
+        let RefreshContextInput {
+            provider_id,
+            provider,
+            credential,
+            stored,
+            allow_network,
+            force,
+            generation,
+            signal,
+        } = input;
         let store = self.models_store.clone();
         let state = self.refresh_state.clone();
         let provider_id = provider_id.to_string();
@@ -1914,6 +2695,24 @@ impl Clone for ProviderRegistry {
             scope_id: self.scope_id,
             dynamic: std::sync::RwLock::new(
                 self.dynamic
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            session_dynamic: std::sync::RwLock::new(
+                self.session_dynamic
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            session_dynamic_owners: std::sync::RwLock::new(
+                self.session_dynamic_owners
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            plugin_owned: std::sync::RwLock::new(
+                self.plugin_owned
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone(),

@@ -74,16 +74,16 @@ impl Provider for ScriptedProvider {
 }
 
 fn scripted_model() -> Model {
-    pir::ai::providers::construction::model(
-        "scripted",
-        "scripted-model",
-        "Scripted model",
-        "scripted-api",
-        "http://127.0.0.1:1",
-        8_192,
-        512,
-        vec!["text"],
-    )
+    pir::ai::providers::construction::model(pir::ai::providers::construction::ModelSpec {
+        provider: "scripted",
+        id: "scripted-model",
+        name: "Scripted model",
+        api: "scripted-api",
+        base_url: "http://127.0.0.1:1",
+        context_window: 8_192,
+        max_tokens: 512,
+        input: vec!["text"],
+    })
 }
 
 fn scripted_message(text: &str) -> AssistantMessage {

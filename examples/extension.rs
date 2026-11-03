@@ -44,8 +44,17 @@ export default function (pi) {
 }
 "#;
 
-#[tokio::main]
-async fn main() -> Result<(), SdkError> {
+fn main() -> std::process::ExitCode {
+    common::run_big_stack(async {
+        if let Err(error) = run().await {
+            eprintln!("error: {error:?}");
+            return std::process::ExitCode::FAILURE;
+        }
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+async fn run() -> Result<(), SdkError> {
     // Disposable workspace: the extension file and the agent directory live
     // here, never in the checkout or `~/.pi`.
     let dir: PathBuf =

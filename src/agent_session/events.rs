@@ -468,16 +468,15 @@ impl AgentSession {
         emit_session_event_to(&self.session_events, event);
     }
 
-    /// Whether any session-level event subscriber is attached. Used as the
-    /// payload gate for `entry_appended`: when neither a plugin handler nor a
-    /// session subscriber observes the append, the message moves into storage
-    /// without being cloned for a wire payload.
+    /// Whether any session-level event subscriber OTHER than the session-event
+    /// bridge is attached. Used as the payload gate for `entry_appended`: when
+    /// neither a plugin handler nor a real host subscriber observes the
+    /// append, the message moves into storage without being cloned for a wire
+    /// payload. The bridge itself drops `entry_appended` (its direct emit
+    /// site owns both plugin faces), so counting it here would materialize
+    /// every entry for nothing.
     pub(crate) fn has_session_event_subscribers(&self) -> bool {
-        !self
-            .session_events
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
+        super::notifications::has_observed_session_event_subscribers(&self.session_events)
     }
 
     /// Whether a compaction run is in flight (upstream `isCompacting`,

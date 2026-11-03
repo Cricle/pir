@@ -81,7 +81,7 @@ pub use compaction::{
     COMPACTION_TASK_VERSION, ESTIMATED_IMAGE_CHARS, SUMMARIZATION_PROMPT,
     SUMMARIZATION_SYSTEM_PROMPT, SUMMARY_PREFIX, SUMMARY_SUFFIX, TOOL_RESULT_MAX_CHARS,
 };
-pub use context::{derive_context, ContextView, MISSING_RESULT_TEXT};
+pub use context::{derive_context, ContextView, Messages, MISSING_RESULT_TEXT};
 pub use documents::{
     agent_definition, agent_seed, builtin_conversation_documents, conversation_definitions,
     provider_definition, ProviderState, AGENT_KIND, AGENT_VERSION, PROVIDER_KIND, PROVIDER_VERSION,
@@ -141,12 +141,16 @@ pub use view::{
 
 // The `Harness` facade, its provider identity and its telemetry vocabulary
 // (upstream `harness/{harness,provider,telemetry}.ts`).
-#[allow(clippy::module_inception)] // `harness::harness` mirrors upstream's layout.
-pub mod harness;
+/// The upstream `harness` layout, compiled as `engine` so the module is not a
+/// child of itself; `harness::harness` remains the public path.
+#[doc(hidden)]
+#[path = "harness.rs"]
+pub mod engine;
+pub use engine as harness;
 pub mod provider;
 pub mod telemetry;
 
-pub use harness::{
+pub use engine::{
     agent_address, usage_address, Conversation, ConversationFrame, ConversationWatch,
     DocumentWatch, Harness, HarnessError, HarnessInspection, HarnessOptions, ReportHandler,
     Submission, SubmissionAbortResult, SCAN_PAGE_SIZE,

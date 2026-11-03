@@ -125,37 +125,62 @@ pub fn thinking_level_argument(term: &str) -> Result<crate::ai::types::ThinkingL
 /// (upstream `findExactModelReferenceMatch`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelMatch {
-    /// Exactly one model matched the term.
-    Found { provider: String, model_id: String },
+    /// Exactly one model matched the term. A trailing `:<level>` that parses
+    /// as a thinking level is split off the term and reported here, so
+    /// `/model anthropic/claude-x:high` also selects the level (upstream
+    /// `d7f7e0dfe`).
+    Found {
+        provider: String,
+        model_id: String,
+        thinking_level: Option<crate::ai::types::ThinkingLevel>,
+    },
     /// Several models matched: the caller shows the candidates.
     Ambiguous(Vec<(String, String)>),
     /// No model matched: the caller opens the selector pre-filtered.
     NotFound,
 }
 
+/// Split a trailing `:<level>` off `term` when the suffix parses as a
+/// thinking level (upstream `splitThinkingSuffix`). A term with no colon, an
+/// empty base, or a suffix that is not a level comes back whole, so ids that
+/// contain a colon (OpenRouter's `qwen/qwen3-coder:exacto`) stay literal.
+fn split_thinking_suffix(term: &str) -> (&str, Option<crate::ai::types::ThinkingLevel>) {
+    let Some((base, suffix)) = term.rsplit_once(':') else {
+        return (term, None);
+    };
+    match crate::ai::providers::resolution::parse_thinking_level(suffix) {
+        Some(level) if !base.is_empty() => (base, Some(level)),
+        _ => (term, None),
+    }
+}
+
 /// Match a `/model <term>` argument against `(provider, id)` pairs
 /// (upstream `findExactModelReferenceMatch`: a case-insensitive match on the
 /// `provider/id` reference, the bare model id, or — when the term carries no
 /// `/` — a provider-suffix match; ambiguity falls back to the selector).
+///
+/// A trailing `:<level>` is split off only when it parses as a thinking
+/// level; anything else is part of the reference being matched.
 pub fn resolve_model_argument(term: &str, models: &[(String, String)]) -> ModelMatch {
     let term = term.trim();
     if term.is_empty() {
         return ModelMatch::NotFound;
     }
-    let normalized = term.to_lowercase();
+    let (reference, thinking_level) = split_thinking_suffix(term);
+    let normalized = reference.to_lowercase();
     let matches: Vec<(String, String)> = models
         .iter()
         .filter(|(provider, id)| {
-            let reference = format!("{provider}/{id}").to_lowercase();
-            if reference == normalized {
+            let candidate = format!("{provider}/{id}").to_lowercase();
+            if candidate == normalized {
                 return true;
             }
-            if term.contains('/') {
+            if reference.contains('/') {
                 return false;
             }
             // Bare id: match the id exactly, or the tail of the reference
             // (`anthropic/claude-x` ends with `claude-x`).
-            id.to_lowercase() == normalized || reference.ends_with(&format!("/{normalized}"))
+            id.to_lowercase() == normalized || candidate.ends_with(&format!("/{normalized}"))
         })
         .cloned()
         .collect();
@@ -164,6 +189,7 @@ pub fn resolve_model_argument(term: &str, models: &[(String, String)]) -> ModelM
         1 => ModelMatch::Found {
             provider: matches[0].0.clone(),
             model_id: matches[0].1.clone(),
+            thinking_level,
         },
         _ => ModelMatch::Ambiguous(matches),
     }
@@ -1681,4 +1707,102 @@ pub fn scoped_cycle_target(
     current: (&str, &str),
 ) -> Option<(String, String)> {
     crate::agent_session::scoped_cycle_target(scoped, available, current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::types::ThinkingLevel;
+
+    /// Providers/ids covering the three match shapes: a plain reference, a
+    /// bare id on a second provider, and an id whose own colon is not a
+    /// thinking level.
+    fn catalog() -> Vec<(String, String)> {
+        [
+            ("anthropic", "claude-sonnet-4-5"),
+            ("openai", "gpt-5"),
+            ("openai", "gpt-5-mini"),
+            ("openrouter", "qwen/qwen3-coder:exacto"),
+            ("zai", "glm-5"),
+        ]
+        .into_iter()
+        .map(|(provider, id)| (provider.to_string(), id.to_string()))
+        .collect()
+    }
+
+    fn found(provider: &str, model_id: &str, thinking_level: Option<ThinkingLevel>) -> ModelMatch {
+        ModelMatch::Found {
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
+            thinking_level,
+        }
+    }
+
+    #[test]
+    fn model_argument_matches_a_plain_reference_without_a_level() {
+        let models = catalog();
+        assert_eq!(
+            resolve_model_argument("anthropic/claude-sonnet-4-5", &models),
+            found("anthropic", "claude-sonnet-4-5", None)
+        );
+        // A bare id (case-insensitively) still matches, with no level.
+        assert_eq!(
+            resolve_model_argument("GLM-5", &models),
+            found("zai", "glm-5", None)
+        );
+    }
+
+    #[test]
+    fn model_argument_splits_a_trailing_thinking_level() {
+        let models = catalog();
+        assert_eq!(
+            resolve_model_argument("anthropic/claude-sonnet-4-5:high", &models),
+            found("anthropic", "claude-sonnet-4-5", Some(ThinkingLevel::High))
+        );
+        // The split happens on a bare id too, and covers the whole ladder.
+        assert_eq!(
+            resolve_model_argument("glm-5:xhigh", &models),
+            found("zai", "glm-5", Some(ThinkingLevel::XHigh))
+        );
+    }
+
+    #[test]
+    fn model_argument_keeps_an_unknown_suffix_literal() {
+        let models = catalog();
+        // `exacto` is not a thinking level, so the colon stays part of the id.
+        assert_eq!(
+            resolve_model_argument("openrouter/qwen/qwen3-coder:exacto", &models),
+            found("openrouter", "qwen/qwen3-coder:exacto", None)
+        );
+        // An unparsable suffix never rescues an otherwise-unknown reference.
+        assert_eq!(
+            resolve_model_argument("gpt-5:turbo", &models),
+            ModelMatch::NotFound
+        );
+    }
+
+    #[test]
+    fn model_argument_keeps_ambiguity_and_not_found() {
+        let models = catalog();
+        assert_eq!(
+            resolve_model_argument("gpt-5-mini", &models),
+            found("openai", "gpt-5-mini", None)
+        );
+        assert_eq!(resolve_model_argument("", &models), ModelMatch::NotFound);
+        assert_eq!(
+            resolve_model_argument("nope:nope", &models),
+            ModelMatch::NotFound
+        );
+
+        // Two providers serving the same id and no `/` in the term: still
+        // ambiguous, and a thinking suffix does not change the match set.
+        let mut duplicated = catalog();
+        duplicated.push(("anthropic".to_string(), "glm-5".to_string()));
+        let expected = ModelMatch::Ambiguous(vec![
+            ("zai".to_string(), "glm-5".to_string()),
+            ("anthropic".to_string(), "glm-5".to_string()),
+        ]);
+        assert_eq!(resolve_model_argument("glm-5", &duplicated), expected);
+        assert_eq!(resolve_model_argument("glm-5:max", &duplicated), expected);
+    }
 }

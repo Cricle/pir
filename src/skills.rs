@@ -214,21 +214,31 @@ pub fn frontmatter_parts(text: &str) -> Option<(&str, &str)> {
     let rest = rest.strip_prefix('\n').unwrap_or(rest);
     let mut closing = None;
     let mut offset = 0;
-    for line in rest.lines() {
-        let trimmed = line.trim_end_matches('\r');
+    // Advance by the real byte length of each line (`split_inclusive('\n')`
+    // keeps the terminator, so `\r\n` counts as two bytes and a final line
+    // without a newline still terminates the loop). `str::lines()` drops both
+    // the `\r` and the `\n` while `+1` only restores the `\n`, which shifts
+    // the closing fence one byte left per CRLF line and can then slice through
+    // a multibyte character.
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line
+            .strip_suffix('\n')
+            .unwrap_or(line)
+            .trim_end_matches('\r');
         if trimmed.trim() == "---" {
             closing = Some(offset);
             break;
         }
-        offset += line.len() + 1;
+        offset += line.len();
     }
     let end = closing?;
-    // The body starts after the closing fence line (and its newline).
-    let body = &rest[end..];
+    // The body starts after the closing fence line (and its newline). `get`
+    // turns a corrupted offset into `None` instead of a char-boundary panic.
+    let body = rest.get(end..)?;
     let body = body.strip_prefix("---").unwrap_or(body);
     let body = body.strip_prefix('\r').unwrap_or(body);
     let body = body.strip_prefix('\n').unwrap_or(body);
-    Some((&rest[..end], body))
+    Some((rest.get(..end)?, body))
 }
 
 /// The file content with its frontmatter block removed (upstream
@@ -328,6 +338,20 @@ pub fn load_skill_from_file_with_diagnostics(
     path: &Path,
 ) -> (Option<SkillInfo>, Vec<SkillDiagnostic>) {
     let mut diagnostics: Vec<SkillDiagnostic> = Vec::new();
+    // pir hardening (FIX-C17): skip oversized skill files before reading them.
+    // A single misplaced or malicious SKILL.md must not be pulled into memory
+    // whole during startup/discovery.
+    let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    if size > crate::config::settings::MAX_CONTEXT_FILE_BYTES {
+        diagnostics.push(SkillDiagnostic::warning(
+            format!(
+                "skill file is {size} bytes, exceeding the {} byte limit; skipped",
+                crate::config::settings::MAX_CONTEXT_FILE_BYTES
+            ),
+            path,
+        ));
+        return (None, diagnostics);
+    }
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(error) => {

@@ -74,7 +74,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ai::api::provider_env_value;
 use crate::ai::error::{AiError, AiResult};
-use crate::ai::transport::ProviderRequestClient;
+use crate::ai::transport::{ProviderRequestClient, StreamingRequest};
 use crate::ai::types::{AbortSignal, ProviderEnv};
 
 /// Scope @google/genai requires for Vertex (`REQUIRED_VERTEX_AI_SCOPE`,
@@ -460,13 +460,15 @@ async fn post_token_form(
     };
     client
         .request_streaming(
-            Method::POST,
-            GOOGLE_TOKEN_URL,
-            &headers,
+            StreamingRequest::new(
+                Method::POST,
+                GOOGLE_TOKEN_URL,
+                &headers,
+                signal,
+                // Token-exchange HTTP (not an AI provider request): no hooks.
+                &crate::ai::types::ProviderStreamHooks::default(),
+            ),
             body.as_bytes().to_vec(),
-            signal,
-            // Token-exchange HTTP (not an AI provider request): no hooks.
-            &crate::ai::types::ProviderStreamHooks::default(),
             &mut on_chunk,
         )
         .await

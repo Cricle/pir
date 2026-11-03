@@ -101,6 +101,17 @@ pub const ENV_NAMES: [&str; 6] = [
 /// abandoned and the run proceeds with a warning.
 pub const DEFAULT_BEFORE_AGENT_START_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Upper bound for every configured timeout (24 h).
+///
+/// `Instant + Duration` panics on Windows/macOS once the result leaves the
+/// representable instant range, and `u64::MAX` milliseconds is far past it.
+/// Clamping at resolution time (and again at `checked_add` sites) turns a
+/// hostile/typo'd `callTimeoutMs`/`hookTimeoutMs` into a bounded wait instead
+/// of a panic that kills the actor.
+pub const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+/// [`MAX_TIMEOUT_MS`] as a [`Duration`].
+pub const MAX_TIMEOUT: Duration = Duration::from_millis(MAX_TIMEOUT_MS);
+
 /// Resolved QuickJS resource limits of one extension runtime.
 ///
 /// The timeout fields are the INITIAL values handed to the runtime state;
@@ -191,7 +202,10 @@ impl ExtensionLimits {
         }
         if let Some(ms) = section.call_timeout_ms {
             match positive_ms(ms) {
-                Some(timeout) => limits.call_timeout = timeout,
+                Some(timeout) => {
+                    note_timeout_clamp("extensionLimits.callTimeoutMs", ms, &mut diagnostics);
+                    limits.call_timeout = timeout;
+                }
                 None => diagnostics.push(format!(
                     "extensionLimits.callTimeoutMs = 0 ignored: the default {} s call timeout stands",
                     limits.call_timeout.as_secs()
@@ -200,7 +214,10 @@ impl ExtensionLimits {
         }
         if let Some(ms) = section.hook_timeout_ms {
             match positive_ms(ms) {
-                Some(timeout) => limits.hook_timeout = timeout,
+                Some(timeout) => {
+                    note_timeout_clamp("extensionLimits.hookTimeoutMs", ms, &mut diagnostics);
+                    limits.hook_timeout = timeout;
+                }
                 None => diagnostics.push(format!(
                     "extensionLimits.hookTimeoutMs = 0 ignored: the default {} min hook timeout stands",
                     limits.hook_timeout.as_secs() / 60
@@ -209,7 +226,14 @@ impl ExtensionLimits {
         }
         if let Some(ms) = section.before_agent_start_timeout_ms {
             match positive_ms(ms) {
-                Some(timeout) => limits.before_agent_start_timeout = timeout,
+                Some(timeout) => {
+                    note_timeout_clamp(
+                        "extensionLimits.beforeAgentStartTimeoutMs",
+                        ms,
+                        &mut diagnostics,
+                    );
+                    limits.before_agent_start_timeout = timeout;
+                }
                 None => diagnostics.push(format!(
                     "extensionLimits.beforeAgentStartTimeoutMs = 0 ignored: the default {} s before_agent_start budget stands",
                     limits.before_agent_start_timeout.as_secs()
@@ -259,8 +283,11 @@ impl ExtensionLimits {
         }
         if let Some(value) = lookup(vars, ENV_CALL_TIMEOUT_MS) {
             match parse_ms(ENV_CALL_TIMEOUT_MS, value) {
-                Ok(Some(ms)) => limits.call_timeout = ms,
-                Ok(None) => diagnostics.push(format!(
+                Ok((Some(ms), clamped)) => {
+                    diagnostics.extend(clamped);
+                    limits.call_timeout = ms;
+                }
+                Ok((None, _)) => diagnostics.push(format!(
                     "{ENV_CALL_TIMEOUT_MS}=0 ignored: the default {} s call timeout stands",
                     limits.call_timeout.as_secs()
                 )),
@@ -269,8 +296,11 @@ impl ExtensionLimits {
         }
         if let Some(value) = lookup(vars, ENV_HOOK_TIMEOUT_MS) {
             match parse_ms(ENV_HOOK_TIMEOUT_MS, value) {
-                Ok(Some(ms)) => limits.hook_timeout = ms,
-                Ok(None) => diagnostics.push(format!(
+                Ok((Some(ms), clamped)) => {
+                    diagnostics.extend(clamped);
+                    limits.hook_timeout = ms;
+                }
+                Ok((None, _)) => diagnostics.push(format!(
                     "{ENV_HOOK_TIMEOUT_MS}=0 ignored: the default {} min hook timeout stands",
                     limits.hook_timeout.as_secs() / 60
                 )),
@@ -279,8 +309,11 @@ impl ExtensionLimits {
         }
         if let Some(value) = lookup(vars, ENV_BEFORE_AGENT_START_TIMEOUT_MS) {
             match parse_ms(ENV_BEFORE_AGENT_START_TIMEOUT_MS, value) {
-                Ok(Some(ms)) => limits.before_agent_start_timeout = ms,
-                Ok(None) => diagnostics.push(format!(
+                Ok((Some(ms), clamped)) => {
+                    diagnostics.extend(clamped);
+                    limits.before_agent_start_timeout = ms;
+                }
+                Ok((None, _)) => diagnostics.push(format!(
                     "{ENV_BEFORE_AGENT_START_TIMEOUT_MS}=0 ignored: the default {} s before_agent_start budget stands",
                     limits.before_agent_start_timeout.as_secs()
                 )),
@@ -424,18 +457,37 @@ fn parse_mb(name: &str, raw: &str) -> Result<Option<usize>, String> {
 }
 
 /// Milliseconds → `Duration`, `0` meaning "keep the default" (`None`).
+/// Values above [`MAX_TIMEOUT_MS`] clamp to [`MAX_TIMEOUT`]: a near-`u64::MAX`
+/// deadline would panic on `Instant + Duration` on Windows/macOS.
 fn positive_ms(ms: u64) -> Option<Duration> {
-    (ms > 0).then(|| Duration::from_millis(ms))
+    (ms > 0).then(|| Duration::from_millis(ms.min(MAX_TIMEOUT_MS)))
+}
+
+/// Diagnostic pushed when a timeout request was clamped by [`positive_ms`].
+fn timeout_clamped(name: &str, ms: u64) -> String {
+    format!(
+        "{name} = {ms} ms clamped to {} h: longer deadlines overflow platform timers",
+        MAX_TIMEOUT.as_secs() / 3600
+    )
+}
+
+/// Push the clamp diagnostic for `name` when `ms` exceeds [`MAX_TIMEOUT_MS`].
+fn note_timeout_clamp(name: &str, ms: u64, diagnostics: &mut Vec<String>) {
+    if ms > MAX_TIMEOUT_MS {
+        diagnostics.push(timeout_clamped(name, ms));
+    }
 }
 
 /// Parse a `*_MS` value: `Some(duration)` for a positive amount, `None` for
-/// `0` (keeps the default). Non-numeric values are errors.
-fn parse_ms(name: &str, raw: &str) -> Result<Option<Duration>, String> {
+/// `0` (keeps the default), plus the clamp diagnostic when the request was
+/// above [`MAX_TIMEOUT_MS`]. Non-numeric values are errors.
+fn parse_ms(name: &str, raw: &str) -> Result<(Option<Duration>, Option<String>), String> {
     let trimmed = raw.trim();
     let ms: u64 = trimmed
         .parse()
         .map_err(|_| format!("{name}=\"{raw}\" ignored: expected milliseconds"))?;
-    Ok(positive_ms(ms))
+    let diagnostic = (ms > MAX_TIMEOUT_MS).then(|| timeout_clamped(name, ms));
+    Ok((positive_ms(ms), diagnostic))
 }
 
 /// MiB → bytes; `0` (the "no limit" spelling) becomes `None`, and a value

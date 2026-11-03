@@ -1,6 +1,6 @@
 //! Live [`SessionService`] mutations and the host-retained session snapshot.
 //!
-//! Pins the two seams added on top of the read-only live binding:
+//! Pins the seams added on top of the read-only live binding:
 //!
 //! 1. `PluginHost::update_session_context` retains the pushed
 //!    `SessionContextSnapshot` as one `Arc` (plus its `entries` field as a
@@ -11,10 +11,12 @@
 //! 2. Mutating methods with a real backing are live: `set_active_tools` writes
 //!    the session override cell synchronously, `set_model` /
 //!    `set_thinking_level` schedule the existing async session method, `abort`
-//!    cancels the in-flight run and `wait_for_idle` tracks the run claim. The
-//!    methods that need UI/session replacement (`new_session`, `fork`,
-//!    `navigate_tree`, `switch_session`, `reload`) keep the documented trait
-//!    defaults, and scheduling without a tokio runtime is a no-op.
+//!    cancels the in-flight run and `wait_for_idle` tracks the run claim.
+//! 3. Native `new_session` / `fork` / `navigate_tree` / `switch_session` calls
+//!    record the SAME `SessionCommandAction` the JS `commandAction` host fn
+//!    builds, stamped with this session's `SessionOrigin`, exactly once; a
+//!    storage-less session records nothing. `reload` schedules the resource
+//!    reload, and scheduling without a tokio runtime is a no-op.
 //!
 //! Everything is in-memory except the session file under `std::env::temp_dir`.
 
@@ -27,7 +29,10 @@ use serde_json::{json, Value as JsonValue};
 
 use pir::agent::tool_batch::ToolResult;
 use pir::agent::tool_execution::{AgentTool, BoxFuture, ToolContext, ToolRegistry};
-use pir::agent_session::{AgentSession, AgentSessionConfig};
+use pir::agent_session::{
+    take_session_command_actions, take_session_command_actions_for, AgentSession,
+    AgentSessionConfig, SessionCommandAction, SessionOrigin,
+};
 use pir::ai::auth::ApiKeyAuth;
 use pir::ai::event_stream::AssistantMessageEventStream;
 use pir::ai::provider::{Provider, ProviderRegistry};
@@ -36,7 +41,9 @@ use pir::ai::types::{
     StreamOptions, TerminalReason, ThinkingLevel,
 };
 use pir::extensions::{ExtensionConfig, ExtensionHandle};
-use pir::plugins::plugin::services::{ForkOptions, NavigateTreeOptions, NewSessionOptions};
+use pir::plugins::plugin::services::{
+    ForkOptions, ForkPosition, NavigateTreeOptions, NewSessionOptions,
+};
 use pir::plugins::plugin::PluginContext;
 use pir::plugins::{AgentPlugin, PluginInfo};
 use pir::session_manager::SessionManager;
@@ -432,7 +439,7 @@ async fn live_mutators_reach_the_session_and_wait_for_idle_tracks_the_claim() {
 }
 
 // ---------------------------------------------------------------------------
-// (3) Unscheduled / unsupported methods stay honest no-ops
+// (3) Unscheduled methods stay honest no-ops
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -467,12 +474,9 @@ fn unsupported_and_runtime_less_actions_are_honest_no_ops() {
         "an unscheduled model switch leaves the session model unchanged"
     );
 
-    // These need UI/session replacement (or a return value the trait cannot
-    // express) and keep the trait defaults: immediate, side-effect-free.
-    service.new_session(NewSessionOptions::default());
-    service.fork(None, ForkOptions::default());
-    service.navigate_tree("missing-entry", NavigateTreeOptions::default());
-    service.switch_session(Path::new("missing-session.jsonl"));
+    // `reload` also needs a runtime, so without one it stays a no-op. The
+    // session-control methods are pinned by
+    // `native_session_commands_record_one_action_for_the_owning_session`.
     service.reload();
 
     assert_eq!(
@@ -482,4 +486,120 @@ fn unsupported_and_runtime_less_actions_are_honest_no_ops() {
     );
     assert_eq!(service.model().expect("model").id, before_model);
     assert!(service.is_idle());
+}
+
+// ---------------------------------------------------------------------------
+// (4) Native session-control calls queue the JS action once
+// ---------------------------------------------------------------------------
+
+#[test]
+fn native_session_commands_record_one_action_for_the_owning_session() {
+    let temp = TempDir::new("commands");
+    let plugin = ProbePlugin::new("commands-probe");
+    // Keep the session alive: the bound context only holds a `Weak` to it.
+    let _session = AgentSession::new_arc_with_plugins(
+        session_config(&temp, StreamMode::Immediate, ToolRegistry::new(), None),
+        vec![plugin.clone() as Arc<dyn AgentPlugin>],
+    );
+    let ctx = plugin.last_context();
+    let service = ctx.session().expect("session service");
+    let session_id = service.session_id().expect("session id");
+    let origin = SessionOrigin::AgentSession {
+        session_id: Some(session_id.to_string()),
+    };
+
+    service.new_session(NewSessionOptions {
+        parent_session: Some(Arc::from("parent-session")),
+    });
+    service.fork(
+        Some("entry-1"),
+        ForkOptions {
+            position: Some(ForkPosition::At),
+        },
+    );
+    service.navigate_tree(
+        "entry-2",
+        NavigateTreeOptions {
+            summarize: true,
+            custom_instructions: Some("summarize the branch".to_owned()),
+            replace_instructions: true,
+            label: Some("branch label".to_owned()),
+        },
+    );
+    service.switch_session(Path::new("other-session.jsonl"));
+
+    // Queued, not applied inline: the session is still the same one until
+    // the owning host's settle drain runs.
+    assert_eq!(
+        service.session_id().as_deref(),
+        Some(session_id.as_ref()),
+        "recording an action does not replace the session immediately"
+    );
+
+    let recorded: Vec<SessionCommandAction> = take_session_command_actions_for(&origin)
+        .into_iter()
+        .map(|entry| entry.action)
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![
+            SessionCommandAction::NewSession {
+                parent_session: Some("parent-session".to_owned()),
+                with_session: None,
+            },
+            SessionCommandAction::Fork {
+                entry_id: Some("entry-1".to_owned()),
+                position: Some("at".to_owned()),
+                with_session: None,
+            },
+            SessionCommandAction::NavigateTree {
+                target_id: "entry-2".to_owned(),
+                summarize: true,
+                custom_instructions: Some("summarize the branch".to_owned()),
+                replace_instructions: true,
+                label: Some("branch label".to_owned()),
+            },
+            SessionCommandAction::SwitchSession {
+                session_path: "other-session.jsonl".to_owned(),
+                with_session: None,
+            },
+        ],
+        "each native call records the JS action once, in call order, under this session's origin"
+    );
+    assert!(
+        take_session_command_actions_for(&origin).is_empty(),
+        "the queue holds no duplicate for the same call"
+    );
+
+    // A storage-less session has no control plane to replace: the same calls
+    // must not enqueue an action no host could own.
+    let ephemeral_temp = TempDir::new("commands-ephemeral");
+    let ephemeral_plugin = ProbePlugin::new("commands-ephemeral-probe");
+    let mut config = session_config(
+        &ephemeral_temp,
+        StreamMode::Immediate,
+        ToolRegistry::new(),
+        None,
+    );
+    config.session = None;
+    let _ephemeral_session = AgentSession::new_arc_with_plugins(
+        config,
+        vec![ephemeral_plugin.clone() as Arc<dyn AgentPlugin>],
+    );
+    let ephemeral_ctx = ephemeral_plugin.last_context();
+    let ephemeral_service = ephemeral_ctx.session().expect("session service");
+    assert!(
+        ephemeral_service.session_id().is_none(),
+        "a session without storage has no id"
+    );
+
+    ephemeral_service.new_session(NewSessionOptions::default());
+    ephemeral_service.fork(None, ForkOptions::default());
+    ephemeral_service.navigate_tree("missing-entry", NavigateTreeOptions::default());
+    ephemeral_service.switch_session(Path::new("missing-session.jsonl"));
+
+    assert!(
+        take_session_command_actions().is_empty(),
+        "a storage-less session records no session-control action"
+    );
 }

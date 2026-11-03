@@ -587,12 +587,24 @@ async fn writer_task<W>(
     mut rx: tokio::sync::mpsc::Receiver<Value>,
     mut output: W,
     writer_alive: tokio::sync::watch::Sender<bool>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> crate::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let result = async {
-        while let Some(value) = rx.recv().await {
+        loop {
+            let value = tokio::select! {
+                // Teardown bound: a sender leaked by a task/session handler
+                // must not keep this thread (and its output handle) alive
+                // forever. The serve loop signals this only AFTER the drain
+                // window, so healthy queued lines are still flushed first.
+                _ = stop.changed() => break,
+                value = rx.recv() => match value {
+                    Some(value) => value,
+                    None => break,
+                },
+            };
             // Iterative text (byte-identical) instead of `serde_json::to_vec`:
             // a response can carry a session tree nested one level per entry
             // (`get_tree`), and serde_json's serializer recurses one frame per
@@ -633,6 +645,7 @@ fn spawn_writer_thread<W>(
     rx: tokio::sync::mpsc::Receiver<Value>,
     output: W,
     writer_alive: tokio::sync::watch::Sender<bool>,
+    stop: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::sync::oneshot::Receiver<crate::Result<()>>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -645,7 +658,7 @@ where
                 .enable_all()
                 .build()
             {
-                Ok(runtime) => runtime.block_on(writer_task(rx, output, writer_alive)),
+                Ok(runtime) => runtime.block_on(writer_task(rx, output, writer_alive, stop)),
                 Err(error) => Err(anyhow::anyhow!("rpc writer runtime failed: {error}")),
             };
             let _ = done_tx.send(result);
@@ -728,6 +741,12 @@ struct RpcServerState {
     /// be acknowledged (`AgentSession::prompt` would only reject the second
     /// from inside its spawned task — too late for the response).
     prompt_claim: Arc<AtomicBool>,
+    /// Strong handle to the session-event forwarder's sender. The subscriber
+    /// closure holds only a `Weak`, so a session whose event list outlives
+    /// the RPC host (a detached background delivery keeps it alive) cannot
+    /// keep the forwarder thread — and its `Out` clone — alive. Dropping this
+    /// at teardown closes the line channel and releases the writer.
+    session_event_tx: std::sync::Mutex<Option<Arc<std::sync::mpsc::SyncSender<Value>>>>,
 }
 
 impl RpcServerState {
@@ -739,7 +758,17 @@ impl RpcServerState {
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             resource_env: Arc::new(std::sync::RwLock::new(None)),
             prompt_claim: Arc::new(AtomicBool::new(false)),
+            session_event_tx: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Drop the attached session's event-forwarder sender, closing its line
+    /// channel (see the field docs).
+    fn clear_session_event_sender(&self) {
+        self.session_event_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     /// Bind `get_commands`' discovery context to a session's cwd and the agent
@@ -1047,7 +1076,20 @@ impl RpcServerState {
                 }
             }
         });
+        // Keep the strong sender on the server state, NOT in the subscriber
+        // closure: a detached background delivery can hold the session's
+        // event list past teardown, and a strong sender there would keep this
+        // forwarder (and its `Out` clone) alive forever.
+        let line_tx = Arc::new(line_tx);
+        *self
+            .session_event_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&line_tx));
+        let weak_line_tx = Arc::downgrade(&line_tx);
         agent_session.on_session_event(Arc::new(move |event| {
+            let Some(line_tx) = weak_line_tx.upgrade() else {
+                return;
+            };
             let line = crate::coding_agent::json::to_session_event_json(&event);
             if line_tx.send(line).is_err() {
                 // The forwarder is gone (writer died): drop further events.
@@ -2257,9 +2299,10 @@ impl RpcServer {
     {
         let (tx, rx) = tokio::sync::mpsc::channel::<Value>(OUT_CHANNEL_CAPACITY);
         let (writer_alive_tx, mut writer_alive_rx) = tokio::sync::watch::channel(true);
+        let (writer_stop_tx, writer_stop_rx) = tokio::sync::watch::channel(false);
         // Off the serving runtime's workers: a stalled client parks the
         // writer's write, not the stdin loop (see `spawn_writer_thread`).
-        let writer = spawn_writer_thread(rx, output, writer_alive_tx);
+        let mut writer = spawn_writer_thread(rx, output, writer_alive_tx, writer_stop_rx);
         let out = Out { tx: tx.clone() };
         drop(tx);
 
@@ -2515,6 +2558,10 @@ impl RpcServer {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        // Close the session-event line channel before dropping the state: the
+        // session object may stay alive through a detached background task,
+        // but its subscriber now holds only a Weak sender.
+        state.clear_session_event_sender();
         drop(state);
         if let Some(session) = attached {
             // BOUNDED teardown, mirroring the TUI worker ("a stuck plugin
@@ -2539,14 +2586,18 @@ impl RpcServer {
         // Bounded writer drain: queued responses/events get their chance to
         // flush, but a sender that outlived the teardown (a leaked `Arc`
         // clone held by a task or a session handler) can no longer hang the
-        // exit. The grace window is far longer than a healthy drain.
-        match tokio::time::timeout(std::time::Duration::from_secs(5), writer).await {
+        // exit. The grace window is far longer than a healthy drain; after it
+        // the writer is explicitly stopped so its output handle is released
+        // even when a leaked sender keeps the channel open.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut writer).await {
             Ok(Ok(writer_result)) => writer_result,
             Ok(Err(_)) => Err(anyhow::anyhow!(
                 "rpc writer thread exited without reporting its result"
             )),
             Err(_elapsed) => {
                 eprintln!("pir rpc: output writer still open after stdin closed; ending session");
+                let _ = writer_stop_tx.send(true);
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer).await;
                 Ok(())
             }
         }

@@ -707,7 +707,9 @@ impl ServerState {
     /// run in ONE blocking task; the registry write lock is taken only for the
     /// admission check and insert. The admission reuses the same session cap as
     /// [`Self::create_session`], so attaching a directory of persisted
-    /// sessions cannot bypass `max_sessions`.
+    /// sessions cannot bypass `max_sessions`. The header cwd is re-checked
+    /// against [`ServerSecurityConfig::allows_cwd`] before the record is built
+    /// (a persisted file is not trusted input).
     async fn open_persisted_session(&self, id: &str) -> Result<(), SessionCommandError> {
         let Some(dir) = &self.sessions_dir else {
             return Ok(());
@@ -730,6 +732,15 @@ impl ServerState {
         let Some(prepared) = prepared else {
             return Ok(());
         };
+        // The persisted cwd comes from the session file header, which is
+        // attacker-controlled whenever the session directory is writable by
+        // another principal (or simply predates a policy tightening). Attach
+        // must enforce the same cwd allowlist as `create`, or reopening a
+        // hand-planted session would point the agent's tools at any path on
+        // the host (R2-5-N04).
+        if !self.security.allows_cwd(&prepared.cwd) {
+            return Err(SessionCommandError::Policy);
+        }
         let mut record = SessionRecord::new(id, prepared.cwd, crate::ai::util::now_ms());
         record.state.metadata.name = prepared.name;
         record.tool_names = self.resolved_tool_names();

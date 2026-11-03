@@ -30,7 +30,7 @@
 //! for the run to settle (bare `agent_end` event) before forking or reading
 //! entries.
 
-use crate::cli_entry_contract::common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};

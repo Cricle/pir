@@ -41,9 +41,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use pir::agent::tool_batch::{FinalizedToolCall, ToolResult};
+use pir::agent::tool_execution::{AgentTool, ToolContext};
 use pir::plugins::{
     builtin_names, instantiate_builtin, AgentPlugin, EventInterest, PluginEvent,
-    PluginEventOutcome, PluginFuture, PluginHost, PluginInfo,
+    PluginEventOutcome, PluginFuture, PluginHost, PluginInfo, RegistrationContext,
 };
 use serde_json::json;
 
@@ -513,6 +514,57 @@ fn every_declared_builtin_event_name_exists() {
     }
 }
 
+/// Regression for the native event-name validation gap (P3-06): a native
+/// `EventInterest::List` is a plain string fence, so a misspelled event is
+/// silently dead code. `coverage::invalid_native_event_names` is the
+/// build-time validator; `PluginHost::build` calls it over every plugin's
+/// declaration and records a warning diagnostic. This test pins the
+/// validator's answers (including the synthetic names with a native emit
+/// site) and the build-time diagnostic.
+#[test]
+fn native_event_interest_validation_names_typos_and_accepts_dispatchable_events() {
+    for (name, interest) in expected_builtin_events() {
+        let invalid = pir::plugins::coverage::invalid_native_event_names(&interest);
+        assert!(
+            invalid.is_empty(),
+            "builtin `{name}` declares non-native event names {invalid:?}"
+        );
+    }
+
+    // Wired native events, the native-only presentation projections, and the
+    // synthetic names with a native dispatch site (`entry_appended` and
+    // `run_failed` are emitted directly; the summarization retries and
+    // `thinking_level_changed` ride the session-event bridge) are all
+    // dispatchable; anything else is a typo the build must diagnose.
+    let valid = EventInterest::List(vec![
+        "terminal_input".to_owned(),
+        "status".to_owned(),
+        "extension_ui_request".to_owned(),
+        "entry_appended".to_owned(),
+        "thinking_level_changed".to_owned(),
+        "summarization_retry_scheduled".to_owned(),
+        "summarization_retry_attempt_start".to_owned(),
+        "summarization_retry_finished".to_owned(),
+        "run_failed".to_owned(),
+        "provider:refreshModels".to_owned(),
+    ]);
+    assert!(
+        pir::plugins::coverage::invalid_native_event_names(&valid).is_empty(),
+        "every name `pi.on` accepts as a known event must be declarable by a \
+         native plugin when it has an emit site"
+    );
+
+    let typo = EventInterest::List(vec!["tool_cal".to_owned(), "input".to_owned()]);
+    assert_eq!(
+        pir::plugins::coverage::invalid_native_event_names(&typo),
+        vec!["tool_cal"],
+        "the validator must name only the misspelled entry"
+    );
+
+    assert!(pir::plugins::coverage::invalid_native_event_names(&EventInterest::None).is_empty());
+    assert!(pir::plugins::coverage::invalid_native_event_names(&EventInterest::All).is_empty());
+}
+
 /// Arm-by-arm audit: the one plugin that ships an `on_event` arm outside its
 /// declaration, plus the invariants that keep a second one from appearing
 /// unnoticed. This asserts the audited declarations only — arms are not
@@ -584,6 +636,520 @@ fn no_compiled_builtin_declares_terminal_input() {
              runs — re-check that path (host.rs:926-934) before adding it"
         );
     }
+}
+
+/// The build-time half of P3-06: the shared validator's warning must actually
+/// land in the host diagnostics, with the plugin path and the misspelled name.
+#[test]
+fn build_warns_about_a_typo_in_a_native_event_declaration() {
+    struct TypoEventPlugin {
+        info: PluginInfo,
+    }
+
+    impl AgentPlugin for TypoEventPlugin {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec!["tool_cal".to_owned(), "input".to_owned()])
+        }
+    }
+
+    let host = PluginHost::build(
+        None,
+        vec![as_plugin(Arc::new(TypoEventPlugin {
+            info: PluginInfo::inline("w16-typo"),
+        }))],
+    );
+    let diagnostics = host.diagnostics();
+    let warning = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.kind == pir::plugins::DiagnosticKind::Warning
+                && diagnostic.path == "<inline:w16-typo>"
+        })
+        .expect("a misspelled native event must produce a load warning");
+    assert!(
+        warning.message.contains("unknown event `tool_cal`"),
+        "the warning names the typo: {}",
+        warning.message
+    );
+    assert_eq!(
+        warning.message.matches("tool_cal").count(),
+        1,
+        "only the misspelled entry is reported: {}",
+        warning.message
+    );
+}
+
+/// Native tool metadata reaches the shared `ToolDef` (the JS `getAllTools()`
+/// view): label defaults are captured explicitly, promptSnippet /
+/// promptGuidelines survive, and the native object advertises its
+/// prepareLoadout capability instead of the old hard-coded `false`.
+#[test]
+fn native_tool_metadata_reaches_the_shared_definition() {
+    struct MetadataTool;
+
+    impl AgentTool for MetadataTool {
+        fn name(&self) -> &str {
+            "w16-metadata-tool"
+        }
+
+        fn label(&self) -> &str {
+            "W16 Metadata Tool"
+        }
+
+        fn description(&self) -> &str {
+            "metadata probe"
+        }
+
+        fn prompt_snippet(&self) -> Option<String> {
+            Some("use the metadata probe".to_owned())
+        }
+
+        fn prompt_guidelines(&self) -> Vec<String> {
+            vec!["keep metadata aligned".to_owned()]
+        }
+
+        fn run(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> pir::agent::tool_execution::BoxFuture<'static, ToolResult> {
+            Box::pin(async { ToolResult::ok("ok") })
+        }
+    }
+
+    struct MetadataPlugin {
+        info: PluginInfo,
+    }
+
+    impl AgentPlugin for MetadataPlugin {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn register(&self, ctx: &mut RegistrationContext<'_>) -> anyhow::Result<()> {
+            ctx.register_tool(Arc::new(MetadataTool));
+            Ok(())
+        }
+    }
+
+    let host = PluginHost::build(
+        None,
+        vec![as_plugin(Arc::new(MetadataPlugin {
+            info: PluginInfo::inline("w16-metadata-plugin"),
+        }))],
+    );
+    let def = host
+        .tool_defs()
+        .into_iter()
+        .find(|def| def.name == "w16-metadata-tool")
+        .expect("the native tool is in the shared registry");
+    assert_eq!(def.label.as_deref(), Some("W16 Metadata Tool"));
+    assert_eq!(
+        def.prompt_snippet.as_deref(),
+        Some("use the metadata probe")
+    );
+    assert_eq!(def.prompt_guidelines, vec!["keep metadata aligned"]);
+    assert!(
+        def.prepare_loadout,
+        "a native tool always exposes its prepareLoadout hook"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Result-contract short-circuit / merge across the native face
+// ---------------------------------------------------------------------------
+
+/// `emit_native` is the JS-adapter-free twin of `emit`: a cancel outcome must
+/// stop the remaining native plugins. The old implementation merged `acc.stop`
+/// but never consulted it, so later plugins still ran after a cancel.
+#[tokio::test(flavor = "current_thread")]
+async fn emit_native_short_circuits_after_a_native_cancel() {
+    struct CancelPlugin {
+        info: PluginInfo,
+    }
+
+    impl AgentPlugin for CancelPlugin {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec!["session_before_switch".to_owned()])
+        }
+
+        fn on_event<'a>(&'a self, _event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            Box::pin(async { PluginEventOutcome::SessionBefore { cancel: true } })
+        }
+    }
+
+    let (after, seen) = Recorder::new(
+        "w16-after-cancel",
+        EventInterest::List(vec!["session_before_switch".to_owned()]),
+    );
+    let host = PluginHost::build(
+        None,
+        vec![
+            as_plugin(Arc::new(CancelPlugin {
+                info: PluginInfo::inline("w16-cancel"),
+            })),
+            as_plugin(after),
+        ],
+    );
+
+    let mut payload = json!({ "type": "session_before_switch", "reason": "switch" });
+    let outcome = host
+        .emit_native("session_before_switch", &mut payload)
+        .await;
+
+    assert_eq!(
+        outcome.result["cancel"],
+        json!(true),
+        "the cancel outcome is the merged result: {:?}",
+        outcome.result
+    );
+    assert!(
+        drain_seen(&seen).is_empty(),
+        "a later native plugin must not run after a cancel: {:?}",
+        drain_seen(&seen)
+    );
+}
+
+/// A raw `Generic` session-before result OVERLAYS the merged object instead of
+/// replacing it, so an earlier typed `SessionBeforeCompact { compaction }`
+/// replacement survives a later native plugin answering `{ cancel: false }`.
+/// It also honors `cancel: true` for every `session_before_*` variant, not
+/// only `session_before_tree`.
+#[tokio::test(flavor = "current_thread")]
+async fn generic_session_before_results_overlay_and_cancel_across_variants() {
+    struct TypedCompactionPlugin {
+        info: PluginInfo,
+    }
+
+    impl AgentPlugin for TypedCompactionPlugin {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec!["session_before_compact".to_owned()])
+        }
+
+        fn on_event<'a>(&'a self, _event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            Box::pin(async {
+                PluginEventOutcome::SessionBeforeCompact {
+                    cancel: false,
+                    compaction: Some(json!({ "summary": "from-typed" })),
+                }
+            })
+        }
+    }
+
+    struct GenericPlugin {
+        info: PluginInfo,
+        event: &'static str,
+        value: serde_json::Value,
+    }
+
+    impl AgentPlugin for GenericPlugin {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec![self.event.to_owned()])
+        }
+
+        fn on_event<'a>(&'a self, _event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            let value = self.value.clone();
+            Box::pin(async move { PluginEventOutcome::Generic(value) })
+        }
+    }
+
+    let host = PluginHost::build(
+        None,
+        vec![
+            as_plugin(Arc::new(TypedCompactionPlugin {
+                info: PluginInfo::inline("w16-typed-compact"),
+            })),
+            as_plugin(Arc::new(GenericPlugin {
+                info: PluginInfo::inline("w16-generic-compact"),
+                event: "session_before_compact",
+                value: json!({ "cancel": false }),
+            })),
+        ],
+    );
+    let mut payload = json!({ "type": "session_before_compact", "reason": "manual" });
+    let outcome = host
+        .emit_native("session_before_compact", &mut payload)
+        .await;
+    assert_eq!(
+        outcome.result["compaction"],
+        json!({ "summary": "from-typed" }),
+        "a later generic result must not drop the earlier typed replacement: {:?}",
+        outcome.result
+    );
+    assert_eq!(outcome.result["cancel"], json!(false));
+
+    // A Generic `cancel: true` on a non-tree variant short-circuits as well.
+    let (after, seen) = Recorder::new(
+        "w16-generic-after-cancel",
+        EventInterest::List(vec!["session_before_switch".to_owned()]),
+    );
+    let host = PluginHost::build(
+        None,
+        vec![
+            as_plugin(Arc::new(GenericPlugin {
+                info: PluginInfo::inline("w16-generic-switch"),
+                event: "session_before_switch",
+                value: json!({ "cancel": true }),
+            })),
+            as_plugin(after),
+        ],
+    );
+    let mut payload = json!({ "type": "session_before_switch", "reason": "switch" });
+    let outcome = host
+        .emit_native("session_before_switch", &mut payload)
+        .await;
+    assert_eq!(outcome.result["cancel"], json!(true));
+    assert!(
+        drain_seen(&seen).is_empty(),
+        "Generic {{cancel:true}} must stop later handlers for every \
+         session_before_* variant"
+    );
+}
+
+/// `before_provider_request` is a result-contract event: the returned object
+/// replaces the request body. A later native handler in the ordered walk must
+/// observe an earlier handler's replacement in `payload.payload`, exactly like
+/// it observes `message_end`/`tool_result`/`input` replacements.
+#[tokio::test(flavor = "current_thread")]
+async fn before_provider_request_chains_a_native_replacement_into_the_payload() {
+    struct ReplaceProviderBody {
+        info: PluginInfo,
+    }
+
+    impl AgentPlugin for ReplaceProviderBody {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec!["before_provider_request".to_owned()])
+        }
+
+        fn on_event<'a>(&'a self, _event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            Box::pin(async {
+                PluginEventOutcome::Generic(json!({
+                    "model": "replaced-model",
+                    "messages": [],
+                }))
+            })
+        }
+    }
+
+    struct ObserveProviderBody {
+        info: PluginInfo,
+        seen: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl AgentPlugin for ObserveProviderBody {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec!["before_provider_request".to_owned()])
+        }
+
+        fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            let body = event
+                .payload
+                .get("payload")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let seen = Arc::clone(&self.seen);
+            Box::pin(async move {
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(body);
+                PluginEventOutcome::None
+            })
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let host = PluginHost::build(
+        None,
+        vec![
+            as_plugin(Arc::new(ReplaceProviderBody {
+                info: PluginInfo::inline("w16-provider-replace"),
+            })),
+            as_plugin(Arc::new(ObserveProviderBody {
+                info: PluginInfo::inline("w16-provider-observe"),
+                seen: Arc::clone(&seen),
+            })),
+        ],
+    );
+    let mut payload = json!({
+        "type": "before_provider_request",
+        "payload": { "model": "original", "messages": [] },
+    });
+    let outcome = host
+        .emit_native("before_provider_request", &mut payload)
+        .await;
+
+    assert_eq!(
+        seen.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+        vec![json!({ "model": "replaced-model", "messages": [] })],
+        "the second handler must observe the first replacement"
+    );
+    assert_eq!(
+        outcome.result,
+        json!({ "model": "replaced-model", "messages": [] }),
+        "the merged replacement remains the host's request body"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// terminal_input panic isolation
+// ---------------------------------------------------------------------------
+
+/// The native `UiService::on_terminal_input` registry is the other half of
+/// the raw-input fan-out, and its callbacks are extension code too: a panic
+/// must not unwind the TUI input thread, and a later registered handler must
+/// still receive the chunk.
+#[tokio::test(flavor = "current_thread")]
+async fn native_terminal_input_ui_handler_panic_is_isolated() {
+    use pir::plugins::services::{TerminalInputAction, TerminalInputHandler};
+
+    struct PanicRawHandler;
+
+    impl TerminalInputHandler for PanicRawHandler {
+        fn handle(&self, _input: &str) -> TerminalInputAction {
+            panic!("raw terminal UI boom")
+        }
+    }
+
+    struct ConsumeRawHandler {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TerminalInputHandler for ConsumeRawHandler {
+        fn handle(&self, input: &str) -> TerminalInputAction {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(input.to_owned());
+            TerminalInputAction::Consume
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let host = PluginHost::build(None, Vec::new());
+    let _panic = host.on_terminal_input(Arc::new(PanicRawHandler));
+    let _consume = host.on_terminal_input(Arc::new(ConsumeRawHandler {
+        seen: Arc::clone(&seen),
+    }));
+    assert!(host.has_terminal_input_handlers());
+
+    assert_eq!(
+        host.dispatch_terminal_input("!").await,
+        TerminalInputAction::Consume,
+        "the panicking handler must fail open and the later handler consume"
+    );
+    assert_eq!(
+        drain_seen(&seen),
+        vec!["!".to_owned()],
+        "the later raw-input handler still received the original chunk"
+    );
+}
+
+/// A panicking native `terminal_input` handler must not unwind the TUI input
+/// thread: the host reports it as an isolated error and later handlers still
+/// get the chunk. `dispatch_terminal_input` used to call `on_event` directly,
+/// bypassing the panic boundary every other native fan-out uses.
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_input_panic_is_isolated_and_later_handlers_run() {
+    struct PanicOnTerminal {
+        info: PluginInfo,
+    }
+
+    impl AgentPlugin for PanicOnTerminal {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec!["terminal_input".to_owned()])
+        }
+
+        fn on_event<'a>(&'a self, _event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            Box::pin(async { panic!("terminal input boom") })
+        }
+    }
+
+    struct ConsumeOnTerminal {
+        info: PluginInfo,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl AgentPlugin for ConsumeOnTerminal {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec!["terminal_input".to_owned()])
+        }
+
+        fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            let shown = event.payload["data"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let seen = Arc::clone(&self.seen);
+            Box::pin(async move {
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(shown);
+                PluginEventOutcome::TerminalInput {
+                    consume: true,
+                    data: None,
+                }
+            })
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let host = PluginHost::build(
+        None,
+        vec![
+            as_plugin(Arc::new(PanicOnTerminal {
+                info: PluginInfo::inline("w16-terminal-panic"),
+            })),
+            as_plugin(Arc::new(ConsumeOnTerminal {
+                info: PluginInfo::inline("w16-terminal-consume"),
+                seen: Arc::clone(&seen),
+            })),
+        ],
+    );
+
+    assert_eq!(
+        host.dispatch_terminal_input("!").await,
+        pir::plugins::services::TerminalInputAction::Consume,
+        "the panic must fail open and the later handler's consume must win"
+    );
+    assert_eq!(
+        drain_seen(&seen),
+        vec!["!".to_owned()],
+        "the later handler received the original chunk"
+    );
 }
 
 /// Behavioural contract for every declaration kind: what

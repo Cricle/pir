@@ -98,7 +98,7 @@ python scripts/soak/soak_session_reopen.py --pir target-alt\release\pir.exe --re
 python scripts/soak/soak_crash_reopen.py --pir target-alt\release\pir.exe --iterations 5
 ```
 
-Record every verdict line in `docs/STATUS.md` with the binary path, size and
+Record every verdict line in `RESULTS.md` with the binary path, size and
 build time; a number without the binary it came from is not evidence.
 
 ---

@@ -343,7 +343,7 @@ impl AgentTool for ReadTool {
                 return ToolResult::error("Operation aborted");
             }
             if let Some(operations) = operations {
-                return read_with_operations(
+                return read_with_operations(ReadRequest {
                     operations,
                     cwd,
                     path,
@@ -352,7 +352,7 @@ impl AgentTool for ReadTool {
                     limit,
                     image_support,
                     signal,
-                )
+                })
                 .await;
             }
             if let Some(environment) = remote {
@@ -417,14 +417,8 @@ impl AgentTool for ReadTool {
     }
 }
 
-/// The pluggable-backend arm of the read tool: normalize + confine the path
-/// exactly like the local arm, then obtain the bytes through the backend. The
-/// image/binary/text shaping below is shared with the other arms, so a model
-/// sees the same result shape from any backend.
-// The per-call knobs are a fixed set threaded from the tool arm; a parameter
-// struct would only repeat them at the single call site.
-#[allow(clippy::too_many_arguments)]
-async fn read_with_operations(
+/// The path and per-call knobs one injected read backend runs with.
+struct ReadRequest {
     operations: std::sync::Arc<dyn ReadOperations>,
     cwd: PathBuf,
     path: String,
@@ -433,7 +427,23 @@ async fn read_with_operations(
     limit: Option<usize>,
     image_support: ImageSupport,
     signal: Option<AbortSignal>,
-) -> ToolResult {
+}
+
+/// The pluggable-backend arm of the read tool: normalize + confine the path
+/// exactly like the local arm, then obtain the bytes through the backend. The
+/// image/binary/text shaping below is shared with the other arms, so a model
+/// sees the same result shape from any backend.
+async fn read_with_operations(request: ReadRequest) -> ToolResult {
+    let ReadRequest {
+        operations,
+        cwd,
+        path,
+        raw_offset,
+        offset,
+        limit,
+        image_support,
+        signal,
+    } = request;
     let parts = match resolve_read_path(&cwd, &path) {
         Ok(parts) => parts,
         Err(error) => return ToolResult::error(error),

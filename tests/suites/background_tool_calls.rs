@@ -1091,6 +1091,371 @@ async fn session_registry_reflects_and_aborts_background_calls() {
     );
 }
 
+/// A background-capable probe that completes when the test releases it,
+/// recording that it entered. Used by the storage-swap delivery regression.
+struct GatedBackgroundProbe {
+    entered: Arc<AtomicUsize>,
+    gate: Arc<tokio::sync::Notify>,
+}
+
+impl AgentTool for GatedBackgroundProbe {
+    fn name(&self) -> &'static str {
+        "bg-gated-probe"
+    }
+
+    fn description(&self) -> &'static str {
+        "completes when the test releases it"
+    }
+
+    fn parameters(&self) -> Option<serde_json::Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }))
+    }
+
+    fn run(&self, _args: &serde_json::Value, _ctx: &ToolContext) -> BoxFuture<'static, ToolResult> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let gate = Arc::clone(&self.gate);
+        Box::pin(async move {
+            gate.notified().await;
+            ToolResult::ok("background-ok")
+        })
+    }
+}
+
+/// One scripted turn with a foreground gate call and a background gate call;
+/// later turns finish the run.
+///
+/// The second provider request parks on `second_request_gate` so the storage
+/// swap test keeps the run in `SESSION_RUNNING` while the stale completion
+/// finishes delivering — the exact window in which an unchecked follow-up
+/// frame would be injected. Every request's context is serialized into
+/// `request_contexts` so the test can assert that no stale completion frame
+/// ever reached a live turn.
+fn session_storage_swap_stream(
+    second_request_gate: Arc<tokio::sync::Notify>,
+    request_contexts: Arc<Mutex<Vec<String>>>,
+) -> SharedEventStreamFn {
+    let requests = Arc::new(AtomicUsize::new(0));
+    Arc::new(move |request| {
+        let index = requests.fetch_add(1, Ordering::SeqCst);
+        let second_request_gate = Arc::clone(&second_request_gate);
+        let request_contexts = Arc::clone(&request_contexts);
+        Box::pin(async move {
+            request_contexts
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(request.context.as_ref()).unwrap_or_default());
+            if index == 1 {
+                // Hold the run open at the second request: the batch
+                // boundary has passed, so this is the only remaining live
+                // turn the stale completion could leak into.
+                second_request_gate.notified().await;
+            }
+            let message = if index == 0 {
+                scripted_message(
+                    vec![
+                        tool_call_block("fg-call", "gate-probe", json!({})),
+                        tool_call_block("bg-call", "bg-gated-probe", json!({ "background": true })),
+                    ],
+                    StopReason::ToolUse,
+                )
+            } else {
+                finished_message("done")
+            };
+            let stream = AssistantMessageEventStream::new();
+            stream.push(AssistantMessageEventStream::done_event(
+                TerminalReason::Stop,
+                message,
+            ));
+            stream
+        })
+    })
+}
+
+/// The `backgroundToolResult` entries persisted into an explicit manager slot
+/// (the helper above always reads the session's CURRENT slot).
+async fn background_results_in(
+    manager: &Arc<tokio::sync::Mutex<SessionManager>>,
+) -> Vec<CustomMessageEntry> {
+    manager
+        .lock()
+        .await
+        .entries()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            FileEntry::CustomMessage(entry) if entry.custom_type == "backgroundToolResult" => {
+                Some(entry)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// FIX-A05 (R1-L1-001): a background completion that has already settled and
+/// is waiting for the batch boundary must re-check its registry generation
+/// after the wait. A session storage swap bumps the generation while holding
+/// that same boundary; the completion must then skip persistence instead of
+/// writing its `backgroundToolResult` into the NEW transcript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_completion_after_session_swap_is_not_persisted_into_new_store() {
+    let dir = fixture_dir("session-swap-stale-completion");
+    let fg_gate = Arc::new(tokio::sync::Notify::new());
+    let fg_entered = Arc::new(AtomicUsize::new(0));
+    let bg_gate = Arc::new(tokio::sync::Notify::new());
+    let bg_entered = Arc::new(AtomicUsize::new(0));
+    // The second request is held open so the stale delivery runs while the
+    // session is still RUNNING (the only window where a follow-up can be
+    // injected); every live request context is recorded for the final
+    // no-frame assertion.
+    let second_request_gate = Arc::new(tokio::sync::Notify::new());
+    let request_contexts = Arc::new(Mutex::new(Vec::new()));
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(GateProbe {
+        entered: Arc::clone(&fg_entered),
+        gate: Arc::clone(&fg_gate),
+    }));
+    tools.register(Arc::new(GatedBackgroundProbe {
+        entered: Arc::clone(&bg_entered),
+        gate: Arc::clone(&bg_gate),
+    }));
+
+    let cwd = dir.to_string_lossy().into_owned();
+    let session = Arc::new(AgentSession::new(AgentSessionConfig {
+        provider_registry: Arc::new(ProviderRegistry::default()),
+        model: session_model(),
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools,
+        session: Some(SessionManager::in_memory(&cwd, None).expect("old in-memory session")),
+        compaction: None,
+        max_turns: 4,
+        system_prompt: Some("background storage swap regression".to_owned()),
+        cwd: Some(dir.clone()),
+        event_stream: Some(session_storage_swap_stream(
+            Arc::clone(&second_request_gate),
+            Arc::clone(&request_contexts),
+        )),
+        extensions: None,
+        tool_selection: None,
+    }));
+    let ends: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let ends_for_handler = Arc::clone(&ends);
+    session.on_session_event(Arc::new(move |event| {
+        if matches!(event, SessionEvent::BackgroundToolEnd { .. }) {
+            ends_for_handler.lock().unwrap().push(event);
+        }
+    }));
+
+    let prompt = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .prompt("start", Arc::new(|_event: AgentEvent| {}))
+                .await
+        }
+    });
+
+    // Both calls of the first batch are running: the foreground one holds the
+    // batch barrier open, the background one will complete into the delivery.
+    for _ in 0..2000 {
+        if fg_entered.load(Ordering::SeqCst) >= 1 && bg_entered.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(
+        fg_entered.load(Ordering::SeqCst) >= 1 && bg_entered.load(Ordering::SeqCst) >= 1,
+        "both the foreground and the background call must start"
+    );
+
+    // Let the background call finish. Its delivery takes the registry entry
+    // (`background_call_count` drops to 0) and then parks on the placeholder
+    // commit gate — the batch has not persisted its results yet.
+    bg_gate.notify_one();
+    for _ in 0..2000 {
+        if session.background_call_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        session.background_call_count(),
+        0,
+        "the completed call must settle out of the in-flight registry"
+    );
+
+    // Start the swap while the foreground batch is still open: its
+    // `begin_batch` queues on the barrier BEFORE the completion (which is
+    // still parked on the placeholder gate). When the batch closes, the swap
+    // runs first, bumps the registry generation, and only then does the
+    // completion acquire the boundary and re-check its generation.
+    let new_storage = SessionManager::in_memory(&cwd, None).expect("new in-memory session");
+    let swap = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move { session.replace_session_storage(new_storage).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Close the foreground batch: persists the placeholders, opens the
+    // completion's commit gate, and lets the queued swap and delivery run.
+    fg_gate.notify_one();
+    assert!(
+        swap.await.expect("swap task"),
+        "the session storage swap must succeed"
+    );
+
+    // The loop passes the batch boundary and parks inside the second request,
+    // so the run is still RUNNING while the stale completion delivers. Wait
+    // for both observable steps (request built + completion event) and give
+    // the delivery's post-barrier branch time to run.
+    for _ in 0..2000 {
+        if !ends.lock().unwrap().is_empty() && request_contexts.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        ends.lock().unwrap().len(),
+        1,
+        "the background completion must still be reported through the event surface"
+    );
+    assert!(
+        request_contexts.lock().unwrap().len() >= 2,
+        "the run must reach the gated second request"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // P3-02: the stale completion must not enter the new session's live turn
+    // through the follow-up inbox (the durable entry is skipped above).
+    assert!(
+        session.get_background_follow_up_messages().await.is_empty(),
+        "a stale background completion must not be injected into the NEW session's follow-up queue"
+    );
+
+    second_request_gate.notify_one();
+    let _ = prompt.await.expect("prompt task");
+
+    // ... and no provider request handed the stale frame to a model, whether
+    // the delivery lost the batch-boundary race (frame consumed into the next
+    // request) or arrived after it (frame queued for a later poll).
+    let contexts = request_contexts.lock().unwrap().clone();
+    assert!(
+        contexts
+            .iter()
+            .all(|context| !context.contains("<background-tool-result ")),
+        "a stale background completion frame must not reach a live model request: {contexts:?}"
+    );
+
+    let new_slot = session.session_manager().expect("new session slot");
+    assert!(
+        background_results_in(&new_slot).await.is_empty(),
+        "a stale background result must not be persisted into the NEW transcript"
+    );
+}
+
+/// AS3 P3-02 (reverse order, P3-新-8): the completion took the batch barrier
+/// FIRST (it persisted into the OLD manager and released the barrier), then
+/// the swap bumps the generation and drains. A follow-up enqueue from the
+/// pre-swap generation must be refused; a frame accepted before the bump must
+/// be inside the drain, never left for the new session's first prompt.
+///
+/// `FollowUpQueueProbe::swap_and_drain` drives the same registry primitives
+/// `swap_session_storage` uses (`abort_all` then the inbox drain) without a
+/// 50/100 ms scheduling race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swap_drain_refuses_follow_up_frames_from_the_pre_swap_generation() {
+    use pir::agent_session::FollowUpQueueProbe;
+
+    let probe = FollowUpQueueProbe::new();
+    let old_generation = probe.generation();
+    probe.open();
+
+    assert!(
+        probe.try_queue_from_generation(old_generation, "completion-before-swap"),
+        "a live completion enqueues under its own generation"
+    );
+    let drained = probe.swap_and_drain().await;
+    assert_eq!(
+        drained,
+        vec!["completion-before-swap".to_owned()],
+        "the swap drain must carry frames accepted before the generation bump"
+    );
+
+    assert!(
+        !probe.try_queue_from_generation(old_generation, "completion-after-drain"),
+        "a stale completion must not enqueue after the swap (the P3-02 reverse window)"
+    );
+    assert!(probe.queued().await.is_empty());
+
+    // The gate stays open for the NEW generation: a call started on the new
+    // storage still gets its live follow-up, and the next prompt reopens
+    // normally.
+    probe.open();
+    let new_generation = probe.generation();
+    assert_ne!(new_generation, old_generation);
+    assert!(probe.try_queue_from_generation(new_generation, "new-completion"));
+    assert_eq!(
+        probe.drain_all().await,
+        vec!["new-completion".to_owned()],
+        "the new generation queues and drains normally"
+    );
+}
+
+/// AS3 P3-02 (concurrent reverse window): 32 old-generation enqueues race the
+/// swap's generation bump + drain. The gate lock makes the generation bump
+/// atomic with respect to `queue_follow_up`'s check-and-send: every accepted
+/// frame is in the drain, every refused frame is absent, and no old frame
+/// survives the swap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn swap_generation_bump_during_enqueue_storm_never_leaks_a_frame() {
+    use pir::agent_session::FollowUpQueueProbe;
+
+    let probe = Arc::new(FollowUpQueueProbe::new());
+    let old_generation = probe.generation();
+    probe.open();
+    let barrier = Arc::new(tokio::sync::Barrier::new(33));
+    let mut tasks = Vec::new();
+    for index in 0..32 {
+        let probe = Arc::clone(&probe);
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let text = format!("completion-{index}");
+            let accepted = probe.try_queue_from_generation(old_generation, &text);
+            (text, accepted)
+        }));
+    }
+    barrier.wait().await;
+    let drained = probe.swap_and_drain().await;
+
+    for task in tasks {
+        let (text, accepted) = task.await.expect("enqueue task panicked");
+        if accepted {
+            assert!(
+                drained.iter().any(|frame| frame == &text),
+                "an accepted frame missed the swap drain (leaked into the new session): {text}"
+            );
+        } else {
+            assert!(
+                !drained.iter().any(|frame| frame == &text),
+                "a refused frame reached the swap drain: {text}"
+            );
+        }
+    }
+    assert!(
+        probe.queued().await.is_empty(),
+        "no pre-swap frame may survive the swap drain"
+    );
+    assert!(
+        !probe.try_queue_from_generation(old_generation, "late-after-swap"),
+        "the pre-swap generation stays stale after the swap"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // `ctx.executeTool(name, args, { background: true })` — Step 3
 // ---------------------------------------------------------------------------
@@ -1273,18 +1638,18 @@ async fn ctx_execute_tool_background_option_detaches_the_nested_call() {
         }
         Box::pin(async {})
     });
-    let shared = NestedShared::new(
-        Arc::new(registry),
+    let shared = NestedShared::new(pir::agent::nested_tool_calls::NestedSharedConfig {
+        registry: Arc::new(registry),
         scheduler,
-        None,
-        Some(handle.clone()),
-        dir.clone(),
-        None,
-        false,
+        hooks: None,
+        extensions: Some(handle.clone()),
+        cwd: dir.clone(),
+        signal: None,
+        sequential: false,
         sink,
-        None,
-        None,
-    );
+        session_env: None,
+        callable: None,
+    });
     let executor = NestedToolExecutor::root(Arc::clone(&shared)).for_call("call-parent");
     handle.bind_nested_executor("call-parent", Arc::new(executor));
 

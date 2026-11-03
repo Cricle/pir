@@ -1473,6 +1473,7 @@ fn service_tier_pricing_reconciliation() {
 fn openai_responses_service_tier_passthrough() {
     use pir::ai::api::openai_responses::shared::build_responses_params;
     use pir::ai::api::openai_responses::ResponsesCompat;
+    use pir::ai::api::openai_responses::ResponsesWireOptions;
     let mut model = parity_model("openai", "https://api.openai.com/v1");
     model.reasoning = false;
     let options = StreamOptions {
@@ -1484,10 +1485,7 @@ fn openai_responses_service_tier_passthrough() {
         &Context::default(),
         &options,
         &ResponsesCompat::default(),
-        &model.id,
-        pir::ai::api::openai_responses::shared::OPENAI_TOOL_CALL_PROVIDERS,
-        false,
-        None,
+        &ResponsesWireOptions::new(&model.id),
     )
     .expect("body");
     assert_eq!(body["service_tier"], json!("flex"));
@@ -1498,10 +1496,7 @@ fn openai_responses_service_tier_passthrough() {
         &Context::default(),
         &options,
         &ResponsesCompat::default(),
-        &model.id,
-        pir::ai::api::openai_responses::shared::OPENAI_TOOL_CALL_PROVIDERS,
-        true,
-        None,
+        &ResponsesWireOptions::new(&model.id).with_omitted_unsupported_fields(true),
     )
     .expect("body");
     assert!(body.get("service_tier").is_none());

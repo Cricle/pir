@@ -9,6 +9,7 @@
 //!   server semantics (sessions owned by a disconnected connection are
 //!   removed server-side, so their attach state cannot be restored).
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1878,5 +1879,149 @@ async fn update_overflow_is_reported_and_snapshot_resync_stays_transcript_empty(
         .await
         .expect("surviving updates after the overflow report");
     assert_eq!(tail["sequence"], 6, "the oldest five updates were dropped");
+    fixture.abort();
+}
+
+// ---------------------------------------------------------------------------
+// R1-L2-002: a timed-out write tears the transport down (no half-frame reuse)
+// ---------------------------------------------------------------------------
+
+/// Scripted peer that completes the handshake and then never reads again.
+/// The client's socket send buffers fill, so a large write can only end
+/// through the request timeout.
+async fn stalled_read_accept_loop(listener: TcpListener, server_id: String) {
+    let Ok((mut stream, _)) = listener.accept().await else {
+        return;
+    };
+    let hello = ServerEnvelope::Hello(ServerHelloV8 {
+        type_: "hello".to_owned(),
+        version: PROTOCOL_VERSION,
+        server_id,
+    });
+    let Ok(frame) = encode_server_envelope(&hello, FrameOptions::default()) else {
+        return;
+    };
+    if stream.write_all(&frame).await.is_err() {
+        return;
+    }
+    // Deliberately no reads: hold the connection open until the test ends.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+}
+
+/// A write that hits the request timeout may have emitted a partial frame
+/// (`write_all` is not cancellation safe). The client must drop the transport
+/// (reader/writer/pending + a `Disconnected` transition) instead of reusing
+/// the connection, and a later call must fail fast with `Disconnected`
+/// instead of queueing another frame behind the torn one.
+#[tokio::test]
+async fn client_write_timeout_drops_transport_and_never_reuses_half_frame() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled listener");
+    let address = listener.local_addr().expect("fixture address");
+    let fixture = tokio::spawn(stalled_read_accept_loop(
+        listener,
+        uuid::Uuid::new_v4().to_string(),
+    ));
+
+    let stream = TcpStream::connect(address).await.expect("dial fixture");
+    let timeouts = ClientTimeouts {
+        connect: Duration::from_millis(500),
+        request: Duration::from_millis(200),
+        update: Duration::from_millis(200),
+    };
+    let mut client = Client::from_stream_with_token_and_timeouts(stream, None, timeouts)
+        .await
+        .expect("handshake over the stalled peer");
+    let target = RpcTarget::server(client.server_id());
+
+    // Frames bigger than any loopback socket buffer: the earlier ones may
+    // still fit in the kernel buffers, a later one cannot be written while
+    // the peer refuses to read. Three attempts keep the fixture deterministic
+    // on auto-tuned stacks without changing what is asserted (the timeout is
+    // the only terminal outcome).
+    let payload = "x".repeat(15 * 1024 * 1024);
+    let mut timed_out = false;
+    for _ in 0..3 {
+        match client
+            .start_call(
+                target.clone(),
+                SESSION_SERVICE_ID,
+                "list",
+                vec![serde_json::json!({"blob": &payload})],
+            )
+            .await
+        {
+            Ok(_) => continue,
+            Err(ClientError::Timeout { operation: "send" }) => {
+                timed_out = true;
+                break;
+            }
+            Err(other) => panic!("unexpected failure while writing: {other:?}"),
+        }
+    }
+    assert!(
+        timed_out,
+        "the stalled peer must eventually hit the write timeout"
+    );
+    assert_eq!(
+        client.pending_requests_count(),
+        0,
+        "a write timeout must clear the pending table with the transport"
+    );
+    assert_eq!(
+        client.connection_state(),
+        ConnectionState::Disconnected,
+        "a write timeout must report the transport as disconnected"
+    );
+
+    // The broken connection is not reused: the next call fails immediately
+    // with a typed Disconnected instead of writing behind the half frame.
+    let started = Instant::now();
+    let second = client
+        .call(target, SESSION_SERVICE_ID, "list", Vec::new())
+        .await;
+    assert!(
+        matches!(second, Err(ClientError::Disconnected)),
+        "expected Disconnected after the dropped transport, got {second:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "the next call must not wait out another request timeout"
+    );
+    fixture.abort();
+}
+
+// ---------------------------------------------------------------------------
+// R1-L2-012: connect falls back to every resolved address
+// ---------------------------------------------------------------------------
+
+/// `lookup_host` may return several addresses (typically AAAA + A). When the
+/// first one is unreachable the client must try the rest inside the same
+/// connect deadline and remember the address that actually worked.
+#[tokio::test]
+async fn connect_tries_every_resolved_address() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind hello server");
+    let real_addr = listener.local_addr().expect("fixture address");
+    let server_id = uuid::Uuid::new_v4().to_string();
+    let fixture = tokio::spawn(scripted_accept_loop(listener, server_id.clone()));
+
+    // An unspecified (0.0.0.0) connect address fails IMMEDIATELY with
+    // WSAEADDRNOTAVAIL on Windows; connecting to a closed loopback port can
+    // instead HANG behind the loopback firewall, consuming the whole connect
+    // deadline before the live address is tried. On Unix the 0.0.0.0 route
+    // maps to localhost and the unused discard port refuses at once.
+    let addrs = [SocketAddr::from(([0, 0, 0, 0], 9)), real_addr];
+    let client = Client::connect_with_timeouts(&addrs[..], short_timeouts())
+        .await
+        .expect("connect must fall back to the live address");
+    assert_eq!(client.server_id(), server_id);
+    assert_eq!(
+        client.address(),
+        Some(real_addr),
+        "the address that accepted the connection is kept for reconnect"
+    );
     fixture.abort();
 }

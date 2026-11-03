@@ -118,6 +118,16 @@ async fn builtin_only_plan_skips_quickjs_but_js_extensions_still_run() {
             "builtin `{name}` is missing from the plugin host: {plugin_paths:?}"
         );
     }
+    assert!(
+        !plugin_paths
+            .iter()
+            .any(|path| path == "<inline:js-extensions>"),
+        "a plan-only handle must not create a JS adapter: {plugin_paths:?}"
+    );
+    assert!(
+        host.js_handle().is_none(),
+        "a plan-only handle must not be exposed as a live JS runtime"
+    );
 
     // Dispatch behaves exactly like the old empty JS runtime: no handlers, no
     // errors and an untouched payload.

@@ -160,6 +160,36 @@ impl ToolRepairPlugin {
     pub fn config(&self) -> &config::ToolRepairConfig {
         self.config.get_or_init(config::ToolRepairConfig::load)
     }
+
+    /// Whether the Phase 0 `before_provider_request` handler could rewrite a
+    /// request body for `model` (the model id the request runs under, when
+    /// known).
+    ///
+    /// The handler gates on the model pushed through
+    /// [`AgentPlugin::on_session_context`] and never on the request payload
+    /// shape, so this is the exact inertness test the host's hook-install
+    /// fast path needs
+    /// ([`crate::plugins::host::PluginHost::has_active_handlers_for`]): a
+    /// model outside `anchorBleedModels` cannot reach
+    /// [`repair::sanitize_request_payload`]'s mutating branch at all.
+    ///
+    /// Both the caller's model and the cached session model are checked: the
+    /// handler always reads the cache, and a summarizer/compaction request can
+    /// legitimately run under a different model than the cached session one.
+    /// A match on EITHER side answers `true`, which is conservative in the
+    /// safe direction — it can keep the value-body path needlessly, but it can
+    /// never skip a live handler.
+    pub fn is_active_for_model(&self, model: Option<&str>) -> bool {
+        if aliases::has_anchor_bleed_bug(model) {
+            return true;
+        }
+        let cached = self
+            .model_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        aliases::has_anchor_bleed_bug(cached.as_deref())
+    }
 }
 
 impl AgentPlugin for ToolRepairPlugin {
@@ -168,12 +198,22 @@ impl AgentPlugin for ToolRepairPlugin {
     }
 
     /// The one event this plugin consumes: `before_provider_request` (Phase 0).
-    /// Declaring the interest is what makes the session host install its
-    /// per-request transport hook (`agent_session/stream.rs`'s
-    /// `has_handlers` gate); a session without it never parses/unwraps the
-    /// request payload for this plugin.
+    /// Declaring the interest is what makes the session/print host consider
+    /// installing its per-request transport hook; the host additionally asks
+    /// [`AgentPlugin::handler_active_for_event`], so a host whose only
+    /// interested plugin is this one skips the hook entirely for a non-gated
+    /// model.
     fn events(&self) -> EventInterest {
         EventInterest::List(vec!["before_provider_request".to_owned()])
+    }
+
+    /// The Phase 0 handler is inert for every model outside
+    /// `anchorBleedModels` (and before any session-context push), so the host
+    /// may skip installing the `before_provider_request` transport hook — and
+    /// with it the full `serde_json::Value` request body — when no other
+    /// handler is live.
+    fn handler_active_for_event(&self, event: &str, model: Option<&str>) -> bool {
+        event == "before_provider_request" && self.is_active_for_model(model)
     }
 
     /// Cache the model id for the Phase 0 gate.

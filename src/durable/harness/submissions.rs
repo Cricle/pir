@@ -474,13 +474,15 @@ pub(crate) async fn admit_submission_in(
             let record = create_submission_in(
                 state,
                 tx,
-                conversation,
-                draft.request_id().map(str::to_owned),
-                SubmissionType::Write,
-                SubmissionStatus::Done,
-                Some(placed.id),
-                None,
-                None,
+                NewSubmission {
+                    conversation,
+                    request_id: draft.request_id().map(str::to_owned),
+                    submission_type: SubmissionType::Write,
+                    status: SubmissionStatus::Done,
+                    entry: Some(placed.id),
+                    reason: None,
+                    detail: None,
+                },
             )
             .await?;
             return Ok(Admitted::new(record.id, Admission::DisplayOnlyPlaced));
@@ -548,13 +550,15 @@ pub(crate) async fn admit_submission_in(
         let record = create_submission_in(
             state,
             tx,
-            conversation,
-            draft.request_id().map(str::to_owned),
-            submission_type,
-            SubmissionStatus::Queued,
-            None,
-            None,
-            None,
+            NewSubmission {
+                conversation,
+                request_id: draft.request_id().map(str::to_owned),
+                submission_type,
+                status: SubmissionStatus::Queued,
+                entry: None,
+                reason: None,
+                detail: None,
+            },
         )
         .await?;
         inbox.items.push(queued_item(record.id, &draft));
@@ -571,12 +575,14 @@ pub(crate) async fn admit_submission_in(
         let users = place_boundary_in(
             state,
             tx,
-            conversation,
-            &mut inbox,
-            Boundary::Final,
-            head,
-            now,
-            queue_modes,
+            BoundaryPass {
+                conversation,
+                inbox: &mut inbox,
+                at: Boundary::Final,
+                head,
+                now,
+                queue_modes,
+            },
         )
         .await?;
         generation::stage_conversation_document_state(
@@ -608,13 +614,15 @@ pub(crate) async fn admit_submission_in(
                 let record = create_submission_in(
                     state,
                     tx,
-                    conversation,
-                    draft.request_id().map(str::to_owned),
-                    SubmissionType::Write,
-                    SubmissionStatus::Unanswered,
-                    None,
-                    Some(REASON_STALE.to_owned()),
-                    None,
+                    NewSubmission {
+                        conversation,
+                        request_id: draft.request_id().map(str::to_owned),
+                        submission_type: SubmissionType::Write,
+                        status: SubmissionStatus::Unanswered,
+                        entry: None,
+                        reason: Some(REASON_STALE.to_owned()),
+                        detail: None,
+                    },
                 )
                 .await?;
                 return Ok(Admitted::new(record.id, Admission::Done));
@@ -630,13 +638,15 @@ pub(crate) async fn admit_submission_in(
             let record = create_submission_in(
                 state,
                 tx,
-                conversation,
-                draft.request_id().map(str::to_owned),
-                SubmissionType::Write,
-                SubmissionStatus::Done,
-                Some(placed.id),
-                None,
-                None,
+                NewSubmission {
+                    conversation,
+                    request_id: draft.request_id().map(str::to_owned),
+                    submission_type: SubmissionType::Write,
+                    status: SubmissionStatus::Done,
+                    entry: Some(placed.id),
+                    reason: None,
+                    detail: None,
+                },
             )
             .await?;
             Ok(Admitted::new(record.id, Admission::Done))
@@ -652,13 +662,15 @@ pub(crate) async fn admit_submission_in(
             let record = create_submission_in(
                 state,
                 tx,
-                conversation,
-                draft.request_id().map(str::to_owned),
-                SubmissionType::Input,
-                SubmissionStatus::Placed,
-                Some(placed.id),
-                None,
-                None,
+                NewSubmission {
+                    conversation,
+                    request_id: draft.request_id().map(str::to_owned),
+                    submission_type: SubmissionType::Input,
+                    status: SubmissionStatus::Placed,
+                    entry: Some(placed.id),
+                    reason: None,
+                    detail: None,
+                },
             )
             .await?;
             generation::start_run_in_state(state, tx, conversation, &[record.id]).await?;
@@ -676,23 +688,35 @@ fn admission_for(status: SubmissionStatus) -> Admission {
     }
 }
 
+/// The inbox contents and policy one boundary pass works over.
+struct BoundaryPass<'a> {
+    conversation: ConversationId,
+    inbox: &'a mut InboxState,
+    at: Boundary,
+    head: Option<EntryId>,
+    now: i64,
+    queue_modes: QueueModes,
+}
+
 /// Place the queued items a final boundary selects (upstream `applyBoundary`).
 ///
 /// The positionally selected items are removed from `inbox`; the caller stages
 /// it. `head` is the active range start, advanced by heads placed here. Every
 /// appended entry goes into `tx`; the returned ids are the placed inputs, in
 /// placement order.
-#[allow(clippy::too_many_arguments)]
 async fn place_boundary_in(
     state: &SessionState<'_>,
     tx: &mut Transaction,
-    conversation: ConversationId,
-    inbox: &mut InboxState,
-    at: Boundary,
-    head: Option<EntryId>,
-    now: i64,
-    queue_modes: QueueModes,
+    pass: BoundaryPass<'_>,
 ) -> Result<Vec<SubmissionId>, StorageError> {
+    let BoundaryPass {
+        conversation,
+        inbox,
+        at,
+        head,
+        now,
+        queue_modes,
+    } = pass;
     let selected = inbox_boundary(inbox, at, &queue_modes.settings());
     let mut active_range_start = head;
     let mut users = Vec::new();
@@ -779,11 +803,8 @@ async fn append_entry_in(
     Ok(record)
 }
 
-/// Create one submission record and stage it.
-#[allow(clippy::too_many_arguments)]
-async fn create_submission_in(
-    state: &SessionState<'_>,
-    tx: &mut Transaction,
+/// One submission record to mint and stage.
+struct NewSubmission {
     conversation: ConversationId,
     request_id: Option<String>,
     submission_type: SubmissionType,
@@ -791,7 +812,23 @@ async fn create_submission_in(
     entry: Option<EntryId>,
     reason: Option<String>,
     detail: Option<Value>,
+}
+
+/// Create one submission record and stage it.
+async fn create_submission_in(
+    state: &SessionState<'_>,
+    tx: &mut Transaction,
+    submission: NewSubmission,
 ) -> Result<SubmissionRecord, StorageError> {
+    let NewSubmission {
+        conversation,
+        request_id,
+        submission_type,
+        status,
+        entry,
+        reason,
+        detail,
+    } = submission;
     let record = SubmissionRecord {
         id: SubmissionId::from_raw(mint_id(state).await?),
         conversation_id: conversation,

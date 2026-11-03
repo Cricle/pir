@@ -497,15 +497,47 @@ impl McpSessionState {
     /// `_excludedTools` at registration time). Without the prune a stale
     /// `mcp__docs__*` name stayed DECLARED after `/mcp disable docs` and every
     /// call failed with [`crate::mcp::error::McpError::ServerDisabled`].
+    /// Whether this plugin currently owns any name in the session's active
+    /// set — an auto-activated discovery tool or a direct bridge it unioned
+    /// in. With no ownership and no configured server, [`Self::recompute`]
+    /// cannot write the set (nothing to add, nothing to prune).
+    fn owns_active_names(&self) -> bool {
+        let discovery_owned = {
+            let discovery = self
+                .discovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            discovery.codemode == DiscoveryToolOwnership::Owned
+                || discovery.tool_search == DiscoveryToolOwnership::Owned
+        };
+        discovery_owned
+            || !self
+                .bridge_owned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+    }
+
     fn recompute(&self, manager: &McpManager) -> Option<Vec<String>> {
         let context = self.context()?;
         let session = context.session()?;
-        let tools = session.all_tools();
         let active: Vec<String> = session
             .active_tools()
             .iter()
             .map(|name| name.to_string())
             .collect();
+        // Fast path: with no configured server AND no activation this plugin
+        // owns, this pass cannot change the active set. Both discovery gates
+        // are false (no enabled exposure), the default-tools bridge union is
+        // empty (no registry entry can qualify), and no owned name needs
+        // pruning — so return without materializing the session's tool
+        // surface. `all_tools()` builds the merged typed definitions and
+        // caches them; at build time it is pure startup cost when no MCP
+        // server exists (measured: ~17.6 KB live).
+        if manager.registry().list().is_empty() && !self.owns_active_names() {
+            return Some(active);
+        }
+        let tools = session.all_tools();
         let exposures: Vec<McpExposure> = manager
             .registry()
             .list()

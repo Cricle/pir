@@ -271,17 +271,18 @@ impl ToolScheduler {
             // Phase 1: preflight each call in source order. Preflight consumes the
             // calls: it is their last reader, so the parallel fan-out below can
             // move each prepared call into its future (no argument copies).
-            let (prepared, mut results, start_events) = prepare::prepare_calls(
-                calls,
-                registry,
-                self.callable.as_deref(),
-                context,
-                hooks,
-                &aborted_flag,
-                self.progress.as_ref(),
-                self.tool_events.as_ref(),
-            )
-            .await;
+            let (prepared, mut results, start_events) =
+                prepare::prepare_calls(prepare::BatchPreflight {
+                    calls,
+                    registry,
+                    callable: self.callable.as_deref(),
+                    context,
+                    hooks,
+                    aborted_flag: &aborted_flag,
+                    progress: self.progress.as_ref(),
+                    faces: self.tool_events.as_ref(),
+                })
+                .await;
 
             // Preflight failures emit an immediate `tool_execution_end` for their
             // error result (upstream emits the end right after the failed
@@ -337,18 +338,19 @@ impl ToolScheduler {
             if self.progress.is_some() {
                 tokio::task::yield_now().await;
             }
-            let (end_events, executed, detached) = execute::execute_prepared(
-                self,
-                prepared,
-                registry,
-                context,
-                hooks,
-                &detach_hooks,
-                &aborted_flag,
-                self.progress.as_ref(),
-                first_preflight_failure,
-            )
-            .await;
+            let (end_events, executed, detached) =
+                execute::execute_prepared(execute::BatchExecution {
+                    scheduler: self,
+                    prepared,
+                    registry,
+                    context,
+                    hooks,
+                    detach_hooks: &detach_hooks,
+                    aborted_flag: &aborted_flag,
+                    progress: self.progress.as_ref(),
+                    first_preflight_failure,
+                })
+                .await;
 
             results.extend(executed);
             results.sort_by_key(|result| result.index);

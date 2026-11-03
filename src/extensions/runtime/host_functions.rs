@@ -39,7 +39,9 @@ fn context_json(state: &RuntimeState) -> String {
         "cwd": cfg.cwd.display().to_string(),
         // Normalized upstream mode: exactly "tui" | "rpc" | "json" | "print".
         "mode": normalize_mode(&cfg.mode),
-        "hasUI": cfg.has_ui,
+        // A bootstrap fail-fast runtime has no usable presentation sink, so
+        // expose the same "no UI" answer the headless hosts do.
+        "hasUI": cfg.has_ui && !state.ui_fail_fast,
         // Full current Model object when the host pushed one; falls back to
         // the configured model id string.
         "model": if session.model.is_null() {

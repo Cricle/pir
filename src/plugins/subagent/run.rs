@@ -1,3 +1,4 @@
+use super::child::ChildRunInputs;
 use super::*;
 
 /// Tool execution entry point: mode validation, the project-agent trust
@@ -185,17 +186,17 @@ async fn run_single(
             );
         })
     };
-    let result = run_child(
+    let result = run_child(ChildRunInputs {
         env,
         extensions,
         agents,
         agent_name,
         task,
         cwd,
-        None,
-        ctx.signal.clone(),
-        Some(on_task_update),
-    )
+        step: None,
+        parent_signal: ctx.signal.clone(),
+        on_task_update: Some(on_task_update),
+    })
     .await;
     let details = builder.build(std::slice::from_ref(&result));
     if ctx
@@ -276,17 +277,17 @@ async fn run_chain(
                 );
             })
         };
-        let result = run_child(
-            Arc::clone(&env),
-            extensions.clone(),
-            Arc::clone(&agents),
-            step.agent.clone(),
-            task_with_context,
+        let result = run_child(ChildRunInputs {
+            env: Arc::clone(&env),
+            extensions: extensions.clone(),
+            agents: Arc::clone(&agents),
+            agent_name: step.agent.clone(),
+            task: task_with_context,
             cwd,
-            Some(index + 1),
-            ctx.signal.clone(),
-            Some(on_task_update),
-        )
+            step: Some(index + 1),
+            parent_signal: ctx.signal.clone(),
+            on_task_update: Some(on_task_update),
+        })
         .await;
         let failed = is_failed(&result);
         completed
@@ -412,17 +413,17 @@ async fn run_parallel(
         };
         handles.push(tokio::spawn(async move {
             let _permit = semaphore.acquire_owned().await;
-            let result = run_child(
+            let result = run_child(ChildRunInputs {
                 env,
                 extensions,
                 agents,
                 agent_name,
-                task_text,
+                task: task_text,
                 cwd,
-                None,
-                signal,
-                Some(on_task_update),
-            )
+                step: None,
+                parent_signal: signal,
+                on_task_update: Some(on_task_update),
+            })
             .await;
             {
                 let mut slots = shared

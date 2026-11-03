@@ -376,6 +376,15 @@ pub(super) async fn run() -> Result<()> {
         Some(_) => false,
         None => entry.app_mode == AppMode::Interactive,
     };
+    // The headless host's OUTPUT mode is part of its extension runtime
+    // config (`"print"` vs `"json"`), not just how stdout is formatted:
+    // `ctx.mode` and the runtime's protocol-safe stdio routing depend on it.
+    // The strict validation parks its runtime for the print host, and the
+    // handoff rejects any construction-field mismatch — so the validation
+    // (and pre-trust bootstrap) config must derive this from the same host
+    // decision the print path makes. `AppMode::Json` is set by `--mode json`
+    // for both the bare entry shape and `pir print`.
+    let print_output = super::cli_preprocess::headless_output_mode(entry.app_mode);
     // First-run setup (upstream main.ts:675-680): the experimental
     // theme/analytics dialog runs before the trust decision and before the
     // real settings load, so the chosen values apply to this same run. The
@@ -412,6 +421,13 @@ pub(super) async fn run() -> Result<()> {
     ) && cli.export.is_none();
     let rpc_command = mode == Some(Mode::Rpc) || matches!(cli.command, Some(Command::Rpc));
     let mut bootstrap_settings: Option<SettingsManager> = None;
+    // The pre-trust pass's live runtime: adopted below as the host runtime
+    // when the final extension plan is identical (upstream reuses
+    // `preTrustExtensions.runtime`), otherwise dropped after strict validation.
+    let mut pre_trust_runtime: Option<(
+        pir::extensions::ExtensionConfig,
+        pir::extensions::ExtensionHandle,
+    )> = None;
     if host_loads_extensions
         && cli.trust_override().is_none()
         && pir::extensions::project_trust::env_override_decision().is_none()
@@ -419,9 +435,22 @@ pub(super) async fn run() -> Result<()> {
     {
         let settings =
             SettingsManager::load(&agent_dir, &project_dir.join(".pi"), &project_dir, false);
-        let config =
-            super::cli_preprocess::extension_runtime_config(rpc_command, interactive, &project_dir);
-        super::cli_preprocess::bootstrap_project_trust_extensions(&cli, &settings, config).await;
+        let config = super::cli_preprocess::extension_runtime_config(
+            rpc_command,
+            interactive,
+            print_output,
+            &project_dir,
+        );
+        // `load_extension_runtime_bootstrap` enables the UI fail-fast flag
+        // around its `project_trust` dispatch (P2-EVENT3-02), so a handler's
+        // `ctx.ui.select` cannot park on the 600 s dialog TTL without a sink.
+        pre_trust_runtime = super::cli_preprocess::bootstrap_project_trust_extensions(
+            &cli,
+            &settings,
+            config,
+            entry.app_mode,
+        )
+        .await;
         // Reused below when the extension pass leaves the project untrusted:
         // it is exactly the manager the final trust state asks for.
         bootstrap_settings = Some(settings);
@@ -491,7 +520,7 @@ pub(super) async fn run() -> Result<()> {
     // every subcommand keeps the default (empty) plan, so no settings,
     // discovery or package scan runs on the way to its own work.
     let extension_plan = if host_loads_extensions {
-        resolve_extension_paths(&cli, &settings_manager, project_trusted)
+        resolve_extension_paths(&cli, &settings_manager, project_trusted, entry.app_mode)
     } else {
         super::cli_preprocess::ResolvedExtensionPaths::default()
     };
@@ -584,8 +613,12 @@ pub(super) async fn run() -> Result<()> {
     let mut cli_flag_diagnostics: Option<Vec<pir::agent_session::CliExtensionFlagDiagnostic>> =
         None;
     if host_loads_extensions && !extension_paths.is_empty() {
-        let validation_config =
-            super::cli_preprocess::extension_runtime_config(rpc_command, interactive, &project_dir);
+        let validation_config = super::cli_preprocess::extension_runtime_config(
+            rpc_command,
+            interactive,
+            print_output,
+            &project_dir,
+        );
         // Package-contributed paths are warn-only: a package extension pir's
         // runtime cannot load (Node APIs, deeper bundler layouts) must not
         // brick startup. The strict gate still hard-fails the user's own
@@ -627,6 +660,37 @@ pub(super) async fn run() -> Result<()> {
                 std::process::exit(1);
             }
         };
+        // Prefer the pre-trust runtime as the LIVE one when the final plan is
+        // exactly the plan it loaded (same ordered paths + construction
+        // config). It already dispatched `project_trust`, so the handler's
+        // module/closure state and queued `ctx.ui` notifications continue
+        // into `session_start`/the session, matching upstream's reuse of
+        // `preTrustExtensions.runtime`. The strict load above still owns the
+        // fatal/warn classification of every final-plan path; its duplicate
+        // runtime is disposed silently. When the final plan adds project
+        // resources (trust granted) the bootstrap instance cannot be extended
+        // in place: it is dropped (disposable, no shutdown event) and the
+        // strict runtime serves the host — the documented residual.
+        let validated = match (validated, pre_trust_runtime.take()) {
+            (strict, Some((bootstrap_config, bootstrap)))
+                if bootstrap.path_plan() == extension_paths
+                    && pir::agent_session::extension_config_matches_for_handoff(
+                        &bootstrap_config,
+                        &validation_config,
+                    ) =>
+            {
+                if let Some(strict) = strict {
+                    pir::agent_session::discard_extension_runtime(strict);
+                }
+                Some(pir::agent_session::adopt_pre_trust_extension_runtime(
+                    bootstrap,
+                ))
+            }
+            (strict, bootstrap) => {
+                drop(bootstrap);
+                strict
+            }
+        };
         if let Some(runtime) = validated {
             // Validate the collected `--flag[=value]` arguments against the
             // loaded registrations. The values were already applied by the
@@ -663,6 +727,10 @@ pub(super) async fn run() -> Result<()> {
             );
         }
     }
+
+    // The pre-trust pass was never needed (empty filtered plan) or was not
+    // adopted: dropping the disposable handle is silent by construction.
+    drop(pre_trust_runtime);
 
     // Upstream `applyExtensionFlagValues` runs even when no extension plan was
     // loaded (no `-e`, `--no-extensions`, only builtins filtered away): every
@@ -866,29 +934,29 @@ pub(super) async fn run() -> Result<()> {
                 // print them to stderr (see the collection site above).
                 // The CLI model/credential/prompt/theme flags are resolved by
                 // the TUI host itself (it owns the full model environment).
-                pir::tui::run(
+                pir::tui::run(pir::tui::TuiRunOptions {
                     extension_paths,
-                    cli.use_theme.clone(),
-                    plan,
-                    config.session_dir.clone(),
-                    pir::coding_agent::resources::ResourcePathOptions {
+                    theme: cli.use_theme.clone(),
+                    session: plan,
+                    session_dir: config.session_dir.clone(),
+                    resource_paths: pir::coding_agent::resources::ResourcePathOptions {
                         skill_paths: cli.skill.clone(),
                         prompt_paths: cli.prompt_template.clone(),
                         no_skills: cli.no_skills,
                         no_prompt_templates: cli.no_prompt_templates,
                     },
-                    Vec::new(),
-                    resolve_interactive_tool_selection(
+                    initial_messages: Vec::new(),
+                    tool_selection: resolve_interactive_tool_selection(
                         &cli,
                         &settings_manager,
                         interactive_extension_runtime.as_ref(),
                     )?,
-                    cli.tui_mode.clone(),
-                    &settings_manager,
-                    &package_resources.themes,
-                    startup_settings_diagnostics,
-                    interactive_overrides(&cli)?,
-                )
+                    cli_tui_mode: cli.tui_mode.clone(),
+                    settings: &settings_manager,
+                    package_themes: &package_resources.themes,
+                    settings_diagnostics: startup_settings_diagnostics,
+                    overrides: interactive_overrides(&cli)?,
+                })
             }
         }
         Some(Command::Print { prompt }) => {
@@ -904,19 +972,19 @@ pub(super) async fn run() -> Result<()> {
             // Headless resolution never yields the picker plan: `--resume`
             // selects this project's most recent session instead.
             let plan = resolve_run_session_plan(&cli, &config, false)?;
-            run_print_mode(
-                &cli,
-                &config,
-                &settings_manager,
-                &extension_paths,
-                pir::coding_agent::cli::PrintPrompts {
+            run_print_mode(PrintModeRequest {
+                cli: &cli,
+                config: &config,
+                settings_manager: &settings_manager,
+                extension_paths: &extension_paths,
+                prompts: pir::coding_agent::cli::PrintPrompts {
                     initial_message: Some(prompt),
                     additional_messages: Vec::new(),
                 },
-                Vec::new(),
+                images: Vec::new(),
                 plan,
-                mode == Some(Mode::Json),
-            )
+                json_output: mode == Some(Mode::Json),
+            })
             .await
         }
         Some(Command::Rpc) => {
@@ -1155,16 +1223,16 @@ pub(super) async fn run() -> Result<()> {
                         );
                         return Ok(());
                     }
-                    run_print_mode(
-                        &cli,
-                        &config,
-                        &settings_manager,
-                        &extension_paths,
+                    run_print_mode(PrintModeRequest {
+                        cli: &cli,
+                        config: &config,
+                        settings_manager: &settings_manager,
+                        extension_paths: &extension_paths,
                         prompts,
                         images,
                         plan,
-                        app_mode == AppMode::Json,
-                    )
+                        json_output: app_mode == AppMode::Json,
+                    })
                     .await
                 }
                 AppMode::Interactive => {
@@ -1207,29 +1275,29 @@ pub(super) async fn run() -> Result<()> {
                             initial_messages.push(combined);
                         }
                         initial_messages.extend(prompts.additional_messages);
-                        pir::tui::run(
+                        pir::tui::run(pir::tui::TuiRunOptions {
                             extension_paths,
-                            cli.use_theme.clone(),
-                            plan,
-                            config.session_dir.clone(),
-                            pir::coding_agent::resources::ResourcePathOptions {
+                            theme: cli.use_theme.clone(),
+                            session: plan,
+                            session_dir: config.session_dir.clone(),
+                            resource_paths: pir::coding_agent::resources::ResourcePathOptions {
                                 skill_paths: cli.skill.clone(),
                                 prompt_paths: cli.prompt_template.clone(),
                                 no_skills: cli.no_skills,
                                 no_prompt_templates: cli.no_prompt_templates,
                             },
                             initial_messages,
-                            resolve_interactive_tool_selection(
+                            tool_selection: resolve_interactive_tool_selection(
                                 &cli,
                                 &settings_manager,
                                 interactive_extension_runtime.as_ref(),
                             )?,
-                            cli.tui_mode.clone(),
-                            &settings_manager,
-                            &package_resources.themes,
-                            startup_settings_diagnostics,
-                            interactive_overrides(&cli)?,
-                        )
+                            cli_tui_mode: cli.tui_mode.clone(),
+                            settings: &settings_manager,
+                            package_themes: &package_resources.themes,
+                            settings_diagnostics: startup_settings_diagnostics,
+                            overrides: interactive_overrides(&cli)?,
+                        })
                     }
                 }
             }

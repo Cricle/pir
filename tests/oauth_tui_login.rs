@@ -226,3 +226,23 @@ async fn cancel_never_loses_the_wakeup_race() {
         assert_eq!(result.expect("wait result"), CallbackWait::Cancelled);
     }
 }
+
+/// SNAP10 P2-S8-2 no-session regression: the TUI's flow selector falls back to
+/// the process-static/native table when the worker has not published a
+/// session (and still rejects unknown provider ids).
+#[test]
+fn tui_login_flow_without_session_keeps_the_static_provider_path() {
+    let static_flow =
+        pir::tui::terminal::tui_oauth_flow_for(None, "anthropic").expect("builtin static flow");
+    let expected = pir::ai::auth::oauth_flow_for("anthropic", None).expect("static flow");
+    assert_eq!(static_flow.name(), expected.name());
+    assert_eq!(
+        static_flow.is_subscription(),
+        expected.is_subscription(),
+        "the no-session path must keep the static provider metadata"
+    );
+    assert!(
+        pir::tui::terminal::tui_oauth_flow_for(None, "not-a-provider").is_none(),
+        "an unknown provider still has no flow without a session"
+    );
+}

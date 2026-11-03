@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pir::agent::tool_batch::ToolResult;
 use pir::agent::tool_execution::{AgentTool, BoxFuture, ToolContext, ToolRegistry};
@@ -303,6 +304,313 @@ async fn event_merge_walks_the_ordered_list_with_upstream_semantics() {
     assert_eq!(payload["input"]["k"], json!(1));
 }
 
+/// A native plugin that records the message text it was handed and returns a
+/// typed `message_end` replacement. It deliberately does NOT mutate the
+/// payload: the host is responsible for writing an earlier handler's return
+/// value back before the next handler runs (P2-01 cross-face chaining).
+struct MessageEndReplacer {
+    info: PluginInfo,
+    label: &'static str,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl AgentPlugin for MessageEndReplacer {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> pir::plugins::EventInterest {
+        pir::plugins::EventInterest::List(vec!["message_end".to_owned()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        Box::pin(async move {
+            let text = event
+                .payload
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_array)
+                .and_then(|content| content.first())
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(text);
+            let mut message = event
+                .payload
+                .get("message")
+                .cloned()
+                .expect("message_end carries a message");
+            message["content"] = json!([{ "type": "text", "text": self.label }]);
+            PluginEventOutcome::Generic(json!({ "message": message }))
+        })
+    }
+}
+
+/// `emit_native` must return and CHAIN native typed outcomes: the second
+/// handler sees the first handler's `message_end` replacement in the payload
+/// and its own (last) replacement is the merged result. Before P2-01 the
+/// outcome was dropped and the payload was never written back.
+#[tokio::test(flavor = "current_thread")]
+async fn emit_native_returns_and_chains_typed_message_end_outcomes() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let host = PluginHost::build(
+        None,
+        vec![
+            Arc::new(MessageEndReplacer {
+                info: PluginInfo::inline("native-first-replacer"),
+                label: "first",
+                seen: Arc::clone(&seen),
+            }) as Arc<dyn AgentPlugin>,
+            Arc::new(MessageEndReplacer {
+                info: PluginInfo::inline("native-second-replacer"),
+                label: "second",
+                seen: Arc::clone(&seen),
+            }),
+        ],
+    );
+    let mut payload = json!({ "type": "message_end", "message": assistant_wire("original") });
+
+    let outcome = host.emit_native("message_end", &mut payload).await;
+    assert_eq!(
+        outcome.result["message"]["content"][0]["text"],
+        json!("second"),
+        "the last native replacement must be the merged outcome: {:?}",
+        outcome.result
+    );
+    assert_eq!(
+        *seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec!["original".to_owned(), "first".to_owned()],
+        "a later native handler must observe the earlier typed replacement in its payload"
+    );
+}
+
+/// A native plugin that handles both result-shaped events used below and
+/// records the payload state it observed.
+struct ResultProbe {
+    info: PluginInfo,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl AgentPlugin for ResultProbe {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> pir::plugins::EventInterest {
+        pir::plugins::EventInterest::List(vec!["message_end".to_owned(), "tool_result".to_owned()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        Box::pin(async move {
+            if event.name.as_ref() == "message_end" {
+                let text = event.payload["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                self.seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(format!("message_end:{text}"));
+                let mut message = event.payload["message"].clone();
+                message["content"] = json!([{ "type": "text", "text": "from-native" }]);
+                return PluginEventOutcome::Generic(json!({ "message": message }));
+            }
+            let text = event.payload["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("tool_result:{text}"));
+            PluginEventOutcome::ToolResult {
+                content: Some(json!([{ "type": "text", "text": "from-native" }])),
+                details: None,
+                structured_content: None,
+                is_error: Some(false),
+                usage: None,
+            }
+        })
+    }
+}
+
+/// The loop-facing unified entry (`emit_with_runtime`) walks the host's list
+/// order: the JS adapter sits at its path-plan slot (before the inline native
+/// plugin), so the native handler observes the JS replacement and its own
+/// replacement is last-wins. This is the regression for the old agent-loop
+/// order (native fan-out first, JS second) and for dropped JS returns.
+#[tokio::test(flavor = "current_thread")]
+async fn emit_with_runtime_orders_js_before_inline_native_and_chains_results() {
+    let temp = TempDir::new("p2-01-order");
+    let runtime = load_runtime(
+        &temp,
+        &[(
+            "ext.ts",
+            r#"
+            export default function (pi) {
+                pi.on("message_end", (event) => ({
+                    message: {
+                        ...event.message,
+                        content: [{ type: "text", text: "from-js" }],
+                    },
+                }));
+                pi.on("tool_result", () => ({
+                    content: [{ type: "text", text: "from-js" }],
+                    isError: false,
+                }));
+            }
+            "#,
+        )],
+    )
+    .await;
+    runtime.set_path_plan(vec![temp.0.join("ext.ts")]);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let host = PluginHost::build(
+        Some(runtime.clone()),
+        vec![Arc::new(ResultProbe {
+            info: PluginInfo::inline("native-result-probe"),
+            seen: Arc::clone(&seen),
+        }) as Arc<dyn AgentPlugin>],
+    );
+
+    let mut message_payload =
+        json!({ "type": "message_end", "message": assistant_wire("original") });
+    let outcome = host
+        .emit_with_runtime(Some(&runtime), "message_end", &mut message_payload)
+        .await
+        .expect("message_end dispatch");
+    assert_eq!(
+        outcome.result["message"]["content"][0]["text"],
+        json!("from-native"),
+        "the native inline plugin runs after the JS adapter: {:?}",
+        outcome.result
+    );
+
+    let mut tool_payload = json!({
+        "type": "tool_result",
+        "toolCallId": "call-1",
+        "toolName": "probe",
+        "content": [{ "type": "text", "text": "original" }],
+        "isError": false,
+    });
+    let outcome = host
+        .emit_with_runtime(Some(&runtime), "tool_result", &mut tool_payload)
+        .await
+        .expect("tool_result dispatch");
+    assert_eq!(
+        outcome.result["content"],
+        json!([{ "type": "text", "text": "from-native" }]),
+        "the native tool_result overlay is last and reaches the merged outcome: {:?}",
+        outcome.result
+    );
+    assert_eq!(
+        *seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![
+            "message_end:from-js".to_owned(),
+            "tool_result:from-js".to_owned(),
+        ],
+        "the later native handler must observe both JS return values in its payload"
+    );
+}
+
+/// `before_agent_start` typed returns chain between native handlers: the later
+/// handler sees the earlier `systemPrompt` in its payload, and the last return
+/// wins the merged result (the session host renders that prompt).
+#[tokio::test(flavor = "current_thread")]
+async fn emit_chains_before_agent_start_returns_into_the_payload() {
+    struct BeforeStartPlugin {
+        info: PluginInfo,
+        prompt: &'static str,
+        seen: Option<Arc<Mutex<Vec<String>>>>,
+    }
+
+    impl AgentPlugin for BeforeStartPlugin {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> pir::plugins::EventInterest {
+            pir::plugins::EventInterest::List(vec!["before_agent_start".to_owned()])
+        }
+
+        fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            Box::pin(async move {
+                if let Some(seen) = &self.seen {
+                    let prompt = event.payload["systemPrompt"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    seen.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(prompt);
+                }
+                PluginEventOutcome::BeforeAgentStart {
+                    system_prompt: Some(self.prompt.to_owned()),
+                    message: None,
+                    messages: Vec::new(),
+                }
+            })
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let host = PluginHost::build(
+        None,
+        vec![
+            Arc::new(BeforeStartPlugin {
+                info: PluginInfo::inline("native-prompt-first"),
+                prompt: "first",
+                seen: None,
+            }) as Arc<dyn AgentPlugin>,
+            Arc::new(BeforeStartPlugin {
+                info: PluginInfo::inline("native-prompt-second"),
+                prompt: "second",
+                seen: Some(Arc::clone(&seen)),
+            }),
+        ],
+    );
+    let mut payload = json!({
+        "type": "before_agent_start",
+        "messageType": "user",
+        "prompt": "go",
+        "systemPrompt": "base",
+    });
+
+    let outcome = host
+        .emit("before_agent_start", &mut payload)
+        .await
+        .expect("before_agent_start dispatch");
+    assert_eq!(outcome.result["systemPrompt"], json!("second"));
+    assert_eq!(
+        *seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec!["first".to_owned()],
+        "the later native handler must observe the earlier typed systemPrompt"
+    );
+}
+
+fn assistant_wire(text: &str) -> Value {
+    json!({
+        "role": "assistant",
+        "content": [{ "type": "text", "text": text }],
+        "api": "test",
+        "provider": "test",
+        "model": "test-model",
+        "usage": {},
+        "stopReason": "stop",
+        "timestamp": 1,
+    })
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn unknown_builtin_names_error_with_upstream_text() {
     let temp = TempDir::new("unknown-builtin");
@@ -377,10 +685,14 @@ async fn replaceable_builtin_is_omitted_by_a_js_registration() {
 async fn duplicate_commands_get_occurrence_invocation_names() {
     let temp = TempDir::new("dedup");
     let source_a = r#"
-        export default function (pi) { pi.registerCommand("dup", { handler: async () => {} }); }
+        export default function (pi) {
+            pi.registerCommand("dup", { handler: async (_args, ctx) => { throw new Error("a:" + ctx.commandName); } });
+        }
     "#;
     let source_b = r#"
-        export default function (pi) { pi.registerCommand("dup", { handler: async () => {} }); }
+        export default function (pi) {
+            pi.registerCommand("dup", { handler: async (_args, ctx) => { throw new Error("b:" + ctx.commandName); } });
+        }
     "#;
     let runtime = load_runtime(&temp, &[("a.ts", source_a), ("b.ts", source_b)]).await;
     let host = PluginHost::build(Some(runtime), Vec::new());
@@ -391,6 +703,23 @@ async fn duplicate_commands_get_occurrence_invocation_names() {
         .map(|command| command.invocation_name)
         .collect();
     assert_eq!(names, vec!["dup:1".to_owned(), "dup:2".to_owned()]);
+
+    // Each occurrence dispatches to its own handler, and the handler's ctx
+    // sees the invocation name the user typed. Before the fix both calls
+    // reached extension A (`a:...`), because the runtime scanned by the
+    // declared name and took the first active registration.
+    let first = host.dispatch_command("dup:1", "").await.expect("dup:1");
+    assert!(!first.ok, "{first:?}");
+    assert_eq!(first.error.as_deref(), Some("a:dup:1"), "{first:?}");
+
+    let second = host.dispatch_command("dup:2", "").await.expect("dup:2");
+    assert!(!second.ok, "{second:?}");
+    assert_eq!(second.error.as_deref(), Some("b:dup:2"), "{second:?}");
+
+    // The bare declared name keeps the historical first-wins answer and
+    // resolves to that first registration's invocation name.
+    let bare = host.dispatch_command("dup", "").await.expect("dup");
+    assert_eq!(bare.error.as_deref(), Some("a:dup:1"), "{bare:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,5 +1477,277 @@ async fn native_plugin_panic_is_isolated_and_later_plugins_still_run() {
     assert!(
         ran.load(std::sync::atomic::Ordering::SeqCst),
         "plugins after a panicking one must still receive the event in order"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Panic isolation on native lifecycle hooks (on_init / on_reload / on_shutdown)
+// ---------------------------------------------------------------------------
+
+/// A native plugin that panics in every lifecycle hook. The host must report
+/// each panic as a diagnostic and keep the remaining plugins running.
+struct PanickingLifecyclePlugin {
+    info: PluginInfo,
+}
+
+impl AgentPlugin for PanickingLifecyclePlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn on_init(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { panic!("lifecycle init boom") })
+    }
+
+    fn on_reload(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { panic!("lifecycle reload boom") })
+    }
+
+    fn on_shutdown(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { panic!("lifecycle shutdown boom") })
+    }
+}
+
+/// Records that the lifecycle hook after a panicking plugin still ran.
+struct LifecycleRecorder {
+    info: PluginInfo,
+    init_ran: Arc<std::sync::atomic::AtomicBool>,
+    reload_ran: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_ran: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AgentPlugin for LifecycleRecorder {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn on_init(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+        self.init_ran
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn on_reload(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+        self.reload_ran
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn on_shutdown(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+        self.shutdown_ran
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_lifecycle_panics_are_isolated_and_later_plugins_run() {
+    let init_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reload_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let plugins: Vec<Arc<dyn AgentPlugin>> = vec![
+        Arc::new(PanickingLifecyclePlugin {
+            info: PluginInfo::inline("panics-lifecycle"),
+        }),
+        Arc::new(LifecycleRecorder {
+            info: PluginInfo::inline("records-lifecycle"),
+            init_ran: Arc::clone(&init_ran),
+            reload_ran: Arc::clone(&reload_ran),
+            shutdown_ran: Arc::clone(&shutdown_ran),
+        }),
+    ];
+    let host = PluginHost::build(None, plugins);
+
+    let failures = host.run_init_hooks().await;
+    assert!(
+        failures
+            .iter()
+            .any(|(path, message)| path.contains("panics-lifecycle")
+                && message.contains("panicked")
+                && message.contains("lifecycle init boom")),
+        "on_init panic must be an isolated failure: {failures:?}"
+    );
+    assert!(
+        init_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "plugins after a panicking on_init must still run"
+    );
+
+    host.reload()
+        .await
+        .expect("reload after a panicking on_reload");
+    assert!(
+        reload_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "plugins after a panicking on_reload must still run"
+    );
+
+    host.shutdown().await;
+    assert!(
+        shutdown_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "plugins after a panicking on_shutdown must still run"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-02 native per-call timeout: a hung handler must not wedge the caller
+// ---------------------------------------------------------------------------
+
+/// Native plugin whose event handler, tool and command all never resolve.
+/// The host's per-call deadline must convert each into a typed error instead
+/// of pinning the emitting task forever.
+struct HangingNativePlugin {
+    info: PluginInfo,
+}
+
+impl HangingNativePlugin {
+    fn new(name: &str) -> Arc<Self> {
+        Arc::new(Self {
+            info: PluginInfo::inline(name),
+        })
+    }
+}
+
+struct HangingTool;
+
+impl AgentTool for HangingTool {
+    fn name(&self) -> &'static str {
+        "hang-tool"
+    }
+
+    fn description(&self) -> &'static str {
+        "P2-02 hanging native tool"
+    }
+
+    fn run(&self, _args: &Value, _ctx: &ToolContext) -> BoxFuture<'static, ToolResult> {
+        Box::pin(std::future::pending())
+    }
+}
+
+impl AgentPlugin for HangingNativePlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn register(&self, ctx: &mut RegistrationContext<'_>) -> anyhow::Result<()> {
+        ctx.register_tool(Arc::new(HangingTool));
+        let handler: pir::plugins::CommandHandler = Arc::new(
+            |_args: &str| -> PluginFuture<'static, pir::extensions::CommandOutcome> {
+                Box::pin(std::future::pending())
+            },
+        );
+        ctx.register_command(
+            "hang-cmd",
+            Some("P2-02 hanging native command"),
+            Some(pir::plugins::CommandBackend::Rust(handler)),
+        );
+        Ok(())
+    }
+
+    fn events(&self) -> pir::plugins::EventInterest {
+        // The same hanging handler exercises both the plain `emit` deadline
+        // (input) and the hosted `tool_call` gate deadline.
+        pir::plugins::EventInterest::List(vec!["input".to_owned(), "tool_call".to_owned()])
+    }
+
+    fn on_event<'a>(&'a self, _event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        Box::pin(std::future::pending())
+    }
+}
+
+fn hanging_host() -> PluginHost {
+    let host = PluginHost::build(
+        None,
+        vec![HangingNativePlugin::new("hangs") as Arc<dyn AgentPlugin>],
+    );
+    // Short budget so the regression is fast; the default is 30 s.
+    host.set_native_call_timeout(Duration::from_millis(50));
+    host
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hanging_native_event_handler_times_out() {
+    let host = hanging_host();
+    let mut payload = json!({ "type": "input", "text": "hi" });
+    let outcome = tokio::time::timeout(Duration::from_secs(2), host.emit("input", &mut payload))
+        .await
+        .expect("a hung native event handler must not wedge emit")
+        .expect("the timeout is reported as an isolated handler error, not a dispatch failure");
+    assert!(
+        outcome
+            .errors
+            .iter()
+            .any(|error| { error.error.contains("timed out") && error.error.contains("hangs") }),
+        "the timed-out handler must be reported: {:?}",
+        outcome.errors
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hanging_native_tool_times_out() {
+    let host = hanging_host();
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        host.call_tool("hang-tool", "call-1", &json!({})),
+    )
+    .await
+    .expect("a hung native tool must not wedge call_tool")
+    .expect_err("the tool deadline must produce an error");
+    assert!(
+        error.to_string().contains("timed out"),
+        "the error must name the timeout: {error}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hanging_native_command_times_out() {
+    let host = hanging_host();
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        host.dispatch_command("hang-cmd", ""),
+    )
+    .await
+    .expect("a hung native command must not wedge dispatch_command")
+    .expect_err("the command deadline must produce an error");
+    assert!(
+        error.to_string().contains("timed out"),
+        "the error must name the timeout: {error}"
+    );
+}
+
+/// The hosted `tool_call` gate (`dispatch_hosted_event`) must use the same
+/// per-plugin deadline as `emit`; before this seam it called
+/// `AgentPlugin::on_event` directly, so a hung native handler would wedge the
+/// tool batch. A timed-out `tool_call` handler is fail-closed: the call is
+/// blocked instead of executed.
+#[tokio::test(flavor = "current_thread")]
+async fn hanging_native_tool_call_gate_times_out_fail_closed() {
+    let host = hanging_host();
+    let call = pir::agent::tool_batch::AgentToolCall::new(0, "call-1", "some-tool", json!({}));
+    let gated = tokio::time::timeout(
+        Duration::from_secs(2),
+        pir::agent::tool_execution::gate_tool_calls_with_host(None, Some(&host), vec![call], None),
+    )
+    .await
+    .expect("a hung tool_call handler must not wedge the gate");
+    assert_eq!(
+        gated.blocked.len(),
+        1,
+        "the timed-out gate must block the call"
+    );
+    assert!(
+        gated.blocked[0]
+            .result
+            .content
+            .contains("extension handler failed"),
+        "the gate must fail closed on the timeout: {:?}",
+        gated.blocked[0].result.content
+    );
+    assert!(
+        gated.blocked[0].result.content.contains("timed out"),
+        "the block reason must name the deadline: {:?}",
+        gated.blocked[0].result.content
+    );
+    assert!(
+        gated.calls.is_empty(),
+        "a blocked call must never reach the scheduler"
     );
 }

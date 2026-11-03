@@ -207,7 +207,21 @@ pub(super) fn render_block_range(
                 loose,
             } => {
                 render_list(
-                    items, markers, tasks, *ordered, *start, *loose, 0, width, theme, options, "",
+                    &ListInput {
+                        items,
+                        markers,
+                        tasks,
+                        ordered: *ordered,
+                        start: *start,
+                        loose: *loose,
+                    },
+                    0,
+                    &ListRenderCtx {
+                        width,
+                        theme,
+                        options,
+                        inline_prefix: "",
+                    },
                     lines,
                 );
             }
@@ -356,17 +370,21 @@ fn render_markdown_block_one(
         } => {
             let mut lines = Vec::new();
             render_list(
-                items,
-                markers,
-                tasks,
-                *ordered,
-                *start,
-                *loose,
+                &ListInput {
+                    items,
+                    markers,
+                    tasks,
+                    ordered: *ordered,
+                    start: *start,
+                    loose: *loose,
+                },
                 0,
-                width,
-                theme,
-                options,
-                inline_prefix,
+                &ListRenderCtx {
+                    width,
+                    theme,
+                    options,
+                    inline_prefix,
+                },
                 &mut lines,
             );
             lines
@@ -418,21 +436,48 @@ fn render_markdown_block_one(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_list(
-    items: &[String],
-    markers: &[String],
-    tasks: &[Option<bool>],
+/// The parsed list payload a [`render_list`] call paints; bundled so the
+/// recursive call keeps a small, named surface instead of six positional
+/// fields.
+#[derive(Clone, Copy)]
+struct ListInput<'a> {
+    items: &'a [String],
+    markers: &'a [String],
+    tasks: &'a [Option<bool>],
     ordered: bool,
     start: u64,
     loose: bool,
-    depth: usize,
+}
+
+/// Rendering inputs shared by every nesting level of one list.
+#[derive(Clone, Copy)]
+struct ListRenderCtx<'a> {
     width: usize,
-    theme: &MarkdownTheme,
-    options: &MarkdownOptions,
-    inline_prefix: &str,
+    theme: &'a MarkdownTheme,
+    options: &'a MarkdownOptions,
+    inline_prefix: &'a str,
+}
+
+fn render_list(
+    list: &ListInput<'_>,
+    depth: usize,
+    ctx: &ListRenderCtx<'_>,
     lines: &mut Vec<String>,
 ) {
+    let ListInput {
+        items,
+        markers,
+        tasks,
+        ordered,
+        start,
+        loose,
+    } = *list;
+    let ListRenderCtx {
+        width,
+        theme,
+        options,
+        inline_prefix,
+    } = *ctx;
     let indent = "    ".repeat(depth);
     for (index, item) in items.iter().enumerate() {
         // Upstream bullet selection (markdown.ts:775-781): with
@@ -485,17 +530,16 @@ fn render_list(
             } = item_block
             {
                 render_list(
-                    nested,
-                    nested_markers,
-                    nested_tasks,
-                    *nested_ordered,
-                    *nested_start,
-                    *nested_loose,
+                    &ListInput {
+                        items: nested,
+                        markers: nested_markers,
+                        tasks: nested_tasks,
+                        ordered: *nested_ordered,
+                        start: *nested_start,
+                        loose: *nested_loose,
+                    },
                     depth + 1,
-                    width,
-                    theme,
-                    options,
-                    inline_prefix,
+                    ctx,
                     lines,
                 );
                 rendered_any = true;

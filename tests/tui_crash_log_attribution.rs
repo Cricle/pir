@@ -179,3 +179,23 @@ fn discovering_paths_registers_the_entry_points_for_attribution() {
     clear_loaded_extensions();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// FIX-B04: the restore guard only runs `cleanup_terminal` while it is still
+/// armed AND the thread still owns the surface. The panic hook cleans up
+/// first and clears ownership, so the unwind's guard drop must be a no-op —
+/// a second `Clear(All)` would erase the panic text.
+#[test]
+fn terminal_restore_guard_skips_cleanup_after_the_panic_hook_restored() {
+    use pir::tui::terminal::restore_guard_should_cleanup_for_test;
+
+    assert!(restore_guard_should_cleanup_for_test(true, true));
+    assert!(
+        !restore_guard_should_cleanup_for_test(true, false),
+        "panic hook already restored and cleared ownership"
+    );
+    assert!(
+        !restore_guard_should_cleanup_for_test(false, true),
+        "disarmed happy-path guard must not restore twice"
+    );
+    assert!(!restore_guard_should_cleanup_for_test(false, false));
+}

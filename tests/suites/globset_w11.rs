@@ -13,54 +13,54 @@
 //! literal, and matching is case-sensitive. The last test of section 1 pins
 //! those rules through the public `resolve_tool_selection`.
 
-use pir::ai::providers::construction::model;
+use pir::ai::providers::construction::{model, ModelSpec};
 use pir::ai::providers::resolution::{glob_matches, resolve_model_scope, CompiledGlob};
 use pir::ai::types::Model;
 use pir::coding_agent::resolve_tool_selection;
 
 fn catalog() -> Vec<Model> {
     vec![
-        model(
-            "anthropic",
-            "claude-sonnet-4-5",
-            "Claude Sonnet",
-            "anthropic-messages",
-            "https://api.anthropic.com",
-            200_000,
-            16_384,
-            vec!["text"],
-        ),
-        model(
-            "anthropic",
-            "claude-opus-4-8",
-            "Claude Opus",
-            "anthropic-messages",
-            "https://api.anthropic.com",
-            200_000,
-            16_384,
-            vec!["text"],
-        ),
-        model(
-            "openai",
-            "gpt-5.5",
-            "GPT",
-            "openai-completions",
-            "https://api.openai.com/v1",
-            128_000,
-            16_384,
-            vec!["text"],
-        ),
+        model(ModelSpec {
+            provider: "anthropic",
+            id: "claude-sonnet-4-5",
+            name: "Claude Sonnet",
+            api: "anthropic-messages",
+            base_url: "https://api.anthropic.com",
+            context_window: 200_000,
+            max_tokens: 16_384,
+            input: vec!["text"],
+        }),
+        model(ModelSpec {
+            provider: "anthropic",
+            id: "claude-opus-4-8",
+            name: "Claude Opus",
+            api: "anthropic-messages",
+            base_url: "https://api.anthropic.com",
+            context_window: 200_000,
+            max_tokens: 16_384,
+            input: vec!["text"],
+        }),
+        model(ModelSpec {
+            provider: "openai",
+            id: "gpt-5.5",
+            name: "GPT",
+            api: "openai-completions",
+            base_url: "https://api.openai.com/v1",
+            context_window: 128_000,
+            max_tokens: 16_384,
+            input: vec!["text"],
+        }),
         // A bracketed id: `[1m]` would otherwise parse as a character class.
-        model(
-            "custom",
-            "bracketed-model[1m]",
-            "Bracketed",
-            "openai-completions",
-            "https://example.invalid/v1",
-            128_000,
-            16_384,
-            vec!["text"],
-        ),
+        model(ModelSpec {
+            provider: "custom",
+            id: "bracketed-model[1m]",
+            name: "Bracketed",
+            api: "openai-completions",
+            base_url: "https://example.invalid/v1",
+            context_window: 128_000,
+            max_tokens: 16_384,
+            input: vec!["text"],
+        }),
     ]
 }
 

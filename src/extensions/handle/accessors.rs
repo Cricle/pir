@@ -2,6 +2,17 @@ use super::*;
 
 use std::sync::atomic::Ordering;
 
+thread_local! {
+    /// Catalog rebuilds that reached the runtime, and the model rows they
+    /// carried. Both live at [`ExtensionHandle::update_model_registry`] — the
+    /// common sink of every catalog rebuild path — so the R1-L1-008
+    /// regression probe observes the runtime write itself rather than one
+    /// internal builder that a bypass could skip (P2-新-2). Per-thread, like
+    /// the other current-thread test seams.
+    static MODEL_REGISTRY_PUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MODEL_REGISTRY_MODEL_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 // ---------------------------------------------------------------------------
 // Renderer-callback UI guard
 // ---------------------------------------------------------------------------
@@ -303,6 +314,20 @@ impl ExtensionHandle {
             .clone()
     }
 
+    /// Toggle the bootstrap-only UI fail-fast flag. The pre-trust bootstrap
+    /// load turns it on around its `project_trust` dispatch (no presentation
+    /// sink exists yet) and off before the handle can be adopted as the live
+    /// host, so session dialogs keep the normal sink and TTL.
+    pub fn set_ui_fail_fast(&self, fail_fast: bool) {
+        crate::extensions::runtime::lock_state(&self.state).ui_fail_fast = fail_fast;
+    }
+
+    /// Whether the bootstrap-only UI fail-fast flag is currently set (test
+    /// seam; the live host must observe `false`).
+    pub fn ui_fail_fast_enabled(&self) -> bool {
+        crate::extensions::runtime::lock_state(&self.state).ui_fail_fast
+    }
+
     /// The runtime's shared `ctx.ui.getToolsExpanded` / `setToolsExpanded`
     /// cell (upstream types.ts:296-299).
     ///
@@ -480,9 +505,44 @@ impl ExtensionHandle {
 
     /// Push the serialized model registry snapshot backing
     /// `ctx.modelRegistry` (available models + provider ids).
+    ///
+    /// The wrapper object is assembled from the two OWNED values: building it
+    /// with `serde_json::json!` would route every value through `to_value`
+    /// again, deep-copying the whole (~1.7k model) catalog a second time at
+    /// the end of a push that already serialized it.
     pub fn update_model_registry(&self, models: JsonValue, providers: JsonValue) {
+        // Regression probe at the common sink: every rebuild path, including
+        // one that bypasses `AgentSession::build_model_catalog`, must land
+        // here, and the row count is the full serialized model array it
+        // pushes (P2-新-2).
+        let model_rows = models
+            .as_array()
+            .map_or(0, |models| u64::try_from(models.len()).unwrap_or(u64::MAX));
+        MODEL_REGISTRY_PUSHES.with(|pushes| pushes.set(pushes.get().saturating_add(1)));
+        MODEL_REGISTRY_MODEL_ROWS.with(|rows| rows.set(rows.get().saturating_add(model_rows)));
+        let mut registry = serde_json::Map::with_capacity(2);
+        registry.insert("models".to_owned(), models);
+        registry.insert("providers".to_owned(), providers);
         let mut state = crate::extensions::runtime::lock_state(&self.state);
-        state.model_registry = serde_json::json!({ "models": models, "providers": providers });
+        state.model_registry = JsonValue::Object(registry);
+    }
+
+    /// Test seam behind `AgentSession::model_catalog_push_stats`: count of
+    /// `update_model_registry` calls and model rows pushed on the calling
+    /// thread since the last reset. Kills the "rebuild outside
+    /// `build_model_catalog`" false green. Crate-only: the public test seam
+    /// stays on `AgentSession`.
+    pub(crate) fn model_registry_push_stats_for_test(&self) -> (u64, u64) {
+        (
+            MODEL_REGISTRY_PUSHES.with(std::cell::Cell::get),
+            MODEL_REGISTRY_MODEL_ROWS.with(std::cell::Cell::get),
+        )
+    }
+
+    /// Reset [`Self::model_registry_push_stats_for_test`].
+    pub(crate) fn reset_model_registry_push_stats_for_test(&self) {
+        MODEL_REGISTRY_PUSHES.with(|pushes| pushes.set(0));
+        MODEL_REGISTRY_MODEL_ROWS.with(|rows| rows.set(0));
     }
 
     /// Push the serialized scoped-model list backing `ctx.scopedModels`.
@@ -540,7 +600,9 @@ impl ExtensionHandle {
     /// Push the provider ids that hold a usable credential, backing the
     /// `pi.setModel` `false` result for unauthenticated providers.
     pub fn update_authenticated_providers(&self, providers: Vec<String>) {
-        crate::extensions::runtime::lock_state(&self.state).authenticated_providers = providers;
+        let mut state = crate::extensions::runtime::lock_state(&self.state);
+        state.authenticated_providers = providers;
+        state.authenticated_providers_known = true;
     }
 
     /// Bind the nested-call executor for an in-flight tool call id so the JS
@@ -911,8 +973,13 @@ impl ExtensionHandle {
     /// [`crate::extensions::EXTENSION_CALL_TIMEOUT`]). Used by tests; the
     /// timeout is enforced as a QuickJS interrupt-handler deadline, so a
     /// runaway JS job is actually aborted and the runtime stays usable.
+    ///
+    /// Clamped to [`crate::extensions::limits::MAX_TIMEOUT`] (24 h): a
+    /// `Duration::MAX` override must not overflow the platform instant when
+    /// the deadline is armed.
     pub fn set_call_timeout(&self, timeout: std::time::Duration) {
-        crate::extensions::runtime::lock_state(&self.state).call_timeout = timeout;
+        crate::extensions::runtime::lock_state(&self.state).call_timeout =
+            timeout.min(crate::extensions::limits::MAX_TIMEOUT);
     }
 
     /// The effective per-call JS dispatch timeout (the resolved
@@ -946,5 +1013,188 @@ impl ExtensionHandle {
         crate::extensions::runtime::lock_state(&self.state)
             .stream_hook_bridges
             .remove(session);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Non-owning handle + OAuth-flow binding (SNAP4 P2-新-1)
+// ---------------------------------------------------------------------------
+
+/// A non-owning reference to one actor-backed [`ExtensionHandle`].
+///
+/// `JsOAuthFlow` used to hold a strong `ExtensionHandle` clone, and the
+/// provider it is wrapped around lives in a `ProviderRegistry` that can be
+/// shared by a parent session and its subagent children. A child's OAuth
+/// overlay therefore kept the child's actor mailbox alive after
+/// `ChildRuntime::drop` (the actor only exits when its last sender drops),
+/// pinning a QuickJS runtime per spawned OAuth child. This view keeps only
+/// `Weak` references: upgrading succeeds while the owning session still holds
+/// a handle and fails once every strong clone is gone, so the registry cannot
+/// extend a runtime's lifetime.
+struct WeakExtensionHandle {
+    tx: mpsc::WeakSender<Command>,
+    state: std::sync::Weak<StdMutex<RuntimeState>>,
+    loaded: std::sync::Weak<StdMutex<Vec<LoadedExtension>>>,
+    ready: std::sync::Weak<AtomicBool>,
+    path_plan: std::sync::Weak<RwLock<Vec<PathBuf>>>,
+    pending_commands: std::sync::Weak<std::sync::atomic::AtomicUsize>,
+    preempt_background_at_ms: std::sync::Weak<std::sync::atomic::AtomicU64>,
+    next_dispatch_epoch: std::sync::Weak<std::sync::atomic::AtomicU64>,
+    abandoned_dispatch_epochs: std::sync::Weak<StdMutex<std::collections::BTreeSet<u64>>>,
+    terminal_input_handlers: std::sync::Weak<std::sync::atomic::AtomicUsize>,
+    suppress_session_shutdown: std::sync::Weak<AtomicBool>,
+}
+
+impl WeakExtensionHandle {
+    /// `None` for a plan-only handle: no actor exists to outlive its owner.
+    fn from_handle(handle: &ExtensionHandle) -> Option<Self> {
+        Some(Self {
+            tx: handle.tx.as_ref()?.downgrade(),
+            state: Arc::downgrade(&handle.state),
+            loaded: Arc::downgrade(&handle.loaded),
+            ready: Arc::downgrade(&handle.ready),
+            path_plan: Arc::downgrade(&handle.path_plan),
+            pending_commands: Arc::downgrade(&handle.pending_commands),
+            preempt_background_at_ms: Arc::downgrade(&handle.preempt_background_at_ms),
+            next_dispatch_epoch: Arc::downgrade(&handle.next_dispatch_epoch),
+            abandoned_dispatch_epochs: Arc::downgrade(&handle.abandoned_dispatch_epochs),
+            terminal_input_handlers: Arc::downgrade(&handle.terminal_input_handlers),
+            suppress_session_shutdown: Arc::downgrade(&handle.suppress_session_shutdown),
+        })
+    }
+
+    /// Upgrade to a normal handle for one bounded operation. The temporary
+    /// strong sender is dropped when the caller's handle falls out of scope.
+    fn upgrade(&self) -> Option<ExtensionHandle> {
+        let tx = self.tx.upgrade()?;
+        Some(ExtensionHandle {
+            tx: Some(tx),
+            state: self.state.upgrade()?,
+            loaded: self.loaded.upgrade()?,
+            ready: self.ready.upgrade()?,
+            path_plan: self.path_plan.upgrade()?,
+            pending_commands: self.pending_commands.upgrade()?,
+            preempt_background_at_ms: self.preempt_background_at_ms.upgrade()?,
+            next_dispatch_epoch: self.next_dispatch_epoch.upgrade()?,
+            abandoned_dispatch_epochs: self.abandoned_dispatch_epochs.upgrade()?,
+            terminal_input_handlers: self.terminal_input_handlers.upgrade()?,
+            suppress_session_shutdown: self.suppress_session_shutdown.upgrade()?,
+        })
+    }
+}
+
+/// An [`crate::ai::auth::OAuthFlow`] whose JS dispatch binds to the owning
+/// session's runtime through a [`WeakExtensionHandle`] instead of a strong
+/// clone. Each `login`/`refresh` upgrades for the duration of the operation
+/// and otherwise leaves the actor free to shut down with its session.
+struct WeakJsOAuthFlow {
+    provider_id: String,
+    display_name: String,
+    is_subscription: bool,
+    js: WeakExtensionHandle,
+}
+
+impl WeakJsOAuthFlow {
+    fn upgraded_flow(
+        &self,
+        op: &str,
+    ) -> crate::ai::error::AiResult<crate::ai::providers::js_stream::JsOAuthFlow> {
+        let js = self.js.upgrade().ok_or_else(|| {
+            crate::ai::error::AiError::NonRetryable(format!(
+                "provider `{}` oauth {op}: the extension runtime has exited",
+                self.provider_id
+            ))
+        })?;
+        Ok(crate::ai::providers::js_stream::JsOAuthFlow::new(
+            self.provider_id.clone(),
+            self.display_name.clone(),
+            self.is_subscription,
+            js,
+        ))
+    }
+}
+
+impl crate::ai::auth::OAuthFlow for WeakJsOAuthFlow {
+    fn name(&self) -> &str {
+        &self.display_name
+    }
+
+    fn is_subscription(&self) -> bool {
+        self.is_subscription
+    }
+
+    fn login<'a>(
+        &'a self,
+        interaction: &'a dyn crate::ai::auth::AuthInteraction,
+        options: &'a crate::ai::auth::LoginOptions,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = crate::ai::error::AiResult<crate::ai::auth::OAuthCredential>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let flow = self.upgraded_flow("login")?;
+            flow.login(interaction, options).await
+        })
+    }
+
+    fn refresh<'a>(
+        &'a self,
+        credential: &'a crate::ai::auth::OAuthCredential,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = crate::ai::error::AiResult<crate::ai::auth::OAuthCredential>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let flow = self.upgraded_flow("refresh")?;
+            flow.refresh(credential).await
+        })
+    }
+
+    fn to_auth(
+        &self,
+        credential: &crate::ai::auth::OAuthCredential,
+    ) -> crate::ai::error::AiResult<crate::ai::types::ModelAuth> {
+        // Same projection as `JsOAuthFlow::to_auth` (the JS wrapper derives
+        // the API key at login/refresh time): pure, no runtime needed.
+        match credential.extra_str("apiKey") {
+            Some(api_key) if !api_key.is_empty() => Ok(crate::ai::types::ModelAuth {
+                api_key: Some(api_key.to_string()),
+                headers: None,
+                base_url: None,
+            }),
+            _ => Err(crate::ai::error::AiError::NonRetryable(format!(
+                "provider `{}`: the stored oauth credential carries no derived API key",
+                self.provider_id
+            ))),
+        }
+    }
+}
+
+impl ExtensionHandle {
+    /// Build an OAuth flow bound to this runtime WITHOUT keeping it alive from
+    /// the provider overlay that stores the flow (SNAP4 P2-新-1). Returns
+    /// `None` for a plan-only handle (no actor, nothing an OAuth login could
+    /// dispatch to).
+    pub(crate) fn weak_oauth_flow(
+        &self,
+        provider_id: impl Into<String>,
+        display_name: impl Into<String>,
+        is_subscription: bool,
+    ) -> Option<crate::ai::auth::OAuthFlowBox> {
+        let js = WeakExtensionHandle::from_handle(self)?;
+        Some(Arc::new(WeakJsOAuthFlow {
+            provider_id: provider_id.into(),
+            display_name: display_name.into(),
+            is_subscription,
+            js,
+        }))
     }
 }

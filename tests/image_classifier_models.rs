@@ -895,7 +895,7 @@ async fn script_generate_images_missing_key_returns_error_result() {
         "content: {content}"
     );
     // The call surfaced as a nested row named like upstream.
-    let nested = result.nested_calls.as_ref().expect("nested calls");
+    let nested = result.nested_calls.as_deref().expect("nested calls");
     assert!(
         nested
             .calls

@@ -183,13 +183,8 @@ pub const STACK_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// `main_cli/run_mode.rs` before clap parsing, so it stays out of `--help`,
 /// like [`crate::plugins::codemode::worker::WORKER_SUBCOMMAND`].
 ///
-/// Always compiled: a build without the `env-daemon` feature uses it to report
-/// the documented missing-feature diagnostic instead of an unrecognized
-/// subcommand.
-// A lib-only build has no caller (the `pir` bin's pre-clap arm is the only
-// one); gating the const would break that off-arm in a `cli`-only bin.
-#[allow(
-    dead_code,
-    reason = "public surface for the `pir` bin's pre-clap `env-daemon` arm; not referenced inside the library"
-)]
+/// Always compiled with the `cli` front end: a build without the `env-daemon`
+/// feature uses it to report the documented missing-feature diagnostic instead
+/// of an unrecognized subcommand. `main_cli` is the only caller.
+#[cfg(feature = "cli")]
 pub const DAEMON_SUBCOMMAND: &str = "env-daemon";

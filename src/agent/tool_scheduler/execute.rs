@@ -20,6 +20,29 @@ use crate::agent::tool_execution::{
     ToolRegistry,
 };
 
+/// One batch's execution request: the preflighted calls plus the
+/// scheduler-wide handles execution reads.
+pub(super) struct BatchExecution<'a> {
+    /// The scheduler whose config and detach sink the batch uses.
+    pub(super) scheduler: &'a ToolScheduler,
+    /// The preflighted calls, in source order (execution owns them).
+    pub(super) prepared: Vec<PreparedCall>,
+    /// The registry a detach hand-off resolves its tool from.
+    pub(super) registry: &'a ToolRegistry,
+    /// The batch context (nested executor, abort signal, parent call id).
+    pub(super) context: &'a ToolContext,
+    /// The run's hooks (borrowed: attached hooks live in `detach_hooks`).
+    pub(super) hooks: Option<&'a ToolHooks>,
+    /// The detach sink's hooks handle, shared by every detached call.
+    pub(super) detach_hooks: &'a Option<Option<Arc<ToolHooks>>>,
+    /// The batch-start abort snapshot.
+    pub(super) aborted_flag: &'a Arc<AtomicBool>,
+    /// The progress observer (`None` = no observer).
+    pub(super) progress: Option<&'a ToolExecutionProgress>,
+    /// Index of the first failed preflight call, if any (fail-fast).
+    pub(super) first_preflight_failure: Option<usize>,
+}
+
 /// Execute the preflighted calls, returning the `end` events, the finalized
 /// results in source order, and the calls a detach sink adopted.
 ///
@@ -35,17 +58,8 @@ use crate::agent::tool_execution::{
 /// levels needed ~2.03 MiB of libtest's default 2 MiB thread stack, a
 /// ~30 KiB margin that any frame growth turned into an intermittent
 /// overflow. Boxing keeps every level's contribution thin.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn execute_prepared<'a>(
-    scheduler: &'a ToolScheduler,
-    prepared: Vec<PreparedCall>,
-    registry: &'a ToolRegistry,
-    context: &'a ToolContext,
-    hooks: Option<&'a ToolHooks>,
-    detach_hooks: &'a Option<Option<Arc<ToolHooks>>>,
-    aborted_flag: &'a Arc<AtomicBool>,
-    progress: Option<&'a ToolExecutionProgress>,
-    first_preflight_failure: Option<usize>,
+    batch: BatchExecution<'a>,
 ) -> crate::agent::tool_execution::BoxFuture<
     'a,
     (
@@ -54,6 +68,17 @@ pub(super) fn execute_prepared<'a>(
         Vec<DetachedToolCall>,
     ),
 > {
+    let BatchExecution {
+        scheduler,
+        prepared,
+        registry,
+        context,
+        hooks,
+        detach_hooks,
+        aborted_flag,
+        progress,
+        first_preflight_failure,
+    } = batch;
     Box::pin(async move {
         // The requesting tool call id (`parentToolCallId`) every event and
         // extension payload this batch emits must carry. `None` for a

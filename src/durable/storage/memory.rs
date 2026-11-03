@@ -17,7 +17,7 @@
 use crate::durable::delta::apply_immutable_batches;
 use crate::durable::errors::{StorageError, StorageRequestError};
 use crate::durable::ids::{ConversationId, DocumentId, EntryId, Seq, SubmissionId, TaskId};
-use crate::durable::storage::scan::{page_of, scan_start, ScanStart};
+use crate::durable::storage::scan::{page_of, page_of_owned, scan_start, ScanStart};
 use crate::durable::types::{
     ConversationQuery, ConversationRecord, Cursor, DocumentAddress, DocumentContent,
     DocumentCreate, DocumentPoint, DocumentQuery, DocumentRecord, DocumentScope, EntryQuery,
@@ -27,6 +27,7 @@ use crate::durable::types::{
 };
 use crate::durable::Storage;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 /// The record family an identifier belongs to.
@@ -136,9 +137,31 @@ pub struct MemoryStorage {
     /// [`Storage::commit`], so two concurrent commits cannot prepare the same
     /// sequence. Callers that drive the two halves themselves own this.
     commit_lock: Mutex<()>,
+    /// Test seam (R1-L3-002): visible entries materialized by a scan since the
+    /// last reset. Every materialized entry is exactly one deep clone of an
+    /// `EntryRecord` — the old O(n^2) shape materialized the whole remaining
+    /// fork chain per page, the fixed shape only `limit + 1`.
+    entry_scan_materialized: AtomicUsize,
 }
 
 impl MemoryStorage {
+    /// How many visible entries the scans on this storage materialized since
+    /// the last [`Self::reset_entry_scan_materialized`] (test seam, R1-L3-002).
+    ///
+    /// Each increment corresponds to one deep `EntryRecord` clone handed to the
+    /// `limit + 1` over-fetch window. A paged scan over a fork chain must
+    /// materialize `limit + 1` records per page, not the whole remaining set.
+    #[doc(hidden)]
+    pub fn entry_scan_materialized(&self) -> usize {
+        self.entry_scan_materialized.load(Ordering::Relaxed)
+    }
+
+    /// Reset [`Self::entry_scan_materialized`] (test seam, R1-L3-002).
+    #[doc(hidden)]
+    pub fn reset_entry_scan_materialized(&self) {
+        self.entry_scan_materialized.store(0, Ordering::Relaxed);
+    }
+
     /// Create an empty storage. The root conversation ID is reserved, so the
     /// first minted ID is 2.
     pub fn new() -> Self {
@@ -209,7 +232,7 @@ impl MemoryStorage {
             .checked_add(1)
             .ok_or_else(|| StorageError::Io("Memory sequence space is exhausted".to_owned()))?;
         let actions = prepare_document_actions(&prepared.writes)?;
-        apply_commit(&mut inner.state, &prepared.writes, &actions, prepared.seq);
+        apply_commit(&mut inner.state, prepared.writes, &actions, prepared.seq);
         inner.next_seq = following_seq;
         Ok(prepared.seq)
     }
@@ -306,19 +329,27 @@ impl MemoryStorage {
 
     /// Visible entries newest first: the fork chain's segments from the
     /// requested conversation back to the root.
-    fn visible_entries(
-        state: &State,
+    ///
+    /// Returns borrowed records and stops as soon as `max_items` visible
+    /// entries were collected, so a paged scan never copies the whole chain.
+    fn visible_entries<'a>(
+        state: &'a State,
         conversation_id: ConversationId,
         min_entry_id: Option<EntryId>,
         max_entry_id: Option<EntryId>,
-    ) -> Result<Vec<EntryRecord>, StorageError> {
+        max_items: usize,
+        materialized: &AtomicUsize,
+    ) -> Result<Vec<&'a EntryRecord>, StorageError> {
         require_conversation(state, conversation_id)?;
         let min = min_entry_id.map_or(i64::MIN, |id| id.as_i64());
         let max = max_entry_id.map_or(i64::MAX, |id| id.as_i64());
         let mut out = Vec::new();
+        if max_items == 0 {
+            return Ok(out);
+        }
         let mut current = conversation_id;
         let mut upper = max;
-        loop {
+        'segments: loop {
             let ids = state
                 .entry_ids
                 .get(&current)
@@ -332,7 +363,11 @@ impl MemoryStorage {
                     break;
                 }
                 if let Some(entry) = state.entries.get(&id) {
-                    out.push(entry.clone());
+                    materialized.fetch_add(1, Ordering::Relaxed);
+                    out.push(entry);
+                    if out.len() >= max_items {
+                        break 'segments;
+                    }
                 }
             }
             let Some(parent) = state
@@ -353,16 +388,24 @@ impl MemoryStorage {
 
     /// Visible entries oldest first: the fork chain's segments from the root
     /// conversation forward.
-    fn visible_entries_ascending(
-        state: &State,
+    ///
+    /// Like [`Self::visible_entries`], it returns borrowed records and stops
+    /// once `max_items` entries were collected.
+    fn visible_entries_ascending<'a>(
+        state: &'a State,
         conversation_id: ConversationId,
         min_entry_id: Option<EntryId>,
         max_entry_id: Option<EntryId>,
-    ) -> Result<Vec<EntryRecord>, StorageError> {
+        max_items: usize,
+        materialized: &AtomicUsize,
+    ) -> Result<Vec<&'a EntryRecord>, StorageError> {
         require_conversation(state, conversation_id)?;
         let min = min_entry_id.map_or(i64::MIN, |id| id.as_i64());
         let max = max_entry_id.map_or(i64::MAX, |id| id.as_i64());
         let mut segments: Vec<(ConversationId, i64)> = Vec::new();
+        if max_items == 0 {
+            return Ok(Vec::new());
+        }
         let mut current = conversation_id;
         let mut upper = max;
         loop {
@@ -394,7 +437,11 @@ impl MemoryStorage {
                     break;
                 }
                 if let Some(entry) = state.entries.get(id) {
-                    out.push(entry.clone());
+                    materialized.fetch_add(1, Ordering::Relaxed);
+                    out.push(entry);
+                    if out.len() >= max_items {
+                        return Ok(out);
+                    }
                 }
             }
         }
@@ -768,93 +815,79 @@ fn check_document_actions(
 
 fn apply_commit(
     state: &mut State,
-    writes: &[StorageWrite],
+    writes: Vec<StorageWrite>,
     actions: &BTreeMap<DocumentId, DocumentAction>,
     seq: Seq,
 ) {
+    // Consume the batch so each record moves into the state exactly once.
+    // Recovery replays markers that may hold a whole 100 MB transcript; a
+    // clone here would keep every record alive twice until the batch drops.
     for write in writes {
         match write {
             StorageWrite::Conversation { value } => {
+                let id = value.id;
                 state
                     .record_types
-                    .insert(value.id.as_i64(), TableName::Conversation);
-                state.conversations.insert(value.id, value.clone());
-                insert_sorted(&mut state.conversation_ids, value.id);
+                    .insert(id.as_i64(), TableName::Conversation);
                 if let Some(owner) = &value.owner {
                     insert_map_id(
                         &mut state.conversation_ids_by_owner_conversation,
                         owner.conversation_id,
-                        value.id,
+                        id,
                     );
-                    insert_map_id(
-                        &mut state.conversation_ids_by_owner_task,
-                        owner.task_id,
-                        value.id,
-                    );
+                    insert_map_id(&mut state.conversation_ids_by_owner_task, owner.task_id, id);
                 }
+                state.conversations.insert(id, value);
+                insert_sorted(&mut state.conversation_ids, id);
             }
             StorageWrite::Entry { value } => {
-                state
-                    .record_types
-                    .insert(value.id.as_i64(), TableName::Entry);
-                state.entries.insert(value.id, value.clone());
-                state.entry_commit_seqs.insert(value.id, seq);
-                insert_sorted(
-                    state.entry_ids.entry(value.conversation_id).or_default(),
-                    value.id,
-                );
-                if value.head.is_some() {
-                    insert_sorted(
-                        state
-                            .head_entry_ids
-                            .entry(value.conversation_id)
-                            .or_default(),
-                        value.id,
-                    );
+                let id = value.id;
+                let conversation_id = value.conversation_id;
+                let is_head = value.head.is_some();
+                state.record_types.insert(id.as_i64(), TableName::Entry);
+                state.entries.insert(id, value);
+                state.entry_commit_seqs.insert(id, seq);
+                insert_sorted(state.entry_ids.entry(conversation_id).or_default(), id);
+                if is_head {
+                    insert_sorted(state.head_entry_ids.entry(conversation_id).or_default(), id);
                 }
             }
             StorageWrite::Task { value } => {
-                state
-                    .record_types
-                    .insert(value.id.as_i64(), TableName::Task);
+                let id = value.id;
+                state.record_types.insert(id.as_i64(), TableName::Task);
                 let status = value.state.status();
-                match state.tasks.get(&value.id) {
+                match state.tasks.get(&id) {
                     None => {
-                        insert_sorted(&mut state.task_ids, value.id);
-                        insert_sorted(
-                            state.task_ids_by_status.entry(status).or_default(),
-                            value.id,
-                        );
+                        insert_sorted(&mut state.task_ids, id);
+                        insert_sorted(state.task_ids_by_status.entry(status).or_default(), id);
                     }
                     Some(previous) => {
                         let previous_status = previous.state.status();
                         if previous_status != status {
                             if let Some(ids) = state.task_ids_by_status.get_mut(&previous_status) {
-                                remove_sorted(ids, value.id);
+                                remove_sorted(ids, id);
                             }
-                            insert_sorted(
-                                state.task_ids_by_status.entry(status).or_default(),
-                                value.id,
-                            );
+                            insert_sorted(state.task_ids_by_status.entry(status).or_default(), id);
                         }
                     }
                 }
-                state.tasks.insert(value.id, value.clone());
+                state.tasks.insert(id, value);
             }
             StorageWrite::Submission { value } => {
+                let id = value.id;
                 state
                     .record_types
-                    .insert(value.id.as_i64(), TableName::Submission);
-                let previous = state.submissions.get(&value.id).cloned();
+                    .insert(id.as_i64(), TableName::Submission);
+                let previous = state.submissions.get(&id).cloned();
                 match &previous {
                     None => {
-                        insert_sorted(&mut state.submission_ids, value.id);
+                        insert_sorted(&mut state.submission_ids, id);
                         insert_sorted(
                             state
                                 .submission_ids_by_status
                                 .entry(value.status)
                                 .or_default(),
-                            value.id,
+                            id,
                         );
                     }
                     Some(previous) => {
@@ -862,14 +895,14 @@ fn apply_commit(
                             if let Some(ids) =
                                 state.submission_ids_by_status.get_mut(&previous.status)
                             {
-                                remove_sorted(ids, value.id);
+                                remove_sorted(ids, id);
                             }
                             insert_sorted(
                                 state
                                     .submission_ids_by_status
                                     .entry(value.status)
                                     .or_default(),
-                                value.id,
+                                id,
                             );
                         }
                     }
@@ -877,16 +910,18 @@ fn apply_commit(
                 if let Some(previous) = &previous {
                     if let Some(request_id) = &previous.request_id {
                         let key = (previous.conversation_id, request_id.clone());
-                        if state.submission_ids_by_request.get(&key) == Some(&value.id) {
+                        if state.submission_ids_by_request.get(&key) == Some(&id) {
                             state.submission_ids_by_request.remove(&key);
                         }
                     }
                 }
-                state.submissions.insert(value.id, value.clone());
-                if let Some(request_id) = &value.request_id {
+                let conversation_id = value.conversation_id;
+                let request_id = value.request_id.clone();
+                state.submissions.insert(id, value);
+                if let Some(request_id) = request_id {
                     state
                         .submission_ids_by_request
-                        .insert((value.conversation_id, request_id.clone()), value.id);
+                        .insert((conversation_id, request_id), id);
                 }
             }
             StorageWrite::DocumentCreate { .. }
@@ -1089,12 +1124,19 @@ impl Storage for MemoryStorage {
             let inner = self.inner.lock().await;
             assert_open(&inner)?;
             let state = &inner.state;
-            let visible = Self::visible_entries(state, conversation_id, Some(id), Some(id))?;
+            let visible = Self::visible_entries(
+                state,
+                conversation_id,
+                Some(id),
+                Some(id),
+                1,
+                &self.entry_scan_materialized,
+            )?;
             let Some(entry) = visible.into_iter().next() else {
                 return Ok(None);
             };
             Ok(Some(EntryWithSeq {
-                entry,
+                entry: entry.clone(),
                 commit_seq: state
                     .entry_commit_seqs
                     .get(&id)
@@ -1168,19 +1210,28 @@ impl Storage for MemoryStorage {
                     }
                 }
             }
+            let max_items = limit.saturating_add(1);
             let entries = match start.order {
-                ScanOrder::Descending => {
-                    Self::visible_entries(state, query.conversation_id, min_entry_id, max_entry_id)?
-                }
+                ScanOrder::Descending => Self::visible_entries(
+                    state,
+                    query.conversation_id,
+                    min_entry_id,
+                    max_entry_id,
+                    max_items,
+                    &self.entry_scan_materialized,
+                )?,
                 ScanOrder::Ascending => Self::visible_entries_ascending(
                     state,
                     query.conversation_id,
                     min_entry_id,
                     max_entry_id,
+                    max_items,
+                    &self.entry_scan_materialized,
                 )?,
             };
-            let values: Vec<EntryRecord> = entries.into_iter().take(limit + 1).collect();
-            let (items, next) = page_of(&values, limit, start.order, |entry| entry.id.as_i64());
+            let values: Vec<EntryRecord> = entries.into_iter().cloned().collect();
+            let (items, next) =
+                page_of_owned(values, limit, start.order, |entry| entry.id.as_i64());
             Ok(Page { items, next })
         })
     }

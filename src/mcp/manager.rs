@@ -1482,6 +1482,17 @@ impl McpManager {
         result
     }
 
+    #[doc(hidden)]
+    /// Test seam for the identity-checked close: runs the same
+    /// [`ServerConnection::drop_client_if`] the `get_client` dead-client and
+    /// 401/403 error paths use. Not part of pir's supported surface.
+    pub async fn drop_client_if_for_tests(&self, server: &str, expected: &Arc<McpClient>) -> bool {
+        match self.connection(server).await {
+            Ok(connection) => connection.drop_client_if(expected).await,
+            Err(_) => false,
+        }
+    }
+
     /// Drain the notifications the client recorded and react (upstream
     /// runtime.ts `onNotification` wiring): `notifications/message` appends
     /// to the server log (`log.write`, line 386). Returns whether a
@@ -2148,12 +2159,11 @@ impl ServerConnection {
             if dead {
                 // The close runs outside the slot lock (the client bounds it by
                 // `CLOSE_TIMEOUT`). Only the dead client this loop probed is
-                // released: a concurrent reconnect may already have installed
-                // a replacement, which must not be torn down here.
+                // released: the identity check and the take share one slot
+                // lock (`drop_client_if`), so a replacement installed by a
+                // concurrent reconnect can never be torn down here.
                 if let Some(client) = installed.as_ref() {
-                    if self.slot_holds(client).await {
-                        self.drop_client().await;
-                    }
+                    self.drop_client_if(client).await;
                 }
                 continue;
             }
@@ -2622,14 +2632,28 @@ impl ServerConnection {
                 // expired sessions (`session_recovery_timeout`), so pir never
                 // constructs it and this arm is exercised via
                 // `ConnectionClosed`.
-                Err(error @ (McpError::SessionExpired | McpError::ConnectionClosed)) => {
+                Err(error @ McpError::SessionExpired) => {
                     // The server no longer knows the session (restart,
                     // deploy), so it did not run the request: retry once on a
                     // fresh connection.
-                    self.drop_client().await;
+                    self.drop_client_if(&client).await;
                     if attempt == 1 {
                         return Err(error);
                     }
+                }
+                // The response channel closed after the request was sent
+                // (server exit, dropped transport). The request may already
+                // have run server-side, so a retry could duplicate a
+                // side-effecting tool: release the dead client (letting the
+                // NEXT call reconnect) and report the original error.
+                Err(error @ McpError::ConnectionClosed) => {
+                    tracing::warn!(
+                        server = %self.name,
+                        tool,
+                        "MCP connection closed mid-call; the tool result is unknown and the call is not retried"
+                    );
+                    self.drop_client_if(&client).await;
+                    return Err(error);
                 }
                 // A 401/403 bearer challenge. An `auth: { provider }` server
                 // sends a provider token, not an OAuth grant: a 401 re-reads
@@ -2659,7 +2683,7 @@ impl ServerConnection {
                         if !crate::mcp::oauth::is_unauthorized(&error) {
                             return Err(error);
                         }
-                        self.drop_client().await;
+                        self.drop_client_if(&client).await;
                         if attempt == 1 {
                             // Upstream `markNeedsAuth` (runtime.ts:326): the
                             // provider's current token was already rejected, so
@@ -2742,7 +2766,7 @@ impl ServerConnection {
                             server: server_name,
                         });
                     }
-                    self.drop_client().await;
+                    self.drop_client_if(&client).await;
                     if attempt == 1 {
                         return Err(error);
                     }
@@ -2758,6 +2782,40 @@ impl ServerConnection {
     fn notify_settled(&self) {
         self.settled
             .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
+    /// Take `expected` out of the slot and close it only if it is still the
+    /// installed client. Identity check and take happen under ONE slot-lock
+    /// acquisition, so a replacement installed by a concurrent reconnect is
+    /// never torn down by an older request's error path. A miss changes
+    /// neither the slot nor the state and returns `false`.
+    async fn drop_client_if(&self, expected: &Arc<McpClient>) -> bool {
+        let taken = {
+            let mut slot = self.client.lock().await;
+            if !slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
+                return false;
+            }
+            let taken = slot.take();
+            if taken.is_some() {
+                self.client_instance.store(0, Ordering::SeqCst);
+                self.closing.store(true, Ordering::SeqCst);
+            }
+            self.set_state(ConnectionState::Disconnected { error: None });
+            taken
+        };
+        let Some(client) = taken else {
+            return false;
+        };
+        // The removed client's tool list is no longer authoritative; the
+        // reconnect's discovery must list again (readiness invalidation). The
+        // close runs outside the slot lock (bounded by `CLOSE_TIMEOUT`).
+        self.reset_readiness();
+        let _closing = ClosingGuard { connection: self };
+        client.close().await;
+        true
     }
 
     /// Take the live client out under the slot lock, mark the close in

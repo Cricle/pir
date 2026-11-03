@@ -177,8 +177,10 @@
 //!   JS local time.
 //! * [`enable_windows_vt_input`] performs upstream's console-mode change
 //!   (`GetStdHandle` / `GetConsoleMode` / `SetConsoleMode |
-//!   ENABLE_VIRTUAL_TERMINAL_INPUT`) and the TUI restores the previous mode on
-//!   cleanup, which upstream does not do; a console that refuses the call
+//!   ENABLE_VIRTUAL_TERMINAL_INPUT`) and the TUI restores only that flag on
+//!   cleanup (a read-modify-write of the current mode, so the line/echo/
+//!   processed bits `disable_raw_mode` just restored are kept), which upstream
+//!   does not do; a console that refuses the call
 //!   reports [`VtInputOutcome::Unavailable`] — the degradation upstream
 //!   swallows (Shift+Tab would then arrive as plain Tab). The TUI installs the
 //!   flag only behind the `PIR_TUI_VT_INPUT=1` opt-in: upstream parses the
@@ -257,6 +259,12 @@ const NATIVE_SHIFT_ENTER_LEGACY: &[u8] = b"\x1b[13;2~";
 pub const SHIFT_TAB_VT_SEQUENCE: &[u8] = b"\x1b[Z";
 /// `ENABLE_VIRTUAL_TERMINAL_INPUT` (`native/win32/src/win32-platform.c:40`).
 pub const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+/// `ENABLE_QUICK_EDIT_MODE` (`wincon.h`): with it set, a mouse selection
+/// suspends console output until Esc, which freezes the TUI.
+pub const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+/// `ENABLE_EXTENDED_FLAGS` (`wincon.h`): required for the QuickEdit bit to
+/// take effect.
+pub const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
 
 // ---------------------------------------------------------------------------
 // Timeouts (upstream terminal.ts:128-145)
@@ -1235,25 +1243,61 @@ pub fn vt_input_mode_change(current: u32) -> Option<u32> {
         .then_some(current | ENABLE_VIRTUAL_TERMINAL_INPUT)
 }
 
-/// The console input mode before [`enable_windows_vt_input`] changed it, for
-/// the cleanup restore (upstream leaves the flag set). The state lives inside
-/// this Windows-only accessor: console modes exist only on Windows, so no
-/// unread static is carried by the other builds.
+/// The `ENABLE_VIRTUAL_TERMINAL_INPUT` bit before
+/// [`enable_windows_vt_input`] changed it: `-1` when nothing was captured,
+/// otherwise `0`/`1` for the saved bit. Only the flag is saved — the rest of
+/// the console mode belongs to raw mode and must not be written back (see
+/// [`restore_vt_input_bits`]).
 #[cfg(windows)]
-fn previous_console_mode() -> &'static std::sync::atomic::AtomicI64 {
-    static PREVIOUS_CONSOLE_MODE: std::sync::atomic::AtomicI64 =
+fn previous_vt_input_enabled() -> &'static std::sync::atomic::AtomicI64 {
+    static PREVIOUS_VT_INPUT_ENABLED: std::sync::atomic::AtomicI64 =
         std::sync::atomic::AtomicI64::new(-1);
-    &PREVIOUS_CONSOLE_MODE
+    &PREVIOUS_VT_INPUT_ENABLED
 }
 
-/// The console input mode before [`disable_windows_quick_edit`] changed it, or
-/// `-1` when QuickEdit was already off. Like [`previous_console_mode`], the
-/// state lives inside this Windows-only accessor.
+/// The `ENABLE_QUICK_EDIT_MODE` bit before [`disable_windows_quick_edit`]
+/// cleared it: `-1` when nothing was captured, otherwise `0`/`1` for the saved
+/// bit. Saving the whole mode would write the raw-mode bits back on restore
+/// (see [`restore_quick_edit_bits`]).
 #[cfg(windows)]
-fn previous_quick_edit_mode() -> &'static std::sync::atomic::AtomicI64 {
-    static PREVIOUS_QUICK_EDIT_MODE: std::sync::atomic::AtomicI64 =
+fn previous_quick_edit_enabled() -> &'static std::sync::atomic::AtomicI64 {
+    static PREVIOUS_QUICK_EDIT_ENABLED: std::sync::atomic::AtomicI64 =
         std::sync::atomic::AtomicI64::new(-1);
-    &PREVIOUS_QUICK_EDIT_MODE
+    &PREVIOUS_QUICK_EDIT_ENABLED
+}
+
+/// The mode [`disable_windows_quick_edit`] installs: clear QuickEdit and keep
+/// every other bit.
+pub fn quick_edit_disabled_mode(current: u32) -> u32 {
+    (current | ENABLE_EXTENDED_FLAGS) & !ENABLE_QUICK_EDIT_MODE
+}
+
+/// Read-modify-write the QuickEdit bit onto a freshly read console mode.
+///
+/// Only the saved bit is re-applied: `current` keeps every other flag,
+/// including the `ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT |
+/// ENABLE_PROCESSED_INPUT` bits `disable_raw_mode` has just restored. Writing
+/// back a full mode captured under raw mode would clear those bits again and
+/// leave the user's shell without echo or line editing.
+#[doc(hidden)]
+pub fn restore_quick_edit_bits(current: u32, saved_enabled: bool) -> u32 {
+    if saved_enabled {
+        current | ENABLE_QUICK_EDIT_MODE
+    } else {
+        current & !ENABLE_QUICK_EDIT_MODE
+    }
+}
+
+/// Read-modify-write the `ENABLE_VIRTUAL_TERMINAL_INPUT` bit onto a freshly
+/// read console mode; every other bit is preserved for the same reason as
+/// [`restore_quick_edit_bits`].
+#[doc(hidden)]
+pub fn restore_vt_input_bits(current: u32, saved_enabled: bool) -> u32 {
+    if saved_enabled {
+        current | ENABLE_VIRTUAL_TERMINAL_INPUT
+    } else {
+        current & !ENABLE_VIRTUAL_TERMINAL_INPUT
+    }
 }
 
 /// Clear `ENABLE_QUICK_EDIT_MODE` on the console input handle.
@@ -1269,9 +1313,6 @@ pub fn disable_windows_quick_edit() -> bool {
 
     use crossterm_winapi::{ConsoleMode, Handle, HandleType};
 
-    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
-    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
-
     let Ok(handle) = Handle::new(HandleType::InputHandle) else {
         return false;
     };
@@ -1282,11 +1323,10 @@ pub fn disable_windows_quick_edit() -> bool {
     if mode & ENABLE_QUICK_EDIT_MODE == 0 {
         return false;
     }
-    let next = (mode | ENABLE_EXTENDED_FLAGS) & !ENABLE_QUICK_EDIT_MODE;
-    if console.set_mode(next).is_err() {
+    if console.set_mode(quick_edit_disabled_mode(mode)).is_err() {
         return false;
     }
-    previous_quick_edit_mode().store(mode as i64, Ordering::Relaxed);
+    previous_quick_edit_enabled().store(1, Ordering::Relaxed);
     true
 }
 
@@ -1296,20 +1336,30 @@ pub fn disable_windows_quick_edit() -> bool {
     false
 }
 
-/// Restore the console mode captured by [`disable_windows_quick_edit`].
+/// Restore the QuickEdit bit captured by [`disable_windows_quick_edit`].
+///
+/// Reads the *current* console mode first and toggles only the QuickEdit bit
+/// ([`restore_quick_edit_bits`]): cleanup runs after `disable_raw_mode()`, so
+/// the current mode already carries the restored line/echo/processed bits and
+/// those must survive.
 #[cfg(windows)]
 pub fn restore_windows_quick_edit() {
     use std::sync::atomic::Ordering;
 
     use crossterm_winapi::{ConsoleMode, Handle, HandleType};
 
-    let previous = previous_quick_edit_mode().swap(-1, Ordering::Relaxed);
+    let previous = previous_quick_edit_enabled().swap(-1, Ordering::Relaxed);
     if previous < 0 {
         return;
     }
-    if let Ok(handle) = Handle::new(HandleType::InputHandle) {
-        let _ = ConsoleMode::from(handle).set_mode(previous as u32);
-    }
+    let Ok(handle) = Handle::new(HandleType::InputHandle) else {
+        return;
+    };
+    let console = ConsoleMode::from(handle);
+    let Ok(current) = console.mode() else {
+        return;
+    };
+    let _ = console.set_mode(restore_quick_edit_bits(current, previous != 0));
 }
 
 /// Restore the console mode captured by [`disable_windows_quick_edit`].
@@ -1366,7 +1416,10 @@ pub fn enable_windows_vt_input() -> VtInputOutcome {
     if console.set_mode(next).is_err() {
         return VtInputOutcome::Unavailable;
     }
-    previous_console_mode().store(mode as i64, Ordering::Relaxed);
+    previous_vt_input_enabled().store(
+        i64::from(mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0),
+        Ordering::Relaxed,
+    );
     VtInputOutcome::Enabled
 }
 
@@ -1376,21 +1429,28 @@ pub fn enable_windows_vt_input() -> VtInputOutcome {
     VtInputOutcome::UnsupportedPlatform
 }
 
-/// Restore the console mode captured by [`enable_windows_vt_input`] (upstream
-/// never does this; pir restores it so the flag cannot leak to the parent
-/// console).
+/// Restore the `ENABLE_VIRTUAL_TERMINAL_INPUT` bit captured by
+/// [`enable_windows_vt_input`] (upstream never does this; pir restores it so
+/// the flag cannot leak to the parent console). Like
+/// [`restore_windows_quick_edit`], this reads the current mode and toggles
+/// only the saved bit.
 #[cfg(windows)]
 pub fn restore_windows_vt_input() {
     use crossterm_winapi::{ConsoleMode, Handle, HandleType};
     use std::sync::atomic::Ordering;
 
-    let previous = previous_console_mode().swap(-1, Ordering::Relaxed);
+    let previous = previous_vt_input_enabled().swap(-1, Ordering::Relaxed);
     if previous < 0 {
         return;
     }
-    if let Ok(handle) = Handle::new(HandleType::InputHandle) {
-        let _ = ConsoleMode::from(handle).set_mode(previous as u32);
-    }
+    let Ok(handle) = Handle::new(HandleType::InputHandle) else {
+        return;
+    };
+    let console = ConsoleMode::from(handle);
+    let Ok(current) = console.mode() else {
+        return;
+    };
+    let _ = console.set_mode(restore_vt_input_bits(current, previous != 0));
 }
 
 /// Restore the console mode captured by [`enable_windows_vt_input`].

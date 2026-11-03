@@ -1,6 +1,16 @@
 use super::*;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
+
+thread_local! {
+    /// `context_usage()` walks paid for by `push_session_context` on this
+    /// thread. The P3-01 cache-hit short circuit is otherwise invisible to
+    /// tests (the rebuilt payload is identical); this counter makes a
+    /// regression that moves `context_usage()` back before the fingerprint
+    /// check observable without timing a 10k-entry fixture.
+    static CONTEXT_USAGE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// One `share_metadata` result: the resolved system prompt plus the declared
 /// tool entries (name, description, JSON schema) for the TUI `/share` and
@@ -129,6 +139,139 @@ struct CachedTree {
     text: String,
 }
 
+/// Cheap identity of the registry catalog serialized into
+/// `ctx.modelRegistry`. A value match proves a rebuild from the live registry
+/// would produce the same wire snapshot.
+///
+/// The per-provider `identity` is the live provider `Arc`'s address: catalog
+/// and dynamic providers are immutable values, and a runtime registration /
+/// remote-overlay update replaces the whole `Arc`, so a refcount-free pointer
+/// comparison detects it. Providers that mutate their model list in place
+/// declare it with [`crate::ai::provider::Provider::supports_refresh`]; their
+/// current model identities are included explicitly.
+#[derive(Clone, PartialEq, Eq)]
+struct ModelCatalogFingerprint {
+    providers: Vec<ProviderCatalogFingerprint>,
+    virtual_models: Vec<VirtualModelFingerprint>,
+    credentials: CredentialEnvironmentFingerprint,
+}
+
+/// The fields of a virtual-model registration that change its serialized
+/// catalog row (identity, display name, routing target, reasoning flag and
+/// limit overrides). A re-registration under the same id with any of these
+/// different must rebuild the catalog.
+#[derive(Clone, PartialEq, Eq)]
+struct VirtualModelFingerprint {
+    provider: String,
+    id: String,
+    physical_provider: String,
+    physical_id: String,
+    name: Option<String>,
+    reasoning: Option<bool>,
+    context_window: Option<u64>,
+    max_tokens: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ProviderCatalogFingerprint {
+    id: String,
+    /// The display name is part of the serialized providers wire
+    /// (`runtime_loader::ModelCatalog::from_models`); an in-place name change
+    /// must rebuild the catalog even when the model list is unchanged.
+    name: String,
+    /// Live `Arc` address for immutable catalog providers / non-plugin
+    /// dynamic providers (a runtime registration replaces the whole `Arc`).
+    /// For a `pi.registerProvider`-owned dynamic provider this is `0`: its
+    /// `sync_plugin_providers` entry is rebuilt every prompt, so the address
+    /// is not a stable identity (P2-新-1). [`Self::plugin_config`] plus
+    /// [`Self::models_content`] identify it instead.
+    identity: usize,
+    /// Fingerprint of the plugin definition's config JSON for a dynamic
+    /// provider owned by `pi.registerProvider`. `None` for every other
+    /// provider (static catalog / remote-overlay / host-registered dynamic).
+    plugin_config: Option<u64>,
+    /// Content hashes of an in-place-refreshable provider's current models
+    /// (currently only the single-model radius gateway), AND of every
+    /// plugin-owned dynamic provider (whose `Arc` is rebuilt on each sync).
+    /// `Debug` output is a deterministic, complete field dump of the plain
+    /// data `Model`; hashes keep credentials that `authHeader` writes into
+    /// model headers out of the cached fingerprint.
+    models_content: Option<Vec<u64>>,
+}
+
+/// The credential-bearing files [`crate::ai::providers::load_pi_environment`]
+/// derives `authenticated_providers` from (`models.json` templates,
+/// `settings.json` scope, `auth.json` stored credentials), identified by
+/// `(path, mtime, size, content hash)`, plus the process environment values
+/// they resolve (`has_configured_auth` provider env vars and every `$ENV` /
+/// `${ENV}` template reference found in those files).
+///
+/// The content hash makes an equal-length rewrite inside one filesystem
+/// timestamp tick observable (P3-新-2); the env snapshot makes an in-process
+/// credential environment change observable (P3-新-1). Files stay small
+/// (`models.json` is capped at 8 MiB), so hashing is far cheaper than the
+/// catalog rebuild it guards.
+#[derive(Clone, PartialEq, Eq)]
+struct CredentialEnvironmentFingerprint {
+    agent_dir: PathBuf,
+    cwd: PathBuf,
+    project_trusted: bool,
+    files: Vec<CredentialFileStamp>,
+    /// `(env name, value hash)` for every auth-relevant variable, sorted by
+    /// name. `None` means unset; the hash never stores the secret itself.
+    env: Vec<(String, Option<u64>)>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CredentialFileStamp {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: Option<u64>,
+    /// `DefaultHasher` over the full file bytes. `None` when the file does
+    /// not exist or could not be read (a read failure does not pin the cache:
+    /// the load also fails and [`AgentSession::build_model_catalog`] refuses
+    /// to store its fingerprint).
+    content_hash: Option<u64>,
+}
+
+/// The catalog fingerprint the runtime's current `ctx.modelRegistry` was
+/// built from (the serialized catalog itself is not retained: the session
+/// push rebuilds only on a mismatch, and the rebuild moves the values into
+/// the runtime).
+#[derive(Clone, PartialEq, Eq)]
+struct ModelCatalogCache {
+    fingerprint: ModelCatalogFingerprint,
+}
+
+/// Cheap identity of the non-extension tool surface pushed into the runtime:
+/// the session's fixed core [`ToolRegistry`](crate::agent::tool_execution::ToolRegistry)
+/// and the unified plugin host's registry generation (which moves on every
+/// JS/MCP/builtin registration rebuild). Builtin commands ride the same
+/// generation, so one key covers both pushes.
+#[derive(Clone, PartialEq, Eq)]
+struct ToolSurfaceCacheKey {
+    plugin_registry_generation: Option<u64>,
+    tools_identity: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ToolSurfaceCache {
+    key: ToolSurfaceCacheKey,
+}
+
+/// Session-side counter for the per-prompt catalog push (the path the
+/// snapshot cache exists to skip). The other two probes are measured at their
+/// common sink instead of inside `build_model_catalog`, so a regression that
+/// re-adds a rebuild outside it is still visible:
+/// - catalog pushes / model rows: [`crate::extensions::ExtensionHandle::update_model_registry`]
+///   (every rebuild path that reaches the runtime must pass through it);
+/// - credential loads: [`AgentSession::authenticated_providers`] (the only
+///   session path that calls `load_pi_environment` for the catalog).
+#[derive(Default)]
+struct ModelCatalogPushStats {
+    credential_environment_loads: AtomicU64,
+}
+
 /// The last session-context push's fingerprint (plus the ephemeral history
 /// snapshot it was taken from). `None` until the first push.
 pub(super) struct SessionContextCache {
@@ -140,6 +283,14 @@ pub(super) struct SessionContextCache {
     sessions: CachedSessions,
     /// The last rendered forest text, reused while [`TreeCacheKey`] matches.
     tree: Option<Arc<CachedTree>>,
+    /// The catalog fingerprint the runtime's `ctx.modelRegistry` reflects.
+    catalog: Option<ModelCatalogCache>,
+    /// The tool-surface key the runtime's core tools / builtin commands
+    /// reflect.
+    tool_surface: Option<ToolSurfaceCache>,
+    /// Counters shared across every push of this session (observability for
+    /// the cache tests; no production behavior depends on them).
+    stats: Arc<ModelCatalogPushStats>,
 }
 
 impl SessionContextCache {
@@ -157,6 +308,55 @@ impl SessionContextCache {
             _ => false,
         }
     }
+}
+
+/// Dispatch the `resources_discover` event and resolve the paths its handlers
+/// contributed (shared by AgentSession's resource install and the print
+/// host's one-shot discovery). Returns `None` when no handler is registered,
+/// the dispatch failed, or the merged result carried no paths.
+pub(crate) async fn dispatch_resources_discover_event(
+    plugins: &PluginHost,
+    cwd: &Path,
+    reason: &str,
+) -> Option<crate::extensions::resources::ExtensionResourcePaths> {
+    use crate::extensions::resources::ExtensionResourcePaths;
+
+    if !plugins.has_handlers("resources_discover") {
+        return None;
+    }
+    let mut payload = serde_json::json!({
+        "type": "resources_discover",
+        "reason": reason,
+        "cwd": cwd.display().to_string(),
+    });
+    let outcome = match plugins.emit("resources_discover", &mut payload).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            crate::ext_diag!("[ext] resources_discover dispatch failed: {error}");
+            return None;
+        }
+    };
+    for error in &outcome.errors {
+        crate::ext_diag!(
+            "[ext] resources_discover handler error ({}): {}",
+            error.event,
+            error.error
+        );
+    }
+    let paths = ExtensionResourcePaths::from_event_result(&outcome.result, cwd);
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Named inputs for [`AgentSession::build_session_context_snapshot`].
+struct SessionSnapshotInputs {
+    model: JsonValue,
+    context_window: u64,
+    trusted_project: bool,
+    context_tokens: Option<u64>,
+    sessions_dir: Option<PathBuf>,
+    sessions_modified: Option<SystemTime>,
+    cached_sessions: Option<CachedSessions>,
+    cached_tree: Option<Arc<CachedTree>>,
 }
 
 impl AgentSession {
@@ -427,17 +627,134 @@ session does not have"
     /// runtime/plugin host already holds the identical snapshot and the push
     /// is skipped.
     pub(super) async fn push_session_context(&self, model: &Model) -> bool {
-        let Some(runtime) = &self.extensions else {
-            // No JS runtime, but the plugin list still receives the model
-            // snapshot: a builtin/inline-only session is exactly where the
-            // `tool-repair` builtin's `before_provider_request` model gate has
-            // no other source for the model id. The JS-facing pushes below are
-            // all runtime-only, so this branch is the whole plugin contract.
+        let Some(runtime) = self.event_extensions() else {
+            // No JS face for this session (no runtime at all, or the
+            // subagent shared-runtime fallback whose parent handle must not
+            // receive the child's session state), but the plugin list still
+            // receives the model snapshot: a builtin/inline-only session is
+            // exactly where the `tool-repair` builtin's
+            // `before_provider_request` model gate has no other source for
+            // the model id. The JS-facing pushes below are all runtime-only,
+            // so this branch is the whole plugin contract.
             if let Some(plugins) = &self.plugins {
                 plugins.update_session_context(model_snapshot(model));
             }
             return false;
         };
+        // The snapshot's `context_tokens` is the LAST usage record (upstream
+        // `SessionContextSnapshot.contextTokens` = "Estimated context tokens
+        // (last usage)"), not a lifetime accumulator: `self.tokens` sums every
+        // settle, so it would report a monotonically growing number that
+        // `ctx.getContextUsage()` then turns into a bogus percentage.
+        //
+        // The live value is computed AFTER the fingerprint cache check below
+        // (P3-01): the check only needs a candidate, and a cache HIT proves
+        // the projection inputs — resident entries (count + last id), leaf,
+        // storage identity, model (which carries `contextWindow`) and the
+        // ephemeral history Arc — are unchanged, so the cached count is still
+        // the live one. A usage record is a message ENTRY, so one can only
+        // appear through an append, which moves `entry_count`/`last_entry_id`.
+        // This keeps the hit path free of `context_usage()`'s O(entries)
+        // metadata walk; a miss pays it once and stores the fresh value in
+        // the fingerprint (shared by fingerprint and payload, so they agree).
+        let cached_context_tokens = self
+            .session_context_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|cache| cache.fingerprint.context_tokens);
+        // Same resolution as the settings load: operator override, the
+        // extension `project_trust` decision, then the trust store/policy.
+        let trusted_project =
+            crate::extensions::project_trust::resolve_project_trust(&self.cwd, &self.agent_dir);
+        let model_json = serde_json::to_value(model).unwrap_or(JsonValue::Null);
+        let context_window = model.context_window;
+        // The session-derived payload is the expensive half (context
+        // projection, full entry tree, per-entry projection copy, session
+        // listing). Its fingerprint is computed FIRST so a hit can skip the
+        // catalog/tool-surface rebuilds below as well; the runtime and the
+        // plugin host already hold exactly the previous push's state.
+        let history = match &self.session {
+            Some(_) => None,
+            None => Some(self.history_snapshot()),
+        };
+        let mut fingerprint = self
+            .snapshot_fingerprint(
+                model_json.clone(),
+                trusted_project,
+                &history,
+                cached_context_tokens,
+            )
+            .await;
+        // One cache lock decides the session-snapshot hit and takes every
+        // sub-cache (session listing, tree, catalog stamp, tool-surface key)
+        // plus the shared probe counters.
+        let (
+            session_snapshot_matches,
+            cached_sessions,
+            cached_tree,
+            cached_catalog,
+            cached_tool_surface,
+            stats,
+        ) = {
+            let cache = self
+                .session_context_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match cache.as_ref() {
+                Some(cache) => (
+                    cache.matches(&fingerprint, &history),
+                    if cache.sessions.matches(
+                        fingerprint.sessions_dir.as_deref(),
+                        fingerprint.sessions_modified,
+                    ) {
+                        Some(cache.sessions.clone())
+                    } else {
+                        None
+                    },
+                    cache.tree.clone(),
+                    cache.catalog.clone(),
+                    cache.tool_surface.clone(),
+                    Arc::clone(&cache.stats),
+                ),
+                None => (
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Arc::new(ModelCatalogPushStats::default()),
+                ),
+            }
+        };
+
+        // Providers with a usable credential back the `pi.setModel` `false`
+        // result (upstream returns false for unauthenticated providers), and
+        // the model catalog backs `ctx.modelRegistry`/`modelRuntime`. Both
+        // halves are cached by fingerprint: the ~1.7k-model `to_value`
+        // serialization and the `load_pi_environment` settings/models/auth
+        // reread only happen when the registry identity or one of the
+        // credential files actually moved. A session-snapshot hit therefore
+        // skips them too (R1-L1-008).
+        let catalog_fingerprint = self.model_catalog_fingerprint(trusted_project);
+        let (catalog_cache, catalog_rebuilt) = match cached_catalog {
+            Some(cache) if cache.fingerprint == catalog_fingerprint => (Some(cache), false),
+            _ => {
+                let (catalog, credentials_ok) = self.build_model_catalog(&stats);
+                catalog.apply_owned(runtime);
+                // A transient credential-environment failure must not be
+                // cached as a permanent empty auth list (P3-新-3): keep no
+                // stamp so the next push retries. `apply_owned` still pushes
+                // the catalog models with the permissive-empty convention.
+                (
+                    credentials_ok.then_some(ModelCatalogCache {
+                        fingerprint: catalog_fingerprint,
+                    }),
+                    true,
+                )
+            }
+        };
+
         // Host-pushed tool defs so the JS `getActiveTools`/`getAllTools`
         // facades see non-extension tools WITH their real description and
         // parameter schema: the session's core (builtin) tools first, then
@@ -448,72 +765,31 @@ session does not have"
         // plugin can never shadow a core tool in the JS view either.
         // JS-extension tools are skipped: they already ride the QuickJS
         // registry export (`tool_defs`), and pushing them here would
-        // duplicate their rows.
-        {
-            let mut defs: Vec<crate::extensions::ToolDef> =
-                crate::coding_agent::tools::tool_definitions(&self.tools)
-                    .into_iter()
-                    .map(|tool| {
-                        crate::extensions::ToolDef::core(
-                            tool.name,
-                            tool.description,
-                            tool.parameters,
-                        )
-                    })
-                    .collect();
-            if let Some(plugins) = &self.plugins {
-                let mut seen: std::collections::BTreeSet<String> =
-                    defs.iter().map(|def| def.name.clone()).collect();
-                for (def, backend) in plugins.registry().resolved_tools() {
-                    if matches!(backend, crate::plugins::ToolBackend::Rust(_))
-                        && seen.insert(def.name.clone())
-                    {
-                        defs.push(def.clone());
-                    }
-                }
+        // duplicate their rows. Cached on the plugin registry generation, so
+        // a steady prompt does not clone every def/schema again.
+        let tool_surface_key = self.tool_surface_cache_key();
+        let (tool_surface_cache, tool_surface_rebuilt) = match cached_tool_surface {
+            Some(cache) if cache.key == tool_surface_key => (cache, false),
+            _ => {
+                self.push_tool_surface(runtime);
+                (
+                    ToolSurfaceCache {
+                        key: tool_surface_key,
+                    },
+                    true,
+                )
             }
-            runtime.update_core_tools(defs);
-        }
-        // Builtin (Rust plugin) commands join `getCommands()` alongside the
-        // extension-registered ones (all entries carry the upstream `source`
-        // tag).
-        if let Some(plugins) = &self.plugins {
-            let builtin_commands: Vec<crate::extensions::CommandDef> = plugins
-                .registry()
-                .resolved_commands()
-                .into_iter()
-                .filter(|command| {
-                    matches!(
-                        command.backend,
-                        Some(crate::plugins::CommandBackend::Rust(_))
-                    )
-                })
-                .map(|command| command.def)
-                .collect();
-            runtime.update_builtin_commands(builtin_commands);
-        }
-        // Providers with a usable credential back the `pi.setModel` `false`
-        // result (upstream returns false for unauthenticated providers), and
-        // the model catalog backs `ctx.modelRegistry`/`modelRuntime`. Same
-        // serialized shape the pre-load push uses
-        // (`ModelCatalog::apply`), so a factory-time lookup and a
-        // post-session lookup can never disagree.
-        ModelCatalog::from_registry(&self.registry)
-            .with_authenticated_providers(self.authenticated_providers())
-            .apply(runtime);
-        // Same resolution as the settings load: operator override, the
-        // extension `project_trust` decision, then the trust store/policy.
-        let trusted_project =
-            crate::extensions::project_trust::resolve_project_trust(&self.cwd, &self.agent_dir);
-        let model_json = serde_json::to_value(model).unwrap_or(JsonValue::Null);
-        let context_window = model.context_window;
+        };
+
         // `ctx.modelRegistry.complete` host path: the completion closure built
         // for the session's current model (`__pir_host.modelCompleteJson`),
         // covering builtin/models.json providers the extension runtime cannot
-        // stream itself. `complete_fn_for_host_op` omits the INLINE transport
-        // hooks that would re-enter the (suspended) extension actor from
-        // inside the host op. Re-pushed before every prompt, so a model switch
-        // is visible to the op.
+        // stream itself. The session-scoped variant resolves the provider (and
+        // OAuth credential) through this session's overlay instead of the
+        // process-shared dynamic map (SNAP9 P2-S8-4). `actor_hooks: false`
+        // omits the INLINE transport hooks that would re-enter the (suspended)
+        // extension actor from inside the host op. Re-pushed before every
+        // prompt, so a model switch is visible to the op.
         //
         // R1: the host op serializes the completion's message straight to the
         // extension (`CompleteOk { ok: true, message }`), a consumer face the
@@ -525,7 +801,7 @@ session does not have"
         runtime.set_complete_fn(
             model.provider.as_str(),
             model.id.as_str(),
-            without_retry_class_carrier(self.complete_fn_for_host_op(model)),
+            without_retry_class_carrier(self.complete_fn_for_host_op_session_scoped(model)),
         );
         // The live session-only model scope (upstream `ctx.scopedModels`), not
         // an always-empty list: extension handlers read it to mirror the
@@ -534,49 +810,48 @@ session does not have"
         runtime.set_thinking_level_value(self.current_thinking().wire_key());
         runtime.set_system_prompt_value(&self.effective_system_prompt());
 
-        // The session-derived payload is the expensive half (context
-        // projection, full entry tree, per-entry projection copy, session
-        // listing). Skip it when nothing it reflects has moved since the last
-        // push: the extension runtime and the plugin host still hold exactly
-        // that snapshot, so a repeated push would be a no-op.
-        let history = match &self.session {
-            Some(_) => None,
-            None => Some(self.history_snapshot()),
-        };
-        let fingerprint = self
-            .snapshot_fingerprint(model_json.clone(), trusted_project, &history)
-            .await;
-        let (cached_sessions, cached_tree) = match self
-            .session_context_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            Some(cache) if cache.matches(&fingerprint, &history) => return false,
-            Some(cache) => (
-                if cache.sessions.matches(
-                    fingerprint.sessions_dir.as_deref(),
-                    fingerprint.sessions_modified,
-                ) {
-                    Some(cache.sessions.clone())
-                } else {
-                    None
-                },
-                cache.tree.clone(),
-            ),
-            None => (None, None),
-        };
+        if session_snapshot_matches {
+            // The catalog/tool caches can invalidate independently of the
+            // session-derived payload (an auth.json edit, a provider
+            // registration); persist their fresh stamps so the next push
+            // reuses instead of rebuilding a second time.
+            if catalog_rebuilt || tool_surface_rebuilt {
+                let mut cache = self
+                    .session_context_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(cache) = cache.as_mut() {
+                    if catalog_rebuilt {
+                        // `None` clears a stale stamp after a failed
+                        // credential load, forcing a retry next push.
+                        cache.catalog = catalog_cache;
+                    }
+                    if tool_surface_rebuilt {
+                        cache.tool_surface = Some(tool_surface_cache);
+                    }
+                }
+            }
+            return false;
+        }
+        // Cache miss: compute the live last-usage value once and use it for
+        // BOTH the fingerprint being stored and the payload, so a usage change
+        // and a rebuilt snapshot always agree. The counter is the P3-01
+        // regression seam: a hit returns above and must not move it.
+        CONTEXT_USAGE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+        let context_tokens = self.context_usage().await.and_then(|usage| usage.tokens);
+        fingerprint.context_tokens = context_tokens.unwrap_or(0);
 
         let (snapshot, sessions, tree) = self
-            .build_session_context_snapshot(
-                model_json,
+            .build_session_context_snapshot(SessionSnapshotInputs {
+                model: model_json,
                 context_window,
                 trusted_project,
-                fingerprint.sessions_dir.clone(),
-                fingerprint.sessions_modified,
+                context_tokens,
+                sessions_dir: fingerprint.sessions_dir.clone(),
+                sessions_modified: fingerprint.sessions_modified,
                 cached_sessions,
                 cached_tree,
-            )
+            })
             .await;
         // Unified push: with a plugin host (always present alongside an
         // extension runtime) the host forwards the snapshot to the JS handle
@@ -596,6 +871,9 @@ session does not have"
             history,
             sessions,
             tree,
+            catalog: catalog_cache,
+            tool_surface: Some(tool_surface_cache),
+            stats,
         });
         true
     }
@@ -610,12 +888,124 @@ session does not have"
         self.push_session_context(&model).await
     }
 
+    /// Test seam for the P3-01 cache-hit short circuit: how many
+    /// `context_usage()` walks `push_session_context` paid for on the calling
+    /// thread since the last reset. A cache hit must not move it.
+    #[doc(hidden)]
+    pub fn session_context_usage_calls_for_test(&self) -> u64 {
+        CONTEXT_USAGE_CALLS.with(|calls| calls.get())
+    }
+
+    /// Reset [`Self::session_context_usage_calls_for_test`].
+    #[doc(hidden)]
+    pub fn reset_session_context_usage_calls_for_test(&self) {
+        CONTEXT_USAGE_CALLS.with(|calls| calls.set(0));
+    }
+
+    /// Test seam: run `sync_plugin_providers` (the per-prompt plugin provider
+    /// pass) exactly like `run_prompt` does, so a test can observe that a
+    /// re-sync with unchanged definitions does not invalidate the catalog
+    /// fingerprint.
+    #[doc(hidden)]
+    pub async fn sync_plugin_providers_for_test(&self) {
+        if let Some(plugins) = &self.plugins {
+            self.sync_plugin_providers(plugins).await;
+        }
+    }
+
+    /// Test seam: rebuild the plugin registry (the `/reload` definition
+    /// refresh) and then run the per-prompt provider sync, so a test can flip
+    /// a plugin `pi.registerProvider` definition between syncs.
+    #[doc(hidden)]
+    pub async fn refresh_plugin_registry_and_sync_providers_for_test(&self) {
+        if let Some(plugins) = &self.plugins {
+            plugins.rebuild_registry().await;
+            self.sync_plugin_providers(plugins).await;
+        }
+    }
+
+    /// Test seam: whether THIS session's `extension_api_keys` map holds a key
+    /// installed by `sync_plugin_providers` for `provider`. A subagent child
+    /// shares its parent's `ProviderRegistry` but must install its own copy;
+    /// the registry alone cannot answer this (SNAP3 P2-1).
+    #[doc(hidden)]
+    pub fn extension_api_key_installed_for_test(&self, provider: &str) -> bool {
+        self.extension_api_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(provider)
+    }
+
+    /// Test seam: the plugin API key THIS session installed for `provider`.
+    /// Shared-registry children must keep their own value; the map is
+    /// per-session even though the registry is not (SNAP3 P2-1, SNAP4).
+    #[doc(hidden)]
+    pub fn extension_api_key_for_test(&self, provider: &str) -> Option<String> {
+        self.extension_api_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(provider)
+            .cloned()
+    }
+
+    /// Test/profiling probe for the R1-L1-008 cache:
+    /// `(catalog registry pushes, model rows pushed,
+    /// credential-environment loads)` paid since the last reset.
+    ///
+    /// The first two counters live at `ExtensionHandle::update_model_registry`
+    /// — the common sink every catalog rebuild must reach — so a regression
+    /// that rebuilds the catalog OUTSIDE `build_model_catalog` is still
+    /// counted (P2-新-2). The credential counter lives in
+    /// `authenticated_providers`, the session's only `load_pi_environment`
+    /// caller for this path. A cache hit must leave all three at zero.
+    #[doc(hidden)]
+    pub fn model_catalog_push_stats(&self) -> (u64, u64, u64) {
+        let (catalog_pushes, model_rows) = self
+            .extensions
+            .as_ref()
+            .map(ExtensionHandle::model_registry_push_stats_for_test)
+            .unwrap_or((0, 0));
+        let credential_environment_loads = self
+            .session_context_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|cache| {
+                cache
+                    .stats
+                    .credential_environment_loads
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .unwrap_or(0);
+        (catalog_pushes, model_rows, credential_environment_loads)
+    }
+
+    /// Reset [`Self::model_catalog_push_stats`].
+    #[doc(hidden)]
+    pub fn reset_model_catalog_push_stats(&self) {
+        if let Some(runtime) = &self.extensions {
+            runtime.reset_model_registry_push_stats_for_test();
+        }
+        if let Some(cache) = self
+            .session_context_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            cache
+                .stats
+                .credential_environment_loads
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// The cheap fingerprint described on [`SnapshotFingerprint`].
     async fn snapshot_fingerprint(
         &self,
         model: JsonValue,
         project_trusted: bool,
         history: &Option<HistorySnapshot>,
+        context_tokens: Option<u64>,
     ) -> SnapshotFingerprint {
         let (
             session_cwd,
@@ -681,7 +1071,7 @@ session does not have"
             entry_count,
             last_entry_id,
             leaf_id,
-            context_tokens: self.tokens.load(Ordering::SeqCst),
+            context_tokens: context_tokens.unwrap_or(0),
             pending_messages: self.pending_messages.load(Ordering::SeqCst),
             project_trusted,
             sessions_dir,
@@ -692,21 +1082,24 @@ session does not have"
     /// Build the session-derived snapshot payload (the expensive half), the
     /// `sessions` listing cache entry, and the rendered-tree cache entry that
     /// go with it.
-    #[allow(clippy::too_many_arguments)]
     async fn build_session_context_snapshot(
         &self,
-        model: JsonValue,
-        context_window: u64,
-        trusted_project: bool,
-        sessions_dir: Option<PathBuf>,
-        sessions_modified: Option<SystemTime>,
-        cached_sessions: Option<CachedSessions>,
-        cached_tree: Option<Arc<CachedTree>>,
+        inputs: SessionSnapshotInputs,
     ) -> (
         SessionContextSnapshot,
         CachedSessions,
         Option<Arc<CachedTree>>,
     ) {
+        let SessionSnapshotInputs {
+            model,
+            context_window,
+            trusted_project,
+            context_tokens,
+            sessions_dir,
+            sessions_modified,
+            cached_sessions,
+            cached_tree,
+        } = inputs;
         // Session-manager snapshot extensions: header, branch, full tree,
         // leaf, labels, and the session projection backing the new
         // `ctx.sessionManager` methods. ONE session lock covers all of it; the
@@ -948,14 +1341,9 @@ session does not have"
                 .session_path()
                 .as_ref()
                 .map(|path| path.display().to_string()),
-            context_tokens: {
-                let total = self.tokens.load(Ordering::SeqCst);
-                if total > 0 {
-                    Some(total)
-                } else {
-                    None
-                }
-            },
+            // The last-usage value computed by `push_session_context` (the
+            // same value the fingerprint used); `None`/zero means unknown.
+            context_tokens: context_tokens.filter(|tokens| *tokens > 0),
             context_window: Some(context_window),
             has_pending_messages: self.pending_messages.load(Ordering::SeqCst) > 0,
             project_trusted: trusted_project,
@@ -970,21 +1358,193 @@ session does not have"
         (snapshot, sessions_cache, tree_cache)
     }
 
-    /// Provider ids with a usable credential (models.json key, provider
-    /// environment variable, or stored `auth.json` credential). Empty when
-    /// the environment cannot be loaded (the runtime then stays permissive).
-    fn authenticated_providers(&self) -> Vec<String> {
-        match crate::ai::providers::load_pi_environment(Some(&self.cwd)) {
-            Ok(environment) => self
-                .registry
+    /// The cheap fingerprint described on [`ModelCatalogFingerprint`]. Reads
+    /// only provider identities/names, virtual-model identities, the
+    /// refresh-capable and plugin-owned dynamic providers' current model
+    /// definitions, the plugin provider definitions' config hashes, four
+    /// file stamps (with content hashes) and the auth-relevant environment —
+    /// no catalog serialization and no settings/models/auth parse.
+    fn model_catalog_fingerprint(&self, trusted_project: bool) -> ModelCatalogFingerprint {
+        // `pi.registerProvider` definitions are re-applied (and their dynamic
+        // `Arc` rebuilt) on every prompt by `sync_plugin_providers`. Their
+        // address is therefore NOT an identity; the definition config hash
+        // plus the resulting model content are (P2-新-1).
+        let plugin_definitions = plugin_provider_definitions(self.plugins.as_deref());
+        let dynamic_ids: BTreeSet<String> = self
+            .registry
+            .dynamic
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        let providers =
+            self.registry
                 .providers()
                 .iter()
-                .filter(|provider| {
-                    crate::ai::providers::has_configured_auth(provider.id(), &environment.api_keys)
+                .map(|provider| {
+                    let plugin_config = dynamic_ids
+                        .contains(provider.id())
+                        .then(|| plugin_definitions.get(provider.id()).copied())
+                        .flatten();
+                    // Catalog and dynamic providers are immutable snapshots; a
+                    // runtime registration replaces the `Arc`, and a remote
+                    // overlay update swaps the dynamic-map entry. The address
+                    // therefore identifies the exact model list without cloning
+                    // it. Plugin-owned and in-place-refresh providers use their
+                    // model content instead.
+                    ProviderCatalogFingerprint {
+                        id: provider.id().to_owned(),
+                        name: provider.name().to_owned(),
+                        identity: if plugin_config.is_some() {
+                            0
+                        } else {
+                            Arc::as_ptr(provider) as *const () as usize
+                        },
+                        plugin_config,
+                        models_content: (provider.supports_refresh() || plugin_config.is_some())
+                            .then(|| {
+                                provider
+                                    .get_models()
+                                    .iter()
+                                    .map(|model| hash_bytes(format!("{model:?}").as_bytes()))
+                                    .collect()
+                            }),
+                    }
                 })
-                .map(|provider| provider.id().to_owned())
-                .collect(),
-            Err(_) => Vec::new(),
+                .collect();
+        let virtual_models = self
+            .registry
+            .virtual_models()
+            .iter()
+            .map(|registration| VirtualModelFingerprint {
+                provider: registration.provider.clone(),
+                id: registration.id.clone(),
+                physical_provider: registration.physical.provider.clone(),
+                physical_id: registration.physical.id.clone(),
+                name: registration.name.clone(),
+                reasoning: registration.reasoning,
+                context_window: registration
+                    .model_override
+                    .and_then(|overrides| overrides.context_window),
+                max_tokens: registration
+                    .model_override
+                    .and_then(|overrides| overrides.max_tokens),
+            })
+            .collect();
+        ModelCatalogFingerprint {
+            providers,
+            virtual_models,
+            credentials: credential_environment_fingerprint(&self.cwd, trusted_project),
+        }
+    }
+
+    /// Serialize the live catalog and credential environment (the expensive
+    /// half of the push). Returns whether the credential environment loaded:
+    /// on failure the caller must NOT store the catalog fingerprint, so the
+    /// next push retries instead of caching a permanent empty auth list
+    /// (P3-新-3).
+    fn build_model_catalog(&self, stats: &ModelCatalogPushStats) -> (ModelCatalog, bool) {
+        let (authenticated, credentials_ok) = match self.authenticated_providers(stats) {
+            Ok(providers) => (providers, true),
+            Err(()) => (Vec::new(), false),
+        };
+        let catalog =
+            ModelCatalog::from_registry(&self.registry).with_authenticated_providers(authenticated);
+        (catalog, credentials_ok)
+    }
+
+    /// Cheap identity described on [`ToolSurfaceCacheKey`].
+    fn tool_surface_cache_key(&self) -> ToolSurfaceCacheKey {
+        ToolSurfaceCacheKey {
+            plugin_registry_generation: self
+                .plugins
+                .as_ref()
+                .map(|plugins| plugins.registry_generation()),
+            tools_identity: Arc::as_ptr(&self.tools) as usize,
+        }
+    }
+
+    /// Push the core tool definitions and the builtin (Rust plugin) commands
+    /// into the runtime (cache-miss half of [`Self::tool_surface_cache_key`]).
+    fn push_tool_surface(&self, runtime: &ExtensionHandle) {
+        let mut defs: Vec<crate::extensions::ToolDef> =
+            crate::coding_agent::tools::tool_definitions(&self.tools)
+                .into_iter()
+                .map(|tool| {
+                    crate::extensions::ToolDef::core(tool.name, tool.description, tool.parameters)
+                })
+                .collect();
+        if let Some(plugins) = &self.plugins {
+            let mut seen: std::collections::BTreeSet<String> =
+                defs.iter().map(|def| def.name.clone()).collect();
+            for (def, backend) in plugins.registry().resolved_tools() {
+                if matches!(backend, crate::plugins::ToolBackend::Rust(_))
+                    && seen.insert(def.name.clone())
+                {
+                    defs.push(def.clone());
+                }
+            }
+        }
+        runtime.update_core_tools(defs);
+        // Builtin (Rust plugin) commands join `getCommands()` alongside the
+        // extension-registered ones (all entries carry the upstream `source`
+        // tag).
+        if let Some(plugins) = &self.plugins {
+            let builtin_commands: Vec<crate::extensions::CommandDef> = plugins
+                .registry()
+                .resolved_commands()
+                .into_iter()
+                .filter(|command| {
+                    matches!(
+                        command.backend,
+                        Some(crate::plugins::CommandBackend::Rust(_))
+                    )
+                })
+                .map(|command| command.def)
+                .collect();
+            runtime.update_builtin_commands(builtin_commands);
+        }
+    }
+
+    /// Provider ids with a usable credential (models.json key, provider
+    /// environment variable, or stored `auth.json` credential). `Err` when
+    /// the environment cannot be loaded; the catalog is still pushed with an
+    /// empty (permissive) list, but the caller must not cache the result
+    /// (P3-新-3). The counter lives here so any catalog path that resolves
+    /// credentials is counted, not just [`Self::build_model_catalog`]
+    /// (P2-新-2).
+    fn authenticated_providers(&self, stats: &ModelCatalogPushStats) -> Result<Vec<String>, ()> {
+        stats
+            .credential_environment_loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match crate::ai::providers::load_pi_environment(Some(&self.cwd)) {
+            Ok(environment) => {
+                // Providers can come from THREE places: the session registry
+                // (plugin-registered), the models.json-composed environment
+                // registry (providers defined only in `models.json` never
+                // appear in the session registry), and resolved models.json
+                // API keys. Enumerating only the session registry made a
+                // models.json-only credential invisible to
+                // `hasConfiguredAuth`, so the JS answer depended on the
+                // permissive-empty fallback.
+                let mut authenticated: Vec<String> = Vec::new();
+                for provider in environment
+                    .registry
+                    .providers()
+                    .iter()
+                    .chain(self.registry.providers().iter())
+                {
+                    let id = provider.id();
+                    if !authenticated.iter().any(|known| known == id)
+                        && crate::ai::providers::has_configured_auth(id, &environment.api_keys)
+                    {
+                        authenticated.push(id.to_owned());
+                    }
+                }
+                Ok(authenticated)
+            }
+            Err(_) => Err(()),
         }
     }
 
@@ -1059,44 +1619,18 @@ session does not have"
     ) -> crate::extensions::resources::ExtensionResourceReload {
         use crate::extensions::resources::{
             load_extension_resources, merge_prompt_templates, merge_skills, register_theme_files,
-            ExtensionResourcePaths, ExtensionResourceReload,
+            ExtensionResourceReload,
         };
 
         let mut report = ExtensionResourceReload::default();
-        if !plugins.has_handlers("resources_discover") {
-            self.retract_previous_extension_resources(&mut report);
-            return report;
-        }
         // Upstream `ResourcesDiscoverEvent` carries the session cwd
         // (extensions/types.ts:724-729) so handlers resolve relative skill /
         // prompt / theme paths against the same directory the host loads from.
-        let mut payload = serde_json::json!({
-            "type": "resources_discover",
-            "reason": reason,
-            "cwd": self.cwd.display().to_string(),
-        });
-        let outcome = match plugins.emit("resources_discover", &mut payload).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                crate::ext_diag!("[ext] resources_discover dispatch failed: {error}");
-                self.retract_previous_extension_resources(&mut report);
-                return report;
-            }
-        };
-        // Errors inside handlers are isolated by the merge layer; a broken
-        // handler must not silently disable the contributions of the others.
-        for error in &outcome.errors {
-            crate::ext_diag!(
-                "[ext] resources_discover handler error ({}): {}",
-                error.event,
-                error.error
-            );
-        }
-        let paths = ExtensionResourcePaths::from_event_result(&outcome.result, &self.cwd);
-        if paths.is_empty() {
+        let Some(paths) = dispatch_resources_discover_event(plugins, &self.cwd, reason).await
+        else {
             self.retract_previous_extension_resources(&mut report);
             return report;
-        }
+        };
         let loaded = load_extension_resources(&self.cwd, &paths);
         report.diagnostics.extend(loaded.diagnostics);
         report.theme_files = loaded.theme_files.len();
@@ -1189,6 +1723,174 @@ session does not have"
             None => crate::extensions::resources::ExtensionResourceReload::default(),
         }
     }
+}
+
+/// Identity of every file [`crate::ai::providers::load_pi_environment`] reads
+/// for the session's credential state. The loader resolves the GLOBAL agent
+/// dir through the process environment (same as `auth.json` reads in
+/// `has_configured_auth`), so the stamps use that same directory; the project
+/// settings scope is included because a malformed project settings file turns
+/// the whole load into an empty authenticated list.
+fn credential_environment_fingerprint(
+    cwd: &Path,
+    project_trusted: bool,
+) -> CredentialEnvironmentFingerprint {
+    let agent_dir = crate::ai::providers::agent_dir();
+    // Every env var `has_configured_auth` consults ...
+    let mut env_names: BTreeSet<String> = crate::ai::auth::env_api_keys::all()
+        .into_iter()
+        .flat_map(|(_, names)| names.iter().map(|name| (*name).to_owned()))
+        .collect();
+    let files: Vec<CredentialFileStamp> = [
+        agent_dir.join("settings.json"),
+        agent_dir.join("models.json"),
+        agent_dir.join("auth.json"),
+        cwd.join(".pi").join("settings.json"),
+    ]
+    .into_iter()
+    .map(|path| {
+        // `auth.json` holds opaque stored credentials, never `$ENV`
+        // templates; scanning it would only yield bogus names from tokens.
+        let scan_env = path.file_name().and_then(|name| name.to_str()) != Some("auth.json");
+        let (stamp, references) = credential_file_stamp(path, scan_env);
+        // ... plus every `$ENV` / `${ENV}` template reference in the files
+        // themselves (models.json apiKey/headers, project settings values).
+        if scan_env {
+            env_names.extend(references);
+        }
+        stamp
+    })
+    .collect();
+    let env = env_names
+        .into_iter()
+        .map(|name| {
+            let value = std::env::var_os(&name).map(|value| hash_os_str(&value));
+            (name, value)
+        })
+        .collect();
+    CredentialEnvironmentFingerprint {
+        agent_dir,
+        cwd: cwd.to_path_buf(),
+        project_trusted,
+        files,
+        env,
+    }
+}
+
+/// `(mtime, size, content hash)` of one credential file; all `None` when it
+/// does not exist. The content hash catches an equal-length rewrite that
+/// lands inside the filesystem timestamp granularity (P3-新-2). The returned
+/// strings are the `$ENV` / `${ENV}` names referenced by the file, for the
+/// environment half of the fingerprint.
+fn credential_file_stamp(path: PathBuf, scan_env: bool) -> (CredentialFileStamp, Vec<String>) {
+    match std::fs::metadata(&path) {
+        Ok(metadata) => {
+            let content = std::fs::read(&path).ok();
+            let content_hash = content.as_deref().map(hash_bytes);
+            let mut references = Vec::new();
+            if scan_env {
+                if let Some(bytes) = &content {
+                    if let Ok(text) = std::str::from_utf8(bytes) {
+                        collect_env_references(text, &mut references);
+                    }
+                }
+            }
+            (
+                CredentialFileStamp {
+                    path,
+                    modified: metadata.modified().ok(),
+                    len: Some(metadata.len()),
+                    content_hash,
+                },
+                references,
+            )
+        }
+        Err(_) => (
+            CredentialFileStamp {
+                path,
+                modified: None,
+                len: None,
+                content_hash: None,
+            },
+            Vec::new(),
+        ),
+    }
+}
+
+/// `DefaultHasher` over arbitrary bytes. Only compared in-process (the
+/// fingerprint never leaves the session cache), so hash stability across
+/// compiler versions does not matter.
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_os_str(value: &std::ffi::OsStr) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Collect `$NAME` / `${NAME}` template identifiers from a credential file.
+/// Conservative: only ASCII identifiers starting with a letter or `_`, and a
+/// braced reference must be closed. Values are never stored; the caller keeps
+/// a hash of each referenced variable's current value.
+fn collect_env_references(text: &str, out: &mut Vec<String>) {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'$' {
+            index += 1;
+            continue;
+        }
+        let braced = bytes.get(index + 1) == Some(&b'{');
+        let start = index + if braced { 2 } else { 1 };
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        let valid_start = bytes
+            .get(start)
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_');
+        if valid_start && end > start && (!braced || bytes.get(end) == Some(&b'}')) {
+            if let Ok(name) = std::str::from_utf8(&bytes[start..end]) {
+                out.push(name.to_owned());
+            }
+        }
+        index = end.max(index + 1);
+    }
+}
+
+/// One `{id, config}` `pi.registerProvider` definition: id → config JSON
+/// hash. Last definition wins, matching `sync_plugin_providers`' sequential
+/// upsert.
+fn plugin_provider_definitions(
+    plugins: Option<&crate::plugins::PluginHost>,
+) -> BTreeMap<String, u64> {
+    let Some(plugins) = plugins else {
+        return BTreeMap::new();
+    };
+    let mut definitions = BTreeMap::new();
+    for def in plugins.registry().provider_defs() {
+        let Some(id) = def.get("id").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let config = def.get("config").cloned().unwrap_or(JsonValue::Null);
+        definitions.insert(id.to_owned(), hash_json(&config));
+    }
+    definitions
+}
+
+fn hash_json(value: &JsonValue) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(value)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Wrap the `ctx.modelRegistry.complete` host closure so its returned message

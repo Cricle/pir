@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use pir::ai::providers::construction::model;
+use pir::ai::providers::construction::{model, ModelSpec};
 use pir::ai::providers::resolution::{
     find_exact_model_reference_match, find_initial_model, glob_matches, parse_model_pattern,
     resolve_cli_model, resolve_model_scope, try_match_model, InitialModelOptions, ScopedModel,
@@ -14,36 +14,36 @@ use pir::ai::types::{Model, ThinkingLevel};
 
 fn catalog() -> Vec<Model> {
     vec![
-        model(
-            "anthropic",
-            "claude-opus-4-8",
-            "Claude Opus",
-            "anthropic-messages",
-            "https://api.anthropic.com",
-            200_000,
-            16_384,
-            vec!["text", "image"],
-        ),
-        model(
-            "anthropic",
-            "claude-opus-4-8-20260101",
-            "Claude Opus dated",
-            "anthropic-messages",
-            "https://api.anthropic.com",
-            200_000,
-            16_384,
-            vec!["text"],
-        ),
-        model(
-            "openai",
-            "gpt-5.5",
-            "GPT",
-            "openai-completions",
-            "https://api.openai.com/v1",
-            128_000,
-            16_384,
-            vec!["text"],
-        ),
+        model(ModelSpec {
+            provider: "anthropic",
+            id: "claude-opus-4-8",
+            name: "Claude Opus",
+            api: "anthropic-messages",
+            base_url: "https://api.anthropic.com",
+            context_window: 200_000,
+            max_tokens: 16_384,
+            input: vec!["text", "image"],
+        }),
+        model(ModelSpec {
+            provider: "anthropic",
+            id: "claude-opus-4-8-20260101",
+            name: "Claude Opus dated",
+            api: "anthropic-messages",
+            base_url: "https://api.anthropic.com",
+            context_window: 200_000,
+            max_tokens: 16_384,
+            input: vec!["text"],
+        }),
+        model(ModelSpec {
+            provider: "openai",
+            id: "gpt-5.5",
+            name: "GPT",
+            api: "openai-completions",
+            base_url: "https://api.openai.com/v1",
+            context_window: 128_000,
+            max_tokens: 16_384,
+            input: vec!["text"],
+        }),
     ]
 }
 

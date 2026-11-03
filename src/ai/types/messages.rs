@@ -493,7 +493,7 @@ pub struct AssistantMessage {
     #[serde(rename = "stopReason")]
     pub stop_reason: StopReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deferred: Option<DeferredHandle>,
+    pub deferred: Option<Box<DeferredHandle>>,
     #[serde(
         rename = "errorMessage",
         default,
@@ -617,7 +617,7 @@ pub struct ToolResultMessage {
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub nested_calls: Option<NestedToolCalls>,
+    pub nested_calls: Option<Box<NestedToolCalls>>,
     #[serde(rename = "isError")]
     pub is_error: bool,
     /// Milliseconds the tool's execution took, measured with a monotonic clock

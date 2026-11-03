@@ -5,9 +5,13 @@ use pir::protocol::{
     encode_server_envelope, Command, FrameOptions, ServerEnvelope, ServerHelloV8, ServerSnapshot,
     PROTOCOL_VERSION, SESSION_SERVICE_ID,
 };
-use pir::server::{empty_snapshot, Server, ServerSecurityConfig};
+use pir::server::{empty_snapshot, Server, ServerSecurityConfig, ServerState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+/// Serializes the tests in this binary that mutate the process-wide
+/// `PIR_SERVER_ALLOWED_ROOTS` (the cwd policy re-reads it on every call).
+static ALLOWED_ROOTS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn authenticated_server_accepts_valid_token_and_rejects_invalid_token() {
@@ -533,10 +537,8 @@ async fn next_update_times_out_without_incoming_updates() {
         .expect("serve client");
 }
 
-#[allow(dead_code)]
-fn _snapshot_type_is_public(snapshot: ServerSnapshot) -> ServerSnapshot {
-    snapshot
-}
+/// Compile-time pin: `ServerSnapshot` is part of the public server surface.
+const _: fn(ServerSnapshot) -> ServerSnapshot = std::convert::identity;
 
 // ---------------------------------------------------------------------------
 // Session policy: bash exclusion, remote-cwd gate, idle timeout
@@ -600,10 +602,24 @@ impl Drop for AllowedRootsCleanup {
     }
 }
 
+/// Removes an auxiliary temp dir on drop.
+#[cfg(unix)]
+struct TempDirCleanup(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for TempDirCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Regression: a remote `create` naming an explicit `cwd` is policy-gated —
 /// the default rejects any cwd but the server's own with the typed `forbidden`
 /// error, and `PIR_SERVER_ALLOWED_ROOTS` (a `;`-separated root list) widens it
-/// to cwds inside those roots (`ServerSecurityConfig::allows_cwd`).
+/// to cwds inside those roots (`ServerSecurityConfig::resolve_cwd`). The gate
+/// canonicalizes before comparing components, so a symlink inside the root
+/// that points outside it, and (on Unix) a differently-cased sibling
+/// directory, are rejected while a plain subdirectory is accepted.
 #[tokio::test]
 async fn create_with_cwd_is_policy_gated_and_allowed_roots_widen_it() {
     let root = std::env::temp_dir().join(format!(
@@ -614,9 +630,9 @@ async fn create_with_cwd_is_policy_gated_and_allowed_roots_widen_it() {
             .expect("system clock after epoch")
             .as_nanos()
     ));
-    std::fs::create_dir_all(&root).expect("create the cwd allowlist root");
+    std::fs::create_dir_all(root.join("sub")).expect("create the cwd allowlist root");
     let _cleanup = AllowedRootsCleanup(root.clone());
-    // Only this test in this binary touches the allowlist env var.
+    let _env_guard = ALLOWED_ROOTS_ENV_LOCK.lock().await;
     std::env::remove_var("PIR_SERVER_ALLOWED_ROOTS");
     let root_text = root.to_string_lossy().to_string();
 
@@ -663,9 +679,13 @@ async fn create_with_cwd_is_policy_gated_and_allowed_roots_widen_it() {
         root_text.clone(),
         root.join("sub").to_string_lossy().to_string(),
     ] {
+        let expected = std::fs::canonicalize(&cwd)
+            .expect("canonicalize the allowed cwd")
+            .to_string_lossy()
+            .to_string();
         let created = client
             .request(Command::Create {
-                cwd: Some(cwd),
+                cwd: Some(cwd.clone()),
                 name: None,
                 model: None,
                 thinking_level: None,
@@ -673,6 +693,12 @@ async fn create_with_cwd_is_policy_gated_and_allowed_roots_widen_it() {
             .await
             .expect("a cwd inside an allowed root must be accepted");
         assert_eq!(created["command"], "create");
+        // The session is built with the canonical path, not the raw request.
+        assert_eq!(
+            created["session"]["cwd"].as_str(),
+            Some(expected.as_str()),
+            "session cwd must be the canonical path for {cwd:?}"
+        );
     }
     let outside = format!("{root_text}-outside");
     let error = client
@@ -711,6 +737,187 @@ async fn create_with_cwd_is_policy_gated_and_allowed_roots_widen_it() {
         matches!(error, ClientError::Server { ref code, .. } if code == "forbidden"),
         "expected `forbidden` for a `..` traversal cwd, got {error:?}"
     );
+
+    // Phase 4 — a symlink placed inside an allowed root that resolves outside
+    // it must be rejected (canonicalize-then-compare).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let root_name = root
+            .file_name()
+            .expect("temp root has a file name")
+            .to_string_lossy()
+            .to_string();
+        let temp_parent = root.parent().expect("temp root has a parent");
+        let outside_dir = temp_parent.join(format!("{root_name}-outside"));
+        std::fs::create_dir_all(&outside_dir).expect("create the outside dir");
+        let _outside_cleanup = TempDirCleanup(outside_dir.clone());
+        let link = root.join("link-outside");
+        symlink(&outside_dir, &link).expect("create a symlink inside the allowed root");
+        let error = client
+            .request(Command::Create {
+                cwd: Some(link.to_string_lossy().to_string()),
+                name: None,
+                model: None,
+                thinking_level: None,
+            })
+            .await
+            .expect_err("a symlink escaping the allowed root must be rejected");
+        assert!(
+            matches!(error, ClientError::Server { ref code, .. } if code == "forbidden"),
+            "expected `forbidden` for a symlink escape, got {error:?}"
+        );
+
+        // A sibling directory whose name differs only in case is a distinct
+        // directory on case-sensitive filesystems; Unix comparison must stay
+        // case-sensitive (no lowercasing fold).
+        let case_variant = temp_parent.join(root_name.to_ascii_uppercase());
+        std::fs::create_dir_all(&case_variant).expect("create the case-variant sibling");
+        let _case_cleanup = TempDirCleanup(case_variant.clone());
+        let distinct =
+            std::fs::canonicalize(&case_variant).ok() != std::fs::canonicalize(&root).ok();
+        if distinct {
+            let error = client
+                .request(Command::Create {
+                    cwd: Some(case_variant.to_string_lossy().to_string()),
+                    name: None,
+                    model: None,
+                    thinking_level: None,
+                })
+                .await
+                .expect_err("a case-variant sibling outside the root must be rejected");
+            assert!(
+                matches!(error, ClientError::Server { ref code, .. } if code == "forbidden"),
+                "expected `forbidden` for a case-variant sibling, got {error:?}"
+            );
+        }
+    }
+    drop(client);
+    accepting
+        .await
+        .expect("accept task join")
+        .expect("serve client");
+}
+
+/// Regression (R2-5-N04): `attach` reopens a persisted session from its JSONL
+/// header, whose cwd is untrusted (another principal may write the session
+/// directory, or the session may predate a policy tightening). Attach must
+/// re-check that cwd against the same allowlist `create` enforces: a header
+/// cwd outside every allowed root — or a symlink inside a root that resolves
+/// outside it — is rejected with `forbidden`, while an allowed cwd still
+/// reopens.
+#[tokio::test]
+async fn attach_persisted_session_rechecks_cwd_against_allowed_roots() {
+    let _env_guard = ALLOWED_ROOTS_ENV_LOCK.lock().await;
+    let base = std::env::temp_dir().join(format!(
+        "pir-attach-cwd-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos()
+    ));
+    let root = base.join("allowed");
+    let sessions = base.join("sessions");
+    let outside = base.join("outside");
+    let allowed_cwd = root.join("sub");
+    std::fs::create_dir_all(&allowed_cwd).expect("create the allowed cwd");
+    std::fs::create_dir_all(&sessions).expect("create the session dir");
+    std::fs::create_dir_all(&outside).expect("create the outside cwd");
+    let _cleanup = AllowedRootsCleanup(base.clone());
+    std::env::remove_var("PIR_SERVER_ALLOWED_ROOTS");
+
+    // Seed one persisted session per header cwd. `create_with_id` writes the
+    // file lazily, so `append_session_info` materializes the header.
+    let seed = |cwd: &std::path::Path, id: &str| {
+        let mut manager = pir::session_manager::SessionManager::create_with_id(
+            &cwd.to_string_lossy(),
+            &sessions,
+            id,
+        )
+        .expect("create persisted session");
+        // The file is created lazily on the first CONVERSATION entry; a
+        // session-info entry alone stays in memory. A user message writes the
+        // header (with this cwd) plus one row.
+        manager
+            .append_message(pir::ai::types::Message::User(pir::ai::types::UserMessage {
+                role: pir::ai::types::UserRole::User,
+                content: vec![pir::ai::types::ContentBlock::Text(
+                    pir::ai::types::TextContent {
+                        text: "seed".to_owned(),
+                        text_signature: None,
+                    },
+                )],
+                tools_added: None,
+                tools_removed: None,
+                timestamp: 1,
+                sections: None,
+            }))
+            .expect("materialize the session file");
+    };
+    seed(&allowed_cwd, "attach-allowed");
+    seed(&outside, "attach-outside");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let link = root.join("link-outside");
+        symlink(&outside, &link).expect("create a symlink inside the allowed root");
+        seed(&link, "attach-link-outside");
+    }
+
+    std::env::set_var(
+        "PIR_SERVER_ALLOWED_ROOTS",
+        root.to_string_lossy().to_string(),
+    );
+    let state = ServerState::new(empty_snapshot(uuid::Uuid::new_v4().to_string()))
+        .with_session_dir(sessions.clone());
+    let server = Server::bind_with_state("127.0.0.1:0", state)
+        .await
+        .expect("bind attach-cwd test server");
+    let address = server.local_addr().expect("local address");
+    let accepting = tokio::spawn(async move { server.accept_once().await });
+    let mut client = Client::connect(address).await.expect("hello handshake");
+
+    let error = client
+        .request(Command::Attach {
+            session_id: "attach-outside".to_owned(),
+        })
+        .await
+        .expect_err("a persisted cwd outside every allowed root must not attach");
+    assert!(
+        matches!(error, ClientError::Server { ref code, .. } if code == "forbidden"),
+        "expected `forbidden` for an outside header cwd, got {error:?}"
+    );
+
+    #[cfg(unix)]
+    {
+        let error = client
+            .request(Command::Attach {
+                session_id: "attach-link-outside".to_owned(),
+            })
+            .await
+            .expect_err("a persisted symlink cwd escaping the allowed root must not attach");
+        assert!(
+            matches!(error, ClientError::Server { ref code, .. } if code == "forbidden"),
+            "expected `forbidden` for a symlink header cwd, got {error:?}"
+        );
+    }
+
+    let attached = client
+        .request(Command::Attach {
+            session_id: "attach-allowed".to_owned(),
+        })
+        .await
+        .expect("a persisted cwd inside an allowed root must attach");
+    let expected = allowed_cwd.to_string_lossy().to_string();
+    assert_eq!(
+        attached["session"]["cwd"].as_str(),
+        Some(expected.as_str()),
+        "the reopened record must carry the persisted (allowed) cwd"
+    );
+
     drop(client);
     accepting
         .await

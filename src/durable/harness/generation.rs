@@ -374,6 +374,21 @@ pub trait DeferredPoll: Send + Sync {
     fn cancel<'a>(&'a self, model: &'a Model, handle: &'a DeferredHandle) -> HarnessFuture<'a, ()>;
 }
 
+/// The task-shaped fields of one [`GenerationStore::create_task`] request
+/// (upstream `tx.createTask`'s per-task arguments): the installed task kind,
+/// its input, the owning task, and the background flag.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskDraft<'a> {
+    /// The installed task kind name (`catalogue.task(kind)` resolves it).
+    pub kind: &'a str,
+    /// The task's input value.
+    pub input: Value,
+    /// The owning task; `None` creates a conversation-owned task.
+    pub owner: Option<TaskId>,
+    /// Whether the task is created in the background.
+    pub background: bool,
+}
+
 /// The harness writes and committed reads one generation phase needs.
 ///
 /// `*_in` methods run inside the generation's own commit and **must stage into
@@ -416,18 +431,14 @@ pub trait GenerationStore: Send + Sync {
         by_task: TaskId,
     ) -> HarnessFuture<'a, EntryRecord>;
 
-    /// Create a task in `tx` (upstream `tx.createTask`); `owner` names the
-    /// owning task, `None` a conversation-owned one.
-    #[allow(clippy::too_many_arguments)]
+    /// Create a task in `tx` (upstream `tx.createTask`); `draft.owner` names
+    /// the owning task, `None` a conversation-owned one.
     fn create_task<'a>(
         &'a self,
         catalogue: &'a TaskCatalogue,
         tx: &'a mut Transaction,
         conversation: ConversationId,
-        kind: &'a str,
-        input: Value,
-        owner: Option<TaskId>,
-        background: bool,
+        draft: TaskDraft<'a>,
     ) -> HarnessFuture<'a, TaskId>;
 
     /// The conversation's newest visible entry (upstream
@@ -893,7 +904,7 @@ async fn request(
         Ok(view) => view,
         Err(error) => return fault(format!("request could not read the context: {error}")),
     };
-    let mut messages = view.messages.clone();
+    let mut messages = view.messages.to_vec();
     if let Some(replaced) = harness.hooks.before_request(messages.clone()).await {
         messages = replaced;
     }
@@ -924,7 +935,7 @@ async fn request(
         compacted,
         model: reference,
         cutoff,
-        messages: Some(view.messages),
+        messages: Some(view.messages.into_vec()),
         poll_at: None,
     };
     classify(harness, runtime, request, message, context).await;
@@ -1178,7 +1189,7 @@ async fn classify(
     let now = runtime.now().unwrap_or(0);
 
     if message.stop_reason == StopReason::Deferred {
-        if let Some(handle) = message.deferred.clone() {
+        if let Some(handle) = message.deferred.as_deref().cloned() {
             let poll_at = std::cmp::max(
                 now + handle
                     .poll_after_ms
@@ -1341,15 +1352,17 @@ async fn classify(
                         &host,
                         &catalogue,
                         tx,
-                        conversation,
-                        task_id,
-                        &RunSettlement::Unanswered {
-                            reason: "model_error".to_owned(),
-                            detail: Some(Value::String(text.clone())),
+                        FailedRun {
+                            conversation,
+                            task_id,
+                            settlement: &RunSettlement::Unanswered {
+                                reason: "model_error".to_owned(),
+                                detail: Some(Value::String(text.clone())),
+                            },
+                            policy: settings.after_failed_run,
+                            head,
+                            boundary_head: None,
                         },
-                        settings.after_failed_run,
-                        head,
-                        None,
                     )
                     .await?;
                     Ok(Some(NextTaskState::Terminal {
@@ -1573,12 +1586,14 @@ async fn answer(
                     let boundary = apply_boundary(
                         &host,
                         tx,
-                        conversation,
-                        &settings,
-                        Boundary::Final,
-                        head,
-                        now,
-                        task_id,
+                        BoundaryPlacement {
+                            conversation,
+                            settings: &settings,
+                            at: Boundary::Final,
+                            head,
+                            now,
+                            by_task: task_id,
+                        },
                     )
                     .await?;
                     let outcome = TaskOutcome::Completed {
@@ -1608,10 +1623,12 @@ async fn answer(
                                     &catalogue,
                                     tx,
                                     conversation,
-                                    GENERATION_TASK_NAME,
-                                    json!({}),
-                                    None,
-                                    false,
+                                    TaskDraft {
+                                        kind: GENERATION_TASK_NAME,
+                                        input: json!({}),
+                                        owner: None,
+                                        background: false,
+                                    },
                                 )
                                 .await
                                 .map_err(TaskRuntimeError::Invalid)?;
@@ -1668,7 +1685,7 @@ async fn start_tool_round(
             .context(conversation, Some(request.cutoff))
             .await
         {
-            Ok(view) => view.messages,
+            Ok(view) => view.messages.into_vec(),
             Err(error) => {
                 return fault(format!(
                     "the tool round could not read the context: {error}"
@@ -1744,14 +1761,16 @@ async fn start_tool_round(
                                 &catalogue,
                                 tx,
                                 conversation,
-                                TOOL_TASK_NAME,
-                                json!({
-                                    "kind": "model",
-                                    "assistant": entry.id.as_i64(),
-                                    "callId": call.id,
-                                }),
-                                Some(task_id),
-                                false,
+                                TaskDraft {
+                                    kind: TOOL_TASK_NAME,
+                                    input: json!({
+                                        "kind": "model",
+                                        "assistant": entry.id.as_i64(),
+                                        "callId": call.id,
+                                    }),
+                                    owner: Some(task_id),
+                                    background: false,
+                                },
                             )
                             .await
                             .map_err(TaskRuntimeError::Invalid)?;
@@ -1816,14 +1835,16 @@ async fn tools(
                             &catalogue,
                             tx,
                             conversation,
-                            TOOL_TASK_NAME,
-                            json!({
-                                "kind": "model",
-                                "assistant": assistant.as_i64(),
-                                "callId": next,
-                            }),
-                            Some(task_id),
-                            false,
+                            TaskDraft {
+                                kind: TOOL_TASK_NAME,
+                                input: json!({
+                                    "kind": "model",
+                                    "assistant": assistant.as_i64(),
+                                    "callId": next,
+                                }),
+                                owner: Some(task_id),
+                                background: false,
+                            },
                         )
                         .await
                         .map_err(TaskRuntimeError::Invalid)?;
@@ -1969,9 +1990,19 @@ async fn finish_tool_round(
                     } else {
                         Boundary::PostTools
                     };
-                    let boundary =
-                        apply_boundary(&host, tx, conversation, &settings, at, head, now, task_id)
-                            .await?;
+                    let boundary = apply_boundary(
+                        &host,
+                        tx,
+                        BoundaryPlacement {
+                            conversation,
+                            settings: &settings,
+                            at,
+                            head,
+                            now,
+                            by_task: task_id,
+                        },
+                    )
+                    .await?;
                     let outcome = TaskOutcome::Completed {
                         result: json!({ "entryId": assistant }),
                     };
@@ -2013,10 +2044,12 @@ async fn finish_tool_round(
                                 &catalogue,
                                 tx,
                                 conversation,
-                                GENERATION_TASK_NAME,
-                                json!({}),
-                                None,
-                                false,
+                                TaskDraft {
+                                    kind: GENERATION_TASK_NAME,
+                                    input: json!({}),
+                                    owner: None,
+                                    background: false,
+                                },
                             )
                             .await
                             .map_err(TaskRuntimeError::Invalid)?;
@@ -2242,12 +2275,14 @@ async fn fail_run(
                         &host,
                         &catalogue,
                         tx,
-                        conversation,
-                        current.id,
-                        &settlement,
-                        settings.after_failed_run,
-                        head,
-                        None,
+                        FailedRun {
+                            conversation,
+                            task_id: current.id,
+                            settlement: &settlement,
+                            policy: settings.after_failed_run,
+                            head,
+                            boundary_head: None,
+                        },
                     )
                     .await?;
                     Ok(Some(NextTaskState::Terminal {
@@ -2266,20 +2301,32 @@ async fn fail_run(
         .await;
 }
 
+/// One failed run's settlement inputs.
+struct FailedRun<'a> {
+    conversation: ConversationId,
+    task_id: TaskId,
+    settlement: &'a RunSettlement,
+    policy: AfterFailedRun,
+    head: Option<EntryId>,
+    boundary_head: Option<EntryId>,
+}
+
 /// End a failed run, settling its inputs, and do with the inputs queued behind
 /// it what `after_failed_run` says (spec §6).
-#[allow(clippy::too_many_arguments)]
 async fn end_failed_run_in(
     harness: &Arc<GenerationHarness>,
     catalogue: &TaskCatalogue,
     tx: &mut Transaction,
-    conversation: ConversationId,
-    task_id: TaskId,
-    settlement: &RunSettlement,
-    policy: AfterFailedRun,
-    head: Option<EntryId>,
-    boundary_head: Option<EntryId>,
+    run: FailedRun<'_>,
 ) -> Result<(), TaskRuntimeError> {
+    let FailedRun {
+        conversation,
+        task_id,
+        settlement,
+        policy,
+        head,
+        boundary_head,
+    } = run;
     end_run_in(harness, tx, conversation, task_id, settlement).await?;
     if policy == AfterFailedRun::Withdraw {
         let mut inbox = load_inbox_in(harness, tx, conversation)?;
@@ -2299,12 +2346,14 @@ async fn end_failed_run_in(
         let boundary = apply_boundary(
             harness,
             tx,
-            conversation,
-            &settings,
-            Boundary::Final,
-            boundary_head.or(head),
-            harness_epoch_ms(),
-            task_id,
+            BoundaryPlacement {
+                conversation,
+                settings: &settings,
+                at: Boundary::Final,
+                head: boundary_head.or(head),
+                now: harness_epoch_ms(),
+                by_task: task_id,
+            },
         )
         .await?;
         if !boundary.users.is_empty() {
@@ -2377,23 +2426,35 @@ struct BoundaryResult {
     reset: bool,
 }
 
+/// The conversation, policy and clock inputs of one boundary placement.
+struct BoundaryPlacement<'a> {
+    conversation: ConversationId,
+    settings: &'a Settings,
+    at: Boundary,
+    head: Option<EntryId>,
+    now: i64,
+    by_task: TaskId,
+}
+
 /// Place the queued items a boundary selects (upstream `applyBoundary`).
 ///
 /// Reads `pi.inbox` through the transaction (read-your-writes), places every
 /// selected write and user item, settles their submissions and stages the
 /// inbox without the selected items. `head` is the active range start; a write
 /// targeting an entry before it is stale.
-#[allow(clippy::too_many_arguments)]
 async fn apply_boundary(
     harness: &Arc<GenerationHarness>,
     tx: &mut Transaction,
-    conversation: ConversationId,
-    settings: &Settings,
-    at: Boundary,
-    head: Option<EntryId>,
-    now: i64,
-    by_task: TaskId,
+    placement: BoundaryPlacement<'_>,
 ) -> Result<BoundaryResult, TaskRuntimeError> {
+    let BoundaryPlacement {
+        conversation,
+        settings,
+        at,
+        head,
+        now,
+        by_task,
+    } = placement;
     let mut inbox = load_inbox_in(harness, tx, conversation)?;
     let selected = inbox::boundary(&inbox, at, settings);
     let reset = inbox::has_queued_reset(&inbox);
@@ -2553,10 +2614,12 @@ pub(crate) async fn start_run_in(
             catalogue,
             tx,
             conversation,
-            GENERATION_TASK_NAME,
-            json!({}),
-            None,
-            false,
+            TaskDraft {
+                kind: GENERATION_TASK_NAME,
+                input: json!({}),
+                owner: None,
+                background: false,
+            },
         )
         .await
         .map_err(TaskRuntimeError::Invalid)?;

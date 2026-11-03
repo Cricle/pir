@@ -692,9 +692,11 @@ impl Footer {
             // The frame pool is rewound over the previous row buffers: the
             // rebuild writes into them in place (only the rows past the new
             // frame are trimmed away), so a miss does not pay for the buffers.
-            let mut rows = Rows::new(&mut memo.rows);
-            render_footer_into(width, &state, &mut rows);
-            rows.trim();
+            {
+                let mut rows = Rows::new(&mut memo.rows);
+                render_footer_into(width, &state, &mut rows);
+                rows.trim();
+            }
             memo.key = Some(FooterRowsKey {
                 state: state.clone(),
                 width,

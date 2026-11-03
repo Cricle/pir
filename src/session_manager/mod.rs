@@ -49,6 +49,7 @@
 #![cfg_attr(not(feature = "session"), allow(dead_code))]
 
 pub mod json_depth;
+mod paged_context;
 pub mod projection;
 // Session-selector search (upstream
 // `modes/interactive/components/session-selector-search.ts`): token/phrase/
@@ -58,9 +59,17 @@ pub mod search;
 // The tail-first memory-mapped reader (`memmap2`) is the only persistence
 // piece that needs an external crate; it rides the `session` feature.
 #[cfg(feature = "session")]
+pub mod page_cache;
+#[cfg(feature = "session")]
 pub mod tail_page;
 pub mod types;
 
+#[cfg(feature = "session")]
+pub use page_cache::{
+    CachedTailPage, PageCache, PageCacheKey, PageCacheStats, DEFAULT_PAGE_CACHE_BYTES,
+    DEFAULT_PAGE_CACHE_PAGES,
+};
+pub use paged_context::PagedPromptContext;
 pub use projection::{
     build_context_entries, build_projection_entry_meta, build_session_projection,
     projected_message_count, session_entry_to_context_messages, ProjectedSessionEntry,
@@ -78,9 +87,9 @@ pub use tail_page::{
 // `coding_agent::session_resolve` and the SDK's `next_older_page`. A
 // "disabled" value here would be a behaviour lie — the constants are call
 // arguments, not behaviour — so the stub keeps the real defaults, identical to
-// `tail_page.rs` (1 MiB / 1024 entries).
+// `tail_page.rs` (512 KiB / 1024 entries).
 #[cfg(not(feature = "session"))]
-pub const DEFAULT_TAIL_PAGE_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_TAIL_PAGE_BYTES: usize = 512 * 1024;
 
 #[cfg(not(feature = "session"))]
 pub const DEFAULT_TAIL_PAGE_ENTRIES: usize = 1024;
@@ -188,6 +197,7 @@ pub use types::{
     ThinkingLevelChangeEntry, UsageEntry, CURRENT_SESSION_VERSION,
 };
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -212,6 +222,58 @@ pub const SESSION_PERSISTENCE_DISABLED: &str =
 /// Upper bound for the header line read during discovery (mirrors upstream's
 /// `MAX_SESSION_HEADER_SCAN_BYTES`).
 const SESSION_HEADER_SCAN_BYTES: u64 = 1024 * 1024;
+
+/// Sentinel prefix of the lazy selector-search corpus descriptor stored in
+/// [`SessionSummary::all_messages_text`] (R1-L3-013).
+///
+/// The listing phase no longer joins every user/assistant message into one
+/// `String` per session: it stores a descriptor of the form
+/// `<prefix><mtime-nanos-hex>:<file-len-hex>\0<path>` instead, so the corpus
+/// bytes only exist while a search actually scans that session. The NUL
+/// separator cannot occur in a filesystem path, and a real corpus containing
+/// NUL is JSON-escaped (`\u0000`) in the session file, so a corpus cannot
+/// collide with a legitimate descriptor prefix in practice.
+pub(crate) const LAZY_SESSION_CORPUS_PREFIX: &str = "\u{0}pir-lazy-session-corpus\u{0}";
+
+thread_local! {
+    /// Test seam (R1-L3-013): message-text bytes materialized into the
+    /// `all_messages_text` of summaries returned by a listing on this thread.
+    /// The pre-fix listing stored every session's full corpus here; the lazy
+    /// listing stores zero message text (only descriptors).
+    static SESSION_LISTING_CORPUS_BYTES: Cell<u64> = const { Cell::new(0) };
+    /// Test seam (R1-L3-013): bytes of `all_messages_text` copied by
+    /// [`SessionManager::filter_sessions_by_cwd`] on this thread. With lazy
+    /// descriptors this is a few hundred bytes per matching session instead of
+    /// a full corpus copy.
+    static SESSION_FILTER_CORPUS_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Message-text bytes materialized into listed summaries on this thread since
+/// the last reset (test/profiling probe, R1-L3-013).
+#[doc(hidden)]
+pub fn session_listing_corpus_bytes() -> u64 {
+    SESSION_LISTING_CORPUS_BYTES.with(Cell::get)
+}
+
+/// Reset [`session_listing_corpus_bytes`] (test probe).
+#[doc(hidden)]
+pub fn reset_session_listing_corpus_bytes() {
+    SESSION_LISTING_CORPUS_BYTES.with(|bytes| bytes.set(0));
+}
+
+/// Bytes of `all_messages_text` copied by
+/// [`SessionManager::filter_sessions_by_cwd`] on this thread since the last
+/// reset (test/profiling probe, R1-L3-013).
+#[doc(hidden)]
+pub fn session_filter_corpus_bytes() -> u64 {
+    SESSION_FILTER_CORPUS_BYTES.with(Cell::get)
+}
+
+/// Reset [`session_filter_corpus_bytes`] (test probe).
+#[doc(hidden)]
+pub fn reset_session_filter_corpus_bytes() {
+    SESSION_FILTER_CORPUS_BYTES.with(|bytes| bytes.set(0));
+}
 
 /// Session files opened by [`SessionManager::list_sessions`] since the last
 /// reset, a `#[doc(hidden)]` test seam pinning "one read per file": the
@@ -459,10 +521,16 @@ pub fn default_session_dir(cwd: &str) -> PathBuf {
 /// upstream `SessionInfo` discovery record, session-manager.ts:229-243).
 /// Field population mirrors upstream `buildSessionInfo` (799-882): `name`
 /// from the latest `session_info` entry, `first_message` the first user
-/// message text, `message_count` every `message` entry,
-/// `parent_session_path` the header's `parentSession`, and
-/// `all_messages_text` every user/assistant message's text joined with a space
-/// (the selector-search corpus, exactly like upstream `buildSessionInfo`).
+/// message text, `message_count` every `message` entry, and
+/// `parent_session_path` the header's `parentSession`.
+///
+/// `all_messages_text` is the selector-search corpus *source*, not
+/// necessarily the corpus itself (R1-L3-013): a listing stores only a small
+/// lazy descriptor (session file path plus its listing fingerprint) and the
+/// search code streams the file on the first corpus-scanning query. This
+/// keeps a directory of large sessions from keeping every full transcript
+/// corpus resident at once. Summaries built by callers/tests may still carry
+/// the literal corpus text, which search matches directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
     pub path: PathBuf,
@@ -477,10 +545,12 @@ pub struct SessionSummary {
     /// Text of the first user message in the file, or `"(no messages)"` like
     /// upstream when the session carries none.
     pub first_message: String,
-    /// Every user/assistant message's text, in file order, joined with a
-    /// single space (upstream `SessionInfo.allMessagesText`). This is the
-    /// corpus the session selector searches, so a query can hit a message
-    /// from any point in the conversation.
+    /// The selector-search corpus source (upstream `SessionInfo.allMessagesText`).
+    /// A listing fills this with a lazy descriptor (see
+    /// [`lazy_session_corpus_path`]) instead of the full joined text; search
+    /// resolves it by streaming the file on demand, so a query still hits a
+    /// message from any point in the conversation. Explicitly-built summaries
+    /// (tests, in-memory callers) may pass the literal corpus text.
     pub all_messages_text: String,
     /// Number of `message` entries in the file (upstream `messageCount`).
     pub message_count: usize,
@@ -669,8 +739,16 @@ struct LoadedSessionFile {
     /// every line: a 100 MB session used to hold a second full copy of the file
     /// in a `Vec<String>` while parsing.
     unparsed_raw: Vec<Option<String>>,
-    /// Parse outcome per line (`None` for blank and unparseable lines).
-    parsed: Vec<Option<FileEntry>>,
+    /// Parse outcome per line (`None` for blank and unparseable lines), already
+    /// in the manager's final `Arc` form.
+    ///
+    /// MEMORY SHAPE: the parsed entries are wrapped exactly once, DURING the
+    /// parse, instead of landing in an intermediate `Vec<Option<FileEntry>>`
+    /// and being moved into a second `Arc` buffer afterwards. On a full open
+    /// that intermediate table was `size_of::<Option<FileEntry>>()` (664 B at
+    /// the time of writing) per line — a multi-hundred-KB block whose only
+    /// purpose was to be walked once into `Arc::new`.
+    parsed: Vec<Option<Arc<FileEntry>>>,
     /// Raw text of non-blank lines that failed to parse.
     unparsed_lines: Vec<String>,
     /// True when the final line lacked a `\n` (upstream's non-empty `pending`).
@@ -683,14 +761,14 @@ struct LoadedSessionFile {
 impl LoadedSessionFile {
     /// Parsed entries in file order, MOVED out of the parse result.
     ///
-    /// INVARIANT (move, not clone): the loader is consumed here, so the parsed
-    /// entries are handed over instead of being deep-cloned into a second
-    /// buffer that the temporary `LoadedSessionFile` then dropped — the clone
-    /// copied the whole session (every stored tool result) on every open. A
-    /// caller that still needs `lines`/`unparsed_lines` takes those fields
-    /// first (`std::mem::take`); this method consumes the rest.
-    fn into_entries(self) -> Vec<FileEntry> {
-        self.parsed.into_iter().flatten().collect()
+    /// INVARIANT (move, not clone): every element already is the manager's
+    /// `Arc<FileEntry>` handle, so this is a pointer move — no entry, message
+    /// body or tool result is duplicated here.
+    fn into_shared_entries(self) -> Vec<Arc<FileEntry>> {
+        let capacity = self.parsed.iter().filter(|entry| entry.is_some()).count();
+        let mut shared: Vec<Arc<FileEntry>> = Vec::with_capacity(capacity);
+        shared.extend(self.parsed.into_iter().flatten());
+        shared
     }
 }
 
@@ -700,8 +778,54 @@ impl LoadedSessionFile {
 /// repair — the cap now errors, per line, with no truncation).
 const MAX_SESSION_LINE_BYTES: usize = 256 * 1024 * 1024;
 
+/// Upper bound for one line while building a session listing
+/// ([`SessionManager::list_sessions`] / [`SessionManager::list_session_headers`]).
+///
+/// A listing only needs the entry tag, the message role and small metadata
+/// from a line. The full 256 MiB entry cap is the loader contract; paying it
+/// here made a directory with one multi-hundred-MiB single-line session
+/// allocate the whole line (growing `Vec` plus JSON string) just to count one
+/// message. Over-cap lines are still consumed and counted from their retained
+/// prefix, so `message_count` stays exact while listing memory stays bounded.
+const LISTING_PEEK_LINE_BYTES: usize = 1024 * 1024;
+
+/// Read-buffer size for a listing's per-file reader. The listing scans the
+/// file for message tags (`fill_buf` chunks); a large buffer cuts the syscall
+/// and loop count on a multi-hundred-MiB single-line session. 1 MiB matches
+/// the loader's streaming buffer; the per-file allocation is transient and
+/// released before the next candidate, while the listing's retained peak is
+/// still bounded by [`LISTING_PEEK_LINE_BYTES`].
+const LISTING_READ_BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Pick a per-file read buffer for a listing. Small session headers do not
+/// need a 1 MiB allocation per candidate; a directory with hundreds of tiny
+/// sessions otherwise allocates hundreds of MiB in total just to read headers.
+/// Large files get the full buffer because the scan is dominated by one or a
+/// few multi-MiB lines.
+fn listing_read_buffer_size(file_len: u64) -> usize {
+    const SMALL: usize = 8 * 1024;
+    const MEDIUM: usize = 64 * 1024;
+    if file_len >= 8 * 1024 * 1024 {
+        LISTING_READ_BUFFER_SIZE
+    } else if file_len >= 256 * 1024 {
+        MEDIUM
+    } else {
+        SMALL
+    }
+}
+
 /// Streaming read buffer size (upstream `SESSION_READ_BUFFER_SIZE`).
 pub(crate) const SESSION_READ_BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Read-buffer size for streaming the SKIPPED prefix of a paged session
+/// ([`SessionManager::for_each_prefix_entry`]). The prefix is scanned once per
+/// consumer (usage totals, the virtual-model restore, recorded system
+/// messages), so the whole 1 MiB loader buffer was allocated several times per
+/// build — and each read was appended into `pending` whole, growing the
+/// drain-retaining pending buffer to the read size as well. 64 KiB keeps the
+/// identical streaming semantics (the memory cap is per LINE, not per read)
+/// at a fraction of the transient footprint.
+const PREFIX_SCAN_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Decode one session line, borrowing from `raw` when it is valid UTF-8 and
 /// falling back to the lossy decode (upstream `StringDecoder`) — counting the
@@ -755,12 +879,160 @@ fn repair_missing_trailing_newline(path: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+thread_local! {
+    /// Test seam (R1-L3-016): bytes examined by the streaming newline search
+    /// on this thread. The old shape re-scanned the whole accumulated `pending`
+    /// after every read (O(L^2) for one long line); the cursor shape scans each
+    /// byte once. Thread-local so parallel integration tests stay isolated.
+    static SESSION_LINE_SCAN_BYTES: Cell<u64> = const { Cell::new(0) };
+    /// Test seam (R1-L1-009): `(entries visited, branch paths built)` by the
+    /// turn-end entry-id lookup on this thread. The linear shape visited the
+    /// whole branch path once per tool result (O(path x toolResults)); the
+    /// indexed shape visits it a bounded number of times regardless of the
+    /// result count. Thread-local so parallel integration tests stay isolated.
+    static TURN_ENTRY_LOOKUP_SCANS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+}
+
+fn note_turn_entry_lookup_scan() {
+    TURN_ENTRY_LOOKUP_SCANS.with(|state| {
+        let (entries, builds) = state.get();
+        state.set((entries.saturating_add(1), builds));
+    });
+}
+
+fn note_turn_entry_lookup_path_build() {
+    TURN_ENTRY_LOOKUP_SCANS.with(|state| {
+        let (entries, builds) = state.get();
+        state.set((entries, builds.saturating_add(1)));
+    });
+}
+
+fn reset_turn_entry_lookup_scans() {
+    TURN_ENTRY_LOOKUP_SCANS.with(|state| state.set((0, 0)));
+}
+
+fn turn_entry_lookup_scans() -> (usize, usize) {
+    TURN_ENTRY_LOOKUP_SCANS.with(Cell::get)
+}
+
+/// Bytes examined by the streaming session-line newline search on the current
+/// thread (test seam, R1-L3-016).
+#[doc(hidden)]
+pub fn session_line_scan_bytes() -> u64 {
+    SESSION_LINE_SCAN_BYTES.with(Cell::get)
+}
+
+/// Reset the current thread's streaming newline-search counter
+/// (test seam, R1-L3-016).
+#[doc(hidden)]
+pub fn reset_session_line_scan_bytes() {
+    SESSION_LINE_SCAN_BYTES.with(|bytes| bytes.set(0));
+}
+
+/// `memchr(b'\n', slice)` plus the scan-accounting seam: adds only the bytes
+/// actually examined (the match is inclusive) to the thread-local total.
+fn find_session_newline(slice: &[u8]) -> Option<usize> {
+    let found = memchr::memchr(b'\n', slice);
+    let examined = found.map_or(slice.len(), |index| index + 1);
+    SESSION_LINE_SCAN_BYTES.with(|total| total.set(total.get().saturating_add(examined as u64)));
+    found
+}
+
 /// Read all entries from a session file (upstream `loadEntriesFromFile`):
 /// streamed line-by-line with a bounded read buffer and no whole-file cap, so
 /// a read never stops mid-line. Invalid UTF-8 is tolerated lossily (upstream
 /// `StringDecoder`) with a warning note. The header is validated before any
 /// repair, and a missing trailing newline is repaired only after a COMPLETE
 /// read (upstream `appendFileSync "\n"` on a non-empty final line).
+/// Mmap-backed full-session loader. Returns `None` when the file cannot be
+/// mapped (empty file, platform/permission), leaving the streaming loader as
+/// the fallback. Lines are borrowed from the read-only map; only parsed values
+/// and genuinely unparseable lines are owned.
+///
+/// The mmap reader rides the `session` feature (`tail_page`), so a
+/// no-session build has no mapped loader at all and every read takes the
+/// streaming fallback.
+#[cfg(feature = "session")]
+fn load_entries_from_file_mapped(path: &Path) -> crate::Result<Option<LoadedSessionFile>> {
+    // Test/diagnostic escape hatch: the streaming loader remains the reference
+    // implementation and can be forced for before/after measurements.
+    if std::env::var_os("PIR_DISABLE_SESSION_MMAP").is_some() {
+        return Ok(None);
+    }
+    let file = std::fs::File::open(path)
+        .map_err(|error| anyhow::anyhow!("cannot read session {}: {error}", path.display()))?;
+    let length = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("cannot read session {}: {error}", path.display()))?
+        .len();
+    if length == 0 {
+        return Ok(None);
+    }
+    let map = match tail_page::map_read_only(&file) {
+        Ok(map) => map,
+        Err(_) => return Ok(None),
+    };
+    // Exact per-line capacity: the map is fully readable, so one newline count
+    // (a `memchr` pass, ~0.1 ms per 100 MB) replaces the byte-size estimate
+    // `len / 256` (capped at 16 384). The estimate multiplies by the ELEMENT
+    // size of `Vec<Option<FileEntry>>` (~664 B), so on a 2 MB fixture it
+    // reserved one 5.4 MB block for 1 490 actual lines — 5x the file's parsed
+    // footprint — and any file of 4 MB+ hit the cap at ~11 MB. The exact count
+    // reserves exactly one slot per line, and the tail gets one more.
+    let line_capacity = memchr::memchr_iter(b'\n', &map).count().saturating_add(1);
+    let mut parsed: Vec<Option<Arc<FileEntry>>> = Vec::with_capacity(line_capacity);
+    let mut unparsed_raw: Vec<Option<String>> = Vec::with_capacity(line_capacity);
+    let mut unparsed_lines: Vec<String> = Vec::new();
+    let mut header_version: Option<u32> = None;
+    let mut lossy_lines = 0usize;
+    let mut push_line = |raw: &[u8]| {
+        let text = decode_session_line(raw, &mut lossy_lines);
+        let entry = parse_entry_line_with_version(&text, header_version);
+        if header_version.is_none() {
+            if let Some(header) = entry.as_ref().and_then(FileEntry::as_header) {
+                header_version = Some(header.version.unwrap_or(1));
+            }
+        }
+        if entry.is_none() && !text.trim().is_empty() {
+            let owned = text.into_owned();
+            unparsed_raw.push(Some(owned.clone()));
+            unparsed_lines.push(owned);
+        } else {
+            unparsed_raw.push(None);
+        }
+        parsed.push(entry.map(Arc::new));
+    };
+
+    let mut start = 0usize;
+    let mut torn_tail = false;
+    while start < map.len() {
+        match find_session_newline(&map[start..]) {
+            Some(relative) => {
+                let end = start + relative;
+                push_line(&map[start..end]);
+                start = end + 1;
+            }
+            None => {
+                // The final line has no newline: parse it exactly like the
+                // streaming loader's `pending` tail and mark it torn.
+                push_line(&map[start..]);
+                torn_tail = true;
+                break;
+            }
+        }
+    }
+    drop(push_line);
+    finish_loaded_session(
+        path,
+        parsed,
+        unparsed_raw,
+        unparsed_lines,
+        torn_tail,
+        lossy_lines,
+    )
+    .map(Some)
+}
+
 fn load_entries_from_file(path: &Path) -> crate::Result<LoadedSessionFile> {
     use std::io::Read;
     if !path.exists() {
@@ -771,6 +1043,18 @@ fn load_entries_from_file(path: &Path) -> crate::Result<LoadedSessionFile> {
             torn_tail: false,
             header_valid: false,
         });
+    }
+    // Large sessions: map the file read-only and parse borrowed lines. This
+    // avoids the streaming loader's `pending` buffer (a 64 MiB single-line
+    // session otherwise holds the 64 MiB line plus the parsed entry). Fall
+    // back to the incremental reader when mapping is unavailable (always in a
+    // no-session build: the mmap reader rides the `session` feature).
+    #[cfg(not(feature = "session"))]
+    let mapped = None::<LoadedSessionFile>;
+    #[cfg(feature = "session")]
+    let mapped = load_entries_from_file_mapped(path)?;
+    if let Some(loaded) = mapped {
+        return Ok(loaded);
     }
     let mut file = std::fs::File::open(path)
         .map_err(|error| anyhow::anyhow!("cannot read session {}: {error}", path.display()))?;
@@ -787,10 +1071,14 @@ fn load_entries_from_file(path: &Path) -> crate::Result<LoadedSessionFile> {
     // at ~1.8 GB on load + one turn). Only lines that FAIL to parse stay
     // owned, in `unparsed_raw` (aligned with `parsed` so the fork can carry
     // them verbatim); `unparsed_lines` keeps the manager's append-only list.
-    let mut parsed: Vec<Option<FileEntry>> = Vec::with_capacity(estimated_entries);
+    let mut parsed: Vec<Option<Arc<FileEntry>>> = Vec::with_capacity(estimated_entries);
     let mut unparsed_raw: Vec<Option<String>> = Vec::with_capacity(estimated_entries);
     let mut unparsed_lines: Vec<String> = Vec::new();
     let mut pending: Vec<u8> = Vec::new();
+    // Bytes at the tail of `pending` already searched for a newline. The loop
+    // used to rescan `pending[line_start..]` from zero after every read, which
+    // is O(L^2) for one long line; the cursor makes each byte be scanned once.
+    let mut scanned = 0usize;
     let mut lossy_lines = 0usize;
     let mut header_version: Option<u32> = None;
     loop {
@@ -802,8 +1090,8 @@ fn load_entries_from_file(path: &Path) -> crate::Result<LoadedSessionFile> {
         }
         pending.extend_from_slice(&buffer[..read]);
         let mut line_start = 0usize;
-        while let Some(relative) = pending[line_start..].iter().position(|byte| *byte == b'\n') {
-            let end = line_start + relative;
+        while let Some(relative) = find_session_newline(&pending[line_start + scanned..]) {
+            let end = line_start + scanned + relative;
             let raw = &pending[line_start..end];
             // ONE UTF-8 validation per line: decoding the line and observing
             // whether it was lossy is the same check, so the former separate
@@ -823,10 +1111,14 @@ fn load_entries_from_file(path: &Path) -> crate::Result<LoadedSessionFile> {
             } else {
                 unparsed_raw.push(None);
             }
-            parsed.push(entry);
+            parsed.push(entry.map(Arc::new));
             line_start = end + 1;
+            scanned = 0;
         }
         pending.drain(..line_start);
+        // Everything left was covered by the search above; the next read only
+        // has to scan the bytes it appends.
+        scanned = pending.len();
         if pending.len() > MAX_SESSION_LINE_BYTES {
             anyhow::bail!(
                 "Session entry line exceeds {MAX_SESSION_LINE_BYTES}-byte limit: {}",
@@ -848,8 +1140,29 @@ fn load_entries_from_file(path: &Path) -> crate::Result<LoadedSessionFile> {
         } else {
             unparsed_raw.push(None);
         }
-        parsed.push(entry);
+        parsed.push(entry.map(Arc::new));
     }
+    finish_loaded_session(
+        path,
+        parsed,
+        unparsed_raw,
+        unparsed_lines,
+        torn_tail,
+        lossy_lines,
+    )
+}
+
+/// Shared post-processing for the streaming and mmap session loaders: warn
+/// about lossy UTF-8 lines, validate the header, and repair a torn trailing
+/// newline. Extracted so both loaders cannot drift.
+fn finish_loaded_session(
+    path: &Path,
+    parsed: Vec<Option<Arc<FileEntry>>>,
+    unparsed_raw: Vec<Option<String>>,
+    unparsed_lines: Vec<String>,
+    torn_tail: bool,
+    lossy_lines: usize,
+) -> crate::Result<LoadedSessionFile> {
     if lossy_lines > 0 {
         tracing::warn!(
             "session {} contains {lossy_lines} line(s) with invalid UTF-8; decoded lossily",
@@ -869,7 +1182,7 @@ fn load_entries_from_file(path: &Path) -> crate::Result<LoadedSessionFile> {
     // `loadEntriesFromFile`): the first parsed line must be a session header;
     // otherwise the file is not a session (no entries, no repair).
     let first_entry = loaded.parsed.iter().flatten().next();
-    loaded.header_valid = first_entry.is_some_and(FileEntry::is_header);
+    loaded.header_valid = first_entry.is_some_and(|entry| entry.is_header());
     if first_entry.is_some() && !loaded.header_valid {
         loaded.parsed.clear();
         loaded.unparsed_raw.clear();
@@ -931,8 +1244,16 @@ fn load_entries_retrying_transient_empties(path: &Path) -> crate::Result<LoadedS
 /// Read and validate only the first parseable line of a session file
 /// (bounded, upstream `readSessionHeader`). Returns `Ok(None)` when the file
 /// has no session header; I/O errors and the scan limit surface as `Err`.
+///
+/// MEMORY SHAPE: a header is ONE short line, so the read buffer follows the
+/// listing ladder (8 KiB / 64 KiB / 1 MiB by file size) instead of a flat
+/// 1 MiB. The old shape allocated a full MiB before reading ~100 bytes, on
+/// every open and every discovery probe (hundreds of files in a session dir).
 fn read_session_header_bounded(path: &Path) -> crate::Result<Option<SessionHeader>> {
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let buffer_size = std::fs::metadata(path)
+        .map(|metadata| listing_read_buffer_size(metadata.len()))
+        .unwrap_or(8 * 1024);
+    let mut reader = std::io::BufReader::with_capacity(buffer_size, std::fs::File::open(path)?);
     read_session_header_from_reader(&mut reader)
 }
 
@@ -997,8 +1318,10 @@ fn read_session_header_for_discovery(path: &Path) -> Option<SessionHeader> {
 
 /// The header+peek discovery payload of [`SessionManager::list_sessions`]
 /// (upstream `buildSessionInfo`): the latest `session_info` name, the first
-/// user message's text, the message count, and the joined text of every
-/// user/assistant message (the selector-search corpus).
+/// user message's text, the message count, and — only when explicitly
+/// requested — the joined text of every user/assistant message (the
+/// selector-search corpus). The listing itself passes `collect_corpus=false`
+/// and stores a lazy descriptor instead (R1-L3-013).
 struct SessionInfoPeek {
     name: Option<String>,
     first_message: String,
@@ -1086,12 +1409,136 @@ fn line_has_entry_type(line: &[u8], expected: &str) -> bool {
     rest.first() == Some(&b'"')
 }
 
-/// Stream the remainder of a session file once and extract the
-/// [`SessionInfoPeek`] fields. Every line that is a `message` entry is counted
-/// with a cheap byte scan; user/assistant lines are deserialized to collect
-/// their text, while tool-result lines (often the largest) are skipped by the
-/// role scan. `session_info` lines are always deserialized.
+/// Read ONE line into `line` with a hard cap, using `fill_buf`/`consume` so a
+/// line longer than `max` never grows `line` past the cap.
+///
+/// Returns `Ok(true)` when one line was consumed: either the terminated line
+/// itself (including the `\n`) or the final unterminated tail at EOF, OR an
+/// over-long line was skipped (then `line` is left EMPTY — a real line is
+/// never empty because a blank line keeps its `\n`). Returns `Ok(false)` at
+/// EOF with nothing left. Overlong bytes are discarded through their newline,
+/// so the caller can `continue` with the next line instead of misparsing the
+/// second half as a fresh one.
+///
+/// The cap counts CONTENT bytes: a terminated line may carry `max` bytes plus
+/// its `\n`, but an unterminated tail has no newline to account for, so it
+/// must fit in `max` itself (an EOF tail of `max + 1` is over-long).
+fn read_bounded_line<R: std::io::BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<bool> {
+    Ok(read_bounded_line_impl(reader, line, max, false)?.0)
+}
+
+/// [`read_bounded_line`] with control over what an over-cap line leaves in
+/// `line`.
+///
+/// `retain_prefix` keeps the bytes accumulated before the cap was hit instead
+/// of clearing them. Callers that only byte-scan the line's head (the listing
+/// tag/role checks) use this to count an oversized entry without ever holding
+/// the whole line. Parsers that need valid JSON keep it `false` and treat a
+/// truncated line as absent.
+///
+/// Returns `(consumed, truncated)`: `consumed` is the old `read_bounded_line`
+/// result (a line or an over-cap line was consumed; `false` only at EOF), and
+/// `truncated` says the retained `line` is only a prefix. The retained prefix
+/// never exceeds `max` bytes, so `max` remains the memory bound.
+fn read_bounded_line_impl<R: std::io::BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    max: usize,
+    retain_prefix: bool,
+) -> std::io::Result<(bool, bool)> {
+    line.clear();
+    let mut discarding = false;
+    let mut truncated = false;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            // EOF: a non-empty tail is a final unterminated line; an over-long
+            // tail was already dropped (or retained as a prefix). The
+            // no-prefix path keeps the historical result: a discarded
+            // `max + 1` tail reports no line.
+            return Ok((!line.is_empty() || (truncated && retain_prefix), truncated));
+        }
+        let newline = memchr::memchr(b'\n', buf);
+        let take = newline.map_or(buf.len(), |index| index + 1);
+        if !discarding {
+            // The newline, when present, is the one byte `max + 1` admits.
+            let allowed = match newline {
+                Some(_) => max.saturating_add(1),
+                None => max,
+            };
+            if line.len().saturating_add(take) > allowed {
+                discarding = true;
+                truncated = true;
+                if !retain_prefix {
+                    line.clear();
+                }
+            } else {
+                line.extend_from_slice(&buf[..take]);
+            }
+        }
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok((true, truncated));
+        }
+    }
+}
+
+/// Test/profiling seam for [`read_bounded_line`]: exercises the cap with a
+/// small `max` instead of a 256 MiB fixture.
+#[doc(hidden)]
+pub fn read_bounded_line_for_test<R: std::io::BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<bool> {
+    read_bounded_line(reader, line, max)
+}
+
+/// Stream the remainder of a session file once and extract the full
+/// [`SessionInfoPeek`] payload, including the selector-search corpus. Used by
+/// the lazy corpus reader ([`read_session_corpus_for_search`]) and the test
+/// seams; production listings use [`peek_session_listing`], which skips the
+/// corpus.
 fn peek_session_info(reader: &mut impl std::io::BufRead) -> SessionInfoPeek {
+    peek_session_info_mode(reader, MAX_SESSION_LINE_BYTES, true, false)
+}
+
+/// [`peek_session_info`] with an injectable line cap (test seam): the small
+/// `max` exercises the over-cap discard path without a 256 MiB fixture.
+fn peek_session_info_with_max(reader: &mut impl std::io::BufRead, max: usize) -> SessionInfoPeek {
+    peek_session_info_mode(reader, max, true, false)
+}
+
+/// The listing peek: name, first user message, and message count, but NO
+/// corpus. Once the first user text is known, later message lines are skipped
+/// after the cheap `type`/role byte scans — the listing never deserializes
+/// hundreds of conversation messages just to throw their joined text away.
+///
+/// The line cap is [`LISTING_PEEK_LINE_BYTES`], far below the loader's
+/// 256 MiB entry cap: an individual message body is never needed here, and
+/// buffering it made a listing allocate the whole line just to count it.
+fn peek_session_listing(reader: &mut impl std::io::BufRead) -> SessionInfoPeek {
+    peek_session_info_mode(reader, LISTING_PEEK_LINE_BYTES, false, true)
+}
+
+/// Shared scanner behind [`peek_session_info`] and [`peek_session_listing`].
+///
+/// Every `message` line is counted with a cheap byte scan. User/assistant
+/// lines are deserialized only when their text is actually needed: always for
+/// the first user message, and for every user/assistant message only when
+/// `collect_corpus` is set. When `retain_prefix` is set, an over-cap line's
+/// head is scanned for the entry tag/role (so the message is still counted)
+/// but is never deserialized: a prefix is not valid JSON.
+fn peek_session_info_mode(
+    reader: &mut impl std::io::BufRead,
+    max: usize,
+    collect_corpus: bool,
+    retain_prefix: bool,
+) -> SessionInfoPeek {
     let mut peek = SessionInfoPeek {
         name: None,
         first_message: String::new(),
@@ -1099,13 +1546,24 @@ fn peek_session_info(reader: &mut impl std::io::BufRead) -> SessionInfoPeek {
         message_count: 0,
     };
     let mut line = Vec::new();
-    loop {
-        line.clear();
-        let Ok(read) = reader.read_until(b'\n', &mut line) else {
+    while let Ok((consumed, truncated)) =
+        read_bounded_line_impl(reader, &mut line, max, retain_prefix)
+    {
+        if !consumed {
             break;
-        };
-        if read == 0 {
-            break;
+        }
+        if truncated {
+            // The retained prefix is enough for the byte-level tag/role scan
+            // but not for JSON parsing. Count the message and move on.
+            if line_has_entry_type(&line, "message") {
+                peek.message_count += 1;
+            }
+            continue;
+        }
+        // An empty `line` after a consumed non-truncated read is an over-long
+        // line that was discarded through its newline; skip it.
+        if line.is_empty() {
+            continue;
         }
         if line_has_entry_type(&line, "message") {
             peek.message_count += 1;
@@ -1114,6 +1572,12 @@ fn peek_session_info(reader: &mut impl std::io::BufRead) -> SessionInfoPeek {
             // answers both role questions.
             let (is_assistant, is_user) = line_message_roles(&line);
             if !is_assistant && !is_user {
+                continue;
+            }
+            // The listing only needs the first user message. Once it exists,
+            // the remaining conversation lines contribute nothing to a
+            // listing, so skip their JSON parse entirely.
+            if !collect_corpus && !peek.first_message.is_empty() {
                 continue;
             }
             let Ok(text) = std::str::from_utf8(&line) else {
@@ -1132,13 +1596,16 @@ fn peek_session_info(reader: &mut impl std::io::BufRead) -> SessionInfoPeek {
             if text.is_empty() {
                 continue;
             }
-            if peek.first_message.is_empty() && is_user && !is_assistant {
-                peek.first_message = text.clone();
+            let is_first_user = peek.first_message.is_empty() && is_user && !is_assistant;
+            if collect_corpus {
+                if !peek.all_messages_text.is_empty() {
+                    peek.all_messages_text.push(' ');
+                }
+                peek.all_messages_text.push_str(&text);
             }
-            if !peek.all_messages_text.is_empty() {
-                peek.all_messages_text.push(' ');
+            if is_first_user {
+                peek.first_message = text;
             }
-            peek.all_messages_text.push_str(&text);
         } else if line_has_entry_type(&line, "session_info") {
             let Ok(text) = std::str::from_utf8(&line) else {
                 continue;
@@ -1167,9 +1634,13 @@ fn peek_session_info(reader: &mut impl std::io::BufRead) -> SessionInfoPeek {
 fn read_session_listing(
     path: &Path,
     resolved_cwd: Option<&str>,
+    file_len: u64,
 ) -> Option<(SessionHeader, SessionInfoPeek)> {
     SESSION_LIST_FILE_READS.fetch_add(1, Ordering::Relaxed);
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let mut reader = std::io::BufReader::with_capacity(
+        listing_read_buffer_size(file_len),
+        std::fs::File::open(path).ok()?,
+    );
     let header = read_session_header_from_reader(&mut reader)
         .ok()
         .flatten()?;
@@ -1178,8 +1649,58 @@ fn read_session_listing(
             return None;
         }
     }
-    let peek = peek_session_info(&mut reader);
+    let peek = peek_session_listing(&mut reader);
     Some((header, peek))
+}
+
+/// Build the lazy corpus descriptor a listing stores in
+/// [`SessionSummary::all_messages_text`]: the file's mtime (nanoseconds) and
+/// length fingerprint the snapshot, and the path lets the search scanner
+/// re-read the transcript on demand.
+fn lazy_session_corpus_marker(path: &Path, modified: SystemTime, file_len: u64) -> String {
+    let version = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let path = path.to_string_lossy();
+    let mut marker = String::with_capacity(LAZY_SESSION_CORPUS_PREFIX.len() + 40 + path.len());
+    marker.push_str(LAZY_SESSION_CORPUS_PREFIX);
+    marker.push_str(&format!("{version:x}:{file_len:x}"));
+    marker.push('\u{0}');
+    marker.push_str(&path);
+    marker
+}
+
+/// The file path carried by a lazy corpus descriptor, or `None` when `text`
+/// is a literal corpus (a summary built in memory / by a test).
+pub(crate) fn lazy_session_corpus_path(text: &str) -> Option<&Path> {
+    let rest = text.strip_prefix(LAZY_SESSION_CORPUS_PREFIX)?;
+    let (_fingerprint, path) = rest.split_once('\u{0}')?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(Path::new(path))
+}
+
+/// Stream a session file and rebuild its full selector-search corpus
+/// (R1-L3-013): every user/assistant message's text joined with a space,
+/// exactly like the old listing peek. The search code calls this only when a
+/// query actually has to scan the messages of a lazily-listed session.
+///
+/// Best-effort: a non-regular file (the listing's TOCTOU FIFO guard) or a
+/// file without a session header yields `None`.
+pub(crate) fn read_session_corpus_for_search(path: &Path) -> Option<String> {
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut reader = std::io::BufReader::with_capacity(
+        LISTING_READ_BUFFER_SIZE,
+        std::fs::File::open(path).ok()?,
+    );
+    read_session_header_from_reader(&mut reader)
+        .ok()
+        .flatten()?;
+    Some(peek_session_info(&mut reader).all_messages_text)
 }
 
 /// Scan a session file for the latest `session_info` name ONLY (the
@@ -1187,15 +1708,25 @@ fn read_session_listing(
 /// `type` scan the full peek uses and never deserialized, so no message text
 /// (and no `all_messages_text` corpus) is materialized.
 fn peek_session_name(reader: &mut impl std::io::BufRead) -> Option<String> {
+    peek_session_name_with_max(reader, LISTING_PEEK_LINE_BYTES)
+}
+
+/// [`peek_session_name`] with an injectable line cap (test seam; see
+/// [`peek_session_info_with_max`]).
+fn peek_session_name_with_max(reader: &mut impl std::io::BufRead, max: usize) -> Option<String> {
     let mut name = None;
     let mut line = Vec::new();
-    loop {
-        line.clear();
-        let Ok(read) = reader.read_until(b'\n', &mut line) else {
+    while let Ok((consumed, truncated)) = read_bounded_line_impl(reader, &mut line, max, true) {
+        if !consumed {
             break;
-        };
-        if read == 0 {
-            break;
+        }
+        if truncated {
+            // A prefix of an oversized line is not valid JSON; it cannot be a
+            // complete `session_info` entry, so skip it and keep scanning.
+            continue;
+        }
+        if line.is_empty() {
+            continue;
         }
         if !line_has_entry_type(&line, "session_info") {
             continue;
@@ -1216,14 +1747,51 @@ fn peek_session_name(reader: &mut impl std::io::BufRead) -> Option<String> {
     name
 }
 
+/// Test/profiling seam for [`peek_session_info_with_max`], flattened to the
+/// fields the cap tests assert: `(name, first_message, message_count)`.
+#[doc(hidden)]
+pub fn peek_session_info_for_test(
+    reader: &mut impl std::io::BufRead,
+    max: usize,
+) -> (Option<String>, String, usize) {
+    let peek = peek_session_info_with_max(reader, max);
+    (peek.name, peek.first_message, peek.message_count)
+}
+
+/// Test/profiling seam for the listing peek with an injectable cap. Unlike
+/// [`peek_session_info_for_test`], over-cap lines keep their prefix so the
+/// message count and a following small line still behave like production
+/// ([`peek_session_listing`]).
+#[doc(hidden)]
+pub fn peek_session_listing_for_test(
+    reader: &mut impl std::io::BufRead,
+    max: usize,
+) -> (Option<String>, String, usize) {
+    let peek = peek_session_info_mode(reader, max, false, true);
+    (peek.name, peek.first_message, peek.message_count)
+}
+
+/// Test/profiling seam for [`peek_session_name_with_max`].
+#[doc(hidden)]
+pub fn peek_session_name_for_test(
+    reader: &mut impl std::io::BufRead,
+    max: usize,
+) -> Option<String> {
+    peek_session_name_with_max(reader, max)
+}
+
 /// One open for the header-only listing: bounded header scan, cwd filter,
 /// then the session_info-only tail scan.
 fn read_session_header_listing(
     path: &Path,
     resolved_cwd: Option<&str>,
+    file_len: u64,
 ) -> Option<(SessionHeader, Option<String>)> {
     SESSION_HEADER_LIST_FILE_READS.fetch_add(1, Ordering::Relaxed);
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let mut reader = std::io::BufReader::with_capacity(
+        listing_read_buffer_size(file_len),
+        std::fs::File::open(path).ok()?,
+    );
     let header = read_session_header_from_reader(&mut reader)
         .ok()
         .flatten()?;
@@ -1262,7 +1830,16 @@ fn find_most_recent_session(session_dir: &Path, cwd: Option<&str>) -> Option<Pat
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
         .filter_map(|path| {
-            let mtime = std::fs::metadata(&path).ok()?.modified().ok()?;
+            // `Path::metadata` follows symlinks (a symlink to a regular
+            // session stays a candidate) but rejects FIFOs/devices/dirs:
+            // opening a `*.jsonl` FIFO would block `/resume` forever.
+            // Accepted TOCTOU: the header read opens the path again; a swap to
+            // a FIFO between this check and that open could still block.
+            let metadata = std::fs::metadata(&path).ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let mtime = metadata.modified().ok()?;
             Some((path, mtime))
         })
         .collect();
@@ -1303,6 +1880,189 @@ pub enum AppendFailure {
     PartialWrite(usize),
 }
 
+/// Build one JSONL row (`line` plus its trailing newline) as a single buffer.
+fn json_row(line: &str) -> Vec<u8> {
+    let mut row = Vec::with_capacity(line.len() + 1);
+    row.extend_from_slice(line.as_bytes());
+    row.push(b'\n');
+    row
+}
+
+/// Write an ALREADY ENCODED JSONL row with ONE `write_all` call.
+///
+/// INVARIANT: `O_APPEND` atomicity applies per `write`, not per logical row.
+/// Writing the JSON and the `\n` in two calls lets a concurrent appender of
+/// the same session land a complete row between them, producing a permanently
+/// unparseable interleaved line (the loader carries it as unparsed and the
+/// migration refuses to write the file back).
+fn write_json_row(writer: &mut impl std::io::Write, row: &[u8]) -> std::io::Result<()> {
+    writer.write_all(row)
+}
+
+/// Write one JSONL row (`line` plus its trailing newline) with ONE
+/// `write_all` call.
+///
+/// Shared by the create path and `persist_entry`'s append path, so the
+/// counting-Writer seam below exercises the REAL append write (the append
+/// path used to build its row inline, leaving the seam covering nothing).
+fn write_json_line(writer: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
+    SESSION_JSON_LINE_WRITES.with(|writes| writes.set(writes.get().saturating_add(1)));
+    write_json_row(writer, &json_row(line))
+}
+
+thread_local! {
+    /// JSONL rows written through [`write_json_line`] ON THIS THREAD since the
+    /// last reset (test/profiling probe). Thread-local so parallel tests in
+    /// one integration-test binary can assert an exact count without
+    /// serializing the whole file.
+    static SESSION_JSON_LINE_WRITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of JSONL rows [`write_json_line`] has written on this thread
+/// (test/profiling probe): one `SessionManager::append_message` must account
+/// for exactly ONE row write on the real `persist_entry` path.
+#[doc(hidden)]
+pub fn session_json_line_writes() -> u64 {
+    SESSION_JSON_LINE_WRITES.with(|writes| writes.get())
+}
+
+/// Reset [`session_json_line_writes`] for this thread (test probe).
+#[doc(hidden)]
+pub fn reset_session_json_line_writes() {
+    SESSION_JSON_LINE_WRITES.with(|writes| writes.set(0));
+}
+
+/// Test/profiling seam for [`write_json_line`]: a counting `Write` proves one
+/// row reaches the file through a single `write_all` call.
+#[doc(hidden)]
+pub fn write_json_line_for_test<W: std::io::Write>(
+    writer: &mut W,
+    line: &str,
+) -> std::io::Result<()> {
+    write_json_line(writer, line)
+}
+
+/// Filesystem identity of an open session file.
+///
+/// Length is not an identity: [`SessionManager::rewrite_file`] publishes a
+/// brand-new inode through an atomic rename, and a replacement transcript can
+/// easily have exactly the same byte length (a migration that only flips the
+/// header `version` digit is the canonical case). Unix identifies a file by
+/// `(dev, ino)`, Windows by `(volume serial number, file index)`; platforms
+/// without an identity return `None`, which callers treat as "reopen the path
+/// for every append" so a cached handle can never write a superseded file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileIdentity {
+    #[cfg(unix)]
+    Unix { dev: u64, ino: u64 },
+    #[cfg(windows)]
+    Windows {
+        volume_serial_number: u32,
+        file_index: u64,
+    },
+}
+
+impl FileIdentity {
+    /// Identity from path-level metadata (Unix; `dev`/`ino` are stable there).
+    #[cfg(unix)]
+    fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(Self::Unix {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
+    /// Identity from an OPEN file handle.
+    ///
+    /// Unix reads `dev`/`ino` off the handle metadata. Windows cannot use
+    /// `std::fs::Metadata` at all for this: the stable `MetadataExt` has no
+    /// volume/file-index accessors (they are still `windows_by_handle`
+    /// unstable), so read `BY_HANDLE_FILE_INFORMATION` through `windows-sys`
+    /// — the same sanctioned probe the coding-agent confinement walk uses.
+    fn from_file(file: &std::fs::File) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            let metadata = file.metadata().ok()?;
+            Self::from_metadata(&metadata)
+        }
+        #[cfg(windows)]
+        {
+            windows_file_identity::volume_and_index(file).map(
+                |(volume_serial_number, file_index)| Self::Windows {
+                    volume_serial_number,
+                    file_index,
+                },
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = file;
+            None
+        }
+    }
+}
+
+/// Windows `BY_HANDLE_FILE_INFORMATION` identity probe.
+///
+/// `std::os::windows::fs::MetadataExt::{volume_serial_number, file_index}`
+/// are still unstable, so the stable way to obtain a file identity is the
+/// same `GetFileInformationByHandle` call the confinement walk makes. This is
+/// an isolated, documented `unsafe` boundary (the crate denies `unsafe_code`
+/// everywhere else).
+#[cfg(windows)]
+mod windows_file_identity {
+    #![allow(unsafe_code)]
+
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    pub(super) fn volume_and_index(file: &std::fs::File) -> Option<(u32, u64)> {
+        // SAFETY: `BY_HANDLE_FILE_INFORMATION` is plain old data; its all-zero
+        // bit pattern is valid, and the call below fills every field read here.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is live (borrowed from `file`) and `info` is a
+        // valid out-parameter.
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) };
+        if ok == 0 {
+            return None;
+        }
+        Some((
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    }
+}
+
+/// Identity of the file currently named by `path`.
+///
+/// Unix reads it straight off the path metadata. Windows opens a handle for
+/// the path and probes it with `GetFileInformationByHandle`, because the
+/// path-level metadata does not expose a file index.
+fn path_file_identity(path: &Path, path_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        let _ = path;
+        FileIdentity::from_metadata(path_metadata)
+    }
+    #[cfg(windows)]
+    {
+        let _ = path_metadata;
+        std::fs::File::open(path)
+            .ok()
+            .and_then(|file| FileIdentity::from_file(&file))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, path_metadata);
+        None
+    }
+}
+
 /// Manages one conversation session as an append-only entry tree stored in a
 /// JSONL file (the pir facade over upstream `SessionManager` semantics).
 #[derive(Debug)]
@@ -1330,6 +2090,15 @@ pub struct SessionManager {
     /// by path (a deleted path fails exactly like the old per-append open),
     /// so an append can never vanish into an unlinked inode.
     append_len: u64,
+    /// Filesystem identity of the file `append_file` refers to. The length
+    /// alone cannot tell an atomic rewrite (same-directory temp + rename)
+    /// from an ordinary append: when the replacement has the same length the
+    /// stale handle would keep writing the superseded inode and the entry
+    /// would silently vanish. Compared against the identity at `session_file`
+    /// before every append ([`Self::append_handle_matches_path`]). `None`
+    /// means the platform/filesystem exposes no identity; the handle is then
+    /// reopened by path for every append.
+    append_identity: Option<FileIdentity>,
     /// Every parsed line, header first (upstream `fileEntries`). Entries are
     /// `Arc`-shared with the `by_id` index so each parsed entry is held once
     /// in memory instead of twice (the index clone used to deep-copy every
@@ -1339,7 +2108,7 @@ pub struct SessionManager {
     /// Raw text of lines that failed to deserialize on load. Their presence
     /// refuses migration rewrites so the file is never erased mid-entry.
     unparsed_raw_lines: Vec<String>,
-    by_id: BTreeMap<String, Arc<FileEntry>>,
+    by_id: HashMap<String, Arc<FileEntry>>,
     /// Interned `toolsAdded` payloads shared by every compaction checkpoint.
     /// The loadout is identical across hundreds of compactions; storing one
     /// `Arc` per distinct schema instead of a deep `serde_json::Value` per
@@ -1369,6 +2138,11 @@ pub struct SessionManager {
     /// PAGED mode (pir extension): the entries before the tail window stayed on
     /// disk and are NOT resident. See [`SessionManager::open_paged`].
     paged: Option<PagedWindow>,
+    /// Bounded LRU of parsed prefix pages plus its background-prefetch
+    /// bookkeeping. Created by [`SessionManager::open_paged`]; `None` for a
+    /// full/in-memory manager (nothing is ever read back from disk).
+    #[cfg(feature = "session")]
+    page_cache: Option<Arc<page_cache::PageCache>>,
 }
 
 /// The paged-open state of a [`SessionManager`]: the byte window that is NOT
@@ -1411,6 +2185,42 @@ impl MissingSessionCwd {
             fallback_cwd
         )
     }
+}
+
+/// Named inputs for [`SessionManager::append_compaction_off_thread`].
+pub struct CompactionAppendArgs {
+    /// Summary text stored on the compaction entry.
+    pub summary: String,
+    /// Entry id of the first kept entry; `None` self-retains the entry.
+    pub first_kept_entry_id: Option<String>,
+    /// Projected token count before the cut.
+    pub tokens_before: u64,
+    /// Upstream `details` payload (file ops, etc.).
+    pub details: Option<JsonValue>,
+    /// Usage of the summarizer call that produced the summary.
+    pub usage: Option<Usage>,
+    /// Whether the compaction was generated by an extension hook.
+    pub from_hook: bool,
+}
+
+/// Named inputs for [`SessionManager::append_bash_execution`].
+pub struct BashExecutionRecord<'a> {
+    /// Command line that produced the output.
+    pub command: &'a str,
+    /// Captured command output.
+    pub output: &'a str,
+    /// Process exit code; `None` when the command did not complete.
+    pub exit_code: Option<i64>,
+    /// Whether the command was cancelled.
+    pub cancelled: bool,
+    /// Whether the captured output was truncated.
+    pub truncated: bool,
+    /// Path to the full output when it was spilled to disk.
+    pub full_output_path: Option<&'a str>,
+    /// Whether the record is hidden from the model context.
+    pub exclude_from_context: bool,
+    /// Wall-clock timestamp in milliseconds.
+    pub timestamp: u64,
 }
 
 impl SessionManager {
@@ -1473,9 +2283,10 @@ impl SessionManager {
             flushed: false,
             append_file: None,
             append_len: 0,
+            append_identity: None,
             file_entries: Vec::new(),
             unparsed_raw_lines: Vec::new(),
-            by_id: BTreeMap::new(),
+            by_id: HashMap::new(),
             tool_schema_intern: HashMap::new(),
             labels_by_id: BTreeMap::new(),
             label_timestamps_by_id: BTreeMap::new(),
@@ -1512,9 +2323,10 @@ impl SessionManager {
             flushed: false,
             append_file: None,
             append_len: 0,
+            append_identity: None,
             file_entries: Vec::new(),
             unparsed_raw_lines: Vec::new(),
-            by_id: BTreeMap::new(),
+            by_id: HashMap::new(),
             tool_schema_intern: HashMap::new(),
             labels_by_id: BTreeMap::new(),
             label_timestamps_by_id: BTreeMap::new(),
@@ -1524,6 +2336,7 @@ impl SessionManager {
             widen_stall: None,
             projection_builds: AtomicU64::new(0),
             paged: None,
+            page_cache: None,
         };
         match session_file {
             Some(path) => manager.set_session_file(&path, preloaded_file_entries)?,
@@ -1546,15 +2359,21 @@ impl SessionManager {
         preloaded: Option<Vec<FileEntry>>,
     ) -> crate::Result<()> {
         // Any cached append handle belongs to the previous file.
-        self.append_file = None;
-        self.append_len = 0;
+        self.clear_append_handle();
+        // Parsed prefix pages are keyed by path, but a manager switching files
+        // has no use for the outgoing session's cache; dropping it returns the
+        // memory immediately.
+        #[cfg(feature = "session")]
+        {
+            self.page_cache = None;
+        }
         self.session_file = Some(path.to_path_buf());
         if path.exists() {
             let entries = match preloaded {
                 Some(entries) => {
                     // Preloaded entries carry no unparsed raw lines of their own.
                     self.unparsed_raw_lines.clear();
-                    entries
+                    entries.into_iter().map(Arc::new).collect()
                 }
                 None => {
                     let mut loaded = load_entries_retrying_transient_empties(path)?;
@@ -1569,7 +2388,7 @@ impl SessionManager {
                             self.unparsed_raw_lines.len()
                         );
                     }
-                    loaded.into_entries()
+                    loaded.into_shared_entries()
                 }
             };
             if entries.is_empty() {
@@ -1585,7 +2404,7 @@ impl SessionManager {
                 self.flushed = true;
                 return Ok(());
             }
-            self.load_entries(entries, None)?;
+            self.load_shared_entries(entries, None)?;
             self.flushed = true;
         } else {
             self.unparsed_raw_lines.clear();
@@ -1620,8 +2439,7 @@ impl SessionManager {
         self.leaf_id = None;
         self.flushed = false;
         // The new session has no file yet (and may reuse the old path).
-        self.append_file = None;
-        self.append_len = 0;
+        self.clear_append_handle();
 
         if self.persist {
             let file_timestamp = timestamp.replace([':', '.'], "-");
@@ -1798,6 +2616,12 @@ impl SessionManager {
 
     fn build_index(&mut self) {
         self.by_id.clear();
+        // Exact capacity: the index has one slot per non-header resident
+        // entry. A `BTreeMap` node per 11 entries plus per-key String clones
+        // was measurable on a full widen; `HashMap` with the exact entry count
+        // allocates one table and keeps the same O(1) lookups (no caller
+        // iterates `by_id` in order).
+        self.by_id.reserve(self.file_entries.len());
         self.labels_by_id.clear();
         self.label_timestamps_by_id.clear();
         self.leaf_id = None;
@@ -1854,8 +2678,7 @@ impl SessionManager {
         // The rewrite replaces the file, so any cached append handle would
         // point at the superseded file and silently drop later appends: drop
         // it first. The next append reopens lazily.
-        self.append_file = None;
-        self.append_len = 0;
+        self.clear_append_handle();
         self.reject_paged_rewrite()?;
         if !self.persist {
             return Ok(());
@@ -1931,6 +2754,44 @@ impl SessionManager {
             .any(|entry| entry_is_conversation(entry.as_ref()))
     }
 
+    /// Drop the cached append handle and the identity it was opened with.
+    /// The next append reopens `session_file` by path; a path that no longer
+    /// exists fails exactly like the old per-append open.
+    fn clear_append_handle(&mut self) {
+        self.append_file = None;
+        self.append_len = 0;
+        self.append_identity = None;
+    }
+
+    /// Whether the cached append handle still names the CURRENT file at
+    /// `path`.
+    ///
+    /// A cached handle outlives an external delete/truncate/replace. The
+    /// length catches delete/truncate, but an atomic [`Self::rewrite_file`]
+    /// (or a branched rewrite) publishes a NEW inode; when the replacement
+    /// happens to have the same length — a migration that only flips the
+    /// header `version` is exactly that — a length-only check would keep
+    /// appending to the unlinked old file and lose the entry. Compare the
+    /// filesystem identity instead. When either side has no identity (an
+    /// unsupported platform/filesystem), report a mismatch so the caller
+    /// reopens by path: one extra open per append is the correct price for
+    /// never writing a superseded inode.
+    fn append_handle_matches_path(&self, path: &Path) -> bool {
+        let Some(handle_identity) = self.append_identity else {
+            return false;
+        };
+        let Ok(path_metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        if path_metadata.len() != self.append_len {
+            return false;
+        }
+        match path_file_identity(path, &path_metadata) {
+            Some(path_identity) => path_identity == handle_identity,
+            None => false,
+        }
+    }
+
     /// Persist one new entry BEFORE the caller commits it to memory.
     ///
     /// The write is the fallible half of an append; the in-memory index
@@ -1985,13 +2846,12 @@ impl SessionManager {
             let write_result: crate::Result<()> = (|| {
                 for existing in &self.file_entries {
                     let line = serde_json::to_string(existing)?;
-                    file.write_all(line.as_bytes())?;
-                    file.write_all(b"\n")?;
+                    // One write per row: see `write_json_line`.
+                    write_json_line(&mut file, &line)?;
                     written = written.saturating_add(line.len() as u64 + 1);
                 }
                 let line = serde_json::to_string(entry)?;
-                file.write_all(line.as_bytes())?;
-                file.write_all(b"\n")?;
+                write_json_line(&mut file, &line)?;
                 written = written.saturating_add(line.len() as u64 + 1);
                 file.flush()?;
                 // The creation barrier stays: this is the one write that may
@@ -2009,22 +2869,21 @@ impl SessionManager {
                 return Err(error);
             }
             // Reuse the created descriptor for every later append.
-            self.append_file = Some(file);
             self.append_len = written;
+            self.append_identity = FileIdentity::from_file(&file);
+            self.append_file = Some(file);
             self.flushed = true;
             return Ok(());
         }
         let line = serde_json::to_string(entry)?;
-        // A cached handle outlives an external delete/truncate/replace: when
-        // the path no longer names a file of the length written through it,
-        // drop the handle and reopen by path. A missing path then fails
-        // exactly like the old per-append open did, instead of silently
-        // appending to the unlinked inode and losing the entry.
-        if self.append_file.is_some()
-            && !std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == self.append_len)
-        {
-            self.append_file = None;
-            self.append_len = 0;
+        // A cached handle outlives an external delete/truncate/replace: drop
+        // it unless the path still names the SAME file (identity) with the
+        // length written through it. A missing path then fails exactly like
+        // the old per-append open did, instead of silently appending to the
+        // unlinked inode and losing the entry. Identity — not length alone —
+        // is what catches a same-length atomic rewrite.
+        if self.append_file.is_some() && !self.append_handle_matches_path(&path) {
+            self.clear_append_handle();
         }
         if self.append_file.is_none() {
             let opened = std::fs::OpenOptions::new()
@@ -2033,7 +2892,9 @@ impl SessionManager {
                 .map_err(|error| {
                     anyhow::anyhow!("cannot append to session {}: {error}", path.display())
                 })?;
-            self.append_len = opened.metadata()?.len();
+            let metadata = opened.metadata()?;
+            self.append_len = metadata.len();
+            self.append_identity = FileIdentity::from_file(&opened);
             self.append_file = Some(opened);
         }
         // This is the length the file must return to when the write fails.
@@ -2050,12 +2911,21 @@ impl SessionManager {
                 if matches!(failure, Some(AppendFailure::BeforeWrite)) {
                     anyhow::bail!("injected session append failure");
                 }
-                file.write_all(line.as_bytes())?;
                 if let Some(AppendFailure::PartialWrite(bytes)) = failure {
-                    file.write_all(&line.as_bytes()[..bytes.min(line.len())])?;
+                    // The seam writes only a prefix of the row (never the
+                    // newline), reproducing the partial-line failure the
+                    // rollback below must erase.
+                    let row = json_row(&line);
+                    let prefix = bytes.min(line.len());
+                    write_json_row(file, &row[..prefix])?;
                     anyhow::bail!("injected session append failure");
                 }
-                file.write_all(b"\n")?;
+                // ONE write for the line AND its newline (the same
+                // `write_json_line` the create path uses): `O_APPEND`
+                // atomicity is per `write`, so two calls let a concurrent
+                // appender slip a whole row between this entry's JSON and its
+                // newline.
+                write_json_line(file, &line)?;
                 // Visibility barrier, not a durability one: `File` has no
                 // user-space buffer, so the line is already readable by a
                 // fresh open after this (a no-op) flush. Only `sync_all` is
@@ -2086,6 +2956,7 @@ impl SessionManager {
             // re-reads the real length when truncation itself failed.
             self.append_file = None;
             self.append_len = previous_len;
+            self.append_identity = None;
             return Err(error);
         }
         self.append_len = previous_len.saturating_add(line.len() as u64 + 1);
@@ -2317,6 +3188,10 @@ impl SessionManager {
             parsed_entries: stats.parsed_entries,
         });
         manager.unparsed_raw_lines = page.unparsed_lines().to_vec();
+        manager.page_cache = Some(Arc::new(page_cache::PageCache::new(
+            page_cache::DEFAULT_PAGE_CACHE_PAGES,
+            page_cache::DEFAULT_PAGE_CACHE_BYTES,
+        )));
         manager.load_shared_entries(entries, None)?;
         manager.flushed = true;
         // One INFO line per paged open (a rare, meaningful event): the
@@ -2373,8 +3248,18 @@ impl SessionManager {
         };
         use std::io::Read;
         let mut file = std::fs::File::open(path)?;
-        let mut buffer = vec![0u8; SESSION_READ_BUFFER_SIZE];
+        // 64 KiB, not the loader's 1 MiB buffer: the prefix is scanned once
+        // per consumer (usage totals, virtual-model restore, recorded system
+        // messages — three-plus reads per build), and the whole 1 MiB read is
+        // appended into `pending` before its lines are processed, so the big
+        // buffer grew both allocations AND the drain-retaining `pending` to
+        // ~2 MiB per scan. 64 KiB keeps the same streaming guarantees (the
+        // cap is per line, not per read) at 1/32nd of the transient footprint.
+        let mut buffer = vec![0u8; PREFIX_SCAN_BUFFER_SIZE];
         let mut pending: Vec<u8> = Vec::new();
+        // Same `scanned` cursor as `load_entries_from_file`: only the bytes a
+        // read appends are searched for the next newline.
+        let mut scanned = 0usize;
         let mut header_version: Option<u32> = None;
         let mut visited = 0usize;
         let mut consumed = 0u64;
@@ -2387,9 +3272,8 @@ impl SessionManager {
             pending.extend_from_slice(&buffer[..limit]);
             consumed += limit as u64;
             let mut line_start = 0usize;
-            while let Some(relative) = pending[line_start..].iter().position(|byte| *byte == b'\n')
-            {
-                let end = line_start + relative;
+            while let Some(relative) = find_session_newline(&pending[line_start + scanned..]) {
+                let end = line_start + scanned + relative;
                 // A TERMINATED over-long line must fail like an unterminated
                 // one (the check after the drain): the cap bounds a single
                 // line's allocation, and a 32 MiB+ line closed by a newline
@@ -2411,8 +3295,10 @@ impl SessionManager {
                     callback(entry);
                 }
                 line_start = end + 1;
+                scanned = 0;
             }
             pending.drain(..line_start);
+            scanned = pending.len();
             if pending.len() > MAX_PREFIX_ENTRY_LINE_BYTES {
                 anyhow::bail!(
                     "session {} holds an over-long entry line (>{MAX_PREFIX_ENTRY_LINE_BYTES} bytes) before the resident window",
@@ -2439,6 +3325,11 @@ impl SessionManager {
     /// whole-prefix scan; the returned page's
     /// [`SessionTailPage::page_start`] is the cursor for the next step.
     ///
+    /// Served from the manager's bounded page cache when the same
+    /// `(cursor, caps)` was read (or prefetched) before; a hit returns the
+    /// cached parsed entries without touching the file. Concurrent reads of
+    /// one key are coalesced onto a single parse.
+    ///
     /// `None` for a non-paged session or when the cursor is already the file
     /// start.
     #[cfg(feature = "session")]
@@ -2458,7 +3349,73 @@ impl SessionManager {
             return Ok(None);
         };
         let limit = cursor.min(paged.file_bytes);
+        if let Some(cache) = self.page_cache.as_ref() {
+            let key = page_cache::PageCacheKey::new(path.clone(), limit, max_bytes, max_entries);
+            return Ok(cache
+                .get_or_load(key)?
+                .map(tail_page::SessionTailPage::from_cached));
+        }
         tail_page::SessionTailPage::open_window(path, Some(limit), max_bytes, max_entries)
+    }
+
+    /// Prefetch the page [`Self::read_older_page`] would read for `cursor` on
+    /// a background thread, so the scroll-up read that follows is a cache hit.
+    ///
+    /// Returns whether a prefetch thread was started: `false` when the session
+    /// is not paged, the cursor is the file start, the page is already cached
+    /// or a load/prefetch for the same key is already in flight. Safe (and
+    /// cheap) to call repeatedly from the UI's near-top trigger — the cache
+    /// dedupes.
+    #[cfg(feature = "session")]
+    pub fn prefetch_older_page(&self, cursor: u64, max_bytes: usize, max_entries: usize) -> bool {
+        let Some(paged) = self.paged.as_ref() else {
+            return false;
+        };
+        if cursor == 0 {
+            return false;
+        }
+        let Some(path) = self.session_file.as_ref() else {
+            return false;
+        };
+        let Some(cache) = self.page_cache.as_ref() else {
+            return false;
+        };
+        let limit = cursor.min(paged.file_bytes);
+        cache.prefetch(page_cache::PageCacheKey::new(
+            path.clone(),
+            limit,
+            max_bytes,
+            max_entries,
+        ))
+    }
+
+    /// Whether the page for `(cursor, caps)` is currently in the repage cache
+    /// (test/diagnostic helper; a successful [`Self::prefetch_older_page`] is
+    /// observable here once its background thread completes).
+    #[cfg(feature = "session")]
+    pub fn is_older_page_cached(&self, cursor: u64, max_bytes: usize, max_entries: usize) -> bool {
+        let Some(paged) = self.paged.as_ref() else {
+            return false;
+        };
+        let Some(path) = self.session_file.as_ref() else {
+            return false;
+        };
+        let Some(cache) = self.page_cache.as_ref() else {
+            return false;
+        };
+        let limit = cursor.min(paged.file_bytes);
+        cache.contains(&page_cache::PageCacheKey::new(
+            path.clone(),
+            limit,
+            max_bytes,
+            max_entries,
+        ))
+    }
+
+    /// Cache counters of a paged manager (`None` for a full/in-memory one).
+    #[cfg(feature = "session")]
+    pub fn older_page_cache_stats(&self) -> Option<page_cache::PageCacheStats> {
+        self.page_cache.as_ref().map(|cache| cache.stats())
     }
 
     /// Materialize the skipped prefix into the resident entry list (the FULL
@@ -2479,10 +3436,13 @@ impl SessionManager {
         };
         let mut loaded = load_entries_from_file(&path)?;
         self.unparsed_raw_lines = std::mem::take(&mut loaded.unparsed_lines);
-        let entries = loaded.into_entries();
-        self.load_entries(entries, None)?;
+        let entries = loaded.into_shared_entries();
+        self.load_shared_entries(entries, None)?;
         self.flushed = true;
         self.paged = None;
+        // The whole transcript is resident now; cached prefix pages are dead
+        // weight (and may hold `Arc`s into the old window).
+        self.page_cache = None;
         Ok(())
     }
 
@@ -2646,8 +3606,12 @@ impl SessionManager {
     /// same path are returned. Unreadable or non-upstream-format files are
     /// skipped (best-effort, like upstream `SessionManager.list`). Beyond the
     /// header, a bounded peek populates `name`, `first_message`,
-    /// `all_messages_text`, `message_count`, and `parent_session_path`
-    /// (upstream `buildSessionInfo`).
+    /// `message_count`, and `parent_session_path` (upstream `buildSessionInfo`).
+    ///
+    /// `all_messages_text` receives a lazy corpus descriptor, not the joined
+    /// transcript text (R1-L3-013): listing a directory of large sessions
+    /// stays O(metadata + header/preview) in resident bytes, and the search
+    /// layer streams the file the first time a query must scan its messages.
     #[cfg(feature = "session")]
     pub fn list_sessions(session_dir: &Path, cwd: Option<&str>) -> Vec<SessionSummary> {
         Self::list_sessions_cancellable(session_dir, cwd, None, None).sessions
@@ -2684,30 +3648,58 @@ impl SessionManager {
         // Candidates first so `total` is known up front (upstream readdir +
         // `.jsonl` filter before the info loads start). Name-descending order
         // matches upstream's pre-sort; the final order is by modified time.
-        let mut candidates: Vec<(PathBuf, SystemTime)> = entries
+        //
+        // ONE `Path::metadata` per candidate, AFTER the extension filter (the
+        // filter and the mtime used to be two separate stats, one of them on
+        // every non-session file). `Path::metadata` — not
+        // `DirEntry::metadata` — follows symlinks, so a symlinked session stays
+        // a candidate and sorts by its TARGET file's mtime, the same rule as
+        // `find_most_recent_session`; FIFOs/devices/dirs are rejected before
+        // any open can block.
+        //
+        // Accepted TOCTOU: the candidate is opened later by
+        // `read_session_listing`; a path swapped for a FIFO between this
+        // `metadata` and that `File::open` could still block. Closing that
+        // needs an `O_NONBLOCK` open plus an `fstat` check (not done here).
+        let mut candidates: Vec<(PathBuf, SystemTime, u64)> = entries
             .flatten()
             .filter(|entry| {
                 entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
             })
-            .map(|entry| {
-                let modified = entry
-                    .metadata()
-                    .and_then(|meta| meta.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                (entry.path(), modified)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let metadata = path.metadata().ok()?;
+                if !metadata.is_file() {
+                    return None;
+                }
+                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                Some((path, modified, metadata.len()))
             })
             .collect();
         candidates.sort_by(|a, b| b.0.cmp(&a.0));
         let total = candidates.len();
         let mut sessions: Vec<SessionSummary> = Vec::new();
         let mut cancelled = false;
-        for (index, (path, modified)) in candidates.into_iter().enumerate() {
+        for (index, (path, modified, file_len)) in candidates.into_iter().enumerate() {
             if is_cancelled() {
                 cancelled = true;
                 break;
             }
             // One open per file: header, cwd filter, and peek share a reader.
-            if let Some((header, peek)) = read_session_listing(&path, resolved_cwd.as_deref()) {
+            if let Some((header, peek)) =
+                read_session_listing(&path, resolved_cwd.as_deref(), file_len)
+            {
+                // The listing peek never collects message text; count anything
+                // it did materialize so a regression back to the eager corpus
+                // trips the seam test.
+                SESSION_LISTING_CORPUS_BYTES.with(|bytes| {
+                    bytes.set(
+                        bytes
+                            .get()
+                            .saturating_add(peek.all_messages_text.len() as u64),
+                    )
+                });
+                let all_messages_text = lazy_session_corpus_marker(&path, modified, file_len);
                 sessions.push(SessionSummary {
                     path,
                     id: header.id,
@@ -2715,7 +3707,7 @@ impl SessionManager {
                     modified,
                     name: peek.name,
                     first_message: peek.first_message,
-                    all_messages_text: peek.all_messages_text,
+                    all_messages_text,
                     message_count: peek.message_count,
                     parent_session_path: header.parent_session,
                 });
@@ -2754,7 +3746,8 @@ impl SessionManager {
     /// sessions): it reads the bounded header line plus the latest
     /// `session_info` name and the file's mtime, and never peeks message
     /// lines. [`Self::list_sessions`] keeps its full `SessionSummary` shape
-    /// (first message, message count, selector-search corpus) unchanged.
+    /// (first message, message count, lazy selector-search corpus source)
+    /// unchanged.
     ///
     /// When `cwd` is `Some`, only sessions whose header cwd resolves to the
     /// same path are returned. Unreadable or non-upstream-format files are
@@ -2771,24 +3764,34 @@ impl SessionManager {
         let Ok(entries) = std::fs::read_dir(session_dir) else {
             return Vec::new();
         };
-        let mut candidates: Vec<(PathBuf, SystemTime)> = entries
+        // Same candidate rule as `list_sessions_cancellable`: extension filter
+        // first, then ONE `Path::metadata` that both rejects non-regular files
+        // (FIFOs/devices/dirs, before any open can block) and yields the mtime.
+        // `Path::metadata` follows symlinks, so a symlinked session sorts by
+        // its TARGET file's mtime — consistent with `find_most_recent_session`.
+        // Accepted TOCTOU: `read_session_header_listing` opens the path later;
+        // a swap to a FIFO in between could still block (an `O_NONBLOCK` open
+        // + `fstat` would be needed to close that window).
+        let mut candidates: Vec<(PathBuf, SystemTime, u64)> = entries
             .flatten()
             .filter(|entry| {
                 entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
             })
-            .map(|entry| {
-                let modified = entry
-                    .metadata()
-                    .and_then(|meta| meta.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                (entry.path(), modified)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let metadata = path.metadata().ok()?;
+                if !metadata.is_file() {
+                    return None;
+                }
+                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                Some((path, modified, metadata.len()))
             })
             .collect();
         candidates.sort_by(|a, b| b.0.cmp(&a.0));
         let mut sessions: Vec<SessionHeaderSummary> = Vec::new();
-        for (path, modified) in candidates {
+        for (path, modified, file_len) in candidates {
             if let Some((header, name)) =
-                read_session_header_listing(&path, resolved_cwd.as_deref())
+                read_session_header_listing(&path, resolved_cwd.as_deref(), file_len)
             {
                 sessions.push(SessionHeaderSummary {
                     path,
@@ -2836,6 +3839,11 @@ impl SessionManager {
     /// any file. The `/resume` flow used to call [`Self::list_sessions`]
     /// twice (once filtered, once unfiltered); one unfiltered scan followed by
     /// this in-memory filter is the single-pass equivalent.
+    ///
+    /// Only lightweight fields are copied: a listing's `all_messages_text` is
+    /// a lazy descriptor (R1-L3-013), never a full corpus, so this filter does
+    /// not duplicate transcript text. [`session_filter_corpus_bytes`] exposes
+    /// the copied `all_messages_text` volume as a test seam.
     pub fn filter_sessions_by_cwd(sessions: &[SessionSummary], cwd: &str) -> Vec<SessionSummary> {
         let resolved_cwd = resolve_path_str(cwd);
         sessions
@@ -2843,7 +3851,16 @@ impl SessionManager {
             .filter(|session| {
                 !session.cwd.is_empty() && resolve_path_str(&session.cwd) == resolved_cwd
             })
-            .cloned()
+            .map(|session| {
+                SESSION_FILTER_CORPUS_BYTES.with(|bytes| {
+                    bytes.set(
+                        bytes
+                            .get()
+                            .saturating_add(session.all_messages_text.len() as u64),
+                    )
+                });
+                session.clone()
+            })
             .collect()
     }
 
@@ -2858,6 +3875,12 @@ impl SessionManager {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            // Never open a FIFO/device/directory: only regular files (or
+            // symlinks to one, since `Path::metadata` follows links) are
+            // session candidates.
+            if !path.metadata().is_ok_and(|meta| meta.is_file()) {
                 continue;
             }
             if read_session_header_for_discovery(&path).is_some_and(|header| header.id == id) {
@@ -2910,6 +3933,20 @@ impl SessionManager {
     ) -> crate::Result<Option<SessionTailPage>> {
         let _ = (cursor, max_bytes, max_entries);
         Ok(None)
+    }
+
+    /// `session` off: there is no page reader to prefetch with.
+    #[cfg(not(feature = "session"))]
+    pub fn prefetch_older_page(&self, cursor: u64, max_bytes: usize, max_entries: usize) -> bool {
+        let _ = (cursor, max_bytes, max_entries);
+        false
+    }
+
+    /// `session` off: nothing is ever cached.
+    #[cfg(not(feature = "session"))]
+    pub fn is_older_page_cached(&self, cursor: u64, max_bytes: usize, max_entries: usize) -> bool {
+        let _ = (cursor, max_bytes, max_entries);
+        false
     }
 
     /// `session` off: a non-paged session is already "full", so widening is a
@@ -3144,6 +4181,7 @@ impl SessionManager {
         matches: impl Fn(&StoredMessage) -> bool,
     ) -> Option<String> {
         for entry in path.iter().rev() {
+            note_turn_entry_lookup_scan();
             let FileEntry::Message(message_entry) = *entry else {
                 continue;
             };
@@ -3197,19 +4235,27 @@ impl SessionManager {
     }
 
     /// The persisted entry ids of a completed turn, resolved over ONE
-    /// branch-path walk (the extension `turn_end` payload's `messageEntryId`
-    /// and `toolResultEntryIds`).
+    /// branch-path walk plus ONE hash index (the extension `turn_end`
+    /// payload's `messageEntryId` and `toolResultEntryIds`).
     ///
     /// Same match rules as [`Self::find_persisted_assistant_entry_id`] /
     /// [`Self::find_persisted_tool_result_entry_id`], but the path index is
-    /// built once: the per-message lookups each rebuilt a hash map over the
-    /// whole session, so a turn with N tool results paid N+1 full-session
-    /// index builds while the caller held the session lock.
+    /// built once and every tool result is then an O(1) lookup: the former
+    /// shape walked the whole path once PER RESULT, so a turn with N tool
+    /// results over an M-entry branch paid O(N x M) comparisons while the
+    /// caller held the session lock.
+    ///
+    /// The tool-result index is keyed by the exact tuple the match predicate
+    /// compares (`toolCallId`, `toolName`, `timestamp`). Entries are inserted
+    /// oldest-to-newest, so a later duplicate overwrites the earlier id —
+    /// identical to the newest-first linear scan it replaces. Empty entry ids
+    /// never enter the index (the old predicate rejected them too).
     pub(crate) fn find_persisted_turn_entry_ids(
         &self,
         message: &crate::ai::types::AssistantMessage,
         tool_results: &[crate::ai::types::ToolResultMessage],
     ) -> (Option<String>, Vec<String>) {
+        note_turn_entry_lookup_path_build();
         let path = projection::build_session_path(&self.file_entries, self.leaf_id.as_deref());
         let message_entry_id = Self::find_message_entry_id_in(&path, |stored| match stored {
             StoredMessage::Assistant(stored) => {
@@ -3219,20 +4265,69 @@ impl SessionManager {
             }
             _ => false,
         });
+        if tool_results.is_empty() {
+            return (message_entry_id, Vec::new());
+        }
+        let mut tool_result_index: HashMap<(&str, &str, u64), &str> =
+            HashMap::with_capacity(path.len());
+        for entry in &path {
+            note_turn_entry_lookup_scan();
+            let FileEntry::Message(message_entry) = *entry else {
+                continue;
+            };
+            if message_entry.id.is_empty() {
+                continue;
+            }
+            let StoredMessage::ToolResult(stored) = &message_entry.message else {
+                continue;
+            };
+            // Path order is oldest -> newest; overwriting keeps the newest id
+            // for a duplicate key, matching `find_message_entry_id_in`.
+            tool_result_index.insert(
+                (
+                    stored.tool_call_id.as_str(),
+                    stored.tool_name.as_str(),
+                    stored.timestamp,
+                ),
+                message_entry.id.as_str(),
+            );
+        }
         let tool_result_entry_ids = tool_results
             .iter()
             .filter_map(|result| {
-                Self::find_message_entry_id_in(&path, |stored| match stored {
-                    StoredMessage::ToolResult(stored) => {
-                        stored.tool_call_id == result.tool_call_id
-                            && stored.tool_name == result.tool_name
-                            && stored.timestamp == result.timestamp
-                    }
-                    _ => false,
-                })
+                tool_result_index
+                    .get(&(
+                        result.tool_call_id.as_str(),
+                        result.tool_name.as_str(),
+                        result.timestamp,
+                    ))
+                    .map(|id| (*id).to_owned())
             })
             .collect();
         (message_entry_id, tool_result_entry_ids)
+    }
+
+    /// Test seam (R1-L1-009): [`Self::find_persisted_turn_entry_ids`] plus the
+    /// branch-path work it consumed on this thread
+    /// (`(entries_visited, path_builds)`), so an integration test can prove a
+    /// turn's lookup is O(path + results) rather than O(path x results) while
+    /// still asserting the exact ids the real implementation returns.
+    #[doc(hidden)]
+    pub fn find_persisted_turn_entry_ids_for_test(
+        &self,
+        message: &crate::ai::types::AssistantMessage,
+        tool_results: &[crate::ai::types::ToolResultMessage],
+    ) -> (Option<String>, Vec<String>, usize, usize) {
+        reset_turn_entry_lookup_scans();
+        let (message_entry_id, tool_result_entry_ids) =
+            self.find_persisted_turn_entry_ids(message, tool_results);
+        let (entries_visited, path_builds) = turn_entry_lookup_scans();
+        (
+            message_entry_id,
+            tool_result_entry_ids,
+            entries_visited,
+            path_builds,
+        )
     }
 
     /// Append a message as child of the current leaf, then advance the leaf.
@@ -3317,16 +4412,18 @@ impl SessionManager {
     /// closure (`blocking_lock`), so the compaction append runs on the
     /// blocking pool and never parks a runtime worker while holding the
     /// session lock.
-    #[allow(clippy::too_many_arguments)]
     pub async fn append_compaction_off_thread(
         session: &Arc<tokio::sync::Mutex<Self>>,
-        summary: impl Into<String> + Send + 'static,
-        first_kept_entry_id: Option<String>,
-        tokens_before: u64,
-        details: Option<JsonValue>,
-        usage: Option<Usage>,
-        from_hook: bool,
+        args: CompactionAppendArgs,
     ) -> crate::Result<String> {
+        let CompactionAppendArgs {
+            summary,
+            first_kept_entry_id,
+            tokens_before,
+            details,
+            usage,
+            from_hook,
+        } = args;
         let session = Arc::clone(session);
         tokio::task::spawn_blocking(move || -> crate::Result<String> {
             let mut session = session.blocking_lock();
@@ -3351,18 +4448,20 @@ impl SessionManager {
     /// Unlike [`Self::append_message`] this writes the coding-agent-only
     /// `bashExecution` role directly, so a pi session reads it back verbatim
     /// instead of losing it to `unparsed_raw_lines`.
-    #[allow(clippy::too_many_arguments)]
     pub fn append_bash_execution(
         &mut self,
-        command: &str,
-        output: &str,
-        exit_code: Option<i64>,
-        cancelled: bool,
-        truncated: bool,
-        full_output_path: Option<&str>,
-        exclude_from_context: bool,
-        timestamp: u64,
+        record: BashExecutionRecord<'_>,
     ) -> crate::Result<String> {
+        let BashExecutionRecord {
+            command,
+            output,
+            exit_code,
+            cancelled,
+            truncated,
+            full_output_path,
+            exclude_from_context,
+            timestamp,
+        } = record;
         let entry = FileEntry::Message(MessageEntry {
             id: self.generate_id(),
             parent_id: self.leaf_id.clone(),
@@ -3436,7 +4535,6 @@ impl SessionManager {
     /// after the entry replays. The current system message of the leaf-path
     /// entries (if any) is stored as the entry's `systemMessage`. Returns the
     /// entry id.
-    #[allow(clippy::too_many_arguments)]
     pub fn append_compaction(
         &mut self,
         summary: impl Into<String>,
@@ -3880,6 +4978,7 @@ impl SessionManager {
         let old_file_entries = std::mem::take(&mut self.file_entries);
         let old_append_file = self.append_file.take();
         let old_append_len = self.append_len;
+        let old_append_identity = self.append_identity;
         let old_flushed = self.flushed;
         let old_leaf = self.leaf_id.clone();
 
@@ -3897,8 +4996,7 @@ impl SessionManager {
         };
         // The branched file is a different file: never write through the
         // source session's cached handle.
-        self.append_file = None;
-        self.append_len = 0;
+        self.clear_append_handle();
         self.build_index();
 
         // A branch is immediately addressable by its caller (the TUI opens the
@@ -3912,6 +5010,7 @@ impl SessionManager {
                 self.file_entries = old_file_entries;
                 self.append_file = old_append_file;
                 self.append_len = old_append_len;
+                self.append_identity = old_append_identity;
                 self.flushed = old_flushed;
                 self.build_index();
                 self.leaf_id = old_leaf;

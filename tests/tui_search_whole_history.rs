@@ -88,7 +88,8 @@ use pir::tui::app::{ChatContainer, ChatEntry};
 use pir::tui::core::{Component, Rows, Terminal, Text, TuiCore};
 use pir::tui::terminal::{
     apply_older_page, probe_older_page, resident_probe_slice, search_walk_step, should_load_older,
-    sync_windowed_band, tail_window_start, OlderPageEffect, OlderPages, SearchWalkStep,
+    sync_windowed_band, tail_window_start, OlderPageEffect, OlderPageReply, OlderPageSearch,
+    OlderPageTranscript, OlderPages, SearchWalkProbe, SearchWalkStep, SearchWalkView,
     TranscriptWindow, TRANSCRIPT_TAIL_BYTES, TRANSCRIPT_WINDOW_MAX_ENTRIES,
 };
 use pir::tui::theme::{with_theme, ThemeColor};
@@ -544,11 +545,15 @@ impl Harness {
                         &mut alt.search,
                         windowed,
                         &mut self.pages,
-                        &self.entries,
-                        &mut self.window,
-                        &mut self.probe,
-                        self.core.columns().max(1),
-                        false,
+                        &mut SearchWalkView {
+                            entries: &self.entries,
+                            window: &mut self.window,
+                        },
+                        &mut SearchWalkProbe {
+                            probe: &mut self.probe,
+                            width: self.core.columns().max(1),
+                            hide_thinking: false,
+                        },
                     )
                 } else {
                     SearchWalkStep::Idle
@@ -666,17 +671,23 @@ impl Harness {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let effect = apply_older_page(
             &mut self.pages,
-            chunk,
-            next_cursor,
-            false,
-            &mut self.entries,
-            &mut self.window,
-            &mut self.streaming_entry,
-            &mut self.tool_entries,
-            &mut alt.search,
-            &mut self.probe,
-            self.core.columns().max(1),
-            false,
+            OlderPageReply {
+                chunk,
+                cursor: next_cursor,
+                failed: false,
+            },
+            OlderPageTranscript {
+                entries: &mut self.entries,
+                window: &mut self.window,
+                streaming_entry: &mut self.streaming_entry,
+                tool_entries: &mut self.tool_entries,
+            },
+            OlderPageSearch {
+                search: &mut alt.search,
+                probe: &mut self.probe,
+                probe_width: self.core.columns().max(1),
+                hide_thinking: false,
+            },
         );
         drop(alt);
         if effect == OlderPageEffect::Materialized {

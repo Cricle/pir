@@ -1,9 +1,10 @@
 # MAPPING.md — TS → Rust module mapping
 
 Per-module truth for the upstream `pi` → pir port. Current state and evidence:
-[`docs/STATUS.md`](docs/STATUS.md); feature contract: [`docs/FEATURES.md`](docs/FEATURES.md).
+[`RESULTS.md`](RESULTS.md); feature contract: [`docs/FEATURES.md`](docs/FEATURES.md).
 
-**Last verified: 2026-10-22**; later rows carry their own dates.
+**Last verified: 2026-11-01** (the 2026-11-01 doc-drift pass updated the
+audit-fixed rows below; other rows keep their original landing dates).
 
 ## Legend
 
@@ -20,18 +21,18 @@ any, is kept).
 | `src/protocol/` | `packages/protocol/src` | done | Strict CBOR, framing, codec; PROTOCOL_VERSION 8. |
 | `src/telemetry/` | `packages/telemetry/src` | done | Vendor-neutral core API: spans/links/status, counters/gauges/histograms, W3C `traceparent` propagation, `Telemetry` facade over `TelemetryRecorder`, `TestTelemetry`; OTel mapping in `src/telemetry/mod.rs`. AI path: `StreamOptions::telemetry` parents one `pi.ai.request` span per request, first-chunk/block events, duration/token metrics, trace headers at the provider boundary. No production exporter/backend ships in-tree (explicit N/A). Tests: `tests/suites/telemetry_core_w10.rs`, `ai_telemetry_w11.rs`. |
 | `src/durable/chord/` | `packages/chord/src` | n/a (delta subset kept) | Only the delta closure: `diff.rs` (`diff_revisions`/`diff_objects`/`overlap`) and `apply.rs` (`apply_immutable_trusted`); `src/durable/delta.rs` carries `Op`/`Seg`/`Path`. Full chord is deferred/N-A by user decision (2026-10-21); chord-lite is unscheduled. |
-| `src/ai/` | `packages/ai/src` | done | Core types, event stream, registry, bounded transport; OpenAI/Anthropic/Google SSE + responses/codex/azure/bedrock+SigV4/vertex/mistral adapters; thinking configs + retry classification; OAuth (9 flows); catalog **42 providers / 1,756 entries** (`ai_catalog_full_w10`). Shared `Arc<Context>` provider boundary; lazy message transforms; COW stream snapshots; bounded event stream (32, producer backpressure); structural `partial` mirror refresh. |
+| `src/ai/` | `packages/ai/src` | done | Core types, event stream, registry, bounded transport; OpenAI/Anthropic/Google SSE + responses/codex/azure/bedrock+SigV4/vertex/mistral adapters; thinking configs + retry classification; OAuth (9 flows); catalog **42 providers / 1,756 entries** (`ai_catalog_full_w10`). Shared `Arc<Context>` provider boundary; lazy message transforms; COW stream snapshots; bounded event stream (32, producer backpressure); structural `partial` mirror refresh. Session-scoped dynamic/OAuth overlays isolate parent/child provider resolution; native auth hooks stay process-wide last-wins. |
 | `src/agent/` | `packages/agent/src` | done | Tool abstraction, loop, batch scheduler, per-file mutation queues, cancellation, steering/follow-up; chained `message_end` replacement before persistence/preflight (`tests/suites/tool_repair.rs`); finishTurn/prepareRequest; nested-call depth cap 16. Background/detach: `background: true` is stripped by preflight and the call runs detached with its own AbortSignal (`tool_batch.rs`); detached calls do not join batch-degrade decisions. Degenerate-loop guard: 20 consecutive identical single-tool executions (`REPEAT_STREAK_STOP = 20`, name+canonical args+final result+is_error after `message_end`) synthesize a `StopReason::Error` terminal. Print/RPC/server and `AgentBuilder` default to 1,000 turns (`PIR_MAX_TURNS` only for the CLI hosts; raw `CreateAgentSessionOptions` stays at 100); the TUI stays at 100. Loop handoffs are `Arc`-shared (`AgentStart`/`TurnStart.context`, `LoopResult`, `AgentEnd.result`); `run_with_options_shared` returns the `Arc`. |
-| `src/agent_session/` | `packages/coding-agent/src/core` (AgentSession) | done | Headless facade over registry+tools+storage+compaction+loop; steeringMode/followUpMode (one-at-a-time); full session-control surface; `navigate_tree` summarization; AbortSignal backed by CancellationToken; copy-on-write history; single-consumer inbox; background tool-call registry (`background.rs`, limit 4 via `max_background_calls`, completion injects `backgroundToolResult` + `BackgroundToolEnd`; `abort_background`/`abort_all_background`/`background_calls`; Drop aborts in flight). `PI_TIMING` per-turn diagnostics + `last_run_diagnostics`. |
+| `src/agent_session/` | `packages/coding-agent/src/core` (AgentSession) | done | Headless facade over registry+tools+storage+compaction+loop; steeringMode/followUpMode (one-at-a-time); full session-control surface; `navigate_tree` summarization; AbortSignal backed by CancellationToken; copy-on-write history; single-consumer inbox; background tool-call registry (`background.rs`, limit 4 via `max_background_calls`, completion injects `backgroundToolResult` + `BackgroundToolEnd`; `abort_background`/`abort_all_background`/`background_calls`; Drop aborts in flight). `PI_TIMING` per-turn diagnostics + `last_run_diagnostics`. Session-event bridge installed for native-only / JS-only / mixed hosts; direct `agent_settled` / `entry_appended` / `session_info_changed` sites own both faces, and compaction hooks flush the bridge before direct compact events (`notifications.rs:108-158`, `plugins/host.rs:1654-1663`). |
 | `src/system_prompt.rs` | coding-agent core | done | Ordered section builder, XML wrapping, section diff. |
 | `src/skills.rs` | `core/skills.ts` | done | SKILL.md validation/discovery + `<available_skills>` XML; structured warnings/collision diagnostics; symlink-following discovery. |
 | `src/session_manager/` | `core/session-manager.ts` | done (rewritten for upstream interop) | On-disk version-3 JSONL (8-hex ids, 11 entry types, projection, `firstKeptEntryId`) shared with pi; old pir v4 files skipped, not migrated. Paged tail-first open (`open_paged` + `tail_page.rs`) keeps a bounded resident window, skipped prefix on disk. Stack-safe tree emission (`TreeChildren` iterative Drop, `to_value_iterative`/`forest_to_json_iterative`, `for_each_tree_row` + `TreeRowMeta`/`TreeScanStats`) works whole-session for both managers, streaming a paged prefix as row metadata; `json_depth.rs` has an iterative `Value`→text writer/teardown. Appends reuse one handle with per-line flush; fsync deferred to `sync_now()`/Drop; length re-check detects external deletion. Session listing is one pass per file with in-memory cwd filtering. |
 | `src/client/` | `packages/client/src` | done | TCP client, versioned hello, framed CBOR, timeouts; `reconnect()` + ReconnectPolicy + typed connection-state listeners + attach/subscription restore. |
 | `src/server/` | `packages/server/src` | done | TCP + Unix-socket presets, hello handshake, framed CBOR, snapshot; JSONL-persisted session hosting, multi-attach broadcast, draining with `server_draining`. |
-| `src/coding_agent/` | `packages/coding-agent/src` | done | Core tools with a persistent shell pool and runtime-death guards; bash/powershell export `PIR_BIN` and prepend its dir to `PATH`. Print/RPC/JSON hosts, upstream CLI contract, skills/prompt-template wiring, `--export` HTML, crash log, package manager, in-process grep/find, OpenAI-compat detect. `tools.commandTimeoutMs` (default 120000; `0` disables) caps foreground shells; 30 s no-output heartbeat; a busy pool member >5 s falls back to a fresh shell; print/RPC signals abort with 130/143/129. Tool lifecycle frames carry upstream `args`/`result` shapes. Security: `read`/`write`/`edit` re-establish confinement against open handles; spill files are owner-only and swept; remote write/edit is atomic; out-of-loop bash arms `ShellTreeKill`. Tests: `tools_security_w9`, `env_client_e2e`, `bash_tree_kill_prompt`. |
+| `src/coding_agent/` | `packages/coding-agent/src` | done | Core tools with a persistent shell pool and runtime-death guards; bash/powershell export `PIR_BIN` and prepend its dir to `PATH`. Print/RPC/JSON hosts, upstream CLI contract, skills/prompt-template wiring, `--export` HTML, crash log, package manager, in-process grep/find, OpenAI-compat detect. `tools.commandTimeoutMs` (default 120000; `0` disables) caps foreground shells; 30 s no-output heartbeat; a busy pool member >5 s falls back to a fresh shell; print/RPC signals abort with 130/143/129. Tool lifecycle frames carry upstream `args`/`result` shapes. Security: `read`/`write`/`edit` re-establish confinement against open handles; spill files are owner-only and swept; remote write/edit is atomic; out-of-loop bash arms `ShellTreeKill`. Print host lifecycle hooks now flow through the unified host (`print.rs:2848,3026,3491,3792,3713,3963,5581,5093,4827,4057`); limitations in `docs/hooks.md`. Tests: `tools_security_w9`, `env_client_e2e`, `bash_tree_kill_prompt`, `print_lifecycle_hooks`. |
 | `src/tui/` | `packages/tui/src` | done | ratatui/crossterm loop, multiline editor, unicode-safe width, markdown/diff streaming renderers, fuzzy autocomplete, keybindings, OKLCH/OKHSL themes, clipboard, dialogs, OSC 7501. Alt-screen viewport: scrollbar scrub/hover/jump-to-end, search box, right-click paste; windowed transcript + paged history; whole-history search (bounded backward walk, `tests/tui_search_whole_history.rs`); `/tree` streams without widening. Extension renderer/widget/footer/header callbacks run with async `ctx.ui` suppressed. Syntax highlighting (`tests/suites/tui_syntax_highlight.rs`); clipboard paste (`tui_clipboard_paste.rs`); settings diagnostics; native Shift+Enter; settings-routed `tui.altScreen.*` (`tui_gaps_w11.rs`). Steady-frame call lines and write preview memoized (`tests/tui_frame_reuse.rs`). |
-| `src/extensions/` | `core/extensions` | done | QuickJS (rquickjs + swc): full event surface, nested `ctx.executeTool`, dialogs, sessionManager, `registerProvider`/`registerVirtualModel`, `/reload`; npm resolution + CJS/ESM interop. Non-goals: libnode/node subprocess, native addons, stateful pi-tui components. Per-extension limits from GLOBAL `extensionLimits` + `PI_EXT_*`; `fs.watch` on notify with adaptive poll; scalar sessionManager getters read host fields; snapshot fingerprint-cached; builtin-only plans never start QuickJS (`tests/builtin_only_no_js.rs`). |
-| `src/plugins/` | upstream extension architecture | done | Unified `AgentPlugin` layer: Rust builtins + JS adapter share one registry with upstream conflict semantics. Builtins: `subagent`, `mcp` (rmcp 3.5 + OAuth; `builtinTools`/`exposure` resolution), `codemode` (worker process, thread fallback), `python`, `context-mode`, `tool-search`, `tool-repair` (native wins over JS), `todo` (contract in `docs/todo-builtin.md`). MCP connects single-flight; loader default-disables `@malinamnam/pi-phone` (global opt-in or explicit `-e`), native `phone` builtin default-off; codemode live-worker cap 2 (third queues); deterministic tool_search ordering; subagent description from the resolved agent dir. Tests: `plugins_w11`. |
+| `src/extensions/` | `core/extensions` | done | QuickJS (rquickjs + swc): full event surface, nested `ctx.executeTool`, dialogs, sessionManager, `registerProvider`/`registerVirtualModel`, `/reload`; npm resolution + CJS/ESM interop. `pi.events` is JS-runtime-only; native `EventService` is not bridged. Non-goals: libnode/node subprocess, native addons, stateful pi-tui components. Per-extension limits from GLOBAL `extensionLimits` + `PI_EXT_*`; `fs.watch` on notify with adaptive poll; scalar sessionManager getters read host fields; snapshot fingerprint-cached; builtin-only plans never start QuickJS (`tests/builtin_only_no_js.rs`). |
+| `src/plugins/` | upstream extension architecture | done | Unified `AgentPlugin` layer: Rust builtins + JS adapter share one ordered dispatch (`PluginHost::emit`, with `emit_native` where the JS face has its own lifecycle) and typed `PluginEventOutcome` merging (`plugins/merge.rs`). `ProviderService::register_provider_impl` is the typed native provider path; runtime JSON remains declarative-only. Builtins: `subagent`, `mcp` (rmcp 3.5 + OAuth; `builtinTools`/`exposure` resolution), `codemode` (worker process, thread fallback), `python`, `context-mode`, `tool-search`, `tool-repair` (native wins over JS), `todo` (contract in `docs/todo-builtin.md`). MCP connects single-flight; loader default-disables `@malinamnam/pi-phone` (global opt-in or explicit `-e`), native `phone` builtin default-off; codemode live-worker cap 2 (third queues); deterministic tool_search ordering; subagent description from the resolved agent dir. Tests: `plugins_w11`. |
 | `src/config/` (settings) | `core/settings-manager.ts` + schema/defaults | done | Full settings surface (all fields, deep merge, locked persistence, 4 migrations), trust.json + project trust, models.json `$ENV`/`!cmd` templates, keybindings/models-store/theme schemas in `schemas/`, model resolution order, `deny_unknown_fields` on MCP server config. `mcp.json` loader: upstream wrapper + legacy flat shape, `autoEnableCodemode`, pir-specific `builtinTools` (default `true`; `false` restores upstream codemode default; explicit exposure overrides win). |
 | `src/sdk/` | `core/sdk.ts` + `packages/agent/src/agent.ts` | done | `AgentBuilder` → cheap-clone `Agent` → typed `SdkEvent` stream (`#[non_exhaustive]`, bounded backpressure); typed `SdkError`, no anyhow leakage; doctests on every public item; examples in `examples/`. Full reference: `docs/sdk.md`. |
 | `src/compaction/` | `core/compaction` | done | Upstream algorithm at HEAD semantics (projected cut points, split-turn, checkpoint prompts; estimate prefix-timestamp guard) + branch summarization (prompts verbatim). |
@@ -60,6 +61,33 @@ authoritative.
 Current decisions only; superseded/landed items were removed in the 2026-10-29
 cleanup (their landing points are frozen in code and tests).
 
+Closed by the 2026-11-01 audit pass (no longer deviations):
+
+- **Plugin dispatch** — `PluginHost::emit` walks one ordered list (native
+  plugins + the JS adapter once); typed `PluginEventOutcome`s merge with
+  upstream semantics, including `SessionBeforeCompact`'s replacement
+  (`plugins/host.rs:1687`, `plugins/merge.rs:1-24`, `plugins/plugin.rs:130-145`).
+- **Print hooks** — `pir print` now wires `session_start`,
+  `resources_discover`, per-prompt `input`, `before_agent_start`, `turn_end`,
+  `agent_before_settle`, threshold `session_before_compact` /
+  `session_compact` / `session_compact_failed`, and `agent_settled`
+  (`coding_agent/print.rs:2848,3026,3491,3792,3713,3963,5581,5093,4827,4057`;
+  `tests/print_lifecycle_hooks.rs`, 17/17).
+- **Native providers** — `ProviderService::register_provider_impl` installs a
+  typed plugin-owned provider; the runtime JSON path is declarative-only
+  (`models` / `baseUrl` / `api` / `headers` / `authHeader`), and native auth
+  hooks remain process-wide last-wins (`plugin_services.rs:2934-2961`,
+  `providers.rs:2575-2652`, `plugins/services/mod.rs:1786`).
+- **Event bridge** — installed for native-only, JS-only and mixed hosts; the
+  direct `agent_settled` / `entry_appended` / `session_info_changed` sites own
+  both faces and the bridge skips them; compaction hooks flush the bridge
+  first (`notifications.rs:108-158`, `plugins/host.rs:1654-1663`).
+- **SNAP provider overlay** — TUI `/login`, `/model` refresh and `/share`
+  resolve through the session-scoped provider/OAuth overlay;
+  `login_provider` / `refresh_provider_models` / `get_auth_for_session` have
+  production callers (`providers.rs:1321,1342,1356,1370,1393`;
+  `.audit/fix/lane-snap10.md`).
+
 ### Deliberate absences
 
 - **/llama router extension** — bundles an external llama.cpp server → not ported.
@@ -85,7 +113,7 @@ cleanup (their landing points are frozen in code and tests).
 
 - **OSC 7501 / OSC 11** — crossterm swallows bare replies; both degrade to unsupported by default; `PI_PROGRAM_STATUS=1` and the pre-event-loop theme read force enable.
 - **terminal image protocols** — halfblocks only (default-off feature); no kitty/iterm2 probing.
-- **ctx.ui chrome** — `setFooter`/`setHeader`/`setWorkingIndicator`/`setHiddenThinkingLabel`/`ui.custom` are no-op shims; `setWidget` lacks placement/frames options.
+- **ctx.ui chrome** — `setFooter`/`setHeader` are wired through native bar factories; `setWorkingIndicator` / `setHiddenThinkingLabel` are implemented; `ctx.ui.custom` is hosted as a real TUI overlay (`prelude.js.txt:695`, `plugin_services.rs:2333`, `:2011`). `setEditorComponent` remains bookkeeping-only, and `setWidget` supports static/factory above/below slots.
 - **CLI cosmetics** — `--version` shape and hand-written help sections differ cosmetically; `-p ---foo` parses differently (clap).
 - **extensions/api/prelude.rs** — one byte-frozen JS asset, not split into modules.
 - **syntax highlighting** — TUI half is ported; export HTML remains a static, script-free subset (`export_html.rs`).
@@ -97,5 +125,5 @@ cleanup (their landing points are frozen in code and tests).
 
 Q1–Q10, G1–G11 and the 2026-10-10 alignment waves are closed; landing points
 and tests are frozen in code. Historical ledgers were removed in the
-2026-10-28/29 cleanup. Current evidence: [`docs/STATUS.md`](docs/STATUS.md) and
+2026-10-28/29 cleanup. Current evidence: [`RESULTS.md`](RESULTS.md) and
 `logs/acc-final/` (the old `logs/phase2/` ledger was removed in the docs cleanup).

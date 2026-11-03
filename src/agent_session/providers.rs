@@ -62,6 +62,1199 @@ fn refresh_models_due(scope: usize, id: &str, fingerprint: u64) -> bool {
     }
 }
 
+/// Last successful provider-definition sync for one `(ProviderRegistry,
+/// AgentSession)` pair: the resolved definition-set fingerprint, the model
+/// content each definition installed, and the exact provider allocations this
+/// session left in the dynamic map. When all still match,
+/// [`AgentSession::sync_plugin_providers`] returns without rebuilding the
+/// dynamic provider `Arc`s (P2-新-1): re-registering an unchanged definition
+/// used to replace every provider allocation on every prompt, which in turn
+/// invalidated the session catalog fingerprint by address.
+///
+/// The key carries the SESSION identity in addition to
+/// `ProviderRegistry::refresh_scope_id()`: a subagent child shares the
+/// parent's `Arc<ProviderRegistry>` (and therefore its scope id) but installs
+/// its own `extension_api_keys` and OAuth wrappers in `sync_plugin_providers`.
+/// A registry-only stamp let the child's first sync short-circuit on the
+/// parent's stamp, silently leaving the child without its plugin API keys.
+struct ProviderSyncStamp {
+    /// Weak registry identity: a dead registry's stamp is pruned on the next
+    /// insert instead of accumulating for every registry in the process.
+    registry: std::sync::Weak<ProviderRegistry>,
+    /// Weak session identity (the second half of the map key). Kept separate
+    /// from the registry weak: a child session dies while the parent's shared
+    /// registry (and its other stamps) stays alive, and must still be pruned.
+    session: std::sync::Weak<std::sync::atomic::AtomicU8>,
+    definitions: u64,
+    /// `(provider id, installed model list hash)` in definition order. A
+    /// runtime registration that replaced or removed a provider between two
+    /// syncs changes this, so the fast path cannot hide an external update.
+    models: Vec<(String, u64)>,
+    /// Whether this stamp came from a fully-applied, non-live pass and may be
+    /// used to skip the next sync. Cleanup-only stamps (written by a live or
+    /// partially-applied pass solely to record `installed` for child
+    /// teardown) are always `false`, so they can never short-circuit.
+    fast_path: bool,
+    /// The exact dynamic provider allocation this session installed for each
+    /// definition, as `Weak`s, plus the entry the installation displaced. A
+    /// shared `ProviderRegistry` lets a subagent child overwrite the parent's
+    /// entries (and vice versa); comparing only definitions/models would keep
+    /// the parent's fast path green while its `OAuthFlowOverlay` still points
+    /// at the child's extension handle. The `Weak` does not extend provider
+    /// lifetimes (SNAP4 P2-新-1).
+    installed: Vec<(String, ProviderInstallation)>,
+}
+
+/// One dynamic provider a session installed, plus the chain of entries the
+/// installation displaced (nearest first).
+///
+/// `previous` is a STRONG reference chain on purpose: the parent provider is
+/// no longer in the shared map once the child overwrote it, so only this
+/// record keeps the exact allocation alive for the child-teardown restore
+/// (SNAP6 P1-1). The provider itself only holds weak runtime bindings
+/// (SNAP4), so the extra strong reference cannot pin the parent's extension
+/// runtime.
+///
+/// Each node records the session that owned it (when its installation could
+/// be found in a live stamp). Teardown walks the chain and skips nodes whose
+/// owner has torn down, so two parallel children that finish out of order
+/// restore the live parent instead of re-installing the already-finished
+/// sibling's wrapper (SNAP7 P2-3).
+#[derive(Clone)]
+struct ProviderInstallation {
+    installed: std::sync::Weak<dyn crate::ai::provider::Provider>,
+    previous: Vec<PreviousProvider>,
+}
+
+/// One displaced dynamic entry in a [`ProviderInstallation`] restore chain.
+#[derive(Clone)]
+pub(crate) struct PreviousProvider {
+    provider: crate::ai::provider::ProviderBox,
+    /// The installation that owned `provider`, when known. `None` means the
+    /// entry did not belong to any tracked session or live native binding when
+    /// it was displaced (e.g. an external/static-overlay registration), so it
+    /// has no teardown that could invalidate it.
+    owner: Option<PreviousInstallationOwner>,
+}
+
+/// Who installed one displaced entry (SNAP7's owner/liveness stamp, extended
+/// with the native `ProviderService` binding token the PROVIDER3 lane needs
+/// for runtime JSON/JSON-backed virtual registrations).
+#[derive(Clone)]
+enum PreviousInstallationOwner {
+    /// A session's provider-sync pass.
+    Session {
+        key: ProviderSyncStampKey,
+        session: std::sync::Weak<std::sync::atomic::AtomicU8>,
+    },
+    /// A live [`crate::plugins::services::ProviderService`] binding, which
+    /// records its own dynamic installs in [`native_dynamic_installations`].
+    Binding {
+        scope: u64,
+        binding: std::sync::Weak<std::sync::atomic::AtomicU8>,
+    },
+}
+
+/// One live native runtime-JSON provider installation: the exact allocation
+/// this binding owns, its liveness token, and the restore chain it displaced.
+/// Mirrors the session stamp's `installed` record so a parent/sibling native
+/// service can be recognized as the owner of an entry it installed (SNAP7
+/// P2-S7-2: a native registration used to look like `owner=None`, i.e.
+/// permanently live).
+struct NativeDynamicInstallation {
+    installed: std::sync::Weak<dyn crate::ai::provider::Provider>,
+    owner: std::sync::Weak<std::sync::atomic::AtomicU8>,
+    previous: Vec<PreviousProvider>,
+}
+
+type NativeDynamicKey = (u64, String, usize);
+type NativeDynamicInstallations =
+    std::sync::Mutex<std::collections::HashMap<NativeDynamicKey, NativeDynamicInstallation>>;
+
+fn native_dynamic_installations() -> &'static NativeDynamicInstallations {
+    static INSTALLATIONS: std::sync::OnceLock<NativeDynamicInstallations> =
+        std::sync::OnceLock::new();
+    INSTALLATIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn retain_live_native_dynamic_installations(
+    installations: &mut std::collections::HashMap<NativeDynamicKey, NativeDynamicInstallation>,
+) {
+    installations.retain(|_, installation| installation.owner.strong_count() > 0);
+}
+
+/// One virtual-model installation installed by a native binding. The route
+/// callback is part of the entry: `VirtualModelRegistry::register` does not
+/// touch callbacks, so restoring only the registration would leave a dead
+/// owner's callback routing live requests.
+#[derive(Clone)]
+pub(crate) struct PreviousVirtualModel {
+    pub(crate) registration: crate::ai::virtual_::VirtualModelRegistration,
+    pub(crate) route: Option<crate::ai::virtual_::VirtualRouteFn>,
+    owner: Option<PreviousInstallationOwner>,
+}
+
+struct NativeVirtualModelInstallation {
+    owner: std::sync::Weak<std::sync::atomic::AtomicU8>,
+    registration: crate::ai::virtual_::VirtualModelRegistration,
+    previous: Vec<PreviousVirtualModel>,
+}
+
+type NativeVirtualModelKey = (u64, String, String, usize);
+type NativeVirtualModelInstallations = std::sync::Mutex<
+    std::collections::HashMap<NativeVirtualModelKey, NativeVirtualModelInstallation>,
+>;
+
+fn native_virtual_model_installations() -> &'static NativeVirtualModelInstallations {
+    static INSTALLATIONS: std::sync::OnceLock<NativeVirtualModelInstallations> =
+        std::sync::OnceLock::new();
+    INSTALLATIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn retain_live_native_virtual_model_installations(
+    installations: &mut std::collections::HashMap<
+        NativeVirtualModelKey,
+        NativeVirtualModelInstallation,
+    >,
+) {
+    installations.retain(|_, installation| installation.owner.strong_count() > 0);
+}
+
+type ProviderSyncStampKey = (u64, usize);
+type ProviderSyncStamps =
+    std::sync::Mutex<std::collections::HashMap<ProviderSyncStampKey, ProviderSyncStamp>>;
+
+fn provider_sync_stamps() -> &'static ProviderSyncStamps {
+    static STAMPS: std::sync::OnceLock<ProviderSyncStamps> = std::sync::OnceLock::new();
+    STAMPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Process-unique identity of THIS session (never of its provider registry).
+/// `session_state` is a per-`AgentSession` `Arc` created by the build and
+/// never replaced; unlike `session_id` it exists for ephemeral sessions
+/// (including the subagent child) too.
+fn provider_sync_session_identity(session: &AgentSession) -> usize {
+    std::sync::Arc::as_ptr(&session.session_state) as usize
+}
+
+fn provider_sync_session_handle(
+    session: &AgentSession,
+) -> std::sync::Weak<std::sync::atomic::AtomicU8> {
+    std::sync::Arc::downgrade(&session.session_state)
+}
+
+impl AgentSession {
+    /// This session's provider-resolution identity inside its registry
+    /// (SNAP8 P2-1). Shared by provider sync, `/login`, credential refresh and
+    /// request dispatch so all four consult the same per-session overlay.
+    pub(crate) fn provider_session_key(&self) -> crate::ai::provider::ProviderSessionKey {
+        crate::ai::provider::ProviderSessionKey::new(
+            self.registry.refresh_scope_id(),
+            &self.session_state,
+        )
+    }
+
+    /// Test seam: the key a test passes to the session-scoped registry
+    /// lookups/`/login`/refresh entry points.
+    #[doc(hidden)]
+    pub fn provider_session_key_for_test(&self) -> crate::ai::provider::ProviderSessionKey {
+        self.provider_session_key()
+    }
+
+    /// Session-scoped completion callback for compaction runs driven from the
+    /// prompt loop. The legacy callback calls
+    /// `ProviderRegistry::stream_resolving_auth` without a session, so while a
+    /// subagent child is alive the parent's threshold/overflow compaction can
+    /// resolve the child's provider (and API key/runtime). This variant keeps
+    /// the same request options but resolves the provider and credential
+    /// through THIS session's overlay (SNAP9 P2-S8-4).
+    pub(super) fn complete_fn_session_scoped(&self) -> Arc<crate::compaction::CompleteFn> {
+        let signal = self
+            .signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        self.complete_fn_for_signal_session_scoped(&self.current_model(), signal)
+    }
+
+    /// [`Self::complete_fn_session_scoped`] against an explicit model (the
+    /// routed model of a virtual selection). `signal` is the compaction or
+    /// branch-summary abort signal, carried on the same request options the
+    /// legacy path uses.
+    pub(super) fn complete_fn_for_signal_session_scoped(
+        &self,
+        model: &Model,
+        signal: AbortSignal,
+    ) -> Arc<crate::compaction::CompleteFn> {
+        let options = self.stream_options_with_actor_hooks(model, Some(signal), true);
+        self.complete_closure_session_scoped(
+            model,
+            options,
+            "summarization stream did not terminate",
+        )
+    }
+
+    /// Session-scoped `ctx.modelRegistry.complete` host op. Same
+    /// `actor_hooks: false` contract as
+    /// [`Self::stream_options_with_actor_hooks`](crate::agent_session::stream):
+    /// the call runs inside the extension actor, so inline provider hooks
+    /// would re-enter it.
+    pub(super) fn complete_fn_for_host_op_session_scoped(
+        &self,
+        model: &Model,
+    ) -> Arc<crate::compaction::CompleteFn> {
+        let options = self.stream_options_with_actor_hooks(model, None, false);
+        self.complete_closure_session_scoped(model, options, "completion stream did not terminate")
+    }
+
+    /// Shared tail of the session-scoped completion callbacks: stream through
+    /// `stream_resolving_auth_for(Some(session))` so provider/credential
+    /// resolution never falls back to the process-shared last writer.
+    fn complete_closure_session_scoped(
+        &self,
+        model: &Model,
+        options: StreamOptions,
+        missing_message: &'static str,
+    ) -> Arc<crate::compaction::CompleteFn> {
+        let registry = Arc::clone(&self.registry);
+        let session_key = self.provider_session_key();
+        let model = model.clone();
+        Arc::new(Box::new(move |context| {
+            let registry = Arc::clone(&registry);
+            let session_key = session_key.clone();
+            let model = model.clone();
+            let options = options.clone();
+            Box::pin(async move {
+                let stream =
+                    registry.stream_resolving_auth_for(Some(&session_key), model, context, options);
+                // Completion consumer: drain while waiting. With the bounded
+                // event queue, a consumer that never pops an event parks the
+                // provider producer forever (`drain_and_result` discards the
+                // events this caller will never read).
+                match stream.drain_and_result().await {
+                    Some(message) => Ok((*message).clone()),
+                    None => Err(missing_message.to_owned()),
+                }
+            })
+        }))
+    }
+}
+
+/// Registry-backed stream callback scoped to one session (SNAP8 P2-1).
+///
+/// Mirrors [`crate::agent_session::events::registry_event_stream`] but
+/// resolves the provider (and any OAuth credential refresh) through
+/// `session_key`'s overlay first, so a subagent child sharing the registry
+/// cannot redirect the parent's in-flight model request to its own extension
+/// runtime.
+pub(super) fn session_registry_event_stream(
+    registry: Arc<ProviderRegistry>,
+    session_key: crate::ai::provider::ProviderSessionKey,
+    model: crate::ai::types::Model,
+    options: crate::ai::types::StreamOptions,
+) -> EventStreamFn {
+    let base_thinking = options
+        .reasoning
+        .unwrap_or(crate::ai::types::ThinkingLevel::Off);
+    Box::new(move |request: ProviderRequest| {
+        let model = request.model.unwrap_or_else(|| model.clone());
+        let mut options = options.clone();
+        if request.thinking_level != base_thinking {
+            options.reasoning = Some(request.thinking_level);
+        }
+        let context = crate::agent::agent_loop::context_into_owned(request.context);
+        let stream =
+            registry.stream_resolving_auth_for(Some(&session_key), model, context, options);
+        Box::pin(async move { stream })
+    })
+}
+
+fn retain_live_provider_sync_stamps(
+    stamps: &mut std::collections::HashMap<ProviderSyncStampKey, ProviderSyncStamp>,
+) {
+    stamps.retain(|_, stamp| stamp.registry.strong_count() > 0 && stamp.session.strong_count() > 0);
+}
+
+/// Find the live installation that currently claims `provider` for `id` in
+/// this registry scope: its owner (session stamp or native binding token) and
+/// the restore chain that installation recorded.
+fn provider_installation_owner(
+    scope: u64,
+    id: &str,
+    provider: &crate::ai::provider::ProviderBox,
+) -> Option<(PreviousInstallationOwner, Vec<PreviousProvider>)> {
+    let session_owner = {
+        let mut stamps = provider_sync_stamps()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retain_live_provider_sync_stamps(&mut stamps);
+        stamps
+            .iter()
+            .filter(|((stamp_scope, _), _)| *stamp_scope == scope)
+            .find_map(|(key, stamp)| {
+                stamp
+                    .installed
+                    .iter()
+                    .find_map(|(installed_id, installation)| {
+                        (installed_id == id
+                            && installation.installed.upgrade().is_some_and(|installed| {
+                                std::sync::Arc::ptr_eq(&installed, provider)
+                            }))
+                        .then(|| {
+                            (
+                                PreviousInstallationOwner::Session {
+                                    key: *key,
+                                    session: stamp.session.clone(),
+                                },
+                                installation.previous.clone(),
+                            )
+                        })
+                    })
+            })
+    };
+    if session_owner.is_some() {
+        return session_owner;
+    }
+    native_dynamic_installation_owner(scope, id, provider)
+}
+
+/// The native `ProviderService` installation that claims `provider` for `id`.
+fn native_dynamic_installation_owner(
+    scope: u64,
+    id: &str,
+    provider: &crate::ai::provider::ProviderBox,
+) -> Option<(PreviousInstallationOwner, Vec<PreviousProvider>)> {
+    let mut installations = native_dynamic_installations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    retain_live_native_dynamic_installations(&mut installations);
+    installations.iter().find_map(
+        |((installed_scope, installed_id, binding_ptr), installation)| {
+            if *installed_scope != scope || installed_id != id {
+                return None;
+            }
+            let installed = installation.installed.upgrade()?;
+            if !std::sync::Arc::ptr_eq(&installed, provider) {
+                return None;
+            }
+            let binding = installation.owner.upgrade()?;
+            if std::sync::Arc::as_ptr(&binding) as usize != *binding_ptr {
+                return None;
+            }
+            Some((
+                PreviousInstallationOwner::Binding {
+                    scope,
+                    binding: installation.owner.clone(),
+                },
+                installation.previous.clone(),
+            ))
+        },
+    )
+}
+
+/// Build the restore chain for one displaced dynamic entry: the entry itself
+/// when a live session stamp or native binding claims it, followed by that
+/// installation's own chain. Entries installed by the current session are
+/// dropped (a session must never restore its own stale wrapper); the older
+/// entries they displaced are kept.
+fn provider_previous_chain(
+    scope: u64,
+    session: usize,
+    id: &str,
+    displaced: &crate::ai::provider::ProviderBox,
+) -> Vec<PreviousProvider> {
+    let mut chain = Vec::new();
+    match provider_installation_owner(scope, id, displaced) {
+        Some((owner, nested)) => {
+            chain.push(PreviousProvider {
+                provider: displaced.clone(),
+                owner: Some(owner),
+            });
+            chain.extend(nested);
+        }
+        None => chain.push(PreviousProvider {
+            provider: displaced.clone(),
+            owner: None,
+        }),
+    }
+    chain.retain(|entry| {
+        entry
+            .owner
+            .as_ref()
+            .is_none_or(|owner| !owner.belongs_to_session(session))
+    });
+    dedup_provider_chain(chain)
+}
+
+fn dedup_provider_chain(chain: Vec<PreviousProvider>) -> Vec<PreviousProvider> {
+    let mut deduped: Vec<PreviousProvider> = Vec::with_capacity(chain.len());
+    for entry in chain {
+        if deduped
+            .iter()
+            .any(|existing| std::sync::Arc::ptr_eq(&existing.provider, &entry.provider))
+        {
+            continue;
+        }
+        deduped.push(entry);
+    }
+    deduped
+}
+
+/// Build the restore chain for one entry displaced by a NATIVE binding's
+/// runtime registration. Re-registering the same id from the same binding
+/// keeps the chain recorded by its FIRST installation, so teardown can never
+/// unwind into a dead intermediate the binding itself installed.
+pub(crate) fn native_dynamic_previous_chain(
+    registry: &ProviderRegistry,
+    binding: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    id: &str,
+    displaced: Option<&crate::ai::provider::ProviderBox>,
+) -> Vec<PreviousProvider> {
+    let Some(displaced) = displaced else {
+        return Vec::new();
+    };
+    let scope = registry.refresh_scope_id();
+    let binding_ptr = std::sync::Arc::as_ptr(binding) as usize;
+    {
+        let mut installations = native_dynamic_installations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retain_live_native_dynamic_installations(&mut installations);
+        if let Some(installation) = installations.get(&(scope, id.to_owned(), binding_ptr)) {
+            if installation
+                .installed
+                .upgrade()
+                .is_some_and(|installed| std::sync::Arc::ptr_eq(&installed, displaced))
+            {
+                return installation.previous.clone();
+            }
+        }
+    }
+    let mut chain = Vec::new();
+    match provider_installation_owner(scope, id, displaced) {
+        Some((owner, nested)) => {
+            chain.push(PreviousProvider {
+                provider: displaced.clone(),
+                owner: Some(owner),
+            });
+            chain.extend(nested);
+        }
+        None => chain.push(PreviousProvider {
+            provider: displaced.clone(),
+            owner: None,
+        }),
+    }
+    chain.retain(|entry| {
+        entry
+            .owner
+            .as_ref()
+            .is_none_or(|owner| !owner.belongs_to_binding(scope, binding_ptr))
+    });
+    dedup_provider_chain(chain)
+}
+
+/// Record (or replace) one native binding's runtime-JSON installation. The
+/// chain doubles as the cross-binding ownership ledger consulted by another
+/// native service's [`native_dynamic_previous_chain`].
+pub(crate) fn record_native_dynamic_installation(
+    registry: &ProviderRegistry,
+    binding: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    id: &str,
+    installed: std::sync::Weak<dyn crate::ai::provider::Provider>,
+    previous: Vec<PreviousProvider>,
+) {
+    let scope = registry.refresh_scope_id();
+    let binding_ptr = std::sync::Arc::as_ptr(binding) as usize;
+    let mut installations = native_dynamic_installations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    retain_live_native_dynamic_installations(&mut installations);
+    installations.insert(
+        (scope, id.to_owned(), binding_ptr),
+        NativeDynamicInstallation {
+            installed,
+            owner: std::sync::Arc::downgrade(binding),
+            previous,
+        },
+    );
+}
+
+/// Drop one native binding's ownership record (teardown decided the dynamic
+/// entry; the restore itself is identity-checked by the registry).
+pub(crate) fn forget_native_dynamic_installation(
+    registry: &ProviderRegistry,
+    binding: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    id: &str,
+) {
+    let scope = registry.refresh_scope_id();
+    let binding_ptr = std::sync::Arc::as_ptr(binding) as usize;
+    let mut installations = native_dynamic_installations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    installations.remove(&(scope, id.to_owned(), binding_ptr));
+    retain_live_native_dynamic_installations(&mut installations);
+}
+
+/// Remove every JSON/virtual ownership record of one binding (defensive Drop
+/// sweep; the per-entry restore paths already remove their own records).
+pub(crate) fn forget_native_binding_installations(
+    registry: &ProviderRegistry,
+    binding: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+) {
+    let scope = registry.refresh_scope_id();
+    let binding_ptr = std::sync::Arc::as_ptr(binding) as usize;
+    {
+        let mut installations = native_dynamic_installations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        installations.retain(|(record_scope, _, record_binding), _| {
+            *record_scope != scope || *record_binding != binding_ptr
+        });
+        retain_live_native_dynamic_installations(&mut installations);
+    }
+    {
+        let mut installations = native_virtual_model_installations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        installations.retain(|(record_scope, _, _, record_binding), _| {
+            *record_scope != scope || *record_binding != binding_ptr
+        });
+        retain_live_native_virtual_model_installations(&mut installations);
+    }
+}
+
+impl PreviousInstallationOwner {
+    /// Whether this chain node may still be installed: its session/binding is
+    /// alive AND its installation record still claims this exact allocation.
+    /// A sibling that finished first removed its record (and its liveness
+    /// token dies with the child), so the restore walk continues to the next
+    /// parent entry instead of resurrecting the finished sibling.
+    fn is_live(&self, id: &str, provider: &crate::ai::provider::ProviderBox) -> bool {
+        match self {
+            Self::Session { key, session } => {
+                if session.strong_count() == 0 {
+                    return false;
+                }
+                let mut stamps = provider_sync_stamps()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                retain_live_provider_sync_stamps(&mut stamps);
+                stamps.get(key).is_some_and(|stamp| {
+                    stamp.installed.iter().any(|(installed_id, installation)| {
+                        installed_id == id
+                            && installation.installed.upgrade().is_some_and(|installed| {
+                                std::sync::Arc::ptr_eq(&installed, provider)
+                            })
+                    })
+                })
+            }
+            Self::Binding { scope, binding } => {
+                if binding.strong_count() == 0 {
+                    return false;
+                }
+                native_dynamic_installation_owner(*scope, id, provider)
+                    .is_some_and(|(owner, _)| owner.is_same_binding(*scope, binding))
+            }
+        }
+    }
+
+    fn belongs_to_session(&self, session: usize) -> bool {
+        matches!(self, Self::Session { key, .. } if key.1 == session)
+    }
+
+    fn belongs_to_binding(&self, scope: u64, binding: usize) -> bool {
+        matches!(
+            self,
+            Self::Binding {
+                scope: owner_scope,
+                binding: owner_binding,
+            } if *owner_scope == scope
+                && owner_binding.strong_count() > 0
+                && owner_binding.as_ptr() as usize == binding
+        )
+    }
+
+    fn is_same_binding(
+        &self,
+        scope: u64,
+        binding: &std::sync::Weak<std::sync::atomic::AtomicU8>,
+    ) -> bool {
+        match self {
+            Self::Binding {
+                scope: owner_scope,
+                binding: owner_binding,
+            } => *owner_scope == scope && owner_binding.ptr_eq(binding),
+            Self::Session { .. } => false,
+        }
+    }
+
+    /// Virtual registrations have no provider allocation; liveness re-checks
+    /// the owner's recorded registration (and route callback identity) so a
+    /// re-registration by the same binding invalidates its older chain node.
+    fn is_live_virtual(
+        &self,
+        provider: &str,
+        id: &str,
+        registration: &crate::ai::virtual_::VirtualModelRegistration,
+        route: &Option<crate::ai::virtual_::VirtualRouteFn>,
+    ) -> bool {
+        match self {
+            Self::Session { session, .. } => {
+                // Session-bound virtual registrations are tracked only when a
+                // native binding installs them; a bare session owner means
+                // the session still exists.
+                session.strong_count() > 0
+            }
+            Self::Binding { scope, binding } => {
+                if binding.strong_count() == 0 {
+                    return false;
+                }
+                native_virtual_model_installation_owner(*scope, provider, id, registration, route)
+                    .is_some_and(|(owner, _)| owner.is_same_binding(*scope, binding))
+            }
+        }
+    }
+}
+
+fn native_virtual_model_installation_owner(
+    scope: u64,
+    provider: &str,
+    id: &str,
+    registration: &crate::ai::virtual_::VirtualModelRegistration,
+    route: &Option<crate::ai::virtual_::VirtualRouteFn>,
+) -> Option<(PreviousInstallationOwner, Vec<PreviousVirtualModel>)> {
+    let mut installations = native_virtual_model_installations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    retain_live_native_virtual_model_installations(&mut installations);
+    installations.iter().find_map(
+        |((installed_scope, installed_provider, installed_id, binding_ptr), installation)| {
+            if *installed_scope != scope
+                || installed_provider != provider
+                || installed_id != id
+                || &installation.registration != registration
+            {
+                return None;
+            }
+            let binding = installation.owner.upgrade()?;
+            if std::sync::Arc::as_ptr(&binding) as usize != *binding_ptr {
+                return None;
+            }
+            // The registration carries this binding's `native-plugin:<id>`
+            // source, so it identifies the installer even when a caller
+            // installed/replaced the route callback out-of-band.
+            let _ = route;
+            Some((
+                PreviousInstallationOwner::Binding {
+                    scope,
+                    binding: installation.owner.clone(),
+                },
+                installation.previous.clone(),
+            ))
+        },
+    )
+}
+
+fn same_virtual_route(
+    left: &Option<crate::ai::virtual_::VirtualRouteFn>,
+    right: &Option<crate::ai::virtual_::VirtualRouteFn>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+        _ => false,
+    }
+}
+
+/// Build the restore chain for one virtual-model entry displaced by a NATIVE
+/// binding. Re-registering the same key from the same binding keeps the
+/// original chain (the ledger record's registration matches the displaced
+/// value).
+pub(crate) fn native_virtual_previous_chain(
+    registry: &ProviderRegistry,
+    binding: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    provider: &str,
+    id: &str,
+    displaced: Option<&crate::ai::virtual_::VirtualModelRegistration>,
+    displaced_route: Option<&crate::ai::virtual_::VirtualRouteFn>,
+) -> Vec<PreviousVirtualModel> {
+    let Some(displaced) = displaced else {
+        return Vec::new();
+    };
+    let scope = registry.refresh_scope_id();
+    let binding_ptr = std::sync::Arc::as_ptr(binding) as usize;
+    let route = displaced_route.cloned();
+    {
+        let mut installations = native_virtual_model_installations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retain_live_native_virtual_model_installations(&mut installations);
+        if let Some(installation) =
+            installations.get(&(scope, provider.to_owned(), id.to_owned(), binding_ptr))
+        {
+            if &installation.registration == displaced {
+                return installation.previous.clone();
+            }
+        }
+    }
+    let mut chain = Vec::new();
+    match native_virtual_model_installation_owner(scope, provider, id, displaced, &route) {
+        Some((owner, nested)) => {
+            chain.push(PreviousVirtualModel {
+                registration: displaced.clone(),
+                route,
+                owner: Some(owner),
+            });
+            chain.extend(nested);
+        }
+        None => chain.push(PreviousVirtualModel {
+            registration: displaced.clone(),
+            route,
+            owner: None,
+        }),
+    }
+    chain.retain(|entry| {
+        entry
+            .owner
+            .as_ref()
+            .is_none_or(|owner| !owner.belongs_to_binding(scope, binding_ptr))
+    });
+    dedup_virtual_chain(chain)
+}
+
+fn dedup_virtual_chain(chain: Vec<PreviousVirtualModel>) -> Vec<PreviousVirtualModel> {
+    let mut deduped: Vec<PreviousVirtualModel> = Vec::with_capacity(chain.len());
+    for entry in chain {
+        if deduped.iter().any(|existing| {
+            existing.registration == entry.registration
+                && same_virtual_route(&existing.route, &entry.route)
+        }) {
+            continue;
+        }
+        deduped.push(entry);
+    }
+    deduped
+}
+
+pub(crate) fn record_native_virtual_installation(
+    registry: &ProviderRegistry,
+    binding: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    provider: &str,
+    id: &str,
+    registration: crate::ai::virtual_::VirtualModelRegistration,
+    previous: Vec<PreviousVirtualModel>,
+) {
+    let scope = registry.refresh_scope_id();
+    let binding_ptr = std::sync::Arc::as_ptr(binding) as usize;
+    let mut installations = native_virtual_model_installations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    retain_live_native_virtual_model_installations(&mut installations);
+    installations.insert(
+        (scope, provider.to_owned(), id.to_owned(), binding_ptr),
+        NativeVirtualModelInstallation {
+            owner: std::sync::Arc::downgrade(binding),
+            registration,
+            previous,
+        },
+    );
+}
+
+pub(crate) fn forget_native_virtual_installation(
+    registry: &ProviderRegistry,
+    binding: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    provider: &str,
+    id: &str,
+) {
+    let scope = registry.refresh_scope_id();
+    let binding_ptr = std::sync::Arc::as_ptr(binding) as usize;
+    let mut installations = native_virtual_model_installations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    installations.remove(&(scope, provider.to_owned(), id.to_owned(), binding_ptr));
+    retain_live_native_virtual_model_installations(&mut installations);
+}
+
+/// The nearest still-live entry in a virtual restore chain, including its
+/// route callback. `None` means every displaced owner has torn down, so
+/// teardown removes the key (and its callback).
+pub(crate) fn resolve_previous_virtual_model(
+    previous: &[PreviousVirtualModel],
+) -> Option<(
+    crate::ai::virtual_::VirtualModelRegistration,
+    Option<crate::ai::virtual_::VirtualRouteFn>,
+)> {
+    previous
+        .iter()
+        .find(|entry| match &entry.owner {
+            None => true,
+            Some(owner) => owner.is_live_virtual(
+                &entry.registration.provider,
+                &entry.registration.id,
+                &entry.registration,
+                &entry.route,
+            ),
+        })
+        .map(|entry| (entry.registration.clone(), entry.route.clone()))
+}
+
+/// The nearest still-live entry in a restore chain. `None` means every
+/// displaced owner has torn down, so teardown removes the dynamic entry.
+pub(crate) fn resolve_previous_provider(
+    id: &str,
+    previous: &[PreviousProvider],
+) -> Option<crate::ai::provider::ProviderBox> {
+    previous
+        .iter()
+        .find(|entry| match &entry.owner {
+            None => true,
+            Some(owner) => owner.is_live(id, &entry.provider),
+        })
+        .map(|entry| entry.provider.clone())
+}
+
+/// Record the provider allocation THIS pass installed for `id`. Recorded at
+/// registration time instead of re-reading the shared dynamic map at the end
+/// of the pass: a concurrent sibling sync can replace the entry between the
+/// registration and a post-pass snapshot, which would otherwise stamp the
+/// sibling's wrapper as "ours" and defeat the identity check (SNAP4 P2-新-1).
+/// A duplicate definition id keeps the last installation, matching the
+/// dynamic map's last-writer-wins registration.
+fn record_provider_installation(
+    registry: &ProviderRegistry,
+    session: &crate::ai::provider::ProviderSessionKey,
+    installed: &mut Vec<(String, std::sync::Weak<dyn crate::ai::provider::Provider>)>,
+    id: &str,
+    provider: &crate::ai::provider::ProviderBox,
+) {
+    // Session overlay first: the model request, `/login` and credential
+    // refresh paths resolve this allocation for THIS session even if a
+    // sibling/child later overwrites the process-shared dynamic map.
+    registry.record_session_sync_dynamic_provider(session, id, provider);
+    let entry = (id.to_owned(), std::sync::Arc::downgrade(provider));
+    match installed.iter_mut().find(|(existing, _)| existing == id) {
+        Some(slot) => *slot = entry,
+        None => installed.push(entry),
+    }
+}
+
+/// Whether every provider this session installed is still the exact
+/// allocation the shared dynamic map resolves to. A child session sharing the
+/// parent's registry replaces these entries on its own sync; the mismatch
+/// forces the parent (and any sibling child) to re-install its own OAuth
+/// wrapper/keys instead of short-circuiting into another session's state.
+fn provider_sync_installations_match(
+    registry: &ProviderRegistry,
+    installed: &[(String, ProviderInstallation)],
+) -> bool {
+    let dynamic = registry
+        .dynamic
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    installed.iter().all(|(id, installation)| {
+        let Some(current) = dynamic.get(id) else {
+            return false;
+        };
+        installation
+            .installed
+            .upgrade()
+            .is_some_and(|installed| std::sync::Arc::ptr_eq(current, &installed))
+    })
+}
+
+/// Demote one session's stamp to a cleanup-only record before a live pass.
+/// The pass may replace the installed provider kind (`streamSimple` installs
+/// a `JsStreamProvider`; `refreshModels` replaces the model list), so its
+/// `fast_path` must stop short-circuiting: keeping it would let a later
+/// reversion to the same plain definition keep the JS provider (P2-2).
+///
+/// The `installed` ownership records stay in place. A cancelled live pass
+/// then still has a cleanup stamp for everything the session already
+/// installed (SNAP6 P2-2), and a definition removed by the pass remains in
+/// the record until teardown.
+fn demote_provider_sync_stamp(scope: u64, session: usize) {
+    let mut stamps = provider_sync_stamps()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(stamp) = stamps.get_mut(&(scope, session)) {
+        stamp.fast_path = false;
+    }
+    retain_live_provider_sync_stamps(&mut stamps);
+}
+
+/// The ownership records one session's last pass left behind. Read before a
+/// full pass so a partial/cancelled pass can carry forward entries whose
+/// definitions were removed (SNAP6 P2-2).
+fn provider_sync_session_installations(
+    scope: u64,
+    session: usize,
+) -> Vec<(String, ProviderInstallation)> {
+    let mut stamps = provider_sync_stamps()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    retain_live_provider_sync_stamps(&mut stamps);
+    stamps
+        .get(&(scope, session))
+        .map(|stamp| stamp.installed.clone())
+        .unwrap_or_default()
+}
+
+/// Combine a pass's fresh installations with the session's previous ownership
+/// records and the dynamic map as it was before the pass.
+///
+/// For a freshly installed id the displaced entry is the pre-pass `dynamic`
+/// value. When that value is still the allocation this SAME session installed
+/// in an earlier pass, keep the earlier record's `previous` (the true owner
+/// before this session first took the id) instead of recording the session's
+/// own stale wrapper. Otherwise the displaced entry is turned into a restore
+/// chain that also carries the chain of the session that installed it, so
+/// teardown can skip a sibling that has already ended (SNAP7 P2-3). Entries
+/// not reinstalled in this pass (removed definitions, a cancelled partial
+/// pass) are carried over unchanged so teardown can still find them.
+fn merge_provider_installations(
+    scope: u64,
+    session: usize,
+    dynamic_before: &std::collections::BTreeMap<String, crate::ai::provider::ProviderBox>,
+    prior: &[(String, ProviderInstallation)],
+    installed_now: &[(String, std::sync::Weak<dyn crate::ai::provider::Provider>)],
+) -> Vec<(String, ProviderInstallation)> {
+    let mut merged = Vec::with_capacity(prior.len().max(installed_now.len()));
+    for (id, installed) in installed_now {
+        let displaced = dynamic_before.get(id).cloned();
+        let previous = match prior.iter().find(|(old_id, _)| old_id == id) {
+            Some((_, old)) => {
+                let displaced_is_ours = displaced.as_ref().is_some_and(|candidate| {
+                    old.installed.upgrade().is_some_and(|old_installed| {
+                        std::sync::Arc::ptr_eq(candidate, &old_installed)
+                    })
+                });
+                if displaced_is_ours {
+                    old.previous.clone()
+                } else {
+                    displaced
+                        .as_ref()
+                        .map(|candidate| provider_previous_chain(scope, session, id, candidate))
+                        .unwrap_or_default()
+                }
+            }
+            None => displaced
+                .as_ref()
+                .map(|candidate| provider_previous_chain(scope, session, id, candidate))
+                .unwrap_or_default(),
+        };
+        merged.push((
+            id.clone(),
+            ProviderInstallation {
+                installed: installed.clone(),
+                previous,
+            },
+        ));
+    }
+    for (id, old) in prior {
+        if !installed_now.iter().any(|(new_id, _)| new_id == id) {
+            merged.push((id.clone(), old.clone()));
+        }
+    }
+    merged
+}
+
+/// Persist the ownership record after one successful installation. The stamp
+/// is cleanup-only (`fast_path: false`) until the pass completes, so the
+/// record is available even if the pass is cancelled at a later `await`
+/// (SNAP6 P2-2). The final successful pass overwrites it with the reusable
+/// fast-path stamp.
+fn persist_provider_sync_installations(
+    session: &AgentSession,
+    scope: u64,
+    dynamic_before: &std::collections::BTreeMap<String, crate::ai::provider::ProviderBox>,
+    prior: &[(String, ProviderInstallation)],
+    installed_now: &[(String, std::sync::Weak<dyn crate::ai::provider::Provider>)],
+) {
+    let merged = merge_provider_installations(
+        scope,
+        provider_sync_session_identity(session),
+        dynamic_before,
+        prior,
+        installed_now,
+    );
+    write_provider_sync_stamp(session, scope, 0, Vec::new(), false, merged);
+}
+
+/// Remove or restore the dynamic provider entries one session installed. Each
+/// id is changed only while the shared registry still resolves it to the
+/// exact allocation that session's last sync installed (SNAP6 P1-1).
+///
+/// Why this exists (SNAP4 review P2-1): a subagent child shares the parent's
+/// `Arc<ProviderRegistry>` but runs its own `sync_plugin_providers`, which
+/// replaces the parent's dynamic entries with child-built ones — including
+/// `OAuthFlowOverlay`s bound (weakly) to the child's extension runtime. The
+/// weak binding stops the registry from pinning the child actor, but the
+/// entry itself survived the child's end, so the parent's `/login` or OAuth
+/// credential refresh between the child's end and the parent's next prompt
+/// still resolved the child's flow: executing the child's JS callback while
+/// the child lives (wrong session/cwd) or failing with "the extension runtime
+/// has exited" after it is gone.
+///
+/// Deleting the child's entry was not enough (SNAP5 review P1-1): the parent
+/// session may issue another model request in the SAME prompt after a
+/// subagent tool returns, and `sync_plugin_providers` only runs at the start
+/// of `run_prompt`. The parent's provider had been overwritten in the shared
+/// map, so deleting the child's entry left `provider_box` with nothing and
+/// the request failed with `Unknown provider`. The stamp therefore records
+/// the entry each installation displaced; cleanup restores that allocation
+/// (the parent's/external owner's provider) and only deletes when there was
+/// no previous owner.
+///
+/// The session's [`ProviderSyncStamp`] is the ownership record: its
+/// `installed` list holds the `Weak`s this session's own registration passes
+/// returned plus the strong `previous` allocations. Removing the stamp first
+/// makes the cleanup one-shot; each entry is then changed through
+/// [`crate::ai::providers::RegisterDynamicProviderShared::restore_dynamic_provider_shared_if_installed`],
+/// whose `Arc` identity check leaves a later parent/sibling/external
+/// registration of the same id untouched. Synchronous on purpose: the caller
+/// is a `Drop` guard in the child teardown path.
+pub(crate) fn cleanup_provider_sync_session(
+    registry: &ProviderRegistry,
+    scope: u64,
+    session: usize,
+    provider_session: &crate::ai::provider::ProviderSessionKey,
+) {
+    // Session-scoped overlay first: after this session ends no request may
+    // resolve its dynamic/OAuth providers through the shared registry, even
+    // when the process-shared map still temporarily holds them.
+    registry.clear_session_dynamic_providers(provider_session);
+    let installed = {
+        let mut stamps = provider_sync_stamps()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let installed = stamps
+            .remove(&(scope, session))
+            .map(|stamp| stamp.installed)
+            .unwrap_or_default();
+        retain_live_provider_sync_stamps(&mut stamps);
+        installed
+    };
+    for (id, installation) in installed {
+        use crate::ai::providers::RegisterDynamicProviderShared as _;
+        let previous = resolve_previous_provider(&id, &installation.previous);
+        registry.restore_dynamic_provider_shared_if_installed(
+            &id,
+            &installation.installed,
+            previous.as_ref(),
+        );
+    }
+}
+
+/// Synchronous cleanup for one session's dynamic provider entries, run when
+/// the guard drops. See [`cleanup_provider_sync_session`].
+struct ProviderSyncCleanupGuard {
+    registry: Arc<ProviderRegistry>,
+    scope: u64,
+    session: usize,
+    provider_session: crate::ai::provider::ProviderSessionKey,
+}
+
+impl Drop for ProviderSyncCleanupGuard {
+    fn drop(&mut self) {
+        // No await: `Drop` only touches entries whose exact `Arc` this
+        // session installed. `ProviderSyncStamp` uses `Weak`s for the
+        // installed allocation and a strong restore chain, so a provider that
+        // was already replaced is left to its current owner while the nearest
+        // still-live displaced owner is restored otherwise.
+        cleanup_provider_sync_session(
+            &self.registry,
+            self.scope,
+            self.session,
+            &self.provider_session,
+        );
+    }
+}
+
+/// Store one session's provider-sync stamp. `fast_path == false` stamps exist
+/// only so child teardown can find the allocations a live/partial pass
+/// installed; they can never skip a later sync.
+fn write_provider_sync_stamp(
+    session: &AgentSession,
+    scope: u64,
+    definitions: u64,
+    models: Vec<(String, u64)>,
+    fast_path: bool,
+    installed: Vec<(String, ProviderInstallation)>,
+) {
+    let mut stamps = provider_sync_stamps()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    retain_live_provider_sync_stamps(&mut stamps);
+    stamps.insert(
+        (scope, provider_sync_session_identity(session)),
+        ProviderSyncStamp {
+            registry: std::sync::Arc::downgrade(&session.registry),
+            session: provider_sync_session_handle(session),
+            definitions,
+            models,
+            fast_path,
+            installed,
+        },
+    );
+}
+
+/// Hash of the ordered `(id, config)` definition set with the `$ENV`
+/// references `sync_plugin_providers` interpolates resolved. `None` when a
+/// definition has no string id (the sync loop skips it, so the fast path must
+/// not treat the set as stable).
+fn provider_sync_signature(defs: &[JsonValue]) -> Option<u64> {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for def in defs {
+        let id = def.get("id").and_then(JsonValue::as_str)?;
+        id.hash(&mut hasher);
+        let config = def.get("config").cloned().unwrap_or(JsonValue::Null);
+        provider_config_fingerprint(&config).hash(&mut hasher);
+        // `apiKey` and `headers` values expand `$VAR` / `${VAR}` from the
+        // process environment at registration time; an env change must re-run
+        // the pass even when the raw definition is byte-identical.
+        if let Some(key) = config.get("apiKey").and_then(JsonValue::as_str) {
+            interpolate_api_key(key).hash(&mut hasher);
+        }
+        if let Some(headers) = config.get("headers").and_then(JsonValue::as_object) {
+            for (name, value) in headers {
+                name.hash(&mut hasher);
+                value.as_str().map(interpolate_api_key).hash(&mut hasher);
+            }
+        }
+    }
+    Some(hasher.finish())
+}
+
+/// `(id, model content hash)` for the registry state each definition should
+/// have produced. `Debug` is a deterministic, complete dump of the plain
+/// `Model` data (all collections are ordered maps); only the hash is kept.
+fn provider_sync_models(session: &AgentSession, defs: &[JsonValue]) -> Vec<(String, u64)> {
+    use std::hash::{Hash as _, Hasher as _};
+
+    defs.iter()
+        .filter_map(|def| def.get("id").and_then(JsonValue::as_str))
+        .map(|id| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for model in session.registry.get_provider_models(id) {
+                format!("{model:?}").hash(&mut hasher);
+            }
+            (id.to_owned(), hasher.finish())
+        })
+        .collect()
+}
+
+/// Whether a definition needs the synchronous per-prompt pass even when its
+/// config is unchanged: `refreshModels` owns a time window evaluated inside the
+/// loop, and `streamSimple` binds the provider to the live JS handle.
+fn provider_def_needs_live_pass(def: &JsonValue) -> bool {
+    def.get("config").is_some_and(|config| {
+        config.get("refreshModels").and_then(JsonValue::as_bool) == Some(true)
+            || config.get("streamSimple").and_then(JsonValue::as_bool) == Some(true)
+    })
+}
+
 fn mark_refresh_models(scope: usize, id: &str, fingerprint: u64, models: Option<JsonValue>) {
     refresh_stamps()
         .lock()
@@ -103,15 +1296,224 @@ fn parse_refreshed_models(config: &JsonValue, models: &JsonValue) -> Option<Vec<
 }
 
 impl AgentSession {
+    /// Arm a `Drop` guard that restores (or removes) the dynamic provider
+    /// entries THIS session installed in its (possibly parent-shared)
+    /// registry when the guard is dropped. The subagent child holds it for the
+    /// whole run so a cancelled `run_child` future cleans up too, not only the
+    /// normal `shutdown` tail.
+    ///
+    /// Each entry is changed only while it is still identical to the `Weak`
+    /// recorded by this session's last provider sync; a parent/sibling that
+    /// re-registered the id afterwards keeps its entry. When the entry is
+    /// still ours, the nearest still-live provider in the captured restore
+    /// chain is put back instead of deleting the id, so the parent's next
+    /// model request in the same prompt keeps resolving its own provider
+    /// (SNAP6 P1-1). Entries whose owner session has already torn down are
+    /// skipped (SNAP7 P2-3).
+    pub(crate) fn provider_sync_cleanup_guard(&self) -> impl Drop {
+        ProviderSyncCleanupGuard {
+            registry: Arc::clone(&self.registry),
+            scope: self.registry.refresh_scope_id(),
+            session: provider_sync_session_identity(self),
+            provider_session: self.provider_session_key(),
+        }
+    }
+
+    /// `/login` for THIS session: resolves the provider through the session
+    /// overlay before the shared dynamic map, so a live subagent child's
+    /// OAuth flow (wrong session/cwd) is never executed (SNAP8 P2-1).
+    pub async fn login_provider(
+        &self,
+        provider_id: &str,
+        auth_type: crate::ai::types::AuthType,
+        interaction: &dyn crate::ai::auth::AuthInteraction,
+        options: &crate::ai::auth::LoginOptions,
+    ) -> crate::ai::error::AiResult<crate::plugins::services::ProviderAuth> {
+        self.registry
+            .login_for_session(
+                &self.provider_session_key(),
+                provider_id,
+                auth_type,
+                interaction,
+                options,
+            )
+            .await
+    }
+
+    /// Model/credential refresh for THIS session: provider lookup (and the
+    /// OAuth credential refresh inside it) uses the session overlay first
+    /// (SNAP8 P2-1).
+    pub async fn refresh_provider_models(
+        &self,
+        options: crate::ai::provider::ModelsRefreshOptions,
+    ) -> crate::ai::provider::ModelsRefreshResult {
+        self.registry
+            .refresh_for_session(&self.provider_session_key(), options)
+            .await
+    }
+
+    /// The OAuth flow of one provider as THIS session sees it (SNAP10
+    /// P2-S8-2). The TUI uses it for `/login` rows and subscription labels:
+    /// a live child's overlay entry can never answer for the parent, while a
+    /// session-less caller keeps [`crate::ai::auth::oauth_flow_for`]'s static
+    /// behavior.
+    pub fn oauth_flow_for_provider(
+        &self,
+        provider_id: &str,
+    ) -> Option<crate::ai::auth::OAuthFlowBox> {
+        self.registry
+            .provider_box_for_session_for_test(&self.provider_session_key(), provider_id)
+            .and_then(|provider| provider.oauth_flow())
+    }
+
+    /// Resolve a provider's request auth through THIS session (SNAP10
+    /// P2-S8-2): `ProviderRegistry::get_auth_for_session` uses the session
+    /// overlay for the provider/OAuth flow and refreshes an expiring stored
+    /// credential inside the store lock. Used by the TUI `/share` Radius token
+    /// path; `None`/`Err` means the provider is unknown or unconfigured.
+    pub async fn get_auth_for_provider(
+        &self,
+        provider_id: &str,
+    ) -> crate::ai::error::AiResult<Option<crate::ai::types::AuthResult>> {
+        let session = self.provider_session_key();
+        let model = self
+            .registry
+            .get_provider_models_for_session(&session, provider_id)
+            .into_iter()
+            .next()
+            .or_else(|| {
+                (self.current_model().provider == provider_id).then(|| self.current_model())
+            })
+            .ok_or_else(|| crate::ai::error::AiError::UnknownProvider(provider_id.to_string()))?;
+        self.registry.get_auth_for_session(&session, &model).await
+    }
+
+    /// `(provider, model)` pairs visible to THIS session, for the TUI model
+    /// selectors (SNAP10 P2-S8-2). Provider ids come from the live registry
+    /// (catalog + plugin/dynamic entries); each list is resolved through the
+    /// session overlay, so a child's same-id provider cannot replace the
+    /// parent's models. Virtual overlay entries are appended like
+    /// `ProviderRegistry::get_models`.
+    pub fn provider_model_pairs(&self) -> Vec<(String, String)> {
+        let session = self.provider_session_key();
+        let mut pairs = std::collections::BTreeSet::new();
+        for provider in self.registry.providers() {
+            let id = provider.id().to_string();
+            for model in self.registry.get_provider_models_for_session(&session, &id) {
+                pairs.insert((model.provider, model.id));
+            }
+        }
+        for registration in self.registry.virtual_models() {
+            pairs.insert((registration.provider, registration.id));
+        }
+        pairs.into_iter().collect()
+    }
+
+    /// Test seam for the child-teardown cleanup guard: dropping the returned
+    /// value runs exactly the synchronous cleanup `run_child` performs when
+    /// its child session ends (SNAP4 review P2-1 / SNAP6 P1-1).
+    #[doc(hidden)]
+    pub fn provider_sync_cleanup_guard_for_test(&self) -> impl Drop {
+        self.provider_sync_cleanup_guard()
+    }
+
     /// Convert `pi.registerProvider` definitions 鈥?from the unified plugin
     /// registry (JS extensions and Rust builtins alike) 鈥?into real registry
-    /// providers. Idempotent: definitions are upserted by provider id each
-    /// time. Async: a `refreshModels` hook (upstream
+    /// providers. Idempotent: definitions are upserted by provider id, and an
+    /// unchanged definition set with unchanged installed model content short-
+    /// circuits before any dynamic provider `Arc` is rebuilt. Async: a
+    /// `refreshModels` hook (upstream
     /// `ProviderConfig.refreshModels`) refreshes the model list through a
     /// bounded JS round trip at registration.
     pub(super) async fn sync_plugin_providers(&self, plugins: &PluginHost) {
-        for def in plugins.registry().provider_defs() {
+        let defs = plugins.registry().provider_defs();
+        // Idempotent fast path (P2-新-1): re-applying an unchanged definition
+        // set used to rebuild every dynamic provider `Arc` on every prompt,
+        // which invalidated the session catalog cache by address even though
+        // the catalog was identical. The stamp is scoped to this session
+        // (registry scope + session identity) and records both the resolved
+        // definition set and the model content it installed; a changed
+        // definition, a changed credential env value, or
+        // an external provider replacement/removal falls through to the full
+        // loop. Definitions with per-prompt semantics (`refreshModels` window,
+        // `streamSimple` JS handle) always take the full loop.
+        let needs_live_pass = defs.iter().any(provider_def_needs_live_pass);
+        let sync_signature = provider_sync_signature(&defs);
+        let scope = self.registry.refresh_scope_id();
+        let session = provider_sync_session_identity(self);
+        let provider_session = self.provider_session_key();
+        // Keep the previous pass's ownership records (including the entries it
+        // displaced) available to the full pass: a partial/cancelled pass must
+        // still leave a cleanup record for definitions it does not reach, and
+        // a removed definition must stay removable at teardown (SNAP6 P2-2).
+        let prior_installations = provider_sync_session_installations(scope, session);
+        if needs_live_pass {
+            // A live pass installs per-prompt state (`refreshModels` window,
+            // `streamSimple` JS handle) and may not write a fast-path stamp.
+            // Demote any stamp from an earlier plain pass so a later reversion
+            // to the same plain definition cannot short-circuit and leave the
+            // JS-stream provider installed (P2-2). The pass keeps the
+            // installed ownership records and writes cleanup stubs as it
+            // installs, so a cancelled pass is still reclaimable by child
+            // teardown.
+            demote_provider_sync_stamp(scope, session);
+        } else if let Some(signature) = sync_signature {
+            let models = provider_sync_models(self, &defs);
+            let candidate = {
+                let mut stamps = provider_sync_stamps()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Prune dead sessions before the lookup: a dead child's stamp
+                // must not be observable even if the allocator reuses its
+                // identity address for a new child of the same shared registry
+                // (the Weak still reports zero strong references for the old
+                // allocation).
+                retain_live_provider_sync_stamps(&mut stamps);
+                stamps.get(&(scope, session)).map(|stamp| {
+                    (
+                        stamp.definitions,
+                        stamp.models.clone(),
+                        stamp.installed.clone(),
+                        stamp.fast_path,
+                    )
+                })
+            };
+            // The dynamic map is shared across sessions; a matching stamp only
+            // means this session's last pass installed the same definitions,
+            // not that its allocations are still the ones the registry
+            // resolves. A subagent child's pass replaces them (and binds its
+            // own OAuth flow), so verify the exact `Arc`s before short-
+            // circuiting (SNAP4 P2-新-1). The check runs after dropping the
+            // stamp lock to keep the lock order off the dynamic-map lock.
+            if let Some((stamped_signature, stamped_models, installed, fast_path)) = candidate {
+                if fast_path
+                    && stamped_signature == signature
+                    && stamped_models == models
+                    && provider_sync_installations_match(&self.registry, &installed)
+                {
+                    return;
+                }
+            }
+        }
+        // The shared map as it is BEFORE this pass installs anything: the
+        // entry each successful registration displaces is the `previous` that
+        // child teardown restores (SNAP6 P1-1).
+        let dynamic_before = self
+            .registry
+            .dynamic
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut applied_all = true;
+        // The providers THIS pass installed, as identity witnesses for the
+        // fast path. Kept per pass (not snapshotted from the shared map): the
+        // map is last-writer-wins across sessions sharing this registry, so a
+        // post-pass read could observe a sibling's replacement.
+        let mut installed: Vec<(String, std::sync::Weak<dyn crate::ai::provider::Provider>)> =
+            Vec::new();
+        for def in &defs {
             let Some(id) = def.get("id").and_then(JsonValue::as_str) else {
+                applied_all = false;
                 continue;
             };
             let config = def.get("config").cloned().unwrap_or(JsonValue::Null);
@@ -132,6 +1534,7 @@ impl AgentSession {
                 Ok(models) => models,
                 Err(error) => {
                     crate::ext_diag!("[ext] provider `{id}` skipped: {error}");
+                    applied_all = false;
                     continue;
                 }
             };
@@ -293,6 +1696,7 @@ impl AgentSession {
                     crate::ext_diag!(
                         "[ext] provider `{id}` skipped: streamSimple requires the JS extension runtime"
                     );
+                    applied_all = false;
                     continue;
                 };
                 match crate::ai::providers::RegisterJsStreamProviderShared::register_js_stream_provider_shared(
@@ -301,9 +1705,27 @@ impl AgentSession {
                     models,
                     js,
                 ) {
-                    Ok(_) => {}
+                    Ok(registered) => {
+                        // The live pass writes only a cleanup-only stamp, but
+                        // it must record this installation for child teardown.
+                        record_provider_installation(
+                            &self.registry,
+                            &provider_session,
+                            &mut installed,
+                            id,
+                            &registered,
+                        );
+                        persist_provider_sync_installations(
+                            self,
+                            scope,
+                            &dynamic_before,
+                            &prior_installations,
+                            &installed,
+                        );
+                    }
                     Err(error) => {
-                        crate::ext_diag!("[ext] provider `{id}` registration failed: {error}")
+                        crate::ext_diag!("[ext] provider `{id}` registration failed: {error}");
+                        applied_all = false;
                     }
                 }
                 continue;
@@ -321,6 +1743,10 @@ impl AgentSession {
                     .and_then(JsonValue::as_str)
                     .filter(|url| !url.is_empty())
                 else {
+                    // Nothing was installed for this definition, so this pass
+                    // must not write a stamp that claims every definition is
+                    // fully applied (review-snap3 P3-5).
+                    applied_all = false;
                     continue;
                 };
                 let existing = self.registry.get_provider_models(id);
@@ -328,6 +1754,7 @@ impl AgentSession {
                     crate::ext_diag!(
                         "[ext] provider `{id}` skipped: baseUrl-only override but the provider has no known models"
                     );
+                    applied_all = false;
                     continue;
                 }
                 let overridden: Vec<crate::ai::types::Model> = existing
@@ -346,9 +1773,25 @@ impl AgentSession {
                     .registry
                     .register_dynamic_provider_shared(id.to_string(), dynamic)
                 {
-                    Ok(_) => {}
+                    Ok(registered) => {
+                        record_provider_installation(
+                            &self.registry,
+                            &provider_session,
+                            &mut installed,
+                            id,
+                            &registered,
+                        );
+                        persist_provider_sync_installations(
+                            self,
+                            scope,
+                            &dynamic_before,
+                            &prior_installations,
+                            &installed,
+                        );
+                    }
                     Err(error) => {
-                        crate::ext_diag!("[ext] provider `{id}` baseUrl override failed: {error}")
+                        crate::ext_diag!("[ext] provider `{id}` baseUrl override failed: {error}");
+                        applied_all = false;
                     }
                 }
                 continue;
@@ -381,7 +1824,8 @@ impl AgentSession {
                 .registry
                 .register_dynamic_provider_shared(id.to_string(), dynamic)
             {
-                Ok(_) => {
+                Ok(registered) => {
+                    let mut installed_provider = registered;
                     if let Some(api_key) = config
                         .get("apiKey")
                         .and_then(JsonValue::as_str)
@@ -404,7 +1848,7 @@ impl AgentSession {
                         .and_then(JsonValue::as_bool)
                         == Some(true)
                     {
-                        if let Some(js) = plugins.js_handle().cloned() {
+                        if let Some(js) = plugins.js_handle() {
                             let display_name = config
                                 .get("oauth")
                                 .and_then(|oauth| oauth.get("name"))
@@ -416,37 +1860,101 @@ impl AgentSession {
                                 .and_then(|oauth| oauth.get("isSubscription"))
                                 .and_then(JsonValue::as_bool)
                                 .unwrap_or(false);
-                            let flow: crate::ai::auth::OAuthFlowBox = std::sync::Arc::new(
-                                crate::ai::providers::js_stream::JsOAuthFlow::new(
-                                    id.to_string(),
-                                    display_name,
-                                    is_subscription,
-                                    js,
-                                ),
-                            );
-                            let current = self
-                                .registry
-                                .dynamic
-                                .write()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .get(id)
-                                .cloned();
-                            if let Some(inner) = current {
-                                let wrapped =
-                                    crate::ai::providers::js_stream::with_oauth_flow(inner, flow);
+                            // Bind the flow to this session's runtime through a
+                            // WEAK handle (SNAP4 P2-新-1): the overlay is kept
+                            // in the (possibly parent-shared) registry, and a
+                            // strong `ExtensionHandle` clone here used to pin
+                            // the child's actor/QuickJS runtime after the
+                            // child session and its `ChildRuntime` dropped.
+                            // The flow re-binds a fresh `JsOAuthFlow` per
+                            // login/refresh and fails cleanly once the owning
+                            // runtime is gone.
+                            if let Some(flow) =
+                                js.weak_oauth_flow(id.to_string(), display_name, is_subscription)
+                            {
+                                // Wrap the provider this pass registered, not
+                                // whatever the shared map holds now (another
+                                // session may have replaced it between the
+                                // registration and this wrap).
+                                let wrapped = crate::ai::providers::js_stream::with_oauth_flow(
+                                    installed_provider.clone(),
+                                    flow,
+                                );
                                 self.registry
                                     .dynamic
                                     .write()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .insert(id.to_string(), wrapped);
+                                    .insert(id.to_string(), wrapped.clone());
+                                // The stamp must witness the overlay actually
+                                // left in the map, not the inner provider it
+                                // wraps; both are ours, but only the overlay
+                                // is what the fast-path lookup compares.
+                                installed_provider = wrapped;
                             }
                         }
                     }
+                    record_provider_installation(
+                        &self.registry,
+                        &provider_session,
+                        &mut installed,
+                        id,
+                        &installed_provider,
+                    );
+                    persist_provider_sync_installations(
+                        self,
+                        scope,
+                        &dynamic_before,
+                        &prior_installations,
+                        &installed,
+                    );
                 }
                 Err(error) => {
-                    crate::ext_diag!("[ext] provider `{id}` registration failed: {error}")
+                    crate::ext_diag!("[ext] provider `{id}` registration failed: {error}");
+                    applied_all = false;
                 }
             }
+        }
+        // A fully-applied plain pass writes the reusable fast-path stamp. Any
+        // other pass that installed providers (live `streamSimple`/
+        // `refreshModels`, or a pass with a skipped definition) still writes a
+        // cleanup-only stamp: it records the allocations this session owns so
+        // child teardown can restore/remove them, while `fast_path: false`
+        // guarantees it can never short-circuit a later sync. Both branches
+        // carry prior ownership records for definitions this pass did not
+        // reinstall (removed definitions, cancelled partial passes).
+        let final_installations = merge_provider_installations(
+            scope,
+            session,
+            &dynamic_before,
+            &prior_installations,
+            &installed,
+        );
+        // A fully-applied non-live pass is the authoritative definition set:
+        // drop overlay entries whose definition disappeared (the legacy
+        // cleanup stamp still carries them until teardown for the shared map,
+        // but a live session must resolve the static/global fallback again).
+        if applied_all && !needs_live_pass {
+            let keep: Vec<String> = installed.iter().map(|(id, _)| id.clone()).collect();
+            self.registry
+                .retain_session_dynamic_providers(&provider_session, &keep);
+        }
+        let fast_path_eligible = applied_all && !needs_live_pass;
+        match (fast_path_eligible, sync_signature) {
+            (true, Some(signature)) => {
+                let models = provider_sync_models(self, &defs);
+                write_provider_sync_stamp(
+                    self,
+                    scope,
+                    signature,
+                    models,
+                    true,
+                    final_installations,
+                );
+            }
+            _ if !final_installations.is_empty() => {
+                write_provider_sync_stamp(self, scope, 0, Vec::new(), false, final_installations);
+            }
+            _ => {}
         }
     }
 
@@ -650,74 +2158,23 @@ impl AgentSession {
                             updated = true;
                         }
                     }
-                    // Virtual routing: only a virtual selection routes.
+                    // Virtual routing: only a virtual selection routes. The
+                    // projection is shared with `ProviderService::complete`
+                    // (`resolve_virtual_request`), so an explicit completion
+                    // and a session prompt produce the same physical route,
+                    // route-callback decision and system prompt.
                     let model = request.model.clone()?;
                     if crate::ai::virtual_::is_virtual_model(&model) {
-                        match route_virtual_model(&registry, &model) {
-                            Ok(Some((registration, static_physical))) => {
-                                // Per-request route callback (upstream
-                                // `VirtualModelDefinition.route`): consulted
-                                // when the registration carries one; a
-                                // failure or an invalid target falls back to
-                                // the static route above (fail-open to the
-                                // static path, never blocks the request).
-                                let physical = match registry
-                                    .virtual_model_registry()
-                                    .route_callback(&model.provider, &model.id)
-                                {
-                                    Some(callback) => {
-                                        let route_request =
-                                            crate::ai::virtual_::VirtualRouteRequest {
-                                                model: serde_json::to_value(&model)
-                                                    .unwrap_or(JsonValue::Null),
-                                                thinking_level: Some(
-                                                    request.thinking_level.to_string(),
-                                                ),
-                                                messages: serde_json::to_value(
-                                                    &request.context.messages,
-                                                )
-                                                .unwrap_or(JsonValue::Null),
-                                            };
-                                        match callback(route_request).await {
-                                            Ok(decision) => registry
-                                                .get_physical_model(
-                                                    &decision.physical.provider,
-                                                    &decision.physical.id,
-                                                )
-                                                .unwrap_or_else(|| {
-                                                    crate::ext_diag!(
-                                                        "[ext] virtual model {} route callback target {}/{} is not a physical model; using the static route",
-                                                        registration.key(),
-                                                        decision.physical.provider,
-                                                        decision.physical.id
-                                                    );
-                                                    static_physical.clone()
-                                                }),
-                                            Err(error) => {
-                                                crate::ext_diag!(
-                                                    "[ext] virtual model {} route callback failed; using the static route: {error}",
-                                                    registration.key()
-                                                );
-                                                static_physical.clone()
-                                            }
-                                        }
-                                    }
-                                    None => static_physical,
-                                };
-                                if let Some(extra) = &registration.system_prompt {
-                                    // The registration's prompt is prepended
-                                    // clone-on-write: the shared context is
-                                    // cloned only when the routing actually
-                                    // rewrites the prompt.
-                                    let mut context = Arc::clone(&request.context);
-                                    let shared = Arc::make_mut(&mut context);
-                                    shared.system_prompt =
-                                        Some(match shared.system_prompt.take() {
-                                            Some(existing) => format!("{extra}\n\n{existing}"),
-                                            None => extra.clone(),
-                                        });
-                                    request.context = context;
-                                }
+                        let thinking_level = request.thinking_level.to_string();
+                        match resolve_virtual_request(
+                            &registry,
+                            &model,
+                            &mut request.context,
+                            Some(&thinking_level),
+                        )
+                        .await
+                        {
+                            Ok(Some((registration, physical))) => {
                                 *routed_registration
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -809,6 +2266,102 @@ fn route_virtual_model(
             )
         })?;
     Ok(Some((registration, physical)))
+}
+
+/// The one virtual-selection request projection shared by the session's
+/// `prepare_request` hook and `ProviderService::complete`.
+///
+/// It resolves the static physical route, consults the per-request `route`
+/// callback (falling back to the static route on a callback error or an
+/// invalid target), and prepends the registration's `systemPrompt` to the
+/// request context. `thinking_level` is the request's selected level, carried
+/// into [`crate::ai::virtual_::VirtualRouteRequest`] exactly as upstream does.
+///
+/// Returns `Ok(None)` when `model` is not virtual or its `(provider, id)` pair
+/// is no longer registered; `Err` when the static route is registered but its
+/// physical model no longer exists (the session logs and leaves the request
+/// unrouted, preserving the pre-existing failure surface).
+pub(crate) async fn resolve_virtual_request(
+    registry: &ProviderRegistry,
+    model: &Model,
+    context: &mut Arc<crate::ai::types::Context>,
+    thinking_level: Option<&str>,
+) -> Result<Option<(crate::ai::virtual_::VirtualModelRegistration, Model)>, String> {
+    if !crate::ai::virtual_::is_virtual_model(model) {
+        return Ok(None);
+    }
+    let Some((registration, static_physical)) = route_virtual_model(registry, model)? else {
+        return Ok(None);
+    };
+    let mut physical = match registry
+        .virtual_model_registry()
+        .route_callback(&model.provider, &model.id)
+    {
+        Some(callback) => {
+            let route_request = crate::ai::virtual_::VirtualRouteRequest {
+                model: serde_json::to_value(model).unwrap_or(JsonValue::Null),
+                thinking_level: thinking_level.map(str::to_owned),
+                messages: serde_json::to_value(&context.messages).unwrap_or(JsonValue::Null),
+            };
+            match callback(route_request).await {
+                Ok(decision) => registry
+                    .get_physical_model(&decision.physical.provider, &decision.physical.id)
+                    .unwrap_or_else(|| {
+                        crate::ext_diag!(
+                            "[ext] virtual model {} route callback target {}/{} is not a physical model; using the static route",
+                            registration.key(),
+                            decision.physical.provider,
+                            decision.physical.id
+                        );
+                        static_physical.clone()
+                    }),
+                Err(error) => {
+                    crate::ext_diag!(
+                        "[ext] virtual model {} route callback failed; using the static route: {error}",
+                        registration.key()
+                    );
+                    static_physical.clone()
+                }
+            }
+        }
+        None => static_physical,
+    };
+    if let Some(extra) = &registration.system_prompt {
+        // The registration's prompt is prepended clone-on-write: the shared
+        // context is cloned only when the routing actually rewrites the
+        // prompt.
+        let mut routed_context = Arc::clone(context);
+        let shared = Arc::make_mut(&mut routed_context);
+        shared.system_prompt = Some(match shared.system_prompt.take() {
+            Some(existing) => format!("{extra}\n\n{existing}"),
+            None => extra.clone(),
+        });
+        *context = routed_context;
+    }
+    apply_virtual_model_overrides(&registration, &mut physical);
+    Ok(Some((registration, physical)))
+}
+
+/// Apply the virtual registration's `modelOverride` to the routed physical
+/// model. This is the shared projection both request paths use: the session's
+/// `prepare_request` returns this physical model to the loop, and
+/// `ProviderService::complete` streams it — so `maxTokens` (and the context
+/// window used for the request clamp) cannot disagree between an AgentSession
+/// prompt and an explicit completion of the same virtual model. Caller-level
+/// completion options still win over the registration default in `complete`.
+fn apply_virtual_model_overrides(
+    registration: &crate::ai::virtual_::VirtualModelRegistration,
+    physical: &mut Model,
+) {
+    let Some(overrides) = registration.model_override else {
+        return;
+    };
+    if let Some(max_tokens) = overrides.max_tokens {
+        physical.max_tokens = max_tokens;
+    }
+    if let Some(context_window) = overrides.context_window {
+        physical.context_window = context_window;
+    }
 }
 /// Restore the virtual models persisted on the session branch
 /// (`pi.virtual-model-state` custom entries) into the provider registry's
@@ -1010,6 +2563,96 @@ fn parse_provider_models(config: &serde_json::Value) -> Result<Vec<Model>, Strin
         });
     }
     Ok(parsed)
+}
+
+/// Build the runtime `DynamicProviderConfig` for
+/// [`ProviderService::register_provider`](crate::plugins::services::ProviderService::register_provider).
+///
+/// This is the immediate-registration subset of a `pi.registerProvider`
+/// config: `models`, `baseUrl`, `api`, `apiKey`, provider/model `headers` and
+/// `authHeader`. Callback-driven fields (`streamSimple`, `refreshModels`,
+/// `oauth`) are rejected with a clear message: a native plugin that needs
+/// them registers a typed [`crate::ai::provider::Provider`] implementation
+/// instead, and a declarative Rust definition still gets the full sync pass.
+/// A model-less `baseUrl` definition overrides the existing provider models,
+/// matching `sync_plugin_providers`' baseUrl-only path.
+pub(crate) fn runtime_dynamic_provider_config(
+    registry: &ProviderRegistry,
+    id: &str,
+    config: &JsonValue,
+) -> Result<DynamicProviderConfig, String> {
+    for field in ["streamSimple", "refreshModels"] {
+        if config.get(field).and_then(JsonValue::as_bool) == Some(true) {
+            return Err(format!(
+                "provider `{id}`: runtime `{field}` requires a typed Provider or the plugin-registry sync"
+            ));
+        }
+    }
+    if config
+        .get("oauth")
+        .and_then(|oauth| oauth.get("login"))
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+    {
+        return Err(format!(
+            "provider `{id}`: runtime `oauth` callbacks require a typed Provider"
+        ));
+    }
+
+    let provider_headers = apply_provider_headers(config);
+    let auth_header = config
+        .get("authHeader")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let resolved_key = config
+        .get("apiKey")
+        .and_then(JsonValue::as_str)
+        .map(interpolate_api_key)
+        .filter(|key| !key.is_empty());
+    let mut models = parse_provider_models(config)?;
+    let base_url = config
+        .get("baseUrl")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if models.is_empty() {
+        if base_url.is_empty() {
+            return Err(format!(
+                "provider `{id}`: runtime registration needs `models` or a `baseUrl` override"
+            ));
+        }
+        let existing = registry.get_provider_models(id);
+        if existing.is_empty() {
+            return Err(format!(
+                "provider `{id}`: baseUrl-only override but the provider has no known models"
+            ));
+        }
+        models = existing
+            .into_iter()
+            .map(|mut model| {
+                model.base_url = base_url.clone();
+                model
+            })
+            .collect();
+    }
+    apply_configured_headers(
+        &mut models,
+        provider_headers.as_ref(),
+        auth_header,
+        resolved_key.as_deref(),
+    );
+    Ok(DynamicProviderConfig {
+        base_url,
+        api_key: resolved_key,
+        api: config
+            .get("api")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        models,
+        compat: None,
+        refresh: None,
+    })
 }
 
 /// `thinkingLevelMap` (upstream `Model.thinkingLevelMap`): `{level: wireValue}`

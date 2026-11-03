@@ -94,7 +94,20 @@ impl AgentSession {
             CacheWarmingMode::Idle => Some(warmer.idle_delay),
             _ => None,
         };
-        self.spawn_cache_warm_task(registry, model, context, api_key, idle_delay);
+        // SNAP11 P2-S8-4 residual: snapshot THIS session's provider identity
+        // for the detached task. The key carries only a `Weak` liveness token,
+        // so the task never keeps the session (or its extension runtime)
+        // alive; if the session ends before the warm fires, the warmer falls
+        // back to the legacy global resolution.
+        let provider_session = self.provider_session_key();
+        self.spawn_cache_warm_task(
+            registry,
+            provider_session,
+            model,
+            context,
+            api_key,
+            idle_delay,
+        );
     }
 
     /// Spawn the bounded warm task (both modes): detached from the settled
@@ -105,6 +118,7 @@ impl AgentSession {
     fn spawn_cache_warm_task(
         &self,
         registry: Arc<crate::ai::provider::ProviderRegistry>,
+        provider_session: crate::ai::provider::ProviderSessionKey,
         model: crate::ai::types::Model,
         context: crate::ai::types::Context,
         api_key: Option<String>,
@@ -129,12 +143,18 @@ impl AgentSession {
                 tokio::time::sleep(delay).await;
             }
             // prompt() aborts the registered signal on staleness;
-            // `warm_once_with_hooks` races the request against it and returns
-            // `None` for a stale warm.
-            if let Some(message) = crate::cache_warmer::warm_once_with_hooks(
+            // `warm_once_with_hooks_owned_for_session` races the request
+            // against it and returns `None` for a stale warm. The snapshot was
+            // built for this task and is owned here, so it moves into the
+            // request without a second full-transcript clone. The session key
+            // is checked at request time: a warm whose session ended in the
+            // idle delay resolves through the legacy global path instead of a
+            // dead overlay.
+            if let Some(message) = crate::cache_warmer::warm_once_with_hooks_owned_for_session(
                 &registry,
+                Some(&provider_session),
                 &model,
-                &context,
+                context,
                 api_key.as_deref(),
                 Some(warm_signal),
                 hooks,

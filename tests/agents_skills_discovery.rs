@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use pir::coding_agent::resources::{
     collect_ancestor_agents_skill_dirs, DiscoveredResources, ResourceDiscoveryOptions,
 };
+use pir::plugins::subagent::{load_agents_from_dir, AgentSource};
+use pir::skills::{frontmatter_parts, strip_frontmatter};
 
 fn unique_dir(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -347,4 +349,104 @@ fn missing_agents_dirs_are_silent_and_no_home_skips_the_user_root() {
         ],
         "no home directory means no ~/.agents/skills root"
     );
+}
+
+// ---------------------------------------------------------------------------
+// frontmatter byte offsets (FIX-C04 / R1-L5-001)
+// ---------------------------------------------------------------------------
+
+/// CRLF files must locate the closing fence by real byte offsets: the old
+/// `lines()` + `+1` accounting dropped the `\r` from the count and shifted the
+/// body one byte left per line, which could slice through a multibyte char.
+#[test]
+fn frontmatter_parts_handles_crlf_multibyte_and_unterminated_lines() {
+    // CRLF with three frontmatter lines.
+    let crlf = "---\r\nname: demo\r\ndescription: demo skill\r\ndisable-model-invocation: true\r\n---\r\nBody line\r\n";
+    let (yaml, body) = frontmatter_parts(crlf).expect("crlf frontmatter");
+    assert_eq!(
+        yaml,
+        "name: demo\r\ndescription: demo skill\r\ndisable-model-invocation: true\r\n"
+    );
+    assert_eq!(body, "Body line\r\n");
+    let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).expect("crlf yaml parses");
+    assert_eq!(parsed["name"].as_str(), Some("demo"));
+
+    // The last frontmatter line is multibyte Chinese: offsets and char
+    // boundaries must still agree.
+    let multibyte = "---\nname: demo\ndescription: 中文描述，多字节\n---\n正文\n";
+    let (yaml, body) = frontmatter_parts(multibyte).expect("multibyte frontmatter");
+    assert_eq!(yaml, "name: demo\ndescription: 中文描述，多字节\n");
+    assert_eq!(body, "正文\n");
+
+    // No trailing newline on the closing fence or the body.
+    let unterminated = "---\r\nname: demo\r\ndescription: 中文\r\n---";
+    let (yaml, body) = frontmatter_parts(unterminated).expect("unterminated frontmatter");
+    assert_eq!(yaml, "name: demo\r\ndescription: 中文\r\n");
+    assert_eq!(body, "");
+    assert_eq!(strip_frontmatter(unterminated), "");
+
+    // The LF form keeps exactly the old semantics.
+    let lf = "---\nname: demo\ndescription: demo skill\ndisable-model-invocation: true\n---\nBody line\n";
+    assert_eq!(
+        frontmatter_parts(lf),
+        Some((
+            "name: demo\ndescription: demo skill\ndisable-model-invocation: true\n",
+            "Body line\n"
+        ))
+    );
+
+    // An opening fence without a closing one is not a frontmatter block.
+    assert!(frontmatter_parts("---\nname: demo\n").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Oversized resources (FIX-C17 / R1-L6-019)
+// ---------------------------------------------------------------------------
+
+/// A sub-1-MiB cap check runs before reading: a 2 MiB `SKILL.md` is skipped
+/// and reported, never loaded.
+#[test]
+fn oversized_skill_files_are_skipped_with_a_diagnostic() {
+    let layout = layout("oversized-skill");
+    let dir = layout.cwd.join(".pi").join("skills").join("huge");
+    fs::create_dir_all(&dir).expect("skill dir");
+    let mut contents = String::from("---\nname: huge\ndescription: huge\n---\n");
+    contents.push_str(&"x".repeat(2 * 1024 * 1024));
+    fs::write(dir.join("SKILL.md"), contents).expect("write skill");
+
+    let resources = discover(&layout, true);
+    assert!(
+        resources.skills.is_empty(),
+        "an over-limit SKILL.md must not load: {:?}",
+        skill_names(&resources)
+    );
+    assert!(
+        resources
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("huge") && diagnostic.contains("1048576")),
+        "the skip diagnostic names the path and the limit: {:?}",
+        resources.diagnostics
+    );
+}
+
+/// The same cap applies to subagent markdown discovery: a 2 MiB agent file is
+/// skipped while its siblings still load.
+#[test]
+fn oversized_subagent_markdown_is_skipped() {
+    let dir = unique_dir("subagent-oversized");
+    let agents_dir = dir.join("agents");
+    fs::create_dir_all(&agents_dir).expect("agents dir");
+    fs::write(
+        agents_dir.join("good.md"),
+        "---\nname: good\ndescription: loadable\n---\nBody\n",
+    )
+    .expect("write good agent");
+    let mut huge = String::from("---\nname: huge\ndescription: oversized\n---\n");
+    huge.push_str(&"x".repeat(2 * 1024 * 1024));
+    fs::write(agents_dir.join("huge.md"), huge).expect("write huge agent");
+
+    let agents = load_agents_from_dir(&agents_dir, AgentSource::User);
+    let names: Vec<&str> = agents.iter().map(|agent| agent.name.as_str()).collect();
+    assert_eq!(names, vec!["good"], "the oversized agent is skipped");
 }

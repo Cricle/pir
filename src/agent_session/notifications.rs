@@ -23,36 +23,93 @@ const NATIVE_EVENT_BACKLOG_BOUND: usize = 64;
 const NATIVE_EVENT_DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One queued native session-level event dispatch.
-struct NativeSessionEvent {
-    plugins: Arc<PluginHost>,
-    event: String,
-    payload: JsonValue,
-    /// `true` for events that originated as a [`SessionEvent`]: those are the
-    /// session's own events and go through [`PluginHost::emit`], which reaches
-    /// the JS adapter and the native plugins exactly once (the JS face has no
-    /// other delivery path for them). `false` for notification-derived events
-    /// (`status` / `extension_ui_request`): the JS runtime PRODUCED those, so
-    /// only the native face observes them.
-    both_faces: bool,
+enum NativeSessionEvent {
+    /// A real event to fan out to the plugin faces.
+    Dispatch {
+        plugins: Arc<PluginHost>,
+        event: String,
+        payload: JsonValue,
+        /// `true` for events that originated as a [`SessionEvent`]: those are
+        /// the session's own events and go through [`PluginHost::emit`], which
+        /// reaches the JS adapter and the native plugins exactly once (the JS
+        /// face has no other delivery path for them). `false` for
+        /// notification-derived events (`status` / `extension_ui_request`):
+        /// the JS runtime PRODUCED those, so only the native face observes
+        /// them.
+        both_faces: bool,
+    },
+    /// A queue barrier: resolves once every previously queued item has been
+    /// dispatched. Used by [`PluginHost::emit`] before the compaction-hook
+    /// events that bypass this queue, so the two delivery channels preserve
+    /// the upstream event order.
+    Barrier {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
+/// Dispatch one SessionEvent to both plugin faces through the ordered
+/// `PluginHost::emit`. `allow_direct_events` selects whether the three
+/// direct-extension events (`agent_settled`, `entry_appended`,
+/// `session_info_changed`) are forwarded: AgentSession's bridge sets false
+/// because their emit sites already dispatch both faces; print's bridge sets
+/// true because its persist/loop paths do not own an extension emit.
+///
+/// Shared by the AgentSession bridge worker and the print host's bridge.
+#[cfg(feature = "print")]
+pub(crate) async fn dispatch_session_event_to_plugins(
+    plugins: &Arc<PluginHost>,
+    event: &SessionEvent,
+    allow_direct_events: bool,
+) {
+    if !allow_direct_events
+        && matches!(
+            event,
+            SessionEvent::SessionInfoChanged { .. }
+                | SessionEvent::AgentSettled { .. }
+                | SessionEvent::EntryAppended { .. }
+        )
+    {
+        return;
+    }
+    let mut payload = session_event_to_json(event);
+    let Some(name) = payload
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    if !plugins.has_handlers(&name) {
+        return;
+    }
+    if let Err(error) = plugins.emit(&name, &mut payload).await {
+        crate::ext_diag!("[ext] {name} dispatch failed: {error}");
+    }
 }
 
 fn dispatch_native_session_event(item: NativeSessionEvent) -> BoxFuture<'static, ()> {
     Box::pin(async move {
-        let interested = if item.both_faces {
-            item.plugins.has_handlers(&item.event)
+        let (plugins, event, mut payload, both_faces) = match item {
+            NativeSessionEvent::Barrier { done } => {
+                let _ = done.send(());
+                return;
+            }
+            NativeSessionEvent::Dispatch {
+                plugins,
+                event,
+                payload,
+                both_faces,
+            } => (plugins, event, payload, both_faces),
+        };
+        let interested = if both_faces {
+            plugins.has_handlers(&event)
         } else {
-            item.plugins.has_native_handlers(&item.event)
+            plugins.has_native_handlers(&event)
         };
         // Nobody declared interest: skip the payload move and the dispatch.
         if !interested {
             return;
         }
-        let NativeSessionEvent {
-            plugins,
-            event,
-            mut payload,
-            both_faces,
-        } = item;
         let dispatch = async {
             if both_faces {
                 if let Err(error) = plugins.emit(&event, &mut payload).await {
@@ -87,6 +144,43 @@ struct NativeEventBridge {
     backlog: EventBacklog<NativeSessionEvent>,
 }
 
+impl NativeEventBridge {
+    /// Wait until every event accepted before this call has been dispatched
+    /// (FIFO barrier). When the queue has no free slot — or no worker can be
+    /// started — wait on the accepted/processed counters instead; both only
+    /// count items accepted BEFORE the snapshot, so the barrier still covers
+    /// exactly the backlog the caller needs drained.
+    async fn flush(&self) {
+        let accepted = self.backlog.accepted();
+        let (done, wait) = tokio::sync::oneshot::channel();
+        if self
+            .backlog
+            .push_with(|| NativeSessionEvent::Barrier { done })
+        {
+            let _ = wait.await;
+            return;
+        }
+        while self.backlog.processed() < accepted {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The flush seam installed on the [`PluginHost`]: weakly holds the
+    /// bridge so a host outliving its session cannot keep the queue worker
+    /// alive through this callback.
+    fn flush_handle(bridge: &Arc<Self>) -> crate::plugins::host::SessionEventFlush {
+        let bridge = Arc::downgrade(bridge);
+        Arc::new(move || {
+            let bridge = bridge.clone();
+            Box::pin(async move {
+                if let Some(bridge) = bridge.upgrade() {
+                    bridge.flush().await;
+                }
+            })
+        })
+    }
+}
+
 /// Installed bridges, keyed by the allocation identity of each session's
 /// `session_events` list. Weak: the subscriber handler owns the bridge, so a
 /// dropped session releases its queue and worker; dead entries are pruned on
@@ -94,13 +188,22 @@ struct NativeEventBridge {
 static NATIVE_SESSION_EVENT_BRIDGES: Mutex<Vec<Weak<NativeEventBridge>>> = Mutex::new(Vec::new());
 
 /// The bridge for `events`, installing it (and the `SessionEvent` subscriber)
-/// when absent. `None` when the host has no native (non-JS) plugins — there is
+/// when absent. `None` when the host has no plugin face at all — there is
 /// nothing to deliver to.
+///
+/// The gate must NOT be native-only: a JS-only plan (`--no-extensions -e
+/// ext.ts`, or an SDK session with just a JS handle) has a JS adapter and JS
+/// handlers but no non-JS plugin, and its `pi.on` face still needs the
+/// `SessionEvent` names that have no direct extension emit site
+/// (`queue_update`, `compaction_start`/`_end`, `auto_retry_*`,
+/// `bash_execution_update`, `background_tool_end`). The per-event
+/// [`PluginHost::has_handlers`] check inside the worker then skips the
+/// dispatch when neither face actually registered a handler.
 fn native_event_bridge(
     events: &Arc<SessionEventHandlers>,
     plugins: &Arc<PluginHost>,
 ) -> Option<Arc<NativeEventBridge>> {
-    if !plugins.has_non_js_plugins() {
+    if !plugins.has_non_js_plugins() && plugins.js_handle().is_none() {
         return None;
     }
     let mut bridges = NATIVE_SESSION_EVENT_BRIDGES
@@ -110,6 +213,7 @@ fn native_event_bridge(
     for bridge in bridges.iter() {
         if let Some(existing) = bridge.upgrade() {
             if std::ptr::eq(existing.events.as_ptr(), Arc::as_ptr(events)) {
+                plugins.set_session_event_flush(Some(NativeEventBridge::flush_handle(&existing)));
                 return Some(existing);
             }
         }
@@ -127,6 +231,23 @@ fn native_event_bridge(
     let handler_bridge = Arc::clone(&bridge);
     let handler_plugins = Arc::clone(plugins);
     let handler: SessionEventHandler = Arc::new(move |event: SessionEvent| {
+        // `session_info_changed`, `agent_settled` and `entry_appended` are
+        // also upstream EXTENSION events (`_extensionRunner.emit(event)`
+        // beside `_emit(event)`). Every emit site dispatches those three
+        // through `PluginHost::emit` directly (the prompt/append path owns
+        // both faces), so forwarding the session event here would hand each
+        // face a second copy. The bridge exists for the events WITHOUT a
+        // direct extension emit site. Reject them BEFORE serializing: the
+        // `entry_appended` payload is the largest session-event tree and this
+        // subscriber must not force its materialization.
+        if matches!(
+            &event,
+            SessionEvent::SessionInfoChanged { .. }
+                | SessionEvent::AgentSettled { .. }
+                | SessionEvent::EntryAppended { .. }
+        ) {
+            return;
+        }
         let payload = session_event_to_json(&event);
         let Some(name) = payload
             .get("type")
@@ -135,22 +256,22 @@ fn native_event_bridge(
         else {
             return;
         };
-        // `session_info_changed` is also an upstream EXTENSION event
-        // (`_extensionRunner.emit(event)` beside `_emit(event)`). The name
-        // mutator emits that extension face directly, so forwarding the
-        // session event here would hand both faces a duplicate.
-        if name == "session_info_changed" {
-            return;
-        }
         // Synchronous and non-blocking by contract; outside a tokio runtime
         // the event is dropped (counted by the backlog), never a panic.
-        handler_bridge.backlog.push_with(|| NativeSessionEvent {
-            plugins: Arc::clone(&handler_plugins),
-            event: name,
-            payload,
-            both_faces: true,
-        });
+        handler_bridge
+            .backlog
+            .push_with(|| NativeSessionEvent::Dispatch {
+                plugins: Arc::clone(&handler_plugins),
+                event: name,
+                payload,
+                both_faces: true,
+            });
     });
+    // The host's direct compaction-hook emits drain this queue before they
+    // dispatch, so `compaction_start` (queued) is observed by both faces
+    // before `session_before_compact` (direct), and `compaction_end` before
+    // `session_compact_failed`.
+    plugins.set_session_event_flush(Some(NativeEventBridge::flush_handle(&bridge)));
     // The registry lock is held across the push so two concurrent installs
     // for the same session cannot both register a subscriber. The handler
     // list never takes this lock, so the ordering cannot deadlock.
@@ -162,8 +283,52 @@ fn native_event_bridge(
     Some(bridge)
 }
 
-/// Register the native fan-out on a session's [`SessionEvent`] stream exactly
-/// once.
+/// The live bridge registered for `events`, without installing one.
+fn existing_native_event_bridge(
+    events: &Arc<SessionEventHandlers>,
+) -> Option<Arc<NativeEventBridge>> {
+    let mut bridges = NATIVE_SESSION_EVENT_BRIDGES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    bridges.retain(|bridge| bridge.strong_count() > 0);
+    for bridge in bridges.iter() {
+        if let Some(existing) = bridge.upgrade() {
+            if std::ptr::eq(existing.events.as_ptr(), Arc::as_ptr(events)) {
+                return Some(existing);
+            }
+        }
+    }
+    None
+}
+
+/// Whether `events` has a subscriber besides the native/session-event bridge.
+///
+/// The bridge is installed at construction and observes every session event,
+/// but it deliberately drops `entry_appended` (the append path dispatches that
+/// one directly to both plugin faces). Treating the bridge as a consumer made
+/// `has_session_event_subscribers` permanently true and forced the append hot
+/// path to materialize the wire entry even when no plugin handler and no host
+/// subscriber existed. This predicate answers the producer's real question:
+/// "will anybody other than the drop-only bridge use this payload?"
+pub(super) fn has_observed_session_event_subscribers(events: &Arc<SessionEventHandlers>) -> bool {
+    // Read the length in its own statement so the handler-list lock is
+    // released before the bridge registry lock is taken (the installer takes
+    // them in the opposite order).
+    let total = events
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len();
+    let bridge_subscribers = usize::from(existing_native_event_bridge(events).is_some());
+    total > bridge_subscribers
+}
+
+/// Register the session-event fan-out on a session's [`SessionEvent`] stream
+/// exactly once.
+///
+/// Both plugin faces ride the bridge: the ordered [`PluginHost::emit`] reaches
+/// the JS adapter and native plugins, including in a JS-only plan where
+/// [`PluginHost::has_non_js_plugins`] is false but the JS runtime still has
+/// `pi.on` handlers (`--no-extensions -e ext.ts`).
 ///
 /// Every session-level event outside the agent-loop enum (upstream
 /// `AgentSessionEvent`: `queue_update`, `compaction_start`/`_end`, the
@@ -173,8 +338,10 @@ fn native_event_bridge(
 /// [`session_event_to_json`] payload the RPC/TUI hosts see and hands it to
 /// [`PluginHost::emit`] on a bounded, ordered backlog — so both faces observe
 /// those events exactly once and a slow handler never blocks the emitting
-/// session. The call is idempotent per session; the first run (or an idle
-/// notification apply) installs it before any of those events can fire.
+/// session. The call is idempotent per session; [`AgentSession::build`]
+/// installs it at construction (before a manual `compact()` or
+/// `execute_bash()` can fire), and the run/idle/test entry points keep
+/// idempotent calls as safety nets.
 pub(super) fn install_native_session_event_bridge(
     events: &Arc<SessionEventHandlers>,
     plugins: &Arc<PluginHost>,
@@ -193,7 +360,7 @@ fn push_native_notification_event(
     let Some(bridge) = native_event_bridge(events, plugins) else {
         return;
     };
-    bridge.backlog.push_with(|| NativeSessionEvent {
+    bridge.backlog.push_with(|| NativeSessionEvent::Dispatch {
         plugins: Arc::clone(plugins),
         event: event.to_owned(),
         payload,
@@ -318,6 +485,23 @@ fn native_notification_event(notification: &Notification) -> Option<(&'static st
 }
 
 impl AgentSession {
+    /// Install the session-event fan-out for this session if it has a plugin
+    /// face (a non-JS plugin or a JS runtime handle).
+    ///
+    /// This is the idempotent entry every lazy caller uses. Construction calls
+    /// it once the plugin host exists, which is what covers `SessionEvent`
+    /// producers that run before the first prompt or idle drain: a manual
+    /// [`AgentSession::compact`] (including its `summarization_retry_*`
+    /// children) and [`AgentSession::execute_bash`] emit directly to
+    /// `session_events` without passing through `start_run`. Installing only
+    /// at those later entry points left a JS-only session's `pi.on` face
+    /// blind for the whole pre-run window.
+    pub(super) fn ensure_session_event_bridge(&self) {
+        if let Some(plugins) = &self.plugins {
+            install_native_session_event_bridge(&self.session_events, plugins);
+        }
+    }
+
     /// Mirror the presentation-class extension notifications a HEADLESS
     /// session would otherwise never deliver to native plugins.
     ///
@@ -362,13 +546,11 @@ impl AgentSession {
     /// Test seam: deliver one synthetic session-level event through the
     /// `session_events` subscribers (the exact path the queue/compaction/
     /// retry emission sites use), so a test can exercise the native fan-out
-    /// without a real threshold crossing or a retryable provider. Installs
-    /// the bridge first when the session has not run yet.
+    /// without a real threshold crossing or a retryable provider. Calls the
+    /// idempotent installer first; construction already installed it.
     #[doc(hidden)]
     pub fn emit_session_event_for_test(&self, event: SessionEvent) {
-        if let Some(plugins) = &self.plugins {
-            install_native_session_event_bridge(&self.session_events, plugins);
-        }
+        self.ensure_session_event_bridge();
         self.emit_session_event(event);
     }
 
@@ -566,10 +748,11 @@ impl AgentSession {
         let Some(plugins) = &self.plugins else {
             return;
         };
-        // Idle hosts call this between runs: install the native session-event
-        // forwarder here too, so an idle `pi.sendMessage` queue update (or a
-        // manual compaction) reaches native plugins before the first prompt.
-        install_native_session_event_bridge(&self.session_events, plugins);
+        // Idle hosts call this between runs: keep the native session-event
+        // forwarder installed here too. Construction already installs it; this
+        // idempotent call is a safety net for an idle `pi.sendMessage` queue
+        // update (or a manual compaction) before the first prompt.
+        self.ensure_session_event_bridge();
         let notifications = plugins.take_notifications(|notification| notification.is_actionable());
         for notification in notifications {
             match notification {

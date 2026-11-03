@@ -479,6 +479,7 @@ impl SdkEvent {
                 steering: steering.clone(),
                 follow_up: follow_up.clone(),
             }),
+
             SessionEvent::CompactionStart { reason } => Some(Self::CompactionStart {
                 reason: (*reason).to_owned(),
             }),
@@ -540,17 +541,21 @@ impl SdkEvent {
                 delay_ms: *delay_ms,
                 error_message: error_message.clone(),
             }),
-            SessionEvent::SummarizationRetryAttemptStart { .. } => {
-                // The source enum lives in the private `agent_session::events`
-                // module; read its upstream wire view instead of reaching for
-                // the type (the same shape every other face consumes).
-                let wire = crate::agent_session::session_event_to_json(event);
+            SessionEvent::SummarizationRetryAttemptStart { source } => {
+                // Project the typed source directly. The previous shape
+                // serialized the WHOLE event to a `serde_json::Value` just to
+                // read these two fields back out.
+                let (source, reason) = match source {
+                    crate::agent_session::SummarizationRetrySource::BranchSummary => {
+                        ("branchSummary", None)
+                    }
+                    crate::agent_session::SummarizationRetrySource::Compaction { reason } => {
+                        ("compaction", Some((*reason).to_owned()))
+                    }
+                };
                 Some(Self::SummarizationRetryAttemptStart {
-                    source: wire["source"].as_str().unwrap_or_default().to_owned(),
-                    reason: wire
-                        .get("reason")
-                        .and_then(JsonValue::as_str)
-                        .map(str::to_owned),
+                    source: source.to_owned(),
+                    reason,
                 })
             }
             SessionEvent::SummarizationRetryFinished => Some(Self::SummarizationRetryFinished),
@@ -576,6 +581,124 @@ impl SdkEvent {
                 details: details.clone(),
                 structured_content: structured_content.clone(),
                 usage: *usage,
+            }),
+        }
+    }
+
+    /// [`SdkEvent::from_session_event`] for a session event the caller OWNS
+    /// and will not use again.
+    ///
+    /// The session-event fan-out hands every subscriber an owned event (the
+    /// last one the original, earlier ones their own clone), so the live
+    /// prompt-stream bridge never needs the event afterwards. Projecting
+    /// through the borrowed entry point deep-cloned every payload
+    /// (`EntryAppended`'s whole JSON entry included) and then dropped the
+    /// event; this variant moves those fields into the SDK event instead.
+    /// The public borrowed projection stays unchanged for hosts that still
+    /// hold the event.
+    pub(crate) fn from_session_event_owned(event: SessionEvent) -> Option<Self> {
+        match event {
+            SessionEvent::QueueUpdate {
+                steering,
+                follow_up,
+                ..
+            } => Some(Self::QueueUpdate {
+                steering,
+                follow_up,
+            }),
+            SessionEvent::CompactionStart { reason } => Some(Self::CompactionStart {
+                reason: reason.to_owned(),
+            }),
+            SessionEvent::CompactionEnd {
+                reason,
+                result,
+                aborted,
+                will_retry,
+                error_message,
+            } => Some(Self::CompactionEnd {
+                reason: reason.to_owned(),
+                result,
+                aborted,
+                will_retry,
+                error_message,
+            }),
+            SessionEvent::AgentSettled { .. } => None,
+            SessionEvent::EntryAppended { entry } => Some(Self::EntryAppended { entry }),
+            SessionEvent::SessionInfoChanged { name } => Some(Self::SessionInfoChanged { name }),
+            SessionEvent::ThinkingLevelChanged { level } => {
+                Some(Self::ThinkingLevelChanged { level })
+            }
+            SessionEvent::BashExecutionUpdate { id, delta } => {
+                Some(Self::BashExecutionUpdate { id, delta })
+            }
+            SessionEvent::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message,
+            } => Some(Self::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message,
+            }),
+            SessionEvent::AutoRetryEnd {
+                success,
+                attempt,
+                final_error,
+            } => Some(Self::AutoRetryEnd {
+                success,
+                attempt,
+                final_error,
+            }),
+            SessionEvent::SummarizationRetryScheduled {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message,
+            } => Some(Self::SummarizationRetryScheduled {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message,
+            }),
+            SessionEvent::SummarizationRetryAttemptStart { source } => {
+                let (source, reason) = match source {
+                    crate::agent_session::SummarizationRetrySource::BranchSummary => {
+                        ("branchSummary", None)
+                    }
+                    crate::agent_session::SummarizationRetrySource::Compaction { reason } => {
+                        ("compaction", Some(reason.to_owned()))
+                    }
+                };
+                Some(Self::SummarizationRetryAttemptStart {
+                    source: source.to_owned(),
+                    reason,
+                })
+            }
+            SessionEvent::SummarizationRetryFinished => Some(Self::SummarizationRetryFinished),
+            SessionEvent::BackgroundToolEnd {
+                call_id,
+                tool_name,
+                parent_call_id,
+                is_error,
+                duration_ms,
+                output,
+                images,
+                details,
+                structured_content,
+                usage,
+            } => Some(Self::BackgroundToolEnd {
+                call_id,
+                tool_name,
+                parent_call_id,
+                is_error,
+                duration_ms,
+                output,
+                images,
+                details,
+                structured_content,
+                usage,
             }),
         }
     }
@@ -703,13 +826,7 @@ pub(crate) fn from_loop_event(
             // the plain streaming path reads `aborted` and skips the clones
             // entirely. `Arc::unwrap_or_clone` would also duplicate the whole
             // context, which the SDK outcome does not keep.
-            let outcome = capture_outcome.then(|| LoopOutcome {
-                terminal: result.terminal.clone(),
-                tool_results: result.tool_results.clone(),
-                messages: result.new_messages.clone(),
-                turns: result.turns,
-                aborted: result.aborted,
-            });
+            let outcome = capture_outcome.then(|| loop_outcome(&result));
             // Terminal settlement is the caller's job: the session may re-enter
             // the loop (`agent_before_settle` continuation) after this event.
             let event = project_agent_end.then(|| SdkEvent::AgentEnd {
@@ -798,6 +915,22 @@ pub(crate) struct LoopOutcome {
     pub aborted: bool,
 }
 
+/// Capture the SDK outcome from one finished loop run.
+///
+/// The agent-loop result is `Arc`-shared with the run, so the owned fields
+/// the SDK outcome keeps are cloned here. Shared by the full event projection
+/// and the non-streaming fast path, which needs the outcome but no
+/// [`SdkEvent`].
+pub(crate) fn loop_outcome(result: &crate::agent::agent_loop::LoopResult) -> LoopOutcome {
+    LoopOutcome {
+        terminal: result.terminal.clone(),
+        tool_results: result.tool_results.clone(),
+        messages: result.new_messages.clone(),
+        turns: result.turns,
+        aborted: result.aborted,
+    }
+}
+
 /// The live SDK event sink shared between the per-run event handler, the
 /// bridge plugin, and the stream consumer. `None` when no streaming run is in
 /// flight (plain [`crate::sdk::Agent::prompt`] leaves it empty).
@@ -807,17 +940,18 @@ pub(crate) struct LoopOutcome {
 /// `tool_execution_update` payloads share a single ordered queue.
 pub(crate) type SharedSink = Arc<Mutex<Option<tokio::sync::mpsc::Sender<SdkEvent>>>>;
 
-/// Push one event to the live sink, if a streaming run is attached.
+/// Push an event to the live sink, if a streaming run is attached.
+///
+/// The event is built on demand by `project`, which runs only when a sender
+/// is attached and always UNDER the sink lock: a session event projected
+/// outside the lock could otherwise enqueue after the stream's terminal
+/// `AgentSettled` (P2-M). With the lock held on both sides, every push either
+/// completes before the detach or observes `None` after it — no event can
+/// follow the stream's terminal pair.
 ///
 /// Non-blocking by contract: [`tokio::sync::mpsc::Sender::try_send`] never
 /// awaits, so holding the sink mutex across the push cannot block the agent
 /// loop or deadlock a `current_thread` runtime.
-///
-/// The push happens UNDER the sink lock deliberately (P2-M): a push that
-/// cloned the sender and then raced a stream's detach could otherwise enqueue
-/// after the terminal `AgentSettled`. With the lock held on both sides, every
-/// push either completes before the detach or observes `None` after it — no
-/// event can follow the stream's terminal pair.
 ///
 /// Drop policy: the run channel is bounded (default
 /// [`super::agent::EVENT_CHANNEL_CAPACITY`], configurable through
@@ -829,12 +963,23 @@ pub(crate) type SharedSink = Arc<Mutex<Option<tokio::sync::mpsc::Sender<SdkEvent
 /// [`AgentOutcome`] or, on a stream, from
 /// [`crate::sdk::Agent::prompt_stream_with_outcome`]'s
 /// [`SdkEvent::AgentOutcome`] (itself best-effort like every streamed event).
-pub(crate) fn push_to_sink(sink: &SharedSink, event: SdkEvent) {
+///
+/// Session-level events fire on every transcript append; for a non-streaming
+/// run ([`crate::sdk::Agent::prompt`]) there is no sink, so eagerly projecting
+/// them deep-cloned the entry JSON (and every other payload) for a receiver
+/// that does not exist. Handing the projection in as a closure makes that
+/// impossible: no sender, no clone.
+pub(crate) fn push_to_sink_lazy<F>(sink: &SharedSink, project: F)
+where
+    F: FnOnce() -> Option<SdkEvent>,
+{
     let guard = sink
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(sender) = guard.as_ref() {
-        let _ = sender.try_send(event);
+        if let Some(event) = project() {
+            let _ = sender.try_send(event);
+        }
     }
 }
 
@@ -894,9 +1039,7 @@ impl AgentPlugin for SdkBridgePlugin {
         // agent a deep-clone consumer of the tree; the borrow parse below
         // costs nothing for unrelated events.
         if event.name.as_ref() == "tool_execution_update" {
-            if let Some(sdk_event) = tool_update_event(event.payload) {
-                push_to_sink(&self.sink, sdk_event);
-            }
+            push_to_sink_lazy(&self.sink, || tool_update_event(event.payload));
         }
         Box::pin(async { PluginEventOutcome::None })
     }

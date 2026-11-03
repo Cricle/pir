@@ -779,6 +779,28 @@ impl ClientHandler for PirClientHandler {
     }
 }
 
+/// The transport-independent inputs of one serve-loop handshake.
+struct ConnectServiceOptions {
+    timeout: Duration,
+    child_pid: Option<u32>,
+    frame_cap: Option<Arc<super::stdio::FrameCapState>>,
+    stderr_tail: Option<Arc<Mutex<Vec<u8>>>>,
+    client_options: McpClientOptions,
+}
+
+/// Everything a completed serve loop hands to client assembly.
+struct ConnectedService {
+    notifications: Arc<Mutex<NotificationBuffer>>,
+    invalidation: Arc<DiscoveryInvalidation>,
+    progress_resets: ProgressResets,
+    timeout: Duration,
+    child_pid: Option<u32>,
+    frame_cap: Option<Arc<super::stdio::FrameCapState>>,
+    stderr_tail: Option<Arc<Mutex<Vec<u8>>>>,
+    client_options: McpClientOptions,
+    handlers: RequestHandlers,
+}
+
 /// The live rmcp client service plus pir's connection bookkeeping.
 pub struct McpClient {
     service: tokio::sync::Mutex<Option<RunningService<RoleClient, PirClientHandler>>>,
@@ -896,11 +918,13 @@ impl McpClient {
         } = connection;
         Self::connect_service(
             transport,
-            timeout,
-            child_pid,
-            Some(frame_cap),
-            Some(stderr_tail),
-            client_options,
+            ConnectServiceOptions {
+                timeout,
+                child_pid,
+                frame_cap: Some(frame_cap),
+                stderr_tail: Some(stderr_tail),
+                client_options,
+            },
         )
         .await
     }
@@ -965,29 +989,33 @@ impl McpClient {
         let transport = rmcp::transport::StreamableHttpClientTransport::with_client(client, config);
         Self::connect_service(
             transport,
-            timeout,
-            None,
-            Some(frame_cap),
-            None,
-            client_options,
+            ConnectServiceOptions {
+                timeout,
+                child_pid: None,
+                frame_cap: Some(frame_cap),
+                stderr_tail: None,
+                client_options,
+            },
         )
         .await
     }
 
     /// Serve the client over a ready transport, bounded by `timeout`.
-    #[allow(clippy::too_many_arguments)]
     async fn connect_service<T, E, A>(
         transport: T,
-        timeout: Duration,
-        child_pid: Option<u32>,
-        frame_cap: Option<Arc<super::stdio::FrameCapState>>,
-        stderr_tail: Option<Arc<Mutex<Vec<u8>>>>,
-        client_options: McpClientOptions,
+        options: ConnectServiceOptions,
     ) -> Result<Self, McpError>
     where
         T: rmcp::transport::IntoTransport<RoleClient, E, A>,
         E: std::error::Error + Send + Sync + 'static,
     {
+        let ConnectServiceOptions {
+            timeout,
+            child_pid,
+            frame_cap,
+            stderr_tail,
+            client_options,
+        } = options;
         let handlers: RequestHandlers = Arc::new(RwLock::new(HashMap::new()));
         let handler = PirClientHandler::new(HandlerOptions {
             roots: client_options.roots.clone(),
@@ -1019,6 +1047,28 @@ impl McpClient {
         };
         Self::finish_connect(
             service,
+            ConnectedService {
+                notifications,
+                invalidation,
+                progress_resets,
+                timeout,
+                child_pid,
+                frame_cap,
+                stderr_tail,
+                client_options,
+                handlers,
+            },
+        )
+        .await
+    }
+
+    /// Snapshot the negotiated server info, reject unsupported protocol
+    /// versions, and assemble the client.
+    async fn finish_connect(
+        service: RunningService<RoleClient, PirClientHandler>,
+        connected: ConnectedService,
+    ) -> Result<Self, McpError> {
+        let ConnectedService {
             notifications,
             invalidation,
             progress_resets,
@@ -1028,25 +1078,7 @@ impl McpClient {
             stderr_tail,
             client_options,
             handlers,
-        )
-        .await
-    }
-
-    /// Snapshot the negotiated server info, reject unsupported protocol
-    /// versions, and assemble the client.
-    #[allow(clippy::too_many_arguments)]
-    async fn finish_connect(
-        service: RunningService<RoleClient, PirClientHandler>,
-        notifications: Arc<Mutex<NotificationBuffer>>,
-        invalidation: Arc<DiscoveryInvalidation>,
-        progress_resets: ProgressResets,
-        timeout: Duration,
-        child_pid: Option<u32>,
-        frame_cap: Option<Arc<super::stdio::FrameCapState>>,
-        stderr_tail: Option<Arc<Mutex<Vec<u8>>>>,
-        client_options: McpClientOptions,
-        handlers: RequestHandlers,
-    ) -> Result<Self, McpError> {
+        } = connected;
         let mut protocol_version = None;
         let mut capabilities = None;
         let mut instructions = None;
@@ -1296,6 +1328,12 @@ impl McpClient {
         let timeout = self.effective_timeout(options);
         let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
+        // Known limitation (see `tests/mcp_integration.rs`
+        // `request_deadline_bounds_a_blocked_dispatch`): rmcp's
+        // `send_cancellable_request` can block INSIDE its first poll when the
+        // peer pipe is stalled, and a future that blocks in `poll` keeps this
+        // `select!` from polling the deadline. The deadline therefore bounds
+        // an async-pending dispatch, not a synchronously blocked one.
         let mut handle = tokio::select! {
             dispatched = operation(peer) => match dispatched {
                 Ok(handle) => handle,

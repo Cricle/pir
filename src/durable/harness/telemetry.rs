@@ -1043,31 +1043,36 @@ impl TelemetrySink for NoTelemetry {
 /// # Example
 ///
 /// ```
-/// use std::sync::Arc;
-/// use pir::durable::harness::telemetry::{HarnessTelemetry, RecordingTelemetry};
+/// use pir::durable::harness::telemetry::{
+///     PhaseSpanEnd, PhaseSpanStart, RecordingTelemetry,
+/// };
 ///
 /// let recording = RecordingTelemetry::new();
 /// let telemetry = recording.handle();
 /// let span = telemetry.start_phase_span(
-///     7,
-///     "generation",
-///     "generate",
-///     "run",
-///     None,
-///     false,
+///     PhaseSpanStart {
+///         task_id: 7,
+///         task_name: "generation",
+///         phase: "generate",
+///         kind: "run",
+///         attempt: None,
+///         resumed: false,
+///     },
 ///     None,
 ///     &[],
 /// );
 /// telemetry.checkpoint_changed(Some(span), "tools");
 /// telemetry.end_phase_span(
 ///     span,
-///     "generation",
-///     "generate",
-///     Some("next=tools"),
-///     None,
-///     None,
+///     PhaseSpanEnd {
+///         task_name: "generation",
+///         phase: "generate",
+///         outcome: Some("next=tools"),
+///         tool_name: None,
+///         tool_call_id: None,
+///         duration_millis: Some(12.5),
+///     },
 ///     Default::default(),
-///     Some(12.5),
 /// );
 /// assert_eq!(recording.spans().len(), 1);
 /// ```
@@ -1082,6 +1087,50 @@ impl std::fmt::Debug for HarnessTelemetry {
             .field("enabled", &self.enabled())
             .finish()
     }
+}
+
+/// The start fields of one `pi.durable.phase` invocation (upstream phase
+/// span start attributes).
+///
+/// `kind` is `"run"` or `"abort"`; `attempt` is omitted from the span when
+/// `None`; `resumed` is true only for the first invocation of a task loaded
+/// by this process.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PhaseSpanStart<'a> {
+    /// The task's durable id.
+    pub task_id: i64,
+    /// The task's kind name (`task.name` attribute).
+    pub task_name: &'a str,
+    /// The phase name (`prepare`, `request`, …).
+    pub phase: &'a str,
+    /// `"run"` or `"abort"`.
+    pub kind: &'a str,
+    /// The attempt number; `None` omits the attribute.
+    pub attempt: Option<i64>,
+    /// Whether this is the first invocation of a task loaded by this process.
+    pub resumed: bool,
+}
+
+/// The end fields of one `pi.durable.phase` span (upstream phase span end
+/// attributes plus the duration metric inputs).
+///
+/// `task_name` and `phase` are the start values, used only for the duration
+/// metric.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PhaseSpanEnd<'a> {
+    /// The task's kind name (start value).
+    pub task_name: &'a str,
+    /// The phase name (start value).
+    pub phase: &'a str,
+    /// The `outcome` end attribute; omitted when `None`.
+    pub outcome: Option<&'a str>,
+    /// The `tool.name` end attribute; omitted when `None`.
+    pub tool_name: Option<&'a str>,
+    /// The `tool.call_id` end attribute; omitted when `None`.
+    pub tool_call_id: Option<&'a str>,
+    /// The duration in milliseconds; the `pi.durable.phase.duration`
+    /// histogram is recorded only when both this and `outcome` are present.
+    pub duration_millis: Option<f64>,
 }
 
 impl HarnessTelemetry {
@@ -1243,22 +1292,22 @@ impl HarnessTelemetry {
 
     /// Start `pi.durable.phase` for one phase invocation.
     ///
-    /// `kind` is `"run"` or `"abort"`; `attempt` is omitted when `None`;
-    /// `resumed` is true only for the first invocation of a task loaded by
-    /// this process. `links` carries stored submission/task trace carriers.
+    /// `links` carries stored submission/task trace carriers.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub fn start_phase_span(
         &self,
-        task_id: i64,
-        task_name: &str,
-        phase: &str,
-        kind: &str,
-        attempt: Option<i64>,
-        resumed: bool,
+        start: PhaseSpanStart<'_>,
         parent: Option<SpanHandle>,
         links: &[SpanLink<'_>],
     ) -> SpanHandle {
+        let PhaseSpanStart {
+            task_id,
+            task_name,
+            phase,
+            kind,
+            attempt,
+            resumed,
+        } = start;
         let attributes = [
             Attribute::number(schema_key(PHASE_SPAN.start_attributes, "task.id"), task_id),
             Attribute::string(
@@ -1319,21 +1368,15 @@ impl HarnessTelemetry {
     /// End `pi.durable.phase` with its optional end attributes, status and,
     /// when both `outcome` and `duration_millis` are present, the
     /// `pi.durable.phase.duration` histogram.
-    ///
-    /// `task_name` and `phase` are the start values, used only for the
-    /// duration metric.
-    #[allow(clippy::too_many_arguments)]
-    pub fn end_phase_span(
-        &self,
-        span: SpanHandle,
-        task_name: &str,
-        phase: &str,
-        outcome: Option<&str>,
-        tool_name: Option<&str>,
-        tool_call_id: Option<&str>,
-        status: SpanStatus<'_>,
-        duration_millis: Option<f64>,
-    ) {
+    pub fn end_phase_span(&self, span: SpanHandle, end: PhaseSpanEnd<'_>, status: SpanStatus<'_>) {
+        let PhaseSpanEnd {
+            task_name,
+            phase,
+            outcome,
+            tool_name,
+            tool_call_id,
+            duration_millis,
+        } = end;
         let mut attributes = [
             Attribute::string(schema_key(PHASE_SPAN.end_attributes, "outcome"), ""),
             Attribute::string(schema_key(PHASE_SPAN.end_attributes, "tool.name"), ""),

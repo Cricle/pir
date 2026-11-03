@@ -465,3 +465,33 @@ pub fn print_usage(agent: &pir::sdk::Agent) {
         usage.turns, usage.total_tokens
     );
 }
+
+// ---------------------------------------------------------------------------
+// Example entry point
+// ---------------------------------------------------------------------------
+
+/// Run one example's async body on a thread with a 64 MiB stack.
+///
+/// The GNU/Windows linker starts the main thread at 2 MiB, and unoptimized
+/// agent futures run far deeper than that in debug builds: a prompt that
+/// round-trips one tool through the plugin host overflows the default stack
+/// (measured on `plugin.rs`, after the tool list prints). `quickstart`-level
+/// usage fits a small stack today, but every example uses this wrapper so a
+/// fresh clone runs the whole set unchanged. A real embedder on this
+/// platform wants the same shape (or a raised PE stack) until the SDK boxes
+/// the remaining deep futures.
+pub fn run_big_stack<F>(future: F) -> std::process::ExitCode
+where
+    F: std::future::Future<Output = std::process::ExitCode> + Send + 'static,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build the example tokio runtime");
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || runtime.block_on(future))
+        .expect("spawn the example big-stack thread")
+        .join()
+        .expect("the example thread panicked")
+}

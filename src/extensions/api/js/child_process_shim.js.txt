@@ -407,6 +407,17 @@ function spawnSync(command, args, options) {
       windowsHide: opts.windowsHide === true,
       stdio: stdio,
       input: input,
+      timeout: typeof opts.timeout === "number" && opts.timeout > 0
+        ? Math.floor(opts.timeout)
+        : undefined,
+      maxBuffer: typeof opts.maxBuffer === "number" && opts.maxBuffer > 0
+        ? Math.floor(opts.maxBuffer)
+        : undefined,
+      // Node's AbortSignal option. The runtime exposes one shared abort flag
+      // (the one `ctx.signal` reads), so the host polls it while it waits; an
+      // already-aborted signal is reported in-band without spawning.
+      signal: opts.signal !== undefined && opts.signal !== null,
+      signalAborted: !!(opts.signal && opts.signal.aborted === true),
     });
   } catch (error) {
     // Node reports a spawn failure in-band (`error` field), not as a throw.
@@ -420,6 +431,21 @@ function spawnSync(command, args, options) {
   const stderr = result.stderr === null || result.stderr === undefined
     ? null
     : decodeOutput(Buffer.from(result.stderr, "base64"), encoding);
+  // Node reports timeout / abort / maxBuffer exhaustion as the result's
+  // `error` field (spawnSync does not throw); execSync rethrows it.
+  let error;
+  if (result.error && typeof result.error === "object") {
+    error = new Error(result.error.message || "Command failed");
+    error.code = result.error.code;
+    error.errno = result.error.code;
+    error.syscall = "spawnSync " + String(command);
+    error.status = result.status === undefined ? null : result.status;
+    error.signal = result.signal === undefined ? null : result.signal;
+    error.stdout = stdout;
+    error.stderr = stderr;
+    error.pid = result.pid;
+    error.cmd = [String(command)].concat(argv).join(" ");
+  }
   return {
     pid: result.pid,
     output: [null, stdout, stderr],
@@ -427,7 +453,7 @@ function spawnSync(command, args, options) {
     stderr: stderr,
     status: result.status === undefined ? null : result.status,
     signal: result.signal === undefined ? null : result.signal,
-    error: undefined,
+    error: error,
   };
 }
 

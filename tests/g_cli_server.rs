@@ -13,6 +13,7 @@ mod cli_package_install;
 mod cli_parity_wave;
 #[path = "suites/client_reconnect.rs"]
 mod client_reconnect;
+pub mod common;
 #[path = "suites/g_server_persistence.rs"]
 mod g_server_persistence;
 #[path = "suites/mcp_config_shape.rs"]

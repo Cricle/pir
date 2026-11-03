@@ -17,8 +17,17 @@ use std::sync::{Arc, Mutex};
 use pir::ai::types::ThinkingLevel;
 use pir::sdk::{AgentBuilder, SdkEvent, SessionMode};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    common::run_big_stack(async {
+        if let Err(error) = run().await {
+            eprintln!("error: {error:?}");
+            return std::process::ExitCode::FAILURE;
+        }
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let dir: PathBuf =
         std::env::temp_dir().join(format!("pir-sdk-sessions-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

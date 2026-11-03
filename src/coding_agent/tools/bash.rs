@@ -1710,16 +1710,16 @@ impl AgentTool for BashTool {
                 if signal.as_ref().is_some_and(|s| s.is_aborted()) {
                     return ToolResult::error("Command aborted");
                 }
-                run_with_operations(
+                run_with_operations(BashRun {
                     operations,
-                    &command,
-                    &cwd,
+                    command: &command,
+                    cwd: &cwd,
                     timeout_secs,
                     timeout_from_setting,
                     session_env,
                     on_update,
                     signal,
-                )
+                })
                 .await
             });
         }
@@ -1777,17 +1777,17 @@ impl AgentTool for BashTool {
             let mut initial_update_emitted = false;
             if pool_enabled && !shell.stdin_transport() && !background {
                 if let Some(outcome) = super::shell_pool::global()
-                    .execute(
-                        super::shell_pool::ShellProtocol::Bash,
-                        shell.program(),
-                        &cwd,
-                        &command,
-                        session_env.as_deref(),
-                        2 * DEFAULT_MAX_BYTES,
+                    .execute(super::shell_pool::PoolCommand {
+                        protocol: super::shell_pool::ShellProtocol::Bash,
+                        program: shell.program(),
+                        cwd: &cwd,
+                        command: &command,
+                        session_env: session_env.as_deref(),
+                        keep: 2 * DEFAULT_MAX_BYTES,
                         timeout_secs,
-                        signal.as_ref(),
-                        on_update.as_ref(),
-                    )
+                        signal: signal.as_ref(),
+                        on_update: on_update.as_ref(),
+                    })
                     .await
                 {
                     if let Some(result) =
@@ -2264,24 +2264,34 @@ async fn run_remote_bash(
     }
 }
 
+/// The command and per-call knobs one injected bash backend runs with.
+pub(crate) struct BashRun<'a> {
+    pub(crate) operations: std::sync::Arc<dyn BashOperations>,
+    pub(crate) command: &'a str,
+    pub(crate) cwd: &'a std::path::Path,
+    pub(crate) timeout_secs: Option<f64>,
+    pub(crate) timeout_from_setting: bool,
+    pub(crate) session_env: Option<std::sync::Arc<crate::agent::tool_execution::ToolSessionEnv>>,
+    pub(crate) on_update: Option<crate::agent::tool_execution::ToolUpdateFn>,
+    pub(crate) signal: Option<crate::ai::types::AbortSignal>,
+}
+
 /// The pluggable-backend arm of the bash tool: the command runs through an
 /// injected [`BashOperations`] while this side owns the rolling capture,
 /// streaming updates, truncation footer and structured content — the same
 /// shaping as the local and remote arms, so a backend only has to stream
 /// bytes and report an exit code.
-// The per-call knobs are a fixed set threaded from the tool arm; a parameter
-// struct would only repeat them at the single call site.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_with_operations(
-    operations: std::sync::Arc<dyn BashOperations>,
-    command: &str,
-    cwd: &std::path::Path,
-    timeout_secs: Option<f64>,
-    timeout_from_setting: bool,
-    session_env: Option<std::sync::Arc<crate::agent::tool_execution::ToolSessionEnv>>,
-    on_update: Option<crate::agent::tool_execution::ToolUpdateFn>,
-    signal: Option<crate::ai::types::AbortSignal>,
-) -> ToolResult {
+pub(crate) async fn run_with_operations(run: BashRun<'_>) -> ToolResult {
+    let BashRun {
+        operations,
+        command,
+        cwd,
+        timeout_secs,
+        timeout_from_setting,
+        session_env,
+        on_update,
+        signal,
+    } = run;
     let started_at = std::time::Instant::now();
     let capture = std::sync::Arc::new(std::sync::Mutex::new(ShellCapture::new(
         2 * DEFAULT_MAX_BYTES,

@@ -20,7 +20,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use pir::env_client::{
-    open_terminal, was_closed, writer_queue_limits, Connection, TerminalOptions, WRITE_CHUNK,
+    open_terminal, was_closed, writer_queue_limits, Connection, Context, ExecCommand, ExecOptions,
+    RemoteExecutionEnv, RemoteExecutionEnvOptions, TerminalOptions, WRITE_CHUNK,
 };
 use pir::env_daemon::frame::{self, Frame, CANCEL, ERROR, EVENT, REQUEST, RESULT};
 
@@ -59,6 +60,9 @@ fn mock_pty_daemon_child() {
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut terminals: Vec<u32> = Vec::new();
+    // `exec` requests are never answered: the test drops the caller's future
+    // and observes the kill cancel instead.
+    let mut execs: Vec<u32> = Vec::new();
     while let Ok(Some(request)) = frame::read_frame(&mut input) {
         let op = request
             .json
@@ -84,9 +88,16 @@ fn mock_pty_daemon_child() {
                     "features": [],
                 }),
             ),
+            (REQUEST, "exec") => {
+                execs.push(request.id);
+                append(&dir, "exec-ids.txt", format!("{}\n", request.id).as_bytes());
+                // Deliberately no reply: the caller drops the future, and the
+                // guard must send the kill cancel on its own.
+            }
             (REQUEST, "pty") => {
                 terminals.push(request.id);
                 append(&dir, "pty.jsonl", format!("{}\n", request.json).as_bytes());
+                append(&dir, "pty-ids.txt", format!("{}\n", request.id).as_bytes());
                 frame::write_frame(
                     &mut out,
                     &Frame::new(EVENT, request.id, json!({ "kind": "started", "pid": 1234 })),
@@ -173,6 +184,11 @@ fn mock_pty_daemon_child() {
             }
             (REQUEST, "lstat") => reply(&mut out, request.id, json!({ "kind": "directory" })),
             (CANCEL, _) => {
+                append(
+                    &dir,
+                    "cancels.jsonl",
+                    format!("{}\n", request.id).as_bytes(),
+                );
                 if terminals.contains(&request.id) {
                     frame::write_frame(
                         &mut out,
@@ -184,6 +200,24 @@ fn mock_pty_daemon_child() {
                     )
                     .expect("abort error");
                     terminals.retain(|id| *id != request.id);
+                }
+                if execs.contains(&request.id) {
+                    let mode = request
+                        .json
+                        .get("mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("cancel");
+                    append(&dir, "exec-cancels.jsonl", format!("{mode}\n").as_bytes());
+                    frame::write_frame(
+                        &mut out,
+                        &Frame::new(
+                            ERROR,
+                            request.id,
+                            json!({ "code": "aborted", "message": "aborted" }),
+                        ),
+                    )
+                    .expect("exec abort error");
+                    execs.retain(|id| *id != request.id);
                 }
             }
             (REQUEST, _) => frame::write_frame(
@@ -306,6 +340,49 @@ async fn wait_for_output(output: &Arc<Mutex<Vec<u8>>>, needle: &[u8]) {
     );
 }
 
+/// The `pid:<digits>` line a shell prints for a background job.
+#[cfg(unix)]
+fn printed_pid(output: &Arc<Mutex<Vec<u8>>>) -> i32 {
+    let bytes = output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let text = String::from_utf8_lossy(&bytes);
+    let start = text
+        .find("pid:")
+        .expect("the shell printed the background pid")
+        + 4;
+    let digits: String = text[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().expect("a numeric pid")
+}
+
+/// Wait until `pid` is gone (`kill(pid, 0)` reports `ESRCH`).
+#[cfg(unix)]
+async fn wait_for_process_gone(pid: i32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        // SAFETY: signal 0 performs the existence/permission check only.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ESRCH),
+                "the background job must be gone: {error}"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background process {pid} survived the terminal's idle close"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Wait until the daemon captured exactly `bytes` of `ptyWrite` payloads.
 async fn wait_for_writes(path: &Path, bytes: usize) -> Vec<u8> {
     for _ in 0..600 {
@@ -342,6 +419,67 @@ async fn wait_for_ops(dir: &Path, count: usize) -> Vec<Value> {
         "daemon never logged {count} terminal operations: {:?}",
         std::fs::read_to_string(&path).unwrap_or_default()
     );
+}
+
+/// The id of the first `pty` request the mock daemon recorded.
+async fn wait_for_pty_id(dir: &Path) -> u32 {
+    for _ in 0..600 {
+        if let Ok(text) = std::fs::read_to_string(dir.join("pty-ids.txt")) {
+            if let Some(line) = text.lines().next() {
+                return line.trim().parse().expect("a numeric pty request id");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the daemon never received a pty request");
+}
+
+fn cancel_count(dir: &Path, id: u32) -> usize {
+    std::fs::read_to_string(dir.join("cancels.jsonl"))
+        .ok()
+        .map(|text| {
+            text.lines()
+                .filter(|line| line.trim() == id.to_string())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// The id of the first `exec` request the mock daemon recorded.
+async fn wait_for_exec_id(dir: &Path) -> u32 {
+    for _ in 0..600 {
+        if let Ok(text) = std::fs::read_to_string(dir.join("exec-ids.txt")) {
+            if let Some(line) = text.lines().next() {
+                return line.trim().parse().expect("a numeric exec request id");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the daemon never received an exec request");
+}
+
+/// Wait until the mock daemon logged an `exec` cancel with `mode`.
+async fn wait_for_exec_cancel(dir: &Path, mode: &str) {
+    for _ in 0..600 {
+        if let Ok(text) = std::fs::read_to_string(dir.join("exec-cancels.jsonl")) {
+            if text.lines().any(|line| line.trim() == mode) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the daemon never received an exec cancel with mode `{mode}`");
+}
+
+/// Wait until the mock daemon logged a `CANCEL` frame for `id`.
+async fn wait_for_cancel(dir: &Path, id: u32) {
+    for _ in 0..600 {
+        if cancel_count(dir, id) > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the daemon never received a CANCEL frame for pty {id}");
 }
 
 /// Wait until the mock daemon consumed a wedged (`hang`) request, i.e. the
@@ -741,6 +879,116 @@ async fn closing_a_terminal_aborts_its_request() {
     connection.close();
 }
 
+/// Dropping the last `RemoteTerminal` handle without `close()` must run the
+/// same teardown: the mock daemon sees the `CANCEL` for the `pty` request
+/// (the real daemon kills the program and its session) and a retained
+/// `Exited` settles instead of waiting forever. The old implementation kept
+/// the daemon-side PTY, the writer task and the settlement alive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_last_terminal_handle_aborts_its_request() {
+    let tree = Tree::new("drop");
+    let connection = mock_connection(&tree.0);
+    let terminal = open_terminal(
+        connection.clone(),
+        TerminalOptions::new(tree.root(), 80, 24, |_| {}),
+    )
+    .await
+    .expect("open terminal");
+    let exited = terminal.exited();
+    let pty_id = wait_for_pty_id(&tree.0).await;
+
+    drop(terminal);
+
+    let error = tokio::time::timeout(Duration::from_secs(5), exited.wait())
+        .await
+        .expect("dropping the last handle must settle `exited` instead of leaking it")
+        .expect_err("a dropped terminal settles as aborted");
+    assert_eq!(error.code, "aborted", "{error:?}");
+    assert!(
+        was_closed(&error),
+        "the settlement identifies the implicit close: {error:?}"
+    );
+    // The daemon-side request was cancelled, not merely forgotten.
+    wait_for_cancel(&tree.0, pty_id).await;
+    connection.close();
+}
+
+/// `close()` followed by dropping the handle must not send a second cancel:
+/// the teardown is idempotent even though both paths observe the last owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_then_drop_aborts_exactly_once() {
+    let tree = Tree::new("close-drop");
+    let connection = mock_connection(&tree.0);
+    let terminal = open_terminal(
+        connection.clone(),
+        TerminalOptions::new(tree.root(), 80, 24, |_| {}),
+    )
+    .await
+    .expect("open terminal");
+    let pty_id = wait_for_pty_id(&tree.0).await;
+
+    terminal.close();
+    wait_for_cancel(&tree.0, pty_id).await;
+    drop(terminal);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        cancel_count(&tree.0, pty_id),
+        1,
+        "close() then drop must abort the pty request exactly once"
+    );
+    connection.close();
+}
+
+/// P2-01 on the wire, on every platform: dropping an `exec` future before the
+/// daemon answers must send the explicit kill cancel (`{ mode: "kill" }`), not
+/// merely forget the id, so `cleanup()` is not the only remaining killer. The
+/// old implementation sent nothing and this wait times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_an_exec_future_sends_the_kill_cancel() {
+    let tree = Tree::new("exec-drop");
+    let connection = mock_connection(&tree.0);
+    let mut options = RemoteExecutionEnvOptions::new("pi-env:mock-exec", connection.clone());
+    options.cwd = Some(tree.root());
+    let environment = RemoteExecutionEnv::new(options);
+    let command = ExecCommand::Shell("sleep 10".to_string());
+    let exec_options = ExecOptions {
+        cwd: Some(tree.root()),
+        ..Default::default()
+    };
+    let context = Context::default();
+    let mut exec = Box::pin(environment.exec(&command, &exec_options, &context));
+
+    // Drive the future until the mock daemon has the exec request.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::read_to_string(tree.0.join("exec-ids.txt"))
+            .map(|text| !text.trim().is_empty())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon never received the exec request"
+        );
+        tokio::select! {
+            result = &mut exec => panic!("exec settled before it could be dropped: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+    }
+    let exec_id = wait_for_exec_id(&tree.0).await;
+
+    // No abort signal, no daemon reply: only the guard's Drop can kill it.
+    drop(exec);
+    wait_for_exec_cancel(&tree.0, "kill").await;
+    assert!(
+        cancel_count(&tree.0, exec_id) >= 1,
+        "the kill cancel targets the registered exec request"
+    );
+    assert_eq!(environment.running_len_for_tests(), 0);
+    connection.close();
+}
+
 // ---------------------------------------------------------------------------
 // The real daemon
 // ---------------------------------------------------------------------------
@@ -807,5 +1055,63 @@ async fn the_builtin_daemon_runs_a_terminal_end_to_end() {
     terminal.write_async(b"hi\n").await.expect("write");
     assert_eq!(terminal.exited().wait().await.expect("exit code"), 3);
     wait_for_output(&output, b"got:hi").await;
+    connection.close();
+}
+
+/// A background job can keep the terminal open after its shell exits. The
+/// idle close ends the session, so the job's process group must be killed
+/// before the daemon reports the pty request finished — otherwise the job
+/// becomes an orphan. A following pty request proves the daemon still serves.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_terminal_close_kills_the_background_process_group() {
+    let tree = Tree::new("pty-idle-kill");
+    let connection = real_connection();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let callback = Arc::clone(&output);
+    let terminal = open_terminal(
+        connection.clone(),
+        TerminalOptions::new(tree.root(), 80, 24, move |bytes| {
+            callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+        })
+        .argv(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "sleep 1000 & echo pid:$!; exit 0".to_owned(),
+        ])
+        .inherit_env(true),
+    )
+    .await
+    .expect("open terminal");
+    assert_eq!(terminal.exited().wait().await.expect("exit code"), 0);
+    wait_for_output(&output, b"pid:").await;
+    let pid = printed_pid(&output);
+    wait_for_process_gone(pid).await;
+
+    // The daemon is healthy after the idle close.
+    let second_output = Arc::new(Mutex::new(Vec::new()));
+    let second_callback = Arc::clone(&second_output);
+    let second = open_terminal(
+        connection.clone(),
+        TerminalOptions::new(tree.root(), 80, 24, move |bytes| {
+            second_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+        })
+        .argv(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "printf alive".to_owned(),
+        ])
+        .inherit_env(true),
+    )
+    .await
+    .expect("the daemon still serves a new pty");
+    assert_eq!(second.exited().wait().await.expect("second exit code"), 0);
+    wait_for_output(&second_output, b"alive").await;
     connection.close();
 }

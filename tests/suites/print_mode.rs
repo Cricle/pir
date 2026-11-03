@@ -31,6 +31,7 @@ use pir::agent_session::SessionEvent;
 use pir::ai::auth::ApiKeyAuth;
 use pir::ai::event_stream::AssistantMessageEventStream;
 use pir::ai::provider::{Provider, ProviderRegistry};
+use pir::ai::providers::PiEnvironment;
 use pir::ai::types::{
     AssistantMessage, ContentBlock, Context, Message, Model, ModelCost, ModelCostRates, StopReason,
     StreamOptions, TerminalReason, TextContent, ThinkingLevel, ToolCall, Usage, UserMessage,
@@ -41,10 +42,15 @@ use pir::coding_agent::print::{
     background_abort_diagnostic, background_abort_event, partition_file_args,
     print_apply_max_turns, print_apply_retry, print_compaction_config, print_compaction_hook,
     print_loop_deps, print_plugin_host, print_retry_policy, print_tool_definitions,
-    print_transport_hooks, text_with_background_reports, threshold_model_for,
-    try_extension_command, PrintBackground, PrintSessionEventSink, SharedSession,
+    print_transport_hooks, print_transport_hooks_with_model, run_print_with_environment,
+    text_with_background_reports, threshold_model_for, try_extension_command, OutputMode,
+    PrintBackground, PrintOptions, PrintSessionEventSink, SharedSession,
 };
+use pir::coding_agent::resources::ResourcePathOptions;
+use pir::coding_agent::session_resolve::SessionPlan;
 use pir::compaction::{CompactionConfig, PathEntryMeta, ProjectionEntryMeta};
+use pir::config::settings::Settings;
+use pir::config::Config;
 use pir::extensions::{ExtensionConfig, ExtensionHandle, SessionContextSnapshot};
 use pir::plugins::builtin::instantiate_builtin;
 use pir::plugins::{AgentPlugin, PluginHost};
@@ -443,6 +449,46 @@ async fn print_transport_hooks_route_the_native_before_provider_request_face() {
     assert!(fallback.after_provider_response.is_none());
 }
 
+/// The print-widen fast path: with `tool-repair` as the ONLY interested
+/// handler and a model outside `anchorBleedModels`, the payload hook is not
+/// installed at all, so the OpenAI adapter keeps its streamed body path
+/// instead of materializing the request transcript as a `serde_json::Value`.
+/// A gated model keeps the hook (and its sanitizing behavior) exactly as
+/// before; the no-model entry point keeps the historical coarse gate.
+#[tokio::test(flavor = "current_thread")]
+async fn print_transport_hooks_skip_the_payload_hook_only_when_tool_repair_is_inert() {
+    let host = Arc::new(PluginHost::build(None, vec![tool_repair_builtin()]));
+
+    // Non-gated model (the default print run): no payload hook.
+    let mut model = test_model();
+    model.id = "gpt-4.1".to_owned();
+    host.update_session_context(model_snapshot(&model.id));
+    let inert = print_transport_hooks_with_model(Some(&host), None, Some(&model));
+    assert!(
+        inert.before_provider_request.is_none(),
+        "an inert tool-repair must not force the value-body path"
+    );
+
+    // Gated model: the hook exists and still sanitizes through the host.
+    let mut gated = test_model();
+    gated.id = "glm-4.6".to_owned();
+    host.update_session_context(model_snapshot(&gated.id));
+    let active = print_transport_hooks_with_model(Some(&host), None, Some(&gated));
+    let before = active
+        .before_provider_request
+        .as_ref()
+        .expect("a gated model keeps the native request hook");
+    let returned = before(anchored_body()).await;
+    assert_eq!(tool_pattern(&returned), &serde_json::json!("foo"));
+
+    // No model known: the historical coarse interest gate is unchanged.
+    let unknown = print_transport_hooks_with_model(Some(&host), None, None);
+    assert!(
+        unknown.before_provider_request.is_some(),
+        "unknown model must keep the pre-gate behavior"
+    );
+}
+
 /// A JS extension whose `before_provider_request` handler counts its
 /// dispatches and returns a replacement; the response observer records the
 /// status.
@@ -508,6 +554,18 @@ async fn print_transport_hooks_merge_native_and_js_exactly_once() {
         .await
         .expect("probe the recorded status");
     assert_eq!(status, serde_json::json!(418));
+
+    // A NON-gated model must not suppress the hook while a live JS handler
+    // exists: the JS face cannot be introspected for model gating, so the
+    // host keeps the value path (conservative).
+    host.update_session_context(model_snapshot("gpt-4.1"));
+    let mut non_gated = test_model();
+    non_gated.id = "gpt-4.1".to_owned();
+    let js_live = print_transport_hooks_with_model(Some(&host), Some(&runtime), Some(&non_gated));
+    assert!(
+        js_live.before_provider_request.is_some(),
+        "a live JS handler must keep the payload hook for every model"
+    );
 
     // Without a host the fallback still dispatches the JS side (the
     // host-less seam stays intact).
@@ -2093,22 +2151,23 @@ async fn run_print_compaction_probe(
     // `test_model().context_window` is 128_000: with a 1_000-token reserve the
     // gate sits at 127_000 tokens, and `keep_recent_tokens: 1` keeps the cut
     // plan trivial (the user message is summarized, the tool turn is kept).
-    let hook = print_compaction_hook(
-        CompactionConfig {
+    let hook = print_compaction_hook(pir::coding_agent::print::PrintCompactionInputs {
+        config: CompactionConfig {
             enabled: true,
             reserve_tokens: 1_000,
             keep_recent_tokens: 1,
         },
-        test_model(),
+        model: test_model(),
         registry,
-        None,
-        ThinkingLevel::Off,
-        pir::ai::types::ProviderStreamHooks::default(),
-        Arc::clone(&session),
-        None,
-        None,
-        Some(recording_session_event_sink(Arc::clone(&frames))),
-    );
+        api_key: None,
+        thinking_level: ThinkingLevel::Off,
+        hooks: pir::ai::types::ProviderStreamHooks::default(),
+        session: Arc::clone(&session),
+        projected: None,
+        plugins: None,
+        runtime: None,
+        session_events: Some(recording_session_event_sink(Arc::clone(&frames))),
+    });
     let result = run_with_options(
         deps,
         Context {
@@ -2443,22 +2502,23 @@ async fn run_print_double_compaction_probe() -> (
             projection.messages,
         )
     };
-    let hook = print_compaction_hook(
-        CompactionConfig {
+    let hook = print_compaction_hook(pir::coding_agent::print::PrintCompactionInputs {
+        config: CompactionConfig {
             enabled: true,
             reserve_tokens: 800,
             keep_recent_tokens: 1,
         },
         model,
         registry,
-        None,
-        ThinkingLevel::Off,
-        pir::ai::types::ProviderStreamHooks::default(),
-        Arc::clone(&session),
+        api_key: None,
+        thinking_level: ThinkingLevel::Off,
+        hooks: pir::ai::types::ProviderStreamHooks::default(),
+        session: Arc::clone(&session),
         projected,
-        None,
-        Some(recording_session_event_sink(Arc::clone(&frames))),
-    );
+        plugins: None,
+        runtime: None,
+        session_events: Some(recording_session_event_sink(Arc::clone(&frames))),
+    });
     // The production per-message persistence sink (`run_print`): every
     // loop-produced message lands in the session at its `message_end`, so the
     // post-compaction metadata rebuild reads the entries the rebuilt context
@@ -2752,22 +2812,23 @@ async fn run_print_append_failure_probe(
         ThinkingLevel::Off,
     );
     deps.stream = scripted_compaction_append_retry_stream(Arc::clone(&requests));
-    let hook = print_compaction_hook(
-        CompactionConfig {
+    let hook = print_compaction_hook(pir::coding_agent::print::PrintCompactionInputs {
+        config: CompactionConfig {
             enabled: true,
             reserve_tokens: 1_000,
             keep_recent_tokens: 1,
         },
-        test_model(),
+        model: test_model(),
         registry,
-        None,
-        ThinkingLevel::Off,
-        pir::ai::types::ProviderStreamHooks::default(),
-        Arc::clone(&session),
-        None,
-        None,
-        Some(recording_session_event_sink(Arc::clone(&frames))),
-    );
+        api_key: None,
+        thinking_level: ThinkingLevel::Off,
+        hooks: pir::ai::types::ProviderStreamHooks::default(),
+        session: Arc::clone(&session),
+        projected: None,
+        plugins: None,
+        runtime: None,
+        session_events: Some(recording_session_event_sink(Arc::clone(&frames))),
+    });
     let result = run_with_options(
         deps,
         Context {
@@ -2982,13 +3043,15 @@ fn print_prompt_cache_renders_and_refreshes_the_mcp_section() {
                - mcp__docs (codemode): connected · 2 tools\n\
                - mcp__slow (deferred): connecting";
     let mut cache = pir::coding_agent::print::PrintPromptCache::new_with_mcp_servers(
-        None,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        dir.0.clone(),
-        None,
-        Some(mcp.to_owned()),
+        pir::coding_agent::print::PrintPromptCacheInputs {
+            preamble_override: None,
+            append: Vec::new(),
+            project_files: Vec::new(),
+            skills: Vec::new(),
+            cwd: dir.0.clone(),
+            package_dir: None,
+            mcp_servers: Some(mcp.to_owned()),
+        },
     );
     let prompt = cache.sync(&registry, &[], None);
     assert!(
@@ -3235,5 +3298,171 @@ fn print_retry_defaults_to_the_enabled_policy() {
             max_retries: 2,
             ..expected
         })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Main-loop provider resolution scope (P2-S8-4 print residual)
+// ---------------------------------------------------------------------------
+
+/// One provider double for the print main-loop scope probe: replies with a
+/// fixed marker and counts the requests it serves.
+struct ScopedReplyProvider {
+    model: Model,
+    reply: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+impl Provider for ScopedReplyProvider {
+    #[allow(clippy::misnamed_getters)]
+    fn id(&self) -> &str {
+        &self.model.provider
+    }
+
+    fn name(&self) -> &str {
+        "scoped reply provider"
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        vec![self.model.clone()]
+    }
+
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        Vec::new()
+    }
+
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: Context,
+        _options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let stream = AssistantMessageEventStream::new();
+        stream.push(AssistantMessageEventStream::done_event(
+            TerminalReason::Stop,
+            AssistantMessage {
+                api: self.model.api.clone(),
+                provider: self.model.provider.clone(),
+                model: self.model.id.clone(),
+                content: vec![ContentBlock::Text(TextContent {
+                    text: self.reply.to_owned(),
+                    text_signature: None,
+                })],
+                stop_reason: StopReason::Stop,
+                timestamp: 1,
+                ..AssistantMessage::default()
+            },
+        ));
+        stream
+    }
+}
+
+/// P2-S8-4 print residual: print's MAIN prompt stream must resolve through
+/// the print host's own provider session, not the process-shared dynamic map.
+///
+/// A different LIVE session sharing the registry owns a shared dynamic entry
+/// under the same provider id. Before the fix the main loop used the
+/// session-less `registry_event_stream`, so that foreign entry (and its
+/// credential/runtime) served print's prompt. With the run-scoped key the
+/// static provider answers and the foreign provider is never called.
+///
+/// The run is a real `run_print_with_environment` invocation: reverting only
+/// the `LoopOptions::event_stream` wiring (keeping the rest of the host)
+/// makes this fail, so it pins the production seam rather than a helper.
+#[tokio::test(flavor = "current_thread")]
+async fn print_main_loop_stream_ignores_another_sessions_shared_provider() {
+    let temp = TempDir::new("main-loop-provider-scope");
+    let model = test_model();
+    let static_calls = Arc::new(AtomicUsize::new(0));
+    let foreign_calls = Arc::new(AtomicUsize::new(0));
+
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(ScopedReplyProvider {
+        model: model.clone(),
+        reply: "STATIC_PROMPT_REPLY",
+        calls: Arc::clone(&static_calls),
+    }));
+    // A different live session owns the shared dynamic entry for `test` (the
+    // shape `AgentSession::sync_plugin_providers` leaves behind).
+    let foreign = registry.standalone_provider_session();
+    registry.register_session_owned_dynamic_provider_for_test(
+        foreign.key(),
+        "test",
+        Arc::new(ScopedReplyProvider {
+            model: model.clone(),
+            reply: "FOREIGN_PROMPT_REPLY",
+            calls: Arc::clone(&foreign_calls),
+        }),
+    );
+
+    let session_dir = temp.0.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("create sessions dir");
+    let config = Config {
+        session_dir: session_dir.to_string_lossy().into_owned(),
+        ..Config::default()
+    };
+    let options = PrintOptions {
+        prompt: "hi".to_owned(),
+        additional_messages: Vec::new(),
+        mode: OutputMode::Text,
+        session: SessionPlan::New { id: None },
+        no_context_files: true,
+        cli_provider: Some("test".to_owned()),
+        cli_model: Some("test-model".to_owned()),
+        cli_thinking: None,
+        api_key_override: Some("test-key".to_owned()),
+        model_patterns: None,
+        session_name: None,
+        system_prompt_override: Some("BASE-SYSTEM".to_owned()),
+        append_system_prompt: Vec::new(),
+        settings_default_tools: None,
+        cli_tools: Vec::new(),
+        cli_exclude_tools: Vec::new(),
+        no_tools: false,
+        no_builtin_tools: false,
+        is_continuing: false,
+        resources: ResourcePathOptions {
+            no_skills: true,
+            no_prompt_templates: true,
+            ..ResourcePathOptions::default()
+        },
+        images: Vec::new(),
+    };
+
+    let outcome = run_print_with_environment(
+        options,
+        &config,
+        &[],
+        temp.0.clone(),
+        PiEnvironment {
+            registry,
+            models: vec![model],
+            api_keys: BTreeMap::from([("test".to_owned(), "test-key".to_owned())]),
+            settings: Settings::default(),
+        },
+    )
+    .await
+    .expect("run_print");
+
+    // Keep the foreign key alive for the whole run: a dead owner would make
+    // the entry invisible to a session-less lookup too, hiding the regression.
+    drop(foreign);
+
+    assert_eq!(outcome.exit_code, 0);
+    assert!(
+        outcome.text.contains("STATIC_PROMPT_REPLY"),
+        "print's main-loop request must be served by the static provider: {:?}",
+        outcome.text
+    );
+    assert_eq!(
+        foreign_calls.load(Ordering::SeqCst),
+        0,
+        "a provider owned by another live session must never serve print's prompt"
+    );
+    assert_eq!(
+        static_calls.load(Ordering::SeqCst),
+        1,
+        "the static provider must answer exactly the one prompt request"
     );
 }

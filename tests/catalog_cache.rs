@@ -80,3 +80,48 @@ fn shared_handle_is_parse_once() {
         "the second call must return the cached Arc, not re-parse the catalog"
     );
 }
+
+/// `models-store.json` caches provider catalogs, validators and internal base
+/// URLs. On Unix the temp file backing the atomic write is created 0600, so
+/// both the first write and a later refresh replace the file with a private
+/// mode even when the agent dir is shared.
+#[cfg(unix)]
+#[test]
+fn models_store_write_back_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use pir::ai::providers::ModelsStoreEntry;
+
+    let dir = std::env::temp_dir().join(format!(
+        "pir-models-store-mode-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let entry = ModelsStoreEntry {
+        models: Vec::new(),
+        last_modified: Some(1),
+        checked_at: Some(1),
+        etag: Some("\"one\"".to_string()),
+    };
+    pir::ai::providers::write_models_store_entry(&dir, "provider", entry.clone())
+        .expect("first store write");
+    let path = dir.join("models-store.json");
+    let first = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(first, 0o600, "first models-store write must be private");
+
+    let refreshed = ModelsStoreEntry {
+        etag: Some("\"two\"".to_string()),
+        ..entry
+    };
+    pir::ai::providers::write_models_store_entry(&dir, "provider", refreshed)
+        .expect("refresh store write");
+    let second = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(second, 0o600, "refresh write must stay private");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

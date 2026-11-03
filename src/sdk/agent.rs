@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::Stream;
@@ -34,8 +34,8 @@ pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// `tool_execution_update` half on its own.
 ///
 /// The push is a non-blocking `try_send`: a full channel drops the event
-/// (documented on [`super::event::push_to_sink`] and [`SdkEvent`]); the run never blocks on a
-/// slow consumer.
+/// (documented on [`super::event::push_to_sink_lazy`] and [`SdkEvent`]); the
+/// run never blocks on a slow consumer.
 fn forward_stream_event(event_tx: &Option<tokio::sync::mpsc::Sender<SdkEvent>>, event: SdkEvent) {
     if let Some(sender) = event_tx {
         let _ = sender.try_send(event);
@@ -45,6 +45,13 @@ fn forward_stream_event(event_tx: &Option<tokio::sync::mpsc::Sender<SdkEvent>>, 
 /// Shared predicate selecting which [`SdkEvent`]s a streaming run forwards
 /// ([`Agent::prompt_stream_with`]). Cloned into the per-run event handler.
 pub(crate) type EventFilter = Arc<dyn Fn(&SdkEvent) -> bool + Send + Sync>;
+
+/// Shared accept-all filter for the non-streaming run path. `Agent::prompt`
+/// never applies a filter (its handler returns before the filter runs), so it
+/// reuses one lazily-initialized closure instead of allocating a fresh
+/// `Arc` per prompt.
+static ACCEPT_ALL_EVENTS: std::sync::LazyLock<EventFilter> =
+    std::sync::LazyLock::new(|| Arc::new(|_: &SdkEvent| true));
 
 /// How long [`Agent::shutdown`] waits for an in-flight run to settle after
 /// aborting before giving up with an error (a run wedged in a tool that
@@ -102,15 +109,30 @@ pub(crate) struct AgentInner {
     /// `tool_execution_update` payloads ride this run's stream.
     pub sink: SharedSink,
     /// Admission flag for the ONE per-agent streaming slot. `true` from the
-    /// synchronous `prompt_stream*` call until its task has emitted the
-    /// terminal pair and detached. A concurrent stream is rejected BEFORE it
-    /// can attach (or steal) the sink or race a session prompt, so the
-    /// winner's bridge events always belong to the winner's stream.
+    /// synchronous `prompt_stream*` call until its session run has settled
+    /// (the terminal events may still be in flight to a slow or non-polling
+    /// consumer). A concurrent stream is rejected BEFORE it can attach (or
+    /// steal) the sink or race a session prompt, so the winner's bridge events
+    /// always belong to the winner's stream.
     pub stream_active: AtomicBool,
+    /// Monotonic id of the last admitted streaming run. A [`StreamRunGuard`]
+    /// remembers the generation it was created with and clears `stream_active`
+    /// only while that generation is still current, so an older run's teardown
+    /// can never release (or detach) a newer run's slot.
+    pub stream_generation: AtomicU64,
     /// Capacity of the bounded event channel used by streaming runs.
     /// Defaults to [`EVENT_CHANNEL_CAPACITY`]; read at stream start so a
     /// change applies to the next run.
     pub event_channel_capacity: AtomicUsize,
+    /// Whether the internal session-event bridge has been installed on the
+    /// session. Installed lazily by the FIRST streaming run: a non-streaming
+    /// ([`Agent::prompt`]) agent has no stream to mirror onto, and holding a
+    /// permanent session-event subscriber made the session's
+    /// `has_session_event_subscribers()` gate permanently true, which forces
+    /// every transcript append to materialize a wire `entry_appended` payload
+    /// for nobody. One-way: once a stream has run, the subscription lives for
+    /// the session's lifetime (there is no unsubscribe handle).
+    pub session_bridge_installed: AtomicBool,
     /// Set by [`Agent::shutdown`]; post-shutdown prompts are rejected.
     pub shut_down: AtomicBool,
     /// The agent's working directory (new sessions are stamped with it).
@@ -156,16 +178,65 @@ pub(crate) struct AgentInner {
 /// observe the old sender.
 struct StreamRunGuard {
     inner: Arc<AgentInner>,
+    /// The generation this run was admitted with. Generations are unique per
+    /// admitted stream, so an older guard can tell that the slot no longer
+    /// belongs to it.
+    generation: u64,
+    /// This run's own event sender. The shared sink is detached only when it
+    /// still holds THIS channel (`Sender::same_channel`); a later stream that
+    /// attached after this one settled keeps its sink.
+    sender: tokio::sync::mpsc::Sender<SdkEvent>,
+    /// Set by [`StreamRunGuard::release_admission`]. Once this run has
+    /// released its admission, a newer stream may have claimed the slot even
+    /// before the generation bump is visible here, so `Drop` must not clear
+    /// `stream_active` again.
+    admission_released: AtomicBool,
+}
+
+impl StreamRunGuard {
+    /// Whether the shared streaming slot still belongs to this run.
+    fn owns_generation(&self) -> bool {
+        self.inner.stream_generation.load(Ordering::SeqCst) == self.generation
+    }
+
+    /// Release the per-agent streaming admission WITHOUT detaching the sink.
+    ///
+    /// Called once the session run has settled and BEFORE the terminal events
+    /// are delivered: those sends use backpressure, so a consumer that keeps
+    /// the stream open but stops polling must not hold the agent's streaming
+    /// slot forever. The sink stays attached until `Drop`, so this run's
+    /// bridge events still belong to this stream. Idempotent with `Drop`, and
+    /// a no-op once a NEWER stream has been admitted: releasing the new run's
+    /// admission here would let a third stream into a still-running slot.
+    fn release_admission(&self) {
+        if self.owns_generation() {
+            self.admission_released.store(true, Ordering::SeqCst);
+            self.inner.stream_active.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Drop for StreamRunGuard {
     fn drop(&mut self) {
-        *self
-            .inner
-            .sink
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.inner.stream_active.store(false, Ordering::SeqCst);
+        {
+            let mut sink = self
+                .inner
+                .sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if sink
+                .as_ref()
+                .is_some_and(|sender| sender.same_channel(&self.sender))
+            {
+                *sink = None;
+            }
+        }
+        // An admission this guard already released belongs to whoever claimed
+        // the slot next; clearing it here would race a new stream that has
+        // won `stream_active` but not yet published its generation.
+        if !self.admission_released.load(Ordering::SeqCst) && self.owns_generation() {
+            self.inner.stream_active.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -197,40 +268,65 @@ fn rejected_event_stream(
     sdk_event_stream(receiver)
 }
 
+/// Construction parameters for [`Agent::new`] (the builder's assembly step).
+///
+/// A purpose-named struct instead of the previous nine positional arguments:
+/// every field is named at the call site, so adjacent same-typed parameters
+/// cannot be transposed. `pub(crate)` — [`super::AgentBuilder::build`] is the
+/// only caller.
+pub(crate) struct AgentInit {
+    /// The headless session facade doing the work.
+    pub session: Arc<AgentSession>,
+    /// The shared streaming sink slot (see [`AgentInner::sink`]).
+    pub sink: SharedSink,
+    /// The agent's working directory (new sessions are stamped with it).
+    pub cwd: PathBuf,
+    /// Directory fresh session files are created in; `None` for
+    /// [`SessionMode::None`](crate::sdk::SessionMode::None) agents.
+    pub session_dir: Option<PathBuf>,
+    /// The agent's OWN config directory (D2).
+    pub agent_dir: PathBuf,
+    /// Whether the model was explicitly chosen (see [`AgentInner`]).
+    pub model_pinned: bool,
+    /// Whether the thinking level was explicitly chosen (see [`AgentInner`]).
+    pub thinking_pinned: bool,
+    /// Usage totals of an attached session's loaded history (zero for a fresh
+    /// session).
+    pub initial_usage: UsageSnapshot,
+    /// Provider the configured API key belongs to, when it came from the
+    /// environment for one provider (see [`AgentInner`]).
+    pub api_key_provider: Option<String>,
+}
+
 impl Agent {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        session: Arc<AgentSession>,
-        sink: SharedSink,
-        cwd: PathBuf,
-        session_dir: Option<PathBuf>,
-        agent_dir: PathBuf,
-        model_pinned: bool,
-        thinking_pinned: bool,
-        initial_usage: UsageSnapshot,
-        api_key_provider: Option<String>,
-    ) -> Self {
+    pub(crate) fn new(init: AgentInit) -> Self {
+        let AgentInit {
+            session,
+            sink,
+            cwd,
+            session_dir,
+            agent_dir,
+            model_pinned,
+            thinking_pinned,
+            initial_usage,
+            api_key_provider,
+        } = init;
         let state = session.state();
         // Session-level events (queue/compaction/entry/session-info/retry/
         // bash/background completion) are emitted outside the agent-loop event
-        // enum; subscribe once and mirror them onto whichever prompt stream
-        // (if any) is active. The sink slot is shared, so an event with no
-        // live stream is dropped and the subscription never outlives the
-        // session.
-        {
-            let event_sink = Arc::clone(&sink);
-            session.on_session_event(Arc::new(move |event| {
-                if let Some(sdk_event) = SdkEvent::from_session_event(&event) {
-                    super::event::push_to_sink(&event_sink, sdk_event);
-                }
-            }));
-        }
+        // enum. The bridge that mirrors them onto the active prompt stream is
+        // installed on FIRST stream use (`ensure_session_event_bridge`): a
+        // permanent subscriber at build time would make the session's
+        // `entry_appended` payload gate always materialize the wire entry,
+        // even for `Agent::prompt` runs that have no stream at all.
         Self {
             inner: Arc::new(AgentInner {
                 session,
                 sink,
                 stream_active: AtomicBool::new(false),
+                stream_generation: AtomicU64::new(0),
                 event_channel_capacity: AtomicUsize::new(EVENT_CHANNEL_CAPACITY),
+                session_bridge_installed: AtomicBool::new(false),
                 shut_down: AtomicBool::new(false),
                 cwd,
                 agent_dir,
@@ -355,7 +451,7 @@ impl Agent {
                 Arc::clone(&outcome_slot),
                 settled_aborted,
                 None,
-                Arc::new(|_: &SdkEvent| true),
+                Arc::clone(&*ACCEPT_ALL_EVENTS),
                 true,
             );
             let terminal = if images.is_empty() {
@@ -405,10 +501,15 @@ impl Agent {
     /// is always [`SdkEvent::AgentSettled`] unless the receiver was dropped
     /// first.
     ///
-    /// One prompt stream may be active per agent. A concurrent call is
-    /// rejected before it can attach the shared event sink: its stream yields
-    /// [`SdkEvent::PromptRejected`] followed by [`SdkEvent::AgentSettled`],
-    /// while the in-flight run's stream is untouched.
+    /// One prompt stream may be active per agent RUN: admission covers the
+    /// run, not the consumer's reading of it. It is released as soon as the
+    /// run settles, before the terminal events are delivered, so a caller that
+    /// stops polling an old stream cannot block the next call (the old stream
+    /// still delivers its terminal events when drained). A concurrent call
+    /// DURING a run is rejected before it can attach the shared event sink:
+    /// its stream yields [`SdkEvent::PromptRejected`] followed by
+    /// [`SdkEvent::AgentSettled`], while the in-flight run's stream is
+    /// untouched.
     ///
     /// This path yields events only; it does not capture an
     /// [`AgentOutcome`](crate::sdk::AgentOutcome), so it also skips the
@@ -628,13 +729,31 @@ impl Agent {
             );
         }
 
-        // The sink is attached only after admission, so it is guaranteed to
-        // be empty: the in-flight stream's bridge events can never be stolen.
+        // The sink is attached only after admission. A previously settled
+        // stream may still hold its sender here until its task exits; this
+        // run replaces it, and that older guard detaches only a channel that
+        // still matches its own (`Sender::same_channel`).
+        // The generation makes every later cleanup (this guard's Drop, or a
+        // premature `release_admission`) scoped to THIS run: once another
+        // stream is admitted, the older guard can neither clear the new
+        // sink nor release its admission.
+        // The counter stores the LAST allocated generation, so the admitted
+        // run's id is the post-increment value. (Using `fetch_add`'s return
+        // value here made the current counter already one ahead, so
+        // `owns_generation()` was false from the start and the admission was
+        // never released.)
+        let generation = self.inner.stream_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let sender = event_tx.clone();
         *self
             .inner
             .sink
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event_tx.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender.clone());
+        // The stream exists now, so session-level events have somewhere to
+        // go: install the bridge (once per session) before the run starts.
+        // `Agent::prompt` never reaches this point and therefore never holds
+        // a permanent session-event subscription.
+        self.ensure_session_event_bridge();
 
         let session = Arc::clone(&self.inner.session);
         // RAII: created before the task is spawned and moved into it, so the
@@ -642,6 +761,9 @@ impl Agent {
         // cancellation, and panic alike.
         let run_guard = StreamRunGuard {
             inner: Arc::clone(&self.inner),
+            generation,
+            sender,
+            admission_released: AtomicBool::new(false),
         };
         // Read the shutdown flag INSIDE the task, not here: the task does not
         // poll until the caller yields, so `prompt_stream(..)` followed by
@@ -673,12 +795,19 @@ impl Agent {
             .map(ContentBlock::Image)
             .collect::<Vec<_>>();
         tokio::spawn(async move {
-            // Owns the sink detach and admission release. It is dropped after
-            // the terminal sends below, so a late bridge update can never be
-            // queued after `AgentSettled` and the next stream is admitted only
-            // once this one has fully settled.
+            // Owns the sink detach and the fallback admission release. The
+            // admission is released explicitly as soon as the session run
+            // settles (below), BEFORE the backpressured terminal sends: a
+            // consumer that keeps this stream but stops polling must not hold
+            // the agent's streaming slot. The sink stays attached until Drop,
+            // so a late bridge update can never be queued after `AgentSettled`.
             let _run_guard = run_guard;
             if agent.shut_down.load(Ordering::SeqCst) {
+                // The run never started, so the admission is free BEFORE the
+                // backpressured terminal sends — exactly like the settled
+                // path below. The guard's generation check keeps a newer
+                // stream's admission untouched.
+                _run_guard.release_admission();
                 // Rejection terminals are sent with backpressure (this task is
                 // async, so waiting cannot stall the agent loop) — a caller
                 // that configured a tiny channel must still observe the
@@ -705,10 +834,13 @@ impl Agent {
                 // `session.prompt` returns only after the whole prompt run
                 // settled (every `agent_before_settle` continuation and
                 // post-run recovery included), so this is the SDK's terminal
-                // point. Deliver the outcome and the settled event with
-                // backpressure: terminal events are not best-effort like the
-                // intermediate stream. The guard then detaches the sink before
-                // the task exits.
+                // point. The run owns the session no more: free the streaming
+                // admission before the terminal sends, whose backpressure can
+                // wait indefinitely on a consumer that stopped polling. Deliver
+                // the outcome and the settled event with backpressure: terminal
+                // events are not best-effort like the intermediate stream. The
+                // guard then detaches the sink before the task exits.
+                _run_guard.release_admission();
                 match result {
                     Ok(terminal) => {
                         if capture_outcome {
@@ -753,6 +885,37 @@ impl Agent {
         sdk_event_stream(stream_rx)
     }
 
+    /// Install the session-event → prompt-stream bridge on first stream use.
+    ///
+    /// The subscription has no unsubscribe handle, so installing it at build
+    /// time made it permanent even for agents that only ever call
+    /// [`Agent::prompt`]. The session's `entry_appended` payload gate counts
+    /// any subscriber other than its own bridge as a reason to materialize the
+    /// wire entry; a stream-less agent would pay that clone on every append
+    /// for an event nobody can receive. Deferring installation keeps the gate
+    /// closed until a stream actually exists, and a stream run installs it
+    /// before its first prompt reaches the session.
+    fn ensure_session_event_bridge(&self) {
+        if self
+            .inner
+            .session_bridge_installed
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let event_sink = Arc::clone(&self.inner.sink);
+        self.inner.session.on_session_event(Arc::new(move |event| {
+            // Project lazily: between runs the sink may already be detached
+            // again, and the projection would clone the entry JSON for
+            // nobody. This handler owns its event (the fan-out hands the last
+            // subscriber the original), so the owned projection moves the
+            // payload into the SDK event instead of deep-cloning it.
+            super::event::push_to_sink_lazy(&event_sink, || {
+                SdkEvent::from_session_event_owned(event)
+            });
+        }));
+    }
+
     /// Build the per-run event handler: maps loop events into SDK events,
     /// captures the run outcome (`capture_outcome`; `false` on the plain
     /// streaming path so settlement clones nothing), records the final loop
@@ -788,6 +951,11 @@ impl Agent {
         capture_outcome: bool,
     ) -> EventHandler {
         let awaiting_message_end = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A non-streaming run has no sink: only the terminal `AgentEnd`
+        // carries data it reads (the outcome capture). Everything else would
+        // be projected into an `SdkEvent` and dropped immediately, so take a
+        // fast path that skips the projection entirely.
+        let has_stream = event_tx.is_some();
         Arc::new(move |event: AgentEvent| {
             // Record the run's terminal aborted flag from the ONE event that
             // carries it. The SDK's terminal event is emitted after the whole
@@ -795,8 +963,18 @@ impl Agent {
             if let AgentEvent::AgentEnd { result } = &event {
                 settled_aborted.store(result.aborted, Ordering::SeqCst);
             }
-            let (sdk_event, outcome) =
-                super::event::from_loop_event(event, capture_outcome, event_tx.is_some());
+            if !has_stream {
+                if let AgentEvent::AgentEnd { result } = &event {
+                    if capture_outcome {
+                        *outcome_slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(super::event::loop_outcome(result));
+                    }
+                }
+                return;
+            }
+            let (sdk_event, outcome) = super::event::from_loop_event(event, capture_outcome, true);
             if let Some(outcome) = outcome {
                 *outcome_slot
                     .lock()
@@ -949,15 +1127,17 @@ impl Agent {
             .inner
             .session
             .active_tool_snapshot(self.inner.session.plugin_host());
-        let mut tools: Vec<ToolInfo> = active
-            .iter()
-            .filter_map(|name| registry.get(name))
-            .map(|tool| ToolInfo {
+        let mut tools: Vec<ToolInfo> = Vec::with_capacity(active.len());
+        for name in active.iter() {
+            let Some(tool) = registry.get(name) else {
+                continue;
+            };
+            tools.push(ToolInfo {
                 name: tool.name().to_owned(),
                 description: tool.description().to_owned(),
                 parameters: tool.parameters(),
-            })
-            .collect();
+            });
+        }
         tools.sort_by(|left, right| left.name.cmp(&right.name));
         tools
     }
@@ -1060,10 +1240,9 @@ impl Agent {
     /// The file itself is created lazily by the first persisted message, so
     /// a freshly built agent may report a path that does not exist yet.
     pub fn session_path(&self) -> Option<PathBuf> {
-        let state = self.inner.session.state();
-        state
-            .session_path
-            .map(std::path::PathBuf::from)
+        self.inner
+            .session
+            .session_path()
             .filter(|path| !path.as_os_str().is_empty())
     }
 
@@ -1299,14 +1478,18 @@ impl Agent {
         // Read the recorded settings and totals BEFORE the swap: a paged
         // session streams its skipped prefix one entry at a time, so this
         // never materializes the whole transcript.
-        let projection = manager.build_session_projection().ok();
-        let recorded_model = projection
-            .as_ref()
-            .and_then(|projection| projection.model.clone());
+        //
+        // Only the two SETTINGS fields are needed here, and they live in
+        // state entries on the leaf path. Building the full projection (the
+        // old shape) cloned every message of the conversation just to read
+        // `projection.model`, which made attaching a medium/large session pay
+        // an avoidable transcript-sized copy.
+        let recorded = session_recorded_settings(&manager);
+        let recorded_model = recorded.model;
         // `get_session_context_settings` defaults the level to "off" when the
         // branch never recorded one; only an explicit change entry may
         // override the agent's current level.
-        let recorded_thinking = session_recorded_thinking(&manager);
+        let recorded_thinking = recorded.thinking;
         let totals = session_history_totals(&manager);
         let session_id = manager.id().to_owned();
         // Validate + resolve BEFORE the swap: a resumed branch whose recorded
@@ -1378,7 +1561,7 @@ impl Agent {
         } else {
             recorded_thinking
         }
-        .unwrap_or_else(|| self.inner.session.state().thinking);
+        .unwrap_or_else(|| self.inner.session.thinking_level());
         self.inner.session.set_thinking_level(requested_level).await;
         Ok(())
     }
@@ -1422,10 +1605,14 @@ impl Agent {
 
     /// The model currently in use (`provider` + `id` snapshot).
     pub fn model(&self) -> ModelRef {
-        let state = self.inner.session.state();
+        // `state()` also clones the session id/path strings; the model
+        // accessor is enough for the two identity fields. (The full `Model`
+        // clone remains inherent to `AgentSession::model`; a dedicated
+        // identity accessor is the missing seam.)
+        let model = self.inner.session.model();
         ModelRef {
-            provider: state.provider,
-            id: state.model,
+            provider: model.provider,
+            id: model.id,
         }
     }
 
@@ -1444,7 +1631,9 @@ impl Agent {
     /// # }
     /// ```
     pub fn thinking_level(&self) -> crate::ai::types::ThinkingLevel {
-        self.inner.session.state().thinking
+        // `session.thinking_level()` reads just the level cell; `state()`
+        // would clone the whole model snapshot for one `Copy` field.
+        self.inner.session.thinking_level()
     }
 
     /// Switch the model for subsequent runs (upstream `types.ts`
@@ -1468,8 +1657,16 @@ impl Agent {
     ///
     /// # let agent = AgentBuilder::new().no_session().build().await?;
     /// # let other = pir::ai::providers::construction::model(
-    /// #     "provider", "other-model", "other-model", "openai-completions",
-    /// #     "http://localhost:11434/v1", 128_000, 8_192, vec!["text"],
+    /// #     pir::ai::providers::construction::ModelSpec {
+    /// #         provider: "provider",
+    /// #         id: "other-model",
+    /// #         name: "other-model",
+    /// #         api: "openai-completions",
+    /// #         base_url: "http://localhost:11434/v1",
+    /// #         context_window: 128_000,
+    /// #         max_tokens: 8_192,
+    /// #         input: vec!["text"],
+    /// #     },
     /// # );
     /// agent.set_model(other).await?;
     /// assert_eq!(agent.model().id, "other-model");
@@ -1488,7 +1685,7 @@ impl Agent {
         // effective level to `off` instead of leaving the previous level
         // active. Without this, `Agent::thinking_level` kept reporting a level
         // the current model does not support.
-        let current = self.inner.session.state().thinking;
+        let current = self.inner.session.thinking_level();
         self.inner.session.set_thinking_level(current).await;
         // An explicit runtime switch is a pin: a later attach must not
         // replace it with the attached session's recorded model.
@@ -1629,6 +1826,23 @@ impl Agent {
             .older_transcript_messages(cursor, max_bytes, max_entries)
             .await
             .map_err(SdkError::from_anyhow)
+    }
+
+    /// Ask the session manager to parse the older page at `cursor` on a
+    /// background thread and keep it in its bounded page cache, so a following
+    /// [`Agent::older_transcript_messages`] is a cache hit. Returns whether a
+    /// prefetch was started; repeated calls for the same cursor/caps are
+    /// deduped. Mirrors the TUI's near-top scroll trigger for embedders.
+    pub async fn prefetch_older_page(
+        &self,
+        cursor: u64,
+        max_bytes: usize,
+        max_entries: usize,
+    ) -> bool {
+        self.inner
+            .session
+            .prefetch_older_transcript(cursor, max_bytes, max_entries)
+            .await
     }
 
     /// [`Agent::older_transcript_messages`] with the session layer's default
@@ -1989,26 +2203,53 @@ fn accumulate_entry_totals(entry: &FileEntry, turns: &mut usize, tokens: &mut u6
     }
 }
 
-/// The thinking level recorded on the session's active branch, when the
-/// branch carries an explicit `thinking_level_change` entry.
+/// Model + thinking level recorded on the session's active branch.
 ///
-/// `get_session_context_settings` reports `"off"` as its default for a branch
-/// with no entry; applying that default would silently disable thinking on
-/// every resumed session, so absence is reported as `None` here.
-pub(crate) fn session_recorded_thinking(
-    manager: &SessionManager,
-) -> Option<crate::ai::types::ThinkingLevel> {
+/// Read from the leaf→root path only: the settings live in state entries and
+/// assistant messages on that path, so there is no need to materialize the
+/// compaction-aware projection (which clones every message of the
+/// conversation). Attach paths used to build the full projection only to
+/// read `projection.model`; this walks the same path with no transcript copy.
+///
+/// `get_session_context_settings` reports `"off"` as its thinking default for
+/// a branch with no entry; applying that default would silently disable
+/// thinking on every resumed session, so absence is reported as `None`.
+#[derive(Debug, Default)]
+pub(crate) struct RecordedSessionSettings {
+    /// `(provider, model_id)` of the last model-recorded entry, if any.
+    pub model: Option<(String, String)>,
+    /// Explicitly recorded thinking level, if the branch carries one.
+    pub thinking: Option<crate::ai::types::ThinkingLevel>,
+}
+
+pub(crate) fn session_recorded_settings(manager: &SessionManager) -> RecordedSessionSettings {
     let path = crate::session_manager::projection::build_session_path(
         manager.resident_entries(),
         manager.leaf_id(),
     );
-    path.iter().rev().find_map(|entry| match entry {
-        FileEntry::ThinkingLevelChange(change) => change
-            .thinking_level
-            .parse::<crate::ai::types::ThinkingLevel>()
-            .ok(),
-        _ => None,
-    })
+    let mut settings = RecordedSessionSettings::default();
+    for entry in &path {
+        match entry {
+            FileEntry::ThinkingLevelChange(change) => {
+                // Last PARSEABLE level wins, matching the previous
+                // reverse `find_map` (a corrupt trailing value must not hide
+                // an earlier valid one).
+                if let Ok(level) = change.thinking_level.parse() {
+                    settings.thinking = Some(level);
+                }
+            }
+            FileEntry::ModelChange(change) => {
+                settings.model = Some((change.provider.clone(), change.model_id.clone()));
+            }
+            FileEntry::Message(message_entry) => {
+                if let StoredMessage::Assistant(assistant) = &message_entry.message {
+                    settings.model = Some((assistant.provider.clone(), assistant.model.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    settings
 }
 
 /// Recompute a session's historical turn/token totals without materializing

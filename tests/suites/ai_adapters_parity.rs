@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use pir::ai::api::bedrock::{
     build_additional_model_request_fields, build_bedrock_body, convert_bedrock_messages,
     format_amz_date, map_bedrock_stop_reason, parse_bedrock_event_stream, resolve_bedrock_region,
-    sigv4_sign_at, sigv4_signing_key,
+    sigv4_sign_at, sigv4_signing_key, SigV4Request,
 };
 use pir::ai::api::google_vertex::resolve_vertex_url;
 use pir::ai::api::mistral::{
@@ -28,7 +28,9 @@ use pir::ai::api::openai_responses::codex::{
 use pir::ai::api::openai_responses::shared::{
     convert_responses_messages, convert_responses_tools, parse_responses_sse,
 };
-use pir::ai::api::openai_responses::{build_responses_params, ResponsesCompat};
+use pir::ai::api::openai_responses::{
+    build_responses_params, ResponsesCompat, ResponsesWireOptions,
+};
 use pir::ai::api::transform::{normalize_id_part, short_hash, transform_messages};
 use pir::ai::providers::catalog;
 use pir::ai::types::*;
@@ -364,10 +366,7 @@ fn responses_params_golden_with_reasoning_and_cache() {
         &simple_context("Hello"),
         &options,
         &ResponsesCompat::default(),
-        "gpt-5.5",
-        pir::ai::api::openai_responses::shared::OPENAI_TOOL_CALL_PROVIDERS,
-        false,
-        None,
+        &ResponsesWireOptions::new("gpt-5.5"),
     )
     .expect("params");
     assert_eq!(params["model"], "gpt-5.5");
@@ -399,10 +398,12 @@ fn responses_chatgpt_sign_in_omits_unsupported_fields() {
         &simple_context("Hello"),
         &options,
         &ResponsesCompat::default(),
-        "gpt-5.5",
-        pir::ai::api::openai_responses::shared::OPENAI_TOOL_CALL_PROVIDERS,
-        pir::ai::api::openai_responses::shared::is_chatgpt_sign_in(&model, Some("chatgpt-token")),
-        None,
+        &ResponsesWireOptions::new("gpt-5.5").with_omitted_unsupported_fields(
+            pir::ai::api::openai_responses::shared::is_chatgpt_sign_in(
+                &model,
+                Some("chatgpt-token"),
+            ),
+        ),
     )
     .expect("params");
     assert!(params.get("max_output_tokens").is_none());
@@ -950,15 +951,17 @@ fn sigv4_matches_aws_published_test_vector() {
     );
     let payload = b"";
     let signed = sigv4_sign_at(
-        "GET",
-        url,
-        &headers,
-        payload,
-        "AKIDEXAMPLE",
-        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-        None,
-        "us-east-1",
-        "iam",
+        &SigV4Request {
+            method: "GET",
+            url,
+            headers: &headers,
+            payload,
+            access_key: "AKIDEXAMPLE",
+            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            session_token: None,
+            region: "us-east-1",
+            service: "iam",
+        },
         "20150830T123600Z",
     )
     .expect("signature");

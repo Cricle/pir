@@ -50,6 +50,13 @@ const REMOTE_PLATFORMS: [(&str, &str); 4] = [
 /// How long a detection, check or upload over `ssh` may take before it is abandoned.
 const SSH_TIMEOUT: Duration = Duration::from_secs(60);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Largest stdout or stderr captured from one `ssh` invocation; one byte more
+/// is read to detect overflow, then the stream is cut at this bound and marked
+/// with [`SSH_OUTPUT_TRUNCATED`]. A remote host cannot make the client buffer
+/// unbounded output (a deployment's own stderr can be large, so 8 MiB).
+const MAX_SSH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+/// Appended to a stream that exceeded [`MAX_SSH_OUTPUT_BYTES`].
+const SSH_OUTPUT_TRUNCATED: &[u8] = b"\n[output truncated]";
 
 /// A failure of the SSH surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,15 +311,20 @@ pub fn ssh_arguments(
 }
 
 /// One `ssh` invocation's options.
+#[doc(hidden)]
 #[derive(Default)]
-struct RunSshOptions {
-    args: Option<Vec<String>>,
-    stdin: Vec<u8>,
-    timeout: Option<Duration>,
+pub struct RunSshOptions {
+    pub args: Option<Vec<String>>,
+    pub stdin: Vec<u8>,
+    pub timeout: Option<Duration>,
 }
 
 /// Run one remote command over `ssh`, feeding `stdin`; stdout on success.
-async fn run_ssh(
+///
+/// `#[doc(hidden)]`: the env-client integration tests drive this directly with
+/// a fake `ssh` to pin the stdin/wait deadline and the output bound.
+#[doc(hidden)]
+pub async fn run_ssh(
     target: &SshTarget,
     command: &str,
     options: RunSshOptions,
@@ -335,18 +347,32 @@ async fn run_ssh(
             exit_code: None,
             stderr: String::new(),
         })?;
+    // One deadline covers the whole invocation: a remote side that never
+    // reads stdin (a hung sshd, a program that ignores its input) must not
+    // stall the upload before the wait timeout even starts.
+    let timeout = options.timeout.unwrap_or(SSH_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut stdin_timed_out = false;
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&options.stdin).await;
+        if tokio::time::timeout_at(deadline, stdin.write_all(&options.stdin))
+            .await
+            .is_err()
+        {
+            stdin_timed_out = true;
+        }
         drop(stdin);
     }
-    let timeout = options.timeout.unwrap_or(SSH_TIMEOUT);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_task = stdout.map(|pipe| tokio::spawn(read_all(pipe)));
     let stderr_task = stderr.map(|pipe| tokio::spawn(read_all(pipe)));
-    let status = tokio::select! {
-        status = child.wait() => Some(status),
-        () = tokio::time::sleep(timeout) => None,
+    let status = if stdin_timed_out {
+        None
+    } else {
+        tokio::select! {
+            status = child.wait() => Some(status),
+            () = tokio::time::sleep_until(deadline) => None,
+        }
     };
     let timed_out = status.is_none();
     if timed_out {
@@ -396,9 +422,17 @@ async fn run_ssh(
     })
 }
 
-async fn read_all(mut pipe: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
+/// Read one pipe, capped at [`MAX_SSH_OUTPUT_BYTES`]; a longer stream is cut
+/// and marked with [`SSH_OUTPUT_TRUNCATED`]. `#[doc(hidden)]` as a test seam.
+#[doc(hidden)]
+pub async fn read_all(pipe: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
+    let mut limited = pipe.take(MAX_SSH_OUTPUT_BYTES as u64 + 1);
     let mut bytes = Vec::new();
-    let _ = pipe.read_to_end(&mut bytes).await;
+    let _ = limited.read_to_end(&mut bytes).await;
+    if bytes.len() > MAX_SSH_OUTPUT_BYTES {
+        bytes.truncate(MAX_SSH_OUTPUT_BYTES);
+        bytes.extend_from_slice(SSH_OUTPUT_TRUNCATED);
+    }
     bytes
 }
 

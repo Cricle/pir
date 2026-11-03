@@ -148,7 +148,49 @@ pub trait RegisterDynamicProviderShared {
     /// Remove a dynamic provider previously registered through
     /// [`Self::register_dynamic_provider_shared`]. Returns whether an entry
     /// was removed. Statically registered providers are untouched.
+    ///
+    /// This is an unconditional removal (id-only). Session-owned cleanup uses
+    /// [`Self::unregister_dynamic_provider_shared_if_installed`] instead so a
+    /// provider another session re-registered under the same id is never
+    /// deleted by a child's teardown.
     fn unregister_dynamic_provider_shared(&self, name: &str) -> bool;
+
+    /// Remove `name` only when the dynamic map still resolves it to the exact
+    /// provider allocation identified by `installed`. Returns whether the
+    /// entry was removed.
+    ///
+    /// `installed` is the `Weak` an earlier registration returned. A parent
+    /// or sibling session that later registered the same provider id replaced
+    /// the map entry with a different `Arc`; the identity check then fails and
+    /// that newer entry is left untouched. The comparison and removal happen
+    /// under the dynamic map's write lock, so a concurrent registration cannot
+    /// slip between them.
+    fn unregister_dynamic_provider_shared_if_installed(
+        &self,
+        name: &str,
+        installed: &std::sync::Weak<dyn crate::ai::provider::Provider>,
+    ) -> bool;
+
+    /// Undo one session's installation of `name`: only when the dynamic map
+    /// still resolves it to the exact allocation identified by `installed`,
+    /// put `previous` back (the entry this session displaced) or remove the
+    /// entry when there was no previous owner. Returns whether the map
+    /// changed.
+    ///
+    /// This is the teardown primitive for shared registries (SNAP6): a
+    /// subagent child shares its parent's `Arc<ProviderRegistry>` and its
+    /// provider sync overwrites the parent's dynamic entries. Deleting the
+    /// child's entry alone left the parent's next model request resolving to
+    /// `Unknown provider`; restoring the captured previous allocation keeps
+    /// the parent's same-prompt request working. The identity check ignores
+    /// entries a parent/sibling/external registration wrote after the child's
+    /// installation.
+    fn restore_dynamic_provider_shared_if_installed(
+        &self,
+        name: &str,
+        installed: &std::sync::Weak<dyn crate::ai::provider::Provider>,
+        previous: Option<&ProviderBox>,
+    ) -> bool;
 }
 
 impl RegisterDynamicProviderShared for ProviderRegistry {
@@ -181,6 +223,49 @@ impl RegisterDynamicProviderShared for ProviderRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(name)
             .is_some()
+    }
+
+    fn unregister_dynamic_provider_shared_if_installed(
+        &self,
+        name: &str,
+        installed: &std::sync::Weak<dyn crate::ai::provider::Provider>,
+    ) -> bool {
+        self.restore_dynamic_provider_shared_if_installed(name, installed, None)
+    }
+
+    fn restore_dynamic_provider_shared_if_installed(
+        &self,
+        name: &str,
+        installed: &std::sync::Weak<dyn crate::ai::provider::Provider>,
+        previous: Option<&ProviderBox>,
+    ) -> bool {
+        // Upgrade BEFORE taking the map lock: the weak upgrade only touches
+        // the provider's Arc refcount and must not extend the critical
+        // section. A dead allocation means the entry was already replaced (or
+        // collected), so there is nothing this session may undo.
+        let Some(installed) = installed.upgrade() else {
+            return false;
+        };
+        let mut dynamic = self
+            .dynamic
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(current) = dynamic.get(name) else {
+            return false;
+        };
+        if !Arc::ptr_eq(current, &installed) {
+            return false;
+        }
+        match previous {
+            // Defensive: never leave the session's own allocation installed
+            // under the guise of "restoring" it.
+            Some(previous) if Arc::ptr_eq(previous, &installed) => false,
+            Some(previous) => {
+                dynamic.insert(name.to_owned(), previous.clone());
+                true
+            }
+            None => dynamic.remove(name).is_some(),
+        }
     }
 }
 
@@ -562,7 +647,7 @@ impl RemoteCatalogOverlay {
         // `withPersonalizedCatalog` always issues a full catalog request).
         let has_cached_body = has_cached_body && self.personalize.is_none();
 
-        let client = reqwest::Client::builder()
+        let client = crate::ai::transport::pi_reqwest_client_builder()?
             .timeout(REMOTE_CATALOG_REQUEST_TIMEOUT)
             .connect_timeout(REMOTE_CATALOG_REQUEST_TIMEOUT)
             .build()
@@ -679,7 +764,7 @@ impl RemoteCatalogOverlay {
                 });
             }
         }
-        // Read the validators before `text()` consumes the response.
+        // Read the validators before the bounded read consumes the response.
         let etag = response
             .headers()
             .get("etag")
@@ -694,15 +779,12 @@ impl RemoteCatalogOverlay {
             .and_then(crate::ai::transport::parse_http_date)
             .map(|seconds| seconds.saturating_mul(1000))
             .unwrap_or(0);
-        let body = response
-            .text()
-            .await
-            .map_err(|error| AiError::Http(error.to_string()))?;
-        if body.len() > REMOTE_CATALOG_MAX_BODY_BYTES {
-            return Err(AiError::ResponseTooLarge {
-                limit: REMOTE_CATALOG_MAX_BODY_BYTES,
-            });
-        }
+        let body = crate::ai::transport::read_bounded_response_body(
+            response,
+            REMOTE_CATALOG_MAX_BODY_BYTES,
+            "remote catalog",
+        )
+        .await?;
         let values = parse_remote_catalog(&body)?;
         let models = self.runtime_models(&values);
         // Upstream `isNewer(catalog.lastModified, localGeneratedAt)`: only a

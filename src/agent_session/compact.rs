@@ -140,11 +140,12 @@ impl AgentSession {
         if self.run_abort_requested.swap(false, Ordering::SeqCst) {
             compaction_signal.abort();
         }
-        let mut run = CompactionRunGuard::start(
-            Some(Arc::clone(&self.session_events)),
-            Some(Arc::clone(&self.compacting)),
-            "manual",
-        );
+        // The manual claim owns the `compacting` flag (owner-tagged, see
+        // `ManualCompactionClaim::release`), so the event guard must not flip
+        // it: an older compaction's guard dropping after a newer one claimed
+        // would otherwise report idle while the newer run is still going.
+        let mut run =
+            CompactionRunGuard::start(Some(Arc::clone(&self.session_events)), None, "manual");
         let retry_observer = self.summarization_retry_observer(
             super::events::SummarizationRetrySource::Compaction { reason: "manual" },
         );
@@ -219,8 +220,17 @@ impl AgentSession {
     async fn claim_manual_compaction(&self) -> crate::Result<ManualCompactionClaim> {
         loop {
             if self.try_claim_compaction() {
+                // Publish this claim's monotonic owner BEFORE any await: a
+                // stale claim's release/Drop compares against it and becomes
+                // a no-op once a newer compaction has published its own.
+                let owner = MANUAL_COMPACTION_CLAIM_SEQ.fetch_add(1, Ordering::Relaxed);
+                self.manual_compaction_owner.store(owner, Ordering::SeqCst);
+                self.compacting.store(true, Ordering::SeqCst);
                 return Ok(ManualCompactionClaim {
                     state: Arc::clone(&self.session_state),
+                    active_owner: Arc::clone(&self.manual_compaction_owner),
+                    owner,
+                    compacting: Arc::clone(&self.compacting),
                     run_abort_requested: Arc::clone(&self.run_abort_requested),
                     idle_notify: Arc::clone(&self.idle_notify),
                 });
@@ -274,6 +284,18 @@ impl AgentSession {
         custom_instructions: Option<&str>,
         compaction_signal: AbortSignal,
     ) -> Result<(CompactionResult, u64), CompactFailure> {
+        // Storage-swap isolation (P2-03): bind this compaction to the
+        // manager it STARTS on, before the projection and summarizer awaits.
+        // `compact()` does not hold the storage slot against a concurrent
+        // `replace_session_storage` (hosts may create/resume a session while
+        // /compact runs); appending this transcript's cut point
+        // (`firstKeptEntryId`) to the replacement would leave it with a
+        // dangling boundary. The append below re-checks this identity under
+        // the same lock acquisition as the write.
+        let expected_session_id = match &self.session {
+            Some(session) => Some(session.lock().await.id().to_owned()),
+            None => None,
+        };
         // Borrowed cut basis: session-backed compaction runs over the
         // projection's per-entry METADATA zipped with its own message list
         // (one materialization of the conversation, no `CutEntry` copy, no
@@ -360,19 +382,35 @@ impl AgentSession {
                         .unwrap_or_default(),
                     None => Vec::new(),
                 };
-                let mut payload = serde_json::json!({
-                    "type": "session_before_compact",
-                    "customInstructions": custom_instructions,
-                    "reason": "manual",
-                    "willRetry": false,
-                    "preparation": borrowed_preparation_summary(
-                        &preparation,
-                        previous_compaction_details(&branch_entries),
-                    ),
-                    "branchEntries": serde_json::to_value(&branch_entries)
-                        .unwrap_or(JsonValue::Null),
-                    "signal": { "aborted": compaction_signal.is_aborted() },
-                });
+                // Build the payload by moving the already-serialized
+                // `preparation` / `branchEntries` values: a `json!` literal
+                // re-serializes every `Value` expression, doubling the whole
+                // branch (and the summarized messages inside `preparation`).
+                let preparation_json = borrowed_preparation_summary(
+                    &preparation,
+                    previous_compaction_details(&branch_entries),
+                );
+                let branch_entries_json =
+                    serde_json::to_value(&branch_entries).unwrap_or(JsonValue::Null);
+                let mut payload_map = serde_json::Map::with_capacity(6);
+                payload_map.insert(
+                    "type".to_owned(),
+                    JsonValue::String("session_before_compact".to_owned()),
+                );
+                payload_map.insert(
+                    "customInstructions".to_owned(),
+                    custom_instructions
+                        .map_or(JsonValue::Null, |text| JsonValue::String(text.to_owned())),
+                );
+                payload_map.insert("reason".to_owned(), JsonValue::String("manual".to_owned()));
+                payload_map.insert("willRetry".to_owned(), JsonValue::Bool(false));
+                payload_map.insert("preparation".to_owned(), preparation_json);
+                payload_map.insert("branchEntries".to_owned(), branch_entries_json);
+                payload_map.insert(
+                    "signal".to_owned(),
+                    serde_json::json!({ "aborted": compaction_signal.is_aborted() }),
+                );
+                let mut payload = JsonValue::Object(payload_map);
                 match plugins.emit("session_before_compact", &mut payload).await {
                     Ok(outcome) => {
                         if outcome.result.get("cancel").and_then(JsonValue::as_bool) == Some(true) {
@@ -399,12 +437,13 @@ impl AgentSession {
                 }
             }
         }
+        let from_extension = extension_compaction.is_some();
         let result = match extension_compaction {
             Some(result) => result,
             None => match compaction::compact_with_preparation_refs(
                 preparation,
                 &model,
-                self.complete_fn_for_signal(&model, compaction_signal.clone()),
+                self.complete_fn_for_signal_session_scoped(&model, compaction_signal.clone()),
                 custom_instructions,
             )
             .await
@@ -429,18 +468,56 @@ impl AgentSession {
             },
         };
         let appended_entry_id = match &self.session {
-            Some(session) => Some(
-                SessionManager::append_compaction_off_thread(
+            Some(session) => {
+                match super::settle::append_compaction_if_session(super::settle::CompactionAppend {
                     session,
-                    result.summary.clone(),
-                    result.first_kept_entry_id.clone(),
-                    result.tokens_before,
-                    Some(compaction_details(&result)),
-                    Some(result.usage),
-                    false,
-                )
-                .await?,
-            ),
+                    expected_session_id: expected_session_id.as_deref(),
+                    summary: result.summary.clone(),
+                    first_kept_entry_id: result.first_kept_entry_id.clone(),
+                    tokens_before: result.tokens_before,
+                    details: Some(compaction_details(&result)),
+                    usage: Some(result.usage),
+                    // Extension-generated: gates file-op carry-over in the
+                    // next compaction's preparation (upstream `fromHook`),
+                    // exactly like the manual/threshold parity below.
+                    from_hook: from_extension,
+                })
+                .await
+                {
+                    Ok(Some(entry_id)) => Some(entry_id),
+                    Ok(None) => {
+                        // The storage slot now names a different manager: the
+                        // old transcript's cut (and its `firstKeptEntryId`)
+                        // must not enter the replacement session. The manual
+                        // compaction fails instead of reporting a summary
+                        // that was never persisted.
+                        return Err(CompactFailure::new(
+                            anyhow::anyhow!(
+                                "session storage was replaced while the compaction was running"
+                            ),
+                            Some(
+                                "Compaction failed: session storage was replaced while the \
+                                 compaction was running"
+                                    .to_owned(),
+                            ),
+                            false,
+                            // Keep the extension provenance on the failure:
+                            // the replacement content was extension-generated
+                            // even though it never reached storage.
+                            from_extension,
+                        ));
+                    }
+                    Err(error) => {
+                        let error_message = Some(format!("Compaction failed: {error}"));
+                        return Err(CompactFailure::new(
+                            error,
+                            error_message,
+                            false,
+                            from_extension,
+                        ));
+                    }
+                }
+            }
             None => None,
         };
         let rebuilt = compaction::rebuilt_context(&context, &result);
@@ -470,7 +547,10 @@ impl AgentSession {
                 "type": "session_compact",
                 "reason": "manual",
                 "willRetry": false,
-                "fromExtension": false,
+                // True when the handler's replacement supplied the summary
+                // (upstream `SessionCompactEvent.fromExtension`), matching the
+                // persisted `fromHook` above and the threshold/overflow paths.
+                "fromExtension": from_extension,
                 "compaction": compaction_result_wire(&result, estimated_tokens_after),
             });
             if let Some(entry) =
@@ -523,6 +603,14 @@ impl AgentSession {
         // request (the "fail once, continue unchanged, retry next turn"
         // contract).
         gate: Option<Arc<ThresholdRunGate>>,
+        // The concrete session-manager identity this PROMPT RUN belongs to,
+        // bound by `run_prompt` before its first projection. Most threshold
+        // compactions summarize a context/message snapshot built from THAT
+        // transcript, so every append is validated against this run-start
+        // identity — never against the current storage slot, which a
+        // concurrent `replace_session_storage` may already have swapped for a
+        // replacement manager.
+        run_session_id: Option<String>,
     ) -> CompactionFn {
         let model = threshold_model.unwrap_or_else(|| self.current_model());
         // The summarizer completes against the same (routed) model the
@@ -535,7 +623,7 @@ impl AgentSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let complete = self.complete_fn_for_signal(&model, signal.clone());
+        let complete = self.complete_fn_for_signal_session_scoped(&model, signal.clone());
         let session = self.session.clone();
         let history = self.history.clone();
         let plugins = self.plugins.clone();
@@ -544,9 +632,14 @@ impl AgentSession {
         // `isCompacting`.
         let session_events = self.session_events.clone();
         let compacting = self.compacting.clone();
-        // Flipped after a successful compaction: the prompt-start snapshot no
-        // longer matches the rebuilt context, so later turns re-read the
-        // session projection (upstream compacts against the live session).
+        // Flipped whenever the prompt-start snapshot no longer matches the
+        // storage the hook must compact against: after a successful
+        // compaction (the rebuilt context replaces the snapshot) and after a
+        // FAILED persistence append (a retry must re-read the live session
+        // instead of re-using a context whose append target disappeared, see
+        // the append branches below). Later turns then take the live metadata
+        // path, whose run-identity gate re-checks the storage before a
+        // compaction can start.
         let snapshot_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The per-session slot `abort_compaction()` fires for a THRESHOLD
         // compaction; armed fresh at every trigger (see the body).
@@ -585,6 +678,7 @@ impl AgentSession {
             let compacting = Arc::clone(&compacting);
             let auto_cancel = Arc::clone(&auto_cancel);
             let gate = gate.clone();
+            let run_session_id = run_session_id.clone();
             Box::pin(async move {
                 // Threshold basis: the prompt-start projection snapshot
                 // plus the run's newer (not yet projected) messages while the
@@ -604,13 +698,60 @@ impl AgentSession {
                 // tail.
                 let snapshot_fresh = projected.is_some()
                     && !snapshot_stale.load(std::sync::atomic::Ordering::SeqCst);
+                // The per-run skip belongs to THIS threshold check even when
+                // the storage-identity gate below prevents the compaction from
+                // running; consuming it here keeps it from leaking into a
+                // later turn.
+                if gate.as_ref().is_some_and(|gate| {
+                    gate.skip_next
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                }) {
+                    return context;
+                }
                 let mut owned_metas: Vec<compaction::ProjectionEntryMeta> = Vec::new();
                 let mut owned_branch: Vec<compaction::PathEntryMeta> = Vec::new();
-                if !snapshot_fresh {
-                    if let Some(session) = session.as_ref() {
-                        let session = session.lock().await;
+                // Storage-swap isolation (P2-03, run-context binding): the
+                // threshold summarizes `context` — and, while fresh, the
+                // metadata in `projected` — both produced from the transcript
+                // this PROMPT RUN started on (`run_session_id`, bound at
+                // `run_prompt` entry). The current storage slot may already
+                // name a replacement, so it can neither provide the basis for
+                // a stale/live check nor decide where this transcript's cut
+                // may be appended. Read the live identity in the SAME lock
+                // acquisition as any live metadata (closing the
+                // read-metadata→capture-identity window) and stop before the
+                // trigger check when it does not match the run.
+                let mut live_session_id: Option<String> = None;
+                if let Some(session) = session.as_ref() {
+                    let session = session.lock().await;
+                    if !snapshot_fresh {
                         owned_metas = session.projection_entry_meta();
                         owned_branch = session.branch_path_meta(None);
+                    }
+                    live_session_id = Some(session.id().to_owned());
+                }
+                if session.is_some() {
+                    let identity_matches =
+                        match (run_session_id.as_deref(), live_session_id.as_deref()) {
+                            (Some(expected), Some(live)) => expected == live,
+                            _ => false,
+                        };
+                    if !identity_matches {
+                        // The context (and any snapshot metadata) belongs to
+                        // the outgoing transcript; the replacement must never
+                        // receive its summary or `firstKeptEntryId`. Also
+                        // invalidate the snapshot so a later turn re-reads the
+                        // live session and runs this same identity gate again
+                        // instead of retrying with the stale context.
+                        snapshot_stale.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let expected = run_session_id.as_deref().unwrap_or("<none>");
+                        let live = live_session_id.as_deref().unwrap_or("<none>");
+                        crate::ext_diag!(
+                            "[session] skipped automatic compaction: the run's session \
+                             identity ({expected}) does not match the current storage slot \
+                             ({live}); the context belongs to the outgoing transcript"
+                        );
+                        return context;
                     }
                 }
                 let (metas, branch): (
@@ -644,12 +785,6 @@ impl AgentSession {
                 } else {
                     compaction::estimate_projected_context_tokens(refs.as_slice(), branch).tokens
                 };
-                if gate.as_ref().is_some_and(|gate| {
-                    gate.skip_next
-                        .swap(false, std::sync::atomic::Ordering::SeqCst)
-                }) {
-                    return context;
-                }
                 if !compaction::should_compact_tokens(context_tokens, model.context_window, &config)
                 {
                     return context;
@@ -665,6 +800,17 @@ impl AgentSession {
                     gate.attempted
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
+                // Storage-swap isolation (P2-03): the append sites below bind
+                // to the RUN-START identity, NOT to the manager the trigger
+                // happened to observe. The context being summarized was built
+                // from the run's transcript, so only that manager may receive
+                // its cut point; a swap before (or during) this compaction
+                // makes the helper drop the append instead of writing the
+                // outgoing transcript's `firstKeptEntryId` into the
+                // replacement. The identity gate above guarantees this is
+                // `Some` for every session-backed run; a session-backed hook
+                // without an identity never reaches an append.
+                let expected_session_id = run_session_id.clone();
                 // Arm THIS trigger's own cancellation. A fresh signal per
                 // threshold compaction means `abort_compaction()` cancels only
                 // this summarizer call: the run signal is untouched (the turn
@@ -706,18 +852,33 @@ impl AgentSession {
                                 .unwrap_or_default(),
                             None => Vec::new(),
                         };
-                        let mut payload = serde_json::json!({
-                            "type": "session_before_compact",
-                            "customInstructions": null,
-                            "reason": "threshold",
-                            "willRetry": false,
-                            "preparation": borrowed_preparation_summary(
-                                &prepared,
-                                previous_compaction_details(&branch_entries),
-                            ),
-                            "branchEntries": serde_json::to_value(&branch_entries).unwrap_or(JsonValue::Null),
-                            "signal": { "aborted": compaction_aborted() },
-                        });
+                        // Move the pre-serialized values (see the manual
+                        // payload above): no second serialization of the
+                        // branch or preparation.
+                        let preparation_json = borrowed_preparation_summary(
+                            &prepared,
+                            previous_compaction_details(&branch_entries),
+                        );
+                        let branch_entries_json =
+                            serde_json::to_value(&branch_entries).unwrap_or(JsonValue::Null);
+                        let mut payload_map = serde_json::Map::with_capacity(7);
+                        payload_map.insert(
+                            "type".to_owned(),
+                            JsonValue::String("session_before_compact".to_owned()),
+                        );
+                        payload_map.insert("customInstructions".to_owned(), JsonValue::Null);
+                        payload_map.insert(
+                            "reason".to_owned(),
+                            JsonValue::String("threshold".to_owned()),
+                        );
+                        payload_map.insert("willRetry".to_owned(), JsonValue::Bool(false));
+                        payload_map.insert("preparation".to_owned(), preparation_json);
+                        payload_map.insert("branchEntries".to_owned(), branch_entries_json);
+                        payload_map.insert(
+                            "signal".to_owned(),
+                            serde_json::json!({ "aborted": compaction_aborted() }),
+                        );
+                        let mut payload = JsonValue::Object(payload_map);
                         match plugins.emit("session_before_compact", &mut payload).await {
                             Ok(outcome) => {
                                 if outcome.result.get("cancel").and_then(JsonValue::as_bool)
@@ -806,34 +967,77 @@ impl AgentSession {
                         let appended_entry_id = if let Some(session) = &session {
                             // The compaction append builds the current system
                             // message from the whole projection and fsyncs the
-                            // first write: run it on the blocking pool.
-                            match SessionManager::append_compaction_off_thread(
-                                session,
-                                result.summary.clone(),
-                                result.first_kept_entry_id.clone(),
-                                result.tokens_before,
-                                Some(compaction_details(&result)),
-                                // Extension-provided usage is persisted with
-                                // the compaction entry (upstream
-                                // agent-session.ts:3164-3168).
-                                Some(result.usage),
-                                // Extension-generated: gates file-op
-                                // carry-over in the next compaction's
-                                // preparation (upstream `fromHook`).
-                                true,
+                            // first write: run it on the blocking pool. The
+                            // helper re-checks the RUN-START identity (the
+                            // transcript this context came from) under the
+                            // same lock as the write (P2-03).
+                            match super::settle::append_compaction_if_session(
+                                super::settle::CompactionAppend {
+                                    session,
+                                    expected_session_id: expected_session_id.as_deref(),
+                                    summary: result.summary.clone(),
+                                    first_kept_entry_id: result.first_kept_entry_id.clone(),
+                                    tokens_before: result.tokens_before,
+                                    details: Some(compaction_details(&result)),
+                                    // Extension-provided usage is persisted
+                                    // with the compaction entry (upstream
+                                    // agent-session.ts:3164-3168).
+                                    usage: Some(result.usage),
+                                    // Extension-generated: gates file-op
+                                    // carry-over in the next compaction's
+                                    // preparation (upstream `fromHook`).
+                                    from_hook: true,
+                                },
                             )
                             .await
                             {
-                                Ok(entry_id) => Some(entry_id),
+                                Ok(Some(entry_id)) => Some(entry_id),
+                                Ok(None) => {
+                                    // The storage slot now names a different
+                                    // manager: the extension compaction's cut
+                                    // belongs to the outgoing transcript and
+                                    // must not enter the replacement. Treat
+                                    // it as a persistence failure (end first,
+                                    // failed second) instead of silently
+                                    // continuing with an unpersisted summary.
+                                    let aborted = compaction_aborted();
+                                    let reason = "session storage was replaced while the \
+                                                  compaction was running";
+                                    let error_message = if aborted {
+                                        None
+                                    } else {
+                                        Some(format!("Auto-compaction failed: {reason}"))
+                                    };
+                                    crate::ext_diag!(
+                                        "[session] extension compaction persistence dropped: {reason}"
+                                    );
+                                    // The old snapshot/context must not be
+                                    // retried against whatever manager the slot
+                                    // names later: re-read the live session on
+                                    // the next turn (the run-identity gate then
+                                    // decides whether it is still ours).
+                                    snapshot_stale.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    emit_threshold_compaction_persistence_failure(
+                                        &session_events,
+                                        &plugins,
+                                        &mut run,
+                                        error_message,
+                                        aborted,
+                                        from_extension,
+                                    )
+                                    .await;
+                                    return context;
+                                }
                                 Err(error) => {
                                     // Storage did not take the compaction: the
                                     // in-memory context must stay the
-                                    // pre-compaction one (and the prompt-start
-                                    // snapshot fresh), so the next turn retries
-                                    // instead of sending a context whose
-                                    // summary/leaf boundary is not persisted.
-                                    // Upstream `appendCompaction` throws into
-                                    // the `_runAutoCompaction` catch.
+                                    // pre-compaction one, and the prompt-start
+                                    // snapshot is invalidated so the next turn
+                                    // re-reads the live session instead of
+                                    // retrying the old context against a
+                                    // possibly swapped slot. Upstream
+                                    // `appendCompaction` throws into the
+                                    // `_runAutoCompaction` catch.
                                     let aborted = compaction_aborted();
                                     let error_message = if aborted {
                                         None
@@ -843,6 +1047,7 @@ impl AgentSession {
                                     crate::ext_diag!(
                                         "[session] extension compaction persistence failed: {error}"
                                     );
+                                    snapshot_stale.store(true, std::sync::atomic::Ordering::SeqCst);
                                     emit_threshold_compaction_persistence_failure(
                                         &session_events,
                                         &plugins,
@@ -983,23 +1188,62 @@ impl AgentSession {
                 };
                 let appended_entry_id = if let Some(session) = &session {
                     // Blocking projection + first-write fsync: off-thread.
-                    match SessionManager::append_compaction_off_thread(
-                        session,
-                        compacted.summary.clone(),
-                        compacted.first_kept_entry_id.clone(),
-                        compacted.tokens_before,
-                        Some(compaction_details(&compacted)),
-                        Some(compacted.usage),
-                        false,
+                    // The helper re-checks the manager identity captured at
+                    // compaction start under the same lock as the write
+                    // (P2-03).
+                    match super::settle::append_compaction_if_session(
+                        super::settle::CompactionAppend {
+                            session,
+                            expected_session_id: expected_session_id.as_deref(),
+                            summary: compacted.summary.clone(),
+                            first_kept_entry_id: compacted.first_kept_entry_id.clone(),
+                            tokens_before: compacted.tokens_before,
+                            details: Some(compaction_details(&compacted)),
+                            usage: Some(compacted.usage),
+                            from_hook: false,
+                        },
                     )
                     .await
                     {
-                        Ok(entry_id) => Some(entry_id),
+                        Ok(Some(entry_id)) => Some(entry_id),
+                        Ok(None) => {
+                            // The storage slot now names a different manager:
+                            // the summary and its `firstKeptEntryId` belong
+                            // to the outgoing transcript. Emit the terminal
+                            // end-then-failed pair and keep the original
+                            // context; never report an unpersisted compaction.
+                            let aborted = compaction_aborted();
+                            let reason = "session storage was replaced while the \
+                                          compaction was running";
+                            let error_message = if aborted {
+                                None
+                            } else {
+                                Some(format!("Auto-compaction failed: {reason}"))
+                            };
+                            crate::ext_diag!(
+                                "[session] threshold compaction persistence dropped: {reason}"
+                            );
+                            // See the extension branch above: invalidate the
+                            // snapshot so the retry re-reads the live session
+                            // and is gated by the run-start identity.
+                            snapshot_stale.store(true, std::sync::atomic::Ordering::SeqCst);
+                            emit_threshold_compaction_persistence_failure(
+                                &session_events,
+                                &plugins,
+                                &mut run,
+                                error_message,
+                                aborted,
+                                false,
+                            )
+                            .await;
+                            return context;
+                        }
                         Err(error) => {
                             // Same contract as the extension branch above: no
-                            // rebuilt context, no stale snapshot, and the
-                            // terminal end-then-failed pair — the next turn
-                            // retries the compaction.
+                            // rebuilt context and the terminal end-then-failed
+                            // pair; the next turn re-reads the live session
+                            // (the identity gate rejects a swapped slot)
+                            // instead of retrying the old context.
                             let aborted = compaction_aborted();
                             let error_message = if aborted {
                                 None
@@ -1009,6 +1253,7 @@ impl AgentSession {
                             crate::ext_diag!(
                                 "[session] threshold compaction persistence failed: {error}"
                             );
+                            snapshot_stale.store(true, std::sync::atomic::Ordering::SeqCst);
                             emit_threshold_compaction_persistence_failure(
                                 &session_events,
                                 &plugins,
@@ -1084,9 +1329,10 @@ impl AgentSession {
 /// `session_compact_failed`, exactly the upstream `_runAutoCompaction` catch
 /// order (agent-session.ts:3272-3296).
 ///
-/// The caller then returns the ORIGINAL context and leaves the prompt-start
-/// snapshot fresh, so the same storage state the hook just read stays valid and
-/// the next turn re-runs the threshold check and retries the compaction.
+/// The caller then returns the ORIGINAL context and invalidates the
+/// prompt-start snapshot (`snapshot_stale`), so the next turn re-reads the
+/// live session and retries the threshold check under the run-start identity
+/// gate instead of re-applying the old context to a possibly swapped slot.
 async fn emit_threshold_compaction_persistence_failure(
     session_events: &Arc<std::sync::RwLock<Vec<SessionEventHandler>>>,
     plugins: &Option<Arc<crate::plugins::PluginHost>>,
@@ -1159,14 +1405,29 @@ impl From<anyhow::Error> for CompactFailure {
     }
 }
 
+/// Monotonic owner id for [`ManualCompactionClaim`]: every successful claim
+/// gets a fresh id, so a release from an OLDER claim can detect that a newer
+/// compaction owns the session and must not touch it.
+static MANUAL_COMPACTION_CLAIM_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// Holds the session's manual-compaction claim for one
 /// [`AgentSession::compact`] call. Released explicitly before the terminal
 /// `compaction_end` (upstream `_clearManualCompactionState()`, so end
-/// listeners observe idle state) and again on drop for every other exit path;
-/// both releases are compare-exchanges, so a stale release can never steal a
-/// claim a newer run or compaction took in between.
+/// listeners observe idle state) and again on drop for every other exit path.
+/// Both releases first take the owner token, so a stale release (the explicit
+/// one followed by `Drop`, or an older compaction finishing while a newer one
+/// already claimed the session) can never clear a newer claim.
 struct ManualCompactionClaim {
     state: Arc<AtomicU8>,
+    /// The session's published owner id; `owner` is only live while this still
+    /// matches. The compare-exchange both claims the release (idempotence)
+    /// and publishes "no owner" in one step.
+    active_owner: Arc<AtomicU64>,
+    /// This claim's monotonic owner id.
+    owner: u64,
+    /// The session's `isCompacting` flag, cleared with the claim so the flag
+    /// cannot outlive it (and cannot be cleared by an older claim's drop).
+    compacting: Arc<AtomicBool>,
     /// Cleared before the claim is released (same order as the run guard):
     /// an abort that cancelled the compaction must not leak a stale request
     /// into the next run's `run_abort_requested` check.
@@ -1177,9 +1438,20 @@ struct ManualCompactionClaim {
 impl ManualCompactionClaim {
     /// Release the claim and wake every waiter. Idempotent.
     fn release(&self) {
-        // Only the owner may clear: an idempotent second release (explicit
-        // release then Drop) must not touch a newer owner's request.
+        // Only the live owner may clear: a stale explicit release or Drop must
+        // not touch a newer compaction's claim, abort request or flag. Taking
+        // the owner token is the idempotence point, so the explicit release
+        // and the later `Drop` issue exactly one transition.
+        if self.active_owner.load(Ordering::SeqCst) != self.owner
+            || self
+                .active_owner
+                .compare_exchange(self.owner, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return;
+        }
         if self.state.load(Ordering::SeqCst) == SESSION_COMPACTING {
+            self.compacting.store(false, Ordering::SeqCst);
             self.run_abort_requested.store(false, Ordering::SeqCst);
             if self
                 .state
@@ -1473,10 +1745,21 @@ fn collect_file_op(
 /// The outcome of a `session_before_compact` dispatch (upstream
 /// `SessionBeforeCompactResult`): proceed with the built-in summary, cancel
 /// the run, or use the handler's replacement compaction verbatim.
-pub(super) enum BeforeCompactDecision {
+pub(crate) enum BeforeCompactDecision {
     Proceed,
     Cancel,
     Replace(Box<CompactionResult>),
+}
+
+/// Named inputs for [`dispatch_before_compact`].
+pub(crate) struct BeforeCompactDispatch<'a> {
+    pub(crate) plugins: Option<&'a Arc<PluginHost>>,
+    pub(crate) reason: &'static str,
+    pub(crate) will_retry: bool,
+    pub(crate) custom_instructions: Option<&'a str>,
+    pub(crate) preparation: &'a compaction::BorrowedCompactionPreparation<'a>,
+    pub(crate) branch_entries: &'a [FileEntry],
+    pub(crate) aborted: bool,
 }
 
 /// Dispatch `session_before_compact` for one compaction run (upstream
@@ -1484,34 +1767,47 @@ pub(super) enum BeforeCompactDecision {
 /// overflow recovery paths; the manual/threshold paths emit the same payload
 /// inline. Returns [`BeforeCompactDecision::Proceed`] when no handler exists
 /// or the dispatch fails (fail-open, exactly like the existing paths).
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn dispatch_before_compact(
-    plugins: Option<&Arc<PluginHost>>,
-    reason: &'static str,
-    will_retry: bool,
-    custom_instructions: Option<&str>,
-    preparation: &compaction::BorrowedCompactionPreparation<'_>,
-    branch_entries: &[FileEntry],
-    aborted: bool,
+pub(crate) async fn dispatch_before_compact(
+    input: BeforeCompactDispatch<'_>,
 ) -> BeforeCompactDecision {
+    let BeforeCompactDispatch {
+        plugins,
+        reason,
+        will_retry,
+        custom_instructions,
+        preparation,
+        branch_entries,
+        aborted,
+    } = input;
     let Some(plugins) = plugins else {
         return BeforeCompactDecision::Proceed;
     };
     if !plugins.has_handlers("session_before_compact") {
         return BeforeCompactDecision::Proceed;
     }
-    let mut payload = serde_json::json!({
-        "type": "session_before_compact",
-        "customInstructions": custom_instructions,
-        "reason": reason,
-        "willRetry": will_retry,
-        "preparation": borrowed_preparation_summary(
-            preparation,
-            previous_compaction_details(branch_entries),
-        ),
-        "branchEntries": serde_json::to_value(branch_entries).unwrap_or(JsonValue::Null),
-        "signal": { "aborted": aborted },
-    });
+    // Insert the pre-serialized preparation / branch values by move so the
+    // whole branch is serialized exactly once.
+    let preparation_json =
+        borrowed_preparation_summary(preparation, previous_compaction_details(branch_entries));
+    let branch_entries_json = serde_json::to_value(branch_entries).unwrap_or(JsonValue::Null);
+    let mut payload_map = serde_json::Map::with_capacity(7);
+    payload_map.insert(
+        "type".to_owned(),
+        JsonValue::String("session_before_compact".to_owned()),
+    );
+    payload_map.insert(
+        "customInstructions".to_owned(),
+        custom_instructions.map_or(JsonValue::Null, |text| JsonValue::String(text.to_owned())),
+    );
+    payload_map.insert("reason".to_owned(), JsonValue::String(reason.to_owned()));
+    payload_map.insert("willRetry".to_owned(), JsonValue::Bool(will_retry));
+    payload_map.insert("preparation".to_owned(), preparation_json);
+    payload_map.insert("branchEntries".to_owned(), branch_entries_json);
+    payload_map.insert(
+        "signal".to_owned(),
+        serde_json::json!({ "aborted": aborted }),
+    );
+    let mut payload = JsonValue::Object(payload_map);
     match plugins.emit("session_before_compact", &mut payload).await {
         Ok(outcome) => {
             if outcome.result.get("cancel").and_then(JsonValue::as_bool) == Some(true) {

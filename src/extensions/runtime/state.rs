@@ -262,6 +262,7 @@ impl RuntimeState {
             virtual_model_defs: Vec::new(),
 
             config,
+            ui_fail_fast: false,
             invalidated: false,
             tool_call_aborted: false,
             registered_ext_ids: std::collections::BTreeSet::new(),
@@ -286,6 +287,7 @@ impl RuntimeState {
             settings: JsonValue::Null,
             builtin_commands: Vec::new(),
             authenticated_providers: Vec::new(),
+            authenticated_providers_known: false,
             nested_executors: HashMap::new(),
             dialog_responses: HashMap::new(),
             dialog_notifies: HashMap::new(),

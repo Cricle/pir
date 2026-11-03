@@ -14,7 +14,7 @@ use clap::Parser;
 use pir::coding_agent::cli::{Cli, Command};
 use pir::coding_agent::package_manager::{
     config_json, config_resource_rows, run_config_interactive_with, set_config_resource_enabled,
-    ConfigResource,
+    ConfigResource, ConfigResourceToggle,
 };
 use pir::config::settings::SettingsManager;
 
@@ -87,13 +87,15 @@ fn config_discovers_package_resources_and_writes_toggle_filters() {
     // `-extensions/a.js` filter (upstream `togglePackageResource`).
     let message = set_config_resource_enabled(
         &mut settings,
-        &agent,
-        &cwd,
-        false,
-        false,
-        "extensions:extensions/a.js",
-        None,
-        false,
+        ConfigResourceToggle {
+            agent_dir: &agent,
+            cwd: &cwd,
+            project_trusted: false,
+            local: false,
+            selector: "extensions:extensions/a.js",
+            source: None,
+            enabled: false,
+        },
     )
     .expect("disable");
     assert_eq!(
@@ -117,13 +119,15 @@ fn config_discovers_package_resources_and_writes_toggle_filters() {
     let mut settings = settings;
     set_config_resource_enabled(
         &mut settings,
-        &agent,
-        &cwd,
-        false,
-        false,
-        "extensions:extensions/a.js",
-        None,
-        true,
+        ConfigResourceToggle {
+            agent_dir: &agent,
+            cwd: &cwd,
+            project_trusted: false,
+            local: false,
+            selector: "extensions:extensions/a.js",
+            source: None,
+            enabled: true,
+        },
     )
     .expect("enable");
     assert_eq!(
@@ -142,13 +146,15 @@ fn config_json_reports_scope_packages_and_resource_state() {
     let mut settings = settings_with_packages(&agent, &cwd, &["npm:foo"]);
     set_config_resource_enabled(
         &mut settings,
-        &agent,
-        &cwd,
-        false,
-        false,
-        "extensions:extensions/a.js",
-        None,
-        false,
+        ConfigResourceToggle {
+            agent_dir: &agent,
+            cwd: &cwd,
+            project_trusted: false,
+            local: false,
+            selector: "extensions:extensions/a.js",
+            source: None,
+            enabled: false,
+        },
     )
     .expect("disable");
 
@@ -192,13 +198,15 @@ fn config_toggle_requires_a_source_when_two_packages_share_a_pattern() {
 
     let error = set_config_resource_enabled(
         &mut settings,
-        &agent,
-        &cwd,
-        false,
-        false,
-        "extensions:extensions/shared.js",
-        None,
-        false,
+        ConfigResourceToggle {
+            agent_dir: &agent,
+            cwd: &cwd,
+            project_trusted: false,
+            local: false,
+            selector: "extensions:extensions/shared.js",
+            source: None,
+            enabled: false,
+        },
     )
     .expect_err("ambiguous selector must fail");
     let message = error.to_string();
@@ -209,13 +217,15 @@ fn config_toggle_requires_a_source_when_two_packages_share_a_pattern() {
     // Naming the package resolves it.
     let message = set_config_resource_enabled(
         &mut settings,
-        &agent,
-        &cwd,
-        false,
-        false,
-        "extensions:extensions/shared.js",
-        Some("npm:bar"),
-        false,
+        ConfigResourceToggle {
+            agent_dir: &agent,
+            cwd: &cwd,
+            project_trusted: false,
+            local: false,
+            selector: "extensions:extensions/shared.js",
+            source: Some("npm:bar"),
+            enabled: false,
+        },
     )
     .expect("source-qualified toggle");
     assert!(message.contains("npm:bar"), "got: {message}");
@@ -240,37 +250,43 @@ fn config_toggle_errors_are_explicit() {
 
     let bad_kind = set_config_resource_enabled(
         &mut settings,
-        &agent,
-        &cwd,
-        false,
-        false,
-        "widgets:extensions/a.js",
-        None,
-        false,
+        ConfigResourceToggle {
+            agent_dir: &agent,
+            cwd: &cwd,
+            project_trusted: false,
+            local: false,
+            selector: "widgets:extensions/a.js",
+            source: None,
+            enabled: false,
+        },
     )
     .expect_err("unknown kind");
     assert!(bad_kind.to_string().contains("Invalid resource kind"));
     let no_colon = set_config_resource_enabled(
         &mut settings,
-        &agent,
-        &cwd,
-        false,
-        false,
-        "extensions/a.js",
-        None,
-        false,
+        ConfigResourceToggle {
+            agent_dir: &agent,
+            cwd: &cwd,
+            project_trusted: false,
+            local: false,
+            selector: "extensions/a.js",
+            source: None,
+            enabled: false,
+        },
     )
     .expect_err("missing selector separator");
     assert!(no_colon.to_string().contains("expected <kind>:<pattern>"));
     let missing = set_config_resource_enabled(
         &mut settings,
-        &agent,
-        &cwd,
-        false,
-        false,
-        "extensions:extensions/nope.js",
-        None,
-        false,
+        ConfigResourceToggle {
+            agent_dir: &agent,
+            cwd: &cwd,
+            project_trusted: false,
+            local: false,
+            selector: "extensions:extensions/nope.js",
+            source: None,
+            enabled: false,
+        },
     )
     .expect_err("missing resource");
     assert!(missing.to_string().contains("No extensions resource"));
@@ -278,13 +294,15 @@ fn config_toggle_errors_are_explicit() {
     // A project-scope write is refused while the project is untrusted.
     let untrusted = set_config_resource_enabled(
         &mut settings,
-        &agent,
-        &cwd,
-        false,
-        true,
-        "extensions:extensions/a.js",
-        None,
-        false,
+        ConfigResourceToggle {
+            agent_dir: &agent,
+            cwd: &cwd,
+            project_trusted: false,
+            local: true,
+            selector: "extensions:extensions/a.js",
+            source: None,
+            enabled: false,
+        },
     )
     .expect_err("untrusted project write");
     assert!(untrusted.to_string().contains("not trusted"));

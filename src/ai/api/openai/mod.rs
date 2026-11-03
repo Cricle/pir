@@ -18,7 +18,16 @@ use crate::ai::types::*;
 
 mod compat_detect;
 mod reasoning;
+mod session_message_source;
 mod sse;
+
+pub use session_message_source::SessionMessageSource;
+
+/// Request bodies at or above this estimated size are serialized to a temp
+/// file and streamed from disk instead of being kept resident as a `Vec`.
+/// Small requests stay on the in-memory path (no temp-file overhead, no
+/// chunked wire shape change).
+const STREAM_BODY_TO_FILE_BYTES: usize = 8 * 1024 * 1024;
 
 pub use compat_detect::{detect_compat, resolve_compat};
 use reasoning::apply_assistant_reasoning;
@@ -249,11 +258,26 @@ async fn openai_stream(
     let compat = resolve_compat(model);
     // Payload mutations keep the value-based body: `on_payload` receives a
     // `Value` to inspect/replace, and the anthropic-style cache-control
-    // markers are attached by mutating message objects. Without either, the
-    // streamed body serializes byte-identically straight from the transcript
-    // (no transcript-sized `Value` tree).
+    // markers are attached by mutating message objects. A transport
+    // `before_provider_request` hook is the same situation — its contract is a
+    // parsed `Value`, so the streamed twin cannot serve it. Applying that hook
+    // HERE (instead of letting the transport serialize-then-parse) keeps one
+    // `Value` tree and one serialization per request.
     let cache_control = compat_cache_control(&compat, resolve_cache_retention(options));
-    let streamed = options.hooks.on_payload.is_none() && cache_control.is_none();
+    let before_provider_request = options.hooks.before_provider_request.is_some();
+    let streamed =
+        options.hooks.on_payload.is_none() && cache_control.is_none() && !before_provider_request;
+    if options.message_source.is_some()
+        && (!streamed || crate::ai::api::copilot_headers::is_github_copilot_model(model))
+    {
+        // A streamed transcript cannot be handed to a Value-mutating hook or
+        // inspected for Copilot's dynamic vision header. Refuse instead of
+        // silently sending only the run's tail messages.
+        return Err(AiError::Http(
+            "message_source requires the streamed body path (payload hook, cache-control marker, or Copilot header is active)"
+                .to_string(),
+        ));
+    }
     let mut value_body = if streamed {
         None
     } else {
@@ -265,6 +289,16 @@ async fn openai_stream(
         }
         Some(body)
     };
+    if before_provider_request {
+        let Some(body) = value_body.take() else {
+            return Err(AiError::Http(
+                "internal request body state: hook path built no value body".to_string(),
+            ));
+        };
+        value_body = Some(
+            crate::ai::transport::apply_before_provider_request_value(body, &options.hooks).await,
+        );
+    }
     let streamed_body = if streamed {
         Some(build_openai_body_streamed(
             model, context, options, &compat,
@@ -310,6 +344,13 @@ async fn openai_stream(
     {
         return Ok(());
     }
+    let mut transport_hooks = options.hooks.clone();
+    if before_provider_request {
+        // The adapter applied the hook to the Value above; do not run it a
+        // second time on the serialized body (that would parse the transcript
+        // into another full `Value` tree).
+        transport_hooks.before_provider_request = None;
+    }
     let (status, response_headers) = {
         let mut on_chunk = crate::ai::api::EventChunkSink::new(
             |chunk: &[u8], ready: &mut Vec<AssistantMessageEvent>| {
@@ -325,28 +366,69 @@ async fn openai_stream(
         let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
         match (&streamed_body, value_body.as_mut()) {
             (Some(body), _) => {
-                client
-                    .post_json_streaming_with(
-                        &url,
-                        &headers,
-                        body,
-                        options.signal.as_ref(),
-                        &options.hooks,
-                        &mut on_chunk,
-                    )
-                    .await?
+                // Serialize from the typed transcript. Small requests keep one
+                // exact-ish reservation (the former `to_vec` grew through
+                // log2(n) reallocations and briefly held both buffers); a
+                // transcript-sized request is written to a temp file instead,
+                // so the serialized bytes never live on the heap through the
+                // HTTP send. This branch never carries a before_provider_request
+                // hook (that forces the value body above).
+                let estimated = body.estimated_json_bytes();
+                if estimated >= STREAM_BODY_TO_FILE_BYTES {
+                    let payload = client.serialize_payload_to_file(body)?;
+                    client
+                        .post_payload_file_streaming_with(
+                            &url,
+                            &headers,
+                            &payload,
+                            options.signal.as_ref(),
+                            &transport_hooks,
+                            &mut on_chunk,
+                        )
+                        .await?
+                } else {
+                    let payload = client.serialize_payload_with_capacity(body, estimated)?;
+                    client
+                        .post_payload_streaming_with(
+                            &url,
+                            &headers,
+                            payload,
+                            options.signal.as_ref(),
+                            &transport_hooks,
+                            &mut on_chunk,
+                        )
+                        .await?
+                }
             }
             (None, Some(body)) => {
-                client
-                    .post_json_streaming_with(
-                        &url,
-                        &headers,
-                        body,
-                        options.signal.as_ref(),
-                        &options.hooks,
-                        &mut on_chunk,
-                    )
-                    .await?
+                // The value body is already built (on_payload / cache-control
+                // / before_provider_request). Serialize a large one straight
+                // to a temp file so the request body never joins the Value tree
+                // on the heap.
+                if estimated_context_json_bytes(context) >= STREAM_BODY_TO_FILE_BYTES {
+                    let payload = client.serialize_payload_to_file(body)?;
+                    client
+                        .post_payload_file_streaming_with(
+                            &url,
+                            &headers,
+                            &payload,
+                            options.signal.as_ref(),
+                            &transport_hooks,
+                            &mut on_chunk,
+                        )
+                        .await?
+                } else {
+                    client
+                        .post_json_streaming_with(
+                            &url,
+                            &headers,
+                            body,
+                            options.signal.as_ref(),
+                            &transport_hooks,
+                            &mut on_chunk,
+                        )
+                        .await?
+                }
             }
             (None, None) => unreachable!("one of the two body shapes is always built"),
         }
@@ -388,6 +470,7 @@ fn build_openai_body_parts(
     context: &Context,
     options: &StreamOptions,
     compat: &OpenAiCompat,
+    has_tool_history: bool,
 ) -> AiResult<OpenAiBodyParts> {
     let cache_retention = resolve_cache_retention(options);
     let cache_control = compat_cache_control(compat, cache_retention);
@@ -459,7 +542,7 @@ fn build_openai_body_parts(
             // conversation has tool_calls/tool_results even though no tool is
             // declared now; with no tool history at all the field is omitted
             // entirely (several gateways reject an empty `tools: []`).
-            if has_tool_history(&context.messages) {
+            if has_tool_history {
                 converted_tools = Some(Vec::new());
             }
         }
@@ -542,7 +625,23 @@ pub fn build_openai_body(
     options: &StreamOptions,
     compat: &OpenAiCompat,
 ) -> AiResult<Value> {
-    let parts = build_openai_body_parts(model, context, options, compat)?;
+    if options.message_source.is_some() {
+        // The value body is a materialized `Value` tree and cannot consume a
+        // streamed transcript. Callers that install a message source must use
+        // the streamed body path (no payload hooks, no Anthropic-style cache
+        // markers); failing loudly is safer than sending a truncated request.
+        return Err(AiError::Http(
+            "a message source requires the streamed body path (payload hooks and cache-control markers cannot consume it)"
+                .to_string(),
+        ));
+    }
+    let parts = build_openai_body_parts(
+        model,
+        context,
+        options,
+        compat,
+        has_tool_history(&context.messages),
+    )?;
     let mut body = parts.body;
     body["messages"] = Value::Array(convert_messages(model, context, compat));
     // Anthropic-style cache_control markers (upstream
@@ -594,7 +693,13 @@ pub struct OpenAiStreamedBody<'a> {
     body: Value,
     model: &'a Model,
     context: &'a Context,
+    /// The transcript to serialize. Owned so the builder can choose between a
+    /// borrowed slice and a chained (streamed history + run messages) source
+    /// without leaking a temporary into the struct lifetime.
+    source: Box<dyn MessageSource + 'a>,
     compat: &'a OpenAiCompat,
+    summary: MessageSourceSummary,
+    estimated_json_bytes: usize,
 }
 
 impl OpenAiStreamedBody<'_> {
@@ -603,24 +708,146 @@ impl OpenAiStreamedBody<'_> {
     pub fn body(&self) -> &Value {
         &self.body
     }
+
+    /// A conservative estimate of the serialized body size, used to reserve
+    /// the transport payload once. It counts the source's text/image/tool-call
+    /// payload bytes plus fixed JSON/escaping overhead; it never builds a
+    /// `Value` tree or a transcript copy.
+    pub fn estimated_json_bytes(&self) -> usize {
+        self.estimated_json_bytes
+    }
+}
+
+/// [`OpenAiStreamedBody::estimated_json_bytes`] over a bare context, shared
+/// with the value-body path (which needs the same threshold decision after
+/// `before_provider_request` has already built a `Value`).
+pub(crate) fn estimated_context_json_bytes(context: &Context) -> usize {
+    let text: usize = context.messages.iter().map(estimated_message_bytes).sum();
+    // JSON punctuation, keys, escaping and the non-message body fields.
+    // Underestimating only costs one reallocation, never correctness.
+    text.saturating_add(text / 8)
+        .saturating_add(context.messages.len().saturating_mul(96))
+        .saturating_add(8 * 1024)
+}
+
+fn estimated_source_json_bytes(summary: &MessageSourceSummary) -> usize {
+    summary
+        .approximate_json_bytes
+        .saturating_add(summary.approximate_json_bytes / 8)
+        .saturating_add(summary.message_count.saturating_mul(96))
+        .saturating_add(8 * 1024)
+}
+
+fn estimated_content_bytes(block: &ContentBlock) -> usize {
+    match block {
+        ContentBlock::Text(content) => content
+            .text
+            .len()
+            .saturating_add(content.text_signature.as_deref().map_or(0, str::len)),
+        ContentBlock::Thinking(content) => content
+            .thinking
+            .len()
+            .saturating_add(content.thinking_signature.as_deref().map_or(0, str::len)),
+        ContentBlock::Image(content) => content.data.len().saturating_add(content.mime_type.len()),
+        ContentBlock::ToolCall(call) => call
+            .id
+            .len()
+            .saturating_add(call.name.len())
+            .saturating_add(
+                call.arguments
+                    .iter()
+                    .map(|(key, value)| {
+                        key.len()
+                            .saturating_add(value.as_str().map_or(64, str::len))
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(call.thought_signature.as_deref().map_or(0, str::len)),
+    }
+}
+
+fn estimated_message_bytes(message: &Message) -> usize {
+    let content = match message {
+        Message::User(payload) | Message::System(payload) | Message::Developer(payload) => {
+            payload.content.iter()
+        }
+        Message::Assistant(payload) => payload.content.iter(),
+        Message::ToolResult(payload) => payload.content.iter(),
+    };
+    content
+        .map(estimated_content_bytes)
+        .fold(0usize, usize::saturating_add)
+}
+
+/// Whether the OpenAI-compatible adapter can serve a request from a streamed
+/// [`MessageSource`] without materializing a value body.
+///
+/// The streamed body path is unavailable when the payload must be inspected or
+/// mutated (`on_payload`) or when the transport installs a
+/// `before_provider_request` hook (its contract is a parsed `Value`), and when
+/// the compat wants Anthropic-style `cache_control` markers (they are attached
+/// by mutating message objects). GitHub Copilot's dynamic headers also inspect
+/// `Context::messages` directly. Hosts that install a message source must
+/// check this first and keep the projection fallback otherwise.
+pub fn openai_streamed_body_supported(model: &Model, options: &StreamOptions) -> bool {
+    let compat = resolve_compat(model);
+    options.hooks.on_payload.is_none()
+        && options.hooks.before_provider_request.is_none()
+        && compat_cache_control(&compat, resolve_cache_retention(options)).is_none()
+        && !crate::ai::api::copilot_headers::is_github_copilot_model(model)
 }
 
 /// Build the streamed twin of [`build_openai_body`] (see
 /// [`OpenAiStreamedBody`]). The non-message fields are built by the SAME code
 /// path ([`build_openai_body_parts`]), in the same insertion order, so the two
 /// bodies serialize to identical bytes.
+///
+/// A [`StreamOptions::message_source`] (when set) supplies the historical
+/// prefix and `context.messages` supplies the messages this run produced; the
+/// two are chained into the same wire sequence the full vector would build.
 pub fn build_openai_body_streamed<'a>(
     model: &'a Model,
     context: &'a Context,
+    options: &'a StreamOptions,
+    compat: &'a OpenAiCompat,
+) -> AiResult<OpenAiStreamedBody<'a>> {
+    if let Some(prefix) = options.message_source.as_deref() {
+        let source = ChainedMessageSource::new(prefix, context.messages.as_slice());
+        return build_openai_body_streamed_from_source(
+            model,
+            context,
+            Box::new(source),
+            options,
+            compat,
+        );
+    }
+    let source = SliceMessageSource::new(context.messages.as_slice());
+    build_openai_body_streamed_from_source(model, context, Box::new(source), options, compat)
+}
+
+/// [`build_openai_body_streamed`] over an explicit source. Public so the print
+/// host and tests can hand the serializer a file-backed transcript without
+/// first materializing `Context::messages`.
+pub fn build_openai_body_streamed_from_source<'a>(
+    model: &'a Model,
+    context: &'a Context,
+    source: Box<dyn MessageSource + 'a>,
     options: &StreamOptions,
     compat: &'a OpenAiCompat,
 ) -> AiResult<OpenAiStreamedBody<'a>> {
-    let parts = build_openai_body_parts(model, context, options, compat)?;
+    let summary = source
+        .summary()
+        .map_err(|error| AiError::Http(error.to_string()))?;
+    let parts = build_openai_body_parts(model, context, options, compat, summary.has_tool_history)?;
+    let estimated_json_bytes = estimated_source_json_bytes(&summary);
     Ok(OpenAiStreamedBody {
         body: parts.body,
         model,
         context,
+        source,
         compat,
+        summary,
+        estimated_json_bytes,
     })
 }
 
@@ -629,7 +856,8 @@ impl serde::Serialize for OpenAiStreamedBody<'_> {
     where
         S: serde::Serializer,
     {
-        let plan = ReplayPlan::prepare(self.model, self.context, self.compat, false);
+        let plan =
+            ConverterPlan::from_summary(self.model, self.context, self.compat, &self.summary);
         // The body is always a JSON object (`build_openai_body_parts` starts
         // from an object literal). Degrade to an empty object instead of
         // panicking if that invariant ever breaks: a malformed request is a
@@ -649,6 +877,7 @@ impl serde::Serialize for OpenAiStreamedBody<'_> {
                         model: self.model,
                         plan: &plan,
                         compat: self.compat,
+                        source: &*self.source,
                     },
                 )?;
             } else {
@@ -661,13 +890,16 @@ impl serde::Serialize for OpenAiStreamedBody<'_> {
 
 /// The `messages` array of [`OpenAiStreamedBody`], converted one message at a
 /// time. The per-message conversion is [`OpenAiMessageConverter`] — the same
-/// state machine [`convert_messages`] drives — so the sequence (including the
-/// `requiresAssistantAfterToolResult` insertions and the skipped messages) is
-/// identical to the materialized array.
+/// state machine [`convert_messages`] drives — and the transform is the
+/// streaming twin of [`crate::ai::api::transform::transform_messages_lazy`],
+/// so the sequence (including the `requiresAssistantAfterToolResult`
+/// insertions and the skipped messages) is identical to the materialized
+/// array while only one message is resident at a time.
 struct StreamedMessages<'a> {
     model: &'a Model,
-    plan: &'a ReplayPlan<'a>,
+    plan: &'a ConverterPlan<'a>,
     compat: &'a OpenAiCompat,
+    source: &'a dyn MessageSource,
 }
 
 impl serde::Serialize for StreamedMessages<'_> {
@@ -675,14 +907,11 @@ impl serde::Serialize for StreamedMessages<'_> {
     where
         S: serde::Serializer,
     {
-        let transformed = self.plan.transformed(self.model);
         let mut converter = OpenAiMessageConverter::new(self.model, self.plan, self.compat);
         let mut sequence = serializer.serialize_seq(None)?;
         // One message's items at a time — never a transcript-sized item list.
-        // The list is per message (instead of one reused Vec) because a lazy
-        // text item borrows THAT message's text; the list itself is tiny, and
-        // what used to dominate (a `Value` per message, its text copied into
-        // it) is gone.
+        // The list is per message because a lazy text item borrows THAT
+        // message's text.
         {
             let mut items: Vec<WireItem<'_>> = Vec::new();
             converter.emit_leading_system(&self.plan.leading_system, &mut items);
@@ -690,13 +919,35 @@ impl serde::Serialize for StreamedMessages<'_> {
                 sequence.serialize_element(item)?;
             }
         }
-        for message in &transformed {
+        let normalize =
+            |id: &str, _source: &AssistantMessage| normalize_openai_tool_call_id(self.model, id);
+        let mut transform =
+            crate::ai::api::transform::StreamingMessageTransform::new(self.model, Some(&normalize));
+        let mut emit = |message: &Message| -> Result<(), S::Error> {
             let mut items: Vec<WireItem<'_>> = Vec::new();
             converter.convert(message, &mut items);
             for item in &items {
                 sequence.serialize_element(item)?;
             }
+            Ok(())
+        };
+        let mut messages = self.source.messages();
+        loop {
+            let Some(message) = messages.next() else {
+                break;
+            };
+            let message = message.map_err(serde::ser::Error::custom)?;
+            if self.plan.fold_system_messages
+                && matches!(
+                    message.message(),
+                    Message::System(_) | Message::Developer(_)
+                )
+            {
+                continue;
+            }
+            transform.push(message.message(), &mut emit)?;
         }
+        transform.finish(&mut emit)?;
         sequence.end()
     }
 }
@@ -882,7 +1133,7 @@ fn convert_messages_inner(
 ) -> Vec<Value> {
     let plan = ReplayPlan::prepare(model, context, compat, force_cloned_replay);
     let transformed = plan.transformed(model);
-    let mut converter = OpenAiMessageConverter::new(model, &plan, compat);
+    let mut converter = OpenAiMessageConverter::new(model, &plan.plan, compat);
     // The VALUE path materializes every item (its callers inspect or mutate the
     // body as `Value`s, e.g. `on_payload`), so the lazy text items are turned
     // into the identical objects here — the lazy shape only saves copies on the
@@ -890,7 +1141,7 @@ fn convert_messages_inner(
     let mut messages: Vec<Value> = Vec::with_capacity(transformed.len() + 1);
     {
         let mut wire: Vec<WireItem<'_>> = Vec::new();
-        converter.emit_leading_system(&plan.leading_system, &mut wire);
+        converter.emit_leading_system(&plan.plan.leading_system, &mut wire);
         messages.extend(wire.into_iter().map(WireItem::into_value));
     }
     for message in &transformed {
@@ -901,17 +1152,18 @@ fn convert_messages_inner(
     messages
 }
 
-/// The replay shape of one request: the transcript as it enters the adapter
-/// (borrowed when possible), the leading system prompt with any mid-convo
-/// system text folded in, and the per-request conversion flags.
-struct ReplayPlan<'a> {
-    /// The transcript as replayed: borrowed from the context, or the former
-    /// clone-every-message shape for the mid-convo collapse and the
-    /// `#[doc(hidden)]` audit seam.
-    replay: ReplayInput<'a>,
+/// The per-request conversion flags shared by the value body and the streamed
+/// body: the leading system prompt (with any mid-convo system text folded in),
+/// the instruction-role selection, and the compat gates the message converter
+/// reads.
+struct ConverterPlan<'a> {
     /// The folded leading system prompt (`""` when there is none). Borrowed
     /// from the context unless a mid-convo system message was folded in.
     leading_system: std::borrow::Cow<'a, str>,
+    /// Whether mid-conversation system/developer messages are folded into the
+    /// leading prompt and dropped from the transcript (upstream
+    /// `supportsMidConvoSystemMessages`, default false).
+    fold_system_messages: bool,
     /// Instruction-role selection (upstream `instructionRole`): reasoning
     /// models on developer-role providers use `developer`.
     instruction_role: &'static str,
@@ -933,6 +1185,172 @@ struct ReplayPlan<'a> {
     /// pir keeps `context.tools` top-level, so an inline `toolsAdded` entry
     /// with one of these names is already declared and must not be repeated.
     request_tool_names: std::collections::BTreeSet<String>,
+}
+
+impl<'a> ConverterPlan<'a> {
+    /// Plan for a resident transcript (`Context::messages`).
+    fn from_context(model: &Model, context: &'a Context, compat: &OpenAiCompat) -> Self {
+        let supports_mid_convo_system_messages =
+            compat.supports_mid_convo_system_messages.unwrap_or(false);
+        let has_mid_convo =
+            !supports_mid_convo_system_messages && context.messages.iter().any(is_system_message);
+        let leading_system = fold_leading_system(
+            context.system_prompt.as_deref(),
+            context.messages.iter().filter_map(instruction_text),
+            has_mid_convo,
+        );
+        Self::build(
+            model,
+            context,
+            compat,
+            leading_system,
+            has_mid_convo,
+            &context.messages,
+        )
+    }
+
+    /// Plan for a [`MessageSource`]: the source summary already carries every
+    /// instruction message, so the mid-convo collapse and the tool-change scan
+    /// never walk the transcript again.
+    fn from_summary(
+        model: &Model,
+        context: &'a Context,
+        compat: &OpenAiCompat,
+        summary: &MessageSourceSummary,
+    ) -> Self {
+        let supports_mid_convo_system_messages =
+            compat.supports_mid_convo_system_messages.unwrap_or(false);
+        let has_mid_convo =
+            !supports_mid_convo_system_messages && !summary.instruction_messages.is_empty();
+        let leading_system = fold_leading_system(
+            context.system_prompt.as_deref(),
+            summary
+                .instruction_messages
+                .iter()
+                .filter_map(instruction_text),
+            has_mid_convo,
+        );
+        Self::build(
+            model,
+            context,
+            compat,
+            leading_system,
+            has_mid_convo,
+            &summary.instruction_messages,
+        )
+    }
+
+    fn build(
+        model: &Model,
+        context: &Context,
+        compat: &OpenAiCompat,
+        leading_system: std::borrow::Cow<'a, str>,
+        fold_system_messages: bool,
+        instruction_source: &[Message],
+    ) -> Self {
+        let supports_mid_convo_system_messages =
+            compat.supports_mid_convo_system_messages.unwrap_or(false);
+        let grammar_input_properties = create_grammar_tool_input_properties(
+            context.tools.as_deref().unwrap_or(&[]),
+            compat.supports_openai_grammar_tools.unwrap_or(false),
+        )
+        .unwrap_or_default();
+        // Upstream `resolveTranscriptTools`: in-place tool additions are only
+        // anchored when the transport accepts system messages after the start
+        // and no tool was removed or redeclared (`hasNonAdditiveToolChanges`).
+        let anchors_tool_additions = supports_mid_convo_system_messages
+            && compat.supports_mid_convo_tool_additions.unwrap_or(false)
+            && !has_non_additive_tool_changes(instruction_source);
+        // Upstream `resolveTranscriptTools` derives the request tools from the
+        // leading system message's `toolsAdded`; later system messages only
+        // carry definitions not already in that list. pir's request tools are
+        // `context.tools`, so an inline addition duplicating one of them is
+        // filtered out at conversion time.
+        let request_tool_names = if anchors_tool_additions {
+            context
+                .tools
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        Self {
+            leading_system,
+            fold_system_messages,
+            instruction_role: if model.reasoning && compat.supports_developer_role.unwrap_or(false)
+            {
+                "developer"
+            } else {
+                "system"
+            },
+            grammar_input_properties,
+            supports_images: model.input.iter().any(|input| input == "image"),
+            requires_tool_result_name: compat.requires_tool_result_name.unwrap_or(false),
+            requires_assistant_after_tool_result: compat
+                .requires_assistant_after_tool_result
+                .unwrap_or(false),
+            requires_thinking_as_text: compat.requires_thinking_as_text.unwrap_or(false),
+            requires_reasoning_content: compat
+                .requires_reasoning_content_on_assistant_messages
+                .unwrap_or(false),
+            anchors_tool_additions,
+            request_tool_names,
+        }
+    }
+}
+
+fn instruction_text(message: &Message) -> Option<String> {
+    match message {
+        Message::System(system) | Message::Developer(system) => {
+            Some(crate::ai::types::system_message_text(system))
+        }
+        _ => None,
+    }
+}
+
+/// Fold mid-conversation instruction text into the leading system prompt
+/// (upstream `collapseSystemMessages`). `fold` is the compatibility gate; a
+/// message set with no non-empty text leaves the borrowed prompt untouched.
+fn fold_leading_system<'a>(
+    base: Option<&'a str>,
+    texts: impl Iterator<Item = String>,
+    fold: bool,
+) -> std::borrow::Cow<'a, str> {
+    let mut leading = std::borrow::Cow::Borrowed(base.unwrap_or(""));
+    if !fold {
+        return leading;
+    }
+    let mut collapsed = String::new();
+    for text in texts {
+        if !text.trim().is_empty() {
+            if !collapsed.is_empty() {
+                collapsed.push_str("\n\n");
+            }
+            collapsed.push_str(&text);
+        }
+    }
+    if !collapsed.is_empty() {
+        let mut owned = leading.into_owned();
+        if !owned.is_empty() {
+            owned.push_str("\n\n");
+        }
+        owned.push_str(&collapsed);
+        leading = std::borrow::Cow::Owned(owned);
+    }
+    leading
+}
+
+/// The replay shape of one request for the VALUE body path: the transcript as
+/// it enters the adapter (borrowed when possible) plus the conversion plan.
+struct ReplayPlan<'a> {
+    /// The transcript as replayed: borrowed from the context, or the former
+    /// clone-every-message shape for the mid-convo collapse and the
+    /// `#[doc(hidden)]` audit seam.
+    replay: ReplayInput<'a>,
+    plan: ConverterPlan<'a>,
 }
 
 /// How the plan's transcript is carried. The borrowed form is the live one;
@@ -961,14 +1379,7 @@ impl<'a> ReplayPlan<'a> {
         // (`supportsMidConvoSystemMessages`, default false), all mid-transcript
         // system/developer text is replayed into the leading system prompt and the
         // messages are dropped from the transcript.
-        let supports_mid_convo_system_messages =
-            compat.supports_mid_convo_system_messages.unwrap_or(false);
-        // COW: the leading prompt is copied only when a mid-convo system
-        // message is actually folded into it.
-        let mut leading_system: std::borrow::Cow<'a, str> =
-            std::borrow::Cow::Borrowed(context.system_prompt.as_deref().unwrap_or(""));
-        let has_mid_convo =
-            !supports_mid_convo_system_messages && context.messages.iter().any(is_system_message);
+        let plan = ConverterPlan::from_context(model, context, compat);
         // INVARIANT (borrowed replay): the mid-convo collapse is the IDENTITY on a
         // transcript with no system/developer message — the only branch that needs
         // a filtered list is the collapse itself (it drops those messages and
@@ -978,32 +1389,15 @@ impl<'a> ReplayPlan<'a> {
         // longer pays a second copy of every tool-result file content. The
         // borrow is a plain read of `context.messages`; nothing mutates `context`
         // in between.
-        let replay = if !force_cloned_replay && !has_mid_convo {
+        let replay = if !force_cloned_replay && !plan.fold_system_messages {
             ReplayInput::Borrowed(context.messages.as_slice())
         } else {
-            let mut collapsed = String::new();
             let mut kept: Vec<&'a Message> = Vec::with_capacity(context.messages.len());
             for message in &context.messages {
-                match message {
-                    Message::System(system) | Message::Developer(system) => {
-                        let text = crate::ai::types::system_message_text(system);
-                        if !text.trim().is_empty() {
-                            if !collapsed.is_empty() {
-                                collapsed.push_str("\n\n");
-                            }
-                            collapsed.push_str(&text);
-                        }
-                    }
-                    other => kept.push(other),
+                if is_system_message(message) {
+                    continue;
                 }
-            }
-            if !collapsed.is_empty() {
-                let mut leading = leading_system.into_owned();
-                if !leading.is_empty() {
-                    leading.push_str("\n\n");
-                }
-                leading.push_str(&collapsed);
-                leading_system = std::borrow::Cow::Owned(leading);
+                kept.push(message);
             }
             if force_cloned_replay {
                 // Audit reference leg only: the former deep-clone shape.
@@ -1012,62 +1406,14 @@ impl<'a> ReplayPlan<'a> {
                 ReplayInput::Filtered(kept)
             }
         };
-        let grammar_input_properties = create_grammar_tool_input_properties(
-            context.tools.as_deref().unwrap_or(&[]),
-            compat.supports_openai_grammar_tools.unwrap_or(false),
-        )
-        .unwrap_or_default();
-        // Upstream `resolveTranscriptTools`: in-place tool additions are only
-        // anchored when the transport accepts system messages after the start
-        // and no tool was removed or redeclared (`hasNonAdditiveToolChanges`).
-        let anchors_tool_additions = supports_mid_convo_system_messages
-            && compat.supports_mid_convo_tool_additions.unwrap_or(false)
-            && !has_non_additive_tool_changes(&context.messages);
-        // Upstream `resolveTranscriptTools` derives the request tools from the
-        // leading system message's `toolsAdded`; later system messages only
-        // carry definitions not already in that list. pir's request tools are
-        // `context.tools`, so an inline addition duplicating one of them is
-        // filtered out at conversion time.
-        let request_tool_names = if anchors_tool_additions {
-            context
-                .tools
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect()
-        } else {
-            std::collections::BTreeSet::new()
-        };
-        Self {
-            replay,
-            leading_system,
-            instruction_role: if model.reasoning && compat.supports_developer_role.unwrap_or(false)
-            {
-                "developer"
-            } else {
-                "system"
-            },
-            grammar_input_properties,
-            supports_images: model.input.iter().any(|input| input == "image"),
-            requires_tool_result_name: compat.requires_tool_result_name.unwrap_or(false),
-            requires_assistant_after_tool_result: compat
-                .requires_assistant_after_tool_result
-                .unwrap_or(false),
-            requires_thinking_as_text: compat.requires_thinking_as_text.unwrap_or(false),
-            requires_reasoning_content: compat
-                .requires_reasoning_content_on_assistant_messages
-                .unwrap_or(false),
-            anchors_tool_additions,
-            request_tool_names,
-        }
+        Self { replay, plan }
     }
 
     /// The transformed transcript (upstream `transformMessages`): pass 1
     /// normalization plus pass 2 (orphaned-call synthesis, errored/aborted
     /// assistant skip, system messages held across pending calls), with every
     /// untouched message BORROWED rather than cloned.
-    fn transformed(&self, model: &Model) -> Vec<std::borrow::Cow<'_, Message>> {
+    fn transformed(&self, model: &Model) -> Vec<crate::ai::api::transform::LazyMessage<'_>> {
         let normalize =
             |id: &str, _source: &AssistantMessage| normalize_openai_tool_call_id(model, id);
         match &self.replay {
@@ -1225,7 +1571,7 @@ struct OpenAiMessageConverter<'a> {
 }
 
 impl<'a> OpenAiMessageConverter<'a> {
-    fn new(model: &Model, plan: &'a ReplayPlan<'_>, compat: &'a OpenAiCompat) -> Self {
+    fn new(model: &Model, plan: &'a ConverterPlan<'_>, compat: &'a OpenAiCompat) -> Self {
         Self {
             compat,
             instruction_role: plan.instruction_role,

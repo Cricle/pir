@@ -27,6 +27,8 @@
 //! truncated. Sidecar data for a document whose content was reclaimed (a
 //! current-only document replaced by a newer base, or a retired one) or for a
 //! task that ended terminal is optional, so its absence is not corruption.
+//! A live task's sidecar is compacted to its newest record (a complete
+//! replacement), so only that newest record is required to rebuild the task.
 //!
 //! # Corruption and poisoning
 //!
@@ -56,10 +58,11 @@ use crate::durable::types::{
 };
 use crate::durable::Storage;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 /// The on-disk format version.
@@ -77,6 +80,18 @@ const IDS_FILE: &str = "ids.jsonl";
 /// The suffix of a sidecar rewrite in progress.
 const RECLAIM_SUFFIX: &str = ".reclaim";
 
+/// A live task's sidecar is rewritten to its newest record once appending
+/// another record would grow it past this many bytes.
+///
+/// [`TaskRecord`] is a complete replacement record, so every older snapshot in
+/// the file is dead weight: it costs disk space and forces recovery to parse
+/// and replay it. Compacting at a fixed byte threshold bounds both the file
+/// size and its record count independently of how many times the task changes
+/// state; the newest record always survives, so recovery still rebuilds the
+/// latest state.
+#[doc(hidden)]
+pub const TASK_SIDECAR_COMPACT_BYTES: u64 = 32 * 1024;
+
 /// Options for [`JsonlStorage::open_with_options`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct JsonlStorageOptions {
@@ -87,26 +102,24 @@ pub struct JsonlStorageOptions {
 /// One operation stored in a main commit marker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
-// Wire-shaped (serde-tagged) enum: boxing a variant would only add an
-// indirection at every construction and match site without changing the
-// serialized bytes, and a marker holds a handful of operations at a time.
-#[allow(clippy::large_enum_variant)]
+// Wire-shaped (serde-tagged) enum: `Box` only adds private indirection inside
+// the binary and serializes exactly like the inner record.
 enum MainOperation {
     #[serde(rename = "conversation")]
-    Conversation { value: ConversationRecord },
+    Conversation { value: Box<ConversationRecord> },
     #[serde(rename = "entry")]
-    Entry { value: EntryRecord },
+    Entry { value: Box<EntryRecord> },
     #[serde(rename = "submission")]
-    Submission { value: SubmissionRecord },
+    Submission { value: Box<SubmissionRecord> },
     #[serde(rename = "task")]
-    Task { value: TaskRecord },
+    Task { value: Box<TaskRecord> },
     #[serde(rename = "task.sidecar")]
     TaskSidecar { id: TaskId, ordinal: i64 },
     #[serde(rename = "document.retire")]
     DocumentRetire { id: DocumentId },
     #[serde(rename = "document.create")]
     DocumentCreate {
-        record: DocumentCreate,
+        record: Box<DocumentCreate>,
         ordinal: i64,
     },
     #[serde(rename = "document.change")]
@@ -159,12 +172,10 @@ struct MainMarker {
 /// The bulk payload a sidecar record carries.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
-// Wire-shaped enum (see [`MainOperation`]): one sidecar record is materialized
-// at a time, so the variant size is not a hot-path concern.
-#[allow(clippy::large_enum_variant)]
+// Wire-shaped enum (see [`MainOperation`]): `Box` serializes like the record.
 enum SidecarPayload {
     #[serde(rename = "task")]
-    Task { value: TaskRecord },
+    Task { value: Box<TaskRecord> },
     #[serde(rename = "document")]
     Document {
         id: DocumentId,
@@ -173,7 +184,7 @@ enum SidecarPayload {
 }
 
 /// One sidecar line.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct SidecarRecord {
     format: i64,
     #[serde(rename = "type")]
@@ -181,6 +192,22 @@ struct SidecarRecord {
     seq: Seq,
     ordinal: i64,
     payload: SidecarPayload,
+}
+
+impl Clone for SidecarRecord {
+    fn clone(&self) -> Self {
+        // Test seam (R1-L3-008): recovery must keep one copy of each sidecar
+        // record and move it into the replayed write instead of deep-cloning
+        // the payload into an index or a second parse list.
+        SIDECAR_RECORD_CLONES.with(|clones| clones.set(clones.get().saturating_add(1)));
+        Self {
+            format: self.format,
+            kind: self.kind.clone(),
+            seq: self.seq,
+            ordinal: self.ordinal,
+            payload: self.payload.clone(),
+        }
+    }
 }
 
 impl SidecarRecord {
@@ -223,15 +250,157 @@ struct EncodedCommit {
     sidecars: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug)]
-struct ParsedLine<T> {
-    value: T,
-    start: usize,
+/// Where one sidecar line starts, plus the key that a marker confirms it with.
+///
+/// Recovery keeps this instead of the parsed record so a sidecar file's
+/// bookkeeping costs a few bytes per line rather than a full copy of its
+/// payload.
+#[derive(Clone, Copy, Debug)]
+struct SidecarLine {
+    seq: Seq,
+    ordinal: i64,
+    start: u64,
 }
 
-#[derive(Clone, Debug)]
-struct ParsedFile<T> {
-    lines: Vec<ParsedLine<T>>,
+/// What recovery must do with one sidecar file after replay.
+#[derive(Clone, Copy, Debug)]
+enum SidecarReclamation {
+    /// The file holds nothing that must survive (a terminal task or a retired
+    /// current-only document).
+    Delete,
+    /// Rewrite the file to the bytes starting at this offset, streaming them
+    /// from the old file instead of building the whole content in memory.
+    KeepFrom(u64),
+}
+
+/// One line handed out by [`LogLineReader`]. `text` borrows the reader's
+/// reusable buffer and excludes the trailing `\n`.
+struct LogLine<'a> {
+    number: usize,
+    start: u64,
+    text: &'a str,
+}
+
+/// A streaming line reader for JSONL logs.
+///
+/// A torn (newline-less) trailing line is truncated on [`Self::open`], matching
+/// the whole-file reader this replaces. Lines are then read one at a time
+/// through [`tokio::io::BufReader`]: the file and its decoded text are never
+/// materialized in full, so a large session bounds recovery's line overhead to
+/// one line instead of the whole log.
+struct LogLineReader {
+    name: String,
+    reader: Option<BufReader<tokio::fs::File>>,
+    buffer: Vec<u8>,
+    offset: u64,
+    line_number: usize,
+}
+
+impl LogLineReader {
+    async fn open(path: &Path, name: &str) -> Result<Self, StorageError> {
+        truncate_torn_tail(path, name).await?;
+        let reader = match tokio::fs::File::open(path).await {
+            Ok(file) => Some(BufReader::new(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(StorageError::io(format!("read of {name}"), error)),
+        };
+        Ok(Self {
+            name: name.to_owned(),
+            reader,
+            buffer: Vec::new(),
+            offset: 0,
+            line_number: 0,
+        })
+    }
+
+    async fn next_line(&mut self) -> Result<Option<LogLine<'_>>, StorageError> {
+        let Some(reader) = self.reader.as_mut() else {
+            return Ok(None);
+        };
+        self.buffer.clear();
+        let count = reader
+            .read_until(b'\n', &mut self.buffer)
+            .await
+            .map_err(|error| StorageError::io(format!("read of {}", self.name), error))?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let start = self.offset;
+        self.offset += count as u64;
+        self.line_number += 1;
+        if self.buffer.last() != Some(&b'\n') {
+            // `open` truncated a torn tail, so a partial line here means the
+            // file changed underneath us. Ignore it like a torn tail rather
+            // than parsing a fragment.
+            return Ok(None);
+        }
+        let text = std::str::from_utf8(&self.buffer[..self.buffer.len() - 1]).map_err(|error| {
+            StorageError::Corruption(JsonlCorruptionError::with_cause(
+                format!(
+                    "Invalid UTF-8 in complete {} line {}",
+                    self.name, self.line_number
+                ),
+                error,
+            ))
+        })?;
+        Ok(Some(LogLine {
+            number: self.line_number,
+            start,
+            text,
+        }))
+    }
+}
+
+/// Truncate a torn trailing line (the bytes after the last `\n`) before a
+/// [`LogLineReader`] starts. Missing files are fine (they read as empty).
+async fn truncate_torn_tail(path: &Path, name: &str) -> Result<(), StorageError> {
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StorageError::io(format!("read of {name}"), error)),
+    };
+    let length = file
+        .metadata()
+        .await
+        .map_err(|error| StorageError::io(format!("read of {name}"), error))?
+        .len();
+    if length == 0 {
+        return Ok(());
+    }
+    file.seek(std::io::SeekFrom::Start(length - 1))
+        .await
+        .map_err(|error| StorageError::io(format!("read of {name}"), error))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)
+        .await
+        .map_err(|error| StorageError::io(format!("read of {name}"), error))?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+
+    // Scan backwards in fixed-size chunks for the last complete line. The
+    // buffer is one chunk regardless of file size.
+    let mut position = length;
+    let mut chunk = vec![0u8; 64 * 1024];
+    let complete = loop {
+        let start = position.saturating_sub(chunk.len() as u64);
+        let span = (position - start) as usize;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|error| StorageError::io(format!("read of {name}"), error))?;
+        file.read_exact(&mut chunk[..span])
+            .await
+            .map_err(|error| StorageError::io(format!("read of {name}"), error))?;
+        if let Some(index) = chunk[..span].iter().rposition(|byte| *byte == b'\n') {
+            break start + index as u64 + 1;
+        }
+        if start == 0 {
+            break 0;
+        }
+        position = start;
+    };
+    drop(file);
+    truncate_file(path, complete).await
 }
 
 /// Append-only JSONL implementation of [`Storage`].
@@ -333,21 +502,27 @@ impl JsonlStorage {
             .map_err(|error| StorageError::Io(format!("JSONL commit task failed: {error}")))?
     }
 
-    /// The marker already published this state, so reclamation is retryable
-    /// best-effort maintenance.
-    async fn reclaim_sidecars(&self, replacements: &BTreeMap<String, String>) {
-        reclaim_sidecars_files(&self.directory, self.fsync, replacements).await;
-    }
-
     // ── recovery ────────────────────────────────────────────────────────────
 
     async fn recover(&self) -> Result<(), StorageError> {
-        let main = read_lines(&self.main_path, MAIN_FILE).await?;
-        let mut markers = Vec::with_capacity(main.lines.len());
+        // ── pass 1: validate the main log, keeping only a light index ─────────
+        //
+        // Marker lines carry the session's entries (including `model`/`data`),
+        // so holding every `MainMarker` alive would keep a full second copy of
+        // the session. Validate here and retain only what replay and sidecar
+        // reclamation need; replay re-reads the log line by line below.
         let mut previous_seq = 0i64;
-        for (index, line) in main.lines.iter().enumerate() {
-            let description = format!("{MAIN_FILE} line {}", index + 1);
-            let marker: MainMarker = parse_json(&line.value, &description)?;
+        let mut document_operations: HashMap<DocumentId, Vec<(Seq, i64)>> = HashMap::new();
+        let mut current_only_documents: HashSet<DocumentId> = HashSet::new();
+        let mut retired_documents: HashSet<DocumentId> = HashSet::new();
+        let mut final_task_is_live: HashMap<TaskId, bool> = HashMap::new();
+        // The newest sidecar record a live task may need. Older live-task
+        // records are superseded snapshots that compaction is free to drop.
+        let mut latest_task_markers: HashMap<TaskId, (Seq, i64)> = HashMap::new();
+        let mut main_lines = LogLineReader::open(&self.main_path, MAIN_FILE).await?;
+        while let Some(line) = main_lines.next_line().await? {
+            let description = format!("{MAIN_FILE} line {}", line.number);
+            let marker: MainMarker = parse_json(line.text, &description)?;
             if marker.format != FORMAT_VERSION || marker.kind != "commit" || marker.seq.as_i64() < 1
             {
                 return Err(StorageError::Corruption(JsonlCorruptionError::new(
@@ -364,9 +539,37 @@ impl JsonlStorage {
                 operation
                     .validate(&description)
                     .map_err(StorageError::Corruption)?;
+                match operation {
+                    MainOperation::DocumentCreate { record, ordinal } => {
+                        if record.is_current_only() {
+                            current_only_documents.insert(record.id);
+                        }
+                        document_operations
+                            .entry(record.id)
+                            .or_default()
+                            .push((marker.seq, *ordinal));
+                    }
+                    MainOperation::DocumentChange { id, ordinal } => {
+                        document_operations
+                            .entry(*id)
+                            .or_default()
+                            .push((marker.seq, *ordinal));
+                    }
+                    MainOperation::DocumentRetire { id } => {
+                        retired_documents.insert(*id);
+                    }
+                    MainOperation::Task { value } => {
+                        final_task_is_live.insert(value.id, false);
+                    }
+                    MainOperation::TaskSidecar { id, ordinal } => {
+                        final_task_is_live.insert(*id, true);
+                        latest_task_markers.insert(*id, (marker.seq, *ordinal));
+                    }
+                    _ => {}
+                }
             }
-            markers.push(marker);
         }
+        drop(main_lines);
 
         let listing = tokio::fs::read_dir(&self.directory)
             .await
@@ -400,83 +603,62 @@ impl JsonlStorage {
         }
         names.sort();
 
-        let mut parsed_files: BTreeMap<String, ParsedFile<SidecarRecord>> = BTreeMap::new();
-        let mut record_by_key: HashMap<String, SidecarRecord> = HashMap::new();
+        // Sidecar records are parsed exactly once. `record_by_key` owns the
+        // only copy (`Arc` shares it with no one until replay moves it out);
+        // `parsed_files` keeps only per-line keys and byte offsets for
+        // truncation and reclamation.
+        let mut parsed_files: BTreeMap<String, Vec<SidecarLine>> = BTreeMap::new();
+        let mut record_by_key: HashMap<String, Arc<SidecarRecord>> = HashMap::new();
         for file in &names {
             let path = self.directory.join(file);
-            let parsed = read_lines(&path, file).await?;
-            let mut records = Vec::with_capacity(parsed.lines.len());
-            let mut previous: Option<SidecarRecord> = None;
-            for (index, line) in parsed.lines.into_iter().enumerate() {
-                let description = format!("{file} line {}", index + 1);
-                let record: SidecarRecord = parse_json(&line.value, &description)?;
+            let mut lines = LogLineReader::open(&path, file).await?;
+            let mut records = Vec::new();
+            let mut previous: Option<(Seq, i64)> = None;
+            while let Some(line) = lines.next_line().await? {
+                let description = format!("{file} line {}", line.number);
+                let record: SidecarRecord = parse_json(line.text, &description)?;
                 record
                     .validate(&description)
                     .map_err(StorageError::Corruption)?;
-                if let Some(previous) = &previous {
-                    if record.seq < previous.seq
-                        || (record.seq == previous.seq && record.ordinal <= previous.ordinal)
+                if let Some((previous_seq, previous_ordinal)) = previous {
+                    if record.seq < previous_seq
+                        || (record.seq == previous_seq && record.ordinal <= previous_ordinal)
                     {
                         return Err(StorageError::Corruption(JsonlCorruptionError::new(
                             format!("Sidecar records are out of order in {file}"),
                         )));
                     }
                 }
-                previous = Some(record.clone());
-                record_by_key.insert(
-                    sidecar_key(file, record.seq, record.ordinal),
-                    record.clone(),
-                );
-                records.push(ParsedLine {
-                    value: record,
+                previous = Some((record.seq, record.ordinal));
+                let seq = record.seq;
+                let ordinal = record.ordinal;
+                record_by_key.insert(sidecar_key(file, seq, ordinal), Arc::new(record));
+                records.push(SidecarLine {
+                    seq,
+                    ordinal,
                     start: line.start,
                 });
             }
-            parsed_files.insert(file.clone(), ParsedFile { lines: records });
+            parsed_files.insert(file.clone(), records);
         }
 
-        let mut current_only_documents: HashSet<DocumentId> = HashSet::new();
-        let mut retired_documents: HashSet<DocumentId> = HashSet::new();
-        let mut final_task_is_live: HashMap<TaskId, bool> = HashMap::new();
-        for marker in &markers {
-            for operation in &marker.writes {
-                match operation {
-                    MainOperation::DocumentCreate { record, .. } => {
-                        if record.is_current_only() {
-                            current_only_documents.insert(record.id);
-                        }
-                    }
-                    MainOperation::DocumentRetire { id } => {
-                        retired_documents.insert(*id);
-                    }
-                    MainOperation::Task { value } => {
-                        final_task_is_live.insert(value.id, false);
-                    }
-                    MainOperation::TaskSidecar { id, .. } => {
-                        final_task_is_live.insert(*id, true);
-                    }
-                    _ => {}
-                }
-            }
-        }
         let retired_current_only: HashSet<DocumentId> = retired_documents
             .iter()
             .filter(|id| current_only_documents.contains(id))
             .copied()
             .collect();
 
-        let mut latest_bases: HashMap<DocumentId, SidecarRecord> = HashMap::new();
-        for marker in &markers {
-            for operation in &marker.writes {
-                let (id, ordinal) = match operation {
-                    MainOperation::DocumentCreate { record, ordinal } => (record.id, *ordinal),
-                    MainOperation::DocumentChange { id, ordinal } => (*id, *ordinal),
-                    _ => continue,
-                };
-                if !current_only_documents.contains(&id) {
-                    continue;
-                }
-                let key = sidecar_key(&sidecar_file_name("doc", id), marker.seq, ordinal);
+        // Only the winning base's key is kept. The old code cloned the whole
+        // base sidecar record here, which for a large document was a third
+        // full copy of its content.
+        let mut latest_bases: HashMap<DocumentId, (Seq, i64)> = HashMap::new();
+        for (id, operations) in &document_operations {
+            if !current_only_documents.contains(id) {
+                continue;
+            }
+            let file = sidecar_file_name("doc", *id);
+            for (seq, ordinal) in operations {
+                let key = sidecar_key(&file, *seq, *ordinal);
                 let Some(record) = record_by_key.get(&key) else {
                     continue;
                 };
@@ -487,25 +669,27 @@ impl JsonlStorage {
                 else {
                     continue;
                 };
-                if *payload_id != id || !matches!(content, DocumentContent::Base { .. }) {
+                if *payload_id != *id || !matches!(content, DocumentContent::Base { .. }) {
                     continue;
                 }
-                let replace = match latest_bases.get(&id) {
+                let replace = match latest_bases.get(id) {
                     None => true,
-                    Some(previous) => {
-                        record.seq > previous.seq
-                            || (record.seq == previous.seq && record.ordinal > previous.ordinal)
+                    Some((previous_seq, previous_ordinal)) => {
+                        *seq > *previous_seq
+                            || (*seq == *previous_seq && *ordinal > *previous_ordinal)
                     }
                 };
                 if replace {
-                    latest_bases.insert(id, record.clone());
+                    latest_bases.insert(*id, (*seq, *ordinal));
                 }
             }
         }
         let is_before_latest_base = |id: DocumentId, seq: Seq, ordinal: i64| -> bool {
             latest_bases
                 .get(&id)
-                .is_some_and(|base| seq < base.seq || (seq == base.seq && ordinal < base.ordinal))
+                .is_some_and(|(base_seq, base_ordinal)| {
+                    seq < *base_seq || (seq == *base_seq && ordinal < *base_ordinal)
+                })
         };
 
         let terminal_tasks: HashSet<TaskId> = final_task_is_live
@@ -513,109 +697,123 @@ impl JsonlStorage {
             .filter(|(_, live)| !**live)
             .map(|(id, _)| *id)
             .collect();
+        // ── pass 2: replay markers one at a time ─────────────────────────────
+        //
+        // Consuming each `MainMarker` lets every operation move its payload
+        // into the `StorageWrite`; sidecar records likewise leave their `Arc`
+        // by value. Nothing on this path deep-clones a record.
         let mut confirmed: HashSet<String> = HashSet::new();
-        for marker in &markers {
-            let mut writes = Vec::new();
-            for operation in &marker.writes {
+        let mut main_lines = LogLineReader::open(&self.main_path, MAIN_FILE).await?;
+        while let Some(line) = main_lines.next_line().await? {
+            let description = format!("{MAIN_FILE} line {}", line.number);
+            let marker: MainMarker = parse_json(line.text, &description)?;
+            let marker_seq = marker.seq;
+            let mut writes = Vec::with_capacity(marker.writes.len());
+            for operation in marker.writes {
                 match operation {
                     MainOperation::Conversation { value } => {
-                        writes.push(StorageWrite::Conversation {
-                            value: value.clone(),
-                        })
+                        writes.push(StorageWrite::Conversation { value: *value })
                     }
-                    MainOperation::Entry { value } => writes.push(StorageWrite::Entry {
-                        value: value.clone(),
-                    }),
-                    MainOperation::Submission { value } => writes.push(StorageWrite::Submission {
-                        value: value.clone(),
-                    }),
-                    MainOperation::Task { value } => writes.push(StorageWrite::Task {
-                        value: value.clone(),
-                    }),
+                    MainOperation::Entry { value } => {
+                        writes.push(StorageWrite::Entry { value: *value })
+                    }
+                    MainOperation::Submission { value } => {
+                        writes.push(StorageWrite::Submission { value: *value })
+                    }
+                    MainOperation::Task { value } => {
+                        writes.push(StorageWrite::Task { value: *value })
+                    }
                     MainOperation::DocumentRetire { id } => {
-                        writes.push(StorageWrite::DocumentRetire { id: *id })
+                        writes.push(StorageWrite::DocumentRetire { id })
                     }
                     MainOperation::TaskSidecar { id, ordinal } => {
-                        let optional = terminal_tasks.contains(id);
+                        let terminal = terminal_tasks.contains(&id);
+                        let is_latest =
+                            latest_task_markers
+                                .get(&id)
+                                .is_some_and(|&(seq, latest_ordinal)| {
+                                    seq == marker_seq && latest_ordinal == ordinal
+                                });
+                        // A live task keeps only its newest sidecar record (the
+                        // older snapshots are complete replacements that a
+                        // compaction, or a crash before one, may have dropped).
+                        // Only the newest record is required to rebuild the
+                        // state; a terminal task needs no sidecar at all.
+                        let optional = terminal || !is_latest;
                         let record = confirm_record(
-                            marker,
-                            *ordinal,
-                            &sidecar_file_name("task", *id),
-                            &record_by_key,
+                            marker_seq,
+                            ordinal,
+                            &sidecar_file_name("task", id),
+                            &mut record_by_key,
                             &mut confirmed,
                             optional,
                         )?;
                         if let Some(record) = record {
-                            let SidecarPayload::Task { value } = &record.payload else {
+                            let record = into_owned_record(record);
+                            let SidecarPayload::Task { value } = record.payload else {
                                 return Err(StorageError::Corruption(JsonlCorruptionError::new(
                                     format!(
-                                        "Confirmed task sidecar data does not match commit {}",
-                                        marker.seq
+                                        "Confirmed task sidecar data does not match commit {marker_seq}"
                                     ),
                                 )));
                             };
-                            if value.id != *id {
+                            if value.id != id {
                                 return Err(StorageError::Corruption(JsonlCorruptionError::new(
                                     format!(
-                                        "Confirmed task sidecar data does not match commit {}",
-                                        marker.seq
+                                        "Confirmed task sidecar data does not match commit {marker_seq}"
                                     ),
                                 )));
                             }
-                            if !optional {
-                                writes.push(StorageWrite::Task {
-                                    value: value.clone(),
-                                });
+                            if !terminal {
+                                writes.push(StorageWrite::Task { value: *value });
                             }
                         }
                     }
                     MainOperation::DocumentCreate { record, ordinal } => {
                         let reclaimed = retired_current_only.contains(&record.id)
-                            || is_before_latest_base(record.id, marker.seq, *ordinal);
+                            || is_before_latest_base(record.id, marker_seq, ordinal);
                         let sidecar = confirm_record(
-                            marker,
-                            *ordinal,
+                            marker_seq,
+                            ordinal,
                             &sidecar_file_name("doc", record.id),
-                            &record_by_key,
+                            &mut record_by_key,
                             &mut confirmed,
                             reclaimed,
                         )?;
                         let mut content: Option<DocumentContent> = None;
                         if let Some(sidecar_record) = sidecar {
+                            let sidecar_record = into_owned_record(sidecar_record);
                             let SidecarPayload::Document {
                                 id: payload_id,
                                 content: payload_content,
-                            } = &sidecar_record.payload
+                            } = sidecar_record.payload
                             else {
                                 return Err(StorageError::Corruption(JsonlCorruptionError::new(
                                     format!(
-                                        "Confirmed document sidecar data does not match commit {}",
-                                        marker.seq
+                                        "Confirmed document sidecar data does not match commit {marker_seq}"
                                     ),
                                 )));
                             };
-                            if *payload_id != record.id {
+                            if payload_id != record.id {
                                 return Err(StorageError::Corruption(JsonlCorruptionError::new(
                                     format!(
-                                        "Confirmed document sidecar data does not match commit {}",
-                                        marker.seq
+                                        "Confirmed document sidecar data does not match commit {marker_seq}"
                                     ),
                                 )));
                             }
-                            content = Some(payload_content.clone());
+                            content = Some(payload_content);
                         }
                         if let Some(content) = &content {
                             if !matches!(content, DocumentContent::Base { .. }) {
                                 return Err(StorageError::Corruption(JsonlCorruptionError::new(
                                     format!(
-                                        "Document creation lacks a confirmed base in commit {}",
-                                        marker.seq
+                                        "Document creation lacks a confirmed base in commit {marker_seq}"
                                     ),
                                 )));
                             }
                         }
                         writes.push(StorageWrite::DocumentCreate {
-                            record: record.clone(),
+                            record: *record,
                             content: match content {
                                 Some(content) if !reclaimed => content,
                                 _ => DocumentContent::Base {
@@ -626,13 +824,13 @@ impl JsonlStorage {
                         });
                     }
                     MainOperation::DocumentChange { id, ordinal } => {
-                        let reclaimed = retired_current_only.contains(id)
-                            || is_before_latest_base(*id, marker.seq, *ordinal);
+                        let reclaimed = retired_current_only.contains(&id)
+                            || is_before_latest_base(id, marker_seq, ordinal);
                         let sidecar = confirm_record(
-                            marker,
-                            *ordinal,
-                            &sidecar_file_name("doc", *id),
-                            &record_by_key,
+                            marker_seq,
+                            ordinal,
+                            &sidecar_file_name("doc", id),
+                            &mut record_by_key,
                             &mut confirmed,
                             reclaimed,
                         )?;
@@ -642,40 +840,36 @@ impl JsonlStorage {
                         let Some(record) = sidecar else {
                             continue;
                         };
+                        let record = into_owned_record(record);
                         let SidecarPayload::Document {
                             id: payload_id,
                             content,
-                        } = &record.payload
+                        } = record.payload
                         else {
                             return Err(StorageError::Corruption(JsonlCorruptionError::new(
                                 format!(
-                                    "Confirmed document sidecar data does not match commit {}",
-                                    marker.seq
+                                    "Confirmed document sidecar data does not match commit {marker_seq}"
                                 ),
                             )));
                         };
-                        if *payload_id != *id {
+                        if payload_id != id {
                             return Err(StorageError::Corruption(JsonlCorruptionError::new(
                                 format!(
-                                    "Confirmed document sidecar data does not match commit {}",
-                                    marker.seq
+                                    "Confirmed document sidecar data does not match commit {marker_seq}"
                                 ),
                             )));
                         }
-                        writes.push(StorageWrite::DocumentChange {
-                            id: *id,
-                            content: content.clone(),
-                        });
+                        writes.push(StorageWrite::DocumentChange { id, content });
                     }
                 }
             }
             let prepared = self
                 .memory
-                .prepare_commit_at(writes, marker.seq)
+                .prepare_commit_at(writes, marker_seq)
                 .await
                 .map_err(|error| {
                     StorageError::Corruption(JsonlCorruptionError::with_cause(
-                        format!("Invalid committed state at sequence {}", marker.seq),
+                        format!("Invalid committed state at sequence {marker_seq}"),
                         error,
                     ))
                 })?;
@@ -684,18 +878,25 @@ impl JsonlStorage {
                 .await
                 .map_err(|error| {
                     StorageError::Corruption(JsonlCorruptionError::with_cause(
-                        format!("Invalid committed state at sequence {}", marker.seq),
+                        format!("Invalid committed state at sequence {marker_seq}"),
                         error,
                     ))
                 })?;
         }
+        drop(main_lines);
+        // Unconfirmed records are not replayed and hold no further interest.
+        // Release every remaining record before building the (streamed)
+        // reclamation rewrites so the two peaks cannot add up.
+        drop(record_by_key);
 
-        let mut reclamations: BTreeMap<String, String> = BTreeMap::new();
-        for (file, parsed) in &parsed_files {
-            let mut unconfirmed_at: Option<usize> = None;
-            for line in &parsed.lines {
-                let key = sidecar_key(file, line.value.seq, line.value.ordinal);
+        let mut reclamations: BTreeMap<String, SidecarReclamation> = BTreeMap::new();
+        for (file, lines) in &parsed_files {
+            let mut unconfirmed_at: Option<u64> = None;
+            let mut confirmed_count = 0usize;
+            for line in lines {
+                let key = sidecar_key(file, line.seq, line.ordinal);
                 if confirmed.contains(&key) {
+                    confirmed_count += 1;
                     if unconfirmed_at.is_some() {
                         return Err(StorageError::Corruption(JsonlCorruptionError::new(
                             format!("Confirmed record follows an unconfirmed tail in {file}"),
@@ -714,57 +915,75 @@ impl JsonlStorage {
                     "Invalid sidecar file name: {file}"
                 )))
             })?;
-            let confirmed_lines: Vec<&ParsedLine<SidecarRecord>> = parsed
-                .lines
+            if file.starts_with("task-") {
+                let task_id = TaskId::from_raw(numeric_id);
+                if terminal_tasks.contains(&task_id) {
+                    reclamations.insert(file.clone(), SidecarReclamation::Delete);
+                    continue;
+                }
+                // A live task needs only its newest record. A crash between
+                // the marker append and its compaction leaves older snapshots
+                // behind; drop that prefix here, streaming the retained tail.
+                if let Some(latest) = latest_task_markers.get(&task_id) {
+                    if let Some(first_retained) = lines
+                        .iter()
+                        .find(|line| (line.seq, line.ordinal) >= *latest)
+                    {
+                        if first_retained.start > 0 {
+                            reclamations.insert(
+                                file.clone(),
+                                SidecarReclamation::KeepFrom(first_retained.start),
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+            if !file.starts_with("doc-") {
+                continue;
+            }
+            let document_id = DocumentId::from_raw(numeric_id);
+            if retired_current_only.contains(&document_id) {
+                reclamations.insert(file.clone(), SidecarReclamation::Delete);
+                continue;
+            }
+            let Some((base_seq, base_ordinal)) = latest_bases.get(&document_id).copied() else {
+                continue;
+            };
+            let is_before_base = |line: &SidecarLine| {
+                line.seq < base_seq || (line.seq == base_seq && line.ordinal < base_ordinal)
+            };
+            let retained_count = lines
                 .iter()
                 .filter(|line| {
-                    confirmed.contains(&sidecar_key(file, line.value.seq, line.value.ordinal))
+                    confirmed.contains(&sidecar_key(file, line.seq, line.ordinal))
+                        && !is_before_base(line)
                 })
-                .collect();
-            let mut retained: Option<Vec<&ParsedLine<SidecarRecord>>> = None;
-            if file.starts_with("task-") && terminal_tasks.contains(&TaskId::from_raw(numeric_id)) {
-                retained = Some(Vec::new());
-            } else if file.starts_with("doc-") {
-                let document_id = DocumentId::from_raw(numeric_id);
-                if retired_current_only.contains(&document_id) {
-                    retained = Some(Vec::new());
-                } else if latest_bases.contains_key(&document_id) {
-                    retained = Some(
-                        confirmed_lines
-                            .iter()
-                            .copied()
-                            .filter(|line| {
-                                !is_before_latest_base(
-                                    document_id,
-                                    line.value.seq,
-                                    line.value.ordinal,
-                                )
-                            })
-                            .collect(),
+                .count();
+            if retained_count < confirmed_count {
+                let first_retained = lines.iter().find(|line| {
+                    confirmed.contains(&sidecar_key(file, line.seq, line.ordinal))
+                        && !is_before_base(line)
+                });
+                if let Some(first_retained) = first_retained {
+                    reclamations.insert(
+                        file.clone(),
+                        SidecarReclamation::KeepFrom(first_retained.start),
                     );
                 }
             }
-            if let Some(retained) = retained {
-                if retained.len() < confirmed_lines.len() || retained.is_empty() {
-                    let mut content = String::new();
-                    for line in retained {
-                        content.push_str(&json_line(&line.value)?);
-                    }
-                    reclamations.insert(file.clone(), content);
-                }
-            }
         }
-        self.reclaim_sidecars(&reclamations).await;
+        reclaim_recovered_sidecars(&self.directory, self.fsync, &reclamations).await;
 
         // Minted IDs are not part of any commit record; the journal restores
         // the watermark so a reopen never hands the same ID out twice. A torn
-        // trailing line is dropped by `read_lines` (the caller never observed
+        // trailing line is dropped by the reader (the caller never observed
         // that ID, so skipping it is safe); an unparseable complete line is
         // ignored for the same reason — the journal is advisory.
-        let ids = read_lines(&self.directory.join(IDS_FILE), IDS_FILE).await?;
         let mut highest_minted = 0i64;
-        for line in &ids.lines {
-            if let Ok(id) = line.value.trim().parse::<i64>() {
+        let mut ids = LogLineReader::open(&self.directory.join(IDS_FILE), IDS_FILE).await?;
+        while let Some(line) = ids.next_line().await? {
+            if let Ok(id) = line.text.trim().parse::<i64>() {
                 highest_minted = highest_minted.max(id);
             }
         }
@@ -847,34 +1066,186 @@ async fn reclaim_sidecars_files(
     }
 }
 
-async fn replace_sidecar_file(directory: &Path, fsync: bool, file: &str, content: &str) {
+/// Apply recovery's sidecar reclamations without materializing the retained
+/// content: `KeepFrom` streams the old file's suffix into the rewrite temp.
+async fn reclaim_recovered_sidecars(
+    directory: &Path,
+    fsync: bool,
+    reclamations: &BTreeMap<String, SidecarReclamation>,
+) {
+    if reclamations.is_empty() {
+        return;
+    }
+    for (file, reclamation) in reclamations {
+        match reclamation {
+            SidecarReclamation::Delete => replace_sidecar_file(directory, fsync, file, "").await,
+            SidecarReclamation::KeepFrom(offset) => {
+                replace_sidecar_suffix(directory, fsync, file, *offset).await
+            }
+        }
+    }
+}
+
+/// Atomically rewrite a sidecar to the bytes after `offset`, copying them from
+/// the existing file in fixed-size chunks (the retained suffix can be almost
+/// the whole sidecar).
+///
+/// `offset` must be the byte offset of a retained line start, so it is always
+/// strictly inside the file. If it is not, the file is left untouched: seeking
+/// to (or past) EOF and copying zero bytes would otherwise silently replace
+/// the sidecar with an empty file, discarding records that were never proven
+/// reclaimable. The next recovery recomputes the plan from a fresh scan.
+async fn replace_sidecar_suffix(directory: &Path, fsync: bool, file: &str, offset: u64) {
+    let path = directory.join(file);
+    let length = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return,
+    };
+    if offset >= length {
+        return;
+    }
+    let temporary = directory.join(format!("{file}{RECLAIM_SUFFIX}"));
+    let result = async {
+        let mut source = tokio::fs::File::open(&path).await?;
+        source.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut target = tokio::fs::File::create(&temporary).await?;
+        tokio::io::copy(&mut source, &mut target).await?;
+        target.flush().await?;
+        if fsync {
+            target.sync_all().await?;
+        }
+        // Windows refuses (or behaves unpredictably) on renaming over a file
+        // this process still has open; close both handles first.
+        drop(source);
+        drop(target);
+        tokio::fs::rename(&temporary, &path).await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            if fsync {
+                sync_parent_dir(&path);
+            }
+        }
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+        }
+    }
+}
+
+/// Atomically rewrite (`content` non-empty) or delete a sidecar.
+///
+/// Public so the durable storage tests can exercise the failure path with a
+/// rename target that cannot be replaced.
+pub async fn replace_sidecar_file(directory: &Path, fsync: bool, file: &str, content: &str) {
     let path = directory.join(file);
     if content.is_empty() {
         let _ = tokio::fs::remove_file(&path).await;
         return;
     }
     let temporary = directory.join(format!("{file}{RECLAIM_SUFFIX}"));
-    if tokio::fs::write(&temporary, content.as_bytes())
-        .await
-        .is_err()
-    {
-        return;
+    let result = async {
+        tokio::fs::write(&temporary, content.as_bytes()).await?;
+        if fsync {
+            let handle = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&temporary)
+                .await?;
+            handle.sync_all().await?;
+        }
+        tokio::fs::rename(&temporary, &path).await?;
+        Ok::<(), std::io::Error>(())
     }
-    if fsync {
-        if let Ok(handle) = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&temporary)
-            .await
-        {
-            if handle.sync_all().await.is_err() {
-                return;
+    .await;
+    match result {
+        Ok(()) => {
+            if fsync {
+                sync_parent_dir(&path);
             }
-        } else {
-            return;
+        }
+        Err(_) => {
+            // A failed rewrite must not leave a full sidecar-sized copy
+            // behind; recovery only reaps it on the next `open`.
+            let _ = tokio::fs::remove_file(&temporary).await;
         }
     }
-    let _ = tokio::fs::rename(&temporary, &path).await;
 }
+
+thread_local! {
+    /// Test seam (R1-L3-007): calls into [`sync_parent_dir`] on this thread.
+    ///
+    /// `append_file` and `replace_sidecar_file` bump it whenever `fsync` is
+    /// enabled. It is thread-local so independent integration tests cannot
+    /// perturb each other, and it counts the CALL even on platforms where the
+    /// directory sync itself is a no-op, so a dropped call site fails the
+    /// regression test on every platform.
+    static PARENT_DIR_SYNC_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+thread_local! {
+    /// Test seam (R1-L3-008): deep clones of [`SidecarRecord`] on this thread.
+    ///
+    /// Recovery must keep one copy of every sidecar record: the parsed record
+    /// is wrapped in an `Arc` once, indexed by key, and moved into the replayed
+    /// write. A regression that re-introduces `record.clone()` into the map or
+    /// the parse list makes this counter jump by one full record per line.
+    static SIDECAR_RECORD_CLONES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Number of sidecar-record deep clones on the current thread (test seam,
+/// R1-L3-008).
+#[doc(hidden)]
+pub fn sidecar_record_clones() -> usize {
+    SIDECAR_RECORD_CLONES.with(Cell::get)
+}
+
+/// Reset the current thread's sidecar-record clone counter (test seam,
+/// R1-L3-008).
+#[doc(hidden)]
+pub fn reset_sidecar_record_clones() {
+    SIDECAR_RECORD_CLONES.with(|clones| clones.set(0));
+}
+
+/// Number of parent-directory sync calls on the current thread
+/// (test seam, R1-L3-007).
+#[doc(hidden)]
+pub fn parent_dir_sync_calls() -> usize {
+    PARENT_DIR_SYNC_CALLS.with(Cell::get)
+}
+
+/// Reset the current thread's parent-directory sync counter
+/// (test seam, R1-L3-007).
+#[doc(hidden)]
+pub fn reset_parent_dir_sync_calls() {
+    PARENT_DIR_SYNC_CALLS.with(|calls| calls.set(0));
+}
+
+/// Flush the directory entry that names `path`.
+///
+/// A file's own `sync_all` does not make its directory entry durable: a newly
+/// created sidecar or a completed rename can still be lost on a crash. Only
+/// called when `fsync` is enabled; best-effort because the marker (or the next
+/// recovery) already owns the state.
+fn sync_parent_dir(path: &Path) {
+    PARENT_DIR_SYNC_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    sync_parent_dir_impl(path);
+}
+
+#[cfg(unix)]
+fn sync_parent_dir_impl(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+}
+
+/// Windows journals metadata through `MoveFileExW`; there is no directory
+/// handle to sync.
+#[cfg(not(unix))]
+fn sync_parent_dir_impl(_path: &Path) {}
 
 impl CommitShared {
     async fn commit(self, writes: Vec<StorageWrite>) -> Result<Seq, StorageError> {
@@ -882,10 +1253,36 @@ impl CommitShared {
         ensure_usable(&self.closed, &self.poison).await?;
         let prepared = self.memory.prepare_commit(writes).await?;
         let encoded = encode_commit(prepared.seq, &prepared.writes)?;
+        // Compaction is decided before the append: once the file would cross
+        // the threshold, the newest record replaces every older snapshot after
+        // the marker has made it durable.
+        let mut compact_tasks: HashSet<String> = HashSet::new();
+        for (file, content) in &encoded.sidecars {
+            if !file.starts_with("task-") {
+                continue;
+            }
+            let existing = match tokio::fs::metadata(self.directory.join(file)).await {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(_) => 0,
+            };
+            if content.lines().count() > 1
+                || (existing > 0
+                    && existing.saturating_add(content.len() as u64) > TASK_SIDECAR_COMPACT_BYTES)
+            {
+                compact_tasks.insert(file.clone());
+            }
+        }
         let reclamations = {
             let current_only = self.current_only_documents.lock().await;
             let live_tasks = self.live_task_sidecars.lock().await;
-            plan_reclamations(&prepared.writes, &encoded, &current_only, &live_tasks)
+            plan_reclamations(
+                &prepared.writes,
+                &encoded,
+                &current_only,
+                &live_tasks,
+                &compact_tasks,
+            )
         };
 
         let mut sidecar_paths = Vec::with_capacity(encoded.sidecars.len());
@@ -927,32 +1324,38 @@ impl CommitShared {
 }
 
 fn confirm_record(
-    marker: &MainMarker,
+    marker_seq: Seq,
     ordinal: i64,
     file: &str,
-    record_by_key: &HashMap<String, SidecarRecord>,
+    record_by_key: &mut HashMap<String, Arc<SidecarRecord>>,
     confirmed: &mut HashSet<String>,
     optional: bool,
-) -> Result<Option<SidecarRecord>, StorageError> {
-    let key = sidecar_key(file, marker.seq, ordinal);
+) -> Result<Option<Arc<SidecarRecord>>, StorageError> {
+    let key = sidecar_key(file, marker_seq, ordinal);
     if confirmed.contains(&key) {
         return Err(StorageError::Corruption(JsonlCorruptionError::new(
             "Sidecar record is confirmed more than once",
         )));
     }
-    let Some(record) = record_by_key.get(&key) else {
+    let Some(record) = record_by_key.remove(&key) else {
         if optional {
             return Ok(None);
         }
         return Err(StorageError::Corruption(JsonlCorruptionError::new(
-            format!(
-                "Missing confirmed sidecar record {file} at sequence {}",
-                marker.seq
-            ),
+            format!("Missing confirmed sidecar record {file} at sequence {marker_seq}"),
         )));
     };
     confirmed.insert(key);
-    Ok(Some(record.clone()))
+    Ok(Some(record))
+}
+
+/// Take the record out of its `Arc`.
+///
+/// A key is confirmed at most once, so `record_by_key` normally holds the only
+/// reference and this is a move; the clone fallback only keeps the function
+/// total if a future caller keeps another handle.
+fn into_owned_record(record: Arc<SidecarRecord>) -> SidecarRecord {
+    Arc::try_unwrap(record).unwrap_or_else(|shared| (*shared).clone())
 }
 
 fn encode_commit(seq: Seq, writes: &[StorageWrite]) -> Result<EncodedCommit, StorageError> {
@@ -962,13 +1365,13 @@ fn encode_commit(seq: Seq, writes: &[StorageWrite]) -> Result<EncodedCommit, Sto
     for write in writes {
         match write {
             StorageWrite::Conversation { value } => main.push(MainOperation::Conversation {
-                value: value.clone(),
+                value: Box::new(value.clone()),
             }),
             StorageWrite::Entry { value } => main.push(MainOperation::Entry {
-                value: value.clone(),
+                value: Box::new(value.clone()),
             }),
             StorageWrite::Submission { value } => main.push(MainOperation::Submission {
-                value: value.clone(),
+                value: Box::new(value.clone()),
             }),
             StorageWrite::DocumentRetire { id } => {
                 main.push(MainOperation::DocumentRetire { id: *id })
@@ -976,7 +1379,7 @@ fn encode_commit(seq: Seq, writes: &[StorageWrite]) -> Result<EncodedCommit, Sto
             StorageWrite::Task { value } => {
                 if value.state.status() == TaskStatus::Terminal {
                     main.push(MainOperation::Task {
-                        value: value.clone(),
+                        value: Box::new(value.clone()),
                     });
                 } else {
                     let ordinal = next_ordinal;
@@ -988,7 +1391,7 @@ fn encode_commit(seq: Seq, writes: &[StorageWrite]) -> Result<EncodedCommit, Sto
                         seq,
                         ordinal,
                         payload: SidecarPayload::Task {
-                            value: value.clone(),
+                            value: Box::new(value.clone()),
                         },
                     };
                     sidecars
@@ -1026,7 +1429,7 @@ fn encode_commit(seq: Seq, writes: &[StorageWrite]) -> Result<EncodedCommit, Sto
                     .or_default()
                     .push_str(&json_line(&sidecar)?);
                 main.push(MainOperation::DocumentCreate {
-                    record: record.clone(),
+                    record: Box::new(record.clone()),
                     ordinal,
                 });
             }
@@ -1075,6 +1478,7 @@ fn plan_reclamations(
     encoded: &EncodedCommit,
     current_only: &HashSet<DocumentId>,
     live_tasks: &HashSet<TaskId>,
+    compact_tasks: &HashSet<String>,
 ) -> BTreeMap<String, String> {
     let mut created_current_only = HashSet::new();
     let mut retired_documents = HashSet::new();
@@ -1120,13 +1524,23 @@ fn plan_reclamations(
         }
     }
     for (id, task) in &final_tasks {
-        if task.state.status() == TaskStatus::Terminal
-            && (live_tasks.contains(id)
-                || encoded
-                    .sidecars
-                    .contains_key(&sidecar_file_name("task", *id)))
-        {
-            replacements.insert(sidecar_file_name("task", *id), String::new());
+        let file = sidecar_file_name("task", *id);
+        if task.state.status() == TaskStatus::Terminal {
+            if live_tasks.contains(id) || encoded.sidecars.contains_key(&file) {
+                replacements.insert(file, String::new());
+            }
+            continue;
+        }
+        if compact_tasks.contains(&file) {
+            // Every record in this commit is a complete replacement; keep the
+            // last one (highest ordinal) and drop every superseded snapshot.
+            if let Some(latest) = encoded
+                .sidecars
+                .get(&file)
+                .and_then(|content| content.lines().last())
+            {
+                replacements.insert(file, format!("{latest}\n"));
+            }
         }
     }
     replacements
@@ -1206,60 +1620,22 @@ async fn append_file(path: &Path, data: &[u8], sync: bool) -> std::io::Result<()
     file.flush().await?;
     if sync {
         file.sync_all().await?;
+        // Creating a new sidecar or main log must also persist its directory
+        // entry, otherwise a crash can drop the file the marker references.
+        sync_parent_dir(path);
     }
     Ok(())
 }
 
-async fn truncate_file(path: &Path, length: usize) -> Result<(), StorageError> {
+async fn truncate_file(path: &Path, length: u64) -> Result<(), StorageError> {
     let file = tokio::fs::OpenOptions::new()
         .write(true)
         .open(path)
         .await
         .map_err(|error| StorageError::io("truncation", error))?;
-    file.set_len(length as u64)
+    file.set_len(length)
         .await
         .map_err(|error| StorageError::io("truncation", error))
-}
-
-/// Read complete lines of a log file, truncating a torn trailing line first.
-async fn read_lines(path: &Path, name: &str) -> Result<ParsedFile<String>, StorageError> {
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ParsedFile { lines: Vec::new() });
-        }
-        Err(error) => return Err(StorageError::io(format!("read of {name}"), error)),
-    };
-    let mut complete = bytes.len();
-    if complete > 0 && bytes[complete - 1] != b'\n' {
-        complete = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        truncate_file(path, complete).await?;
-    }
-    let mut lines = Vec::new();
-    let mut start = 0usize;
-    let mut line_number = 1usize;
-    for end in 0..complete {
-        if bytes[end] != b'\n' {
-            continue;
-        }
-        let text = std::str::from_utf8(&bytes[start..end]).map_err(|error| {
-            StorageError::Corruption(JsonlCorruptionError::with_cause(
-                format!("Invalid UTF-8 in complete {name} line {line_number}"),
-                error,
-            ))
-        })?;
-        lines.push(ParsedLine {
-            value: text.to_owned(),
-            start,
-        });
-        start = end + 1;
-        line_number += 1;
-    }
-    Ok(ParsedFile { lines })
 }
 
 impl Storage for JsonlStorage {
@@ -1490,4 +1866,75 @@ pub async fn sidecar_files(directory: &Path) -> std::io::Result<Vec<String>> {
     }
     names.sort();
     Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{replace_sidecar_suffix, RECLAIM_SUFFIX};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_directory(tag: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("pir-jsonl-{tag}-{}-{stamp}", std::process::id()))
+    }
+
+    /// `KeepFrom` offsets always point at a retained line start, so anything
+    /// at or past EOF is a corrupted/raced state. Rewriting then would truncate
+    /// the sidecar to an empty file; the guard must leave it untouched instead.
+    #[tokio::test]
+    async fn replace_sidecar_suffix_preserves_the_file_when_offset_reaches_eof() {
+        let dir = temp_directory("suffix-eof");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create fixture directory");
+        let file = "task-20.jsonl";
+        let original = b"{\"format\":1,\"type\":\"record\",\"seq\":1}\n\
+                         {\"format\":1,\"type\":\"record\",\"seq\":2}\n";
+        tokio::fs::write(dir.join(file), original)
+            .await
+            .expect("write sidecar");
+
+        for offset in [original.len() as u64, original.len() as u64 + 4096] {
+            replace_sidecar_suffix(&dir, false, file, offset).await;
+            assert_eq!(
+                tokio::fs::read(dir.join(file)).await.expect("read sidecar"),
+                original,
+                "an out-of-range offset ({offset}) must not truncate the sidecar"
+            );
+        }
+        assert!(
+            !dir.join(format!("{file}{RECLAIM_SUFFIX}")).exists(),
+            "the guard must not leave a rewrite temporary behind"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// The normal path still copies exactly the bytes from a valid line-start
+    /// offset to EOF.
+    #[tokio::test]
+    async fn replace_sidecar_suffix_keeps_the_retained_tail() {
+        let dir = temp_directory("suffix-tail");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create fixture directory");
+        let file = "task-20.jsonl";
+        let first = b"{\"format\":1,\"type\":\"record\",\"seq\":1}\n";
+        let second = b"{\"format\":1,\"type\":\"record\",\"seq\":2}\n";
+        let original = [first.as_slice(), second.as_slice()].concat();
+        tokio::fs::write(dir.join(file), &original)
+            .await
+            .expect("write sidecar");
+
+        replace_sidecar_suffix(&dir, false, file, first.len() as u64).await;
+        assert_eq!(
+            tokio::fs::read(dir.join(file)).await.expect("read sidecar"),
+            second,
+            "the retained suffix must be copied verbatim"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 }

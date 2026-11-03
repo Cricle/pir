@@ -296,22 +296,23 @@ async fn paged_compaction_releases_the_shared_session_lock() {
         gate: Arc::clone(&gate),
         calls: Arc::clone(&calls),
     }));
-    let hook = print_compaction_hook(
-        CompactionConfig {
+    let hook = print_compaction_hook(pir::coding_agent::print::PrintCompactionInputs {
+        config: CompactionConfig {
             enabled: true,
             reserve_tokens: 1,
             keep_recent_tokens: 1,
         },
-        test_model(10),
-        Arc::new(registry),
-        None,
-        ThinkingLevel::Off,
-        ProviderStreamHooks::default(),
-        Arc::clone(&session),
-        None,
-        None,
-        None,
-    );
+        model: test_model(10),
+        registry: Arc::new(registry),
+        api_key: None,
+        thinking_level: ThinkingLevel::Off,
+        hooks: ProviderStreamHooks::default(),
+        session: Arc::clone(&session),
+        projected: None,
+        plugins: None,
+        runtime: None,
+        session_events: None,
+    });
     let context = Arc::new(Context {
         system_prompt: None,
         messages: Vec::new(),

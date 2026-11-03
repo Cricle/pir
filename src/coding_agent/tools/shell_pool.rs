@@ -1139,11 +1139,8 @@ mod platform_dir {
     }
 
     struct Descriptor {
-        #[allow(
-            dead_code,
-            reason = "the box owns the memory the descriptor pointer refers to"
-        )]
-        storage: Box<SECURITY_DESCRIPTOR>,
+        // Held only to own the memory `pointer` points into.
+        _storage: Box<SECURITY_DESCRIPTOR>,
         pointer: *mut core::ffi::c_void,
     }
 
@@ -1177,7 +1174,10 @@ mod platform_dir {
                     return None;
                 }
             }
-            Some(Self { storage, pointer })
+            Some(Self {
+                _storage: storage,
+                pointer,
+            })
         }
     }
 }
@@ -2321,6 +2321,32 @@ fn pool_runtime() -> Option<&'static tokio::runtime::Runtime> {
         .as_ref()
 }
 
+/// The borrowed per-call inputs of one pooled command.
+pub(super) struct PoolCommand<'a> {
+    pub(super) protocol: ShellProtocol,
+    pub(super) program: &'a str,
+    pub(super) cwd: &'a Path,
+    pub(super) command: &'a str,
+    pub(super) session_env: Option<&'a ToolSessionEnv>,
+    pub(super) keep: usize,
+    pub(super) timeout_secs: Option<f64>,
+    pub(super) signal: Option<&'a AbortSignal>,
+    pub(super) on_update: Option<&'a ToolUpdateFn>,
+}
+
+/// The owned form of [`PoolCommand`] handed to the pool-runtime task.
+struct PoolCommandOwned {
+    protocol: ShellProtocol,
+    program: String,
+    cwd: std::path::PathBuf,
+    command: String,
+    session_env: Option<ToolSessionEnv>,
+    keep: usize,
+    timeout_secs: Option<f64>,
+    signal: Option<AbortSignal>,
+    on_update: Option<ToolUpdateFn>,
+}
+
 impl ShellPool {
     pub fn new(spawner: Arc<dyn MemberSpawn>) -> Self {
         Self::with_channel_dir(spawner, Arc::new(ChannelDir::process_default()))
@@ -2402,22 +2428,21 @@ impl ShellPool {
     /// The whole body runs on the pool's own runtime (see [`pool_runtime`]):
     /// the member's pipes belong to that reactor, so command I/O must never
     /// be polled from the caller's runtime.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one pooled command's full context: shell identity, isolation inputs, and the wait/abort/streaming knobs"
-    )]
     pub(super) async fn execute(
         self: &Arc<Self>,
-        protocol: ShellProtocol,
-        program: &str,
-        cwd: &Path,
-        command: &str,
-        session_env: Option<&ToolSessionEnv>,
-        keep: usize,
-        timeout_secs: Option<f64>,
-        signal: Option<&AbortSignal>,
-        on_update: Option<&ToolUpdateFn>,
+        command: PoolCommand<'_>,
     ) -> Option<ProtocolOutcome> {
+        let PoolCommand {
+            protocol,
+            program,
+            cwd,
+            command,
+            session_env,
+            keep,
+            timeout_secs,
+            signal,
+            on_update,
+        } = command;
         let runtime = pool_runtime()?;
         let this = Arc::clone(self);
         // Caller-life link: `_caller_link` is a local of THIS future, so a
@@ -2428,15 +2453,17 @@ impl ShellPool {
         let _caller_link = CallerLink { _sender: caller_tx };
         runtime
             .spawn(this.clone().execute_local(
-                protocol,
-                program.to_owned(),
-                cwd.to_owned(),
-                command.to_owned(),
-                session_env.cloned(),
-                keep,
-                timeout_secs,
-                signal.cloned(),
-                on_update.cloned(),
+                PoolCommandOwned {
+                    protocol,
+                    program: program.to_owned(),
+                    cwd: cwd.to_owned(),
+                    command: command.to_owned(),
+                    session_env: session_env.cloned(),
+                    keep,
+                    timeout_secs,
+                    signal: signal.cloned(),
+                    on_update: on_update.cloned(),
+                },
                 caller_rx,
             ))
             .await
@@ -2446,23 +2473,22 @@ impl ShellPool {
 
     /// The execute body, polled on the pool runtime only. Owned `Arc` so the
     /// spawned future is `'static`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one pooled command's full context: shell identity, isolation inputs, and the wait/abort/streaming knobs"
-    )]
     async fn execute_local(
         self: Arc<Self>,
-        protocol: ShellProtocol,
-        program: String,
-        cwd: std::path::PathBuf,
-        command: String,
-        session_env: Option<ToolSessionEnv>,
-        keep: usize,
-        timeout_secs: Option<f64>,
-        signal: Option<AbortSignal>,
-        on_update: Option<ToolUpdateFn>,
+        command: PoolCommandOwned,
         mut caller_rx: oneshot::Receiver<()>,
     ) -> Option<ProtocolOutcome> {
+        let PoolCommandOwned {
+            protocol,
+            program,
+            cwd,
+            command,
+            session_env,
+            keep,
+            timeout_secs,
+            signal,
+            on_update,
+        } = command;
         let program = program.as_str();
         let cwd = cwd.as_path();
         let command = command.as_str();
@@ -2830,17 +2856,17 @@ impl ShellPool {
         timeout_secs: Option<f64>,
     ) -> PooledTestOutcome {
         match self
-            .execute(
+            .execute(PoolCommand {
                 protocol,
                 program,
                 cwd,
                 command,
-                None,
-                usize::MAX,
+                session_env: None,
+                keep: usize::MAX,
                 timeout_secs,
-                None,
-                None,
-            )
+                signal: None,
+                on_update: None,
+            })
             .await
         {
             Some(ProtocolOutcome::Completed { rc, capture }) => {
@@ -2868,6 +2894,43 @@ impl ShellPool {
     }
 }
 
+thread_local! {
+    /// Nesting depth of [`without_prewarm`] on this thread. A prompt RENDER
+    /// (`prepare_loadout` run to derive the declared/hidden set) must not spawn
+    /// the member: it happens while the session is being built, and the first
+    /// real run loadout repeats the hook and starts the member before the
+    /// provider request anyway.
+    static PREWARM_SUPPRESSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f` with the shell-pool warm-up suppressed on this thread.
+///
+/// Scoped to prompt derivation, never to a run loadout: [`prewarm`] still
+/// starts the member from the first real `build_tool_loadout` (and from print's
+/// loadout pass), so the first bash call keeps its warm member. A nested
+/// suppression is counted, and the guard restores the depth on panic.
+pub(crate) fn without_prewarm<T>(f: impl FnOnce() -> T) -> T {
+    struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PREWARM_SUPPRESSED.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+
+    PREWARM_SUPPRESSED.with(|depth| depth.set(depth.get() + 1));
+    let guard = Guard;
+    let value = f();
+    drop(guard);
+    value
+}
+
+/// Whether this thread is currently deriving a prompt (see
+/// [`without_prewarm`]).
+fn prewarm_suppressed() -> bool {
+    PREWARM_SUPPRESSED.with(|depth| depth.get() > 0)
+}
+
 /// Fire-and-forget pool warm-up for the bash member: when the pool is
 /// enabled, start the persistent member in the background so the first real
 /// tool call skips the process-creation cost. Idempotent with the lazy path
@@ -2878,7 +2941,15 @@ impl ShellPool {
 /// Call from the session tool-loadout preparation when the bash tool is in
 /// the enabled set (gating lives at the call site). There is no PowerShell
 /// warm-up: that tool always spawns one-shot (see the module docs).
+///
+/// Prompt RENDERING calls the same hook while the session is built; that pass
+/// is wrapped in [`without_prewarm`], so a session that is constructed but
+/// never prompted does not hold a shell member (measured: ~9.5 MB of the
+/// process tree at TUI startup). The first `build_tool_loadout` warms normally.
 pub fn prewarm(protocol: ShellProtocol) {
+    if prewarm_suppressed() {
+        return;
+    }
     if !crate::config::settings::current_shell_prefs().pool {
         return;
     }
@@ -2901,6 +2972,25 @@ pub fn prewarm(protocol: ShellProtocol) {
             .ensure_member(protocol, shell.program(), &cwd)
             .await;
     });
+}
+
+#[cfg(test)]
+mod prewarm_suppression_tests {
+    use super::{prewarm_suppressed, without_prewarm};
+
+    /// The prompt-render guard must be scoped: nested render passes stay
+    /// suppressed, and the guard restores the prior depth on exit so the first
+    /// run loadout warms normally.
+    #[test]
+    fn without_prewarm_scopes_and_restores_the_gate() {
+        assert!(!prewarm_suppressed());
+        without_prewarm(|| {
+            assert!(prewarm_suppressed());
+            without_prewarm(|| assert!(prewarm_suppressed()));
+            assert!(prewarm_suppressed());
+        });
+        assert!(!prewarm_suppressed());
+    }
 }
 
 /// Test/inspection outcome of one pooled run.

@@ -30,6 +30,7 @@ pub(super) fn run_actor(
     state: Arc<StdMutex<RuntimeState>>,
     mut rx: mpsc::Receiver<Command>,
     ready_tx: std::sync::mpsc::Sender<anyhow::Result<()>>,
+    suppress_session_shutdown: Arc<AtomicBool>,
 ) {
     let rt = Arc::new(
         match tokio::runtime::Builder::new_current_thread()
@@ -103,13 +104,16 @@ pub(super) fn run_actor(
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
                 }
-                let result = shutdown_runtime(&runtime).await;
+                let result =
+                    shutdown_runtime(&runtime, !suppress_session_shutdown.load(Ordering::Relaxed))
+                        .await;
                 let _ = reply.send(result);
                 break;
             }
             let runtime = runtime.clone();
             let state = state.clone();
             let config = config.clone();
+            let suppress_session_shutdown = suppress_session_shutdown.clone();
             let _ = tasks.spawn_local(async move {
                 // This task owns one queued host command: count it as
                 // in-flight for the background-preemption rule, and decrement
@@ -269,11 +273,26 @@ pub(super) fn run_actor(
                             }
                         }
                     }
-                    Command::RunSlash { name, args, reply } => {
+                    Command::RunSlash {
+                        name,
+                        args,
+                        ext_id,
+                        invocation_name,
+                        reply,
+                    } => {
                         let runtime = current_runtime(&runtime);
                         match runtime {
                             Some(runtime) => {
-                                let _ = reply.send(runtime.dispatch_command(&name, &args).await);
+                                let _ = reply.send(
+                                    runtime
+                                        .dispatch_command_for_ext(
+                                            &name,
+                                            &args,
+                                            ext_id,
+                                            &invocation_name,
+                                        )
+                                        .await,
+                                );
                             }
                             None => {
                                 let _ = reply
@@ -294,7 +313,9 @@ pub(super) fn run_actor(
                         }
                     }
                     Command::Reload { reply } => {
-                        let _ = reply.send(reload_runtime(&config, &state, &runtime).await);
+                        let emit_shutdown = !suppress_session_shutdown.load(Ordering::Relaxed);
+                        let _ = reply
+                            .send(reload_runtime(&config, &state, &runtime, emit_shutdown).await);
                     }
                     Command::ClearAbort { reply } => {
                         if let Some(runtime) = current_runtime(&runtime) {
@@ -419,26 +440,39 @@ pub(super) fn run_actor(
         // captured `pi`/`ctx` object throws instead of silently working.
         // An explicit `Shutdown` already took the runtime out above, so this
         // remains exactly-once for both the drop and explicit paths.
+        //
+        // Disposable trust-bootstrap runtimes skip the event entirely: their
+        // handler instance is not the real session, and the host later emits
+        // `session_shutdown` once for the real runtime.
         if let Some(runtime) = current_runtime(&runtime) {
-            let mut payload = serde_json::json!({ "type": "session_shutdown", "reason": "quit" });
-            let _ = runtime.emit("session_shutdown", &mut payload).await;
+            if !suppress_session_shutdown.load(Ordering::Relaxed) {
+                let mut payload =
+                    serde_json::json!({ "type": "session_shutdown", "reason": "quit" });
+                let _ = runtime.emit("session_shutdown", &mut payload).await;
+            }
             runtime.invalidate();
         }
     });
 }
 
 /// Tear one runtime generation down on the actor thread: emit the quit
-/// lifecycle event, invalidate every captured `pi`/`ctx`, then take the
-/// runtime out of its slot and drop it. Removing it also makes the
-/// mailbox-close tail a no-op, so `session_shutdown` is emitted exactly once.
+/// lifecycle event (unless this is a disposable bootstrap runtime),
+/// invalidate every captured `pi`/`ctx`, then take the runtime out of its
+/// slot and drop it. Removing it also makes the mailbox-close tail a no-op,
+/// so `session_shutdown` is emitted exactly once.
 async fn shutdown_runtime(
     slot: &StdMutex<Option<std::rc::Rc<ExtensionRuntime>>>,
+    emit_session_shutdown: bool,
 ) -> anyhow::Result<()> {
     let Some(runtime) = current_runtime(slot) else {
         return Ok(());
     };
-    let mut payload = serde_json::json!({ "type": "session_shutdown", "reason": "quit" });
-    let result = runtime.emit("session_shutdown", &mut payload).await;
+    let result = if emit_session_shutdown {
+        let mut payload = serde_json::json!({ "type": "session_shutdown", "reason": "quit" });
+        runtime.emit("session_shutdown", &mut payload).await
+    } else {
+        Ok(EmitOutcome::default())
+    };
     runtime.invalidate();
     // Release the generation's child/worker/fetch/server/net handles BEFORE
     // the `Rc` is dropped: a still-suspended command task holding an `Rc` can
@@ -552,6 +586,7 @@ async fn reload_runtime(
     config: &ExtensionConfig,
     state: &Arc<StdMutex<RuntimeState>>,
     runtime: &StdMutex<Option<std::rc::Rc<ExtensionRuntime>>>,
+    emit_shutdown: bool,
 ) -> anyhow::Result<LoadResult> {
     {
         let mut guard = crate::extensions::runtime::lock_state(state);
@@ -561,7 +596,7 @@ async fn reload_runtime(
         guard.reloading = true;
     }
 
-    let result = perform_reload(config, state, runtime).await;
+    let result = perform_reload(config, state, runtime, emit_shutdown).await;
 
     crate::extensions::runtime::lock_state(state).reloading = false;
     result
@@ -571,6 +606,7 @@ async fn perform_reload(
     config: &ExtensionConfig,
     state: &Arc<StdMutex<RuntimeState>>,
     runtime: &StdMutex<Option<std::rc::Rc<ExtensionRuntime>>>,
+    emit_shutdown: bool,
 ) -> anyhow::Result<LoadResult> {
     let paths = crate::extensions::runtime::lock_state(state)
         .load_paths
@@ -632,8 +668,10 @@ async fn perform_reload(
     // tasks that still hold an `Rc` keep it alive until they finish; its
     // `Drop` releases only the descriptors tagged with its own generation.
     if let Some(old) = old.as_ref() {
-        let mut payload = serde_json::json!({ "type": "session_shutdown", "reason": "reload" });
-        let _ = old.emit("session_shutdown", &mut payload).await;
+        if emit_shutdown {
+            let mut payload = serde_json::json!({ "type": "session_shutdown", "reason": "reload" });
+            let _ = old.emit("session_shutdown", &mut payload).await;
+        }
         old.invalidate();
         // Release the old generation's children/workers/fetches/servers/
         // watchers before the fresh load starts; otherwise both generations'
@@ -661,13 +699,15 @@ async fn perform_reload(
 
     let result = fresh.load(&paths).await;
     // Reload lifecycle on the new runtime regardless of per-extension load
-    // errors (failing extensions are isolated entries).
+    // errors (failing extensions are isolated entries). `resources_discover`
+    // is deliberately NOT dispatched here: the host/session owns that event
+    // and sends it to BOTH faces once after the reload (AgentSession::reload /
+    // SDK Runtime::reload -> reload_extension_resources). Emitting it here
+    // made every JS handler see it twice per `/reload`.
     let mut payload = serde_json::json!({ "type": "session_start", "reason": "reload" });
     if let Err(error) = fresh.emit("session_start", &mut payload).await {
         crate::ext_diag!("[ext] session_start (reload) dispatch failed: {error}");
     }
-    let mut payload = serde_json::json!({ "type": "resources_discover", "reason": "reload" });
-    let _ = fresh.emit("resources_discover", &mut payload).await;
     *runtime
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fresh);

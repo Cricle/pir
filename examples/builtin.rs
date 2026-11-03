@@ -22,8 +22,17 @@ use std::path::PathBuf;
 use pir::ai::types::ThinkingLevel;
 use pir::sdk::{AgentBuilder, SdkError};
 
-#[tokio::main]
-async fn main() -> Result<(), SdkError> {
+fn main() -> std::process::ExitCode {
+    common::run_big_stack(async {
+        if let Err(error) = run().await {
+            eprintln!("error: {error:?}");
+            return std::process::ExitCode::FAILURE;
+        }
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+async fn run() -> Result<(), SdkError> {
     // Keep every agent-dir read inside a disposable directory.
     let dir: PathBuf = std::env::temp_dir().join(format!("pir-sdk-builtin-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

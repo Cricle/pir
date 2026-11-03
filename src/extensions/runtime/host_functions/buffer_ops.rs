@@ -106,10 +106,12 @@ fn install_buffer_proto(proto: Object<'_>) -> Result<()> {
                     &this.0,
                     value.0.as_ref(),
                     offset.0.as_ref(),
-                    $min,
-                    $max,
-                    $size,
-                    $be,
+                    IntWriteSpec {
+                        min: $min,
+                        max: $max,
+                        size: $size,
+                        big_endian: $be,
+                    },
                 )?;
                 Ok(Value::new_float(ctx, result as f64))
             }
@@ -556,17 +558,32 @@ fn coerce_number<'js>(ctx: &Ctx<'js>, value: Option<&Value<'js>>) -> Result<f64>
 // Numeric ops
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
+/// One integer write op's numeric shape: accepted value range, byte width and
+/// endianness.
+struct IntWriteSpec {
+    /// Inclusive lower bound.
+    min: f64,
+    /// Inclusive upper bound.
+    max: f64,
+    /// Byte width written at the offset.
+    size: usize,
+    /// Whether bytes are written most-significant first.
+    big_endian: bool,
+}
+
 fn do_write_int<'js>(
     ctx: &Ctx<'js>,
     this: &Object<'js>,
     value: Option<&Value<'js>>,
     offset: Option<&Value<'js>>,
-    min: f64,
-    max: f64,
-    size: usize,
-    big_endian: bool,
+    spec: IntWriteSpec,
 ) -> Result<i64> {
+    let IntWriteSpec {
+        min,
+        max,
+        size,
+        big_endian,
+    } = spec;
     // JS shim order: offset validity first, then the value range.
     let off = checked_offset(ctx, this, offset, size)?;
     let v = checked_int_value(ctx, value, min, max)? as i64;

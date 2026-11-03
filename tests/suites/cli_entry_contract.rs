@@ -10,10 +10,7 @@
 //! semver), the `--list-models` table, the `config` package/resource listing,
 //! the package-management roundtrip, and the JSON-mode in-band provider
 //! error (exit 0). Failed prompts run against the shared instant-401 sandbox
-//! endpoint (`common::sandbox_endpoint()`), never an unreachable host.
-
-#[path = "../common/mod.rs"]
-pub(crate) mod common;
+//! endpoint (`crate::common::sandbox_endpoint()`), never an unreachable host.
 
 use std::io::Cursor;
 use std::process::Command;
@@ -491,7 +488,7 @@ fn sandbox_command(args: &[&str], label: &str) -> (std::process::Command, std::p
 /// Minimal models.json pointed at the shared instant-401 sandbox endpoint:
 /// provider requests fail FAST with a non-retryable auth error.
 fn sandbox_models_json() -> String {
-    let base_url = common::sandbox_endpoint();
+    let base_url = crate::common::sandbox_endpoint();
     format!(
         r#"{{"providers":{{"bench":{{"name":"rpc test","baseUrl":"{base_url}","apiKey":"x","api":"openai-completions","models":[{{"id":"bench-model","name":"bench","api":"openai-completions","baseUrl":"{base_url}","reasoning":false,"contextWindow":4096,"maxTokens":256,"input":["text"]}}]}}}}}}"#
     )

@@ -14,7 +14,7 @@ use serde_json::Value as JsonValue;
 
 use crate::ai::error::{AiError, AiResult};
 use crate::ai::images::unix_millis;
-use crate::ai::transport::ProviderRequestClient;
+use crate::ai::transport::{ProviderRequestClient, StreamingRequest};
 use crate::ai::types::{
     ClassifierAnswer, ClassifierApi, ClassifierBoolCriteria, ClassifierContext, ClassifierModel,
     ClassifierOptions, ClassifierQuestion, ClassifierRequestOptions, ClassifierResult,
@@ -168,12 +168,15 @@ async fn post_classifier_request_with_no_retry(
     let mut received = Vec::new();
     let (_, _) = client
         .post_json_streaming_with_no_retry_statuses(
-            url,
-            &headers,
+            StreamingRequest::new(
+                reqwest::Method::POST,
+                url,
+                &headers,
+                signal,
+                // Utility HTTP (not an AI provider request): no transport hooks.
+                &crate::ai::types::ProviderStreamHooks::default(),
+            ),
             body,
-            signal,
-            // Utility HTTP (not an AI provider request): no transport hooks.
-            &crate::ai::types::ProviderStreamHooks::default(),
             no_retry_statuses,
             &mut |chunk| {
                 received.extend_from_slice(chunk);

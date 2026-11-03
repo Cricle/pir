@@ -1,10 +1,17 @@
 name: CI
 
-# Two workflows only: CI (below) and Release (tag-only).
-# CI runs ONE gate definition on a two-entry OS matrix: fmt, clippy, doctests
-# and the full test groups must pass on both Windows and Linux. Advisory/MSRV/
-# bench smoke checks stay local dependency-bump checks; they made CI slow and
-# failed on registry advisories unrelated to the code change.
+# Speed-first split (no duplicated full gate):
+# - lint (Linux): fmt, clippy --all-targets --all-features, SDK no-default
+#   feature matrix, doctests, and the offline SDK examples. One runner, one
+#   target dir: the example builds reuse the lint compile artifacts.
+# - test (Windows): the full nextest suite, eight sequential groups. This is
+#   the primary platform and the only place the whole suite runs.
+# - test-linux-subset (Linux): lib + bins only (plus a type-check of all
+#   tests). Catches Linux-only runtime regressions without paying for the
+#   full integration suite twice.
+# Benchmarks are MANUAL ONLY (`scripts/run_benchmarks.sh`, dev profile): CI
+# compiles them through clippy --all-targets but never runs them — criterion
+# wall-clock numbers are meaningless on a shared runner.
 on:
   push:
     branches: [master]
@@ -32,43 +39,59 @@ env:
   RUST_MIN_STACK: "8388608"
 
 jobs:
-  gate:
-    name: ${{ matrix.name }} full gate
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: Linux
-            cache-key: linux-full
-          - os: windows-latest
-            name: Windows
-            cache-key: windows-full
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 360
+  lint:
+    name: Lint + SDK matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: Use a short temp directory (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          mkdir -p /c/tmp
-          echo "TEMP=C:\\tmp" >> "$GITHUB_ENV"
-          echo "TMP=C:\\tmp" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ${{ matrix.cache-key }}
+          shared-key: linux-lint
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: SDK feature matrix (no-default-features)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The embedder surface must build without the default `full` set.
+          # This is the shape examples/ and external SDK consumers use; it
+          # caught the `tail_page`/print-only helpers that leaked into the
+          # no-session build.
+          for features in "sdk" "sdk,session" "sdk,print" "sdk,session,print"; do
+            echo "==> --no-default-features --features $features"
+            cargo check --lib --locked --no-default-features --features "$features"
+          done
       - name: Doctests
         run: cargo test --doc --locked
+      - name: SDK examples (offline set; the script checks the example set first)
+        run: bash scripts/run_examples.sh
+
+  test:
+    name: Tests (full suite)
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use a short temp directory (Windows)
+        shell: bash
+        run: |
+          mkdir -p /c/tmp
+          echo "TEMP=C:\\tmp" >> "$GITHUB_ENV"
+          echo "TMP=C:\\tmp" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-test
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install nextest
         uses: taiki-e/install-action@cargo-nextest
       - name: Tests (eight sequential groups; per-group binary cleanup)
@@ -105,3 +128,22 @@ jobs:
             done
           done
           exit "$status"
+
+  test-linux-subset:
+    name: Linux lib + bins
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-subset
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install nextest
+        uses: taiki-e/install-action@cargo-nextest
+      - name: Lib + bin unit tests
+        run: cargo nextest run --lib --bins --locked --profile ci
+      - name: Type-check every integration test (Linux)
+        run: cargo check --tests --locked

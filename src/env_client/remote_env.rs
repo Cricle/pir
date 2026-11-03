@@ -330,6 +330,47 @@ pub struct WatchExclude {
     pub names: Vec<String>,
 }
 
+/// Removes one `exec` request from [`RemoteExecutionEnv::running`] when its
+/// call ends — a reply, an error, an abort or a dropped future all run `Drop`.
+///
+/// The guard distinguishes two states:
+///
+/// - **settled**: the daemon answered (success or error), or the connection
+///   failed; the request cannot still be running remotely, so the recorded
+///   id is simply forgotten and `cleanup()` must not kill it.
+/// - **registered but not settled**: the caller dropped the `exec` future
+///   (outer task cancellation, an ad-hoc timeout) without an abort signal and
+///   without a daemon reply. The command may still be running in the daemon,
+///   and the id would no longer be visible to `cleanup()`; the guard therefore
+///   sends the explicit `{ mode: "kill" }` cancel itself (a synchronous frame
+///   write, not an async wait) before forgetting the id.
+struct RunningGuard {
+    running: Arc<Mutex<HashMap<u32, u32>>>,
+    /// The `(request id, session id)` `on_start` assigned to this call, filled
+    /// in when the request is registered (the future may be dropped before or
+    /// after that point).
+    started: Arc<Mutex<Option<(u32, u32)>>>,
+    /// Used to kill a request whose caller went away before it settled.
+    connection: Connection,
+    /// Set once the daemon replied (or the request failed): the command is no
+    /// longer in flight and must not be killed by `Drop`.
+    settled: bool,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        let Some((request_id, session)) = lock(&self.started).take() else {
+            return;
+        };
+        if !self.settled {
+            // The caller dropped the future while the daemon may still be
+            // executing: kill it instead of silently forgetting it.
+            self.connection.kill(request_id, session);
+        }
+        lock(&self.running).remove(&request_id);
+    }
+}
+
 /// An `ExecutionEnv` on another machine, reached through a pi-env daemon.
 pub struct RemoteExecutionEnv {
     pub id: String,
@@ -1023,8 +1064,19 @@ impl RemoteExecutionEnv {
             }) as EventFn
         });
         let running = self.running.clone();
-        let on_start = Arc::new(move |request_id: u32, session: u32| {
-            lock(&running).insert(request_id, session);
+        let started: Arc<Mutex<Option<(u32, u32)>>> = Arc::new(Mutex::new(None));
+        // Held across the request: a settled request removes its recorded id
+        // from `running`; a future dropped before the daemon replies sends the
+        // kill itself (see `RunningGuard`).
+        let mut guard = RunningGuard {
+            running: running.clone(),
+            started: started.clone(),
+            connection: self.connection.clone(),
+            settled: false,
+        };
+        let on_start = Arc::new(move |id: u32, session: u32| {
+            lock(&running).insert(id, session);
+            *lock(&started) = Some((id, session));
         });
         let result = self
             .connection
@@ -1040,18 +1092,18 @@ impl RemoteExecutionEnv {
                 },
             )
             .await;
+        // Whatever the daemon said (a result, an error, an abort or a lost
+        // connection) settled the request; only a dropped future is unsettled.
+        guard.settled = true;
         match result {
-            Ok(reply) => {
-                lock(&self.running).remove(&reply.request_id);
-                Ok(ExecResult {
-                    exit_code: reply.json["exitCode"].as_i64().unwrap_or(0),
-                    spill_path: reply
-                        .json
-                        .get("spillPath")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                })
-            }
+            Ok(reply) => Ok(ExecResult {
+                exit_code: reply.json["exitCode"].as_i64().unwrap_or(0),
+                spill_path: reply
+                    .json
+                    .get("spillPath")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }),
             Err(error) => Err(ExecutionError::from_remote(&error, options.timeout_secs)),
         }
     }
@@ -1098,6 +1150,13 @@ impl RemoteExecutionEnv {
         for (request_id, session) in running {
             self.connection.kill(request_id, session);
         }
+    }
+
+    /// `#[doc(hidden)]` test seam: how many settled-or-running requests
+    /// `cleanup()` would still kill.
+    #[doc(hidden)]
+    pub fn running_len_for_tests(&self) -> usize {
+        lock(&self.running).len()
     }
 
     /// `_fileOp`: resolve, check for an abort, run, and map failures.

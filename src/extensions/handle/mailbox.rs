@@ -5,6 +5,17 @@ use super::*;
 /// Bounds teardown even when an extension handler wedges the actor.
 const SHUTDOWN_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Why a [`ExtensionHandle::command_with_deadline`] wait ended without a
+/// reply.
+enum CommandWaitError {
+    /// The mailbox refused the command (the actor is gone).
+    NotRunning,
+    /// The actor accepted the command but its reply channel closed.
+    ReplyDropped,
+    /// The caller-side budget elapsed before the command settled.
+    TimedOut(Duration),
+}
+
 impl ExtensionHandle {
     /// Create a runtime on a dedicated actor thread and return its handle.
     ///
@@ -17,11 +28,54 @@ impl ExtensionHandle {
     /// host logs it) instead of running silently without extensions.
     #[cfg(not(feature = "extensions"))]
     pub fn start(config: ExtensionConfig) -> anyhow::Result<Self> {
+        Self::start_inner(config, false)
+    }
+    /// Start a DISPOSABLE runtime: same actor and load surface as [`Self::start`],
+    /// but closing its mailbox (dropping the last handle) never emits
+    /// `session_shutdown` to the JS handlers. The CLI's pre-trust bootstrap
+    /// pass uses this: that runtime only exists to resolve `project_trust`
+    /// before the real session runtime is loaded, and the handler must see
+    /// exactly one `session_shutdown` — the real session's teardown.
+    #[cfg(not(feature = "extensions"))]
+    pub(crate) fn start_disposable(config: ExtensionConfig) -> anyhow::Result<Self> {
+        Self::start_inner(config, true)
+    }
+    #[cfg(feature = "extensions")]
+    pub fn start(config: ExtensionConfig) -> anyhow::Result<Self> {
+        Self::start_inner(config, false)
+    }
+    #[cfg(feature = "extensions")]
+    pub(crate) fn start_disposable(config: ExtensionConfig) -> anyhow::Result<Self> {
+        Self::start_inner(config, true)
+    }
+
+    /// Re-enable the normal end-of-session `session_shutdown` on a handle
+    /// created by [`Self::start_disposable`].
+    ///
+    /// The CLI's pre-trust bootstrap runtime becomes the LIVE host runtime
+    /// when the final extension plan is identical to the bootstrap plan
+    /// (upstream `ResourceLoader.loadFinalExtensionSet` reuses
+    /// `preTrustExtensions.runtime`). Adoption happens after the one
+    /// `project_trust` dispatch, so the real session teardown must emit the
+    /// event exactly once, like any other host runtime.
+    pub(crate) fn allow_session_shutdown_on_drop(&self) {
+        self.suppress_session_shutdown
+            .store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(not(feature = "extensions"))]
+    fn start_inner(
+        config: ExtensionConfig,
+        _suppress_session_shutdown: bool,
+    ) -> anyhow::Result<Self> {
         let _ = config;
         anyhow::bail!("this build has no JS extension runtime (the `extensions` feature is off)")
     }
     #[cfg(feature = "extensions")]
-    pub fn start(mut config: ExtensionConfig) -> anyhow::Result<Self> {
+    fn start_inner(
+        mut config: ExtensionConfig,
+        suppress_session_shutdown: bool,
+    ) -> anyhow::Result<Self> {
         let started = crate::config::timings::start_phase();
         // Resolve the engine limits ONCE, before the actor exists: the actor
         // thread's OS stack is derived from the JS stack budget, and the
@@ -36,7 +90,13 @@ impl ExtensionHandle {
         // back to `false` on exit, so `is_ready` cannot report a dead actor
         // as usable.
         let ready = Arc::new(AtomicBool::new(false));
-        let tx = start_actor(config, Arc::clone(&state), Arc::clone(&ready))?;
+        let suppress_session_shutdown = Arc::new(AtomicBool::new(suppress_session_shutdown));
+        let tx = start_actor(
+            config,
+            Arc::clone(&state),
+            Arc::clone(&ready),
+            Arc::clone(&suppress_session_shutdown),
+        )?;
         let (
             pending_commands,
             preempt_background_at_ms,
@@ -64,6 +124,7 @@ impl ExtensionHandle {
             next_dispatch_epoch,
             abandoned_dispatch_epochs: abandoned,
             terminal_input_handlers,
+            suppress_session_shutdown,
         };
         // One-time QuickJS/actor construction (prelude injected): the phase
         // `--only-builtin` and `--no-extensions` skip entirely.
@@ -131,6 +192,10 @@ impl ExtensionHandle {
             next_dispatch_epoch,
             abandoned_dispatch_epochs: abandoned,
             terminal_input_handlers,
+            // No actor (and therefore no mailbox-close tail) exists to emit a
+            // lifecycle event; the flag is irrelevant but keeps the shape
+            // uniform with actor-backed handles.
+            suppress_session_shutdown: Arc::new(AtomicBool::new(true)),
         };
         // `--only-builtin` / builtin-only plans log this instead of
         // `ext.runtime.start`; no actor, engine or prelude is built.
@@ -372,6 +437,67 @@ impl ExtensionHandle {
         crate::extensions::runtime::lock_state(&self.state).call_timeout
     }
 
+    /// Send one command and wait for its reply under the caller-side budget
+    /// (`extensionLimits.callTimeoutMs` / `PI_EXT_CALL_TIMEOUT_MS`).
+    ///
+    /// The mailbox send and the reply wait share one deadline: while the
+    /// actor is wedged in a long synchronous JS turn it stops draining the
+    /// channel, so a full mailbox would otherwise block the caller in `send`
+    /// forever — the agent loop must not hang on an unresponsive extension.
+    /// This is a caller-side fallback only: it does not interrupt the JS
+    /// command already executing (its side effects may land after the
+    /// timeout). When the command was actually queued, the actor's own
+    /// completion path releases the `pending_commands` slot; calling
+    /// [`Self::command_cancelled`] here would decrement it a second time.
+    async fn command_with_deadline<T>(
+        &self,
+        send: impl std::future::Future<Output = Result<(), mpsc::error::SendError<Command>>>,
+        reply_rx: oneshot::Receiver<T>,
+    ) -> Result<T, CommandWaitError> {
+        self.command_with_deadline_for(self.event_timeout(), send, reply_rx)
+            .await
+    }
+
+    /// [`Self::command_with_deadline`] with an explicit caller-side budget
+    /// (used by reserved-prefix hook dispatch, whose runtime-side deadline is
+    /// the long hook timeout rather than the per-call timeout).
+    async fn command_with_deadline_for<T>(
+        &self,
+        timeout: Duration,
+        send: impl std::future::Future<Output = Result<(), mpsc::error::SendError<Command>>>,
+        reply_rx: oneshot::Receiver<T>,
+    ) -> Result<T, CommandWaitError> {
+        self.command_queued();
+        let mut sent = false;
+        let result = tokio::time::timeout(timeout, async {
+            send.await.map_err(|_| CommandWaitError::NotRunning)?;
+            sent = true;
+            reply_rx.await.map_err(|_| CommandWaitError::ReplyDropped)
+        })
+        .await;
+        match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                // Only a failed send leaves the command out of the actor's
+                // hands; a dropped reply means the actor already completed it.
+                if matches!(error, CommandWaitError::NotRunning) {
+                    self.command_cancelled();
+                }
+                Err(error)
+            }
+            Err(_) => {
+                // The timeout may fire mid-`send`: tokio's `send` is
+                // cancel-safe, so the command was never queued and the slot
+                // must be released here. A timeout after the send accepted
+                // the command is the actor's slot to release.
+                if !sent {
+                    self.command_cancelled();
+                }
+                Err(CommandWaitError::TimedOut(timeout))
+            }
+        }
+    }
+
     /// Dispatch an event through the reply-free extension path: the JS
     /// handlers observe the event exactly as [`Self::emit`] would deliver it,
     /// but no reply payload is built or transferred. For an event whose
@@ -470,23 +596,27 @@ impl ExtensionHandle {
             ));
         };
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_queued();
-        if let Err(error) = tx
-            .send(Command::CallTool {
-                name: tool_name.to_owned(),
-                call_id: tool_call_id.to_owned(),
-                params: params.clone(),
-                reply: reply_tx,
-            })
-            .await
-        {
-            self.command_cancelled();
-            let _ = error;
-            return Err(anyhow::anyhow!("extension actor is not running"));
-        }
-        reply_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("extension actor dropped the tool reply"))?
+        let result = self
+            .command_with_deadline(
+                tx.send(Command::CallTool {
+                    name: tool_name.to_owned(),
+                    call_id: tool_call_id.to_owned(),
+                    params: params.clone(),
+                    reply: reply_tx,
+                }),
+                reply_rx,
+            )
+            .await;
+        result.map_err(|error| match error {
+            CommandWaitError::NotRunning => anyhow::anyhow!("extension actor is not running"),
+            CommandWaitError::ReplyDropped => {
+                anyhow::anyhow!("extension actor dropped the tool reply")
+            }
+            CommandWaitError::TimedOut(timeout) => anyhow::anyhow!(
+                "extension tool `{tool_name}` timed out after {timeout:?} \
+                 (the extension actor is unresponsive)"
+            ),
+        })?
     }
 
     /// Dispatch a slash command by name (first registration wins).
@@ -495,6 +625,24 @@ impl ExtensionHandle {
     /// [`Self::reload`]) only when no extension registered a JS command with
     /// that name (P2-16); a registered `reload` command wins.
     pub async fn dispatch_command(&self, name: &str, args: &str) -> anyhow::Result<CommandOutcome> {
+        self.dispatch_command_for_ext(name, args, None, name).await
+    }
+
+    /// Dispatch a slash command to one exact registration.
+    ///
+    /// `ext_id` selects the owning JS extension when several extensions
+    /// registered the same command name (the unified registry resolves them
+    /// to `name:1`, `name:2`, ...); `None` keeps the historical first-wins
+    /// scan. `invocation_name` is surfaced to the handler as
+    /// `ctx.commandName` so a duplicate-name handler can tell which
+    /// invocation it is serving.
+    pub async fn dispatch_command_for_ext(
+        &self,
+        name: &str,
+        args: &str,
+        ext_id: Option<u64>,
+        invocation_name: &str,
+    ) -> anyhow::Result<CommandOutcome> {
         let js_command_registered = self
             .command_defs()
             .iter()
@@ -515,22 +663,28 @@ impl ExtensionHandle {
             });
         };
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_queued();
-        if let Err(error) = tx
-            .send(Command::RunSlash {
-                name: name.to_owned(),
-                args: args.to_owned(),
-                reply: reply_tx,
-            })
-            .await
-        {
-            self.command_cancelled();
-            let _ = error;
-            return Err(anyhow::anyhow!("extension actor is not running"));
-        }
-        reply_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("extension actor dropped the command reply"))?
+        let result = self
+            .command_with_deadline(
+                tx.send(Command::RunSlash {
+                    name: name.to_owned(),
+                    args: args.to_owned(),
+                    ext_id,
+                    invocation_name: invocation_name.to_owned(),
+                    reply: reply_tx,
+                }),
+                reply_rx,
+            )
+            .await;
+        result.map_err(|error| match error {
+            CommandWaitError::NotRunning => anyhow::anyhow!("extension actor is not running"),
+            CommandWaitError::ReplyDropped => {
+                anyhow::anyhow!("extension actor dropped the command reply")
+            }
+            CommandWaitError::TimedOut(timeout) => anyhow::anyhow!(
+                "extension command `{name}` timed out after {timeout:?} \
+                 (the extension actor is unresponsive)"
+            ),
+        })?
     }
 
     /// Invoke a registered keyboard shortcut by key combo (first registration
@@ -551,21 +705,25 @@ impl ExtensionHandle {
             });
         };
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_queued();
-        if let Err(error) = tx
-            .send(Command::InvokeShortcut {
-                key: key.to_owned(),
-                reply: reply_tx,
-            })
-            .await
-        {
-            self.command_cancelled();
-            let _ = error;
-            return Err(anyhow::anyhow!("extension actor is not running"));
-        }
-        reply_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("extension actor dropped the shortcut reply"))?
+        let result = self
+            .command_with_deadline(
+                tx.send(Command::InvokeShortcut {
+                    key: key.to_owned(),
+                    reply: reply_tx,
+                }),
+                reply_rx,
+            )
+            .await;
+        result.map_err(|error| match error {
+            CommandWaitError::NotRunning => anyhow::anyhow!("extension actor is not running"),
+            CommandWaitError::ReplyDropped => {
+                anyhow::anyhow!("extension actor dropped the shortcut reply")
+            }
+            CommandWaitError::TimedOut(timeout) => anyhow::anyhow!(
+                "extension shortcut `{key}` timed out after {timeout:?} \
+                 (the extension actor is unresponsive)"
+            ),
+        })?
     }
 
     /// `/reload`: re-run the extension loader for the currently loaded
@@ -650,9 +808,10 @@ impl ExtensionHandle {
 
     /// Explicitly terminate the JS runtime and stop the `pir-ext-actor` thread.
     ///
-    /// The actor emits `session_shutdown {reason: "quit"}` to the JS handlers,
-    /// invalidates the runtime, drops the QuickJS instance on its owning
-    /// thread, and exits its mailbox loop. Idempotent: a plan-only handle, a
+    /// The actor emits `session_shutdown {reason: "quit"}` to the JS handlers
+    /// (a disposable handle created by [`Self::start_disposable`] skips the
+    /// event), invalidates the runtime, drops the QuickJS instance on its
+    /// owning thread, and exits its mailbox loop. Idempotent: a plan-only handle, a
     /// mailbox already closed by an earlier shutdown, or an actor that dies
     /// during teardown all return `Ok(())`. The enqueue and reply wait are
     /// bounded by `SHUTDOWN_REPLY_TIMEOUT`; on expiry teardown reports an
@@ -832,22 +991,38 @@ impl ExtensionHandle {
             return Ok(None);
         };
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_queued();
-        if let Err(error) = tx
-            .send(Command::PrepareLoadout {
-                name: tool_name.to_owned(),
-                loadout: loadout.clone(),
-                reply: reply_tx,
-            })
-            .await
+        // Reserved stream/route hook keys use the long hook budget on BOTH
+        // sides: the actor arms `prepare_loadout_timeout`, and the caller must
+        // not cut the wait at the short per-call timeout first.
+        use crate::ai::providers::{JS_ROUTE_HOOK_PREFIX, JS_STREAM_HOOK_PREFIX};
+        let timeout = if tool_name.starts_with(JS_STREAM_HOOK_PREFIX)
+            || tool_name.starts_with(JS_ROUTE_HOOK_PREFIX)
         {
-            self.command_cancelled();
-            let _ = error;
-            return Err("extension actor is not running".to_owned());
-        }
-        reply_rx
-            .await
-            .map_err(|_| "extension actor dropped the prepareLoadout reply".to_owned())?
+            crate::extensions::runtime::lock_state(&self.state).hook_timeout
+        } else {
+            self.event_timeout()
+        };
+        let result = self
+            .command_with_deadline_for(
+                timeout,
+                tx.send(Command::PrepareLoadout {
+                    name: tool_name.to_owned(),
+                    loadout: loadout.clone(),
+                    reply: reply_tx,
+                }),
+                reply_rx,
+            )
+            .await;
+        result.map_err(|error| match error {
+            CommandWaitError::NotRunning => "extension actor is not running".to_owned(),
+            CommandWaitError::ReplyDropped => {
+                "extension actor dropped the prepareLoadout reply".to_owned()
+            }
+            CommandWaitError::TimedOut(timeout) => format!(
+                "extension tool `{tool_name}` prepareLoadout timed out after {timeout:?} \
+                 (the extension actor is unresponsive)"
+            ),
+        })?
     }
 
     /// Execute a `user_bash` handler's exported `BashOperations.exec`
@@ -864,38 +1039,44 @@ impl ExtensionHandle {
             return Err("the extension runtime is not running".to_owned());
         };
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_queued();
-        if let Err(error) = tx
-            .send(Command::CallBashOperations {
-                token: token.to_owned(),
-                request: request.clone(),
-                reply: reply_tx,
-            })
-            .await
-        {
-            self.command_cancelled();
-            let _ = error;
-            return Err("extension actor is not running".to_owned());
-        }
-        reply_rx
-            .await
-            .map_err(|_| "extension actor dropped the bash operations reply".to_owned())?
+        let result = self
+            .command_with_deadline(
+                tx.send(Command::CallBashOperations {
+                    token: token.to_owned(),
+                    request: request.clone(),
+                    reply: reply_tx,
+                }),
+                reply_rx,
+            )
+            .await;
+        result.map_err(|error| match error {
+            CommandWaitError::NotRunning => "extension actor is not running".to_owned(),
+            CommandWaitError::ReplyDropped => {
+                "extension actor dropped the bash operations reply".to_owned()
+            }
+            CommandWaitError::TimedOut(timeout) => format!(
+                "bash operations `{token}` timed out after {timeout:?} \
+                 (the extension actor is unresponsive)"
+            ),
+        })?
     }
 }
 
 /// Spawn the `pir-ext-actor` thread (QuickJS runtime + command mailbox) and
 /// block until it reports readiness.
 ///
-/// The only caller today is [`ExtensionHandle::start`]; `start_plan_only`
-/// deliberately never reaches this function (the memory this saves is exactly
-/// the runtime constructed by `run_actor`). Construction of the QuickJS
-/// runtime is fast, so the blocking wait keeps `start` synchronous: callers
-/// cannot race a load against actor readiness.
+/// The callers are [`ExtensionHandle::start`] /
+/// [`ExtensionHandle::start_disposable`]; `start_plan_only` deliberately never
+/// reaches this function (the memory this saves is exactly the runtime
+/// constructed by `run_actor`). Construction of the QuickJS runtime is fast,
+/// so the blocking wait keeps `start` synchronous: callers cannot race a load
+/// against actor readiness.
 #[cfg(feature = "extensions")]
 fn start_actor(
     config: ExtensionConfig,
     state: Arc<StdMutex<RuntimeState>>,
     ready: Arc<AtomicBool>,
+    suppress_session_shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<mpsc::Sender<Command>> {
     let (tx, rx) = mpsc::channel::<Command>(64);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
@@ -929,7 +1110,13 @@ fn start_actor(
             // stuck at `true` behind a gone actor, and the runtime's
             // streaming cell never outlives the actor.
             let _liveness = ActorLiveness(actor_ready, stream_key);
-            run_actor(config, thread_state, rx, ready_tx);
+            run_actor(
+                config,
+                thread_state,
+                rx,
+                ready_tx,
+                suppress_session_shutdown,
+            );
         })
         .map_err(|error| anyhow::anyhow!("failed to spawn the extension actor thread: {error}"))?;
     ready_rx

@@ -415,12 +415,22 @@ fn percent_decode(input: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = &input[i + 1..i + 3];
-            if let Ok(value) = u8::from_str_radix(hex, 16) {
-                out.push(value);
-                i += 3;
+        if bytes[i] == b'%' {
+            // Take the two bytes after `%` from the byte slice: `str` slicing
+            // by range would panic when either boundary falls inside a
+            // multi-byte character (e.g. `%€`), and a malformed escape must
+            // stay literal, matching Node's URL parser.
+            let Some(hex) = input.get(i + 1..i + 3) else {
+                out.push(bytes[i]);
+                i += 1;
                 continue;
+            };
+            if hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                if let Ok(value) = u8::from_str_radix(hex, 16) {
+                    out.push(value);
+                    i += 3;
+                    continue;
+                }
             }
         }
         out.push(bytes[i]);
@@ -969,7 +979,7 @@ impl ExtensionModuleLoader {
         // Virtual modules (TypeBox shim, pi package shims).
         if let Some(canonical) = super::api::shims::canonical_virtual_name(name) {
             if let Some(src) = super::api::shims::source_for(canonical) {
-                return Some(src.to_string());
+                return Some(src);
             }
         }
         if let Ok(cache) = self.cache.lock() {
@@ -1538,5 +1548,29 @@ fn module_dirname(path: &str) -> String {
     match path.rfind('/') {
         Some(index) => path[..index].to_string(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_decode;
+
+    #[test]
+    fn malformed_percent_escapes_stay_literal_without_panicking() {
+        // `%` followed by a multi-byte character: `str` slice boundaries used
+        // to land inside the character and panic inside the QuickJS loader
+        // callback, aborting the host.
+        assert_eq!(percent_decode("file:///%€"), "file:///%€");
+        assert_eq!(percent_decode("file:///%中"), "file:///%中");
+        // Truncated escapes are kept verbatim, like Node's URL parser.
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("%2"), "%2");
+        assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn valid_percent_escapes_decode() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("file:///%E4%B8%AD"), "file:///中");
     }
 }

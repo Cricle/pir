@@ -38,7 +38,7 @@ use pir::durable::harness::context::{derive_context, ContextView};
 use pir::durable::harness::documents::conversation_definitions;
 use pir::durable::harness::generation::{
     generation_task, AgentSource, CompactionTasks, DeferredPoll, DocumentKind, GenerationHarness,
-    GenerationHooks, GenerationModels, GenerationStore, ToolControl, ToolTasks,
+    GenerationHooks, GenerationModels, GenerationStore, TaskDraft, ToolControl, ToolTasks,
     COMPACTION_TASK_NAME, GENERATION_TASK_NAME, TOOL_TASK_NAME,
 };
 use pir::durable::harness::inbox::INBOX_KIND;
@@ -314,11 +314,14 @@ impl GenerationStore for Store {
         catalogue: &'a pir::durable::harness::scheduler::TaskCatalogue,
         tx: &'a mut Transaction,
         conversation: ConversationId,
-        kind: &'a str,
-        input: Value,
-        owner: Option<TaskId>,
-        background: bool,
+        draft: TaskDraft<'a>,
     ) -> pir::durable::harness::generation::HarnessFuture<'a, TaskId> {
+        let TaskDraft {
+            kind,
+            input,
+            owner,
+            background,
+        } = draft;
         Box::pin(async move {
             let definition = catalogue
                 .task(kind)

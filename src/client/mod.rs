@@ -503,31 +503,56 @@ impl Client {
         token: Option<&str>,
         timeouts: ClientTimeouts,
     ) -> Result<Self, ClientError> {
-        // Resolve once so reconnect can target the same endpoint later. The
-        // lookup and the TCP connect each stay inside the connect bound.
-        let resolved = match timeout(timeouts.connect, lookup_host(address)).await {
-            Ok(result) => match result?.next() {
-                Some(addr) => addr,
-                None => {
-                    return Err(ClientError::Io(io::Error::new(
-                        io::ErrorKind::AddrNotAvailable,
-                        "address resolved to nothing",
-                    )))
-                }
-            },
+        // Resolve every candidate address: a host whose first record is
+        // unreachable (typically a spurious IPv6 record) must still connect
+        // through a later one. The chosen address is kept for reconnect.
+        let addresses: Vec<SocketAddr> = match timeout(timeouts.connect, lookup_host(address)).await
+        {
+            Ok(result) => result?.collect(),
             Err(_) => {
                 return Err(ClientError::Timeout {
                     operation: "connect",
                 })
             }
         };
-        let stream = match timeout(timeouts.connect, TcpStream::connect(resolved)).await {
-            Ok(result) => result?,
-            Err(_) => {
+        if addresses.is_empty() {
+            return Err(ClientError::Io(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "address resolved to nothing",
+            )));
+        }
+        // All sequential attempts share one connect deadline (no Happy
+        // Eyeballs racing; a bounded ordered fallback is enough here).
+        let deadline = tokio::time::Instant::now() + timeouts.connect;
+        let mut last_error = None;
+        let mut chosen = None;
+        for addr in addresses {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
                 return Err(ClientError::Timeout {
                     operation: "connect",
-                })
+                });
             }
+            match timeout(remaining, TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    chosen = Some((stream, addr));
+                    break;
+                }
+                Ok(Err(error)) => last_error = Some(error),
+                Err(_) => {
+                    return Err(ClientError::Timeout {
+                        operation: "connect",
+                    })
+                }
+            }
+        }
+        let Some((stream, resolved)) = chosen else {
+            return match last_error {
+                Some(error) => Err(ClientError::Io(error)),
+                None => Err(ClientError::Timeout {
+                    operation: "connect",
+                }),
+            };
         };
         let mut client = Self::from_stream_with_token_and_timeouts(stream, token, timeouts).await?;
         client.address = Some(resolved);
@@ -644,6 +669,13 @@ impl Client {
     /// Return the hello-derived compatibility snapshot.
     pub fn snapshot(&self) -> &Value {
         &self.hello.snapshot
+    }
+
+    /// Test/profiling probe (`#[doc(hidden)]`): the socket address selected
+    /// for the current connection (also the address reconnect dials).
+    #[doc(hidden)]
+    pub fn address(&self) -> Option<SocketAddr> {
+        self.address
     }
 
     /// Return the attachment id currently leased to this connection, if any.
@@ -1622,7 +1654,11 @@ impl Client {
         let frame = encode_client_envelope(message, self.frame_options)?;
         // The write is bounded by the request timeout: a peer that never
         // reads (full socket buffer) must fail the send instead of blocking
-        // the caller forever. A torn-down transport fails fast.
+        // the caller forever. `write_all` is not cancellation safe, so a
+        // timed-out write may have left a partial frame on the wire: every
+        // write failure (timeout included) tears the transport down instead
+        // of letting a later request reuse the connection with a half frame
+        // still queued.
         let write = async {
             let writer = self.writer.as_mut().ok_or(ClientError::Disconnected)?;
             writer.write_all(&frame).await?;
@@ -1630,8 +1666,15 @@ impl Client {
             Ok::<(), ClientError>(())
         };
         match timeout(self.timeouts.request, write).await {
-            Ok(result) => result,
-            Err(_) => Err(ClientError::Timeout { operation: "send" }),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.drop_transport();
+                Err(error)
+            }
+            Err(_) => {
+                self.drop_transport();
+                Err(ClientError::Timeout { operation: "send" })
+            }
         }
     }
 

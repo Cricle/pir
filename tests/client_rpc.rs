@@ -13,10 +13,10 @@
 //! sandbox endpoint (`common::sandbox_endpoint`), so the run settles fast and
 //! deterministically.
 
-mod common;
+pub mod common;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -216,6 +216,675 @@ async fn jsonl_client_round_trips_commands_events_and_close() {
     }
     // close is idempotent.
     client.close().await.expect("second close");
+}
+
+/// R1-L2-005: a subscriber that falls behind the 1024-entry ring must observe
+/// an explicit `event_stream_lagged` marker (with the exact missing count)
+/// before the oldest retained event — the old code silently swallowed
+/// `broadcast::RecvError::Lagged` in its wait/collect helpers.
+#[tokio::test]
+async fn jsonl_client_reports_event_stream_lag_in_band() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    use pir::client::rpc::EVENT_CHANNEL_CAPACITY;
+
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    let (server_read, mut server_write) = tokio::io::split(server_end);
+    let event_count = EVENT_CHANNEL_CAPACITY + 64;
+    let server = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(server_read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read hello");
+        let request: serde_json::Value = serde_json::from_str(line.trim()).expect("hello json");
+        let id = request["id"].as_str().expect("request id").to_owned();
+        // Flood small events BEFORE the response, so the client dispatches
+        // all of them while the test subscriber is not reading.
+        for sequence in 0..event_count {
+            let event = json!({ "type": "tick", "sequence": sequence });
+            server_write
+                .write_all(format!("{event}\n").as_bytes())
+                .await
+                .expect("write tick");
+        }
+        let response = json!({
+            "type": "response",
+            "id": id,
+            "command": "hello",
+            "success": true,
+            "data": { "protocol": "pir-rpc-jsonl" },
+        });
+        server_write
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("write hello response");
+        server_write.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    let (client_read, client_write) = tokio::io::split(client_end);
+    let client = RpcClient::with_streams(client_read, client_write);
+    let mut events = client.events();
+    client
+        .hello()
+        .await
+        .expect("the hello response arrives after the flood");
+
+    let marker = events.recv().await.expect("a lag marker, not a silent gap");
+    assert_eq!(marker["type"], json!("event_stream_lagged"), "{marker}");
+    assert_eq!(marker["reason"], json!("buffer_overflow"), "{marker}");
+    let missing = marker["missing"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("missing count: {marker}"));
+    assert_eq!(
+        missing as usize,
+        event_count - EVENT_CHANNEL_CAPACITY,
+        "the marker must report exactly the evicted count"
+    );
+
+    // The retained tail follows the marker, oldest first and gap-free.
+    let first = events.recv().await.expect("oldest retained event");
+    assert_eq!(first["type"], json!("tick"));
+    assert_eq!(first["sequence"], json!(missing));
+
+    let stats = client.event_buffer_stats();
+    assert_eq!(stats.dropped_events, missing);
+    assert_eq!(stats.reported_missing, missing);
+    assert_eq!(stats.lag_notices, 1);
+    assert!(stats.buffered_events <= EVENT_CHANNEL_CAPACITY);
+
+    client.close().await.expect("close");
+    server.abort();
+}
+
+/// R2-1-N01: the fan-out must be bounded by bytes, not just 1024 entries.
+/// 1024 large events (64 KiB each, 64 MiB total) stay under the old count cap
+/// but must be trimmed to [`EVENT_CHANNEL_BYTE_CAPACITY`], and the subscriber
+/// must observe the gap marker.
+#[tokio::test]
+async fn jsonl_client_bounds_broadcast_bytes_and_reports_the_gap() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    use pir::client::rpc::{EVENT_CHANNEL_BYTE_CAPACITY, EVENT_CHANNEL_CAPACITY};
+
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    let (server_read, mut server_write) = tokio::io::split(server_end);
+    let payload = "x".repeat(64 * 1024);
+    let server_payload = payload.clone();
+    let server = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(server_read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read hello");
+        let request: serde_json::Value = serde_json::from_str(line.trim()).expect("hello json");
+        let id = request["id"].as_str().expect("request id").to_owned();
+        // 1024 x 64 KiB = 64 MiB: far under the 1024-entry count cap but four
+        // times the byte cap. The old ring would retain every event.
+        for sequence in 0..EVENT_CHANNEL_CAPACITY {
+            let event = json!({
+                "type": "snapshot",
+                "sequence": sequence,
+                "payload": server_payload.clone(),
+            });
+            server_write
+                .write_all(format!("{event}\n").as_bytes())
+                .await
+                .expect("write snapshot");
+        }
+        let response = json!({
+            "type": "response",
+            "id": id,
+            "command": "hello",
+            "success": true,
+            "data": { "protocol": "pir-rpc-jsonl" },
+        });
+        server_write
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("write hello response");
+        server_write.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    let (client_read, client_write) = tokio::io::split(client_end);
+    let client = RpcClient::with_streams(client_read, client_write);
+    let mut events = client.events();
+    client
+        .hello()
+        .await
+        .expect("the hello response arrives after the flood");
+
+    let stats = client.event_buffer_stats();
+    assert!(
+        stats.buffered_bytes <= EVENT_CHANNEL_BYTE_CAPACITY,
+        "the event ring must honor the byte cap: {} > {}",
+        stats.buffered_bytes,
+        EVENT_CHANNEL_BYTE_CAPACITY
+    );
+    assert!(
+        stats.buffered_bytes > EVENT_CHANNEL_BYTE_CAPACITY / 2,
+        "the ring should use most of its byte budget, got {}",
+        stats.buffered_bytes
+    );
+    assert!(
+        stats.buffered_events < EVENT_CHANNEL_CAPACITY,
+        "the byte cap must evict before the count cap: {stats:?}"
+    );
+    assert!(
+        stats.dropped_events > 0,
+        "byte overflow must drop oldest events: {stats:?}"
+    );
+
+    // P3-P2C-01: pin the eviction accounting. Every one of the 1024 events was
+    // stored (the receiver existed before the flood), so eviction can only
+    // remove a prefix and `buffered_bytes` must be exactly the compact JSON
+    // size of the retained suffix; `dropped_events` must be the prefix length.
+    let retained = stats.buffered_events;
+    let expected_sizes: Vec<usize> = (EVENT_CHANNEL_CAPACITY - retained..EVENT_CHANNEL_CAPACITY)
+        .map(|sequence| {
+            serde_json::to_string(&json!({
+                "type": "snapshot",
+                "sequence": sequence,
+                "payload": payload.clone(),
+            }))
+            .expect("test event serializes")
+            .len()
+        })
+        .collect();
+    let expected_retained_bytes: usize = expected_sizes.iter().sum();
+    assert_eq!(
+        stats.buffered_bytes, expected_retained_bytes,
+        "buffered_bytes must be the exact compact JSON size of the retained suffix: {stats:?}"
+    );
+    assert_eq!(
+        stats.dropped_events as usize,
+        EVENT_CHANNEL_CAPACITY - retained,
+        "every evicted event must be counted exactly once: {stats:?}"
+    );
+
+    let marker = events.recv().await.expect("a byte-overflow lag marker");
+    assert_eq!(marker["type"], json!("event_stream_lagged"), "{marker}");
+    let missing = marker["missing"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("missing count: {marker}"));
+    assert!(missing > 0, "{marker}");
+    // `record_lag` runs when the marker is handed to the receiver above, not
+    // when the flood is dispatched: re-read the stats after `recv()` instead
+    // of asserting on the pre-recv snapshot.
+    let stats = client.event_buffer_stats();
+    assert_eq!(missing, stats.dropped_events, "{stats:?}");
+    assert_eq!(stats.reported_missing, missing, "{stats:?}");
+    assert_eq!(stats.lag_notices, 1, "{stats:?}");
+
+    let first = events.recv().await.expect("oldest retained snapshot");
+    assert_eq!(first["type"], json!("snapshot"));
+    assert_eq!(first["sequence"], json!(missing));
+    let mut received_bytes = serde_json::to_string(&first)
+        .expect("received snapshot serializes")
+        .len();
+    for offset in 1..retained {
+        let event = events.recv().await.expect("retained snapshot");
+        assert_eq!(event["type"], json!("snapshot"));
+        assert_eq!(event["sequence"], json!(missing + offset as u64));
+        received_bytes += serde_json::to_string(&event)
+            .expect("received snapshot serializes")
+            .len();
+    }
+    assert_eq!(
+        received_bytes, stats.buffered_bytes,
+        "the drained payloads must account for exactly the retained byte budget"
+    );
+    let after_drain = client.event_buffer_stats();
+    assert_eq!(after_drain.buffered_events, retained);
+    assert_eq!(
+        after_drain.buffered_bytes, stats.buffered_bytes,
+        "reading retained events must not change the ring's byte accounting"
+    );
+
+    client.close().await.expect("close");
+    server.abort();
+}
+
+/// R3-P2-1 regression: `EventHub::subscribe` must snapshot the cursor and
+/// register the subscriber in one critical section. The old implementation
+/// read `next_sequence`, released the lock, and only then incremented the
+/// subscriber count, while `send` checked the count outside that lock. A
+/// `send` could therefore see zero subscribers after the new receiver had
+/// already snapshotted its cursor but before it registered, drop the event
+/// without advancing the sequence, and leave the receiver's stream with a
+/// silent gap and no `event_stream_lagged` marker.
+///
+/// The test publishes a numbered event stream continuously (a new subscriber
+/// is created while sends are in flight) and checks, for every subscription,
+/// that the received `sequence` values are contiguous from the first event,
+/// with any gap accounted for exactly by a preceding lag marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jsonl_client_concurrent_subscribe_never_silently_skips_events() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    enum Observed {
+        Tick(u64),
+        Lag(u64),
+    }
+
+    // Stop the detached churner threads even if an assertion below panics:
+    // the handles are only joined on the success path.
+    struct StopOnDrop(Arc<AtomicBool>);
+
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let (client_end, server_end) = tokio::io::duplex(1024 * 1024);
+    let (server_read, mut server_write) = tokio::io::split(server_end);
+    let stop = Arc::new(AtomicBool::new(false));
+    let _stop_guard = StopOnDrop(Arc::clone(&stop));
+    // Global publisher sequence: assigned before each write, so a value read
+    // at time T is an upper bound on every event written before T. Each
+    // subscription snapshots it at creation time to anchor its stream to the
+    // registration point instead of treating its first tick as "sequence 0".
+    let published = Arc::new(AtomicU64::new(0));
+    let server_stop = Arc::clone(&stop);
+    let server_published = Arc::clone(&published);
+    let server = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(server_read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read hello");
+        let request: serde_json::Value = serde_json::from_str(line.trim()).expect("hello json");
+        let id = request["id"].as_str().expect("request id").to_owned();
+        let response = json!({
+            "type": "response",
+            "id": id,
+            "command": "hello",
+            "success": true,
+            "data": { "protocol": "pir-rpc-jsonl" },
+        });
+        server_write
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("write hello response");
+        server_write.flush().await.expect("flush");
+        while !server_stop.load(Ordering::SeqCst) {
+            // Publish in small batches so the reader task and the subscribing
+            // threads interleave on the hub instead of one side finishing
+            // before the other starts.
+            for _ in 0..64 {
+                let sequence = server_published.fetch_add(1, Ordering::SeqCst);
+                let event = json!({ "type": "tick", "sequence": sequence });
+                if server_write
+                    .write_all(format!("{event}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if server_write.flush().await.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let (client_read, client_write) = tokio::io::split(client_end);
+    let client = RpcClient::with_streams(client_read, client_write);
+    client.hello().await.expect("hello");
+
+    // Extra subscriber churn on real threads: subscribe/drop as fast as
+    // possible so `send` keeps racing registration edges and the subscriber
+    // count keeps flapping around zero. These receivers never read, so they
+    // cannot observe anything; the observing workers below are the ones that
+    // assert continuity.
+    let mut churners = Vec::new();
+    for _ in 0..2 {
+        let client = client.clone();
+        let stop = Arc::clone(&stop);
+        churners.push(std::thread::spawn(move || {
+            let mut spins = 0_u32;
+            while !stop.load(Ordering::SeqCst) {
+                drop(client.events());
+                spins = spins.wrapping_add(1);
+                if spins.is_multiple_of(256) {
+                    std::thread::yield_now();
+                }
+            }
+        }));
+    }
+
+    let subscriptions = Arc::new(AtomicUsize::new(0));
+    let ticks_seen = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let client = client.clone();
+        let published = Arc::clone(&published);
+        let subscriptions = Arc::clone(&subscriptions);
+        let ticks_seen = Arc::clone(&ticks_seen);
+        workers.push(tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                // Subscribe while the producer is running: this is the window
+                // under test. Keep the receiver short-lived so the subscriber
+                // count flaps and senders keep hitting registration edges.
+                //
+                // `published_before` is recorded before the call and
+                // `registered_at` inside the subscription critical section
+                // (between the cursor snapshot and the subscriber count bump).
+                // A publisher sequence >= `registered_at` is assigned after
+                // that snapshot; its `send` either commits before registration
+                // (never claimed by this receiver) or after it (must be
+                // delivered), so the first delivered tick cannot be newer than
+                // the snapshot unless a lag marker covered an eviction.
+                let published_before = published.load(Ordering::SeqCst);
+                let registration_snapshot = Arc::new(AtomicU64::new(u64::MAX));
+                let snapshot_slot = Arc::clone(&registration_snapshot);
+                let publisher = Arc::clone(&published);
+                let mut receiver = client.events_with_registration_hook_for_test(move || {
+                    snapshot_slot.store(publisher.load(Ordering::SeqCst), Ordering::SeqCst);
+                });
+                let registered_at = registration_snapshot.load(Ordering::SeqCst);
+                assert_ne!(
+                    registered_at,
+                    u64::MAX,
+                    "the registration hook must run inside events()"
+                );
+                subscriptions.fetch_add(1, Ordering::SeqCst);
+                let read_deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+                let mut observed = Vec::new();
+                while observed.len() < 12 && tokio::time::Instant::now() < read_deadline {
+                    match tokio::time::timeout(Duration::from_millis(2), receiver.recv()).await {
+                        Ok(Ok(value)) => {
+                            if value["type"] == "event_stream_lagged" {
+                                let missing = value["missing"].as_u64().unwrap_or_else(|| {
+                                    panic!("lag marker without a missing count: {value}")
+                                });
+                                observed.push(Observed::Lag(missing));
+                            } else {
+                                assert_eq!(
+                                    value["type"],
+                                    json!("tick"),
+                                    "unexpected event: {value}"
+                                );
+                                let sequence = value["sequence"].as_u64().unwrap_or_else(|| {
+                                    panic!("tick without a numeric sequence: {value}")
+                                });
+                                observed.push(Observed::Tick(sequence));
+                            }
+                        }
+                        Ok(Err(error)) => panic!("event stream closed during the test: {error:?}"),
+                        Err(_) => break,
+                    }
+                }
+
+                let mut expected_next: Option<u64> = None;
+                let mut first_tick: Option<u64> = None;
+                let mut lag_before_first_tick = false;
+                let mut ticks = 0_usize;
+                for observation in observed {
+                    match observation {
+                        Observed::Tick(sequence) => {
+                            if first_tick.is_none() {
+                                first_tick = Some(sequence);
+                            }
+                            if let Some(expected) = expected_next {
+                                assert_eq!(
+                                    sequence, expected,
+                                    "receiver silently skipped publisher event(s): expected \
+                                     sequence {expected}, got {sequence}; no lag marker was \
+                                     reported"
+                                );
+                            }
+                            expected_next = Some(sequence + 1);
+                            ticks += 1;
+                        }
+                        Observed::Lag(missing) => {
+                            // The next retained event must be exactly `missing`
+                            // publisher events after the last one received.
+                            if expected_next.is_some() {
+                                expected_next = expected_next.map(|expected| expected + missing);
+                            } else {
+                                lag_before_first_tick = true;
+                            }
+                        }
+                    }
+                }
+                if let Some(first) = first_tick {
+                    // The first tick may legitimately be a pre-registration
+                    // backlog event, but it cannot be *newer* than the
+                    // registration snapshot (published_before={published_before}):
+                    // every sequence >= `registered_at` was assigned after the
+                    // snapshot inside `events()`, so the dispatcher's `send`
+                    // either committed before registration (never claimed by
+                    // this receiver) or after it (must be delivered), unless an
+                    // explicit lag marker already covered an eviction gap.
+                    assert!(
+                        lag_before_first_tick || first <= registered_at,
+                        "receiver started at publisher sequence {first}, past its registration \
+                         snapshot {registered_at} (published_before={published_before}), without \
+                         a lag marker"
+                    );
+                }
+                ticks_seen.fetch_add(ticks, Ordering::SeqCst);
+            }
+        }));
+    }
+    for worker in workers {
+        worker.await.expect("subscriber worker must not panic");
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    for churner in churners {
+        churner.join().expect("churner thread must not panic");
+    }
+    server.abort();
+    let subscriptions = subscriptions.load(Ordering::SeqCst);
+    let ticks_seen = ticks_seen.load(Ordering::SeqCst);
+    assert!(
+        subscriptions > 100,
+        "the test must churn subscriptions while the producer runs, got {subscriptions}"
+    );
+    assert!(
+        ticks_seen > 100,
+        "the test must observe a live stream, got {ticks_seen} ticks"
+    );
+    client.close().await.expect("close");
+}
+
+/// R3-P2-1 regression (deterministic): `EventHub::subscribe` must snapshot the
+/// cursor and register the subscriber in one critical section.
+///
+/// The old implementation released the state lock between reading
+/// `next_sequence` and bumping the subscriber count, while `send` checked the
+/// count outside that lock. An event dispatched in that window was dropped
+/// without advancing the hub sequence, so the new receiver silently skipped it
+/// with no `event_stream_lagged` marker.
+///
+/// That window only exists inside `events()` and *before* the receiver's first
+/// tick, so a black-box "first tick is the baseline" stream check cannot see
+/// it: every subscription legitimately starts at an arbitrary publisher
+/// sequence. This test uses the `#[doc(hidden)]`
+/// `events_with_registration_hook_for_test` seam to publish an event while the
+/// subscription sits between the cursor snapshot and the registration:
+///
+/// - the fixed client holds the state lock across the hook, so the dispatcher
+///   blocks in `send` (its listener, which runs only after the hub fan-out,
+///   never fires) and the event is stored after registration;
+/// - the old client would let `send` observe zero subscribers and drop the
+///   event, and the receiver below would never see it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jsonl_client_subscribe_registration_cannot_drop_a_concurrent_event() {
+    use std::sync::atomic::AtomicBool;
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    let (server_read, mut server_write) = tokio::io::split(server_end);
+    let (write_event_tx, write_event_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(server_read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read hello");
+        let request: serde_json::Value = serde_json::from_str(line.trim()).expect("hello json");
+        let id = request["id"].as_str().expect("request id").to_owned();
+        let response = json!({
+            "type": "response",
+            "id": id,
+            "command": "hello",
+            "success": true,
+            "data": { "protocol": "pir-rpc-jsonl" },
+        });
+        server_write
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("write hello response");
+        server_write.flush().await.expect("flush");
+        // The hook signals us from inside the subscription critical section;
+        // publish exactly one event while it is held. If the signal never
+        // arrives (the registration hook did not run), stay idle so the
+        // receiver-side timeout reports the silently skipped event.
+        if write_event_rx.await.is_err() {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            return;
+        }
+        let event = json!({ "type": "tick", "sequence": 0 });
+        server_write
+            .write_all(format!("{event}\n").as_bytes())
+            .await
+            .expect("write tick");
+        server_write.flush().await.expect("flush tick");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    let (client_read, client_write) = tokio::io::split(client_end);
+    let client = RpcClient::with_streams(client_read, client_write);
+    client.hello().await.expect("hello");
+
+    // `dispatch_event` fans out to the hub before invoking listeners, so this
+    // flag flips only once the hub's `send` has returned. While the hook holds
+    // the state lock it must stay false until registration completes.
+    let dispatched = Arc::new(AtomicBool::new(false));
+    let listener_flag = Arc::clone(&dispatched);
+    let _listener = client.on_event(move |value| {
+        if value["type"] == "tick" {
+            listener_flag.store(true, Ordering::SeqCst);
+        }
+    });
+
+    let hook = move || {
+        let _ = write_event_tx.send(());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(
+                !dispatched.load(Ordering::SeqCst),
+                "hub send completed between the cursor snapshot and subscriber registration; \
+                 a concurrent event can be dropped without a lag marker"
+            );
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+
+    let mut receiver = client.events_with_registration_hook_for_test(hook);
+    let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("the event published during registration must not be silently dropped")
+        .expect("event stream must stay open");
+    assert_eq!(event["type"], json!("tick"));
+    assert_eq!(event["sequence"], json!(0));
+    assert_eq!(
+        client.event_buffer_stats().buffered_events,
+        1,
+        "the concurrent event must be retained exactly once"
+    );
+
+    client.close().await.expect("close");
+    server.abort();
+}
+
+/// R3-P2-2: `buffered_bytes` is documented as the sum of compact JSON
+/// encodings, not a `Value` heap estimate. Pin that accounting (including
+/// Unicode/escape expansion) so the "serialized bytes" contract cannot drift
+/// silently into a different unit without updating the docs and the cap.
+#[tokio::test]
+async fn jsonl_client_event_buffer_bytes_are_compact_json_bytes() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let events = vec![
+        json!({ "type": "note", "text": "héllo\n\t\"quoted\" 😀" }),
+        json!({ "type": "numbers", "values": [0, -1, 42, 1.5, 1e300] }),
+        json!({ "type": "nested", "object": { "a": null, "b": true, "c": [false] } }),
+    ];
+    let expected_bytes: usize = events
+        .iter()
+        .map(|event| {
+            serde_json::to_string(event)
+                .expect("test event serializes")
+                .len()
+        })
+        .sum();
+
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    let (server_read, mut server_write) = tokio::io::split(server_end);
+    let server_events = events.clone();
+    let server = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(server_read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read hello");
+        let request: serde_json::Value = serde_json::from_str(line.trim()).expect("hello json");
+        let id = request["id"].as_str().expect("request id").to_owned();
+        // Publish the events before the response: the reader processes lines
+        // in order, so `hello()` resolving proves all three were dispatched
+        // (and retained by the subscriber below).
+        for event in &server_events {
+            let line = serde_json::to_string(event).expect("serialize event");
+            server_write
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write event");
+        }
+        let response = json!({
+            "type": "response",
+            "id": id,
+            "command": "hello",
+            "success": true,
+            "data": { "protocol": "pir-rpc-jsonl" },
+        });
+        server_write
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("write hello response");
+        server_write.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    let (client_read, client_write) = tokio::io::split(client_end);
+    let client = RpcClient::with_streams(client_read, client_write);
+    let mut receiver = client.events();
+    client.hello().await.expect("hello");
+
+    let stats = client.event_buffer_stats();
+    assert_eq!(stats.buffered_events, events.len(), "{stats:?}");
+    assert_eq!(
+        stats.buffered_bytes, expected_bytes,
+        "buffered_bytes must be the exact compact JSON byte count of the retained events \
+         (documented budget unit), not a Value heap or RSS estimate: {stats:?}"
+    );
+
+    // The retained values are structurally identical to the ones sent (the
+    // exact byte accounting is asserted above), and draining them does not
+    // change the retained byte accounting.
+    for expected in &events {
+        let received = receiver.recv().await.expect("retained event");
+        assert_eq!(&received, expected);
+    }
+    assert_eq!(client.event_buffer_stats().buffered_bytes, expected_bytes);
+
+    client.close().await.expect("close");
+    server.abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -585,4 +1254,82 @@ async fn jsonl_client_sends_upstream_command_bodies() {
     assert_eq!(seen[2].1["type"], json!("get_available_thinking_levels"));
     assert_eq!(seen[3].1["type"], json!("bash"));
     assert_eq!(seen[3].1["excludeFromContext"], json!(true));
+}
+
+/// R1-L2-004: enqueueing a command shares the request bound with the
+/// response wait. A peer that stops reading stdin leaves the writer task
+/// blocked in `write_all`; once the 256-slot channel fills, `send` must time
+/// out with `Timeout { operation: "send" }` instead of parking forever.
+#[tokio::test]
+async fn jsonl_client_send_times_out_when_the_peer_stops_reading() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    let (server_read, mut server_write) = tokio::io::split(server_end);
+    let server = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(server_read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read hello");
+        let request: serde_json::Value = serde_json::from_str(line.trim()).expect("hello json");
+        let id = request["id"].as_str().expect("request id").to_owned();
+        let response = json!({
+            "type": "response",
+            "id": id,
+            "command": "hello",
+            "success": true,
+            "data": { "protocol": "pir-rpc-jsonl" },
+        });
+        server_write
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("write hello response");
+        server_write.flush().await.expect("flush hello response");
+        // Stop reading stdin: the writer task blocks on the duplex pipe and
+        // the client's 256-slot queue fills.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let (client_read, client_write) = tokio::io::split(client_end);
+    let client = RpcClient::with_streams_and_timeouts(
+        client_read,
+        client_write,
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    );
+    client.hello().await.expect("handshake response");
+
+    // Pad each command so 300 of them cannot fit in the 64 KiB duplex pipe
+    // while the peer is not reading: the queue (capacity 256) must fill.
+    let padding = "p".repeat(2048);
+    let mut sends = Vec::new();
+    for _ in 0..300 {
+        let client = client.clone();
+        let padding = padding.clone();
+        sends.push(async move {
+            client
+                .send(json!({"type": "get_state", "padding": padding}))
+                .await
+        });
+    }
+    let results = tokio::time::timeout(
+        Duration::from_secs(5),
+        futures_util::future::join_all(sends),
+    )
+    .await
+    .expect("every send must finish; a full queue cannot park a send forever");
+    assert_eq!(results.len(), 300);
+    let send_timeouts = results
+        .iter()
+        .filter(|result| matches!(result, Err(RpcClientError::Timeout { operation: "send" })))
+        .count();
+    assert!(
+        send_timeouts >= 1,
+        "at least one blocked enqueue must report the send timeout; got {:?}",
+        results
+            .iter()
+            .map(|result| format!("{result:?}"))
+            .collect::<Vec<_>>()
+    );
+    drop(client);
+    server.abort();
 }

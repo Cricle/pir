@@ -19,7 +19,8 @@ use pir::ai::providers::config_value::{
     clear_config_value_cache, execute_command_with_timeout, resolve_config_value,
 };
 use pir::ai::providers::{
-    catalog, load_pi_config_with, merge_pi_config, parse_pi_config, CatalogProviderEntry,
+    catalog, load_pi_config_with, load_pi_environment, merge_pi_config, parse_pi_config,
+    CatalogProviderEntry,
 };
 use pir::ai::types::{Model, ModelCost, ModelCostRates};
 
@@ -215,6 +216,158 @@ async fn callback_server_handles_concurrent_connections() {
         Ok(Err(error)) => panic!("idle connection readiness failed: {error}"),
     }
     drop(idle_alive);
+}
+
+// ---------------------------------------------------------------------------
+// FIX-D10 (R2-1-N05): the accept loop caps concurrent callback connections
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn callback_server_rejects_connections_over_the_cap() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let server = pir::ai::auth::callback_server::OAuthCallbackServer::start(
+        "Test",
+        "127.0.0.1",
+        0,
+        "/auth/callback",
+        None,
+        Some("st3"),
+    )
+    .await
+    .expect("callback server starts");
+    let port = server.port();
+
+    // Fill the 32-connection cap with idle spares: each handler holds its
+    // permit while waiting for a request head.
+    let mut idle = Vec::new();
+    for _ in 0..32 {
+        idle.push(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("idle connect"),
+        );
+    }
+
+    // The next connection is over the cap: accepted, then closed immediately
+    // without a handler.
+    let mut overflow = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("overflow connect");
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), overflow.read(&mut buf))
+        .await
+        .expect("an over-cap connection must be closed promptly")
+        .expect("read over-cap connection");
+    assert_eq!(read, 0, "an over-cap connection must observe EOF");
+    drop(overflow);
+
+    // Release the spares; their handlers see EOF and return their permits.
+    drop(idle);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // A fresh connection enters again and a legitimate callback completes.
+    let mut callback = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("callback connect after release");
+    callback
+        .write_all(b"GET /auth/callback?code=c3&state=st3 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .expect("write callback");
+    let pairs = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server.wait(Some(std::time::Duration::from_secs(5))),
+    )
+    .await
+    .expect("wait must resolve after the cap is released")
+    .expect("wait ok");
+    match pairs {
+        pir::ai::auth::callback_server::CallbackWait::Completed(pairs) => {
+            assert_eq!(
+                pir::ai::auth::callback_server::query_param(&pairs, "code"),
+                Some("c3")
+            );
+        }
+        other => panic!("unexpected wait result: {other:?}"),
+    }
+    server.confirm_page(None);
+}
+
+// ---------------------------------------------------------------------------
+// FIX-D08 (R2-4-N04): models.json reads are capped at 8 MiB
+// ---------------------------------------------------------------------------
+
+/// Build a valid models.json of exactly `total_bytes` bytes by padding the
+/// JSON document with trailing whitespace (legal JSON).
+fn padded_models_json(total_bytes: usize) -> String {
+    let body = r#"{"providers":{"acme":{"name":"Acme","baseUrl":"https://acme.example/v1","apiKey":"sk-acme","models":[{"id":"acme-large"}]}}}"#;
+    assert!(body.len() < total_bytes);
+    let mut contents = String::with_capacity(total_bytes);
+    contents.push_str(body);
+    contents.push_str(&" ".repeat(total_bytes - body.len()));
+    contents
+}
+
+#[test]
+fn models_json_over_limit_is_treated_as_absent() {
+    let _guard = env_lock().lock().unwrap();
+    let previous = std::env::var("PIR_AGENT_DIR").ok();
+    let dir = temp_dir("models-json-over-limit");
+    let contents = padded_models_json(9 * 1024 * 1024);
+    assert_eq!(contents.len(), 9 * 1024 * 1024);
+    std::fs::write(dir.join("models.json"), &contents).expect("write models.json");
+    drop(contents);
+
+    set_env("PIR_AGENT_DIR", Some(dir.to_str().unwrap()));
+    let configured = load_pi_config_with(None).expect("load must not fail");
+    let environment = load_pi_environment(None).expect("environment load must not fail");
+    set_env("PIR_AGENT_DIR", previous.as_deref());
+
+    assert!(
+        configured.is_none(),
+        "a models.json above the 8 MiB cap must be treated as absent"
+    );
+    assert!(
+        environment
+            .models
+            .iter()
+            .all(|model| model.provider != "acme"),
+        "providers from an over-limit models.json must not be registered"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn models_json_under_limit_still_parses() {
+    let _guard = env_lock().lock().unwrap();
+    let previous = std::env::var("PIR_AGENT_DIR").ok();
+    let dir = temp_dir("models-json-small");
+    let contents = padded_models_json(1024);
+    assert_eq!(contents.len(), 1024);
+    std::fs::write(dir.join("models.json"), &contents).expect("write models.json");
+
+    set_env("PIR_AGENT_DIR", Some(dir.to_str().unwrap()));
+    let configured = load_pi_config_with(None).expect("load must not fail");
+    set_env("PIR_AGENT_DIR", previous.as_deref());
+
+    let configured = configured.expect("a 1 KiB models.json must still parse");
+    assert_eq!(configured.model.provider, "acme");
+    assert_eq!(configured.model.id, "acme-large");
+    assert_eq!(configured.api_key.as_deref(), Some("sk-acme"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression for the existing JSONC behavior: BOM, both comment forms and
+/// trailing commas keep parsing with plain `serde_json` after the read cap.
+#[test]
+fn parse_pi_config_still_accepts_jsonc() {
+    let contents = "\u{feff}{\n  // default provider\n  \"defaultProvider\": \"acme\",\n  /* block comment */\n  \"providers\": {\n    \"acme\": {\n      \"name\": \"Acme\",\n      \"models\": [\n        // the only entry\n        { \"id\": \"acme-large\" },\n      ],\n    },\n  },\n}";
+    let config = parse_pi_config(contents).expect("JSONC parses");
+    assert_eq!(config.default_provider.as_deref(), Some("acme"));
+    let provider = config.providers.get("acme").expect("acme provider");
+    assert_eq!(provider.name.as_deref(), Some("Acme"));
+    assert_eq!(provider.models.len(), 1);
+    assert_eq!(provider.models[0].id, "acme-large");
 }
 
 // ---------------------------------------------------------------------------

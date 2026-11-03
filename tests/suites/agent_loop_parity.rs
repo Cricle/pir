@@ -707,7 +707,7 @@ async fn nested_tool_calls_get_generated_ids_parent_attribution_and_record() {
     // The parent tool result records the bounded nestedCalls entry.
     let nested_calls = parent_result
         .nested_calls
-        .as_ref()
+        .as_deref()
         .expect("nestedCalls record");
     assert!(nested_calls.complete);
     assert_eq!(nested_calls.calls.len(), 1);
@@ -842,7 +842,7 @@ async fn nested_tool_call_depth_is_bounded() {
     // Every executed level is recorded; the record stays complete.
     let nested_calls = parent_result
         .nested_calls
-        .as_ref()
+        .as_deref()
         .expect("nestedCalls record");
     eprintln!("DEPTH DEBUG: {:?}", nested_calls);
     assert!(nested_calls.complete);

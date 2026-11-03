@@ -269,6 +269,12 @@ def main(argv=None):
                     help="how long to watch for the session's FIRST paint before the "
                          "interaction phase (a huge transcript may take a while)")
     ap.add_argument("--out", default=os.path.join(REPO, "logs", "perf", "tui-session"))
+    ap.add_argument("--with-js-extension", action="store_true",
+                    help="write one minimal JS extension into the fixture agent dir "
+                         "(extensions/js-probe.js: a tool + a command + a session_start "
+                         "hook) so the leg loads the QuickJS runtime; the default leg is "
+                         "the same fixture without it. This is the controlled JS-kernel "
+                         "A/B: everything else (models, settings, session) is identical.")
     args = ap.parse_args(argv)
 
     if not os.path.exists(args.pir):
@@ -308,6 +314,25 @@ def main(argv=None):
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     agent = big.build_agent_dir(port, args.context_window)
+    if args.with_js_extension:
+        # Minimal-but-real JS extension: the prelude, the SWC transpile, the
+        # QuickJS actor and the handler tables all engage; the plugin registers
+        # one tool, one command and one event hook so its handler rows exist.
+        ext_dir = os.path.join(agent, "extensions")
+        os.makedirs(ext_dir, exist_ok=True)
+        with open(os.path.join(ext_dir, "js-probe.js"), "w", encoding="utf-8") as fh:
+            fh.write(
+                "export default function (pi) {\n"
+                "  pi.registerTool({\n"
+                "    name: \"js_probe\",\n"
+                "    description: \"Probe tool\",\n"
+                "    parameters: { type: \"object\", properties: {} },\n"
+                "    async execute() { return { content: [{ type: \"text\", text: \"ok\" }] }; },\n"
+                "  });\n"
+                "  pi.registerCommand(\"jsprobe\", { handler: async () => {} });\n"
+                "  pi.on(\"session_start\", async () => {});\n"
+                "}\n"
+            )
 
     results = []
     invalid_legs = []

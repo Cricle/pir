@@ -45,11 +45,13 @@ use super::{parse_entry_line, parse_entry_line_with_version};
 /// binds first wins).
 ///
 /// Sizing (measured): the page is a FIXED resident cost on top of the process
-/// floor — the parsed entries dominate, so 1 MiB / 1024 entries keeps an
-/// ordinary session's window (and every keep-recent cut window: the default
-/// `keepRecentTokens` of 20000 is ~80 KB of text) fully covered while leaving
-/// ~4x headroom over the previous 4 MiB default.
-pub const DEFAULT_TAIL_PAGE_BYTES: usize = 1024 * 1024;
+/// floor — the parsed entries dominate. 512 KiB covers an ordinary session's
+/// viewport many times over (the default `keepRecentTokens` of 20000 is ~80 KB
+/// of text) while halving the resident window, its projection copy and the
+/// mapped pages touched at startup. The TUI replays only this bounded window
+/// and loads older pages on scroll (`read_older_page`), so a resumed 2 MB
+/// session no longer parses/clones half its file just to paint the first frame.
+pub const DEFAULT_TAIL_PAGE_BYTES: usize = 512 * 1024;
 
 /// Default entry cap for a tail page.
 pub const DEFAULT_TAIL_PAGE_ENTRIES: usize = 1024;
@@ -83,7 +85,8 @@ pub struct TailPageStats {
 /// A read-only, tail-first page of a session file (see the module docs).
 pub struct SessionTailPage {
     path: PathBuf,
-    map: memmap2::Mmap,
+    /// File length at map time.
+    file_len: u64,
     /// First byte of the parsed window.
     page_start: u64,
     /// First byte of the region this page was allowed to cover (the file end,
@@ -92,6 +95,9 @@ pub struct SessionTailPage {
     entries: Vec<Arc<FileEntry>>,
     unparsed_lines: Vec<String>,
     header: Option<SessionHeader>,
+    /// The header from the file's FIRST line, resolved once at map time. A
+    /// cached page keeps reporting the session identity without the map.
+    file_header: Option<SessionHeader>,
     stats: TailPageStats,
 }
 
@@ -147,7 +153,8 @@ impl SessionTailPage {
         };
         let file_len = map.len() as u64;
         let window_end = end.map(|end| end.min(file_len)).unwrap_or(file_len);
-        let header_version = read_header_version(&map);
+        let file_header = read_file_header(&map);
+        let header_version = file_header.as_ref().and_then(|header| header.version);
         let page_start = find_page_start(&map[..window_end as usize], max_bytes, max_entries);
         let (entries, unparsed_lines, parsed_lines) = parse_window(
             &map[page_start as usize..window_end as usize],
@@ -169,14 +176,33 @@ impl SessionTailPage {
         };
         Ok(Some(SessionTailPage {
             path: path.to_path_buf(),
-            map,
+            file_len,
             page_start: page_start as u64,
             window_end,
             entries,
             unparsed_lines,
             header,
+            file_header,
             stats,
         }))
+    }
+
+    /// Rebuild a page around already-parsed entries (the page cache's hit
+    /// path). The returned page is byte-for-byte equivalent to the one the
+    /// cache loaded: same cursor, counters, headers and entry `Arc`s — only
+    /// the mmap is gone.
+    pub(crate) fn from_cached(cached: Arc<super::page_cache::CachedTailPage>) -> Self {
+        Self {
+            path: cached.path().to_path_buf(),
+            file_len: cached.file_len(),
+            page_start: cached.page_start(),
+            window_end: cached.window_end(),
+            entries: cached.entries().to_vec(),
+            unparsed_lines: cached.unparsed_lines().to_vec(),
+            header: cached.header().cloned(),
+            file_header: cached.file_header().cloned(),
+            stats: cached.stats(),
+        }
     }
 
     /// The file this page came from.
@@ -208,7 +234,7 @@ impl SessionTailPage {
     }
 
     /// The session header read from the FILE'S FIRST LINE, independent of the
-    /// page (a bounded probe, see [`read_header_version`]): a tail page of a
+    /// page (a bounded probe, see [`read_file_header`]): a tail page of a
     /// huge session does not contain the header, but the session id and cwd it
     /// carries are part of the identity a caller must not invent. `None` when
     /// the file does not start with a session header.
@@ -217,16 +243,7 @@ impl SessionTailPage {
     /// with, so a paged open reports the file's real session id — reading the
     /// page's first line would mis-identify a huge session.
     pub fn file_header(&self) -> Option<SessionHeader> {
-        if let Some(header) = self.header.as_ref() {
-            return Some(header.clone());
-        }
-        let probe = &self.map[..HEADER_PROBE_BYTES.min(self.map.len())];
-        let end = probe
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .unwrap_or(probe.len());
-        let text = String::from_utf8_lossy(&probe[..end]);
-        parse_entry_line(&text).and_then(|entry| entry.as_header().cloned())
+        self.file_header.clone()
     }
 
     /// The session id, when the header is in the page.
@@ -257,7 +274,7 @@ impl SessionTailPage {
 
     /// Total file length at map time.
     pub fn file_len(&self) -> u64 {
-        self.map.len() as u64
+        self.file_len
     }
 
     /// First byte of the region this page covered (the file end for a normal
@@ -308,7 +325,7 @@ impl SessionTailPage {
     unsafe_code,
     reason = "memmap2::Mmap::map is unsafe; a read-only map of an append-only file is sound and never written through"
 )]
-fn map_read_only(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
+pub(crate) fn map_read_only(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
     // SAFETY: the file is opened read-only, the map is never written through,
     // and the session writer only appends (never truncates or rewrites) bytes
     // already covered by the map, so the mapping stays valid for its lifetime.
@@ -322,7 +339,12 @@ fn parse_window(
     bytes: &[u8],
     header_version: Option<u32>,
 ) -> (Vec<Arc<FileEntry>>, Vec<String>, usize) {
-    let mut entries: Vec<Arc<FileEntry>> = Vec::new();
+    // Exact line capacity: the window is fully in memory, so one newline count
+    // replaces `Vec` growth (and its transient double buffers) while parsing
+    // the newest entries of a large session.
+    let line_capacity = memchr::memchr_iter(b'\n', bytes).count()
+        + usize::from(!bytes.is_empty() && bytes[bytes.len() - 1] != b'\n');
+    let mut entries: Vec<Arc<FileEntry>> = Vec::with_capacity(line_capacity);
     let mut unparsed_lines: Vec<String> = Vec::new();
     let mut parsed_lines = 0usize;
     for line in bytes.split(|byte| *byte == b'\n') {
@@ -343,16 +365,17 @@ fn parse_window(
     (entries, unparsed_lines, parsed_lines)
 }
 
-/// Read the version off the session header WITHOUT parsing the whole file: the
-/// first line is probed within [`HEADER_PROBE_BYTES`] from the map start.
-fn read_header_version(map: &[u8]) -> Option<u32> {
+/// Read the session header from the file's first line WITHOUT parsing the
+/// whole file: the first line is probed within [`HEADER_PROBE_BYTES`] from the
+/// map start.
+fn read_file_header(map: &[u8]) -> Option<SessionHeader> {
     let probe = &map[..HEADER_PROBE_BYTES.min(map.len())];
     let end = probe
         .iter()
         .position(|byte| *byte == b'\n')
         .unwrap_or(probe.len());
     let text = String::from_utf8_lossy(&probe[..end]);
-    parse_entry_line(&text).and_then(|entry| entry.as_header().and_then(|header| header.version))
+    parse_entry_line(&text).and_then(|entry| entry.as_header().cloned())
 }
 
 /// First byte of the tail window: scan backwards from the end and stop at the
@@ -360,18 +383,34 @@ fn read_header_version(map: &[u8]) -> Option<u32> {
 /// tail bytes are touched, never the prefix.
 ///
 /// The returned offset is always a line start (0, or the byte after a `\n`),
-/// so the window parses as whole lines.
+/// so the window parses as whole lines. Two edge cases matter for the cursor
+/// contract:
+///
+/// - a **torn tail** (the last entry's line has no trailing newline) is still
+///   a line. Counting it up front keeps the entry cap exact; the old
+///   `newlines > max_entries` rule returned one entry too many (and made the
+///   next page overlap that extra entry's line);
+/// - a **line larger than `max_bytes`** is never split. The scan stops at that
+///   line's start, so the page overshoots the byte budget instead of cutting a
+///   UTF-8/JSON record in half (a split would be unparsable and would be lost
+///   from every page).
 fn find_page_start(bytes: &[u8], max_bytes: usize, max_entries: usize) -> usize {
     let len = bytes.len();
     let max_bytes = max_bytes.max(1);
     let max_entries = max_entries.max(1);
-    let mut newlines = 0usize;
+    // A trailing line without its newline terminator still counts as a line.
+    let mut lines = usize::from(len > 0 && bytes[len - 1] != b'\n');
     for index in (0..len).rev() {
         if bytes[index] != b'\n' {
             continue;
         }
-        newlines += 1;
-        if newlines > max_entries || len - index >= max_bytes {
+        // This newline terminates the line before it; the window starts after
+        // it. `lines` counts the lines already covered to the right.
+        if lines >= max_entries {
+            return index + 1;
+        }
+        lines += 1;
+        if len - index >= max_bytes {
             return index + 1;
         }
     }

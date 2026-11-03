@@ -3,7 +3,7 @@ commit=3daa20280f6a7c7cbe0935680c9a38fdc3863005
 date=2026-10-13
 target_repo=pir
 migration_status=in_progress
-pending_drift=74 commits / 305 files / +24,126 -9,375 (3daa20280..2ec55d808, 2026-10-19); see docs/STATUS.md
+pending_drift=184 commits / 597 files / +44,149 -13,594 (3daa20280..38ff99177, 2026-10-24); 110 commits after 2ec55d808; 62 commits / 266 files / +12,716 -3,052 after v1.4.0; see docs/upstream-drift-status.md
 
 # Version map: upstream pi -> pir. pir has its own semver.
 upstream_pi_version=1.4.0

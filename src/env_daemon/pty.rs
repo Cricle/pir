@@ -327,6 +327,9 @@ pub fn run(
                 let now = Instant::now();
                 if now >= idle {
                     // A background job may keep the terminal open after the program exited.
+                    // Closing the terminal ends its session: kill the process group so the
+                    // job cannot outlive it (the `groups` entry is removed below).
+                    kill(&mut killed);
                     break;
                 }
                 idle - now

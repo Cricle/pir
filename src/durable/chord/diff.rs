@@ -324,9 +324,7 @@ fn lower_bound(values: &[usize], value: usize) -> usize {
     values.partition_point(|&candidate| candidate < value)
 }
 
-/// The LCS table is filled bottom-up by index; iterating the indices is the
-/// algorithm, not a missed iterator.
-#[allow(clippy::needless_range_loop)]
+/// The LCS table is filled bottom-up, walking both slices from the end.
 fn lcs_matches(
     before: &[Value],
     after: &[Value],
@@ -341,10 +339,10 @@ fn lcs_matches(
     }
     let width = after.len() + 1;
     let mut lengths = vec![0u32; (before.len() + 1) * width];
-    for left in (0..before.len()).rev() {
-        for right in (0..after.len()).rev() {
+    for (left, left_value) in before.iter().enumerate().rev() {
+        for (right, right_value) in after.iter().enumerate().rev() {
             let at = left * width + right;
-            lengths[at] = if equal(&before[left], &after[right]) {
+            lengths[at] = if equal(left_value, right_value) {
                 lengths[(left + 1) * width + right + 1] + 1
             } else {
                 lengths[(left + 1) * width + right].max(lengths[left * width + right + 1])
@@ -392,9 +390,8 @@ fn semantically_aligned(left: &Value, right: &Value) -> bool {
     }
 }
 
-/// The matcher walks two index ranges at once, so index loops are the clearest
-/// form here.
-#[allow(clippy::needless_range_loop)]
+/// The matcher walks two index ranges at once, so it advances the index
+/// windows explicitly.
 fn identity_subsequence(
     before: &[Value],
     before_start: usize,
@@ -408,10 +405,9 @@ fn identity_subsequence(
     let mut matches = Vec::new();
     if after_count < before_count {
         let mut before_index = before_start;
-        for after_index in after_start..after_end {
-            while before_index < before_end
-                && !same_value(&before[before_index], &after[after_index])
-            {
+        for (offset, after_value) in after[after_start..after_end].iter().enumerate() {
+            let after_index = after_start + offset;
+            while before_index < before_end && !same_value(&before[before_index], after_value) {
                 before_index += 1;
             }
             if before_index == before_end {
@@ -424,9 +420,9 @@ fn identity_subsequence(
     }
     if before_count < after_count {
         let mut after_index = after_start;
-        for before_index in before_start..before_end {
-            while after_index < after_end && !same_value(&before[before_index], &after[after_index])
-            {
+        for (offset, before_value) in before[before_start..before_end].iter().enumerate() {
+            let before_index = before_start + offset;
+            while after_index < after_end && !same_value(before_value, &after[after_index]) {
                 after_index += 1;
             }
             if after_index == after_end {
@@ -530,19 +526,34 @@ fn identity_anchors(
     matches
 }
 
-#[allow(clippy::too_many_arguments)]
-fn process_array_matches(
-    before: &[Value],
-    after: &[Value],
-    path: &mut Vec<Seg>,
-    out: &mut Emitter,
+/// One array region being diffed: the two slices plus the index windows into
+/// them and the region's index in the emitted output.
+#[derive(Clone, Copy)]
+struct ArrayRegion<'a> {
+    before: &'a [Value],
+    after: &'a [Value],
     before_start: usize,
     before_end: usize,
     after_start: usize,
     after_end: usize,
     output_start: usize,
+}
+
+fn process_array_matches(
+    region: ArrayRegion<'_>,
+    path: &mut Vec<Seg>,
+    out: &mut Emitter,
     matches: &[(usize, usize)],
 ) {
+    let ArrayRegion {
+        before,
+        after,
+        before_start,
+        before_end,
+        after_start,
+        after_end,
+        output_start,
+    } = region;
     let mut before_at = before_start;
     let mut after_at = after_start;
     let mut output_at = output_start;
@@ -551,15 +562,17 @@ fn process_array_matches(
             return;
         }
         diff_array_region(
-            before,
-            after,
+            ArrayRegion {
+                before,
+                after,
+                before_start: before_at,
+                before_end: before_match,
+                after_start: after_at,
+                after_end: after_match,
+                output_start: output_at,
+            },
             path,
             out,
-            before_at,
-            before_match,
-            after_at,
-            after_match,
-            output_at,
         );
         output_at += after_match - after_at;
         if !same_value(&before[before_match], &after[after_match]) {
@@ -573,23 +586,31 @@ fn process_array_matches(
     }
     if !out.overflowed {
         diff_array_region(
-            before, after, path, out, before_at, before_end, after_at, after_end, output_at,
+            ArrayRegion {
+                before,
+                after,
+                before_start: before_at,
+                before_end,
+                after_start: after_at,
+                after_end,
+                output_start: output_at,
+            },
+            path,
+            out,
         );
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn diff_array_region(
-    before: &[Value],
-    after: &[Value],
-    path: &mut Vec<Seg>,
-    out: &mut Emitter,
-    mut before_start: usize,
-    mut before_end: usize,
-    mut after_start: usize,
-    mut after_end: usize,
-    mut output_start: usize,
-) {
+fn diff_array_region(region: ArrayRegion<'_>, path: &mut Vec<Seg>, out: &mut Emitter) {
+    let ArrayRegion {
+        before,
+        after,
+        mut before_start,
+        mut before_end,
+        mut after_start,
+        mut after_end,
+        mut output_start,
+    } = region;
     if out.overflowed {
         return;
     }
@@ -632,15 +653,17 @@ fn diff_array_region(
             .collect();
         if !positional.is_empty() {
             process_array_matches(
-                before,
-                after,
+                ArrayRegion {
+                    before,
+                    after,
+                    before_start,
+                    before_end,
+                    after_start,
+                    after_end,
+                    output_start,
+                },
                 path,
                 out,
-                before_start,
-                before_end,
-                after_start,
-                after_end,
-                output_start,
                 &positional,
             );
             return;
@@ -658,15 +681,17 @@ fn diff_array_region(
     .filter(|matches| !matches.is_empty())
     {
         process_array_matches(
-            before,
-            after,
+            ArrayRegion {
+                before,
+                after,
+                before_start,
+                before_end,
+                after_start,
+                after_end,
+                output_start,
+            },
             path,
             out,
-            before_start,
-            before_end,
-            after_start,
-            after_end,
-            output_start,
             &subsequence,
         );
         return;
@@ -682,15 +707,17 @@ fn diff_array_region(
     );
     if !identity.is_empty() {
         process_array_matches(
-            before,
-            after,
+            ArrayRegion {
+                before,
+                after,
+                before_start,
+                before_end,
+                after_start,
+                after_end,
+                output_start,
+            },
             path,
             out,
-            before_start,
-            before_end,
-            after_start,
-            after_end,
-            output_start,
             &identity,
         );
         return;
@@ -711,15 +738,17 @@ fn diff_array_region(
             })
             .collect();
         process_array_matches(
-            before,
-            after,
+            ArrayRegion {
+                before,
+                after,
+                before_start,
+                before_end,
+                after_start,
+                after_end,
+                output_start,
+            },
             path,
             out,
-            before_start,
-            before_end,
-            after_start,
-            after_end,
-            output_start,
             &absolute,
         );
         return;
@@ -756,7 +785,19 @@ fn diff_array(before: &[Value], after: &[Value], path: &mut Vec<Seg>, out: &mut 
             return;
         }
     }
-    diff_array_region(before, after, path, out, 0, before.len(), 0, after.len(), 0);
+    diff_array_region(
+        ArrayRegion {
+            before,
+            after,
+            before_start: 0,
+            before_end: before.len(),
+            after_start: 0,
+            after_end: after.len(),
+            output_start: 0,
+        },
+        path,
+        out,
+    );
 }
 
 // ─── Objects ─────────────────────────────────────────────────────────────────

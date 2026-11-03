@@ -39,9 +39,10 @@ extensions/runtime/host_functions/child_fns.rs 1 0 0  # libc::kill on a child th
 extensions/runtime/host_functions/node_fns.rs 3 0 0  # Win32 GetProcessTimes + libc getrusage out-parameters
 mcp/stdio.rs 1 0 0  # libc::killpg on the spawned MCP server's process group
 plugins/builtin/phone/session.rs 1 0 0  # libc::kill on the phone session's child process group
+session_manager/mod.rs 2 0 0  # Win32 GetFileInformationByHandle identity probe (BY_HANDLE_FILE_INFORMATION)
 session_manager/tail_page.rs 1 0 0  # memmap2 read-only map of an append-only session file
 tui/stdin_buffer.rs 3 0 0  # Win32 console input + Unix termios FFI
 tui/terminal.rs 1 0 0  # libc::raise(SIGTSTP) for terminal suspend
 tui/theme/osc11.rs 5 0 0  # libc fcntl/poll/read on the process' own stdin
 
-# total: 18 file(s), 121 unsafe block(s), 1 unsafe fn, 0 unsafe impl/trait
+# total: 19 file(s), 123 unsafe block(s), 1 unsafe fn, 0 unsafe impl/trait

@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use pir::ai::auth::ApiKeyAuth;
 use pir::ai::event_stream::AssistantMessageEventStream;
 use pir::ai::provider::{Provider, ProviderRegistry};
-use pir::ai::providers::construction::model;
+use pir::ai::providers::construction::{model, ModelSpec};
 use pir::ai::types::{
     AssistantMessage, ContentBlock, Context, Message, Model, StopReason, StreamOptions,
     TerminalReason, TextContent, ThinkingLevel, Tool, UserMessage, UserRole,
@@ -127,16 +127,16 @@ impl Drop for TempDir {
 }
 
 fn test_model() -> Model {
-    model(
-        "fake",
-        "fake-model",
-        "fake-model",
-        "openai-completions",
-        "http://127.0.0.1:9/v1",
-        4_096,
-        256,
-        vec!["text"],
-    )
+    model(ModelSpec {
+        provider: "fake",
+        id: "fake-model",
+        name: "fake-model",
+        api: "openai-completions",
+        base_url: "http://127.0.0.1:9/v1",
+        context_window: 4_096,
+        max_tokens: 256,
+        input: vec!["text"],
+    })
 }
 
 /// Minimal provider for the hermetic `with_registry` builds below; never

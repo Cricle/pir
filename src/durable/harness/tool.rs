@@ -2460,10 +2460,12 @@ fn run_call_phase<'a>(
                     host.as_ref(),
                     &input,
                     &call,
-                    Ending::Completed,
-                    error,
-                    context,
-                    None,
+                    SettleCall {
+                        ending: Ending::Completed,
+                        result: error,
+                        context,
+                        duration_ms: None,
+                    },
                 )
                 .await;
                 return;
@@ -2484,10 +2486,12 @@ fn run_call_phase<'a>(
                     host.as_ref(),
                     &input,
                     &call,
-                    Ending::Completed,
-                    error,
-                    context,
-                    None,
+                    SettleCall {
+                        ending: Ending::Completed,
+                        result: error,
+                        context,
+                        duration_ms: None,
+                    },
                 )
                 .await;
                 return;
@@ -2528,10 +2532,12 @@ fn run_call_phase<'a>(
                 host.as_ref(),
                 &input,
                 &call,
-                Ending::Completed,
-                error,
-                context,
-                None,
+                SettleCall {
+                    ending: Ending::Completed,
+                    result: error,
+                    context,
+                    duration_ms: None,
+                },
             )
             .await;
             return;
@@ -2545,10 +2551,12 @@ fn run_call_phase<'a>(
                     host.as_ref(),
                     &input,
                     &call,
-                    Ending::Completed,
-                    error,
-                    context,
-                    None,
+                    SettleCall {
+                        ending: Ending::Completed,
+                        result: error,
+                        context,
+                        duration_ms: None,
+                    },
                 )
                 .await;
                 return;
@@ -2668,12 +2676,14 @@ fn run_execute_phase<'a>(
             host.as_ref(),
             &input,
             &call,
-            Ending::Failed {
-                message: message.clone(),
+            SettleCall {
+                ending: Ending::Failed {
+                    message: message.clone(),
+                },
+                result,
+                context,
+                duration_ms: None,
             },
-            result,
-            context,
-            None,
         )
         .await;
     })
@@ -2716,10 +2726,12 @@ fn run_abort_phase<'a>(
             host.as_ref(),
             &input,
             &call,
-            Ending::Aborted,
-            result,
-            context,
-            None,
+            SettleCall {
+                ending: Ending::Aborted,
+                result,
+                context,
+                duration_ms: None,
+            },
         )
         .await;
     })
@@ -3026,10 +3038,12 @@ async fn run(
         host,
         input,
         call,
-        tool,
-        result,
-        &snapshot,
-        context.clone(),
+        FinalResult {
+            tool,
+            result,
+            reported: &snapshot,
+            context: context.clone(),
+        },
     )
     .await;
     settle(
@@ -3037,10 +3051,12 @@ async fn run(
         host,
         input,
         call,
-        ending,
-        settled,
-        context,
-        duration_ms,
+        SettleCall {
+            ending,
+            result: settled,
+            context,
+            duration_ms,
+        },
     )
     .await;
     for waiter in pending {
@@ -3281,6 +3297,14 @@ fn structured_output_error(
     }
 }
 
+/// The tool registration and reported state one result is settled against.
+struct FinalResult<'a> {
+    tool: &'a ToolRegistration,
+    result: ToolExecutionResult,
+    reported: &'a ReportedSnapshot,
+    context: Context,
+}
+
 /// The settled result: the tool's result with the retained output and last
 /// details as fallbacks, its diagnostics after those reported through the api,
 /// `afterTool` applied, explicit text bounded, and `structured_output` checked
@@ -3289,17 +3313,19 @@ fn structured_output_error(
 /// A nested call whose `structured_output` breaks the contract gets an error
 /// result without it; a model-issued call only loses it, and the break is
 /// reported to the host.
-#[allow(clippy::too_many_arguments)]
 async fn final_result(
     runtime: &TaskRuntime,
     host: &dyn ToolHost,
     input: &ToolTaskInput,
     call: &ToolHookCall,
-    tool: &ToolRegistration,
-    result: ToolExecutionResult,
-    reported: &ReportedSnapshot,
-    context: Context,
+    pending: FinalResult<'_>,
 ) -> ToolExecutionResult {
+    let FinalResult {
+        tool,
+        result,
+        reported,
+        context,
+    } = pending;
     let mut harness: Vec<ToolDiagnostic> = Vec::new();
     let retained = if result.output.is_empty() {
         Some(reported.output.clone())
@@ -3559,6 +3585,14 @@ fn settle_read<T>(read: Result<T, TaskRuntimeError>, what: &str) -> T {
     }
 }
 
+/// The ending, result and context one tool call settles with.
+struct SettleCall {
+    ending: Ending,
+    result: ToolExecutionResult,
+    context: Context,
+    duration_ms: Option<u64>,
+}
+
 /// Commit the tool's terminal state and mark its slot done.
 ///
 /// A model-issued call appends its result entry and ends with the entry ID; a
@@ -3566,17 +3600,19 @@ fn settle_read<T>(read: Result<T, TaskRuntimeError>, what: &str) -> T {
 /// usage, and ends with a small receipt. Nested calls this call left running are
 /// aborted first, so they report into their slots before the slots below the
 /// call leave `pi.live`.
-#[allow(clippy::too_many_arguments)]
 async fn settle(
     runtime: &TaskRuntime,
     host: &dyn ToolHost,
     input: &ToolTaskInput,
     call: &ToolHookCall,
-    ending: Ending,
-    result: ToolExecutionResult,
-    context: Context,
-    duration_ms: Option<u64>,
+    settlement: SettleCall,
 ) {
+    let SettleCall {
+        ending,
+        result,
+        context,
+        duration_ms,
+    } = settlement;
     let task_id = runtime.task_id();
     let conversation = runtime.conversation_id();
     // Every live nested call the task owns, also those an earlier attempt made

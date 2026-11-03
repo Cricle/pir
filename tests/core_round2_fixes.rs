@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
@@ -37,7 +37,7 @@ use pir::ai::types::{
     AssistantMessage, ContentBlock, Context, Cost, Message, Model, ModelCost, ModelCostRates,
     ProviderStreamHooks, StopReason, TerminalReason, TextContent, Usage, UserMessage, UserRole,
 };
-use pir::cache_warmer::{warm_once, warm_once_with_hooks};
+use pir::cache_warmer::{warm_once, warm_once_with_hooks, warm_once_with_hooks_owned};
 use pir::coding_agent::print::extension_transport_hooks;
 use pir::coding_agent::rpc::PromptClaimGuard;
 use pir::compaction::{estimate_context_tokens, estimate_projected_context_tokens, CutEntry};
@@ -315,7 +315,9 @@ async fn warm_once_with_hooks_carries_the_hooks_to_the_provider_request() {
         on_payload: Some(Arc::new(|_| {})),
         ..Default::default()
     };
-    let result = warm_once_with_hooks(&registry, &model, &context, None, None, hooks).await;
+    // The session hot path uses the OWNED variant; hooks must reach the
+    // provider request exactly like the borrowed wrapper.
+    let result = warm_once_with_hooks_owned(&registry, &model, context, None, None, hooks).await;
     assert!(result.is_some(), "the warm request must complete");
     let carried = seen
         .lock()
@@ -326,6 +328,106 @@ async fn warm_once_with_hooks_carries_the_hooks_to_the_provider_request() {
         carried.on_payload.is_some(),
         "the warm request must carry the explicit per-request hooks"
     );
+}
+
+/// Records the transcript allocation each provider request carried: the
+/// messages pointer plus the length. A `Context::clone` allocates a new
+/// message buffer, so an unchanged pointer proves the owned warm path moved
+/// the snapshot instead of copying it.
+struct ContextSeamProvider {
+    seen: Arc<Mutex<Option<(usize, usize)>>>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl Provider for ContextSeamProvider {
+    fn id(&self) -> &str {
+        "hookrec"
+    }
+    fn name(&self) -> &str {
+        "hookrec"
+    }
+    fn get_models(&self) -> Vec<Model> {
+        vec![model_with("hookrec", "rec-model")]
+    }
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        vec![ApiKeyAuth::new("fake key", vec!["FAKE_TEST_KEY".into()])]
+    }
+    fn stream(
+        &self,
+        _model: &Model,
+        context: Context,
+        _options: pir::ai::types::StreamOptions,
+    ) -> AssistantMessageEventStream {
+        *self.seen.lock().unwrap() =
+            Some((context.messages.as_ptr() as usize, context.messages.len()));
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let stream = AssistantMessageEventStream::new();
+        stream.push(AssistantMessageEventStream::done_event(
+            TerminalReason::Stop,
+            AssistantMessage {
+                api: "fake".into(),
+                provider: "hookrec".into(),
+                model: "rec-model".into(),
+                stop_reason: StopReason::Stop,
+                ..Default::default()
+            },
+        ));
+        stream
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn owned_warm_path_moves_the_transcript_without_a_second_clone() {
+    let seen: Arc<Mutex<Option<(usize, usize)>>> = Arc::new(Mutex::new(None));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(ContextSeamProvider {
+        seen: Arc::clone(&seen),
+        calls: Arc::clone(&calls),
+    }));
+    let model = model_with("hookrec", "rec-model");
+    let read_seen = |seen: &Arc<Mutex<Option<(usize, usize)>>>| {
+        seen.lock().unwrap().expect("provider saw a request")
+    };
+
+    // Owned hot path: the snapshot is already owned by the warming task, so
+    // the provider must receive the SAME message allocation.
+    let context = Context {
+        system_prompt: None,
+        messages: vec![user_message("hi"), user_message("there")],
+        tools: None,
+    };
+    let expected = (context.messages.as_ptr() as usize, context.messages.len());
+    let result =
+        warm_once_with_hooks_owned(&registry, &model, context, None, None, Default::default())
+            .await;
+    assert!(result.is_some(), "the warm request must complete");
+    assert_eq!(
+        read_seen(&seen),
+        expected,
+        "the owned warm path must move the transcript, not clone it"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // Control: the borrowed compatibility wrapper still clones for callers
+    // that only have a reference. The pointer seam catches that clone, so the
+    // assertion above is meaningful.
+    let borrowed = Context {
+        system_prompt: None,
+        messages: vec![user_message("hi"), user_message("there")],
+        tools: None,
+    };
+    let borrowed_ptr = borrowed.messages.as_ptr() as usize;
+    let result =
+        warm_once_with_hooks(&registry, &model, &borrowed, None, None, Default::default()).await;
+    assert!(result.is_some(), "the warm request must complete");
+    let (cloned_ptr, cloned_len) = read_seen(&seen);
+    assert_eq!(cloned_len, borrowed.messages.len());
+    assert_ne!(
+        cloned_ptr, borrowed_ptr,
+        "the borrowed wrapper clones by design (proving the pointer seam discriminates)"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "current_thread")]

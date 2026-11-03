@@ -48,10 +48,6 @@ pub struct SplitErrorToolResult {
 /// as the tool result and the caption and images after all tool results of the
 /// turn, in the same user message. Returns `None` for results that need no
 /// split (#10794).
-#[cfg_attr(
-    not(any(feature = "provider-anthropic", feature = "provider-bedrock")),
-    allow(dead_code)
-)]
 pub fn split_error_tool_result_images(message: &ToolResultMessage) -> Option<SplitErrorToolResult> {
     if !message.is_error {
         return None;
@@ -107,14 +103,6 @@ pub fn normalize_id_part(part: &str) -> String {
 /// by the Anthropic, Google, and OpenAI Completions adapters). Unlike
 /// [`normalize_id_part`] it keeps trailing separators and does not cap the
 /// length; callers truncate as their provider requires.
-#[cfg_attr(
-    not(any(
-        feature = "provider-anthropic",
-        feature = "provider-openai",
-        feature = "provider-google"
-    )),
-    allow(dead_code)
-)]
 pub(crate) fn sanitize_id_part(part: &str) -> String {
     part.chars()
         .map(|c| {
@@ -203,6 +191,46 @@ fn replace_images_with_placeholder(
     result
 }
 
+/// One transformed message in a replay list: borrowed when unchanged, boxed
+/// when the transform had to rebuild it.
+///
+/// A `Cow<'a, Message>` would be the natural shape, but `Message` is a large
+/// enum (~600 bytes in debug builds), so a `Vec<Cow<Message>>` for a
+/// 75k-message transcript costs ~45 MB per pass — twice that across
+/// [`transform_messages_lazy_iter`]'s two passes. A pointer + box is 16 bytes
+/// and keeps the large payload behind one heap allocation only when a message
+/// actually changes.
+pub enum LazyMessage<'a> {
+    Borrowed(&'a Message),
+    Owned(Box<Message>),
+}
+
+impl LazyMessage<'_> {
+    pub fn into_owned(self) -> Message {
+        match self {
+            Self::Borrowed(message) => message.clone(),
+            Self::Owned(message) => *message,
+        }
+    }
+}
+
+impl std::ops::Deref for LazyMessage<'_> {
+    type Target = Message;
+
+    fn deref(&self) -> &Message {
+        match self {
+            Self::Borrowed(message) => message,
+            Self::Owned(message) => message,
+        }
+    }
+}
+
+impl AsRef<Message> for LazyMessage<'_> {
+    fn as_ref(&self) -> &Message {
+        self
+    }
+}
+
 /// Transform one transcript for replay against `model` (upstream
 /// `transformMessages`). `normalize_tool_call_id` is invoked for tool calls on
 /// messages from a different provider/api/model; the mapping is applied to the
@@ -214,7 +242,7 @@ pub fn transform_messages(
 ) -> Vec<Message> {
     transform_messages_lazy(messages, model, normalize_tool_call_id)
         .into_iter()
-        .map(std::borrow::Cow::into_owned)
+        .map(LazyMessage::into_owned)
         .collect()
 }
 
@@ -234,7 +262,7 @@ pub fn transform_messages_lazy<'a>(
     messages: &'a [Message],
     model: &Model,
     normalize_tool_call_id: Option<NormalizeToolCallId<'_>>,
-) -> Vec<std::borrow::Cow<'a, Message>> {
+) -> Vec<LazyMessage<'a>> {
     transform_messages_lazy_iter(messages.iter(), model, normalize_tool_call_id)
 }
 
@@ -252,7 +280,7 @@ pub fn transform_messages_lazy_refs<'a>(
     messages: &[&'a Message],
     model: &Model,
     normalize_tool_call_id: Option<NormalizeToolCallId<'_>>,
-) -> Vec<std::borrow::Cow<'a, Message>> {
+) -> Vec<LazyMessage<'a>> {
     transform_messages_lazy_iter(messages.iter().copied(), model, normalize_tool_call_id)
 }
 
@@ -264,19 +292,17 @@ fn transform_messages_lazy_iter<'a, I>(
     messages: I,
     model: &Model,
     normalize_tool_call_id: Option<NormalizeToolCallId<'_>>,
-) -> Vec<std::borrow::Cow<'a, Message>>
+) -> Vec<LazyMessage<'a>>
 where
     I: IntoIterator<Item = &'a Message>,
 {
-    use std::borrow::Cow;
-
     let supports_images = model.input.iter().any(|input| input == "image");
 
     // First pass: image downgrade, thinking/text lowering, tool-call id
     // normalization (recorded into a map for the tool results).
     let mut tool_call_id_map: Vec<(String, String)> = Vec::new();
     let messages = messages.into_iter();
-    let mut transformed: Vec<Cow<'a, Message>> = Vec::with_capacity(messages.size_hint().0);
+    let mut transformed: Vec<LazyMessage<'a>> = Vec::with_capacity(messages.size_hint().0);
     for message in messages {
         transformed.push(transform_message_lazy(
             message,
@@ -290,7 +316,7 @@ where
     // Second pass: synthetic tool results for orphaned calls, errored/aborted
     // assistant skip, system messages held across pending tool calls.
     let mut pending = PendingToolCalls::default();
-    let mut result: Vec<Cow<'a, Message>> = Vec::with_capacity(transformed.len());
+    let mut result: Vec<LazyMessage<'a>> = Vec::with_capacity(transformed.len());
     for message in transformed {
         match &*message {
             Message::Assistant(assistant) => {
@@ -344,7 +370,7 @@ fn transform_message_lazy<'a>(
     normalize_tool_call_id: Option<NormalizeToolCallId<'_>>,
     tool_call_id_map: &mut Vec<(String, String)>,
     supports_images: bool,
-) -> std::borrow::Cow<'a, Message> {
+) -> LazyMessage<'a> {
     use std::borrow::Cow;
 
     match message {
@@ -353,27 +379,27 @@ fn transform_message_lazy<'a>(
             // receives a text-only message: borrow it instead of rebuilding
             // the whole content list (every request replays the transcript).
             if supports_images || !has_image_block(&user.content) {
-                return Cow::Borrowed(message);
+                return LazyMessage::Borrowed(message);
             }
-            Cow::Owned(Message::User(crate::ai::types::UserMessage {
+            LazyMessage::Owned(Box::new(Message::User(crate::ai::types::UserMessage {
                 content: replace_images_with_placeholder(
                     &user.content,
                     NON_VISION_USER_IMAGE_PLACEHOLDER,
                 ),
                 ..user.clone()
-            }))
+            })))
         }
         // System/developer messages are replayed unchanged (they only carry
         // text; the image downgrade does not apply to them).
-        Message::System(_) | Message::Developer(_) => Cow::Borrowed(message),
+        Message::System(_) | Message::Developer(_) => LazyMessage::Borrowed(message),
         Message::Assistant(assistant) => match transform_assistant_lazy(
             assistant,
             model,
             normalize_tool_call_id,
             tool_call_id_map,
         ) {
-            Cow::Borrowed(_) => Cow::Borrowed(message),
-            Cow::Owned(assistant) => Cow::Owned(Message::Assistant(assistant)),
+            Cow::Borrowed(_) => LazyMessage::Borrowed(message),
+            Cow::Owned(assistant) => LazyMessage::Owned(Box::new(Message::Assistant(assistant))),
         },
         Message::ToolResult(tool_result) => {
             // ToolResult: remap the tool call id when the matching call was
@@ -387,7 +413,7 @@ fn transform_message_lazy<'a>(
             // borrowed, not rebuilt (tool output can be megabytes).
             let needs_image_downgrade = !supports_images && has_image_block(&tool_result.content);
             if !needs_image_downgrade && normalized.is_none() {
-                return Cow::Borrowed(message);
+                return LazyMessage::Borrowed(message);
             }
             let mut result = tool_result.clone();
             if needs_image_downgrade {
@@ -399,7 +425,7 @@ fn transform_message_lazy<'a>(
             if let Some(normalized) = normalized {
                 result.tool_call_id = normalized;
             }
-            Cow::Owned(Message::ToolResult(result))
+            LazyMessage::Owned(Box::new(Message::ToolResult(result)))
         }
     }
 }
@@ -412,44 +438,162 @@ fn transform_message_lazy<'a>(
 struct PendingToolCalls<'a> {
     calls: Vec<(String, String)>,
     answered: Vec<String>,
-    held: Vec<std::borrow::Cow<'a, Message>>,
+    held: Vec<LazyMessage<'a>>,
+}
+
+/// The synthetic tool result the orphaned-call pass inserts.
+fn missing_tool_result(id: String, name: String) -> Message {
+    Message::ToolResult(ToolResultMessage {
+        role: crate::ai::types::ToolResultRole::ToolResult,
+        tool_call_id: id,
+        tool_name: name,
+        content: vec![ContentBlock::Text(crate::ai::types::TextContent {
+            text: "No result provided".to_string(),
+            text_signature: None,
+        })],
+        details: None,
+        usage: None,
+        added_tool_names: Vec::new(),
+        structured_content: None,
+        nested_calls: None,
+        is_error: true,
+        duration_ms: None,
+        timestamp: crate::ai::util::now_ms(),
+    })
 }
 
 impl<'a> PendingToolCalls<'a> {
     /// Synthesize `No result provided` tool results for every pending call
     /// without one, then release the held system messages.
-    fn close(&mut self, out: &mut Vec<std::borrow::Cow<'a, Message>>) {
+    fn close(&mut self, out: &mut Vec<LazyMessage<'a>>) {
         for (id, name) in self.calls.drain(..) {
             if !self.answered.contains(&id) {
-                out.push(std::borrow::Cow::Owned(Message::ToolResult(
-                    ToolResultMessage {
-                        role: crate::ai::types::ToolResultRole::ToolResult,
-                        tool_call_id: id,
-                        tool_name: name,
-                        content: vec![ContentBlock::Text(crate::ai::types::TextContent {
-                            text: "No result provided".to_string(),
-                            text_signature: None,
-                        })],
-                        details: None,
-                        usage: None,
-                        added_tool_names: Vec::new(),
-                        structured_content: None,
-                        nested_calls: None,
-                        is_error: true,
-                        duration_ms: None,
-                        timestamp: crate::ai::util::now_ms(),
-                    },
-                )));
+                out.push(LazyMessage::Owned(Box::new(missing_tool_result(id, name))));
             }
         }
         self.answered.clear();
         out.append(&mut self.held);
     }
+
+    /// [`Self::close`] with the messages emitted one at a time instead of
+    /// collected — the streaming replay path.
+    fn close_emit<E>(&mut self, emit: &mut impl FnMut(&Message) -> Result<(), E>) -> Result<(), E> {
+        let calls = std::mem::take(&mut self.calls);
+        for (id, name) in calls {
+            if !self.answered.contains(&id) {
+                emit(&missing_tool_result(id, name))?;
+            }
+        }
+        self.answered.clear();
+        let held = std::mem::take(&mut self.held);
+        for message in &held {
+            emit(message)?;
+        }
+        Ok(())
+    }
+}
+
+/// One message at a time replay transformation — the streaming twin of
+/// [`transform_messages_lazy`].
+///
+/// `transform_messages_lazy` first transforms every message, then runs the
+/// orphaned-call/skip pass over the materialized list. The second pass is a
+/// forward filter with bounded state (pending `(id, name)` pairs plus system
+/// messages held across a pending batch), so the two passes compose into one
+/// streaming pass with the SAME output order: each input message is
+/// transformed and fed to the second-pass state machine immediately, and the
+/// machine emits when a batch boundary is reached. A system message that must
+/// be held across a pending tool batch is the only message retained, and it is
+/// owned (small), never the transcript.
+pub struct StreamingMessageTransform<'a> {
+    model: &'a Model,
+    normalize_tool_call_id: Option<NormalizeToolCallId<'a>>,
+    supports_images: bool,
+    tool_call_id_map: Vec<(String, String)>,
+    pending: PendingToolCalls<'a>,
+}
+
+impl<'a> StreamingMessageTransform<'a> {
+    pub fn new(model: &'a Model, normalize_tool_call_id: Option<NormalizeToolCallId<'a>>) -> Self {
+        Self {
+            model,
+            normalize_tool_call_id,
+            supports_images: model.input.iter().any(|input| input == "image"),
+            tool_call_id_map: Vec::new(),
+            pending: PendingToolCalls::default(),
+        }
+    }
+
+    /// Feed one transcript message; emit every transformed message it
+    /// contributes in wire order.
+    pub fn push<E>(
+        &mut self,
+        message: &Message,
+        emit: &mut impl FnMut(&Message) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let transformed = transform_message_lazy(
+            message,
+            self.model,
+            self.normalize_tool_call_id,
+            &mut self.tool_call_id_map,
+            self.supports_images,
+        );
+        self.apply(transformed, emit)
+    }
+
+    /// Flush the second-pass state at the end of the transcript.
+    pub fn finish<E>(&mut self, emit: &mut impl FnMut(&Message) -> Result<(), E>) -> Result<(), E> {
+        self.pending.close_emit(emit)
+    }
+
+    fn apply<E>(
+        &mut self,
+        message: LazyMessage<'_>,
+        emit: &mut impl FnMut(&Message) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if let Message::Assistant(assistant) = &*message {
+            let retry_failed = matches!(
+                assistant.stop_reason,
+                crate::ai::types::StopReason::Error | crate::ai::types::StopReason::Aborted
+            );
+            let calls: Vec<(String, String)> = assistant
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolCall(call) => Some((call.id.clone(), call.name.clone())),
+                    _ => None,
+                })
+                .collect();
+            self.pending.close_emit(emit)?;
+            if retry_failed {
+                // Skip errored/aborted assistant messages entirely.
+                return Ok(());
+            }
+            self.pending.calls = calls;
+            self.pending.answered.clear();
+            return emit(&message);
+        }
+        if let Message::ToolResult(tool_result) = &*message {
+            self.pending.answered.push(tool_result.tool_call_id.clone());
+            return emit(&message);
+        }
+        if matches!(&*message, Message::System(_)) {
+            if !self.pending.calls.is_empty() {
+                self.pending
+                    .held
+                    .push(LazyMessage::Owned(Box::new(message.into_owned())));
+                return Ok(());
+            }
+            return emit(&message);
+        }
+        self.pending.close_emit(emit)?;
+        emit(&message)
+    }
 }
 
 /// Transform one assistant message's content blocks for replay, borrowing the
-/// message when the transformation is the identity (same model, no id
-/// normalization, no empty thinking block to drop).
+/// message when the transformation is the identity (same model, no empty
+/// thinking block to drop).
 fn transform_assistant_lazy<'a>(
     assistant: &'a AssistantMessage,
     model: &Model,
@@ -462,15 +606,15 @@ fn transform_assistant_lazy<'a>(
     // Same-model replay keeps signed thinking, text and tool calls as they
     // are; the ONLY block it drops is an unsigned thinking block whose text is
     // whitespace-only (the signed/redacted checks precede the emptiness check
-    // in the loop below).
+    // in the loop below). Tool-call id normalization runs only on the
+    // cross-model branch below, so a same-model message is the identity even
+    // when the caller passed a normalizer: borrowing it avoids rebuilding
+    // every assistant message (and copying its text) on each request.
     let drops_empty_thinking = |block: &ContentBlock| {
         matches!(block, ContentBlock::Thinking(thinking)
             if thinking.thinking_signature.is_none() && thinking.thinking.trim().is_empty())
     };
-    if same_model
-        && normalize_tool_call_id.is_none()
-        && !assistant.content.iter().any(drops_empty_thinking)
-    {
+    if same_model && !assistant.content.iter().any(drops_empty_thinking) {
         // Same model: text, signed thinking and tool calls replay unchanged;
         // only a whitespace-only thinking block is dropped.
         return Cow::Borrowed(assistant);

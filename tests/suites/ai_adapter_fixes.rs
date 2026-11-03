@@ -1568,10 +1568,7 @@ fn azure_params_omit_prompt_cache_retention() {
         &context,
         &options,
         &compat,
-        "gpt-5.2",
-        pir::ai::api::openai_responses::shared::OPENAI_TOOL_CALL_PROVIDERS,
-        false,
-        None,
+        &pir::ai::api::openai_responses::shared::ResponsesWireOptions::new("gpt-5.2"),
     )
     .expect("params");
     assert_eq!(params["prompt_cache_retention"], json!("24h"));
@@ -1851,12 +1848,14 @@ async fn transport_retry_hook_reports_the_schedule_and_proceeds() {
 
     let result = client
         .request_streaming(
-            reqwest::Method::GET,
-            &format!("{base}/models"),
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                reqwest::Method::GET,
+                &format!("{base}/models"),
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             Vec::new(),
-            None,
-            &hooks,
             &mut |_chunk| Ok(()),
         )
         .await;
@@ -1898,12 +1897,14 @@ async fn transport_retry_hook_cancel_fails_with_retry_cancelled() {
 
     let result = client
         .request_streaming(
-            reqwest::Method::GET,
-            &format!("{base}/models"),
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                reqwest::Method::GET,
+                &format!("{base}/models"),
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             Vec::new(),
-            None,
-            &hooks,
             &mut |_chunk| Ok(()),
         )
         .await;
@@ -1954,12 +1955,14 @@ async fn transport_retry_hook_wait_still_honours_the_request_signal() {
     let started = Instant::now();
     let result = client
         .request_streaming(
-            reqwest::Method::GET,
-            &format!("{base}/models"),
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                reqwest::Method::GET,
+                &format!("{base}/models"),
+                &BTreeMap::new(),
+                Some(&signal),
+                &hooks,
+            ),
             Vec::new(),
-            Some(&signal),
-            &hooks,
             &mut |_chunk| Ok(()),
         )
         .await;

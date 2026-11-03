@@ -552,11 +552,8 @@ mod platform {
     }
 
     struct SecurityDescriptor {
-        #[allow(
-            dead_code,
-            reason = "the box owns the memory the descriptor pointer refers to"
-        )]
-        storage: Box<SECURITY_DESCRIPTOR>,
+        // Held only to own the memory `pointer` points into.
+        _storage: Box<SECURITY_DESCRIPTOR>,
         pointer: *mut core::ffi::c_void,
     }
 
@@ -587,7 +584,10 @@ mod platform {
             {
                 return None;
             }
-            Some(Self { storage, pointer })
+            Some(Self {
+                _storage: storage,
+                pointer,
+            })
         }
     }
 }

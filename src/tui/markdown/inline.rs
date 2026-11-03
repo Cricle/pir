@@ -344,7 +344,6 @@ fn try_emit_extended_autolink(
 /// when the visible text differs from the href. `rendered_text` is the
 /// already-styled link text, `compare_text` the raw token text the href is
 /// compared against (for mailto links the prefix is stripped first).
-#[allow(clippy::too_many_arguments)]
 fn emit_styled_link(
     out: &mut String,
     rendered_text: &str,

@@ -9,11 +9,13 @@
 //!
 //! - [`MirrorCadence`] is the bounded-cadence fallback used by the adapters
 //!   whose argument fragments are parsed as a whole at each refresh: once for
-//!   the first fragment, whenever a container structurally closes, and
-//!   otherwise only every [`MIRROR_REFRESH_BYTES`] appended bytes. A stale
-//!   mirror is always the last well-formed whole-document parse, and the
-//!   FINAL arguments are always parsed fresh from the complete raw buffer at
-//!   `toolcall_end`.
+//!   the first fragment, when the ROOT container closes (the depth returns to
+//!   zero), and otherwise only every [`MIRROR_REFRESH_BYTES`] appended bytes.
+//!   Closing a nested object/array is not a completion signal: re-parsing the
+//!   whole accumulated document at every nested close is the O(n²) behavior
+//!   this cadence exists to avoid. A stale mirror is always the last
+//!   well-formed whole-document parse, and the FINAL arguments are always
+//!   parsed fresh from the complete raw buffer at `toolcall_end`.
 //! - `StreamingJsonMirror` is the incremental parser used by the OpenAI
 //!   Completions adapter (upstream Unreleased `StreamingJsonParser` /
 //!   `ToolCallArgumentsStream`). It reads every fragment once and reports the
@@ -35,13 +37,17 @@ pub(crate) const MIRROR_REFRESH_BYTES: usize = 8 * 1024;
 
 /// Per-call refresh cadence for the mirrored argument map.
 ///
-/// The close signal is STRUCTURAL, not textual: the scanner tracks whether it
-/// is inside a JSON string (with escape state across fragments) and the open
-/// container depth, so braces/brackets that are merely string content — for
-/// example a `write` payload containing `}` or `]` — never count as a
-/// container closing. A 1 MiB argument payload streamed in 20-byte fragments
-/// therefore refreshes at the byte cadence (~128 times), not once per fragment
-/// whose tail happens to end in a brace (~52k).
+/// The close signal is STRUCTURAL and TOP-LEVEL ONLY: the scanner tracks
+/// whether it is inside a JSON string (with escape state across fragments) and
+/// the open container depth, so braces/brackets that are merely string content
+/// — for example a `write` payload containing `}` or `]` — never count as a
+/// container closing, and a nested `}`/`]` only decrements the depth. Only the
+/// close that brings the depth back to zero completes the root value. A 1 MiB
+/// argument payload streamed in 20-byte fragments therefore refreshes at the
+/// byte cadence (~128 times) plus once at the final root close, not once per
+/// fragment whose tail happens to end in a brace (~52k), and not once per
+/// nested element close (which would re-parse the whole document each time,
+/// O(n²)).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MirrorCadence {
     /// Raw argument bytes appended since the last mirror refresh.
@@ -65,11 +71,11 @@ impl MirrorCadence {
 
     /// Record `appended` raw argument bytes (the size of the fragment just
     /// accumulated). Returns `true` when the caller should now rebuild the
-    /// mirrored arguments: on the first NON-EMPTY fragment, whenever this
-    /// fragment closes a top-level container (or ends on a structural closing
-    /// brace outside a string), and otherwise once per
-    /// [`MIRROR_REFRESH_BYTES`] appended. An empty fragment changes nothing,
-    /// so it never consumes the first refresh.
+    /// mirrored arguments: on the first NON-EMPTY fragment, when this
+    /// fragment closes the ROOT container (the open-container depth returns
+    /// to zero), and otherwise once per [`MIRROR_REFRESH_BYTES`] appended.
+    /// An empty fragment changes nothing, so it never consumes the first
+    /// refresh.
     pub(crate) fn record(&mut self, appended: impl AsRef<str>) -> bool {
         let appended = appended.as_ref();
         if appended.is_empty() {
@@ -78,7 +84,8 @@ impl MirrorCadence {
         self.appended_since_refresh = self.appended_since_refresh.saturating_add(appended.len());
         // Structural completion signal: the common "the call is complete"
         // case, delivered without waiting for the byte cadence (the final
-        // parse at `toolcall_end` runs regardless).
+        // parse at `toolcall_end` runs regardless). Nested containers closing
+        // must NOT trigger a whole-document parse here.
         let completes = self.scan(appended);
         if self.refreshed && !completes && self.appended_since_refresh < MIRROR_REFRESH_BYTES {
             return false;
@@ -90,14 +97,14 @@ impl MirrorCadence {
 
     /// Advance the JSON lexical state over one fragment.
     ///
-    /// Returns `true` when the fragment completes a top-level container
-    /// (depth returns to zero) or its last structural character — outside any
-    /// string literal — is a closing `}`/`]`. String content and escapes are
-    /// tracked across calls, so a brace inside a string can never trigger a
-    /// refresh.
+    /// Returns `true` only when this fragment closes the root container: the
+    /// scanner must have been inside at least one `{`/`[` (depth > 0) and the
+    /// closing `}`/`]` must bring the depth back to zero. Closing a nested
+    /// container leaves depth > 0 and is therefore not a completion signal.
+    /// String content and escapes are tracked across calls, so a brace inside
+    /// a string can never trigger a refresh.
     fn scan(&mut self, fragment: &str) -> bool {
         let mut closed_top_level = false;
-        let mut last_structural_close = false;
         for byte in fragment.bytes() {
             if self.in_string {
                 if self.escaped {
@@ -106,31 +113,25 @@ impl MirrorCadence {
                     self.escaped = true;
                 } else if byte == b'"' {
                     self.in_string = false;
-                    last_structural_close = false;
                 }
                 continue;
             }
             match byte {
                 b' ' | b'\t' | b'\n' | b'\r' => {}
-                b'"' => {
-                    self.in_string = true;
-                    last_structural_close = false;
-                }
+                b'"' => self.in_string = true,
                 b'{' | b'[' => {
                     self.depth = self.depth.saturating_add(1);
-                    last_structural_close = false;
                 }
-                b'}' | b']' => {
-                    if self.depth > 0 {
-                        self.depth -= 1;
-                        closed_top_level |= self.depth == 0;
+                b'}' | b']' if self.depth > 0 => {
+                    self.depth -= 1;
+                    if self.depth == 0 {
+                        closed_top_level = true;
                     }
-                    last_structural_close = true;
                 }
-                _ => last_structural_close = false,
+                _ => {}
             }
         }
-        closed_top_level || last_structural_close
+        closed_top_level
     }
 }
 
@@ -950,3 +951,270 @@ pub(crate) mod streaming_json {
 }
 
 pub(crate) use streaming_json::{apply_json_changes, JsonChange, StreamingJsonMirror};
+
+#[cfg(test)]
+mod tests {
+    use super::{MirrorCadence, MIRROR_REFRESH_BYTES};
+
+    /// Number of times the caller would run a whole-document parse: every
+    /// `record()` that reports a refresh.
+    fn count_refreshes(fragments: &[&str]) -> usize {
+        let mut cadence = MirrorCadence::new();
+        fragments
+            .iter()
+            .filter(|fragment| cadence.record(*fragment))
+            .count()
+    }
+
+    fn split_every(text: &str, step: usize) -> Vec<&str> {
+        let mut parts = Vec::new();
+        let mut start = 0;
+        while start < text.len() {
+            let mut end = (start + step).min(text.len());
+            while end < text.len() && !text.is_char_boundary(end) {
+                end += 1;
+            }
+            parts.push(&text[start..end]);
+            start = end;
+        }
+        parts
+    }
+
+    /// Split immediately after every structural `}`/`]` outside strings. This
+    /// is the adversarial fragmentation for the old completion rule: almost
+    /// every fragment ends in a closer, so the old implementation re-parsed
+    /// the whole accumulated document once per fragment.
+    fn split_after_structural_closers(text: &str) -> Vec<&str> {
+        let bytes = text.as_bytes();
+        let mut parts = Vec::new();
+        let mut start = 0;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (index, &byte) in bytes.iter().enumerate() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            if byte == b'"' {
+                in_string = true;
+            } else if byte == b'}' || byte == b']' {
+                parts.push(&text[start..=index]);
+                start = index + 1;
+            }
+        }
+        if start < text.len() {
+            parts.push(&text[start..]);
+        }
+        parts
+    }
+
+    fn nested_arguments(items: usize) -> String {
+        let items: Vec<serde_json::Value> = (0..items)
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "path": format!("src/module_{index}.rs"),
+                    "meta": {
+                        "before": [1, 2, 3],
+                        "after": {
+                            "lines": [format!(
+                                "brace }} bracket ] quote \" slash \\ {index}"
+                            )],
+                        },
+                    },
+                    "nested": {"deeper": {"flag": true}},
+                })
+            })
+            .collect();
+        serde_json::to_string(&serde_json::json!({ "items": items })).expect("fixture serializes")
+    }
+
+    /// The pre-fix `MirrorCadence`: any `}`/`]` outside a string could end a
+    /// fragment and request a refresh, even when nested containers were still
+    /// open. Kept only for regression comparisons in tests.
+    #[derive(Default)]
+    struct LegacyCadence {
+        appended_since_refresh: usize,
+        refreshed: bool,
+        in_string: bool,
+        escaped: bool,
+        depth: usize,
+    }
+
+    impl LegacyCadence {
+        fn record(&mut self, fragment: &str) -> bool {
+            if fragment.is_empty() {
+                return false;
+            }
+            self.appended_since_refresh += fragment.len();
+            let mut closed_top_level = false;
+            let mut last_structural_close = false;
+            for byte in fragment.bytes() {
+                if self.in_string {
+                    if self.escaped {
+                        self.escaped = false;
+                    } else if byte == b'\\' {
+                        self.escaped = true;
+                    } else if byte == b'"' {
+                        self.in_string = false;
+                        last_structural_close = false;
+                    }
+                    continue;
+                }
+                match byte {
+                    b' ' | b'\t' | b'\n' | b'\r' => {}
+                    b'"' => {
+                        self.in_string = true;
+                        last_structural_close = false;
+                    }
+                    b'{' | b'[' => {
+                        self.depth = self.depth.saturating_add(1);
+                        last_structural_close = false;
+                    }
+                    b'}' | b']' => {
+                        if self.depth > 0 {
+                            self.depth -= 1;
+                            closed_top_level |= self.depth == 0;
+                        }
+                        last_structural_close = true;
+                    }
+                    _ => last_structural_close = false,
+                }
+            }
+            if self.refreshed
+                && !(closed_top_level || last_structural_close)
+                && self.appended_since_refresh < MIRROR_REFRESH_BYTES
+            {
+                return false;
+            }
+            self.appended_since_refresh = 0;
+            self.refreshed = true;
+            true
+        }
+    }
+
+    fn legacy_refresh_count(fragments: &[&str]) -> usize {
+        let mut cadence = LegacyCadence::default();
+        fragments
+            .iter()
+            .filter(|fragment| cadence.record(fragment))
+            .count()
+    }
+
+    #[test]
+    fn only_the_root_close_completes_a_nested_stream() {
+        let mut cadence = MirrorCadence::new();
+        assert!(
+            cadence.record(r#"{"a":{"b":[1,2,3"#),
+            "first fragment refreshes"
+        );
+        assert!(
+            !cadence.record("]"),
+            "closing a nested array must not refresh"
+        );
+        assert!(
+            !cadence.record("}"),
+            "closing a nested object must not refresh"
+        );
+        assert!(cadence.record("}"), "closing the root object refreshes");
+        assert_eq!(cadence.depth, 0);
+        assert!(!cadence.in_string);
+    }
+
+    #[test]
+    fn nested_container_closes_stay_on_the_byte_cadence() {
+        let document = nested_arguments(600);
+        assert!(
+            document.len() > MIRROR_REFRESH_BYTES * 8,
+            "fixture must span several cadence windows (got {} bytes)",
+            document.len()
+        );
+        let fragments = split_after_structural_closers(&document);
+        assert!(
+            fragments.len() > 1_000,
+            "fixture must have many nested closes"
+        );
+
+        let refreshes = count_refreshes(&fragments);
+        // First fragment + one refresh per MIRROR_REFRESH_BYTES window + the
+        // final root close. This is linear in the input size and independent
+        // of the number of nested containers.
+        let linear_bound = 3 + document.len() / MIRROR_REFRESH_BYTES;
+        assert!(
+            refreshes <= linear_bound,
+            "nested closes caused {refreshes} whole-document parses for {} bytes (bound {linear_bound})",
+            document.len()
+        );
+
+        let legacy = legacy_refresh_count(&fragments);
+        assert!(
+            legacy > refreshes * 8,
+            "the old completion rule should be clearly superlinear: legacy={legacy}, fixed={refreshes}"
+        );
+    }
+
+    #[test]
+    fn braces_and_escapes_inside_strings_never_end_the_document() {
+        let document = r#"{"path":"C:\\temp\\}","text":"closing } ] and opening { [ plus \"quote\" and \\ backslash","tail":{"k":[1,2]}}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(document).is_ok());
+
+        // One-byte fragments split every escape sequence and every brace.
+        let fragments = split_every(document, 1);
+        let refreshes = count_refreshes(&fragments);
+        assert_eq!(
+            refreshes, 2,
+            "only the first fragment and the root close may parse"
+        );
+
+        let mut cadence = MirrorCadence::new();
+        for fragment in &fragments {
+            cadence.record(*fragment);
+        }
+        assert_eq!(cadence.depth, 0);
+        assert!(!cadence.in_string);
+    }
+
+    #[test]
+    fn truncated_json_does_not_complete_but_keeps_the_byte_cadence() {
+        // Open object -> nested object -> array, then a string whose `\u`
+        // escape is split across fragments and a `}` that is merely string
+        // content. No completion may fire while the containers stay open.
+        let mut cadence = MirrorCadence::new();
+        assert!(cadence.record(r#"{"a":{"b":["#));
+        assert!(!cadence.record(r#""unterminated \u00"#));
+        assert!(
+            !cadence.record("}"),
+            "a closer inside a string is not structural"
+        );
+        assert!(!cadence.record(r#"12"#));
+        // End the string literal; this is not a structural close either, but
+        // it makes the following `]`/`}` real container closers.
+        assert!(!cadence.record("\""));
+        assert!(!cadence.record("]}"));
+        assert!(cadence.record("}"));
+
+        // A genuinely truncated stream keeps refreshing only at the byte
+        // cadence; it never reports structural completion.
+        let mut cadence = MirrorCadence::new();
+        assert!(cadence.record(r#"{"tool":{"args":["#));
+        let mut refreshes = 1;
+        for _ in 0..20_000 {
+            if cadence.record("1234567890") {
+                refreshes += 1;
+            }
+        }
+        assert_eq!(
+            refreshes,
+            1 + 200_000 / MIRROR_REFRESH_BYTES,
+            "truncated streams must stay on the byte cadence"
+        );
+        assert_eq!(cadence.depth, 3);
+        assert!(!cadence.in_string);
+    }
+}

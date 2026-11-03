@@ -14,7 +14,10 @@
 //! - every command is correlated by a client-issued `req_N` id
 //!   (`pendingRequests`), with a per-request timeout;
 //! - events are delivered to [`RpcClient::on_event`] listeners and to
-//!   [`RpcClient::events`] broadcast receivers;
+//!   [`RpcClient::events`] receivers. The async fan-out is bounded by both
+//!   event count and serialized bytes; a receiver that falls behind is given
+//!   an explicit `event_stream_lagged` value (with the exact `missing` count)
+//!   before the next retained event instead of silently losing the gap;
 //! - [`RpcClient::wait_for_idle`]/[`RpcClient::wait_for_settled`] wait for the
 //!   `agent_settled` event, [`RpcClient::collect_events`] and
 //!   [`RpcClient::prompt_and_wait`] are the upstream `collectEvents` /
@@ -28,7 +31,7 @@
 //! with the same error (upstream `rejectPendingRequests`) and marks the
 //! client closed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -47,10 +50,32 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// (upstream 60 s).
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How many events a [`RpcClient::events`] receiver may fall behind before
-/// `recv` reports `Lagged` (the listener callbacks never lag: they run on the
-/// reader task).
+/// How many events the [`RpcClient::events`] fan-out retains (the listener
+/// callbacks never lag: they run on the reader task).
 pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Byte cap for the [`RpcClient::events`] fan-out: the sum of the serialized
+/// sizes of all retained events stays at or below this many bytes. Event
+/// frames are capped at [`MAX_PROTOCOL_LINE_BYTES`] each, so a count-only
+/// 1024-entry ring could pin a gigabyte of snapshots; this bound keeps the
+/// retained payload at 16 MiB and drops the oldest events instead.
+///
+/// The accounting unit is the **compact JSON encoding** of each event (exactly
+/// what `serde_json` emits: no whitespace, UTF-8, no trailing newline). It is
+/// deliberately not an RSS/heap measurement: the in-memory [`Value`] adds an
+/// enum tag, `Vec`/`Map` allocations and per-element overhead that are not
+/// counted, so actual heap use can be a multiple of
+/// [`RpcEventBufferStats::buffered_bytes`] (worst for numeric arrays, whose
+/// JSON is 1-2 bytes per element). Treat this as a wire-format budget, not a
+/// hard process-memory bound.
+pub const EVENT_CHANNEL_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
+
+/// Largest single event admitted to the [`RpcClient::events`] fan-out,
+/// measured as its serialized JSON size. A larger value is replaced by an
+/// `event_stream_lagged` marker (`reason: "event_too_large"`) instead of
+/// being retained. Well-formed peer lines are already bounded by
+/// [`MAX_PROTOCOL_LINE_BYTES`], so this only guards in-process producers.
+pub const MAX_EVENT_BYTES: usize = 2 * MAX_PROTOCOL_LINE_BYTES;
 
 /// Default grace period [`RpcClient::close`] gives the child to exit after
 /// stdin closes before killing it.
@@ -178,13 +203,400 @@ impl Drop for RpcEventSubscription {
     }
 }
 
+/// Snapshot of the bounded [`RpcClient::events`] fan-out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcEventBufferStats {
+    /// Events currently retained by the shared ring.
+    pub buffered_events: usize,
+    /// Compact JSON bytes currently retained by the shared ring (see
+    /// [`EVENT_CHANNEL_BYTE_CAPACITY`]). This is a serialized-byte budget,
+    /// not an estimate of the `Value` heap or process RSS.
+    pub buffered_bytes: usize,
+    /// Events evicted because the count or byte cap was exceeded.
+    pub dropped_events: u64,
+    /// Single events rejected for exceeding [`MAX_EVENT_BYTES`].
+    pub oversized_events: u64,
+    /// Sum of the `missing` counts handed to receivers in
+    /// `event_stream_lagged` values so far.
+    pub reported_missing: u64,
+    /// Number of `event_stream_lagged` values handed to receivers so far.
+    pub lag_notices: u64,
+}
+
+/// One retained event in the fan-out ring.
+struct BufferedEvent {
+    /// Monotonic sequence assigned when the event entered the ring. Evicted
+    /// sequence numbers are exactly what a lagging receiver is told it missed.
+    sequence: u64,
+    value: Value,
+    /// Exact compact JSON size counted by [`EVENT_CHANNEL_BYTE_CAPACITY`].
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct EventHubState {
+    buffered: VecDeque<BufferedEvent>,
+    /// Sequence number the next stored event will receive.
+    next_sequence: u64,
+    /// Sum of `bytes` over `buffered`.
+    bytes: usize,
+    /// Number of live [`RpcEventReceiver`]s.
+    ///
+    /// Guarded by the same mutex as `next_sequence`: [`EventHub::subscribe`]
+    /// snapshots the cursor and registers here in one critical section, and
+    /// [`EventHub::send`] decides whether to store under this lock. That is
+    /// what makes "cursor snapshot + registration" atomic, so no event can be
+    /// appended between reading the cursor and becoming a subscriber (which
+    /// would silently skip it for the new receiver without a gap marker).
+    subscribers: usize,
+    closed: bool,
+}
+
+/// Bounded event fan-out for [`RpcClient::events`].
+///
+/// Unlike `tokio::sync::broadcast`, the ring is bounded by BOTH event count
+/// and serialized bytes: a burst of large snapshots cannot pin a gigabyte of
+/// memory just because it stayed at or below the 1024-entry count. Dropped
+/// events are never silent: a receiver that missed events gets an in-band
+/// `event_stream_lagged` value (with the exact `missing` count) before the
+/// next retained event, and the loss is counted in
+/// [`RpcClient::event_buffer_stats`].
+struct EventHub {
+    state: Mutex<EventHubState>,
+    /// Wake-up channel only; event values live in `state` (authoritative).
+    /// Lagging this channel is harmless: receivers re-check the state.
+    wake: broadcast::Sender<()>,
+    count_capacity: usize,
+    byte_capacity: usize,
+    max_event_bytes: usize,
+    dropped_events: AtomicU64,
+    oversized_events: AtomicU64,
+    reported_missing: AtomicU64,
+    lag_notices: AtomicU64,
+}
+
+thread_local! {
+    /// Test-only hook used by [`RpcClient::events_with_registration_hook_for_test`].
+    ///
+    /// It runs inside [`EventHub::subscribe`] after the cursor snapshot and
+    /// before the subscriber count is bumped, with the state lock held. The
+    /// regression test uses it to inject a concurrent `send` into the
+    /// registration window and assert that it cannot observe zero subscribers.
+    static REGISTRATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn run_registration_hook() {
+    let hook = REGISTRATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+impl EventHub {
+    fn new(count_capacity: usize, byte_capacity: usize, max_event_bytes: usize) -> Self {
+        let (wake, _) = broadcast::channel(64);
+        Self {
+            state: Mutex::new(EventHubState::default()),
+            wake,
+            count_capacity,
+            byte_capacity,
+            max_event_bytes,
+            dropped_events: AtomicU64::new(0),
+            oversized_events: AtomicU64::new(0),
+            reported_missing: AtomicU64::new(0),
+            lag_notices: AtomicU64::new(0),
+        }
+    }
+
+    fn subscribe(self: &Arc<Self>) -> RpcEventReceiver {
+        // Arming the wake channel, snapshotting the cursor and registering
+        // the subscriber all happen while holding `state`. `send` decides
+        // whether to store under that same lock, so a concurrent send either
+        // commits before this registration (its value was never claimed by
+        // this receiver) or commits after it with a sequence >= this cursor
+        // (the receiver observes it, or an explicit lag marker if it was
+        // evicted later). There is no "cursor read but not yet registered"
+        // window in which a stored event could be skipped without a marker.
+        //
+        // Holding `state` across `wake.subscribe()` is deliberate: the wake
+        // subscription must be armed before registration so a later send's
+        // `wake.send` reaches this receiver, and doing it inside the critical
+        // section moves the registration point to lock acquisition instead of
+        // after the wake subscription. `send`/`close` only call `wake.send`
+        // after releasing `state`, so the lock order cannot invert.
+        //
+        // "Events emitted before `events()`" are still not replayed: the
+        // cursor starts at the sequence after everything already stored.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wake = self.wake.subscribe();
+        let next_sequence = state.next_sequence;
+        // `#[doc(hidden)]` test seam: runs between the cursor snapshot and the
+        // registration while this lock is held, so a concurrent send cannot
+        // observe an intermediate (unregistered) state.
+        run_registration_hook();
+        state.subscribers += 1;
+        drop(state);
+        RpcEventReceiver {
+            hub: Arc::clone(self),
+            wake,
+            next_sequence,
+        }
+    }
+
+    fn has_subscribers(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .subscribers
+            > 0
+    }
+
+    fn send(&self, value: Value) {
+        // `broadcast::Sender::send` does not retain events when nobody is
+        // subscribed; do the same and avoid serializing/storing a large
+        // snapshot. This first check is only a fast path; the authoritative
+        // one is repeated below under the `state` lock, the same critical
+        // section that registers subscribers.
+        if !self.has_subscribers() {
+            return;
+        }
+        let mut value = value;
+        let mut bytes = serialized_event_bytes(&value);
+        if bytes > self.max_event_bytes || bytes > self.byte_capacity {
+            // A single event that cannot fit the budget is rejected: keep a
+            // small observable marker instead of pinning the oversized value.
+            self.oversized_events.fetch_add(1, Ordering::SeqCst);
+            value = lag_event(1, "event_too_large");
+            bytes = serialized_event_bytes(&value);
+        }
+        let evicted = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Re-check under the lock: `subscribe` registers under this same
+            // lock, so a receiver that registers before this point is
+            // guaranteed to see the event (its cursor was snapshotted before
+            // this sequence was assigned); a receiver that registers after
+            // returns without the value.
+            if state.closed || state.subscribers == 0 {
+                return;
+            }
+            let sequence = state.next_sequence;
+            state.next_sequence += 1;
+            state.bytes += bytes;
+            state.buffered.push_back(BufferedEvent {
+                sequence,
+                value,
+                bytes,
+            });
+            let mut evicted = 0_u64;
+            // Drop oldest first: count and byte budgets are both enforced.
+            while state.bytes > self.byte_capacity || state.buffered.len() > self.count_capacity {
+                let Some(front) = state.buffered.pop_front() else {
+                    break;
+                };
+                state.bytes -= front.bytes;
+                evicted += 1;
+            }
+            evicted
+        };
+        if evicted > 0 {
+            self.dropped_events.fetch_add(evicted, Ordering::SeqCst);
+        }
+        let _ = self.wake.send(());
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closed = true;
+        drop(state);
+        let _ = self.wake.send(());
+    }
+
+    fn record_lag(&self, missing: u64) {
+        self.reported_missing.fetch_add(missing, Ordering::SeqCst);
+        self.lag_notices.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn stats(&self) -> RpcEventBufferStats {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        RpcEventBufferStats {
+            buffered_events: state.buffered.len(),
+            buffered_bytes: state.bytes,
+            dropped_events: self.dropped_events.load(Ordering::SeqCst),
+            oversized_events: self.oversized_events.load(Ordering::SeqCst),
+            reported_missing: self.reported_missing.load(Ordering::SeqCst),
+            lag_notices: self.lag_notices.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// Error returned by [`RpcEventReceiver::recv`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcEventRecvError {
+    /// The client went away and every retained event was already delivered.
+    Closed,
+}
+
+impl std::fmt::Display for RpcEventRecvError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RpcEventRecvError::Closed => write!(formatter, "rpc event stream is closed"),
+        }
+    }
+}
+
+impl std::error::Error for RpcEventRecvError {}
+
+/// Error returned by [`RpcEventReceiver::try_recv`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcEventTryRecvError {
+    /// No event is currently buffered.
+    Empty,
+    /// The client went away and every retained event was already delivered.
+    Closed,
+}
+
+/// Async event stream returned by [`RpcClient::events`].
+///
+/// The stream is bounded by both event count ([`EVENT_CHANNEL_CAPACITY`]) and
+/// serialized bytes ([`EVENT_CHANNEL_BYTE_CAPACITY`]). When a consumer falls
+/// behind, the next `recv` yields an explicit value
+/// `{"type":"event_stream_lagged","missing":N,"reason":"..."}` before the
+/// oldest retained event, so the gap is observable instead of silent.
+pub struct RpcEventReceiver {
+    hub: Arc<EventHub>,
+    wake: broadcast::Receiver<()>,
+    next_sequence: u64,
+}
+
+impl RpcEventReceiver {
+    /// Wait for the next event, or an explicit gap marker when the consumer
+    /// fell behind the bounded ring.
+    pub async fn recv(&mut self) -> Result<Value, RpcEventRecvError> {
+        loop {
+            match self.try_recv() {
+                Ok(value) => return Ok(value),
+                Err(RpcEventTryRecvError::Closed) => return Err(RpcEventRecvError::Closed),
+                Err(RpcEventTryRecvError::Empty) => {}
+            }
+            match self.wake.recv().await {
+                // The wake payload is irrelevant; the state is authoritative.
+                Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => {
+                    return match self.try_recv() {
+                        Ok(value) => Ok(value),
+                        Err(_) => Err(RpcEventRecvError::Closed),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Non-blocking [`Self::recv`].
+    pub fn try_recv(&mut self) -> Result<Value, RpcEventTryRecvError> {
+        let state = self
+            .hub
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(front) = state.buffered.front() {
+            if self.next_sequence < front.sequence {
+                let missing = front.sequence - self.next_sequence;
+                self.next_sequence = front.sequence;
+                drop(state);
+                self.hub.record_lag(missing);
+                return Ok(lag_event(missing, "buffer_overflow"));
+            }
+            let index = (self.next_sequence - front.sequence) as usize;
+            if let Some(event) = state.buffered.get(index) {
+                self.next_sequence += 1;
+                return Ok(event.value.clone());
+            }
+        } else if self.next_sequence < state.next_sequence {
+            // Everything was evicted (or already skipped) before this receipt.
+            let missing = state.next_sequence - self.next_sequence;
+            self.next_sequence = state.next_sequence;
+            drop(state);
+            self.hub.record_lag(missing);
+            return Ok(lag_event(missing, "buffer_overflow"));
+        }
+        if state.closed {
+            Err(RpcEventTryRecvError::Closed)
+        } else {
+            Err(RpcEventTryRecvError::Empty)
+        }
+    }
+}
+
+impl Drop for RpcEventReceiver {
+    fn drop(&mut self) {
+        // Paired with `EventHub::subscribe`: the count lives under the state
+        // lock so `send`'s under-lock check is exact.
+        let mut state = self
+            .hub
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.subscribers = state.subscribers.saturating_sub(1);
+    }
+}
+
+/// Exact compact JSON size of one event, counted without allocating the
+/// encoded form (large snapshots would otherwise be serialized twice).
+///
+/// This is the budget unit documented on [`EVENT_CHANNEL_BYTE_CAPACITY`]:
+/// serialized bytes, not the `Value` heap.
+fn serialized_event_bytes(value: &Value) -> usize {
+    struct Counter(usize);
+
+    impl std::io::Write for Counter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buffer.len());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(0);
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        // A value that cannot be serialized cannot be measured; treat it as
+        // oversized so it never enters the ring.
+        Err(_) => usize::MAX,
+    }
+}
+
+/// The in-band gap notification emitted by the client (never by the peer).
+fn lag_event(missing: u64, reason: &str) -> Value {
+    json!({
+        "type": "event_stream_lagged",
+        "missing": missing,
+        "reason": reason,
+    })
+}
+
 struct RpcInner {
     /// Writer task channel; `None` once the client is closed.
     writer: tokio::sync::Mutex<Option<mpsc::Sender<String>>>,
     /// Requests awaiting a response, keyed by the client-issued id.
     pending: Mutex<HashMap<String, oneshot::Sender<RpcResult>>>,
-    /// Event fan-out for async consumers.
-    events: broadcast::Sender<Value>,
+    /// Event fan-out for async consumers (count- and byte-bounded).
+    events: Arc<EventHub>,
     /// Event listeners (upstream `eventListeners`).
     listeners: RwLock<Vec<(u64, EventListener)>>,
     next_listener: AtomicU64,
@@ -251,7 +663,7 @@ impl RpcInner {
     fn dispatch_event(&self, value: Value) {
         // Broadcast first (a full/without-receivers channel is fine: upstream
         // listeners are reached below regardless).
-        let _ = self.events.send(value.clone());
+        self.events.send(value.clone());
         let listeners = self
             .listeners
             .read()
@@ -375,12 +787,16 @@ impl RpcClient {
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let events = Arc::new(EventHub::new(
+            EVENT_CHANNEL_CAPACITY,
+            EVENT_CHANNEL_BYTE_CAPACITY,
+            MAX_EVENT_BYTES,
+        ));
         let (line_tx, mut line_rx) = mpsc::channel::<String>(256);
         let inner = Arc::new(RpcInner {
             writer: tokio::sync::Mutex::new(Some(line_tx)),
             pending: Mutex::new(HashMap::new()),
-            events: event_tx,
+            events,
             listeners: RwLock::new(Vec::new()),
             next_listener: AtomicU64::new(0),
             next_request: AtomicU64::new(0),
@@ -510,11 +926,52 @@ impl RpcClient {
         }
     }
 
-    /// Subscribe to agent events as an async stream (broadcast). Events
-    /// emitted before this call are not replayed — register first, then send
-    /// the command (upstream `onEvent` has the same ordering requirement).
-    pub fn events(&self) -> broadcast::Receiver<Value> {
+    /// Subscribe to agent events as an async stream. Events emitted before
+    /// this call are not replayed — register first, then send the command
+    /// (upstream `onEvent` has the same ordering requirement).
+    ///
+    /// The cursor snapshot and the subscriber registration happen in one
+    /// critical section, so once this call returns every event the dispatcher
+    /// stores reaches this receiver (or triggers an explicit lag marker);
+    /// there is no "cursor read but not yet registered" window.
+    ///
+    /// The stream is bounded by [`EVENT_CHANNEL_CAPACITY`] entries and
+    /// [`EVENT_CHANNEL_BYTE_CAPACITY`] serialized bytes. A consumer that falls
+    /// behind receives an explicit `event_stream_lagged` value carrying the
+    /// number of missed events before the next retained event.
+    pub fn events(&self) -> RpcEventReceiver {
         self.inner.events.subscribe()
+    }
+
+    /// Test-only variant of [`Self::events`]: `hook` runs inside
+    /// [`EventHub::subscribe`] between the cursor snapshot and the subscriber
+    /// registration, while the state lock is held.
+    ///
+    /// Regression tests use it to force a concurrent `send` into the old
+    /// "cursor read but not yet registered" window. Production callers must
+    /// use [`Self::events`]; the hook is consumed by this call and never
+    /// stored.
+    #[doc(hidden)]
+    pub fn events_with_registration_hook_for_test<F>(&self, hook: F) -> RpcEventReceiver
+    where
+        F: FnOnce() + 'static,
+    {
+        REGISTRATION_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+        let receiver = self.inner.events.subscribe();
+        // The hook is taken by `subscribe`; clear a leftover from a panicking
+        // hook so it cannot leak into the next subscription on this thread.
+        REGISTRATION_HOOK.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+        receiver
+    }
+
+    /// Snapshot of the event fan-out bounds and loss counters (see
+    /// [`RpcEventBufferStats`]).
+    pub fn event_buffer_stats(&self) -> RpcEventBufferStats {
+        self.inner.events.stats()
     }
 
     /// Register a synchronous event listener (upstream `onEvent`). The
@@ -603,9 +1060,21 @@ impl RpcClient {
             self.drop_pending(&id);
             return Err(RpcClientError::Closed);
         };
-        if writer.send(line).await.is_err() {
-            self.drop_pending(&id);
-            return Err(RpcClientError::Closed);
+        // Enqueueing must share the request bound with the response wait: a
+        // peer that stops reading stdin keeps the writer task blocked in
+        // `write_all`, so a full 256-slot channel would otherwise park this
+        // send forever. Timing out cancels the queue wait, so an unsent line
+        // cannot be written later.
+        match tokio::time::timeout(self.inner.request_timeout, writer.send(line)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.drop_pending(&id);
+                return Err(RpcClientError::Closed);
+            }
+            Err(_) => {
+                self.drop_pending(&id);
+                return Err(RpcClientError::Timeout { operation: "send" });
+            }
         }
         match tokio::time::timeout(self.inner.request_timeout, receiver).await {
             Ok(Ok(response)) => response,
@@ -677,8 +1146,7 @@ impl RpcClient {
                         return Ok(value);
                     }
                 }
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(broadcast::error::RecvError::Closed)) => return Err(RpcClientError::Closed),
+                Ok(Err(RpcEventRecvError::Closed)) => return Err(RpcClientError::Closed),
                 Err(_) => return Err(RpcClientError::Timeout { operation: "event" }),
             }
         }
@@ -721,8 +1189,7 @@ impl RpcClient {
                         return Ok(events);
                     }
                 }
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(broadcast::error::RecvError::Closed)) => return Err(RpcClientError::Closed),
+                Ok(Err(RpcEventRecvError::Closed)) => return Err(RpcClientError::Closed),
                 Err(_) => {
                     return Err(RpcClientError::Timeout {
                         operation: "collect_events",
@@ -1137,6 +1604,9 @@ impl RpcInner {
     /// normal `Drop` would otherwise never run.
     fn close_now(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        // End the async event stream too: receivers drain what is retained,
+        // then observe `RpcEventRecvError::Closed`.
+        self.events.close();
         if let Ok(mut writer) = self.writer.try_lock() {
             writer.take();
         }
@@ -1180,7 +1650,7 @@ fn disposition(data: Value) -> Result<String, RpcClientError> {
 
 /// Collect from an already-subscribed receiver until `agent_settled`.
 async fn collect_from(
-    receiver: &mut broadcast::Receiver<Value>,
+    receiver: &mut RpcEventReceiver,
     timeout: Duration,
 ) -> Result<Vec<Value>, RpcClientError> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -1200,8 +1670,7 @@ async fn collect_from(
                     return Ok(events);
                 }
             }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Closed)) => return Err(RpcClientError::Closed),
+            Ok(Err(RpcEventRecvError::Closed)) => return Err(RpcClientError::Closed),
             Err(_) => {
                 return Err(RpcClientError::Timeout {
                     operation: "collect_events",

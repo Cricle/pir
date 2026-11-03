@@ -40,8 +40,17 @@ fn print_requests(label: &str, log: &Arc<Mutex<Vec<Context>>>, from: usize) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), SdkError> {
+fn main() -> std::process::ExitCode {
+    common::run_big_stack(async {
+        if let Err(error) = run().await {
+            eprintln!("error: {error:?}");
+            return std::process::ExitCode::FAILURE;
+        }
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+async fn run() -> Result<(), SdkError> {
     let (registry, model, requests) = common::ScriptedProvider::registry_recording(vec![
         common::text_message("Steering received: I will answer in one sentence."),
         common::text_message("First turn answer."),

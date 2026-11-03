@@ -29,6 +29,11 @@ use std::sync::{Arc, Mutex, Weak};
 /// One registered handler.
 type Handler<T> = Arc<dyn Fn(&T) + Send + Sync>;
 
+/// How many handlers [`EventBus::emit`] snapshots onto the stack before
+/// falling back to a heap `Vec`: a bus with at most this many subscribers
+/// publishes without allocating.
+const EMIT_INLINE_HANDLERS: usize = 8;
+
 struct Entry<T> {
     id: u64,
     handler: Handler<T>,
@@ -105,16 +110,37 @@ impl<T> EventBus<T> {
     /// Publish one event to every handler registered at call time, in
     /// registration order.
     pub fn emit(&self, event: &T) {
-        let handlers: Vec<Handler<T>> = self
+        let handlers = self
             .inner
             .handlers
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .map(|entry| Arc::clone(&entry.handler))
-            .collect();
-        for handler in handlers {
-            handler(event);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if handlers.len() <= EMIT_INLINE_HANDLERS {
+            // Stack snapshot: the whole handler list still snaps atomically
+            // under the lock (registration order preserved, later
+            // subscribe/unsubscribe during dispatch cannot race it), but the
+            // common embedding shape pays no per-emit heap allocation. The
+            // refcount bumps remain: handlers must outlive the lock.
+            let mut inline: [Option<Handler<T>>; EMIT_INLINE_HANDLERS] =
+                std::array::from_fn(|_| None);
+            for (slot, entry) in inline.iter_mut().zip(handlers.iter()) {
+                *slot = Some(Arc::clone(&entry.handler));
+            }
+            drop(handlers);
+            for slot in &mut inline {
+                if let Some(handler) = slot.take() {
+                    handler(event);
+                }
+            }
+        } else {
+            let snapshot: Vec<Handler<T>> = handlers
+                .iter()
+                .map(|entry| Arc::clone(&entry.handler))
+                .collect();
+            drop(handlers);
+            for handler in snapshot {
+                handler(event);
+            }
         }
     }
 

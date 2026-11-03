@@ -71,7 +71,7 @@ use crate::durable::session::guard::{
     FailureLatch, FailureLatchCore, GuardedStorage, SessionReport,
 };
 use crate::durable::session::publication::{
-    run_contained, CommitChange, CommitPublication, ListenerSet, TableCommitChange,
+    run_contained, CommitChange, CommitListener, CommitPublication, ListenerSet, TableCommitChange,
 };
 use crate::durable::session::transaction::{Transaction, TransactionScope};
 use crate::durable::timers::{TimerCallback, TimerHandle, Timers};
@@ -467,6 +467,201 @@ impl SessionState<'_> {
     }
 }
 
+/// A commit-listener set that knows which listeners need document changes.
+///
+/// A publication has two halves: the cheap table records (every internal
+/// consumer needs them) and the adopted document changes, which cost a full
+/// value map plus the operation batch per plan (`adopt`). Only real observers
+/// consume the document half: host subscribers and live document observers.
+/// Internal listeners that merely mirror table records — the scheduler, the
+/// task-graph view, submission waiters — and a host fan-out whose subscriber
+/// registry is empty must not force it.
+///
+/// The registration surface stays that of [`ListenerSet`], so existing
+/// internal registrations keep compiling and default to the safe
+/// document-demand classification:
+///
+/// * [`Self::add`] — always needs the document half (host listeners, document
+///   attachments, standalone views);
+/// * [`Self::add_table_only`] — never needs it;
+/// * [`Self::add_gated`] — needs it only while `probe()` reports true.
+///
+/// [`Self::mark_last_table_only`] and [`Self::mark_last_gated`] reclassify the
+/// most recently registered still-live listener. The harness uses them for the
+/// listeners installed by components it opens itself (`TaskScheduler`,
+/// `TaskGraphView`, `ConversationViews`), whose registration code lives in
+/// other modules.
+#[derive(Default)]
+pub struct GatedListeners {
+    listeners: ListenerSet,
+    /// Ids that always require document changes.
+    document: std::collections::HashSet<u64>,
+    /// Ids whose document demand is probed at each commit.
+    gated: Vec<(u64, Arc<dyn Fn() -> bool + Send + Sync>)>,
+    /// Registration order of the ids still registered.
+    order: Vec<u64>,
+}
+
+impl GatedListeners {
+    fn classify(
+        &mut self,
+        id: u64,
+        document: bool,
+        probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) {
+        if document {
+            self.document.insert(id);
+        }
+        if let Some(probe) = probe {
+            self.gated.push((id, probe));
+        }
+        self.order.push(id);
+    }
+
+    /// Register a listener that always consumes document changes.
+    pub fn add(&mut self, listener: CommitListener) -> u64 {
+        let id = self.listeners.add(listener);
+        self.classify(id, true, None);
+        id
+    }
+
+    /// Register a listener that only consumes table changes.
+    pub fn add_table_only(&mut self, listener: CommitListener) -> u64 {
+        let id = self.listeners.add(listener);
+        self.classify(id, false, None);
+        id
+    }
+
+    /// Register a listener whose document demand is decided at commit time.
+    pub fn add_gated(
+        &mut self,
+        listener: CommitListener,
+        probe: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> u64 {
+        let id = self.listeners.add(listener);
+        self.classify(id, false, Some(probe));
+        id
+    }
+
+    /// Remove one listener by id. Returns whether it was present.
+    pub fn remove(&mut self, id: u64) -> bool {
+        let removed = self.listeners.remove(id);
+        self.document.remove(&id);
+        self.gated.retain(|(key, _)| *key != id);
+        self.order.retain(|key| *key != id);
+        removed
+    }
+
+    /// Whether any listener is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.listeners.is_empty()
+    }
+
+    /// The registered listener count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.listeners.len()
+    }
+
+    /// A snapshot of the listeners, in registration order.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<CommitListener> {
+        self.listeners.snapshot()
+    }
+
+    /// Capture one commit's listeners and evaluate every gated probe exactly
+    /// once.
+    ///
+    /// The probes run even when an earlier listener already demands documents
+    /// (`||` must not short-circuit them): a gated listener captures per-commit
+    /// state inside its probe — the facade fan-out snapshots its host
+    /// subscriber registry there — and dispatch must use the state from the
+    /// same instant as the gate. This snapshot is taken when the commit
+    /// starts; a listener registered later is not part of it (see
+    /// [`SessionInner::begin_commit`]).
+    #[must_use]
+    pub fn begin_commit(&self) -> PreparedListeners {
+        let mut documents = !self.document.is_empty();
+        for (_, probe) in &self.gated {
+            documents |= probe();
+        }
+        PreparedListeners {
+            listeners: self.listeners.snapshot(),
+            documents,
+        }
+    }
+
+    /// Drop every listener (close).
+    pub fn clear(&mut self) {
+        self.listeners.clear();
+        self.document.clear();
+        self.gated.clear();
+        self.order.clear();
+    }
+
+    fn mark_last(
+        &mut self,
+        document: bool,
+        probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> bool {
+        let Some(id) = self.order.last().copied() else {
+            return false;
+        };
+        self.document.remove(&id);
+        self.gated.retain(|(key, _)| *key != id);
+        if document {
+            self.document.insert(id);
+        }
+        if let Some(probe) = probe {
+            self.gated.push((id, probe));
+        }
+        true
+    }
+
+    /// Reclassify the most recently registered listener as table-only.
+    ///
+    /// Returns `false` when no listener is registered.
+    pub fn mark_last_table_only(&mut self) -> bool {
+        self.mark_last(false, None)
+    }
+
+    /// Reclassify the most recently registered listener as gated by `probe`.
+    ///
+    /// Returns `false` when no listener is registered.
+    pub fn mark_last_gated(&mut self, probe: Arc<dyn Fn() -> bool + Send + Sync>) -> bool {
+        self.mark_last(false, Some(probe))
+    }
+}
+
+/// One gated listener set captured for one commit.
+pub struct PreparedListeners {
+    /// The listeners to run, in registration order.
+    pub listeners: Vec<CommitListener>,
+    /// Whether this set needs the document half for this commit.
+    pub documents: bool,
+}
+
+/// The listener half of one commit, captured when the commit starts.
+///
+/// Both the document gate and the dispatch use this snapshot. A host
+/// subscription is a synchronous registry write ([`Session`](crate::durable::session::Session)
+/// `subscribe_commits`) that may land while a commit is in flight; because the
+/// commit captured its listeners at start, such a subscriber is not called for
+/// this commit and first receives the next one. It therefore never receives a
+/// publication whose document half was skipped: the gate and the dispatch are
+/// two views of the same snapshot.
+pub struct CommitListeners {
+    /// Internal listeners, in registration order.
+    internal: Vec<CommitListener>,
+    /// Host listeners, in registration order.
+    host: Vec<CommitListener>,
+    /// Whether any listener will receive this commit's publication.
+    has_listeners: bool,
+    /// Whether this commit must adopt and publish the document half.
+    publishes_documents: bool,
+}
+
 /// The session state, owned exclusively by the line task.
 pub struct SessionInner {
     /// The storage behind its failure guard.
@@ -474,9 +669,9 @@ pub struct SessionInner {
     /// The loaded document cache.
     pub documents: DocumentCache,
     /// Host commit listeners.
-    pub commit_listeners: ListenerSet,
+    pub commit_listeners: GatedListeners,
     /// Internal listeners (a panic fails the session).
-    pub internal_listeners: ListenerSet,
+    pub internal_listeners: GatedListeners,
     /// Live document observers; retirement is delivered through
     /// [`attach::deliver`](crate::durable::session::attach::deliver) so their
     /// pins are released and the retired incarnation leaves the cache.
@@ -549,6 +744,32 @@ impl SessionInner {
         SessionState {
             storage: &self.storage,
             now: &*self.now,
+        }
+    }
+
+    /// Capture the listener half of one commit, before the commit's first
+    /// await.
+    ///
+    /// Every gated probe is evaluated exactly once here. The returned snapshot
+    /// decides both whether the cheap table half is built and whether the
+    /// expensive document half is adopted, and it is the set
+    /// [`publish`](self::publish) dispatches to. Internal listeners cannot
+    /// change while the line owns the commit; the facade's host registry can
+    /// (it is a lock, not a line command), which is exactly why dispatch must
+    /// use this snapshot instead of re-reading the registry: a subscriber that
+    /// registers after the commit started misses this commit but never sees a
+    /// publication missing the document changes the gate skipped.
+    #[must_use]
+    pub fn begin_commit(&self) -> CommitListeners {
+        let internal = self.internal_listeners.begin_commit();
+        let host = self.commit_listeners.begin_commit();
+        CommitListeners {
+            has_listeners: !internal.listeners.is_empty() || !host.listeners.is_empty(),
+            publishes_documents: !self.attachments.is_empty()
+                || internal.documents
+                || host.documents,
+            internal: internal.listeners,
+            host: host.listeners,
         }
     }
 
@@ -1393,8 +1614,8 @@ pub fn open_with_report_and_timers(
     let inner = SessionInner {
         storage: guarded,
         documents: DocumentCache::new(retention),
-        commit_listeners: ListenerSet::default(),
-        internal_listeners: ListenerSet::default(),
+        commit_listeners: GatedListeners::default(),
+        internal_listeners: GatedListeners::default(),
         attachments: Vec::new(),
         close_listeners: Vec::new(),
         close_subscriptions: Vec::new(),
@@ -1763,12 +1984,23 @@ fn staged_loaded_documents(transaction: &Transaction) -> HashMap<DocumentId, Loa
 /// reaches storage; the caller resolves the commit.
 fn hold_commit(
     inner: &mut SessionInner,
+    listeners: &CommitListeners,
     plans: &[DocumentPlan],
     loaded: &HashMap<DocumentId, LoadedDocument>,
     deadline: Option<i64>,
     context: &Context,
 ) -> Result<(), StorageError> {
     let now = inner.now();
+    // Same fast path as an immediate commit: a hold with no document observer
+    // has nobody to publish to, so it must not clone every held value and op
+    // batch into `changes`. The decision was captured at commit start
+    // (`begin_commit`) so a subscription that lands after the commit began
+    // cannot turn a skipped document half into a frame for a late listener.
+    // The cache and hold state below still own their revisions; only the
+    // publication half is skipped. Table-only internal listeners cannot
+    // consume a hold (holds contain no table writes), so they do not count
+    // here.
+    let observing = listeners.publishes_documents;
     let mut changes = Vec::new();
     for plan in plans {
         let Some(StorageWrite::DocumentChange { id, content }) = &plan.content else {
@@ -1837,15 +2069,17 @@ fn hold_commit(
             (current, next) => current.or(next),
         };
 
-        changes.push(DocumentCommitChange::Document {
-            record: record.clone(),
-            conversation_id: plan
-                .conversation_id
-                .or_else(|| record.scope.conversation_id()),
-            version: Some(version),
-            value: Some(value.clone()),
-            ops: plan.ops.clone(),
-        });
+        if observing {
+            changes.push(DocumentCommitChange::Document {
+                record: record.clone(),
+                conversation_id: plan
+                    .conversation_id
+                    .or_else(|| record.scope.conversation_id()),
+                version: Some(version),
+                value: Some(value.clone()),
+                ops: plan.ops.clone(),
+            });
+        }
     }
     inner.sync_held_count();
     inner.arm_hold_timer();
@@ -1860,7 +2094,7 @@ fn hold_commit(
         seq: inner.last_seq,
         changes: changes.into_iter().map(CommitChange::Document).collect(),
     };
-    match publish(inner, &publication, context) {
+    match publish(inner, listeners, &publication, context) {
         Ok(()) => Ok(()),
         Err(message) => {
             if !inner.latch.is_failed() {
@@ -1980,6 +2214,14 @@ async fn run_commit(inner: &mut SessionInner, job: CommitJob) {
         )));
         return;
     }
+    // Capture the listener half of this commit now, before its first await
+    // (the hold flush, the callback, assembly, storage). The capture decides
+    // both the document gate and the dispatch set, so a host subscription that
+    // lands while this commit is in flight takes effect on the next commit
+    // only; it can never observe a frame built after its arrival that omits
+    // the document changes the gate skipped. The facade fan-out uses this
+    // same capture as its subscriber snapshot.
+    let listeners = inner.begin_commit();
     // An immediate commit is based on stored state, so every held change is
     // stored first (upstream `takeHeld` in front of a commit's own writes). A
     // deferred commit does not flush: it either merges its document changes
@@ -2098,7 +2340,7 @@ async fn run_commit(inner: &mut SessionInner, job: CommitJob) {
             CommitPersistence::Immediate => None,
         };
         let loaded = staged_loaded_documents(&transaction);
-        match hold_commit(inner, &plans, &loaded, deadline, &job.context) {
+        match hold_commit(inner, &listeners, &plans, &loaded, deadline, &job.context) {
             Ok(()) => {
                 inner.sweep_documents();
                 let _ = job.reply.send(Ok(value));
@@ -2120,21 +2362,43 @@ async fn run_commit(inner: &mut SessionInner, job: CommitJob) {
     // ADMITTED. Caller cancellation no longer applies: the line owns the
     // settlement, and the guard records a failure instead of unwinding it.
     //
-    // With no observer there is nothing to publish, so the table half is not
-    // built at all: a commit's cost stays the storage call plus adoption, and
-    // the batch never gets copied. With an observer, the table half is built
-    // from `&writes` **before** the batch moves into storage, so the document
-    // content writes (the bulk of a batch) are never cloned — only the table
-    // records the publication must own are copied, once. `seq` is filled in
-    // when storage returns it and the adopted document changes are appended
-    // after adoption, in plan order — exactly the order
-    // `CommitPublication::build` produces.
-    let observed = inner
-        .telemetry
-        .as_ref()
-        .is_some_and(crate::durable::harness::telemetry::HarnessTelemetry::enabled)
-        || !inner.internal_listeners.is_empty()
-        || !inner.commit_listeners.is_empty();
+    // The listener snapshot was taken by `begin_commit` before the first
+    // await. Its two gates are used here:
+    //
+    // * `listeners.has_listeners` decides whether the (cheap) table half is
+    //   built and dispatched at all. It must be known **before** the batch
+    //   moves into storage, because `CommitPublication::build` copies the
+    //   table records out of `&writes`. Internal listeners always need table
+    //   changes, even when no host subscriber exists.
+    // * `observed` also includes telemetry, which consumes table records only.
+    // * `listeners.publishes_documents` decides whether the expensive document
+    //   half is adopted. Only real observers need it: host subscribers,
+    //   attachments, and document-classified internal listeners. A table-only
+    //   listener (the scheduler, the task graph, submission waiters) or the
+    //   facade's subscriber-gated fan-out with an empty registry does not.
+    //
+    // Both the gate and the dispatch read that one snapshot. The facade's host
+    // registry is a lock, not a line command: `subscribe_commits` can run on
+    // another thread at any instant, including between the snapshot and the
+    // fan-out. Dispatching the captured set (rather than re-reading the
+    // registry) is what makes the semantics precise — a subscription only
+    // affects commits that start after it, and a late subscriber misses this
+    // commit instead of receiving its table-only remainder.
+    //
+    // With no document consumer, `adopt` is skipped, so document values and
+    // operation batches are never cloned — the cache bookkeeping below only
+    // borrows them. With a listener, the table half is built from `&writes`
+    // **before** the batch moves into storage, so the document content writes
+    // (the bulk of a batch) are never cloned — only the table records the
+    // publication must own are copied, once. `seq` is filled in when storage
+    // returns it and the adopted document changes are appended after adoption,
+    // in plan order — exactly the order `CommitPublication::build` produces.
+    let has_listeners = listeners.has_listeners;
+    let observed = has_listeners
+        || inner
+            .telemetry
+            .as_ref()
+            .is_some_and(crate::durable::harness::telemetry::HarnessTelemetry::enabled);
     let mut publication = observed.then(|| CommitPublication::build(inner.last_seq, &writes));
     let storage = inner.storage.storage();
     let seq = match inner.storage.write(storage.commit(writes)).await {
@@ -2148,7 +2412,23 @@ async fn run_commit(inner: &mut SessionInner, job: CommitJob) {
     inner.last_seq = seq;
 
     // ── adopt (cache values and pointer bookkeeping, no reads) ──────────────
-    let documents = adopt(&plans, seq);
+    //
+    // Only a commit that reaches a document observer needs the publication
+    // half of adoption (`DocumentCommitChange`). The cache bookkeeping below
+    // reads the plan's value by reference, so a no-observer commit never
+    // clones a document value or operation batch here.
+    //
+    // The gate was captured at commit start, before the storage await; a
+    // subscriber that registers while storage is in flight is not part of
+    // this commit and first receives the next one. Do not move this decision
+    // later without also making dispatch use the same set: sampling twice is
+    // the probe→dispatch race this commit snapshot exists to close.
+    let publishing = listeners.publishes_documents;
+    let documents = if publishing {
+        adopt(&plans, seq)
+    } else {
+        Vec::new()
+    };
     for plan in &plans {
         if plan.retire {
             inner.documents.mark_retired(&plan.address_id, seq);
@@ -2174,18 +2454,20 @@ async fn run_commit(inner: &mut SessionInner, job: CommitJob) {
     // ── publish ─────────────────────────────────────────────────────────────
     // Finish the publication built before the storage call: the committed
     // sequence and, after the table changes (in write order), the adopted
-    // document changes (in plan order). With no observer this is one `None`
-    // branch and the adopted changes are dropped without being collected.
-    let published = if !(inner.internal_listeners.is_empty() && inner.commit_listeners.is_empty()) {
+    // document changes (in plan order). With no listener this branch is
+    // skipped and `documents` is empty by construction; with table-only
+    // listeners it dispatches the table half and `documents` is empty because
+    // `publishing` was false.
+    let published = if has_listeners {
         match publication.as_mut() {
             Some(publication) => {
                 publication.seq = seq;
                 publication
                     .changes
                     .extend(documents.into_iter().map(CommitChange::Document));
-                publish(inner, publication, &job.context)
+                publish(inner, &listeners, publication, &job.context)
             }
-            // Unreachable: `observed` is true whenever a listener is registered.
+            // Unreachable: `observed` includes `has_listeners`.
             None => Ok(()),
         }
     } else {
@@ -2371,6 +2653,7 @@ fn deliver_retired_attachments(inner: &mut SessionInner, publication: &CommitPub
 /// reported and never fails the commit.
 pub fn publish(
     inner: &mut SessionInner,
+    listeners: &CommitListeners,
     publication: &CommitPublication,
     context: &Context,
 ) -> Result<(), String> {
@@ -2381,8 +2664,7 @@ pub fn publish(
             .or_else(|| telemetry.extract(context.trace_carrier()))
     });
     let mut first_error = None;
-    let internal = inner.internal_listeners.snapshot();
-    for listener in &internal {
+    for listener in &listeners.internal {
         if let Err(message) = run_contained(listener, publication, context) {
             if first_error.is_none() {
                 // Latch the first failure immediately, but defer the close half
@@ -2398,8 +2680,7 @@ pub fn publish(
             inner.report_with_span(&message, ReportInfo::ListenerError, span);
         }
     }
-    let host = inner.commit_listeners.snapshot();
-    for listener in &host {
+    for listener in &listeners.host {
         // A failing host listener neither fails the commit nor skips the
         // others; it is reported as a listener error (upstream `contained`).
         if let Err(message) = run_contained(listener, publication, context) {

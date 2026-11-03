@@ -268,3 +268,31 @@ fn wrap_keeps_multiline_input_splitting() {
         vec!["one", "", "two"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// ANSI stripping: DCS payloads and two-byte/charset escapes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn strip_ansi_removes_dcs_payloads_including_sixel() {
+    // A sixel image is a DCS string: `ESC P q ... ESC \`. Neither the
+    // introducer nor the raster payload may leak into exported text.
+    let sixel = "\x1bPq\"1;1;4;4#0;2;0;0;0#1;2;100;100;0!4~\x1b\\hello";
+    assert_eq!(strip_ansi(sixel), "hello");
+    // An unterminated DCS swallows the rest: the payload is binary-ish, not
+    // printable output.
+    assert_eq!(strip_ansi("before\x1bPq#0;2;0;0;0"), "before");
+}
+
+#[test]
+fn strip_ansi_removes_charset_and_two_byte_escapes() {
+    // `ESC ( B`: ASCII character-set designator (the `B` belongs to it).
+    assert_eq!(strip_ansi("\x1b(Bhello"), "hello");
+    assert_eq!(strip_ansi("\x1b)0hello"), "hello");
+    // Save/restore cursor.
+    assert_eq!(strip_ansi("\x1b7hello\x1b8"), "hello");
+    // Keypad mode.
+    assert_eq!(strip_ansi("\x1b=hello\x1b>"), "hello");
+    // Unknown escapes keep the old behavior: drop only the ESC byte.
+    assert_eq!(strip_ansi("\x1bZhello"), "Zhello");
+}

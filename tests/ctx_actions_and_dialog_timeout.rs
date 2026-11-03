@@ -857,3 +857,64 @@ async fn dialog_global_ttl_applies_without_a_request_timeout() {
 fn take_queue_is_empty() -> bool {
     pir::agent_session::take_session_command_actions().is_empty()
 }
+
+// ---------------------------------------------------------------------------
+// P2-EVENT3-02: bootstrap UI fail-fast
+// ---------------------------------------------------------------------------
+
+const BOOTSTRAP_UI_TS: &str = r#"
+export default function (pi) {
+  pi.on("project_trust", async (_event, ctx) => {
+    const choice = await ctx.ui.select("Trust this project?", ["yes"]);
+    globalThis.__pir_bootstrap_ui = {
+      choice: choice === undefined ? "null" : String(choice),
+      hasUI: ctx.hasUI === true,
+    };
+  });
+}
+"#;
+
+/// The pre-trust bootstrap pass must not park on a `ctx.ui.*` dialog whose
+/// sink does not exist yet (interactive/RPC bootstrap configs are `has_ui:true`
+/// with no presentation host). `ui_fail_fast` makes the dialog resolve as a
+/// null/cancel immediately and reports `hasUI:false`; clearing the flag before
+/// adoption restores the live host's dialog behavior.
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_ui_fail_fast_skips_dialog_and_clears_for_live_host() {
+    let dir = temp_dir("bootstrap-ui");
+    let path = dir.join("ext.ts");
+    std::fs::write(&path, BOOTSTRAP_UI_TS).unwrap();
+    let mut config = js_config(&dir, true);
+    config.mode = "interactive".to_string();
+
+    let started = std::time::Instant::now();
+    let handle = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        pir::agent_session::load_extension_runtime_bootstrap(std::slice::from_ref(&path), config),
+    )
+    .await
+    .expect("bootstrap project_trust must not block on a UI dialog")
+    .expect("bootstrap runtime");
+
+    let report: Value = handle
+        .eval_json("JSON.stringify(globalThis.__pir_bootstrap_ui)")
+        .await
+        .expect("read bootstrap UI result");
+    assert_eq!(report["choice"], json!("null"), "{report}");
+    assert_eq!(
+        report["hasUI"],
+        json!(false),
+        "a fail-fast bootstrap runtime must not advertise a usable UI: {report}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the dialog resolved immediately ({:?})",
+        started.elapsed()
+    );
+
+    assert!(
+        !handle.ui_fail_fast_enabled(),
+        "the bootstrap load must clear the flag before the handle can be adopted"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -110,6 +110,29 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+/// Whether `data` contains a relative vertical cursor move (`CSI n A` up or
+/// `CSI n B` down). Column moves (`CSI n G`) and absolute positioning
+/// (`CSI r;c H`) do not count.
+fn has_vertical_cursor_move(data: &str) -> bool {
+    let bytes = data.as_bytes();
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        if bytes[index] == 0x1b && bytes[index + 1] == b'[' {
+            let mut cursor = index + 2;
+            let digits_start = cursor;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+            if cursor > digits_start && cursor < bytes.len() && matches!(bytes[cursor], b'A' | b'B')
+            {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Cursor anchoring (IME candidate position / drift origin)
 // ---------------------------------------------------------------------------
@@ -128,7 +151,10 @@ fn hidden_cursor_is_positioned_at_the_editor_cell_and_reanchored() {
         (0..5).map(|index| format!("line {index}")).collect(),
     )));
     core.set_dock_height(2);
-    let cell = Arc::new(Mutex::new(Some((1usize, 3usize))));
+    // The dock cursor cell sits on the dock's FIRST row, not the frame's last
+    // row: that is the case where a no-change frame computed from
+    // `frame_len - 1` moves the cursor up by the dock offset again (drift).
+    let cell = Arc::new(Mutex::new(Some((0usize, 3usize))));
     core.set_dock_cursor_cell(Arc::clone(&cell));
     // showHardwareCursor stays off: the reverse-video cell is the visible
     // cursor, but the hardware cursor must still be positioned.
@@ -150,12 +176,17 @@ fn hidden_cursor_is_positioned_at_the_editor_cell_and_reanchored() {
 
     // A frame with no content change still re-anchors the cursor: the
     // terminal may have moved it for IME composition, and the next frame's
-    // relative moves trust `hardware_cursor_row`.
+    // relative moves trust `hardware_cursor_row`. It must NOT emit a second
+    // vertical move — the anchor is already on the dock cell (FIX-B06).
     core.render();
     let second = capture.take();
     assert!(
         second.contains("\x1b[4G"),
         "an unchanged frame re-anchors the cursor: {second:?}"
+    );
+    assert!(
+        !has_vertical_cursor_move(&second),
+        "an unchanged frame must not move the cursor vertically again: {second:?}"
     );
 
     // A selector replacing the editor drops the cell: back to hiding only.

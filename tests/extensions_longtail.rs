@@ -346,6 +346,68 @@ async fn cache_warming_decision_invalid_action_ignored() {
     assert_eq!(seen["type"], "cache_warming_decision");
 }
 
+// ---------------------------------------------------------------------------
+// Worker entry source cap (`new Worker(file)` shares fs.readFile's 32 MiB
+// limit; the async `error` event carries E2BIG)
+// ---------------------------------------------------------------------------
+
+/// An entry file over the 32 MiB source cap fails the Worker's async `error`
+/// event with `E2BIG`. The fixture is sparse, so the test does not allocate
+/// 33 MiB of disk; the host must refuse after buffering only `cap + 1` bytes.
+#[tokio::test(flavor = "current_thread")]
+async fn worker_entry_file_is_capped_with_e2big() {
+    let cwd = write_temp_fixture("worker-entry-cap", &[]);
+    let huge = cwd.join("huge-worker.cjs");
+    let file = std::fs::File::create(&huge).expect("create huge worker entry");
+    file.set_len(32 * 1024 * 1024 + 1)
+        .expect("set sparse worker entry length");
+    drop(file);
+    let path_json = serde_json::to_string(&huge.to_string_lossy()).expect("path json");
+
+    let rt = new_runtime_at(&cwd).await;
+    rt.seed_module(
+        "pir-ext:worker-cap.ts",
+        &format!(
+            r#"
+            import {{ Worker }} from "node:worker_threads";
+            export default (pi) => {{
+                pi.on("session_start", async () => {{
+                    const outcome = await new Promise((resolve) => {{
+                        const worker = new Worker({path_json});
+                        worker.on("error", (error) => resolve({{
+                            code: error.code,
+                            message: String(error.message),
+                        }}));
+                    }});
+                    globalThis.__worker_cap = outcome;
+                }});
+            }};
+            "#
+        ),
+    )
+    .expect("seed");
+    rt.seeded_load("pir-ext:worker-cap.ts")
+        .await
+        .expect("load seeded extension");
+
+    let mut payload = json!({ "reason": "startup" });
+    let outcome = rt.emit("session_start", &mut payload).await.expect("emit");
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+
+    let seen: serde_json::Value = rt
+        .eval_json("JSON.stringify(globalThis.__worker_cap ?? null)")
+        .await
+        .expect("eval");
+    assert_eq!(seen["code"], "E2BIG", "{seen}");
+    assert!(
+        seen["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("32-MiB"),
+        "the cap error names the limit: {seen}"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cache_warming_decision_without_handlers_yields_no_result() {
     let rt = ExtensionRuntime::new(test_config_default_prompt())

@@ -1505,6 +1505,31 @@ async fn before_provider_request_honors_in_place_mutation() {
     );
 }
 
+#[tokio::test]
+async fn later_in_place_mutation_is_not_clobbered_by_an_earlier_replacement() {
+    let temp = TempDir::new("replace-then-mutate");
+    let agent = AgentSession::new_with_plugins(
+        session_config(&temp.0, None, ok_registry(), None),
+        vec![
+            Arc::new(ReplacePayloadPlugin {
+                info: PluginInfo::inline("replace-payload"),
+            }) as Arc<dyn AgentPlugin>,
+            Arc::new(MutatePayloadPlugin {
+                info: PluginInfo::inline("mutate-payload"),
+            }) as Arc<dyn AgentPlugin>,
+        ],
+    );
+    let hook = agent
+        .provider_stream_hooks_for_test()
+        .before_provider_request
+        .expect("the handler installs the transport hook");
+    assert_eq!(
+        hook(json!({ "orig": 1 })).await,
+        json!({ "replaced": true, "inPlace": true }),
+        "a later mutation-only handler must not be clobbered by the earlier replacement"
+    );
+}
+
 #[cfg(feature = "extensions")]
 #[tokio::test(flavor = "current_thread")]
 async fn before_provider_request_honors_js_in_place_mutation() {
@@ -1542,6 +1567,63 @@ async fn before_provider_request_honors_js_in_place_mutation() {
         json!({ "orig": 1, "fromJs": true }),
         "a JS handler's in-place payload mutation must reach the provider request"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 6b. before_provider_headers per-request seam
+// ---------------------------------------------------------------------------
+
+struct MutateHeadersPlugin {
+    info: PluginInfo,
+}
+
+impl AgentPlugin for MutateHeadersPlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(vec!["before_provider_headers".to_owned()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        Box::pin(async move {
+            if let Some(headers) = event.payload.get_mut("headers") {
+                headers["X-Pir-Hook"] = json!("yes");
+                // A null value deletes the header, matching the event contract.
+                if let Some(object) = headers.as_object_mut() {
+                    object.insert("X-Delete-Me".to_owned(), Value::Null);
+                }
+            }
+            PluginEventOutcome::None
+        })
+    }
+}
+
+#[tokio::test]
+async fn before_provider_headers_is_a_per_request_transform() {
+    let temp = TempDir::new("headers-transform");
+    let agent = AgentSession::new_with_plugins(
+        session_config(&temp.0, None, ok_registry(), None),
+        vec![Arc::new(MutateHeadersPlugin {
+            info: PluginInfo::inline("mutate-headers"),
+        }) as Arc<dyn AgentPlugin>],
+    );
+    let hook = agent
+        .provider_stream_hooks_for_test()
+        .before_provider_headers
+        .expect("the handler installs the per-request header hook");
+    let headers = BTreeMap::from([
+        ("X-Delete-Me".to_owned(), "old".to_owned()),
+        ("X-Keep-Me".to_owned(), "ok".to_owned()),
+    ]);
+    let updated = hook(headers).await;
+    assert_eq!(updated.get("X-Pir-Hook").map(String::as_str), Some("yes"));
+    assert!(
+        !updated.contains_key("X-Delete-Me"),
+        "a null header value must delete: {updated:?}"
+    );
+    assert_eq!(updated.get("X-Keep-Me").map(String::as_str), Some("ok"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1913,4 +1995,499 @@ async fn mcp_servers_change_emits_once_per_registry_change() {
         changes[2]
     );
     host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// P1-02: a JS `session_before_compact` replacement survives the adapter merge
+// ---------------------------------------------------------------------------
+
+/// The JS face returns `{ compaction }` from `session_before_compact`
+/// (prelude `SessionBeforeCompactResult`). The result must survive
+/// `PluginEventOutcome::from_wire` → `MergedEmit` → `compact.rs`; before the
+/// typed `SessionBeforeCompact` outcome it was reduced to `{cancel}` and the
+/// summarizer ran instead.
+///
+/// This drives the REAL `PluginHost::emit` path through
+/// `AgentSession::prompt`'s overflow recovery (not just a payload assertion):
+/// the first provider request returns a context-overflow terminal, the JS
+/// handler supplies the replacement, and the retried request must carry the
+/// JS summary with no summarizer call.
+#[cfg(feature = "extensions")]
+#[tokio::test]
+async fn js_before_compact_replacement_is_used_verbatim() {
+    let temp = TempDir::new("js-before-compact-replacement");
+    let extension_path = temp.0.join("compact_replace.ts");
+    std::fs::write(
+        &extension_path,
+        r#"
+        export default function (pi) {
+            globalThis.__compact = {};
+            pi.on("session_before_compact", (event) => {
+                globalThis.__compact.beforeReason = event.reason;
+                return {
+                    compaction: {
+                        summary: "JS EXT SUMMARY",
+                        tokensBefore: 42,
+                    },
+                };
+            });
+            pi.on("session_compact", (event) => {
+                globalThis.__compact.fromExtension = event.fromExtension;
+                globalThis.__compact.summary =
+                    event.compaction && event.compaction.summary;
+            });
+        }
+        "#,
+    )
+    .expect("write extension");
+    let handle = ExtensionHandle::start(extension_config(&temp.0)).expect("start extensions");
+    let loaded = handle
+        .load(std::slice::from_ref(&extension_path))
+        .await
+        .expect("load extension");
+    assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_responder = Arc::clone(&calls);
+    let summary_seen = Arc::new(AtomicBool::new(false));
+    let summary_seen_for_responder = Arc::clone(&summary_seen);
+    let registry = fake_registry(Arc::new(move |index, context| {
+        calls_for_responder.fetch_add(1, Ordering::SeqCst);
+        match index {
+            0 => {
+                let mut message = assistant_text("");
+                message.content.clear();
+                message.stop_reason = StopReason::Error;
+                message.error_message =
+                    Some("prompt is too long: 200000 tokens > 16384 maximum".into());
+                message
+            }
+            _ => {
+                if context.messages.iter().any(|message| matches!(message,
+                    Message::User(user)
+                        if user.content.iter().any(|block| matches!(block,
+                            ContentBlock::Text(text)
+                                if text.text.starts_with(pir::compaction::prompts::COMPACTION_SUMMARY_PREFIX)
+                                    && text.text.contains("JS EXT SUMMARY")
+                        ))
+                )) {
+                    summary_seen_for_responder.store(true, Ordering::SeqCst);
+                }
+                assistant_text("recovered through the JS extension compaction")
+            }
+        }
+    }));
+
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_overflow_transcript(&mut session);
+    let mut config = session_config(&temp.0, Some(session), registry, Some(overflow_config()));
+    config.extensions = Some(handle.clone());
+    let agent = AgentSession::new_with_plugins(config, Vec::new());
+
+    let terminal = agent
+        .prompt("hi", Arc::new(|_event| {}))
+        .await
+        .expect("prompt recovers through the JS replacement");
+    assert_eq!(
+        terminal.stop_reason,
+        StopReason::Stop,
+        "the retried request must complete: {terminal:?}"
+    );
+    assert!(
+        summary_seen.load(Ordering::SeqCst),
+        "the JS replacement summary must head the retry context"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "failed main request + retried main request; no summarizer call"
+    );
+
+    let probe = handle
+        .eval_json("JSON.stringify(globalThis.__compact ?? {})")
+        .await
+        .expect("probe JS compact events");
+    assert_eq!(probe["beforeReason"], json!("overflow"));
+    assert_eq!(
+        probe["fromExtension"],
+        json!(true),
+        "session_compact must report the extension-provided replacement: {probe}"
+    );
+    assert_eq!(probe["summary"], json!("JS EXT SUMMARY"));
+}
+
+// ---------------------------------------------------------------------------
+// P2-D1: native-face compaction lifecycle order
+// ---------------------------------------------------------------------------
+
+/// Read the native recorder's event names (its declared interest limits the
+/// stream to the events under test).
+fn recorded_event_names(events: &Recorded) -> Vec<String> {
+    events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+async fn wait_for_recorded_event_names(events: &Recorded, expected: usize) -> Vec<String> {
+    for _ in 0..500 {
+        let names = recorded_event_names(events);
+        if names.len() >= expected {
+            return names;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "native compaction lifecycle never reached {expected} events: {:?}",
+        recorded_event_names(events)
+    );
+}
+
+const COMPACTION_LIFECYCLE_EVENTS: [&str; 4] = [
+    "compaction_start",
+    "session_before_compact",
+    "session_compact",
+    "compaction_end",
+];
+
+/// Records the four lifecycle events, delaying `compaction_start` long enough
+/// that a direct `session_before_compact` dispatch without a queue flush would
+/// overtake it. This makes the order assertion detect the pre-fix bug instead
+/// of relying on bridge-worker scheduling.
+struct DelayedStartOrderPlugin {
+    info: PluginInfo,
+    events: Recorded,
+}
+
+impl AgentPlugin for DelayedStartOrderPlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(
+            COMPACTION_LIFECYCLE_EVENTS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+        )
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        Box::pin(async move {
+            if event.name == "compaction_start" {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((event.name.to_string(), event.payload.clone()));
+            PluginEventOutcome::None
+        })
+    }
+}
+
+fn delayed_start_plugin() -> (Arc<DelayedStartOrderPlugin>, Recorded) {
+    let events: Recorded = Arc::new(Mutex::new(Vec::new()));
+    (
+        Arc::new(DelayedStartOrderPlugin {
+            info: PluginInfo::inline("delayed-start-order"),
+            events: Arc::clone(&events),
+        }),
+        events,
+    )
+}
+
+/// A native-only host must observe the same compaction order as the JS face:
+/// the queued `compaction_start` is flushed before the direct
+/// `session_before_compact`, and `compaction_end` follows the direct
+/// `session_compact` through the FIFO queue.
+#[tokio::test]
+async fn native_manual_compaction_orders_its_lifecycle_events() {
+    let temp = TempDir::new("native-manual-compaction-order");
+    let registry = fake_registry(Arc::new(|_index, _context| assistant_text("SUMMARY")));
+    let (plugin, recorded) = delayed_start_plugin();
+
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_overflow_transcript(&mut session);
+    let mut config = session_config(
+        &temp.0,
+        Some(session),
+        registry,
+        Some(pir::compaction::CompactionConfig {
+            enabled: true,
+            reserve_tokens: 1,
+            keep_recent_tokens: 8,
+        }),
+    );
+    // No automatic trigger: the manual path owns this compaction.
+    config.model.context_window = 1_000_000;
+    let agent = AgentSession::new_with_plugins(config, vec![plugin as Arc<dyn AgentPlugin>]);
+
+    agent.compact(None).await.expect("manual compact");
+
+    let order = wait_for_recorded_event_names(&recorded, COMPACTION_LIFECYCLE_EVENTS.len()).await;
+    let expected: Vec<String> = COMPACTION_LIFECYCLE_EVENTS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    assert_eq!(
+        order, expected,
+        "native manual compaction must preserve the upstream lifecycle order"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        recorded_event_names(&recorded),
+        expected,
+        "the lifecycle events must be delivered exactly once"
+    );
+
+    // Non-extension manual compaction: the built-in summarizer keeps the
+    // pi-generated provenance (`fromExtension: false`; `fromHook` omitted).
+    let payload = recorded
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(name, _)| name == "session_compact")
+        .map(|(_, payload)| payload.clone())
+        .expect("session_compact payload");
+    assert_eq!(payload["reason"], json!("manual"));
+    assert_eq!(payload["fromExtension"], json!(false), "{payload}");
+    let from_hook = agent
+        .with_session_manager(|session| {
+            session.entries().into_iter().find_map(|entry| match entry {
+                FileEntry::Compaction(inner) => Some(inner.from_hook),
+                _ => None,
+            })
+        })
+        .await
+        .expect("session storage attached");
+    assert_eq!(
+        from_hook,
+        Some(None),
+        "a built-in manual compaction must not be marked fromHook"
+    );
+}
+
+/// Threshold counterpart for the native face.
+#[tokio::test]
+async fn native_threshold_compaction_orders_its_lifecycle_events() {
+    let temp = TempDir::new("native-threshold-compaction-order");
+    let registry = fake_registry(Arc::new(|_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            return assistant_text("THRESHOLD SUMMARY");
+        }
+        assistant_text("model reply")
+    }));
+    let (plugin, recorded) = delayed_start_plugin();
+
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_overflow_transcript(&mut session);
+    let mut config = session_config(
+        &temp.0,
+        Some(session),
+        registry,
+        Some(pir::compaction::CompactionConfig {
+            enabled: true,
+            reserve_tokens: 1,
+            keep_recent_tokens: 8,
+        }),
+    );
+    config.model.context_window = 64;
+    let agent = AgentSession::new_with_plugins(config, vec![plugin as Arc<dyn AgentPlugin>]);
+
+    agent
+        .prompt("trigger threshold", Arc::new(|_event| {}))
+        .await
+        .expect("the threshold prompt completes");
+
+    let order = wait_for_recorded_event_names(&recorded, COMPACTION_LIFECYCLE_EVENTS.len()).await;
+    let expected: Vec<String> = COMPACTION_LIFECYCLE_EVENTS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    assert_eq!(
+        order, expected,
+        "native threshold compaction must preserve the upstream lifecycle order"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        recorded_event_names(&recorded),
+        expected,
+        "the lifecycle events must be delivered exactly once"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-D2: manual compaction provenance
+// ---------------------------------------------------------------------------
+
+/// A manual compaction whose summary comes from a `session_before_compact`
+/// replacement must persist `fromHook: true` and report
+/// `fromExtension: true`, exactly like the threshold/overflow replacement
+/// paths (previously both were hardcoded to false).
+#[tokio::test]
+async fn manual_replacement_compaction_marks_from_extension_and_from_hook() {
+    let temp = TempDir::new("manual-replacement-provenance");
+    let registry = fake_registry(Arc::new(|_index, _context| assistant_text("SUMMARY")));
+    let trace: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let payloads: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let plugin = Arc::new(OverflowCompactPlugin {
+        info: PluginInfo::inline("manual-replacement"),
+        trace: Arc::clone(&trace),
+        payloads: Arc::clone(&payloads),
+        replacement: true,
+    });
+
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_overflow_transcript(&mut session);
+    let mut config = session_config(
+        &temp.0,
+        Some(session),
+        registry,
+        Some(pir::compaction::CompactionConfig {
+            enabled: true,
+            reserve_tokens: 1,
+            keep_recent_tokens: 8,
+        }),
+    );
+    config.model.context_window = 1_000_000;
+    let agent = AgentSession::new_with_plugins(config, vec![plugin as Arc<dyn AgentPlugin>]);
+
+    let result = agent
+        .compact(None)
+        .await
+        .expect("manual replacement compact");
+    assert_eq!(result.summary, "EXT SUMMARY");
+
+    let payload = {
+        let recorded = payloads.lock().unwrap();
+        recorded
+            .iter()
+            .find(|(name, _)| name == "session_compact")
+            .map(|(_, payload)| payload.clone())
+            .expect("session_compact payload")
+    };
+    assert_eq!(payload["reason"], json!("manual"));
+    assert_eq!(
+        payload["fromExtension"],
+        json!(true),
+        "manual replacement must report fromExtension: true: {payload}"
+    );
+    assert_eq!(payload["compaction"]["summary"], json!("EXT SUMMARY"));
+    assert_eq!(
+        payload["compactionEntry"]["fromHook"],
+        json!(true),
+        "the persisted entry must carry fromHook: true: {payload}"
+    );
+
+    let from_hook = agent
+        .with_session_manager(|session| {
+            session.entries().into_iter().find_map(|entry| match entry {
+                FileEntry::Compaction(inner) => Some((inner.summary, inner.from_hook)),
+                _ => None,
+            })
+        })
+        .await
+        .expect("session storage attached");
+    assert_eq!(
+        from_hook,
+        Some(("EXT SUMMARY".to_owned(), Some(true))),
+        "manual replacement must persist the extension provenance"
+    );
+}
+
+/// The same provenance on the JS-only face: `pi.on("session_compact")` must
+/// see `fromExtension: true` and the persisted entry `fromHook: true`.
+#[cfg(feature = "extensions")]
+#[tokio::test]
+async fn js_manual_replacement_compaction_marks_from_extension_and_from_hook() {
+    let temp = TempDir::new("js-manual-replacement-provenance");
+    let extension_path = temp.0.join("manual_replace.ts");
+    std::fs::write(
+        &extension_path,
+        r#"
+        export default function (pi) {
+            globalThis.__compact = {};
+            pi.on("session_before_compact", (event) => {
+                globalThis.__compact.beforeReason = event.reason;
+                return {
+                    compaction: {
+                        summary: "JS MANUAL EXT SUMMARY",
+                        tokensBefore: 42,
+                    },
+                };
+            });
+            pi.on("session_compact", (event) => {
+                globalThis.__compact.fromExtension = event.fromExtension;
+                globalThis.__compact.entryFromHook =
+                    event.compactionEntry && event.compactionEntry.fromHook;
+                globalThis.__compact.summary =
+                    event.compaction && event.compaction.summary;
+            });
+        }
+        "#,
+    )
+    .expect("write extension");
+    let handle = ExtensionHandle::start(extension_config(&temp.0)).expect("start extensions");
+    let loaded = handle
+        .load(std::slice::from_ref(&extension_path))
+        .await
+        .expect("load extension");
+    assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+
+    let registry = fake_registry(Arc::new(|_index, _context| assistant_text("SUMMARY")));
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_overflow_transcript(&mut session);
+    let mut config = session_config(
+        &temp.0,
+        Some(session),
+        registry,
+        Some(pir::compaction::CompactionConfig {
+            enabled: true,
+            reserve_tokens: 1,
+            keep_recent_tokens: 8,
+        }),
+    );
+    config.model.context_window = 1_000_000;
+    config.extensions = Some(handle.clone());
+    let agent = AgentSession::new_with_plugins(config, Vec::new());
+
+    let result = agent
+        .compact(None)
+        .await
+        .expect("JS manual replacement compact");
+    assert_eq!(result.summary, "JS MANUAL EXT SUMMARY");
+
+    let probe = handle
+        .eval_json("JSON.stringify(globalThis.__compact ?? {})")
+        .await
+        .expect("probe JS compact events");
+    assert_eq!(probe["beforeReason"], json!("manual"));
+    assert_eq!(
+        probe["fromExtension"],
+        json!(true),
+        "JS session_compact must report the manual replacement: {probe}"
+    );
+    assert_eq!(probe["entryFromHook"], json!(true), "{probe}");
+    assert_eq!(probe["summary"], json!("JS MANUAL EXT SUMMARY"));
+
+    let from_hook = agent
+        .with_session_manager(|session| {
+            session.entries().into_iter().find_map(|entry| match entry {
+                FileEntry::Compaction(inner) => Some(inner.from_hook),
+                _ => None,
+            })
+        })
+        .await
+        .expect("session storage attached");
+    assert_eq!(
+        from_hook,
+        Some(Some(true)),
+        "the JS replacement must persist fromHook: true"
+    );
 }

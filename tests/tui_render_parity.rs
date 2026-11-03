@@ -72,9 +72,10 @@ fn render_into_lines(component: &dyn Component, width: usize) -> Vec<String> {
 fn render_into_lines_with_pool(
     component: &dyn Component,
     width: usize,
-    mut pool: Vec<String>,
+    pool: Vec<String>,
 ) -> Vec<String> {
-    let mut rows = Rows::new(&mut pool);
+    let mut scratch = pool.clone();
+    let mut rows = Rows::new(&mut scratch);
     component.render_into(width, &mut rows);
     rows.trim();
     pool

@@ -26,20 +26,22 @@ impl Drop for AgentSession {
 
 /// Dispatch `project_trust` to the NATIVE plugins of a freshly built host.
 ///
-/// The runtime loader already consulted the JS face at load time — before the
-/// unified host existed — so this is the missing native half. [`PluginHost::emit_native`]
+/// The CLI's pre-trust bootstrap pass already consulted the JS face — before
+/// the unified host existed — so this is the missing native half. [`PluginHost::emit_native`]
 /// skips the host's JS adapter, so a host that also carries the same runtime
-/// handle never dispatches the JS face twice.
+/// handle never dispatches the JS face twice. The final runtime loads do not
+/// dispatch `project_trust` themselves; each face sees it exactly once.
 ///
 /// Session construction is synchronous, so the event is spawned on the current
 /// runtime instead of awaited: construction never blocks on a plugin handler,
 /// and a host built with no runtime available (a plain sync embedder) skips the
-/// fan-out with a debug log rather than panicking. Ordering caveat: the handler
-/// therefore runs after `new_with_plugins` returns and may race a very fast
-/// first `session_start`/prompt, or (on a multi-thread runtime) the
-/// `bind_context` pass that follows host construction; `project_trust` is
-/// informational (pir's trust decision stays host-owned, see
-/// [`dispatch_project_trust`]), so the later delivery is harmless.
+/// fan-out with a debug log rather than panicking.
+///
+/// The public constructors call this only AFTER `bind_context` has returned,
+/// never from the host build itself. `emit_native` runs the one-shot init hooks
+/// only once a context is bound, so this ordering makes `on_init` precede
+/// `project_trust` deterministically even when the spawned task starts on
+/// another worker thread of a multi-thread runtime.
 fn spawn_native_project_trust(host: &Arc<PluginHost>, cwd: Option<&Path>) {
     if !host.has_native_handlers("project_trust") {
         return;
@@ -134,6 +136,9 @@ impl AgentSession {
         let (session, services) = Self::build_with_live_services(config, inline_plugins, agent_dir);
         if let (Some(plugins), Some(services)) = (session.plugins.as_ref(), services) {
             plugins.bind_context(services.into_context());
+            // Only now is the service context bound, so `emit_native` will
+            // run `on_init` before dispatching `project_trust` (G2).
+            spawn_native_project_trust(plugins, Some(session.cwd.as_path()));
         }
         session
     }
@@ -178,6 +183,22 @@ impl AgentSession {
         cwd: Option<&Path>,
         agent_dir: Option<&Path>,
     ) -> Arc<PluginHost> {
+        Self::build_plugin_host_with_settings_in(extensions, inline_plugins, cwd, agent_dir, None)
+    }
+
+    /// [`Self::build_plugin_host_in`] with an already-loaded settings
+    /// snapshot. The session constructor hands the SAME snapshot to the host
+    /// and to [`Self::build`], so a TUI/RPC startup reads
+    /// `<agent-dir>/settings.json` and `<cwd>/.pi/settings.json` once instead
+    /// of twice (the host's builtin gates and the session's steering/queue
+    /// modes both need them).
+    fn build_plugin_host_with_settings_in(
+        extensions: Option<&crate::extensions::ExtensionHandle>,
+        inline_plugins: Vec<Arc<dyn crate::plugins::AgentPlugin>>,
+        cwd: Option<&Path>,
+        agent_dir: Option<&Path>,
+        settings: Option<&SettingsManager>,
+    ) -> Arc<PluginHost> {
         // The settings-driven builtin gates (`pythonTool: false` and
         // `disabledBuiltinExtensions`) drop their paths from the recorded
         // plan BEFORE `PluginHost::build` below can instantiate them — through
@@ -185,8 +206,13 @@ impl AgentSession {
         // cannot drift again (print used to build its host directly and
         // silently ignore `pythonTool: false`).
         if let Some(extensions) = extensions {
-            let settings = Self::host_settings_in(cwd, agent_dir);
-            Self::restrict_plan_for_builtins(extensions, &settings);
+            match settings {
+                Some(settings) => Self::restrict_plan_for_builtins(extensions, settings),
+                None => {
+                    let settings = Self::host_settings_in(cwd, agent_dir);
+                    Self::restrict_plan_for_builtins(extensions, &settings);
+                }
+            }
         }
         let host = Arc::new(PluginHost::build(extensions.cloned(), inline_plugins));
         for diagnostic in &host.registry().diagnostics().to_vec() {
@@ -199,11 +225,9 @@ impl AgentSession {
         // (`new_arc_with_plugins` does it automatically).
         #[cfg(feature = "phone")]
         install_phone_plugin_adapter(&host);
-        // Native half of the startup `project_trust` fan-out: the runtime
-        // loader already dispatched the event to the JS face while loading,
-        // BEFORE this host existed. `emit_native` skips the host's JS
-        // adapter, so the JS face is never consulted twice.
-        spawn_native_project_trust(&host, cwd);
+        // The native `project_trust` fan-out is NOT spawned here: it must run
+        // after `bind_context`, otherwise `emit_native` cannot run `on_init`
+        // first on a multi-thread runtime. The public constructors own it.
         host
     }
 
@@ -283,20 +307,33 @@ impl AgentSession {
         // registry); never construct a second one.
         let wants_host =
             prepared_host.is_some() || config.extensions.is_some() || has_inline_plugins;
+        // ONE settings load serves both consumers below: the host's
+        // `pythonTool`/`disabledBuiltinExtensions` gates and the session's
+        // steering/follow-up modes plus the extension settings snapshot.
+        let mut settings: Option<SettingsManager> = None;
         let plugins = if wants_host {
             Some(match prepared_host {
                 Some(host) => host,
-                None => Self::build_plugin_host_in(
-                    config.extensions.as_ref(),
-                    inline_plugins,
-                    config.cwd.as_deref(),
-                    Some(&agent_dir),
-                ),
+                None => {
+                    if config.extensions.is_some() {
+                        settings = Some(Self::host_settings_in(
+                            config.cwd.as_deref(),
+                            Some(&agent_dir),
+                        ));
+                    }
+                    Self::build_plugin_host_with_settings_in(
+                        config.extensions.as_ref(),
+                        inline_plugins,
+                        config.cwd.as_deref(),
+                        Some(&agent_dir),
+                        settings.as_ref(),
+                    )
+                }
             })
         } else {
             None
         };
-        let session = Self::build(config, plugins, has_inline_plugins, agent_dir);
+        let session = Self::build(config, plugins, has_inline_plugins, agent_dir, settings);
         let services = session
             .plugins
             .as_ref()
@@ -305,15 +342,21 @@ impl AgentSession {
     }
 
     fn build(
-        config: AgentSessionConfig,
+        mut config: AgentSessionConfig,
         plugins: Option<Arc<PluginHost>>,
         has_inline_plugins: bool,
         agent_dir: PathBuf,
+        settings: Option<SettingsManager>,
     ) -> Self {
         let cwd = config
             .cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        // Take the caller's prompt instead of cloning it: an explicit prompt is
+        // the whole rendered system prompt and can be large, and the config is
+        // owned here. The derived-prompt decision is captured before the move.
+        let explicit_system_prompt = config.system_prompt.take();
+        let context_derived_prompt = explicit_system_prompt.is_none();
         let (session_id, session_path) = match &config.session {
             Some(session) => (
                 Some(session.id().to_owned()),
@@ -415,22 +458,25 @@ impl AgentSession {
         let mut prompt_context = None;
         let preamble_override: Option<String> = None;
         let append_sections: Vec<String> = Vec::new();
-        let system_prompt = config.system_prompt.clone().or_else(|| {
-            let host_override = plugins
+        let system_prompt = explicit_system_prompt.or_else(|| {
+            // One owned override list: the host's runtime `setActiveTools`
+            // store wins, else the resolved host selection. The merge and the
+            // active-name resolution both borrow it; no second clone.
+            let override_names = plugins
                 .as_deref()
-                .and_then(PluginHost::active_tools_override);
-            let override_names = host_override.clone().or_else(|| {
-                tool_selection
-                    .as_ref()
-                    .map(|selection| selection.enabled.clone())
-            });
+                .and_then(PluginHost::active_tools_override)
+                .or_else(|| {
+                    tool_selection
+                        .as_ref()
+                        .map(|selection| selection.enabled.clone())
+                });
             let (prompt_tools, hidden_tools, active) = match plugins.as_deref() {
                 Some(plugins) => {
                     let mut registry = tools.clone();
                     crate::agent::tool_execution::merge_plugin_tools(
                         &mut registry,
                         plugins,
-                        host_override.as_deref(),
+                        override_names.as_deref(),
                     );
                     registry.remove_exposure(crate::agent::tool_execution::ToolExposure::Hidden);
                     let active = registry.active_names(override_names.as_deref());
@@ -498,7 +544,11 @@ impl AgentSession {
         let mut steering_mode = SteeringMode::OneAtATime;
         let mut follow_up_mode = FollowUpMode::OneAtATime;
         if let Some(extensions) = &config.extensions {
-            let mut manager = runtime_loader::load_settings_for_in(&agent_dir, &cwd);
+            // Reuse the host-build snapshot when the caller had one (the
+            // normal interactive/RPC path); the identical load only runs when
+            // a prepared host came from outside (SDK builder).
+            let mut manager =
+                settings.unwrap_or_else(|| runtime_loader::load_settings_for_in(&agent_dir, &cwd));
             for error in manager.drain_errors() {
                 crate::ext_diag!("[ext] settings {}: {}", error.scope_name(), error.message);
             }
@@ -553,6 +603,7 @@ impl AgentSession {
                 });
                 persist
             });
+        let js_event_dispatch = Arc::new(AtomicBool::new(true));
         let scheduler = ToolScheduler::new(ToolSchedulerConfig::default()).with_detach(
             background::background_sink(
                 Arc::clone(&background),
@@ -562,6 +613,7 @@ impl AgentSession {
                     background_follow_up_inbox_handle.clone(),
                     Arc::clone(&session_state_handle),
                     config.extensions.clone(),
+                    Arc::clone(&js_event_dispatch),
                 )
                 .with_plugins(plugins.clone())
                 .with_run_settling(Arc::clone(&run_settling_handle)),
@@ -576,7 +628,7 @@ impl AgentSession {
         let api_key = config
             .api_key
             .map(|key| stream::ProviderApiKey::new(config.model.provider.clone(), key));
-        Self {
+        let session = Self {
             registry: config.provider_registry,
             model: RwLock::new(config.model),
             extension_api_keys: Mutex::new(HashMap::new()),
@@ -608,6 +660,7 @@ impl AgentSession {
             extensions: config.extensions,
             plugins,
             session_start_sent: AtomicBool::new(false),
+            js_event_dispatch,
             #[cfg(feature = "mcp")]
             mcp_unreachable_warned: AtomicBool::new(false),
             merged_extension_tools: Mutex::new(None),
@@ -646,11 +699,12 @@ impl AgentSession {
             extension_resource_contribution: std::sync::RwLock::new(
                 session_ctx::ExtensionResourceContribution::default(),
             ),
-            context_derived_prompt: config.system_prompt.is_none(),
+            context_derived_prompt,
             scoped_models: RwLock::new(Vec::new()),
             session_events: session_events_handle,
             compacting: Arc::new(AtomicBool::new(false)),
             auto_compaction_cancel: Arc::new(Mutex::new(None)),
+            manual_compaction_owner: Arc::new(AtomicU64::new(0)),
             self_weak: RwLock::new(None),
             queue_mirror: Arc::new(Mutex::new(QueueMirror::default())),
             last_run_diagnostics: std::sync::RwLock::new(None),
@@ -666,7 +720,18 @@ impl AgentSession {
             native_actions: Arc::new(Mutex::new(VecDeque::new())),
             native_action_flush: tokio::sync::Mutex::new(()),
             agent_dir,
-        }
+        };
+        // Install the session-event fan-out NOW, while the plugin host and the
+        // `session_events` list are both reachable, instead of lazily at the
+        // first prompt/idle drain. `compact()` and `execute_bash()` are public
+        // APIs that emit `compaction_start`/`_end`, `summarization_retry_*`
+        // and `bash_execution_update` before any run; a JS-only plan must
+        // deliver those to its `pi.on` handlers too. The installer is
+        // idempotent per session (keyed by the `session_events` allocation),
+        // so the later entry-point calls cannot install a second subscriber
+        // or double-deliver.
+        session.ensure_session_event_bridge();
+        session
     }
 
     /// Install the discovered skills and prompt templates backing the
@@ -1602,33 +1667,41 @@ fn rust_hidden_declarations(
     registry: &crate::agent::tool_execution::ToolRegistry,
     active: &[String],
 ) -> Vec<String> {
-    let declared = crate::agent::tool_execution::declared_tools(registry, active);
-    if declared.is_empty() {
-        return Vec::new();
-    }
-    let callable = crate::agent::tool_execution::callable_tools(registry, active);
-    let mut exposures = std::collections::BTreeMap::new();
-    let mut namespaces = std::collections::BTreeMap::new();
-    for tool in registry.iter() {
-        exposures.insert(tool.name().to_owned(), tool.exposure());
-        if let Some(namespace) = tool.namespace() {
-            namespaces.insert(tool.name().to_owned(), namespace);
+    // This helper only feeds the RENDERED system prompt (its declared/hidden
+    // sections), so it runs during session construction and resource
+    // installation — never as part of a run. `prepare_loadout` is the same
+    // hook a run uses, and the bash tool warms the shell pool from it; wrapping
+    // the render pass keeps that warm-up for the first real loadout instead of
+    // spawning the member (and its dedicated runtime) before any prompt.
+    crate::coding_agent::tools::shell_pool::without_prewarm(|| {
+        let declared = crate::agent::tool_execution::declared_tools(registry, active);
+        if declared.is_empty() {
+            return Vec::new();
         }
-    }
-    let loadout = crate::agent::tool_execution::ToolLoadout {
-        declared,
-        callable,
-        registered: registry.iter().cloned().collect(),
-        exposures,
-        namespaces,
-    };
-    let mut hidden = std::collections::BTreeSet::new();
-    for tool in &loadout.declared {
-        if let Some(changes) = tool.prepare_loadout(&loadout) {
-            hidden.extend(changes.hidden_declarations);
+        let callable = crate::agent::tool_execution::callable_tools(registry, active);
+        let mut exposures = std::collections::BTreeMap::new();
+        let mut namespaces = std::collections::BTreeMap::new();
+        for tool in registry.iter() {
+            exposures.insert(tool.name().to_owned(), tool.exposure());
+            if let Some(namespace) = tool.namespace() {
+                namespaces.insert(tool.name().to_owned(), namespace);
+            }
         }
-    }
-    hidden.into_iter().collect()
+        let loadout = crate::agent::tool_execution::ToolLoadout {
+            declared,
+            callable,
+            registered: registry.iter().cloned().collect(),
+            exposures,
+            namespaces,
+        };
+        let mut hidden = std::collections::BTreeSet::new();
+        for tool in &loadout.declared {
+            if let Some(changes) = tool.prepare_loadout(&loadout) {
+                hidden.extend(changes.hidden_declarations);
+            }
+        }
+        hidden.into_iter().collect()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1733,6 +1806,10 @@ impl AgentSession {
             // session.
             services.bind_session(&session);
             plugins.bind_context(services.into_context());
+            // Spawn only after the bind: `emit_native` gates its one-shot
+            // `on_init` pass on a bound context, so this is what makes
+            // `on_init` precede `project_trust` on every runtime flavor (G2).
+            spawn_native_project_trust(plugins, Some(session.cwd.as_path()));
         }
         session.install_phone_host();
         session
@@ -1975,8 +2052,14 @@ impl AgentSession {
         let session_name = self.session_name().await;
         let commands = self.phone_command_catalog();
         let session_file = self.session_path().map(|path| path.display().to_string());
-        serde_json::json!({
-            "state": {
+        // Build the envelope field by field and MOVE the pre-built message /
+        // command arrays into it: `json!` re-serializes every `Value`
+        // expression, which deep-copied the whole transcript on every phone
+        // snapshot push.
+        let mut snapshot = serde_json::Map::with_capacity(5);
+        snapshot.insert(
+            "state".to_owned(),
+            serde_json::json!({
                 "model": serde_json::to_value(&model).unwrap_or(serde_json::Value::Null),
                 "thinkingLevel": self.current_thinking().wire_key(),
                 "isStreaming": self.is_streaming(),
@@ -1995,12 +2078,13 @@ impl AgentSession {
                     "cacheRead": stats.tokens.cache_read,
                     "cacheWrite": stats.tokens.cache_write,
                 },
-            },
-            "messages": messages,
-            "liveAssistantMessage": serde_json::Value::Null,
-            "liveTools": [],
-            "commands": commands,
-        })
+            }),
+        );
+        snapshot.insert("messages".to_owned(), serde_json::Value::Array(messages));
+        snapshot.insert("liveAssistantMessage".to_owned(), serde_json::Value::Null);
+        snapshot.insert("liveTools".to_owned(), serde_json::Value::Array(Vec::new()));
+        snapshot.insert("commands".to_owned(), serde_json::Value::Array(commands));
+        serde_json::Value::Object(snapshot)
     }
 
     #[cfg(feature = "phone")]

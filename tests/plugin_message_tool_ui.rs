@@ -986,14 +986,20 @@ async fn tool_service_executes_plugin_and_core_tools_with_child_ids() {
         .expect_err("unknown tools fail");
     assert!(matches!(error, PluginServiceError::Failed(_)));
 
-    // The session abort signal reaches the tool context.
+    // An abort BETWEEN runs is a no-op for the next service call (the stored
+    // signal belongs to the previous run; upstream only cancels an in-flight
+    // operation). The tool context must get a fresh, unaborted signal —
+    // otherwise every later bash/write/edit call fails "Operation aborted".
     session.abort();
-    let aborted = tools
+    let idle = tools
         .execute_tool("caller-d", "core-abort", json!({}), Default::default())
         .await
         .expect("abort-aware tool runs");
-    assert!(aborted.is_error);
-    assert_eq!(aborted.result.content, "aborted");
+    assert!(
+        !idle.is_error,
+        "an idle abort must not leak into the next call"
+    );
+    assert_eq!(idle.result.content, "ran");
 }
 
 fn short_echo_command() -> (&'static str, Vec<String>) {

@@ -652,6 +652,12 @@ impl CancellationHandle {
         let signal = self.0.clone();
         Box::pin(async move { signal.cancelled().await })
     }
+
+    /// The underlying abort signal, for adapters that must hand it to a
+    /// provider request (`StreamOptions::signal`).
+    pub(crate) fn abort_signal(&self) -> AbortSignal {
+        self.0.clone()
+    }
 }
 
 /// A subscription token for `pi.events` / `ui.onTerminalInput`.
@@ -1726,16 +1732,57 @@ pub trait UiService: Send + Sync {
 }
 
 /// Provider / MCP / virtual-model registration and `modelRegistry.complete`.
+///
+/// # Native provider registration (the parity contract)
+///
+/// A native plugin has two registration paths, both live on the session-bound
+/// implementation ([`crate::agent_session::plugin_services`]):
+///
+/// - [`Self::register_provider_impl`] installs a typed [`ProviderBox`]. The
+///   whole [`Provider`](crate::ai::provider::Provider) surface is reachable
+///   this way — `stream`/`stream_simple`, `get_all_models`, `filter_models`,
+///   `headers`, `refresh_models`, `fetch_deferred`, `oauth_flow` — which is
+///   the Rust equivalent of a JS `pi.registerProvider({ streamSimple,
+///   refreshModels, oauth, filterModels, ... })` object.
+/// - [`Self::register_provider`] installs an upstream-shaped JSON config at
+///   runtime. It supports the declarative `models`/`baseUrl`/`api`/`apiKey`
+///   fields only; `streamSimple`/`refreshModels`/`oauth` callbacks remain
+///   JS-only on this path (use a typed provider for the equivalent
+///   capability). Declarative Rust plugin definitions also keep flowing
+///   through `RegistrationContext::register_provider` and the session's full
+///   sync pass.
+///
+/// Typed registrations are owned by the binding that made them: explicit
+/// [`Self::unregister_provider`] and service teardown remove exactly that
+/// binding's entries, never a parent/sibling registration of the same id or a
+/// JS/shared dynamic entry. Runtime JSON and virtual-model registrations
+/// follow the same ownership rule and additionally restore the entry they
+/// displaced: a parent registration or JS definition under the same id/key
+/// becomes visible again when the child/sibling that overwrote it tears down.
 pub trait ProviderService: Send + Sync {
-    /// `pi.registerProvider`. `config` is the upstream provider config
-    /// (inherently JSON: models, hooks, headers).
+    /// `pi.registerProvider` with an upstream-shaped JSON config.
+    ///
+    /// The live session service applies this immediately to the registry's
+    /// dynamic overlay (the same overlay the JS definition sync uses). The
+    /// supported runtime subset is `models`, `baseUrl`, `api`, provider/model
+    /// `headers`, and `authHeader` (with `apiKey` supplying the
+    /// `Authorization` value); callback-driven fields are reported and
+    /// skipped. Use [`Self::register_provider_impl`] for the full typed
+    /// surface.
     fn register_provider(&self, _id: &str, _config: JsonValue) {}
 
-    /// `pi.unregisterProvider`.
+    /// `pi.unregisterProvider` for a registration owned by this binding.
+    ///
+    /// The live service removes this binding's typed and runtime-JSON
+    /// registrations for `id`; the runtime-JSON installation restores the
+    /// dynamic entry it displaced. An entry installed by a parent/sibling or a
+    /// JS definition after this binding's installation is left untouched.
     fn unregister_provider(&self, _id: &str) {}
 
     /// Register a Rust provider implementation (the typed `streamSimple` /
-    /// OAuth seam).
+    /// OAuth seam). Last registration for the same id wins within one binding;
+    /// registrations from different bindings stack so teardown of one never
+    /// removes another's provider.
     fn register_provider_impl(&self, _provider: ProviderBox) {}
 
     /// Register the typed native auth hook for a provider (login/refresh/
@@ -1773,9 +1820,21 @@ pub trait ProviderService: Send + Sync {
     }
 
     /// `pi.registerVirtualModel`; the definition is upstream wire JSON.
+    ///
+    /// The live service applies the registration immediately to the session
+    /// registry's virtual-model overlay, tagged with a per-binding source so
+    /// the plugin-registry sync never treats it as a stale JS definition and
+    /// teardown removes only this binding's registration. Teardown restores
+    /// the previous registration and route callback for the same
+    /// `(provider, id)` key when this binding displaced another owner's entry.
     fn register_virtual_model(&self, _definition: JsonValue) {}
 
-    /// `pi.unregisterVirtualModel`.
+    /// `pi.unregisterVirtualModel` for a registration owned by this binding.
+    ///
+    /// Only a registration whose current value is this binding's exact
+    /// registration is undone; a JS/definition sync or a sibling that
+    /// re-registered the key keeps its value. When this binding displaced an
+    /// earlier registration, that one (and its route callback) is restored.
     fn unregister_virtual_model(&self, _provider: &str, _id: &str) {}
 
     /// Physical model behind a virtual model, when one exists.
@@ -1789,7 +1848,13 @@ pub trait ProviderService: Send + Sync {
     }
 
     /// `modelRegistry.complete`, bound to the session's completion
-    /// capability: models other than the session's current one fail closed.
+    /// capability: the request streams through the session's provider
+    /// registry with its resolved credentials, so any model that registry
+    /// knows (including one just installed by [`Self::register_provider_impl`])
+    /// can be completed. A virtual model is projected exactly like a session
+    /// request (static physical route, per-request `route` callback,
+    /// `systemPrompt`, and `modelOverride.maxTokens` when the caller passes no
+    /// cap). An unknown model fails closed instead of fabricating a message.
     fn complete(
         &self,
         _model: &Model,

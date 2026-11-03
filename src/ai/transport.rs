@@ -1,5 +1,7 @@
 //! Shared HTTP transport for AI providers.
 use std::collections::BTreeMap;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -70,18 +72,51 @@ pub type BeforeProviderRequestHook = std::sync::Arc<
         + Sync,
 >;
 
+/// Apply the per-request `before_provider_request` hook to a request value.
+///
+/// Adapters that already hold the request as a `Value` (the OpenAI body path
+/// when a hook is installed) call this before serializing, so the hook never
+/// forces a second transcript-sized tree and the transport can be handed a
+/// hook-free `ProviderStreamHooks` clone. Without a hook the value is returned
+/// unchanged.
+pub(crate) async fn apply_before_provider_request_value(
+    value: serde_json::Value,
+    hooks: &ProviderStreamHooks,
+) -> serde_json::Value {
+    match hooks.before_provider_request.as_ref() {
+        Some(hook) => hook(value).await,
+        None => value,
+    }
+}
+
 /// Apply the per-request `before_provider_request` hook to a serialized JSON
 /// body. Without a hook — or when the body is not JSON (never the case for AI
 /// provider requests) — the body passes through unchanged.
 async fn apply_before_provider_request(body: Vec<u8>, hooks: &ProviderStreamHooks) -> Vec<u8> {
-    let Some(hook) = hooks.before_provider_request.as_ref() else {
+    if hooks.before_provider_request.is_none() {
         return body;
-    };
+    }
+    // The parsed Value owns every string it carries, so the serialized body
+    // can be released BEFORE the hook runs: keeping it alive through the hook
+    // and the replacement serialization held a transcript-sized `Vec` next to
+    // the transcript-sized `Value` and the new `Vec` (three copies of the same
+    // request on a resumed session). The replacement is always serialized from
+    // the hook's returned Value, exactly like before; only the fallback to the
+    // pre-hook bytes on a serializer error is gone — `Value` serialization
+    // cannot fail for a JSON tree (the writer is an in-memory Vec).
+    let reserved = body.len();
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return body;
     };
-    let replaced = hook(value).await;
-    serde_json::to_vec(&replaced).unwrap_or(body)
+    drop(body);
+    let replaced = apply_before_provider_request_value(value, hooks).await;
+    let mut payload = Vec::with_capacity(reserved);
+    if serde_json::to_writer(&mut payload, &replaced).is_err() {
+        // Unreachable for a `Value` (map keys are strings, the writer is an
+        // in-memory Vec); fail closed instead of sending a partial body.
+        payload.clear();
+    }
+    payload
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +214,57 @@ impl Default for ProviderRequestConfig {
 pub fn is_codex_responses_url(url: &str) -> bool {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     path.trim_end_matches('/').ends_with("/codex/responses")
+}
+
+/// Build a reqwest client for Pi-managed auxiliary HTTP traffic (OAuth token
+/// endpoints, remote catalogs, AWS credential endpoints).
+///
+/// reqwest is built with `default-features = false` (no `system-proxy`), so a
+/// bare `Client::builder()` silently ignores env/OS proxies. Every such client
+/// resolves its proxy through [`ProviderRequestConfig::env_proxy_url`] and
+/// honours the standard `NO_PROXY`/`no_proxy` exclusions. The builder itself
+/// leaves redirect handling at reqwest's default; clients that carry provider
+/// credentials (the provider transport and OAuth HTTP client) must add
+/// `redirect(Policy::none())` themselves so 301/302/307/308 cannot forward
+/// `x-api-key`, `api-key`, `x-goog-api-key` or `authorization` to another host.
+pub(crate) fn pi_reqwest_client_builder() -> AiResult<reqwest::ClientBuilder> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(proxy_url) = ProviderRequestConfig::env_proxy_url() {
+        let proxy = reqwest::Proxy::all(&proxy_url)
+            .map_err(|error| AiError::Http(format!("invalid proxy URL: {error}")))?
+            .no_proxy(reqwest::NoProxy::from_env());
+        builder = builder.proxy(proxy);
+    }
+    Ok(builder)
+}
+
+/// Read a response body under a hard size cap: an oversized `Content-Length`
+/// is rejected before any read, and the streamed read (`Response::chunk`)
+/// stops at `limit` even when the header is absent (chunked) or lies, so the
+/// whole body can never be buffered before the check. `what` labels the
+/// failure for the read error path.
+pub(crate) async fn read_bounded_response_body(
+    mut response: reqwest::Response,
+    limit: usize,
+    what: &str,
+) -> AiResult<String> {
+    if let Some(length) = response.content_length() {
+        if length > limit as u64 {
+            return Err(AiError::ResponseTooLarge { limit });
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        AiError::Http(format!("reading the {what} response body failed: {error}"))
+    })? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(AiError::ResponseTooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    // Match `Response::text()`: lossy UTF-8 and a stripped leading BOM.
+    let body = String::from_utf8_lossy(&body);
+    Ok(body.strip_prefix('\u{feff}').unwrap_or(&body).to_string())
 }
 
 impl ProviderRequestConfig {
@@ -333,7 +419,9 @@ impl ReqwestTransport {
     /// Build the shared reqwest client — the construction
     /// [`ProviderRequestClient::new`] has always used.
     pub fn new(config: &ProviderRequestConfig) -> AiResult<Self> {
-        let mut builder = reqwest::Client::builder().connect_timeout(config.timeout);
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(config.timeout)
+            .redirect(reqwest::redirect::Policy::none());
         if let Some(proxy_url) = &config.proxy_url {
             let proxy = reqwest::Proxy::all(proxy_url)
                 .map_err(|error| AiError::Http(format!("invalid proxy URL: {error}")))?;
@@ -341,6 +429,85 @@ impl ReqwestTransport {
         }
         let client = builder.build().map_err(|e| AiError::Http(e.to_string()))?;
         Ok(Self { client })
+    }
+
+    /// Build one reqwest request for the retry loop. `reqwest::Body::from(Vec)`
+    /// moves the serialized payload into a single reusable `Bytes`
+    /// allocation; `reqwest::Request::try_clone` then shares that allocation
+    /// across attempts (a refcount bump, never a body copy). Header validation
+    /// matches [`ProviderRequestClient::build_request`], so both transports
+    /// fail fast on the same inputs.
+    fn prepare(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        body: Vec<u8>,
+    ) -> AiResult<reqwest::Request> {
+        let headers = build_header_map(headers)?;
+        self.client
+            .request(method.clone(), url)
+            .headers(headers)
+            .body(body)
+            .build()
+            .map_err(|error| AiError::Http(error.to_string()))
+    }
+
+    /// Build one reqwest request whose body is streamed from `path`.
+    ///
+    /// The file is opened fresh for every attempt (a streaming body cannot be
+    /// shared via `Request::try_clone`). A buffered reader keeps the read
+    /// buffer off the transcript-sized heap; the explicit Content-Length
+    /// preserves the wire shape of the Vec-backed path (no chunked encoding).
+    fn prepare_file(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        path: &Path,
+        len: u64,
+    ) -> AiResult<reqwest::Request> {
+        let mut headers = build_header_map(headers)?;
+        headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::HeaderValue::from(len),
+        );
+        let file = std::fs::File::open(path)?;
+        let file = tokio::fs::File::from_std(file);
+        let stream = futures_util::stream::unfold(file, |mut file| async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut buffer = vec![0u8; 64 * 1024];
+            match file.read(&mut buffer).await {
+                Ok(0) => None,
+                Ok(read) => {
+                    buffer.truncate(read);
+                    Some((Ok::<_, std::io::Error>(buffer), file))
+                }
+                Err(error) => Some((Err(error), file)),
+            }
+        });
+        self.client
+            .request(method.clone(), url)
+            .headers(headers)
+            .body(reqwest::Body::wrap_stream(stream))
+            .build()
+            .map_err(|error| AiError::Http(error.to_string()))
+    }
+
+    /// Send one already prepared reqwest request. Callers replay via
+    /// [`reqwest::Request::try_clone`], which keeps the body shared.
+    fn execute_prepared(
+        &self,
+        request: reqwest::Request,
+    ) -> crate::agent::tool_execution::BoxFuture<'_, AiResult<HttpResponse>> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .execute(request)
+                .await
+                .map_err(|error| AiError::Http(error.to_string()))?;
+            Ok(into_http_response(response))
+        })
     }
 }
 
@@ -364,37 +531,247 @@ impl HttpTransport for ReqwestTransport {
                 .send()
                 .await
                 .map_err(|error| AiError::Http(error.to_string()))?;
-            let status = response.status().as_u16();
-            let headers = response.headers().clone();
-            let body = response.bytes_stream().map(|item| {
-                item.map_err(|error| AiError::Http(error.to_string()))
-                    .map(HttpBodyChunk::new)
-            });
-            Ok(HttpResponse {
-                status,
-                headers,
-                body: Box::pin(body),
-            })
+            Ok(into_http_response(response))
         })
     }
+}
+
+/// Map one reqwest response head into the transport seam response.
+fn into_http_response(response: reqwest::Response) -> HttpResponse {
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let body = response.bytes_stream().map(|item| {
+        item.map_err(|error| AiError::Http(error.to_string()))
+            .map(HttpBodyChunk::new)
+    });
+    HttpResponse {
+        status,
+        headers,
+        body: Box::pin(body),
+    }
+}
+
+/// Validate and pack caller headers for either transport. An empty value is
+/// the upstream `null` suppression marker: the header shadows a default but
+/// must not be sent. Invalid names/values fail fast (never retried).
+fn build_header_map(headers: &BTreeMap<String, String>) -> AiResult<HeaderMap> {
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        if value.is_empty() {
+            continue;
+        }
+        let key = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| AiError::Http(error.to_string()))?;
+        let val = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|error| AiError::Http(error.to_string()))?;
+        map.insert(key, val);
+    }
+    Ok(map)
+}
+
+/// One prepared request for an attempt.
+///
+/// With a retry budget, the DEFAULT reqwest transport keeps the serialized
+/// body in one reusable `Bytes` allocation owned by the `reqwest::Request`;
+/// every attempt replays the request through `try_clone`, which only bumps the
+/// body's refcount. The injection seam keeps the public `HttpRequest` shape
+/// (owned `Vec` body): only its attempts that still have a retry budget pay a
+/// body copy, exactly like before this optimization.
+enum PreparedRequest {
+    Reqwest(reqwest::Request),
+    Seam(HttpRequest),
+}
+
+/// Where the serialized request body lives across the retry loop.
+enum AttemptSource {
+    /// No retry budget: the body is MOVED into the single attempt.
+    Owned(Option<Vec<u8>>),
+    /// Retry budget over the injection seam: one `HttpRequest` owns the body.
+    Seam(HttpRequest),
+    /// Retry budget over the default reqwest transport: one request owns a
+    /// reusable `Bytes` body shared by every attempt.
+    Replay(reqwest::Request),
+    /// A temp-file-serialized body: each attempt opens the file fresh (a
+    /// streaming reqwest body cannot be cloned), keeping the body off the heap.
+    File { path: PathBuf, len: u64 },
+}
+
+/// The attempt executor selected at construction: the default reqwest client
+/// (zero-copy request replay) or an injected [`HttpTransport`] (public seam).
+#[derive(Clone)]
+enum AttemptTransport {
+    Reqwest(Arc<ReqwestTransport>),
+    Seam(Arc<dyn HttpTransport>),
+}
+
+impl AttemptTransport {
+    fn prepare(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        body: Vec<u8>,
+    ) -> AiResult<PreparedRequest> {
+        match self {
+            Self::Reqwest(transport) => transport
+                .prepare(method, url, headers, body)
+                .map(PreparedRequest::Reqwest),
+            Self::Seam(_) => ProviderRequestClient::build_request(method, url, headers, body)
+                .map(PreparedRequest::Seam),
+        }
+    }
+
+    /// Prepare one attempt whose body lives in a temp file. The default
+    /// transport streams the file; the Vec-shaped injection seam reads it
+    /// back (test-only, and the file is bounded by the caller's threshold).
+    fn prepare_file(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        path: &Path,
+        len: u64,
+    ) -> AiResult<PreparedRequest> {
+        match self {
+            Self::Reqwest(transport) => transport
+                .prepare_file(method, url, headers, path, len)
+                .map(PreparedRequest::Reqwest),
+            Self::Seam(_) => {
+                let body = std::fs::read(path)?;
+                ProviderRequestClient::build_request(method, url, headers, body)
+                    .map(PreparedRequest::Seam)
+            }
+        }
+    }
+
+    fn execute(
+        &self,
+        request: PreparedRequest,
+    ) -> crate::agent::tool_execution::BoxFuture<'_, AiResult<HttpResponse>> {
+        match (self, request) {
+            (Self::Reqwest(transport), PreparedRequest::Reqwest(request)) => {
+                transport.execute_prepared(request)
+            }
+            (Self::Seam(transport), PreparedRequest::Seam(request)) => transport.execute(request),
+            // Both halves are produced by the same variant, so this arm is
+            // unreachable; fail closed with a typed error instead of panicking.
+            _ => Box::pin(async {
+                Err(AiError::Http(
+                    "internal transport error: request kind does not match transport".to_string(),
+                ))
+            }),
+        }
+    }
+}
+
+/// One serialized request body stored in a temp file, for bodies too large to
+/// keep resident as a `Vec` through the request.
+///
+/// The file is created exclusively in the platform temp directory, written by
+/// [`ProviderRequestClient::serialize_payload_to_file`], streamed by the
+/// default reqwest transport (reopened per retry attempt), and removed on
+/// drop. The injection seam reads it back into an [`HttpRequest`] because that
+/// public seam is Vec-shaped and is test-only.
+#[derive(Debug)]
+pub struct SerializedPayloadFile {
+    path: PathBuf,
+    len: u64,
+}
+
+impl SerializedPayloadFile {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl Drop for SerializedPayloadFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Distinguishes concurrent temp bodies in one process.
+static PROVIDER_BODY_FILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The request body handed to one streaming attempt loop.
+enum StreamRequestBody<'a> {
+    Bytes(Vec<u8>),
+    File(&'a SerializedPayloadFile),
+}
+
+/// The request-shape half of one streaming call: method, target, caller
+/// headers, and the per-request cancellation/hook context.
+///
+/// Every streaming entry point takes this bundle, so a request's shape is
+/// assembled once and threaded through the retry loop and its private helpers
+/// without repeating the same five positional values in each signature.
+pub struct StreamingRequest<'a> {
+    method: Method,
+    url: &'a str,
+    headers: &'a BTreeMap<String, String>,
+    signal: Option<&'a AbortSignal>,
+    hooks: &'a ProviderStreamHooks,
+}
+
+impl<'a> StreamingRequest<'a> {
+    /// Bundle one request's method, URL, headers and per-request signal/hooks.
+    pub fn new(
+        method: Method,
+        url: &'a str,
+        headers: &'a BTreeMap<String, String>,
+        signal: Option<&'a AbortSignal>,
+        hooks: &'a ProviderStreamHooks,
+    ) -> Self {
+        Self {
+            method,
+            url,
+            headers,
+            signal,
+            hooks,
+        }
+    }
+}
+
+/// The inputs of one retry decision: the attempt that just failed, its
+/// trigger summary, the server-requested delay headers, and the
+/// cancellation/hook context (see [`ProviderRequestClient::backoff`]).
+struct RetryAttempt<'a> {
+    /// 0-based index of the attempt that just failed.
+    attempt: u32,
+    /// The `auto_retry_start` trigger summary.
+    error_message: &'a str,
+    /// `retry-after-ms` header value (`None` when absent or unparseable).
+    retry_after_ms: Option<&'a str>,
+    /// `retry-after` header value (`None` when absent or unparseable).
+    retry_after: Option<&'a str>,
+    signal: Option<&'a AbortSignal>,
+    hooks: &'a ProviderStreamHooks,
 }
 
 /// A reusable provider HTTP client with bounded retries and response reads.
 #[derive(Clone)]
 pub struct ProviderRequestClient {
-    /// The attempt executor: [`ReqwestTransport`] by default ([`Self::new`]),
-    /// or an arbitrary transport via [`Self::with_transport`].
-    transport: Arc<dyn HttpTransport>,
+    /// The attempt executor: the default [`ReqwestTransport`]
+    /// ([`Self::new`]), or an arbitrary transport via
+    /// [`Self::with_transport`].
+    transport: AttemptTransport,
     pub config: ProviderRequestConfig,
     /// Per-client payload diagnostics (see [`Self::payload_diagnostics`]).
     ///
-    /// MEMORY SHAPE (pir extension): a JSON request body is materialized once
-    /// (it has to be — `reqwest` owns the bytes it sends) and, when a retry is
-    /// still possible, KEPT so the next attempt reuses it; the former shape
-    /// cloned the whole body unconditionally on every attempt, a second
-    /// full-size copy of a summarizer chunk per call. The counters make that
-    /// property testable: a single-attempt request must report one allocation
-    /// and ZERO copies.
+    /// MEMORY SHAPE (pir extension): a small JSON request body is materialized
+    /// once and kept in ONE reusable allocation; a transcript-sized one
+    /// ([`Self::serialize_payload_to_file`]) is written to a temp file and
+    /// streamed instead. The default reqwest transport replays a Vec body by
+    /// cloning the `reqwest::Request`, which shares that allocation (refcount
+    /// only), so the common case — a successful first attempt under the
+    /// default two-retry budget — pays ZERO body copies; a file body reopens
+    /// the file per attempt. The injection seam (`with_transport`) keeps its
+    /// historical behavior: an attempt that must keep the body for a possible
+    /// retry pays one `Vec` copy. The counters make the property testable.
     payload: Arc<PayloadDiagnostics>,
     /// Per-request total timeout (upstream `StreamOptions.timeoutMs`, set by
     /// the adapter from `options.timeout_ms`). Reset on this client clone, so
@@ -416,6 +793,7 @@ enum TimeoutKind {
 struct PayloadDiagnostics {
     allocations: std::sync::atomic::AtomicU64,
     copies: std::sync::atomic::AtomicU64,
+    bytes_copied: std::sync::atomic::AtomicU64,
 }
 
 /// One client's payload-construction counters.
@@ -423,9 +801,9 @@ struct PayloadDiagnostics {
 pub struct PayloadDiagnosticsSnapshot {
     /// Request bodies serialized (`serde_json::to_vec` successes).
     pub allocations: u64,
-    /// Full-body copies made to keep a body available for a retry. A request
-    /// with no retry budget and a request on its last possible attempt make
-    /// none.
+    /// Full-body copies made to keep a body available for a retry. The default
+    /// reqwest transport makes none (it replays one shared `Bytes` body); the
+    /// injection seam copies only on attempts that still have a retry budget.
     pub copies: u64,
 }
 
@@ -434,7 +812,12 @@ impl ProviderRequestClient {
     /// optional proxy come from `config`; unchanged pre-seam construction).
     pub fn new(config: ProviderRequestConfig) -> AiResult<Self> {
         let transport = Arc::new(ReqwestTransport::new(&config)?);
-        Ok(Self::with_transport(config, transport))
+        Ok(Self {
+            transport: AttemptTransport::Reqwest(transport),
+            config,
+            payload: Arc::new(PayloadDiagnostics::default()),
+            request_timeout: None,
+        })
     }
 
     /// [`Self::new`] over an arbitrary [`HttpTransport`] (additive seam): the
@@ -447,7 +830,7 @@ impl ProviderRequestClient {
         transport: Arc<dyn HttpTransport>,
     ) -> Self {
         Self {
-            transport,
+            transport: AttemptTransport::Seam(transport),
             config,
             payload: Arc::new(PayloadDiagnostics::default()),
             request_timeout: None,
@@ -469,7 +852,7 @@ impl ProviderRequestClient {
     /// Replace the attempt executor for this client clone (upstream
     /// per-request `fetch` injection).
     pub fn set_transport(&mut self, transport: Arc<dyn HttpTransport>) {
-        self.transport = transport;
+        self.transport = AttemptTransport::Seam(transport);
     }
 
     /// The payload-construction counters of this client (see
@@ -487,6 +870,14 @@ impl ProviderRequestClient {
         }
     }
 
+    /// Total request-body bytes copied to keep a request replayable (a
+    /// diagnostic; zero for every request over the default reqwest transport).
+    pub fn payload_bytes_copied(&self) -> u64 {
+        self.payload
+            .bytes_copied
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Reset the payload counters (test seam).
     pub fn reset_payload_diagnostics(&self) {
         self.payload
@@ -495,15 +886,94 @@ impl ProviderRequestClient {
         self.payload
             .copies
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.payload
+            .bytes_copied
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Serialize one JSON request body, counting the allocation.
     fn serialize_payload<T: Serialize>(&self, body: &T) -> AiResult<Vec<u8>> {
-        let payload = serde_json::to_vec(body)?;
+        self.serialize_payload_with_capacity(body, 0)
+    }
+
+    /// [`Self::serialize_payload`] with a caller-supplied capacity hint.
+    ///
+    /// A transcript-sized provider body (tens of MiB) otherwise grows its
+    /// output `Vec` through several reallocations; the last one briefly holds
+    /// both the old and the new buffer. Callers that can estimate the wire
+    /// size (the OpenAI streamed body) reserve it once.
+    pub(crate) fn serialize_payload_with_capacity<T: Serialize>(
+        &self,
+        body: &T,
+        capacity: usize,
+    ) -> AiResult<Vec<u8>> {
+        let mut payload = Vec::with_capacity(capacity);
+        serde_json::to_writer(&mut payload, body)?;
         self.payload
             .allocations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(payload)
+    }
+
+    /// Serialize one JSON request body directly into a temp file.
+    ///
+    /// Used by the OpenAI streamed body when the estimated wire size is large
+    /// enough that holding the serialized bytes would dominate the peak: the
+    /// body is written with a bounded buffer, and the default transport
+    /// streams the file into reqwest (reopening it for each retry attempt)
+    /// instead of keeping a transcript-sized `Vec` alive. The error type is
+    /// the same as [`Self::serialize_payload_with_capacity`]; a serialization
+    /// failure removes the partially written file through the guard's drop.
+    pub(crate) fn serialize_payload_to_file<T: Serialize>(
+        &self,
+        body: &T,
+    ) -> AiResult<SerializedPayloadFile> {
+        let mut last_error = None;
+        for _ in 0..16 {
+            let nonce = PROVIDER_BODY_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "pir-provider-body-{}-{nonce}.json",
+                std::process::id()
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    let written = (|| -> AiResult<u64> {
+                        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
+                        serde_json::to_writer(&mut writer, body)?;
+                        writer.flush()?;
+                        let written = writer
+                            .into_inner()
+                            .map_err(std::io::IntoInnerError::into_error)?;
+                        Ok(written.metadata()?.len())
+                    })();
+                    match written {
+                        Ok(len) => {
+                            self.payload
+                                .allocations
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(SerializedPayloadFile { path, len });
+                        }
+                        Err(error) => {
+                            // The success guard does not exist yet: remove the
+                            // partial body before reporting the failure.
+                            let _ = std::fs::remove_file(&path);
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| std::io::Error::other("cannot create provider body temp file"))
+            .into())
     }
 
     pub fn with_default_config() -> AiResult<Self> {
@@ -545,23 +1015,14 @@ impl ProviderRequestClient {
     /// [`request_streaming_with`](Self::request_streaming_with).
     ///
     /// Returns the final status and response headers.
-    // Eight parameters mirror the streaming call shape of the buffered
-    // `request` path plus the chunk callback; a params struct would touch
-    // every provider transport for no behavioral gain.
-    #[allow(clippy::too_many_arguments)]
     pub async fn request_streaming(
         &self,
-        method: Method,
-        url: &str,
-        headers: &BTreeMap<String, String>,
+        request: StreamingRequest<'_>,
         body: Vec<u8>,
-        signal: Option<&AbortSignal>,
-        hooks: &ProviderStreamHooks,
         on_chunk: &mut (dyn FnMut(&[u8]) -> AiResult<()> + Send),
     ) -> AiResult<(u16, BTreeMap<String, String>)> {
         let mut sink = SyncFnSink(on_chunk);
-        self.request_streaming_with(method, url, headers, body, signal, hooks, &mut sink)
-            .await
+        self.request_streaming_with(request, body, &mut sink).await
     }
 
     /// [`request_streaming`](Self::request_streaming) with an awaitable chunk
@@ -579,24 +1040,15 @@ impl ProviderRequestClient {
     /// attempt resolves (success / final failure / cancellation). The hooks
     /// are pure observers — retry counts, backoff computation, `Retry-After`
     /// priority and cancellation semantics are untouched.
-    #[allow(clippy::too_many_arguments)]
     pub async fn request_streaming_with<C: ChunkSink>(
         &self,
-        method: Method,
-        url: &str,
-        headers: &BTreeMap<String, String>,
+        request: StreamingRequest<'_>,
         body: Vec<u8>,
-        signal: Option<&AbortSignal>,
-        hooks: &ProviderStreamHooks,
         on_chunk: &mut C,
     ) -> AiResult<(u16, BTreeMap<String, String>)> {
         self.request_streaming_with_no_retry_statuses(
-            method,
-            url,
-            headers,
-            body,
-            signal,
-            hooks,
+            request,
+            StreamRequestBody::Bytes(body),
             &[],
             on_chunk,
         )
@@ -610,15 +1062,10 @@ impl ProviderRequestClient {
     /// the same `NonRetryable("HTTP <status>: ...")` error it would after an
     /// exhausted retry budget. An empty list is exactly
     /// [`request_streaming_with`](Self::request_streaming_with).
-    #[allow(clippy::too_many_arguments)]
     async fn request_streaming_with_no_retry_statuses<C: ChunkSink>(
         &self,
-        method: Method,
-        url: &str,
-        headers: &BTreeMap<String, String>,
-        body: Vec<u8>,
-        signal: Option<&AbortSignal>,
-        hooks: &ProviderStreamHooks,
+        request: StreamingRequest<'_>,
+        body: StreamRequestBody<'_>,
         no_retry_statuses: &[u16],
         on_chunk: &mut C,
     ) -> AiResult<(u16, BTreeMap<String, String>)> {
@@ -626,15 +1073,12 @@ impl ProviderRequestClient {
         // `auto_retry_end` observation once the final attempt resolved.
         // `retries_started` is the upstream `_retryAttempt` counter (number of
         // scheduled retries), incremented exactly when a retry wait starts.
+        let hooks = request.hooks;
         let mut retries_started: u32 = 0;
         let outcome = self
             .request_streaming_attempts(
-                method,
-                url,
-                headers,
+                request,
                 body,
-                signal,
-                hooks,
                 no_retry_statuses,
                 on_chunk,
                 &mut retries_started,
@@ -671,33 +1115,63 @@ impl ProviderRequestClient {
     /// The retry loop behind [`Self::request_streaming_with`] (same behavior
     /// as the pre-seam implementation). `retries_started` counts the scheduled
     /// retry waits for the `auto_retry_end` observation.
-    #[allow(clippy::too_many_arguments)]
     async fn request_streaming_attempts<C: ChunkSink>(
         &self,
-        method: Method,
-        url: &str,
-        headers: &BTreeMap<String, String>,
-        body: Vec<u8>,
-        signal: Option<&AbortSignal>,
-        hooks: &ProviderStreamHooks,
+        request: StreamingRequest<'_>,
+        body: StreamRequestBody<'_>,
         no_retry_statuses: &[u16],
         on_chunk: &mut C,
         retries_started: &mut u32,
     ) -> AiResult<(u16, BTreeMap<String, String>)> {
+        let StreamingRequest {
+            method,
+            url,
+            headers,
+            signal,
+            hooks,
+        } = request;
         // `before_provider_request` hook: transform the payload once, before
-        // the retry loop (retries reuse the transformed body).
-        let body = apply_before_provider_request(body, hooks).await;
+        // the retry loop (retries reuse the transformed body). A file body is
+        // read back only on this hook path: the hook's contract is a parsed
+        // `Value`, so a body it must inspect cannot stay streaming. The
+        // OpenAI streamed caller uses the file entry only when no such hook is
+        // installed, keeping the no-hook path allocation-bounded.
+        let body = match body {
+            StreamRequestBody::Bytes(body) => {
+                StreamRequestBody::Bytes(apply_before_provider_request(body, hooks).await)
+            }
+            StreamRequestBody::File(file) if hooks.before_provider_request.is_some() => {
+                let bytes = std::fs::read(file.path())?;
+                StreamRequestBody::Bytes(apply_before_provider_request(bytes, hooks).await)
+            }
+            file => file,
+        };
         // Retry budget for this request: the Codex endpoint defaults to zero
         // retries when neither the client construction nor the stream options
         // set an explicit count (see [`ProviderRequestClient::effective_max_retries`]).
         let max_retries = self.effective_max_retries(url);
-        // The body is MOVED into the request on the attempt that cannot be
-        // followed by another one (the retry budget is exhausted); only an
-        // attempt that must keep the body for a possible retry pays a copy.
-        // The former shape cloned the whole body on EVERY attempt, so the
-        // common no-retry request carried a second full-size copy of it (a
-        // summarizer chunk is ~0.3 MB; a 248-chunk span paid it 248 times).
-        let mut body_slot: Option<Vec<u8>> = Some(body);
+        // The serialized body is materialized exactly once. With NO retry
+        // budget it is MOVED into the single attempt. With a retry budget the
+        // default reqwest transport prepares one request whose reusable
+        // `Bytes` body every attempt shares via `Request::try_clone` (refcount
+        // only): a successful first attempt under the default two-retry budget
+        // no longer pays a full-body clone. The injection seam keeps the
+        // public `HttpRequest` shape, so only ITS attempts that must keep the
+        // body for a possible retry pay one `Vec` copy (the last attempt
+        // consumes the original). A file body reopens the file per attempt.
+        let mut source = Some(match body {
+            StreamRequestBody::Bytes(body) if max_retries == 0 => AttemptSource::Owned(Some(body)),
+            StreamRequestBody::Bytes(body) => {
+                match self.transport.prepare(&method, url, headers, body)? {
+                    PreparedRequest::Reqwest(request) => AttemptSource::Replay(request),
+                    PreparedRequest::Seam(request) => AttemptSource::Seam(request),
+                }
+            }
+            StreamRequestBody::File(file) => AttemptSource::File {
+                path: file.path().to_path_buf(),
+                len: file.len(),
+            },
+        });
         let mut attempt = 0;
         'attempt: loop {
             if let Some(signal) = signal {
@@ -705,15 +1179,50 @@ impl ProviderRequestClient {
                     return Err(AiError::Aborted);
                 }
             }
-            let payload = if attempt >= max_retries {
-                body_slot.take().unwrap_or_default()
-            } else if let Some(body) = body_slot.as_ref() {
-                self.payload
-                    .copies
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                body.clone()
-            } else {
-                Vec::new()
+            let request = match source.take() {
+                Some(AttemptSource::Owned(Some(payload))) => {
+                    self.transport.prepare(&method, url, headers, payload)?
+                }
+                Some(AttemptSource::Seam(request)) if attempt < max_retries => {
+                    self.payload
+                        .copies
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.payload.bytes_copied.fetch_add(
+                        request.body.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    let attempted = request.clone();
+                    source = Some(AttemptSource::Seam(request));
+                    PreparedRequest::Seam(attempted)
+                }
+                Some(AttemptSource::Seam(request)) => PreparedRequest::Seam(request),
+                Some(AttemptSource::Replay(request)) => {
+                    // Shares the request body's `Bytes` allocation; this is a
+                    // refcount bump, not a payload copy.
+                    let attempted = request.try_clone().ok_or_else(|| {
+                        AiError::Http(
+                            "request body cannot be replayed for a retry (non-reusable body)"
+                                .to_string(),
+                        )
+                    })?;
+                    source = Some(AttemptSource::Replay(request));
+                    PreparedRequest::Reqwest(attempted)
+                }
+                Some(AttemptSource::File { path, len }) => {
+                    // A streaming body cannot be cloned: reopen the file for
+                    // this attempt and keep the source for a possible retry.
+                    source = Some(AttemptSource::File {
+                        path: path.clone(),
+                        len,
+                    });
+                    self.transport
+                        .prepare_file(&method, url, headers, &path, len)?
+                }
+                Some(AttemptSource::Owned(None)) | None => {
+                    return Err(AiError::Http(
+                        "internal transport error: request body was already consumed".to_string(),
+                    ))
+                }
             };
             let deadline = self
                 .request_timeout
@@ -721,7 +1230,6 @@ impl ProviderRequestClient {
                 // instant; degrade to "no total deadline" (the idle timeout
                 // still bounds the wait) instead of panicking.
                 .and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
-            let request = Self::build_request(&method, url, headers, payload)?;
             // Upstream bounds the header wait with the undici
             // `headersTimeout` (the idle setting, reset per progress event).
             let response = match self.send_with_idle(request, deadline, signal).await {
@@ -738,12 +1246,14 @@ impl ProviderRequestClient {
                     }
                     if attempt < max_retries {
                         self.backoff(
-                            attempt,
-                            &error.to_string(),
-                            None,
-                            None,
-                            signal,
-                            hooks,
+                            RetryAttempt {
+                                attempt,
+                                error_message: &error.to_string(),
+                                retry_after_ms: None,
+                                retry_after: None,
+                                signal,
+                                hooks,
+                            },
                             retries_started,
                         )
                         .await?;
@@ -781,15 +1291,17 @@ impl ProviderRequestClient {
                 && attempt < max_retries
             {
                 self.backoff(
-                    attempt,
-                    // The retry path does not drain the error body; the
-                    // status is the cheap, deterministic trigger summary
-                    // (upstream surfaces the SDK's status-bearing message).
-                    &format!("HTTP {status}"),
-                    retry_after_ms.as_deref(),
-                    retry_after.as_deref(),
-                    signal,
-                    hooks,
+                    RetryAttempt {
+                        attempt,
+                        // The retry path does not drain the error body; the
+                        // status is the cheap, deterministic trigger summary
+                        // (upstream surfaces the SDK's status-bearing message).
+                        error_message: &format!("HTTP {status}"),
+                        retry_after_ms: retry_after_ms.as_deref(),
+                        retry_after: retry_after.as_deref(),
+                        signal,
+                        hooks,
+                    },
                     retries_started,
                 )
                 .await?;
@@ -827,12 +1339,14 @@ impl ProviderRequestClient {
                             // status itself is refused.
                             if !no_retry_statuses.contains(&status) && attempt < max_retries {
                                 self.backoff(
-                                    attempt,
-                                    &error.to_string(),
-                                    retry_after_ms.as_deref(),
-                                    retry_after.as_deref(),
-                                    signal,
-                                    hooks,
+                                    RetryAttempt {
+                                        attempt,
+                                        error_message: &error.to_string(),
+                                        retry_after_ms: retry_after_ms.as_deref(),
+                                        retry_after: retry_after.as_deref(),
+                                        signal,
+                                        hooks,
+                                    },
                                     retries_started,
                                 )
                                 .await?;
@@ -889,12 +1403,14 @@ impl ProviderRequestClient {
                         }
                         if !delivered && attempt < max_retries {
                             self.backoff(
-                                attempt,
-                                &error.to_string(),
-                                retry_after_ms.as_deref(),
-                                retry_after.as_deref(),
-                                signal,
-                                hooks,
+                                RetryAttempt {
+                                    attempt,
+                                    error_message: &error.to_string(),
+                                    retry_after_ms: retry_after_ms.as_deref(),
+                                    retry_after: retry_after.as_deref(),
+                                    signal,
+                                    hooks,
+                                },
                                 retries_started,
                             )
                             .await?;
@@ -930,35 +1446,81 @@ impl ProviderRequestClient {
         on_chunk: &mut C,
     ) -> AiResult<(u16, BTreeMap<String, String>)> {
         let payload = self.serialize_payload(body)?;
-        self.request_streaming_with(Method::POST, url, headers, payload, signal, hooks, on_chunk)
-            .await
+        self.request_streaming_with(
+            StreamingRequest::new(Method::POST, url, headers, signal, hooks),
+            payload,
+            on_chunk,
+        )
+        .await
     }
 
+    /// [`post_json_streaming_with`](Self::post_json_streaming_with) with an
+    /// already-serialized payload. Used by the OpenAI streamed body so it can
+    /// reserve the exact output size once instead of growing a `Vec` through
+    /// several reallocations.
+    pub async fn post_payload_streaming_with<C: ChunkSink>(
+        &self,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        payload: Vec<u8>,
+        signal: Option<&AbortSignal>,
+        hooks: &ProviderStreamHooks,
+        on_chunk: &mut C,
+    ) -> AiResult<(u16, BTreeMap<String, String>)> {
+        self.request_streaming_with(
+            StreamingRequest::new(Method::POST, url, headers, signal, hooks),
+            payload,
+            on_chunk,
+        )
+        .await
+    }
+
+    /// [`post_payload_streaming_with`](Self::post_payload_streaming_with)
+    /// with the body in a temp file. The default transport streams the file
+    /// (reopening it for each retry attempt); the injection seam reads it into
+    /// its Vec-shaped [`HttpRequest`]. `before_provider_request` still sees the
+    /// complete parsed body: this entry is only used when that hook is absent,
+    /// and falls back to the bytes path if a caller passes one.
+    pub async fn post_payload_file_streaming_with<C: ChunkSink>(
+        &self,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        payload: &SerializedPayloadFile,
+        signal: Option<&AbortSignal>,
+        hooks: &ProviderStreamHooks,
+        on_chunk: &mut C,
+    ) -> AiResult<(u16, BTreeMap<String, String>)> {
+        self.request_streaming_with_no_retry_statuses(
+            StreamingRequest {
+                method: Method::POST,
+                url,
+                headers,
+                signal,
+                hooks,
+            },
+            StreamRequestBody::File(payload),
+            &[],
+            on_chunk,
+        )
+        .await
+    }
     /// [`post_json_streaming`](Self::post_json_streaming) with per-request
     /// `noRetryStatuses` (upstream `provider-retry.ts:121`): a listed status
     /// fails the request immediately, without consuming the retry budget or
     /// sleeping through a backoff, while every other status keeps the unchanged
     /// retry policy. An empty list is exactly [`Self::post_json_streaming`].
-    #[allow(clippy::too_many_arguments)]
     pub async fn post_json_streaming_with_no_retry_statuses<T: Serialize>(
         &self,
-        url: &str,
-        headers: &BTreeMap<String, String>,
+        request: StreamingRequest<'_>,
         body: &T,
-        signal: Option<&AbortSignal>,
-        hooks: &ProviderStreamHooks,
         no_retry_statuses: &[u16],
         on_chunk: &mut (dyn FnMut(&[u8]) -> AiResult<()> + Send),
     ) -> AiResult<(u16, BTreeMap<String, String>)> {
         let payload = self.serialize_payload(body)?;
         let mut sink = SyncFnSink(on_chunk);
         self.request_streaming_with_no_retry_statuses(
-            Method::POST,
-            url,
-            headers,
-            payload,
-            signal,
-            hooks,
+            request,
+            StreamRequestBody::Bytes(payload),
             no_retry_statuses,
             &mut sink,
         )
@@ -977,12 +1539,8 @@ impl ProviderRequestClient {
         let payload = self.serialize_payload(body)?;
         let mut sink = SyncFnSink(on_chunk);
         self.request_streaming_with(
-            Method::POST,
-            url,
-            headers,
+            StreamingRequest::new(Method::POST, url, headers, signal, hooks),
             payload,
-            signal,
-            hooks,
             &mut sink,
         )
         .await
@@ -1003,23 +1561,10 @@ impl ProviderRequestClient {
         headers: &BTreeMap<String, String>,
         body: Vec<u8>,
     ) -> AiResult<HttpRequest> {
-        let mut map = HeaderMap::new();
-        for (name, value) in headers {
-            // An empty value is the upstream `null` suppression marker: the
-            // header shadows a default but must not be sent.
-            if value.is_empty() {
-                continue;
-            }
-            let key = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                .map_err(|e| AiError::Http(e.to_string()))?;
-            let val = reqwest::header::HeaderValue::from_str(value)
-                .map_err(|e| AiError::Http(e.to_string()))?;
-            map.insert(key, val);
-        }
         Ok(HttpRequest {
             method: method.clone(),
             url: url.to_string(),
-            headers: map,
+            headers: build_header_map(headers)?,
             body,
         })
     }
@@ -1059,7 +1604,7 @@ impl ProviderRequestClient {
     /// parked until the idle/total timer fired.
     async fn send_with_idle(
         &self,
-        request: HttpRequest,
+        request: PreparedRequest,
         deadline: Option<tokio::time::Instant>,
         signal: Option<&AbortSignal>,
     ) -> Result<HttpResponse, AiError> {
@@ -1165,21 +1710,11 @@ impl ProviderRequestClient {
 
     /// Compute and wait out one retry delay (`error_message` is the
     /// `auto_retry_start` trigger summary; the wait itself is unchanged).
-    #[allow(clippy::too_many_arguments)]
-    async fn backoff(
-        &self,
-        attempt: u32,
-        error_message: &str,
-        retry_after_ms: Option<&str>,
-        retry_after: Option<&str>,
-        signal: Option<&AbortSignal>,
-        hooks: &ProviderStreamHooks,
-        retries_started: &mut u32,
-    ) -> AiResult<()> {
+    async fn backoff(&self, retry: RetryAttempt<'_>, retries_started: &mut u32) -> AiResult<()> {
         // Upstream provider-retry: `retry-after-ms` wins over `retry-after`,
         // and a server-requested delay above the configured cap fails the
         // request immediately instead of silently clamping it.
-        if let Some(delay) = server_retry_delay(retry_after_ms, retry_after) {
+        if let Some(delay) = server_retry_delay(retry.retry_after_ms, retry.retry_after) {
             let max = self.config.max_retry_delay;
             if max > Duration::ZERO && delay > max {
                 return Err(AiError::NonRetryable(format!(
@@ -1191,20 +1726,20 @@ impl ProviderRequestClient {
             return self
                 .wait_backoff(
                     delay,
-                    attempt,
-                    error_message,
-                    signal,
-                    hooks,
+                    retry.attempt,
+                    retry.error_message,
+                    retry.signal,
+                    retry.hooks,
                     retries_started,
                 )
                 .await;
         }
         self.wait_backoff(
-            exponential_backoff_delay(attempt),
-            attempt,
-            error_message,
-            signal,
-            hooks,
+            exponential_backoff_delay(retry.attempt),
+            retry.attempt,
+            retry.error_message,
+            retry.signal,
+            retry.hooks,
             retries_started,
         )
         .await
@@ -1223,7 +1758,6 @@ impl ProviderRequestClient {
     /// / `onRetryScheduled`: emitted before the sleep, with the post-
     /// `Retry-After` delay) and increments `retries_started` (the upstream
     /// `_retryAttempt` counter behind `auto_retry_end`).
-    #[allow(clippy::too_many_arguments)]
     async fn wait_backoff(
         &self,
         delay: Duration,
@@ -1478,4 +2012,117 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+#[cfg(test)]
+mod lane_e_streaming_file_body_tests {
+    use super::*;
+    use std::io::Read as _;
+    use std::net::TcpListener;
+
+    #[derive(Default)]
+    struct CollectSink(Vec<u8>);
+
+    impl ChunkSink for CollectSink {
+        fn send<'a>(
+            &'a mut self,
+            chunk: &'a [u8],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AiResult<()>> + Send + 'a>>
+        {
+            self.0.extend_from_slice(chunk);
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    /// Read one HTTP request (headers + Content-Length body) from `stream`.
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 16 * 1024];
+        let head_end = loop {
+            let read = stream.read(&mut buffer).expect("read request");
+            assert!(read > 0, "connection closed before request headers");
+            received.extend_from_slice(&buffer[..read]);
+            if let Some(index) = received.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index;
+            }
+        };
+        let head = String::from_utf8_lossy(&received[..head_end]).into_owned();
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .expect("Content-Length header");
+        let mut body = received[head_end + 4..].to_vec();
+        while body.len() < content_length {
+            let read = stream.read(&mut buffer).expect("read request body");
+            assert!(read > 0, "connection closed before request body");
+            body.extend_from_slice(&buffer[..read]);
+        }
+        (head, body)
+    }
+
+    #[tokio::test]
+    async fn file_payload_streams_content_length_and_retries() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let mut sizes = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout");
+                let (_head, body) = read_request(&mut stream);
+                sizes.push(body.len());
+                let response = if attempt == 0 {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+            sizes
+        });
+
+        let client = ProviderRequestClient::with_default_config().expect("client");
+        let payload_value = serde_json::json!({
+            "messages": [{"role": "user", "content": "x".repeat(256 * 1024)}],
+        });
+        let payload = client
+            .serialize_payload_to_file(&payload_value)
+            .expect("file payload");
+        let payload_len = payload.len() as usize;
+        let payload_path = payload.path().to_path_buf();
+        assert!(payload_path.exists(), "temp body file exists");
+
+        let mut sink = CollectSink::default();
+        let url = format!("http://{address}/v1/chat/completions");
+        let (status, _headers) = client
+            .post_payload_file_streaming_with(
+                &url,
+                &BTreeMap::new(),
+                &payload,
+                None,
+                &ProviderStreamHooks::default(),
+                &mut sink,
+            )
+            .await
+            .expect("file streaming request");
+        assert_eq!(status, 200);
+        assert_eq!(sink.0, b"OK");
+
+        let sizes = server.join().expect("server");
+        assert_eq!(sizes, vec![payload_len, payload_len]);
+
+        drop(payload);
+        assert!(!payload_path.exists(), "temp body file is removed on drop");
+    }
 }

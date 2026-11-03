@@ -39,6 +39,7 @@
 //!
 //! [`DocumentCache`]: super::documents::DocumentCache
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::Value;
@@ -48,10 +49,45 @@ use crate::durable::delta::Op;
 use crate::durable::ids::{DocumentId, Seq};
 use crate::durable::session::documents::LoadedDocument;
 use crate::durable::session::guard::FailureLatch;
-use crate::durable::session::line::SessionInner;
+use crate::durable::session::line::{CloseListener, SessionInner};
 use crate::durable::session::observation::{retirement_operations, CommittedStateSource, WatchEnd};
 use crate::durable::session::publication::{CommitChange, CommitPublication};
 use crate::durable::types::DocumentCommitChange;
+
+/// First id of the close-listener namespace owned by attachments and document
+/// watches.
+///
+/// Host `subscribe_close` ids start at 1 and grow from there; this range is
+/// far enough above them that the two registries cannot collide in practice,
+/// while still living in the session's existing removable
+/// [`close_subscriptions`](SessionInner::close_subscriptions) registry.
+const OWNED_CLOSE_ID_BASE: u64 = 1 << 62;
+
+static NEXT_OWNED_CLOSE_ID: AtomicU64 = AtomicU64::new(OWNED_CLOSE_ID_BASE);
+
+/// Allocate an id for a close listener owned by an attachment or a watch.
+pub(crate) fn next_owned_close_id() -> u64 {
+    NEXT_OWNED_CLOSE_ID.fetch_add(1, Ordering::AcqRel)
+}
+
+/// Register `listener` under an owned id in the removable close registry.
+///
+/// Unlike [`SessionInner::close_listeners`], entries here can be removed again
+/// by [`unregister_owned_close_listener`], which is what makes [`detach`] and
+/// a stopped watch release the state their close listener captures.
+pub(crate) fn register_owned_close_listener(
+    inner: &mut SessionInner,
+    id: u64,
+    listener: CloseListener,
+) {
+    inner.close_subscriptions.push((id, listener));
+}
+
+/// Remove one owned close listener by id. Unknown ids are ignored, so this is
+/// idempotent alongside the repeated-`detach` path.
+pub(crate) fn unregister_owned_close_listener(inner: &mut SessionInner, id: u64) {
+    inner.close_subscriptions.retain(|(key, _)| *key != id);
+}
 
 /// One observer attached to one committed incarnation.
 ///
@@ -67,6 +103,8 @@ pub struct Attached {
     pub record_id: DocumentId,
     /// The internal listener that forwards this incarnation's commits.
     pub listener_id: u64,
+    /// Id of this attachment's close listener in the removable close registry.
+    close_listener_id: u64,
     /// Delivery bookkeeping shared with the listener and [`detach`].
     state: Arc<Mutex<AttachState>>,
 }
@@ -173,34 +211,43 @@ pub fn attach_state(
 
     // `session.ts:861` — `subscribeClose(() => observer.closeSession(#failure))`.
     // A close listener runs synchronously on the line during `shutdown`, before
-    // the listener sets are cleared, so the observer ends exactly once.
+    // the listener sets are cleared, so the observer ends exactly once. Unlike
+    // the unkeyed `close_listeners` list, this registration carries an id, so
+    // [`detach`] can release it — and the document snapshot it captures —
+    // instead of retaining it until the session closes.
     let closing = state.clone();
     let latch = inner.latch.clone();
-    inner.close_listeners.push(Arc::new(move || {
-        let mut state = lock(&closing);
-        if state.detached {
-            // Detached observers are not the session's to end.
-            return;
-        }
-        if state.retired {
-            // Retirement already won: the source records `Retired` and the
-            // terminal frame must remain drainable. A later close/failure must
-            // not replace it with `SessionClosed`/`SessionFailed`.
-            return;
-        }
-        state.closed = true;
-        let reason = match latch.failure() {
-            Some(error) => WatchEnd::SessionFailed(error),
-            None => WatchEnd::SessionClosed,
-        };
-        state.source.end(reason);
-    }));
+    let close_listener_id = next_owned_close_id();
+    register_owned_close_listener(
+        inner,
+        close_listener_id,
+        Arc::new(move || {
+            let mut state = lock(&closing);
+            if state.detached {
+                // Detached observers are not the session's to end.
+                return;
+            }
+            if state.retired {
+                // Retirement already won: the source records `Retired` and the
+                // terminal frame must remain drainable. A later close/failure must
+                // not replace it with `SessionClosed`/`SessionFailed`.
+                return;
+            }
+            state.closed = true;
+            let reason = match latch.failure() {
+                Some(error) => WatchEnd::SessionFailed(error),
+                None => WatchEnd::SessionClosed,
+            };
+            state.source.end(reason);
+        }),
+    );
 
     let attached = Attached {
         source,
         address_id: attached_address,
         record_id: loaded.record.id,
         listener_id,
+        close_listener_id,
         state,
     };
     // Keep the line-side handle: retirement delivery needs `&mut SessionInner`
@@ -216,6 +263,11 @@ pub fn detach(inner: &mut SessionInner, attached: &Attached) {
     inner
         .attachments
         .retain(|registered| registered.listener_id != attached.listener_id);
+    // Also retire the close listener: it captures this attachment's state
+    // (including its committed document snapshot), and leaving it registered
+    // would retain that snapshot until the session closes. Unknown ids are
+    // ignored, so a repeated detach stays idempotent.
+    unregister_owned_close_listener(inner, attached.close_listener_id);
     let mut state = lock(&attached.state);
     if state.detached {
         return;

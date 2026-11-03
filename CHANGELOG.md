@@ -6,6 +6,75 @@
      requires the `v*` tag to equal Cargo.toml's `[package].version` (v0.0.1 ->
      0.0.1), and the same value is recorded in .migration-info. -->
 
+### 2026-11-02
+
+**Memory**
+
+- Session listing scans oversized single-line files through a 1 MiB line
+  window (`memchr`, size-adaptive reader): peak RSS for 100 sessions with a
+  256 MiB outlier drops from 799.4 MB to 2.12 MB (−99.7%), and median listing
+  time from 636.77 ms to 407.60 ms (−36%).
+- Printing a 100 MB session no longer clones the full projection or builds a
+  request-sized JSON tree: paged prompt context is built without widening,
+  OpenAI request bodies of 8 MiB or more stream from a temporary file, and
+  messages replay lazily (16 B/element). Widen peak RSS falls from 973.6 MB to
+  206.8–215.7 MB (−78%); compaction of a fully resident 100 MB session from
+  563.2 MB to 426.3 MB (−24.3%).
+- TUI startup peak for a 2 MB session falls from 81.9 MB to 72.1–72.6 MB
+  (−11–12%) by deferring shell-pool prewarm and deduplicating the settings
+  snapshot.
+- A minimal JS extension adds about 25 MB (TUI peak 72.0–72.5 → 97.3–97.5 MB),
+  but only 2.31 MB is live heap; the rest is QuickJS code pages and thread
+  stack. Without JS plugins no QuickJS runtime is created, and the prelude
+  inflate buffer is now exactly sized.
+- Message slots shrink from 592 B to 408 B: `AssistantMessage.deferred` and
+  `ToolResultMessage.nested_calls` are boxed optionals (400 B each), saving
+  ~14 MB on a 100 MB transcript without changing the JSON wire shape.
+
+**Performance**
+
+- Eight SDK criterion benchmarks (`benches/sdk_benchmark.rs`) cover build,
+  prompt roundtrip/streaming, transcript, attach and event paths.
+- SDK fast paths: non-streaming prompts skip per-delta event projection, the
+  session-event bridge subscribes on the first streamed prompt, and metadata
+  reads use leaf-path accessors instead of building projections.
+- Widen wall/CPU time is down 34%.
+
+**Extensions and Hooks**
+
+- All 49 native events are wired end to end, validated through one
+  `is_known_event` that accepts pir's synthetic session-event names.
+- Native fan-out honors `cancel`/`block`/`handled`; `before_provider_request`
+  results chain into the request; `session_before_*` `Generic` results apply
+  field overlays and respect `cancel: true`. A mutation-only handler that
+  returns `None` no longer gets an earlier handler's replacement re-applied
+  over its in-place payload edit.
+- `/reload` runs exactly one lifecycle: `session_shutdown{reload}` →
+  `on_reload` → JS reload → `session_start{reload}`.
+- `terminal_input`, `on_init`/`on_reload`/`on_shutdown` and synchronous
+  `on_context`/`on_session_context`/`status` callbacks are panic-isolated;
+  `on_init` runs before the first terminal chunk and on read-only entry
+  points.
+
+**SDK and examples**
+
+- Ten runnable SDK examples plus `scripts/run_examples.sh`: offline examples
+  need no network or credentials, and each declares only its required
+  features.
+- Every example runs on a 64 MiB thread, so `cargo run --example …` works on
+  Windows/GNU's 2 MiB main stack.
+- `--no-default-features --features sdk` builds are clean again; the SDK
+  quickstart is now a complete external-consumer program.
+
+**CI**
+
+- CI is split into lint (fmt, clippy, SDK feature matrix, doctests, examples),
+  a Windows full test suite, and a Linux lib+bins subset; benchmarks run only
+  manually via `scripts/run_benchmarks.sh`.
+- Lint suppressions fall from 144 to 36 outer `#[allow]` in `src/`
+  (`too_many_arguments` 70 → 0 across `src/` and `tests/`) via struct-based
+  parameter refactors; new suppressions are not accepted.
+
 ### 2026-10-29
 
 **Core**

@@ -27,10 +27,30 @@
 //!
 //! Lifecycle: `workerExit` (worker's `process.exit`) and `terminate` both set
 //! the shared shutdown flag; the worker pump observes it, the thread pushes
-//! its final `exit` record, sets `done`, and leaves the registry. A worker
-//! spinning in a pure JS loop (never awaiting) cannot observe the flag —
-//! the interrupt-handler route is not wired here; `terminate` reports
-//! `{done:false}` after its bounded wait instead of blocking forever.
+//! its final `exit` record, sets `done`, and the parent releases the registry
+//! entry once it has observed the exit.
+//!
+//! A worker spinning in a pure JS loop (never awaiting) also has to stop:
+//! the worker runtime installs the shared [`WorkerShared::abort`] flag as its
+//! QuickJS interrupt flag ([`ExtensionRuntime::set_interrupt_flag`]), and
+//! `terminate` / [`release_generation`] set it synchronously. The engine's
+//! interrupt handler then aborts the eval at the next bytecode boundary, so
+//! `terminate` no longer depends on the JS pump observing `shutdown`. The
+//! worker script's own synchronous body additionally runs under the parent
+//! runtime's configured call deadline ([`ExtensionRuntime::arm_deadline`]),
+//! so a `while (true) {}` that nobody terminates dies on the timeout instead
+//! of pinning a thread forever.
+//!
+//! Boundary: a QuickJS interrupt is delivered between bytecode instructions,
+//! not inside a native host function. A worker blocked in an uninterruptible
+//! synchronous host call (`fs.readFileSync` on a stalled FIFO, a `spawnSync`
+//! `wait`, ...) still cannot be killed; such a thread is counted as orphaned
+//! after its generation is released and the process-wide live-thread cap
+//! ([`MAX_LIVE_WORKER_THREADS`]) refuses new workers instead of letting a
+//! `/reload` loop accumulate threads without bound. The runtime's own Drop
+//! evaluates `process.emit("exit")`; [`AbortWorkerOnDrop`] sets the same
+//! interrupt flag first, so a synchronous infinite loop in a user exit
+//! handler is bounded by the bytecode poll instead of pinning the thread.
 //!
 //! Queue bounds: each mailbox (inbound and outbound) holds at most
 //! [`MAX_MAILBOX_BYTES`] of message text. Node's MessagePort queues without
@@ -46,7 +66,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::extensions::api::embedded::Shim;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -63,7 +83,13 @@ use crate::extensions::{ExtensionConfig, ExtensionLimits, ExtensionRuntime};
 /// (`main_cli::js_mode::SCRIPT_THREAD_STACK`, itself 64 MiB).
 const WORKER_THREAD_STACK: usize = 64 * 1024 * 1024;
 
-/// Hard cap on live `worker_threads.Worker` threads for the whole process.
+/// Hard cap on `worker_threads.Worker` registry entries for the process.
+///
+/// The registry (`WORKERS`) is process-global and entries are removed when a
+/// worker exits or its generation is released, so with one live generation
+/// this reads as the per-generation worker cap. It is not a live-OS-thread
+/// bound: [`MAX_LIVE_WORKER_THREADS`] is the registry-independent cap that
+/// also covers threads whose generation was already released.
 ///
 /// Each Worker is one OS thread plus a full QuickJS runtime; a JS loop that
 /// creates Workers without terminating them would otherwise exhaust threads
@@ -73,6 +99,19 @@ const WORKER_THREAD_STACK: usize = 64 * 1024 * 1024;
 /// while keeping the worst case bounded. Beyond it `new Worker` throws the
 /// ordinary error the shim surfaces.
 const MAX_WORKER_THREADS: usize = 64;
+
+/// Process-wide hard cap on OS threads actually alive, **across
+/// generations**.
+///
+/// [`MAX_WORKER_THREADS`] bounds only the registry of the current runtime
+/// generation. `/reload` removes the old entries from the registry immediately
+/// (`release_generation`), so without a second, registry-independent bound the
+/// same process could spawn 64 more workers after every reload — each one a
+/// 64 MiB-stack thread plus a QuickJS heap — and a reload loop could grow the
+/// leak without limit. Two generations' worth is enough for a successor to
+/// start while the predecessor drains; once the count reaches this bound,
+/// `op_start` refuses to spawn more until orphaned threads exit.
+const MAX_LIVE_WORKER_THREADS: usize = MAX_WORKER_THREADS * 2;
 
 /// JS stack requested for the worker's QuickJS runtime.
 ///
@@ -125,11 +164,6 @@ fn next_poll_slice(current_ms: u64, had_message: bool) -> u64 {
     }
     current_ms.saturating_mul(2).min(POLL_FALLBACK_MAX_MS)
 }
-
-/// Upper bound of one `terminate` op's in-thread wait; the JS `terminate`
-/// loops the op with `setTimeout(0)` yields between calls so the parent JS
-/// thread stays responsive.
-const MAX_TERMINATE_WAIT_MS: u64 = 200;
 
 /// Worker-side boot overlay (`worker_boot.js.txt`): worker id / threadId /
 /// workerData placeholders are replaced with JSON literals before eval.
@@ -209,10 +243,50 @@ impl Mailbox {
     }
 }
 
+/// Cross-thread view of one worker's thread lifetime. `release_generation`
+/// marks a still-running worker orphaned; the worker's exit guard records
+/// `exited` and retires the orphan mark. Both transitions hold the same
+/// mutex, so the orphan counter cannot be incremented after its thread has
+/// already returned (or decremented twice).
+#[derive(Default)]
+struct WorkerLifecycle {
+    exited: bool,
+    orphaned: bool,
+}
+
+/// Why a worker was asked to stop. [`WorkerShared::shutdown`] alone cannot be
+/// turned into an exit code: the worker's own `process.exit(code)` also sets
+/// it, and that code must win over Node's "terminated" code 1. The terminal
+/// path therefore records the reason (as an atomic, written before `shutdown`)
+/// and [`WorkerShared::finalize_exit_code`] resolves the reported code from it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum StopReason {
+    /// No stop requested yet.
+    None = 0,
+    /// The worker called `process.exit`; `WorkerShared::exit_code` holds the
+    /// requested code (including a legitimate 0).
+    ProcessExit = 1,
+    /// The parent called `Worker.terminate()`.
+    Terminate = 2,
+    /// The owning runtime generation was released (`/reload`, shutdown, drop).
+    GenerationRelease = 3,
+}
+
+impl StopReason {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::ProcessExit,
+            2 => Self::Terminate,
+            3 => Self::GenerationRelease,
+            _ => Self::None,
+        }
+    }
+}
+
 /// One live worker's mailboxes + lifecycle flags, shared between the parent
 /// runtime thread, the worker thread, and the host ops.
 struct WorkerShared {
-    id: u64,
     /// Owning runtime generation: a reload/shutdown shuts down exactly the
     /// workers its own runtime started (a successor's workers keep running).
     generation: u64,
@@ -224,12 +298,34 @@ struct WorkerShared {
     /// Wakes a parked `workerRecvPoll` on the receiving side.
     inbound_notify: tokio::sync::Notify,
     outbound_notify: tokio::sync::Notify,
-    /// Set by `terminate` or the worker's `process.exit`; every poll
-    /// returns `stop` afterwards.
+    /// Set by `terminate`, generation release, or the worker's `process.exit`;
+    /// every poll returns `stop` afterwards.
     shutdown: AtomicBool,
-    /// Set by the worker thread right before it leaves the registry.
+    /// Why the stop was requested; written before [`Self::shutdown`] so the
+    /// worker's terminal path can distinguish a forced stop (Node reports 1)
+    /// from a normal completion (`process.exit` supplies its own code).
+    stop_reason: AtomicU8,
+    /// Cooperative interrupt flag installed into THIS worker runtime's
+    /// QuickJS interrupt handler. Unlike [`Self::shutdown`] it is observed by
+    /// a synchronous JS loop at the next bytecode boundary, which is what
+    /// makes `terminate`/`/reload` able to stop `while (true) {}`. Kept as an
+    /// `Arc` so the worker runtime's handler can borrow it without touching
+    /// the registry.
+    abort: Arc<AtomicBool>,
+    /// Workers whose generation was released while their thread was still
+    /// alive. Guarded by the shared mutex: the release path and the thread
+    /// exit guard must agree on whether the thread was still running, and
+    /// increment/decrement [`ORPHANED_WORKERS`] exactly once.
+    lifecycle: StdMutex<WorkerLifecycle>,
+    /// Set by the worker thread after the final exit code and `exit` record
+    /// are published; the parent releases the registry entry once it observes
+    /// this flag (or the corresponding `exit` answer).
     done: AtomicBool,
-    /// Exit code recorded by `workerExit` (the worker's `process.exit`).
+    /// Final exit code. `workerExit` (the worker's `process.exit`) writes it
+    /// first when the worker chose its own code; otherwise the terminal path
+    /// resolves it from [`Self::stop_reason`] (see
+    /// [`Self::finalize_exit_code`]). Read by `recv_poll`, `op_terminate` and
+    /// the `exit` control record so all three agree.
     exit_code: StdMutex<Option<i32>>,
     /// Test/observability count of timer-fallback wakes in `recv_poll` (a
     /// delivered message does not count). Pins the adaptive park: an idle
@@ -239,15 +335,17 @@ struct WorkerShared {
 }
 
 impl WorkerShared {
-    fn new(id: u64, generation: u64) -> Self {
+    fn new(generation: u64) -> Self {
         Self {
-            id,
             generation,
             inbound: StdMutex::new(Mailbox::default()),
             outbound: StdMutex::new(Mailbox::default()),
             inbound_notify: tokio::sync::Notify::new(),
             outbound_notify: tokio::sync::Notify::new(),
             shutdown: AtomicBool::new(false),
+            stop_reason: AtomicU8::new(StopReason::None as u8),
+            abort: Arc::new(AtomicBool::new(false)),
+            lifecycle: StdMutex::new(WorkerLifecycle::default()),
             done: AtomicBool::new(false),
             exit_code: StdMutex::new(None),
             poll_wakes: AtomicU64::new(0),
@@ -257,11 +355,127 @@ impl WorkerShared {
     fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
         mutex.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Resolve and persist this worker's final exit code. The first caller
+    /// wins: `workerExit` (the worker's `process.exit`) stores its code
+    /// before any terminal path runs, so a legitimate `process.exit(0)` is
+    /// preserved even when a `terminate` races it. Otherwise a forced stop
+    /// (`Worker.terminate()` or a generation release) reports Node's 1, and a
+    /// natural terminal path keeps the caller's default (0 for a completed
+    /// pump). Every reader — `recv_poll`, `op_terminate`, and the `exit`
+    /// control record — sees this one slot, so a terminate racing an idle
+    /// worker cannot report 0 through one path and 1 through another.
+    fn finalize_exit_code(&self, natural: i32) -> i32 {
+        let mut slot = Self::lock(&self.exit_code);
+        if let Some(code) = *slot {
+            return code;
+        }
+        let code = match StopReason::from_u8(self.stop_reason.load(Ordering::SeqCst)) {
+            StopReason::Terminate | StopReason::GenerationRelease => 1,
+            StopReason::None | StopReason::ProcessExit => natural,
+        };
+        *slot = Some(code);
+        code
+    }
 }
 
 static WORKERS: OnceLock<StdMutex<HashMap<u64, Arc<WorkerShared>>>> = OnceLock::new();
 static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
 static ENV_DATA: OnceLock<StdMutex<HashMap<String, String>>> = OnceLock::new();
+/// OS worker threads currently alive (spawned but not yet returned). This is
+/// registry-independent: `release_generation` removes registry entries long
+/// before a wedged thread exits, and only this count bounds cross-generation
+/// accumulation.
+static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// Live worker threads whose owning generation was released before they
+/// exited (registry entries gone, thread still running). Observability for
+/// the `/reload` regression; always a subset of [`LIVE_WORKERS`]. This counts
+/// only the [`release_generation`] path: a worker detached by the shim's
+/// terminate-timeout `release` op still occupies a [`LIVE_WORKERS`] slot (and
+/// the hard cap) but is not included here.
+static ORPHANED_WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// Test-only override for [`MAX_LIVE_WORKER_THREADS`] (0 = the constant).
+static LIVE_WORKER_LIMIT_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+fn live_worker_limit() -> usize {
+    let override_limit = LIVE_WORKER_LIMIT_OVERRIDE.load(Ordering::SeqCst);
+    if override_limit == 0 {
+        MAX_LIVE_WORKER_THREADS
+    } else {
+        override_limit
+    }
+}
+
+/// Reserve one live-thread slot, or report the cap. The reservation is
+/// released by [`LiveWorkerReservation`] on every early-return path and, once
+/// the thread starts, by the thread's own exit guard.
+fn reserve_live_worker_slot() -> bool {
+    let limit = live_worker_limit();
+    LIVE_WORKERS
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+            (live < limit).then_some(live + 1)
+        })
+        .is_ok()
+}
+
+/// Reservation guard for the spawn path: dropping it before the thread takes
+/// ownership restores the counter (failed source read, registry insert, or
+/// `thread::Builder::spawn`).
+struct LiveWorkerReservation {
+    active: bool,
+}
+
+impl LiveWorkerReservation {
+    fn new() -> Option<Self> {
+        let reserved = reserve_live_worker_slot();
+        // `bool::then_some` constructs its argument EAGERLY, so
+        // `reserved.then_some(Self { active: true })` built (and immediately
+        // dropped) a decrementing guard even on a REJECTED reservation. That
+        // made every cap rejection subtract a slot and drove `LIVE_WORKERS`
+        // below zero (wrapping to `usize::MAX`, so the next reservation
+        // overflowed). The guard must exist only when the increment happened.
+        if reserved {
+            Some(Self { active: true })
+        } else {
+            None
+        }
+    }
+
+    /// Hand the reserved slot to the worker thread's exit guard.
+    fn transfer(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for LiveWorkerReservation {
+    fn drop(&mut self) {
+        if self.active {
+            LIVE_WORKERS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Per-thread exit guard: decrements the live count and clears the orphan
+/// marker when the worker function returns (normally, by an interrupt, or by
+/// panic unwinding through `catch_unwind`).
+struct WorkerThreadSlot {
+    shared: Arc<WorkerShared>,
+}
+
+impl Drop for WorkerThreadSlot {
+    fn drop(&mut self) {
+        // Retire the orphan mark before the live count so the orphan total is
+        // never transiently larger than the live total.
+        let mut lifecycle = WorkerShared::lock(&self.shared.lifecycle);
+        lifecycle.exited = true;
+        if lifecycle.orphaned {
+            lifecycle.orphaned = false;
+            ORPHANED_WORKERS.fetch_sub(1, Ordering::SeqCst);
+        }
+        drop(lifecycle);
+        LIVE_WORKERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 fn workers() -> &'static StdMutex<HashMap<u64, Arc<WorkerShared>>> {
     WORKERS.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -281,10 +495,16 @@ fn worker_by_id(id: u64) -> Option<Arc<WorkerShared>> {
 
 /// Shut down every worker started by `generation` (runtime drop or actor
 /// `Shutdown`). The worker thread observes the shutdown flag at its next pump
-/// iteration and leaves; an OS thread spinning in pure synchronous JS cannot
-/// be killed, so the entry is removed immediately (the parent pump sees
-/// `stop`/`done` instead of a dead registry entry) and the thread's own `Arc`
-/// keeps the mailboxes alive until it exits.
+/// iteration; a thread spinning in pure synchronous JS is aborted through the
+/// worker runtime's QuickJS interrupt flag (`WorkerShared::abort`), which is
+/// independent of the message pump. The registry entry is removed immediately
+/// (the parent pump sees `stop`/`done` instead of a dead registry entry) and
+/// the thread's own `Arc` keeps the mailboxes alive until it exits.
+///
+/// A thread that does not exit (stuck inside a native host function, which a
+/// QuickJS interrupt cannot preempt) is marked orphaned: [`ORPHANED_WORKERS`]
+/// records it and [`MAX_LIVE_WORKER_THREADS`] keeps repeated `/reload`s from
+/// accumulating a fresh generation of leaked threads.
 pub(super) fn release_generation(generation: u64) {
     let stale: Vec<Arc<WorkerShared>> = {
         let mut table = workers().lock().unwrap_or_else(PoisonError::into_inner);
@@ -296,7 +516,24 @@ pub(super) fn release_generation(generation: u64) {
         ids.iter().filter_map(|id| table.remove(id)).collect()
     };
     for shared in stale {
+        // Record the reason before the flag the worker's terminal path reads,
+        // so the exit record cannot be built with a stale "normal" reason.
+        shared
+            .stop_reason
+            .store(StopReason::GenerationRelease as u8, Ordering::SeqCst);
         shared.shutdown.store(true, Ordering::SeqCst);
+        shared.abort.store(true, Ordering::SeqCst);
+        {
+            let mut lifecycle = WorkerShared::lock(&shared.lifecycle);
+            // `exited` is set by the worker's exit guard under this same
+            // mutex: a thread that already returned is never counted as
+            // orphaned, and a thread marked here retires the count when it
+            // returns.
+            if !lifecycle.exited && !lifecycle.orphaned {
+                lifecycle.orphaned = true;
+                ORPHANED_WORKERS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         shared.inbound_notify.notify_waiters();
         shared.outbound_notify.notify_waiters();
         shared.inbound_notify.notify_one();
@@ -317,6 +554,31 @@ pub fn worker_count_for_tests() -> usize {
 #[doc(hidden)]
 pub fn worker_limit_for_tests() -> usize {
     MAX_WORKER_THREADS
+}
+
+/// Registry-independent count of OS worker threads still alive.
+#[doc(hidden)]
+pub fn live_worker_count_for_tests() -> usize {
+    LIVE_WORKERS.load(Ordering::SeqCst)
+}
+
+/// Process-wide live-thread hard cap (across generations).
+#[doc(hidden)]
+pub fn live_worker_limit_for_tests() -> usize {
+    MAX_LIVE_WORKER_THREADS
+}
+
+/// Workers whose generation was released while their thread was still alive.
+#[doc(hidden)]
+pub fn orphaned_worker_count_for_tests() -> usize {
+    ORPHANED_WORKERS.load(Ordering::SeqCst)
+}
+
+/// Override the cross-generation live cap for one test (`0` restores the
+/// constant). Tests must save/restore it around the assertion.
+#[doc(hidden)]
+pub fn test_set_live_worker_limit(limit: usize) {
+    LIVE_WORKER_LIMIT_OVERRIDE.store(limit, Ordering::SeqCst);
 }
 
 /// Everything the worker thread needs to boot its runtime. `Send` by design:
@@ -405,6 +667,32 @@ struct OpErr<'a> {
     message: &'a str,
 }
 
+/// One worker-op failure: the envelope code plus the message. Most ops report
+/// the generic [`WORKER_OP_ERROR`]; `start` forwards the Node error code
+/// (e.g. `E2BIG` for a Worker entry over the shared 32 MiB source cap) so the
+/// async `error` event carries the same code as `fs.readFile`.
+struct OpError {
+    code: &'static str,
+    message: String,
+}
+
+const WORKER_OP_ERROR: &str = "ERR_WORKER_OP";
+
+impl From<String> for OpError {
+    fn from(message: String) -> Self {
+        Self {
+            code: WORKER_OP_ERROR,
+            message,
+        }
+    }
+}
+
+impl OpError {
+    fn coded(code: &'static str, message: String) -> Self {
+        Self { code, message }
+    }
+}
+
 /// One op's answer. Every op but the two message posts builds a `JsonValue`
 /// for [`worker_op`] to wrap in the envelope; the posts answer with their
 /// *finished* envelope text ([`SENT_OK`] / [`DROPPED_OK`], fixed per op), so
@@ -431,14 +719,27 @@ fn worker_op(
     let mut payload: JsonValue = serde_json::from_str(payload).unwrap_or(JsonValue::Null);
     let result = match op {
         "start" => op_start(state, allowed_roots, &payload, generation).map(OpAnswer::from),
-        "parentSend" => op_send(&mut payload, "inbound"),
-        "workerSend" => op_send(&mut payload, "outbound"),
-        "workerExit" => op_worker_exit(&payload).map(OpAnswer::from),
-        "terminate" => op_terminate(&payload).map(OpAnswer::from),
-        "release" => op_release(&payload).map(OpAnswer::from),
-        "envGet" => op_env_get(&payload).map(OpAnswer::from),
-        "envSet" => op_env_set(&payload).map(OpAnswer::from),
-        other => Err(format!("unknown worker op `{other}`")),
+        "parentSend" => op_send(&mut payload, "inbound").map_err(OpError::from),
+        "workerSend" => op_send(&mut payload, "outbound").map_err(OpError::from),
+        "workerExit" => op_worker_exit(&payload)
+            .map(OpAnswer::from)
+            .map_err(OpError::from),
+        "terminate" => op_terminate(&payload)
+            .map(OpAnswer::from)
+            .map_err(OpError::from),
+        "state" => op_state(&payload)
+            .map(OpAnswer::from)
+            .map_err(OpError::from),
+        "release" => op_release(&payload)
+            .map(OpAnswer::from)
+            .map_err(OpError::from),
+        "envGet" => op_env_get(&payload)
+            .map(OpAnswer::from)
+            .map_err(OpError::from),
+        "envSet" => op_env_set(&payload)
+            .map(OpAnswer::from)
+            .map_err(OpError::from),
+        other => Err(format!("unknown worker op `{other}`").into()),
     };
     match result {
         // Infallible: `OpOk` is a `bool` plus a `serde_json::Value`, and the
@@ -454,10 +755,10 @@ fn worker_op(
         Ok(OpAnswer::Wire(text)) => text.to_owned(),
         // Same proof as `OpOk` (a `bool` plus two `&str`s, no map): the old
         // fallback could blank out `message`, hiding the operator's error.
-        Err(message) => serde_json::to_string(&OpErr {
+        Err(error) => serde_json::to_string(&OpErr {
             ok: false,
-            code: "ERR_WORKER_OP",
-            message: message.as_str(),
+            code: error.code,
+            message: error.message.as_str(),
         })
         .expect("OpErr serialization is infallible: bool + two &str, in-memory writer"),
     }
@@ -472,17 +773,28 @@ fn op_start(
     allowed_roots: &Arc<StdMutex<Vec<PathBuf>>>,
     payload: &JsonValue,
     generation: u64,
-) -> Result<JsonValue, String> {
+) -> Result<JsonValue, OpError> {
     if workers()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .len()
         >= MAX_WORKER_THREADS
     {
-        return Err(format!(
-            "too many worker threads: the process limit is {MAX_WORKER_THREADS}"
-        ));
+        return Err(
+            format!("too many worker threads: the process limit is {MAX_WORKER_THREADS}").into(),
+        );
     }
+    // Reserve before reading/spawning: the reservation also enforces the
+    // cross-generation cap, so a `/reload` loop cannot keep growing the
+    // process while the previous generation's threads are still alive.
+    let Some(reservation) = LiveWorkerReservation::new() else {
+        return Err(format!(
+            "too many live worker threads: {} are still running across generations (process limit {})",
+            LIVE_WORKERS.load(Ordering::SeqCst),
+            live_worker_limit()
+        )
+        .into());
+    };
     let eval = payload
         .get("eval")
         .and_then(JsonValue::as_bool)
@@ -494,16 +806,32 @@ fn op_start(
     let filename = payload_str(payload, "filename").unwrap_or("").to_owned();
     let (code, from_dir, filename) = if eval {
         if code.trim().is_empty() {
-            return Err("worker eval source must be a non-empty string".to_owned());
+            return Err("worker eval source must be a non-empty string"
+                .to_owned()
+                .into());
         }
         let cwd = lock_state(state).config.cwd.display().to_string();
         (code, cwd, "[worker eval]".to_owned())
     } else {
         if filename.trim().is_empty() {
-            return Err("worker filename must be a non-empty string".to_owned());
+            return Err("worker filename must be a non-empty string"
+                .to_owned()
+                .into());
         }
-        let source = std::fs::read_to_string(&filename)
-            .map_err(|error| format!("Cannot find module '{filename}': {error}"))?;
+        // Worker entry sources share `fs.readFile`'s 32 MiB cap: a Worker is
+        // one more QuickJS runtime in this process, so an unbounded entry
+        // read is an unbounded host-heap allocation.
+        let source =
+            super::node_fns::read_text_capped(std::path::Path::new(&filename), "open", &filename)
+                .map_err(|error| {
+                let (code, message) = super::node_fns::node_error_parts(error);
+                let message = if code == "ENOENT" {
+                    format!("Cannot find module '{filename}': {message}")
+                } else {
+                    message
+                };
+                OpError::coded(code, message)
+            })?;
         let dir = std::path::Path::new(&filename)
             .parent()
             .map(|dir| dir.display().to_string())
@@ -536,7 +864,7 @@ fn op_start(
     };
 
     let id = NEXT_WORKER_ID.fetch_add(1, Ordering::SeqCst);
-    let shared = Arc::new(WorkerShared::new(id, generation));
+    let shared = Arc::new(WorkerShared::new(generation));
     workers()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -559,13 +887,19 @@ fn op_start(
         .stack_size(WORKER_THREAD_STACK)
         .spawn(move || worker_thread_main(spec, shared));
     match spawned {
-        Ok(_handle) => Ok(serde_json::json!({ "id": id, "threadId": id })),
+        Ok(_handle) => {
+            // The thread's `WorkerThreadSlot` guard now owns the live-count
+            // slot; the local reservation must not release it a second time.
+            reservation.transfer();
+            Ok(serde_json::json!({ "id": id, "threadId": id }))
+        }
         Err(error) => {
             workers()
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id);
-            Err(format!("failed to spawn worker thread: {error}"))
+            // Dropping `reservation` releases the slot.
+            Err(format!("failed to spawn worker thread: {error}").into())
         }
     }
 }
@@ -666,37 +1000,42 @@ fn op_worker_exit(payload: &JsonValue) -> Result<JsonValue, String> {
         return Ok(serde_json::json!({ "dropped": true }));
     };
     *WorkerShared::lock(&shared.exit_code) = Some(code);
+    shared
+        .stop_reason
+        .store(StopReason::ProcessExit as u8, Ordering::SeqCst);
     shared.shutdown.store(true, Ordering::SeqCst);
     shared.inbound_notify.notify_one();
     shared.outbound_notify.notify_one();
     Ok(serde_json::json!({ "exiting": true }))
 }
 
-/// One bounded wait of the terminate loop. The JS side loops this op (with
-/// executor yields between calls) until `done` or its own budget runs out.
+/// Signal one worker to stop and report its current state without blocking
+/// the extension actor.
+///
+/// `shutdown` lets the JS pump observe the stop; `abort` is consumed by the
+/// worker runtime's QuickJS interrupt handler, so a pure synchronous JS loop
+/// (`while (true) {}`) is interrupted at the next bytecode boundary instead of
+/// making this op poll for 200 ms and answer `{done:false}` forever. The JS
+/// `terminate()` loop re-invokes this op with a timer yield until `done` is
+/// observed; the actor is never parked here (R2-3-N07). The legacy `waitMs`
+/// field of the payload is accepted for wire compatibility and ignored: the
+/// answer is always the current `{done, exitCode}` snapshot, with `exitCode`
+/// finalized before `done` is published so the two views cannot disagree.
 fn op_terminate(payload: &JsonValue) -> Result<JsonValue, String> {
     let id = payload
         .get("id")
         .and_then(JsonValue::as_u64)
         .ok_or("missing worker id")?;
-    let wait_ms = payload
-        .get("waitMs")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or(MAX_TERMINATE_WAIT_MS)
-        .min(MAX_TERMINATE_WAIT_MS);
     let Some(shared) = worker_by_id(id) else {
         return Ok(serde_json::json!({ "done": true, "exitCode": 1 }));
     };
+    shared
+        .stop_reason
+        .store(StopReason::Terminate as u8, Ordering::SeqCst);
     shared.shutdown.store(true, Ordering::SeqCst);
+    shared.abort.store(true, Ordering::SeqCst);
     shared.inbound_notify.notify_one();
     shared.outbound_notify.notify_one();
-    let deadline = Instant::now() + Duration::from_millis(wait_ms);
-    while Instant::now() < deadline {
-        if shared.done.load(Ordering::SeqCst) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
     let done = shared.done.load(Ordering::SeqCst);
     let exit_code = *WorkerShared::lock(&shared.exit_code);
     if done {
@@ -708,6 +1047,35 @@ fn op_terminate(payload: &JsonValue) -> Result<JsonValue, String> {
     Ok(serde_json::json!({
         "done": done,
         "exitCode": exit_code.unwrap_or(1),
+    }))
+}
+
+/// Read-only terminal snapshot of one worker, for regression tests that must
+/// prove the registry retains a completed worker until the parent explicitly
+/// observes the exit. Unlike `terminate`/`release` it has no side effects:
+/// it does not drain the mailbox, change the stop reason, or remove the
+/// entry. `done` is stored after the final code is published, so a `done`
+/// answer implies `exitCode` is final.
+fn op_state(payload: &JsonValue) -> Result<JsonValue, String> {
+    let id = payload
+        .get("id")
+        .and_then(JsonValue::as_u64)
+        .ok_or("missing worker id")?;
+    let Some(shared) = worker_by_id(id) else {
+        // No entry: either the parent already released it or the worker
+        // never existed. Either way there is nothing left to observe.
+        return Ok(serde_json::json!({
+            "present": false,
+            "done": true,
+            "exitCode": null,
+        }));
+    };
+    let done = shared.done.load(Ordering::SeqCst);
+    let exit_code = *WorkerShared::lock(&shared.exit_code);
+    Ok(serde_json::json!({
+        "present": true,
+        "done": done,
+        "exitCode": exit_code,
     }))
 }
 
@@ -868,7 +1236,7 @@ pub fn test_register_worker() -> u64 {
     workers()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .insert(id, Arc::new(WorkerShared::new(id, 0)));
+        .insert(id, Arc::new(WorkerShared::new(0)));
     id
 }
 
@@ -929,22 +1297,52 @@ fn push_record(shared: &WorkerShared, record: JsonValue) {
 }
 
 fn finish_worker(shared: &WorkerShared, code: i32) {
+    // Persist the terminal code before publishing `done`/the record: every
+    // later reader (`recv_poll`, `op_terminate`, the parent's `exit` event)
+    // must observe the same value, whichever path settles first.
+    let code = shared.finalize_exit_code(code);
     push_record(shared, serde_json::json!({ "kind": "exit", "code": code }));
     shared.done.store(true, Ordering::SeqCst);
     shared.outbound_notify.notify_one();
     shared.inbound_notify.notify_one();
-    // Drop the registry entry: the thread's own Arc keeps the mailboxes alive
-    // until the thread function returns.
-    workers()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&shared.id);
+    // Keep the registry entry until the parent observes the exit
+    // (`op_release`, or `op_terminate` answering `done:true`). Removing it
+    // here would make a later `terminate()` fall back to the hard-coded 1
+    // while a normal completion's recorded 0 is still unread; the thread's
+    // own `Arc` keeps the mailboxes alive until this function returns.
+}
+
+/// Sets the worker's abort flag when the worker function unwinds, just before
+/// `ExtensionRuntime::drop` evaluates the process-exit teardown JS. A user
+/// `process.on("exit")` handler with a synchronous infinite loop would
+/// otherwise pin the worker thread (and its [`LIVE_WORKERS`] slot) forever on
+/// every exit path; the QuickJS interrupt handler then breaks the teardown at
+/// the next bytecode poll.
+///
+/// The guarantee is the bound, not handler completion: QuickJS only
+/// decrements its interrupt counter between polls, so the remaining phase
+/// when the teardown starts is not fixed. A short, well-behaved exit handler
+/// USUALLY runs to completion, but it can also be truncated at the first
+/// poll. A native host call inside the handler is not interruptible at all
+/// (the same boundary as terminate); it just cannot loop in JS forever.
+struct AbortWorkerOnDrop(Arc<AtomicBool>);
+
+impl Drop for AbortWorkerOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Thread entry: panic isolation around the whole worker run. A panicked
 /// worker reports through the same `error` + `exit(1)` channel as a failed
 /// boot, never leaving the parent pump waiting forever.
 fn worker_thread_main(spec: WorkerSpec, shared: Arc<WorkerShared>) {
+    // Registry-independent live-thread accounting: the slot is released when
+    // this function returns (normal exit, interrupt, or panic unwind) — after
+    // `release_generation` has already removed the registry entry.
+    let _live_slot = WorkerThreadSlot {
+        shared: Arc::clone(&shared),
+    };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         worker_thread_run(spec, Arc::clone(&shared))
     }));
@@ -1016,6 +1414,15 @@ async fn run_worker_async(spec: WorkerSpec, shared: Arc<WorkerShared>) {
             return;
         }
     };
+    // The parent (`terminate` / `release_generation`) sets this flag without
+    // touching this runtime; the QuickJS interrupt handler polls it at
+    // bytecode boundaries, so a pure synchronous JS loop can be aborted.
+    runtime.set_interrupt_flag(Arc::clone(&shared.abort));
+    // Declared after `runtime`: Rust drops locals in reverse order, so this
+    // flips the abort flag immediately before `runtime`'s Drop runs the
+    // `process.emit("exit")` teardown JS. That keeps a synchronous infinite
+    // loop in a user exit handler from pinning this thread (P3-05).
+    let _abort_on_drop = AbortWorkerOnDrop(Arc::clone(&shared.abort));
     for root in &spec.roots {
         runtime.allow_root(root.clone());
     }
@@ -1053,7 +1460,14 @@ async fn run_worker_async(spec: WorkerSpec, shared: Arc<WorkerShared>) {
         .replace("__PIR_WORKER_DATA__", &data_json)
         .replace("__PIR_WORKER_DIR__", &dir_json);
     if let Err(error) = runtime.eval_boot(&boot).await {
-        fail(format!("worker boot failed: {error}"), &shared);
+        if shared.shutdown.load(Ordering::SeqCst) {
+            // The boot JS was interrupted by a terminate/reload that raced
+            // the worker startup: a clean stop, not a boot failure.
+            let code = { *WorkerShared::lock(&shared.exit_code) }.unwrap_or(1);
+            finish_worker(&shared, code);
+        } else {
+            fail(format!("worker boot failed: {error}"), &shared);
+        }
         return;
     }
 
@@ -1068,14 +1482,45 @@ async fn run_worker_async(spec: WorkerSpec, shared: Arc<WorkerShared>) {
     let run_source = format!(
         "globalThis.__pirWorkerRunStart({{ code: {code_json}, filename: {file_json}, fromDir: {dir_json} }})"
     );
+    // Synchronous worker bodies run under the parent runtime's configured
+    // call deadline (the same `ExtensionRuntime::arm_deadline` the actor uses
+    // for a tool call). This is what stops `while (true) {}` even when no one
+    // calls `terminate`: the QuickJS interrupt handler aborts the eval at the
+    // deadline. Asynchronous work belongs to the pump loop that starts after
+    // the body returns, so it is not bounded by this deadline.
+    let code_budget = runtime.call_timeout();
+    let code_deadline = runtime.arm_deadline();
     let outcome = runtime
         .ctx
         .async_with(async |ctx| ctx.eval::<String, _>(run_source.clone()))
         .await;
+    runtime.disarm_deadline(code_deadline);
     let outcome = match outcome {
         Ok(payload) => payload,
         Err(error) => {
-            fail(format!("worker code failed to evaluate: {error}"), &shared);
+            if shared.shutdown.load(Ordering::SeqCst) {
+                // `terminate` / `/reload`: the abort flag deliberately tore
+                // down the eval. This is a clean stop, not a worker error.
+                // Do not touch the engine again: the abort flag is still set,
+                // so any further JS entry (including reading the pending
+                // exception) would be interrupted immediately.
+                let code = { *WorkerShared::lock(&shared.exit_code) }.unwrap_or(1);
+                finish_worker(&shared, code);
+            } else {
+                // Read (and clear) the pending exception before the thread
+                // drops the runtime: it distinguishes a deadline interrupt
+                // from a genuine engine failure in the error record, and a
+                // stale interrupt exception must not leak into teardown.
+                let detail = runtime.take_pending_exception_text().await;
+                let detail = detail.map(|text| format!(" ({text})")).unwrap_or_default();
+                fail(
+                    format!(
+                        "worker code exceeded its {:?} synchronous deadline or failed to evaluate: {error}{detail}",
+                        code_budget
+                    ),
+                    &shared,
+                );
+            }
             return;
         }
     };
@@ -1118,10 +1563,21 @@ async fn run_worker_async(spec: WorkerSpec, shared: Arc<WorkerShared>) {
         })
         .await;
     if let Err(error) = pump {
-        fail(format!("worker pump failed: {error}"), &shared);
+        if shared.shutdown.load(Ordering::SeqCst) {
+            // The interrupt was our own `terminate`/`/reload` abort (the pump
+            // was executing JS when the flag was observed): clean stop.
+            let code = { *WorkerShared::lock(&shared.exit_code) }.unwrap_or(1);
+            finish_worker(&shared, code);
+        } else {
+            fail(format!("worker pump failed: {error}"), &shared);
+        }
         return;
     }
 
-    let code = { *WorkerShared::lock(&shared.exit_code) }.unwrap_or(0);
-    finish_worker(&shared, code);
+    // The pump only returns Ok when it observed `stop`/`done`; a normal,
+    // self-directed completion supplies its code through `process.exit`
+    // (already stored). If no code was recorded, `finish_worker` consults the
+    // stop reason: a terminate/generation release becomes Node's 1, a truly
+    // natural return stays 0.
+    finish_worker(&shared, 0);
 }

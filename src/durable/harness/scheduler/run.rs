@@ -57,7 +57,9 @@ use crate::durable::harness::scheduler::{
     with_state, Invocation, InvocationMode, Reservation, SchedulerInner,
 };
 use crate::durable::harness::task::RunningTask;
-use crate::durable::harness::telemetry::{SpanHandle, SpanLink, SpanStatus};
+use crate::durable::harness::telemetry::{
+    PhaseSpanEnd, PhaseSpanStart, SpanHandle, SpanLink, SpanStatus,
+};
 use crate::durable::ids::TaskId;
 use crate::durable::session::Transaction;
 use crate::durable::types::{TaskOutcome, TaskRecord, TaskState};
@@ -249,12 +251,14 @@ impl SchedulerInner {
             }
         }
         let span = self.telemetry.start_phase_span(
-            running.id.as_i64(),
-            &running.kind,
-            phase,
-            kind,
-            attempt,
-            invocation.resumed,
+            PhaseSpanStart {
+                task_id: running.id.as_i64(),
+                task_name: &running.kind,
+                phase,
+                kind,
+                attempt,
+                resumed: invocation.resumed,
+            },
             parent,
             &links,
         );
@@ -290,13 +294,15 @@ impl SchedulerInner {
         };
         self.telemetry.end_phase_span(
             active.span,
-            &active.task_name,
-            &active.phase,
-            Some(&outcome),
-            tool_name.as_deref(),
-            tool_call_id.as_deref(),
+            PhaseSpanEnd {
+                task_name: &active.task_name,
+                phase: &active.phase,
+                outcome: Some(&outcome),
+                tool_name: tool_name.as_deref(),
+                tool_call_id: tool_call_id.as_deref(),
+                duration_millis: Some(millis),
+            },
             status,
-            Some(millis),
         );
     }
 

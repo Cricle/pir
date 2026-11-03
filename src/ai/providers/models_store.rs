@@ -472,10 +472,17 @@ fn write_store(path: &Path, store: &ModelsStoreFile) -> Result<u64, String> {
     let hash = content_hash(&serialized);
     let temp = temp_store_path(path);
     let written = (|| -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // `models-store.json` carries provider catalogs/etags/internal
+            // base URLs; keep it private like `auth.json` even when the
+            // agent dir is shared.
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
         file.write_all(&serialized)?;
         file.flush()?;
         file.sync_all()?;

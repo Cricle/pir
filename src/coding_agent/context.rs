@@ -338,15 +338,19 @@ pub fn session_system_prompt_with_hidden_and_options_and_inputs_and_mcp_with_ove
     let files = resolve_context_files_with(cwd, options);
     let skills = discover_prompt_skills_with(cwd, options);
     let prompt = context_system_prompt_unconditional_with(
-        cwd,
-        tools,
-        hidden_tools,
-        &files,
-        &skills,
-        options.package_dir,
-        mcp_servers.as_deref(),
-        preamble_override,
-        append,
+        &PromptSources {
+            cwd,
+            tools,
+            hidden_tools,
+            files: &files,
+            skills: &skills,
+            package_dir: options.package_dir,
+            mcp_servers: mcp_servers.as_deref(),
+        },
+        PromptOverrides {
+            preamble_override,
+            append,
+        },
     );
     (
         prompt,
@@ -592,15 +596,19 @@ pub fn session_system_prompt_from_inputs_with_overrides(
     append: &[String],
 ) -> String {
     context_system_prompt_unconditional_with(
-        cwd,
-        tools,
-        hidden_tools,
-        &inputs.files,
-        &inputs.skills,
-        package_dir,
-        inputs.mcp_servers.as_deref(),
-        preamble_override,
-        append,
+        &PromptSources {
+            cwd,
+            tools,
+            hidden_tools,
+            files: &inputs.files,
+            skills: &inputs.skills,
+            package_dir,
+            mcp_servers: inputs.mcp_servers.as_deref(),
+        },
+        PromptOverrides {
+            preamble_override,
+            append,
+        },
     )
 }
 
@@ -653,6 +661,26 @@ fn context_system_prompt_from_parts(
     ))
 }
 
+/// The resolved prompt sources every system-prompt variant renders.
+struct PromptSources<'a> {
+    cwd: &'a Path,
+    tools: &'a [ToolInfo],
+    hidden_tools: &'a [String],
+    files: &'a [(PathBuf, String)],
+    skills: &'a [crate::skills::SkillInfo],
+    package_dir: Option<&'a Path>,
+    mcp_servers: Option<&'a str>,
+}
+
+/// CLI prompt overrides applied on top of [`PromptSources`].
+#[derive(Default)]
+struct PromptOverrides<'a> {
+    /// Replaces the default preamble when present.
+    preamble_override: Option<&'a str>,
+    /// Entries rendered as `addendum` sections.
+    append: &'a [String],
+}
+
 /// Build the prompt from resolved parts with NO "nothing to inject" check: the
 /// base preamble, `<tools>`/`<rules>` (from the declared set) and `<cwd>` are
 /// always produced (upstream `buildSystemPrompt`, system-prompt.ts:60-199,
@@ -673,46 +701,39 @@ fn context_system_prompt_unconditional(
     mcp_servers: Option<&str>,
 ) -> String {
     context_system_prompt_unconditional_with(
-        cwd,
-        tools,
-        hidden_tools,
-        files,
-        skills,
-        package_dir,
-        mcp_servers,
-        None,
-        &[],
+        &PromptSources {
+            cwd,
+            tools,
+            hidden_tools,
+            files,
+            skills,
+            package_dir,
+            mcp_servers,
+        },
+        PromptOverrides::default(),
     )
 }
 
 /// [`context_system_prompt_unconditional`] with explicit CLI prompt
 /// overrides. `preamble_override` replaces the default preamble;
 /// `append` entries render as the `addendum` section in its upstream position.
-#[allow(clippy::too_many_arguments)]
 fn context_system_prompt_unconditional_with(
-    cwd: &Path,
-    tools: &[ToolInfo],
-    hidden_tools: &[String],
-    files: &[(PathBuf, String)],
-    skills: &[crate::skills::SkillInfo],
-    package_dir: Option<&Path>,
-    mcp_servers: Option<&str>,
-    preamble_override: Option<&str>,
-    append: &[String],
+    sources: &PromptSources<'_>,
+    overrides: PromptOverrides<'_>,
 ) -> String {
     build_system_prompt(&SystemPromptInput {
-        preamble_override: preamble_override.map(str::to_owned),
-        append: append.to_vec(),
-        tools,
-        hidden_tools,
-        project_files: files,
-        skills,
-        cwd,
+        preamble_override: overrides.preamble_override.map(str::to_owned),
+        append: overrides.append.to_vec(),
+        tools: sources.tools,
+        hidden_tools: sources.hidden_tools,
+        project_files: sources.files,
+        skills: sources.skills,
+        cwd: sources.cwd,
         // The package asset dir is a resolved option (upstream
         // `getPackageDir`; read once at the boundary); the builder itself
         // never reads the process environment.
-        package_dir,
-        custom_sections: mcp_custom_sections(mcp_servers),
+        package_dir: sources.package_dir,
+        custom_sections: mcp_custom_sections(sources.mcp_servers),
     })
 }
 

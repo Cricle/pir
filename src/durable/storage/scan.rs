@@ -88,3 +88,28 @@ pub fn page_of<T: Clone>(
         (items, next)
     }
 }
+
+/// Build a [`Page`](crate::durable::types::Page) from an owned over-fetched
+/// vector, moving the returned items instead of cloning them.
+///
+/// `values` must hold at most `limit + 1` items: when it holds more than
+/// `limit`, the extra item proves there is another page and is dropped after
+/// the last returned item supplies the continuation cursor. Backends that
+/// already materialized owned records use this to avoid a second deep clone of
+/// every page item.
+pub fn page_of_owned<T>(
+    mut values: Vec<T>,
+    limit: usize,
+    order: ScanOrder,
+    id: impl Fn(&T) -> i64,
+) -> (Vec<T>, Option<Cursor>) {
+    let next = if limit > 0 && values.len() > limit {
+        values
+            .get(limit - 1)
+            .map(|last| next_cursor(id(last), order))
+    } else {
+        None
+    };
+    values.truncate(limit);
+    (values, next)
+}

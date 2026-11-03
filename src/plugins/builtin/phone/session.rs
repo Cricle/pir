@@ -814,6 +814,15 @@ struct ClientQueue {
     notify: Notify,
 }
 
+/// The per-client and shared byte/line budgets one enqueue is checked
+/// against.
+struct QueueBudget<'a> {
+    max_lines: usize,
+    max_bytes: usize,
+    total_bytes: &'a AtomicUsize,
+    total_max: usize,
+}
+
 impl ClientQueue {
     fn new() -> Self {
         Self {
@@ -871,16 +880,7 @@ impl ClientQueue {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn push(
-        &self,
-        line: String,
-        class: LineClass,
-        max_lines: usize,
-        max_bytes: usize,
-        total_bytes: &AtomicUsize,
-        total_max: usize,
-    ) -> EnqueueOutcome {
+    fn push(&self, line: String, class: LineClass, budget: QueueBudget<'_>) -> EnqueueOutcome {
         let mut state = self
             .state
             .lock()
@@ -889,9 +889,9 @@ impl ClientQueue {
             return EnqueueOutcome::Dropped;
         }
         let len = line.len();
-        let max_lines = max_lines.max(1);
-        let max_bytes = max_bytes.max(1);
-        let total_max = total_max.max(1);
+        let max_lines = budget.max_lines.max(1);
+        let max_bytes = budget.max_bytes.max(1);
+        let total_max = budget.total_max.max(1);
 
         if class.is_update() {
             if len > max_bytes {
@@ -900,7 +900,7 @@ impl ClientQueue {
             }
             if state.lines.len() < max_lines
                 && state.bytes + len <= max_bytes
-                && reserve_bytes(total_bytes, len, total_max)
+                && reserve_bytes(budget.total_bytes, len, total_max)
             {
                 state.bytes += len;
                 state.lines.push_back((line, class));
@@ -919,8 +919,12 @@ impl ClientQueue {
                     return EnqueueOutcome::Dropped;
                 };
                 state.bytes = state.bytes.saturating_sub(removed.len());
-                total_bytes.fetch_sub(removed.len(), Ordering::AcqRel);
-                if state.bytes + len <= max_bytes && reserve_bytes(total_bytes, len, total_max) {
+                budget
+                    .total_bytes
+                    .fetch_sub(removed.len(), Ordering::AcqRel);
+                if state.bytes + len <= max_bytes
+                    && reserve_bytes(budget.total_bytes, len, total_max)
+                {
                     state.bytes += len;
                     state.lines.push_back((line, class));
                     drop(state);
@@ -944,9 +948,11 @@ impl ClientQueue {
                 return EnqueueOutcome::OverBudget;
             };
             state.bytes = state.bytes.saturating_sub(removed.len());
-            total_bytes.fetch_sub(removed.len(), Ordering::AcqRel);
+            budget
+                .total_bytes
+                .fetch_sub(removed.len(), Ordering::AcqRel);
         }
-        if !reserve_bytes(total_bytes, len, total_max) {
+        if !reserve_bytes(budget.total_bytes, len, total_max) {
             return EnqueueOutcome::OverBudget;
         }
         state.bytes += len;
@@ -1019,10 +1025,12 @@ impl BridgeInner {
                 Some(entry) => entry.queue.push(
                     line,
                     class,
-                    entry.queue_capacity,
-                    self.config.client_queue_bytes,
-                    &self.queued_bytes,
-                    self.config.total_queue_bytes,
+                    QueueBudget {
+                        max_lines: entry.queue_capacity,
+                        max_bytes: self.config.client_queue_bytes,
+                        total_bytes: &self.queued_bytes,
+                        total_max: self.config.total_queue_bytes,
+                    },
                 ),
                 None => return,
             }
@@ -1349,10 +1357,12 @@ impl SessionBridge {
                 let outcome = entry.queue.push(
                     line.clone(),
                     class,
-                    entry.queue_capacity,
-                    self.inner.config.client_queue_bytes,
-                    &self.inner.queued_bytes,
-                    self.inner.config.total_queue_bytes,
+                    QueueBudget {
+                        max_lines: entry.queue_capacity,
+                        max_bytes: self.inner.config.client_queue_bytes,
+                        total_bytes: &self.inner.queued_bytes,
+                        total_max: self.inner.config.total_queue_bytes,
+                    },
                 );
                 self.inner.account_outcome(outcome);
                 if matches!(outcome, EnqueueOutcome::OverBudget) {
@@ -1412,10 +1422,12 @@ impl SessionBridge {
                 let outcome = entry.queue.push(
                     line,
                     LineClass::Terminal,
-                    entry.queue_capacity,
-                    self.inner.config.client_queue_bytes,
-                    &self.inner.queued_bytes,
-                    self.inner.config.total_queue_bytes,
+                    QueueBudget {
+                        max_lines: entry.queue_capacity,
+                        max_bytes: self.inner.config.client_queue_bytes,
+                        total_bytes: &self.inner.queued_bytes,
+                        total_max: self.inner.config.total_queue_bytes,
+                    },
                 );
                 self.inner.account_outcome(outcome);
                 if matches!(outcome, EnqueueOutcome::OverBudget) {

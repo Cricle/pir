@@ -30,10 +30,12 @@
 //! silently (it is a chain step, not a terminal error).
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 
+use super::{sigv4_sign, SigV4Request};
 use crate::ai::api::provider_env_value;
 use crate::ai::error::{AiError, AiResult};
 use crate::ai::types::ProviderEnv;
@@ -62,6 +64,243 @@ const MAX_ASSUME_ROLE_DEPTH: usize = 5;
 /// Cap on any single STS/ECS response body (both payloads are tiny XML/JSON
 /// documents; the cap bounds memory against a hostile endpoint).
 const MAX_RESPONSE_BODY_BYTES: u64 = 4 * 1024 * 1024;
+/// Process-level credential-cache lifetime when the source reports no
+/// expiration (static env/profile keys, or a `credential_process` without
+/// `Expiration`): long enough to stop re-reading files and re-resolving on
+/// every request, short enough that shared-file edits are picked up without a
+/// restart.
+const CREDENTIAL_CACHE_DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
+/// Expiring credentials are refreshed this long before their source-reported
+/// expiration, so a request never starts with credentials about to lapse.
+const CREDENTIAL_CACHE_REFRESH_MARGIN: Duration = Duration::from_secs(60);
+
+/// The AWS environment variables the chain reads. The cache key is the
+/// effective value of every one of them (request-level [`ProviderEnv`] first,
+/// then the process env), so a request that changes any input never reuses an
+/// entry resolved for a different configuration.
+const CREDENTIAL_ENV_KEYS: &[&str] = &[
+    "AWS_PROFILE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+    "AWS_SSO_CACHE_DIR",
+    "AWS_EC2_METADATA_DISABLED",
+    "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+    "HOME",
+    "USERPROFILE",
+];
+
+/// Credentials plus the absolute expiry the source reported (the public
+/// `AwsCredentials` shape is intentionally unchanged).
+#[derive(Debug, Clone)]
+struct ExpiringCredentials {
+    credentials: AwsCredentials,
+    expiration: Option<SystemTime>,
+}
+
+/// A full chain resolution (credentials + profile region) plus expiry, used
+/// internally so the cache can respect temporary-credential expiration
+/// without adding a field to the public `ResolvedBedrockAuth`.
+#[derive(Debug, Clone)]
+struct ResolvedCredential {
+    auth: ResolvedBedrockAuth,
+    expiration: Option<SystemTime>,
+}
+
+impl ResolvedCredential {
+    fn new(
+        credentials: AwsCredentials,
+        region: Option<String>,
+        expiration: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            auth: ResolvedBedrockAuth {
+                credentials,
+                region,
+            },
+            expiration,
+        }
+    }
+}
+
+impl ResolvedBedrockAuth {
+    /// Wrap a resolution that carries no source expiration (static keys).
+    fn into_resolved_expiring(self) -> ResolvedCredential {
+        ResolvedCredential {
+            auth: self,
+            expiration: None,
+        }
+    }
+}
+
+impl ExpiringCredentials {
+    fn into_resolved(self, region: Option<String>) -> ResolvedCredential {
+        ResolvedCredential::new(self.credentials, region, self.expiration)
+    }
+}
+
+/// Clock- and TTL-injectable process-level credential cache.
+///
+/// Each effective environment has its own [`tokio::sync::OnceCell`]: the map
+/// lock is held only to look up/insert a cell, never across `resolve().await`.
+/// Concurrent misses for the same key wait on the same cell and resolve once
+/// (single flight), while different keys use different cells and resolve in
+/// parallel. Errors are never stored: a failed resolution leaves the cell
+/// empty, so the next request tries again.
+struct CredentialCache {
+    entries: tokio::sync::Mutex<CacheCells>,
+    ttl: Duration,
+    refresh_margin: Duration,
+    clock: Box<dyn Fn() -> SystemTime + Send + Sync>,
+}
+
+/// One key's single-flight resolution cell.
+type CacheCell = tokio::sync::OnceCell<CachedCredential>;
+
+/// The per-key cells, protected only for lookup/insert (never across a
+/// resolution).
+type CacheCells = std::collections::HashMap<CredentialCacheKey, Arc<CacheCell>>;
+
+/// A successful resolution plus whether it may be reused. A result whose
+/// expiration already falls inside the refresh margin is handed to this
+/// caller but never served from the cache.
+struct CachedCredential {
+    auth: ResolvedBedrockAuth,
+    expires_at: Option<SystemTime>,
+}
+
+/// The effective credential configuration an entry was resolved for.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CredentialCacheKey(Vec<(&'static str, Option<String>)>);
+
+impl CredentialCacheKey {
+    fn from_env(env: Option<&ProviderEnv>) -> Self {
+        Self(
+            CREDENTIAL_ENV_KEYS
+                .iter()
+                .map(|name| (*name, provider_env_value(name, env)))
+                .collect(),
+        )
+    }
+}
+
+impl CredentialCache {
+    fn new(
+        clock: impl Fn() -> SystemTime + Send + Sync + 'static,
+        ttl: Duration,
+        refresh_margin: Duration,
+    ) -> Self {
+        Self {
+            entries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            ttl,
+            refresh_margin,
+            clock: Box::new(clock),
+        }
+    }
+
+    fn process() -> Self {
+        Self::new(
+            SystemTime::now,
+            CREDENTIAL_CACHE_DEFAULT_TTL,
+            CREDENTIAL_CACHE_REFRESH_MARGIN,
+        )
+    }
+
+    /// Return the cached credentials for `key` when still fresh, otherwise
+    /// run `resolve` once and cache a successful, still-valid result.
+    ///
+    /// Concurrency: the map lock only protects the lookup/insert; the cell it
+    /// returns performs the single-flight. Same-key misses share one cell
+    /// (`OnceCell` runs one initializer), different keys use different cells
+    /// and resolve independently.
+    async fn get_or_resolve<F, Fut>(
+        &self,
+        key: CredentialCacheKey,
+        resolve: F,
+    ) -> AiResult<ResolvedBedrockAuth>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = AiResult<ResolvedCredential>> + Send,
+    {
+        let cell = {
+            let mut cells = self.entries.lock().await;
+            let now = (self.clock)();
+            // Expired/uncacheable entries are dropped before resolving: a
+            // failed refresh must never resurrect one, and errors are never
+            // cached. A cell with no value yet is in flight (or empty after a
+            // failed resolution): keep it so same-key callers stay single
+            // flight.
+            cells.retain(|_, cell| match cell.get() {
+                Some(entry) => entry.expires_at.is_some_and(|expires_at| now < expires_at),
+                None => true,
+            });
+            Arc::clone(cells.entry(key.clone()).or_default())
+        };
+        let resolved = cell
+            .get_or_try_init(|| async {
+                let resolved = resolve().await?;
+                let now = (self.clock)();
+                let expires_at = match resolved.expiration {
+                    Some(expiration) => expiration.checked_sub(self.refresh_margin).unwrap_or(now),
+                    None => now.checked_add(self.ttl).unwrap_or(now),
+                };
+                Ok::<CachedCredential, AiError>(CachedCredential {
+                    auth: resolved.auth,
+                    // Already inside the refresh margin: return it to this
+                    // caller, but never let it become a cache hit.
+                    expires_at: (expires_at > now).then_some(expires_at),
+                })
+            })
+            .await;
+        match resolved {
+            Ok(entry) => Ok(entry.auth.clone()),
+            Err(error) => {
+                // Errors are never cached. Drop the empty cell so the next
+                // request starts a fresh attempt; a concurrent resolver may
+                // have filled it in the meantime, in which case keep it.
+                let mut cells = self.entries.lock().await;
+                if cells
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &cell) && cell.get().is_none())
+                {
+                    cells.remove(&key);
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+/// The process-wide Bedrock credential cache.
+fn credential_cache() -> &'static CredentialCache {
+    static CACHE: std::sync::OnceLock<CredentialCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(CredentialCache::process)
+}
+
+/// Convert an ISO-8601 UTC timestamp (`Expiration` in ECS/IMDS/STS and
+/// `credential_process` payloads) into an absolute [`SystemTime`].
+fn system_time_from_iso8601(value: &str) -> Option<SystemTime> {
+    let seconds = u64::try_from(parse_iso8601_utc_seconds(value)?).ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
+}
+
+/// Convert epoch milliseconds (the SSO portal's `expiration` field) into an
+/// absolute [`SystemTime`].
+fn system_time_from_epoch_millis(value: i64) -> Option<SystemTime> {
+    let millis = u64::try_from(value).ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_millis(millis))
+}
 
 /// Resolved AWS credentials plus where they came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,7 +428,19 @@ pub fn ecs_full_uri_host_allowed(full_uri: &str) -> bool {
 }
 
 /// Resolve the full credential chain for one Bedrock request.
+///
+/// Process-level cached: a successful resolution is reused while fresh
+/// (expiration-aware, with a conservative TTL when the source reports none),
+/// and concurrent misses resolve once. Errors are never cached.
 pub async fn resolve_credentials(env: Option<&ProviderEnv>) -> AiResult<ResolvedBedrockAuth> {
+    let key = CredentialCacheKey::from_env(env);
+    credential_cache()
+        .get_or_resolve(key, || resolve_credentials_uncached(env))
+        .await
+}
+
+/// The uncached chain walk behind [`resolve_credentials`].
+async fn resolve_credentials_uncached(env: Option<&ProviderEnv>) -> AiResult<ResolvedCredential> {
     let plan = plan_source(
         provider_env_value("AWS_PROFILE", env).as_deref(),
         provider_env_value("AWS_ACCESS_KEY_ID", env).as_deref(),
@@ -199,22 +450,23 @@ pub async fn resolve_credentials(env: Option<&ProviderEnv>) -> AiResult<Resolved
         provider_env_value("AWS_CONTAINER_CREDENTIALS_FULL_URI", env).as_deref(),
     );
     match plan {
-        SourcePlan::Profile { name } => load_profile_async(&name).await,
-        SourcePlan::StaticEnv => Ok(ResolvedBedrockAuth {
-            credentials: AwsCredentials {
+        SourcePlan::Profile { name } => load_profile_async_expiring(&name).await,
+        SourcePlan::StaticEnv => Ok(ResolvedCredential::new(
+            AwsCredentials {
                 access_key_id: provider_env_value("AWS_ACCESS_KEY_ID", env).unwrap_or_default(),
                 secret_access_key: provider_env_value("AWS_SECRET_ACCESS_KEY", env)
                     .unwrap_or_default(),
                 session_token: provider_env_value("AWS_SESSION_TOKEN", env),
                 source: "environment".to_string(),
             },
-            region: None,
-        }),
-        SourcePlan::WebIdentity => web_identity_credentials(env).await,
-        SourcePlan::Ecs { url } => Ok(ResolvedBedrockAuth {
-            credentials: fetch_ecs_credentials(&url).await?,
-            region: None,
-        }),
+            None,
+            None,
+        )),
+        SourcePlan::WebIdentity => web_identity_credentials_expiring(env).await,
+        SourcePlan::Ecs { url } => {
+            let resolved = fetch_ecs_credentials_expiring(&url).await?;
+            Ok(resolved.into_resolved(None))
+        }
         SourcePlan::StaticEnvIncomplete => Err(AiError::Authentication(
             "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must both be set when either is present"
                 .to_string(),
@@ -231,13 +483,10 @@ pub async fn resolve_credentials(env: Option<&ProviderEnv>) -> AiResult<Resolved
             // provider, and IMDS terminates the chain. A present-but-failing
             // `default` profile stays fail-closed (never silently skipped).
             if shared_files_present() {
-                return load_profile_async("default").await;
+                return load_profile_async_expiring("default").await;
             }
-            if let Some(credentials) = imds_credentials().await {
-                return Ok(ResolvedBedrockAuth {
-                    credentials,
-                    region: None,
-                });
+            if let Some(resolved) = imds_credentials_expiring().await {
+                return Ok(resolved.into_resolved(None));
             }
             Err(AiError::Authentication(
                 "No AWS credentials for Bedrock: set AWS_BEARER_TOKEN_BEDROCK, \
@@ -577,14 +826,21 @@ fn read_optional(path: Option<&std::path::PathBuf>) -> AiResult<Option<String>> 
 /// `aws sso login` exchanged for role credentials). Fail-closed throughout:
 /// a configured-but-failing feature never silently degrades.
 pub async fn load_profile_async(name: &str) -> AiResult<ResolvedBedrockAuth> {
+    Ok(load_profile_async_expiring(name).await?.auth)
+}
+
+/// [`load_profile_async`] plus the resolved credentials' expiry.
+async fn load_profile_async_expiring(name: &str) -> AiResult<ResolvedCredential> {
     let (credentials_path, config_path) = shared_file_paths();
     let credentials = read_optional(credentials_path.as_ref())?;
     let config = read_optional(config_path.as_ref())?;
     let origin = shared_origin(credentials_path.as_ref(), config_path.as_ref());
-    resolve_profile(
+    resolve_profile_inner(
         &parse_profile_files(credentials.as_deref(), config.as_deref()),
         name,
         &origin,
+        0,
+        &[],
     )
     .await
 }
@@ -599,7 +855,9 @@ pub async fn resolve_profile(
     name: &str,
     origin: &str,
 ) -> AiResult<ResolvedBedrockAuth> {
-    resolve_profile_inner(files, name, origin, 0, &[]).await
+    Ok(resolve_profile_inner(files, name, origin, 0, &[])
+        .await?
+        .auth)
 }
 
 /// Boxed so `source_profile` chains can recurse (async fns cannot call
@@ -611,7 +869,7 @@ fn resolve_profile_inner<'a>(
     origin: &'a str,
     depth: usize,
     ancestors: &'a [String],
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = AiResult<ResolvedBedrockAuth>> + Send + 'a>>
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = AiResult<ResolvedCredential>> + Send + 'a>>
 {
     Box::pin(async move {
         if depth > MAX_ASSUME_ROLE_DEPTH {
@@ -642,14 +900,16 @@ fn resolve_profile_inner<'a>(
             .map(String::as_str)
             .map(str::trim)
         {
-            let credentials = run_credential_process(command).await?;
-            return Ok(ResolvedBedrockAuth {
+            let parsed = run_credential_process_expiring(command).await?;
+            let region = profile_region(&entries);
+            return Ok(ExpiringCredentials {
                 credentials: AwsCredentials {
                     source: "credential-process".to_string(),
-                    ..credentials
+                    ..parsed.credentials
                 },
-                region: profile_region(&entries),
-            });
+                expiration: parsed.expiration,
+            }
+            .into_resolved(region));
         }
         if let Some(role_arn) = entries
             .get("role_arn")
@@ -678,7 +938,7 @@ fn resolve_profile_inner<'a>(
             let source =
                 resolve_profile_inner(files, source_name, origin, depth + 1, &next).await?;
             let region = profile_region(&entries)
-                .or(source.region.clone())
+                .or_else(|| source.auth.region.clone())
                 .or_else(|| region_from_env("AWS_REGION"))
                 .or_else(|| region_from_env("AWS_DEFAULT_REGION"))
                 .unwrap_or_else(|| "us-east-1".to_string());
@@ -693,23 +953,25 @@ fn resolve_profile_inner<'a>(
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "pir".to_string());
-            let credentials = sts_assume_role(
+            let parsed = sts_assume_role_expiring(
                 &sts_endpoint(&region),
                 &region,
                 role_arn,
                 &session_name,
-                &source.credentials,
+                &source.auth.credentials,
             )
             .await?;
-            return Ok(ResolvedBedrockAuth {
+            let region = profile_region(&entries);
+            return Ok(ExpiringCredentials {
                 credentials: AwsCredentials {
                     source: "assume-role".to_string(),
-                    ..credentials
+                    ..parsed.credentials
                 },
-                region: profile_region(&entries),
-            });
+                expiration: parsed.expiration,
+            }
+            .into_resolved(region));
         }
-        static_profile_credentials(&entries, name, origin)
+        Ok(static_profile_credentials(&entries, name, origin)?.into_resolved_expiring())
     })
 }
 
@@ -876,7 +1138,7 @@ fn find_cached_sso_token(
 async fn sso_profile_credentials(
     files: &AwsProfileFiles,
     entries: &BTreeMap<String, String>,
-) -> AiResult<ResolvedBedrockAuth> {
+) -> AiResult<ResolvedCredential> {
     let required = |key: &str| -> AiResult<String> {
         entries
             .get(key)
@@ -985,15 +1247,22 @@ async fn sso_profile_credentials(
         AiError::Authentication("SSO role credentials are missing secretAccessKey".into())
     })?;
     let session_token = field("sessionToken").map(str::to_string);
-    Ok(ResolvedBedrockAuth {
-        credentials: AwsCredentials {
+    // `roleCredentials.expiration` is epoch milliseconds; an absent or
+    // unparseable value simply falls back to the cache's conservative TTL.
+    let expiration = role
+        .get("expiration")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(system_time_from_epoch_millis);
+    Ok(ResolvedCredential::new(
+        AwsCredentials {
             access_key_id: access_key_id.to_string(),
             secret_access_key: secret_access_key.to_string(),
             session_token,
             source: "sso".to_string(),
         },
-        region: profile_region(entries).or(Some(sso_region)),
-    })
+        profile_region(entries).or(Some(sso_region)),
+        expiration,
+    ))
 }
 
 /// Read a region from the process environment (present and non-empty only).
@@ -1065,6 +1334,11 @@ pub fn split_command_line(command: &str) -> Option<Vec<String>> {
 /// closed: spawn errors, non-zero exits, timeouts, and malformed output are
 /// all typed errors.
 pub async fn run_credential_process(command: &str) -> AiResult<AwsCredentials> {
+    Ok(run_credential_process_expiring(command).await?.credentials)
+}
+
+/// [`run_credential_process`] plus the parsed `Expiration`.
+async fn run_credential_process_expiring(command: &str) -> AiResult<ExpiringCredentials> {
     let parts = split_command_line(command).ok_or_else(|| {
         AiError::Authentication(format!(
             "credential_process '{command}' could not be split into program and arguments \
@@ -1127,7 +1401,7 @@ pub async fn run_credential_process(command: &str) -> AiResult<AwsCredentials> {
                     "credential_process '{program}' failed with {code}: {stderr_excerpt}"
                 )));
             }
-            parse_credential_process_output(&String::from_utf8_lossy(&out))
+            parse_credential_process_output_expiring(&String::from_utf8_lossy(&out))
         }
     }
 }
@@ -1160,9 +1434,14 @@ where
 
 /// Parse a `credential_process` stdout payload. `Version`, when present, must
 /// be `1`; `AccessKeyId`/`SecretAccessKey` are required and non-empty;
-/// `SessionToken` and `Expiration` are optional (`Expiration` is carried
-/// opaquely — pir signs immediately and does not cache across calls).
+/// `SessionToken` and `Expiration` are optional (`Expiration` feeds the
+/// process-level credential cache).
 pub fn parse_credential_process_output(body: &str) -> AiResult<AwsCredentials> {
+    Ok(parse_credential_process_output_expiring(body)?.credentials)
+}
+
+/// [`parse_credential_process_output`] plus the parsed `Expiration`.
+fn parse_credential_process_output_expiring(body: &str) -> AiResult<ExpiringCredentials> {
     let value: serde_json::Value = serde_json::from_str(body).map_err(|error| {
         AiError::Authentication(format!(
             "credential_process output was not valid JSON: {error}"
@@ -1186,11 +1465,16 @@ pub fn parse_credential_process_output(body: &str) -> AiResult<AwsCredentials> {
             .map(str::to_string)
     };
     match (field("AccessKeyId"), field("SecretAccessKey")) {
-        (Some(access_key_id), Some(secret_access_key)) => Ok(AwsCredentials {
-            access_key_id,
-            secret_access_key,
-            session_token: field("SessionToken"),
-            source: "credential-process".to_string(),
+        (Some(access_key_id), Some(secret_access_key)) => Ok(ExpiringCredentials {
+            credentials: AwsCredentials {
+                access_key_id,
+                secret_access_key,
+                session_token: field("SessionToken"),
+                source: "credential-process".to_string(),
+            },
+            expiration: field("Expiration")
+                .as_deref()
+                .and_then(system_time_from_iso8601),
         }),
         _ => Err(AiError::Authentication(
             "credential_process output is missing AccessKeyId or SecretAccessKey".to_string(),
@@ -1210,6 +1494,21 @@ pub async fn sts_assume_role(
     session_name: &str,
     source: &AwsCredentials,
 ) -> AiResult<AwsCredentials> {
+    Ok(
+        sts_assume_role_expiring(endpoint, region, role_arn, session_name, source)
+            .await?
+            .credentials,
+    )
+}
+
+/// [`sts_assume_role`] plus the STS response's `Expiration`.
+async fn sts_assume_role_expiring(
+    endpoint: &str,
+    region: &str,
+    role_arn: &str,
+    session_name: &str,
+    source: &AwsCredentials,
+) -> AiResult<ExpiringCredentials> {
     let client = credentials_client(STS_TIMEOUT, "STS")?;
     let body = form_urlencode(&[
         ("Action", "AssumeRole"),
@@ -1224,17 +1523,17 @@ pub async fn sts_assume_role(
         ),
         ("accept".to_string(), "application/xml".to_string()),
     ]);
-    let signed = crate::ai::api::bedrock::sigv4_sign(
-        "POST",
-        endpoint,
-        &headers,
-        body.as_bytes(),
-        &source.access_key_id,
-        &source.secret_access_key,
-        source.session_token.as_deref(),
+    let signed = sigv4_sign(&SigV4Request {
+        method: "POST",
+        url: endpoint,
+        headers: &headers,
+        payload: body.as_bytes(),
+        access_key: &source.access_key_id,
+        secret_key: &source.secret_access_key,
+        session_token: source.session_token.as_deref(),
         region,
-        "sts",
-    )?;
+        service: "sts",
+    })?;
     let mut request = client.post(endpoint).body(body);
     for (name, value) in signed {
         request = request.header(name, value);
@@ -1254,9 +1553,9 @@ pub async fn sts_assume_role(
             truncate_body(&body)
         )));
     }
-    let mut credentials = parse_sts_credentials(&body)?;
-    credentials.source = "assume-role".to_string();
-    Ok(credentials)
+    let mut parsed = parse_sts_credentials_expiring(&body)?;
+    parsed.credentials.source = "assume-role".to_string();
+    Ok(parsed)
 }
 
 /// `application/x-www-form-urlencoded` body serialization (percent-encoding,
@@ -1325,6 +1624,11 @@ fn imds_endpoint() -> Option<String> {
 /// `None` so the chain continues, with the whole flow bounded by
 /// [`IMDS_TOTAL_BUDGET`] so non-EC2 environments skip quickly and silently.
 pub async fn imds_credentials() -> Option<AwsCredentials> {
+    Some(imds_credentials_expiring().await?.credentials)
+}
+
+/// [`imds_credentials`] plus the IMDS document's `Expiration`.
+async fn imds_credentials_expiring() -> Option<ExpiringCredentials> {
     if imds_disabled() {
         return None;
     }
@@ -1375,7 +1679,7 @@ pub async fn imds_credentials() -> Option<AwsCredentials> {
             Some(token),
         )
         .await?;
-        parse_imds_credentials(&body).ok()
+        parse_imds_credentials_expiring(&body).ok()
     })
     .await
     .ok()?;
@@ -1411,6 +1715,11 @@ async fn fetch_imds_text(
 /// Parse an IMDS role-credentials document
 /// (`{AccessKeyId, SecretAccessKey, Token, Expiration}`).
 pub fn parse_imds_credentials(body: &str) -> AiResult<AwsCredentials> {
+    Ok(parse_imds_credentials_expiring(body)?.credentials)
+}
+
+/// [`parse_imds_credentials`] plus the document's `Expiration`.
+fn parse_imds_credentials_expiring(body: &str) -> AiResult<ExpiringCredentials> {
     let value: serde_json::Value = serde_json::from_str(body).map_err(|error| {
         AiError::Authentication(format!(
             "IMDS credentials response was not valid JSON: {error}"
@@ -1429,11 +1738,16 @@ pub fn parse_imds_credentials(body: &str) -> AiResult<AwsCredentials> {
         field("SecretAccessKey"),
         field("Token"),
     ) {
-        (Some(access_key_id), Some(secret_access_key), Some(token)) => Ok(AwsCredentials {
-            access_key_id,
-            secret_access_key,
-            session_token: Some(token),
-            source: "ec2-imds".to_string(),
+        (Some(access_key_id), Some(secret_access_key), Some(token)) => Ok(ExpiringCredentials {
+            credentials: AwsCredentials {
+                access_key_id,
+                secret_access_key,
+                session_token: Some(token),
+                source: "ec2-imds".to_string(),
+            },
+            expiration: field("Expiration")
+                .as_deref()
+                .and_then(system_time_from_iso8601),
         }),
         _ => Err(AiError::Authentication(
             "IMDS credentials response is missing AccessKeyId, SecretAccessKey, or Token"
@@ -1450,6 +1764,13 @@ pub fn parse_imds_credentials(body: &str) -> AiResult<AwsCredentials> {
 /// anonymous (no signing), so it rides the plain reqwest client with a
 /// bounded timeout.
 pub async fn web_identity_credentials(env: Option<&ProviderEnv>) -> AiResult<ResolvedBedrockAuth> {
+    Ok(web_identity_credentials_expiring(env).await?.auth)
+}
+
+/// [`web_identity_credentials`] plus the STS response's `Expiration`.
+async fn web_identity_credentials_expiring(
+    env: Option<&ProviderEnv>,
+) -> AiResult<ResolvedCredential> {
     let token_file = provider_env_value("AWS_WEB_IDENTITY_TOKEN_FILE", env)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
@@ -1487,16 +1808,21 @@ pub async fn web_identity_credentials(env: Option<&ProviderEnv>) -> AiResult<Res
              refusing to build the STS endpoint"
         )));
     }
-    let credentials =
-        sts_assume_role_with_web_identity(&sts_endpoint(&region), &role_arn, &session_name, token)
-            .await?;
-    Ok(ResolvedBedrockAuth {
+    let parsed = sts_assume_role_with_web_identity_expiring(
+        &sts_endpoint(&region),
+        &role_arn,
+        &session_name,
+        token,
+    )
+    .await?;
+    Ok(ExpiringCredentials {
         credentials: AwsCredentials {
             source: "web-identity".to_string(),
-            ..credentials
+            ..parsed.credentials
         },
-        region: None,
-    })
+        expiration: parsed.expiration,
+    }
+    .into_resolved(None))
 }
 
 /// The regional STS endpoint (the `.cn` partition gets the `.com.cn` suffix).
@@ -1530,6 +1856,23 @@ pub async fn sts_assume_role_with_web_identity(
     session_name: &str,
     web_identity_token: &str,
 ) -> AiResult<AwsCredentials> {
+    Ok(sts_assume_role_with_web_identity_expiring(
+        endpoint,
+        role_arn,
+        session_name,
+        web_identity_token,
+    )
+    .await?
+    .credentials)
+}
+
+/// [`sts_assume_role_with_web_identity`] plus the STS response's `Expiration`.
+async fn sts_assume_role_with_web_identity_expiring(
+    endpoint: &str,
+    role_arn: &str,
+    session_name: &str,
+    web_identity_token: &str,
+) -> AiResult<ExpiringCredentials> {
     let client = credentials_client(STS_TIMEOUT, "STS")?;
     let fields = [
         ("Action", "AssumeRoleWithWebIdentity"),
@@ -1557,9 +1900,9 @@ pub async fn sts_assume_role_with_web_identity(
             truncate_body(&body)
         )));
     }
-    let mut credentials = parse_sts_credentials(&body)?;
-    credentials.source = "web-identity".to_string();
-    Ok(credentials)
+    let mut parsed = parse_sts_credentials_expiring(&body)?;
+    parsed.credentials.source = "web-identity".to_string();
+    Ok(parsed)
 }
 
 /// Precompiled matchers for the STS XML field extraction (the tags are fixed,
@@ -1570,6 +1913,7 @@ struct StsFieldPatterns {
     access_key_id: Result<Regex, String>,
     secret_access_key: Result<Regex, String>,
     session_token: Result<Regex, String>,
+    expiration: Result<Regex, String>,
 }
 
 fn sts_field_regex(tag: &str) -> Result<Regex, String> {
@@ -1583,12 +1927,18 @@ fn sts_field_patterns() -> &'static StsFieldPatterns {
         access_key_id: sts_field_regex("AccessKeyId"),
         secret_access_key: sts_field_regex("SecretAccessKey"),
         session_token: sts_field_regex("SessionToken"),
+        expiration: sts_field_regex("Expiration"),
     })
 }
 
 /// Extract the temporary credentials from an `AssumeRoleWithWebIdentity`
 /// XML response (namespace-tolerant tag matching over `<Credentials>`).
 pub fn parse_sts_credentials(xml: &str) -> AiResult<AwsCredentials> {
+    Ok(parse_sts_credentials_expiring(xml)?.credentials)
+}
+
+/// [`parse_sts_credentials`] plus the `<Expiration>` timestamp.
+fn parse_sts_credentials_expiring(xml: &str) -> AiResult<ExpiringCredentials> {
     let patterns = sts_field_patterns();
     let field = |compiled: &Result<Regex, String>| -> AiResult<Option<String>> {
         let re = compiled
@@ -1602,13 +1952,17 @@ pub fn parse_sts_credentials(xml: &str) -> AiResult<AwsCredentials> {
     let access_key_id = field(&patterns.access_key_id)?;
     let secret_access_key = field(&patterns.secret_access_key)?;
     let session_token = field(&patterns.session_token)?;
+    let expiration = field(&patterns.expiration)?;
     match (access_key_id, secret_access_key, session_token) {
         (Some(access), Some(secret), Some(session)) if !access.is_empty() && !secret.is_empty() => {
-            Ok(AwsCredentials {
-                access_key_id: access,
-                secret_access_key: secret,
-                session_token: Some(session),
-                source: "web-identity".to_string(),
+            Ok(ExpiringCredentials {
+                credentials: AwsCredentials {
+                    access_key_id: access,
+                    secret_access_key: secret,
+                    session_token: Some(session),
+                    source: "web-identity".to_string(),
+                },
+                expiration: expiration.as_deref().and_then(system_time_from_iso8601),
             })
         }
         _ => Err(AiError::Authentication(
@@ -1631,7 +1985,16 @@ pub fn parse_sts_credentials(xml: &str) -> AiResult<AwsCredentials> {
 /// EKS and hardened ECS endpoints reject unauthenticated fetches.
 /// Fail-closed: non-2xx or malformed payloads are typed errors.
 pub async fn fetch_ecs_credentials(url: &str) -> AiResult<AwsCredentials> {
-    let client = credentials_client(ECS_TIMEOUT, "ECS credentials")?;
+    Ok(fetch_ecs_credentials_expiring(url).await?.credentials)
+}
+
+/// [`fetch_ecs_credentials`] plus the payload's `Expiration`.
+async fn fetch_ecs_credentials_expiring(url: &str) -> AiResult<ExpiringCredentials> {
+    // ECS/EKS container credentials endpoints are loopback or link-local
+    // (169.254.0.0/16); like IMDS they must never be routed through the
+    // user-configured HTTP proxy — the endpoint is not reachable there and
+    // the Authorization token must not leave the host.
+    let client = direct_credentials_client(ECS_TIMEOUT, "ECS credentials")?;
     let mut request = client.get(url).header("accept", "application/json");
     if let Some(token) = ecs_authorization_token()? {
         request = request.header("authorization", token);
@@ -1647,7 +2010,7 @@ pub async fn fetch_ecs_credentials(url: &str) -> AiResult<AwsCredentials> {
             truncate_body(&body)
         )));
     }
-    parse_ecs_credentials(&body)
+    parse_ecs_credentials_expiring(&body)
 }
 
 /// The ECS container-credentials authorization token (P1-3): when
@@ -1682,9 +2045,14 @@ pub fn ecs_authorization_token() -> AiResult<Option<String>> {
 }
 
 /// Parse the ECS credentials payload
-/// (`{AccessKeyId, SecretAccessKey, Token, Expiration}`). `Expiration` is
-/// carried opaquely: pir signs immediately and does not cache across calls.
+/// (`{AccessKeyId, SecretAccessKey, Token, Expiration}`). `Expiration` feeds
+/// the process-level credential cache.
 pub fn parse_ecs_credentials(body: &str) -> AiResult<AwsCredentials> {
+    Ok(parse_ecs_credentials_expiring(body)?.credentials)
+}
+
+/// [`parse_ecs_credentials`] plus the payload's `Expiration`.
+fn parse_ecs_credentials_expiring(body: &str) -> AiResult<ExpiringCredentials> {
     let value: serde_json::Value = serde_json::from_str(body).map_err(|error| {
         AiError::Authentication(format!(
             "ECS container credentials response was not valid JSON: {error}"
@@ -1701,11 +2069,16 @@ pub fn parse_ecs_credentials(body: &str) -> AiResult<AwsCredentials> {
     let access_key_id = required("AccessKeyId");
     let secret_access_key = required("SecretAccessKey");
     match (access_key_id, secret_access_key) {
-        (Some(access), Some(secret)) => Ok(AwsCredentials {
-            access_key_id: access,
-            secret_access_key: secret,
-            session_token: required("Token"),
-            source: "ecs-container".to_string(),
+        (Some(access), Some(secret)) => Ok(ExpiringCredentials {
+            credentials: AwsCredentials {
+                access_key_id: access,
+                secret_access_key: secret,
+                session_token: required("Token"),
+                source: "ecs-container".to_string(),
+            },
+            expiration: required("Expiration")
+                .as_deref()
+                .and_then(system_time_from_iso8601),
         }),
         _ => Err(AiError::Authentication(
             "ECS container credentials response is missing AccessKeyId or SecretAccessKey"
@@ -1722,6 +2095,16 @@ fn truncate_body(body: &str) -> String {
 /// The bounded HTTPS client for the AWS credential endpoints: request +
 /// connect timeouts, with `what` labeling the typed build-failure error.
 fn credentials_client(timeout: Duration, what: &str) -> AiResult<reqwest::Client> {
+    crate::ai::transport::pi_reqwest_client_builder()?
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| AiError::Http(format!("{what} client build failed: {error}")))
+}
+
+/// Direct (proxy-free) client for loopback/link-local metadata endpoints
+/// (ECS container credentials), matching the IMDS boundary.
+fn direct_credentials_client(timeout: Duration, what: &str) -> AiResult<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(5))
@@ -1758,4 +2141,371 @@ async fn read_bounded_body(mut response: reqwest::Response, what: &str) -> AiRes
             "the {what} response body was not valid UTF-8: {error}"
         ))
     })
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn fake_clock(
+        start: SystemTime,
+    ) -> (
+        Arc<Mutex<SystemTime>>,
+        Box<dyn Fn() -> SystemTime + Send + Sync>,
+    ) {
+        let shared = Arc::new(Mutex::new(start));
+        let clock = Arc::clone(&shared);
+        (
+            shared,
+            Box::new(move || *clock.lock().unwrap_or_else(|poison| poison.into_inner())),
+        )
+    }
+
+    fn advance(clock: &Arc<Mutex<SystemTime>>, by: Duration) {
+        let mut now = clock.lock().unwrap_or_else(|poison| poison.into_inner());
+        *now = now.checked_add(by).expect("fake clock must not overflow");
+    }
+
+    fn resolution(access_key_id: &str, expiration: Option<SystemTime>) -> ResolvedCredential {
+        ResolvedCredential::new(
+            AwsCredentials {
+                access_key_id: access_key_id.to_string(),
+                secret_access_key: "secret".to_string(),
+                session_token: None,
+                source: "test".to_string(),
+            },
+            None,
+            expiration,
+        )
+    }
+
+    fn test_key(name: &str) -> CredentialCacheKey {
+        CredentialCacheKey(vec![("AWS_PROFILE", Some(name.to_string()))])
+    }
+
+    #[test]
+    fn temporary_credential_parsers_capture_the_source_expiration() {
+        let expected =
+            system_time_from_iso8601("2030-01-01T00:00:00Z").expect("the fixture timestamp parses");
+        let ecs = parse_ecs_credentials_expiring(
+            r#"{"AccessKeyId":"A","SecretAccessKey":"B","Token":"T","Expiration":"2030-01-01T00:00:00Z"}"#,
+        )
+        .expect("ECS payload parses");
+        assert_eq!(ecs.expiration, Some(expected));
+        let process = parse_credential_process_output_expiring(
+            r#"{"Version":1,"AccessKeyId":"A","SecretAccessKey":"B","Expiration":"2030-01-01T00:00:00Z"}"#,
+        )
+        .expect("credential_process payload parses");
+        assert_eq!(process.expiration, Some(expected));
+        let sts = parse_sts_credentials_expiring(
+            "<AssumeRoleResponse><AssumeRoleResult><Credentials>\
+             <AccessKeyId>A</AccessKeyId><SecretAccessKey>B</SecretAccessKey>\
+             <SessionToken>T</SessionToken><Expiration>2030-01-01T00:00:00Z</Expiration>\
+             </Credentials></AssumeRoleResult></AssumeRoleResponse>",
+        )
+        .expect("STS payload parses");
+        assert_eq!(sts.expiration, Some(expected));
+        let imds = parse_imds_credentials_expiring(
+            r#"{"AccessKeyId":"A","SecretAccessKey":"B","Token":"T","Expiration":"2030-01-01T00:00:00Z"}"#,
+        )
+        .expect("IMDS payload parses");
+        assert_eq!(imds.expiration, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn cache_hit_returns_the_entry_without_resolving_again() {
+        let (_clock, now) = fake_clock(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let cache = CredentialCache::new(now, Duration::from_secs(300), Duration::from_secs(60));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = test_key("dev");
+
+        for _ in 0..3 {
+            let calls = Arc::clone(&calls);
+            let resolved = cache
+                .get_or_resolve(key.clone(), move || {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(resolution("AKID-HIT", None))
+                    }
+                })
+                .await
+                .expect("resolution succeeds");
+            assert_eq!(resolved.credentials.access_key_id, "AKID-HIT");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one resolution for three hits"
+        );
+    }
+
+    #[tokio::test]
+    async fn reported_expiration_refreshes_the_entry_before_it_lapses() {
+        let (clock, now) = fake_clock(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let cache = CredentialCache::new(now, Duration::from_secs(300), Duration::from_secs(60));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = test_key("expiring");
+
+        // First resolution reports an expiration 10 minutes out; the cache
+        // refreshes it one minute early (9 minutes from now).
+        let calls_first = Arc::clone(&calls);
+        let clock_first = Arc::clone(&clock);
+        let first = cache
+            .get_or_resolve(key.clone(), move || {
+                let calls = Arc::clone(&calls_first);
+                let clock = Arc::clone(&clock_first);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let now = *clock.lock().unwrap_or_else(|poison| poison.into_inner());
+                    Ok(resolution(
+                        "AKID-1",
+                        now.checked_add(Duration::from_secs(600)),
+                    ))
+                }
+            })
+            .await
+            .expect("first resolution");
+        assert_eq!(first.credentials.access_key_id, "AKID-1");
+
+        // Inside the freshness window: cached.
+        advance(&clock, Duration::from_secs(8 * 60));
+        let calls_second = Arc::clone(&calls);
+        let second = cache
+            .get_or_resolve(key.clone(), move || {
+                let calls = Arc::clone(&calls_second);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(resolution("UNEXPECTED", None))
+                }
+            })
+            .await
+            .expect("cache hit");
+        assert_eq!(second.credentials.access_key_id, "AKID-1");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "still cached at +8m");
+
+        // Past expiration minus the refresh margin (9m): resolve again.
+        advance(&clock, Duration::from_secs(2 * 60));
+        let calls_third = Arc::clone(&calls);
+        let clock_third = Arc::clone(&clock);
+        let third = cache
+            .get_or_resolve(key, move || {
+                let calls = Arc::clone(&calls_third);
+                let clock = Arc::clone(&clock_third);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let now = *clock.lock().unwrap_or_else(|poison| poison.into_inner());
+                    Ok(resolution(
+                        "AKID-2",
+                        now.checked_add(Duration::from_secs(600)),
+                    ))
+                }
+            })
+            .await
+            .expect("refresh");
+        assert_eq!(third.credentials.access_key_id, "AKID-2");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "expired entry refreshed");
+    }
+
+    #[tokio::test]
+    async fn credentials_without_expiration_use_the_default_ttl() {
+        let (clock, now) = fake_clock(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let cache = CredentialCache::new(now, Duration::from_secs(300), Duration::from_secs(60));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = test_key("static");
+
+        let resolve = |calls: Arc<AtomicUsize>| {
+            move || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(resolution("AKID-STATIC", None))
+                }
+            }
+        };
+
+        cache
+            .get_or_resolve(key.clone(), resolve(Arc::clone(&calls)))
+            .await
+            .expect("first");
+        advance(&clock, Duration::from_secs(4 * 60));
+        cache
+            .get_or_resolve(key.clone(), resolve(Arc::clone(&calls)))
+            .await
+            .expect("hit inside TTL");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        advance(&clock, Duration::from_secs(60));
+        cache
+            .get_or_resolve(key, resolve(Arc::clone(&calls)))
+            .await
+            .expect("refresh after TTL");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn errors_are_never_cached() {
+        let (_clock, now) = fake_clock(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let cache = CredentialCache::new(now, Duration::from_secs(300), Duration::from_secs(60));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = test_key("failing");
+
+        let calls_first = Arc::clone(&calls);
+        let first = cache
+            .get_or_resolve(key.clone(), move || {
+                let calls = Arc::clone(&calls_first);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(AiError::Authentication("no credentials".to_string()))
+                }
+            })
+            .await;
+        assert!(first.is_err(), "the first failure must surface");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let calls_second = Arc::clone(&calls);
+        let second = cache
+            .get_or_resolve(key, move || {
+                let calls = Arc::clone(&calls_second);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(resolution("AKID-RECOVERED", None))
+                }
+            })
+            .await
+            .expect("a failed resolution must not be cached");
+        assert_eq!(second.credentials.access_key_id, "AKID-RECOVERED");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn expiration_inside_the_refresh_margin_is_not_cached() {
+        let (clock, now) = fake_clock(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let cache = CredentialCache::new(now, Duration::from_secs(300), Duration::from_secs(60));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = test_key("almost-expired");
+
+        for _ in 0..2 {
+            let calls = Arc::clone(&calls);
+            let clock = Arc::clone(&clock);
+            cache
+                .get_or_resolve(key.clone(), move || {
+                    let calls = Arc::clone(&calls);
+                    let clock = Arc::clone(&clock);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let now = *clock.lock().unwrap_or_else(|poison| poison.into_inner());
+                        Ok(resolution(
+                            "AKID-SOON",
+                            now.checked_add(Duration::from_secs(30)),
+                        ))
+                    }
+                })
+                .await
+                .expect("resolution");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "credentials already inside the refresh margin must not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_keys_resolve_in_parallel() {
+        let (_clock, now) = fake_clock(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let cache = Arc::new(CredentialCache::new(
+            now,
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        ));
+        // Both resolvers must be inside `resolve` at the same time. A
+        // cache-wide lock (the old design) holds the first resolver while the
+        // second waits for the lock, so the barrier below never completes and
+        // the timeout fails the test.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let per_resolve = Duration::from_millis(150);
+
+        let run = |key: CredentialCacheKey,
+                   access_key: &'static str,
+                   barrier: Arc<tokio::sync::Barrier>| {
+            let cache = Arc::clone(&cache);
+            async move {
+                cache
+                    .get_or_resolve(key, move || async move {
+                        barrier.wait().await;
+                        tokio::time::sleep(per_resolve).await;
+                        Ok(resolution(access_key, None))
+                    })
+                    .await
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                run(test_key("parallel-a"), "AKID-A", Arc::clone(&barrier)),
+                run(test_key("parallel-b"), "AKID-B", barrier)
+            )
+        })
+        .await
+        .expect("different keys must not serialize on the credential cache");
+        assert_eq!(
+            first.expect("first key").credentials.access_key_id,
+            "AKID-A"
+        );
+        assert_eq!(
+            second.expect("second key").credentials.access_key_id,
+            "AKID-B"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "two different keys must resolve concurrently: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_misses_resolve_once() {
+        let (_clock, now) = fake_clock(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let cache = Arc::new(CredentialCache::new(
+            now,
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = test_key("concurrent");
+
+        let run = |calls: Arc<AtomicUsize>| {
+            let cache = Arc::clone(&cache);
+            let key = key.clone();
+            async move {
+                cache
+                    .get_or_resolve(key, move || {
+                        let calls = Arc::clone(&calls);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok(resolution("AKID-SHARED", None))
+                        }
+                    })
+                    .await
+            }
+        };
+        let (first, second) = tokio::join!(run(Arc::clone(&calls)), run(Arc::clone(&calls)));
+        assert_eq!(
+            first.expect("first").credentials.access_key_id,
+            "AKID-SHARED"
+        );
+        assert_eq!(
+            second.expect("second").credentials.access_key_id,
+            "AKID-SHARED"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "single-flight: concurrent misses must resolve exactly once"
+        );
+    }
 }

@@ -3,10 +3,12 @@
 //! `scripts/gen_shims_deflate.py` writes `assets/shims/<name>.js.txt.deflate`
 //! beside the raw `src/extensions/api/js/*.js.txt` sources. The API modules
 //! `include_bytes!` the blobs (not the sources) and expose each one as a
-//! [`Shim`], which inflates its zlib stream at most once per process, on first
-//! use. The extension host boots by importing every shimmed builtin, so the
-//! first boot pays the whole inflate cost (~3.3 MB decoded) and later uses read
-//! the cached `String`.
+//! [`Shim`]. [`Shim::source`] caches the inflation for the process (the
+//! prelude and the globals bundle are needed by every runtime construction),
+//! while [`Shim::inflate`] returns a fresh exactly-sized `String` for the
+//! module loader: a virtual module's decoded source is dead once QuickJS has
+//! compiled it, and the boot sweep imports every shimmed builtin, so keeping
+//! all of them resident would pin ~2 MB of Rust heap for the session.
 //!
 //! The raw `.js.txt` files remain the source of truth: tests, the generator and
 //! the SDK-surface auditors read them, and the golden test in `g_extensions`
@@ -15,9 +17,27 @@
 //! UTF-8 text.
 
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::ops::Deref;
 use std::sync::OnceLock;
+
+/// `Write` sink that only counts bytes: the first inflation pass sizes the
+/// exact-capacity buffer without retaining (or growing) a payload.
+#[derive(Default)]
+struct CountingSink {
+    bytes: u64,
+}
+
+impl Write for CountingSink {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len() as u64);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// One embedded, deflate-compressed JS shim.
 pub struct Shim {
@@ -49,11 +69,41 @@ impl Shim {
 
     /// Inflate the blob without touching the cache. Used by the byte-identity
     /// test and the boot-cost measurement.
+    ///
+    /// The inflated `String` is cached for the process, so its capacity is
+    /// part of the resident cost: the old pre-size (`deflated.len() * 4`,
+    /// ~2.0 MB for the ~1.1 MB prelude) kept the overshoot live forever.
+    /// A zlib stream carries no decoded length, so `read_to_end` has to grow
+    /// (and re-copy) the buffer several times; `shrink_to_fit` then re-copies
+    /// it once more. A first pass counts the decoded bytes into a sink with
+    /// no payload allocation, and the second pass decodes into an
+    /// exact-capacity `Vec` (`read_exact`, no growth, no shrink copy). The
+    /// decoded bytes are unchanged and the cached buffer is exactly sized.
     pub fn inflate(&self) -> std::io::Result<String> {
-        // Shims compress at ~4.0x; pre-size the buffer to avoid regrowth.
-        let mut text = String::with_capacity(self.deflated.len().saturating_mul(4));
-        flate2::read::ZlibDecoder::new(self.deflated).read_to_string(&mut text)?;
-        Ok(text)
+        let mut counter = CountingSink::default();
+        std::io::copy(
+            &mut flate2::read::ZlibDecoder::new(self.deflated),
+            &mut counter,
+        )?;
+        let length = usize::try_from(counter.bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "embedded shim expands beyond the platform address space",
+            )
+        })?;
+        let mut bytes = vec![0u8; length];
+        let mut decoder = flate2::read::ZlibDecoder::new(self.deflated);
+        decoder.read_exact(&mut bytes)?;
+        let mut trailing = [0u8; 1];
+        if decoder.read(&mut trailing)? != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "embedded shim changed length between inflate passes",
+            ));
+        }
+        String::from_utf8(bytes).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.utf8_error())
+        })
     }
 
     /// The JS source, inflated on first use and cached for the process.

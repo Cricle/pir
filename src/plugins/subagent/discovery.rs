@@ -172,6 +172,18 @@ pub fn load_agents_from_dir(dir: &Path, source: AgentSource) -> Vec<AgentConfig>
         .collect();
     paths.sort();
     for path in paths {
+        // pir hardening (FIX-C17): skip oversized agent markdown before
+        // reading it; discovery must not pull a whole giant file into memory.
+        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if size > crate::config::settings::MAX_CONTEXT_FILE_BYTES {
+            tracing::warn!(
+                path = %path.display(),
+                size,
+                limit = crate::config::settings::MAX_CONTEXT_FILE_BYTES,
+                "skipping oversized subagent markdown file"
+            );
+            continue;
+        }
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };

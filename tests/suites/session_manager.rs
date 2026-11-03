@@ -15,7 +15,8 @@ use pir::ai::types::{
 };
 use pir::session_manager::{
     AppendFailure, CompactionEntry, ContextEditEntry, FileEntry, LabelEntry, MessageEntry,
-    SessionInfoEntry, SessionManager, StoredMessage, UsageEntry, CURRENT_SESSION_VERSION,
+    SessionHeader, SessionInfoEntry, SessionManager, StoredMessage, UsageEntry,
+    CURRENT_SESSION_VERSION,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -1472,9 +1473,10 @@ fn list_sessions_populates_name_first_message_count_and_parent() {
 // Session selector search (upstream `session-selector-search.ts`)
 // ---------------------------------------------------------------------------
 
-/// The listing collects EVERY user/assistant message as the search corpus
-/// (upstream `allMessagesText`), and the search implements the upstream
-/// selector semantics: case-insensitive tokens matched with AND across
+/// The listing defers the selector corpus (R1-L3-013): `all_messages_text`
+/// carries a lazy descriptor, and the search scans EVERY user/assistant
+/// message on the first corpus-scanning query. The search implements the
+/// upstream selector semantics: case-insensitive tokens matched with AND across
 /// id/name/cwd/messages, quoted phrases with whitespace normalization,
 /// `re:` regex mode, tiered scoring, and no result for a miss.
 #[test]
@@ -1501,9 +1503,11 @@ fn session_search_matches_every_message_and_upstream_semantics() {
         .into_iter()
         .next()
         .expect("one session");
-    assert_eq!(
-        summary.all_messages_text, "Alpha first question reply about Beta topic second user Gamma",
-        "every user/assistant message feeds the search corpus"
+    assert!(
+        summary.all_messages_text.len() < 512
+            && !summary.all_messages_text.contains("Alpha first question"),
+        "the listing stores a lazy corpus descriptor, not the joined transcript: {} bytes",
+        summary.all_messages_text.len()
     );
     assert_eq!(summary.first_message, "Alpha first question");
 
@@ -2392,28 +2396,28 @@ fn bash_execution_entries_round_trip_as_upstream_role() {
     let mut session = SessionManager::create("C:/repo", &dir).unwrap();
     session.append_message(user_message("hi")).unwrap();
     let included_id = session
-        .append_bash_execution(
-            "echo hi",
-            "hi\n",
-            Some(0),
-            false,
-            false,
-            None,
-            false,
-            1_700_000_000_000,
-        )
+        .append_bash_execution(pir::session_manager::BashExecutionRecord {
+            command: "echo hi",
+            output: "hi\n",
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            exclude_from_context: false,
+            timestamp: 1_700_000_000_000,
+        })
         .unwrap();
     let excluded_id = session
-        .append_bash_execution(
-            "echo secret",
-            "secret",
-            Some(0),
-            false,
-            false,
-            None,
-            true,
-            1_700_000_000_001,
-        )
+        .append_bash_execution(pir::session_manager::BashExecutionRecord {
+            command: "echo secret",
+            output: "secret",
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            exclude_from_context: true,
+            timestamp: 1_700_000_000_001,
+        })
         .unwrap();
 
     // Wire shape: a normal message entry whose message role is bashExecution
@@ -3008,5 +3012,289 @@ fn last_assistant_text_matches_the_projection_without_building_it() {
     assert_eq!(
         omitted.last_assistant_text().as_deref(),
         Some("kept answer")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Linear paged prompt context (print's widen-free full transcript)
+// ---------------------------------------------------------------------------
+
+/// Serialize entries (header first) into a v3 JSONL session file.
+fn write_session_file(path: &std::path::Path, entries: &[FileEntry]) {
+    let mut text = String::new();
+    for entry in entries {
+        text.push_str(&serde_json::to_string(entry).unwrap());
+        text.push('\n');
+    }
+    std::fs::write(path, text).unwrap();
+}
+
+fn message_entry(id: &str, parent: Option<&str>, message: Message) -> FileEntry {
+    FileEntry::Message(MessageEntry {
+        id: id.to_owned(),
+        parent_id: parent.map(str::to_owned),
+        timestamp: "2026-01-01T00:00:00.000Z".to_owned(),
+        message: StoredMessage::from(message),
+    })
+}
+
+#[test]
+fn paged_prompt_context_equals_the_full_projection_and_keeps_the_manager_paged() {
+    let dir = temp_dir("paged-prompt-context");
+    let mut session = SessionManager::create(dir.to_string_lossy().as_ref(), &dir).unwrap();
+    for index in 0..24 {
+        session
+            .append_message(user_message(&format!("user {index} {}", "u".repeat(300))))
+            .unwrap();
+        session
+            .append_message(assistant_message(
+                &format!("assistant {index} {}", "a".repeat(300)),
+                StopReason::Stop,
+            ))
+            .unwrap();
+    }
+    let path = session.path().to_path_buf();
+    let mut paged = SessionManager::open_paged(&path, 2 * 1024, 4).expect("paged open");
+    assert!(paged.is_paged(), "the fixture must leave a skipped prefix");
+    // A prompt appended while paged must be part of the streamed context,
+    // exactly like the projection-based path that appends before projecting.
+    paged
+        .append_message(user_message("appended while paged"))
+        .unwrap();
+
+    let builds_before = paged.projection_build_count();
+    let context = paged
+        .build_paged_prompt_context()
+        .expect("stream the paged context")
+        .expect("a linear session is supported");
+    assert!(
+        paged.is_paged(),
+        "the streaming builder must not widen the manager"
+    );
+    assert_eq!(
+        paged.projection_build_count(),
+        builds_before,
+        "the streaming builder must not materialize a SessionProjection"
+    );
+
+    let full = SessionManager::open(&path)
+        .expect("full open")
+        .build_session_projection()
+        .expect("full projection");
+    assert_eq!(context.messages.len(), full.messages.len());
+    assert_eq!(context.messages, full.messages);
+    assert_eq!(
+        text_of(context.messages.last().expect("last message")),
+        "appended while paged"
+    );
+}
+
+#[test]
+fn paged_prompt_context_refuses_a_branched_session() {
+    let dir = temp_dir("paged-prompt-branch");
+    let path = dir.join("branch.jsonl");
+    let header = FileEntry::Session(SessionHeader::new(
+        "branch-session",
+        dir.to_string_lossy().as_ref(),
+        "2026-01-01T00:00:00.000Z".to_owned(),
+    ));
+    write_session_file(
+        &path,
+        &[
+            header,
+            message_entry("m1", None, user_message(&"root ".repeat(800))),
+            message_entry(
+                "m2",
+                Some("m1"),
+                assistant_message("main line", StopReason::Stop),
+            ),
+            message_entry(
+                "m3",
+                Some("m1"),
+                assistant_message("side branch", StopReason::Stop),
+            ),
+        ],
+    );
+    let paged = SessionManager::open_paged(&path, 2 * 1024, 2).expect("paged open");
+    assert!(paged.is_paged());
+    assert!(
+        paged
+            .build_paged_prompt_context()
+            .expect("scan the session")
+            .is_none(),
+        "a branch must take the widening fallback"
+    );
+}
+
+#[test]
+fn paged_prompt_context_refuses_a_context_edit_session() {
+    let dir = temp_dir("paged-prompt-edit");
+    let path = dir.join("edit.jsonl");
+    let header = FileEntry::Session(SessionHeader::new(
+        "edit-session",
+        dir.to_string_lossy().as_ref(),
+        "2026-01-01T00:00:00.000Z".to_owned(),
+    ));
+    let edit = FileEntry::ContextEdit(ContextEditEntry {
+        id: "e1".to_owned(),
+        parent_id: Some("m2".to_owned()),
+        timestamp: "2026-01-01T00:00:00.000Z".to_owned(),
+        target_id: "m1".to_owned(),
+        replacement: None,
+    });
+    write_session_file(
+        &path,
+        &[
+            header,
+            message_entry("m1", None, user_message(&"root ".repeat(800))),
+            message_entry(
+                "m2",
+                Some("m1"),
+                assistant_message("answer", StopReason::Stop),
+            ),
+            edit,
+        ],
+    );
+    let paged = SessionManager::open_paged(&path, 2 * 1024, 2).expect("paged open");
+    assert!(paged.is_paged());
+    assert!(
+        paged
+            .build_paged_prompt_context()
+            .expect("scan the session")
+            .is_none(),
+        "a context edit must take the widening fallback"
+    );
+}
+
+/// The JSON transcript view serializes the SAME values as the projection
+/// without materializing its aggregate `Vec<Message>`.
+///
+/// `AgentSession::transcript_json` (RPC `get_messages`, SDK `transcript_json`,
+/// `/export`) used to build the whole projection and then serialize the
+/// clone. The fast walk must keep the exact upstream message objects for plain
+/// message entries, context-edit replacements, custom messages and compaction
+/// checkpoints.
+#[test]
+fn context_json_matches_the_projection_without_materializing_it() {
+    let mut session = SessionManager::in_memory("C:/repo", None).unwrap();
+    let first_user = session
+        .append_message(user_message("first question"))
+        .unwrap();
+    session
+        .append_message(assistant_message("first answer", StopReason::Stop))
+        .unwrap();
+    session
+        .append_message(user_message("second question"))
+        .unwrap();
+    let edited = session
+        .append_message(assistant_message("second answer", StopReason::Stop))
+        .unwrap();
+    session
+        .append_context_edit(&edited, Some(serde_json::json!("rewritten answer")))
+        .unwrap();
+    session
+        .append_custom_message_entry(
+            "test.custom",
+            serde_json::json!([{ "type": "text", "text": "custom payload" }]),
+            false,
+            None,
+        )
+        .unwrap();
+    // A compaction cuts the retained range to `first_user` onward and replays
+    // its summary + stored system message.
+    session
+        .append_compaction("compacted summary", Some(&first_user), 10, None)
+        .unwrap();
+    session
+        .append_message(user_message("after compaction"))
+        .unwrap();
+
+    let projection = session.build_session_projection().unwrap();
+    let expected: Vec<serde_json::Value> = projection
+        .messages
+        .iter()
+        .map(|message| serde_json::to_value(message).unwrap())
+        .collect();
+    let actual = pir::session_manager::projection::build_session_context_json(
+        session.resident_entries(),
+        session.leaf_id(),
+    );
+    assert_eq!(actual, expected);
+}
+
+/// The direct stored-message fast path (no `Message` clone) stays
+/// byte-identical on the common compaction-free transcript shape.
+#[test]
+fn context_json_matches_a_plain_projection_too() {
+    let mut session = SessionManager::in_memory("C:/repo", None).unwrap();
+    session.append_message(user_message("q1")).unwrap();
+    session
+        .append_message(assistant_message("a1", StopReason::Stop))
+        .unwrap();
+    session.append_message(user_message("q2")).unwrap();
+
+    let projection = session.build_session_projection().unwrap();
+    let expected: Vec<serde_json::Value> = projection
+        .messages
+        .iter()
+        .map(|message| serde_json::to_value(message).unwrap())
+        .collect();
+    assert_eq!(
+        pir::session_manager::projection::build_session_context_json(
+            session.resident_entries(),
+            session.leaf_id(),
+        ),
+        expected
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Memory shape (allocation-cost pins)
+// ---------------------------------------------------------------------------
+
+/// Pin the element sizes that drive the session loaders' per-line buffers.
+///
+/// The full-open loader reserves `Vec<Option<FileEntry>>` slots from the file
+/// size (`len / 256`, capped at 16 384), so [`FileEntry`]'s size IS the open
+/// path's reservation cost: the `message` variant dominates, and every session
+/// entry lives in an `Arc<FileEntry>` allocation of exactly this size. This
+/// test exists so a variant payload change cannot silently re-inflate the
+/// open/widen peak (measured 2026-11-02: a 2 MB fixture's widen reserved one
+/// 5.4 MB `Vec<Option<FileEntry>>` block because `FileEntry` was 664 B).
+///
+/// Boxing `AssistantMessage.deferred`/`ToolResultMessage.nested_calls` shrank
+/// the message slot sizes to 408/400/400 B (`Message`/`AssistantMessage`/
+/// `ToolResultMessage`) on 64-bit, and `FileEntry`/`StoredMessage` to 528/408 B.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<Message>() == 408);
+    assert!(std::mem::size_of::<AssistantMessage>() == 400);
+    assert!(std::mem::size_of::<ToolResultMessage>() == 400);
+};
+
+#[test]
+fn session_entry_element_sizes_stay_small() {
+    use std::mem::size_of;
+    let file_entry = size_of::<FileEntry>();
+    let stored = size_of::<StoredMessage>();
+    println!("size_of(FileEntry) = {file_entry}");
+    println!("size_of(StoredMessage) = {stored}");
+    println!("size_of(MessageEntry) = {}", size_of::<MessageEntry>());
+    println!(
+        "size_of(CompactionEntry) = {}",
+        size_of::<CompactionEntry>()
+    );
+    println!("size_of(Message) = {}", size_of::<Message>());
+    // Guard rails, not exact pins: the loader's reserve multiplies these by
+    // the estimated entry count, and Arc<FileEntry> multiplies them by every
+    // resident entry.
+    assert!(
+        file_entry <= 560,
+        "FileEntry grew to {file_entry} B; box the dominant variant payload \
+         instead of re-inflating every per-entry allocation"
+    );
+    assert!(
+        stored <= 440,
+        "StoredMessage grew to {stored} B; box the dominant variant payload"
     );
 }

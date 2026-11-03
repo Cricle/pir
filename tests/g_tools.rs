@@ -6,7 +6,7 @@
 // process-wide env lock needs. The copy is duplicated per binary, and that is
 // correct: separate test binaries are separate processes with separate
 // environments, so their locks can never race each other.
-mod common;
+pub mod common;
 
 #[path = "suites/builtin_disable_w13.rs"]
 mod builtin_disable_w13;

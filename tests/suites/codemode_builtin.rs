@@ -132,7 +132,19 @@ fn fake_registry(respond: Responder) -> Arc<ProviderRegistry> {
 
 /// A trivial registry tool the script can call (`tools.echo({...})`).
 struct EchoTool {
-    calls: AtomicUsize,
+    calls: Arc<AtomicUsize>,
+}
+
+impl EchoTool {
+    fn new() -> (Self, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                calls: Arc::clone(&calls),
+            },
+            calls,
+        )
+    }
 }
 
 impl AgentTool for EchoTool {
@@ -185,11 +197,14 @@ impl Drop for TempDir {
 }
 
 fn codemode_tools() -> ToolRegistry {
+    codemode_tools_with_counter().0
+}
+
+fn codemode_tools_with_counter() -> (ToolRegistry, Arc<AtomicUsize>) {
     let mut tools = ToolRegistry::new();
-    tools.register(Arc::new(EchoTool {
-        calls: AtomicUsize::new(0),
-    }));
-    tools
+    let (echo, calls) = EchoTool::new();
+    tools.register(Arc::new(echo));
+    (tools, calls)
 }
 
 /// Activates `codemode` (plus the fixture's direct tools) through the
@@ -361,7 +376,10 @@ async fn script_calls_registered_tool_as_nested_call() {
     assert!(content.contains("hi from script"), "content: {content}");
     // The script's tool call surfaced as a nested call with a
     // `<parentToolCallId>/<n>` id and an ok status.
-    let nested = codemode.nested_calls.as_ref().expect("nested calls record");
+    let nested = codemode
+        .nested_calls
+        .as_deref()
+        .expect("nested calls record");
     assert_eq!(nested.calls.len(), 1);
     assert_eq!(nested.calls[0].name, "echo");
     assert!(
@@ -810,7 +828,9 @@ async fn abort_stops_a_running_script_promptly() {
     let mut arguments = BTreeMap::new();
     arguments.insert(
         "code".to_owned(),
-        serde_json::Value::String("// @options: {\"timeout_ms\": 60000}\nwhile (true) {}".into()),
+        serde_json::Value::String(
+            "// @options: {\"timeout_ms\": 60000}\nawait tools.echo({ text: 'running' });\nwhile (true) {}".into(),
+        ),
     );
     let registry = fake_registry(Arc::new(move |index, _context| {
         if index == 0 {
@@ -822,10 +842,18 @@ async fn abort_stops_a_running_script_promptly() {
             assistant(vec![text("done")], StopReason::Stop)
         }
     }));
-    let agent = codemode_session(registry, codemode_tools(), &temp, None);
+    let (tools, echo_calls) = codemode_tools_with_counter();
+    let agent = codemode_session(registry, tools, &temp, None);
+    // Deterministic start signal: abort only once the script is demonstrably
+    // running (its first nested `echo` returned). A fixed sleep aborts before
+    // the script starts on a loaded machine, and an aborted-not-started tool
+    // call legitimately reports the run-level abort instead of a script
+    // failure.
     let aborter = Arc::clone(&agent);
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        while echo_calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         aborter.abort();
     });
     let started = std::time::Instant::now();

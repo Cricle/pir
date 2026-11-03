@@ -389,6 +389,9 @@ struct StreamBuf {
     /// Last data arrival; re-arms the post-exit quiet window.
     last_data: Instant,
     mode: SinkMode,
+    /// Per-sink capture cap. `spawnSync`'s Node `maxBuffer` lowers it for
+    /// that one call; every other path keeps [`MAX_STREAM_BYTES`].
+    max_bytes: usize,
     /// The handle was dropped (child killed/reaped): a parked reader must be
     /// released and stop reading.
     closed: bool,
@@ -405,9 +408,16 @@ impl StreamBuf {
             eof: false,
             last_data: Instant::now(),
             mode,
+            max_bytes: MAX_STREAM_BYTES,
             closed: false,
             waits: 0,
         }
+    }
+
+    fn with_limit(mode: SinkMode, max_bytes: usize) -> Self {
+        let mut buf = Self::new(mode);
+        buf.max_bytes = max_bytes.max(1);
+        buf
     }
 
     /// Append one chunk under the standing overflow policy. Returns whether
@@ -416,21 +426,21 @@ impl StreamBuf {
         self.last_data = Instant::now();
         // Backpressure: park until the WHOLE chunk fits, so the cap is never
         // crossed and no byte is dropped (the caller waits on the condvar).
-        if self.mode == SinkMode::Backpressure && self.data.len() + chunk.len() > MAX_STREAM_BYTES {
+        if self.mode == SinkMode::Backpressure && self.data.len() + chunk.len() > self.max_bytes {
             return true;
         }
         // A reader hands over at most one 8 KiB read at a time, so the
-        // oversized branch is defensive: keep only the newest MAX bytes.
-        if chunk.len() > MAX_STREAM_BYTES {
+        // oversized branch is defensive: keep only the newest max bytes.
+        if chunk.len() > self.max_bytes {
             self.data.clear();
-            self.data.extend(&chunk[chunk.len() - MAX_STREAM_BYTES..]);
+            self.data.extend(&chunk[chunk.len() - self.max_bytes..]);
             self.dropped = true;
             self.dropped_chunks = self.dropped_chunks.saturating_add(1);
             return false;
         }
         let total = self.data.len() + chunk.len();
-        if total > MAX_STREAM_BYTES {
-            self.data.drain(..total - MAX_STREAM_BYTES);
+        if total > self.max_bytes {
+            self.data.drain(..total - self.max_bytes);
             self.dropped = true;
             self.dropped_chunks = self.dropped_chunks.saturating_add(1);
         }
@@ -464,14 +474,21 @@ struct StreamSink {
     buf: StdMutex<StreamBuf>,
     /// Signalled when the consumer drained (`take_base64`) or the sink closed.
     space: Condvar,
+    max_bytes: usize,
 }
 
 impl StreamSink {
     fn new(label: String, mode: SinkMode) -> Arc<Self> {
+        Self::with_limit(label, mode, MAX_STREAM_BYTES)
+    }
+
+    fn with_limit(label: String, mode: SinkMode, max_bytes: usize) -> Arc<Self> {
+        let max_bytes = max_bytes.max(1);
         Arc::new(Self {
             label,
-            buf: StdMutex::new(StreamBuf::new(mode)),
+            buf: StdMutex::new(StreamBuf::with_limit(mode, max_bytes)),
             space: Condvar::new(),
+            max_bytes,
         })
     }
 
@@ -502,7 +519,7 @@ impl StreamSink {
                     crate::ext_diag!(
                         "[ext] child {} stream full ({} bytes buffered); the reader is paused (backpressure) after {} waits",
                         self.label,
-                        MAX_STREAM_BYTES,
+                        self.max_bytes,
                         waits
                     );
                 }
@@ -521,6 +538,14 @@ impl StreamSink {
 
     fn eof(&self) -> bool {
         lock(&self.buf).eof
+    }
+
+    /// Has this sink dropped bytes since the capture began? `spawnSync` polls
+    /// this to apply Node's `maxBuffer` kill (the Truncate sink keeps
+    /// draining, so the child is not deadlocked while the caller waits).
+    fn overflowed(&self) -> bool {
+        let buf = lock(&self.buf);
+        buf.dropped || buf.dropped_chunks > 0
     }
 
     fn last_data(&self) -> Instant {
@@ -547,7 +572,7 @@ impl StreamSink {
             crate::ext_diag!(
                 "[ext] child {} output exceeded the {} byte stream cap; the oldest bytes were truncated ({} chunks so far)",
                 self.label,
-                MAX_STREAM_BYTES,
+                self.max_bytes,
                 dropped_chunks
             );
         }
@@ -1692,6 +1717,35 @@ fn spawn_sync(
                 .map_err(|error| FnError::new("EINVAL", format!("invalid base64 input: {error}")))
         })
         .transpose()?;
+    let timeout = payload
+        .get("timeout")
+        .and_then(JsonValue::as_u64)
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis);
+    let max_buffer = payload
+        .get("maxBuffer")
+        .and_then(JsonValue::as_u64)
+        .filter(|bytes| *bytes > 0)
+        .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX));
+    let signal_requested = payload_bool(payload, "signal");
+    // Node reports an already-aborted signal in-band (never a throw from
+    // spawnSync itself): `{error: AbortError, status: null, signal: null}`.
+    if signal_requested
+        && (payload_bool(payload, "signalAborted") || lock_state(state).tool_call_aborted)
+    {
+        return Ok(serde_json::json!({
+            "pid": 0,
+            "status": JsonValue::Null,
+            "signal": JsonValue::Null,
+            "stdout": JsonValue::Null,
+            "stderr": JsonValue::Null,
+            "truncated": false,
+            "error": {
+                "code": "ABORT_ERR",
+                "message": "The operation was aborted",
+            },
+        }));
+    }
 
     let mut command = build_command(state, allowed_roots, &launch, payload)?;
     if launch.shimmed {
@@ -1716,9 +1770,20 @@ fn spawn_sync(
     // consumer can drain while the child runs — a parked reader would deadlock
     // against a child that outruns the cap. Keeping the newest bytes and
     // reporting `truncated` is Node's own blocking-form degradation
-    // (`maxBuffer`).
-    let stdout_sink = StreamSink::new(format!("spawnSync {pid} stdout"), SinkMode::Truncate);
-    let stderr_sink = StreamSink::new(format!("spawnSync {pid} stderr"), SinkMode::Truncate);
+    // (`maxBuffer`). An explicit `maxBuffer` lowers this call's cap; the wait
+    // loop kills the child as soon as either sink exceeds it (ENOBUFS).
+    let max_buffer_explicit = max_buffer.is_some();
+    let max_buffer = max_buffer.unwrap_or(MAX_STREAM_BYTES);
+    let stdout_sink = StreamSink::with_limit(
+        format!("spawnSync {pid} stdout"),
+        SinkMode::Truncate,
+        max_buffer,
+    );
+    let stderr_sink = StreamSink::with_limit(
+        format!("spawnSync {pid} stderr"),
+        SinkMode::Truncate,
+        max_buffer,
+    );
     let activity = ActivitySignal::new();
     start_reader(
         child.stdout.take(),
@@ -1743,9 +1808,65 @@ fn spawn_sync(
         // asynchronous `spawn` keeps it open for `child.stdin.write`).
     }
 
-    let status = child
-        .wait()
-        .map_err(|error| FnError::new("EIO", format!("waiting for `{cmd}` failed: {error}")))?;
+    // Deadline / abort / maxBuffer enforcement: poll `try_wait` instead of
+    // blocking in `wait()`, so the host can kill the child on the first of
+    // the three conditions. `timeout` is Node's milliseconds value; an abort
+    // is the runtime's shared abort flag (the only AbortSignal source the
+    // extension runtime exposes).
+    let timeout_at = timeout.map(|timeout| Instant::now() + timeout);
+    let mut forced_failure: Option<(&'static str, String)> = None;
+    let status = 'wait: loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| FnError::new("EIO", format!("waiting for `{cmd}` failed: {error}")))?
+        {
+            break status;
+        }
+        let aborted = signal_requested && lock_state(state).tool_call_aborted;
+        let overflow = stdout_sink.overflowed() || stderr_sink.overflowed();
+        let timed_out = timeout_at.is_some_and(|deadline| Instant::now() >= deadline);
+        if aborted || overflow || timed_out {
+            forced_failure = Some(if aborted {
+                ("ABORT_ERR", "The operation was aborted".to_owned())
+            } else if overflow {
+                (
+                    "ENOBUFS",
+                    format!("spawnSync {cmd} ENOBUFS: maxBuffer ({max_buffer} bytes) exceeded"),
+                )
+            } else {
+                (
+                    "ETIMEDOUT",
+                    format!("spawnSync {cmd} ETIMEDOUT: timed out after {timeout:?}"),
+                )
+            });
+            // Graceful first, then hard-kill: `send_term` is SIGTERM on Unix
+            // and TerminateProcess on Windows. The short grace keeps a
+            // well-behaved child's own exit status when it dies on SIGTERM.
+            send_term(&mut child);
+            let kill_at = Instant::now() + Duration::from_millis(250);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break 'wait status,
+                    Ok(None) => {}
+                    Err(error) => {
+                        return Err(FnError::new(
+                            "EIO",
+                            format!("waiting for `{cmd}` failed: {error}"),
+                        ))
+                    }
+                }
+                if Instant::now() >= kill_at {
+                    let _ = child.kill();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            break 'wait child.wait().map_err(|error| {
+                FnError::new("EIO", format!("waiting for `{cmd}` failed: {error}"))
+            })?;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     // Post-exit quiet window (see EXIT_STDIO_GRACE): a descendant that
     // inherited the pipes must not hang the call. The window re-arms on every
     // chunk either reader captures, so a still-writing descendant is drained.
@@ -1766,16 +1887,43 @@ fn spawn_sync(
         }
         let _ = activity.wait_since(seen, remaining);
     }
+    // A fast child can exit before the wait loop observes the overflow. The
+    // sink still records the dropped chunks, so an explicit `maxBuffer` must
+    // report ENOBUFS even then (Node kills at the cap; the exit status is not
+    // a successful result).
+    if forced_failure.is_none()
+        && max_buffer_explicit
+        && (stdout_sink.overflowed() || stderr_sink.overflowed())
+    {
+        forced_failure = Some((
+            "ENOBUFS",
+            format!("spawnSync {cmd} ENOBUFS: maxBuffer ({max_buffer} bytes) exceeded"),
+        ));
+    }
     let exit = exit_info(&status);
     let (stdout, stdout_dropped) = stdout_sink.take_base64();
     let (stderr, stderr_dropped) = stderr_sink.take_base64();
+    let forced = forced_failure.is_some();
+    let error = forced_failure.map(|(code, message)| {
+        serde_json::json!({
+            "code": code,
+            "message": message,
+        })
+    });
     Ok(serde_json::json!({
         "pid": pid,
-        "status": exit.code,
+        // Node reports a null status for a killed blocking child; the signal
+        // stays meaningful (SIGTERM on Unix, null on Windows TerminateProcess).
+        "status": if forced {
+            JsonValue::Null
+        } else {
+            serde_json::to_value(exit.code).unwrap_or(JsonValue::Null)
+        },
         "signal": signal_name(exit.signal),
         "stdout": captured_slot(kinds[1], stdout),
         "stderr": captured_slot(kinds[2], stderr),
         "truncated": stdout_dropped || stderr_dropped,
+        "error": error,
     }))
 }
 

@@ -370,7 +370,7 @@ impl AgentSession {
             let native = plugins
                 .as_ref()
                 .is_some_and(|plugins| plugins.has_native_handlers("tool_execution_update"));
-            let extensions = self.extensions.clone();
+            let extensions = self.event_extensions().cloned();
             let dispatch_sem = Arc::new(tokio::sync::Semaphore::new(EXT_DISPATCH_CONCURRENCY));
             return Some(Arc::new(move |partial: JsonValue| {
                 // The host sink needs its own snapshot; the extension payload
@@ -434,7 +434,7 @@ impl AgentSession {
         if let Some(plugins) = self.plugins.as_ref() {
             if plugins.has_native_handlers("tool_execution_update") {
                 let plugins = Arc::clone(plugins);
-                let extensions = self.extensions.clone();
+                let extensions = self.event_extensions().cloned();
                 let dispatch_sem = Arc::new(tokio::sync::Semaphore::new(EXT_DISPATCH_CONCURRENCY));
                 return Some(Arc::new(move |partial: JsonValue| {
                     let payload = crate::agent::tool_execution::tool_update_payload_owned(partial);
@@ -462,7 +462,7 @@ impl AgentSession {
                 }));
             }
         }
-        extension_tool_update_channel(self.extensions.as_ref())
+        extension_tool_update_channel(self.event_extensions())
     }
 }
 

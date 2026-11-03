@@ -75,8 +75,17 @@ impl AgentPlugin for GreetingPlugin {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), SdkError> {
+fn main() -> std::process::ExitCode {
+    common::run_big_stack(async {
+        if let Err(error) = run().await {
+            eprintln!("error: {error:?}");
+            return std::process::ExitCode::FAILURE;
+        }
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+async fn run() -> Result<(), SdkError> {
     let (registry, model, requests) = common::ScriptedProvider::registry_recording(vec![
         common::tool_calls_message(&[("greet", json!({ "name": "Ada" }))]),
         common::text_message("The greet tool said: Hello, Ada!"),

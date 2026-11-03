@@ -973,36 +973,46 @@ pub fn build_anthropic_request_with_strict_sampling(
     } else {
         BTreeMap::new()
     };
-    let headers = request_headers(
+    let headers = request_headers(AnthropicHeaderInput {
         model,
         options,
         oauth,
-        &betas,
-        request_auth.as_ref(),
-        &cache_retention,
-        &compat,
-        &copilot_dynamic_headers,
-    );
+        betas: &betas,
+        request_auth: request_auth.as_ref(),
+        cache_retention: &cache_retention,
+        compat: &compat,
+        dynamic_headers: &copilot_dynamic_headers,
+    });
     Ok((body, headers, sampling.has_preferred_strict_tools))
+}
+
+/// Inputs for [`request_headers`].
+struct AnthropicHeaderInput<'a> {
+    model: &'a Model,
+    options: &'a StreamOptions,
+    oauth: bool,
+    betas: &'a [String],
+    request_auth: Option<&'a AnthropicRequestAuth>,
+    cache_retention: &'a CacheRetention,
+    compat: &'a AnthropicCompat,
+    dynamic_headers: &'a BTreeMap<String, String>,
 }
 
 /// Request headers (upstream `createClient` default headers + SDK auth).
 /// Caller-provided headers always win; model headers merge before them
 /// (upstream `mergeClientHeaders(..., model.headers, optionsHeaders)`,
 /// anthropic-messages.ts:1021-1030/1043-1051).
-// The header inputs map one-to-one onto the upstream `createClient` call; a
-// parameter struct would be a pure reshuffle of this single call site.
-#[allow(clippy::too_many_arguments)]
-fn request_headers(
-    model: &Model,
-    options: &StreamOptions,
-    oauth: bool,
-    betas: &[String],
-    request_auth: Option<&AnthropicRequestAuth>,
-    cache_retention: &CacheRetention,
-    compat: &AnthropicCompat,
-    dynamic_headers: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
+fn request_headers(input: AnthropicHeaderInput<'_>) -> BTreeMap<String, String> {
+    let AnthropicHeaderInput {
+        model,
+        options,
+        oauth,
+        betas,
+        request_auth,
+        cache_retention,
+        compat,
+        dynamic_headers,
+    } = input;
     let mut headers = BTreeMap::new();
     headers.insert("anthropic-version".into(), "2023-06-01".into());
     headers.insert("content-type".into(), "application/json".into());
@@ -1576,6 +1586,9 @@ fn system_message_text(message: &UserMessage) -> String {
     crate::ai::types::system_message_text(message)
 }
 
+/// Converted `messages` plus system-prompt tail and per-message thinking levels.
+type ConvertedAnthropicMessages = (Vec<Value>, Vec<String>, Vec<(usize, String)>);
+
 /// Convert pir messages to Anthropic `messages` (upstream `convertMessages`).
 /// Later system messages are folded into the top-level system prompt unless
 /// native tool changes are in use, in which case they are sent as system-role
@@ -1588,7 +1601,6 @@ fn system_message_text(message: &UserMessage) -> String {
 /// a recorded `providerThinkingLevel` reports its message index with that
 /// effort so [`build_anthropic_request_with_strict_sampling`] can insert the
 /// effort-only system marker before it.
-#[allow(clippy::type_complexity)]
 fn convert_messages(
     model: &Model,
     context: &Context,
@@ -1597,7 +1609,7 @@ fn convert_messages(
     native_tool_changes: bool,
     managed_provider: Option<&str>,
     sampling: &mut StrictToolSampling,
-) -> AiResult<(Vec<Value>, Vec<String>, Vec<(usize, String)>)> {
+) -> AiResult<ConvertedAnthropicMessages> {
     let _ = options;
     let allow_empty_signature = anthropic_compat(model).allow_empty_signature;
     // Upstream runs transformMessages before conversion (replaying aborted

@@ -128,7 +128,7 @@ use crate::durable::entries::{
 use crate::durable::harness::agent::ModelRef;
 use crate::durable::harness::context::{ContextView, MISSING_RESULT_TEXT};
 use crate::durable::harness::generation::{
-    CompactionTasks, DocumentKind, GenerationStore, HarnessFuture,
+    CompactionTasks, DocumentKind, GenerationStore, HarnessFuture, TaskDraft,
 };
 use crate::durable::harness::live::{
     live_from_object, live_to_object, CompactionFailure, CompactionStatus, LiveState, RetryStatus,
@@ -567,10 +567,12 @@ pub async fn create_compaction_in(
             catalogue,
             tx,
             conversation,
-            COMPACTION_TASK_NAME,
-            value,
-            task_owner,
-            background,
+            TaskDraft {
+                kind: COMPACTION_TASK_NAME,
+                input: value,
+                owner: task_owner,
+                background,
+            },
         )
         .await?;
     let status = compaction_status_of(task_id, input.reason, task_owner.is_some());

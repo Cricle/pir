@@ -3518,19 +3518,21 @@ async fn serve_websocket(
     // first would leave the reader owning the socket.
     let (writer, reader) = ws.split();
     let bridge_client_id = subscriber.id();
-    let result = websocket_session(
+    let result = websocket_session(WsConnection {
         reader,
         writer,
-        Arc::clone(&progress),
-        Arc::clone(&meta),
-        meta.bridge.clone(),
-        bridge_client_id,
+        peer: WsReaderContext {
+            progress: Arc::clone(&progress),
+            meta: Arc::clone(&meta),
+            bridge: meta.bridge.clone(),
+            client_id: bridge_client_id,
+        },
         subscriber,
         close_rx,
         abort_tx,
         abort_rx,
         shutdown,
-    )
+    })
     .await;
 
     // Only clear the slot if it is still ours (a newer client may have
@@ -3574,6 +3576,28 @@ fn bridge_close_frame(reason: Option<CloseReason>) -> (u16, &'static str) {
     }
 }
 
+/// The connection context shared by the reader half: progress accounting, the
+/// server state, and the bridge identity of the subscribing client.
+struct WsReaderContext {
+    progress: Arc<ReadProgress>,
+    meta: Arc<ServerMeta>,
+    bridge: SessionBridge,
+    client_id: u64,
+}
+
+/// One accepted websocket connection, split into the halves the reader task
+/// and the writer loop drive.
+struct WsConnection {
+    reader: WsSource,
+    writer: WsWriter,
+    peer: WsReaderContext,
+    subscriber: BridgeSubscriber,
+    close_rx: watch::Receiver<Option<CloseFrame>>,
+    abort_tx: watch::Sender<bool>,
+    abort_rx: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
+}
+
 /// Drive one connection: a reader task (messages -> bridge/actions) and a
 /// writer loop (bridge queue/actions/control -> socket).
 ///
@@ -3583,30 +3607,22 @@ fn bridge_close_frame(reason: Option<CloseReason>) -> (u16, &'static str) {
 /// guarantee — a partial frame lives in the socket's codec, not in the read
 /// future — but the tasks still keep the writer's `select!` off the read path
 /// and let tungstenite flush pongs/close replies while the writer is parked.
-// The single WS connection driver; grouping its borrows into a struct would
-// only re-pack the same arguments without making the handoff clearer.
-#[allow(clippy::too_many_arguments)]
-async fn websocket_session(
-    reader: WsSource,
-    writer: WsWriter,
-    progress: Arc<ReadProgress>,
-    meta: Arc<ServerMeta>,
-    bridge: SessionBridge,
-    client_id: u64,
-    subscriber: BridgeSubscriber,
-    close_rx: watch::Receiver<Option<CloseFrame>>,
-    abort_tx: watch::Sender<bool>,
-    abort_rx: watch::Receiver<bool>,
-    shutdown: watch::Receiver<bool>,
-) -> Result<(), String> {
+async fn websocket_session(connection: WsConnection) -> Result<(), String> {
+    let WsConnection {
+        reader,
+        writer,
+        peer,
+        subscriber,
+        close_rx,
+        abort_tx,
+        abort_rx,
+        shutdown,
+    } = connection;
     let (actions_tx, actions_rx) = mpsc::channel(WS_ACTION_QUEUE);
 
     let mut reader = tokio::spawn(websocket_reader(
         reader,
-        Arc::clone(&progress),
-        meta,
-        bridge,
-        client_id,
+        peer,
         actions_tx,
         abort_rx,
         shutdown.clone(),
@@ -3648,17 +3664,19 @@ async fn websocket_session(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn websocket_reader(
     mut reader: WsSource,
-    progress: Arc<ReadProgress>,
-    meta: Arc<ServerMeta>,
-    bridge: SessionBridge,
-    client_id: u64,
+    peer: WsReaderContext,
     actions: mpsc::Sender<WsAction>,
     mut abort: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let WsReaderContext {
+        progress,
+        meta,
+        bridge,
+        client_id,
+    } = peer;
     let idle_timeout = ws_idle_timeout(&meta);
     // Separate receivers for the host-dispatch select: a host adapter whose
     // promise never resolves must not keep the reader (and the bridge

@@ -91,7 +91,7 @@ use crate::durable::harness::agent::{configure, resolve_agent, Agent, AgentChang
 use crate::durable::harness::compaction::{
     create_compaction_in_state, CompactionInput, CompactionReason,
 };
-use crate::durable::harness::context::{derive_context, ContextView};
+use crate::durable::harness::context::{derive_context_owned, ContextView};
 use crate::durable::harness::documents::PROVIDER_KIND;
 use crate::durable::harness::documents::{agent_definition, conversation_definitions, AGENT_KIND};
 use crate::durable::harness::generation::{
@@ -119,7 +119,9 @@ use crate::durable::harness::view::{
 };
 use crate::durable::ids::{ConversationId, EntryId, SubmissionId, TaskId, ROOT_CONVERSATION_ID};
 use crate::durable::session::assemble::DocBehaviours;
-use crate::durable::session::attach::{attach_state, detach, Attached};
+use crate::durable::session::attach::{
+    attach_state, detach, next_owned_close_id, register_owned_close_listener, Attached,
+};
 use crate::durable::session::facade::{
     ConversationCreatedFuture, ConversationCreatedHook, ConversationOwnership, Session,
 };
@@ -634,6 +636,8 @@ struct WatchStop {
     stopped: AtomicBool,
     session: Session,
     subscription: u64,
+    /// Id of this watch's close listener in the removable close registry.
+    close_listener: u64,
     watch: CommittedWatch,
     delivery: Arc<WatchDelivery>,
     cancel: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -642,6 +646,11 @@ struct WatchStop {
 impl WatchStop {
     fn stop_with(&self, reason: WatchEnd) {
         if !self.stopped.swap(true, Ordering::AcqRel) {
+            // Remove the close listener first: once this watch is stopped, a
+            // later close must not run its listener, and the listener must not
+            // keep the watch state alive after this handle is gone. Unknown
+            // ids are ignored, so stopping twice stays idempotent.
+            self.session.unsubscribe_close(self.close_listener);
             self.session.unsubscribe_commits(self.subscription);
             self.watch.stop(reason);
             // A parked delivery task would otherwise wait forever on a watch
@@ -1339,7 +1348,7 @@ struct Inner {
     scheduler: TaskScheduler,
     task_graph: TaskGraphView,
     /// The conversation view mounts behind `Conversation::watch`.
-    views: ConversationViews,
+    views: Arc<ConversationViews>,
     registry: Arc<dyn RegistryReader>,
     settings: Arc<dyn Fn() -> Settings + Send + Sync>,
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
@@ -1470,6 +1479,20 @@ impl Harness {
         }
 
         let session = scheduler.session().clone();
+        // R1-L3-014: the scheduler's internal listener mirrors conversation and
+        // task records only. Classifying it as table-only keeps a harness with
+        // no host subscriber and no mounted view on the no-adopt fast path; it
+        // still receives the table half of every publication.
+        if let Err(error) = session
+            .handle()
+            .maintain(|inner| {
+                inner.internal_listeners.mark_last_table_only();
+            })
+            .await
+        {
+            let _ = scheduler.close().await;
+            return Err(HarnessError::Storage(error));
+        }
         let task_graph = match TaskGraphView::open_with_report(
             session.clone(),
             Arc::new(scheduler.clone()) as Arc<dyn TaskGraphBlocking>,
@@ -1483,6 +1506,18 @@ impl Harness {
                 return Err(HarnessError::Storage(error));
             }
         };
+        // The task-graph listener consumes task/conversation table records
+        // only, exactly like the scheduler's.
+        if let Err(error) = session
+            .handle()
+            .maintain(|inner| {
+                inner.internal_listeners.mark_last_table_only();
+            })
+            .await
+        {
+            let _ = scheduler.close().await;
+            return Err(HarnessError::Storage(error));
+        }
         // The conversation view mount backs `Conversation::watch`. Its
         // listener failures follow the same report policy as the harness.
         let views_report: Report = {
@@ -1500,13 +1535,34 @@ impl Harness {
                 telemetry.record_report(None, "listener_error", None, None, None);
             })
         };
-        let views = match ConversationViews::open_with_report(session.clone(), views_report).await {
-            Ok(views) => views,
-            Err(error) => {
+        let views = Arc::new(
+            match ConversationViews::open_with_report(session.clone(), views_report).await {
+                Ok(views) => views,
+                Err(error) => {
+                    let _ = scheduler.close().await;
+                    return Err(HarnessError::Storage(error));
+                }
+            },
+        );
+        // The view listener only consumes document changes while a mount is
+        // live (`Conversation::watch`). Recording that as a probe keeps an
+        // idle harness on the no-adopt fast path while a mounted watch still
+        // sees the complete published state on the next commit.
+        {
+            let probe_views = views.clone();
+            let probe: Arc<dyn Fn() -> bool + Send + Sync> =
+                Arc::new(move || probe_views.mount_count() > 0);
+            if let Err(error) = session
+                .handle()
+                .maintain(move |inner| {
+                    inner.internal_listeners.mark_last_gated(probe);
+                })
+                .await
+            {
                 let _ = scheduler.close().await;
                 return Err(HarnessError::Storage(error));
             }
-        };
+        }
 
         let submission_waiters = Arc::new(SubmissionWaiters::default());
         let (watch_liveness, _) = tokio::sync::watch::channel(());
@@ -1530,7 +1586,8 @@ impl Harness {
 
         // Settle submission waiters from the session's internal listener: it
         // runs on the mutation line, before host listeners, and only sends on
-        // a oneshot (no host code runs there).
+        // a oneshot (no host code runs there). It reads submission table
+        // records only, so it must not force document publication either.
         {
             let waiters = submission_waiters.clone();
             let listener: crate::durable::session::publication::InternalListener =
@@ -1553,7 +1610,7 @@ impl Harness {
                 .session
                 .handle()
                 .maintain(move |inner| {
-                    inner.internal_listeners.add(listener);
+                    inner.internal_listeners.add_table_only(listener);
                 })
                 .await
             {
@@ -2330,16 +2387,19 @@ impl Harness {
             Some(value) => listener(value),
             None => false,
         });
+        let close_listener = next_owned_close_id();
         let stop = Arc::new(WatchStop {
             stopped: AtomicBool::new(false),
             session: self.inner.session.clone(),
             subscription,
+            close_listener,
             watch: watch.clone(),
             delivery: delivery.clone(),
             cancel: std::sync::Mutex::new(None),
         });
         // A close ends the watch; a failure ends it with the same reason every
-        // other observer uses.
+        // other observer uses. The id-keyed registration lets `stop()` remove
+        // it again instead of retaining this watch's state until close.
         let closing_stop = stop.clone();
         let session = self.inner.session.clone();
         if let Err(error) = self
@@ -2347,12 +2407,16 @@ impl Harness {
             .session
             .handle()
             .maintain(move |inner| {
-                inner.close_listeners.push(Arc::new(move || {
-                    closing_stop.stop_with(match session.failure() {
-                        Some(error) => WatchEnd::SessionFailed(error),
-                        None => WatchEnd::SessionClosed,
-                    });
-                }));
+                register_owned_close_listener(
+                    inner,
+                    close_listener,
+                    Arc::new(move || {
+                        closing_stop.stop_with(match session.failure() {
+                            Some(error) => WatchEnd::SessionFailed(error),
+                            None => WatchEnd::SessionClosed,
+                        });
+                    }),
+                );
             })
             .await
         {
@@ -2523,7 +2587,9 @@ impl Harness {
                 )));
             }
         }
-        Ok(derive_context(&entries, at))
+        // The scan owns the records; move the active ones into the view
+        // instead of cloning a second full transcript.
+        Ok(derive_context_owned(entries, at))
     }
 
     /// Load one committed incarnation and materialize it at the definition's

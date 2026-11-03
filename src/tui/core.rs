@@ -27,27 +27,59 @@ use super::program_status::{
 // Frame-work counters (a measurement seam, `parser.copy_count()` precedent)
 // ---------------------------------------------------------------------------
 
-/// How much work one frame's full-frame passes did, counted at the four
-/// per-row passes of the follow-end render path:
+/// How much work one frame's per-row passes did, counted at the follow-end
+/// render path:
 ///
-/// - `rebuilt_rows`: rows the content components wrote in
-///   [`TuiCore::frame_lines`] — the WHOLE transcript on the main-screen
-///   (non-windowed) path, the materialized window band on the windowed
-///   viewport (P0.3), never the visible window alone;
+/// - `rebuilt_rows` / `rerendered_rows`: rows the content components actually
+///   re-rendered in [`TuiCore::frame_lines`] (`render_into` /
+///   [`Component::render_block_into`] ran). A frame whose component content
+///   revisions are unchanged reports 0 here and serves the whole transcript
+///   band from the per-component caches (`cached_rows`) instead of rebuilding
+///   it. A component that implements [`Component::content_blocks`] reports
+///   only the CHANGED blocks' rows here: a streaming delta or one settled tool
+///   block re-renders that entry's block, not the materialized band;
+/// - `rebuilt_blocks`: cache-miss blocks that actually re-ran
+///   `render_block_into` (one per whole-component miss for components without
+///   a block decomposition). `rebuilt_blocks == 0` on a steady frame;
+/// - `cached_rows`: rows served without re-running their component or block.
+///   A cache hit at an unchanged frame position whose raw canvas is still
+///   clean is served without any per-row comparison; when the canvas was
+///   decorated/clamped or the block moved, the hit still compares each row
+///   with the canvas and only writes rows whose bytes differ (see
+///   `cache_copy_bytes`);
+/// - `cache_copy_bytes`: bytes actually written from a component/block cache
+///   into the frame canvas. A steady hit writes zero bytes; a content change
+///   writes only the rows that differ (instead of the whole band the pre-fix
+///   path copied);
+/// - `cache_buffer_allocs` / `cache_buffer_reuses`: cache-miss render targets.
+///   A miss renders into the slot's existing row buffer when there is one
+///   (`reuses`); only the first render of a component/block allocates a fresh
+///   `Vec<String>` (`allocs`). The pre-fix miss allocated a new `Vec` on every
+///   content frame and then copied its rows into the frame canvas;
 /// - `snapshot_rows` / `snapshot_bytes`: rows/bytes actually copied when the
 ///   fresh raw frame hands its row buffers over to the alt-screen search
 ///   snapshot. The displaced snapshot buffer becomes the frame's work buffer
 ///   and already holds the previous raw rows, so only rows whose content
 ///   changed are copied — a steady frame copies zero rows and bytes;
 /// - `diff_scanned_rows`: rows the changed-line scan compared against the
-///   previous frame;
+///   previous frame. The regular main screen uses the frame builder's exact
+///   dirty-row markers (from the same byte comparisons that fill the canvas)
+///   and scans only rows whose raw bytes changed; without trustworthy markers
+///   (a decorated/clamped prior canvas, or a length change) it falls back to
+///   the full `max(new, previous)` scan. The windowed path diffs only the
+///   painted viewport;
+/// - `diff_skipped_rows`: rows the regular path proved unchanged from the
+///   dirty-row markers and therefore did not compare. `diff_scanned_rows +
+///   diff_skipped_rows` equals the `max(new, previous)` frame height whenever
+///   the marker fast path ran;
 /// - `reset_rows`: rows [`TuiCore`] appended the segment reset to — i.e. the
 ///   rows the frame actually WROTE (the reset is lazy: an unwritten row keeps
 ///   the baseline bytes it was written with, reset included).
 ///
-/// Each pass walks O(frame height) rows (`snapshot_rows`/`snapshot_bytes`
-/// only the changed ones); the counters exist so tests can pin that baseline
-/// (and, later, a windowed/dirty-row target) without timing — allocation
+/// The builders still touch O(frame height) rows on an unversioned component,
+/// but the transcript cache serves unchanged blocks without comparing them,
+/// and the snapshot copy / changed-line scan visit the exact dirty rows only.
+/// The counters exist so tests can pin that work without timing — allocation
 /// counts cannot see a `clone_from`/compare/`push_str` pass.
 ///
 /// Cost: one `Relaxed` `fetch_add` per pass per frame (the per-row values are
@@ -58,9 +90,36 @@ use super::program_status::{
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FrameWork {
     pub rebuilt_rows: u64,
+    /// Cache-miss blocks that actually re-ran a block render this frame.
+    /// One per whole-component miss for components without a block
+    /// decomposition; zero on a steady frame.
+    pub rebuilt_blocks: u64,
+    /// Rows produced by components/blocks that actually re-ran `render_into`
+    /// / `render_block_into` this frame. A frame whose content revisions are
+    /// unchanged serves every transcript row from the row caches and reports
+    /// zero here (the dock's rows are the only remaining work).
+    pub rerendered_rows: u64,
+    /// Rows served without re-running their component or block
+    /// (`render_into` skipped because revision/width/theme matched). A hit at
+    /// an unchanged position with a clean raw canvas is served without any
+    /// per-row comparison; otherwise the hit compares before copying.
+    pub cached_rows: u64,
+    /// Bytes actually written from a component row cache into the frame
+    /// canvas. A cache hit whose frame rows already hold the cached bytes
+    /// writes nothing; a changed component writes only the rows that differ.
+    pub cache_copy_bytes: u64,
+    /// Cache-miss renders that had to allocate a fresh `Vec<String>` (the
+    /// component's first versioned render).
+    pub cache_buffer_allocs: u64,
+    /// Cache-miss renders that reused the slot's existing row buffer
+    /// (`clear`/`rewind` in place instead of a fresh `Vec`).
+    pub cache_buffer_reuses: u64,
     pub snapshot_rows: u64,
     pub snapshot_bytes: u64,
     pub diff_scanned_rows: u64,
+    /// Rows the regular path proved unchanged from the exact dirty-row
+    /// markers and skipped comparing. See the struct docs.
+    pub diff_skipped_rows: u64,
     pub reset_rows: u64,
 }
 
@@ -70,9 +129,16 @@ impl FrameWork {
     pub fn snapshot() -> Self {
         Self {
             rebuilt_rows: FRAME_WORK.rebuilt_rows.load(Ordering::Relaxed),
+            rebuilt_blocks: FRAME_WORK.rebuilt_blocks.load(Ordering::Relaxed),
+            rerendered_rows: FRAME_WORK.rerendered_rows.load(Ordering::Relaxed),
+            cached_rows: FRAME_WORK.cached_rows.load(Ordering::Relaxed),
+            cache_copy_bytes: FRAME_WORK.cache_copy_bytes.load(Ordering::Relaxed),
+            cache_buffer_allocs: FRAME_WORK.cache_buffer_allocs.load(Ordering::Relaxed),
+            cache_buffer_reuses: FRAME_WORK.cache_buffer_reuses.load(Ordering::Relaxed),
             snapshot_rows: FRAME_WORK.snapshot_rows.load(Ordering::Relaxed),
             snapshot_bytes: FRAME_WORK.snapshot_bytes.load(Ordering::Relaxed),
             diff_scanned_rows: FRAME_WORK.diff_scanned_rows.load(Ordering::Relaxed),
+            diff_skipped_rows: FRAME_WORK.diff_skipped_rows.load(Ordering::Relaxed),
             reset_rows: FRAME_WORK.reset_rows.load(Ordering::Relaxed),
         }
     }
@@ -81,9 +147,16 @@ impl FrameWork {
     #[doc(hidden)]
     pub fn reset() {
         FRAME_WORK.rebuilt_rows.store(0, Ordering::Relaxed);
+        FRAME_WORK.rebuilt_blocks.store(0, Ordering::Relaxed);
+        FRAME_WORK.rerendered_rows.store(0, Ordering::Relaxed);
+        FRAME_WORK.cached_rows.store(0, Ordering::Relaxed);
+        FRAME_WORK.cache_copy_bytes.store(0, Ordering::Relaxed);
+        FRAME_WORK.cache_buffer_allocs.store(0, Ordering::Relaxed);
+        FRAME_WORK.cache_buffer_reuses.store(0, Ordering::Relaxed);
         FRAME_WORK.snapshot_rows.store(0, Ordering::Relaxed);
         FRAME_WORK.snapshot_bytes.store(0, Ordering::Relaxed);
         FRAME_WORK.diff_scanned_rows.store(0, Ordering::Relaxed);
+        FRAME_WORK.diff_skipped_rows.store(0, Ordering::Relaxed);
         FRAME_WORK.reset_rows.store(0, Ordering::Relaxed);
     }
 }
@@ -91,17 +164,31 @@ impl FrameWork {
 /// The atomics behind [`FrameWork`] (relaxed: counters, not synchronization).
 struct FrameWorkCounters {
     rebuilt_rows: AtomicU64,
+    rebuilt_blocks: AtomicU64,
+    rerendered_rows: AtomicU64,
+    cached_rows: AtomicU64,
+    cache_copy_bytes: AtomicU64,
+    cache_buffer_allocs: AtomicU64,
+    cache_buffer_reuses: AtomicU64,
     snapshot_rows: AtomicU64,
     snapshot_bytes: AtomicU64,
     diff_scanned_rows: AtomicU64,
+    diff_skipped_rows: AtomicU64,
     reset_rows: AtomicU64,
 }
 
 static FRAME_WORK: FrameWorkCounters = FrameWorkCounters {
     rebuilt_rows: AtomicU64::new(0),
+    rebuilt_blocks: AtomicU64::new(0),
+    rerendered_rows: AtomicU64::new(0),
+    cached_rows: AtomicU64::new(0),
+    cache_copy_bytes: AtomicU64::new(0),
+    cache_buffer_allocs: AtomicU64::new(0),
+    cache_buffer_reuses: AtomicU64::new(0),
     snapshot_rows: AtomicU64::new(0),
     snapshot_bytes: AtomicU64::new(0),
     diff_scanned_rows: AtomicU64::new(0),
+    diff_skipped_rows: AtomicU64::new(0),
     reset_rows: AtomicU64::new(0),
 };
 
@@ -109,36 +196,51 @@ static FRAME_WORK: FrameWorkCounters = FrameWorkCounters {
 /// [`FrameWork`] measurement seam (alongside
 /// [`ToolMemoWork`](crate::tui::messages::ToolMemoWork) for the tool block's
 /// memos): relaxed adds per row claimed, per row the row POOL had to grow for,
-/// and per whole-row copy/reuse. A steady frame must have `pool_growth == 0`
-/// and `row_write_bytes == 0`: the pool is already sized and every row still
-/// holds its previous bytes, so the claim path only compares and reuses.
-/// Any allocation a frame reports while its memos did not rebuild is
-/// attributable here.
+/// and per whole-row copy/reuse.
+///
+/// A steady frame has `pool_growth == 0` (the pool is already sized), but it
+/// is NOT true that `row_write_bytes == 0` for every clean frame: the
+/// component-cache path now compares each cached row with the frame canvas via
+/// [`Rows::push`], so a row that changed is still written (and a dock that
+/// repaints its spinner writes its own rows). What the cache eliminated is the
+/// UNCONDITIONAL copy: cached rows that already match the canvas land in
+/// `row_reuse_bytes`, not `row_write_bytes`, and [`Rows::append_cached`]
+/// reports the bytes it actually wrote. Any allocation a frame reports while
+/// its memos did not rebuild is attributable here.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RowsWork {
-    /// Rows claimed through [`Rows`] (the frame height; a claimed row may be
-    /// served by the exact-content reuse path instead of a write).
+    /// Rows claimed through [`Rows`] across every canvas of the frame: a
+    /// steady frame claims one per frame row, while a cache-miss content
+    /// frame also claims the rows it writes into the component/block render
+    /// target before copying them into the frame canvas (so the count can
+    /// exceed the frame height — it is not a frame-height claim).
     pub row_writes: u64,
     /// Bytes actually copied into pooled row buffers by the whole-row writes
-    /// ([`Rows::push`] / [`Rows::push_fmt`]) since the last reset. This is the
-    /// transcript memcpy the steady frame must make disappear: before the
-    /// copy-on-change fast path, every cached body line was copied out of its
-    /// cache slot on every frame.
+    /// ([`Rows::push`] / [`Rows::push_fmt`] / [`Rows::append_cached`]) since
+    /// the last reset. Before the copy-on-change fast path, every cached body
+    /// line was copied out of its cache slot on every frame.
     ///
     /// Construction through [`Rows::line_mut`] / [`Rows::line_at`] is not
     /// counted here — those rows are built in place by the component itself
     /// (the editor/dock path), not copied from a cache.
     pub row_write_bytes: u64,
     /// Bytes of whole-row writes served by the pooled row that already held
-    /// exactly those bytes (no clear, no copy). A steady frame's cached lines
-    /// land here; it is the avoided half of `row_write_bytes`.
+    /// exactly those bytes (no clear, no copy). Cached rows that match the
+    /// frame canvas land here; it is the avoided half of `row_write_bytes`.
     pub row_reuse_bytes: u64,
     /// Rows served by the exact-content reuse path (subset of `row_writes`).
     pub rows_reused: u64,
     /// Rows newly appended to the pool (`String::new()` + a `Vec` push) —
     /// zero on a frame whose row count did not grow past the pool.
     pub pool_growth: u64,
+    /// Bytes compared by [`Rows::push`]'s exact-content reuse check. This is
+    /// the exact byte-scan count (equal-length rows scan until the first
+    /// differing byte; a length mismatch scans no bytes) — not a `min(len)`
+    /// upper bound. A steady cache hit served at an unchanged frame position
+    /// with a clean raw canvas skips the comparison entirely and reports
+    /// zero here; a moved/decorated canvas reports only the rows it served.
+    pub row_compare_bytes: u64,
 }
 
 impl RowsWork {
@@ -151,6 +253,7 @@ impl RowsWork {
             row_reuse_bytes: ROWS_WORK.row_reuse_bytes.load(Ordering::Relaxed),
             rows_reused: ROWS_WORK.rows_reused.load(Ordering::Relaxed),
             pool_growth: ROWS_WORK.pool_growth.load(Ordering::Relaxed),
+            row_compare_bytes: ROWS_WORK.row_compare_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -162,6 +265,18 @@ impl RowsWork {
         ROWS_WORK.row_reuse_bytes.store(0, Ordering::Relaxed);
         ROWS_WORK.rows_reused.store(0, Ordering::Relaxed);
         ROWS_WORK.pool_growth.store(0, Ordering::Relaxed);
+        ROWS_WORK.row_compare_bytes.store(0, Ordering::Relaxed);
+    }
+}
+
+impl std::ops::AddAssign for RowsWork {
+    fn add_assign(&mut self, other: Self) {
+        self.row_writes += other.row_writes;
+        self.row_write_bytes += other.row_write_bytes;
+        self.row_reuse_bytes += other.row_reuse_bytes;
+        self.rows_reused += other.rows_reused;
+        self.pool_growth += other.pool_growth;
+        self.row_compare_bytes += other.row_compare_bytes;
     }
 }
 
@@ -172,6 +287,7 @@ struct RowsWorkCounters {
     row_reuse_bytes: AtomicU64,
     rows_reused: AtomicU64,
     pool_growth: AtomicU64,
+    row_compare_bytes: AtomicU64,
 }
 
 static ROWS_WORK: RowsWorkCounters = RowsWorkCounters {
@@ -180,6 +296,7 @@ static ROWS_WORK: RowsWorkCounters = RowsWorkCounters {
     row_reuse_bytes: AtomicU64::new(0),
     rows_reused: AtomicU64::new(0),
     pool_growth: AtomicU64::new(0),
+    row_compare_bytes: AtomicU64::new(0),
 };
 
 /// Reusable row canvas for [`Component::render_into`].
@@ -195,12 +312,39 @@ static ROWS_WORK: RowsWorkCounters = RowsWorkCounters {
 /// so stale pooled content can never reach the diff.
 pub struct Rows<'a> {
     lines: &'a mut Vec<String>,
+    /// First row index owned by this canvas (0 for a whole frame; the
+    /// transcript's end when a component renders after an already-assembled
+    /// prefix). `next` is absolute so components that read [`Rows::len`] as a
+    /// frame row (the dock's mouse layout, the scrollbar wrapper) keep working.
+    base: usize,
     next: usize,
     /// This canvas's own work counters (the process-wide [`RowsWork`] also
     /// aggregates every canvas; a frame test reads this instance's copy so it
     /// is unaffected by other tests/frames running in parallel).
     work: RowsWork,
+    /// Absolute row indices this canvas wrote (appended or changed) since the
+    /// last `rewind`. The frame builder folds these into the regular mode's
+    /// dirty-row markers, so an unchanged row is never compared twice (the
+    /// exact-content check that found it unchanged IS the comparison).
+    ///
+    /// The first [`CHANGED_INLINE`] indices are held inline so a steady frame
+    /// (which records zero changed rows) and the common one-to-few-row edits
+    /// (cursor tick, one transcript row) never touch the heap. A content frame
+    /// that rewrites more rows spills into `changed_overflow`; that allocation
+    /// is paid only by frames that actually changed many rows.
+    changed: [usize; CHANGED_INLINE],
+    changed_len: usize,
+    changed_overflow: Vec<usize>,
+    /// Whether this canvas publishes into the process-wide [`RowsWork`].
+    /// `false` for scratch canvases used to probe a component's output (the
+    /// header's revision hash), which must not appear as frame work.
+    count_global: bool,
 }
+
+/// Inline capacity of [`Rows`]' dirty-row list. A steady frame records no
+/// entries; real deltas are one row (spinner/cursor) or a handful (an entry's
+/// block). Both stay inline, so the canvas allocates nothing on those frames.
+const CHANGED_INLINE: usize = 16;
 
 impl<'a> Rows<'a> {
     /// Wrap a row pool. The pool starts rewound (the frame is empty); its
@@ -208,8 +352,80 @@ impl<'a> Rows<'a> {
     pub fn new(lines: &'a mut Vec<String>) -> Self {
         Self {
             lines,
+            base: 0,
             next: 0,
             work: RowsWork::default(),
+            changed: [0; CHANGED_INLINE],
+            changed_len: 0,
+            changed_overflow: Vec::new(),
+            count_global: true,
+        }
+    }
+
+    /// A throwaway canvas whose work does not reach the process-wide
+    /// [`RowsWork`] counters (revision probes; see
+    /// [`Component::content_revision`]).
+    #[doc(hidden)]
+    pub fn unmeasured(lines: &'a mut Vec<String>) -> Self {
+        Self {
+            lines,
+            base: 0,
+            next: 0,
+            work: RowsWork::default(),
+            changed: [0; CHANGED_INLINE],
+            changed_len: 0,
+            changed_overflow: Vec::new(),
+            count_global: false,
+        }
+    }
+
+    /// Wrap a row pool positioned after `start` rows already assembled in it:
+    /// the component writes at `start..` and [`Rows::len`] reports absolute
+    /// frame rows, exactly like a whole-frame canvas. Existing rows below
+    /// `start` are never read nor claimed.
+    pub fn at(lines: &'a mut Vec<String>, start: usize) -> Self {
+        if start > lines.len() {
+            lines.resize_with(start, String::new);
+        }
+        Self {
+            lines,
+            base: start,
+            next: start,
+            work: RowsWork::default(),
+            changed: [0; CHANGED_INLINE],
+            changed_len: 0,
+            changed_overflow: Vec::new(),
+            count_global: true,
+        }
+    }
+
+    /// Absolute row indices written on this canvas since the last rewind.
+    /// Duplicates are possible (a row may be pushed and then painted in
+    /// place); callers that need a set sort/dedup it.
+    pub fn changed_rows(&self) -> &[usize] {
+        if self.changed_overflow.is_empty() {
+            &self.changed[..self.changed_len]
+        } else {
+            &self.changed_overflow
+        }
+    }
+
+    /// Record one dirty row index, filling the inline list first and spilling
+    /// into the heap only when a single frame rewrites more than
+    /// [`CHANGED_INLINE`] rows.
+    #[inline]
+    fn record_changed(&mut self, index: usize) {
+        if !self.changed_overflow.is_empty() {
+            self.changed_overflow.push(index);
+        } else if self.changed_len < CHANGED_INLINE {
+            self.changed[self.changed_len] = index;
+            self.changed_len += 1;
+        } else {
+            self.changed_overflow.reserve(CHANGED_INLINE * 2);
+            self.changed_overflow
+                .extend_from_slice(&self.changed[..CHANGED_INLINE]);
+            self.changed_overflow.push(index);
+            self.changed_len = 0;
         }
     }
 
@@ -221,23 +437,46 @@ impl<'a> Rows<'a> {
 
     /// Start a new frame: the pool keeps every row buffer it holds.
     pub fn rewind(&mut self) {
-        self.next = 0;
+        self.next = self.base;
+        self.changed_len = 0;
+        self.changed_overflow.clear();
     }
 
-    /// Rows appended since the last [`Rows::rewind`] (the frame height).
+    /// Absolute row index just past the rows this canvas wrote (the frame
+    /// height for a whole-frame canvas; the frame row after the component for
+    /// an [`Rows::at`] canvas).
     pub fn len(&self) -> usize {
         self.next
     }
 
-    /// Whether the frame has no rows yet.
+    /// Whether this canvas has no rows yet.
     pub fn is_empty(&self) -> bool {
-        self.next == 0
+        self.next == self.base
     }
 
     /// Drop the pool's rows past the frame end (a shorter frame than the one
     /// the pool was recycled from must not leave unreachable rows behind).
+    ///
+    /// Only for a canvas that OWNS its `Vec` (a private component row buffer).
+    /// A [`Rows::at`] slice shares the vector with the components rendered
+    /// after it, so trimming at that component's end would throw away their
+    /// recycled rows; the frame builder trims the shared canvas once, after
+    /// the last component (see `TuiCore::frame_lines`).
     pub fn trim(&mut self) {
         self.lines.truncate(self.next);
+        if self.changed_overflow.is_empty() {
+            let mut write = 0;
+            for read in 0..self.changed_len {
+                let index = self.changed[read];
+                if index < self.next {
+                    self.changed[write] = index;
+                    write += 1;
+                }
+            }
+            self.changed_len = write;
+        } else {
+            self.changed_overflow.retain(|index| *index < self.next);
+        }
     }
 
     /// Append one row, copying `s` into the pooled slot unless the slot
@@ -252,57 +491,95 @@ impl<'a> Rows<'a> {
     pub fn push(&mut self, s: &str) {
         let index = self.next;
         if index == self.lines.len() {
-            ROWS_WORK.pool_growth.fetch_add(1, Ordering::Relaxed);
             self.work.pool_growth += 1;
             self.lines.push(String::new());
         }
         self.next = index + 1;
-        ROWS_WORK.row_writes.fetch_add(1, Ordering::Relaxed);
         self.work.row_writes += 1;
         let row = &mut self.lines[index];
-        if row == s {
-            ROWS_WORK.rows_reused.fetch_add(1, Ordering::Relaxed);
-            ROWS_WORK
-                .row_reuse_bytes
-                .fetch_add(s.len() as u64, Ordering::Relaxed);
+        // Exact compare count: a length mismatch compares no bytes; an
+        // equal-length row scans until the first differing byte (or the end
+        // when identical). The old `min(len)` heuristic over-reported
+        // different-length rows and under-described early mismatches.
+        let (equal, scanned) = if row.len() != s.len() {
+            (false, 0)
+        } else if row == s {
+            // The common steady-frame path uses the optimized string
+            // comparison; only the equal-length but different case pays the
+            // prefix scan that makes the counter exact.
+            (true, row.len() as u64)
+        } else {
+            let common = row
+                .as_bytes()
+                .iter()
+                .zip(s.as_bytes())
+                .position(|(left, right)| left != right)
+                .map_or(row.len(), |position| position + 1);
+            (false, common as u64)
+        };
+        self.work.row_compare_bytes += scanned;
+        if equal {
             self.work.rows_reused += 1;
             self.work.row_reuse_bytes += s.len() as u64;
             return;
         }
         row.clear();
         row.push_str(s);
+        self.record_changed(index);
         self.work.row_write_bytes += s.len() as u64;
-        ROWS_WORK
-            .row_write_bytes
-            .fetch_add(s.len() as u64, Ordering::Relaxed);
     }
 
     /// [`Rows::push`] without the throwaway formatted `String`. The formatted
     /// row is always built from scratch, so the pooled slot is cleared first.
     pub fn push_fmt(&mut self, args: std::fmt::Arguments<'_>) {
+        let index = self.next;
         let row = self.claim();
         row.clear();
         let _ = std::fmt::Write::write_fmt(row, args);
         let written = row.len() as u64;
+        self.record_changed(index);
         self.work.row_write_bytes += written;
-        ROWS_WORK
-            .row_write_bytes
-            .fetch_add(written, Ordering::Relaxed);
+    }
+
+    /// Append a whole cached row slice, reusing pooled rows whose bytes are
+    /// already exact and copying only the rows that differ. Returns the bytes
+    /// actually written.
+    ///
+    /// The cache is authoritative for the component's output, but the frame
+    /// canvas is recycled independently: on a cache hit at an unchanged
+    /// position it already holds the same row (the previous frame's raw row),
+    /// and on a content change most of a re-rendered band is unchanged. The
+    /// per-row equality check turns those into a compare-only reuse instead of
+    /// an unconditional `clear + push_str` of the whole band. A moved row (or
+    /// a genuinely changed one) is still copied; the returned byte count is
+    /// what [`FrameWork::cache_copy_bytes`] reports.
+    pub fn append_cached(&mut self, rows: &[String]) -> u64 {
+        let mut written = 0u64;
+        for source in rows {
+            let before = self.work.row_write_bytes;
+            self.push(source.as_str());
+            written += self.work.row_write_bytes - before;
+        }
+        written
     }
 
     /// Mutable access to the row the canvas cursor sits on — the row most
     /// recently appended by [`Rows::push`] / [`Rows::push_fmt`] — for
-    /// padding/painting it in place. Appends an empty row first when the
-    /// frame has none yet (the recycled slot is cleared), so a component can
+    /// padding/painting it in place. Appends an empty row first when this
+    /// canvas has none yet (the recycled slot is cleared), so a component can
     /// claim a fresh row with `out.push("")` and then build it here from
     /// scratch.
     pub fn line_mut(&mut self) -> &mut String {
-        if self.next == 0 {
+        if self.next == self.base {
+            let index = self.next;
+            self.record_changed(index);
             let row = self.claim();
             row.clear();
             return row;
         }
-        &mut self.lines[self.next - 1]
+        let index = self.next - 1;
+        self.record_changed(index);
+        &mut self.lines[index]
     }
 
     /// Mutable access to a row already written in the current frame
@@ -317,6 +594,7 @@ impl<'a> Rows<'a> {
             index < self.next,
             "row {index} is not part of the current frame"
         );
+        self.record_changed(index);
         &mut self.lines[index]
     }
 
@@ -327,14 +605,43 @@ impl<'a> Rows<'a> {
     fn claim(&mut self) -> &mut String {
         let index = self.next;
         if index == self.lines.len() {
-            ROWS_WORK.pool_growth.fetch_add(1, Ordering::Relaxed);
             self.work.pool_growth += 1;
             self.lines.push(String::new());
         }
         self.next = index + 1;
-        ROWS_WORK.row_writes.fetch_add(1, Ordering::Relaxed);
         self.work.row_writes += 1;
         &mut self.lines[index]
+    }
+}
+
+impl Drop for Rows<'_> {
+    /// Publish this canvas's counters to the process-wide [`RowsWork`] as one
+    /// relaxed add per field, instead of one atomic per row. The counters are
+    /// read by frame tests/probes after the render returns, never mid-canvas,
+    /// and `count_global == false` scratch probes stay invisible.
+    fn drop(&mut self) {
+        if !self.count_global {
+            return;
+        }
+        let work = self.work;
+        ROWS_WORK
+            .row_writes
+            .fetch_add(work.row_writes, Ordering::Relaxed);
+        ROWS_WORK
+            .row_write_bytes
+            .fetch_add(work.row_write_bytes, Ordering::Relaxed);
+        ROWS_WORK
+            .row_reuse_bytes
+            .fetch_add(work.row_reuse_bytes, Ordering::Relaxed);
+        ROWS_WORK
+            .rows_reused
+            .fetch_add(work.rows_reused, Ordering::Relaxed);
+        ROWS_WORK
+            .pool_growth
+            .fetch_add(work.pool_growth, Ordering::Relaxed);
+        ROWS_WORK
+            .row_compare_bytes
+            .fetch_add(work.row_compare_bytes, Ordering::Relaxed);
     }
 }
 
@@ -355,12 +662,72 @@ pub trait Component: Send {
         }
     }
 
+    /// Cheap monotone revision of everything [`Component::render_into`] reads
+    /// besides `width` and the global theme generation.
+    ///
+    /// The frame renderer ([`TuiCore::frame_lines`]) caches a component's
+    /// rendered rows keyed on `(revision, width, theme)`. While the revision
+    /// is unchanged it serves those rows without calling `render_into` — a
+    /// spinner tick or cursor move then re-renders only the dock, while the
+    /// transcript band is served from the cache. A hit at the same frame
+    /// position whose raw canvas is still clean is served without touching a
+    /// row; a hit whose position moved (or whose canvas was decorated/clamped)
+    /// compares the cached rows and copies only the changed ones. `None` (the
+    /// default) opts the component OUT of the cache and keeps the per-frame
+    /// render. Components with a per-entry output should implement
+    /// [`Component::content_blocks`] so a content frame re-renders only the
+    /// changed block.
+    ///
+    /// Implementors must bump the value whenever the rendered bytes can
+    /// change (content edits, expansion state, hidden labels, ...). The
+    /// renderer already keys on the width and the process theme generation;
+    /// a component with other global inputs must fold them into the revision.
+    fn content_revision(&self) -> Option<u64> {
+        None
+    }
+
+    /// Optional per-entry/changed-block decomposition for a component whose
+    /// output is a sequence of independently cacheable blocks (the transcript:
+    /// one block per materialized `ChatEntry`).
+    ///
+    /// Returning `Some(revisions)` makes [`TuiCore::frame_lines`] cache the
+    /// rows of each block separately and call [`Component::render_block_into`]
+    /// only for blocks whose revision moved — a streaming delta or one settled
+    /// tool block re-renders that block alone, while the rest of the band is
+    /// served from the block row caches. A block revision must move whenever
+    /// that block's rendered bytes can change; width and theme are already
+    /// frame-cache keys. `None` (the default) keeps the whole-component cache
+    /// from [`Component::content_revision`].
+    ///
+    /// A block component must keep its block count stable between calls that
+    /// return the same `Some`; the frame renderer caches block rows aligned by
+    /// index and treats a shortened list as a component shrink.
+    fn content_blocks(&self) -> Option<Vec<u64>> {
+        None
+    }
+
+    /// Render block `index` into the recycled row canvas. Only called when
+    /// [`Component::content_blocks`] returned `Some` and that block's revision
+    /// moved (or its position changed). The default delegates to
+    /// [`Component::render_into`], which is only correct for single-block
+    /// components.
+    fn render_block_into(&self, _index: usize, width: usize, out: &mut Rows<'_>) {
+        self.render_into(width, out);
+    }
+
     fn invalidate(&self) {}
+}
+
+/// FNV-1a mix used by the aggregate content revisions (`Container`,
+/// `ReservedScrollbarColumn`). Deterministic and allocation-free.
+#[doc(hidden)]
+pub(crate) fn mix_content_revision(state: u64, value: u64) -> u64 {
+    (state ^ value).wrapping_mul(0x0000_0100_0000_01B3)
 }
 
 /// Append one blank row of `width` spaces — the `" ".repeat(width)` row the
 /// pre-migration components allocated per frame.
-fn push_blank(out: &mut Rows<'_>, width: usize) {
+pub(crate) fn push_blank(out: &mut Rows<'_>, width: usize) {
     out.push("");
     let row = out.line_mut();
     row.reserve(width);
@@ -524,11 +891,25 @@ impl DockMouseLayout {
     }
 }
 
+/// The flattened block layout of a [`Container`]'s current children: the
+/// cumulative exclusive end offset of every child's block list. Filled once
+/// by [`Component::content_blocks`] and consumed by
+/// [`Component::render_block_into`], so rendering block `k` does not re-expand
+/// every preceding child's block list (the cold-frame O(N²) metadata walk).
+struct BlockLayout {
+    child_count: usize,
+    ends: Vec<usize>,
+}
+
 /// A vertical container: children render top-to-bottom
 /// (upstream `Container`).
 #[derive(Default)]
 pub struct Container {
     children: Vec<Box<dyn Component>>,
+    /// Cached block layout for the current child list; invalidated by every
+    /// structural mutation. `None` means `render_block_into` must expand the
+    /// block lists itself (a direct caller that skipped `content_blocks`).
+    block_layout: Mutex<Option<BlockLayout>>,
 }
 
 impl Container {
@@ -536,13 +917,22 @@ impl Container {
         Self::default()
     }
 
+    fn invalidate_block_layout(&self) {
+        *self
+            .block_layout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     pub fn add_child(&mut self, component: impl Component + 'static) {
         self.children.push(Box::new(component));
+        self.invalidate_block_layout();
     }
 
     pub fn remove_child(&mut self, index: usize) {
         if index < self.children.len() {
             self.children.remove(index);
+            self.invalidate_block_layout();
         }
     }
 
@@ -558,6 +948,7 @@ impl Container {
     pub fn insert_child(&mut self, index: usize, component: impl Component + 'static) {
         let index = index.min(self.children.len());
         self.children.insert(index, Box::new(component));
+        self.invalidate_block_layout();
     }
 
     /// Replace `remove` children starting at `index` with `insert`, in one
@@ -573,10 +964,12 @@ impl Container {
         let index = index.min(self.children.len());
         let end = (index + remove).min(self.children.len());
         self.children.splice(index..end, insert);
+        self.invalidate_block_layout();
     }
 
     pub fn clear(&mut self) {
         self.children.clear();
+        self.invalidate_block_layout();
     }
 
     /// Release the child-vector allocation after the children were dropped.
@@ -601,6 +994,18 @@ impl Container {
     }
 }
 
+/// Block revisions of a child that only exposes a whole-component revision:
+/// a single block keyed by that revision. `None` keeps the parent on the
+/// whole-component cache path.
+fn child_block_revisions(component: &dyn Component) -> Option<Vec<u64>> {
+    if let Some(blocks) = component.content_blocks() {
+        return Some(blocks);
+    }
+    component
+        .content_revision()
+        .map(|revision| vec![mix_content_revision(revision, 0x9e37_79b9_7f4a_7c15)])
+}
+
 impl Component for Container {
     fn render(&self, width: usize) -> Vec<String> {
         let mut lines = Vec::new();
@@ -619,6 +1024,91 @@ impl Component for Container {
     fn render_into(&self, width: usize, out: &mut Rows<'_>) {
         for child in &self.children {
             child.render_into(width, out);
+        }
+    }
+
+    /// The container is clean exactly when every child is clean: the
+    /// transcript wrapper (header + `SharedChat`) reports `Some`, while a
+    /// container holding an unversioned component stays uncached (`None`).
+    fn content_revision(&self) -> Option<u64> {
+        let mut state = 0xcbf2_9ce4_8422_2325u64;
+        for child in &self.children {
+            state = mix_content_revision(state, child.content_revision()?);
+        }
+        Some(state)
+    }
+
+    /// Flatten the children's blocks: a child with its own decomposition
+    /// contributes its block revisions, a child with only a whole-component
+    /// revision contributes one block, and an unversioned child disables the
+    /// block cache for the whole container (the safe fallback).
+    ///
+    /// The per-child cumulative offsets are cached for
+    /// [`Component::render_block_into`]: the frame renderer calls this once
+    /// per frame and then renders every block, so re-expanding each child's
+    /// block list per block would be O(blocks × entries) metadata work on a
+    /// cold 512-block band.
+    fn content_blocks(&self) -> Option<Vec<u64>> {
+        let mut blocks = Vec::new();
+        let mut ends = Vec::with_capacity(self.children.len());
+        for child in &self.children {
+            let Some(revisions) = child_block_revisions(child.as_ref()) else {
+                self.invalidate_block_layout();
+                return None;
+            };
+            blocks.extend(revisions);
+            ends.push(blocks.len());
+        }
+        *self
+            .block_layout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(BlockLayout {
+            child_count: self.children.len(),
+            ends,
+        });
+        Some(blocks)
+    }
+
+    fn render_block_into(&self, index: usize, width: usize, out: &mut Rows<'_>) {
+        // Fast path: the frame renderer already flattened the block list (and
+        // recorded the child offsets) before rendering blocks. Locate the
+        // owning child with a binary search over the cumulative ends.
+        let target = {
+            let layout = self
+                .block_layout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            layout.as_ref().and_then(|layout| {
+                if layout.child_count != self.children.len() {
+                    return None;
+                }
+                let child = layout.ends.partition_point(|&end| end <= index);
+                if child >= self.children.len() {
+                    return None;
+                }
+                let start = child.checked_sub(1).map_or(0, |prev| layout.ends[prev]);
+                Some((child, index - start))
+            })
+        };
+        if let Some((child, local_index)) = target {
+            // `render_block_into`'s default implementation falls back to a
+            // whole-component render, which is exactly the single synthesized
+            // block of a child that only exposes `content_revision`.
+            self.children[child].render_block_into(local_index, width, out);
+            return;
+        }
+        // Direct caller without a preceding `content_blocks` (or a stale
+        // layout): expand the child block lists once for this call.
+        let mut local_index = index;
+        for child in &self.children {
+            let Some(revisions) = child_block_revisions(child.as_ref()) else {
+                return;
+            };
+            if local_index < revisions.len() {
+                child.render_block_into(local_index, width, out);
+                return;
+            }
+            local_index -= revisions.len();
         }
     }
 
@@ -718,6 +1208,45 @@ impl Component for ReservedScrollbarColumn {
         }
         for index in start..out.len() {
             out.line_at(index).push(' ');
+        }
+    }
+
+    /// The wrapper adds only the reserve column / trailing space on top of the
+    /// child rows, so its revision is the child's plus the live reserve flag.
+    fn content_revision(&self) -> Option<u64> {
+        let child = self.child.content_revision()?;
+        Some(mix_content_revision(child, u64::from(self.reserves())))
+    }
+
+    /// Propagate the child's block decomposition with the reserve flag folded
+    /// into every block revision; the padding is applied per block in
+    /// [`Self::render_block_into`].
+    fn content_blocks(&self) -> Option<Vec<u64>> {
+        let reserve = u64::from(self.reserves());
+        Some(
+            child_block_revisions(self.child.as_ref())?
+                .into_iter()
+                .map(|revision| mix_content_revision(revision, reserve))
+                .collect(),
+        )
+    }
+
+    fn render_block_into(&self, index: usize, width: usize, out: &mut Rows<'_>) {
+        let content_width = if self.reserves() && width > 1 {
+            width - 1
+        } else {
+            width
+        };
+        let start = out.len();
+        // Always delegate to the child's block renderer: a child that only
+        // exposes a whole-component revision uses the trait's default
+        // `render_block_into` (a whole render, exactly its single synthesized
+        // block), so no per-block `content_blocks()` expansion is needed.
+        self.child.render_block_into(index, content_width, out);
+        if content_width != width {
+            for row in start..out.len() {
+                out.line_at(row).push(' ');
+            }
         }
     }
 
@@ -1661,6 +2190,44 @@ impl Drop for Terminal {
 /// copy of it per written row.
 const SEGMENT_RESET: &str = "\x1b[0m\x1b]8;;\x07";
 
+/// One top-level content component's row cache, aligned by index with the
+/// [`TuiCore::content`] vector.
+///
+/// A component that reports [`Component::content_revision`] is rendered into
+/// `rows` only when `(revision, width, theme)` moves; a miss reuses the slot's
+/// existing row buffer as the render target (no fresh `Vec<String>` per
+/// content frame). A hit at the same start on a clean raw canvas is served
+/// without touching a row; a moved/decorated hit re-appends through
+/// [`Rows::append_cached`], which compares each row and copies only the rows
+/// that changed. Components without a revision keep `revision == None` and
+/// are rendered into the frame every time; their `rows` stays empty. A
+/// component that reports [`Component::content_blocks`] gets one
+/// [`FrameBlockSlot`] per block instead of one whole-component slot.
+#[derive(Default)]
+struct FrameComponentSlot {
+    revision: Option<u64>,
+    width: usize,
+    theme: u64,
+    /// Absolute frame row this component was placed at in the frame it
+    /// produced. A cache hit at the same start with a clean raw canvas can be
+    /// served without touching the pooled rows at all.
+    start: usize,
+    rows: Vec<String>,
+    /// Per-block caches for a component that implements
+    /// [`Component::content_blocks`]; empty for whole-component slots.
+    blocks: Vec<FrameBlockSlot>,
+}
+
+/// One independently cached block of a [`Component::content_blocks`]
+/// component. `rows` is the block's own recycled render target, so a changed
+/// block re-renders in place and an unchanged block is not touched.
+struct FrameBlockSlot {
+    revision: u64,
+    /// Absolute frame row this block started at in the frame it produced.
+    start: usize,
+    rows: Vec<String>,
+}
+
 /// The differential main-screen renderer.
 pub struct TuiCore {
     terminal: Arc<Terminal>,
@@ -1677,6 +2244,23 @@ pub struct TuiCore {
     /// the live snapshot (`last_frame`) nor the live diff baseline
     /// (`previous_lines`) — both stay distinct buffers.
     frame_scratch: Vec<String>,
+    /// Per-top-level-component rendered-row caches (see
+    /// [`FrameComponentSlot`] and [`TuiCore::frame_lines`]). Cleared whenever
+    /// the raw frame is invalidated so the next frame rebuilds everything.
+    frame_slots: Vec<FrameComponentSlot>,
+    /// Whether `frame_scratch` still holds the previous frame's RAW rows (no
+    /// decorator paint, no width clamp). Only then may a cache hit at the same
+    /// frame position skip the per-row exact-content comparison: the pooled
+    /// row already holds the cached bytes. Any path that paints/clamps the
+    /// work buffer clears it, and the next frame falls back to the comparing
+    /// append.
+    frame_scratch_raw: bool,
+    /// Exact absolute row indices whose raw bytes changed while building the
+    /// most recent frame (`None` = markers unavailable because the pooled
+    /// canvas was decorated/clamped and the row compares ran against stale
+    /// bytes). The regular main-screen path uses it to skip unchanged rows in
+    /// the changed-line scan.
+    last_frame_dirty: Option<Vec<usize>>,
     /// Recycle pool for the windowed render path ([`TuiCore::render_scrolled`]):
     /// the buffer `previous_lines` retired one scrolled frame earlier, reused
     /// row by row (`clone_from`) instead of allocating a fresh painted frame
@@ -1744,6 +2328,10 @@ pub struct TuiCore {
     /// canvas only): tests pin the steady-frame row-copy bytes through this
     /// per-instance copy, so parallel tests cannot pollute the measurement.
     last_rows_work: RowsWork,
+    /// [`FrameWork`] of the most recent [`TuiCore::frame_lines`] (this core's
+    /// build only): `rebuilt_rows`, rerendered rows and cache hits. Per-core
+    /// so a frame-cache test is unaffected by parallel frames in other tests.
+    last_frame_work: FrameWork,
     /// Set by [`TuiCore::invalidate_frame`]: the next full render must clear
     /// the screen (`2J` + home + `3J`) — the caller knows rows below the new
     /// content are stale (e.g. after an overlay swapped the alternate screen
@@ -1934,6 +2522,9 @@ impl TuiCore {
             content: Mutex::new(Vec::new()),
             previous_lines: Vec::new(),
             frame_scratch: Vec::new(),
+            frame_slots: Vec::new(),
+            frame_scratch_raw: true,
+            last_frame_dirty: None,
             scrolled_scratch: Vec::new(),
             previous_width: 0,
             previous_height: 0,
@@ -1954,6 +2545,7 @@ impl TuiCore {
             frame_version: 0,
             last_frame_changed_rows: None,
             last_rows_work: RowsWork::default(),
+            last_frame_work: FrameWork::default(),
             force_clear: false,
             dock_cursor_cell: None,
             show_hardware_cursor: false,
@@ -2200,6 +2792,15 @@ impl TuiCore {
         self.last_rows_work
     }
 
+    /// [`FrameWork`] of the last [`TuiCore::render`]'s component build (this
+    /// core's own measurement; the process-wide counters include concurrent
+    /// tests). `rebuilt_rows`/`rerendered_rows` count rows whose component
+    /// re-ran `render_into`; `cached_rows` counts rows the revision cache
+    /// served without a render.
+    pub fn last_frame_work(&self) -> FrameWork {
+        self.last_frame_work
+    }
+
     /// Map a screen row (0-based from the top of the terminal) to the absolute
     /// buffer row whose undecorated line is shown there; `None` for a row
     /// below the painted content (a frame shorter than the screen).
@@ -2279,23 +2880,270 @@ impl TuiCore {
     /// assignments in [`TuiCore::render`]).
     fn frame_lines(&mut self, width: usize) -> Vec<String> {
         let mut scratch = std::mem::take(&mut self.frame_scratch);
+        // Only a canvas that still holds the previous frame's RAW rows may
+        // serve a same-position cache hit without comparing: a decorator or
+        // width clamp may have rewritten rows that the cache would restore.
+        let scratch_was_raw = self.frame_scratch_raw;
+        let previous_scratch_len = scratch.len();
+        // The pool is the previous RAW frame only when it also has the
+        // previous frame's length. The first full repaint parks the retired
+        // baseline (empty on the first frame), so an empty short pool must not
+        // be treated as "every row already matches".
+        let scratch_matches_last = scratch_was_raw && previous_scratch_len == self.last_frame.len();
+        let theme = super::theme::Theme::generation();
+        let mut new_slots: Vec<FrameComponentSlot> = Vec::new();
+        let mut work = RowsWork::default();
+        let mut rerendered_rows = 0u64;
+        let mut rebuilt_blocks = 0u64;
+        let mut cached_rows = 0u64;
+        let mut cache_copy_bytes = 0u64;
+        let mut cache_buffer_allocs = 0u64;
+        let mut cache_buffer_reuses = 0u64;
+        let mut dirty: Vec<usize> = Vec::new();
+        // Dirty markers are exact only when every append compared against the
+        // previous frame's raw bytes. A decorated/clamped canvas (or a pool
+        // that does not hold that whole frame) invalidates the comparison
+        // baseline, so the regular diff falls back to a scan.
+        let dirty_known = scratch_matches_last;
+        let mut cursor = 0usize;
         {
-            let mut rows = Rows::new(&mut scratch);
-            rows.rewind();
-            for component in self
+            let content = self
                 .content
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-            {
-                component.render_into(width, &mut rows);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            new_slots.reserve(content.len());
+            for (index, component) in content.iter().enumerate() {
+                let revision = component.content_revision();
+                let component_start = cursor;
+                let previous = if index < self.frame_slots.len() {
+                    Some(std::mem::take(&mut self.frame_slots[index]))
+                } else {
+                    None
+                };
+                let geometry_matches = previous
+                    .as_ref()
+                    .is_some_and(|slot| slot.width == width && slot.theme == theme);
+                if let Some(block_revisions) = component.content_blocks() {
+                    let mut previous_blocks: Vec<Option<FrameBlockSlot>> = previous
+                        .map(|slot| slot.blocks.into_iter().map(Some).collect())
+                        .unwrap_or_default();
+                    let mut blocks = Vec::with_capacity(block_revisions.len());
+                    for (block_index, block_revision) in block_revisions.into_iter().enumerate() {
+                        let previous_block =
+                            previous_blocks.get_mut(block_index).and_then(Option::take);
+                        let hit = geometry_matches
+                            && previous_block
+                                .as_ref()
+                                .is_some_and(|block| block.revision == block_revision);
+                        let previous_start = previous_block.as_ref().map(|block| block.start);
+                        let had_previous = previous_block.is_some();
+                        let mut rows = previous_block.map(|block| block.rows).unwrap_or_default();
+                        if !hit {
+                            let reused = had_previous;
+                            if reused {
+                                cache_buffer_reuses += 1;
+                            } else {
+                                cache_buffer_allocs += 1;
+                            }
+                            let rendered_len;
+                            {
+                                let mut out = Rows::new(&mut rows);
+                                component.render_block_into(block_index, width, &mut out);
+                                out.trim();
+                                work += out.work();
+                                rendered_len = out.len();
+                            }
+                            rerendered_rows += rendered_len as u64;
+                            rebuilt_blocks += 1;
+                        }
+                        // A hit at the SAME frame position on a clean raw
+                        // canvas already holds exactly these bytes: serve it
+                        // with no comparison and no write.
+                        if hit
+                            && previous_start == Some(cursor)
+                            && scratch_matches_last
+                            && cursor + rows.len() <= scratch.len()
+                        {
+                            cached_rows += rows.len() as u64;
+                        } else {
+                            let mut out = Rows::at(&mut scratch, cursor);
+                            cache_copy_bytes += out.append_cached(&rows);
+                            if dirty_known {
+                                dirty.extend_from_slice(out.changed_rows());
+                            }
+                            work += out.work();
+                            if hit {
+                                cached_rows += rows.len() as u64;
+                            }
+                        }
+                        cursor += rows.len();
+                        blocks.push(FrameBlockSlot {
+                            revision: block_revision,
+                            start: cursor.saturating_sub(rows.len()),
+                            rows,
+                        });
+                    }
+                    // Previous blocks beyond the new count are dropped with
+                    // `previous_blocks`; their rows are not part of the frame.
+                    new_slots.push(FrameComponentSlot {
+                        revision,
+                        width,
+                        theme,
+                        start: component_start,
+                        rows: Vec::new(),
+                        blocks,
+                    });
+                    continue;
+                }
+                let cache_hit = revision.is_some_and(|revision| {
+                    geometry_matches
+                        && previous.as_ref().is_some_and(|slot| {
+                            slot.revision == Some(revision) && slot.blocks.is_empty()
+                        })
+                });
+                if cache_hit {
+                    // The slot's rows were produced under this exact
+                    // (revision, width, theme). A same-position hit on a clean
+                    // raw canvas is served without touching the canvas; a hit
+                    // whose position moved (or whose canvas was decorated)
+                    // re-appends through the exact-content check.
+                    let start = previous.as_ref().map_or(usize::MAX, |slot| slot.start);
+                    let rows = previous.map(|slot| slot.rows).unwrap_or_default();
+                    if start == cursor
+                        && scratch_matches_last
+                        && cursor + rows.len() <= scratch.len()
+                    {
+                        cached_rows += rows.len() as u64;
+                    } else {
+                        let mut out = Rows::at(&mut scratch, cursor);
+                        cache_copy_bytes += out.append_cached(&rows);
+                        if dirty_known {
+                            dirty.extend_from_slice(out.changed_rows());
+                        }
+                        work += out.work();
+                        cached_rows += rows.len() as u64;
+                    }
+                    cursor += rows.len();
+                    new_slots.push(FrameComponentSlot {
+                        revision,
+                        width,
+                        theme,
+                        start: component_start,
+                        rows,
+                        blocks: Vec::new(),
+                    });
+                } else if let Some(revision) = revision {
+                    // Content changed: rebuild this component's cached rows
+                    // in the slot's recycled buffer (a first render allocates
+                    // the Vec; every later miss rewinds the same one), then
+                    // append them at the current frame position with the
+                    // exact-content check.
+                    let (mut rows, reused) = match previous {
+                        Some(slot) if slot.revision.is_some() => (slot.rows, true),
+                        _ => (Vec::new(), false),
+                    };
+                    if reused {
+                        cache_buffer_reuses += 1;
+                    } else {
+                        cache_buffer_allocs += 1;
+                    }
+                    {
+                        let mut out = Rows::new(&mut rows);
+                        component.render_into(width, &mut out);
+                        out.trim();
+                        work += out.work();
+                    }
+                    let mut out = Rows::at(&mut scratch, cursor);
+                    cache_copy_bytes += out.append_cached(&rows);
+                    if dirty_known {
+                        dirty.extend_from_slice(out.changed_rows());
+                    }
+                    work += out.work();
+                    rerendered_rows += rows.len() as u64;
+                    rebuilt_blocks += 1;
+                    cursor += rows.len();
+                    new_slots.push(FrameComponentSlot {
+                        revision: Some(revision),
+                        width,
+                        theme,
+                        start: component_start,
+                        rows,
+                        blocks: Vec::new(),
+                    });
+                } else {
+                    // Unversioned component: render it into the frame
+                    // directly, exactly like the pre-cache path.
+                    let mut out = Rows::at(&mut scratch, cursor);
+                    component.render_into(width, &mut out);
+                    let len = out.len() - cursor;
+                    if dirty_known {
+                        dirty.extend_from_slice(out.changed_rows());
+                    }
+                    work += out.work();
+                    rerendered_rows += len as u64;
+                    rebuilt_blocks += 1;
+                    cursor += len;
+                    new_slots.push(FrameComponentSlot {
+                        revision: None,
+                        width,
+                        theme,
+                        start: component_start,
+                        rows: Vec::new(),
+                        blocks: Vec::new(),
+                    });
+                }
             }
-            rows.trim();
-            self.last_rows_work = rows.work();
-            FRAME_WORK
-                .rebuilt_rows
-                .fetch_add(rows.len() as u64, Ordering::Relaxed);
         }
+        // Rows the new frame shrank away are removals the diff must process
+        // even though no remaining row was written.
+        if cursor < previous_scratch_len && dirty_known {
+            dirty.extend(cursor..previous_scratch_len);
+        }
+        scratch.truncate(cursor);
+        if dirty_known {
+            dirty.sort_unstable();
+            dirty.dedup();
+            self.last_frame_dirty = Some(dirty);
+        } else {
+            self.last_frame_dirty = None;
+        }
+        // Every row of the rebuilt canvas was either left as the previous raw
+        // row (a same-position hit) or pushed through the exact-content check;
+        // the canvas therefore holds raw frame bytes again.
+        self.frame_scratch_raw = true;
+        self.frame_slots = new_slots;
+        self.last_rows_work = work;
+        self.last_frame_work = FrameWork {
+            rebuilt_rows: rerendered_rows,
+            rebuilt_blocks,
+            rerendered_rows,
+            cached_rows,
+            cache_copy_bytes,
+            cache_buffer_allocs,
+            cache_buffer_reuses,
+            ..FrameWork::default()
+        };
+        FRAME_WORK
+            .rebuilt_rows
+            .fetch_add(rerendered_rows, Ordering::Relaxed);
+        FRAME_WORK
+            .rebuilt_blocks
+            .fetch_add(rebuilt_blocks, Ordering::Relaxed);
+        FRAME_WORK
+            .rerendered_rows
+            .fetch_add(rerendered_rows, Ordering::Relaxed);
+        FRAME_WORK
+            .cached_rows
+            .fetch_add(cached_rows, Ordering::Relaxed);
+        FRAME_WORK
+            .cache_copy_bytes
+            .fetch_add(cache_copy_bytes, Ordering::Relaxed);
+        FRAME_WORK
+            .cache_buffer_allocs
+            .fetch_add(cache_buffer_allocs, Ordering::Relaxed);
+        FRAME_WORK
+            .cache_buffer_reuses
+            .fetch_add(cache_buffer_reuses, Ordering::Relaxed);
         scratch
     }
 
@@ -2326,20 +3174,23 @@ impl TuiCore {
     /// factory renderer, decorator or a width mis-measurement can; the write
     /// paths clamp as a guard instead of letting one bad row corrupt the
     /// whole frame.
-    fn clamp_row_width(line: &mut String, width: usize) {
+    fn clamp_row_width(line: &mut String, width: usize) -> bool {
         if width == 0 {
+            let changed = !line.is_empty();
             line.clear();
-            return;
+            return changed;
         }
         // Image payload rows are escape-sequence framing, not text: their
         // visible width is meaningless here (upstream skips `isImageLine` in
         // the same clamp).
         if super::terminal_image::is_image_line(line) {
-            return;
+            return false;
         }
         if ansi::visible_width(line.as_str()) > width {
             *line = ansi::truncate_to_width(line, width, "");
+            return true;
         }
+        false
     }
 
     /// Publish a frame branch's written-row count to [`FrameWork::reset_rows`]
@@ -2488,19 +3339,38 @@ impl TuiCore {
         let mut snapshot_rows = 0u64;
         let mut snapshot_bytes = 0u64;
         let mut changed_rows: Option<(usize, usize)> = None;
-        for (index, (line, snapshot)) in
-            new_lines.iter_mut().zip(self.last_frame.iter()).enumerate()
-        {
-            if line == snapshot {
-                continue;
+        if let Some(dirty) = self.last_frame_dirty.clone() {
+            // The frame builder's exact dirty markers already compared the
+            // fresh frame against this same previous-raw buffer. Copy only the
+            // marked rows into the recycled work buffer instead of scanning
+            // every row of a long transcript again.
+            for &index in &dirty {
+                if index >= self.last_frame.len() {
+                    continue;
+                }
+                new_lines[index].clone_from(&self.last_frame[index]);
+                snapshot_rows += 1;
+                snapshot_bytes += self.last_frame[index].len() as u64;
+                changed_rows = Some(match changed_rows {
+                    Some((first, _)) => (first, index),
+                    None => (index, index),
+                });
             }
-            line.clone_from(snapshot);
-            snapshot_rows += 1;
-            snapshot_bytes += snapshot.len() as u64;
-            changed_rows = Some(match changed_rows {
-                Some((first, _)) => (first, index),
-                None => (index, index),
-            });
+        } else {
+            for (index, (line, snapshot)) in
+                new_lines.iter_mut().zip(self.last_frame.iter()).enumerate()
+            {
+                if line == snapshot {
+                    continue;
+                }
+                line.clone_from(snapshot);
+                snapshot_rows += 1;
+                snapshot_bytes += snapshot.len() as u64;
+                changed_rows = Some(match changed_rows {
+                    Some((first, _)) => (first, index),
+                    None => (index, index),
+                });
+            }
         }
         // A frame-length change realigns every row from the shorter end, so
         // the search cache must not trust a narrow range; mark the whole
@@ -2561,6 +3431,11 @@ impl TuiCore {
                 scroll_offset: 0,
             },
         );
+        if self.decorator.is_some() {
+            // The decorator paints into the raw frame in the follow path;
+            // the pool no longer holds raw bytes for the next cache hit.
+            self.frame_scratch_raw = false;
+        }
         // No whole-frame reset pass any more: every write path appends the
         // per-line reset lazily to the rows it writes (see
         // [`TuiCore::append_line_reset`]), and the baseline keeps exactly the
@@ -2585,12 +3460,13 @@ impl TuiCore {
                 // keeps this correct if it is not.
                 out.push_str("\x1b[H");
             }
+            let mut clamped = false;
             for (i, line) in new_lines.iter_mut().enumerate() {
                 if i > 0 {
                     out.push_str("\r\n");
                 }
                 out.push_str("\x1b[2K");
-                Self::clamp_row_width(line, width);
+                clamped |= Self::clamp_row_width(line, width);
                 Self::append_line_reset(line);
                 out.push_str(line);
             }
@@ -2621,6 +3497,10 @@ impl TuiCore {
                 }
             }
             core.frame_scratch = retired;
+            // The retired baseline is raw only if nothing clamped it (the
+            // lazy reset is stripped above); a decorated/clamped canvas must
+            // make the next frame compare before serving cache hits.
+            core.frame_scratch_raw = core.frame_scratch_raw && !clamped;
             core.previous_width = width;
             core.previous_height = height;
             core.hardware_cursor_row = moved.unwrap_or(last_row);
@@ -2653,20 +3533,51 @@ impl TuiCore {
         let max_lines = new_lines.len().max(self.previous_lines.len());
         let mut first_changed: isize = -1;
         let mut last_changed: isize = -1;
-        for i in 0..max_lines {
-            let old = self.previous_lines.get(i).map(String::as_str).unwrap_or("");
-            let new = new_lines.get(i).map(String::as_str).unwrap_or("");
-            let old = old.strip_suffix(SEGMENT_RESET).unwrap_or(old);
-            if old != new {
-                if first_changed == -1 {
-                    first_changed = i as isize;
-                }
-                last_changed = i as isize;
+        // The frame builder already compared every row it copied into the
+        // canvas. When that comparison ran against the previous frame's RAW
+        // rows (no decorator/clamp rewrote the pool), its dirty markers are
+        // exact and the regular path need not scan unchanged rows again.
+        // `None` falls back to the full-frame scan.
+        let marker_dirty = if self.decorator.is_none() {
+            self.last_frame_dirty.take()
+        } else {
+            self.last_frame_dirty = None;
+            None
+        };
+        let mut scanned_rows = 0u64;
+        let mut skipped_rows = 0u64;
+        if let Some(dirty) = marker_dirty {
+            // `dirty` is sorted+deduped by `frame_lines`; rows past the new
+            // length are the shrink's removals.
+            if let (Some(first), Some(last)) = (dirty.first(), dirty.last()) {
+                first_changed = *first as isize;
+                last_changed = *last as isize;
             }
+            skipped_rows = (max_lines as u64).saturating_sub(dirty.len() as u64);
+        } else {
+            for i in 0..max_lines {
+                let old = self.previous_lines.get(i).map(String::as_str).unwrap_or("");
+                let new = new_lines.get(i).map(String::as_str).unwrap_or("");
+                let old = old.strip_suffix(SEGMENT_RESET).unwrap_or(old);
+                if old != new {
+                    if first_changed == -1 {
+                        first_changed = i as isize;
+                    }
+                    last_changed = i as isize;
+                }
+            }
+            scanned_rows = max_lines as u64;
         }
         FRAME_WORK
             .diff_scanned_rows
-            .fetch_add(max_lines as u64, Ordering::Relaxed);
+            .fetch_add(scanned_rows, Ordering::Relaxed);
+        FRAME_WORK
+            .diff_skipped_rows
+            .fetch_add(skipped_rows, Ordering::Relaxed);
+        // Per-core copy of the same measurement (the process-wide counter is
+        // shared with parallel tests).
+        self.last_frame_work.diff_scanned_rows = scanned_rows;
+        self.last_frame_work.diff_skipped_rows = skipped_rows;
         let appended_lines = new_lines.len() > self.previous_lines.len();
         if appended_lines {
             if first_changed == -1 {
@@ -2691,7 +3602,11 @@ impl TuiCore {
             let mut cursor_out = String::new();
             let moved = self.append_cursor_sync(
                 &mut cursor_out,
-                frame_len.saturating_sub(1),
+                // FIX-B06: the cursor's real row is `hardware_cursor_row`,
+                // not the frame's last row — the dock cell may sit above it,
+                // and using `frame_len - 1` would move the cursor by that
+                // offset again on every unchanged frame (drift).
+                self.hardware_cursor_row,
                 frame_len,
                 prev_viewport_top,
                 false,
@@ -2795,8 +3710,9 @@ impl TuiCore {
         // bytes ARE the baseline bytes of the frame that wrote it).
         // `clone_from` reuses each baseline row's allocation, so a one-row
         // spinner tick copies one row, not the whole frame.
+        let mut clamped = false;
         for i in first_changed..=render_end {
-            Self::clamp_row_width(&mut new_lines[i], width);
+            clamped |= Self::clamp_row_width(&mut new_lines[i], width);
             self.previous_lines[i].clone_from(&new_lines[i]);
             Self::append_line_reset(&mut self.previous_lines[i]);
         }
@@ -2889,6 +3805,7 @@ impl TuiCore {
         self.previous_lines.truncate(new_lines.len());
         let frame_len = new_lines.len();
         self.frame_scratch = new_lines;
+        self.frame_scratch_raw = self.frame_scratch_raw && !clamped;
         self.previous_width = width;
         self.previous_height = height;
         self.last_window_start = self.previous_viewport_top;
@@ -3120,6 +4037,9 @@ impl TuiCore {
     /// (`previous_lines` empty and no `invalidate_frame`) skips the clear.
     pub fn invalidate_frame(&mut self) {
         self.previous_lines.clear();
+        // The component row caches describe a frame whose bytes the caller
+        // has declared stale; the next frame must re-render every component.
+        self.frame_slots.clear();
         self.previous_width = 0;
         self.previous_height = 0;
         self.hardware_cursor_row = 0;

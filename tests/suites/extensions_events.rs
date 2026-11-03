@@ -1217,6 +1217,9 @@ async fn ctx_facade_reports_session_model_and_thinking() {
                         total_tokens: 500,
                         ..Default::default()
                     },
+                    // Providers stamp responses when they finish; the usage
+                    // validity walk rejects a record older than the prefix.
+                    timestamp: pir::ai::util::now_ms(),
                     ..Default::default()
                 },
             ));

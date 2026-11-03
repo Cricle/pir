@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pir::ai::providers::construction::model;
+use pir::ai::providers::construction::{model, ModelSpec};
 use pir::sdk::{AgentBuilder, SdkError, SessionMode};
 
 // ---------------------------------------------------------------------------
@@ -116,16 +116,16 @@ fn write_auth(agent_dir: &Path, provider: &str) {
 }
 
 fn hermetic_model() -> pir::ai::types::Model {
-    model(
-        "w16-hermetic",
-        "w16-hermetic-model",
-        "w16-hermetic-model",
-        "openai-chat",
-        "http://127.0.0.1:9/v1",
-        128_000,
-        8_192,
-        vec!["text"],
-    )
+    model(ModelSpec {
+        provider: "w16-hermetic",
+        id: "w16-hermetic-model",
+        name: "w16-hermetic-model",
+        api: "openai-chat",
+        base_url: "http://127.0.0.1:9/v1",
+        context_window: 128_000,
+        max_tokens: 8_192,
+        input: vec!["text"],
+    })
 }
 
 /// An agent with no model resolution at all (a caller-supplied registry), so

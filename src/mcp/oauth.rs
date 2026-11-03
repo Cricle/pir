@@ -1856,7 +1856,7 @@ impl McpOAuthServerStore {
             STORE_LOCK_STALE,
         )
         .await?;
-        let mut states = read_states(&self.auth_path);
+        let mut states = read_states(&self.auth_path)?;
         // The first server to load legacy state takes it over (upstream
         // oauth.ts:154-162).
         if !states.contains_key(&self.key) {
@@ -1890,7 +1890,7 @@ impl McpOAuthServerStore {
             STORE_LOCK_STALE,
         )
         .await?;
-        let mut states = read_states(&self.auth_path);
+        let mut states = read_states(&self.auth_path)?;
         let mut state = states
             .remove(&self.key)
             .or_else(|| states.remove(&self.legacy_key))
@@ -1911,7 +1911,7 @@ impl McpOAuthServerStore {
             STORE_LOCK_STALE,
         )
         .await?;
-        let mut states = read_states(&self.auth_path);
+        let mut states = read_states(&self.auth_path)?;
         let stored = if states.contains_key(&self.key) {
             Some(self.key.clone())
         } else if states.contains_key(&self.legacy_key) {
@@ -1966,46 +1966,41 @@ fn lock_path(auth_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.lock", auth_path.display()))
 }
 
-fn read_states(auth_path: &Path) -> StoredStates {
-    let Ok(contents) = std::fs::read_to_string(auth_path) else {
-        return StoredStates::new();
+/// Read every server's stored state.
+///
+/// A missing, empty, or BOM-only file is an empty table (first run). A
+/// non-empty file that does not parse is an ERROR, never a silent reset: a
+/// truncated/corrupt `mcp-auth.json` must not wipe every server's credentials
+/// on the next refresh write.
+fn read_states(auth_path: &Path) -> OAuthResult<StoredStates> {
+    let contents = match std::fs::read_to_string(auth_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StoredStates::new())
+        }
+        Err(error) => {
+            return Err(fatal(format!(
+                "failed to read {}: {error}",
+                auth_path.display()
+            )))
+        }
     };
     let trimmed = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
     if trimmed.trim().is_empty() {
-        return StoredStates::new();
+        return Ok(StoredStates::new());
     }
-    serde_json::from_str::<StoredStates>(trimmed).unwrap_or_default()
+    serde_json::from_str::<StoredStates>(trimmed)
+        .map_err(|error| fatal(format!("failed to parse {}: {error}", auth_path.display())))
 }
 
-/// Pretty JSON with a trailing newline (upstream `serializeStates`).
+/// Pretty JSON with a trailing newline (upstream `serializeStates`), written
+/// atomically (same-directory temp + fsync + rename, `0600`).
 fn write_states(auth_path: &Path, states: &StoredStates) -> OAuthResult<()> {
-    if let Some(parent) = auth_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|error| fatal(error.to_string()))?;
-        }
-    }
     let contents = serde_json::to_string_pretty(states)
         .map(|json| json + "\n")
         .map_err(|error| fatal(format!("failed to serialize mcp-auth.json: {error}")))?;
-    write_private(auth_path, &contents).map_err(|error| fatal(error.to_string()))
-}
-
-#[cfg(unix)]
-fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(contents.as_bytes())
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    std::fs::write(path, contents)
+    crate::config::settings::write_private_text_atomic(auth_path, &contents)
+        .map_err(|error| fatal(error.to_string()))
 }
 
 /// RAII release for a cross-process lock file.

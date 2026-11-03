@@ -61,6 +61,10 @@ mod models;
 pub mod native_host;
 pub(crate) use models::scoped_cycle_target;
 mod notifications;
+// The only consumer is print mode's plugin session-event bridge
+// (`coding_agent::print`, itself `feature = "print"`).
+#[cfg(feature = "print")]
+pub(crate) use notifications::dispatch_session_event_to_plugins;
 pub mod phone_child;
 mod prompt_input;
 mod prompt_loop;
@@ -83,15 +87,73 @@ mod transcript;
 // (print mode drives the agent loop without an `AgentSession`). Gated on the
 // `print` feature so a minimal SDK embed does not import them as dead code.
 #[cfg(feature = "print")]
+pub(crate) use compact::{dispatch_before_compact, BeforeCompactDecision, BeforeCompactDispatch};
+#[cfg(feature = "print")]
 pub(crate) use notifications::drain_extension_notifications;
 #[cfg(feature = "print")]
 pub(crate) use prompt_input::transform_prompt_input;
+#[cfg(feature = "print")]
+pub(crate) use prompt_loop::{
+    dispatch_before_agent_start, project_optional_session_messages_off_thread,
+    BeforeAgentStartDispatch,
+};
+#[cfg(feature = "print")]
+pub(crate) use session_ctx::dispatch_resources_discover_event;
+#[cfg(feature = "print")]
+pub(crate) use settle::{
+    dispatch_agent_before_settle_boundary, dispatch_turn_end_boundary, emit_session_compact_failed,
+    emit_session_compact_success, BoundarySession,
+};
 #[cfg(feature = "print")]
 pub(crate) use stream::provider_stream_event_hook;
 #[cfg(feature = "print")]
 pub(crate) use tool_repair::host_tool_repair_hook;
 #[cfg(feature = "print")]
 pub(crate) use tools::extension_tool_update_channel;
+
+/// Result of the shared `input` dispatcher exposed to the print host.
+///
+/// The dispatcher itself lives in `prompt_input` (module-private so the
+/// `AgentSession` contract stays the only public surface); this facade-level
+/// wrapper lets `coding_agent/print.rs` reuse the exact same payload and image
+/// parsing without touching the module's visibility.
+#[cfg(feature = "print")]
+pub(crate) enum PrintPromptInputAction {
+    Continue {
+        text: String,
+        images: Vec<ContentBlock>,
+    },
+    Handled,
+}
+
+#[cfg(feature = "print")]
+pub(crate) async fn dispatch_print_prompt_input(
+    plugins: &PluginHost,
+    text: &str,
+    images: Vec<ContentBlock>,
+    source: &str,
+    streaming_behavior: Option<&str>,
+) -> PrintPromptInputAction {
+    match prompt_input::dispatch_prompt_input(plugins, text, images, source, streaming_behavior)
+        .await
+    {
+        prompt_input::PromptInputAction::Continue(transform) => PrintPromptInputAction::Continue {
+            text: transform.text,
+            images: transform.images,
+        },
+        prompt_input::PromptInputAction::Handled => PrintPromptInputAction::Handled,
+    }
+}
+
+/// Whether the print host's background-completion follow-up queue holds a
+/// frame (the `pending_messages` half of `context.canContinue` for
+/// `turn_end` / `agent_before_settle`; print's only queued-message source).
+#[cfg(feature = "print")]
+pub(crate) async fn background_follow_up_pending(
+    channel: &background::BackgroundFollowUpChannel,
+) -> bool {
+    !channel.inbox().peek().await.is_empty()
+}
 
 pub use background::BackgroundCallStatus;
 #[doc(hidden)]
@@ -116,10 +178,12 @@ pub use queue::ClearedQueue;
 #[cfg(feature = "subagent")]
 pub(crate) use runtime_loader::partition_cached_extension_failures;
 pub use runtime_loader::{
-    apply_cli_extension_flags, dispatch_project_trust, dispatch_user_bash,
-    dispatch_user_bash_with_host, load_extension_runtime, load_extension_runtime_strict,
-    load_extension_runtime_strict_with_catalog, load_extension_runtime_with_catalog,
-    stash_validated_extension_runtime, CliExtensionFlagDiagnostic, ModelCatalog,
+    adopt_pre_trust_extension_runtime, apply_cli_extension_flags, discard_extension_runtime,
+    dispatch_project_trust, dispatch_user_bash, dispatch_user_bash_with_host,
+    extension_config_matches_for_handoff, load_extension_runtime, load_extension_runtime_bootstrap,
+    load_extension_runtime_strict, load_extension_runtime_strict_with_catalog,
+    load_extension_runtime_with_catalog, stash_validated_extension_runtime,
+    CliExtensionFlagDiagnostic, ModelCatalog,
 };
 pub use session_commands::{
     apply_session_command_to_storage, commit_navigation_to_storage, generate_navigation_summary,
@@ -595,6 +659,12 @@ pub struct AgentSession {
     /// Whether `session_start` has already been dispatched to the extension
     /// runtime (fired once, before the first prompt).
     session_start_sent: AtomicBool,
+    /// Whether events may be dispatched into the attached JS runtime. `false`
+    /// only for the subagent child's shared-runtime fallback (the handle
+    /// belongs to the parent); definitions and tool execution stay available,
+    /// but no child event reaches the parent's handlers. `Arc` so the
+    /// background delivery bundle observes the same latch.
+    js_event_dispatch: Arc<AtomicBool>,
     /// Whether the "MCP tools are unreachable" warning has been printed
     /// (upstream `warnedUnreachable`, one per session; see
     /// [`AgentSession::ensure_discovery_active`]). Without the `mcp` feature
@@ -770,6 +840,13 @@ pub struct AgentSession {
     /// neither aborts the turn nor leaks into the next one (every trigger
     /// arms a fresh signal).
     auto_compaction_cancel: Arc<Mutex<Option<(u64, AbortSignal)>>>,
+    /// Monotonic owner id of the live MANUAL compaction claim (`0` = none).
+    /// [`compact::ManualCompactionClaim::release`] only releases a claim when
+    /// this still names its own owner, so a stale explicit release or `Drop`
+    /// from an earlier compaction can never clear a newer claim (and the
+    /// `compacting` flag follows the same owner). Shared by `Arc` with the
+    /// claim guard.
+    manual_compaction_owner: Arc<AtomicU64>,
     /// Weak self handle filled by the `Arc` constructors. Lets a `&self`
     /// operation (a storage swap, a reload) re-register the live session in
     /// the process-wide native host registry without changing every caller to

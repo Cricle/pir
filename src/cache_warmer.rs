@@ -30,7 +30,7 @@
 
 use std::time::Duration;
 
-use crate::ai::provider::ProviderRegistry;
+use crate::ai::provider::{ProviderRegistry, ProviderSessionKey};
 use crate::ai::types::{
     AbortSignal, AssistantMessage, Context, Model, StopReason, StreamOptions, ThinkingLevel,
 };
@@ -138,7 +138,20 @@ pub async fn warm_once(
     api_key: Option<&str>,
     signal: Option<AbortSignal>,
 ) -> Option<AssistantMessage> {
-    warm_once_with_hooks(
+    warm_once_owned(registry, model, context.clone(), api_key, signal).await
+}
+
+/// [`warm_once`] taking the replayed transcript by value: the warm path that
+/// already owns its [`Context`] (the settled-run snapshot) moves it straight
+/// into the request instead of cloning the whole transcript one more time.
+pub async fn warm_once_owned(
+    registry: &ProviderRegistry,
+    model: &Model,
+    context: Context,
+    api_key: Option<&str>,
+    signal: Option<AbortSignal>,
+) -> Option<AssistantMessage> {
+    warm_once_with_hooks_owned(
         registry,
         model,
         context,
@@ -154,10 +167,55 @@ pub async fn warm_once(
 /// session uses (cache-warmer.ts:332-339), so the extension
 /// `before_provider_request` / `after_provider_response` hooks fire for warm
 /// requests exactly like conversational ones (sdk.ts:420-434).
+///
+/// Borrowing compatibility wrapper: it clones `context` for callers that keep
+/// using the borrowed API. Owned callers should use
+/// [`warm_once_with_hooks_owned`].
 pub async fn warm_once_with_hooks(
     registry: &ProviderRegistry,
     model: &Model,
     context: &Context,
+    api_key: Option<&str>,
+    signal: Option<AbortSignal>,
+    hooks: crate::ai::types::ProviderStreamHooks,
+) -> Option<AssistantMessage> {
+    warm_once_with_hooks_owned(registry, model, context.clone(), api_key, signal, hooks).await
+}
+
+/// [`warm_once_with_hooks`] taking the replayed transcript by value, so the
+/// hot warming path (whose snapshot is already owned) never materializes a
+/// second full-transcript copy just to hand it to the provider.
+///
+/// Session-less compatibility entry point: provider and credential resolution
+/// use the legacy process-global registry path, exactly like the pre-SNAP11
+/// warmer.
+pub async fn warm_once_with_hooks_owned(
+    registry: &ProviderRegistry,
+    model: &Model,
+    context: Context,
+    api_key: Option<&str>,
+    signal: Option<AbortSignal>,
+    hooks: crate::ai::types::ProviderStreamHooks,
+) -> Option<AssistantMessage> {
+    warm_once_with_hooks_owned_for_session(registry, None, model, context, api_key, signal, hooks)
+        .await
+}
+
+/// [`warm_once_with_hooks_owned`] with an optional requester session
+/// (SNAP11 P2-S8-4).
+///
+/// The live session's provider overlay and OAuth credential resolution win
+/// over the process-shared last writer, so a cache warm fired by a parent
+/// while a subagent child is alive can never replay through the child's
+/// extension runtime. The key is a `Weak` snapshot: a warm whose session has
+/// already ended falls back to the legacy global path (no overlay is
+/// consulted), which keeps detached idle warms from failing closed on a dead
+/// key and never selects another session's overlay.
+pub async fn warm_once_with_hooks_owned_for_session(
+    registry: &ProviderRegistry,
+    session: Option<&ProviderSessionKey>,
+    model: &Model,
+    context: Context,
     api_key: Option<&str>,
     signal: Option<AbortSignal>,
     hooks: crate::ai::types::ProviderStreamHooks,
@@ -174,7 +232,12 @@ pub async fn warm_once_with_hooks(
         hooks,
         ..StreamOptions::default()
     };
-    let stream = registry.stream_resolving_auth(model.clone(), context.clone(), options);
+    let stream = match session.filter(|session| session.is_live()) {
+        Some(session) => {
+            registry.stream_resolving_auth_for(Some(session), model.clone(), context, options)
+        }
+        None => registry.stream_resolving_auth(model.clone(), context, options),
+    };
     let awaited = async {
         // Completion consumer: drain while waiting (the bounded event queue
         // parks a producer whose events are never popped; see

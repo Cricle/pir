@@ -5,12 +5,17 @@
 //! backend has fails the suite. JSONL-specific tests cover reopen, torn-line
 //! recovery, corruption detection and the `fsync` path.
 
+use pir::durable::harness::context::derive_context;
+use pir::durable::harness::{
+    ConversationView, ConversationViews, Harness, HarnessOptions, ViewObserver,
+};
+use pir::durable::session::transaction::EntryDraft;
 use pir::durable::{
     apply_immutable_batches, delay_steps, format_size, id_from_number, rank_documents, scan_start,
     seq_from_number, tokenize, truncate_head, truncate_head_of, AssistantEntry, CompactionEntry,
-    ConversationId, ConversationOwner, ConversationParent, ConversationQuery, ConversationRecord,
-    Cursor, DocDefinition, DocumentAddress, DocumentContent, DocumentCreate, DocumentFork,
-    DocumentHistory, DocumentPoint, DocumentPointQuery, DocumentQuery, DocumentScope,
+    Context, ConversationId, ConversationOwner, ConversationParent, ConversationQuery,
+    ConversationRecord, Cursor, DocDefinition, DocumentAddress, DocumentContent, DocumentCreate,
+    DocumentFork, DocumentHistory, DocumentPoint, DocumentPointQuery, DocumentQuery, DocumentScope,
     DocumentSemantics, EntryId, EntryQuery, EntryRecord, JsonlStorage, JsonlStorageOptions,
     MemoryStorage, Op, Page, ResetEntry, ScanOrder, SearchDocument, Seg, Seq, Storage,
     StorageError, StorageWrite, SubmissionId, SubmissionRecord, SubmissionStatus, SubmissionType,
@@ -18,9 +23,178 @@ use pir::durable::{
     TruncatedBy, TruncationOptions, TypedEntry, UserEntry, MAX_TIMER_DELAY_MS,
 };
 use serde_json::{json, Value};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// ── test-only allocation counter (R1-L3-008) ────────────────────────────────
+//
+// The same per-thread counting shape as `tests/backend_copy_audit.rs`:
+// allocations are counted only inside a measured section on the measuring
+// thread, so the libtest harness and sibling tests on other threads are not
+// observed. `#[tokio::test]` uses a current-thread runtime, which keeps the
+// recovery future — and therefore its parse/clone work — on this thread.
+//
+// `LIVE_BYTES`/`PEAK_BYTES` are a heuristic: a value allocated before the
+// section (or on a blocking-pool thread, as `tokio::fs::read` does) can be
+// freed here without a matching increment, so its `dealloc` subtracts bytes
+// this thread never added. `ALLOCATED_BYTES` deliberately never subtracts on
+// dealloc, which makes it the authoritative cumulative seam for "did recovery
+// read the whole log and copy it around?" assertions: the old whole-file
+// reader also allocated one line `String` per line, one parsed marker per line
+// and two payload clones on this thread (about 4x the log), while streaming
+// recovery parses each marker twice (validation and replay) and copies it into
+// `MemoryStorage` (about 3x).
+//
+// `MAX_ALLOCATION_BYTES` is process-global because the old whole-file `Vec` is
+// allocated inside `tokio::fs::read`'s blocking task, where the thread-local
+// counters cannot see it. It catches the shape those counters cannot: one
+// allocation the size of the entire log.
+struct CountingAllocator;
+
+thread_local! {
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+    static ALLOCATION_EVENTS: Cell<u64> = const { Cell::new(0) };
+    static ALLOCATED_BYTES: Cell<u64> = const { Cell::new(0) };
+    /// Bytes currently live from allocations seen since the section opened.
+    static LIVE_BYTES: Cell<u64> = const { Cell::new(0) };
+    /// High-water mark of [`LIVE_BYTES`], i.e. this thread's allocation peak.
+    static PEAK_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Set while a measured section runs. Unlike [`COUNTING`], this is global so
+/// allocations made by blocking-pool threads (where `tokio::fs::read` builds
+/// its whole-file `Vec`) are observed too.
+static MEASURING: AtomicBool = AtomicBool::new(false);
+/// Largest single allocation requested by any thread while [`MEASURING`] was
+/// set. The old whole-file reader allocated the entire log as one `Vec` on the
+/// blocking pool, which the per-thread live counters cannot see; this seam
+/// catches that shape regardless of which thread frees the buffer.
+static MAX_ALLOCATION_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Serializes measured sections: [`MEASURING`] and [`MAX_ALLOCATION_BYTES`] are
+/// process-global, so two allocation tests running in parallel would otherwise
+/// attribute each other's fixture allocations to this section. The lock is
+/// async so it can be held across the measured future without a blocking
+/// mutex guard tripping `await_holding_lock`.
+static MEASURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[expect(
+    unsafe_code,
+    reason = "test-only GlobalAlloc wrapper: delegates straight to System and \
+              adds per-thread counters; the TLS slots are const-initialized so \
+              reading them can never allocate (no recursion into the allocator)"
+)]
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if MEASURING.load(Ordering::Relaxed) {
+            MAX_ALLOCATION_BYTES.fetch_max(layout.size() as u64, Ordering::Relaxed);
+        }
+        let _ = COUNTING.try_with(|counting| {
+            if counting.get() {
+                let _ = ALLOCATION_EVENTS.try_with(|events| events.set(events.get() + 1));
+                let _ =
+                    ALLOCATED_BYTES.try_with(|bytes| bytes.set(bytes.get() + layout.size() as u64));
+                let _ = LIVE_BYTES.try_with(|live| {
+                    let next = live.get().saturating_add(layout.size() as u64);
+                    live.set(next);
+                    let _ = PEAK_BYTES.try_with(|peak| peak.set(peak.get().max(next)));
+                });
+            }
+        });
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _ = COUNTING.try_with(|counting| {
+            if counting.get() {
+                // A value allocated before the section can be freed inside it;
+                // saturating subtraction keeps the live estimate from wrapping.
+                let _ = LIVE_BYTES
+                    .try_with(|live| live.set(live.get().saturating_sub(layout.size() as u64)));
+            }
+        });
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AllocStats {
+    events: u64,
+    /// Cumulative bytes allocated on the measuring thread while the section
+    /// ran. Frees never subtract from this total, so a blocking-thread buffer
+    /// (e.g. `tokio::fs::read`'s whole-file `Vec`) being dropped back on this
+    /// thread cannot cancel the copies made here.
+    bytes: u64,
+    /// Highest live-byte total observed while the section ran.
+    peak_bytes: u64,
+    /// Largest single allocation requested by any thread while the section
+    /// ran. Unlike the live counters this sees blocking-pool allocations, so
+    /// the old whole-file `Vec` shows up here even though its matching
+    /// `dealloc` happens on the measuring thread.
+    max_allocation_bytes: u64,
+}
+
+/// Clears the thread-local and global measurement state even if the measured
+/// future panics, so one failed test cannot leave every later allocation in
+/// the process attributed to `MAX_ALLOCATION_BYTES`.
+struct MeasurementGuard;
+
+impl Drop for MeasurementGuard {
+    fn drop(&mut self) {
+        let _ = COUNTING.try_with(|counting| counting.set(false));
+        MEASURING.store(false, Ordering::SeqCst);
+        MAX_ALLOCATION_BYTES.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Holds [`MEASURE_LOCK`] from before a large fixture is built until its
+/// measured section finishes. The lock alone only serializes sections; a
+/// fixture built outside the lock could still allocate its multi-megabyte
+/// buffers while another test's [`MEASURING`] flag is set, and the global
+/// [`MAX_ALLOCATION_BYTES`] seam would attribute that allocation to the wrong
+/// test.
+struct MeasureSection {
+    _section: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl MeasureSection {
+    /// Acquires the process-global measurement slot and resets the counters.
+    /// Hold the returned value while building a fixture, then pass it to
+    /// [`Self::measure`] so the fixture's allocations are never observed by a
+    /// concurrent measurement.
+    async fn begin() -> Self {
+        let section = MEASURE_LOCK.lock().await;
+        ALLOCATION_EVENTS.with(|events| events.set(0));
+        ALLOCATED_BYTES.with(|bytes| bytes.set(0));
+        LIVE_BYTES.with(|live| live.set(0));
+        PEAK_BYTES.with(|peak| peak.set(0));
+        MAX_ALLOCATION_BYTES.store(0, Ordering::Relaxed);
+        Self { _section: section }
+    }
+
+    /// Runs one measured section while keeping the fixture slot held.
+    async fn measure<T>(self, future: impl Future<Output = T>) -> (T, AllocStats) {
+        COUNTING.with(|counting| counting.set(true));
+        MEASURING.store(true, Ordering::SeqCst);
+        let guard = MeasurementGuard;
+        let value = future.await;
+        let stats = AllocStats {
+            events: ALLOCATION_EVENTS.with(Cell::get),
+            bytes: ALLOCATED_BYTES.with(Cell::get),
+            peak_bytes: PEAK_BYTES.with(Cell::get),
+            max_allocation_bytes: MAX_ALLOCATION_BYTES.load(Ordering::Relaxed),
+        };
+        drop(guard);
+        (value, stats)
+    }
+}
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -613,6 +787,73 @@ async fn memory_conformance() {
     ));
 }
 
+/// Six hundred entries at `limit = 256` must scan in exactly three pages in
+/// both directions: each cursor continues where the previous page ended and no
+/// entry is returned twice.
+async fn assert_three_page_scan(storage: &dyn Storage) {
+    let mut writes = vec![StorageWrite::Conversation {
+        value: conversation(1),
+    }];
+    for id in 1..=600 {
+        writes.push(StorageWrite::Entry {
+            value: entry(1_000 + id, 1, UserEntry::KIND.kind, None),
+        });
+    }
+    storage.commit(writes).await.expect("seed 600 entries");
+
+    let cases: [(ScanOrder, Vec<i64>); 2] = [
+        (ScanOrder::Descending, (1_001..=1_600).rev().collect()),
+        (ScanOrder::Ascending, (1_001..=1_600).collect()),
+    ];
+    for (order, expected) in cases {
+        let mut cursor: Option<Cursor> = None;
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = storage
+                .scan_entries(
+                    EntryQuery {
+                        conversation_id: ConversationId::from_raw(1),
+                        min_entry_id: None,
+                        max_entry_id: None,
+                        order: Some(order),
+                    },
+                    256,
+                    cursor.clone(),
+                )
+                .await
+                .expect("paged scan");
+            pages += 1;
+            assert!(
+                page.items.len() <= 256,
+                "a page never exceeds the requested limit"
+            );
+            seen.extend(page.items.iter().map(|item| item.id.as_i64()));
+            match page.next {
+                Some(next) => {
+                    assert_eq!(next.order, Some(order), "the cursor keeps its order");
+                    cursor = Some(next);
+                }
+                None => break,
+            }
+            assert!(pages <= 3, "600 entries at limit 256 must fit in 3 pages");
+        }
+        assert_eq!(pages, 3, "600 entries at limit 256 need exactly 3 pages");
+        assert_eq!(seen, expected, "pages continue the scan in order");
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 600, "no entry is returned twice");
+    }
+}
+
+#[tokio::test]
+async fn memory_scan_pages_both_orders_across_three_pages() {
+    let storage = MemoryStorage::new();
+    assert_three_page_scan(&storage).await;
+    storage.close().await.expect("close");
+}
+
 #[tokio::test]
 async fn memory_rejects_duplicate_ids_and_bad_batches() {
     let storage = MemoryStorage::new();
@@ -730,6 +971,57 @@ async fn jsonl_conformance() {
     ));
     run_conformance(&storage).await;
     storage.close().await.expect("close");
+    remove_dir(&dir).await;
+}
+
+#[tokio::test]
+async fn jsonl_scan_pages_both_orders_across_three_pages() {
+    let dir = temp_dir("paging");
+    let storage = JsonlStorage::open(&dir).await.expect("open");
+    assert_three_page_scan(&storage).await;
+    storage.close().await.expect("close");
+    remove_dir(&dir).await;
+}
+
+#[tokio::test]
+async fn jsonl_reclaim_failure_removes_the_temporary_file() {
+    let dir = temp_dir("reclaim-failure");
+    tokio::fs::create_dir_all(&dir).await.expect("create dir");
+
+    // A directory at the rename target makes `rename(temporary, target)`
+    // fail after the temporary `.reclaim` file was written and synced.
+    let blocked = dir.join("doc-1.jsonl");
+    tokio::fs::create_dir_all(&blocked)
+        .await
+        .expect("create blocking directory");
+    for fsync in [false, true] {
+        pir::durable::storage::jsonl::replace_sidecar_file(
+            &dir,
+            fsync,
+            "doc-1.jsonl",
+            "{\"format\":1}\n",
+        )
+        .await;
+        assert!(
+            !dir.join("doc-1.jsonl.reclaim").exists(),
+            "a failed rewrite must not leave its temporary file behind (fsync={fsync})"
+        );
+    }
+    assert!(
+        blocked.is_dir(),
+        "the failed rename leaves the target alone"
+    );
+
+    // The successful path still replaces the file atomically.
+    let target = dir.join("doc-2.jsonl");
+    std::fs::write(&target, "old\n").expect("seed target");
+    pir::durable::storage::jsonl::replace_sidecar_file(&dir, true, "doc-2.jsonl", "new\n").await;
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read target"),
+        "new\n"
+    );
+    assert!(!dir.join("doc-2.jsonl.reclaim").exists());
+
     remove_dir(&dir).await;
 }
 
@@ -1541,4 +1833,1166 @@ fn submission_and_task_states_serialize_tagged() {
         serde_json::to_value(&state).expect("serialize"),
         json!({"status": "waiting", "checkpoint": {"phase": "wait"}, "on": [1], "policy": "failFast"})
     );
+}
+
+// ── R1-L3-003: context derivation copies ───────────────────────────────────
+
+#[test]
+fn derive_context_keeps_one_message_copy_per_request() {
+    const COUNT: usize = 48;
+    const PAYLOAD: usize = 32 * 1024;
+
+    // A large-but-cheap fixture: the old implementation cloned every one of
+    // these message strings twice on the way to `ContextView`, even though no
+    // compaction path ran.
+    let entries: Vec<EntryRecord> = (0..COUNT)
+        .map(|index| {
+            let mut record = entry(index as i64 + 1, 1, "pi.user", None);
+            record.model = Some(vec![json!({
+                "role": "user",
+                "content": "x".repeat(PAYLOAD),
+                "timestamp": index as i64 + 1,
+            })]);
+            record
+        })
+        .collect();
+
+    let view = derive_context(&entries, None);
+
+    assert!(
+        !view.messages.is_materialized(),
+        "an ordinary derive must not parse the ordered message list"
+    );
+    assert!(
+        view.messages.shares_entries_with(&view),
+        "the lazy message list must index the view's entries instead of owning a second transcript"
+    );
+    let clone = view.clone();
+    assert!(
+        clone.messages.shares_messages_with(&view.messages),
+        "cloning a view must share the message list instead of deep-copying every message"
+    );
+    assert_eq!(view.messages.len(), COUNT);
+    assert!(view.messages.is_materialized());
+    assert_eq!(
+        view.contributions.len(),
+        COUNT,
+        "the light index still covers every active entry"
+    );
+    assert!(
+        view.contributions.shares_entries_with(&view),
+        "contributions must index the view's entries instead of owning a second transcript"
+    );
+    assert!(
+        !view.contributions.is_materialized(),
+        "an ordinary derive must not build the per-entry message copy"
+    );
+
+    // Reading the contributions still yields the parsed messages; this access
+    // is the lazy materialization the compaction path pays for.
+    assert_eq!(view.contributions[0].len(), 1);
+    assert!(view.contributions.is_materialized());
+}
+
+// ── R1-L3-004: mounted-view entry appends ──────────────────────────────────
+
+struct RevisionRecorder {
+    initial: Mutex<Option<ConversationView>>,
+    advances: Mutex<Vec<ConversationView>>,
+}
+
+impl ViewObserver for RevisionRecorder {
+    fn advance(&self, value: &ConversationView, _ops: &[Op], _context: &Context) {
+        self.advances
+            .lock()
+            .expect("advances lock")
+            .push(value.clone());
+    }
+
+    fn close_session(&self, _failure: Option<&StorageError>) {}
+}
+
+fn draft(text: &str) -> EntryDraft {
+    EntryDraft {
+        kind: "app.user".to_owned(),
+        model: Some(vec![json!({
+            "role": "user",
+            "content": text,
+            "timestamp": 1,
+        })]),
+        data: Some(json!({ "text": text })),
+        head: None,
+        edits: None,
+    }
+}
+
+#[tokio::test]
+async fn view_append_shares_every_historical_entry() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let harness = Harness::open(storage, HarnessOptions::default(), Context::background())
+        .await
+        .expect("open harness");
+    let conversation = harness.root(Context::background()).await.expect("root");
+
+    for index in 0..8 {
+        harness
+            .session()
+            .append_entry(
+                conversation.id(),
+                draft(&format!("entry {index}")),
+                Context::background(),
+            )
+            .await
+            .expect("append entry");
+    }
+
+    let views = ConversationViews::open(harness.session().clone())
+        .await
+        .expect("open views");
+    let attached = views
+        .attach::<RevisionRecorder, _>(
+            conversation.id(),
+            |view| RevisionRecorder {
+                initial: Mutex::new(Some(view.clone())),
+                advances: Mutex::new(Vec::new()),
+            },
+            &Context::background(),
+        )
+        .await
+        .expect("attach recorder");
+
+    harness
+        .session()
+        .append_entry(conversation.id(), draft("appended"), Context::background())
+        .await
+        .expect("append next entry");
+
+    let initial = attached
+        .observer
+        .initial
+        .lock()
+        .expect("initial lock")
+        .clone()
+        .expect("factory ran");
+    let after = attached
+        .observer
+        .advances
+        .lock()
+        .expect("advances lock")
+        .first()
+        .cloned()
+        .expect("one advance");
+
+    assert_eq!(after.entries().len(), initial.entries().len() + 1);
+    assert!(
+        !Arc::ptr_eq(&initial.entries, &after.entries),
+        "the append creates a new entry-list revision"
+    );
+    for index in 0..initial.entries().len() {
+        assert!(
+            std::ptr::eq(
+                initial.entries().get(index).expect("old entry"),
+                after.entries().get(index).expect("shared entry"),
+            ),
+            "entry {index} was deep-copied by the append"
+        );
+    }
+    assert_eq!(after.entries()[initial.entries().len()].kind, "app.user");
+
+    attached.detach.detach();
+}
+
+// ── R1-L3-002: paged scans materialize only the current page ───────────────
+
+/// A two-segment fork chain (root conversation 1 → fork conversation 2) with
+/// 400 entries per segment. A full page must materialize exactly `limit + 1`
+/// `EntryRecord`s; the old shape deep-copied every remaining visible entry on
+/// every page (O(n²) clones), so the first page here would materialize 800.
+#[tokio::test]
+async fn memory_scan_entries_materializes_only_the_current_page() {
+    const SEGMENT: i64 = 400;
+    const LIMIT: usize = 256;
+    const ROOT_FIRST: i64 = 10;
+    const FORK_FIRST: i64 = 1_000;
+
+    let storage = MemoryStorage::new();
+    let mut writes = vec![
+        StorageWrite::Conversation {
+            value: conversation(1),
+        },
+        StorageWrite::Conversation {
+            value: ConversationRecord {
+                id: ConversationId::from_raw(2),
+                parent: Some(ConversationParent {
+                    conversation_id: ConversationId::from_raw(1),
+                    at: EntryId::from_raw(ROOT_FIRST + SEGMENT - 1),
+                }),
+                owner: None,
+            },
+        },
+    ];
+    for offset in 0..SEGMENT {
+        writes.push(StorageWrite::Entry {
+            value: entry(ROOT_FIRST + offset, 1, UserEntry::KIND.kind, None),
+        });
+    }
+    for offset in 0..SEGMENT {
+        writes.push(StorageWrite::Entry {
+            value: entry(FORK_FIRST + offset, 2, UserEntry::KIND.kind, None),
+        });
+    }
+    storage.commit(writes).await.expect("seed fork chain");
+
+    for order in [ScanOrder::Descending, ScanOrder::Ascending] {
+        let mut cursor: Option<Cursor> = None;
+        let mut seen = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            storage.reset_entry_scan_materialized();
+            let page = storage
+                .scan_entries(
+                    EntryQuery {
+                        conversation_id: ConversationId::from_raw(2),
+                        min_entry_id: None,
+                        max_entry_id: None,
+                        order: Some(order),
+                    },
+                    LIMIT,
+                    cursor.clone(),
+                )
+                .await
+                .expect("paged scan");
+            let materialized = storage.entry_scan_materialized();
+            // The over-fetch window holds `items + (next ? 1 : 0)` records:
+            // a full page is limit + 1, the final page just its items.
+            let expected = page.items.len() + usize::from(page.next.is_some());
+            assert_eq!(
+                materialized, expected,
+                "{order:?} page {pages}: materialized {materialized} records, expected {expected}; \
+                 the old shape copied the whole remaining chain"
+            );
+            assert!(
+                materialized <= LIMIT + 1,
+                "{order:?} page {pages}: {materialized} records materialized, over limit + 1"
+            );
+            seen.extend(page.items.iter().map(|entry| entry.id.as_i64()));
+            pages += 1;
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 4, "{order:?}: 800 visible entries span 4 pages");
+        assert_eq!(
+            seen.len(),
+            (2 * SEGMENT) as usize,
+            "{order:?}: every visible entry is returned once"
+        );
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), seen.len(), "{order:?}: duplicate ids");
+    }
+}
+
+// ── R1-L3-007: fsync also syncs the parent directory ──────────────────────
+
+/// `fsync: true` must sync the parent directory after creating/appending a
+/// sidecar and after the main marker append. The seam counts the calls, so
+/// deleting the `sync_parent_dir` call sites fails this test (on every
+/// platform — the directory handle itself is Unix-only).
+#[tokio::test]
+async fn jsonl_fsync_syncs_the_parent_directory_for_new_files() {
+    use pir::durable::storage::jsonl::{parent_dir_sync_calls, reset_parent_dir_sync_calls};
+
+    let dir = temp_dir("fsync-parent");
+    let storage = JsonlStorage::open_with_options(&dir, JsonlStorageOptions { fsync: true })
+        .await
+        .expect("open");
+
+    reset_parent_dir_sync_calls();
+    storage
+        .commit(vec![
+            StorageWrite::Conversation {
+                value: conversation(1),
+            },
+            StorageWrite::Entry {
+                value: entry(10, 1, UserEntry::KIND.kind, None),
+            },
+        ])
+        .await
+        .expect("first commit creates main.jsonl");
+    assert_eq!(
+        parent_dir_sync_calls(),
+        1,
+        "creating main.jsonl must sync its parent directory exactly once"
+    );
+
+    reset_parent_dir_sync_calls();
+    storage
+        .commit(vec![StorageWrite::DocumentCreate {
+            record: document_create(
+                70,
+                "fsync.parent.doc",
+                DocumentHistory::Latest,
+                DocumentFork::Current,
+            ),
+            content: DocumentContent::Base {
+                version: 1,
+                value: serde_json::Map::from_iter([("n".to_owned(), json!(1))]),
+            },
+        }])
+        .await
+        .expect("second commit creates a sidecar");
+    assert_eq!(
+        parent_dir_sync_calls(),
+        2,
+        "a new sidecar and the main marker must each sync the parent directory"
+    );
+
+    storage.close().await.expect("close");
+    remove_dir(&dir).await;
+}
+
+// ── R1-L3-008: streaming JSONL recovery keeps one sidecar copy ─────────────
+
+/// The recovery rewrite of a current-only document's sidecar keeps only the
+/// newest base. This is the `SidecarReclamation::KeepFrom` path: the stale
+/// base line is dropped and the retained suffix is streamed into the rewrite.
+#[tokio::test]
+async fn jsonl_recovery_reclaims_a_replaced_current_only_base() {
+    let dir = temp_dir("recent-base");
+    let document_id = pir::durable::DocumentId::from_raw(80);
+    {
+        let storage = JsonlStorage::open(&dir).await.expect("open");
+        storage
+            .commit(vec![StorageWrite::DocumentCreate {
+                record: document_create(
+                    80,
+                    "latest.doc",
+                    DocumentHistory::Latest,
+                    DocumentFork::Current,
+                ),
+                content: DocumentContent::Base {
+                    version: 1,
+                    value: serde_json::Map::from_iter([("v".to_owned(), json!(1))]),
+                },
+            }])
+            .await
+            .expect("create");
+        storage
+            .commit(vec![StorageWrite::DocumentChange {
+                id: document_id,
+                content: DocumentContent::Base {
+                    version: 2,
+                    value: serde_json::Map::from_iter([("v".to_owned(), json!(2))]),
+                },
+            }])
+            .await
+            .expect("replace base");
+        storage.close().await.expect("close");
+    }
+
+    // Commit-time reclamation already dropped the old base. Put it back as a
+    // crash between the marker append and reclamation would leave it, so the
+    // reopen has to reclaim the stale line itself.
+    let sidecar = dir.join("doc-80.jsonl");
+    let latest = std::fs::read_to_string(&sidecar).expect("read sidecar");
+    let stale = "{\"format\":1,\"type\":\"record\",\"seq\":1,\"ordinal\":0,\
+                 \"payload\":{\"type\":\"document\",\"id\":80,\
+                 \"content\":{\"kind\":\"base\",\"version\":1,\"value\":{\"v\":1}}}}\n";
+    std::fs::write(&sidecar, format!("{stale}{latest}")).expect("restore stale base");
+
+    let storage = JsonlStorage::open(&dir).await.expect("reopen");
+    let document = storage
+        .document(document_id, DocumentPoint::Current)
+        .await
+        .expect("document")
+        .expect("present");
+    assert_eq!(document.value.get("v"), Some(&json!(2)));
+    storage.close().await.expect("close");
+
+    let raw = std::fs::read_to_string(&sidecar).expect("read reclaimed sidecar");
+    assert_eq!(raw.lines().count(), 1, "the stale base is reclaimed: {raw}");
+    assert!(raw.contains("\"seq\":2"), "the newest base survives: {raw}");
+    remove_dir(&dir).await;
+}
+
+/// Recovery truncates a complete but unconfirmed sidecar tail at the exact
+/// byte offset of its first line; the confirmed prefix still replays.
+#[tokio::test]
+async fn jsonl_recovery_truncates_an_unconfirmed_sidecar_tail() {
+    let dir = temp_dir("unconfirmed-tail");
+    {
+        let storage = JsonlStorage::open(&dir).await.expect("open");
+        storage
+            .commit(vec![
+                StorageWrite::Conversation {
+                    value: conversation(1),
+                },
+                StorageWrite::Task {
+                    value: task(20, 1, TaskStatus::Running),
+                },
+            ])
+            .await
+            .expect("seed");
+        storage.close().await.expect("close");
+    }
+
+    let sidecar = dir.join("task-20.jsonl");
+    let mut raw = std::fs::read_to_string(&sidecar).expect("read sidecar");
+    raw.push_str(
+        "{\"format\":1,\"type\":\"record\",\"seq\":2,\"ordinal\":0,\
+         \"payload\":{\"type\":\"document\",\"id\":999,\
+         \"content\":{\"kind\":\"base\",\"version\":1,\"value\":{}}}}\n",
+    );
+    std::fs::write(&sidecar, raw).expect("append unconfirmed line");
+
+    let storage = JsonlStorage::open(&dir).await.expect("reopen");
+    let live = storage
+        .task(TaskId::from_raw(20))
+        .await
+        .expect("task")
+        .expect("present");
+    assert_eq!(live.status(), TaskStatus::Running);
+    storage.close().await.expect("close");
+
+    let raw = std::fs::read_to_string(&sidecar).expect("read truncated sidecar");
+    assert_eq!(
+        raw.lines().count(),
+        1,
+        "the unconfirmed tail is gone: {raw}"
+    );
+    remove_dir(&dir).await;
+}
+
+/// A torn trailing sidecar line (no newline) is truncated before parsing, just
+/// like a torn main marker.
+#[tokio::test]
+async fn jsonl_recovery_truncates_a_torn_sidecar_tail() {
+    let dir = temp_dir("torn-sidecar");
+    {
+        let storage = JsonlStorage::open(&dir).await.expect("open");
+        storage
+            .commit(vec![
+                StorageWrite::Conversation {
+                    value: conversation(1),
+                },
+                StorageWrite::Task {
+                    value: task(20, 1, TaskStatus::Running),
+                },
+            ])
+            .await
+            .expect("seed");
+        storage.close().await.expect("close");
+    }
+
+    let sidecar = dir.join("task-20.jsonl");
+    let mut raw = std::fs::read_to_string(&sidecar).expect("read sidecar");
+    raw.push_str("{\"format\":1,\"type\":\"record\",\"seq\":2,\"ordinal\":0,\"pay");
+    std::fs::write(&sidecar, raw).expect("append torn line");
+
+    let storage = JsonlStorage::open(&dir).await.expect("reopen");
+    assert!(storage
+        .task(TaskId::from_raw(20))
+        .await
+        .expect("task")
+        .is_some());
+    storage.close().await.expect("close");
+
+    let raw = std::fs::read_to_string(&sidecar).expect("read truncated sidecar");
+    assert_eq!(raw.lines().count(), 1, "the torn tail is truncated: {raw}");
+    assert!(raw.ends_with('\n'));
+    remove_dir(&dir).await;
+}
+
+/// One `SidecarRecord` copy per line: parsing wraps the record in an `Arc` and
+/// replay moves it out. The old implementation deep-cloned every record into
+/// `previous`, `record_by_key` and `parsed_files` (plus a clone in
+/// `confirm_record`), so this counter would be at least three per record.
+#[tokio::test]
+async fn jsonl_recovery_keeps_a_single_sidecar_record_copy() {
+    use pir::durable::storage::jsonl::{reset_sidecar_record_clones, sidecar_record_clones};
+
+    const RECORDS: usize = 64;
+    const PAYLOAD: usize = 4 * 1024;
+    let dir = temp_dir("recovery-clones");
+    {
+        let storage = JsonlStorage::open(&dir).await.expect("open");
+        storage
+            .commit(vec![
+                StorageWrite::Conversation {
+                    value: conversation(1),
+                },
+                StorageWrite::Task {
+                    value: task(20, 1, TaskStatus::Running),
+                },
+            ])
+            .await
+            .expect("seed");
+        for index in 0..RECORDS {
+            let mut value = task(20, 1, TaskStatus::Running);
+            value.state = TaskState::Running {
+                checkpoint: json!({"n": index, "blob": "x".repeat(PAYLOAD)}),
+            };
+            storage
+                .commit(vec![StorageWrite::Task { value }])
+                .await
+                .expect("task transition");
+        }
+        storage.close().await.expect("close");
+    }
+
+    reset_sidecar_record_clones();
+    let storage = JsonlStorage::open(&dir).await.expect("reopen");
+    let clones = sidecar_record_clones();
+    assert_eq!(
+        clones, 0,
+        "recovery deep-cloned {clones} sidecar records; each record must be \
+         indexed once and moved into the replayed write"
+    );
+    let live = storage
+        .task(TaskId::from_raw(20))
+        .await
+        .expect("task")
+        .expect("present");
+    assert_eq!(live.status(), TaskStatus::Running);
+    storage.close().await.expect("close");
+    remove_dir(&dir).await;
+}
+
+/// Write the legacy (pre-R1-L3-009) shape of a live-task sidecar: `records`
+/// confirmed full snapshots, one main marker each. The storage-side compaction
+/// no longer produces such files, but directories written by an older build,
+/// and a crash between a marker append and its compaction rewrite, can contain
+/// them; recovery must still replay them and retain only the newest record.
+fn write_legacy_live_task_sidecar(dir: &Path, task_id: i64, records: usize, payload: usize) -> u64 {
+    std::fs::create_dir_all(dir).expect("create fixture directory");
+    let mut sidecar = String::new();
+    let mut main = String::new();
+    for index in 0..records {
+        let seq = index as i64 + 1;
+        let mut value = task(task_id, 1, TaskStatus::Running);
+        value.state = TaskState::Running {
+            checkpoint: json!({"n": index, "blob": "x".repeat(payload)}),
+        };
+        let record = json!({
+            "format": 1,
+            "type": "record",
+            "seq": seq,
+            "ordinal": 0,
+            "payload": {"type": "task", "value": value},
+        });
+        sidecar.push_str(&serde_json::to_string(&record).expect("serialize sidecar record"));
+        sidecar.push('\n');
+        let marker = json!({
+            "format": 1,
+            "type": "commit",
+            "seq": seq,
+            "writes": [{"type": "task.sidecar", "id": task_id, "ordinal": 0}],
+        });
+        main.push_str(&serde_json::to_string(&marker).expect("serialize marker"));
+        main.push('\n');
+    }
+    std::fs::write(
+        dir.join(format!("task-{task_id}.jsonl")),
+        sidecar.as_bytes(),
+    )
+    .expect("write sidecar");
+    std::fs::write(dir.join("main.jsonl"), main.as_bytes()).expect("write main");
+    std::fs::metadata(dir.join(format!("task-{task_id}.jsonl")))
+        .expect("sidecar metadata")
+        .len()
+}
+
+/// A 16 MiB legacy live-task sidecar recovers correctly through the streaming
+/// reader and is compacted to its newest record. Ignored by default so the
+/// ordinary suite stays quick.
+#[tokio::test]
+#[ignore = "16 MiB recovery fixture; run explicitly with --ignored"]
+async fn jsonl_recovers_a_large_task_sidecar_session() {
+    const RECORDS: usize = 64;
+    const PAYLOAD: usize = 256 * 1024;
+    // This fixture is also multi-megabyte and this test does not measure its
+    // own recovery, so hold the measurement slot to keep both the fixture and
+    // the unmeasured recovery from polluting a concurrent measured section.
+    let _section = MeasureSection::begin().await;
+    let dir = temp_dir("large-recovery");
+    let sidecar = dir.join("task-20.jsonl");
+    let bytes = write_legacy_live_task_sidecar(&dir, 20, RECORDS, PAYLOAD);
+    assert!(
+        bytes >= (RECORDS * PAYLOAD) as u64,
+        "fixture must be multi-megabyte, got {bytes} bytes"
+    );
+
+    let storage = JsonlStorage::open(&dir)
+        .await
+        .expect("reopen large session");
+    let live = storage
+        .task(TaskId::from_raw(20))
+        .await
+        .expect("task")
+        .expect("present");
+    assert_eq!(live.status(), TaskStatus::Running);
+    let TaskState::Running { checkpoint } = &live.state else {
+        panic!("unexpected final task state: {:?}", live.state);
+    };
+    assert_eq!(checkpoint.get("n"), Some(&json!(RECORDS - 1)));
+    assert_eq!(
+        checkpoint.get("blob").and_then(Value::as_str).map(str::len),
+        Some(PAYLOAD)
+    );
+    storage.close().await.expect("close");
+
+    let raw = std::fs::read_to_string(&sidecar).expect("read reclaimed sidecar");
+    assert_eq!(
+        raw.lines().count(),
+        1,
+        "recovery compacts the legacy sidecar to its newest record"
+    );
+    assert!(raw.contains(&format!("\"n\":{}", RECORDS - 1)));
+    remove_dir(&dir).await;
+}
+
+/// Allocation limits for reopening an entry-only main log, expressed as
+/// percentages of the log's byte size.
+///
+/// The single-allocation cap is the differential against the old whole-file
+/// reader: `tokio::fs::read` materialized the entire log as one `Vec` (100%).
+/// The cumulative and peak caps are stability guards for the streaming
+/// implementation, calibrated from an actual run rather than estimated: one
+/// 4 KiB payload per marker costs about 5.05x cumulatively (two serde parses
+/// plus the `MemoryStorage` copy) and peaks at about 1.19x. They leave room
+/// for allocator/serde variation while still catching a streaming rewrite
+/// that retains a second copy of every line.
+#[derive(Debug, Clone, Copy)]
+struct EntryLogBudget {
+    /// Cap on cumulative bytes allocated while reopening (frees never subtract
+    /// from this total). Measured streaming shape: ~5.05x of the log.
+    total_percent: u64,
+    /// Cap on the largest single allocation. Streaming recovery never buffers
+    /// more than one line; the old `tokio::fs::read` allocated the whole log
+    /// as one `Vec` on a blocking-pool thread (100%).
+    single_percent: u64,
+    /// Cap on the live high-water mark. Measured streaming shape: ~1.19x.
+    peak_percent: u64,
+}
+
+/// The default-gate fixture runs beside the rest of the parallel suite. The
+/// global single-allocation seam is widened to tolerate an unrelated sibling
+/// test's buffers, while still staying far below the old whole-file `Vec`.
+const MODERATE_ENTRY_LOG_BUDGET: EntryLogBudget = EntryLogBudget {
+    total_percent: 600,
+    single_percent: 50,
+    peak_percent: 135,
+};
+
+/// The 16 MiB fixture is run explicitly, normally with `--test-threads=1`.
+const LARGE_ENTRY_LOG_BUDGET: EntryLogBudget = EntryLogBudget {
+    total_percent: 600,
+    single_percent: 25,
+    peak_percent: 135,
+};
+
+/// Checks the allocation budget of reopening an entry-only main log.
+///
+/// * `stats.max_allocation_bytes` is the direct detector for the old
+///   `tokio::fs::read` shape: that reader materialized the whole log in one
+///   blocking-pool `Vec`, so its largest single allocation was 100% of
+///   `main_bytes`. The streaming reader holds one line (a few KiB).
+/// * `stats.bytes` is the cumulative stability guard. It never subtracts on
+///   `dealloc`, so it measures every per-marker parse/clone the streaming
+///   implementation performs. The old reader is caught by the single-allocation
+///   cap above; this cap catches a streaming implementation that stops moving
+///   payloads and starts copying them again.
+/// * `stats.peak_bytes` guards the streaming live set: it must stay near one
+///   copy of the log. Thread-local live accounting under-counts a blocking
+///   whole-file read (its `dealloc` subtracts a buffer this thread never
+///   added), so the two assertions above are the required signals.
+fn assert_entry_log_allocation_budget(stats: &AllocStats, main_bytes: u64, budget: EntryLogBudget) {
+    assert!(
+        stats.max_allocation_bytes > 0,
+        "the global allocation seam observed no allocation; the measurement is broken"
+    );
+    assert!(
+        stats.max_allocation_bytes <= main_bytes * budget.single_percent / 100,
+        "recovery's largest single allocation was {} bytes for a {} byte main log \
+         ({} allocation events); a streaming reader only buffers one line, while \
+         the old whole-file reader allocated the entire log in one Vec",
+        stats.max_allocation_bytes,
+        main_bytes,
+        stats.events
+    );
+    assert!(
+        stats.peak_bytes <= main_bytes * budget.peak_percent / 100,
+        "recovery peaked at {} live bytes for a {} byte main log ({} allocation \
+         events); streaming replay holds one copy of the state, while the old \
+         whole-file read kept the text and every parsed marker alive at once",
+        stats.peak_bytes,
+        main_bytes,
+        stats.events
+    );
+    assert!(
+        stats.bytes <= main_bytes * budget.total_percent / 100,
+        "recovery allocated {} bytes in total for a {} byte main log ({} allocation \
+         events); streaming replay was measured at about 5x (two validation/replay \
+         parses plus the MemoryStorage copy), so this cap only catches a rewrite \
+         that reintroduces per-line copies",
+        stats.bytes,
+        main_bytes,
+        stats.events
+    );
+}
+
+/// Default-gate sized version of the 16 MiB entry-log test: the same
+/// streaming allocation budget on a ~4 MiB log, so an ordinary
+/// `cargo test --test durable_storage` run exercises the contract. The fixture
+/// uses one entry per marker, exactly like the 16 MiB test, so both cases
+/// exercise the same per-line reading shape and can share the same budget.
+#[tokio::test]
+async fn jsonl_recovers_a_moderate_entry_log_without_holding_markers() {
+    const ENTRIES: i64 = 1_024;
+    const PAYLOAD: usize = 4 * 1024;
+    let section = MeasureSection::begin().await;
+    let dir = temp_dir("moderate-main-log");
+    {
+        let storage = JsonlStorage::open(&dir).await.expect("open");
+        storage
+            .commit(vec![StorageWrite::Conversation {
+                value: conversation(1),
+            }])
+            .await
+            .expect("seed conversation");
+        for index in 0..ENTRIES {
+            let mut value = entry(1_000 + index, 1, UserEntry::KIND.kind, None);
+            value.model = Some(vec![json!({
+                "role": "user",
+                "content": "x".repeat(PAYLOAD),
+            })]);
+            storage
+                .commit(vec![StorageWrite::Entry { value }])
+                .await
+                .expect("append entry");
+        }
+        storage.close().await.expect("close");
+    }
+
+    let main_bytes = std::fs::metadata(dir.join("main.jsonl"))
+        .expect("main log metadata")
+        .len();
+    assert!(
+        main_bytes >= 4 * 1024 * 1024,
+        "fixture too small: {main_bytes} bytes"
+    );
+
+    let (result, stats) = section.measure(JsonlStorage::open(&dir)).await;
+    let storage = result.expect("reopen moderate log");
+    assert_entry_log_allocation_budget(&stats, main_bytes, MODERATE_ENTRY_LOG_BUDGET);
+    let page = storage
+        .scan_entries(
+            EntryQuery {
+                conversation_id: ConversationId::from_raw(1),
+                min_entry_id: None,
+                max_entry_id: None,
+                order: Some(ScanOrder::Descending),
+            },
+            8,
+            None,
+        )
+        .await
+        .expect("scan recovered entries");
+    assert_eq!(page.items.len(), 8);
+    assert_eq!(page.items[0].id.as_i64(), 1_000 + ENTRIES - 1);
+    assert_eq!(
+        page.items[0]
+            .model
+            .as_ref()
+            .and_then(|model| model.first())
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .map(str::len),
+        Some(PAYLOAD)
+    );
+    storage.close().await.expect("close");
+    remove_dir(&dir).await;
+}
+
+/// A 16 MiB main log — one marker per entry — replays through the streaming
+/// marker pass without retaining the file text or every parsed marker.
+/// Ignored by default so the ordinary suite stays quick.
+#[tokio::test]
+#[ignore = "16 MiB recovery fixture; run explicitly with --ignored"]
+async fn jsonl_recovers_a_large_entry_log_without_holding_markers() {
+    const ENTRIES: i64 = 4_096;
+    const PAYLOAD: usize = 4 * 1024;
+    let section = MeasureSection::begin().await;
+    let dir = temp_dir("large-main-log");
+    {
+        let storage = JsonlStorage::open(&dir).await.expect("open");
+        storage
+            .commit(vec![StorageWrite::Conversation {
+                value: conversation(1),
+            }])
+            .await
+            .expect("seed conversation");
+        for index in 0..ENTRIES {
+            let mut value = entry(1_000 + index, 1, UserEntry::KIND.kind, None);
+            value.model = Some(vec![json!({
+                "role": "user",
+                "content": "x".repeat(PAYLOAD),
+            })]);
+            storage
+                .commit(vec![StorageWrite::Entry { value }])
+                .await
+                .expect("append entry");
+        }
+        storage.close().await.expect("close");
+    }
+
+    let main_bytes = std::fs::metadata(dir.join("main.jsonl"))
+        .expect("main log metadata")
+        .len();
+    assert!(main_bytes >= 16 * 1024 * 1024, "fixture too small");
+
+    let (result, stats) = section.measure(JsonlStorage::open(&dir)).await;
+    let storage = result.expect("reopen large log");
+    eprintln!(
+        "MEASURE large main_bytes={main_bytes} events={} bytes={} ({:.3}x) peak={} ({:.3}x) max={} ({:.3}%)",
+        stats.events,
+        stats.bytes,
+        stats.bytes as f64 / main_bytes as f64,
+        stats.peak_bytes,
+        stats.peak_bytes as f64 / main_bytes as f64,
+        stats.max_allocation_bytes,
+        100.0 * stats.max_allocation_bytes as f64 / main_bytes as f64,
+    );
+    assert_entry_log_allocation_budget(&stats, main_bytes, LARGE_ENTRY_LOG_BUDGET);
+    let page = storage
+        .scan_entries(
+            EntryQuery {
+                conversation_id: ConversationId::from_raw(1),
+                min_entry_id: None,
+                max_entry_id: None,
+                order: Some(ScanOrder::Descending),
+            },
+            8,
+            None,
+        )
+        .await
+        .expect("scan recovered entries");
+    assert_eq!(page.items.len(), 8);
+    assert_eq!(page.items[0].id.as_i64(), 1_000 + ENTRIES - 1);
+    assert_eq!(
+        page.items[0]
+            .model
+            .as_ref()
+            .and_then(|model| model.first())
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .map(str::len),
+        Some(PAYLOAD)
+    );
+    storage.close().await.expect("close");
+    remove_dir(&dir).await;
+}
+
+/// Allocation-peak harness for R1-L3-008. Recovery holds one parsed copy of
+/// the sidecar (`record_by_key`), so the live peak tracks the sidecar size
+/// itself. The old `tokio::fs::read` shape peaked at 2x while reading the
+/// file, then held the line strings, `record_by_key` and `parsed_files`
+/// simultaneously for a 3x+ peak; the replay clones then added more.
+///
+/// Run alone: `cargo test --test durable_storage -- --ignored --test-threads=1
+/// jsonl_recovery_allocation_stays_near_one_copy`.
+#[tokio::test]
+#[ignore = "allocation harness; run with --test-threads=1 --ignored"]
+async fn jsonl_recovery_allocation_stays_near_one_copy() {
+    const RECORDS: usize = 512;
+    const PAYLOAD: usize = 32 * 1024;
+    let section = MeasureSection::begin().await;
+    let dir = temp_dir("recovery-allocation");
+    let sidecar_bytes = write_legacy_live_task_sidecar(&dir, 20, RECORDS, PAYLOAD);
+    assert!(sidecar_bytes >= 16 * 1024 * 1024, "fixture too small");
+
+    let (result, stats) = section.measure(JsonlStorage::open(&dir)).await;
+    let storage = result.expect("reopen");
+    assert!(
+        stats.peak_bytes <= sidecar_bytes + sidecar_bytes / 4,
+        "recovery peaked at {} live bytes for a {} byte sidecar ({} allocation events, \
+         {} bytes allocated in total); one parsed copy must stay near 1x, while the old \
+         read-everything + clone-twice shape peaked above 3x",
+        stats.peak_bytes,
+        sidecar_bytes,
+        stats.events,
+        stats.bytes
+    );
+    assert!(
+        stats.bytes <= sidecar_bytes * 3,
+        "recovery allocated {} bytes in total for a {} byte sidecar ({} allocation events); \
+         the old read-everything + clone-twice shape allocated more than 5x",
+        stats.bytes,
+        sidecar_bytes,
+        stats.events
+    );
+    assert!(storage
+        .task(TaskId::from_raw(20))
+        .await
+        .expect("task")
+        .is_some());
+    storage.close().await.expect("close");
+    remove_dir(&dir).await;
+}
+
+// ── R1-L3-009: live task sidecars stay bounded ─────────────────────────────
+
+/// The old implementation appended one full `TaskRecord` per state change, so
+/// a task that changed state N times left N records in `task-<id>.jsonl`, and
+/// every reopen parsed and replayed all of them. Compaction now rewrites the
+/// sidecar to its newest record at a fixed byte threshold, which bounds both
+/// the file size and its line count independently of N.
+#[tokio::test]
+async fn jsonl_live_task_sidecar_stays_bounded_across_many_transitions() {
+    use pir::durable::storage::jsonl::TASK_SIDECAR_COMPACT_BYTES;
+
+    const TRANSITIONS: usize = 600;
+    const PAYLOAD: usize = 256;
+    let dir = temp_dir("task-bounded");
+    let storage = JsonlStorage::open(&dir).await.expect("open");
+    storage
+        .commit(vec![
+            StorageWrite::Conversation {
+                value: conversation(1),
+            },
+            StorageWrite::Task {
+                value: task(20, 1, TaskStatus::Running),
+            },
+        ])
+        .await
+        .expect("seed");
+
+    let mut latest = task(20, 1, TaskStatus::Running);
+    for index in 0..TRANSITIONS {
+        latest.state = match index % 3 {
+            0 => TaskState::Running {
+                checkpoint: json!({"n": index, "blob": "x".repeat(PAYLOAD)}),
+            },
+            1 => TaskState::Waiting {
+                checkpoint: json!({"n": index, "blob": "x".repeat(PAYLOAD)}),
+                on: vec![TaskId::from_raw(99)],
+                policy: pir::durable::JoinPolicy::FailFast,
+            },
+            _ => TaskState::Sleeping {
+                checkpoint: json!({"n": index, "blob": "x".repeat(PAYLOAD)}),
+                until: index as i64,
+            },
+        };
+        latest.restarts = Some(index as i64);
+        storage
+            .commit(vec![StorageWrite::Task {
+                value: latest.clone(),
+            }])
+            .await
+            .expect("task transition");
+    }
+
+    let sidecar = dir.join("task-20.jsonl");
+    let raw = std::fs::read_to_string(&sidecar).expect("read sidecar");
+    let lines = raw.lines().count();
+    assert!(
+        lines <= 256,
+        "a {TRANSITIONS}-transition live task kept {lines} sidecar records; the old \
+         implementation grew one full record per transition"
+    );
+    assert!(
+        lines * 4 < TRANSITIONS,
+        "record count must not track the number of state changes: {lines} records \
+         for {TRANSITIONS} transitions"
+    );
+    assert!(
+        (raw.len() as u64) <= TASK_SIDECAR_COMPACT_BYTES + 4096,
+        "sidecar grew to {} bytes with a {} byte compaction threshold",
+        raw.len(),
+        TASK_SIDECAR_COMPACT_BYTES
+    );
+
+    storage.close().await.expect("close");
+    let reopened = JsonlStorage::open(&dir).await.expect("reopen");
+    let recovered = reopened
+        .task(TaskId::from_raw(20))
+        .await
+        .expect("task")
+        .expect("present");
+    assert_eq!(
+        recovered, latest,
+        "recovery rebuilds the newest full record even though older records were dropped"
+    );
+    reopened.close().await.expect("close");
+    remove_dir(&dir).await;
+}
+
+/// A terminal task still writes its complete record into the main marker (never
+/// a sidecar), reclaims the sidecar, and reopens with every field intact even
+/// after the live history was compacted.
+#[tokio::test]
+async fn jsonl_terminal_task_after_compaction_recovers_the_full_record() {
+    const TRANSITIONS: usize = 200;
+    let dir = temp_dir("task-terminal-compacted");
+    let storage = JsonlStorage::open(&dir).await.expect("open");
+    storage
+        .commit(vec![
+            StorageWrite::Conversation {
+                value: conversation(1),
+            },
+            StorageWrite::Task {
+                value: task(20, 1, TaskStatus::Running),
+            },
+        ])
+        .await
+        .expect("seed");
+    for index in 0..TRANSITIONS {
+        let mut value = task(20, 1, TaskStatus::Running);
+        value.state = TaskState::Running {
+            checkpoint: json!({"n": index, "blob": "x".repeat(128)}),
+        };
+        storage
+            .commit(vec![StorageWrite::Task { value }])
+            .await
+            .expect("task transition");
+    }
+
+    let mut terminal = task(20, 1, TaskStatus::Terminal);
+    terminal.ended_at = Some(4_242);
+    terminal.restarts = Some(7);
+    terminal.memos = Some(serde_json::Map::from_iter([(
+        "note".to_owned(),
+        json!("kept"),
+    )]));
+    storage
+        .commit(vec![StorageWrite::Task {
+            value: terminal.clone(),
+        }])
+        .await
+        .expect("terminal task");
+    assert!(
+        !dir.join("task-20.jsonl").exists(),
+        "a terminal task's sidecar is reclaimed"
+    );
+    let main = std::fs::read_to_string(dir.join("main.jsonl")).expect("read main");
+    assert!(
+        main.contains("\"type\":\"task\""),
+        "the terminal record is stored in the main marker: {main}"
+    );
+    storage.close().await.expect("close");
+
+    let reopened = JsonlStorage::open(&dir).await.expect("reopen");
+    let recovered = reopened
+        .task(TaskId::from_raw(20))
+        .await
+        .expect("task")
+        .expect("present");
+    assert_eq!(recovered, terminal, "the complete terminal record survives");
+    reopened.close().await.expect("close");
+    remove_dir(&dir).await;
+}
+
+/// A crash between the marker append and the compaction rewrite leaves older
+/// full snapshots in the sidecar; a crash before the marker leaves an
+/// unconfirmed tail record. Recovery must rebuild the newest confirmed state,
+/// drop the stale prefix and truncate the unconfirmed tail.
+#[tokio::test]
+async fn jsonl_recovery_compacts_crashed_task_sidecar_and_drops_unconfirmed_tail() {
+    let dir = temp_dir("task-crash-recovery");
+    {
+        let storage = JsonlStorage::open(&dir).await.expect("open");
+        storage
+            .commit(vec![
+                StorageWrite::Conversation {
+                    value: conversation(1),
+                },
+                StorageWrite::Task {
+                    value: task(20, 1, TaskStatus::Running),
+                },
+            ])
+            .await
+            .expect("seed");
+        let mut second = task(20, 1, TaskStatus::Running);
+        second.state = TaskState::Running {
+            checkpoint: json!({"n": 2}),
+        };
+        storage
+            .commit(vec![StorageWrite::Task { value: second }])
+            .await
+            .expect("second transition");
+        storage.close().await.expect("close");
+    }
+
+    let sidecar = dir.join("task-20.jsonl");
+    let mut raw = std::fs::read_to_string(&sidecar).expect("read sidecar");
+    assert_eq!(
+        raw.lines().count(),
+        2,
+        "the fixture keeps both pre-compaction records"
+    );
+    let mut unconfirmed = task(20, 1, TaskStatus::Running);
+    unconfirmed.state = TaskState::Running {
+        checkpoint: json!({"n": 999}),
+    };
+    raw.push_str(
+        &serde_json::to_string(&json!({
+            "format": 1,
+            "type": "record",
+            "seq": 3,
+            "ordinal": 0,
+            "payload": {"type": "task", "value": unconfirmed},
+        }))
+        .expect("serialize unconfirmed record"),
+    );
+    raw.push('\n');
+    std::fs::write(&sidecar, raw).expect("simulate crash shape");
+
+    let storage = JsonlStorage::open(&dir).await.expect("reopen");
+    let live = storage
+        .task(TaskId::from_raw(20))
+        .await
+        .expect("task")
+        .expect("present");
+    let TaskState::Running { checkpoint } = &live.state else {
+        panic!("unexpected recovered state: {:?}", live.state);
+    };
+    assert_eq!(
+        checkpoint.get("n"),
+        Some(&json!(2)),
+        "the unconfirmed transition never landed"
+    );
+    storage.close().await.expect("close");
+
+    let raw = std::fs::read_to_string(&sidecar).expect("read reclaimed sidecar");
+    assert_eq!(
+        raw.lines().count(),
+        1,
+        "recovery keeps only the newest record: {raw}"
+    );
+    assert!(
+        raw.contains("\"n\":2"),
+        "the newest confirmed record survives: {raw}"
+    );
+    remove_dir(&dir).await;
+}
+
+#[test]
+fn page_of_owned_matches_page_of_for_every_limit() {
+    use pir::durable::storage::scan::{page_of, page_of_owned};
+
+    for len in 0..=6usize {
+        let values: Vec<i64> = (0..len as i64).collect();
+        for limit in 0..=6usize {
+            for order in [ScanOrder::Ascending, ScanOrder::Descending] {
+                let (expected_items, expected_next) =
+                    page_of(&values, limit, order, |value| *value);
+                let (items, next) = page_of_owned(values.clone(), limit, order, |value| *value);
+                assert_eq!(items, expected_items, "len={len} limit={limit} {order:?}");
+                assert_eq!(next, expected_next, "len={len} limit={limit} {order:?}");
+            }
+        }
+    }
 }

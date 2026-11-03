@@ -75,7 +75,7 @@ use crate::durable::harness::live::{
 };
 use crate::durable::harness::usage::{UsageState, USAGE_KIND};
 use crate::durable::harness::util::scan_all;
-use crate::durable::harness::view::{ConversationView, ConversationViews, ViewObserver};
+use crate::durable::harness::view::{ConversationView, ConversationViews, EntryList, ViewObserver};
 use crate::durable::ids::{ConversationId, SubmissionId, TaskId};
 use crate::durable::session::facade::Session;
 use crate::durable::session::observation::{WatchEnd, MAX_PENDING_WATCH_FRAMES};
@@ -1878,7 +1878,7 @@ struct StreamObserver {
     /// The newest active entries, refreshed only by the commits that change
     /// them. Entry records are the bulk of a revision, so a publication that
     /// only advances documents does not copy them.
-    entries: Arc<Mutex<Arc<Vec<EntryRecord>>>>,
+    entries: Arc<Mutex<Arc<EntryList>>>,
     /// Generations whose held outcome already ended their turn (upstream's
     /// `held`).
     held: Mutex<HashSet<TaskId>>,
@@ -1889,7 +1889,7 @@ impl StreamObserver {
         conversation_id: ConversationId,
         watch: Arc<EventWatch>,
         current: Arc<Mutex<Arc<ViewPort>>>,
-        entries: Arc<Mutex<Arc<Vec<EntryRecord>>>>,
+        entries: Arc<Mutex<Arc<EntryList>>>,
         held: HashSet<TaskId>,
     ) -> Self {
         Self {
@@ -2105,8 +2105,8 @@ pub async fn watch_events_with_held(
     })?;
 
     let current: Arc<Mutex<Arc<ViewPort>>> = Arc::new(Mutex::new(Arc::new(ViewPort::default())));
-    let latest_entries: Arc<Mutex<Arc<Vec<EntryRecord>>>> =
-        Arc::new(Mutex::new(Arc::new(Vec::new())));
+    let latest_entries: Arc<Mutex<Arc<EntryList>>> =
+        Arc::new(Mutex::new(Arc::new(EntryList::default())));
     let snapshot_slot: Arc<Mutex<Option<SnapshotEvent>>> = Arc::new(Mutex::new(None));
     let watch_slot: Arc<Mutex<Option<Arc<EventWatch>>>> = Arc::new(Mutex::new(None));
     let reporter: Reporter = {
@@ -2132,7 +2132,8 @@ pub async fn watch_events_with_held(
                     *lock(&snapshot_slot) = Some(snapshot_of(&port));
                     // The entries belong to the snapshot cache from here on;
                     // the port kept for translations holds documents only.
-                    *lock(&latest_entries) = Arc::new(std::mem::take(&mut port.entries));
+                    *lock(&latest_entries) =
+                        Arc::new(EntryList::from_vec(std::mem::take(&mut port.entries)));
                     *lock(&current) = Arc::new(port);
                     let replace_current = Arc::clone(&current);
                     let replace_entries = Arc::clone(&latest_entries);
@@ -2143,7 +2144,7 @@ pub async fn watch_events_with_held(
                             let entries = lock(&replace_entries);
                             vec![AgentEvent::Snapshot(snapshot_with_entries(
                                 &docs,
-                                entries.as_ref().clone(),
+                                entries.to_vec(),
                             ))]
                         }),
                     ));

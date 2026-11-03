@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 use super::shared::{off_map_entry_is_not_null, OPENAI_TOOL_CALL_PROVIDERS};
 use crate::ai::api::transform::get_initial_system_prompt;
 use crate::ai::event_stream::AssistantMessageEventStream;
-use crate::ai::transport::ProviderRequestClient;
+use crate::ai::transport::{ProviderRequestClient, StreamingRequest};
 use crate::ai::types::{
     AssistantMessageEvent, Model, ProviderHeaders, StreamOptions, ThinkingLevel,
 };
@@ -289,23 +289,38 @@ fn map_codex_effort(model: &Model, level: ThinkingLevel) -> String {
 // Transport (WebSocket first, SSE fallback)
 // ---------------------------------------------------------------------------
 
+/// Inputs for one [`stream_codex_responses`] request.
+pub struct CodexStreamRequest<'a> {
+    pub client: &'a ProviderRequestClient,
+    pub model: &'a Model,
+    pub options: &'a StreamOptions,
+    pub url: &'a str,
+    pub sse_headers: &'a ProviderHeaders,
+    pub body: Value,
+    pub account_id: &'a str,
+    pub token: &'a str,
+    pub sink: &'a AssistantMessageEventStream,
+}
+
 /// Run one Codex request: pooled WebSocket first, SSE when the WebSocket
 /// fails before emitting any provider event. `body` is the full-history
 /// request body; the WebSocket path may reduce it to a continuation
 /// (`previous_response_id` + input delta) internally, while the SSE path
 /// always sends it whole (upstream's SSE fallback behavior).
-#[allow(clippy::too_many_arguments)]
 pub async fn stream_codex_responses(
-    client: &ProviderRequestClient,
-    model: &Model,
-    options: &StreamOptions,
-    url: &str,
-    sse_headers: &ProviderHeaders,
-    body: Value,
-    account_id: &str,
-    token: &str,
-    sink: &AssistantMessageEventStream,
+    request: CodexStreamRequest<'_>,
 ) -> Result<(), crate::ai::error::AiError> {
+    let CodexStreamRequest {
+        client,
+        model,
+        options,
+        url,
+        sse_headers,
+        body,
+        account_id,
+        token,
+        sink,
+    } = request;
     // `before_provider_request` is a transport-level hook in pir. The
     // WebSocket path bypasses the HTTP transport (and the SSE path may send a
     // zstd-compressed body that the hook cannot parse), so apply it once here
@@ -325,12 +340,14 @@ pub async fn stream_codex_responses(
     }
     let ws_url = codex_ws::resolve_codex_websocket_url(url);
     match codex_ws::try_stream_codex_websocket(
-        &ws_url,
-        &body,
-        account_id,
-        token,
-        model,
-        options,
+        codex_ws::CodexWsRequest {
+            ws_url: &ws_url,
+            body: &body,
+            account_id,
+            token,
+            model,
+            options,
+        },
         &mut parser,
         sink,
     )
@@ -359,7 +376,6 @@ fn new_codex_parser(model: &Model, options: &StreamOptions) -> super::shared::Re
 /// whenever the codec is compiled in, matching upstream's unconditional
 /// `compressRequestBodyZstd` on this endpoint. Without the codec the body goes
 /// out uncompressed.
-#[allow(clippy::too_many_arguments)]
 async fn stream_codex_sse(
     client: &ProviderRequestClient,
     url: &str,
@@ -407,12 +423,14 @@ async fn stream_codex_sse(
         );
         client
             .request_streaming_with(
-                reqwest::Method::POST,
-                url,
-                &headers,
+                StreamingRequest::new(
+                    reqwest::Method::POST,
+                    url,
+                    &headers,
+                    options.signal.as_ref(),
+                    &request_hooks,
+                ),
                 payload,
-                options.signal.as_ref(),
-                &request_hooks,
                 &mut on_chunk,
             )
             .await?

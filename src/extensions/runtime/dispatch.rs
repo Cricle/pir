@@ -157,27 +157,22 @@ pub fn message_update_stream_json(
             } = event
             {
                 let index = *content_index;
-                // The patch needs the PREVIOUS arguments of this content index:
-                // take the baseline (moved out, so the new value can be stored
-                // without a second live copy) and diff it against the partial's
-                // value (O(args) comparison, no allocation).
-                let previous = tool_arguments.take(index);
+                // The patch needs the PREVIOUS arguments of this content
+                // index: diff the stored baseline against the partial's value
+                // (O(args) comparison, no allocation). The baseline is
+                // refreshed IN PLACE after the wire is built — the common
+                // change is one string gaining a suffix, so only that string
+                // is rewritten (`commit`) instead of cloning the whole map.
                 let current = block_arguments(partial, index);
-                let patch = match (previous.as_ref(), current) {
-                    (Some(previous), Some(current)) => tool_argument_patch(previous, current),
-                    _ => None,
-                };
+                let patch = current.and_then(|current| tool_arguments.diff(index, current));
                 let wire = serde_json::to_string(&MessageUpdateStreamWire {
                     event,
                     stream,
                     patch,
                 })
                 .unwrap_or_else(|_| "{}".to_owned());
-                // The baseline is refreshed AFTER the wire is built (the patch
-                // borrows it): the JS side now holds the new value, which is
-                // what the next delta's patch is computed against.
                 match current {
-                    Some(current) => tool_arguments.put(index, current.clone()),
+                    Some(current) => tool_arguments.commit(index, current, patch.map(|p| p.key)),
                     None => tool_arguments.forget(index),
                 }
                 return wire;
@@ -249,7 +244,7 @@ pub struct ToolArgumentPatch<'a> {
 /// structurally (map entries, `Value` equality), never as raw JSON text, so a
 /// fragment that only changes the escaping of a value still compares equal.
 pub fn tool_argument_patch<'a>(
-    previous: &'a std::collections::BTreeMap<String, JsonValue>,
+    previous: &std::collections::BTreeMap<String, JsonValue>,
     current: &'a std::collections::BTreeMap<String, JsonValue>,
 ) -> Option<ToolArgumentPatch<'a>> {
     let mut previous_entries = previous.iter();
@@ -444,7 +439,7 @@ impl<'a> MessageUpdateMessageWire<'a> {
             diagnostics: &partial.diagnostics,
             usage: &partial.usage,
             stop_reason: partial.stop_reason,
-            deferred: partial.deferred.as_ref(),
+            deferred: partial.deferred.as_deref(),
             error_message: partial.error_message.as_deref(),
             raw_stop_reason: partial.raw_stop_reason.as_deref(),
             end_turn: partial.end_turn,
@@ -842,6 +837,11 @@ impl ExtensionRuntime {
             ),
         )
         .await;
+        // Probe the armed deadline BEFORE the recovery drain/disarm: the
+        // QuickJS interrupt handler shares this budget and, on a synchronous
+        // JS turn, usually returns its opaque exception just before the tokio
+        // timeout arm can fire. That outcome is a timeout, not a user error.
+        let deadline_elapsed = self.deadline_elapsed(token);
         // Heap-cap diagnosis: sample the pending exception and the heap
         // BEFORE the recovery drain clears them, so a memory-limit hit turns
         // into the actionable limit error instead of a bare "Exception
@@ -862,10 +862,13 @@ impl ExtensionRuntime {
             // JS side threw where the prelude's try/catch could not see it.
             Ok(Err(js_error)) => {
                 self.recover_after_interrupt().await;
-                return Err(anyhow::anyhow!(
-                    "{}",
-                    memory_failure.unwrap_or_else(|| js_error.to_string())
-                ));
+                if let Some(failure) = memory_failure {
+                    return Err(anyhow::anyhow!("{failure}"));
+                }
+                if deadline_elapsed {
+                    return Err(anyhow::anyhow!("tool `{tool_name}` execution timed out"));
+                }
+                return Err(anyhow::anyhow!("{js_error}"));
             }
             // Elapsed tokio deadline.
             Err(_elapsed) => {
@@ -1099,12 +1102,36 @@ impl ExtensionRuntime {
 
     /// Dispatch a slash command by name (first registration wins).
     pub async fn dispatch_command(&self, name: &str, args: &str) -> anyhow::Result<CommandOutcome> {
+        self.dispatch_command_for_ext(name, args, None, name).await
+    }
+
+    /// Dispatch a slash command to the registration owned by `ext_id` when
+    /// the unified registry deduplicated a duplicate name into `name:2`...
+    /// `invocation_name` is passed through so the handler sees the name the
+    /// user actually invoked (`ctx.commandName`).
+    pub async fn dispatch_command_for_ext(
+        &self,
+        name: &str,
+        args: &str,
+        ext_id: Option<u64>,
+        invocation_name: &str,
+    ) -> anyhow::Result<CommandOutcome> {
         let token = self.arm_deadline();
+        let ext_id_json = ext_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "null".to_owned());
         let result = tokio::time::timeout(
             self.call_timeout(),
-            self.invoke_str2("__pir_dispatchCommand", name.to_string(), args.to_string()),
+            self.invoke_str4(
+                "__pir_dispatchCommand",
+                name.to_string(),
+                args.to_string(),
+                ext_id_json,
+                invocation_name.to_string(),
+            ),
         )
         .await;
+        let deadline_elapsed = self.deadline_elapsed(token);
         if !matches!(result, Ok(Ok(_))) {
             self.recover_after_interrupt().await;
         }
@@ -1113,6 +1140,9 @@ impl ExtensionRuntime {
             Ok(Ok(result_json)) => result_json,
             Ok(Err(js_error)) => {
                 self.recover_after_interrupt().await;
+                if deadline_elapsed {
+                    return Err(anyhow::anyhow!("command `{name}` dispatch timed out"));
+                }
                 return Err(js_error.into());
             }
             Err(_elapsed) => {
@@ -1138,6 +1168,7 @@ impl ExtensionRuntime {
             self.invoke_str1("__pir_dispatchShortcut", key.to_string()),
         )
         .await;
+        let deadline_elapsed = self.deadline_elapsed(token);
         if !matches!(result, Ok(Ok(_))) {
             self.recover_after_interrupt().await;
         }
@@ -1146,6 +1177,9 @@ impl ExtensionRuntime {
             Ok(Ok(result_json)) => result_json,
             Ok(Err(js_error)) => {
                 self.recover_after_interrupt().await;
+                if deadline_elapsed {
+                    return Err(anyhow::anyhow!("shortcut `{key}` dispatch timed out"));
+                }
                 return Err(js_error.into());
             }
             Err(_elapsed) => {

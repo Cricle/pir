@@ -101,7 +101,7 @@ fn assistant_message() -> AssistantMessage {
             cost: Cost::default(),
         },
         stop_reason: StopReason::ToolUse,
-        deferred: Some(DeferredHandle {
+        deferred: Some(Box::new(DeferredHandle {
             provider: "openai".to_owned(),
             model_id: "gpt-x".to_owned(),
             api: "openai-responses".to_owned(),
@@ -109,7 +109,7 @@ fn assistant_message() -> AssistantMessage {
             expires_at: Some(TIMESTAMP + 60_000),
             poll_after_ms: Some(500),
             data: Some(json!({ "poll": true })),
-        }),
+        })),
         error_message: Some("partial".to_owned()),
         raw_stop_reason: Some("tool_use".to_owned()),
         end_turn: Some(true),
@@ -130,7 +130,7 @@ fn tool_result_message() -> ToolResultMessage {
         usage: Some(Usage::default()),
         added_tool_names: vec!["search".to_owned()],
         structured_content: Some(json!({ "ok": true })),
-        nested_calls: Some(NestedToolCalls {
+        nested_calls: Some(Box::new(NestedToolCalls {
             calls: vec![NestedToolCallRecord {
                 id: "nested-1".to_owned(),
                 name: "inner".to_owned(),
@@ -141,7 +141,7 @@ fn tool_result_message() -> ToolResultMessage {
                 error: None,
             }],
             complete: true,
-        }),
+        })),
         is_error: true,
         duration_ms: Some(12),
         timestamp: TIMESTAMP + 4,
@@ -338,7 +338,7 @@ fn rich_messages_keep_every_field() {
     );
     let details = assistant.diagnostics[0].details.as_ref().expect("details");
     assert_eq!(details.get("attempt"), Some(&json!(2)));
-    let deferred = assistant.deferred.as_ref().expect("deferred handle");
+    let deferred = assistant.deferred.as_deref().expect("deferred handle");
     assert_eq!(deferred.id, "batch-1");
     assert_eq!(deferred.poll_after_ms, Some(500));
     assert_eq!(deferred.data, Some(json!({ "poll": true })));
@@ -352,7 +352,7 @@ fn rich_messages_keep_every_field() {
     assert_eq!(result.duration_ms, Some(12));
     let structured = result.structured_content.as_ref().expect("structured");
     assert_eq!(structured["ok"], json!(true));
-    let nested = result.nested_calls.as_ref().expect("nested calls");
+    let nested = result.nested_calls.as_deref().expect("nested calls");
     assert!(nested.complete);
     assert_eq!(nested.calls[0].id, "nested-1");
     assert_eq!(nested.calls[0].status, NestedToolCallStatus::Ok);

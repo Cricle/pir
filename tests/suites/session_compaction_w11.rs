@@ -1741,7 +1741,15 @@ async fn compaction_append_runs_off_the_runtime_thread() {
         let storage = Arc::clone(&storage);
         async move {
             SessionManager::append_compaction_off_thread(
-                &storage, "summary", None, 10, None, None, false,
+                &storage,
+                pir::session_manager::CompactionAppendArgs {
+                    summary: "summary".to_owned(),
+                    first_kept_entry_id: None,
+                    tokens_before: 10,
+                    details: None,
+                    usage: None,
+                    from_hook: false,
+                },
             )
             .await
         }

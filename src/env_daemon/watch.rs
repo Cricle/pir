@@ -31,6 +31,12 @@ const DEBOUNCE: Duration = Duration::from_millis(50);
 /// made in between.
 const FSEVENTS_SETTLE: Duration = Duration::from_millis(500);
 const DEFAULT_POLL_MS: u64 = 2000;
+/// Floor for `pollIntervalMs`: a zero interval would poll as fast as the loop
+/// runs (100% CPU/IO). 50 ms is the fastest cadence the daemon accepts.
+const MIN_POLL_MS: u64 = 50;
+/// Ceiling for `pollIntervalMs`: `Instant + Duration` overflows (panics) on
+/// Windows/macOS for very large values, so one day is the maximum accepted.
+const MAX_POLL_MS: u64 = 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_DIRECTORIES: usize = 10_000;
 /// In polling mode, recently modified small files are also compared by content.
 const HASH_MAX_BYTES: u64 = 256 * 1024;
@@ -207,8 +213,11 @@ fn any_unreliable(targets: &[Target]) -> bool {
             if unsafe { libc::statfs(name.as_ptr(), &mut info) } != 0 {
                 continue;
             }
-            #[allow(clippy::unnecessary_cast)]
-            let kind = (info.f_type as u64) & 0xffff_ffff;
+            // The kernel's `f_type` is signed on some libc targets and
+            // unsigned on others; widen through `i128` so the low 32 bits are
+            // read identically on every supported target without a cast that
+            // is redundant on only some of them.
+            let kind = (i128::from(info.f_type) as u64) & 0xffff_ffff;
             if UNRELIABLE_FILE_SYSTEMS.contains(&kind) {
                 return true;
             }
@@ -247,7 +256,6 @@ struct FileWatcher<'a> {
     control: &'a Control,
     targets: Vec<Target>,
     mode: Mode,
-    poll_interval: Duration,
     max_directories: usize,
     snapshot: Snapshot,
     native: Option<RecommendedWatcher>,
@@ -713,6 +721,17 @@ fn parse_targets(json: &Value) -> Result<Vec<Target>, Failure> {
         .collect()
 }
 
+/// `pollIntervalMs` from the request, clamped to `[MIN_POLL_MS, MAX_POLL_MS]`:
+/// zero must not spin the watcher, and an enormous value must not overflow
+/// `Instant + Duration`.
+fn parse_poll_interval(value: Option<u64>) -> Duration {
+    Duration::from_millis(
+        value
+            .unwrap_or(DEFAULT_POLL_MS)
+            .clamp(MIN_POLL_MS, MAX_POLL_MS),
+    )
+}
+
 /// Watch until cancelled: a `ready` event once coverage is established, then `change` events, or an `error` event
 /// after which nothing follows.
 pub fn run(id: u32, json: &Value, output: &Output, control: &Control) -> Result<Value, Failure> {
@@ -726,15 +745,13 @@ pub fn run(id: u32, json: &Value, output: &Output, control: &Control) -> Result<
         _ => Mode::Native,
     };
     let (events_sender, events) = mpsc::channel();
+    let poll_interval = parse_poll_interval(json["pollIntervalMs"].as_u64());
     let mut watcher = FileWatcher {
         id,
         output,
         control,
         targets,
         mode,
-        poll_interval: Duration::from_millis(
-            json["pollIntervalMs"].as_u64().unwrap_or(DEFAULT_POLL_MS),
-        ),
         max_directories: json["maxDirectories"]
             .as_u64()
             .map_or(DEFAULT_MAX_DIRECTORIES, |max| max as usize),
@@ -748,7 +765,7 @@ pub fn run(id: u32, json: &Value, output: &Output, control: &Control) -> Result<
     watcher.sync(false).map_err(|error| error.failure())?;
     watcher.send(json!({ "kind": "ready", "mode": watcher.mode.name() }));
     let mut flush_at: Option<Instant> = None;
-    let mut poll_at = Instant::now() + watcher.poll_interval;
+    let mut poll_at = Instant::now() + poll_interval;
     loop {
         if watcher.cancelled() {
             return Ok(json!({}));
@@ -784,7 +801,7 @@ pub fn run(id: u32, json: &Value, output: &Output, control: &Control) -> Result<
                 return Ok(json!({}));
             }
             if polling_due {
-                poll_at = Instant::now() + watcher.poll_interval;
+                poll_at = Instant::now() + poll_interval;
             }
         }
     }

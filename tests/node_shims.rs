@@ -1595,6 +1595,112 @@ async fn child_process_exec_and_blocking_variants() {
     );
 }
 
+/// timeout / maxBuffer / signal: the blocking variants must honor Node's
+/// options instead of draining the child to completion.
+const PHASE3_LIMITS_TS: &str = r#"
+import { execSync, spawnSync } from "node:child_process";
+
+export default (pi: any) => {
+  pi.on("session_start", async () => {
+    const isWin = process.platform === "win32";
+    const out: any = {};
+
+    const started = Date.now();
+    const timed = spawnSync(
+      isWin ? "ping -n 10 127.0.0.1" : "sleep 10",
+      [],
+      { shell: true, timeout: 150, encoding: "utf8", windowsHide: true },
+    );
+    out.timeout = {
+      code: timed.error ? timed.error.code : null,
+      status: timed.status,
+      elapsed: Date.now() - started,
+    };
+
+    const big = spawnSync(
+      isWin ? "cmd.exe" : "sh",
+      isWin
+        ? ["/C", "for /L %i in (1,1,1000) do @echo x"]
+        : ["-c", "yes x | head -c 1000"],
+      { maxBuffer: 64, encoding: "utf8", windowsHide: true },
+    );
+    out.maxBuffer = {
+      code: big.error ? big.error.code : null,
+      status: big.status,
+      stdoutLength: big.stdout ? big.stdout.length : -1,
+    };
+
+    const aborted = spawnSync("echo X", [], {
+      shell: true,
+      signal: { aborted: true },
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    out.signal = {
+      code: aborted.error ? aborted.error.code : null,
+      pid: aborted.pid,
+      status: aborted.status,
+    };
+    try {
+      execSync("echo X", {
+        shell: true,
+        signal: { aborted: true },
+        encoding: "utf8",
+        windowsHide: true,
+      });
+      out.execSignal = "no-throw";
+    } catch (error: any) {
+      out.execSignal = error.code;
+    }
+
+    globalThis.__phase3limits = out;
+  });
+};
+"#;
+
+#[tokio::test(flavor = "current_thread")]
+async fn child_process_blocking_timeout_maxbuffer_and_signal() {
+    let rt = new_runtime().await;
+    let v = run_phase3_fixture(&rt, "limits", PHASE3_LIMITS_TS).await;
+
+    assert_eq!(
+        v["timeout"]["code"], "ETIMEDOUT",
+        "spawnSync timeout must surface ETIMEDOUT: {v}"
+    );
+    assert_eq!(
+        v["timeout"]["status"],
+        Value::Null,
+        "a timed-out spawnSync reports null status: {v}"
+    );
+    assert!(
+        v["timeout"]["elapsed"].as_u64().unwrap_or(u64::MAX) < 5_000,
+        "timeout must kill the child instead of waiting for it: {v}"
+    );
+
+    assert_eq!(
+        v["maxBuffer"]["code"], "ENOBUFS",
+        "spawnSync maxBuffer must surface ENOBUFS: {v}"
+    );
+    assert_eq!(
+        v["maxBuffer"]["status"],
+        Value::Null,
+        "a maxBuffer-killed spawnSync reports null status: {v}"
+    );
+
+    assert_eq!(
+        v["signal"]["code"], "ABORT_ERR",
+        "an already-aborted signal must report ABORT_ERR: {v}"
+    );
+    assert_eq!(
+        v["signal"]["pid"], 0,
+        "an already-aborted signal must not spawn a child: {v}"
+    );
+    assert_eq!(
+        v["execSignal"], "ABORT_ERR",
+        "execSync must rethrow the abort error: {v}"
+    );
+}
+
 /// kill(): the exit event must arrive promptly after the kill, `killed` flips.
 const PHASE3_KILL_TS: &str = r#"
 import { spawn } from "node:child_process";

@@ -349,27 +349,44 @@ pub fn canonical_virtual_name(name: &str) -> Option<&'static str> {
 }
 
 /// Source of the virtual module for a canonical name.
-pub fn source_for(canonical: &str) -> Option<&'static str> {
+/// Inflate one shim for a caller that consumes (and drops) the source.
+///
+/// The module loader does not use [`Shim::source`] on purpose: the cached
+/// process-lifetime copy is only needed by tests and by the prelude/globals
+/// boot path, while a virtual module's source is dead once QuickJS has
+/// compiled it. Returning a fresh exact-sized `String` keeps the decoded
+/// bytes out of the resident set after boot.
+fn shim_source(shim: &Shim) -> Option<String> {
+    match shim.inflate() {
+        Ok(source) => Some(source),
+        Err(error) => {
+            crate::ext_diag!("pir-ext: failed to inflate shim `{}`: {error}", shim.name());
+            None
+        }
+    }
+}
+
+pub fn source_for(canonical: &str) -> Option<String> {
     match canonical {
-        "typebox" => Some(TYPEBOX_SHIM.source()),
-        "typebox/compile" => Some(TYPEBOX_COMPILE_SHIM.source()),
-        "typebox/value" => Some(TYPEBOX_VALUE_SHIM.source()),
-        "@earendil-works/pi-coding-agent" => Some(PI_CODING_AGENT_SHIM.source()),
-        "@earendil-works/pi-agent-core" => Some(PI_AGENT_CORE_SHIM.source()),
-        "@earendil-works/pi-ai" => Some(PI_AI_SHIM.source()),
-        "@earendil-works/pi-ai/oauth" => Some(PI_AI_OAUTH_SHIM.source()),
-        "@earendil-works/pi-ai/providers/all" => Some(PI_AI_PROVIDERS_ALL_SHIM.source()),
-        "@earendil-works/pi-tui" => Some(PI_TUI_SHIM.source()),
-        "@earendil-works/pi-codemode" => Some(PI_CODEMODE_SHIM.source()),
-        "@earendil-works/pi-env" => Some(PI_ENV_SHIM.source()),
-        "@earendil-works/chord" => Some(PI_CHORD_SHIM.source()),
-        "@earendil-works/chord/node" => Some(PI_CHORD_NODE_SHIM.source()),
-        "@earendil-works/pi-durable" => Some(PI_DURABLE_SHIM.source()),
-        "@earendil-works/pi-durable/env" => Some(PI_DURABLE_ENV_SHIM.source()),
-        "@earendil-works/pi-durable/throws" => Some(PI_DURABLE_THROWS_SHIM.source()),
-        "better-sqlite3" => Some(BETTER_SQLITE3_SHIM.source()),
-        "sqlite3" => Some(SQLITE3_SHIM.source()),
-        "bcrypt" => Some(BCRYPT_SHIM.source()),
+        "typebox" => shim_source(&TYPEBOX_SHIM),
+        "typebox/compile" => shim_source(&TYPEBOX_COMPILE_SHIM),
+        "typebox/value" => shim_source(&TYPEBOX_VALUE_SHIM),
+        "@earendil-works/pi-coding-agent" => shim_source(&PI_CODING_AGENT_SHIM),
+        "@earendil-works/pi-agent-core" => shim_source(&PI_AGENT_CORE_SHIM),
+        "@earendil-works/pi-ai" => shim_source(&PI_AI_SHIM),
+        "@earendil-works/pi-ai/oauth" => shim_source(&PI_AI_OAUTH_SHIM),
+        "@earendil-works/pi-ai/providers/all" => shim_source(&PI_AI_PROVIDERS_ALL_SHIM),
+        "@earendil-works/pi-tui" => shim_source(&PI_TUI_SHIM),
+        "@earendil-works/pi-codemode" => shim_source(&PI_CODEMODE_SHIM),
+        "@earendil-works/pi-env" => shim_source(&PI_ENV_SHIM),
+        "@earendil-works/chord" => shim_source(&PI_CHORD_SHIM),
+        "@earendil-works/chord/node" => shim_source(&PI_CHORD_NODE_SHIM),
+        "@earendil-works/pi-durable" => shim_source(&PI_DURABLE_SHIM),
+        "@earendil-works/pi-durable/env" => shim_source(&PI_DURABLE_ENV_SHIM),
+        "@earendil-works/pi-durable/throws" => shim_source(&PI_DURABLE_THROWS_SHIM),
+        "better-sqlite3" => shim_source(&BETTER_SQLITE3_SHIM),
+        "sqlite3" => shim_source(&SQLITE3_SHIM),
+        "bcrypt" => shim_source(&BCRYPT_SHIM),
         _ => super::node_shims::source_for(canonical),
     }
 }

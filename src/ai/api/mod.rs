@@ -80,17 +80,7 @@ use crate::ai::types::{
 use crate::ai::types::ProviderEnv;
 
 /// Read a provider-scoped env value: the request env first, then the process
-/// environment (upstream `getProviderEnvValue`). Compiled in every build; the
-/// bedrock, google and openai-family adapters are its consumers, so a build
-/// with only the remaining families sees it unused.
-#[cfg_attr(
-    not(any(
-        feature = "provider-bedrock",
-        feature = "provider-google",
-        feature = "provider-openai"
-    )),
-    allow(dead_code)
-)]
+/// environment (upstream `getProviderEnvValue`).
 pub(crate) fn provider_env_value(name: &str, env: Option<&ProviderEnv>) -> Option<String> {
     if let Some(env) = env {
         if let Some(value) = env.get(name) {
@@ -406,10 +396,7 @@ pub(crate) fn base_message(model: &Model) -> AssistantMessage {
 /// adapters' `mapThinkingLevelToEffort`): the model's `thinkingLevelMap`
 /// override first, then the default low/medium/high ladder. Only the bedrock
 /// and anthropic adapters consume it today.
-#[cfg_attr(
-    not(any(feature = "provider-bedrock", feature = "provider-anthropic")),
-    allow(dead_code)
-)]
+#[cfg(any(feature = "provider-bedrock", feature = "provider-anthropic"))]
 pub(crate) fn map_thinking_level_to_effort(model: &Model, level: Option<ThinkingLevel>) -> String {
     if let Some(level) = level {
         if let Some(mapped) = model
@@ -431,18 +418,6 @@ pub(crate) fn map_thinking_level_to_effort(model: &Model, level: Option<Thinking
 
 /// Apply the per-call retry overrides from [`StreamOptions`] to a cloned
 /// provider client (the shared client keeps its own defaults otherwise).
-/// Every provider adapter calls this; only a build with no provider family
-/// at all sees it unused.
-#[cfg_attr(
-    not(any(
-        feature = "provider-anthropic",
-        feature = "provider-bedrock",
-        feature = "provider-google",
-        feature = "provider-mistral",
-        feature = "provider-openai"
-    )),
-    allow(dead_code)
-)]
 pub(crate) fn apply_stream_retry_overrides(
     client: &mut ProviderRequestClient,
     options: &StreamOptions,
@@ -489,16 +464,6 @@ pub(crate) fn apply_stream_retry_overrides(
 /// When the signal is NOT aborted this is exactly the previous
 /// `AiError::Aborted => Aborted, _ => Error` mapping, so genuine non-abort
 /// failures keep their class.
-#[cfg_attr(
-    not(any(
-        feature = "provider-anthropic",
-        feature = "provider-bedrock",
-        feature = "provider-google",
-        feature = "provider-mistral",
-        feature = "provider-openai"
-    )),
-    allow(dead_code)
-)]
 pub(crate) fn terminal_error_classification(
     error: &AiError,
     signal: Option<&AbortSignal>,
@@ -625,16 +590,6 @@ fn terminal_error_message_with_text(
 /// terminal message with the accumulated stream content (see
 /// `ai::provider::StreamedContent`), which is the same seam upstream's
 /// in-place mutation of the accumulated `output` reaches.
-#[cfg_attr(
-    not(any(
-        feature = "provider-anthropic",
-        feature = "provider-bedrock",
-        feature = "provider-google",
-        feature = "provider-mistral",
-        feature = "provider-openai"
-    )),
-    allow(dead_code)
-)]
 pub(crate) fn finish_provider_stream(
     sink: &AssistantMessageEventStream,
     result: Result<(), AiError>,
@@ -670,32 +625,12 @@ pub(crate) fn finish_provider_stream(
 /// freeze hundreds of full-message snapshots before the first `push_await`
 /// even runs, i.e. the retention would scale with the socket read size
 /// instead of the queue capacity.
-#[cfg_attr(
-    not(any(
-        feature = "provider-anthropic",
-        feature = "provider-bedrock",
-        feature = "provider-google",
-        feature = "provider-mistral",
-        feature = "provider-openai"
-    )),
-    allow(dead_code)
-)]
 pub(crate) struct EventChunkSink<'a, F> {
     feed: F,
     sink: &'a AssistantMessageEventStream,
     ready: Vec<crate::ai::types::AssistantMessageEvent>,
 }
 
-#[cfg_attr(
-    not(any(
-        feature = "provider-anthropic",
-        feature = "provider-bedrock",
-        feature = "provider-google",
-        feature = "provider-mistral",
-        feature = "provider-openai"
-    )),
-    allow(dead_code)
-)]
 impl<'a, F> EventChunkSink<'a, F>
 where
     F: FnMut(&[u8], &mut Vec<crate::ai::types::AssistantMessageEvent>) -> AiResult<()> + Send,
@@ -730,16 +665,6 @@ where
     }
 }
 
-#[cfg_attr(
-    not(any(
-        feature = "provider-anthropic",
-        feature = "provider-bedrock",
-        feature = "provider-google",
-        feature = "provider-mistral",
-        feature = "provider-openai"
-    )),
-    allow(dead_code)
-)]
 impl<F> crate::ai::transport::ChunkSink for EventChunkSink<'_, F>
 where
     F: FnMut(&[u8], &mut Vec<crate::ai::types::AssistantMessageEvent>) -> AiResult<()> + Send,
@@ -813,10 +738,6 @@ fn extract_raw_error_metadata(message: &str) -> Option<String> {
 
 /// Join the text blocks of a message into one string (adapter glue used by
 /// the OpenAI Completions and Google adapters).
-#[cfg_attr(
-    not(any(feature = "provider-openai", feature = "provider-google")),
-    allow(dead_code)
-)]
 pub(crate) fn joined_text_blocks(blocks: &[ContentBlock], separator: &str) -> String {
     blocks
         .iter()
@@ -841,10 +762,6 @@ pub(crate) fn joined_text_blocks(blocks: &[ContentBlock], separator: &str) -> St
 /// explicit request value first, then the `PI_CACHE_RETENTION` provider env
 /// (`long`), then `short`. Shared with the bedrock-converse-stream and
 /// openai-responses adapters, whose upstreams define the same resolver.
-#[cfg_attr(
-    not(any(feature = "provider-bedrock", feature = "provider-openai")),
-    allow(dead_code)
-)]
 pub(crate) fn resolve_cache_retention(options: &StreamOptions) -> CacheRetention {
     if let Some(retention) = options.cache_retention {
         return retention;

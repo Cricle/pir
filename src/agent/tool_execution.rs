@@ -1713,43 +1713,20 @@ impl ToolEventFaces {
     }
 }
 
-/// Whether `plugin` is the QuickJS extensions adapter.
-///
-/// The adapter is the only plugin whose events are already dispatched through
-/// the caller's [`crate::extensions::ExtensionHandle`] (`LoopDeps::extensions`
-/// / the session's JS face); the ordered fan-out below must call the handle
-/// ONCE at the adapter's list position instead of invoking the adapter a
-/// second time.
-fn is_js_adapter(plugin: &Arc<dyn crate::plugins::AgentPlugin>) -> bool {
-    plugin
-        .as_any()
-        .is_some_and(|any| any.is::<crate::plugins::JsExtensionsPlugin>())
-}
-
 /// Dispatch one result-contract event (`tool_call` / `tool_result` /
 /// `user_bash`, ...) through the host's ordered plugin list, keeping the JS
 /// face on the caller's runtime handle and giving every native plugin its
 /// outcome.
 ///
-/// This is the merge-order twin of [`crate::plugins::PluginHost::emit`]:
-///
-/// - plugins are visited in the host's documented order (enabled builtins in
-///   their path-plan position, the JS adapter at the position of its first
-///   file path, inline plugins last), so mixed faces merge exactly as
-///   `emit` documents;
-/// - the JS adapter is dispatched through `runtime` AT ITS SLOT (once); the
-///   adapter itself is never invoked a second time, so a host-built session
-///   cannot double-dispatch the JS face;
-/// - in-place payload mutations chain in that same order (a `tool_call`
-///   `input` rewrite by an earlier handler is visible to later ones), and an
-///   outcome that short-circuits (`block: true`, `cancel: true`, ...) stops
-///   the walk exactly like `emit`;
-/// - `host == None` preserves the historical JS-only route; `runtime == None`
-///   dispatches the host's own JS adapter (if present) plus the natives.
-///
-/// `structuredContent` is pir's extension of the `tool_result` wire shape and
-/// is not part of [`crate::plugins::PluginEventOutcome`]; the JS face's value
-/// is carried through explicitly so switching a host on never drops it.
+/// The ordered walk lives on
+/// [`crate::plugins::PluginHost::emit_hosted_event`] (P2-01): the JS adapter
+/// at its path-plan slot (once), native plugins in list order, typed results
+/// chained before the next handler, and `block`/`cancel` short-circuits
+/// honored. The hosted walk deliberately ignores the native `events()`
+/// declaration fence (the `todo` builtin's defensive `tool_result` arm relies
+/// on it); the agent loop's `emit_with_runtime` honors the fence. `host ==
+/// None` preserves the historical JS-only route; `runtime == None` dispatches
+/// the host's own JS adapter (if present) plus the natives.
 pub(crate) async fn dispatch_hosted_event(
     runtime: Option<&crate::extensions::ExtensionHandle>,
     host: Option<&crate::plugins::PluginHost>,
@@ -1766,93 +1743,14 @@ pub(crate) async fn dispatch_hosted_event(
             }),
         };
     };
-
-    let mut acc = crate::plugins::MergedEmit::new();
-    let mut js_result: Option<JsonValue> = None;
-    let js_in_list = host.plugins().iter().any(is_js_adapter);
-    if !js_in_list {
-        // A caller-supplied handle the host does not own (not a session
-        // shape): keep the historical route — the JS face runs before the
-        // native list, whose outcomes then merge last-wins.
-        if let Some(runtime) = runtime {
-            let outcome = runtime.emit(event, payload).await?;
-            // Build the merged outcome from a borrow, then MOVE the result
-            // into `js_result`: a later structured-content override only reads
-            // `js_result`, so the former clone copied a potentially large
-            // handler result once per event for nothing.
-            let js_outcome = crate::plugins::PluginEventOutcome::Js {
-                result: Box::new(crate::plugins::PluginEventOutcome::from_wire(
-                    event,
-                    &outcome.result,
-                )),
-                errors: outcome.errors,
-            };
-            js_result = Some(outcome.result);
-            acc.merge(event, "<js-extensions>", js_outcome);
-        }
-    }
-
-    for plugin in host.plugins() {
-        if acc.stop {
-            break;
-        }
-        if is_js_adapter(plugin) {
-            match runtime {
-                Some(runtime) => {
-                    let outcome = runtime.emit(event, payload).await?;
-                    // See the runtime-only branch above: move, never clone,
-                    // the handler result into the deferred JS override.
-                    let js_outcome = crate::plugins::PluginEventOutcome::Js {
-                        result: Box::new(crate::plugins::PluginEventOutcome::from_wire(
-                            event,
-                            &outcome.result,
-                        )),
-                        errors: outcome.errors,
-                    };
-                    js_result = Some(outcome.result);
-                    acc.merge(event, &plugin.info().path, js_outcome);
-                }
-                // The host owns the handle: dispatch through the adapter,
-                // which calls the same runtime and writes payload mutations
-                // back in place.
-                None => {
-                    let outcome = plugin
-                        .on_event(crate::plugins::PluginEvent::new(event, payload))
-                        .await;
-                    acc.merge(event, &plugin.info().path, outcome);
-                }
-            }
-            continue;
-        }
-        let outcome = plugin
-            .on_event(crate::plugins::PluginEvent::new(event, payload))
-            .await;
-        acc.merge(event, &plugin.info().path, outcome);
-    }
-
-    let mut result = acc.result;
-    if event == "tool_result" && result.is_object() {
-        // Move the JS face's structured content (its only consumer is this
-        // override); the former path cloned it into `result` while the
-        // deferred `js_result` was about to be dropped.
-        if let Some(structured) = js_result
-            .as_mut()
-            .and_then(JsonValue::as_object_mut)
-            .and_then(|js| js.remove("structuredContent"))
-            .filter(|value| !value.is_null())
-        {
-            result["structuredContent"] = structured;
-        }
-    }
-    Ok(crate::extensions::EmitOutcome {
-        result,
-        payload: if event == "tool_call" && payload.is_object() {
-            payload.clone()
-        } else {
-            JsonValue::Null
-        },
-        errors: acc.errors,
-    })
+    // One ordered walk lives on the host (P2-01): the JS face at its adapter
+    // slot, the native plugins in list order, every typed result chained into
+    // the payload before the next handler. Keeping a private copy here was
+    // the merge-order twin the audit flagged.
+    // Box the host walk: this path nests the JS actor round trip and the
+    // native handler futures; a 2 MiB worker stack (the Tokio default) is not
+    // enough for the unboxed state machine on Windows.
+    Box::pin(host.emit_hosted_event(runtime, event, payload)).await
 }
 
 /// Route every tool call through the extension `tool_call` event before
@@ -2124,7 +2022,6 @@ pub async fn emit_tool_results_skipping(
 /// [`emit_tool_results_skipping`] with the unified plugin host's native
 /// fan-out (see [`dispatch_hosted_event`] for the ordered, once-per-face
 /// dispatch and merge rules).
-#[allow(clippy::too_many_arguments)]
 pub async fn emit_tool_results_skipping_with_host(
     runtime: Option<&crate::extensions::ExtensionHandle>,
     host: Option<&crate::plugins::PluginHost>,

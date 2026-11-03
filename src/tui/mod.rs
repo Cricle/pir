@@ -81,6 +81,7 @@ pub use slash::{
     action_quits, builtin_action, copy_last_assistant_message, last_assistant_text, name_argument,
     parse_slash_command, CopyOutcome, SlashAction, SlashInvocation,
 };
+pub use terminal::TuiRunOptions;
 pub use theme::{
     all_theme_entries, current_theme_name, load_custom_themes, register_custom_theme,
     register_custom_theme_path, set_theme, set_theme_from_settings, theme_appearance,
@@ -111,56 +112,12 @@ pub struct TuiOverrides {
 }
 
 /// Entry point: run the interactive TUI (pi-compatible interactive mode).
-/// `theme` is an optional explicit `--theme/--use-theme` name overriding
-/// `settings.theme` (custom themes from `<agent_dir>/themes/*.json` are
-/// registered first, so either name resolves). `session` is the resolved
-/// [`SessionPlan`] (see `coding_agent::session_resolve`): the worker attaches
-/// the planned session storage once and drives every prompt through one
-/// [`crate::agent_session::AgentSession`]. `session_dir` is the configured
-/// session storage directory. `resources` carries the `--skill` /
-/// `--prompt-template` CLI paths and the corresponding disable flags.
-/// `initial_messages` are the upstream positional
-/// entry messages (`pir "hello" @file.md …`): each is enqueued to the agent
-/// in order after startup (upstream `initialMessage` + `initialMessages`).
-/// `tool_selection` is the host-resolved `--tools`/settings selection; it is
-/// only the active override — the F12 rule: the registry is never filtered, so
-/// every registered tool stays callable — and naming a `defaultActive: false`
-/// tool like `powershell` is what activates it.
-/// `cli_tui_mode` is the validated `--tui-mode` value (`regular`/`fullscreen`);
-/// `None` falls back to `settings.tuiMode`, then the fullscreen default
-/// (upstream `createInteractiveTui` options override `getTuiMode`).
-/// `settings_diagnostics` are the deduplicated startup settings failures the
-/// CLI collected; each one becomes a warning chat notice before the crash
-/// notice (upstream `showWarning`), instead of being printed to stderr.
-// Signature mirrors the upstream options object one-to-one; see the comment
-// on `terminal::run` for why the lint is tolerated.
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    extension_paths: Vec<std::path::PathBuf>,
-    theme: Option<String>,
-    session: crate::coding_agent::session_resolve::SessionPlan,
-    session_dir: String,
-    resources: crate::coding_agent::resources::ResourcePathOptions,
-    initial_messages: Vec<String>,
-    tool_selection: Option<crate::coding_agent::ToolSelection>,
-    cli_tui_mode: Option<String>,
-    settings: &crate::config::settings::SettingsManager,
-    package_themes: &[std::path::PathBuf],
-    settings_diagnostics: Vec<crate::config::settings::SettingsDiagnostic>,
-    overrides: TuiOverrides,
-) -> crate::Result<()> {
-    terminal::run(
-        extension_paths,
-        theme,
-        session,
-        session_dir,
-        resources,
-        initial_messages,
-        tool_selection,
-        cli_tui_mode,
-        settings,
-        package_themes,
-        settings_diagnostics,
-        overrides,
-    )
+///
+/// Public SDK entry (`sdk::parity::run_interactive_mode` re-exports it); the
+/// options mirror the upstream `createInteractiveTui` options object and are
+/// documented on [`TuiRunOptions`]. The initial messages
+/// (`pir "hello" @file.md …`) are enqueued to the agent in order after startup
+/// (upstream `initialMessage` + `initialMessages`).
+pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
+    terminal::run(options)
 }

@@ -217,11 +217,16 @@ impl ExtensionRuntime {
                 // it to a queued host command after the preemption grace.
                 let background_started = (commands_in_flight(&state) == 0).then(|| {
                     let timeout = lock_state(&state).call_timeout;
-                    lock_state(&deadlines).insert(
-                        BACKGROUND_JOB_DEADLINE_TOKEN,
-                        std::time::Instant::now() + timeout,
-                    );
-                    std::time::Instant::now()
+                    let now = std::time::Instant::now();
+                    // `checked_add` guards the platform instant range: an
+                    // over-long timeout falls back to the 24 h ceiling rather
+                    // than panicking the drive loop.
+                    let deadline = now.checked_add(timeout).unwrap_or_else(|| {
+                        now.checked_add(crate::extensions::limits::MAX_TIMEOUT)
+                            .unwrap_or(now)
+                    });
+                    lock_state(&deadlines).insert(BACKGROUND_JOB_DEADLINE_TOKEN, deadline);
+                    now
                 });
                 let mut rounds = 0usize;
                 let mut interrupted = false;
@@ -366,6 +371,14 @@ impl ExtensionRuntime {
         // chain (the extension sees a clear interrupt error) and the drive
         // loop flags the runtime for recovery before the next command.
         let deadlines: Arc<StdMutex<HashMap<u64, std::time::Instant>>> = Arc::default();
+        // External abort flag (worker threads): the parent's `terminate` /
+        // `/reload` cannot arm a deadline on a *worker's* deadline map, so
+        // this runtime's interrupt handler also consults a flag installed
+        // after construction (see [`Self::set_interrupt_flag`]). A pure
+        // synchronous JS loop (`while (true) {}`) is then interrupted at the
+        // next bytecode boundary instead of running until the process exits.
+        let interrupt_flag: Arc<StdMutex<Option<Arc<std::sync::atomic::AtomicBool>>>> =
+            Arc::default();
         let (preempt_at, pending_commands, commands_in_flight) = {
             let state = lock_state(&state);
             (
@@ -376,7 +389,19 @@ impl ExtensionRuntime {
         };
         {
             let deadlines = deadlines.clone();
+            let interrupt_flag = Arc::clone(&interrupt_flag);
             rt.set_interrupt_handler(Some(Box::new(move || {
+                {
+                    let flag = interrupt_flag
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if flag
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+                    {
+                        return true;
+                    }
+                }
                 {
                     let guard = deadlines
                         .lock()
@@ -440,19 +465,26 @@ impl ExtensionRuntime {
                 })?;
             // The prelude is embedded deflated: inflate (once per process,
             // cached) here, at extension-host boot.
-            ctx.eval::<(), _>(HOST_PRELUDE.source()).map_err(|e| {
-                rquickjs::Error::new_loading_message(HOST_PRELUDE_MODULE, e.to_string())
-            })?;
+            if std::env::var_os("PIR_EXT_SKIP_PRELUDE").is_none() {
+                ctx.eval::<(), _>(HOST_PRELUDE.source()).map_err(|e| {
+                    rquickjs::Error::new_loading_message(HOST_PRELUDE_MODULE, e.to_string())
+                })?;
+            }
             // Pre-import every shimmed builtin into `__pirNodeModules` so the
             // synchronous CJS `require("path")` works without awaiting; the
             // dynamic import promise is awaited here (one boot-time sweep).
-            ctx.eval::<(), _>(crate::extensions::api::node_shims::node_modules_bootstrap_source())
+            if std::env::var_os("PIR_EXT_SKIP_NODE_BUILTINS").is_none() {
+                ctx.eval::<(), _>(
+                    crate::extensions::api::node_shims::node_modules_bootstrap_source(),
+                )
                 .map_err(|e| {
                     rquickjs::Error::new_loading_message("pir-node-builtins", e.to_string())
                 })?;
-            let load_builtins: rquickjs::Function = ctx.globals().get("__pirLoadNodeBuiltins")?;
-            let pending: MaybePromise = load_builtins.call(())?;
-            pending.into_future::<String>().await?;
+                let load_builtins: rquickjs::Function =
+                    ctx.globals().get("__pirLoadNodeBuiltins")?;
+                let pending: MaybePromise = load_builtins.call(())?;
+                pending.into_future::<String>().await?;
+            }
 
             // Host-SDK discovery + re-entry paths, published before any
             // extension module body runs. pi-subagents captures both at
@@ -517,6 +549,34 @@ impl ExtensionRuntime {
             // never close the successor's descriptors and vice versa.
         }
 
+        // `PI_TIMING=1`: the engine's own allocator view of the booted
+        // runtime (prelude + node builtins). dhat only sees Rust
+        // allocations; QuickJS allocates through libc, so this number is the
+        // one that explains the process-RSS delta of a JS extension.
+        if crate::config::timings::timing_enabled() {
+            let usage = rt.memory_usage().await;
+            let before = usage.malloc_size;
+            rt.run_gc().await;
+            let usage = rt.memory_usage().await;
+            eprintln!(
+                "pir-timing: ext.jsheap: malloc={} (pre_gc={}) used={} atoms={} atom_bytes={} strings={} string_bytes={} objects={} object_bytes={} shapes={} shape_bytes={} funcs={} func_bytes={} code_bytes={}",
+                usage.malloc_size,
+                before,
+                usage.memory_used_size,
+                usage.atom_count,
+                usage.atom_size,
+                usage.str_count,
+                usage.str_size,
+                usage.obj_count,
+                usage.obj_size,
+                usage.shape_count,
+                usage.shape_size,
+                usage.js_func_count,
+                usage.js_func_size,
+                usage.js_func_code_size,
+            );
+        }
+
         Ok(Self {
             ctx,
             js_runtime: rt,
@@ -530,6 +590,7 @@ impl ExtensionRuntime {
             ),
             deadlines,
             next_deadline_token: std::sync::atomic::AtomicU64::new(0),
+            interrupt_flag,
             unhandled_rejections,
         })
     }

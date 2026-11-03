@@ -59,6 +59,18 @@ async fn seed_and_load(handle: &ExtensionHandle, dir: &std::path::Path, name: &s
     );
 }
 
+/// `worker_threads` tests inspect process-wide live-thread counters and may
+/// temporarily lower the spawn cap; serialize them within this test binary.
+/// (No other suite in `g_extensions` spawns `worker_threads` Workers; the
+/// codemode worker is a separate process.)
+static WORKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn worker_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    WORKER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // ---------------------------------------------------------------------------
 // E1: reload/shutdown releases the previous generation's host resources
 // ---------------------------------------------------------------------------
@@ -135,9 +147,11 @@ fn test_pid_alive(pid: u32) -> bool {
 /// release its HTTP listener (the port becomes bindable again); the host
 /// tables return to their pre-run state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // the worker-test lock must span the runtime awaits
 async fn reload_releases_the_previous_generations_children_workers_and_servers() {
     use std::net::TcpListener;
 
+    let _worker_test = worker_test_guard();
     let dir = fixture_dir("reload-release");
     let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime start");
     seed_and_load(&handle, &dir, "hold.ts", HOLD_RESOURCES_TS).await;
@@ -199,6 +213,447 @@ async fn reload_releases_the_previous_generations_children_workers_and_servers()
         baseline,
         "reload must release the previous generation's host tables"
     );
+    handle.shutdown().await.expect("shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// P2-01: terminate vs. normal completion must report one stable exit code
+// ---------------------------------------------------------------------------
+
+/// Extension surface for the exit-code regressions. Every worker posts a
+/// `ready` message before its body returns, so a boot failure cannot
+/// masquerade as an "idle but running" worker:
+/// - `spawn_idle` leaves a worker parked in its message pump;
+/// - `terminate_idle` requests the stop through the host op and keeps the
+///   parent JS thread busy while the worker's `exit` record is queued — the
+///   ordering that used to surface code 0 for a terminated idle worker;
+/// - `spawn_exit_zero` completes through the worker's own `process.exit(0)`;
+/// - `exit_zero_then_terminate_without_yielding` exits only after the parent
+///   releases a `go` gate, then asks the host for `terminate` from the same
+///   non-yielding window; a read-only `state` snapshot proves the completed
+///   worker is still retained in the registry at that instant;
+/// - `race_terminate_with_exit_zero` runs both terminal paths concurrently.
+const WORKER_IDLE_TS: &str = r#"
+export default function (pi) {
+  const { Worker } = require("node:worker_threads");
+  const idleWorkers = [];
+  globalThis.__idleWorkers = idleWorkers;
+
+  const spawn = (code) => {
+    const worker = new Worker(code, { eval: true });
+    worker.on("error", () => {});
+    return worker;
+  };
+
+  // Synchronous wait: the JS thread (and therefore the parent pump) does not
+  // run until it returns.
+  const busyWait = (ms) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* do not yield */ }
+  };
+
+  pi.registerTool({
+    name: "spawn_idle",
+    description: "starts a worker that becomes idle in its message pump",
+    parameters: { type: "object", properties: {}, required: [] },
+    async execute() {
+      const worker = spawn(`
+        const { parentPort } = require("node:worker_threads");
+        parentPort.postMessage("ready");
+      `);
+      await new Promise((resolve, reject) => {
+        worker.once("message", resolve);
+        worker.once("error", reject);
+      });
+      // Let the body return and the worker park in `workerRecvPoll` before
+      // the parent asks for a terminate.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      idleWorkers.push(worker);
+      return { content: [{ type: "text", text: String(worker.threadId) }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "terminate_idle",
+    description: "terminates the last idle worker and reports both exit-code views",
+    parameters: { type: "object", properties: {}, required: [] },
+    async execute() {
+      const worker = idleWorkers[idleWorkers.length - 1];
+      const exitEvent = new Promise((resolve) => worker.once("exit", resolve));
+      // Request the stop through the host op, then busy-poll it without
+      // yielding: the worker thread finalizes and queues its `exit` record
+      // while the parent pump cannot run. When the pump resumes it must read
+      // that record (this is the ordering that exposed the old code 0).
+      const callTerminate = () => JSON.parse(
+        __pir_host.worker("terminate", JSON.stringify({ id: worker._id }))
+      );
+      let final = callTerminate();
+      const waitUntil = Date.now() + 2000;
+      while (Date.now() < waitUntil && !(final.value && final.value.done)) {
+        busyWait(1);
+        final = callTerminate();
+      }
+      const exitCode = await exitEvent;
+      const terminateCode = await worker.terminate();
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            exitCode: exitCode,
+            terminateCode: terminateCode,
+            directExitCode: final.value ? final.value.exitCode : null,
+          }),
+        }],
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "spawn_exit_zero",
+    description: "starts a worker that completes normally through process.exit(0)",
+    parameters: { type: "object", properties: {}, required: [] },
+    async execute() {
+      const worker = spawn("process.exit(0)");
+      const exitCode = await new Promise((resolve, reject) => {
+        worker.once("exit", resolve);
+        worker.once("error", reject);
+      });
+      const terminateCode = await worker.terminate();
+      return {
+        content: [{ type: "text", text: JSON.stringify({ exitCode: exitCode, terminateCode: terminateCode }) }],
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "exit_zero_then_terminate_without_yielding",
+    description: "completes normally while the parent pump is blocked, then terminates",
+    parameters: { type: "object", properties: {}, required: [] },
+    async execute() {
+      const worker = spawn(`
+        const { parentPort } = require("node:worker_threads");
+        parentPort.postMessage("ready");
+        parentPort.once("message", (message) => {
+          if (message === "go") process.exit(0);
+        });
+      `);
+      const exitEvent = new Promise((resolve) => worker.once("exit", resolve));
+      await new Promise((resolve, reject) => {
+        worker.once("message", resolve);
+        worker.once("error", reject);
+      });
+      // Timing dependency: handling `ready` resumes the shim's `_pump`, which
+      // queues its next `workerRecvPoll` host future, but the host call only
+      // spawns that future; it is not polled while JS jobs are runnable. Yield
+      // once here so the drive loop polls the future into its pending state
+      // before `go` lets the worker exit. Without this barrier the pump has no
+      // poll in flight when `op_terminate` drops the registry entry, so its
+      // first poll afterwards hits `GONE_POLL` and `_settleExit(1)` turns the
+      // recorded normal exit 0 into a spurious 1.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      // The `go` gate forces the completion into the non-yielding window:
+      // the worker cannot call process.exit(0) before this message, and the
+      // parent pump cannot run between the post and the terminate call below.
+      worker.postMessage("go");
+      // `state` is a read-only host snapshot (it neither drains the exit
+      // record nor releases the registry entry). Spin on the worker's
+      // published `done` flag rather than guessing a sleep: once done is
+      // observed, the exit record is queued and the entry still holds the
+      // recorded 0 — exactly the retention guarantee under test. On the
+      // pre-fix code the entry is removed the moment the worker finishes, so
+      // the probe reports `present: false` and terminate hits the fallback.
+      const snapshot = () => JSON.parse(
+        __pir_host.worker("state", JSON.stringify({ id: worker._id }))
+      );
+      let state = snapshot();
+      const waitUntil = Date.now() + 5000;
+      while (
+        Date.now() < waitUntil &&
+        !(state.ok && state.value && (state.value.done || !state.value.present))
+      ) {
+        busyWait(1);
+        state = snapshot();
+      }
+      const direct = JSON.parse(__pir_host.worker("terminate", JSON.stringify({ id: worker._id })));
+      const exitCode = await exitEvent;
+      const terminateCode = await worker.terminate();
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            exitCode: exitCode,
+            terminateCode: terminateCode,
+            directExitCode: direct.value ? direct.value.exitCode : null,
+            directDone: direct.value ? direct.value.done : null,
+            retained: state.value ? state.value.present === true : false,
+            retainedExitCode: state.value ? state.value.exitCode : null,
+          }),
+        }],
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "race_terminate_with_exit_zero",
+    description: "races terminate() against the worker's own process.exit(0)",
+    parameters: { type: "object", properties: {}, required: [] },
+    async execute() {
+      const worker = spawn(`
+        const { parentPort } = require("node:worker_threads");
+        setTimeout(() => process.exit(0), 0);
+        parentPort.postMessage("ready");
+      `);
+      const exitEvent = new Promise((resolve) => worker.once("exit", resolve));
+      await new Promise((resolve, reject) => {
+        worker.once("message", resolve);
+        worker.once("error", reject);
+      });
+      const terminateCode = await worker.terminate();
+      const exitCode = await exitEvent;
+      return {
+        content: [{ type: "text", text: JSON.stringify({ terminateCode: terminateCode, exitCode: exitCode }) }],
+      };
+    },
+  });
+}
+"#;
+
+/// P2-01: terminating a worker that already returned its body and is parked
+/// in the message pump must report exit code 1 (`terminate` semantics), not
+/// the 0 of a normal completion. The test forces the old race window: the
+/// worker's `exit` record is queued while the parent JS thread is busy, so
+/// the parent pump reads it before `terminate()`'s next poll can settle. On
+/// the pre-fix code the record says `{kind:"exit",code:0}`, so both the
+/// `exit` event and `terminate()` report 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // the worker-test lock must span the runtime awaits
+async fn worker_terminate_on_idle_worker_reports_exit_code_one() {
+    let _worker_test = worker_test_guard();
+    let dir = fixture_dir("worker-terminate-idle");
+    let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime start");
+    seed_and_load(&handle, &dir, "idle.ts", WORKER_IDLE_TS).await;
+
+    settle_worker_threads().await;
+    let baseline_live = pir::extensions::runtime::live_worker_count_for_tests();
+    let baseline_registry = pir::extensions::runtime::worker_count_for_tests();
+
+    let spawned = handle
+        .call_tool("spawn_idle", "call-idle-spawn", &serde_json::json!({}))
+        .await
+        .expect("spawn_idle tool");
+    assert!(
+        tool_text(&spawned).parse::<u64>().unwrap_or(0) > 0,
+        "the idle worker started: {}",
+        tool_text(&spawned)
+    );
+
+    let terminated = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.call_tool(
+            "terminate_idle",
+            "call-idle-terminate",
+            &serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("terminate_idle must resolve")
+    .expect("terminate_idle tool");
+    let outcome: serde_json::Value =
+        serde_json::from_str(tool_text(&terminated)).expect("terminate json");
+    assert_eq!(
+        outcome["exitCode"],
+        serde_json::json!(1),
+        "a terminated idle worker's exit event must be 1, not 0: {outcome}"
+    );
+    assert_eq!(
+        outcome["terminateCode"],
+        serde_json::json!(1),
+        "terminate() must return the same code as the exit event: {outcome}"
+    );
+    assert_eq!(
+        outcome["directExitCode"],
+        serde_json::json!(1),
+        "the host terminate answer must agree with the shim: {outcome}"
+    );
+
+    let (live, orphaned) = wait_for_worker_quiescence(baseline_live, Duration::from_secs(10)).await;
+    assert_eq!(live, baseline_live, "the terminated worker's thread exits");
+    assert_eq!(orphaned, 0, "a terminated worker is not orphaned");
+    assert_eq!(
+        pir::extensions::runtime::worker_count_for_tests(),
+        baseline_registry,
+        "the terminated idle worker leaves the registry"
+    );
+
+    handle.shutdown().await.expect("shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The control half of P2-01: a worker that completes through its own
+/// `process.exit(0)` keeps code 0, both in its `exit` event and in the
+/// shim's `terminate()` answer afterwards. This pins the fix to "forced stop
+/// = 1" without turning every completed worker into a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // the worker-test lock must span the runtime awaits
+async fn worker_normal_exit_zero_survives_a_later_terminate() {
+    let _worker_test = worker_test_guard();
+    let dir = fixture_dir("worker-exit-zero");
+    let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime start");
+    seed_and_load(&handle, &dir, "idle.ts", WORKER_IDLE_TS).await;
+
+    settle_worker_threads().await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.call_tool("spawn_exit_zero", "call-exit-zero", &serde_json::json!({})),
+    )
+    .await
+    .expect("spawn_exit_zero must resolve")
+    .expect("spawn_exit_zero tool");
+    let outcome: serde_json::Value = serde_json::from_str(tool_text(&result)).expect("exit json");
+    assert_eq!(
+        outcome["exitCode"],
+        serde_json::json!(0),
+        "a normal process.exit(0) completion stays 0: {outcome}"
+    );
+    assert_eq!(
+        outcome["terminateCode"],
+        serde_json::json!(0),
+        "terminate() after a normal completion returns the recorded 0: {outcome}"
+    );
+
+    handle.shutdown().await.expect("shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deterministic normal-completion race: after the worker's `ready`, the
+/// tool yields once so the parent pump's next `workerRecvPoll` is pending
+/// (a host call only spawns its future; the drive loop polls it once JS
+/// yields) before the `go` gate lets the worker call `process.exit(0)`. The
+/// parent then stays in the same non-yielding window (no pump, no
+/// `op_release`) until it has observed the worker's published `done` flag
+/// through the read-only host `state` snapshot. The registry must still
+/// retain the completed worker at that point, so `terminate` reads the
+/// recorded 0 instead of the hard-coded forced-stop 1; the shim's later
+/// `terminate()` must return the same 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // the worker-test lock must span the runtime awaits
+async fn worker_terminate_after_blocked_normal_exit_reports_zero() {
+    let _worker_test = worker_test_guard();
+    let dir = fixture_dir("worker-exit-zero-blocked");
+    let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime start");
+    seed_and_load(&handle, &dir, "idle.ts", WORKER_IDLE_TS).await;
+
+    settle_worker_threads().await;
+    let baseline_registry = pir::extensions::runtime::worker_count_for_tests();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.call_tool(
+            "exit_zero_then_terminate_without_yielding",
+            "call-exit-zero-blocked",
+            &serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("blocked normal-exit tool must resolve")
+    .expect("blocked normal-exit tool");
+    let outcome: serde_json::Value =
+        serde_json::from_str(tool_text(&result)).expect("blocked exit json");
+    assert_eq!(
+        outcome["exitCode"],
+        serde_json::json!(0),
+        "the normal completion's exit event stays 0: {outcome}"
+    );
+    assert_eq!(
+        outcome["retained"],
+        serde_json::json!(true),
+        "the completed worker must still be retained in the registry before terminate: {outcome}"
+    );
+    assert_eq!(
+        outcome["retainedExitCode"],
+        serde_json::json!(0),
+        "the retained entry must already carry the recorded 0: {outcome}"
+    );
+    assert_eq!(
+        outcome["directDone"],
+        serde_json::json!(true),
+        "the worker must already be done when terminate is asked: {outcome}"
+    );
+    assert_eq!(
+        outcome["directExitCode"],
+        serde_json::json!(0),
+        "the host terminate answer must use the recorded 0, not the forced-stop 1: {outcome}"
+    );
+    assert_eq!(
+        outcome["terminateCode"],
+        serde_json::json!(0),
+        "the shim's terminate() agrees with the exit event: {outcome}"
+    );
+    assert_eq!(
+        pir::extensions::runtime::worker_count_for_tests(),
+        baseline_registry,
+        "the released worker's registry entry is gone"
+    );
+
+    handle.shutdown().await.expect("shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P2-01 race variant: `terminate()` and the worker's own `process.exit(0)`
+/// may win in either order, but the two observable views must agree and the
+/// value must be one of Node's terminal codes (0 = normal exit, 1 =
+/// terminated). A stale 0 produced by the terminate path would still pass the
+/// range check here, which is why the deterministic idle test above carries
+/// the regression.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // the worker-test lock must span the runtime awaits
+async fn worker_terminate_racing_normal_exit_reports_consistent_codes() {
+    let _worker_test = worker_test_guard();
+    let dir = fixture_dir("worker-terminate-race");
+    let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime start");
+    seed_and_load(&handle, &dir, "idle.ts", WORKER_IDLE_TS).await;
+
+    settle_worker_threads().await;
+    let baseline_live = pir::extensions::runtime::live_worker_count_for_tests();
+    let baseline_registry = pir::extensions::runtime::worker_count_for_tests();
+
+    for round in 0..3 {
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            handle.call_tool(
+                "race_terminate_with_exit_zero",
+                &format!("call-exit-race-{round}"),
+                &serde_json::json!({}),
+            ),
+        )
+        .await
+        .expect("race tool must resolve")
+        .expect("race tool");
+        let outcome: serde_json::Value =
+            serde_json::from_str(tool_text(&result)).expect("race json");
+        let terminate_code = outcome["terminateCode"].as_i64();
+        let exit_code = outcome["exitCode"].as_i64();
+        assert_eq!(
+            terminate_code, exit_code,
+            "round {round}: terminate() and the exit event must agree: {outcome}"
+        );
+        assert!(
+            matches!(exit_code, Some(0) | Some(1)),
+            "round {round}: only Node's normal/terminated codes are valid: {outcome}"
+        );
+    }
+
+    let (live, orphaned) = wait_for_worker_quiescence(baseline_live, Duration::from_secs(10)).await;
+    assert_eq!(live, baseline_live, "every raced worker's thread exits");
+    assert_eq!(orphaned, 0);
+    assert_eq!(
+        pir::extensions::runtime::worker_count_for_tests(),
+        baseline_registry,
+        "every raced worker's registry entry is released"
+    );
+
     handle.shutdown().await.expect("shutdown");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1427,6 +1882,369 @@ fn worker_thread_cap_is_bounded() {
     assert_eq!(
         pir::extensions::runtime::worker_limit_for_tests(),
         64,
-        "the live-worker cap is 64 (see worker_fns::MAX_WORKER_THREADS)"
+        "the per-generation worker registry cap is 64 (see worker_fns::MAX_WORKER_THREADS)"
     );
+    assert_eq!(
+        pir::extensions::runtime::live_worker_limit_for_tests(),
+        128,
+        "the cross-generation live-thread cap is 2x the per-generation cap"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R1-L5-003: worker_threads synchronous loops must terminate (deadline,
+// terminate interrupt, and cross-generation bounding)
+// ---------------------------------------------------------------------------
+
+/// Extension surface used by the three worker-lifecycle regressions:
+/// - `spawn_spin` starts `while (true) {}` (a worker that never awaits);
+/// - `terminate_spin` calls the real `Worker.terminate()` on it;
+/// - `spawn_and_exit` starts a worker that exits by itself and resolves on
+///   its `exit` event, proving a later spawn still works.
+const WORKER_SPIN_TS: &str = r#"
+export default function (pi) {
+  const { Worker } = require("node:worker_threads");
+  const spinWorkers = [];
+  globalThis.__spinWorkers = spinWorkers;
+
+  pi.registerTool({
+    name: "spawn_spin",
+    description: "starts a worker spinning in a synchronous loop",
+    parameters: { type: "object", properties: {}, required: [] },
+    async execute() {
+      const worker = new Worker("while (true) {}", { eval: true });
+      worker.on("error", () => {});
+      spinWorkers.push(worker);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ id: worker.threadId }) }],
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "terminate_spin",
+    description: "terminates the last spinning worker",
+    parameters: { type: "object", properties: {}, required: [] },
+    async execute() {
+      const worker = spinWorkers[spinWorkers.length - 1];
+      const started = Date.now();
+      const code = await worker.terminate();
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({ code: code, elapsedMs: Date.now() - started }),
+        }],
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "spawn_and_exit",
+    description: "starts a worker that exits on its own",
+    parameters: { type: "object", properties: {}, required: [] },
+    async execute() {
+      const worker = new Worker("process.exit(0)", { eval: true });
+      worker.on("error", () => {});
+      const code = await new Promise((resolve) => worker.once("exit", resolve));
+      return { content: [{ type: "text", text: String(code) }] };
+    },
+  });
+}
+"#;
+
+fn tool_text(result: &pir::extensions::ToolResult) -> &str {
+    result
+        .content
+        .iter()
+        .find(|item| item.kind == "text")
+        .map(|item| item.text.as_str())
+        .expect("tool text")
+}
+
+/// Poll the registry-independent live-thread count until it falls to
+/// `target_live` AND no released-generation worker remains marked orphaned.
+async fn wait_for_worker_quiescence(target_live: usize, timeout: Duration) -> (usize, usize) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let live = pir::extensions::runtime::live_worker_count_for_tests();
+        let orphaned = pir::extensions::runtime::orphaned_worker_count_for_tests();
+        if (live <= target_live && orphaned == 0) || std::time::Instant::now() >= deadline {
+            return (live, orphaned);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// `LIVE_WORKERS` is process-wide: wait for a previous test's worker thread
+/// (e.g. E1's `setInterval` worker after `shutdown()`) to finish before
+/// capturing a baseline, so a stale count cannot shift `baseline + 1`.
+async fn settle_worker_threads() {
+    let _ = wait_for_worker_quiescence(0, Duration::from_secs(10)).await;
+}
+
+/// EXT2 retains a finished worker's registry entry until the parent pump has
+/// observed the exit (`_settleExit` → `op_release`), so `LIVE_WORKERS` can
+/// fall before the registry drains. Wait for the registry to reach the
+/// baseline before asserting on it (P3-EXT2-04).
+async fn wait_for_worker_registry(target_registry: usize, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while pir::extensions::runtime::worker_count_for_tests() > target_registry
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// `terminate()` on a worker stuck in `while (true) {}` must resolve in
+/// bounded time (the abort flag drives the worker runtime's QuickJS interrupt
+/// handler, not the message pump), the OS thread must actually exit, and a
+/// later `new Worker` must still succeed. On the pre-fix implementation the
+/// terminate op polls forever/200 ms and the thread never exits, so the
+/// outer `tokio::time::timeout` fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // the worker-test lock must span the runtime awaits
+async fn worker_terminate_interrupts_a_synchronous_loop_and_releases_the_thread() {
+    let _worker_test = worker_test_guard();
+    let dir = fixture_dir("worker-terminate-spin");
+    let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime start");
+    seed_and_load(&handle, &dir, "spin.ts", WORKER_SPIN_TS).await;
+
+    settle_worker_threads().await;
+    let baseline_live = pir::extensions::runtime::live_worker_count_for_tests();
+    let baseline_registry = pir::extensions::runtime::worker_count_for_tests();
+
+    let spawned = handle
+        .call_tool("spawn_spin", "call-spawn-spin", &serde_json::json!({}))
+        .await
+        .expect("spawn_spin tool");
+    let info: serde_json::Value = serde_json::from_str(tool_text(&spawned)).expect("spawn json");
+    assert!(
+        info["id"].as_u64().unwrap_or(0) > 0,
+        "the worker started: {info}"
+    );
+    assert_eq!(
+        pir::extensions::runtime::live_worker_count_for_tests(),
+        baseline_live + 1,
+        "the worker thread is counted live"
+    );
+
+    // Let the worker enter the synchronous loop (the abort flag is checked by
+    // the worker's own QuickJS interrupt handler regardless, but a real spin
+    // makes the regression exercise the intended path).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let terminated = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.call_tool(
+            "terminate_spin",
+            "call-terminate-spin",
+            &serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("terminate() must resolve for a synchronous worker loop")
+    .expect("terminate_spin tool");
+    let outcome: serde_json::Value =
+        serde_json::from_str(tool_text(&terminated)).expect("terminate json");
+    assert_eq!(outcome["code"], serde_json::json!(1), "{outcome}");
+
+    let (live, orphaned) = wait_for_worker_quiescence(baseline_live, Duration::from_secs(10)).await;
+    assert_eq!(
+        live, baseline_live,
+        "the terminated worker's OS thread must exit"
+    );
+    assert_eq!(orphaned, 0, "a terminated worker is not orphaned");
+    assert_eq!(
+        pir::extensions::runtime::worker_count_for_tests(),
+        baseline_registry,
+        "the registry entry must be removed"
+    );
+
+    // A later spawn must still work: the per-worker thread/QuickJS runtime
+    // was released, not merely detached.
+    let exited = handle
+        .call_tool("spawn_and_exit", "call-spawn-exit", &serde_json::json!({}))
+        .await
+        .expect("spawn_and_exit tool");
+    assert_eq!(tool_text(&exited), "0", "a fresh worker exits normally");
+    let (live, _) = wait_for_worker_quiescence(baseline_live, Duration::from_secs(10)).await;
+    assert_eq!(live, baseline_live, "the probe worker also exits");
+
+    handle.shutdown().await.expect("shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Requirement 1: the worker script's synchronous body runs under the
+/// inherited call deadline; a `while (true) {}` nobody terminates must still
+/// be interrupted by the worker runtime's QuickJS interrupt handler and the
+/// thread must exit. On the pre-fix implementation the loop runs until the
+/// process exits, so the wait times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // the worker-test lock must span the runtime awaits
+async fn worker_synchronous_loop_is_stopped_by_the_worker_deadline() {
+    let _worker_test = worker_test_guard();
+    let dir = fixture_dir("worker-deadline-spin");
+    let mut config = handle_config(&dir, false);
+    config.limits = Some(pir::extensions::ExtensionLimits {
+        call_timeout: Duration::from_millis(600),
+        ..Default::default()
+    });
+    let handle = ExtensionHandle::start(config).expect("runtime start");
+    seed_and_load(&handle, &dir, "spin.ts", WORKER_SPIN_TS).await;
+
+    settle_worker_threads().await;
+    let baseline_live = pir::extensions::runtime::live_worker_count_for_tests();
+    let baseline_registry = pir::extensions::runtime::worker_count_for_tests();
+
+    handle
+        .call_tool("spawn_spin", "call-spawn-deadline", &serde_json::json!({}))
+        .await
+        .expect("spawn_spin tool");
+    assert_eq!(
+        pir::extensions::runtime::live_worker_count_for_tests(),
+        baseline_live + 1
+    );
+
+    let (live, orphaned) = wait_for_worker_quiescence(baseline_live, Duration::from_secs(10)).await;
+    assert_eq!(
+        live, baseline_live,
+        "the worker body deadline must abort the synchronous loop"
+    );
+    assert_eq!(orphaned, 0);
+    // The thread can exit before the parent pump consumes its error/exit
+    // records and calls `op_release`; the retention path makes the registry
+    // assertion racy unless both counters have drained.
+    wait_for_worker_registry(baseline_registry, Duration::from_secs(10)).await;
+    assert_eq!(
+        pir::extensions::runtime::worker_count_for_tests(),
+        baseline_registry,
+        "the deadline-aborted worker leaves the registry"
+    );
+
+    handle.shutdown().await.expect("shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Requirement 3: `/reload` must abort the old generation's spinning workers
+/// (not just drop their registry entries). Repeating the cycle must not grow
+/// the live-thread count, and the cross-generation counter must return to the
+/// baseline after every reload. On the pre-fix implementation the leaked
+/// threads accumulate, so the live count never returns to baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // the worker-test lock must span the runtime awaits
+async fn reload_aborts_spinning_workers_without_cross_generation_accumulation() {
+    let _worker_test = worker_test_guard();
+    let dir = fixture_dir("worker-reload-spin");
+    let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime start");
+    seed_and_load(&handle, &dir, "spin.ts", WORKER_SPIN_TS).await;
+
+    settle_worker_threads().await;
+    let baseline_live = pir::extensions::runtime::live_worker_count_for_tests();
+    let baseline_registry = pir::extensions::runtime::worker_count_for_tests();
+
+    for round in 0..3 {
+        handle
+            .call_tool(
+                "spawn_spin",
+                &format!("call-spawn-reload-{round}"),
+                &serde_json::json!({}),
+            )
+            .await
+            .expect("spawn_spin tool");
+        assert_eq!(
+            pir::extensions::runtime::live_worker_count_for_tests(),
+            baseline_live + 1,
+            "round {round}: exactly one old-generation worker is alive"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        handle.reload().await.expect("reload");
+        let (live, orphaned) =
+            wait_for_worker_quiescence(baseline_live, Duration::from_secs(10)).await;
+        assert_eq!(
+            live, baseline_live,
+            "round {round}: the reloaded generation must not inherit a leaked worker thread"
+        );
+        assert_eq!(
+            orphaned, 0,
+            "round {round}: every released-generation thread exited"
+        );
+        assert_eq!(
+            pir::extensions::runtime::worker_count_for_tests(),
+            baseline_registry,
+            "round {round}: the registry holds only the fresh generation's workers"
+        );
+    }
+
+    handle.shutdown().await.expect("shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Requirement 3: once the registry-independent live-thread cap is reached
+/// (simulated through the test override, so the test does not reserve 128
+/// real 64 MiB stacks), `op_start` must refuse to spawn instead of letting a
+/// `/reload` loop grow the leak without bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // the worker-test lock must span the runtime awaits
+async fn worker_live_cap_rejects_spawn_while_orphaned_threads_remain() {
+    struct RestoreLiveLimit;
+    impl Drop for RestoreLiveLimit {
+        fn drop(&mut self) {
+            pir::extensions::runtime::test_set_live_worker_limit(0);
+        }
+    }
+
+    let _worker_test = worker_test_guard();
+    let _restore = RestoreLiveLimit;
+    let dir = fixture_dir("worker-live-cap");
+    let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime start");
+    seed_and_load(&handle, &dir, "spin.ts", WORKER_SPIN_TS).await;
+
+    settle_worker_threads().await;
+    let baseline_live = pir::extensions::runtime::live_worker_count_for_tests();
+    // One free slot: the spinning worker below consumes it.
+    pir::extensions::runtime::test_set_live_worker_limit(baseline_live + 1);
+
+    handle
+        .call_tool("spawn_spin", "call-cap-spawn", &serde_json::json!({}))
+        .await
+        .expect("spawn_spin tool");
+    assert_eq!(
+        pir::extensions::runtime::live_worker_count_for_tests(),
+        baseline_live + 1
+    );
+
+    // Probe the host op directly: the Worker shim surfaces a failed start as
+    // an async `error` event, which would hide the rejection shape here.
+    let probe = handle
+        .eval_json(
+            r#"JSON.stringify(JSON.parse(__pir_host.worker("start", JSON.stringify({ eval: true, code: "0", filename: "" }))))"#,
+        )
+        .await
+        .expect("start probe");
+    assert_eq!(
+        probe["ok"],
+        serde_json::json!(false),
+        "cap must refuse: {probe}"
+    );
+    let message = probe["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("live worker threads"),
+        "the rejection names the cross-generation cap: {message}"
+    );
+
+    handle
+        .call_tool(
+            "terminate_spin",
+            "call-cap-terminate",
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("terminate_spin tool");
+    let (live, orphaned) = wait_for_worker_quiescence(baseline_live, Duration::from_secs(10)).await;
+    assert_eq!(live, baseline_live);
+    assert_eq!(orphaned, 0);
+
+    handle.shutdown().await.expect("shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
 }

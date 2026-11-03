@@ -65,6 +65,50 @@ pub(crate) fn exec(candidates: &[&str], args: &[String]) -> i32 {
     127
 }
 
+/// Exec the first candidate program that exists, feeding `stdin` through a
+/// pipe instead of inheriting the process stdin.
+///
+/// The native command has already read stdin to EOF before deciding to fall
+/// back, so an inherited handle is empty: the system tool must receive the
+/// original bytes through a fresh pipe. Returns its exit code, or 127 when no
+/// candidate can be spawned.
+pub(crate) fn exec_with_stdin(candidates: &[&str], args: &[String], stdin: &[u8]) -> i32 {
+    for program in candidates {
+        let child = std::process::Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                eprintln!("{program}: {error}");
+                return 127;
+            }
+        };
+        if let Some(mut pipe) = child.stdin.take() {
+            // A broken pipe means the child stopped reading (or exited); its
+            // own exit code is authoritative, so the write error is ignored.
+            let _ = pipe.write_all(stdin);
+            // Dropping the pipe closes it: the child sees EOF on stdin.
+        }
+        return match child.wait() {
+            Ok(status) => status.code().unwrap_or(1),
+            Err(error) => {
+                eprintln!("{program}: {error}");
+                127
+            }
+        };
+    }
+    eprintln!(
+        "pir: no system `{}` found on PATH (native mode does not support this usage)",
+        candidates.join("` / `")
+    );
+    127
+}
+
 /// Report a usage the native implementation does not cover while the fallback
 /// is disabled.
 pub(crate) fn report_unsupported(command: &str) {

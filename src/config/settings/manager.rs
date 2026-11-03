@@ -46,6 +46,10 @@ pub struct SettingsManager {
     pub global_raw: Value,
     /// Raw project-scope settings (post-migration; `{}` when untrusted).
     pub project_raw: Value,
+    /// Runtime override layer (`apply_overrides`), merged last so it wins
+    /// over both file scopes. Never written to disk, but kept across
+    /// reloads and field writes so a later re-merge cannot silently drop it.
+    overrides: Value,
     /// Global agent directory (typically `~/.pi/agent`).
     pub global_dir: PathBuf,
     /// Project config directory (typically `<cwd>/.pi`).
@@ -72,6 +76,13 @@ impl std::fmt::Debug for SettingsManager {
             .field("project_dir", &self.project_dir)
             .field("cwd", &self.cwd)
             .field("project_trusted", &self.project_trusted)
+            .field(
+                "has_overrides",
+                &self
+                    .overrides
+                    .as_object()
+                    .is_some_and(|map| !map.is_empty()),
+            )
             .field("errors", &self.errors.len())
             .field("warnings", &self.warnings.len())
             .finish()
@@ -278,6 +289,7 @@ impl SettingsManager {
             settings: Settings::default(),
             global_raw: Value::Object(serde_json::Map::new()),
             project_raw: Value::Object(serde_json::Map::new()),
+            overrides: Value::Object(serde_json::Map::new()),
             global_dir: global_dir.to_path_buf(),
             project_dir: project_dir.to_path_buf(),
             cwd: cwd.to_path_buf(),
@@ -352,10 +364,13 @@ impl SettingsManager {
         }
     }
 
-    /// Recompute the merged snapshot after a scope change.
+    /// Recompute the merged snapshot after a scope change: global, then
+    /// project, then the runtime override layer last (so overrides keep
+    /// winning after a reload or a field write rebuilds the merge).
     fn remerge(&mut self) {
         let mut raw = self.global_raw.clone();
         deep_merge_settings_values(&mut raw, &self.project_raw);
+        deep_merge_settings_values(&mut raw, &self.overrides);
         self.raw = raw;
         self.settings = self.parse_typed_settings();
     }
@@ -548,12 +563,12 @@ impl SettingsManager {
     }
 
     /// Apply extra overrides on top of the merged settings (upstream
-    /// `applyOverrides`).
+    /// `applyOverrides`). The overrides are kept as their own layer so a
+    /// later `reload`/`set_global_field` re-merge cannot drop them; they are
+    /// runtime-only and never persisted to either settings file.
     pub fn apply_overrides(&mut self, overrides: &Value) {
-        let mut raw = self.raw.clone();
-        deep_merge_settings_values(&mut raw, overrides);
-        self.raw = raw;
-        self.settings = self.parse_typed_settings();
+        deep_merge_settings_values(&mut self.overrides, overrides);
+        self.remerge();
     }
 
     /// Persist one top-level field of `scope`, writing only that field into

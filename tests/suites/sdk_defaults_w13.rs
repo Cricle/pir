@@ -31,7 +31,7 @@ use pir::agent::tool_batch::ToolResult;
 use pir::ai::auth::ApiKeyAuth;
 use pir::ai::event_stream::AssistantMessageEventStream;
 use pir::ai::provider::{Provider, ProviderRegistry};
-use pir::ai::providers::construction::model;
+use pir::ai::providers::construction::{model, ModelSpec};
 use pir::ai::providers::resolution::{
     find_initial_model, resolve_cli_model, InitialModelOptions, ScopedModel,
 };
@@ -81,16 +81,16 @@ async fn pin_agent_dir(dir: &Path) -> crate::common::AgentDirEnvGuard {
 }
 
 fn test_model(provider: &str, id: &str) -> Model {
-    model(
+    model(ModelSpec {
         provider,
         id,
-        id,
-        "openai-completions",
-        "http://127.0.0.1:9/v1",
-        128_000,
-        8_192,
-        vec!["text"],
-    )
+        name: id,
+        api: "openai-completions",
+        base_url: "http://127.0.0.1:9/v1",
+        context_window: 128_000,
+        max_tokens: 8_192,
+        input: vec!["text"],
+    })
 }
 
 /// The pool shape `models.json` produces for the fixture below: one custom
@@ -322,16 +322,16 @@ async fn sdk_build_surfaces_an_attached_plugin_registration_failure() {
     let result = AgentBuilder::new()
         .with_registry(
             Arc::new(registry),
-            model(
-                "fake",
-                "fake-model",
-                "fake-model",
-                "openai-completions",
-                "http://127.0.0.1:9/v1",
-                4_096,
-                256,
-                vec!["text"],
-            ),
+            model(ModelSpec {
+                provider: "fake",
+                id: "fake-model",
+                name: "fake-model",
+                api: "openai-completions",
+                base_url: "http://127.0.0.1:9/v1",
+                context_window: 4_096,
+                max_tokens: 256,
+                input: vec!["text"],
+            }),
         )
         .no_session()
         .no_compaction()

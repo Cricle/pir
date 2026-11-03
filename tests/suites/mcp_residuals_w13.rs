@@ -6,8 +6,11 @@
 //! * **A server-side JSON-RPC error is not a retryable closure.** A `tools/call`
 //!   the server answers with an `error` object must reach the caller as
 //!   [`McpError::Server`], and the call must reach the server exactly once:
-//!   `McpManager::call_tool` retries `ConnectionClosed`, so a misclassified
+//!   `McpManager::call_tool` retries `SessionExpired`, so a misclassified
 //!   server error would run the tool twice.
+//! * **`ConnectionClosed` is never retried.** The response channel closing
+//!   after dispatch means the tool may already have run server-side; the
+//!   manager drops the dead client and returns the original error.
 //! * **The deadline and abort reach the dispatch, and the timed-out request is
 //!   cancelled on the server** (`notifications/cancelled`, upstream
 //!   `requestInternal`).
@@ -58,6 +61,14 @@ const MOCK_PROGRESS: &str = "progress";
 const MOCK_SILENT: &str = "silent";
 /// A well-behaved server (answers `initialize` and `tools/list` immediately).
 pub(crate) const MOCK_HEALTHY: &str = "healthy";
+/// A server that records the `tools/call` once, then closes its transport
+/// (exits) without answering: the request may already have run server-side.
+const MOCK_EXECUTE_THEN_CLOSE: &str = "execute-then-close";
+
+/// Where an execute-then-close child marks that it closed once. A second
+/// process (the reconnect) sees the marker and answers normally, so the test
+/// can prove the next call recovers.
+const EXEC_CLOSE_MARKER_ENV: &str = "PIR_W13_EXEC_CLOSE_MARKER";
 
 /// Where a child records the `notifications/cancelled` it received.
 const CANCEL_LOG_ENV: &str = "PIR_W13_CANCEL_LOG";
@@ -222,6 +233,22 @@ fn serve_mock(mode: &str, delay_ms: u64, init_delay_ms: u64) {
                         });
                         continue;
                     }
+                    // Records the call (the counter above), then exits without
+                    // an answer: the request may already have run server-side
+                    // when the response channel closes. A reconnected process
+                    // sees the marker and answers, proving recovery.
+                    MOCK_EXECUTE_THEN_CLOSE => {
+                        let closed = std::env::var(EXEC_CLOSE_MARKER_ENV)
+                            .ok()
+                            .is_some_and(|path| std::path::Path::new(&path).exists());
+                        if !closed {
+                            if let Ok(path) = std::env::var(EXEC_CLOSE_MARKER_ENV) {
+                                crate::common::write_file_atomically(path, "closed");
+                            }
+                            std::process::exit(0);
+                        }
+                        Some(json!({ "content": [{ "type": "text", "text": "ok" }] }))
+                    }
                     _ => continue,
                 }
             }
@@ -284,6 +311,24 @@ pub(crate) fn mock_spawn() -> (String, Vec<String>) {
     )
 }
 
+/// [`mock_spawn`] but always re-executing THIS test binary.
+///
+/// The `pir-mock-mcp` helper has its own copy of the W13 mock and does not
+/// implement [`MOCK_EXECUTE_THEN_CLOSE`]; that helper is outside this lane's
+/// file scope, so the one test needing the mode pays the test-binary image
+/// load instead.
+fn in_binary_mock_spawn() -> (String, Vec<String>) {
+    let exe = std::env::current_exe().expect("current exe");
+    (
+        exe.to_string_lossy().into_owned(),
+        vec![
+            "mcp_residuals_w13::w13b_mock_stdio_server".to_owned(),
+            "--exact".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+    )
+}
+
 /// A unique temporary directory removed on drop.
 ///
 /// `pub(crate)` for the W18 pruning suite, which reuses this module's mock
@@ -334,7 +379,28 @@ pub(crate) fn register_mock(
     delay_ms: u64,
     extra: &[(&str, &str)],
 ) {
-    let (command, args) = mock_spawn();
+    register_mock_with(
+        mock_spawn(),
+        manager,
+        name,
+        mode,
+        timeout_secs,
+        delay_ms,
+        extra,
+    );
+}
+
+/// [`register_mock`] with an explicit child-spawn command.
+fn register_mock_with(
+    spawn: (String, Vec<String>),
+    manager: &McpManager,
+    name: &str,
+    mode: &str,
+    timeout_secs: u64,
+    delay_ms: u64,
+    extra: &[(&str, &str)],
+) {
+    let (command, args) = spawn;
     let mut env = serde_json::Map::new();
     env.insert("PIR_W13_MOCK".to_owned(), json!(mode));
     env.insert("PIR_W13_DELAY_MS".to_owned(), json!(delay_ms.to_string()));
@@ -402,9 +468,9 @@ fn a_server_side_tool_error_keeps_its_code_and_message() {
 
 #[test]
 fn a_failed_tool_call_reaches_the_server_exactly_once() {
-    // The retry arms of `McpManager::call_tool` retry `ConnectionClosed` and
-    // `SessionExpired` once. A server-side error must not be among them: the
-    // call already had its side effects.
+    // `McpManager::call_tool` retries `SessionExpired` once
+    // (`ConnectionClosed` is never retried). A server-side error must not be
+    // among them: the call already had its side effects.
     let tree = Tree::new("one-dispatch");
     let counter = tree.path("calls");
     let manager = McpManager::without_log(&std::env::current_dir().expect("cwd"));
@@ -424,6 +490,62 @@ fn a_failed_tool_call_reaches_the_server_exactly_once() {
             .parse()
             .expect("the counter is a number");
         assert_eq!(count, 1, "the failed call was dispatched exactly once");
+        manager.shutdown().await;
+    });
+}
+
+#[test]
+fn a_connection_closed_mid_call_is_not_retried() {
+    // `ConnectionClosed` means the response channel closed after the request
+    // was dispatched: the tool may have run on the server. Retrying would
+    // duplicate its side effects, so the manager must drop the dead client
+    // and return the error after exactly one dispatch.
+    let tree = Tree::new("connection-closed");
+    let counter = tree.path("calls");
+    let marker = tree.path("closed-once");
+    let manager = McpManager::without_log(&std::env::current_dir().expect("cwd"));
+    register_mock_with(
+        in_binary_mock_spawn(),
+        &manager,
+        "closing",
+        MOCK_EXECUTE_THEN_CLOSE,
+        20,
+        0,
+        &[
+            (COUNT_FILE_ENV, counter.as_str()),
+            (EXEC_CLOSE_MARKER_ENV, marker.as_str()),
+        ],
+    );
+    runtime().block_on(async {
+        let error = manager
+            .call_tool("closing", "work", &json!({}), None)
+            .await
+            .expect_err("the transport closed before the response");
+        assert!(
+            matches!(error, McpError::ConnectionClosed),
+            "expected ConnectionClosed, got {error:?}"
+        );
+        let count = std::fs::read_to_string(&counter)
+            .expect("the mock counted its calls")
+            .trim()
+            .parse::<u64>()
+            .expect("the counter is a number");
+        assert_eq!(
+            count, 1,
+            "the side-effecting call was dispatched exactly once (no retry)"
+        );
+        // The dead client is released, so the next call reconnects to a fresh
+        // (marker-aware) child and succeeds.
+        manager
+            .call_tool("closing", "work", &json!({}), None)
+            .await
+            .expect("the next call reconnects and succeeds");
+        let count: u64 = std::fs::read_to_string(&counter)
+            .expect("the mock counted its calls")
+            .trim()
+            .parse()
+            .expect("the counter is a number");
+        assert_eq!(count, 2, "the recovered call reached the new server once");
         manager.shutdown().await;
     });
 }

@@ -84,7 +84,7 @@ mod catalog_drift;
 #[path = "suites/catalog_units.rs"]
 mod catalog_units;
 #[path = "common/mod.rs"]
-mod common;
+pub mod common;
 #[path = "suites/config_cache_lifetime_w16.rs"]
 mod config_cache_lifetime_w16;
 #[path = "suites/g11_provider_attribution.rs"]

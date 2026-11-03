@@ -67,6 +67,73 @@ fn last_user_text(lines: &[serde_json::Value]) -> &str {
         .expect("the last entry is a user message")
 }
 
+/// A `Write` that records every `write` call, so a row written through
+/// `write_all` can be proven to reach the file in ONE call (the newline must
+/// not be a second, separately interleavable write).
+#[derive(Default)]
+struct CountingWriter {
+    writes: Vec<Vec<u8>>,
+}
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writes.push(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn one_jsonl_row_is_emitted_by_a_single_write_call() {
+    let mut writer = CountingWriter::default();
+    pir::session_manager::write_json_line_for_test(&mut writer, "{\"type\":\"message\"}")
+        .expect("write row");
+    assert_eq!(
+        writer.writes.len(),
+        1,
+        "the line and its newline must travel in one write"
+    );
+    assert_eq!(writer.writes[0], b"{\"type\":\"message\"}\n");
+}
+
+/// The seam above only proves `write_json_line` is one `write_all`; this test
+/// proves the REAL `persist_entry` append path calls it exactly once per
+/// entry (the append path used to inline the row buffer, so a regression back
+/// to `write_all(line)` + `write_all(b"\n")` would not have been caught).
+#[test]
+fn persist_entry_emits_one_row_write_per_append() {
+    let dir = guard_temp_dir("single-row-write");
+    let mut session = SessionManager::create("C:/repo", &dir.0).unwrap();
+    // First append creates the file (header replay + entry); measure only the
+    // following, already-flushed append.
+    session.append_message(user_message("first")).unwrap();
+    let path = session.path().to_path_buf();
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    pir::session_manager::reset_session_json_line_writes();
+    session.append_message(user_message("second")).unwrap();
+    assert_eq!(
+        pir::session_manager::session_json_line_writes(),
+        1,
+        "the real append path must emit exactly ONE row through write_json_line"
+    );
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    let appended = after
+        .strip_prefix(&before)
+        .expect("the append only adds bytes");
+    assert!(appended.ends_with('\n'), "the appended row is terminated");
+    assert_eq!(
+        appended.matches('\n').count(),
+        1,
+        "the JSON and its newline are one row, not two writes"
+    );
+    drop(session);
+}
+
 #[test]
 fn every_append_is_a_complete_line_without_an_intervening_sync() {
     let dir = guard_temp_dir("visible");
@@ -221,6 +288,78 @@ fn a_failed_append_rolls_back_memory_and_disk_and_the_next_append_stays_parented
     assert_eq!(last_user_text(&lines), "after");
     drop(reopened);
     drop(session);
+}
+
+/// R1-L3-011: a same-length atomic rewrite must invalidate the cached append
+/// handle by FILE IDENTITY, not by length. A v2→v3 migration is a real
+/// `rewrite_file` that only flips the header's version digit, so it publishes
+/// a new inode with exactly the old byte length. A length-only check keeps
+/// writing the superseded (unlinked) inode, so the entry silently disappears
+/// from the live path.
+#[test]
+fn same_length_rewrite_from_another_manager_redirects_appends_to_the_new_inode() {
+    let dir = guard_temp_dir("same-length-rewrite");
+    let mut writer = SessionManager::create("C:/repo", &dir.0).unwrap();
+    writer.append_message(user_message("kept")).unwrap();
+    let path = writer.path().to_path_buf();
+
+    // Downgrade the header to v2 IN PLACE (same length): opening the file
+    // from a second manager runs the v2→v3 migration, whose rewrite changes
+    // only the version digit and therefore renames a SAME-LENGTH file over
+    // the path.
+    let original = std::fs::read_to_string(&path).unwrap();
+    let downgraded = original.replace("\"version\":3", "\"version\":2");
+    assert_ne!(downgraded, original, "the header version was rewritten");
+    assert_eq!(
+        downgraded.len(),
+        original.len(),
+        "the downgrade must keep the file length identical"
+    );
+    std::fs::write(&path, &downgraded).unwrap();
+
+    // Keep the OLD inode reachable after the rewrite unlinks its name: any
+    // stale-handle write shows up here instead of the live path.
+    let old_inode = dir.0.join("old-inode.jsonl");
+    std::fs::hard_link(&path, &old_inode).unwrap();
+    let old_inode_before = std::fs::read_to_string(&old_inode).unwrap();
+    assert_eq!(old_inode_before, downgraded);
+
+    // Another manager opens the path; the migration rewrites it atomically
+    // (temp file + rename), i.e. exactly the cross-manager `rewrite_file`
+    // the cached handle must notice.
+    let migrated = SessionManager::open(&path).unwrap();
+    assert_eq!(migrated.entries().len(), 1);
+    drop(migrated);
+
+    let rewritten = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        rewritten.len(),
+        original.len(),
+        "the migration rewrite must stay same-length for this regression test"
+    );
+    assert!(
+        !rewritten.contains("\"version\":2"),
+        "the migration must bump the header to v3"
+    );
+
+    writer
+        .append_message(user_message("after rewrite"))
+        .unwrap();
+
+    // The live path contains the append...
+    let lines = lines_of(&path);
+    assert_eq!(lines.len(), 3, "header + kept + after rewrite");
+    assert_eq!(last_user_text(&lines), "after rewrite");
+
+    // ...and the superseded inode was NOT written.
+    assert_eq!(
+        std::fs::read_to_string(&old_inode).unwrap(),
+        old_inode_before,
+        "the cached append handle must never write the superseded inode"
+    );
+    let old_lines = lines_of(&old_inode);
+    assert_eq!(last_user_text(&old_lines), "kept");
+    drop(writer);
 }
 
 #[test]

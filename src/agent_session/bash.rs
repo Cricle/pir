@@ -82,7 +82,7 @@ impl AgentSession {
         match tokio::time::timeout(
             USER_BASH_DISPATCH_TIMEOUT,
             crate::agent_session::dispatch_user_bash_with_host(
-                self.extensions_handle(),
+                self.event_extensions(),
                 self.plugins.as_deref(),
                 command,
                 exclude_from_context,
@@ -322,16 +322,17 @@ impl AgentSession {
         match &self.session {
             Some(session) => {
                 let mut session = session.lock().await;
-                let _ = session.append_bash_execution(
-                    command,
-                    output,
-                    exit_code,
-                    cancelled,
-                    truncated,
-                    full_output_path,
-                    exclude,
-                    timestamp,
-                );
+                let _ =
+                    session.append_bash_execution(crate::session_manager::BashExecutionRecord {
+                        command,
+                        output,
+                        exit_code,
+                        cancelled,
+                        truncated,
+                        full_output_path,
+                        exclude_from_context: exclude,
+                        timestamp,
+                    });
             }
             None => {
                 // Ephemeral sessions keep the output only in the transcript,

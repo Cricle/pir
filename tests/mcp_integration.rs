@@ -5655,41 +5655,78 @@ async fn per_request_progress_reaches_the_callback_and_resets_the_idle_deadline(
 /// stops reading stdin after `initialize` lets the writer, the pipe and then
 /// the channel fill. A request armed with a short deadline must still return
 /// `McpError::Timeout` instead of parking inside `send_cancellable_request`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "blocked dispatch exhausts the test runtime; needs a dedicated dispatch-thread harness"]
-async fn request_deadline_bounds_a_blocked_dispatch() {
-    let (client, manager) = connect_mock_stdio_env(&[("PIR_MOCK_STALL_AFTER_INIT", "1")]).await;
-    // More in-flight pings than the 1024-slot peer channel plus the stdin pipe
-    // can hold, so the LAST dispatch below has nowhere to go.
-    let mut inflight = Vec::new();
-    for _ in 0..4096 {
-        let client = Arc::clone(&client);
-        inflight.push(tokio::spawn(async move {
-            let _ = client
-                .ping_with_options(&McpRequestOptions {
-                    timeout: Some(Duration::from_secs(120)),
-                    ..Default::default()
-                })
-                .await;
-        }));
-    }
-    // Let the writer fill the child's stdin pipe and the rmcp peer channel.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+///
+/// The scenario owns a thread and a runtime of its own: a blocked dispatch
+/// parks every task that needs a peer slot, and rmcp's transport writer parks
+/// on the stalled pipe — so neither the timer that has to fire nor the
+/// runtime's teardown may depend on that runtime's workers. The test body
+/// only waits for the scenario's report, bounded, so a regression fails here
+/// instead of hanging the harness.
+#[test]
+#[ignore = "known limitation: rmcp's send_cancellable_request blocks inside its first poll on a
+            stalled peer pipe, so the request timer cannot fire; the harness fails in ~21s
+            instead of hanging. See src/mcp/client.rs request_cancellable"]
+fn request_deadline_bounds_a_blocked_dispatch() {
+    let (report_tx, report_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Multi-thread on purpose: the stalled pipe parks rmcp's transport
+        // writer, and a single-threaded runtime would then never poll the
+        // request timer that has to fire.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("dedicated dispatch runtime");
+        let report = runtime.block_on(async {
+            let (client, manager) =
+                connect_mock_stdio_env(&[("PIR_MOCK_STALL_AFTER_INIT", "1")]).await;
+            // More in-flight pings than the 1024-slot peer channel plus the
+            // stdin pipe can hold, so the LAST dispatch below has nowhere to
+            // go.
+            let mut inflight = Vec::new();
+            for _ in 0..4096 {
+                let client = Arc::clone(&client);
+                inflight.push(tokio::spawn(async move {
+                    let _ = client
+                        .ping_with_options(&McpRequestOptions {
+                            timeout: Some(Duration::from_secs(120)),
+                            ..Default::default()
+                        })
+                        .await;
+                }));
+            }
+            // Let the writer fill the child's stdin pipe and the rmcp peer
+            // channel.
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let bounded = tokio::time::timeout(
-        Duration::from_secs(10),
-        client
-            .ping_with_options(&McpRequestOptions::new().with_timeout(Duration::from_millis(150))),
-    )
-    .await;
-    let outcome = bounded.expect("the request deadline must also bound a blocked dispatch");
+            let bounded = tokio::time::timeout(
+                Duration::from_secs(10),
+                client.ping_with_options(
+                    &McpRequestOptions::new().with_timeout(Duration::from_millis(150)),
+                ),
+            )
+            .await;
+
+            for task in inflight {
+                task.abort();
+            }
+            // The drained child is killed by the transport on close, inside its
+            // own close budget; keep it out of the reported outcome.
+            manager.shutdown().await;
+            bounded
+        });
+        let _ = report_tx.send(report);
+        // The stalled child leaves a writer parked on its stdin pipe; a bounded
+        // shutdown hands the thread back instead of waiting for that write.
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    });
+
+    let report = report_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the blocked dispatch must not hang the test");
+    let outcome = report.expect("the request deadline must also bound a blocked dispatch");
     assert!(
         matches!(outcome, Err(McpError::Timeout { .. })),
         "expected a typed timeout, got {outcome:?}"
     );
-
-    for task in inflight {
-        task.abort();
-    }
-    manager.shutdown().await;
 }

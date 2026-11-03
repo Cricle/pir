@@ -19,15 +19,15 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use pir::agent::tool_execution::ToolRegistry;
 use pir::agent_session::{AgentSession, AgentSessionConfig};
 use pir::ai::provider::ProviderRegistry;
 use pir::ai::types::{Model, ModelCost, ModelCostRates, ThinkingLevel};
 use pir::plugins::{
-    AgentPlugin, EventInterest, PluginEvent, PluginEventOutcome, PluginFuture, PluginInfo,
-    RegistrationContext,
+    AgentPlugin, EventInterest, PluginEvent, PluginEventOutcome, PluginFuture, PluginHost,
+    PluginInfo, RegistrationContext,
 };
 
 // ---------------------------------------------------------------------------
@@ -208,6 +208,89 @@ impl AgentPlugin for ReloadRecorder {
 }
 
 // ---------------------------------------------------------------------------
+// Reload lifecycle tracing fixture (P3-05)
+// ---------------------------------------------------------------------------
+
+/// Traces the complete native reload lifecycle in dispatch order.
+///
+/// The `session_start {reason: "reload"}` half is the P3-05 regression: it
+/// must be emitted by the HOST exactly once per reload, so a direct
+/// `PluginHost::reload[_native_plugins]` caller and `AgentSession::reload`
+/// observe the same `session_shutdown -> on_reload -> session_start` cycle.
+/// Before the fix only `AgentSession::reload` emitted the start, and moving it
+/// there without deleting the session's own copy would have produced two.
+struct ReloadLifecycleRecorder {
+    info: PluginInfo,
+    trace: Arc<Mutex<Vec<String>>>,
+}
+
+impl ReloadLifecycleRecorder {
+    fn new(name: &str) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(Self {
+                info: PluginInfo::inline(name),
+                trace: Arc::clone(&trace),
+            }),
+            trace,
+        )
+    }
+}
+
+fn lifecycle_trace(trace: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    trace
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn start_reload_count(trace: &[String]) -> usize {
+    trace
+        .iter()
+        .filter(|step| step.as_str() == "event:session_start:reload")
+        .count()
+}
+
+impl AgentPlugin for ReloadLifecycleRecorder {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(vec![
+            "session_shutdown".to_owned(),
+            "session_start".to_owned(),
+        ])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        Box::pin(async move {
+            let reason = event
+                .payload
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            self.trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("event:{}:{reason}", event.name));
+            PluginEventOutcome::None
+        })
+    }
+
+    fn on_reload(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("on_reload".to_owned());
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // D3 — the phone quota credential path follows the canonical resolver
 // ---------------------------------------------------------------------------
 
@@ -363,6 +446,101 @@ async fn session_reload_survives_a_failing_plugin_on_reload() {
 }
 
 // ---------------------------------------------------------------------------
+// P3-05 — the host owns the reload `session_start {reason:"reload"}` so every
+// caller observes the complete lifecycle exactly once
+// ---------------------------------------------------------------------------
+
+/// Direct `PluginHost::reload` (the SDK/RPC/test entry): the host must run the
+/// complete native lifecycle itself, including the `session_start
+/// {reason:"reload"}` that used to live only in `AgentSession::reload`.
+#[tokio::test(flavor = "current_thread")]
+async fn plugin_host_reload_emits_session_start_reload_exactly_once() {
+    let (recorder, trace) = ReloadLifecycleRecorder::new("w14e-host-reload-lifecycle");
+    let host = PluginHost::build(None, vec![recorder as Arc<dyn AgentPlugin>]);
+
+    host.reload().await.expect("composite reload");
+
+    assert_eq!(
+        lifecycle_trace(&trace),
+        vec![
+            "event:session_shutdown:reload".to_owned(),
+            "on_reload".to_owned(),
+            "event:session_start:reload".to_owned(),
+        ],
+        "direct host reload: shutdown -> on_reload -> one session_start"
+    );
+
+    // A second reload is a second complete cycle — exactly one start each,
+    // never two for one call.
+    host.reload().await.expect("second composite reload");
+    let trace = lifecycle_trace(&trace);
+    assert_eq!(trace.len(), 6, "two complete cycles: {trace:?}");
+    assert_eq!(
+        start_reload_count(&trace),
+        2,
+        "one session_start {{reason:\"reload\"}} per host reload call: {trace:?}"
+    );
+}
+
+/// The native-only host seam runs the same lifecycle, so a host that drives
+/// the JS reload itself does not have to emit the native start on its own.
+#[tokio::test(flavor = "current_thread")]
+async fn plugin_host_native_reload_emits_session_start_reload_exactly_once() {
+    let (recorder, trace) = ReloadLifecycleRecorder::new("w14e-host-native-reload");
+    let host = PluginHost::build(None, vec![recorder as Arc<dyn AgentPlugin>]);
+
+    host.reload_native_plugins().await;
+
+    let trace = lifecycle_trace(&trace);
+    assert_eq!(
+        trace,
+        vec![
+            "event:session_shutdown:reload".to_owned(),
+            "on_reload".to_owned(),
+            "event:session_start:reload".to_owned(),
+        ],
+        "native-only reload: shutdown -> on_reload -> one session_start"
+    );
+    assert_eq!(start_reload_count(&trace), 1);
+}
+
+/// `AgentSession` must not duplicate the host's emission: one `reload()` is
+/// one native `session_start {reason:"reload"}` end to end, and the TUI's
+/// `reload_plugins()` seam gives exactly one more for its own reload call.
+#[tokio::test(flavor = "current_thread")]
+async fn session_reload_emits_session_start_reload_exactly_once() {
+    let temp = TempDir::new("reload-start-once");
+    let (recorder, trace) = ReloadLifecycleRecorder::new("w14e-session-reload-lifecycle");
+    let session = AgentSession::new_with_plugins(
+        session_config(&temp.0, None),
+        vec![recorder as Arc<dyn AgentPlugin>],
+    );
+
+    session.reload().await.expect("session reload");
+
+    assert_eq!(
+        lifecycle_trace(&trace),
+        vec![
+            "event:session_shutdown:reload".to_owned(),
+            "on_reload".to_owned(),
+            "event:session_start:reload".to_owned(),
+        ],
+        "AgentSession::reload must not double-emit the host's session_start"
+    );
+
+    session
+        .reload_plugins()
+        .await
+        .expect("native session reload seam");
+    let trace = lifecycle_trace(&trace);
+    assert_eq!(
+        start_reload_count(&trace),
+        2,
+        "one session_start per reload call, never two for one: {trace:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // D4 (d) — the JS extension reload still runs (through the same host entry
 // point), exactly once, and the native-only session seam does not reload it
 // ---------------------------------------------------------------------------
@@ -414,6 +592,153 @@ async fn js_start_reason(handle: &pir::extensions::ExtensionHandle) -> serde_jso
         .expect("probe the JS runtime")
 }
 
+// ---------------------------------------------------------------------------
+// G4 — one `/reload` is ONE cross-face lifecycle in a fixed global order:
+// native session_shutdown -> on_reload -> JS reload -> native session_start
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "extensions")]
+fn append_reload_trace(path: &Path, line: &str) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open reload trace");
+    writeln!(file, "{line}").expect("append reload trace");
+}
+
+#[cfg(feature = "extensions")]
+fn reload_trace_lines(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .expect("read reload trace")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The native half of the cross-face trace: appends its lifecycle steps to the
+/// same file the JS fixture writes, so the test observes ONE global order.
+#[cfg(feature = "extensions")]
+struct FileReloadRecorder {
+    info: PluginInfo,
+    trace: PathBuf,
+}
+
+#[cfg(feature = "extensions")]
+impl AgentPlugin for FileReloadRecorder {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(vec![
+            "session_shutdown".to_owned(),
+            "session_start".to_owned(),
+        ])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        let reason = event
+            .payload
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let line = format!("native:{}:{reason}", event.name);
+        append_reload_trace(&self.trace, &line);
+        Box::pin(async { PluginEventOutcome::None })
+    }
+
+    fn on_reload(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+        append_reload_trace(&self.trace, "native:on_reload");
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Writes a JS extension that logs its reload lifecycle (old-runtime
+/// `session_shutdown`, factory re-run, new-runtime `session_start`) to the
+/// same trace file.
+#[cfg(feature = "extensions")]
+fn write_trace_js_extension(temp: &TempDir, trace: &Path) -> PathBuf {
+    let path = temp.0.join("reload_trace.ts");
+    let trace_literal =
+        serde_json::to_string(&trace.display().to_string()).expect("trace path as JSON");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+        import fs from "node:fs";
+        const trace = {trace_literal};
+        function append(line) {{ fs.appendFileSync(trace, line + "\n"); }}
+        export default function (pi) {{
+            append("js:factory");
+            pi.on("session_shutdown", (event) => {{
+                append("js:session_shutdown:" + (event.reason ?? ""));
+            }});
+            pi.on("session_start", (event) => {{
+                append("js:session_start:" + (event.reason ?? ""));
+            }});
+        }}
+        "#
+        ),
+    )
+    .expect("write trace JS fixture");
+    path
+}
+
+/// `AgentSession::reload` is the one seam the TUI `/reload` now drives. It must
+/// run the complete cross-face cycle exactly once and in this order:
+/// native `session_shutdown{reload}` -> `on_reload` -> JS reload (old JS
+/// shutdown, factories re-run, new JS `session_start`) -> native
+/// `session_start{reload}`. Two separate dispatches (the old TUI behavior)
+/// could interleave the JS reload anywhere in that sequence.
+#[cfg(feature = "extensions")]
+#[tokio::test(flavor = "current_thread")]
+async fn session_reload_traces_native_hooks_around_the_js_reload() {
+    let temp = TempDir::new("reload-order-trace");
+    let _guard = crate::common::AgentDirEnvGuard::scratch("w14e-reload-trace", None).await;
+    let trace_path = temp.0.join("reload-trace.log");
+    let extension_path = write_trace_js_extension(&temp, &trace_path);
+    let handle = pir::extensions::ExtensionHandle::start(extension_config(&temp.0))
+        .expect("start extension runtime");
+    let loaded = handle
+        .load(std::slice::from_ref(&extension_path))
+        .await
+        .expect("load trace JS fixture");
+    assert!(loaded.errors.is_empty(), "load errors: {:?}", loaded.errors);
+
+    let recorder = Arc::new(FileReloadRecorder {
+        info: PluginInfo::inline("w14e-reload-order-trace"),
+        trace: trace_path.clone(),
+    });
+    let session = AgentSession::new_with_plugins(
+        session_config(&temp.0, Some(handle.clone())),
+        vec![recorder as Arc<dyn AgentPlugin>],
+    );
+    // Drop the load-time `js:factory` line: only the reload cycle is asserted.
+    std::fs::remove_file(&trace_path).expect("clear load-time trace");
+
+    let outcome = session.reload().await.expect("session reload");
+
+    assert!(
+        outcome.extensions_reloaded,
+        "the session reload must rebuild the JS runtime"
+    );
+    assert_eq!(
+        reload_trace_lines(&trace_path),
+        vec![
+            "native:session_shutdown:reload".to_owned(),
+            "native:on_reload".to_owned(),
+            "js:session_shutdown:reload".to_owned(),
+            "js:factory".to_owned(),
+            "js:session_start:reload".to_owned(),
+            "native:session_start:reload".to_owned(),
+        ],
+        "the global reload order must be native shutdown -> on_reload -> JS reload -> native start"
+    );
+}
+
 #[cfg(feature = "extensions")]
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_host_reload_still_reloads_the_js_runtime() {
@@ -449,7 +774,7 @@ async fn plugin_host_reload_still_reloads_the_js_runtime() {
 
 #[cfg(feature = "extensions")]
 #[tokio::test(flavor = "current_thread")]
-async fn session_native_reload_leaves_the_js_runtime_to_the_dispatcher() {
+async fn session_native_reload_leaves_the_js_runtime_to_the_caller() {
     let temp = TempDir::new("reload-js-session");
     let _guard = crate::common::AgentDirEnvGuard::scratch("w14e-js-session", None).await;
     let handle = load_js_fixture(&temp).await;
@@ -468,12 +793,13 @@ async fn session_native_reload_leaves_the_js_runtime_to_the_dispatcher() {
     assert_eq!(
         js_start_reason(&handle).await,
         serde_json::json!(null),
-        "the session seam must not reload the JS runtime: the TUI dispatcher owns \
-         that half, so one /reload reloads each face exactly once"
+        "the native-only session seam must not reload the JS runtime: a caller \
+         that owns the JS half reloads it separately"
     );
 
-    // The JS face still reloads through its existing driver (the TUI's
-    // `ExtRequest::Reload` → `ExtensionHandle::reload`).
+    // The JS face still reloads through its own driver
+    // (`ExtensionHandle::reload`); the TUI now uses the unified
+    // `AgentSession::reload` instead of driving this seam itself.
     handle.reload().await.expect("JS runtime reload");
     assert_eq!(
         js_start_reason(&handle).await,
@@ -616,6 +942,15 @@ async fn session_reload_reloads_extensions_tools_and_resources() {
         first.resources.skills, 1,
         "the contributed skill installed: {:?}",
         first.resources
+    );
+    let discoveries = handle
+        .eval_json("JSON.stringify(globalThis.__reload_probe_discoveries ?? 0)")
+        .await
+        .expect("probe resources_discover count");
+    assert_eq!(
+        discoveries,
+        serde_json::json!(1),
+        "one /reload must dispatch resources_discover exactly once to the JS face"
     );
     let (skills, templates) = session.prompt_resources();
     assert_eq!(

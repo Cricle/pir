@@ -103,18 +103,18 @@ fn bind_session_executor(handle: &ExtensionHandle, dir: &Path, call_id: &str) ->
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(HostEchoTool));
     let sink: NestedEventSink = Arc::new(|_event| Box::pin(async {}));
-    let shared = NestedShared::new(
-        Arc::new(registry),
-        pir::agent::tool_scheduler::ToolScheduler::new(Default::default()),
-        None,
-        Some(handle.clone()),
-        dir.to_path_buf(),
-        None,
-        false,
+    let shared = NestedShared::new(pir::agent::nested_tool_calls::NestedSharedConfig {
+        registry: Arc::new(registry),
+        scheduler: pir::agent::tool_scheduler::ToolScheduler::new(Default::default()),
+        hooks: None,
+        extensions: Some(handle.clone()),
+        cwd: dir.to_path_buf(),
+        signal: None,
+        sequential: false,
         sink,
-        None,
-        None,
-    );
+        session_env: None,
+        callable: None,
+    });
     let executor = NestedToolExecutor::root(Arc::clone(&shared)).for_call(call_id);
     handle.bind_nested_executor(call_id, Arc::new(executor));
     shared

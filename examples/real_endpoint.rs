@@ -28,8 +28,17 @@ mod common;
 
 use pir::sdk::{AgentBuilder, ApiKind, Endpoint, SdkError};
 
-#[tokio::main]
-async fn main() -> Result<(), SdkError> {
+fn main() -> std::process::ExitCode {
+    common::run_big_stack(async {
+        if let Err(error) = run().await {
+            eprintln!("error: {error:?}");
+            return std::process::ExitCode::FAILURE;
+        }
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+async fn run() -> Result<(), SdkError> {
     let base_url = std::env::var("PIR_EXAMPLE_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:11434/v1".into());
     let model_id = std::env::var("PIR_EXAMPLE_MODEL").unwrap_or_else(|_| "llama3".into());

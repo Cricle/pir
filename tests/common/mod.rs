@@ -1,7 +1,7 @@
-//! Shared test helpers. Included via `mod common;` from individual test
-//! binaries; everything is `#[allow(dead_code)]` because each binary only
-//! uses the pieces it needs.
-#![allow(dead_code)]
+//! Shared test helpers. Included via `pub mod common;` from individual test
+//! binaries as the crate's public test-support surface; each binary uses only
+//! the pieces it needs, and `pub` keeps the unused-in-this-binary helpers
+//! reachable instead of dead code.
 
 use std::ffi::OsString;
 use std::io::Write;

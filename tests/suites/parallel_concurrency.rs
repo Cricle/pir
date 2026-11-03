@@ -300,18 +300,18 @@ async fn call_timeout_does_not_apply_to_nested_execute() {
         ..ToolSchedulerConfig::default()
     });
     let sink: NestedEventSink = Arc::new(|_event| Box::pin(async {}));
-    let shared = NestedShared::new(
+    let shared = NestedShared::new(pir::agent::nested_tool_calls::NestedSharedConfig {
         registry,
         scheduler,
-        None,
-        None,
-        std::path::PathBuf::from("."),
-        None,
-        false,
+        hooks: None,
+        extensions: None,
+        cwd: std::path::PathBuf::from("."),
+        signal: None,
+        sequential: false,
         sink,
-        None,
-        None,
-    );
+        session_env: None,
+        callable: None,
+    });
     let executor = NestedToolExecutor::root(shared).for_call("call-parent");
     // A nested call runs inside the parent tool's execution, so the parent
     // owns its budget: the scheduler ceiling must NOT cut it off. The outer

@@ -32,7 +32,7 @@ use futures_util::StreamExt;
 use tracing::Instrument;
 
 use crate::agent::nested_tool_calls::{
-    NestedEventSink, NestedShared, NestedToolEvent, NestedToolExecutor,
+    NestedEventSink, NestedShared, NestedSharedConfig, NestedToolEvent, NestedToolExecutor,
 };
 use crate::agent::tool_batch::{AgentToolCall, ToolBatchOutcome, ToolResult};
 use crate::agent::tool_execution::{
@@ -51,34 +51,31 @@ use crate::ai::types::{
 
 use serde_json::Value as JsonValue;
 
-/// Deliver one loop event to the NATIVE Rust plugin fan-out.
+/// Dispatch one extension event (upstream camelCase payload) through the
+/// unified ordered plugin list (P2-01).
 ///
-/// The loop's JS face is dispatched through its own handle
-/// ([`LoopDeps::extensions`], below); the unified host's non-JS plugins are
-/// reached through this companion so a builtin/inline-only plan (a plan-only
-/// extension handle, no JS runtime) still observes live agent events. The JS
-/// adapter inside the host is deliberately NOT consulted here
-/// ([`crate::plugins::PluginHost::emit_native`]), so each face receives the event exactly
-/// once. `None` hosts (print mode, embedders without a plugin host) are a
-/// no-op.
-async fn emit_native_extension(deps: &LoopDeps, event: &str, payload: &mut JsonValue) {
-    let Some(host) = deps.plugin_events.as_ref() else {
-        return;
-    };
-    if !host.has_native_handlers(event) {
+/// The host owns the order (builtins in path-plan position → JS adapter →
+/// inline plugins) and chains every handler's typed result into the payload
+/// before the next handler runs. The loop's JS handle is passed explicitly so
+/// the adapter is dispatched exactly once at its slot. A bare runtime (no
+/// plugin host: print/SDK embedders) keeps the historical JS-only route.
+/// Emissions are skipped entirely when neither face wants the event
+/// (fast-path registry checks), so extension-free runs pay nothing.
+async fn emit_extension(deps: &LoopDeps, event: &str, payload: serde_json::Value) {
+    let (wants_native, wants_js) = extension_event_faces(deps, event);
+    if !wants_native && !wants_js {
         return;
     }
-    host.emit_native(event, payload).await;
-}
-
-/// Dispatch one extension event (upstream camelCase payload) to BOTH faces:
-/// the native Rust plugins first (when the host declares interest), then the
-/// JS runtime (when a handler is registered). Emissions are skipped entirely
-/// when neither face wants the event (fast-path registry checks), so
-/// extension-free runs pay nothing.
-async fn emit_extension(deps: &LoopDeps, event: &str, payload: serde_json::Value) {
     let mut payload = payload;
-    emit_native_extension(deps, event, &mut payload).await;
+    if let Some(host) = deps.plugin_events.as_ref() {
+        if let Err(error) = host
+            .emit_with_runtime(deps.extensions.as_ref(), event, &mut payload)
+            .await
+        {
+            crate::ext_diag!("[ext] {event} dispatch failed: {error}");
+        }
+        return;
+    }
     let Some(runtime) = deps.extensions.as_ref() else {
         return;
     };
@@ -119,17 +116,40 @@ where
     if !wants_native && !wants_js {
         return;
     }
-    let mut payload = build_payload();
-    if wants_native {
-        if let Some(host) = deps.plugin_events.as_ref() {
-            host.emit_native(event, &mut payload).await;
-        }
-    }
-    if wants_js {
-        if let Some(runtime) = deps.extensions.as_ref() {
-            if let Err(error) = runtime.emit(event, &mut payload).await {
+    emit_extension(deps, event, build_payload()).await;
+}
+
+/// Dispatch one event through the unified host (when present) or the bare JS
+/// runtime, returning the merged outcome. Used by the result-contract events
+/// (`message_end`/`context`/`context_with_system`) whose return value the loop
+/// applies. Native-only hosts still go through [`PluginHost::emit_with_runtime`]
+/// so a native replacement is chained and surfaced exactly like a JS one.
+async fn dispatch_event_to_faces(
+    deps: &LoopDeps,
+    event: &str,
+    payload: &mut JsonValue,
+) -> Option<crate::extensions::EmitOutcome> {
+    if let Some(host) = deps.plugin_events.as_ref() {
+        return match host
+            .emit_with_runtime(deps.extensions.as_ref(), event, payload)
+            .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
                 crate::ext_diag!("[ext] {event} dispatch failed: {error}");
+                None
             }
+        };
+    }
+    let runtime = deps
+        .extensions
+        .as_ref()
+        .filter(|runtime| runtime.has_handlers(event))?;
+    match runtime.emit(event, payload).await {
+        Ok(outcome) => Some(outcome),
+        Err(error) => {
+            crate::ext_diag!("[ext] {event} dispatch failed: {error}");
+            None
         }
     }
 }
@@ -170,32 +190,43 @@ async fn emit_message_end<F>(
 where
     F: FnOnce() -> JsonValue,
 {
-    // Both faces observe `message_end` exactly once: the native fan-out first
-    // (it cannot replace the message), then the JS chain whose replacement the
-    // loop applies. When neither is interested the payload is never built.
+    // Both faces observe `message_end` exactly once, in the host's ordered
+    // list. The merged result is the last same-role replacement (native or
+    // JS); when neither face is interested the payload is never built.
     let wants_native = deps
         .plugin_events
         .as_ref()
         .is_some_and(|host| host.has_native_handlers("message_end"));
-    let runtime = deps
+    let wants_js = deps
         .extensions
         .as_ref()
-        .filter(|runtime| runtime.has_handlers("message_end"));
-    if !wants_native && runtime.is_none() {
+        .is_some_and(|runtime| runtime.has_handlers("message_end"));
+    if !wants_native && !wants_js {
         return None;
     }
     let mut payload = build_payload();
-    if wants_native {
-        if let Some(host) = deps.plugin_events.as_ref() {
-            host.emit_native("message_end", &mut payload).await;
+    let mut outcome = if let Some(host) = deps.plugin_events.as_ref() {
+        match host
+            .emit_with_runtime(deps.extensions.as_ref(), "message_end", &mut payload)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                crate::ext_diag!("[ext] message_end dispatch failed: {error}");
+                return None;
+            }
         }
-    }
-    let runtime = runtime?;
-    let mut outcome = match runtime.emit("message_end", &mut payload).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            crate::ext_diag!("[ext] message_end dispatch failed: {error}");
-            return None;
+    } else {
+        let runtime = deps
+            .extensions
+            .as_ref()
+            .filter(|runtime| runtime.has_handlers("message_end"))?;
+        match runtime.emit("message_end", &mut payload).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                crate::ext_diag!("[ext] message_end dispatch failed: {error}");
+                return None;
+            }
         }
     };
     for error in &outcome.errors {
@@ -265,45 +296,40 @@ async fn apply_extension_context(deps: &LoopDeps, context: &mut Arc<Context>) {
         .plugin_events
         .as_ref()
         .is_some_and(|host| host.has_native_handlers("context"));
-    let runtime = deps
+    let wants_js = deps
         .extensions
         .as_ref()
-        .filter(|runtime| runtime.has_handlers("context"));
-    if !wants_native && runtime.is_none() {
+        .is_some_and(|runtime| runtime.has_handlers("context"));
+    if !wants_native && !wants_js {
         return;
     }
     let Ok(messages) = serde_json::to_value(&context.messages) else {
         return;
     };
-    let mut payload = serde_json::json!({ "type": "context", "messages": messages });
-    if wants_native {
-        if let Some(host) = deps.plugin_events.as_ref() {
-            host.emit_native("context", &mut payload).await;
-        }
+    // Move the serialized transcript into the payload: a `json!` literal
+    // would route the `Value` through `to_value` again, deep-copying the
+    // whole conversation on every request.
+    let mut payload_map = serde_json::Map::with_capacity(2);
+    payload_map.insert("type".to_owned(), JsonValue::String("context".to_owned()));
+    payload_map.insert("messages".to_owned(), messages);
+    let mut payload = JsonValue::Object(payload_map);
+    let Some(mut outcome) = dispatch_event_to_faces(deps, "context", &mut payload).await else {
+        return;
+    };
+    for error in &outcome.errors {
+        crate::ext_diag!("[ext] context handler failed: {}", error.error);
     }
-    let mut replacement = None;
-    if let Some(runtime) = runtime {
-        match runtime.emit("context", &mut payload).await {
-            Ok(mut outcome) => {
-                // Take the replacement out of the owned outcome (dropped
-                // right after this match) instead of cloning the whole
-                // messages array: the clone was pure per-turn cost on a
-                // large transcript.
-                replacement = outcome
-                    .result
-                    .get_mut("messages")
-                    .map(serde_json::Value::take);
-            }
-            Err(error) => crate::ext_diag!("[ext] context dispatch failed: {error}"),
-        }
-    }
-    // A JS replacement wins; otherwise a native in-place rewrite (the only
-    // shape a native `on_event` has) is applied.
-    let replacement = replacement.or_else(|| {
-        wants_native
-            .then(|| payload.get("messages").cloned())
-            .flatten()
-    });
+    // The merged replacement wins; otherwise a native in-place rewrite (the
+    // only shape a native `on_event` has) is applied.
+    let replacement = outcome
+        .result
+        .get_mut("messages")
+        .map(serde_json::Value::take)
+        .or_else(|| {
+            wants_native
+                .then(|| payload.get("messages").cloned())
+                .flatten()
+        });
     if let Some(messages) = replacement {
         if let Ok(replaced) = serde_json::from_value::<Vec<Message>>(messages) {
             // Copy-on-write only on an actual replacement: a handler that
@@ -323,11 +349,11 @@ async fn apply_extension_context_with_system(deps: &LoopDeps, context: &mut Arc<
         .plugin_events
         .as_ref()
         .is_some_and(|host| host.has_native_handlers("context_with_system"));
-    let runtime = deps
+    let wants_js = deps
         .extensions
         .as_ref()
-        .filter(|runtime| runtime.has_handlers("context_with_system"));
-    if !wants_native && runtime.is_none() {
+        .is_some_and(|runtime| runtime.has_handlers("context_with_system"));
+    if !wants_native && !wants_js {
         return;
     }
     // Synthesize the leading system message from the loop's system prompt so
@@ -368,33 +394,30 @@ async fn apply_extension_context_with_system(deps: &LoopDeps, context: &mut Arc<
         };
         messages_value.push(value);
     }
-    let mut payload =
-        serde_json::json!({ "type": "context_with_system", "messages": messages_value });
-    if wants_native {
-        if let Some(host) = deps.plugin_events.as_ref() {
-            host.emit_native("context_with_system", &mut payload).await;
-        }
+    let mut payload_map = serde_json::Map::with_capacity(2);
+    payload_map.insert(
+        "type".to_owned(),
+        JsonValue::String("context_with_system".to_owned()),
+    );
+    payload_map.insert("messages".to_owned(), JsonValue::Array(messages_value));
+    let mut payload = JsonValue::Object(payload_map);
+    let Some(mut outcome) =
+        dispatch_event_to_faces(deps, "context_with_system", &mut payload).await
+    else {
+        return;
+    };
+    for error in &outcome.errors {
+        crate::ext_diag!("[ext] context_with_system handler failed: {}", error.error);
     }
-    let mut replacement = None;
-    if let Some(runtime) = runtime {
-        match runtime.emit("context_with_system", &mut payload).await {
-            Ok(mut outcome) => {
-                // Take, do not clone: the outcome is dropped after this match.
-                replacement = outcome
-                    .result
-                    .get_mut("messages")
-                    .map(serde_json::Value::take);
-            }
-            Err(error) => {
-                crate::ext_diag!("[ext] context_with_system dispatch failed: {error}")
-            }
-        }
-    }
-    let replacement = replacement.or_else(|| {
-        wants_native
-            .then(|| payload.get("messages").cloned())
-            .flatten()
-    });
+    let replacement = outcome
+        .result
+        .get_mut("messages")
+        .map(serde_json::Value::take)
+        .or_else(|| {
+            wants_native
+                .then(|| payload.get("messages").cloned())
+                .flatten()
+        });
     let Some(replaced) = replacement else {
         return;
     };
@@ -1101,6 +1124,14 @@ pub struct LoopOptions {
     /// handler replacement is applied BEFORE the message enters the context
     /// and storage. See [`PreambleMessage`].
     pub preamble: Vec<PreambleMessage>,
+    /// Tool names a transcript prefix (carried outside `context.messages` by a
+    /// streaming [`crate::ai::types::MessageSource`]) already declared.
+    ///
+    /// `declareToolChanges` seeds its state from the transcript's system
+    /// declaration messages. A host that streams the history supplies those
+    /// names here so the first request does not re-declare the loadout the
+    /// session already sent. `None` keeps the resident-transcript behavior.
+    pub initial_declared_tools: Option<std::collections::BTreeSet<String>>,
 }
 
 /// Dependencies for a single agent run.
@@ -1392,7 +1423,30 @@ pub async fn run_with_options(
 }
 
 /// Body of [`run_with_options_shared`], executed inside the `agent.run` span.
-async fn run_with_options_in_span(
+///
+/// The returned future is HEAP-BOXED: this is the deepest single state
+/// machine on the prompt path (the whole turn/tool/retry loop), and every
+/// host awaits it inline from its own prompt state machine
+/// (`agent_session::prompt_loop`, print mode). Inline, its poll frame stacks
+/// on top of every caller frame and the debug build's round-trip stack
+/// requirement climbs toward the 2 MiB Windows main-thread default (the
+/// `plugin` example overflowed there before the tool batch got the same
+/// treatment). One `Box::pin` per RUN — the loop body is allocated once,
+/// not per turn — keeps the host-side poll chain thin. Same pattern and
+/// rationale as
+/// [`crate::agent::tool_scheduler::ToolScheduler::execute_batch_inner`].
+fn run_with_options_in_span(
+    deps: LoopDeps,
+    context: Context,
+    signal: Option<AbortSignal>,
+    options: LoopOptions,
+) -> crate::agent::tool_execution::BoxFuture<'static, Arc<LoopResult>> {
+    Box::pin(run_with_options_in_span_inner(
+        deps, context, signal, options,
+    ))
+}
+
+async fn run_with_options_in_span_inner(
     deps: LoopDeps,
     mut context: Context,
     signal: Option<AbortSignal>,
@@ -1537,18 +1591,19 @@ async fn run_with_options_in_span(
         &deps.plugin_events,
         &turn_counter,
     );
-    let nested = NestedShared::new(
-        Arc::clone(&deps.tools),
-        deps.scheduler.clone(),
-        hooks.clone(),
-        deps.extensions.clone(),
-        deps.cwd.clone(),
-        signal.clone(),
-        deps.scheduler.mode() == crate::agent::tool_batch::ToolExecutionMode::Sequential,
-        nested_sink,
-        deps.session_env.clone(),
-        deps.nested_callable.clone(),
-    );
+    let nested = NestedShared::new(NestedSharedConfig {
+        registry: Arc::clone(&deps.tools),
+        scheduler: deps.scheduler.clone(),
+        hooks: hooks.clone(),
+        extensions: deps.extensions.clone(),
+        cwd: deps.cwd.clone(),
+        signal: signal.clone(),
+        sequential: deps.scheduler.mode()
+            == crate::agent::tool_batch::ToolExecutionMode::Sequential,
+        sink: nested_sink,
+        session_env: deps.session_env.clone(),
+        callable: deps.nested_callable.clone(),
+    });
     // The shared state starts inert (JS-only nested routing, no reach wait).
     // This is the run host's one install of the unified plugin host and the
     // MCP reach hook; `configure_plugins` is first-set-wins, and no tool has
@@ -1612,8 +1667,10 @@ async fn run_with_options_in_span(
     // tool names declared to the model so far. Seeded from the transcript's
     // system declaration messages so a resumed/replayed session does not
     // re-declare the tools it already declared.
-    let mut last_declared: std::collections::BTreeSet<String> =
-        declared_tool_names(&context.messages).unwrap_or_default();
+    let mut last_declared: std::collections::BTreeSet<String> = options
+        .initial_declared_tools
+        .take()
+        .unwrap_or_else(|| declared_tool_names(&context.messages).unwrap_or_default());
 
     'agent: loop {
         if preamble_failed || signal.as_ref().is_some_and(AbortSignal::is_aborted) {
@@ -3316,16 +3373,24 @@ async fn emit_tool_progress(
                 let tool_name = tool_name.clone();
                 let parent_call_id = parent_call_id.clone();
                 emit_extension_lazy(deps, "tool_execution_start", move || {
-                    let mut payload = serde_json::json!({
-                        "type": "tool_execution_start",
-                        "toolCallId": call_id,
-                        "toolName": tool_name,
-                        "args": args,
-                    });
+                    // Insert by move: a `json!` literal would re-serialize the
+                    // already-owned `args` value, copying a call's complete
+                    // argument object (file contents, patches) a second time.
+                    let mut payload = serde_json::Map::with_capacity(5);
+                    payload.insert(
+                        "type".to_owned(),
+                        JsonValue::String("tool_execution_start".to_owned()),
+                    );
+                    payload.insert("toolCallId".to_owned(), JsonValue::String(call_id));
+                    payload.insert("toolName".to_owned(), JsonValue::String(tool_name));
+                    payload.insert("args".to_owned(), args);
                     if let Some(parent) = parent_call_id {
-                        payload["parentToolCallId"] = serde_json::Value::String(parent);
+                        payload.insert(
+                            "parentToolCallId".to_owned(),
+                            serde_json::Value::String(parent),
+                        );
                     }
-                    payload
+                    JsonValue::Object(payload)
                 })
                 .await;
             }
@@ -3367,20 +3432,28 @@ async fn emit_tool_progress(
                 let duration_ms = *duration_ms;
                 let parent_call_id = parent_call_id.clone();
                 emit_extension_lazy(deps, "tool_execution_end", move || {
-                    let mut payload = serde_json::json!({
-                        "type": "tool_execution_end",
-                        "toolCallId": call_id,
-                        "toolName": tool_name,
-                        "result": result,
-                        "isError": is_error,
-                    });
+                    // Insert by move (see the start arm): `result` is already
+                    // an owned wire `Value`, so `json!` would copy the whole
+                    // tool output again.
+                    let mut payload = serde_json::Map::with_capacity(6);
+                    payload.insert(
+                        "type".to_owned(),
+                        JsonValue::String("tool_execution_end".to_owned()),
+                    );
+                    payload.insert("toolCallId".to_owned(), JsonValue::String(call_id));
+                    payload.insert("toolName".to_owned(), JsonValue::String(tool_name));
+                    payload.insert("result".to_owned(), result);
+                    payload.insert("isError".to_owned(), JsonValue::Bool(is_error));
                     if let Some(duration) = duration_ms {
-                        payload["durationMs"] = serde_json::json!(duration);
+                        payload.insert("durationMs".to_owned(), JsonValue::from(duration));
                     }
                     if let Some(parent) = parent_call_id {
-                        payload["parentToolCallId"] = serde_json::Value::String(parent);
+                        payload.insert(
+                            "parentToolCallId".to_owned(),
+                            serde_json::Value::String(parent),
+                        );
                     }
-                    payload
+                    JsonValue::Object(payload)
                 })
                 .await;
             }
@@ -3478,17 +3551,24 @@ fn nested_event_sink(
                 };
                 emit(&events, agent_event);
             }
-            // Native plugins observe nested starts/ends with the same
-            // `parentToolCallId` payload the JS face gets.
-            if let Some(host) = plugin_events.as_ref() {
-                if host.has_native_handlers(event_name) {
-                    let mut payload = nested_event_payload(&event);
-                    host.emit_native(event_name, &mut payload).await;
-                }
-            }
-            if let Some(runtime) = extensions.as_ref() {
-                if runtime.has_handlers(event_name) {
-                    let mut payload = nested_event_payload(&event);
+            // Native and JS plugins observe nested starts/ends with the same
+            // `parentToolCallId` payload, in the host's ordered list (P2-01).
+            let wants_native = plugin_events
+                .as_ref()
+                .is_some_and(|host| host.has_native_handlers(event_name));
+            let wants_js = extensions
+                .as_ref()
+                .is_some_and(|runtime| runtime.has_handlers(event_name));
+            if wants_native || wants_js {
+                let mut payload = nested_event_payload(&event);
+                if let Some(host) = plugin_events.as_ref() {
+                    if let Err(error) = host
+                        .emit_with_runtime(extensions.as_ref(), event_name, &mut payload)
+                        .await
+                    {
+                        crate::ext_diag!("[ext] {event_name} dispatch failed: {error}");
+                    }
+                } else if let Some(runtime) = extensions.as_ref() {
                     if let Err(error) = runtime.emit(event_name, &mut payload).await {
                         crate::ext_diag!("[ext] {event_name} dispatch failed: {error}");
                     }
@@ -3984,11 +4064,20 @@ fn next_message_update_stream_id() -> u64 {
 /// `toolcall_delta` against to ship the O(delta) `patch`). The retained memory
 /// is the arguments of the stream's ACTIVE tool calls — one value per in-flight
 /// call, refreshed in place — never a per-delta table.
+///
+/// The baseline is MUTATED in place instead of being replaced with a clone of
+/// the partial's current map: the common argument delta is one string value
+/// gaining a suffix, so after the patch wire is built only that string is
+/// refreshed (`String::clone_from` reuses its allocation). Before, every
+/// `toolcall_delta` cloned the whole `BTreeMap` (one allocation per key plus
+/// one per value) just to keep the next diff's "previous" side.
 #[cfg(feature = "extensions")]
 #[derive(Debug, Default)]
 pub struct ToolArgumentBaselines {
-    arguments:
-        std::collections::HashMap<usize, std::collections::BTreeMap<String, serde_json::Value>>,
+    /// Indexed by content index. A `Vec` instead of a `HashMap`: content
+    /// indices are small dense integers, so the lookup is one bounds check and
+    /// the table itself allocates once per stream, not once per tool call.
+    arguments: Vec<Option<std::collections::BTreeMap<String, serde_json::Value>>>,
 }
 
 #[cfg(feature = "extensions")]
@@ -4002,11 +4091,52 @@ impl ToolArgumentBaselines {
         self.arguments.clear();
     }
 
-    pub(crate) fn take(
+    /// The one-string-suffix patch between the stored baseline and `current`,
+    /// or `None` when the change is absent/not expressible as a patch. The
+    /// returned key/tail borrow `current` only, so the caller can serialize
+    /// the wire and then call [`Self::commit`] with a mutable baseline.
+    pub(crate) fn diff<'a>(
+        &self,
+        index: usize,
+        current: &'a std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Option<crate::extensions::runtime::ToolArgumentPatch<'a>> {
+        let previous = self.arguments.get(index)?.as_ref()?;
+        crate::extensions::runtime::tool_argument_patch(previous, current)
+    }
+
+    /// Refresh the stored baseline after the wire for `current` was built.
+    /// `patched` is the key the shipped patch described: only that string value
+    /// moved, so only it is rewritten; every other change (or an unchanged
+    /// baseline) replaces the map wholesale.
+    pub(crate) fn commit(
         &mut self,
         index: usize,
-    ) -> Option<std::collections::BTreeMap<String, serde_json::Value>> {
-        self.arguments.remove(&index)
+        current: &std::collections::BTreeMap<String, serde_json::Value>,
+        patched: Option<&str>,
+    ) {
+        let previous = self.arguments.get_mut(index).and_then(Option::as_mut);
+        if let Some(previous) = previous {
+            match patched {
+                Some(key) => {
+                    if let (
+                        Some(serde_json::Value::String(value)),
+                        Some(serde_json::Value::String(current_value)),
+                    ) = (previous.get_mut(key), current.get(key))
+                    {
+                        if value != current_value {
+                            value.clone_from(current_value);
+                        }
+                    }
+                }
+                None => {
+                    if previous != current {
+                        previous.clone_from(current);
+                    }
+                }
+            }
+        } else {
+            self.put(index, current.clone());
+        }
     }
 
     pub(crate) fn put(
@@ -4014,11 +4144,16 @@ impl ToolArgumentBaselines {
         index: usize,
         arguments: std::collections::BTreeMap<String, serde_json::Value>,
     ) {
-        self.arguments.insert(index, arguments);
+        if self.arguments.len() <= index {
+            self.arguments.resize_with(index + 1, || None);
+        }
+        self.arguments[index] = Some(arguments);
     }
 
     pub(crate) fn forget(&mut self, index: usize) {
-        self.arguments.remove(&index);
+        if let Some(slot) = self.arguments.get_mut(index) {
+            *slot = None;
+        }
     }
 }
 
@@ -4097,22 +4232,22 @@ impl MessageUpdateDispatcher {
         self.start_next(deps);
     }
 
-    /// Serialize one event to its per-delta wire, drop it, and queue the wire —
-    /// keeping the pipeline moving without awaiting the JS round trip. When the
-    /// JS side is more than the backlog bound behind, wait for the in-flight
-    /// dispatch instead of growing memory without bound.
-    ///
-    /// The serialization (and the event's drop, which releases the `partial`
-    /// `Arc` the provider parser is about to mutate) happens BEFORE the first
-    /// await, so the loop's per-delta work is O(delta) and the parser's next
-    /// mutation copies nothing (see [`MessageUpdateDispatcher`]).
-    async fn enqueue(&mut self, deps: &LoopDeps, event: AssistantMessageEvent) {
-        let wire = crate::extensions::runtime::message_update_stream_json(
-            &event,
+    /// Serialize one event to its per-delta wire. Runs on the provider-stream
+    /// thread before the event is dropped, so the `partial` `Arc` is released
+    /// right here (see [`MessageUpdateDispatcher`]).
+    fn wire_for(&mut self, event: &AssistantMessageEvent) -> String {
+        crate::extensions::runtime::message_update_stream_json(
+            event,
             self.stream,
             &mut self.tool_arguments,
-        );
-        drop(event);
+        )
+    }
+
+    /// Queue an already-serialized wire — keeping the pipeline moving without
+    /// awaiting the JS round trip. When the JS side is more than the backlog
+    /// bound behind, wait for the in-flight dispatch instead of growing memory
+    /// without bound.
+    async fn enqueue_wire(&mut self, deps: &LoopDeps, wire: String) {
         self.pending.push_back(wire);
         self.advance(deps).await;
         while self.pending.len() + usize::from(self.in_flight.is_some())
@@ -4154,13 +4289,19 @@ impl MessageUpdateDispatcher {
 struct NativeMessageUpdateDispatcher {
     pending: std::collections::VecDeque<JsonValue>,
     in_flight: Option<BoxFuture<'static, ()>>,
+    /// Build the full reference payload (including the cumulative
+    /// `message.content`) instead of the compact O(delta) wire. Opted into by
+    /// an [`crate::plugins::AgentPlugin::wants_message_update_content`]
+    /// handler; `false` on the default hot path.
+    full_content: bool,
 }
 
 impl NativeMessageUpdateDispatcher {
-    fn new() -> Self {
+    fn new(full_content: bool) -> Self {
         Self {
             pending: std::collections::VecDeque::new(),
             in_flight: None,
+            full_content,
         }
     }
 
@@ -4191,10 +4332,20 @@ impl NativeMessageUpdateDispatcher {
         self.start_next(deps);
     }
 
-    /// Queue one stream event's compact payload, awaiting the in-flight
-    /// dispatch only when the backlog bound is exceeded.
-    async fn enqueue(&mut self, deps: &LoopDeps, event: &AssistantMessageEvent) {
-        self.pending.push_back(native_message_update_payload(event));
+    /// Build one event's payload on the provider-stream thread (the event's
+    /// borrowed `partial` is not retained).
+    fn payload_for(&self, event: &AssistantMessageEvent) -> JsonValue {
+        if self.full_content {
+            message_update_payload(event)
+        } else {
+            native_message_update_payload(event)
+        }
+    }
+
+    /// Queue one already-built payload, awaiting the in-flight dispatch only
+    /// when the backlog bound is exceeded.
+    async fn enqueue_payload(&mut self, deps: &LoopDeps, payload: JsonValue) {
+        self.pending.push_back(payload);
         self.advance(deps).await;
         while self.pending.len() + usize::from(self.in_flight.is_some())
             > MESSAGE_UPDATE_BACKLOG_BOUND
@@ -4271,26 +4422,12 @@ fn assistant_event_payload(event: &AssistantMessageEvent, with_content: bool) ->
     if !with_content {
         // Compact route: never materialize the cumulative snapshot. The event
         // view forwards only the event's own fields (O(delta)) and the message
-        // view carries the O(1) scalars.
-        let assistant_event = match serde_json::to_value(
-            crate::coding_agent::json::AssistantMessageEventWire::new(event),
-        ) {
-            Ok(value) => value,
-            Err(_) => JsonValue::Null,
-        };
-        let message_json = match assistant_event_partial(event) {
-            Some(partial) => serde_json::to_value(NativePartialMessageWire::new(partial))
-                .unwrap_or_else(|_| serde_json::json!({ "role": "assistant" })),
-            None => serde_json::json!({ "role": "assistant" }),
-        };
-        let mut payload = serde_json::Map::new();
-        payload.insert(
-            "type".to_string(),
-            JsonValue::String("message_update".to_string()),
-        );
-        payload.insert("message".to_string(), message_json);
-        payload.insert("assistantMessageEvent".to_string(), assistant_event);
-        return JsonValue::Object(payload);
+        // view carries the O(1) scalars. One combined serializer builds the
+        // payload value directly; the previous form materialized the event and
+        // message subtrees as separate `Value`s and then copied both into a
+        // third map (three trees per delta instead of one).
+        return serde_json::to_value(NativeMessageUpdateWire { event })
+            .unwrap_or_else(|_| serde_json::json!({ "type": "message_update" }));
     }
     let assistant_event = match serde_json::to_value(event) {
         Ok(value) => value,
@@ -4309,6 +4446,43 @@ fn assistant_event_payload(event: &AssistantMessageEvent, with_content: bool) ->
     payload.insert("message".to_string(), message_json);
     payload.insert("assistantMessageEvent".to_string(), assistant_event);
     JsonValue::Object(payload)
+}
+
+/// Single-pass compact `message_update` payload serializer: the exact
+/// `{type, message, assistantMessageEvent}` object the compact route used to
+/// assemble from two intermediate `serde_json::Value` trees. Serializing the
+/// combined view straight into the target `Value` removes those intermediate
+/// maps/arrays from every native per-delta dispatch (the message and event
+/// subtrees are still built, but exactly once, in their final place).
+struct NativeMessageUpdateWire<'a> {
+    event: &'a AssistantMessageEvent,
+}
+
+impl serde::Serialize for NativeMessageUpdateWire<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("type", "message_update")?;
+        match assistant_event_partial(self.event) {
+            Some(partial) => {
+                map.serialize_entry("message", &NativePartialMessageWire::new(partial))?;
+            }
+            None => {
+                map.serialize_entry("message", &RoleOnlyMessageWire { role: "assistant" })?;
+            }
+        }
+        map.serialize_entry(
+            "assistantMessageEvent",
+            &crate::coding_agent::json::AssistantMessageEventWire::new(self.event),
+        )?;
+        map.end()
+    }
+}
+
+/// The `{"role": "assistant"}` fallback slot of the compact wire.
+#[derive(serde::Serialize)]
+struct RoleOnlyMessageWire {
+    role: &'static str,
 }
 
 /// The O(1) scalar view of a partial assistant message for the compact native
@@ -4391,7 +4565,13 @@ async fn consume_stream(
     let mut updates = MessageUpdateDispatcher::new();
     // Native consumers ride an independent bounded pipeline: their face is
     // never the JS wire, and a builtin-only plan has no JS handler at all.
-    let mut native_updates = NativeMessageUpdateDispatcher::new();
+    // The payload stays compact unless a native handler explicitly opted into
+    // the full cumulative content.
+    let native_full_content = deps
+        .plugin_events
+        .as_ref()
+        .is_some_and(|host| host.wants_message_update_content());
+    let mut native_updates = NativeMessageUpdateDispatcher::new(native_full_content);
     while let Some(event) = stream.next().await {
         // First provider stream event of the process, measured from the run
         // start (network/transport latency included).
@@ -4459,19 +4639,22 @@ async fn consume_stream(
             .as_ref()
             .is_some_and(|host| host.has_native_handlers("message_update"));
         if wants_js_updates || wants_native_updates {
-            emit(
-                handler,
-                AgentEvent::StreamEvent {
-                    turn,
-                    event: event.clone(),
-                },
-            );
-            if wants_native_updates {
-                native_updates.enqueue(deps, &event).await;
+            // Build both faces' wires while the event is still borrowed, then
+            // hand the ORIGINAL event to the loop handler: with either face
+            // active the old code cloned the whole event (delta `String` plus
+            // the partial `Arc`) only to drive the dispatchers and dropped
+            // that clone right after, which is one avoidable allocation per
+            // streamed delta on the extension-enabled path.
+            #[cfg(feature = "extensions")]
+            let js_wire = wants_js_updates.then(|| updates.wire_for(&event));
+            let native_payload = wants_native_updates.then(|| native_updates.payload_for(&event));
+            emit(handler, AgentEvent::StreamEvent { turn, event });
+            if let Some(payload) = native_payload {
+                native_updates.enqueue_payload(deps, payload).await;
             }
             #[cfg(feature = "extensions")]
-            if wants_js_updates {
-                updates.enqueue(deps, event).await;
+            if let Some(wire) = js_wire {
+                updates.enqueue_wire(deps, wire).await;
             }
         } else {
             emit(handler, AgentEvent::StreamEvent { turn, event });
@@ -4527,7 +4710,9 @@ pub fn assistant_event_partial(event: &AssistantMessageEvent) -> Option<&Assista
 /// model (upstream `getCurrentTools(transcript)`): the accumulated
 /// `toolsAdded` minus `toolsRemoved` across the transcript's system
 /// declaration messages. `None` when the transcript carries no declarations.
-fn declared_tool_names(messages: &[Message]) -> Option<std::collections::BTreeSet<String>> {
+pub(crate) fn declared_tool_names(
+    messages: &[Message],
+) -> Option<std::collections::BTreeSet<String>> {
     let mut declared: Option<std::collections::BTreeSet<String>> = None;
     for message in messages {
         let Message::System(system) = message else {
@@ -4692,7 +4877,7 @@ fn to_tool_result_message(
         usage,
         added_tool_names: Vec::new(),
         structured_content: tool_result.structured_content.clone(),
-        nested_calls,
+        nested_calls: nested_calls.map(Box::new),
         is_error: tool_result.is_error,
         duration_ms: finalized.duration_ms,
         timestamp: assistant.timestamp,

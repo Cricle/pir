@@ -36,6 +36,25 @@ pub(super) fn register_session_host_fns(
         });
     }
     {
+        // `pi.on` fail-closed validation: the prelude asks this before
+        // registering a handler. The known set is the SAME registry the hook
+        // coverage test guards (`WIRED_NATIVE_EVENTS` + native-only +
+        // synthetic + test-only), so a typo becomes a load-time TypeError
+        // instead of a handler that can never fire.
+        sync_fn!("isKnownEvent", |event: String| -> bool {
+            crate::plugins::coverage::is_known_event(&event)
+        });
+    }
+    {
+        // Bulk form for diagnostics/tests; mirrors `isKnownEvent`.
+        sync_fn!("knownEventNamesJson", || -> String {
+            serde_json::to_string(
+                &crate::plugins::coverage::known_event_names().collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".to_owned())
+        });
+    }
+    {
         let st = state.clone();
         sync_fn!("getContextJson", move || -> String {
             context_json(&lock_state(&st))
@@ -483,7 +502,10 @@ pub(super) fn register_session_host_fns(
     }
     {
         let st = state.clone();
-        sync_fn!("hasUI", move || -> bool { lock_state(&st).config.has_ui });
+        sync_fn!("hasUI", move || -> bool {
+            let state = lock_state(&st);
+            state.config.has_ui && !state.ui_fail_fast
+        });
     }
     {
         let st = state.clone();

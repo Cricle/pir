@@ -341,25 +341,52 @@ pub struct NestedShared {
     turn: std::sync::OnceLock<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
+/// The run-scoped inputs [`NestedShared::new`] assembles. Field order mirrors
+/// the old positional constructor; `sequential` is the scheduler's execution
+/// mode as seen by the run host, not a new decision.
+pub struct NestedSharedConfig {
+    /// The merged run registry nested calls execute against.
+    pub registry: Arc<ToolRegistry>,
+    /// The run's scheduler (the loop hands over one with both event faces).
+    pub scheduler: crate::agent::tool_scheduler::ToolScheduler,
+    /// Run tool hooks (`None` for a service host without hooks).
+    pub hooks: Option<Arc<ToolHooks>>,
+    /// The run's extension handle (`None` in no-extension builds).
+    pub extensions: Option<crate::extensions::ExtensionHandle>,
+    /// The session working directory.
+    pub cwd: std::path::PathBuf,
+    /// The run's abort signal (`None` for detached service calls).
+    pub signal: Option<AbortSignal>,
+    /// `true` runs nested calls strictly one at a time (the scheduler's
+    /// sequential mode).
+    pub sequential: bool,
+    /// Where nested-call lifecycle events go (loop stream or a no-op sink).
+    pub sink: NestedEventSink,
+    /// The run's shell session environment (`None` when the host builds none).
+    pub session_env: Option<Arc<crate::agent::tool_execution::ToolSessionEnv>>,
+    /// Nested-callable names (upstream `_getCallableTools`); `None` = all.
+    pub callable: Option<Arc<std::collections::BTreeSet<String>>>,
+}
+
 impl NestedShared {
     /// Assemble the shared nested-call state for one agent run.
     ///
     /// `callable` restricts nested calls to those names (upstream
     /// `_getCallableTools`); `None` keeps the registry-wide default (every
     /// registered tool callable).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        registry: Arc<ToolRegistry>,
-        scheduler: crate::agent::tool_scheduler::ToolScheduler,
-        hooks: Option<Arc<ToolHooks>>,
-        extensions: Option<crate::extensions::ExtensionHandle>,
-        cwd: std::path::PathBuf,
-        signal: Option<AbortSignal>,
-        sequential: bool,
-        sink: NestedEventSink,
-        session_env: Option<Arc<crate::agent::tool_execution::ToolSessionEnv>>,
-        callable: Option<Arc<std::collections::BTreeSet<String>>>,
-    ) -> Arc<Self> {
+    pub fn new(config: NestedSharedConfig) -> Arc<Self> {
+        let NestedSharedConfig {
+            registry,
+            scheduler,
+            hooks,
+            extensions,
+            cwd,
+            signal,
+            sequential,
+            sink,
+            session_env,
+            callable,
+        } = config;
         // A host that builds no loop (`plugin_services`) passes a plain
         // scheduler: install the JS face here so nested calls still observe
         // `tool_call`/`tool_result`. The model-issued path (`agent_loop`)
@@ -396,7 +423,6 @@ impl NestedShared {
     /// source-compatible for embedders and tests.
     // Wired by the run host (`agent_loop.rs`) after construction; this
     // module cannot reach the host itself.
-    #[allow(dead_code)]
     pub(crate) fn configure_plugins(
         &self,
         plugins: Option<Arc<crate::plugins::PluginHost>>,
@@ -663,6 +689,19 @@ impl NestedToolExecutor {
             next_child_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             signal: self.signal.clone(),
         }
+    }
+
+    /// [`Self::for_call`] with a caller-supplied first child sequence number.
+    ///
+    /// The model-issued path mints `<call>/<n>` from a per-call counter that
+    /// starts at zero. The native `ToolService` keeps ONE session-wide
+    /// counter across service calls instead, so it seeds the executor with the
+    /// next value: a caller that reuses its call id still gets distinct
+    /// `tool_call_id`s, exactly like the pre-scheduler implementation.
+    pub fn for_call_with_child_sequence(&self, call_id: &str, next_child: u64) -> Self {
+        let mut executor = self.for_call(call_id);
+        executor.next_child_id = Arc::new(std::sync::atomic::AtomicU64::new(next_child));
+        executor
     }
 
     /// Bind the abort signal owned by the call this executor is scoped to

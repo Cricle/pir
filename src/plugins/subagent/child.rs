@@ -276,6 +276,20 @@ fn session_depth(env: &ToolSessionEnv) -> usize {
     subagent_depth(&env.base_tools)
 }
 
+/// One child-session dispatch: the dispatcher's session environment, the
+/// configured agents, and the task plus its progress/cancellation handles.
+pub(super) struct ChildRunInputs {
+    pub env: Arc<ToolSessionEnv>,
+    pub extensions: Option<ExtensionHandle>,
+    pub agents: Arc<Vec<AgentConfig>>,
+    pub agent_name: String,
+    pub task: String,
+    pub cwd: PathBuf,
+    pub step: Option<usize>,
+    pub parent_signal: Option<AbortSignal>,
+    pub on_task_update: Option<OnTaskUpdate>,
+}
+
 /// Run one task in a fresh, isolated, in-process ephemeral child session
 /// (upstream `runSingleAgent`; see the module doc for the in-process
 /// deviation).
@@ -287,18 +301,18 @@ fn session_depth(env: &ToolSessionEnv) -> usize {
 /// overflow libtest's default test-thread stack even one level deep (builtin
 /// audit P1-6). With both boundaries boxed, only a handful of small poll
 /// frames remain per level and the depth guard bounds the chain.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn run_child(
-    env: Arc<ToolSessionEnv>,
-    extensions: Option<ExtensionHandle>,
-    agents: Arc<Vec<AgentConfig>>,
-    agent_name: String,
-    task: String,
-    cwd: PathBuf,
-    step: Option<usize>,
-    parent_signal: Option<AbortSignal>,
-    on_task_update: Option<OnTaskUpdate>,
-) -> BoxFuture<'static, SingleResult> {
+pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResult> {
+    let ChildRunInputs {
+        env,
+        extensions,
+        agents,
+        agent_name,
+        task,
+        cwd,
+        step,
+        parent_signal,
+        on_task_update,
+    } = inputs;
     Box::pin(async move {
         // Refuse BEFORE any agent/session/runtime work: the depth check is
         // pure registry metadata, so a refused depth never allocates a child
@@ -495,13 +509,31 @@ pub(super) fn run_child(
             tool_selection,
         };
         let child = Arc::new(AgentSession::new_with_agent_dir(config, &agent_dir));
+        // Provider teardown (SNAP4 review P2-1 / SNAP6 P1-1): the child shares
+        // `env.provider_registry` with the parent, and its first provider sync
+        // installs child-built dynamic entries (its own API keys and OAuth
+        // overlays weakly bound to THIS child's runtime). The guard restores
+        // the entries this session displaced when it drops — the normal end of
+        // `run_child` or a cancelled/dropped run future — and removes the
+        // entries that had no previous owner. Restoring (rather than deleting)
+        // is what keeps the parent's NEXT model request in the same prompt
+        // resolvable: `sync_plugin_providers` only runs at `run_prompt` start,
+        // so the parent's provider must still be in the shared map when the
+        // subagent tool returns. Entries a parent/sibling re-registered after
+        // the child are left untouched by the guard's `Arc` identity check.
+        let _provider_cleanup = child.provider_sync_cleanup_guard();
         if child_runtime.is_none() {
             // No dedicated child runtime was spawned, so `extensions` is the
             // parent's shared handle. The child host still runs its native
-            // teardown, but must not terminate the parent's JS actor.
+            // teardown, but must not terminate the parent's JS actor. It also
+            // must not DELIVER the child's events to that actor: the parent's
+            // `pi.on` handlers are not this session's. Definition import and
+            // JS tool execution stay available; only event dispatch (host
+            // adapter + the loop's direct JS face + `ctx` pushes) is muted.
             if let Some(host) = child.plugin_host() {
                 host.mark_js_shared();
             }
+            child.disable_js_event_dispatch();
         }
 
         // Live per-message state (upstream accumulates `message_end` events).
@@ -652,35 +684,46 @@ fn declared_tool_infos(
 /// (`codemode` mode `"only"` hides the active `direct` tools that stay
 /// callable). JS `prepareLoadout` hooks are async and only reach the child
 /// session's per-request declarations; the in-tree hiding hooks are Rust.
+///
+/// Like the canonical copy this is a prompt RENDER, not the child's run
+/// loadout: the bash hook warms the persistent shell pool from
+/// `prepare_loadout`, so the render pass runs under
+/// [`shell_pool::without_prewarm`]. The child's first real
+/// `build_tool_loadout` still warms the member (and a child that is built but
+/// never prompted holds no shell).
+///
+/// [`shell_pool::without_prewarm`]: crate::coding_agent::tools::shell_pool::without_prewarm
 fn rust_hidden_declarations(
     registry: &crate::agent::tool_execution::ToolRegistry,
     active: &[String],
 ) -> Vec<String> {
-    let declared = crate::agent::tool_execution::declared_tools(registry, active);
-    if declared.is_empty() {
-        return Vec::new();
-    }
-    let callable = crate::agent::tool_execution::callable_tools(registry, active);
-    let mut exposures = std::collections::BTreeMap::new();
-    let mut namespaces = std::collections::BTreeMap::new();
-    for tool in registry.iter() {
-        exposures.insert(tool.name().to_owned(), tool.exposure());
-        if let Some(namespace) = tool.namespace() {
-            namespaces.insert(tool.name().to_owned(), namespace);
+    crate::coding_agent::tools::shell_pool::without_prewarm(|| {
+        let declared = crate::agent::tool_execution::declared_tools(registry, active);
+        if declared.is_empty() {
+            return Vec::new();
         }
-    }
-    let loadout = crate::agent::tool_execution::ToolLoadout {
-        declared,
-        callable,
-        registered: registry.iter().cloned().collect(),
-        exposures,
-        namespaces,
-    };
-    let mut hidden = std::collections::BTreeSet::new();
-    for tool in &loadout.declared {
-        if let Some(changes) = tool.prepare_loadout(&loadout) {
-            hidden.extend(changes.hidden_declarations);
+        let callable = crate::agent::tool_execution::callable_tools(registry, active);
+        let mut exposures = std::collections::BTreeMap::new();
+        let mut namespaces = std::collections::BTreeMap::new();
+        for tool in registry.iter() {
+            exposures.insert(tool.name().to_owned(), tool.exposure());
+            if let Some(namespace) = tool.namespace() {
+                namespaces.insert(tool.name().to_owned(), namespace);
+            }
         }
-    }
-    hidden.into_iter().collect()
+        let loadout = crate::agent::tool_execution::ToolLoadout {
+            declared,
+            callable,
+            registered: registry.iter().cloned().collect(),
+            exposures,
+            namespaces,
+        };
+        let mut hidden = std::collections::BTreeSet::new();
+        for tool in &loadout.declared {
+            if let Some(changes) = tool.prepare_loadout(&loadout) {
+                hidden.extend(changes.hidden_declarations);
+            }
+        }
+        hidden.into_iter().collect()
+    })
 }

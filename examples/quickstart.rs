@@ -15,8 +15,17 @@ mod common;
 use pir::ai::types::ThinkingLevel;
 use pir::sdk::{AgentBuilder, SdkError};
 
-#[tokio::main]
-async fn main() -> Result<(), SdkError> {
+fn main() -> std::process::ExitCode {
+    common::run_big_stack(async {
+        if let Err(error) = run().await {
+            eprintln!("error: {error:?}");
+            return std::process::ExitCode::FAILURE;
+        }
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+async fn run() -> Result<(), SdkError> {
     // 1. Build a provider + model. No environment resolution is involved:
     //    `with_registry` dispatches straight to this provider.
     let (registry, model) = common::ScriptedProvider::registry(vec![common::text_message(

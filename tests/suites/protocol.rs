@@ -1139,6 +1139,11 @@ fn delta_decoder_rejects_malformed_and_unsafe_operations() {
         serde_json::json!(["s", ["a"]]),
         serde_json::json!(["s", [], 1]),
         serde_json::json!(["d"]),
+        serde_json::json!(["s"]),
+        serde_json::json!(["a"]),
+        serde_json::json!(["t"]),
+        serde_json::json!(["m"]),
+        serde_json::json!(["p"]),
         serde_json::json!(["s", 7, 1]),
         serde_json::json!(["s", ["__proto__", "x"], 1]),
         serde_json::json!(["#", -1, ["a"]]),
@@ -1171,6 +1176,13 @@ fn delta_decoder_reports_shape_errors_instead_of_panicking() {
         (serde_json::json!(["s", ["a"], 1, 2]), "arity"),
         (serde_json::json!(["p", ["a"], 0]), "arity"),
         (serde_json::json!(["m", ["a"], [0, 0]]), "bijection"),
+        // Truncated full-form tuples: the decoder must not index `array[1]`
+        // before checking that the path element exists.
+        (serde_json::json!(["s"]), "arity"),
+        (serde_json::json!(["a"]), "arity"),
+        (serde_json::json!(["t"]), "arity"),
+        (serde_json::json!(["m"]), "arity"),
+        (serde_json::json!(["p"]), "arity"),
     ] {
         let error = decoder
             .decode(std::slice::from_ref(&invalid))

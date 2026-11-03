@@ -15,7 +15,8 @@
 //!   field-wise (an omitted field keeps the value an earlier handler set).
 //! - `session_before_*`: a `cancel: true` short-circuits. The tree variant
 //!   keeps its full result object (preparation overrides) while cancelled
-//!   handlers still stop the list.
+//!   handlers still stop the list; the compact variant keeps the optional
+//!   replacement `compaction` object beside the cancel flag.
 //! - `resources_discover`: path lists accumulate across handlers.
 //! - `tool_result`: field-wise overlay (`content`/`details`/`isError`/
 //!   `usage`).
@@ -193,6 +194,27 @@ impl MergedEmit {
                     self.stop = true;
                 }
             }
+            PluginEventOutcome::SessionBeforeCompact { cancel, compaction } => {
+                // Preserve the optional replacement compaction: the compact
+                // host reads `result.compaction` and uses it verbatim instead
+                // of running the summarizer (upstream
+                // `SessionBeforeCompactResult.compaction`). Omitting it here
+                // was what made a JS `session_before_compact` replacement
+                // ineffective even though the prelude produced it.
+                let mut next = if self.result.is_object() {
+                    self.result.clone()
+                } else {
+                    serde_json::Map::new().into()
+                };
+                next["cancel"] = JsonValue::Bool(cancel);
+                if let Some(compaction) = compaction {
+                    next["compaction"] = compaction;
+                }
+                self.result = next;
+                if cancel {
+                    self.stop = true;
+                }
+            }
             PluginEventOutcome::Discover {
                 skill_paths,
                 prompt_paths,
@@ -278,16 +300,32 @@ impl MergedEmit {
             }
             PluginEventOutcome::Generic(value) => {
                 // Informational events ignore results; hosts that read one
-                // (project_trust) get last-wins. `session_before_tree` rides
-                // this arm so its mutating preparation fields survive, but a
-                // `cancel: true` still short-circuits the ordered list like
-                // the other `session_before_*` events.
-                if event == "session_before_tree"
-                    && value.get("cancel").and_then(JsonValue::as_bool) == Some(true)
+                // (project_trust) get last-wins. `session_before_*` rides this
+                // arm for the variants without a dedicated typed outcome
+                // (`session_before_tree` preparation overrides, or a native
+                // handler's raw wire result), so a later object result must
+                // OVERLAY the fields already merged from earlier handlers:
+                // replacing the whole result would drop an earlier JS typed
+                // `SessionBeforeCompact { compaction }` (or a tree's
+                // preparation) merely because a later plugin answered
+                // `{cancel: false}`.
+                let cancellable = event.starts_with("session_before_");
+                if cancellable && self.result.is_object() && value.is_object() {
+                    let mut next = self.result.clone();
+                    if let (Some(next), Some(value)) = (next.as_object_mut(), value.as_object()) {
+                        for (key, field) in value {
+                            next.insert(key.clone(), field.clone());
+                        }
+                    }
+                    self.result = next;
+                } else {
+                    self.result = value;
+                }
+                if cancellable
+                    && self.result.get("cancel").and_then(JsonValue::as_bool) == Some(true)
                 {
                     self.stop = true;
                 }
-                self.result = value;
             }
         }
     }

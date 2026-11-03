@@ -763,53 +763,125 @@ export default (pi) => {
 }
 
 // ---------------------------------------------------------------------------
-// http.Server pending-request bound: more concurrent requests than the queue
-// holds park the connection threads (backpressure) and every request is still
-// dispatched exactly once and answered.
+// http.Server connection cap: exactly `MAX_SERVER_CONNECTIONS` live sockets are
+// served, and the next one is refused with a 503 that never reaches JS.
+//
+// The 256-request pending queue (`MAX_PENDING_REQUESTS`) is not reachable from the
+// client side: `serve_connection` enqueues one request, waits for its answer, and
+// only then reads the next head, so one connection holds at most one queued
+// request — and at most 64 connections are live. The reachable bound is the
+// connection cap, pinned here.
 // ---------------------------------------------------------------------------
 
-/// Concurrent requests driven at one server. Past the 256-request pending
-/// queue (`MAX_PENDING_REQUESTS` in `http_fns.rs`), connection threads have to
-/// park until `serverPoll` drains — so this count exercises the bound.
-const SERVER_BOUND_REQUESTS: usize = 300;
+/// Live connections allowed by one server (`MAX_SERVER_CONNECTIONS` in
+/// `http_fns.rs`): the accept loop writes a 503 and closes the socket once this
+/// many are live. Mirrored here because the host constant is private; a change
+/// on either side fails this test instead of passing silently.
+const SERVER_CAP_CONNECTIONS: usize = 64;
+
+/// Read one complete HTTP/1.1 response (head plus `content-length` body) and
+/// leave the socket open: these responses are keep-alive on purpose, so
+/// `read_to_end` would wait for a close that must not come.
+fn read_http_response(stream: &mut TcpStream, label: &str) -> (String, String) {
+    let mut head_bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let read = stream
+            .read(&mut byte)
+            .unwrap_or_else(|error| panic!("{label}: reading the response head failed: {error}"));
+        assert_eq!(
+            read, 1,
+            "{label}: connection closed inside the response head"
+        );
+        head_bytes.push(byte[0]);
+        assert!(
+            head_bytes.len() <= 16 * 1024,
+            "{label}: response head exceeded 16 KiB"
+        );
+        if head_bytes.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&head_bytes).into_owned();
+    let mut content_length = 0usize;
+    for line in head.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            content_length = value
+                .trim()
+                .parse()
+                .unwrap_or_else(|error| panic!("{label}: bad content-length {value:?}: {error}"));
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    stream
+        .read_exact(&mut body)
+        .unwrap_or_else(|error| panic!("{label}: reading the response body failed: {error}"));
+    (head, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Connect one loopback socket, retrying: the listener's backlog drains on its
+/// own accept thread, so a failed connect is transient.
+fn connect_loopback(port: u16, label: usize) -> TcpStream {
+    let mut attempt = 0;
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => return stream,
+            Err(error) => {
+                attempt += 1;
+                assert!(attempt < 20, "connect {label} failed: {error}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "fixture uses 300 concurrent sockets, but MAX_SERVER_CONNECTIONS is 64; pending-queue bound is unreachable"]
-async fn server_pending_queue_bounds_without_losing_requests() {
-    let dir = write_temp_fixture("server-bound", &[]);
+async fn server_connection_cap_serves_the_cap_and_refuses_the_next() {
+    let dir = write_temp_fixture("server-cap", &[]);
     let ts = r#"
 import http from "node:http";
 import fs from "node:fs";
 
 const DIR = "__DIR__";
 const PORT_FILE = DIR + "/port.txt";
-const GO_FILE = DIR + "/go.txt";
+const DONE_FILE = DIR + "/done.txt";
 
 export default (pi) => {
   pi.on("session_start", async () => {
-    try { fs.unlinkSync(GO_FILE); } catch {}
-    try { fs.unlinkSync(PORT_FILE); } catch {}
+    globalThis.__pirPaced = { phase: "start", handled: 0, unique: 0, urls: [], timedOut: false };
     const handled = [];
-    let blockedMs = 0;
     const server = http.createServer((req, res) => {
       handled.push(req.url);
+      // No "connection" header on the answer: for an HTTP/1.1 request that
+      // asked for keep-alive the host keeps the socket open, which is what
+      // keeps this connection's slot held after the response.
       res.writeHead(200, { "content-type": "text/plain" });
       res.end("path:" + req.url);
     });
     await new Promise((resolve) => server.listen(0, resolve));
     fs.writeFileSync(PORT_FILE, String(server.address().port));
-    // Block the JS thread (and with it the server's pump) until the Rust side
-    // has opened every connection: the requests pile up in the host's pending
-    // queue, which parks the connection threads past its bound.
-    const started = Date.now();
-    const end = started + 10000;
-    while (!fs.existsSync(GO_FILE) && Date.now() < end) {}
-    blockedMs = Date.now() - started;
-    // The pump resumes: it dispatches and answers the whole backlog.
-    await new Promise((resolve) => setTimeout(resolve, 2500));
+    globalThis.__pirPaced.phase = "listening";
+    // Park the handler while the Rust peer fills every connection slot: the
+    // pending await is the JS event loop, so the server pump keeps dispatching
+    // and answering the peer's requests. The peer publishes DONE_FILE once it
+    // has seen the cap hold; the bound only ends a stalled run.
+    const deadline = Date.now() + 15000;
+    while (!fs.existsSync(DONE_FILE) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     const unique = new Set(handled).size;
+    const urls = handled.slice();
     server.close();
-    globalThis.__pirPaced = { handled: handled.length, unique, blockedMs };
+    globalThis.__pirPaced = {
+      phase: "done",
+      handled: handled.length,
+      unique,
+      urls,
+      timedOut: !fs.existsSync(DONE_FILE),
+    };
   });
 };
 "#
@@ -817,7 +889,7 @@ export default (pi) => {
 
     let rt = ExtensionRuntime::new(test_config()).await.expect("runtime");
     rt.allow_root(dir.clone());
-    let module = "pir-ext:server-bound.ts";
+    let module = "pir-ext:server-cap.ts";
     rt.seed_module(module, &ts).expect("seed fixture");
     assert_eq!(
         rt.seeded_load(module).await.expect("seeded load"),
@@ -825,21 +897,16 @@ export default (pi) => {
         "fixture must load"
     );
 
-    // The Rust side is an out-of-runtime peer (the "another process" shape):
-    // it opens every connection while the fixture's JS thread is blocked, then
-    // releases the fixture and reads all responses.
-    //
-    // The two sides MUST run concurrently: the fixture publishes its port and
-    // then blocks until the peer writes the go flag, while the peer waits for
-    // that port — awaiting the peer BEFORE the emit deadlocks both (the
-    // fixture's handler runs inside the emit).
+    // The Rust side is the out-of-runtime peer (the "another process" shape):
+    // it owns every socket, so only it can hold the cap full. It MUST run
+    // concurrently with the emit — the fixture's handler runs inside the emit
+    // and waits for the peer's DONE_FILE.
     let peer_dir = dir.clone();
     let peer = tokio::task::spawn_blocking(move || {
         use std::io::{Read, Write};
-        use std::net::TcpStream;
 
         let port_file = peer_dir.join("port.txt");
-        let go_file = peer_dir.join("go.txt");
+        let done_file = peer_dir.join("done.txt");
         let port = {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
@@ -855,55 +922,88 @@ export default (pi) => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         };
-        // Connect + send every request first (the listener's backlog drains on
-        // its own accept thread, so a connect rarely needs a retry).
-        let mut streams = Vec::with_capacity(SERVER_BOUND_REQUESTS);
-        for index in 0..SERVER_BOUND_REQUESTS {
-            let mut attempt = 0;
-            let stream = loop {
-                match TcpStream::connect(("127.0.0.1", port)) {
-                    Ok(stream) => break stream,
-                    Err(error) => {
-                        attempt += 1;
-                        assert!(attempt < 20, "connect {index} failed: {error}");
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                }
-            };
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(60)));
-            streams.push(stream);
-        }
-        for (index, stream) in streams.iter_mut().enumerate() {
-            let request =
-                format!("GET /r{index} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n");
+        // Fill the cap: one keep-alive request per socket, and the sockets stay
+        // open after their answer, so all 64 connection threads keep a slot.
+        let mut slots = Vec::with_capacity(SERVER_CAP_CONNECTIONS);
+        let mut served = Vec::with_capacity(SERVER_CAP_CONNECTIONS);
+        for index in 0..SERVER_CAP_CONNECTIONS {
+            let mut stream = connect_loopback(port, index);
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+            let request = format!(
+                "GET /r{index} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: keep-alive\r\n\r\n"
+            );
             stream.write_all(request.as_bytes()).expect("write request");
             stream.flush().expect("flush request");
+            let (head, body) = read_http_response(&mut stream, &format!("connection {index}"));
+            assert!(
+                head.starts_with("HTTP/1.1 200"),
+                "connection {index} is inside the {SERVER_CAP_CONNECTIONS}-connection cap and must \
+                 be served: {head:?}"
+            );
+            assert_eq!(
+                body,
+                format!("path:/r{index}"),
+                "connection {index} must read the answer to its own request: {head:?}"
+            );
+            assert!(
+                head.to_ascii_lowercase().contains("connection: keep-alive"),
+                "connection {index} must stay live after its answer, otherwise it holds no slot: \
+                 {head:?}"
+            );
+            served.push(format!("/r{index}"));
+            slots.push(stream);
         }
-        // Release the fixture's JS thread: its pump resumes and answers.
-        std::fs::write(&go_file, b"go").expect("write go flag");
-
-        let mut answered = 0usize;
-        let mut wrong = 0usize;
-        for (index, stream) in streams.iter_mut().enumerate() {
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).expect("read response");
-            let text = String::from_utf8_lossy(&response);
-            answered += 1;
-            if !text.starts_with("HTTP/1.1 200") || !text.ends_with(&format!("path:/r{index}")) {
-                wrong += 1;
-            }
-        }
-        (answered, wrong)
+        // The cap is full: one more socket is accepted, refused inline, and
+        // closed — no connection thread, no dispatch. No request is written on
+        // it: the host refuses at accept time, and writing into a socket it
+        // has already shut down would race the refusal against a reset.
+        let mut over_cap = connect_loopback(port, SERVER_CAP_CONNECTIONS);
+        let _ = over_cap.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let (head, body) = read_http_response(&mut over_cap, "over-cap connection");
+        assert!(
+            head.starts_with("HTTP/1.1 503"),
+            "the connection past the {SERVER_CAP_CONNECTIONS}-connection cap must be refused with \
+             503 Service Unavailable: {head:?}"
+        );
+        assert_eq!(
+            body, "Too many connections",
+            "the refusal carries the host's over-cap answer: {head:?}"
+        );
+        let mut trailing = Vec::new();
+        over_cap
+            .read_to_end(&mut trailing)
+            .expect("read the refused connection to EOF");
+        assert!(
+            trailing.is_empty(),
+            "the refused connection is closed inline after its 503 ({} extra bytes)",
+            trailing.len()
+        );
+        // Every slot-holding socket is still open here: that is the state the
+        // refusal above was measured against.
+        assert_eq!(
+            slots.len(),
+            SERVER_CAP_CONNECTIONS,
+            "the cap was filled before the refusal was probed"
+        );
+        std::fs::write(&done_file, b"done").expect("write done flag");
+        served
     });
 
-    // Drive both: the emit's first poll starts the fixture (it publishes the
-    // port and then blocks on the go flag), the peer connects + sends + writes
-    // the flag + reads the responses.
     let mut payload = json!({ "reason": "startup" });
     let emit = rt.emit("session_start", &mut payload);
     let (outcome, peer) = tokio::join!(emit, peer);
-    let outcome = outcome.expect("emit session_start");
-    let peer = peer.expect("peer task");
+    let mut served = peer.expect("peer task");
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let progress = rt
+                .eval_json("JSON.stringify(globalThis.__pirPaced ?? null)")
+                .await
+                .map(|value| value.to_string())
+                .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+            panic!("emit session_start failed: {error}; fixture progress: {progress}");
+        }
+    };
     assert!(
         outcome.errors.is_empty(),
         "handler errors: {:?}",
@@ -913,24 +1013,50 @@ export default (pi) => {
         .eval_json("JSON.stringify(globalThis.__pirPaced)")
         .await
         .expect("read fixture report");
+    let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!(
+        report["phase"].as_str(),
+        Some("done"),
+        "the fixture must reach its report: {report}"
+    );
+    assert_eq!(
+        report["timedOut"], false,
+        "the peer must observe the refusal, not the fixture's bound: {report}"
+    );
+    assert_eq!(
+        served.len(),
+        SERVER_CAP_CONNECTIONS,
+        "every connection up to the cap is served: {served:?}"
+    );
+    let mut expected: Vec<String> = (0..SERVER_CAP_CONNECTIONS)
+        .map(|index| format!("/r{index}"))
+        .collect();
+    expected.sort();
+    served.sort();
+    assert_eq!(
+        served, expected,
+        "the served set is exactly the cap's requests, each answered once"
+    );
+    assert_eq!(
         report["handled"].as_u64(),
-        Some(SERVER_BOUND_REQUESTS as u64),
-        "every request is dispatched exactly once past the bound: {report}"
+        Some(SERVER_CAP_CONNECTIONS as u64),
+        "exactly the cap's requests reach JS; the refused connection is never dispatched: {report}"
     );
     assert_eq!(
         report["unique"].as_u64(),
-        Some(SERVER_BOUND_REQUESTS as u64),
-        "no duplicate dispatch: {report}"
+        Some(SERVER_CAP_CONNECTIONS as u64),
+        "no request is dispatched twice: {report}"
     );
+    let mut observed: Vec<String> = report["urls"]
+        .as_array()
+        .expect("fixture must report the urls it handled")
+        .iter()
+        .map(|url| url.as_str().expect("handled url").to_owned())
+        .collect();
+    observed.sort();
     assert_eq!(
-        peer.0, SERVER_BOUND_REQUESTS,
-        "every client received a response: {peer:?}"
+        observed, expected,
+        "JS dispatched exactly the requests the served connections sent: {report}"
     );
-    assert_eq!(
-        peer.1, 0,
-        "every response answered its own request: {peer:?}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
 }

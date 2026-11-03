@@ -7,8 +7,9 @@
 //! is bounded (timeout, explicit close, or explicit cancel).
 //!
 //! Each accepted connection is handled in its own spawned task (upstream
-//! `node:http` concurrency): an idle browser spare connection can never stall
-//! the accept loop, and `close()` mirrors upstream's
+//! `node:http` concurrency), bounded by [`MAX_CALLBACK_CONNECTIONS`]: an idle
+//! browser spare connection can never stall the accept loop, and a local
+//! process cannot pin unbounded handler tasks. `close()` mirrors upstream's
 //! `closeAllConnections` semantics by stopping completion.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +18,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 
 use super::oauth_page::{oauth_error_html, oauth_success_html};
 use crate::ai::error::{AiError, AiResult};
@@ -27,6 +28,13 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Upper bound on one request head (URL line + headers).
 const MAX_HEAD_BYTES: usize = 16 * 1024;
+
+/// Upper bound on concurrently handled callback connections. A browser only
+/// needs a handful of spares, and every handler may sit up to
+/// [`CONNECTION_TIMEOUT`]; excess connections are closed immediately instead
+/// of queued, so a local process cannot pin unbounded tasks during the login
+/// window.
+const MAX_CALLBACK_CONNECTIONS: usize = 32;
 
 async fn send_page(stream: &mut TcpStream, status: u16, reason: &str, html: &str) {
     let response = format!(
@@ -382,6 +390,7 @@ async fn accept_loop(
     path: String,
     complete_tx: mpsc::UnboundedSender<CallbackQuery>,
 ) {
+    let limit = Arc::new(Semaphore::new(MAX_CALLBACK_CONNECTIONS));
     loop {
         // Register before re-checking the flags: `notify_waiters()` stores no
         // permit, so a close/cancel between the check and the await could be
@@ -404,12 +413,20 @@ async fn accept_loop(
         let Ok((stream, _)) = accepted else {
             return;
         };
+        // Over-limit connections are closed without queueing: `try_acquire_owned`
+        // never waits, so a burst cannot stall the accept loop.
+        let Ok(permit) = limit.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
         let handler_state = state.clone();
         let provider = provider_name.clone();
         let expected = expected_state.clone();
         let route = path.clone();
         let tx = complete_tx.clone();
         tokio::spawn(async move {
+            // Held for the whole handler lifetime; released when the task ends.
+            let _permit = permit;
             if handle_connection(
                 stream,
                 &provider,

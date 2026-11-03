@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use pir::config::mcp::McpServerConfig;
+use pir::mcp::error::McpError;
 use pir::mcp::log::McpLog;
 use pir::mcp::manager::{ConnectionState, McpManager};
 use pir::mcp::registry::{McpServerEntry, McpServerSource};
@@ -86,6 +87,72 @@ fn stdio_config(
     serde_json::from_value(value).expect("stdio config")
 }
 
+/// A controllable stdio mock (this test binary re-invoked with `--exact`).
+///
+/// It answers `initialize`/`tools/list` and every `tools/call`. With
+/// `PIR_TEST_EXIT_AFTER_CALL=1` it exits right after answering a `tools/call`
+/// (the transport closes after the response), so the client that sent the
+/// call becomes stale while a reconnected instance is healthy.
+#[test]
+fn replacement_mcp_server_child() {
+    if std::env::var("PIR_TEST_REPLACEMENT_MCP").as_deref() != Ok("1") {
+        return;
+    }
+    use std::io::{BufRead, Write};
+
+    let exit_after_call = std::env::var("PIR_TEST_EXIT_AFTER_CALL").as_deref() == Ok("1");
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(id) = value.get("id").cloned() else {
+            continue;
+        };
+        let method = value
+            .get("method")
+            .and_then(|method| method.as_str())
+            .unwrap_or("");
+        let result = match method {
+            "initialize" => json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "replacement-mock", "version": "1.0.0" },
+            }),
+            "tools/list" => json!({
+                "tools": [{ "name": "work", "inputSchema": { "type": "object" } }],
+            }),
+            "tools/call" => json!({
+                "content": [{ "type": "text", "text": "ok" }],
+            }),
+            _ => json!({}),
+        };
+        let mut stdout = std::io::stdout();
+        let _ = writeln!(
+            stdout,
+            "{}",
+            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+        );
+        let _ = stdout.flush();
+        if method == "tools/call" && exit_after_call {
+            std::process::exit(0);
+        }
+    }
+}
+
+fn replacement_server_spawn() -> (String, Vec<String>) {
+    let exe = std::env::current_exe().expect("current exe");
+    (
+        exe.to_string_lossy().into_owned(),
+        vec![
+            "replacement_mcp_server_child".to_owned(),
+            "--exact".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blocked_connect_does_not_block_disconnect_or_another_server() {
     let manager = McpManager::without_log(&std::env::current_dir().expect("cwd"));
@@ -153,6 +220,96 @@ async fn a_blocked_connect_does_not_block_disconnect_or_another_server() {
     // child's 30s handshake budget is not spent in this test.
     connecting.abort();
     let _ = connecting.await;
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_error_does_not_tear_down_the_replacement_client() {
+    // The old request's error path must remove only the client IT used: an
+    // unconditional take would close a client another caller installed after
+    // reconnecting, and the following call would fail again.
+    let manager = McpManager::without_log(&std::env::current_dir().expect("cwd"));
+    let (command, args) = replacement_server_spawn();
+    manager.registry().register(McpServerEntry {
+        name: "replacement".to_owned(),
+        config: stdio_config(
+            command,
+            args,
+            BTreeMap::from([
+                ("PIR_TEST_REPLACEMENT_MCP".to_owned(), "1".to_owned()),
+                ("PIR_TEST_EXIT_AFTER_CALL".to_owned(), "1".to_owned()),
+            ]),
+        ),
+        source: McpServerSource::Extension("test".to_owned()),
+    });
+
+    let old = manager
+        .get_client("replacement")
+        .await
+        .expect("first connect");
+    // The first call succeeds; the mock then exits, closing the transport.
+    old.call_tool_with_signal("work", &json!({}), None)
+        .await
+        .expect("the first call is answered");
+    let mut closed = false;
+    for _ in 0..500 {
+        if old.transport_is_closed().await {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(closed, "the mock exited after answering the call");
+
+    // The old caller now observes the closure (its error path runs while a
+    // concurrent caller reconnects).
+    let stale_error = tokio::time::timeout(
+        Duration::from_secs(10),
+        old.call_tool_with_signal("work", &json!({}), None),
+    )
+    .await
+    .expect("a closed client reports its error promptly")
+    .expect_err("a closed client cannot dispatch");
+    assert!(
+        matches!(stale_error, McpError::ConnectionClosed),
+        "expected ConnectionClosed, got {stale_error:?}"
+    );
+
+    // The concurrent caller has already installed a replacement client.
+    let replacement = manager
+        .get_client("replacement")
+        .await
+        .expect("reconnect after the old transport closed");
+    assert!(
+        !Arc::ptr_eq(&old, &replacement),
+        "a fresh client was installed"
+    );
+
+    // The stale error path must not take the replacement out of the slot.
+    assert!(
+        !manager.drop_client_if_for_tests("replacement", &old).await,
+        "a stale client identity must not match the replacement"
+    );
+    let still = manager
+        .get_client("replacement")
+        .await
+        .expect("the replacement is still installed");
+    assert!(
+        Arc::ptr_eq(&still, &replacement),
+        "the replacement client was not torn down"
+    );
+    still
+        .call_tool_with_signal("work", &json!({}), None)
+        .await
+        .expect("the replacement client still serves calls");
+
+    // The same identity check still removes the client that IS installed.
+    assert!(
+        manager
+            .drop_client_if_for_tests("replacement", &still)
+            .await,
+        "dropping the installed client succeeds"
+    );
     manager.shutdown().await;
 }
 

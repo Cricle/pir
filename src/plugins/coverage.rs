@@ -14,8 +14,10 @@
 //! Update rule for a new hook: wire the emit site, add the name to
 //! [`WIRED_NATIVE_EVENTS`], and add the row to the doc's
 //! `wired-native-events` block (in the same change). An event that is
-//! intentionally not wired goes into [`UNSUPPORTED_NATIVE_EVENTS`] with a
+//! intentional not wired goes into [`UNSUPPORTED_NATIVE_EVENTS`] with a
 //! reason and the doc's `unsupported-native-events` block instead.
+
+use super::plugin::EventInterest;
 
 /// Upstream hook events (plus pir's session-event bridge events) that reach
 /// the NATIVE plugin fan-out (`AgentPlugin::on_event`) at least once.
@@ -95,7 +97,82 @@ pub const UNSUPPORTED_NATIVE_EVENTS: &[(&str, &str)] = &[];
 /// counterpart (pir's presentation projection).
 pub const NATIVE_ONLY_EVENTS: &[&str] = &["status", "extension_ui_request"];
 
+/// Events that are emitted by pir but are not part of the upstream
+/// `ExtensionEvent` union (session-event bridge names and pir synthetic
+/// events). `pi.on` accepts them like upstream names, so removing one from
+/// this list is a load-time break for extensions observing it.
+pub const SYNTHETIC_EVENTS: &[&str] = &[
+    // Session-event bridge names (`agent_session/notifications.rs`).
+    "entry_appended",
+    "thinking_level_changed",
+    "summarization_retry_scheduled",
+    "summarization_retry_attempt_start",
+    "summarization_retry_finished",
+    // pir-only run outcome + provider refresh hook.
+    "run_failed",
+    "provider:refreshModels",
+];
+
+/// Synthetic event names used only by in-tree tests through the generic
+/// `PluginHost::emit` seam. They stay accepted by `pi.on` so the test harness
+/// keeps exercising the same registration path as production extensions.
+#[doc(hidden)]
+pub const TEST_ONLY_EVENTS: &[&str] = &[
+    "gate_probe",
+    "probe_event",
+    "q3_large_payload",
+    "late_event",
+];
+
+/// Every event name `pi.on` may register: the wired native fan-out, the
+/// native-only presentation projection, pir synthics, and the test-only
+/// names. `pi.on` rejects anything outside this set (fail-closed) so a typo
+/// cannot silently register a handler that never fires.
+pub fn is_known_event(event: &str) -> bool {
+    WIRED_NATIVE_EVENTS.contains(&event)
+        || NATIVE_ONLY_EVENTS.contains(&event)
+        || SYNTHETIC_EVENTS.contains(&event)
+        || TEST_ONLY_EVENTS.contains(&event)
+}
+
+/// All names accepted by [`is_known_event`], in registry order.
+pub fn known_event_names() -> impl Iterator<Item = &'static str> {
+    WIRED_NATIVE_EVENTS
+        .iter()
+        .chain(NATIVE_ONLY_EVENTS.iter())
+        .chain(SYNTHETIC_EVENTS.iter())
+        .chain(TEST_ONLY_EVENTS.iter())
+        .copied()
+}
+
 /// Whether `event` is declared as reaching the native fan-out.
 pub fn is_native_event(event: &str) -> bool {
     WIRED_NATIVE_EVENTS.contains(&event)
+}
+
+/// Names in a native [`EventInterest::List`] that no native emitter can ever
+/// deliver.
+///
+/// [`EventInterest::matches`] is a plain string compare, so a misspelled name
+/// silently turns the plugin's `on_event` arm into dead code. This is the
+/// validation helper `PluginHost::build` runs over every plugin's declaration
+/// (pushing a `PluginDiagnostic` per returned name), so a typo warns at load
+/// time instead of leaving an unreachable arm.
+///
+/// The accepted set is [`is_known_event`] — the SAME registry `pi.on` validates
+/// against. That includes the native-only presentation projections
+/// ([`NATIVE_ONLY_EVENTS`]), the session-event bridge / pir synthetic names
+/// ([`SYNTHETIC_EVENTS`], e.g. `entry_appended` and `run_failed`), and the
+/// hidden test-only names: all of them have a native dispatch site, so a
+/// plugin may legitimately declare them. `None` / `All` declare no names and
+/// always validate.
+pub fn invalid_native_event_names(interest: &EventInterest) -> Vec<&str> {
+    match interest {
+        EventInterest::List(names) => names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !is_known_event(name))
+            .collect(),
+        EventInterest::None | EventInterest::All => Vec::new(),
+    }
 }

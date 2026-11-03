@@ -596,6 +596,45 @@ fn extension_frame_signature(payload: &serde_json::Value) -> String {
     }
 }
 
+/// The session-event → stream bridge is installed by the first STREAMING run
+/// (not at build), so a non-streaming agent never holds a permanent
+/// session-event subscriber. This guards the install point: a stream started
+/// after `Agent::prompt` runs must still observe session-level events.
+#[tokio::test(flavor = "current_thread")]
+async fn first_prompt_stream_after_non_streaming_runs_receives_session_events() {
+    let cwd = TempDir::new("lazy-stream-bridge");
+    let registry = registry(Arc::new(|_index, _context| {
+        assistant(vec![text_block("ok")], StopReason::Stop)
+    }));
+    let agent = agent_builder(registry, cwd.path())
+        .agent_dir(cwd.path())
+        .session(SessionMode::Dir(cwd.path().join("sessions")))
+        .build()
+        .await
+        .expect("build agent");
+
+    agent.prompt("warmup").await.expect("warmup prompt");
+
+    let events: Vec<SdkEvent> = agent.prompt_stream("stream").collect().await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            SdkEvent::EntryAppended { entry }
+                if entry
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+                    .and_then(|role| role.as_str())
+                    == Some("assistant")
+        )),
+        "the first stream after non-streaming runs must still receive \
+         session-level events: {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(SdkEvent::AgentSettled { .. })),
+        "the stream must still end with its terminal event: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn sdk_projects_non_assistant_message_lifecycle() {
     let cwd = TempDir::new("projection-lifecycle");
@@ -771,6 +810,20 @@ async fn sdk_projects_toolcall_stream_frames_in_order_and_arguments() {
         })
         .expect("prompt_stream_with_outcome carries the outcome");
     assert_eq!(outcome.tool_result_texts(), vec!["2 words".to_owned()]);
+
+    // Both public payloads stay live on this path: the per-run `AgentEnd`
+    // event and the terminal outcome carry the same produced-message slice.
+    let agent_end_messages = events
+        .iter()
+        .find_map(|event| match event {
+            SdkEvent::AgentEnd { messages, .. } => Some(messages),
+            _ => None,
+        })
+        .expect("prompt_stream_with_outcome still carries agent_end");
+    assert_eq!(
+        agent_end_messages, &outcome.messages,
+        "agent_end.messages and AgentOutcome.messages must describe the same run"
+    );
 }
 
 #[tokio::test]

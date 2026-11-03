@@ -4,12 +4,14 @@
 //! # Why this exists
 //!
 //! [`crate::plugins::plugin::services::SessionService`]'s `new_session` /
-//! `fork` / `switch_session` methods return `()` and carry no cancellation
-//! channel (the trait predates the host's session-replacement flow). They
-//! remain documented no-ops by default, so a native plugin that calls them
-//! cannot tell "replaced" from "unsupported". The `UiService::custom`
-//! signature likewise carries only a deadline, so a native custom overlay can
-//! only use the editor slot.
+//! `fork` / `navigate_tree` / `switch_session` methods return `()` and carry no
+//! cancellation channel (the trait predates the host's session-replacement
+//! flow). They are BOUND: the call queues the matching
+//! `SessionCommandAction` for this session's host (see
+//! `agent_session::plugin_services`), so a native plugin can act — but it
+//! cannot tell "applied" from "refused", and it cannot cancel. The
+//! `UiService::custom` signature likewise carries only a deadline, so a native
+//! custom overlay can only use the editor slot.
 //!
 //! [`NativeSessionHost`] is the honest native face for both:
 //!

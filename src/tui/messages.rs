@@ -46,7 +46,7 @@ macro_rules! bump_memo_work {
 use super::ansi::{visible_width, wrap_text_with_ansi, BG_RESET};
 use super::core::{Component, Rows, Text};
 use super::markdown::{
-    render_padded_lines, Markdown, MarkdownOptions, MarkdownTheme, StreamingRender,
+    render_padded_lines, Markdown, MarkdownOptions, MarkdownTheme, RenderCtx, StreamingRender,
 };
 use super::syntax;
 use super::theme::{with_theme, Theme, ThemeColor};
@@ -298,6 +298,12 @@ impl Component for SkillInvocationComponent {
 
 /// Assistant message component (upstream `AssistantMessageComponent`).
 pub struct AssistantMessageComponent {
+    /// Process-unique identity of this immutable message view. The frame
+    /// renderer caches the component's whole rendered row block keyed on
+    /// [`Component::content_revision`]; a fresh component must never alias a
+    /// slot left by a dropped one (its `Arc` address can be recycled), so the
+    /// revision carries this monotone id instead of a pointer.
+    revision_id: u64,
     state: Mutex<AssistantState>,
     /// Persistent body cache, one slot per rendered segment in render order.
     /// Before the cache the component built a throwaway [`Markdown`] per
@@ -428,9 +434,18 @@ impl SegmentQuery<'_> {
     }
 }
 
+/// Monotone component identity for the frame cache (see
+/// [`AssistantMessageComponent::revision_id`]).
+static NEXT_ASSISTANT_COMPONENT_ID: AtomicU64 = AtomicU64::new(1);
+
 impl AssistantMessageComponent {
+    fn next_revision_id() -> u64 {
+        NEXT_ASSISTANT_COMPONENT_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
     pub fn new(output_pad: usize) -> Self {
         Self {
+            revision_id: Self::next_revision_id(),
             state: Mutex::new(AssistantState {
                 message: Arc::new(AssistantMessage::default()),
                 hide_thinking: false,
@@ -449,6 +464,7 @@ impl AssistantMessageComponent {
         output_pad: usize,
     ) -> Self {
         Self {
+            revision_id: Self::next_revision_id(),
             state: Mutex::new(AssistantState {
                 message,
                 hide_thinking,
@@ -527,6 +543,50 @@ impl AssistantMessageComponent {
 }
 
 impl Component for AssistantMessageComponent {
+    /// A settled assistant message is immutable for the component's life
+    /// (`AssistantMessageComponent::new_from` holds one fixed `Arc`), so its
+    /// whole rendered row block is cacheable on the frame renderer, exactly
+    /// like every other settled block. The old default (`None`) opted the
+    /// component out of [`TuiCore::frame_lines`](super::core::TuiCore)'s
+    /// per-component row cache: every steady/dirty frame re-locked the state,
+    /// walked the body segments and re-pushed every body row (a 512-message
+    /// transcript compared ~10k rows per frame). The remaining render inputs
+    /// outside the frame key (width, theme generation) are the live hidden
+    /// label (only when `hideThinkingBlock` makes it visible), the
+    /// process-wide mermaid mode and the terminal image capability
+    /// generation; each is folded into the revision.
+    fn content_revision(&self) -> Option<u64> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut revision =
+            super::core::mix_content_revision(self.revision_id, u64::from(state.hide_thinking));
+        revision = super::core::mix_content_revision(
+            revision,
+            super::markdown::global_mermaid_mode() as u64,
+        );
+        revision = super::core::mix_content_revision(
+            revision,
+            super::terminal_image::capabilities_generation(),
+        );
+        if state.hide_thinking {
+            // `ctx.ui.setHiddenThinkingLabel` mutates the contents of the
+            // shared slot in place, so pointer identity cannot detect it.
+            let label = state
+                .hidden_label
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut label_hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in label.as_deref().unwrap_or("Thinking...").bytes() {
+                label_hash ^= u64::from(byte);
+                label_hash = label_hash.wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            revision = super::core::mix_content_revision(revision, label_hash);
+        }
+        Some(revision)
+    }
+
     /// The trait's owned-line form: the same rows, built through
     /// [`Component::render_into`] in a fresh pool. The frame renderer drives
     /// the canvas path; this bridge keeps `render` correct for any caller
@@ -976,12 +1036,14 @@ impl Component for StreamingThinking {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .lines_into(
-                width,
-                self.output_pad,
-                0,
-                &MarkdownTheme::default(),
-                &MarkdownOptions::default(),
-                Some(painter),
+                RenderCtx {
+                    width,
+                    padding_x: self.output_pad,
+                    padding_y: 0,
+                    theme: &MarkdownTheme::default(),
+                    options: &MarkdownOptions::default(),
+                    paint: Some(painter),
+                },
                 out,
             );
     }
@@ -4210,12 +4272,14 @@ impl Component for ToolExecutionComponent {
                 let mut canvas = Rows::new(&mut rows);
                 render_result_section(
                     &state,
-                    is_shell,
-                    is_timed,
-                    expanded,
-                    width,
-                    &bg.open,
-                    &bg.close,
+                    &ResultSectionCtx {
+                        is_shell,
+                        is_timed,
+                        expanded,
+                        width,
+                        bg_open: &bg.open,
+                        bg_close: &bg.close,
+                    },
                     &mut canvas,
                 );
                 canvas.trim();
@@ -4293,19 +4357,27 @@ fn render_tool_images(state: &mut ToolState, width: usize, out: &mut Rows<'_>) {
 /// The `Elapsed X` / `Took X` timer row is deliberately NOT rendered here: the
 /// caller appends it after the cached rows, so a clock tick rebuilds only that
 /// one row (see [`cached_timer_tail`]).
-// Every parameter is part of the memo key the caller derives; bundling them
-// into a struct would just move the same list one line up.
-#[allow(clippy::too_many_arguments)]
-fn render_result_section(
-    state: &ToolState,
+/// The caller-derived memo inputs of [`render_result_section`], bundled so
+/// the function surface stays named.
+#[derive(Clone, Copy)]
+struct ResultSectionCtx<'a> {
     is_shell: bool,
     is_timed: bool,
     expanded: bool,
     width: usize,
-    bg_open: &str,
-    bg_close: &str,
-    out: &mut Rows<'_>,
-) {
+    bg_open: &'a str,
+    bg_close: &'a str,
+}
+
+fn render_result_section(state: &ToolState, ctx: &ResultSectionCtx<'_>, out: &mut Rows<'_>) {
+    let ResultSectionCtx {
+        is_shell,
+        is_timed,
+        expanded,
+        width,
+        bg_open,
+        bg_close,
+    } = *ctx;
     // Box content width (Box.render → Math.max(1, width - paddingX * 2),
     // box.ts:105) — the body wraps to this before the painted rows are padded
     // back to the full width.

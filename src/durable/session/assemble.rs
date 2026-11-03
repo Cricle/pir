@@ -58,6 +58,7 @@
 //!    the `document.copy` publication for a copy plan built by the fork path,
 //!    and `DocumentPlan` exposes the constructors a fork path needs.
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::durable::chord::diff_objects;
@@ -1098,6 +1099,38 @@ pub fn apply_submission_change(
 
 // ─── adopt ──────────────────────────────────────────────────────────────────
 
+thread_local! {
+    /// Test seam (R1-L3-014): full document-revision clones made by [`adopt`]
+    /// on this thread — one per non-empty operation batch and one per
+    /// publication value. A commit with no publication consumer must not call
+    /// [`adopt`] at all, so this stays at zero; a listener-backed commit
+    /// clones the revision it publishes.
+    static DOCUMENT_PUBLICATION_CLONES: Cell<usize> = const { Cell::new(0) };
+}
+
+fn note_document_publication_clone() {
+    DOCUMENT_PUBLICATION_CLONES.with(|clones| clones.set(clones.get().saturating_add(1)));
+}
+
+/// Number of full document-revision copies [`adopt`] made on this thread
+/// (test seam, R1-L3-014).
+///
+/// "Full" means a complete value map or a non-empty operation batch: the
+/// record metadata a publication also carries is not counted. A no-observer
+/// commit must leave this at zero.
+#[doc(hidden)]
+#[must_use]
+pub fn document_publication_clones() -> usize {
+    DOCUMENT_PUBLICATION_CLONES.with(Cell::get)
+}
+
+/// Reset the current thread's document-publication clone counter (test seam,
+/// R1-L3-014).
+#[doc(hidden)]
+pub fn reset_document_publication_clones() {
+    DOCUMENT_PUBLICATION_CLONES.with(|clones| clones.set(0));
+}
+
 /// Adopt every plan after storage settled (`adopt`, `transaction.ts:728-782`).
 ///
 /// Stamps `createdAt` on a creation and `retiredAt` on a retirement with the
@@ -1108,6 +1141,11 @@ pub fn apply_submission_change(
 /// * a copy emits `document.copy` with its exact source (`:762-768`);
 /// * every other publishing plan emits a `document` change carrying the adopted
 ///   value and operations — empty operations for a creation (`:769-778`).
+///
+/// This function owns the publication copy of every document revision. The
+/// line calls it only when a listener (internal observer or host subscriber)
+/// will receive the publication; a commit with no consumer skips it and keeps
+/// its cache bookkeeping on borrowed plan values.
 #[must_use]
 pub fn adopt(plans: &[DocumentPlan], seq: Seq) -> Vec<DocumentCommitChange> {
     let mut publications = Vec::with_capacity(plans.len());
@@ -1154,11 +1192,18 @@ pub fn adopt(plans: &[DocumentPlan], seq: Seq) -> Vec<DocumentCommitChange> {
                 let ops = if plan.is_creation() {
                     Vec::new()
                 } else {
+                    if !plan.ops.is_empty() {
+                        note_document_publication_clone();
+                    }
                     plan.ops.clone()
                 };
                 let conversation_id = plan
                     .conversation_id
                     .or_else(|| record.scope.conversation_id());
+                let value = plan.publication_value();
+                if value.is_some() {
+                    note_document_publication_clone();
+                }
                 publications.push(DocumentCommitChange::Document {
                     record,
                     conversation_id,
@@ -1166,7 +1211,7 @@ pub fn adopt(plans: &[DocumentPlan], seq: Seq) -> Vec<DocumentCommitChange> {
                     // The publication owns its revision; a base's write owns
                     // the plan's only copy, so this is the one clone the
                     // batch/publication split requires.
-                    value: plan.publication_value().cloned(),
+                    value: value.cloned(),
                     ops,
                 });
             }

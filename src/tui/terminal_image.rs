@@ -541,17 +541,65 @@ pub fn protocol_can_display_mime(protocol: ImageProtocol, mime_type: &str) -> bo
             && transcodable_mime(mime_type))
 }
 
-/// One cached transcode: the payload key and its PNG base64 result.
-type PngCacheEntry = (u64, Option<String>);
+/// One cached transcode: the payload key, its PNG base64 result, and the
+/// result's byte length (`0` for a negative-cache `None`).
+struct PngCacheEntry {
+    key: u64,
+    png: Option<String>,
+    size: usize,
+}
 
-/// Cache of transcoded PNG base64 payloads, keyed by a hash of the source
-/// payload + MIME (upstream `Image`'s `pngCache`, bounded to 32 entries).
-/// A failed conversion is cached as `None`: sending the same broken bytes to
-/// the decoder on every frame would repeat the failure at frame rate.
-fn png_cache() -> &'static std::sync::Mutex<Vec<PngCacheEntry>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<PngCacheEntry>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+/// Entry bound of the transcode cache (upstream `pngCache` bound).
+const MAX_PNG_CACHE_ENTRIES: usize = 32;
+
+/// Total-byte bound of the transcode cache. A single decode may be 64 MiB
+/// (≈85 MiB once base64-encoded); 32 such entries would pin gigabytes in a
+/// long TUI session, so the cache is bounded by total size as well.
+const MAX_PNG_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Process-wide cache of transcoded PNG base64 payloads, keyed by a hash of
+/// the source payload + MIME. A failed conversion is cached as `None`:
+/// sending the same broken bytes to the decoder on every frame would repeat
+/// the failure at frame rate. `entries[0]` is the newest; eviction drops from
+/// the tail until both the entry and total-byte bounds hold.
+#[derive(Default)]
+struct PngCache {
+    entries: Vec<PngCacheEntry>,
+    bytes: usize,
+}
+
+impl PngCache {
+    fn lookup(&self, key: u64) -> Option<Option<String>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.png.clone())
+    }
+
+    fn insert(&mut self, key: u64, png: Option<String>, max_entries: usize, max_bytes: usize) {
+        self.remove(key);
+        let size = png.as_ref().map_or(0, String::len);
+        self.entries.insert(0, PngCacheEntry { key, png, size });
+        self.bytes += size;
+        while self.entries.len() > max_entries || self.bytes > max_bytes {
+            let Some(evicted) = self.entries.pop() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(evicted.size);
+        }
+    }
+
+    fn remove(&mut self, key: u64) {
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let entry = self.entries.remove(index);
+            self.bytes = self.bytes.saturating_sub(entry.size);
+        }
+    }
+}
+
+fn png_cache() -> &'static std::sync::Mutex<PngCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<PngCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(PngCache::default()))
 }
 
 fn png_cache_key(base64_data: &str, mime_type: &str) -> u64 {
@@ -612,17 +660,51 @@ fn cached_png_base64(base64_data: &str, mime_type: &str) -> Option<String> {
         let cache = png_cache()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((_, cached)) = cache.iter().find(|(cached_key, _)| *cached_key == key) {
-            return cached.clone();
+        if let Some(cached) = cache.lookup(key) {
+            return cached;
         }
     }
     let png = transcode_to_png_base64(base64_data, mime_type);
     let mut cache = png_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.insert(0, (key, png.clone()));
-    cache.truncate(32);
+    cache.insert(key, png.clone(), MAX_PNG_CACHE_ENTRIES, MAX_PNG_CACHE_BYTES);
     png
+}
+
+/// Drop every cached transcode (test seam: the cache is process-global).
+#[doc(hidden)]
+pub fn png_cache_clear_for_test() {
+    let mut cache = png_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *cache = PngCache::default();
+}
+
+/// Insert one synthetic transcode under explicit bounds and return the
+/// resulting `(entries, bytes)` (test seam). Production inserts use
+/// [`MAX_PNG_CACHE_ENTRIES`] / [`MAX_PNG_CACHE_BYTES`].
+#[doc(hidden)]
+pub fn png_cache_insert_for_test(
+    key: u64,
+    png: Option<String>,
+    max_entries: usize,
+    max_bytes: usize,
+) -> (usize, usize) {
+    let mut cache = png_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.insert(key, png, max_entries, max_bytes);
+    (cache.entries.len(), cache.bytes)
+}
+
+/// Current `(entries, bytes)` of the process-wide cache (test seam).
+#[doc(hidden)]
+pub fn png_cache_stats_for_test() -> (usize, usize) {
+    let cache = png_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (cache.entries.len(), cache.bytes)
 }
 
 /// Render one base64 image for a protocol (upstream `renderImage`); `None`

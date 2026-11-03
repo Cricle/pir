@@ -52,6 +52,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -133,7 +134,7 @@ pub fn transport_options(options: &StreamOptions) -> CodexTransportOptions {
     let metadata = options.metadata.as_ref();
     let transport = metadata
         .and_then(|metadata| metadata.get(METADATA_TRANSPORT))
-        .and_then(|value| serde_json::from_value::<TransportSetting>(value.clone()).ok())
+        .and_then(|value| TransportSetting::deserialize(value).ok())
         .unwrap_or(TransportSetting::Auto);
     let connect_timeout = match metadata
         .and_then(|metadata| metadata.get(METADATA_WEBSOCKET_CONNECT_TIMEOUT_MS))
@@ -372,6 +373,27 @@ fn compress_zstd_impl(_payload: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// One Codex WebSocket turn's request identity: the resolved WebSocket URL,
+/// the wire body, the ChatGPT account/token, and the model the request is for.
+///
+/// The transport options travel separately (they are read from
+/// [`StreamOptions`] like every other adapter), and the parser/sink receive
+/// the events.
+pub struct CodexWsRequest<'a> {
+    /// The resolved `/codex/responses` WebSocket URL.
+    pub ws_url: &'a str,
+    /// The Responses request body (the frame's `response.create` payload).
+    pub body: &'a Value,
+    /// ChatGPT account id (`chatgpt-account-id`).
+    pub account_id: &'a str,
+    /// Access token for the handshake headers.
+    pub token: &'a str,
+    /// The model this turn is for (headers + request-body matching).
+    pub model: &'a Model,
+    /// The per-request options (headers, signal, session, transport knobs).
+    pub options: &'a StreamOptions,
+}
+
 /// Drive one Codex turn over the pooled WebSocket transport.
 ///
 /// Emits `Start` and all parser events on `sink` on success; on a transport
@@ -381,17 +403,19 @@ fn compress_zstd_impl(_payload: &[u8]) -> Option<Vec<u8>> {
 /// instead). Non-transport failures (Codex `error`/`response.failed` events,
 /// invalid JSON frames) are returned as errors and never fall back, matching
 /// upstream's `isCodexNonTransportError` split.
-#[allow(clippy::too_many_arguments)]
 pub async fn try_stream_codex_websocket(
-    ws_url: &str,
-    full_body: &Value,
-    account_id: &str,
-    token: &str,
-    model: &Model,
-    options: &StreamOptions,
+    request: CodexWsRequest<'_>,
     parser: &mut ResponsesSseParser,
     sink: &AssistantMessageEventStream,
 ) -> AiResult<CodexWsOutcome> {
+    let CodexWsRequest {
+        ws_url,
+        body: full_body,
+        account_id,
+        token,
+        model,
+        options,
+    } = request;
     let key = continuation_key(options);
     let pool_key = key.as_ref().map(|key| PoolKey {
         session_id: key.clone(),

@@ -1,6 +1,6 @@
 //! Process-level RPC coverage: stdin/stdout JSON lines stay schema-valid.
 
-use crate::cli_entry_contract::common;
+use crate::common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};

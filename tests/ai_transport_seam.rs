@@ -406,12 +406,14 @@ async fn retryable_status_retries_and_reports_auto_retry_start_and_end() {
     let mut sink = CollectSink::default();
     let (status, headers) = client
         .request_streaming_with(
-            Method::GET,
-            "http://fake/stream",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::GET,
+                "http://fake/stream",
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             Vec::new(),
-            None,
-            &hooks,
             &mut sink,
         )
         .await
@@ -471,12 +473,14 @@ async fn non_retryable_status_fails_once_with_the_error_body() {
     let mut delivered = Vec::new();
     let error = client
         .request_streaming(
-            Method::POST,
-            "http://fake/v1/messages",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::POST,
+                "http://fake/v1/messages",
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             b"{}".to_vec(),
-            None,
-            &hooks,
             &mut |chunk| {
                 delivered.extend_from_slice(chunk);
                 Ok(())
@@ -516,12 +520,14 @@ async fn x_should_retry_header_overrides_the_status_policy() {
     let mut sink = CollectSink::default();
     let error = client
         .request_streaming_with(
-            Method::GET,
-            "http://fake",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::GET,
+                "http://fake",
+                &BTreeMap::new(),
+                None,
+                &ProviderStreamHooks::default(),
+            ),
             Vec::new(),
-            None,
-            &ProviderStreamHooks::default(),
             &mut sink,
         )
         .await
@@ -551,12 +557,14 @@ async fn x_should_retry_header_overrides_the_status_policy() {
     let mut sink = CollectSink::default();
     let (status, _) = client
         .request_streaming_with(
-            Method::GET,
-            "http://fake",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::GET,
+                "http://fake",
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             Vec::new(),
-            None,
-            &hooks,
             &mut sink,
         )
         .await
@@ -583,12 +591,14 @@ async fn connection_errors_retry_and_exhaust_with_the_attempt_count() {
     let mut sink = CollectSink::default();
     let (status, _) = client
         .request_streaming_with(
-            Method::POST,
-            "http://fake/v1",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::POST,
+                "http://fake/v1",
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             b"payload".to_vec(),
-            None,
-            &hooks,
             &mut sink,
         )
         .await
@@ -638,12 +648,14 @@ async fn connection_errors_retry_and_exhaust_with_the_attempt_count() {
     let mut sink = CollectSink::default();
     let error = client
         .request_streaming_with(
-            Method::POST,
-            "http://fake/v1",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::POST,
+                "http://fake/v1",
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             Vec::new(),
-            None,
-            &hooks,
             &mut sink,
         )
         .await
@@ -693,12 +705,14 @@ async fn a_body_error_retries_only_before_the_first_delivered_chunk() {
     let mut sink = CollectSink::default();
     let (status, _) = client
         .request_streaming_with(
-            Method::GET,
-            "http://fake",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::GET,
+                "http://fake",
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             Vec::new(),
-            None,
-            &hooks,
             &mut sink,
         )
         .await
@@ -731,12 +745,14 @@ async fn a_body_error_retries_only_before_the_first_delivered_chunk() {
     let mut sink = CollectSink::default();
     let error = client
         .request_streaming_with(
-            Method::GET,
-            "http://fake",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::GET,
+                "http://fake",
+                &BTreeMap::new(),
+                None,
+                &hook_log(&log),
+            ),
             Vec::new(),
-            None,
-            &hook_log(&log),
             &mut sink,
         )
         .await
@@ -773,12 +789,14 @@ async fn an_over_cap_retry_after_fails_without_waiting_or_resending() {
     let mut sink = CollectSink::default();
     let error = client
         .request_streaming_with(
-            Method::GET,
-            "http://fake",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::GET,
+                "http://fake",
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             Vec::new(),
-            None,
-            &hooks,
             &mut sink,
         )
         .await
@@ -822,12 +840,14 @@ async fn exponential_backoff_delays_follow_the_ladder() {
     let mut sink = CollectSink::default();
     let (status, _) = client
         .request_streaming_with(
-            Method::GET,
-            "http://fake",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::GET,
+                "http://fake",
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             Vec::new(),
-            None,
-            &hooks,
             &mut sink,
         )
         .await
@@ -883,12 +903,14 @@ async fn the_default_retry_wait_actually_sleeps() {
     let started = Instant::now();
     let (status, _) = client
         .request_streaming_with(
-            Method::GET,
-            "http://fake",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::GET,
+                "http://fake",
+                &BTreeMap::new(),
+                None,
+                &ProviderStreamHooks::default(),
+            ),
             Vec::new(),
-            None,
-            &ProviderStreamHooks::default(),
             &mut sink,
         )
         .await
@@ -920,12 +942,14 @@ async fn a_head_that_never_arrives_idle_times_out_and_retries() {
     let mut sink = CollectSink::default();
     let (status, _) = client
         .request_streaming_with(
-            Method::GET,
-            "http://fake",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::GET,
+                "http://fake",
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             Vec::new(),
-            None,
-            &hooks,
             &mut sink,
         )
         .await
@@ -953,12 +977,14 @@ async fn a_body_that_never_completes_hits_the_body_idle_timeout() {
     let mut sink = CollectSink::default();
     let error = client
         .request_streaming_with(
-            Method::GET,
-            "http://fake",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::GET,
+                "http://fake",
+                &BTreeMap::new(),
+                None,
+                &ProviderStreamHooks::default(),
+            ),
             Vec::new(),
-            None,
-            &ProviderStreamHooks::default(),
             &mut sink,
         )
         .await
@@ -997,12 +1023,14 @@ async fn abort_mid_stream_stops_before_the_next_chunk() {
     let headers = BTreeMap::new();
     let hooks = ProviderStreamHooks::default();
     let request = client.request_streaming_with(
-        Method::GET,
-        "http://fake",
-        &headers,
+        pir::ai::transport::StreamingRequest::new(
+            Method::GET,
+            "http://fake",
+            &headers,
+            Some(&signal),
+            &hooks,
+        ),
         Vec::new(),
-        Some(&signal),
-        &hooks,
         &mut sink,
     );
     let (result, ()) = tokio::join!(request, coordinator);
@@ -1040,12 +1068,14 @@ async fn abort_while_waiting_for_the_response_head_is_observed_immediately() {
     let headers = BTreeMap::new();
     let hooks = ProviderStreamHooks::default();
     let request = client.request_streaming_with(
-        Method::GET,
-        "http://fake",
-        &headers,
+        pir::ai::transport::StreamingRequest::new(
+            Method::GET,
+            "http://fake",
+            &headers,
+            Some(&signal),
+            &hooks,
+        ),
         Vec::new(),
-        Some(&signal),
-        &hooks,
         &mut sink,
     );
     let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1079,12 +1109,14 @@ async fn abort_while_waiting_for_the_next_body_chunk_is_observed_immediately() {
     let headers = BTreeMap::new();
     let hooks = ProviderStreamHooks::default();
     let request = client.request_streaming_with(
-        Method::GET,
-        "http://fake",
-        &headers,
+        pir::ai::transport::StreamingRequest::new(
+            Method::GET,
+            "http://fake",
+            &headers,
+            Some(&signal),
+            &hooks,
+        ),
         Vec::new(),
-        Some(&signal),
-        &hooks,
         &mut sink,
     );
     let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1120,12 +1152,14 @@ async fn a_terminal_send_verdict_is_not_retried() {
     let mut sink = CollectSink::default();
     let error = client
         .request_streaming_with(
-            Method::GET,
-            "http://fake",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::GET,
+                "http://fake",
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             Vec::new(),
-            None,
-            &hooks,
             &mut sink,
         )
         .await
@@ -1157,12 +1191,14 @@ async fn a_terminal_body_verdict_is_not_retried() {
     let mut sink = CollectSink::default();
     let error = client
         .request_streaming_with(
-            Method::GET,
-            "http://fake",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                Method::GET,
+                "http://fake",
+                &BTreeMap::new(),
+                None,
+                &hooks,
+            ),
             Vec::new(),
-            None,
-            &hooks,
             &mut sink,
         )
         .await
@@ -1209,12 +1245,14 @@ async fn a_full_sink_pauses_the_body_reader() {
     let headers = BTreeMap::new();
     let hooks = ProviderStreamHooks::default();
     let request = client.request_streaming_with(
-        Method::GET,
-        "http://fake",
-        &headers,
+        pir::ai::transport::StreamingRequest::new(
+            Method::GET,
+            "http://fake",
+            &headers,
+            None,
+            &hooks,
+        ),
         Vec::new(),
-        None,
-        &hooks,
         &mut sink,
     );
     let (result, ()) = tokio::join!(request, coordinator);
@@ -1266,12 +1304,14 @@ async fn abort_during_the_retry_wait_reports_a_cancelled_retry() {
     let mut sink = CollectSink::default();
     let headers = BTreeMap::new();
     let request = client.request_streaming_with(
-        Method::GET,
-        "http://fake",
-        &headers,
+        pir::ai::transport::StreamingRequest::new(
+            Method::GET,
+            "http://fake",
+            &headers,
+            Some(&signal),
+            &hooks,
+        ),
         Vec::new(),
-        Some(&signal),
-        &hooks,
         &mut sink,
     );
     let (result, ()) = tokio::join!(request, coordinator);
@@ -1452,4 +1492,164 @@ async fn a_mid_body_error_reaches_the_provider_event_stream() {
         1,
         "a mid-body failure after a delivered chunk is not retried"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Redirect seam: credentials must never follow a cross-host redirect
+// ---------------------------------------------------------------------------
+
+/// A one-response HTTP server (kept listening for stragglers) that records
+/// every request head it receives.
+fn spawn_http_server(
+    status_and_headers: String,
+    body: &'static str,
+    requests: Arc<Mutex<Vec<String>>>,
+) -> u16 {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut buf = [0u8; 8192];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            requests
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf[..read]).to_string());
+            let response = format!(
+                "{status_and_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    port
+}
+
+fn spawn_redirect_source(location: &str, requests: Arc<Mutex<Vec<String>>>) -> u16 {
+    spawn_http_server(
+        format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\n"),
+        "",
+        requests,
+    )
+}
+
+fn clear_proxy_env() -> Vec<(&'static str, Option<String>)> {
+    let names = [
+        "PI_HTTP_PROXY",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ];
+    let saved = names
+        .iter()
+        .map(|name| (*name, std::env::var(name).ok()))
+        .collect::<Vec<_>>();
+    for name in names {
+        std::env::remove_var(name);
+    }
+    saved
+}
+
+fn restore_env(saved: Vec<(&'static str, Option<String>)>) {
+    for (name, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+}
+
+#[tokio::test]
+async fn reqwest_transport_does_not_follow_cross_host_redirects() {
+    let target_requests = Arc::new(Mutex::new(Vec::new()));
+    let target_port = spawn_http_server(
+        "HTTP/1.1 200 OK\r\n".to_string(),
+        "stolen",
+        Arc::clone(&target_requests),
+    );
+    let source_requests = Arc::new(Mutex::new(Vec::new()));
+    let source_port = spawn_redirect_source(
+        &format!("http://127.0.0.1:{target_port}/steal"),
+        Arc::clone(&source_requests),
+    );
+
+    let transport =
+        pir::ai::transport::ReqwestTransport::new(&config_with(0, Duration::from_secs(1), None))
+            .expect("transport");
+    let mut headers = HeaderMap::new();
+    headers.insert("x-api-key", HeaderValue::from_static("secret-key"));
+    let response = transport
+        .execute(HttpRequest {
+            method: Method::POST,
+            url: format!("http://127.0.0.1:{source_port}/provider"),
+            headers,
+            body: b"{}".to_vec(),
+        })
+        .await
+        .expect("the 307 response head is returned, not followed");
+
+    assert_eq!(response.status, 307);
+    assert!(
+        target_requests.lock().unwrap().is_empty(),
+        "the cross-host redirect target must receive zero requests"
+    );
+    let seen = source_requests.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].contains("x-api-key: secret-key"));
+}
+
+#[tokio::test]
+async fn oauth_client_does_not_follow_cross_host_redirects() {
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = ENV_LOCK.lock().await;
+    let mut saved = clear_proxy_env();
+    // Pin the global settings scope to an empty directory so a user-level
+    // `httpProxy` setting cannot reroute the loopback request.
+    let agent_dir = std::env::temp_dir().join(format!(
+        "pir-redirect-agent-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    saved.push(("PIR_AGENT_DIR", std::env::var("PIR_AGENT_DIR").ok()));
+    std::env::set_var("PIR_AGENT_DIR", &agent_dir);
+
+    let target_requests = Arc::new(Mutex::new(Vec::new()));
+    let target_port = spawn_http_server(
+        "HTTP/1.1 200 OK\r\n".to_string(),
+        "stolen",
+        Arc::clone(&target_requests),
+    );
+    let source_requests = Arc::new(Mutex::new(Vec::new()));
+    let source_port = spawn_redirect_source(
+        &format!("http://127.0.0.1:{target_port}/steal"),
+        Arc::clone(&source_requests),
+    );
+
+    let response = pir::ai::auth::http::post_json_with_headers(
+        &format!("http://127.0.0.1:{source_port}/token"),
+        &serde_json::json!({"grant_type": "authorization_code"}),
+        &[("authorization", "Bearer oauth-secret")],
+    )
+    .await
+    .expect("the 307 response head is returned, not followed");
+
+    restore_env(saved);
+    let _ = std::fs::remove_dir_all(&agent_dir);
+
+    assert_eq!(response.status, 307);
+    assert!(
+        target_requests.lock().unwrap().is_empty(),
+        "the cross-host redirect target must receive zero requests"
+    );
+    let seen = source_requests.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].contains("authorization: Bearer oauth-secret"));
 }

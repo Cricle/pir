@@ -105,11 +105,14 @@ const state = {
   shortcutMeta: {},    // key -> {key, extId, description, sourceInfo} (LAST registration wins)
   busSubs: {},         // channel -> [{extId, handler}]
   autocompleteSuggesters: [], // ui.addAutocompleteProvider callbacks (first non-null wins)
-  // ui.onTerminalInput handlers (upstream interactive-mode raw stdin listeners).
-  // The TUI dispatches each relevant key/mouse/paste chunk through the host's
-  // `terminal_input` bridge, which runs this list in registration order and
-  // applies {consume}/{data}; the host publishes the live count for its
-  // per-input fast path through `__pir_host.terminalInputHandlers`.
+  // Raw terminal-input handlers: upstream `ctx.ui.onTerminalInput` AND
+  // `pi.on("terminal_input")`, which share the one dedicated dispatch list
+  // (the event's raw-chunk `{consume?, data?}` contract is not the generic
+  // `(event, ctx)` handler shape). The TUI dispatches each relevant
+  // key/mouse/paste chunk through the host's `terminal_input` bridge, which
+  // runs this list in registration order and applies {consume}/{data}; the
+  // host publishes the live count for its per-input fast path through
+  // `__pir_host.terminalInputHandlers`.
   terminalInputHandlers: [],
   rendererMeta: {      // first-wins per key (toolRenderers: resolver chain), exported with the registry
     messageRenderers: {},   // customType -> {extId, customType, options, sourceInfo}
@@ -650,7 +653,7 @@ function takeWithSessionToken(surface, options) {
   return registerSessionCallback(callback);
 }
 
-function makeCtx(desc, getSystemPromptOverride, ownerExtId) {
+function makeCtx(desc, getSystemPromptOverride, ownerExtId, commandName) {
   const hasUI = desc.hasUI === true;
   const ctxtMode = normalizeMode(desc.mode);
   // Lazy `ctx.tools` cache (see the getter at its declaration): a ctx is
@@ -1944,6 +1947,11 @@ function makeCtx(desc, getSystemPromptOverride, ownerExtId) {
     modelRegistry,
     signal: makeSignal(),
     ui,
+    // Resolved invocation name for a command dispatch (`dup`, `dup:1`,
+    // `dup:2`, ...). Undefined on event/tool contexts. `invocationName` is
+    // the upstream term; `commandName` is the convenient alias.
+    commandName: commandName ?? undefined,
+    invocationName: commandName ?? undefined,
     isIdle: () => __pir_host.isIdle(),
     // Upstream `ExtensionCommandContext.waitForIdle` (types.ts:405-406):
     // resolve when no prompt run is in flight. The host fn answers against
@@ -2221,12 +2229,72 @@ function markRegistryDirty() {
   }
 }
 
+// `pi.on` fail-closed event-name validation.
+//
+// Upstream `ExtensionAPI.on` accepts only the documented `ExtensionEvent`
+// names; a typo used to register a handler that could never fire. The host
+// owns the canonical registry (`src/plugins/coverage.rs`:
+// `WIRED_NATIVE_EVENTS` + `NATIVE_ONLY_EVENTS` + pir synthetic names +
+// test-only synthetic names) and answers through `isKnownEvent`; reject an
+// unknown name here, at registration time. A host-less prelude evaluation
+// (transpile/byte-compare fixtures) has no registry and keeps the historical
+// permissive behavior.
+function assertKnownEventName(event) {
+  if (typeof event !== "string" || event.length === 0) {
+    throw new TypeError("pi.on: event name must be a non-empty string");
+  }
+  if (typeof __pir_host === "undefined" || typeof __pir_host.isKnownEvent !== "function") {
+    return;
+  }
+  let known = false;
+  try {
+    known = __pir_host.isKnownEvent(event) === true;
+  } catch {
+    // A host that cannot answer must not break extension loading; the
+    // runtime host always installs the function (see `session_fns.rs`).
+    return;
+  }
+  if (!known) {
+    throw new TypeError(
+      `pi.on: unknown event name "${event}" (custom events use pi.events.on; ` +
+        "see docs/hooks.md for the supported hook names)",
+    );
+  }
+}
+
 function makePi(extId) {
   const pi = {
     on(event, handler) {
       assertActive(extId);
+      assertKnownEventName(event);
       const ext = extRecord(extId);
       if (typeof handler !== "function") throw new TypeError("handler must be a function");
+      // Raw terminal input is dispatched from the dedicated
+      // `state.terminalInputHandlers` list (see dispatchTerminalInputToHandlers),
+      // not the per-extension event tables: `pi.on("terminal_input", ...)` must
+      // join the SAME list as `ctx.ui.onTerminalInput` or the handler would be
+      // registered but never called. The handler receives the raw chunk string
+      // and its `{consume?, data?}` return is honored exactly like the UI API.
+      if (event === "terminal_input") {
+        state.terminalInputHandlers.push(handler);
+        publishTerminalInputHandlers();
+        markHandlersDirty();
+        let removed = false;
+        const unsubscribe = () => {
+          if (removed) return;
+          removed = true;
+          const idx = state.terminalInputHandlers.indexOf(handler);
+          if (idx >= 0) {
+            state.terminalInputHandlers.splice(idx, 1);
+            publishTerminalInputHandlers();
+            markHandlersDirty();
+          }
+        };
+        // A failed extension's terminal handlers are dropped with its event
+        // handlers (load-discard cleanup): they live outside ext.handlers.
+        ext.eventUnsubs.push(unsubscribe);
+        return unsubscribe;
+      }
       const list = (ext.handlers[event] ??= []);
       list.push(handler);
       markHandlersDirty();
@@ -4484,13 +4552,24 @@ globalThis.__pir_callTool = async (toolName, toolCallId, paramsJson) => {
   try {
     const result = await def.execute(String(toolCallId), params, signal, onUpdate, ctx);
     const structuredContent = result?.structuredContent ?? null;
+    // Upstream accepts a bare string/array/object tool return; normalize it
+    // to the content-block shape the Rust host expects (a string is one text
+    // block, an array is content blocks, a plain object is details).
+    const normalizedContent =
+      typeof result === "string"
+        ? [{ type: "text", text: result }]
+        : Array.isArray(result)
+          ? result
+          : Array.isArray(result?.content)
+            ? result.content
+            : [];
     // NOTE: structuredContent is NOT validated against `outputSchema`.
     // Upstream treats outputSchema as purely declarative (no validation in
     // packages/agent or packages/coding-agent); the pir-only fail-closed
     // check was removed so tools return their structuredContent freely.
     return JSON.stringify({
       ok: true,
-      content: Array.isArray(result?.content) ? result.content : [],
+      content: normalizedContent,
       details: result?.details ?? null,
       structuredContent,
       terminate: result?.terminate === true,
@@ -4507,18 +4586,34 @@ globalThis.__pir_callTool = async (toolName, toolCallId, paramsJson) => {
 // Command dispatch (first registration wins)
 // ---------------------------------------------------------------------------
 
-globalThis.__pir_dispatchCommand = async (name, args) => {
+globalThis.__pir_dispatchCommand = async (name, args, extIdJson, invocationName) => {
   let entry = null;
   let extId = null;
-  for (const id of Object.keys(state.extensions).sort((a, b) => Number(a) - Number(b))) {
-    const ext = state.extensions[id];
-    if (ext.status === "active" && ext.commands[name]) { entry = ext.commands[name]; extId = id; break; }
+  // The unified host registry resolves duplicate command names to
+  // `name:1`/`name:2` and passes the owning extension id. Prefer that exact
+  // registration; the first-wins scan is the legacy path for callers that
+  // dispatch a bare name (direct handle use, print, shortcuts).
+  const requestedExtId =
+    extIdJson === undefined || extIdJson === null || extIdJson === "" || extIdJson === "null"
+      ? null
+      : Number(extIdJson);
+  if (requestedExtId !== null && Number.isFinite(requestedExtId)) {
+    const ext = state.extensions[requestedExtId];
+    if (ext && ext.status === "active" && ext.commands[name]) {
+      entry = ext.commands[name];
+      extId = requestedExtId;
+    }
+  } else {
+    for (const id of Object.keys(state.extensions).sort((a, b) => Number(a) - Number(b))) {
+      const ext = state.extensions[id];
+      if (ext.status === "active" && ext.commands[name]) { entry = ext.commands[name]; extId = id; break; }
+    }
   }
   if (!entry || typeof entry.handler !== "function") {
     return JSON.stringify({ ok: false, error: `Unknown command: ${name}` });
   }
   const desc = JSON.parse(__pir_host.getContextJson());
-  const ctx = makeCtx(desc);
+  const ctx = makeCtx(desc, undefined, undefined, String(invocationName ?? name));
   try {
     await entry.handler(args ?? "", ctx);
     return JSON.stringify({ ok: true });

@@ -1,21 +1,13 @@
 # Prompt templates
 
-Prompt templates are markdown files discovered from (in precedence order)
-the settings `promptTemplates` paths, `<agentDir>/prompt-templates`,
-`<cwd>/.pi/prompt-templates` (trust-gated), installed packages, and
-`--prompt-template` CLI paths. Name collisions: first wins with a
-diagnostic.
+Prompt templates are markdown files discovered from (in precedence order) the settings `promptTemplates` paths,
+`<agentDir>/prompt-templates`, `<cwd>/.pi/prompt-templates` (trust-gated), installed packages, and
+`--prompt-template` CLI paths. Name collisions: first wins with a diagnostic.
 
-## Format
+## Format and usage
 
-A markdown file whose body is the template. The file stem (without
-extension) is the template name.
+The body is the template; the file stem is its name. `/template:<name>` inserts the body into the editor at the
+cursor; `/templates` lists discovered templates with source paths.
 
-## Usage
-
-`/template:<name>` inserts the template body into the editor at the cursor.
-`/templates` lists the discovered templates with their source paths.
-
-Templates never join the system prompt — they are editor-side expansions
-only (upstream parity). Skills (see [skills.md](skills.md)) are the
-system-prompt counterpart.
+Templates never join the system prompt — editor-side expansions only (upstream parity). Skills (see
+[skills.md](skills.md)) are the system-prompt counterpart.

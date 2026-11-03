@@ -734,7 +734,7 @@ const MAX_READ_FILE_BYTES: u64 = 32 * 1024 * 1024;
 /// between the check and the read, and the bound must hold either way. A
 /// file that exceeds the cap is refused with `E2BIG`; only `cap + 1` bytes
 /// were ever buffered.
-fn read_file_capped(path: &Path) -> Result<Vec<u8>, NodeError> {
+pub(super) fn read_file_capped(path: &Path) -> Result<Vec<u8>, NodeError> {
     let file = std::fs::File::open(path).map_err(|error| read_file_error(&error, path))?;
     let mut bytes = Vec::new();
     file.take(MAX_READ_FILE_BYTES + 1)
@@ -750,6 +750,32 @@ fn read_file_capped(path: &Path) -> Result<Vec<u8>, NodeError> {
         ));
     }
     Ok(bytes)
+}
+
+/// Read a whole UTF-8 file under the same [`MAX_READ_FILE_BYTES`] bound as
+/// [`read_file_capped`]. Module sources (`require`) and Worker entry files go
+/// through this helper so they cannot bypass the `fs.readFile` cap and
+/// materialize an unbounded source string on the host heap. Invalid UTF-8 is
+/// `EINVAL`, matching Node's module loader.
+pub(super) fn read_text_capped(
+    path: &Path,
+    syscall: &str,
+    display: &str,
+) -> Result<String, NodeError> {
+    let bytes = read_file_capped(path)?;
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(_) => Err(NodeError::new(
+            "EINVAL",
+            format!("EINVAL: invalid UTF-8, {syscall} '{display}'"),
+        )),
+    }
+}
+
+/// The `(code, message)` pair a sibling host table needs to map a
+/// [`NodeError`] into its own error envelope.
+pub(super) fn node_error_parts(error: NodeError) -> (&'static str, String) {
+    (error.code, error.message)
 }
 
 /// Write-data channel, preferred order: `dataText` (the exact UTF-8 image of
@@ -1918,8 +1944,7 @@ fn npm_read_source_op(
             if !payload_bool(payload, "asCjs") {
                 return Ok(serde_json::json!({ "kind": "esm", "source": "" }));
             }
-            let source = std::fs::read_to_string(&path)
-                .map_err(|error| NodeError::io(&error, "open", &path))?;
+            let source = read_text_capped(&path, "open", &display)?;
             let js = crate::extensions::transpile::transpile(&display, &source)
                 .map_err(|error| NodeError::new("ERR_INVALID_SYNTAX", error))?;
             let cjs = crate::extensions::esm_cjs::esm_to_cjs(&display, &js)
@@ -1927,13 +1952,11 @@ fn npm_read_source_op(
             Ok(serde_json::json!({ "kind": "esm", "source": cjs }))
         }
         ModuleKind::Json => {
-            let source = std::fs::read_to_string(&path)
-                .map_err(|error| NodeError::io(&error, "open", &path))?;
+            let source = read_text_capped(&path, "open", &display)?;
             Ok(serde_json::json!({ "kind": "json", "source": source }))
         }
         ModuleKind::Cjs => {
-            let source = std::fs::read_to_string(&path)
-                .map_err(|error| NodeError::io(&error, "open", &path))?;
+            let source = read_text_capped(&path, "open", &display)?;
             // TS-strip first: CJS files may still carry modern/TS syntax.
             let js = crate::extensions::transpile::transpile(&display, &source)
                 .map_err(|error| NodeError::new("ERR_INVALID_SYNTAX", error))?;

@@ -536,16 +536,16 @@ Use this for docs, specs and changelogs you want to query repeatedly across turn
                                 return ToolResult::error(format!("ctx_fetch_and_index: {error}"))
                             }
                         };
-                        return ToolResult::ok(metadata_json(
-                            &url,
-                            &source,
-                            &cached.content_type,
-                            cached.body.len(),
-                            0,
-                            indexed,
+                        return ToolResult::ok(metadata_json(FetchMetadata {
+                            url: &url,
+                            source: &source,
+                            content_type: &cached.content_type,
+                            bytes: cached.body.len(),
+                            status: 0,
+                            chunks: indexed,
                             ttl_seconds,
-                            true,
-                        ));
+                            cached: true,
+                        }));
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -579,31 +579,43 @@ Use this for docs, specs and changelogs you want to query repeatedly across turn
                 // future re-fetch, so report it without failing the call.
                 tracing::debug!("ctx_fetch_and_index: cache write failed: {error}");
             }
-            ToolResult::ok(metadata_json(
-                &url,
-                &source,
-                &page.content_type,
-                page.bytes,
-                page.status,
-                report.chunks,
+            ToolResult::ok(metadata_json(FetchMetadata {
+                url: &url,
+                source: &source,
+                content_type: &page.content_type,
+                bytes: page.bytes,
+                status: page.status,
+                chunks: report.chunks,
                 ttl_seconds,
-                false,
-            ))
+                cached: false,
+            }))
         })
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn metadata_json(
-    url: &str,
-    source: &str,
-    content_type: &str,
+/// The fetch/cache facts one `ctx_fetch_and_index` result reports.
+struct FetchMetadata<'a> {
+    url: &'a str,
+    source: &'a str,
+    content_type: &'a str,
     bytes: usize,
     status: u16,
     chunks: usize,
     ttl_seconds: u64,
     cached: bool,
-) -> String {
+}
+
+fn metadata_json(metadata: FetchMetadata<'_>) -> String {
+    let FetchMetadata {
+        url,
+        source,
+        content_type,
+        bytes,
+        status,
+        chunks,
+        ttl_seconds,
+        cached,
+    } = metadata;
     let value = serde_json::json!({
         "url": url,
         "source": source,

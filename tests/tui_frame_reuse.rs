@@ -2997,32 +2997,23 @@ fn steady_frame_allocations_do_not_grow_with_the_transcript() {
 
 /// The frame renderer's per-row passes: the rebuild (`frame_lines`), the
 /// alt-screen snapshot copy, the changed-line scan and the per-line reset.
-/// This pins them through the `FrameWork` counter seam (`src/tui/core.rs`), so
-/// the planned windowing work has a hard target: `rebuilt_rows` → visible rows
-/// + O(1), `reset_rows` → written rows (already true now),
-///   `diff_scanned_rows` → changed tail + O(1), and the snapshot copy → an
-///   `Arc` share instead of a per-row `clone_from`.
+/// This pins them through the `FrameWork` counter seam (`src/tui/core.rs`).
+/// The steady frame now stops at the frame builder: the exact dirty-row
+/// markers make the snapshot copy and the changed-line scan both O(changed)
+/// (zero for a steady frame), and `diff_skipped_rows` accounts for the rows
+/// the regular path proved unchanged. `reset_rows` stays at the written rows.
 ///
-/// Before/after of this lane's lazy reset (the numbers this test used to pin
-/// vs. the ones it pins now, per frame):
+/// Numbers this test pins per frame:
 ///
-/// | fixture      | rebuilt | snapshot | reset (before) | reset (now) | diff |
-/// |--------------|---------|----------|----------------|-------------|------|
-/// | 100 lines    | 100     | 100      | 100            | 0 (steady)  | 100  |
-/// | 3000 lines   | 3000    | 3000     | 3000           | 0 (steady)  | 3000 |
-/// | 3000 + 1-row edit | 3000 | 3000    | 3000           | 1           | 3000 |
+/// | fixture            | rebuilt | snapshot | reset | diff scanned | skipped |
+/// |--------------------|---------|----------|-------|--------------|---------|
+/// | 100/3000 lines     | height  | 0        | 0     | 0            | height  |
+/// | + 1-row edit       | height  | 1        | 1     | 0            | height-1|
+/// | + appended tail    | height+1| 1        | 1     | 0            | height  |
 ///
-/// i.e. the steady follow-end frame's four-pass total drops from
-/// `4 * height` to `3 * height` (400 → 300 row-events at 100 lines,
-/// 12000 → 9000 at 3000 lines, -25%), and a frame that writes `W` rows appends
-/// the segment reset exactly `W` times instead of `height` (a one-row spinner
-/// or edit tick: 1 instead of 3000, a ~3000x cut in reset appends). The reset
-/// BYTES are unchanged: every baseline row still ends with exactly one
-/// `SEGMENT_RESET`, and the rows a frame does not write keep their previous
-/// bytes (asserted below).
-///
-/// Allocation counting can not see these passes: after the leaf/block memos a
-/// steady frame allocates nothing, yet it still walks every row.
+/// The reset BYTES are unchanged: every baseline row still ends with exactly
+/// one `SEGMENT_RESET`, and the rows a frame does not write keep their
+/// previous bytes (asserted below).
 #[test]
 fn frame_passes_scan_the_whole_transcript_not_the_visible_window() {
     let _guard = test_lock();
@@ -3075,9 +3066,21 @@ fn frame_passes_scan_the_whole_transcript_not_the_visible_window() {
             "a steady frame must not reset rows it did not write ({lines}-line fixture)"
         );
         assert_eq!(
-            work.diff_scanned_rows, height,
-            "the changed-line scan must compare every row of the frame \
+            work.diff_scanned_rows, 0,
+            "the frame builder's exact dirty-row markers prove the steady frame \
+             unchanged; the changed-line scan must not walk it again \
              ({lines}-line fixture)"
+        );
+        assert_eq!(
+            work.diff_skipped_rows, height,
+            "every row is accounted for as skipped by the dirty markers \
+             ({lines}-line fixture)"
+        );
+        assert_eq!(
+            core.last_frame_work().diff_scanned_rows,
+            0,
+            "the per-core copy of the diff-scan seam must agree with the \
+             process-wide counter ({lines}-line fixture)"
         );
 
         // The byte invariant behind the lazy reset: every baseline row still
@@ -3109,8 +3112,15 @@ fn frame_passes_scan_the_whole_transcript_not_the_visible_window() {
              ({lines}-line fixture): {edit_work:?}"
         );
         assert_eq!(
-            edit_work.diff_scanned_rows, height,
-            "the changed-line scan still covers the whole frame ({lines}-line fixture)"
+            edit_work.diff_scanned_rows, 0,
+            "the one-row edit is already identified by the exact dirty marker; \
+             no extra band scan ({lines}-line fixture)"
+        );
+        assert_eq!(
+            edit_work.diff_skipped_rows,
+            height - 1,
+            "all but the edited row are skipped by the dirty markers \
+             ({lines}-line fixture)"
         );
         assert_eq!(edit_work.rebuilt_rows, height);
         assert_eq!(
@@ -3153,7 +3163,12 @@ fn frame_passes_scan_the_whole_transcript_not_the_visible_window() {
             append_work.snapshot_rows, 1,
             "only the appended row is new and is copied into the snapshot"
         );
-        assert_eq!(append_work.diff_scanned_rows, height + 1);
+        assert_eq!(append_work.diff_scanned_rows, 0);
+        assert_eq!(
+            append_work.diff_skipped_rows, height,
+            "the appended row is the only dirty marker; every existing row is \
+             skipped ({lines}-line fixture)"
+        );
         let appended = core.last_screen_lines();
         assert_eq!(appended.len(), height_usize + 1);
         assert_eq!(
@@ -3170,13 +3185,17 @@ fn frame_passes_scan_the_whole_transcript_not_the_visible_window() {
         // copy no row and a one-row change copies exactly one. The rebuild and
         // diff scans remain O(height); the reset pass is at the written-row
         // count (0 steady, 1 for a one-row edit/append).
-        let total =
-            work.rebuilt_rows + work.snapshot_rows + work.reset_rows + work.diff_scanned_rows;
+        let total = work.rebuilt_rows
+            + work.snapshot_rows
+            + work.reset_rows
+            + work.diff_scanned_rows
+            + work.diff_skipped_rows;
         assert_eq!(
             total,
             2 * height,
-            "steady baseline = rebuild + diff at O(height); snapshot and reset at O(changed) \
-             ({lines}-line fixture, height={height}): {work:?}"
+            "steady baseline = rebuild O(height) + dirty-marker accounting O(height); \
+             snapshot and reset stay O(changed) ({lines}-line fixture, height={height}): \
+             {work:?}"
         );
     }
 }
@@ -4296,4 +4315,67 @@ z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
     assert_eq!(settled, 0, "the rebuilt rows must settle again");
 
     set_resolved_capabilities(previous);
+}
+
+// ---------------------------------------------------------------------------
+// FIX-B18: drain the async frame writer before leaving the TUI screen
+// ---------------------------------------------------------------------------
+
+/// `suspend_to_background` / `open_external_editor` leave raw mode + the
+/// alternate screen synchronously, while `Terminal::write` only queues bytes
+/// on the `pir-tui-writer` thread. The fix drains the queue with
+/// `flush_bounded` first; this pins the ordering contract it relies on: every
+/// frame enqueued before the flush is on the sink before any synchronous
+/// leave bytes. The real timing race needs a console smoke test, but a
+/// missing/flipped drain fails this contract.
+#[test]
+fn flush_bounded_drains_queued_frames_before_synchronous_screen_exit() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use pir::tui::core::TerminalSink;
+    use pir::tui::stdin_buffer::WriteLog;
+
+    #[derive(Clone)]
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let sink = RecordingSink(Arc::clone(&bytes));
+    let terminal = Terminal::with_sink_factory(
+        move || Box::new(sink.clone()) as Box<dyn TerminalSink>,
+        WriteLog::disabled(),
+    );
+
+    // Queue two frames exactly like the render path does.
+    terminal.write_owned("frame-one".repeat(256));
+    terminal.write_owned("frame-two".repeat(256));
+    // The fix's flush barrier: frames enqueued before it must reach the sink
+    // before the synchronous leave sequence below.
+    assert!(terminal.flush_bounded(std::time::Duration::from_millis(5000)));
+    terminal.write_sync("\x1b[?1049l");
+
+    let recorded = String::from_utf8(bytes.lock().unwrap().clone()).expect("utf-8 sink");
+    let leave = recorded
+        .rfind("\x1b[?1049l")
+        .expect("leave sequence written");
+    let before_leave = &recorded[..leave];
+    assert!(
+        before_leave.contains("frame-one"),
+        "first queued frame drained before LeaveAlternateScreen: {recorded:?}"
+    );
+    assert!(
+        before_leave.contains("frame-two"),
+        "second queued frame drained before LeaveAlternateScreen: {recorded:?}"
+    );
 }

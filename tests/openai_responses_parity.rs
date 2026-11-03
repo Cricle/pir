@@ -487,10 +487,7 @@ fn explicit_prompt_cache_mode_uses_prompt_cache_options() {
         &context,
         &options,
         &compat,
-        "gpt-5.6",
-        shared::OPENAI_TOOL_CALL_PROVIDERS,
-        false,
-        None,
+        &shared::ResponsesWireOptions::new("gpt-5.6"),
     )
     .expect("body");
     assert_eq!(
@@ -510,10 +507,7 @@ fn explicit_prompt_cache_mode_uses_prompt_cache_options() {
         &context,
         &options,
         &compat,
-        "gpt-5.6",
-        shared::OPENAI_TOOL_CALL_PROVIDERS,
-        false,
-        None,
+        &shared::ResponsesWireOptions::new("gpt-5.6"),
     )
     .expect("body");
     assert_eq!(
@@ -539,10 +533,7 @@ fn legacy_models_keep_prompt_cache_retention_24h() {
         &empty_context(),
         &options,
         &compat,
-        "gpt-5.5",
-        shared::OPENAI_TOOL_CALL_PROVIDERS,
-        false,
-        None,
+        &shared::ResponsesWireOptions::new("gpt-5.5"),
     )
     .expect("body");
     assert_eq!(

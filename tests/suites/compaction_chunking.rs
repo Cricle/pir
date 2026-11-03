@@ -293,6 +293,7 @@ fn write_session_with_prefix_compaction(
     summary_bytes: usize,
     pairs: usize,
     filler: usize,
+    details: serde_json::Value,
 ) -> String {
     use std::io::Write as _;
     let summary = format!("PREFIX-COMPACTION-MARKER\n{}", "s".repeat(summary_bytes));
@@ -367,7 +368,7 @@ fn write_session_with_prefix_compaction(
             "summary": summary.clone(),
             "firstKeptEntryId": "c0000000",
             "tokensBefore": 1_500_000,
-            "details": {"readFiles": [], "modifiedFiles": []},
+            "details": details,
             "usage": {
                 "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
                 "totalTokens": 0,
@@ -590,6 +591,130 @@ fn write_session_with_retained_prefix_compaction(
         parent = assistant_id;
     }
     retained
+}
+
+/// Append the resident-window shape the paged file-op regression needs to a
+/// session written by [`write_session`] with 400 pairs:
+///
+/// - a previous `compaction` entry (self-retaining) whose `details` carry
+///   `readFiles`/`modifiedFiles` — the carry-over a paged compaction must
+///   inherit;
+/// - a plain summarized exchange (`U0`/`A0`/`T0`) whose assistant reads
+///   `span/read.rs` — the window span the plan already tracked;
+/// - a split turn (`U1`/`A1`/`T1`) whose assistant writes
+///   `prefix/written.rs`, kept in the turn-prefix span;
+/// - the newest assistant (`A2`) that lands the cut point.
+fn append_window_compaction_with_split_turn(path: &Path) {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open session");
+    let mut line = |value: serde_json::Value| {
+        writeln!(file, "{value}").expect("append line");
+    };
+    line(serde_json::json!({
+        "type": "compaction",
+        "id": "c0000001",
+        "parentId": "a000399",
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "summary": "PREVIOUS-WINDOW-COMPACTION",
+        "firstKeptEntryId": "c0000001",
+        "tokensBefore": 1_500_000,
+        "details": {
+            "readFiles": ["carry/read.rs"],
+            "modifiedFiles": ["carry/mod.rs"],
+        },
+        "usage": {
+            "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
+        },
+        "fromHook": false,
+    }));
+    line(serde_json::json!({
+        "type": "message", "id": "u100000", "parentId": "c0000001",
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "message": {
+            "role": "user", "timestamp": 0,
+            "content": [{"type": "text", "text": "summarized window question"}],
+        },
+    }));
+    line(serde_json::json!({
+        "type": "message", "id": "a100000", "parentId": "u100000",
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "message": {
+            "role": "assistant", "timestamp": 0,
+            "api": "openai-completions", "provider": "mock", "model": "mock-model",
+            "stopReason": "toolUse",
+            "usage": {
+                "input": 10, "output": 1, "cacheRead": 0, "cacheWrite": 0,
+                "totalTokens": 11,
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
+            },
+            "content": [{"type": "toolCall", "id": "call-span-read",
+                         "name": "read", "arguments": {"path": "span/read.rs"}}],
+        },
+    }));
+    line(serde_json::json!({
+        "type": "message", "id": "t100000", "parentId": "a100000",
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "message": {
+            "role": "toolResult", "toolCallId": "call-span-read",
+            "toolName": "read", "content": [{"type": "text", "text": "span read"}],
+            "isError": false, "timestamp": 0,
+        },
+    }));
+    // The split turn: its start is the user entry below, the cut lands on the
+    // newest assistant, so these three entries are the turn-prefix span.
+    line(serde_json::json!({
+        "type": "message", "id": "u100001", "parentId": "t100000",
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "message": {
+            "role": "user", "timestamp": 0,
+            "content": [{"type": "text", "text": "start of the split turn"}],
+        },
+    }));
+    line(serde_json::json!({
+        "type": "message", "id": "a100001", "parentId": "u100001",
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "message": {
+            "role": "assistant", "timestamp": 0,
+            "api": "openai-completions", "provider": "mock", "model": "mock-model",
+            "stopReason": "toolUse",
+            "usage": {
+                "input": 10, "output": 1, "cacheRead": 0, "cacheWrite": 0,
+                "totalTokens": 11,
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
+            },
+            "content": [{"type": "toolCall", "id": "call-prefix-write",
+                         "name": "write", "arguments": {"path": "prefix/written.rs"}}],
+        },
+    }));
+    line(serde_json::json!({
+        "type": "message", "id": "t100001", "parentId": "a100001",
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "message": {
+            "role": "toolResult", "toolCallId": "call-prefix-write",
+            "toolName": "write", "content": [{"type": "text", "text": "prefix written"}],
+            "isError": false, "timestamp": 0,
+        },
+    }));
+    line(serde_json::json!({
+        "type": "message", "id": "a100002", "parentId": "t100001",
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "message": {
+            "role": "assistant", "timestamp": 0,
+            "api": "openai-completions", "provider": "mock", "model": "mock-model",
+            "stopReason": "stop",
+            "usage": {
+                "input": 1_500_000, "output": 100, "cacheRead": 0, "cacheWrite": 0,
+                "totalTokens": 1_500_100,
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
+            },
+            "content": [{"type": "text", "text": "split turn finished"}],
+        },
+    }));
 }
 
 /// A resident span big enough to need several chunks under a small window.
@@ -1250,7 +1375,13 @@ async fn turn_prefix_prompt_without_instructions_is_byte_identical_and_focus_app
 async fn paged_compaction_resumes_from_a_real_shaped_prefix_compaction_line() {
     let dir = temp_dir("paged-resume-prefix");
     let path = dir.join("big.jsonl");
-    let summary = write_session_with_prefix_compaction(&path, 20 * 1024, 400, 900);
+    let summary = write_session_with_prefix_compaction(
+        &path,
+        20 * 1024,
+        400,
+        900,
+        serde_json::json!({"readFiles": [], "modifiedFiles": []}),
+    );
     assert!(
         summary.len() > 4 * 1024,
         "the fixture's compaction line must exceed the old marker+4 KiB window"
@@ -1365,6 +1496,154 @@ async fn paged_compaction_summarizes_the_retained_tail_of_a_prefix_compaction() 
             .collect::<Vec<_>>()
     );
     assert!(paged.result.summary.contains("SUMMARY"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A paged compaction must inherit the previous compaction's `details` and
+/// the split-turn prefix file ops. The paged path used to start `file_ops`
+/// from an empty set and re-extract only `messages_to_summarize`, losing the
+/// carry-over and the turn-prefix span — the chain of cumulative
+/// `readFiles`/`modifiedFiles` broke at the first paged compaction.
+#[tokio::test]
+async fn paged_compaction_carries_previous_details_and_split_turn_file_ops() {
+    let dir = temp_dir("paged-file-ops");
+    let path = dir.join("big.jsonl");
+    write_session(&path, 400, 900);
+    append_window_compaction_with_split_turn(&path);
+
+    let session = SessionManager::open_paged(&path, 32 * 1024, 64).expect("paged open");
+    assert!(session.is_paged(), "the fixture must be paged");
+    assert!(
+        session.resident_entries().iter().any(|entry| matches!(
+            entry.as_ref(),
+            FileEntry::Compaction(inner) if inner.id == "c0000001"
+        )),
+        "the previous compaction must stay in the resident window"
+    );
+
+    let model = test_model(64);
+    let config = CompactionConfig {
+        enabled: true,
+        reserve_tokens: 1,
+        // Only the newest assistant fits the keep-recent budget, so the cut
+        // lands on it and the preceding turn is the split-turn prefix.
+        keep_recent_tokens: 1,
+    };
+    let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let paged = compact_paged(
+        &session,
+        &model,
+        &config,
+        recording_summarizer(Arc::clone(&prompts)),
+        None,
+    )
+    .await
+    .expect("paged compaction");
+    assert_eq!(
+        paged.result.read_files,
+        vec!["carry/read.rs".to_string(), "span/read.rs".to_string()],
+        "the previous details' reads and the window span's reads must survive"
+    );
+    assert_eq!(
+        paged.result.modified_files,
+        vec!["carry/mod.rs".to_string(), "prefix/written.rs".to_string()],
+        "the previous details' writes and the split-turn prefix's writes must survive"
+    );
+    assert!(
+        paged
+            .result
+            .summary
+            .contains("<read-files>\ncarry/read.rs\nspan/read.rs"),
+        "the summary's read-files section must carry every read: {}",
+        paged.result.summary
+    );
+    assert!(
+        paged
+            .result
+            .summary
+            .contains("<modified-files>\ncarry/mod.rs\nprefix/written.rs"),
+        "the summary's modified-files section must carry every write: {}",
+        paged.result.summary
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A paged compaction whose resident window holds NO compaction but whose
+/// skipped prefix ends with one must still inherit that checkpoint's
+/// cumulative `details`: the resident plan cannot see it, and the streaming
+/// loop skips compaction entries, so the paged path has to carry it from the
+/// prefix scan.
+#[tokio::test]
+async fn paged_compaction_carries_prefix_only_compaction_details() {
+    let dir = temp_dir("paged-prefix-details");
+    let path = dir.join("big.jsonl");
+    write_session_with_prefix_compaction(
+        &path,
+        20 * 1024,
+        400,
+        900,
+        serde_json::json!({
+            "readFiles": ["prefix/carry-read.rs"],
+            "modifiedFiles": ["prefix/carry-mod.rs"],
+        }),
+    );
+
+    let session = SessionManager::open_paged(&path, 32 * 1024, 64).expect("paged open");
+    assert!(session.is_paged(), "the fixture must be paged");
+    assert!(
+        !session
+            .resident_entries()
+            .iter()
+            .any(|entry| matches!(entry.as_ref(), FileEntry::Compaction(_))),
+        "the previous compaction must live in the skipped prefix"
+    );
+
+    let model = test_model(4_000);
+    let config = CompactionConfig {
+        enabled: true,
+        reserve_tokens: 512,
+        keep_recent_tokens: 100,
+    };
+    let paged = compact_paged(
+        &session,
+        &model,
+        &config,
+        recording_summarizer(Arc::new(Mutex::new(Vec::new()))),
+        None,
+    )
+    .await
+    .expect("paged compaction");
+    assert!(
+        paged.stats.resumed_from_prefix_compaction,
+        "the span must start at the prefix compaction: {:?}",
+        paged.stats
+    );
+    assert_eq!(
+        paged.result.read_files,
+        vec!["prefix/carry-read.rs".to_string()],
+        "the prefix checkpoint's readFiles must be carried into the new details"
+    );
+    assert_eq!(
+        paged.result.modified_files,
+        vec!["prefix/carry-mod.rs".to_string()],
+        "the prefix checkpoint's modifiedFiles must be carried into the new details"
+    );
+    assert!(
+        paged
+            .result
+            .summary
+            .contains("<read-files>\nprefix/carry-read.rs"),
+        "the summary's read-files section must include the carried read: {}",
+        paged.result.summary
+    );
+    assert!(
+        paged
+            .result
+            .summary
+            .contains("<modified-files>\nprefix/carry-mod.rs"),
+        "the summary's modified-files section must include the carried write: {}",
+        paged.result.summary
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

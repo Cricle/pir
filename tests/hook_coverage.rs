@@ -1,6 +1,6 @@
 //! Hook-coverage gates for the native plugin surface.
 //!
-//! Two kinds of checks live here:
+//! Three kinds of checks live here:
 //!
 //! 1. **Documentation gate** — `docs/hooks.md` declares the wired and
 //!    unsupported native events in marker blocks. Those blocks must match
@@ -9,7 +9,16 @@
 //!    that is added to the dispatcher without updating the doc (or removed
 //!    from the doc without removing the wiring) fails here instead of
 //!    silently regressing.
-//! 2. **Live dispatch** — the newly wired fan-outs, each observed exactly
+//! 2. **Static emit-site gate** — every name in `WIRED_NATIVE_EVENTS` must
+//!    have at least one plausible dispatch site in non-test `src/**/*.rs`
+//!    (an emit helper call or a direct `PluginEvent::new`, beside the exact
+//!    event-name literal), or be a `SessionEvent` wire `type` consumed by the
+//!    ordered `NativeEventBridge`. This catches a name that stays in the
+//!    registry/doc after its last emitter was deleted, which the doc↔registry
+//!    equality check alone cannot see. The check is name-level and
+//!    deliberately tolerant of moved lines, shared emit helpers, and the
+//!    bridge's wire-name mapping; its limits are documented on the test.
+//! 3. **Live dispatch** — the newly wired fan-outs, each observed exactly
 //!    once by a native recorder in a builtin-only plan and, where a JS face
 //!    exists, alongside a real QuickJS runtime with a JS handler:
 //!    `ui_prompt_start`/`_end` around native dialogs (ok/cancel/timeout/drop,
@@ -22,6 +31,7 @@
 //!
 //! All fixtures are in-memory plus a session file under `std::env::temp_dir`.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,8 +52,8 @@ use pir::ai::types::{
     ModelCostRates, StopReason, TerminalReason, TextContent, ThinkingLevel, UserMessage, UserRole,
 };
 use pir::coding_agent::print::{dispatch_print_agent_settled, print_transport_hooks_with_model};
-use pir::extensions::{ExtensionConfig, ExtensionHandle, Notification};
-use pir::plugins::coverage::{UNSUPPORTED_NATIVE_EVENTS, WIRED_NATIVE_EVENTS};
+use pir::extensions::{ExtensionConfig, ExtensionHandle, Notification, SessionContextSnapshot};
+use pir::plugins::coverage::{SYNTHETIC_EVENTS, UNSUPPORTED_NATIVE_EVENTS, WIRED_NATIVE_EVENTS};
 use pir::plugins::plugin::PluginContext;
 use pir::plugins::services::{DialogOptions, SelectOption, TerminalInputAction, UiService};
 use pir::plugins::{
@@ -184,6 +194,516 @@ fn every_upstream_extension_event_is_accounted_for() {
             "`{event}` is listed as both wired and unsupported"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Static emit-site gate
+// ---------------------------------------------------------------------------
+
+/// Tokens that make an event-name literal a plausible dispatch site.
+///
+/// This is intentionally name-level rather than line-number-level: an emit
+/// call may move, and shared helpers such as `emit_plugin_event`,
+/// `emit_extension_lazy`, `emit_with_runtime`, or `emit_read_only_json` take
+/// the event name from their caller. The check only fails when a wired name
+/// has no dispatch-shaped occurrence *anywhere* in non-test `src/**/*.rs`.
+const DISPATCH_MARKERS: &[&str] = &[
+    ".emit(",           // host.emit / runtime.emit / js.emit
+    "::emit(",          // Type::emit
+    "emit_",            // emit_native / emit_with_runtime / emit_plugin_event / ...
+    "dispatch_",        // dispatch_hosted_event / dispatch_event_to_faces / ...
+    "PluginEvent::new", // direct native dispatch (terminal_input)
+];
+
+fn read_source(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
+fn collect_rust_sources(dir: &Path, files: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("read dir {}: {error}", dir.display()));
+    for entry in entries {
+        let entry = entry.expect("source dir entry");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_sources(&path, files);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
+}
+
+/// `Some((prefix_len, hashes))` when `index` starts a raw string
+/// (`r"…"`, `r#"…"#`, `br#"…"#`); `prefix_len` ends just before the opening
+/// quote.
+fn raw_string_prefix(chars: &[char], index: usize) -> Option<(usize, usize)> {
+    if index > 0 {
+        let previous = chars[index - 1];
+        if previous.is_alphanumeric() || previous == '_' {
+            return None;
+        }
+    }
+    let mut cursor = index;
+    if chars.get(cursor) == Some(&'b') {
+        cursor += 1;
+    }
+    if chars.get(cursor) != Some(&'r') {
+        return None;
+    }
+    cursor += 1;
+    let mut hashes = 0;
+    while chars.get(cursor) == Some(&'#') {
+        hashes += 1;
+        cursor += 1;
+    }
+    if chars.get(cursor) == Some(&'"') {
+        Some((cursor - index, hashes))
+    } else {
+        None
+    }
+}
+
+/// Replace Rust comments (and raw-string *contents*) with spaces while
+/// preserving line breaks and ordinary string literals. Comments must not be
+/// able to satisfy the gate, and raw strings in this tree are data/fixtures,
+/// not dispatch code.
+fn strip_rust_comments(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut index = 0;
+    let mut block_depth = 0usize;
+    let mut line_comment = false;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while index < chars.len() {
+        let current = chars[index];
+
+        if line_comment {
+            if current == '\n' {
+                line_comment = false;
+                out.push('\n');
+            } else {
+                out.push(' ');
+            }
+            index += 1;
+            continue;
+        }
+
+        if block_depth > 0 {
+            if current == '/' && chars.get(index + 1) == Some(&'*') {
+                block_depth += 1;
+                out.push(' ');
+                out.push(' ');
+                index += 2;
+            } else if current == '*' && chars.get(index + 1) == Some(&'/') {
+                block_depth -= 1;
+                out.push(' ');
+                out.push(' ');
+                index += 2;
+            } else {
+                out.push(if current == '\n' { '\n' } else { ' ' });
+                index += 1;
+            }
+            continue;
+        }
+
+        if in_string {
+            out.push(current);
+            if escaped {
+                escaped = false;
+            } else if current == '\\' {
+                escaped = true;
+            } else if current == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if let Some((prefix_len, hashes)) = raw_string_prefix(&chars, index) {
+            let content_start = index + prefix_len + 1; // past the opening quote
+            for ch in &chars[index..content_start] {
+                out.push(if *ch == '\n' { '\n' } else { ' ' });
+            }
+            let mut cursor = content_start;
+            while cursor < chars.len() {
+                let value = chars[cursor];
+                if value == '"' {
+                    let mut closing = cursor + 1;
+                    let mut matched = 0;
+                    while matched < hashes && chars.get(closing) == Some(&'#') {
+                        matched += 1;
+                        closing += 1;
+                    }
+                    if matched == hashes {
+                        for ch in &chars[cursor..closing] {
+                            out.push(if *ch == '\n' { '\n' } else { ' ' });
+                        }
+                        cursor = closing;
+                        break;
+                    }
+                }
+                out.push(if value == '\n' { '\n' } else { ' ' });
+                cursor += 1;
+            }
+            index = cursor;
+            continue;
+        }
+
+        // `'"'` is a char literal, not the start of a string.
+        if current == '\''
+            && chars.get(index + 1) == Some(&'"')
+            && chars.get(index + 2) == Some(&'\'')
+        {
+            out.push('\'');
+            out.push('"');
+            out.push('\'');
+            index += 3;
+            continue;
+        }
+
+        if current == '/' && chars.get(index + 1) == Some(&'/') {
+            line_comment = true;
+            out.push(' ');
+            index += 1;
+            continue;
+        }
+        if current == '/' && chars.get(index + 1) == Some(&'*') {
+            block_depth = 1;
+            out.push(' ');
+            index += 1;
+            continue;
+        }
+        if current == '"' {
+            in_string = true;
+            out.push(current);
+            index += 1;
+            continue;
+        }
+
+        out.push(current);
+        index += 1;
+    }
+
+    out
+}
+
+/// The body of the first top-level function whose signature contains
+/// `signature`, from its opening `{` to the first `\n}\n` (the crate's style
+/// closes top-level functions at column 0).
+fn function_body<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
+    let start = source.find(signature)?;
+    let open = start + source[start..].find('{')?;
+    let end = open + source[open..].find("\n}\n")?;
+    Some(&source[open..end])
+}
+
+/// Every `"type": "<name>"` value in `session_event_to_json`, the canonical
+/// `SessionEvent` → wire mapping consumed by `NativeEventBridge`.
+fn session_event_wire_names(source: &str) -> Vec<String> {
+    let Some(body) = function_body(source, "fn session_event_to_json") else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut rest = body;
+    while let Some(position) = rest.find("\"type\"") {
+        rest = &rest[position + "\"type\"".len()..];
+        let Some(after_colon) = rest.trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let Some(after_quote) = after_colon.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = after_quote.find('"') else {
+            continue;
+        };
+        names.push(after_quote[..end].to_owned());
+        rest = &after_quote[end..];
+    }
+    names
+}
+
+/// The bridge must still derive the dispatch name from `payload["type"]` and
+/// fan it out to both faces; otherwise a wire mapping is not an emit site.
+fn session_event_bridge_dispatches_wire_names(source: &str) -> bool {
+    source.contains("session_event_to_json")
+        && source.contains(".get(\"type\")")
+        && source.contains("plugins.emit(&event")
+        && source.contains("plugins.emit_native(&event")
+}
+
+fn camel_to_snake(name: &str) -> String {
+    let mut out = String::new();
+    for (index, character) in name.chars().enumerate() {
+        if character.is_uppercase() {
+            if index > 0 {
+                out.push('_');
+            }
+            out.extend(character.to_lowercase());
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
+/// Wire names the bridge explicitly rejects because their direct emit site
+/// already owns both faces. Those cannot use the wire-mapping allowance.
+fn session_event_bridge_skipped_names(source: &str) -> BTreeSet<String> {
+    let Some(body) = function_body(source, "fn native_event_bridge") else {
+        return BTreeSet::new();
+    };
+    let Some(start) = body.find("if matches!(") else {
+        return BTreeSet::new();
+    };
+    let block = &body[start..];
+    let end = block.find(") {").unwrap_or(block.len());
+    let mut names = BTreeSet::new();
+    let mut rest = &block[..end];
+    while let Some(position) = rest.find("SessionEvent::") {
+        rest = &rest[position + "SessionEvent::".len()..];
+        let end = rest
+            .find(|character: char| !(character.is_alphanumeric() || character == '_'))
+            .unwrap_or(rest.len());
+        names.insert(camel_to_snake(&rest[..end]));
+        rest = &rest[end..];
+    }
+    names
+}
+
+/// A literal counts when a dispatch marker sits on the same line or within
+/// four lines either way (multi-line emit calls put them on separate lines).
+fn has_dispatch_near(dispatch_lines: &[bool], index: usize) -> bool {
+    let start = index.saturating_sub(4);
+    let end = (index + 5).min(dispatch_lines.len());
+    dispatch_lines[start..end].iter().any(|value| *value)
+}
+
+/// Brace depth *before* each line, ignoring braces inside strings and the
+/// `'"'` char literal. Used to find the function that encloses a literal.
+fn brace_depths(lines: &[&str]) -> Vec<usize> {
+    let mut depth = 0usize;
+    let mut depths = Vec::with_capacity(lines.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for line in lines {
+        depths.push(depth);
+        let chars: Vec<char> = line.chars().collect();
+        let mut index = 0;
+        while index < chars.len() {
+            let character = chars[index];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    in_string = false;
+                }
+                index += 1;
+                continue;
+            }
+            if character == '\''
+                && chars.get(index + 1) == Some(&'"')
+                && chars.get(index + 2) == Some(&'\'')
+            {
+                index += 3;
+                continue;
+            }
+            match character {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+    depths
+}
+
+fn is_function_header(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("fn ")
+        || trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("pub(crate) fn ")
+        || trimmed.starts_with("pub(super) fn ")
+        || trimmed.starts_with("const fn ")
+        || trimmed.starts_with("pub const fn ")
+        || trimmed.starts_with("async fn ")
+        || trimmed.starts_with("pub async fn ")
+        || trimmed.starts_with("pub(crate) async fn ")
+        || trimmed.starts_with("pub(super) async fn ")
+        || trimmed.starts_with("unsafe fn ")
+        || trimmed.starts_with("pub unsafe fn ")
+}
+
+/// Line ranges of all function bodies (`fn` headers, including multi-line
+/// signatures, paired with their closing brace at the same depth).
+fn function_ranges(lines: &[&str], depths: &[usize]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for start in 0..lines.len() {
+        if !is_function_header(lines[start]) {
+            continue;
+        }
+        let base = depths[start];
+        let mut body_open = None;
+        for candidate in start..lines.len() {
+            if candidate > start && depths[candidate] < base {
+                break;
+            }
+            if depths[candidate] == base {
+                if lines[candidate].contains('{') {
+                    body_open = Some(candidate);
+                    break;
+                }
+                // A body-less declaration (`fn f();`) must not borrow the
+                // next function's brace.
+                if lines[candidate].trim_end().ends_with(';') {
+                    break;
+                }
+            }
+        }
+        let Some(body_open) = body_open else {
+            continue;
+        };
+        let end = depths
+            .iter()
+            .enumerate()
+            .skip(body_open + 1)
+            .find_map(|(candidate, depth)| (*depth <= base).then_some(candidate.saturating_sub(1)))
+            .unwrap_or(lines.len() - 1);
+        if end >= body_open {
+            ranges.push((start, end));
+        }
+    }
+    ranges
+}
+
+/// The innermost function range containing `index`.
+fn enclosing_function_range(ranges: &[(usize, usize)], index: usize) -> Option<(usize, usize)> {
+    ranges
+        .iter()
+        .filter(|(start, end)| *start <= index && index <= *end)
+        .min_by_key(|(start, end)| end - start)
+        .copied()
+}
+
+/// A literal counts when a dispatch marker is in the same function (payload
+/// construction can sit many lines above the emit) or, for literals outside a
+/// function body, within four lines either way.
+fn has_dispatch_for_literal(
+    dispatch_lines: &[bool],
+    ranges: &[(usize, usize)],
+    index: usize,
+) -> bool {
+    if let Some((start, end)) = enclosing_function_range(ranges, index) {
+        if dispatch_lines[start..=end].iter().any(|value| *value) {
+            return true;
+        }
+    }
+    has_dispatch_near(dispatch_lines, index)
+}
+
+/// Statically prove that every wired event still has an emit site.
+///
+/// Shape of the proof (the strongest deterministic check available without a
+/// proc-macro/registry at every emit call):
+///
+/// * scan every non-test `src/**/*.rs` file (comments removed, inline
+///   `#[cfg(test)]` tails excluded, `src/plugins/coverage.rs` excluded because
+///   it is the registry itself);
+/// * accept an exact quoted event literal when a dispatch helper token
+///   (`DISPATCH_MARKERS`) appears in the same enclosing function (payloads can
+///   be built many lines above the emit), or within four lines outside a
+///   function body; this covers direct calls, shared helpers that take the
+///   name as a parameter, and the direct `PluginEvent::new` native dispatch;
+/// * additionally accept a `SessionEvent` wire `"type"` when the canonical
+///   `session_event_to_json` defines it and `NativeEventBridge` still reads
+///   `payload["type"]` and dispatches it to both faces.
+///
+/// It cannot see event names assembled dynamically at runtime or behind a
+/// non-`src` build script; those would need the emit helpers themselves to
+/// record a registry (follow-up if one is ever added).
+#[test]
+fn every_wired_event_has_a_static_emit_site() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rust_sources(&root, &mut files);
+    files.sort();
+
+    let coverage_path = root.join("plugins").join("coverage.rs");
+    let events_source =
+        strip_rust_comments(&read_source(&root.join("agent_session").join("events.rs")));
+    let notifications_source = strip_rust_comments(&read_source(
+        &root.join("agent_session").join("notifications.rs"),
+    ));
+    let wire_names = session_event_wire_names(&events_source);
+    let bridge_maps_wire_names = session_event_bridge_dispatches_wire_names(&notifications_source);
+    let bridge_skipped_names = session_event_bridge_skipped_names(&notifications_source);
+
+    let mut found: BTreeSet<&str> = BTreeSet::new();
+    for path in files {
+        if path == coverage_path {
+            continue;
+        }
+        let source = strip_rust_comments(&read_source(&path));
+        let lines: Vec<&str> = source.lines().collect();
+        // Inline test modules are terminal in this tree; stop there so test
+        // fixtures cannot satisfy the production gate.
+        let limit = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("#[cfg(test)]"))
+            .unwrap_or(lines.len());
+        let lines = &lines[..limit];
+        let dispatch_lines: Vec<bool> = lines
+            .iter()
+            .map(|line| DISPATCH_MARKERS.iter().any(|marker| line.contains(marker)))
+            .collect();
+        let depths = brace_depths(lines);
+        let ranges = function_ranges(lines, &depths);
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains('"') || !has_dispatch_for_literal(&dispatch_lines, &ranges, index) {
+                continue;
+            }
+            for event in WIRED_NATIVE_EVENTS {
+                if line.contains(&format!("\"{event}\"")) {
+                    found.insert(*event);
+                }
+            }
+        }
+    }
+
+    if bridge_maps_wire_names {
+        for event in &wire_names {
+            if bridge_skipped_names.contains(event.as_str()) {
+                continue;
+            }
+            if let Some(wired) = WIRED_NATIVE_EVENTS
+                .iter()
+                .find(|wired| **wired == event.as_str())
+            {
+                found.insert(*wired);
+            }
+        }
+    }
+
+    let missing: Vec<&str> = WIRED_NATIVE_EVENTS
+        .iter()
+        .copied()
+        .filter(|event| !found.contains(event))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "WIRED_NATIVE_EVENTS entries with no statically visible emit site in \
+         non-test src/**/*.rs: {missing:?}. Expected the exact quoted name \
+         beside `emit`/`emit_native`/`emit_with_runtime`/`emit_read_only_json`/\
+         `dispatch_hosted_event`/`PluginEvent::new`/another `DISPATCH_MARKERS` \
+         token, or a `session_event_to_json` wire `type` consumed by \
+         `NativeEventBridge`. If an emitter moved behind a shared helper or a \
+         new mapping path, extend this gate instead of deleting it."
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -834,6 +1354,133 @@ async fn host_shutdown_dispatches_session_shutdown_to_the_js_face_once_and_stops
     assert!(
         runtime.emit("input", &mut payload).await.is_err(),
         "the actor mailbox must be closed after shutdown"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous callback panic isolation (on_context / on_session_context /
+// statuses)
+// ---------------------------------------------------------------------------
+//
+// These three callbacks are synchronous extension code running on the caller's
+// thread (session construction/rebind, the per-prompt snapshot push, the TUI
+// status poll). A panic in one plugin must be caught at the host boundary:
+// unwinding would take down the session loop or the TUI, and the remaining
+// plugins' context/status results would be lost.
+
+/// A native plugin whose synchronous callbacks all panic.
+struct PanickingSyncCallbacks {
+    info: PluginInfo,
+}
+
+impl AgentPlugin for PanickingSyncCallbacks {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn on_context(&self, _ctx: &PluginContext) {
+        panic!("synchronous on_context boom")
+    }
+
+    fn on_session_context(&self, _snapshot: &SessionContextSnapshot) {
+        panic!("synchronous on_session_context boom")
+    }
+
+    fn statuses(&self) -> Vec<(String, String)> {
+        panic!("synchronous statuses boom")
+    }
+}
+
+/// A well-behaved plugin AFTER the panicking one: it records that each sync
+/// callback still reached it and publishes one status entry.
+struct SyncCallbackRecorder {
+    info: PluginInfo,
+    contexts: AtomicUsize,
+    session_contexts: AtomicUsize,
+    status_polls: AtomicUsize,
+}
+
+impl AgentPlugin for SyncCallbackRecorder {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn on_context(&self, _ctx: &PluginContext) {
+        self.contexts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_session_context(&self, _snapshot: &SessionContextSnapshot) {
+        self.session_contexts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn statuses(&self) -> Vec<(String, String)> {
+        self.status_polls.fetch_add(1, Ordering::SeqCst);
+        vec![("sync-recorder".to_owned(), "ok".to_owned())]
+    }
+}
+
+#[test]
+fn panicking_sync_callbacks_do_not_block_later_plugin_results() {
+    let recorder = Arc::new(SyncCallbackRecorder {
+        info: PluginInfo::inline("hook-coverage-sync-recorder"),
+        contexts: AtomicUsize::new(0),
+        session_contexts: AtomicUsize::new(0),
+        status_polls: AtomicUsize::new(0),
+    });
+    let host = PluginHost::build(
+        None,
+        vec![
+            Arc::new(PanickingSyncCallbacks {
+                info: PluginInfo::inline("hook-coverage-sync-panic"),
+            }) as Arc<dyn AgentPlugin>,
+            Arc::clone(&recorder) as Arc<dyn AgentPlugin>,
+        ],
+    );
+
+    // 1. on_context: the bind completes, and the later plugin still gets its
+    //    identity-scoped context.
+    host.bind_context(pir::plugins::plugin::services::PluginServices::new().build());
+    assert_eq!(
+        recorder.contexts.load(Ordering::SeqCst),
+        1,
+        "a panicking on_context must not keep the next plugin from binding"
+    );
+    assert!(
+        host.context().is_some(),
+        "the context is stored before the (isolated) notification pass"
+    );
+
+    // 2. on_session_context: the snapshot is retained and reaches the later
+    //    plugin.
+    host.update_session_context(SessionContextSnapshot {
+        session_id: Some("sync-panic-session".to_owned()),
+        ..SessionContextSnapshot::default()
+    });
+    assert_eq!(
+        recorder.session_contexts.load(Ordering::SeqCst),
+        1,
+        "a panicking on_session_context must not stop the later plugin"
+    );
+    assert_eq!(
+        host.session_context_snapshot()
+            .and_then(|snapshot| snapshot.session_id.clone())
+            .as_deref(),
+        Some("sync-panic-session"),
+        "the snapshot is retained despite the panic"
+    );
+
+    // 3. statuses: the poll continues and returns the later plugin's entry.
+    let statuses = host.statuses();
+    assert_eq!(
+        recorder.status_polls.load(Ordering::SeqCst),
+        1,
+        "a panicking statuses implementation must not stop the poll"
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|(key, text)| key == "sync-recorder" && text == "ok"),
+        "the later plugin's status survives the earlier panic: {statuses:?}"
     );
 }
 
@@ -1649,6 +2296,295 @@ async fn session_before_tree_non_cancel_handler_leaves_navigation_unchanged() {
 // ---------------------------------------------------------------------------
 // terminal_input (raw terminal input, TUI producer)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Registry / lifecycle invariants
+// ---------------------------------------------------------------------------
+
+/// The known-event registry is the single source for both faces: every wired
+/// event must be registrable through `pi.on`/`EventInterest::List`, the
+/// synthetic names with native emit sites must be declarable natively, and the
+/// four registry lists must not overlap.
+#[test]
+fn known_event_registry_is_the_union_of_the_face_lists_without_duplicates() {
+    use pir::plugins::coverage::{
+        is_known_event, known_event_names, NATIVE_ONLY_EVENTS, TEST_ONLY_EVENTS,
+    };
+    use pir::plugins::EventInterest;
+
+    let all: Vec<&str> = WIRED_NATIVE_EVENTS
+        .iter()
+        .chain(NATIVE_ONLY_EVENTS.iter())
+        .chain(SYNTHETIC_EVENTS.iter())
+        .chain(TEST_ONLY_EVENTS.iter())
+        .copied()
+        .collect();
+    let mut unique = all.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        all.len(),
+        "an event name is listed in more than one face registry: {all:?}"
+    );
+    let known: Vec<&str> = known_event_names().collect();
+    assert_eq!(
+        known, all,
+        "known_event_names() must expose exactly the four registry lists"
+    );
+
+    for event in WIRED_NATIVE_EVENTS.iter().chain(SYNTHETIC_EVENTS.iter()) {
+        assert!(
+            is_known_event(event),
+            "`{event}` is emitted but not accepted by pi.on/EventInterest"
+        );
+        let interest = EventInterest::List(vec![(*event).to_owned()]);
+        assert!(
+            pir::plugins::coverage::invalid_native_event_names(&interest).is_empty(),
+            "`{event}` has a native emit site but is rejected by the native \
+             declaration validator"
+        );
+    }
+}
+
+/// Every name the registry advertises is accepted by the real `pi.on`
+/// (load-time validation + the `terminal_input` special case). This is the
+/// registration half of `wired event -> registration -> emit -> test`.
+#[tokio::test(flavor = "current_thread")]
+async fn every_known_event_name_is_accepted_by_pi_on() {
+    let temp = TempDir::new("known-events-pi-on");
+    let names: Vec<&str> = pir::plugins::coverage::known_event_names().collect();
+    let array = serde_json::to_string(&names).expect("event names as JSON");
+    let extension_path = temp.0.join("all-known-events.ts");
+    std::fs::write(
+        &extension_path,
+        format!(
+            r#"
+        export default function (pi) {{
+            for (const name of {array}) {{
+                pi.on(name, () => {{}});
+            }}
+        }}
+        "#
+        ),
+    )
+    .expect("write extension");
+    let runtime = ExtensionHandle::start(extension_config(&temp.0, false))
+        .expect("the QuickJS runtime must start; a skipped start would make this test vacuous");
+    let loaded = runtime
+        .load(std::slice::from_ref(&extension_path))
+        .await
+        .expect("load all-known-events");
+    assert!(
+        loaded.errors.is_empty(),
+        "every registry name must pass pi.on's fail-closed check: {:?}",
+        loaded.errors
+    );
+    let counts: Value = runtime
+        .eval_json("__pir_handlerCountsJson()")
+        .await
+        .expect("handler counts");
+    // Every advertised name must have registered exactly one handler: a name
+    // rejected by `pi.on` (or silently routed nowhere) fails on its own row
+    // instead of being hidden behind the `terminal_input` special case.
+    for name in &names {
+        assert_eq!(
+            counts[*name],
+            json!(1),
+            "pi.on(\"{name}\") must register exactly one handler: {counts}"
+        );
+    }
+}
+
+/// `on_init` is exactly-once per host (explicit call, a second explicit call,
+/// and the implicit before-first-emit call all collapse) and `on_shutdown` is
+/// exactly-once under racing teardown. Panic isolation for both hooks is
+/// covered by `plugins_unified::native_lifecycle_panics_are_isolated_*`.
+#[tokio::test(flavor = "current_thread")]
+async fn init_and_shutdown_hooks_run_exactly_once() {
+    struct LifecycleCounter {
+        info: PluginInfo,
+        init: Arc<AtomicUsize>,
+        shutdown: Arc<AtomicUsize>,
+        reload: Arc<AtomicUsize>,
+    }
+
+    impl AgentPlugin for LifecycleCounter {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn on_init(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+            self.init.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn on_reload(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+            self.reload.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn on_shutdown(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+            self.shutdown.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let init = Arc::new(AtomicUsize::new(0));
+    let shutdown = Arc::new(AtomicUsize::new(0));
+    let reload = Arc::new(AtomicUsize::new(0));
+    let host = PluginHost::build(
+        None,
+        vec![Arc::new(LifecycleCounter {
+            info: PluginInfo::inline("hook-coverage-lifecycle"),
+            init: Arc::clone(&init),
+            shutdown: Arc::clone(&shutdown),
+            reload: Arc::clone(&reload),
+        }) as Arc<dyn AgentPlugin>],
+    );
+
+    assert!(host.run_init_hooks().await.is_empty());
+    assert!(host.run_init_hooks().await.is_empty());
+    let mut payload = json!({ "type": "session_start", "reason": "startup" });
+    host.emit("session_start", &mut payload)
+        .await
+        .expect("emit after init hooks");
+    assert_eq!(
+        init.load(Ordering::SeqCst),
+        1,
+        "on_init must run exactly once across explicit and implicit entry points"
+    );
+
+    host.reload().await.expect("reload");
+    assert_eq!(
+        reload.load(Ordering::SeqCst),
+        1,
+        "on_reload must run exactly once per reload call"
+    );
+
+    host.shutdown().await;
+    host.shutdown().await;
+    assert_eq!(
+        shutdown.load(Ordering::SeqCst),
+        1,
+        "on_shutdown must run exactly once under racing/duplicate teardown"
+    );
+
+    // The read-only (`session_tree`) and raw-terminal-input entries are also
+    // dispatches: a bound host must run `on_init` before their first event,
+    // not defer it to the first `emit`/`emit_native`.
+    for (label, event) in [
+        ("read-only", "session_tree"),
+        ("terminal", "terminal_input"),
+    ] {
+        let init = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicUsize::new(0));
+        let reload = Arc::new(AtomicUsize::new(0));
+        let name = format!("hook-coverage-{label}");
+        let host = PluginHost::build(
+            None,
+            vec![Arc::new(LifecycleCounter {
+                info: PluginInfo::inline(&name),
+                init: Arc::clone(&init),
+                shutdown: Arc::clone(&shutdown),
+                reload: Arc::clone(&reload),
+            }) as Arc<dyn AgentPlugin>],
+        );
+        if event == "session_tree" {
+            host.emit_read_only_json("session_tree", "{}".to_owned(), None)
+                .await;
+        } else {
+            host.dispatch_terminal_input("x").await;
+        }
+        assert_eq!(
+            init.load(Ordering::SeqCst),
+            1,
+            "on_init must precede the first {label} dispatch"
+        );
+        host.shutdown().await;
+    }
+}
+
+/// G2 regression: the native `project_trust` fan-out is spawned by the session
+/// constructors only AFTER `bind_context`, so `emit_native`'s bound-context
+/// init gate runs `on_init` before the event. On the old build-time spawn a
+/// multi-thread runtime could start the task on another worker before the
+/// bind, dispatching `project_trust` first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_project_trust_observes_on_init_first_on_a_multi_thread_runtime() {
+    struct InitOrderRecorder {
+        info: PluginInfo,
+        trace: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl AgentPlugin for InitOrderRecorder {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec!["project_trust".to_owned()])
+        }
+
+        fn on_init(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+            self.trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("on_init");
+            Box::pin(async { Ok(()) })
+        }
+
+        fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            let name = event.name.to_string();
+            let trace = Arc::clone(&self.trace);
+            Box::pin(async move {
+                if name == "project_trust" {
+                    trace
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push("project_trust");
+                }
+                PluginEventOutcome::None
+            })
+        }
+    }
+
+    let temp = TempDir::new("project-trust-init-order");
+    let _agent_dir = AgentDirGuard::isolate(&temp.0);
+    let handle = ExtensionHandle::start_plan_only(extension_config(&temp.0, false));
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::new(InitOrderRecorder {
+        info: PluginInfo::inline("hook-coverage-project-trust-order"),
+        trace: Arc::clone(&trace),
+    });
+    let _session = AgentSession::new_arc_with_plugins(
+        session_config(&temp.0, &handle),
+        vec![recorder as Arc<dyn AgentPlugin>],
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let delivered = trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&"project_trust");
+        if delivered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the native project_trust fan-out never reached the plugin"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        *trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec!["on_init", "project_trust"],
+        "on_init must complete before project_trust on a multi-thread runtime"
+    );
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn terminal_input_reaches_the_native_fan_out_exactly_once() {

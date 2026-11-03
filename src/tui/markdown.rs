@@ -395,12 +395,14 @@ impl Component for Markdown {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .lines_into(
-                width,
-                self.padding_x,
-                self.padding_y,
-                &self.theme,
-                &self.options,
-                None,
+                RenderCtx {
+                    width,
+                    padding_x: self.padding_x,
+                    padding_y: self.padding_y,
+                    theme: &self.theme,
+                    options: &self.options,
+                    paint: None,
+                },
                 out,
             )
     }
@@ -411,6 +413,32 @@ impl Component for Markdown {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .invalidate();
     }
+}
+
+/// Every rendering input a [`RenderedLines`] entry answers, bundled so the
+/// cache check cannot drift from the fields stored with the rendered rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderKey {
+    generation: u64,
+    width: usize,
+    padding_x: usize,
+    padding_y: usize,
+    theme_generation: u64,
+    mermaid: MermaidRenderingMode,
+    is_streaming: bool,
+    painted: bool,
+}
+
+/// The per-call rendering inputs of [`StreamingRender::lines_into`] and
+/// [`render_tail_into`] (everything except the body and the output canvas).
+#[derive(Clone, Copy)]
+pub(crate) struct RenderCtx<'a> {
+    pub(crate) width: usize,
+    pub(crate) padding_x: usize,
+    pub(crate) padding_y: usize,
+    pub(crate) theme: &'a MarkdownTheme,
+    pub(crate) options: &'a MarkdownOptions,
+    pub(crate) paint: Option<&'a dyn Fn(&str) -> String>,
 }
 
 /// One body's rendered lines, keyed by every input they were rendered under.
@@ -476,26 +504,23 @@ struct FenceTail {
 }
 
 impl RenderedLines {
-    #[allow(clippy::too_many_arguments)]
-    fn answers(
-        &self,
-        generation: u64,
-        width: usize,
-        padding_x: usize,
-        padding_y: usize,
-        theme_generation: u64,
-        mermaid: MermaidRenderingMode,
-        is_streaming: bool,
-        painted: bool,
-    ) -> bool {
-        self.generation == generation
-            && self.width == width
-            && self.padding_x == padding_x
-            && self.padding_y == padding_y
-            && self.theme_generation == theme_generation
-            && self.mermaid == mermaid
-            && self.is_streaming == is_streaming
-            && self.painted == painted
+    /// Whether the cached ROWS still match every layout input. The body
+    /// generation is deliberately excluded: an appended body invalidates the
+    /// exact-line answer but the final prefix is still reusable.
+    fn answers_layout(&self, key: &RenderKey) -> bool {
+        self.width == key.width
+            && self.padding_x == key.padding_x
+            && self.padding_y == key.padding_y
+            && self.theme_generation == key.theme_generation
+            && self.mermaid == key.mermaid
+            && self.is_streaming == key.is_streaming
+            && self.painted == key.painted
+    }
+
+    /// Whether the cached rows answer this exact body and layout (a full
+    /// cache hit: no parse, no allocation).
+    fn answers(&self, key: &RenderKey) -> bool {
+        self.generation == key.generation && self.answers_layout(key)
     }
 
     /// The frame's rows into the canvas: padding, final prefix, mutable tail,
@@ -661,7 +686,15 @@ impl StreamingRender {
         {
             let mut rows = Rows::new(&mut lines);
             self.lines_into(
-                width, padding_x, padding_y, theme, options, paint, &mut rows,
+                RenderCtx {
+                    width,
+                    padding_x,
+                    padding_y,
+                    theme,
+                    options,
+                    paint,
+                },
+                &mut rows,
             );
             rows.trim();
         }
@@ -680,24 +713,29 @@ impl StreamingRender {
     /// cache, but the frame no longer pays the assembled `Vec` and its
     /// per-row clones on top. Row for row byte-identical to
     /// [`StreamingRender::lines`], which bridges through this method.
-    // Every parameter is an independent rendering input (padding axes, theme,
-    // options, the optional paint wrapper, the output canvas); bundling them
-    // into a struct would only move the same list to the call sites.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn lines_into(
-        &mut self,
-        width: usize,
-        padding_x: usize,
-        padding_y: usize,
-        theme: &MarkdownTheme,
-        options: &MarkdownOptions,
-        paint: Option<&dyn Fn(&str) -> String>,
-        out: &mut Rows<'_>,
-    ) {
+    pub(crate) fn lines_into(&mut self, ctx: RenderCtx<'_>, out: &mut Rows<'_>) {
+        let RenderCtx {
+            width,
+            padding_x,
+            padding_y,
+            theme: _,
+            options,
+            paint,
+        } = ctx;
         // Read the generation *before* rendering: a theme swap landing
         // mid-render leaves the lines tagged with the older generation, so the
         // next frame re-renders instead of reusing a mixed-palette entry.
         let theme_generation = Theme::generation();
+        let key = RenderKey {
+            generation: self.generation,
+            width,
+            padding_x,
+            padding_y,
+            theme_generation,
+            mermaid: options.mermaid,
+            is_streaming: options.is_streaming,
+            painted: paint.is_some(),
+        };
         if self.text.trim().is_empty() {
             // The classic path renders no blocks for an empty body; there is
             // nothing to reuse either.
@@ -707,16 +745,7 @@ impl StreamingRender {
             return;
         }
         if let Some(rendered) = self.rendered.as_ref() {
-            if rendered.answers(
-                self.generation,
-                width,
-                padding_x,
-                padding_y,
-                theme_generation,
-                options.mermaid,
-                options.is_streaming,
-                paint.is_some(),
-            ) {
+            if rendered.answers(&key) {
                 self.last_reparsed = 0;
                 rendered.assemble_into(width, padding_y, out);
                 return;
@@ -727,13 +756,7 @@ impl StreamingRender {
         // top exactly like the classic path.
         let previous = self.rendered.take().filter(|rendered| {
             rendered.replace_epoch == self.replace_epoch
-                && rendered.width == width
-                && rendered.padding_x == padding_x
-                && rendered.padding_y == padding_y
-                && rendered.theme_generation == theme_generation
-                && rendered.mermaid == options.mermaid
-                && rendered.is_streaming == options.is_streaming
-                && rendered.painted == paint.is_some()
+                && rendered.answers_layout(&key)
                 && rendered.final_len <= self.text.len()
         });
         let (mut final_len, mut prefix_lines, mut fence_tail) = match previous {
@@ -745,9 +768,6 @@ impl StreamingRender {
             None => (0, Vec::new(), None),
         };
 
-        let content_width = width.saturating_sub(padding_x * 2).max(1);
-        let left = " ".repeat(padding_x);
-        let right = " ".repeat(padding_x);
         let prefix_was = prefix_lines.len();
         let mut tail_lines: Vec<String> = Vec::new();
         let reparsed = render_tail_into(
@@ -756,12 +776,7 @@ impl StreamingRender {
             &mut prefix_lines,
             &mut fence_tail,
             &mut tail_lines,
-            content_width,
-            &left,
-            &right,
-            width,
-            theme,
-            options,
+            &ctx,
         );
         if let Some(paint) = paint {
             // Paint exactly the lines this call produced: the cached prefix
@@ -921,20 +936,22 @@ struct FenceCandidate {
 /// frame then parses only from the fence's mutable line, with a synthetic
 /// opener recreating the block context. Returns the parsed byte count (the
 /// `debug_incremental_metrics` proof counter).
-#[allow(clippy::too_many_arguments)]
 fn render_tail_into(
     text: &str,
     final_len: &mut usize,
     prefix_lines: &mut Vec<String>,
     fence_tail: &mut Option<FenceTail>,
     tail_lines: &mut Vec<String>,
-    content_width: usize,
-    left: &str,
-    right: &str,
-    width: usize,
-    theme: &MarkdownTheme,
-    options: &MarkdownOptions,
+    ctx: &RenderCtx<'_>,
 ) -> usize {
+    let content_width = ctx.width.saturating_sub(ctx.padding_x * 2).max(1);
+    let left_padding = " ".repeat(ctx.padding_x);
+    let right_padding = " ".repeat(ctx.padding_x);
+    let left = left_padding.as_str();
+    let right = right_padding.as_str();
+    let width = ctx.width;
+    let theme = ctx.theme;
+    let options = ctx.options;
     let mut reparsed = 0usize;
     loop {
         let raw_tail = &text[*final_len..];

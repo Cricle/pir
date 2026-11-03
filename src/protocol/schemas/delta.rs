@@ -466,7 +466,21 @@ impl DeltaDecoder {
                     .clone()
                     .ok_or_else(|| DeltaError::Path("[]".to_owned()))?
             } else {
-                let reference = &array[1];
+                // The short/full decision only looks at the tuple length, so a
+                // truncated full-form tuple (`["s"]`) reaches this branch with
+                // no path element. Reject it as a shape error before indexing;
+                // `wire_len` below still pins the exact arity of valid frames.
+                let expected = match verb.as_str() {
+                    "p" => 4,
+                    "d" => 2,
+                    _ => 3,
+                };
+                let reference = array.get(1).ok_or_else(|| {
+                    DeltaError::Shape(format!(
+                        "{verb} arity: expected {expected}, got {}",
+                        array.len()
+                    ))
+                })?;
                 let path = if let Value::Number(number) = reference {
                     let id = number
                         .as_u64()

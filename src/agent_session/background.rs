@@ -338,15 +338,19 @@ impl BackgroundRegistry {
     }
 
     /// Enqueue one settled completion's follow-up frame IFF the run is still
-    /// live and has not started settling.
+    /// live, has not started settling, and the frame's registry generation is
+    /// still current.
     ///
-    /// The gate lock is held across the enqueue, so the settle transition
-    /// (`close_follow_up_queue` + drain) is atomic with respect to this send:
-    /// a send that wins the lock is queued before the drain command and
-    /// dropped by it; a send that loses sees the closed state and does
-    /// nothing. Returns whether the frame was enqueued.
+    /// The gate lock is held across the generation check, the run-state check
+    /// AND the enqueue. `abort_all` bumps the generation under this same lock
+    /// (see there), so the settle transition (`close` + drain) and a storage
+    /// swap (`abort_all` + drain) are atomic with respect to this send:
+    /// an enqueue that wins the lock is queued before the drain command and
+    /// dropped by it; an enqueue that loses sees the closed gate or a stale
+    /// generation and does nothing. Returns whether the frame was enqueued.
     pub(crate) fn queue_follow_up(
         &self,
+        generation: u64,
         session_state: &AtomicU8,
         inbox: &Inbox,
         framed: crate::agent::agent_loop::PromptMessage,
@@ -355,7 +359,10 @@ impl BackgroundRegistry {
             .follow_up_queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if gate.closed || session_state.load(Ordering::SeqCst) != SESSION_RUNNING {
+        if gate.closed
+            || self.is_stale(generation)
+            || session_state.load(Ordering::SeqCst) != SESSION_RUNNING
+        {
             return false;
         }
         inbox.send(framed);
@@ -448,8 +455,25 @@ impl BackgroundRegistry {
     /// settled its entry (and is waiting for the batch boundary) observes the
     /// new generation and delivers nothing, so no stale result can reach a
     /// transcript that no longer belongs to the call.
+    ///
+    /// P3-02 reverse window: the bump runs under the follow-up gate mutex —
+    /// the same critical section `queue_follow_up` holds across its
+    /// generation check and enqueue. A storage swap calls `abort_all` while
+    /// holding the batch barrier and drains the inbox right after it returns;
+    /// a completion that already persisted against the OLD manager (it took
+    /// the barrier first) can therefore only (a) enqueue before the bump, in
+    /// which case the FIFO inbox delivers it before the swap's drain command
+    /// and the drain removes it, or (b) observe the bumped generation and
+    /// refuse. Without the shared lock a check-then-send could slip a stale
+    /// frame past the swap's drain and into the new session's first prompt.
     pub(crate) fn abort_all(&self) -> usize {
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        {
+            let _gate = self
+                .follow_up_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
         let mut guard = self.lock();
         let count = guard.len();
         // A1: an aborted call delivers nothing, so its placeholder gate can
@@ -590,6 +614,11 @@ pub(crate) struct BackgroundDelivery {
     session_state: Arc<AtomicU8>,
     /// JS extension runtime for the `tool_result` dispatch (§2.4.4).
     extensions: Option<crate::extensions::ExtensionHandle>,
+    /// Session latch shared with `AgentSession::js_event_dispatch`: `false`
+    /// means the handle above belongs to another session (subagent
+    /// shared-runtime fallback) and must not receive this completion's
+    /// `tool_result` event.
+    js_event_dispatch: Arc<AtomicBool>,
     /// Unified plugin host for the native half of the same `tool_result`
     /// dispatch (A9). `None` keeps the JS-only route; when either face is
     /// present the completion is dispatched through
@@ -611,6 +640,23 @@ pub(crate) struct BackgroundDelivery {
     run_settling: Option<Arc<AtomicBool>>,
 }
 
+/// One settled background completion: the call identity and metadata captured
+/// at detach time plus the result the future produced.
+struct BackgroundFinish<'a> {
+    /// Registry sequence number of the reserved call.
+    seq: u64,
+    /// Provider-issued tool-call id.
+    call_id: &'a str,
+    /// Tool name the call executed.
+    tool_name: &'a str,
+    /// Arguments the model issued (merge input).
+    args: &'a JsonValue,
+    /// The settled tool result.
+    result: ToolResult,
+    /// Wall-clock duration of the detached future.
+    duration_ms: Option<u64>,
+}
+
 impl BackgroundDelivery {
     /// Bundles the session's owned handles for the completion task (called
     /// once at session construction, before the scheduler takes the sink).
@@ -622,6 +668,7 @@ impl BackgroundDelivery {
         follow_up_inbox: Inbox,
         session_state: Arc<AtomicU8>,
         extensions: Option<crate::extensions::ExtensionHandle>,
+        js_event_dispatch: Arc<AtomicBool>,
     ) -> Self {
         Self {
             persist,
@@ -629,6 +676,7 @@ impl BackgroundDelivery {
             follow_up_inbox,
             session_state,
             extensions,
+            js_event_dispatch,
             plugins: None,
             run_settling: None,
         }
@@ -674,20 +722,15 @@ impl BackgroundDelivery {
     /// reached twice — a retry after a settle race, or a delivery racing the
     /// settle path — can neither duplicate the transcript entry nor the
     /// injected frame.
-    // The delivery bundles the settled call's identity, metadata and result;
-    // grouping them into a struct only to satisfy the lint would obscure the
-    // call site for no readability gain (repo precedent: terminal.rs).
-    #[allow(clippy::too_many_arguments)]
-    async fn finish(
-        &self,
-        registry: &Arc<BackgroundRegistry>,
-        seq: u64,
-        call_id: &str,
-        tool_name: &str,
-        args: &JsonValue,
-        result: ToolResult,
-        duration_ms: Option<u64>,
-    ) {
+    async fn finish(&self, registry: &Arc<BackgroundRegistry>, settled: BackgroundFinish<'_>) {
+        let BackgroundFinish {
+            seq,
+            call_id,
+            tool_name,
+            args,
+            result,
+            duration_ms,
+        } = settled;
         // Aborted or torn down: the session no longer owns this call, so its
         // result must not reach the transcript (§2.5). The taken entry carries
         // the adoption-time metadata the delivery reports (`parent_call_id`).
@@ -729,11 +772,19 @@ impl BackgroundDelivery {
         // `tool_result` handlers (ordered-list order), exactly like the
         // in-loop path. Gate on either face so a host-less, extension-less
         // session keeps the old no-dispatch fast path.
-        if self.extensions.is_some() || self.plugins.is_some() {
+        let js_events_enabled = self
+            .js_event_dispatch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if (js_events_enabled && self.extensions.is_some()) || self.plugins.is_some() {
             let mut inputs = std::collections::HashMap::new();
             inputs.insert(call_id.to_owned(), args.clone());
+            let js_extensions = if js_events_enabled {
+                self.extensions.as_ref()
+            } else {
+                None
+            };
             let merges = crate::agent::tool_execution::emit_tool_results_with_host(
-                self.extensions.as_ref(),
+                js_extensions,
                 self.plugins.as_deref(),
                 &inputs,
                 std::slice::from_ref(&finalized),
@@ -793,6 +844,10 @@ impl BackgroundDelivery {
             registry.commit.release(&entry.commit);
             return;
         }
+        // Set when the post-barrier generation check below finds this
+        // completion belongs to a superseded storage. It then drives BOTH
+        // delivery surfaces: no durable entry AND no live follow-up frame.
+        let mut stale = false;
         if let Some(persist) = self.persist.as_ref() {
             // A1 ordering barrier: custom messages project as user messages,
             // so a `backgroundToolResult` written before the batch's
@@ -833,12 +888,38 @@ impl BackgroundDelivery {
             // write returns, so the entry lands strictly between batches.
             {
                 let _batch_boundary = registry.commit.wait_for_batch_boundary().await;
-                persist(framed.clone(), entry_details).await;
+                // The storage can be swapped while this completion waited for
+                // the placeholder gate and/or the batch barrier. The swap
+                // holds the barrier while it bumps the registry generation, so
+                // the state is settled by the time we acquire it; re-check
+                // here, after the wait and before the write, or a stale result
+                // would land in the NEW transcript (the persist closure locks
+                // the session slot, not the manager it was started from).
+                if registry.is_stale(entry.generation) {
+                    stale = true;
+                    tracing::debug!(
+                        call_id = %call_id,
+                        "background completion belongs to a superseded session; not persisting"
+                    );
+                } else {
+                    persist(framed.clone(), entry_details).await;
+                }
             }
         }
         // The gate has served its purpose (or this host keeps no store):
         // drop it so the runtime's table never retains a settled call.
         registry.commit.release(&entry.commit);
+        // A stale completion is not part of the NEW transcript in any form:
+        // the durable entry was skipped above, so the live follow-up frame
+        // must not reach the new session's running turn either (it would
+        // expose a callId the new transcript never made to the model).
+        if stale {
+            tracing::debug!(
+                call_id = %call_id,
+                "background completion belongs to a superseded session; not queueing a follow-up"
+            );
+            return;
+        }
         // §2.4.2: a running turn is reached through the follow-up inbox (the
         // turn context is a snapshot, so an appended entry alone is invisible
         // to it); the loop polls it at every tool-batch boundary (and at a
@@ -855,6 +936,7 @@ impl BackgroundDelivery {
         // plain flag read here would be a TOCTOU).
         if self.run_settling.is_some() {
             registry.queue_follow_up(
+                entry.generation,
                 &self.session_state,
                 &self.follow_up_inbox,
                 crate::agent::agent_loop::PromptMessage::text(framed),
@@ -964,12 +1046,14 @@ pub(crate) fn background_sink(
             delivery
                 .finish(
                     &registry,
-                    seq,
-                    &call_id,
-                    &tool_name,
-                    &args,
-                    result,
-                    duration_ms,
+                    BackgroundFinish {
+                        seq,
+                        call_id: &call_id,
+                        tool_name: &tool_name,
+                        args: &args,
+                        result,
+                        duration_ms,
+                    },
                 )
                 .await;
         });
@@ -1106,12 +1190,36 @@ impl FollowUpQueueProbe {
     }
 
     /// A completion's enqueue attempt (`BackgroundDelivery::finish` tail).
+    /// Uses the registry's current generation, i.e. the reservation a fresh
+    /// call would get.
     pub fn try_queue(&self, text: &str) -> bool {
+        self.try_queue_from_generation(self.generation(), text)
+    }
+
+    /// [`Self::try_queue`] for a specific reservation generation: the P3-02
+    /// reverse-window probe (an old completion enqueueing after a swap).
+    pub fn try_queue_from_generation(&self, generation: u64, text: &str) -> bool {
         self.registry.queue_follow_up(
+            generation,
             &self.state,
             &self.inbox,
             crate::agent::agent_loop::PromptMessage::text(text),
         )
+    }
+
+    /// The registry generation a reservation would currently capture.
+    pub fn generation(&self) -> u64 {
+        self.registry.generation.load(Ordering::SeqCst)
+    }
+
+    /// What `swap_session_storage` does at the registry level (while holding
+    /// the batch barrier): bump the generation via `abort_all`, then drain
+    /// the inbox. Deterministic probe for the P3-02 reverse window — a
+    /// late enqueue from the pre-swap generation must be refused even though
+    /// the gate itself stays open for the NEW generation.
+    pub async fn swap_and_drain(&self) -> Vec<String> {
+        self.registry.abort_all();
+        self.drain_all().await
     }
 
     /// Marks the run idle (what the guard's Drop does before the next run).

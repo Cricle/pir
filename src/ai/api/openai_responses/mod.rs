@@ -31,7 +31,7 @@ pub use copilot::{
 #[cfg(feature = "provider-openai")]
 pub use responses_compat::ResponsesCompat;
 #[cfg(feature = "provider-openai")]
-pub use shared::build_responses_params;
+pub use shared::{build_responses_params, ResponsesWireOptions};
 pub use shared::{
     convert_responses_messages, convert_responses_tools, convert_responses_tools_with,
     get_responses_tool_support, parse_responses_sse, resolve_responses_request_tools,
@@ -53,7 +53,7 @@ use crate::ai::event_stream::AssistantMessageEventStream;
 #[cfg(feature = "provider-openai")]
 use crate::ai::provider::Provider;
 #[cfg(feature = "provider-openai")]
-use crate::ai::transport::ProviderRequestClient;
+use crate::ai::transport::{ProviderRequestClient, StreamingRequest};
 #[cfg(feature = "provider-openai")]
 use crate::ai::types::*;
 
@@ -117,12 +117,14 @@ async fn stream_responses(
         );
         client
             .request_streaming_with(
-                reqwest::Method::POST,
-                url,
-                headers,
+                StreamingRequest::new(
+                    reqwest::Method::POST,
+                    url,
+                    headers,
+                    options.signal.as_ref(),
+                    &options.hooks,
+                ),
                 payload,
-                options.signal.as_ref(),
-                &options.hooks,
                 &mut on_chunk,
             )
             .await?
@@ -433,16 +435,11 @@ impl Provider for OpenAiResponsesProvider {
                     } else {
                         None
                     };
-                    let mut body = shared::build_responses_params(
-                        &model,
-                        &context,
-                        &options,
-                        &compat,
-                        &model.id,
-                        shared::OPENAI_TOOL_CALL_PROVIDERS,
-                        omit,
-                        configuration_update_effort.as_deref(),
-                    )?;
+                    let wire = shared::ResponsesWireOptions::new(&model.id)
+                        .with_omitted_unsupported_fields(omit)
+                        .with_configuration_update_effort(configuration_update_effort.as_deref());
+                    let mut body =
+                        shared::build_responses_params(&model, &context, &options, &compat, &wire)?;
                     // Upstream `options.onPayload` (openai-responses.ts:174):
                     // inspect (or replace, by mutating in place) the request params
                     // before they are sent.
@@ -671,17 +668,17 @@ impl Provider for OpenAiCodexResponsesProvider {
                 let url = codex::resolve_codex_url(&model.base_url);
                 // WebSocket-first transport (pooled, continuation-cached)
                 // with the SSE path as its fallback; see codex::codex_ws.
-                let result = codex::stream_codex_responses(
-                    &client,
-                    &model,
-                    &options,
-                    &url,
-                    &headers,
+                let result = codex::stream_codex_responses(codex::CodexStreamRequest {
+                    client: &client,
+                    model: &model,
+                    options: &options,
+                    url: &url,
+                    sse_headers: &headers,
                     body,
-                    &account_id,
-                    &api_key,
-                    &sink,
-                )
+                    account_id: &account_id,
+                    token: &api_key,
+                    sink: &sink,
+                })
                 .await;
                 // Upstream `parseErrorResponse` (openai-codex-responses.ts:440):
                 // a failed codex HTTP response (429 usage limits included) is

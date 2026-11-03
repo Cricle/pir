@@ -18,6 +18,117 @@ use super::*;
 const MAX_EPHEMERAL_HISTORY_TOKENS: u64 = 100_000;
 const MAX_EPHEMERAL_HISTORY_MESSAGES: usize = 1_024;
 
+/// Inputs of one shared `before_agent_start` dispatch.
+pub(crate) struct BeforeAgentStartDispatch<'a> {
+    /// The user prompt text (`messageType: "user"`), or `None` for a custom
+    /// message run.
+    pub prompt: Option<&'a str>,
+    /// The custom message wire shape for a `messageType: "custom"` run.
+    pub message: Option<JsonValue>,
+    /// The system prompt the run is currently prepared to send.
+    pub system_prompt: String,
+    /// The mutable `systemPromptOptions` object (null when the host has no
+    /// structured options snapshot).
+    pub system_prompt_options: JsonValue,
+    /// Images attached to the starting user message (omitted when empty).
+    pub images: &'a [ContentBlock],
+}
+
+/// What a `before_agent_start` dispatch decided for the run.
+#[derive(Default)]
+pub(crate) struct BeforeAgentStartOutcome {
+    /// A handler-replaced or options-rendered system prompt for this run.
+    pub system_prompt: Option<String>,
+    /// Custom messages handlers injected ahead of the turn. The caller
+    /// delivers them through its own queue/preamble (AgentSession enqueues
+    /// steering; print appends them to the starting context).
+    pub injected_messages: Vec<String>,
+}
+
+/// Shared `before_agent_start` dispatch used by AgentSession and the print
+/// host: identical payload shape (`messageType` union, optional `images`,
+/// `systemPromptOptions`), in-place options mutation followed by a render with
+/// the ordered prompt builder, and both the modern `messages` array and the
+/// legacy single `message` result shape.
+pub(crate) async fn dispatch_before_agent_start(
+    plugins: &PluginHost,
+    request: BeforeAgentStartDispatch<'_>,
+    package_dir: Option<&std::path::Path>,
+) -> BeforeAgentStartOutcome {
+    use crate::extensions::system_prompt_options::SystemPromptOptions;
+
+    let mut payload = match request.prompt {
+        Some(prompt) => serde_json::json!({
+            "type": "before_agent_start",
+            "messageType": "user",
+            "prompt": prompt,
+            "systemPrompt": request.system_prompt,
+            "systemPromptOptions": request.system_prompt_options,
+        }),
+        None => serde_json::json!({
+            "type": "before_agent_start",
+            "messageType": "custom",
+            "message": request.message,
+            "systemPrompt": request.system_prompt,
+            "systemPromptOptions": request.system_prompt_options,
+        }),
+    };
+    // `images` is optional upstream: an absent key, never null.
+    if !request.images.is_empty() {
+        payload["images"] =
+            serde_json::to_value(request.images).unwrap_or(JsonValue::Array(Vec::new()));
+    }
+    let outcome = match plugins.emit("before_agent_start", &mut payload).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            crate::ext_diag!("[ext] before_agent_start dispatch failed: {error}");
+            return BeforeAgentStartOutcome::default();
+        }
+    };
+    // A timed-out/stuck handler is isolated per handler and must not be
+    // silent: the run proceeds, but the warning names the event and the
+    // (sanitized) error.
+    for error in &outcome.errors {
+        crate::ext_diag!("[ext] before_agent_start handler error: {}", error.error);
+    }
+    let mut system_prompt = outcome
+        .result
+        .get("systemPrompt")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned);
+    // The mutable options object is shared across handlers and rides the
+    // payload home (in-place edits and full replacements alike). When it
+    // changed, this run renders its prompt from the final object with the
+    // ordered section builder (upstream `_preparePromptAndToolLoadout(result.
+    // systemPromptOptions)`).
+    if let Some(options) = payload.get("systemPromptOptions") {
+        if options != &request.system_prompt_options {
+            let rendered = SystemPromptOptions::from_json(options).render(package_dir);
+            system_prompt = Some(rendered);
+        }
+    }
+    // Handlers may inject custom messages ahead of the turn. Upstream
+    // accumulates a `messages` ARRAY across handlers while a single `message`
+    // is the legacy shape: consume both.
+    let mut injected_messages: Vec<String> = Vec::new();
+    if let Some(messages) = outcome.result.get("messages").and_then(JsonValue::as_array) {
+        for message in messages {
+            if let Some(text) = extract_custom_message_text(message) {
+                injected_messages.push(text);
+            }
+        }
+    }
+    if injected_messages.is_empty() {
+        if let Some(message) = extract_custom_message_text(&outcome.result) {
+            injected_messages.push(message);
+        }
+    }
+    BeforeAgentStartOutcome {
+        system_prompt,
+        injected_messages,
+    }
+}
+
 /// Trim `messages` in place to the newest window that fits both caps.
 ///
 /// The retained window never starts with an assistant/tool-result fragment:
@@ -143,7 +254,21 @@ async fn omit_recovery_attempt_entries(
             }
         }
     }
+    let expected_session_id = ledger.run_session_id();
     let mut session = session.lock().await;
+    // The omission edits target entry ids of the run's OWN transcript. After
+    // a swap those ids do not exist in the replacement; refuse before the
+    // first edit instead of probing (and potentially matching an unrelated
+    // id) in the new manager.
+    if let Some(expected_session_id) = expected_session_id.as_deref() {
+        if session.id() != expected_session_id {
+            tracing::debug!(
+                expected_session_id,
+                "dropped the recovery omission after the session storage was swapped"
+            );
+            return;
+        }
+    }
     for entry_id in entry_ids {
         if let Err(error) = session.append_context_edit(&entry_id, None) {
             crate::ext_diag!("[session] failed to omit recovery entry {entry_id}: {error}");
@@ -298,6 +423,34 @@ async fn project_session_messages_off_thread(
     .map_err(|error| anyhow::anyhow!("session projection blocking task failed: {error}"))?
 }
 
+/// [`project_session_messages_off_thread`] over the print host's shared
+/// `Option<SessionManager>` slot.
+///
+/// Print drives the loop without an `AgentSession`, but an `agent_before_settle`
+/// continuation must observe the session transcript exactly like the
+/// AgentSession settle loop does (custom_message drafts project as user
+/// messages, context_edit replaces/removes the edited target, compaction
+/// drafts cut the retained range). `None` means the `--no-session` run keeps
+/// the settled context unchanged.
+#[cfg(feature = "print")]
+pub(crate) async fn project_optional_session_messages_off_thread(
+    session: &Arc<tokio::sync::Mutex<Option<SessionManager>>>,
+) -> crate::Result<Option<Vec<Message>>> {
+    let session = Arc::clone(session);
+    tokio::task::spawn_blocking(move || -> crate::Result<Option<Vec<Message>>> {
+        let mut session = session.blocking_lock();
+        let Some(session) = session.as_mut() else {
+            return Ok(None);
+        };
+        if session.is_paged() {
+            session.widen_to_full()?;
+        }
+        Ok(Some(session.build_session_projection()?.messages))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("session projection blocking task failed: {error}"))?
+}
+
 /// Widen a PAGED session to the full transcript on the blocking pool.
 ///
 /// The run needs the whole transcript before it pushes the extension session
@@ -413,17 +566,14 @@ impl AgentSession {
         trigger: RunTrigger,
         on_event: EventHandler,
     ) -> crate::Result<AssistantMessage> {
-        // Native session-level fan-out: install the `SessionEvent` forwarder
-        // before this run can emit `queue_update` (steering enqueues),
-        // `compaction_start`/`_end`, or `auto_retry_*` — a builtin-only session
-        // must deliver them to its Rust plugins exactly once, just like the
-        // loop events (`LoopDeps::plugin_events`). Idempotent per session.
-        if let Some(plugins) = &self.plugins {
-            super::notifications::install_native_session_event_bridge(
-                &self.session_events,
-                plugins,
-            );
-        }
+        // Native session-level fan-out: construction installed the
+        // `SessionEvent` forwarder before any pre-run producer could emit;
+        // keep this idempotent call as the safety net for the run path
+        // (`queue_update` steering enqueues, `compaction_start`/`_end`,
+        // `auto_retry_*`). A builtin-only session must deliver them to its
+        // Rust plugins exactly once, just like the loop events
+        // (`LoopDeps::plugin_events`).
+        self.ensure_session_event_bridge();
         // Claim the session for this run (the single atomic transition every
         // run start shares, mutual exclusion with a manual compaction's own
         // claim). A run during a run keeps the existing rejection; a run
@@ -602,10 +752,18 @@ impl AgentSession {
     ///
     /// `None` for a store-less (ephemeral) session: the loop's `LoopResult::
     /// preamble` list is what the caller appends to the in-memory transcript.
+    ///
+    /// Storage-swap isolation (P1-01): `run_session_id` is the identity bound
+    /// at `run_prompt` entry. A swap landing after that binding but before
+    /// this write must not append the old run's prompt to the replacement
+    /// session; the append helper checks it under the storage lock and the
+    /// run is failed before its first provider request (continuing would have
+    /// to send a request whose starting message will never be persisted).
     fn preamble_persist_fn(
         &self,
         append: PreambleAppend,
         failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+        run_session_id: Option<String>,
     ) -> Option<agent_loop::PreamblePersistFn> {
         let session = self.session.clone()?;
         let plugins = self.plugins.clone();
@@ -617,35 +775,28 @@ impl AgentSession {
             let session_events = Arc::clone(&session_events);
             let failure = Arc::clone(&failure);
             let append = append.clone();
+            let run_session_id = run_session_id.clone();
             Box::pin(async move {
                 let appended = match &append.custom {
                     Some(custom) => {
-                        let custom = custom.clone();
-                        let session = Arc::clone(&session);
-                        let joined =
-                            tokio::task::spawn_blocking(move || -> crate::Result<String> {
-                                let mut session = session.blocking_lock();
-                                session.append_custom_message_entry(
-                                    &custom.custom_type,
-                                    custom.content,
-                                    custom.display,
-                                    custom.details,
-                                )
-                            })
-                            .await;
-                        match joined {
-                            Ok(appended) => appended,
-                            Err(error) => Err(anyhow::anyhow!(
-                                "session startup blocking task failed: {error}"
-                            )),
-                        }
+                        super::settle::append_custom_message_if_session(
+                            &session,
+                            run_session_id.as_deref(),
+                            custom.clone(),
+                        )
+                        .await
                     }
                     None => {
-                        SessionManager::append_message_off_thread(&session, message.clone()).await
+                        super::settle::append_message_if_session(
+                            &session,
+                            run_session_id.as_deref(),
+                            message.clone(),
+                        )
+                        .await
                     }
                 };
                 match appended {
-                    Ok(entry_id) => {
+                    Ok(Some(entry_id)) => {
                         // One wire payload per entry: the plugin dispatch and
                         // the session-level event share the same upstream
                         // `SessionEntry` shape (agent-session.ts:834).
@@ -677,6 +828,27 @@ impl AgentSession {
                             );
                         }
                         Ok(())
+                    }
+                    Ok(None) => {
+                        // The slot now names a different manager than the one
+                        // this run bound at its start. The starting message
+                        // belongs to the outgoing transcript; fail the run
+                        // before the first provider request instead of
+                        // sending a request whose persisted prompt was
+                        // dropped.
+                        tracing::debug!(
+                            expected_session_id = run_session_id.as_deref().unwrap_or("<unknown>"),
+                            "aborted prompt startup after the session storage was swapped"
+                        );
+                        let message = "session storage was replaced while the prompt was \
+                                       starting; the run was aborted";
+                        let mut slot = failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if slot.is_none() {
+                            *slot = Some(anyhow::anyhow!("{message}"));
+                        }
+                        Err(anyhow::anyhow!("{message}"))
                     }
                     Err(error) => {
                         let placeholder =
@@ -722,6 +894,23 @@ impl AgentSession {
         // requested while the run was still starting.
         if self.run_abort_requested.swap(false, Ordering::SeqCst) || previous_signal.is_aborted() {
             signal.abort();
+        }
+        // R1-L1-002 / P1-01: bind this PROMPT RUN to the concrete session
+        // manager installed in the slot NOW — before the first projection,
+        // extension handler (`session_start` / `before_agent_start` can call
+        // `ctx.newSession()`), preamble write, or sink construction can await.
+        // Every run-scoped write below (starting messages, the per-message
+        // sink, the post-run batch, recovery omission/compaction, boundary
+        // drafts and the virtual selection) re-checks this identity under the
+        // SAME storage lock as its append, so a `replace_session_storage`
+        // landing anywhere in the run can never redirect old-run output into
+        // the replacement transcript. The identity is read from the MANAGER,
+        // not the cached `session_id`: the cache is refreshed during the swap
+        // and may still name the outgoing session here.
+        let persist_ledger = PersistLedger::new();
+        if let Some(session) = &self.session {
+            let run_session_id = session.lock().await.id().to_owned();
+            persist_ledger.bind_run_session_id(Some(run_session_id));
         }
         // A new prompt invalidates any pending idle-mode cache warm task: the
         // conversation prefix is about to change. Abort the live warm's
@@ -881,6 +1070,7 @@ impl AgentSession {
                                 None,
                                 Some(self.threshold_model_for(&model)),
                                 Some(Arc::clone(&threshold_gate)),
+                                persist_ledger.run_session_id(),
                             );
                             let pre_context = Arc::new(Context {
                                 system_prompt: self.system_prompt_snapshot(),
@@ -925,6 +1115,7 @@ impl AgentSession {
                             None,
                             Some(self.threshold_model_for(&model)),
                             Some(Arc::clone(&threshold_gate)),
+                            persist_ledger.run_session_id(),
                         );
                         let pre_context = Arc::new(Context {
                             system_prompt: self.system_prompt_snapshot(),
@@ -984,89 +1175,30 @@ impl AgentSession {
         };
         if let Some(plugins) = &self.plugins {
             if plugins.has_handlers("before_agent_start") {
-                let mut payload = match &trigger {
-                    RunTrigger::User { .. } => serde_json::json!({
-                        "type": "before_agent_start",
-                        "messageType": "user",
-                        "prompt": text,
-                        "systemPrompt": self.effective_system_prompt(),
-                        "systemPromptOptions": prompt_options.clone(),
-                    }),
-                    RunTrigger::Custom(message) => serde_json::json!({
-                        "type": "before_agent_start",
-                        "messageType": "custom",
-                        "message": message.to_json(),
-                        "systemPrompt": self.effective_system_prompt(),
-                        "systemPromptOptions": prompt_options.clone(),
-                    }),
-                };
-                // `images` is optional upstream: an absent key, never null.
-                if !input_images.is_empty() {
-                    payload["images"] =
-                        serde_json::to_value(&input_images).unwrap_or(JsonValue::Array(Vec::new()));
+                let before = dispatch_before_agent_start(
+                    plugins,
+                    BeforeAgentStartDispatch {
+                        prompt: match &trigger {
+                            RunTrigger::User { .. } => Some(text.as_str()),
+                            RunTrigger::Custom(_) => None,
+                        },
+                        message: match &trigger {
+                            RunTrigger::Custom(message) => Some(message.to_json()),
+                            RunTrigger::User { .. } => None,
+                        },
+                        system_prompt: self.effective_system_prompt(),
+                        system_prompt_options: prompt_options.clone(),
+                        images: &input_images,
+                    },
+                    self.package_dir.as_deref(),
+                )
+                .await;
+                if let Some(prompt) = before.system_prompt {
+                    run_system_prompt = Some(prompt);
+                    run_system_prompt_overridden = true;
                 }
-                match plugins.emit("before_agent_start", &mut payload).await {
-                    Ok(outcome) => {
-                        // A timed-out/stuck handler is isolated per handler and
-                        // must not be silent: the run proceeds, but the warning
-                        // names the event and the (sanitized) error.
-                        for error in &outcome.errors {
-                            crate::ext_diag!(
-                                "[ext] before_agent_start handler error: {}",
-                                error.error
-                            );
-                        }
-                        if let Some(prompt) = outcome.result.get("systemPrompt") {
-                            if let Some(prompt) = prompt.as_str() {
-                                run_system_prompt = Some(prompt.to_owned());
-                                run_system_prompt_overridden = true;
-                            }
-                        }
-                        // The mutable options object is shared across handlers
-                        // and rides the payload home (in-place edits and full
-                        // replacements alike). When it changed, this run
-                        // renders its prompt from the final object with the
-                        // ordered section builder (upstream
-                        // `_preparePromptAndToolLoadout(result.
-                        // systemPromptOptions)`, agent-session.ts:1935-1942);
-                        // the forced text a handler returned is already
-                        // folded into `forceSystemPrompt`, so the render
-                        // honors it.
-                        if let Some(options) = payload.get("systemPromptOptions") {
-                            if options != &prompt_options {
-                                let rendered = crate::extensions::system_prompt_options::
-                                    SystemPromptOptions::from_json(options)
-                                        .render(self.package_dir.as_deref());
-                                run_system_prompt = Some(rendered);
-                                run_system_prompt_overridden = true;
-                            }
-                        }
-                        // Handlers may inject custom messages ahead of the
-                        // turn. Upstream accumulates a `messages` ARRAY across
-                        // handlers (runner.ts:1435,1453) while a single
-                        // `message` is the legacy shape: consume both.
-                        let mut injected: Vec<String> = Vec::new();
-                        if let Some(messages) =
-                            outcome.result.get("messages").and_then(JsonValue::as_array)
-                        {
-                            for message in messages {
-                                if let Some(text) = extract_custom_message_text(message) {
-                                    injected.push(text);
-                                }
-                            }
-                        }
-                        if injected.is_empty() {
-                            if let Some(message) = extract_custom_message_text(&outcome.result) {
-                                injected.push(message);
-                            }
-                        }
-                        for message in injected {
-                            self.enqueue_steering(agent_loop::PromptMessage::text(message));
-                        }
-                    }
-                    Err(error) => {
-                        crate::ext_diag!("[ext] before_agent_start dispatch failed: {error}")
-                    }
+                for message in before.injected_messages {
+                    self.enqueue_steering(agent_loop::PromptMessage::text(message));
                 }
             }
             // The session counts as busy while a run starts (upstream
@@ -1078,39 +1210,12 @@ impl AgentSession {
             self.apply_extension_notifications().await;
         }
 
-        let mut stream_options = self.stream_options(Some(signal.clone()));
-        if let Some(plugins) = &self.plugins {
-            // `before_provider_headers`: handlers mutate `headers` in place;
-            // the mutated map flows back through the payload and is applied
-            // to the outgoing request. A `null` value deletes the header.
-            if plugins.has_handlers("before_provider_headers") {
-                let mut payload = serde_json::json!({
-                    "type": "before_provider_headers",
-                    "headers": stream_options.headers.clone().unwrap_or_default(),
-                });
-                match plugins.emit("before_provider_headers", &mut payload).await {
-                    Ok(_) => {
-                        if let Some(headers) = payload.get("headers").and_then(|h| {
-                            serde_json::from_value::<
-                                std::collections::BTreeMap<String, Option<String>>,
-                            >(h.clone())
-                            .ok()
-                        }) {
-                            let mut merged = std::collections::BTreeMap::new();
-                            for (name, value) in headers {
-                                if let Some(value) = value {
-                                    merged.insert(name, value);
-                                }
-                            }
-                            stream_options.headers = Some(merged);
-                        }
-                    }
-                    Err(error) => {
-                        crate::ext_diag!("[ext] before_provider_headers dispatch failed: {error}");
-                    }
-                }
-            }
-        }
+        let stream_options = self.stream_options(Some(signal.clone()));
+
+        // `before_provider_headers` rides the per-request transport hooks
+        // (`stream_options_with_actor_hooks`), so prompts, compaction/branch
+        // summaries and print all observe the same event before auth headers
+        // are applied.
 
         // The steering/follow-up queues are polled below; the per-request
         // transport hooks (`before_provider_request` / `after_provider_response`)
@@ -1170,7 +1275,11 @@ impl AgentSession {
                 RunTrigger::Custom(_) => Some(starting_json.clone()),
             },
             append: true,
-            persist: self.preamble_persist_fn(starting_append, Arc::clone(&preamble_failure)),
+            persist: self.preamble_persist_fn(
+                starting_append,
+                Arc::clone(&preamble_failure),
+                persist_ledger.run_session_id(),
+            ),
         });
         for message in &pending_next_turn {
             let projection = custom_run_user_message(message);
@@ -1185,6 +1294,7 @@ impl AgentSession {
                         wire,
                     },
                     Arc::clone(&preamble_failure),
+                    persist_ledger.run_session_id(),
                 ),
             });
         }
@@ -1282,8 +1392,9 @@ impl AgentSession {
         // ordinal identity (not a count) makes the split exact when the sink
         // intentionally omits a message (overflow recovery) or a write fails:
         // a failed write installs a barrier and the batch re-appends the
-        // unhandled tail in order. See [`PersistLedger`].
-        let persist_ledger = PersistLedger::new();
+        // unhandled tail in order. The ledger (with its run-start session
+        // identity) is created at the top of `run_prompt`. See
+        // [`PersistLedger`].
         let mut first_iteration = true;
         let mut settle_iterations = 0usize;
         // Post-run context-overflow recovery state (upstream
@@ -1311,10 +1422,11 @@ impl AgentSession {
                     // D6: the projection is transcript-sized blocking work;
                     // build it on the blocking pool, not on a runtime worker
                     // while holding the async session lock. A projection error
-                    // keeps the previous tolerant empty-context fallback.
-                    Some(session) => project_session_messages_off_thread(session)
-                        .await
-                        .unwrap_or_default(),
+                    // ABORTS this run (like the first iteration): silently
+                    // continuing with an EMPTY context would send a request
+                    // with no history and write its reply back into the real
+                    // transcript.
+                    Some(session) => project_session_messages_off_thread(session).await?,
                     None => history_owned(self.history_snapshot()),
                 }
             };
@@ -1463,7 +1575,7 @@ impl AgentSession {
                         super::events::emit_session_event_to(&events, session_event);
                     })
                 }),
-                extensions: self.extensions.clone(),
+                extensions: self.event_extensions().cloned(),
                 // The unified host's NATIVE plugin fan-out (Rust builtins +
                 // inline plugins): `extensions` above is the JS face, and the
                 // host is passed separately so a builtin-only plan (plan-only
@@ -1488,6 +1600,7 @@ impl AgentSession {
                         .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone(),
+                    persist_ledger.run_session_id(),
                 ),
                 prepare_request: self
                     .virtual_routing_prepare_request(Arc::clone(&routed_registration)),
@@ -1504,13 +1617,15 @@ impl AgentSession {
                     let shared = Arc::clone(shared);
                     Box::new(move |request: ProviderRequest| shared(request))
                 }
-                None => registry_event_stream(
+                None => super::providers::session_registry_event_stream(
                     Arc::clone(&self.registry),
+                    self.provider_session_key(),
                     current_model.clone(),
                     // The run bakes one `StreamOptions` snapshot; the stream
                     // closure and the loop's request share it (a clone of the
                     // small options struct, not of the registry or the
-                    // transcript).
+                    // transcript). The session key keeps provider/OAuth
+                    // resolution inside this session's overlay (SNAP8 P2-1).
                     stream_options.clone(),
                 ),
             };
@@ -1554,6 +1669,7 @@ impl AgentSession {
                     projected.take(),
                     Some(self.threshold_model_for(&current_model)),
                     Some(Arc::clone(&threshold_gate)),
+                    persist_ledger.run_session_id(),
                 )),
                 event_stream: Some(event_stream),
                 // Generic loop hooks (upstream `transformContext` /
@@ -1569,6 +1685,12 @@ impl AgentSession {
                 // binding above).
                 preamble: std::mem::take(&mut preamble),
                 preamble_messages: Vec::new(),
+                // The loop seeds its declared-tool set from the projected
+                // transcript's system declarations. Session runs always pass
+                // the materialized projection above, so `None` keeps exactly
+                // that behavior (the field exists for hosts that stream the
+                // history instead).
+                initial_declared_tools: None,
             };
 
             // Each settle iteration persists its own messages: the ledger is
@@ -1714,13 +1836,15 @@ impl AgentSession {
                             // may cancel or replace the recovery compaction,
                             // exactly like the manual/threshold paths.
                             let decision = super::compact::dispatch_before_compact(
-                                self.plugins.as_ref(),
-                                "overflow",
-                                true,
-                                Some(focus.as_str()),
-                                &prepared,
-                                &[] as &[FileEntry],
-                                signal.is_aborted(),
+                                super::compact::BeforeCompactDispatch {
+                                    plugins: self.plugins.as_ref(),
+                                    reason: "overflow",
+                                    will_retry: true,
+                                    custom_instructions: Some(focus.as_str()),
+                                    preparation: &prepared,
+                                    branch_entries: &[] as &[FileEntry],
+                                    aborted: signal.is_aborted(),
+                                },
                             )
                             .await;
                             let mut from_extension = false;
@@ -1757,7 +1881,7 @@ impl AgentSession {
                                             compaction::compact_with_preparation_refs(
                                                 prepared,
                                                 &current_model,
-                                                self.complete_fn(),
+                                                self.complete_fn_session_scoped(),
                                                 Some(focus.as_str()),
                                             ),
                                         )
@@ -1957,9 +2081,33 @@ impl AgentSession {
                         if to_append.is_empty() {
                             Vec::new()
                         } else {
-                            let entry_ids =
-                                SessionManager::append_messages_off_thread(session, to_append)
-                                    .await?;
+                            // P2-01: the batch is a run-scoped write exactly
+                            // like the sink. Without the identity check a
+                            // sink failure (or its poison barrier) followed
+                            // by a storage swap would replay the old run's
+                            // unhandled tail into the replacement transcript.
+                            let expected_session_id = persist_ledger.run_session_id();
+                            let entry_ids = match super::settle::append_messages_if_session(
+                                session,
+                                expected_session_id.as_deref(),
+                                to_append,
+                            )
+                            .await?
+                            {
+                                Some(entry_ids) => entry_ids,
+                                None => {
+                                    tracing::debug!(
+                                        expected_session_id =
+                                            expected_session_id.as_deref().unwrap_or("<unknown>"),
+                                        "dropped the post-run persistence batch after the \
+                                         session storage was swapped"
+                                    );
+                                    // The replacement must not receive the
+                                    // old run's tail; nothing was written, so
+                                    // there is no entry to dispatch either.
+                                    Vec::new()
+                                }
+                            };
                             // The recovery omission resolves its targets by
                             // ordinal; record the ids this batch persisted
                             // (the sink records its own committed appends).
@@ -2028,8 +2176,13 @@ impl AgentSession {
             // virtual selection win on the next read without changing the
             // shared projection.
             if let Some(registration) = &routed {
-                self.record_virtual_selection(&registration.provider, &registration.id)
-                    .await;
+                let run_session_id = persist_ledger.run_session_id();
+                self.record_virtual_selection(
+                    &registration.provider,
+                    &registration.id,
+                    run_session_id.as_deref(),
+                )
+                .await;
             }
             self.turns.fetch_add(result.turns, Ordering::SeqCst);
             self.tokens.fetch_add(produced_tokens, Ordering::SeqCst);
@@ -2101,13 +2254,15 @@ impl AgentSession {
                                         Vec::new()
                                     };
                                 let decision = super::compact::dispatch_before_compact(
-                                    self.plugins.as_ref(),
-                                    "overflow",
-                                    true,
-                                    None,
-                                    &preparation,
-                                    &branch_entries,
-                                    signal.is_aborted(),
+                                    super::compact::BeforeCompactDispatch {
+                                        plugins: self.plugins.as_ref(),
+                                        reason: "overflow",
+                                        will_retry: true,
+                                        custom_instructions: None,
+                                        preparation: &preparation,
+                                        branch_entries: &branch_entries,
+                                        aborted: signal.is_aborted(),
+                                    },
                                 )
                                 .await;
                                 match decision {
@@ -2143,7 +2298,7 @@ impl AgentSession {
                                                 compaction::compact_with_preparation_refs(
                                                     preparation,
                                                     &current_model,
-                                                    self.complete_fn(),
+                                                    self.complete_fn_session_scoped(),
                                                     None,
                                                 ),
                                             )
@@ -2164,19 +2319,69 @@ impl AgentSession {
                             // first write: run it on the blocking pool (the
                             // async session lock is acquired inside the
                             // blocking task).
+                            // P2-03: the recovery compaction is a run-scoped
+                            // write, so it re-checks the identity bound at
+                            // run start. A swap during summarization must not
+                            // write the outgoing transcript's cut
+                            // (`firstKeptEntryId`) into the replacement.
+                            let expected_run_session_id = persist_ledger.run_session_id();
                             let appended_entry_id =
-                                match SessionManager::append_compaction_off_thread(
-                                    session,
-                                    compacted.summary.clone(),
-                                    compacted.first_kept_entry_id.clone(),
-                                    compacted.tokens_before,
-                                    Some(compaction_details(&compacted)),
-                                    Some(compacted.usage),
-                                    from_extension,
+                                match super::settle::append_compaction_if_session(
+                                    super::settle::CompactionAppend {
+                                        session,
+                                        expected_session_id: expected_run_session_id.as_deref(),
+                                        summary: compacted.summary.clone(),
+                                        first_kept_entry_id: compacted.first_kept_entry_id.clone(),
+                                        tokens_before: compacted.tokens_before,
+                                        details: Some(compaction_details(&compacted)),
+                                        usage: Some(compacted.usage),
+                                        from_hook: from_extension,
+                                    },
                                 )
                                 .await
                                 {
-                                    Ok(entry_id) => entry_id,
+                                    Ok(Some(entry_id)) => entry_id,
+                                    Ok(None) => {
+                                        // The slot moved to another session
+                                        // while the recovery compaction was
+                                        // being generated: do not append it,
+                                        // do not build a retry context from
+                                        // the replacement, and settle on the
+                                        // original overflow terminal.
+                                        tracing::debug!(
+                                            expected_session_id = expected_run_session_id
+                                                .as_deref()
+                                                .unwrap_or("<unknown>"),
+                                            "dropped the overflow recovery compaction after the \
+                                             session storage was swapped"
+                                        );
+                                        let aborted = signal.is_aborted();
+                                        let error_message = if aborted {
+                                            None
+                                        } else {
+                                            Some(
+                                                "Context overflow recovery failed: the session \
+                                                 storage was replaced"
+                                                    .to_owned(),
+                                            )
+                                        };
+                                        self.emit_session_event(SessionEvent::CompactionEnd {
+                                            reason: "overflow",
+                                            result: None,
+                                            aborted,
+                                            will_retry: false,
+                                            error_message: error_message.clone(),
+                                        });
+                                        self.emit_compact_failed(
+                                            "overflow",
+                                            error_message,
+                                            aborted,
+                                            from_extension,
+                                        )
+                                        .await;
+                                        run.end_emitted();
+                                        break 'settle result;
+                                    }
                                     Err(error) => {
                                         // Storage did not take the recovery
                                         // compaction: nothing was cut, the failed
@@ -2324,7 +2529,10 @@ impl AgentSession {
             // session — covering every AgentSession-backed host (TUI / RPC /
             // server / SDK), including host command dispatches made while
             // idle, which wait for the next settle to be applied.
-            if self.extensions.is_some() {
+            // Native plugins record the same actions through
+            // `SessionService` (no JS runtime required), so a plugin-only
+            // session must drain too.
+            if self.extensions.is_some() || self.plugins.is_some() {
                 for (action, outcome) in self.apply_session_command_actions().await {
                     if let Err(error) = outcome {
                         crate::ext_diag!("[ext] command action {action:?} failed: {error}");
@@ -2340,8 +2548,14 @@ impl AgentSession {
                     // Only the context and the terminal message are read by the
                     // boundary hook; the run result's produced messages moved
                     // into `produced` above already.
-                    self.dispatch_agent_before_settle(plugins, &result.context, &result.terminal)
-                        .await
+                    let run_session_id = persist_ledger.run_session_id();
+                    self.dispatch_agent_before_settle(
+                        plugins,
+                        &result.context,
+                        &result.terminal,
+                        run_session_id.as_deref(),
+                    )
+                    .await
                 }
                 _ => false,
             };
@@ -2440,11 +2654,25 @@ impl AgentSession {
     /// routed turn (one small entry, not the transcript) — the steady state
     /// upstream reaches by preferring a virtual `model_change` over later
     /// responses, which pir's shared projection does not do.
-    async fn record_virtual_selection(&self, provider: &str, model_id: &str) {
+    async fn record_virtual_selection(
+        &self,
+        provider: &str,
+        model_id: &str,
+        expected_session_id: Option<&str>,
+    ) {
         let Some(session) = &self.session else {
             return;
         };
         let mut session = session.lock().await;
+        if let Some(expected_session_id) = expected_session_id {
+            if session.id() != expected_session_id {
+                tracing::debug!(
+                    expected_session_id,
+                    "dropped the virtual selection after the session storage was swapped"
+                );
+                return;
+            }
+        }
         let path = crate::session_manager::projection::build_session_path(
             session.resident_entries(),
             session.leaf_id(),

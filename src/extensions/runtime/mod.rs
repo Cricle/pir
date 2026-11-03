@@ -157,20 +157,20 @@ mod backlog;
 // Extension-originated stdio routing (`process.stdout/stderr.write` off the
 // TUI frame; see the module docs).
 #[cfg(feature = "extensions")]
+// `runtime::runtime` holds the `ExtensionRuntime` impl split out of `mod.rs`.
+// It is compiled as `engine` so the module is not a child of itself.
+#[path = "runtime.rs"]
+mod engine;
+#[cfg(feature = "extensions")]
 mod ext_stdio;
 #[cfg(feature = "extensions")]
 mod hooks;
 #[cfg(feature = "extensions")]
 mod ops;
-#[allow(clippy::module_inception)]
-// `runtime::runtime` holds the `ExtensionRuntime` impl split out of `mod.rs`
-#[cfg(feature = "extensions")]
-mod runtime;
 mod state;
 
 // The engine and the crate's unit tests are the callers; keep the
 // re-export present in every configuration.
-#[allow(unused_imports)]
 pub(crate) use state::lock_state;
 #[cfg(feature = "extensions")]
 pub(crate) use state::recover_interrupted;
@@ -191,6 +191,13 @@ pub use ext_stdio::{ext_stdio_route, ExtStdioRoute, MAX_ROUTED_WRITE_BYTES};
 // a standalone script entry that `load` seeds for extension entries. The
 // bounded rejection log is public so its eviction invariant is testable
 // without a live QuickJS runtime.
+/// Test seams for the idle drain backoff (integration tests live in
+/// `tests/`; inline test modules are forbidden in `src/`).
+#[doc(hidden)]
+#[cfg(feature = "extensions")]
+pub use engine::{next_park_slice_for_tests, park_slice_bounds_for_tests};
+#[cfg(feature = "extensions")]
+pub use engine::{package_entry_root, RejectionLog};
 /// A child wait's condvar park probe (blocking-host wakeup regression).
 #[doc(hidden)]
 #[cfg(feature = "extensions")]
@@ -202,8 +209,10 @@ pub use host_functions::child_fns::{
 #[doc(hidden)]
 #[cfg(feature = "extensions")]
 pub use host_functions::worker_fns::{
-    next_poll_slice_for_tests, poll_slice_bounds_for_tests, test_recv_poll, test_register_worker,
-    test_release_worker, test_worker_poll_wakes, test_worker_send, worker_limit_for_tests,
+    live_worker_count_for_tests, live_worker_limit_for_tests, next_poll_slice_for_tests,
+    orphaned_worker_count_for_tests, poll_slice_bounds_for_tests, test_recv_poll,
+    test_register_worker, test_release_worker, test_set_live_worker_limit, test_worker_poll_wakes,
+    test_worker_send, worker_count_for_tests, worker_limit_for_tests,
 };
 /// Live process-level host handle counts (generation-release regression).
 #[doc(hidden)]
@@ -211,13 +220,6 @@ pub use host_functions::worker_fns::{
 pub use host_functions::{
     fs_watch_count_for_tests, host_resource_counts_for_tests, HostResourceCounts,
 };
-/// Test seams for the idle drain backoff (integration tests live in
-/// `tests/`; inline test modules are forbidden in `src/`).
-#[doc(hidden)]
-#[cfg(feature = "extensions")]
-pub use runtime::{next_park_slice_for_tests, park_slice_bounds_for_tests};
-#[cfg(feature = "extensions")]
-pub use runtime::{package_entry_root, RejectionLog};
 // The `message_update` streaming wire (the delta-only per-delta wire built on
 // the actor thread; see [`dispatch::message_update_stream_json`]) is public so
 // the JS-contract and per-delta allocation tests can pin it against the
@@ -229,6 +231,8 @@ pub use runtime::{package_entry_root, RejectionLog};
 pub(crate) use dispatch::message_update_snapshot_json_for_partial;
 #[cfg(feature = "extensions")]
 pub use dispatch::{message_update_snapshot_json, message_update_stream_json};
+#[cfg(feature = "extensions")]
+pub(crate) use dispatch::{tool_argument_patch, ToolArgumentPatch};
 // Definition/data types are engine-free and live in the always-compiled
 // `crate::extensions::types` (SDK-SCOPE.md): re-exported here so the
 // existing `runtime::<Type>` paths and the `use super::*` globs in this
@@ -251,6 +255,11 @@ pub(crate) struct HostCompletion {
 #[cfg_attr(not(feature = "extensions"), allow(dead_code))]
 pub(crate) struct RuntimeState {
     pub(crate) config: ExtensionConfig,
+    /// Bootstrap-only UI fail-fast: async `ctx.ui.*` dialogs resolve with
+    /// `null` instead of parking on the host sink. Set by the pre-trust
+    /// bootstrap load before its `project_trust` dispatch and cleared before
+    /// the runtime can be adopted as the live host.
+    pub(crate) ui_fail_fast: bool,
     pub(crate) invalidated: bool,
     /// Abort flag for the currently running tool call; polled by the JS side
     /// and set by [`ExtensionRuntime::abort_current_call`] / `ctx.abort()`.
@@ -449,6 +458,12 @@ pub(crate) struct RuntimeState {
     /// Provider ids with a usable credential (session-host-pushed); backs the
     /// `pi.setModel` "no credential" `false` result.
     pub(crate) authenticated_providers: Vec<String>,
+    /// Whether [`Self::authenticated_providers`] reflects a real credential
+    /// load. `false` before the first push means the host cannot check
+    /// (permissive); `true` makes even an EMPTY list authoritative — a
+    /// successful load that found no credentials must answer "no auth", not
+    /// fall back to the permissive default.
+    pub(crate) authenticated_providers_known: bool,
     /// Nested tool executors bound per in-flight tool call id (upstream
     /// `ctx.executeTool` round-trip). Bound by [`crate::agent::tool_execution::ExtensionTool`]
     /// for the duration of a call, consumed by the `executeTool` host fn.
@@ -615,13 +630,20 @@ pub struct ExtensionRuntime {
     /// earlier deadline that is still armed).
     deadlines: Arc<StdMutex<HashMap<u64, std::time::Instant>>>,
     next_deadline_token: std::sync::atomic::AtomicU64,
+    /// Optional co-operative abort flag consulted by the QuickJS interrupt
+    /// handler (installed by a worker thread for `terminate` / `/reload`).
+    /// Kept separate from [`Self::deadlines`] because the owner of the flag
+    /// is another OS thread: the parent sets the flag synchronously and the
+    /// worker's own handler observes it without any cross-runtime deadline
+    /// bookkeeping.
+    interrupt_flag: Arc<StdMutex<Option<Arc<std::sync::atomic::AtomicBool>>>>,
     /// Promise rejections the engine reported still unhandled (the host
     /// promise-rejection tracker records reason texts; a later handler-attach
     /// event removes the entry). Read by the `pir js` script runner (Node's
     /// crash-on-unhandled-rejection contract); the extension host keeps
     /// collecting without ever acting on it — so the record is a BOUNDED
-    /// [`runtime::RejectionLog`] (oldest reasons evicted past
-    /// [`runtime::RejectionLog::MAX`]), never an unbounded `Vec` a rejection
+    /// [`engine::RejectionLog`] (oldest reasons evicted past
+    /// [`engine::RejectionLog::MAX`]), never an unbounded `Vec` a rejection
     /// storm would grow for the process lifetime.
-    unhandled_rejections: Arc<StdMutex<runtime::RejectionLog>>,
+    unhandled_rejections: Arc<StdMutex<engine::RejectionLog>>,
 }

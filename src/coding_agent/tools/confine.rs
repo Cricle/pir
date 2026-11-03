@@ -491,9 +491,8 @@ mod imp {
         /// component; a link (or any non-regular file) is reported with one
         /// link so the ordinary replacement path handles it.
         // `mode_t`/`nlink_t` are `u32`/`u64` on Linux but `u16` on macOS, so
-        // the widening casts are required on macOS and identity casts on
-        // Linux — where clippy's `unnecessary_cast` (denied in CI) fires.
-        #[allow(clippy::unnecessary_cast)]
+        // `From` widens where required and stays identity where the target type
+        // is already the same.
         pub(super) fn target_info(&self, name: &OsStr) -> io::Result<super::TargetInfo> {
             use std::os::unix::fs::PermissionsExt;
 
@@ -514,11 +513,15 @@ mod imp {
             if result != 0 {
                 return Err(io::Error::last_os_error());
             }
-            let mode = stat.st_mode as u32;
+            let mode = u32::from(stat.st_mode);
             let is_regular = stat.st_mode & libc::S_IFMT == libc::S_IFREG;
             Ok(super::TargetInfo {
                 permissions: is_regular.then(|| std::fs::Permissions::from_mode(mode & 0o7777)),
-                hard_links: if is_regular { stat.st_nlink as u64 } else { 1 },
+                hard_links: if is_regular {
+                    u64::from(stat.st_nlink)
+                } else {
+                    1
+                },
             })
         }
 

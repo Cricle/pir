@@ -81,7 +81,18 @@
 //! installs one fan-out listener on the line lazily, on the first commit
 //! ([`Session::ensure_ready`]). Registration itself is immediate; only a commit
 //! sent directly through [`Session::handle`] before the first facade commit can
-//! precede the installation.
+//! precede the installation. The fan-out is registered as a **gated**
+//! listener: while the registry is empty it does not force the document half
+//! of a publication (no `adopt`, no revision clones), and the first subscriber
+//! makes the very next commit publish its complete state.
+//!
+//! A subscription applies to every commit that **starts after** it returns.
+//! Each commit captures its listener set, including the host subscriber
+//! snapshot the document gate is computed from, before its first `await`; the
+//! fan-out dispatches that captured set. A commit already in flight therefore
+//! misses the new subscriber (which first hears from the next commit) but the
+//! subscriber can never receive that commit's publication with its document
+//! changes omitted.
 //!
 //! # Deferred commits (`CommitPersistence`)
 //!
@@ -1147,6 +1158,13 @@ impl Session {
     /// Listeners run synchronously on the line after the commit settled, in
     /// registration order. A panicking listener is contained and never fails
     /// the session (host listener policy).
+    ///
+    /// A subscription takes effect for every commit that **starts** after this
+    /// call returns. A commit already in flight when it returns captured its
+    /// listener snapshot before, so it is not delivered to the new listener —
+    /// the listener first receives the next commit. It never receives a frame
+    /// for the in-flight commit with the document changes omitted (see
+    /// [`Session::ensure_ready`]).
     pub fn subscribe_commits(&self, listener: CommitListener) -> Result<u64, StorageError> {
         if self.handle.is_closing() {
             return Err(StorageError::closed("Session"));
@@ -1160,6 +1178,10 @@ impl Session {
     }
 
     /// Remove one subscription by id. Unknown ids are ignored.
+    ///
+    /// A commit that already captured its listener snapshot may still deliver
+    /// to the removed listener; every commit that starts after this call
+    /// excludes it.
     pub fn unsubscribe_commits(&self, id: u64) {
         self.subscribers
             .lock()
@@ -1171,33 +1193,59 @@ impl Session {
 
     /// Install the line-side fan-out listener exactly once.
     ///
-    /// The installed listener dispatches to whatever is registered *at commit
-    /// time*, so subscriptions added later need no second installation. The
-    /// result is latched: a session that cannot install it (already closed)
-    /// keeps returning that error instead of retrying.
+    /// The installed listener dispatches to the subscriber snapshot captured
+    /// when a commit starts: the gate probe (evaluated by the line's
+    /// `begin_commit`) copies the registry into a slot and the fan-out takes
+    /// that slot instead of re-reading the live registry. The snapshot decides
+    /// both whether the commit adopts the document half and whom it is
+    /// delivered to, so the two can never disagree. Registration is immediate
+    /// but only affects commits that start after it: a subscriber that arrives
+    /// while a commit is in flight misses that commit and first receives the
+    /// next one, never a publication whose document changes were skipped.
+    ///
+    /// It is registered as a gated listener: with no subscribers it is not a
+    /// document-publication consumer, so a default `Session` commit skips
+    /// `adopt`; a non-empty registry makes the next commit publish the full
+    /// adopted state. The result is latched: a session that cannot install it
+    /// (already closed) keeps returning that error instead of retrying.
+    ///
+    /// The listener is **not** removed when the registry drops back to zero.
+    /// `subscribe_commits` is synchronous and may run inside `read_on_line`
+    /// (the document watch path), so installing/removing the line listener on
+    /// every 0→1/1→0 transition would race the line (a commit already queued
+    /// behind the read job could dispatch before the install/removal command).
+    /// Keeping one inert, gated listener makes the 0→1 transition take effect
+    /// on the very next commit and the 1→0 transition stop `adopt`
+    /// immediately, without a lost-publication window.
     async fn ensure_ready(&self) -> Result<(), StorageError> {
         if let Some(result) = self.ready.get() {
             return result.clone();
         }
         let subscribers = self.subscribers.clone();
+        // The subscribers of the commit whose gate probe just ran. `begin_commit`
+        // evaluates the probe once at commit start; dispatch takes this slot
+        // rather than the live registry, so a subscription landing between the
+        // gate and the fan-out cannot receive a frame assembled without the
+        // document changes that gate skipped. The lock is never held across a
+        // host callback.
+        let dispatch: Arc<Mutex<Option<Vec<CommitListener>>>> = Arc::new(Mutex::new(None));
         let result = self
             .ready
             .get_or_init(|| async {
                 self.handle
                     .maintain(move |inner| {
                         let subscribers = subscribers.clone();
+                        let probe_subscribers = subscribers.clone();
+                        let dispatch = dispatch.clone();
+                        let probe_dispatch = dispatch.clone();
                         let report = inner.report.clone();
                         let telemetry = inner.telemetry.clone();
                         let listener: CommitListener = Arc::new(move |publication, context| {
-                            let listeners: Vec<CommitListener> = {
-                                let registry = subscribers
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                registry
-                                    .iter()
-                                    .map(|(_, listener)| listener.clone())
-                                    .collect()
-                            };
+                            let listeners: Vec<CommitListener> = dispatch
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                                .unwrap_or_default();
                             for listener in &listeners {
                                 // A failing host listener never fails the
                                 // commit; it is reported (upstream `contained`).
@@ -1220,7 +1268,22 @@ impl Session {
                                 }
                             }
                         });
-                        inner.commit_listeners.add(listener);
+                        let wants_documents: Arc<dyn Fn() -> bool + Send + Sync> =
+                            Arc::new(move || {
+                                let listeners: Vec<CommitListener> = probe_subscribers
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .iter()
+                                    .map(|(_, listener)| listener.clone())
+                                    .collect();
+                                let wants = !listeners.is_empty();
+                                *probe_dispatch
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(listeners);
+                                wants
+                            });
+                        inner.commit_listeners.add_gated(listener, wants_documents);
                     })
                     .await
             })

@@ -403,6 +403,82 @@ async fn persisted_session_survives_disconnect_and_restart() {
         .expect("serve client 2");
 }
 
+/// P1-01 regression: `Command::Create { cwd: None }` persists the default cwd
+/// in the session header in its ABSOLUTE form (`SessionManager` resolves `"."`
+/// before writing). A restarted server must accept that path as the default
+/// cwd even with `PIR_SERVER_ALLOWED_ROOTS` unset; before the fix every
+/// absolute cwd required an allowlist and the core restart-recovery path
+/// answered `forbidden`.
+#[tokio::test]
+async fn default_cwd_session_reattaches_after_restart_without_allowed_roots() {
+    let _ambient = AllowedRootsGuard::without_roots().await;
+    let temp = TempDir::new("default-cwd-restart");
+    let (registry, _provider) = recording_registry();
+    let state =
+        ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry)
+            .with_session_dir(temp.0.clone());
+    let server = Server::bind_with_state("127.0.0.1:0", state)
+        .await
+        .expect("bind server");
+    let address = server.local_addr().expect("local address");
+    let accepting = tokio::spawn(async move { server.accept_once().await });
+    let mut client = Client::connect(address).await.expect("hello handshake");
+    let session_id = create_session(&mut client).await;
+    // Attach + prompt once so the header and transcript are flushed to disk
+    // (a created session writes its file lazily on the first append).
+    client
+        .request(Command::Attach {
+            session_id: session_id.clone(),
+        })
+        .await
+        .expect("attach the freshly created session");
+    tokio::time::timeout(
+        WAIT_BUDGET,
+        client.request(Command::Prompt {
+            session_id: session_id.clone(),
+            text: "persist the default cwd".to_owned(),
+        }),
+    )
+    .await
+    .expect("prompt completes")
+    .expect("prompt ok");
+    drop(client);
+    tokio::time::timeout(WAIT_BUDGET, accepting)
+        .await
+        .expect("connection task settles")
+        .expect("accept task join")
+        .expect("serve client");
+
+    // Restart: a fresh server on the same directory must reopen and attach
+    // the persisted session using only the shipped default policy.
+    let (registry2, _provider2) = recording_registry();
+    let state2 =
+        ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry2)
+            .with_session_dir(temp.0.clone());
+    let server2 = Server::bind_with_state("127.0.0.1:0", state2)
+        .await
+        .expect("rebind server");
+    let address2 = server2.local_addr().expect("second local address");
+    let accepting2 = tokio::spawn(async move { server2.accept_once().await });
+    let mut client2 = Client::connect(address2).await.expect("second handshake");
+    let attached = tokio::time::timeout(
+        WAIT_BUDGET,
+        client2.request(Command::Attach {
+            session_id: session_id.clone(),
+        }),
+    )
+    .await
+    .expect("attach after restart completes")
+    .expect("the default-cwd session must reattach without PIR_SERVER_ALLOWED_ROOTS");
+    assert_eq!(attached["session"]["id"], session_id.as_str());
+    drop(client2);
+    tokio::time::timeout(WAIT_BUDGET, accepting2)
+        .await
+        .expect("second connection task settles")
+        .expect("accept task join")
+        .expect("serve client 2");
+}
+
 /// A real `pir server` child process bound to an ephemeral port, with its
 /// `PIR_SESSION_DIR`/`PIR_AGENT_DIR` isolated per test.
 struct SpawnedCliServer {
@@ -463,6 +539,10 @@ async fn spawn_cli_server(
 /// the seeded session to be listed and attachable by both generations.
 #[tokio::test]
 async fn cli_server_host_enables_session_persistence_across_restarts() {
+    // The child server runs with `current_dir(agent)`; the seeded header
+    // cwd is this test process's cwd, so the allowlist (inherited from the
+    // process environment) must name that cwd for the attach policy.
+    let _allowed_roots = AllowedRootsGuard::for_persisted_cwd().await;
     let sessions = TempDir::new("cli-host-sessions");
     let agent = TempDir::new("cli-host-agent");
     let session_id = persist_session_file(&sessions.0, "cli-host-persisted", 2);
@@ -873,7 +953,12 @@ fn two_model_registry() -> (Arc<ProviderRegistry>, Arc<TwoModelProvider>) {
 async fn persisted_virtual_model_session_resumes_and_routes() {
     let temp = TempDir::new("virtual-resume");
     let session_id = "virtual-resume-session";
-    let cwd = "C:\\virtual-resume";
+    // Attach re-checks the persisted header cwd against `allows_cwd`. A
+    // literal `"."` here is resolved by `SessionManager` against this process
+    // cwd BEFORE it is written, so the header holds the absolute default path;
+    // `resolve_cwd` accepts that exact path as the default cwd (no allowlist
+    // needed).
+    let cwd = ".";
     {
         let mut manager =
             pir::session_manager::SessionManager::create_with_id(cwd, &temp.0, session_id)
@@ -986,6 +1071,63 @@ fn text_block(text: &str) -> ContentBlock {
         text: text.into(),
         text_signature: None,
     })
+}
+
+/// Environment variable the server's cwd policy re-reads on every
+/// `create`/attach (see `ServerSecurityConfig::resolve_cwd`).
+const ALLOWED_ROOTS_ENV: &str = "PIR_SERVER_ALLOWED_ROOTS";
+
+/// Serializes the tests in this binary that point the process-wide
+/// `PIR_SERVER_ALLOWED_ROOTS` at their persisted-session cwd. The attach
+/// policy re-reads the variable on every call, and `spawn_cli_server`
+/// inherits the process environment.
+static ALLOWED_ROOTS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Holds the env lock and restores the previous `PIR_SERVER_ALLOWED_ROOTS`
+/// value on drop (removing it when it was unset), so a test never clobbers an
+/// ambient CI/developer setting or a sibling test's value.
+struct AllowedRootsGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl AllowedRootsGuard {
+    /// Point the allowlist at the cwd [`persist_session_file`] records: it
+    /// calls `create_with_id(".", ...)`, which resolves `.` against THIS test
+    /// process's cwd before writing the header, while `spawn_cli_server` runs
+    /// the child with a different `current_dir`.
+    async fn for_persisted_cwd() -> Self {
+        let lock = ALLOWED_ROOTS_ENV_LOCK.lock().await;
+        let previous = std::env::var_os(ALLOWED_ROOTS_ENV);
+        let cwd = std::env::current_dir().expect("test process cwd");
+        std::env::set_var(ALLOWED_ROOTS_ENV, cwd);
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+
+    /// Run against the shipped default (no allowlist), restoring the ambient
+    /// value on drop: a default-cwd regression must not pass only because
+    /// another test or the CI exported an allowlist.
+    async fn without_roots() -> Self {
+        let lock = ALLOWED_ROOTS_ENV_LOCK.lock().await;
+        let previous = std::env::var_os(ALLOWED_ROOTS_ENV);
+        std::env::remove_var(ALLOWED_ROOTS_ENV);
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+impl Drop for AllowedRootsGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(ALLOWED_ROOTS_ENV, value),
+            None => std::env::remove_var(ALLOWED_ROOTS_ENV),
+        }
+    }
 }
 
 /// Create a real persisted session file with `turns` user/assistant pairs.

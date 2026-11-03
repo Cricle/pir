@@ -197,7 +197,9 @@ pub fn build_azure_params(
     options: &StreamOptions,
 ) -> Result<Value, crate::ai::error::AiError> {
     use crate::ai::api::openai_responses::responses_compat::ResponsesCompat;
-    use crate::ai::api::openai_responses::shared::AZURE_TOOL_CALL_PROVIDERS;
+    use crate::ai::api::openai_responses::shared::{
+        ResponsesWireOptions, AZURE_TOOL_CALL_PROVIDERS,
+    };
     let mut compat = ResponsesCompat::from_model(model);
     // Azure defaults strict tool schemas on (upstream
     // `supportsStrictMode ?? true`).
@@ -211,15 +213,9 @@ pub fn build_azure_params(
     compat.supports_prompt_cache_retention = false;
     let deployment =
         resolve_deployment_name_with_options(model, options.env.as_ref(), options.azure.as_ref());
+    let wire =
+        ResponsesWireOptions::new(&deployment).with_tool_call_providers(AZURE_TOOL_CALL_PROVIDERS);
     crate::ai::api::openai_responses::shared::build_responses_params(
-        model,
-        context,
-        options,
-        &compat,
-        &deployment,
-        AZURE_TOOL_CALL_PROVIDERS,
-        false,
-        // Azure does not use the GPT-6 configuration_update path.
-        None,
+        model, context, options, &compat, &wire,
     )
 }

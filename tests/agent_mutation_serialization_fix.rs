@@ -69,18 +69,18 @@ impl AgentTool for MutationProbeTool {
 /// plain `ToolContext::new`, this exercises the shared-set path.
 fn nested_batch_context(registry: Arc<ToolRegistry>, scheduler: ToolScheduler) -> ToolContext {
     let sink: NestedEventSink = Arc::new(|_event| Box::pin(async {}));
-    let shared = NestedShared::new(
+    let shared = NestedShared::new(pir::agent::nested_tool_calls::NestedSharedConfig {
         registry,
         scheduler,
-        None,
-        None,
-        PathBuf::from("."),
-        None,
-        false,
+        hooks: None,
+        extensions: None,
+        cwd: PathBuf::from("."),
+        signal: None,
+        sequential: false,
         sink,
-        None,
-        None,
-    );
+        session_env: None,
+        callable: None,
+    });
     ToolContext {
         cwd: PathBuf::from("."),
         signal: None,

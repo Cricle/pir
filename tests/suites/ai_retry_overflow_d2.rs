@@ -468,11 +468,14 @@ async fn d2_no_retry_statuses_fail_a_504_after_one_request() {
     let mut chunks = Vec::new();
     let error = client
         .post_json_streaming_with_no_retry_statuses(
-            "https://example.invalid/v1/decisions",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                reqwest::Method::POST,
+                "https://example.invalid/v1/decisions",
+                &BTreeMap::new(),
+                None,
+                &ProviderStreamHooks::default(),
+            ),
             &serde_json::json!({"input": "oversized"}),
-            None,
-            &ProviderStreamHooks::default(),
             &[504],
             &mut |chunk: &[u8]| {
                 chunks.extend_from_slice(chunk);
@@ -502,11 +505,14 @@ async fn d2_empty_no_retry_statuses_keeps_the_retry_policy() {
     let client = status_client(504, 1, &requests);
     let error = client
         .post_json_streaming_with_no_retry_statuses(
-            "https://example.invalid/v1/decisions",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                reqwest::Method::POST,
+                "https://example.invalid/v1/decisions",
+                &BTreeMap::new(),
+                None,
+                &ProviderStreamHooks::default(),
+            ),
             &serde_json::json!({"input": "oversized"}),
-            None,
-            &ProviderStreamHooks::default(),
             &[],
             &mut |_chunk: &[u8]| Ok(()),
         )
@@ -586,12 +592,14 @@ fn body_client(
 async fn transport_error(client: &ProviderRequestClient) -> AiError {
     client
         .request_streaming(
-            reqwest::Method::POST,
-            "https://example.invalid/v1/responses",
-            &BTreeMap::new(),
+            pir::ai::transport::StreamingRequest::new(
+                reqwest::Method::POST,
+                "https://example.invalid/v1/responses",
+                &BTreeMap::new(),
+                None,
+                &ProviderStreamHooks::default(),
+            ),
             b"{}".to_vec(),
-            None,
-            &ProviderStreamHooks::default(),
             &mut |_chunk: &[u8]| Ok(()),
         )
         .await

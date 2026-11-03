@@ -173,13 +173,14 @@ impl AgentSession {
         let Some(page) = session.read_older_page(cursor, max_bytes, max_entries)? else {
             return Ok(None);
         };
-        let messages: Vec<Message> = page
-            .entries()
-            .iter()
-            .flat_map(|entry| {
-                crate::session_manager::projection::session_entry_to_context_messages(entry)
-            })
-            .collect();
+        // Push-based projection: one shared aggregate instead of a throwaway
+        // `Vec<Message>` per entry (`flat_map` over per-entry collects
+        // allocated and freed one small Vec per entry — a page of ~750 entries
+        // paid ~750 allocations per load-more step).
+        let mut messages: Vec<Message> = Vec::new();
+        for entry in page.entries() {
+            crate::session_manager::projection::push_entry_context_messages(entry, &mut messages);
+        }
         Ok(Some((messages, page.page_start())))
     }
 
@@ -188,6 +189,51 @@ impl AgentSession {
     pub async fn older_transcript_cursor(&self) -> Option<u64> {
         let session = self.session.as_ref()?;
         session.lock().await.prefix_cursor()
+    }
+
+    /// Ask the session manager to parse the page at `cursor` on a background
+    /// thread so the next [`AgentSession::older_transcript_messages`] call is
+    /// a cache hit. Returns whether a prefetch was started (a repeat call for
+    /// the same cursor/caps is deduped by the page cache). The UI's near-top
+    /// scroll trigger calls this; it never parses on the caller's thread.
+    pub async fn prefetch_older_transcript(
+        &self,
+        cursor: u64,
+        max_bytes: usize,
+        max_entries: usize,
+    ) -> bool {
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        let session = session.lock().await;
+        session.prefetch_older_page(cursor, max_bytes, max_entries)
+    }
+
+    /// Whether the page at `cursor` is already in the manager's page cache
+    /// (test/diagnostic; useful to wait for a prefetch without sleeping on a
+    /// fixed timeout).
+    pub async fn is_older_transcript_cached(
+        &self,
+        cursor: u64,
+        max_bytes: usize,
+        max_entries: usize,
+    ) -> bool {
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        session
+            .lock()
+            .await
+            .is_older_page_cached(cursor, max_bytes, max_entries)
+    }
+
+    /// Cache counters of a paged session, when this build has the paged reader.
+    #[cfg(feature = "session")]
+    pub async fn older_transcript_cache_stats(
+        &self,
+    ) -> Option<crate::session_manager::PageCacheStats> {
+        let session = self.session.as_ref()?;
+        session.lock().await.older_page_cache_stats()
     }
 
     /// The transcript as RPC/`get_messages` sees it (upstream
@@ -205,30 +251,26 @@ impl AgentSession {
         }
     }
 
-    /// The transcript as a shared snapshot: zero-copy for ephemeral sessions
-    /// ([`Self::history_snapshot`]); the session branch wraps its freshly
-    /// built projection. Read paths that only iterate or measure use this.
-    pub(super) async fn transcript_snapshot(&self) -> Arc<Vec<Message>> {
-        match &self.session {
-            Some(session) => Arc::new(
-                session
-                    .lock()
-                    .await
-                    .build_session_projection()
-                    .map(|projection| projection.messages)
-                    .unwrap_or_default(),
-            ),
-            None => self.history_snapshot(),
-        }
-    }
-
     /// [`Self::transcript`] serialized to upstream `AgentMessage` JSON.
+    ///
+    /// MEMORY SHAPE: a persisted session walks its retained entries and
+    /// serializes each plain stored message by reference
+    /// ([`crate::session_manager::projection::build_session_context_json`]) —
+    /// the old shape built the full projection (`Vec<Message>`, a clone of
+    /// every message) only to serialize and drop it. An ephemeral session
+    /// serializes its shared history snapshot directly, without the
+    /// `history_owned` copy.
     pub async fn transcript_json(&self) -> Vec<JsonValue> {
-        self.transcript_snapshot()
-            .await
-            .iter()
-            .map(message_json)
-            .collect()
+        match &self.session {
+            Some(session) => {
+                let manager = session.lock().await;
+                crate::session_manager::projection::build_session_context_json(
+                    manager.resident_entries(),
+                    manager.leaf_id(),
+                )
+            }
+            None => self.history_snapshot().iter().map(message_json).collect(),
+        }
     }
 
     /// The COMPLETE session message view (upstream `session.messages`): the
@@ -306,7 +348,7 @@ impl AgentSession {
                 continue;
             }
             let edit = entry.id().and_then(|id| edits.get(id).copied());
-            messages.extend(full_entry_messages(entry, edit));
+            push_full_entry_messages(entry, edit, &mut messages);
         }
         messages
     }
@@ -385,10 +427,11 @@ fn last_assistant_text_in(messages: &[Message]) -> Option<String> {
 /// One retained session entry as upstream `session.messages` records
 /// (`sessionEntryToContextMessages`): message records verbatim, custom
 /// messages and summaries in their own roles.
-fn full_entry_messages(
+fn push_full_entry_messages(
     entry: &crate::session_manager::FileEntry,
     edit: Option<&crate::session_manager::ContextEditEntry>,
-) -> Vec<JsonValue> {
+    messages: &mut Vec<JsonValue>,
+) {
     use crate::session_manager::{FileEntry, StoredMessage};
     match entry {
         FileEntry::Message(inner) => {
@@ -396,18 +439,18 @@ fn full_entry_messages(
             // `full_messages_json`).
             if let StoredMessage::BashExecution(bash) = &inner.message {
                 if bash.excluded() {
-                    return Vec::new();
+                    return;
                 }
             }
             let Ok(mut value) = serde_json::to_value(&inner.message) else {
-                return Vec::new();
+                return;
             };
             if let Some(edit) = edit {
                 if !apply_context_edit(&mut value, edit) {
-                    return Vec::new();
+                    return;
                 }
             }
-            vec![value]
+            messages.push(value);
         }
         FileEntry::CustomMessage(inner) => {
             let mut value = serde_json::json!({
@@ -423,25 +466,24 @@ fn full_entry_messages(
             }
             if let Some(edit) = edit {
                 if !apply_context_edit(&mut value, edit) {
-                    return Vec::new();
+                    return;
                 }
             }
-            vec![value]
+            messages.push(value);
         }
         FileEntry::BranchSummary(inner) => {
             if inner.summary.is_empty() {
-                return Vec::new();
+                return;
             }
-            vec![serde_json::json!({
+            messages.push(serde_json::json!({
                 "role": "branchSummary",
                 "summary": &inner.summary,
                 "fromId": &inner.from_id,
                 "timestamp": crate::session_manager::ms_from_iso(&inner.timestamp)
                     .unwrap_or(0),
-            })]
+            }));
         }
         FileEntry::Compaction(inner) => {
-            let mut messages = Vec::new();
             // The checkpoint's stored system message replays first (upstream
             // `entry.systemMessage ? [entry.systemMessage, summary] : [summary]`).
             if let Some(system) = &inner.system_message {
@@ -456,11 +498,10 @@ fn full_entry_messages(
                 "timestamp": crate::session_manager::ms_from_iso(&inner.timestamp)
                     .unwrap_or(0),
             }));
-            messages
         }
         // State entries (usage, label, custom, model/thinking changes,
         // session_info, context_edit): no message record.
-        _ => Vec::new(),
+        _ => {}
     }
 }
 

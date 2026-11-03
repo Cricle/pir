@@ -253,13 +253,15 @@ pub fn run_package_command_with_trust(
             if let Some(selector) = enable {
                 let message = set_config_resource_enabled(
                     &mut settings,
-                    &agent_dir,
-                    &cwd,
-                    project_trusted,
-                    *local,
-                    selector,
-                    source.as_deref(),
-                    true,
+                    ConfigResourceToggle {
+                        agent_dir: &agent_dir,
+                        cwd: &cwd,
+                        project_trusted,
+                        local: *local,
+                        selector,
+                        source: source.as_deref(),
+                        enabled: true,
+                    },
                 )?;
                 // `--json` owns stdout: the confirmation is a diagnostic, so
                 // a scripted consumer receives one parseable document.
@@ -285,13 +287,15 @@ pub fn run_package_command_with_trust(
             if let Some(selector) = disable {
                 let message = set_config_resource_enabled(
                     &mut settings,
-                    &agent_dir,
-                    &cwd,
-                    project_trusted,
-                    *local,
-                    selector,
-                    source.as_deref(),
-                    false,
+                    ConfigResourceToggle {
+                        agent_dir: &agent_dir,
+                        cwd: &cwd,
+                        project_trusted,
+                        local: *local,
+                        selector,
+                        source: source.as_deref(),
+                        enabled: false,
+                    },
                 )?;
                 // See the `--enable` arm: no plain-text prefix in JSON mode.
                 if *json {
@@ -3555,21 +3559,44 @@ fn set_package_resource_filter(
     Ok(())
 }
 
+/// One resource enable/disable request on the non-interactive writable
+/// surface (the `pir package config --enable/--disable` flags).
+#[derive(Clone, Copy, Debug)]
+pub struct ConfigResourceToggle<'a> {
+    /// The agent (global settings) directory.
+    pub agent_dir: &'a Path,
+    /// The project directory.
+    pub cwd: &'a Path,
+    /// Whether the project directory is trusted; a project-scope write
+    /// without trust is refused.
+    pub project_trusted: bool,
+    /// Whether the toggle targets the project (`--local`) or the global
+    /// settings scope.
+    pub local: bool,
+    /// The `<kind>:<pattern>` selector naming the resource.
+    pub selector: &'a str,
+    /// The owning package that disambiguates a pattern shared by several
+    /// installed packages (upstream `--source`).
+    pub source: Option<&'a str>,
+    /// The requested state.
+    pub enabled: bool,
+}
+
 /// Enabled/disable one package resource by selector (the non-interactive
 /// writable surface). Returns the confirmation line the command prints.
-// The arguments mirror the CLI surface (scope/selector/source/enabled); the
-// function is a single-pass resolver, so a request struct would be a refactor.
-#[allow(clippy::too_many_arguments)]
 pub fn set_config_resource_enabled(
     settings: &mut SettingsManager,
-    agent_dir: &Path,
-    cwd: &Path,
-    project_trusted: bool,
-    local: bool,
-    selector: &str,
-    source: Option<&str>,
-    enabled: bool,
+    toggle: ConfigResourceToggle<'_>,
 ) -> crate::Result<String> {
+    let ConfigResourceToggle {
+        agent_dir,
+        cwd,
+        project_trusted,
+        local,
+        selector,
+        source,
+        enabled,
+    } = toggle;
     if local && !project_trusted {
         return Err(anyhow::anyhow!(
             "Project is not trusted. Use --approve to modify local resource config."
@@ -3699,13 +3726,15 @@ pub fn run_config_interactive_with<R: BufRead, W: Write>(
         }
         let message = set_config_resource_enabled(
             settings,
-            agent_dir,
-            cwd,
-            project_trusted,
-            local,
-            &target.selector(),
-            Some(&target.source),
-            !target.enabled,
+            ConfigResourceToggle {
+                agent_dir,
+                cwd,
+                project_trusted,
+                local,
+                selector: &target.selector(),
+                source: Some(&target.source),
+                enabled: !target.enabled,
+            },
         )?;
         writeln!(writer, "  {message}")?;
     }

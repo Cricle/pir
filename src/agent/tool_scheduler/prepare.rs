@@ -33,6 +33,28 @@ pub(super) struct PreparedCall {
     pub(super) background: bool,
 }
 
+/// One batch's preflight request: the calls to prepare and the scheduler-wide
+/// handles preflight reads.
+pub(super) struct BatchPreflight<'a> {
+    /// The calls to prepare, in source order (consumed: preflight is their
+    /// last reader).
+    pub(super) calls: Vec<AgentToolCall>,
+    /// The registry the calls resolve against.
+    pub(super) registry: &'a ToolRegistry,
+    /// The batch's top-level executable set (`None` = registry-wide).
+    pub(super) callable: Option<&'a std::collections::BTreeSet<String>>,
+    /// The batch context (abort signal, nested executor, ...).
+    pub(super) context: &'a ToolContext,
+    /// The run's hooks.
+    pub(super) hooks: Option<&'a ToolHooks>,
+    /// The batch-start abort snapshot.
+    pub(super) aborted_flag: &'a Arc<AtomicBool>,
+    /// The progress observer (`None` = no observer).
+    pub(super) progress: Option<&'a ToolExecutionProgress>,
+    /// The installed extension/plugin faces (`None` = none installed).
+    pub(super) faces: Option<&'a ToolEventFaces>,
+}
+
 /// Preflight every call in source order (lookup, `background` extraction,
 /// validation, background policy, before-hook), returning the prepared calls,
 /// the error results produced during preflight, and the lifecycle events.
@@ -57,23 +79,23 @@ pub(super) struct PreparedCall {
 ///
 /// The calls are consumed: preflight is their last reader, so each call's
 /// argument payload moves into its prepared call instead of being copied.
-// The scheduler's per-batch context is a fixed set of borrowed handles; folding
-// them into a struct would only move the same fields around.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn prepare_calls(
-    calls: Vec<AgentToolCall>,
-    registry: &ToolRegistry,
-    callable: Option<&std::collections::BTreeSet<String>>,
-    context: &ToolContext,
-    hooks: Option<&ToolHooks>,
-    aborted_flag: &Arc<AtomicBool>,
-    progress: Option<&ToolExecutionProgress>,
-    faces: Option<&ToolEventFaces>,
+    batch: BatchPreflight<'_>,
 ) -> (
     Vec<PreparedCall>,
     Vec<FinalizedToolCall>,
     Vec<ToolExecutionEvent>,
 ) {
+    let BatchPreflight {
+        calls,
+        registry,
+        callable,
+        context,
+        hooks,
+        aborted_flag,
+        progress,
+        faces,
+    } = batch;
     let mut prepared: Vec<PreparedCall> = Vec::new();
     let mut results: Vec<FinalizedToolCall> = Vec::new();
     let mut start_events: Vec<ToolExecutionEvent> = Vec::new();
@@ -464,7 +486,6 @@ pub(super) async fn prepare_calls(
 /// preparation and only executed calls run `afterToolCall`. A gate-blocked
 /// call passes `dispatch_result = false`: it never ran, so it gets no
 /// `tool_result` notification.
-#[allow(clippy::too_many_arguments)]
 async fn push_failure(
     results: &mut Vec<FinalizedToolCall>,
     progress: Option<&ToolExecutionProgress>,

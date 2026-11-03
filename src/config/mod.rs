@@ -11,7 +11,23 @@ pub mod settings;
 pub mod timings;
 pub mod trust;
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
+
+/// Debug-only wrapper that renders a secret token as `None` or
+/// `[REDACTED]`, so a hand-written `Debug` impl can mask it without changing
+/// the public field type.
+pub(crate) struct RedactedToken<'a>(pub(crate) Option<&'a str>);
+
+impl fmt::Debug for RedactedToken<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("Some([REDACTED])"),
+            None => f.write_str("None"),
+        }
+    }
+}
 
 /// Tool execution mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +40,11 @@ pub enum ToolExecutionMode {
 }
 
 /// Top-level agent configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (and `server_auth_token` is skipped by
+/// `Serialize`) so the token can never leak through a log line, panic
+/// message, or serialized response; the field still deserializes normally.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub tool_execution: ToolExecutionMode,
@@ -48,8 +68,9 @@ pub struct Config {
     /// Session directory path.
     #[serde(default = "default_session_dir")]
     pub session_dir: String,
-    /// Optional token required before the remote server handshake.
-    #[serde(default)]
+    /// Optional token required before the remote server handshake. Never
+    /// emitted by `Serialize` or `Debug`; environment/JSON input still loads.
+    #[serde(default, skip_serializing)]
     pub server_auth_token: Option<String>,
     /// Maximum number of simultaneous remote server connections.
     #[serde(default = "default_server_max_connections")]
@@ -66,6 +87,38 @@ pub struct Config {
     /// Permit remote agent/prompt execution.
     #[serde(default = "default_allow_remote_agent")]
     pub allow_remote_agent: bool,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("tool_execution", &self.tool_execution)
+            .field("max_parallel_tools", &self.max_parallel_tools)
+            .field("max_turns", &self.max_turns)
+            .field("fail_fast", &self.fail_fast)
+            .field(
+                "allow_parallel_side_effects",
+                &self.allow_parallel_side_effects,
+            )
+            .field("server_address", &self.server_address)
+            .field("session_dir", &self.session_dir)
+            .field(
+                "server_auth_token",
+                &RedactedToken(self.server_auth_token.as_deref()),
+            )
+            .field("server_max_connections", &self.server_max_connections)
+            .field(
+                "server_max_request_body_bytes",
+                &self.server_max_request_body_bytes,
+            )
+            .field(
+                "server_max_connection_body_bytes",
+                &self.server_max_connection_body_bytes,
+            )
+            .field("allow_remote_bash", &self.allow_remote_bash)
+            .field("allow_remote_agent", &self.allow_remote_agent)
+            .finish()
+    }
 }
 
 fn default_max_parallel_tools() -> usize {

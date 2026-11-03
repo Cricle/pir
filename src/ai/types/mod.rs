@@ -6,6 +6,7 @@
 mod auth;
 mod identity;
 mod image;
+mod message_source;
 mod messages;
 mod model;
 mod stream;
@@ -34,6 +35,10 @@ pub use image::{
     ImagesContent, ImagesContext, ImagesOptions, ImagesRequestOptions, ImagesStopReason,
     InputModality, ModelKind, OutputModality,
 };
+pub use message_source::{
+    approximate_message_json_bytes, message_has_tool_history, summarize_messages,
+    ChainedMessageSource, MessageSource, MessageSourceSummary, SliceMessageSource, SourceMessage,
+};
 pub use messages::{
     AssistantMessage, AssistantRole, ConstrainedSamplingConfig, ContentBlock, Context,
     DeferredHandle, DiagnosticInfo, ImageContent, Message, NestedToolCallRecord,
@@ -50,11 +55,11 @@ pub use stream::{
     finalize_headers, has_header, has_non_empty_header, header_value, insert_header, merge_headers,
     suppress_header, AbortSignal, AbortedError, AssistantMessageEvent, AutoRetryEnd,
     AutoRetryEndHook, AutoRetryStart, AutoRetryStartHook, AzureRequestOptions,
-    BedrockRequestOptions, CacheRetention, Cost, ErrorReason, FetchTransport, HeaderTransform,
-    HeaderTransformHook, ProviderEnv, ProviderHeaders, ProviderStreamHooks, ReasoningSummary,
-    RetryHook, RetryNotice, RetryOutcome, RetryWaitHook, SimpleStreamOptions, StopReason,
-    StreamHook, StreamHookMut, StreamOptions, TerminalReason, TextVerbosity, ThinkingBudgets,
-    ThinkingDisplay, ToolChoice, Usage,
+    BedrockRequestOptions, BeforeProviderHeadersHook, CacheRetention, Cost, ErrorReason,
+    FetchTransport, HeaderTransform, HeaderTransformHook, ProviderEnv, ProviderHeaders,
+    ProviderStreamHooks, ReasoningSummary, RetryHook, RetryNotice, RetryOutcome, RetryWaitHook,
+    SimpleStreamOptions, StopReason, StreamHook, StreamHookMut, StreamOptions, TerminalReason,
+    TextVerbosity, ThinkingBudgets, ThinkingDisplay, ToolChoice, Usage,
 };
 pub use transcript::{
     collapse_system_messages, content_text, create_initial_system_message,

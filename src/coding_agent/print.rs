@@ -22,13 +22,14 @@
 //! through [`BackgroundExit::undelivered`].
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
 use crate::agent::agent_loop::{
-    self, CompactionFn, LoopDeps, LoopOptions, PersistMessageFn, ToolCallWaitFn,
+    self, CompactionFn, EventStreamFn, FinishTurnAction, FinishTurnContext, FinishTurnHook,
+    LoopDeps, LoopOptions, PersistMessageFn, PreambleMessage, ProviderRequest, ToolCallWaitFn,
 };
 use crate::agent::tool_execution::ToolRegistry;
 use crate::agent::tool_scheduler::ToolScheduler;
@@ -40,7 +41,9 @@ use crate::agent_session::{
     BackgroundCallStatus, SessionEvent, SessionEventHandler, SESSION_IDLE, SESSION_RUNNING,
 };
 use crate::ai::provider::ProviderRegistry;
-use crate::ai::types::{ContentBlock, Context, Message, TextContent, UserMessage, UserRole};
+use crate::ai::types::{
+    ContentBlock, Context, Message, MessageSource as _, TextContent, UserMessage, UserRole,
+};
 use crate::coding_agent::session_resolve::{open_session_manager, SessionPlan};
 use crate::compaction::{self, CompactionConfig, ProjectedEntry};
 use crate::extensions::{ExtensionConfig, SessionContextSnapshot};
@@ -132,6 +135,73 @@ pub fn extension_transport_hooks(
     hooks
 }
 
+/// Whether a paged prompt may materialize its full model context from the
+/// session file without widening the manager.
+///
+/// Two consumers need the manager's full ENTRY list during a run, not just
+/// the model context: a live JS runtime (`ctx.sessionManager`) and an
+/// `agent_before_settle` continuation (it re-projects the session). A
+/// builtin-only plan has no JS runtime, and no builtin registers that
+/// continuation. When in doubt this returns `false` and the caller keeps the
+/// eager widen.
+fn print_allows_paged_prompt_context(plugins: Option<&Arc<PluginHost>>) -> bool {
+    let Some(plugins) = plugins else {
+        return true;
+    };
+    if plugins.js_handle().is_some() {
+        return false;
+    }
+    !plugins.has_handlers("agent_before_settle")
+}
+
+/// Whether the print widen fallback may stream its transcript from the session
+/// file instead of materializing `widen_to_full` + a full projection.
+///
+/// Conservative on purpose — every uncertain case keeps the projection path:
+///
+/// * the adapter must be the OpenAI-compatible `/chat/completions` codec and
+///   its streamed body path must be available (no `on_payload`, no
+///   `before_provider_request`, no Anthropic-style cache markers, no Copilot
+///   dynamic headers);
+/// * compaction must be disabled: its threshold hook estimates tokens from
+///   `Context::messages`, which no longer holds the historical prefix;
+/// * no JS runtime / `agent_before_settle` handler may observe or replace the
+///   context (`print_allows_paged_prompt_context`), and no JS `context` /
+///   `context_with_system` handler may rewrite it.
+fn print_can_stream_widen(
+    model: &crate::ai::types::Model,
+    plugins: Option<&Arc<PluginHost>>,
+    extensions: Option<&crate::extensions::ExtensionHandle>,
+    compaction_config: Option<&CompactionConfig>,
+    stream_options: &crate::ai::types::StreamOptions,
+) -> bool {
+    model.api == "openai-completions"
+        && compaction_config.is_none_or(|config| !config.enabled)
+        && print_allows_paged_prompt_context(plugins)
+        && extensions.is_none_or(|runtime| {
+            !runtime.has_handlers("context") && !runtime.has_handlers("context_with_system")
+        })
+        && crate::ai::api::openai::openai_streamed_body_supported(model, stream_options)
+}
+
+/// Tool names already declared ON THE WIRE by a streamed transcript prefix
+/// (the `declareToolChanges` seed; see `LoopOptions::initial_declared_tools`).
+fn streamed_declared_tool_names(messages: &[Message]) -> std::collections::BTreeSet<String> {
+    let mut declared = std::collections::BTreeSet::new();
+    for message in messages {
+        let (Message::System(system) | Message::Developer(system)) = message else {
+            continue;
+        };
+        for tool in system.tools_added.iter().flatten() {
+            declared.insert(tool.name.clone());
+        }
+        for tool in system.tools_removed.iter().flatten() {
+            declared.remove(&tool.name);
+        }
+    }
+    declared
+}
+
 /// Per-request transport hooks for the print host, routed through the unified
 /// plugin host — the print twin of the session's streamFn seam
 /// (agent_session/stream.rs:112-164): the `before_provider_request` payload
@@ -149,6 +219,10 @@ pub fn extension_transport_hooks(
 /// (`tool-repair`'s Phase 0 sanitizer) can never double-run. With no host the
 /// JS-handle-only fallback ([`extension_transport_hooks`]) keeps the previous
 /// behavior for host-less callers.
+///
+/// No model is known here, so the payload hook keeps the historical coarse
+/// interest gate; [`print_transport_hooks_with_model`] is the production entry
+/// and can prove the only interested handler inert.
 pub fn print_transport_hooks(
     plugins: Option<&Arc<PluginHost>>,
     runtime: Option<&crate::extensions::ExtensionHandle>,
@@ -163,6 +237,16 @@ pub fn print_transport_hooks(
 /// ([`crate::agent_session::provider_stream_event_hook`]); it is installed
 /// only when the unified host has a handler. Without a model the hook is
 /// omitted, matching the historical print path (before/after only).
+///
+/// The payload hook uses the model gate rather than plain handler interest: a
+/// host whose only `before_provider_request` handler is provably inert for
+/// this model (the builtin `tool-repair` outside `anchorBleedModels`, with no
+/// JS or other native handler) installs NO payload hook. That is what lets
+/// the OpenAI adapter keep its streamed body path instead of materializing the
+/// whole request as a `serde_json::Value` (the print-widen peak); when any
+/// handler could run, the value path and the hook's order/merge behavior stay
+/// exactly as before. Without a model the historical coarse
+/// [`PluginHost::has_handlers`] gate is kept (`None` proves nothing inert).
 pub fn print_transport_hooks_with_model(
     plugins: Option<&Arc<PluginHost>>,
     runtime: Option<&crate::extensions::ExtensionHandle>,
@@ -172,7 +256,10 @@ pub fn print_transport_hooks_with_model(
         return extension_transport_hooks(runtime);
     };
     let mut hooks = crate::ai::types::ProviderStreamHooks::default();
-    if plugins.has_handlers("before_provider_request") {
+    if plugins.has_active_handlers_for(
+        "before_provider_request",
+        model.map(|model| model.id.as_str()),
+    ) {
         let plugins = Arc::clone(plugins);
         hooks.before_provider_request = Some(Arc::new(move |payload: serde_json::Value| {
             let plugins = Arc::clone(&plugins);
@@ -211,6 +298,36 @@ pub fn print_transport_hooks_with_model(
                     if let Err(error) = plugins.emit("after_provider_response", &mut event).await {
                         eprintln!("[ext] after_provider_response dispatch failed: {error}");
                     }
+                })
+            },
+        ));
+    }
+    if plugins.has_handlers("before_provider_headers") {
+        let plugins = Arc::clone(plugins);
+        hooks.before_provider_headers = Some(Arc::new(
+            move |headers: crate::ai::types::ProviderHeaders| {
+                let plugins = Arc::clone(&plugins);
+                Box::pin(async move {
+                    let original = headers.clone();
+                    let mut event = serde_json::json!({
+                        "type": "before_provider_headers",
+                        "headers": headers,
+                    });
+                    if let Err(error) = plugins.emit("before_provider_headers", &mut event).await {
+                        eprintln!("[ext] before_provider_headers dispatch failed: {error}");
+                        return original;
+                    }
+                    let Some(updated) = event.get("headers").and_then(serde_json::Value::as_object)
+                    else {
+                        return original;
+                    };
+                    let mut merged = crate::ai::types::ProviderHeaders::new();
+                    for (name, value) in updated {
+                        if let Some(value) = value.as_str() {
+                            crate::ai::types::insert_header(&mut merged, name, value.to_owned());
+                        }
+                    }
+                    merged
                 })
             },
         ));
@@ -286,6 +403,259 @@ pub fn print_plugin_host(
     )))
 }
 
+/// `$VAR` / `${VAR}` interpolation for a provider `apiKey` (the print twin of
+/// `agent_session::providers::interpolate_api_key`, which is private to that
+/// module). Unset variables expand to empty, matching the session.
+fn print_interpolate_api_key(value: &str) -> String {
+    if !value.contains('$') {
+        return value.to_owned();
+    }
+    let mut out = String::with_capacity(value.len());
+    let chars: Vec<char> = value.chars().collect();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] != '$' {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        if index + 1 < chars.len() && chars[index + 1] == '{' {
+            if let Some(close) = chars[index + 2..].iter().position(|c| *c == '}') {
+                let name: String = chars[index + 2..index + 2 + close].iter().collect();
+                if !name.is_empty() {
+                    if let Ok(value) = std::env::var(&name) {
+                        out.push_str(&value);
+                    }
+                    index += close + 3;
+                    continue;
+                }
+            }
+        }
+        let mut name = String::new();
+        let mut cursor = index + 1;
+        while cursor < chars.len() && (chars[cursor].is_alphanumeric() || chars[cursor] == '_') {
+            name.push(chars[cursor]);
+            cursor += 1;
+        }
+        if !name.is_empty() {
+            if let Ok(value) = std::env::var(&name) {
+                out.push_str(&value);
+            }
+            index = cursor;
+            continue;
+        }
+        out.push('$');
+        index += 1;
+    }
+    out
+}
+
+/// Parse one `pi.registerProvider` config's `models` array into [`Model`]s.
+///
+/// The print twin of `agent_session::providers::parse_provider_models`
+/// (private to the session module): fills the upstream defaults the wire
+/// shape may omit, then lets `Model`'s serde decode the merged object.
+fn print_provider_models(
+    provider_id: &str,
+    config: &JsonValue,
+) -> Result<Vec<crate::ai::types::Model>, String> {
+    let Some(models) = config.get("models").and_then(JsonValue::as_array) else {
+        return Ok(Vec::new());
+    };
+    let provider_base_url = config
+        .get("baseUrl")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let provider_api = config.get("api").and_then(JsonValue::as_str);
+    let provider_headers = config.get("headers").cloned();
+    let mut parsed = Vec::with_capacity(models.len());
+    for model in models {
+        let Some(id) = model.get("id").and_then(JsonValue::as_str) else {
+            return Err("model entry is missing `id`".to_owned());
+        };
+        let mut value = model.clone();
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| format!("model `{id}` must be an object"))?;
+        object
+            .entry("name")
+            .or_insert_with(|| JsonValue::String(id.to_owned()));
+        object.entry("api").or_insert_with(|| {
+            JsonValue::String(provider_api.unwrap_or("openai-completions").to_owned())
+        });
+        object.insert(
+            "provider".to_owned(),
+            JsonValue::String(provider_id.to_owned()),
+        );
+        if object
+            .get("baseUrl")
+            .and_then(JsonValue::as_str)
+            .is_none_or(str::is_empty)
+        {
+            if provider_base_url.is_empty() {
+                return Err(format!("model `{id}` has no baseUrl"));
+            }
+            object.insert(
+                "baseUrl".to_owned(),
+                JsonValue::String(provider_base_url.to_owned()),
+            );
+        }
+        object.entry("reasoning").or_insert(JsonValue::Bool(false));
+        object
+            .entry("input")
+            .or_insert_with(|| JsonValue::Array(vec![JsonValue::String("text".to_owned())]));
+        object
+            .entry("contextWindow")
+            .or_insert(JsonValue::from(128_000u64));
+        object
+            .entry("maxTokens")
+            .or_insert(JsonValue::from(4_096u64));
+        object.entry("cost").or_insert_with(|| {
+            serde_json::json!({
+                "input": 0.0,
+                "output": 0.0,
+                "cacheRead": 0.0,
+                "cacheWrite": 0.0,
+            })
+        });
+        if let Some(headers) = provider_headers.as_ref().and_then(JsonValue::as_object) {
+            let model_headers = object
+                .entry("headers")
+                .or_insert_with(|| JsonValue::Object(Default::default()));
+            if let Some(model_headers) = model_headers.as_object_mut() {
+                for (key, value) in headers {
+                    model_headers
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+        }
+        let parsed_model: crate::ai::types::Model = serde_json::from_value(value)
+            .map_err(|error| format!("model `{id}` is invalid: {error}"))?;
+        parsed.push(parsed_model);
+    }
+    Ok(parsed)
+}
+
+/// Apply the unified plugin registry's `pi.registerProvider` /
+/// `pi.registerVirtualModel` definitions to the print host's provider
+/// registry.
+///
+/// `AgentSession` does this on every prompt (`sync_plugin_providers` +
+/// `sync_plugin_virtual_models`). Print drives `agent_loop` directly and has
+/// no `AgentSession`, so before this hook its provider registry was exactly
+/// `PiEnvironment.registry`: an extension provider visible in TUI/RPC/SDK
+/// was silently absent from `pir print` / `--mode json`.
+///
+/// The supported surface is the declarative definition subset print can
+/// honor without a session: `models`, `baseUrl`, `api`, `apiKey`, provider
+/// headers, `streamSimple` (routed through the JS callback provider) and
+/// virtual-model overlays. `refreshModels`/`oauth` callbacks stay
+/// session-only; their static model list is still registered so the provider
+/// is selectable in print.
+pub fn sync_print_plugin_providers(plugins: &PluginHost, registry: &ProviderRegistry) {
+    use crate::ai::providers::{RegisterDynamicProviderShared, RegisterJsStreamProviderShared};
+
+    for def in plugins.registry().provider_defs() {
+        let Some(id) = def.get("id").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let config = def.get("config").cloned().unwrap_or(JsonValue::Null);
+        let wants_js_stream = config.get("streamSimple").and_then(JsonValue::as_bool) == Some(true);
+        let base_url = config
+            .get("baseUrl")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let api = config
+            .get("api")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("openai-completions")
+            .to_owned();
+        let mut models = match print_provider_models(id, &config) {
+            Ok(models) => models,
+            Err(error) => {
+                crate::ext_diag!("[ext] print provider `{id}` skipped: {error}");
+                continue;
+            }
+        };
+        if models.is_empty() {
+            // A model-less `baseUrl` definition overrides the URL of the
+            // provider's existing models (upstream `provider-composer`
+            // baseUrl-only path).
+            if base_url.is_empty() {
+                crate::ext_diag!("[ext] print provider `{id}` skipped: no models and no baseUrl");
+                continue;
+            }
+            let existing = registry.get_provider_models(id);
+            if existing.is_empty() {
+                crate::ext_diag!(
+                    "[ext] print provider `{id}` skipped: baseUrl-only override but no known models"
+                );
+                continue;
+            }
+            models = existing
+                .into_iter()
+                .map(|mut model| {
+                    model.base_url = base_url.clone();
+                    model
+                })
+                .collect();
+        }
+        let dynamic = crate::ai::providers::DynamicProviderConfig {
+            base_url,
+            api_key: config
+                .get("apiKey")
+                .and_then(JsonValue::as_str)
+                .map(print_interpolate_api_key)
+                .filter(|key| !key.is_empty()),
+            api,
+            models,
+            compat: None,
+            refresh: None,
+        };
+        if wants_js_stream {
+            if let Some(js) = plugins.js_handle() {
+                if let Err(error) = registry.register_js_stream_provider_shared(
+                    id.to_owned(),
+                    dynamic.models.clone(),
+                    js.clone(),
+                ) {
+                    crate::ext_diag!(
+                        "[ext] print provider `{id}` streamSimple registration failed: {error}"
+                    );
+                }
+                continue;
+            }
+        }
+        if let Err(error) = registry.register_dynamic_provider_shared(id.to_owned(), dynamic) {
+            crate::ext_diag!("[ext] print provider `{id}` registration failed: {error}");
+        }
+    }
+
+    for def in plugins.registry().virtual_model_defs() {
+        let source = def
+            .get("source")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("plugin");
+
+        let registration =
+            match crate::ai::virtual_::VirtualModelRegistration::from_wire(&def, source) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    crate::ext_diag!("[ext] print virtual model definition skipped: {error}");
+                    continue;
+                }
+            };
+        if let Err(error) = registry.register_virtual_model(registration.clone()) {
+            crate::ext_diag!(
+                "[ext] print virtual model `{}` registration failed: {error}",
+                registration.key()
+            );
+        }
+    }
+}
+
 /// Dispatch the print host's `session_start` event through the unified plugin
 /// host.
 ///
@@ -338,52 +708,481 @@ pub async fn dispatch_print_agent_settled(
     }
 }
 
-/// Apply the `input` event to the print host's prompt text through the
-/// unified plugin host.
+/// One prompt after the extension `input` transform.
+#[derive(Debug, Clone)]
+pub struct PrintPromptInput {
+    pub text: String,
+    pub images: Vec<ContentBlock>,
+    /// A handler returned `{action: "handled"}`: the prompt is consumed and no
+    /// model turn starts (upstream `agent-session.ts:2053-2056`). Print keeps
+    /// the same semantics per positional prompt.
+    pub handled: bool,
+}
+
+/// Apply the `input` event to one print prompt through the unified plugin
+/// host (text + images, with `handled`), the print twin of
+/// `agent_session::prompt_input::dispatch_prompt_input`.
 ///
-/// This is the print twin of `agent_session::transform_prompt_input`: the
-/// same `{type, text, images: [], source: "rpc", streamingBehavior: null}`
-/// payload, dispatched through the host's ordered list so native Rust
-/// plugins can transform the prompt exactly like JS handlers. A
-/// `handled`/absent outcome leaves the text untouched (the print facade
-/// always runs the model turn). `host` `None` keeps the JS-only route.
+/// `source` is the upstream default for a programmatic prompt (`"rpc"` was
+/// the historical print value; `AgentSession` uses `"interactive"` for
+/// direct prompts — the payload shape is otherwise identical).
+/// `host` `None` keeps the JS-handle-only route; a missing handler leaves the
+/// prompt byte-identical.
+pub async fn transform_print_input_parts(
+    host: Option<&PluginHost>,
+    runtime: Option<&crate::extensions::ExtensionHandle>,
+    text: &str,
+    images: Vec<ContentBlock>,
+) -> PrintPromptInput {
+    let Some(host) = host else {
+        let text = match runtime {
+            Some(runtime) => crate::agent_session::transform_prompt_input(runtime, text).await,
+            None => text.to_owned(),
+        };
+        return PrintPromptInput {
+            text,
+            images,
+            handled: false,
+        };
+    };
+    if !host.has_handlers("input") {
+        return PrintPromptInput {
+            text: text.to_owned(),
+            images,
+            handled: false,
+        };
+    }
+    // The SAME dispatcher AgentSession's prompt path uses: identical payload
+    // (source `"rpc"` is print's historical source) and image parsing
+    // (`mimeType` defaults to `image/png`, malformed entries dropped). Print
+    // used to carry a near-copy that missed that default.
+    match crate::agent_session::dispatch_print_prompt_input(host, text, images, "rpc", None).await {
+        crate::agent_session::PrintPromptInputAction::Continue { text, images } => {
+            PrintPromptInput {
+                text,
+                images,
+                handled: false,
+            }
+        }
+        crate::agent_session::PrintPromptInputAction::Handled => PrintPromptInput {
+            text: text.to_owned(),
+            images: Vec::new(),
+            handled: true,
+        },
+    }
+}
+
+/// Apply the `input` event to the print host's prompt text (legacy
+/// string-only shape used by callers/tests that have no images).
 pub async fn transform_print_input(
     host: Option<&PluginHost>,
     runtime: Option<&crate::extensions::ExtensionHandle>,
     text: &str,
 ) -> String {
-    let Some(host) = host else {
-        return match runtime {
-            Some(runtime) => crate::agent_session::transform_prompt_input(runtime, text).await,
-            None => text.to_owned(),
-        };
+    transform_print_input_parts(host, runtime, text, Vec::new())
+        .await
+        .text
+}
+
+/// The print-visible result of [`dispatch_print_before_agent_start`].
+#[derive(Debug, Default)]
+pub struct PrintBeforeAgentStartOutcome {
+    pub system_prompt: Option<String>,
+    pub injected_messages: Vec<String>,
+}
+
+/// Dispatch `before_agent_start` for one print prompt through the shared
+/// AgentSession adapter (`agent_session::prompt_loop::
+/// dispatch_before_agent_start`), so both hosts build the same payload and
+/// apply the same `systemPrompt` / `systemPromptOptions` / `messages` result.
+///
+/// `systemPromptOptions` is the print host's structured option object (see
+/// [`PrintPromptCache::system_prompt_options`]); `plugins` `None` returns the
+/// unchanged prompt.
+pub async fn dispatch_print_before_agent_start(
+    plugins: Option<&PluginHost>,
+    prompt: &str,
+    images: &[ContentBlock],
+    system_prompt: String,
+    system_prompt_options: JsonValue,
+) -> PrintBeforeAgentStartOutcome {
+    let Some(plugins) = plugins else {
+        return PrintBeforeAgentStartOutcome::default();
     };
-    let mut payload = serde_json::json!({
-        "type": "input",
-        "text": text,
-        "images": [],
-        "source": "rpc",
-        "streamingBehavior": null,
-    });
-    match host.emit("input", &mut payload).await {
-        Ok(outcome) => {
-            let action = outcome
-                .result
-                .get("action")
-                .and_then(serde_json::Value::as_str);
-            if action == Some("transform") {
-                if let Some(transformed) = outcome
-                    .result
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    return transformed.to_owned();
+    if !plugins.has_handlers("before_agent_start") {
+        return PrintBeforeAgentStartOutcome::default();
+    }
+    let package_dir = crate::config::env::package_dir();
+    let outcome = crate::agent_session::dispatch_before_agent_start(
+        plugins,
+        crate::agent_session::BeforeAgentStartDispatch {
+            prompt: Some(prompt),
+            message: None,
+            system_prompt,
+            system_prompt_options,
+            images,
+        },
+        package_dir.as_deref(),
+    )
+    .await;
+    PrintBeforeAgentStartOutcome {
+        system_prompt: outcome.system_prompt,
+        injected_messages: outcome.injected_messages,
+    }
+}
+
+/// When a print notification drain runs (upstream `AgentSession` applies the
+/// same `pi.sendMessage` differently while a run is starting vs. when idle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrintNotificationPhase {
+    /// The prompt run is being prepared: `sendMessage` steers into THIS run
+    /// (AgentSession's busy semantics; `deliverAs: "nextTurn"` still persists
+    /// for the next run).
+    RunStart,
+    /// The run settled (or the host is idle between prompts): `sendMessage`
+    /// persists a custom message entry and never starts a run. Print has no
+    /// extension-triggered run pump, so `sendUserMessage` is not applied.
+    Settled,
+}
+
+/// One `pi.sendMessage` payload decoded for the print host.
+struct PrintSendMessage {
+    custom_type: String,
+    content: JsonValue,
+    display: bool,
+    details: Option<JsonValue>,
+}
+
+impl PrintSendMessage {
+    fn from_payload(payload: &JsonValue) -> Option<Self> {
+        let message = payload.get("message")?;
+        let custom_type = message.get("customType").and_then(JsonValue::as_str)?;
+        Some(Self {
+            custom_type: custom_type.to_owned(),
+            content: message
+                .get("content")
+                .cloned()
+                .unwrap_or(JsonValue::Array(Vec::new())),
+            display: message
+                .get("display")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            details: message.get("details").cloned().filter(|d| !d.is_null()),
+        })
+    }
+
+    fn user_message(&self) -> Message {
+        let mut content = crate::session_manager::projection::content_blocks(&self.content);
+        if content.is_empty() {
+            content.push(ContentBlock::Text(TextContent {
+                text: custom_message_text(&self.content),
+                text_signature: None,
+            }));
+        }
+        Message::User(UserMessage {
+            role: UserRole::User,
+            content,
+            tools_added: None,
+            tools_removed: None,
+            sections: None,
+            timestamp: crate::ai::util::now_ms(),
+        })
+    }
+}
+
+/// Joined text of a custom message content value (the projection's fallback
+/// for untyped content).
+fn custom_message_text(content: &JsonValue) -> String {
+    match content {
+        JsonValue::String(text) => text.clone(),
+        JsonValue::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                (item.get("type").and_then(JsonValue::as_str) == Some("text"))
+                    .then(|| item.get("text").and_then(JsonValue::as_str))
+                    .flatten()
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+async fn persist_print_custom_message(session: &SharedSession, message: &PrintSendMessage) {
+    let mut guard = session.lock().await;
+    let Some(manager) = guard.as_mut() else {
+        crate::ext_diag!("[ext] sendMessage ignored: the session is not persisted");
+        return;
+    };
+    if let Err(error) = manager.append_custom_message_entry(
+        &message.custom_type,
+        message.content.clone(),
+        message.display,
+        message.details.clone(),
+    ) {
+        crate::ext_diag!("[ext] failed to append custom message entry: {error}");
+    }
+}
+
+/// Print-host presentation drain: `notify` / `status` keep their historical
+/// diagnostic routing; every other presentation class is ignored (print has
+/// no TUI surface). The actionable class is applied separately, never printed
+/// here.
+fn print_presentation_notification(notification: &crate::extensions::Notification) {
+    match notification {
+        crate::extensions::Notification::Notify { message, level } => match level.as_str() {
+            "error" => crate::ext_diag_fatal!("[ext] {level}: {message}"),
+            "warning" | "warn" => crate::ext_diag!("[ext] {level}: {message}"),
+            _ => crate::ext_diag_info!("[ext] {level}: {message}"),
+        },
+        crate::extensions::Notification::Status { key, text } => match text {
+            Some(text) => crate::ext_diag_info!("[ext] status {key}: {text}"),
+            None => crate::ext_diag_info!("[ext] status {key} cleared"),
+        },
+        _ => {}
+    }
+}
+
+/// Drain and apply the print host's extension notifications.
+///
+/// The actionable subset print can honor without an `AgentSession`:
+/// - `sendMessage` steers into the run being prepared (`RunStart`) or persists
+///   a custom message entry (`Settled`; `deliverAs: "nextTurn"`);
+/// - `sendUserMessage` steers its text/image blocks into the preparing run
+///   (print never starts an extra run, so the idle form is dropped with a
+///   diagnostic);
+/// - `appendEntry`, `setSessionName`, `setLabel` persist through the shared
+///   session slot;
+/// - `abort` aborts the current run signal.
+///
+/// `setModel` / `setThinkingLevel` / compaction / shutdown requests are
+/// logged and ignored: print resolves its model and compaction config once per
+/// invocation and has no host loop to apply them (documented in
+/// `docs/hooks.md`). Presentation notifications keep the historical
+/// `notify`/`status` diagnostic routing. Returns the user messages that must
+/// join the preparing run's starting context (they are delivered through the
+/// loop preamble, so `message_start`/`message_end` and replacement apply).
+pub async fn drain_print_extension_notifications(
+    plugins: Option<&Arc<PluginHost>>,
+    runtime: Option<&crate::extensions::ExtensionHandle>,
+    session: &SharedSession,
+    phase: PrintNotificationPhase,
+    run_signal: Option<&crate::ai::types::AbortSignal>,
+) -> Vec<Message> {
+    let Some(plugins) = plugins else {
+        if let Some(runtime) = runtime {
+            // No unified host: the historical JS-only drain (Notify/Status
+            // diagnostics; actionable notifications were never applied here).
+            crate::agent_session::drain_extension_notifications(runtime);
+        }
+        return Vec::new();
+    };
+    for notification in plugins.take_notifications(|notification| notification.is_presentation()) {
+        print_presentation_notification(&notification);
+    }
+    let mut injected = Vec::new();
+    for notification in plugins.take_notifications(|notification| notification.is_actionable()) {
+        match notification {
+            crate::extensions::Notification::SendMessage { payload } => {
+                let Some(message) = PrintSendMessage::from_payload(&payload) else {
+                    crate::ext_diag!("[ext] sendMessage ignored: message requires a customType");
+                    continue;
+                };
+                let deliver_as = payload
+                    .get("options")
+                    .and_then(|options| options.get("deliverAs"))
+                    .and_then(JsonValue::as_str);
+                if phase == PrintNotificationPhase::RunStart && deliver_as != Some("nextTurn") {
+                    // Busy semantics: the preparing run takes the message.
+                    // `triggerTurn: true` cannot start a nested print run, so
+                    // steering it is the non-lossy fallback.
+                    injected.push(message.user_message());
+                } else {
+                    persist_print_custom_message(session, &message).await;
                 }
             }
-            text.to_owned()
+            crate::extensions::Notification::SendUserMessage { payload } => {
+                if phase == PrintNotificationPhase::RunStart {
+                    let content = payload.get("content").cloned().unwrap_or(JsonValue::Null);
+                    let blocks = crate::session_manager::projection::content_blocks(&content);
+                    if blocks.is_empty() {
+                        crate::ext_diag!(
+                            "[ext] sendUserMessage ignored: print has no run to steer"
+                        );
+                    } else {
+                        injected.push(Message::User(UserMessage {
+                            role: UserRole::User,
+                            content: blocks,
+                            tools_added: None,
+                            tools_removed: None,
+                            sections: None,
+                            timestamp: crate::ai::util::now_ms(),
+                        }));
+                    }
+                } else {
+                    crate::ext_diag!(
+                        "[ext] sendUserMessage ignored: print does not start extension runs"
+                    );
+                }
+            }
+            crate::extensions::Notification::AppendEntry { payload } => {
+                let Some(custom_type) = payload.get("customType").and_then(JsonValue::as_str)
+                else {
+                    crate::ext_diag!("[ext] appendEntry ignored: customType is required");
+                    continue;
+                };
+                let data = payload.get("data").cloned().filter(|data| !data.is_null());
+                let mut guard = session.lock().await;
+                match guard.as_mut() {
+                    Some(manager) => {
+                        if let Err(error) = manager.append_custom_entry(custom_type, data) {
+                            crate::ext_diag!("[ext] failed to append custom entry: {error}");
+                        }
+                    }
+                    None => {
+                        crate::ext_diag!("[ext] appendEntry ignored: the session is not persisted")
+                    }
+                }
+            }
+            crate::extensions::Notification::SetSessionName(name) => {
+                let mut guard = session.lock().await;
+                match guard.as_mut() {
+                    Some(manager) => match manager.set_session_name(name.as_deref()) {
+                        Ok(final_name) => {
+                            crate::ext_diag_info!("[ext] session name: {}", final_name.as_str())
+                        }
+                        Err(error) => {
+                            crate::ext_diag!("[ext] failed to persist session name: {error}")
+                        }
+                    },
+                    None => {
+                        crate::ext_diag!(
+                            "[ext] setSessionName ignored: the session is not persisted"
+                        )
+                    }
+                }
+            }
+            crate::extensions::Notification::SetLabel { entry_id, label } => {
+                let mut guard = session.lock().await;
+                match guard.as_mut() {
+                    Some(manager) => {
+                        if let Err(error) = manager.set_label(&entry_id, label.as_deref()) {
+                            crate::ext_diag!("[ext] failed to persist label: {error}");
+                        }
+                    }
+                    None => {
+                        crate::ext_diag!("[ext] setLabel ignored: the session is not persisted")
+                    }
+                }
+            }
+            crate::extensions::Notification::Abort => {
+                if let Some(signal) = run_signal {
+                    signal.abort();
+                } else {
+                    crate::ext_diag!("[ext] abort requested, but print has no live run signal");
+                }
+            }
+            crate::extensions::Notification::SetModel { .. }
+            | crate::extensions::Notification::SetThinkingLevel(_)
+            | crate::extensions::Notification::CompactRequest { .. }
+            | crate::extensions::Notification::ShutdownRequest => {
+                crate::ext_diag!(
+                    "[ext] notification ignored in print: the host resolves model/compaction once per invocation"
+                );
+            }
+            other => {
+                crate::ext_diag!("[ext] notification ignored in print: {other:?}");
+            }
         }
-        Err(_) => text.to_owned(),
     }
+    injected
+}
+
+/// Dispatch the `resources_discover` event for the print host: the shared
+/// AgentSession payload/emit adapter, returning the contributed paths the
+/// caller loads/merges. `None` when no handler exists or nothing was
+/// contributed. Public so the print resource merge is testable without the
+/// full CLI.
+pub async fn dispatch_print_resources_discover(
+    plugins: Option<&PluginHost>,
+    cwd: &std::path::Path,
+    reason: &str,
+) -> Option<crate::extensions::resources::ExtensionResourcePaths> {
+    let plugins = plugins?;
+    crate::agent_session::dispatch_resources_discover_event(plugins, cwd, reason).await
+}
+
+/// Dispatch `agent_before_settle` for the print host over its shared session
+/// slot (the shared AgentSession boundary adapter). Public so the print
+/// settle contract — payload fields, draft commits and the `continue` gate —
+/// is testable without a full `run_print`.
+pub async fn dispatch_print_agent_before_settle(
+    plugins: Option<&PluginHost>,
+    session: SharedSession,
+    context: &Context,
+    terminal: &crate::ai::types::AssistantMessage,
+    pending_messages: bool,
+    run_session_id: Option<&str>,
+) -> bool {
+    let Some(plugins) = plugins else {
+        return false;
+    };
+    if !plugins.has_handlers("agent_before_settle") {
+        return false;
+    }
+    let boundary = crate::agent_session::BoundarySession::Shared(&session);
+    crate::agent_session::dispatch_agent_before_settle_boundary(
+        plugins,
+        Some(boundary),
+        context,
+        terminal,
+        pending_messages,
+        run_session_id,
+    )
+    .await
+}
+
+/// Build the print run's `finish_turn` hook: the shared `turn_end` boundary
+/// over the print host's `SharedSession` slot. `None` when no handler exists
+/// (no loop change at all), matching AgentSession's gate.
+///
+/// `background` answers `context.canContinue`'s `pendingMessages` from the
+/// detached-completion follow-up channel — print's only queued-message source
+/// (AgentSession reads its steering/follow-up inboxes there).
+pub fn print_turn_end_hook(
+    plugins: Option<Arc<PluginHost>>,
+    session: SharedSession,
+    background: Option<Arc<PrintBackground>>,
+    run_session_id: Option<String>,
+) -> Option<FinishTurnHook> {
+    let plugins = plugins?;
+    if !plugins.has_handlers("turn_end") {
+        return None;
+    }
+    Some(Arc::new(move |context: FinishTurnContext| {
+        let plugins = Arc::clone(&plugins);
+        let session = Arc::clone(&session);
+        let background = background.clone();
+        let run_session_id = run_session_id.clone();
+        Box::pin(async move {
+            let pending_messages = match &background {
+                Some(background) => background.has_pending_follow_up().await,
+                None => false,
+            };
+            let boundary = crate::agent_session::BoundarySession::Shared(&session);
+            let continue_requested = crate::agent_session::dispatch_turn_end_boundary(
+                &plugins,
+                Some(boundary),
+                context.turn_index,
+                &context,
+                pending_messages,
+                run_session_id.as_deref(),
+            )
+            .await;
+            continue_requested.then_some(FinishTurnAction::Continue)
+        })
+    }))
 }
 
 /// The `mcp` builtin in a plugin host's ordered dispatch list, if loaded
@@ -507,6 +1306,44 @@ pub fn print_loop_deps(
         max_turns: crate::config::defaults::DEFAULT_AGENT_MAX_TURNS,
         ..LoopDeps::default()
     }
+}
+
+/// Registry-backed event stream scoped to the print host's provider session
+/// (P2-S8-4 print residual).
+///
+/// Request mapping is identical to
+/// [`crate::agent_session::registry_event_stream`]: a `prepare_request`
+/// replacement model wins over the baked one, and a replaced thinking level
+/// replaces the request's reasoning effort. The only difference is provider
+/// (and OAuth credential) resolution: it goes through
+/// [`ProviderRegistry::stream_resolving_auth_for`] with `session_key` so an
+/// entry owned by another live session sharing this registry cannot capture
+/// print's prompt request. Print drives the agent loop without an
+/// `AgentSession`; [`ProviderRegistry::standalone_provider_session`] supplies
+/// the run-scoped key (the same mechanism branch/compaction summaries use).
+fn print_registry_event_stream(
+    registry: Arc<ProviderRegistry>,
+    session_key: crate::ai::provider::ProviderSessionKey,
+    model: crate::ai::types::Model,
+    options: crate::ai::types::StreamOptions,
+) -> EventStreamFn {
+    let base_thinking = options
+        .reasoning
+        .unwrap_or(crate::ai::types::ThinkingLevel::Off);
+    Box::new(move |request: ProviderRequest| {
+        let model = request.model.unwrap_or_else(|| model.clone());
+        let mut options = options.clone();
+        if request.thinking_level != base_thinking {
+            options.reasoning = Some(request.thinking_level);
+        }
+        // The provider trait takes the context by value; the shared request
+        // context is materialized once here (zero-copy when this is the last
+        // handle), never deep-cloned at request construction.
+        let context = crate::agent::agent_loop::context_into_owned(request.context);
+        let stream =
+            registry.stream_resolving_auth_for(Some(&session_key), model, context, options);
+        Box::pin(async move { stream })
+    })
 }
 
 /// The print host's agent-level turn retry policy from its settings snapshot.
@@ -722,6 +1559,8 @@ impl PrintBackground {
             follow_up.inbox(),
             Arc::clone(&state),
             extensions,
+            // Print owns its runtime outright (no shared child fallback).
+            Arc::new(AtomicBool::new(true)),
         );
         Arc::new(Self {
             registry,
@@ -776,6 +1615,15 @@ impl PrintBackground {
     /// How many calls are in flight right now.
     pub fn call_count(&self) -> usize {
         self.registry.len()
+    }
+
+    /// Whether a background completion is queued for the run's next turn
+    /// boundary. Feeds the `pending_messages` half of `context.canContinue`
+    /// for `turn_end` and `agent_before_settle` (the session host reads its
+    /// steering/follow-up queues there; print's only follow-up source is
+    /// detached background completions).
+    pub async fn has_pending_follow_up(&self) -> bool {
+        crate::agent_session::background_follow_up_pending(&self.follow_up).await
     }
 
     /// Every completion the host observed, in settle order (public for the
@@ -1120,16 +1968,32 @@ pub fn print_tool_session_env(
     resolved_active: Arc<std::sync::RwLock<Option<Vec<String>>>>,
     background: Option<Arc<dyn crate::agent::tool_execution::BackgroundControl>>,
 ) -> Arc<crate::agent::tool_execution::ToolSessionEnv> {
-    print_tool_session_env_with_session(
+    print_tool_session_env_with_session(ToolSessionEnvInputs {
         provider_registry,
         model,
         thinking,
         registry,
         resolved_active,
         background,
-        None,
-        None,
-    )
+        session_id: None,
+        session_file: None,
+    })
+}
+
+/// The inputs of one print tool session environment.
+///
+/// [`print_tool_session_env`] forwards the run's tool-selection half with no
+/// persisted-session identity; [`print_tool_session_env_with_session`] takes
+/// the same bundle with the run's `PI_SESSION_ID` / `PI_SESSION_FILE` values.
+pub struct ToolSessionEnvInputs<'a> {
+    pub provider_registry: Arc<ProviderRegistry>,
+    pub model: &'a crate::ai::types::Model,
+    pub thinking: crate::ai::types::ThinkingLevel,
+    pub registry: Arc<ToolRegistry>,
+    pub resolved_active: Arc<std::sync::RwLock<Option<Vec<String>>>>,
+    pub background: Option<Arc<dyn crate::agent::tool_execution::BackgroundControl>>,
+    pub session_id: Option<String>,
+    pub session_file: Option<std::path::PathBuf>,
 }
 
 /// [`print_tool_session_env`] with the run's persisted-session identity: the
@@ -1137,20 +2001,19 @@ pub fn print_tool_session_env(
 /// shell children exactly like an `AgentSession` run (upstream
 /// `ctx.sessionManager.getSessionId()` / `getSessionFile()`). An ephemeral
 /// `--no-session` run passes `None` for both.
-// The parameters are the same session-env inputs the shorter
-// `print_tool_session_env` forwards; grouping them would duplicate that
-// struct's fields at the call site.
-#[allow(clippy::too_many_arguments)]
 pub fn print_tool_session_env_with_session(
-    provider_registry: Arc<ProviderRegistry>,
-    model: &crate::ai::types::Model,
-    thinking: crate::ai::types::ThinkingLevel,
-    registry: Arc<ToolRegistry>,
-    resolved_active: Arc<std::sync::RwLock<Option<Vec<String>>>>,
-    background: Option<Arc<dyn crate::agent::tool_execution::BackgroundControl>>,
-    session_id: Option<String>,
-    session_file: Option<std::path::PathBuf>,
+    inputs: ToolSessionEnvInputs<'_>,
 ) -> Arc<crate::agent::tool_execution::ToolSessionEnv> {
+    let ToolSessionEnvInputs {
+        provider_registry,
+        model,
+        thinking,
+        registry,
+        resolved_active,
+        background,
+        session_id,
+        session_file,
+    } = inputs;
     Arc::new(crate::agent::tool_execution::ToolSessionEnv {
         provider_registry,
         model: model.clone(),
@@ -1210,6 +2073,16 @@ pub fn print_request_definitions(
 /// [`print_active_definitions`]'s per-prompt rebuild, so the two agree
 /// exactly. Only the Rust hooks run (see the build's comment); the in-tree
 /// hook users are Rust.
+///
+/// This is a prompt RENDER, not a run loadout: `print_tool_loadout` runs it
+/// once at startup to derive the declared/hidden surface, long before any
+/// provider request. The bash hook warms the persistent shell pool from
+/// `prepare_loadout`, so without the [`shell_pool::without_prewarm`] gate
+/// `pir print` held a shell member (and its dedicated runtime) at startup
+/// even when the invocation never called a tool. The gate keeps the lazy
+/// get-or-start path for the first real `bash` call intact.
+///
+/// [`shell_pool::without_prewarm`]: crate::coding_agent::tools::shell_pool::without_prewarm
 fn loadout_hook_changes(
     registry: &ToolRegistry,
     active: &[String],
@@ -1217,32 +2090,34 @@ fn loadout_hook_changes(
     std::collections::BTreeMap<String, String>,
     std::collections::BTreeSet<String>,
 ) {
-    let declared_tools = crate::agent::tool_execution::declared_tools(registry, active);
-    let callable_tools = crate::agent::tool_execution::callable_tools(registry, active);
-    let mut exposures = std::collections::BTreeMap::new();
-    let mut namespaces = std::collections::BTreeMap::new();
-    for tool in registry.iter() {
-        exposures.insert(tool.name().to_owned(), tool.exposure());
-        if let Some(namespace) = tool.namespace() {
-            namespaces.insert(tool.name().to_owned(), namespace);
+    crate::coding_agent::tools::shell_pool::without_prewarm(|| {
+        let declared_tools = crate::agent::tool_execution::declared_tools(registry, active);
+        let callable_tools = crate::agent::tool_execution::callable_tools(registry, active);
+        let mut exposures = std::collections::BTreeMap::new();
+        let mut namespaces = std::collections::BTreeMap::new();
+        for tool in registry.iter() {
+            exposures.insert(tool.name().to_owned(), tool.exposure());
+            if let Some(namespace) = tool.namespace() {
+                namespaces.insert(tool.name().to_owned(), namespace);
+            }
         }
-    }
-    let hook_loadout = crate::agent::tool_execution::ToolLoadout {
-        declared: declared_tools,
-        callable: callable_tools,
-        registered: registry.iter().cloned().collect(),
-        exposures,
-        namespaces,
-    };
-    let mut descriptions = std::collections::BTreeMap::new();
-    let mut hidden_declarations = std::collections::BTreeSet::new();
-    for tool in &hook_loadout.declared {
-        if let Some(changes) = tool.prepare_loadout(&hook_loadout) {
-            descriptions.extend(changes.descriptions);
-            hidden_declarations.extend(changes.hidden_declarations);
+        let hook_loadout = crate::agent::tool_execution::ToolLoadout {
+            declared: declared_tools,
+            callable: callable_tools,
+            registered: registry.iter().cloned().collect(),
+            exposures,
+            namespaces,
+        };
+        let mut descriptions = std::collections::BTreeMap::new();
+        let mut hidden_declarations = std::collections::BTreeSet::new();
+        for tool in &hook_loadout.declared {
+            if let Some(changes) = tool.prepare_loadout(&hook_loadout) {
+                descriptions.extend(changes.descriptions);
+                hidden_declarations.extend(changes.hidden_declarations);
+            }
         }
-    }
-    (descriptions, hidden_declarations)
+        (descriptions, hidden_declarations)
+    })
 }
 
 /// The declared names and the prompt's `hiddenTools` input for one active set,
@@ -1293,6 +2168,22 @@ struct PrintedPrompt {
     mcp_servers: Option<String>,
     /// The rendered system prompt.
     prompt: String,
+}
+
+/// The discovery inputs one [`PrintPromptCache`] is built from.
+///
+/// They are captured once before the first prompt; [`PrintPromptCache::sync`]
+/// re-renders only from these values, never from disk. The `mcp_servers`
+/// section is the only input that may also be refreshed later through
+/// [`PrintPromptCache::set_mcp_servers`].
+pub struct PrintPromptCacheInputs {
+    pub preamble_override: Option<String>,
+    pub append: Vec<String>,
+    pub project_files: Vec<(PathBuf, String)>,
+    pub skills: Vec<crate::skills::SkillInfo>,
+    pub cwd: PathBuf,
+    pub package_dir: Option<PathBuf>,
+    pub mcp_servers: Option<String>,
 }
 
 /// The print system prompt, re-rendered per prompt when the DECLARED set
@@ -1350,15 +2241,15 @@ impl PrintPromptCache {
         cwd: PathBuf,
         package_dir: Option<PathBuf>,
     ) -> Self {
-        Self::new_with_mcp_servers(
+        Self::new_with_mcp_servers(PrintPromptCacheInputs {
             preamble_override,
             append,
             project_files,
             skills,
             cwd,
             package_dir,
-            None,
-        )
+            mcp_servers: None,
+        })
     }
 
     /// [`Self::new`] with the invocation's `mcp_servers` section (see
@@ -1368,24 +2259,15 @@ impl PrintPromptCache {
     /// manager's synchronous status snapshot; [`Self::sync`] re-reads it per
     /// prompt through [`Self::set_mcp_servers`], so a `pending` -> `ready`
     /// transition lands on the next prompt.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_mcp_servers(
-        preamble_override: Option<String>,
-        append: Vec<String>,
-        project_files: Vec<(PathBuf, String)>,
-        skills: Vec<crate::skills::SkillInfo>,
-        cwd: PathBuf,
-        package_dir: Option<PathBuf>,
-        mcp_servers: Option<String>,
-    ) -> Self {
+    pub fn new_with_mcp_servers(inputs: PrintPromptCacheInputs) -> Self {
         Self {
-            preamble_override,
-            append,
-            project_files,
-            skills,
-            cwd,
-            package_dir,
-            mcp_servers,
+            preamble_override: inputs.preamble_override,
+            append: inputs.append,
+            project_files: inputs.project_files,
+            skills: inputs.skills,
+            cwd: inputs.cwd,
+            package_dir: inputs.package_dir,
+            mcp_servers: inputs.mcp_servers,
             rendered: None,
         }
     }
@@ -1396,6 +2278,78 @@ impl PrintPromptCache {
     /// next [`Self::sync`], an unchanged section keeps the cached bytes.
     pub fn set_mcp_servers(&mut self, mcp_servers: Option<String>) {
         self.mcp_servers = mcp_servers;
+    }
+
+    /// The `before_agent_start.systemPromptOptions` object for this prompt
+    /// (the print twin of `AgentSession::system_prompt_options_snapshot`):
+    /// the same declared/hidden tool surface, tool snippets/guidelines,
+    /// discovered context files/skills, preamble/addenda, MCP custom section
+    /// and cwd the renderer below uses. A handler may mutate it in place; the
+    /// shared dispatch re-renders it with the ordered builder. No disk IO and
+    /// no mutation of the cached prompt.
+    pub fn system_prompt_options(
+        &self,
+        registry: &ToolRegistry,
+        active: &[String],
+        cell: Option<&[String]>,
+    ) -> JsonValue {
+        use crate::extensions::system_prompt_options::{
+            ContextFileOption, SkillOption, SystemPromptOptions,
+        };
+
+        let effective: &[String] = match cell {
+            Some(names) if names != active => names,
+            _ => active,
+        };
+        let (_, hidden) = print_prompt_state(registry, effective);
+        let mut tool_snippets = std::collections::BTreeMap::new();
+        let mut tool_guidelines = std::collections::BTreeMap::new();
+        for tool in registry.iter() {
+            let info = crate::system_prompt::ToolInfo::from_agent_tool(tool.as_ref());
+            if let Some(snippet) = info.snippet.as_deref().map(str::trim) {
+                if !snippet.is_empty() {
+                    tool_snippets.insert(info.name.clone(), snippet.to_owned());
+                }
+            }
+            if !info.guidelines.is_empty() {
+                tool_guidelines.insert(info.name.clone(), info.guidelines.clone());
+            }
+        }
+        let mut sections = serde_json::Map::new();
+        for (name, content) in
+            crate::coding_agent::context::mcp_custom_sections(self.mcp_servers.as_deref())
+        {
+            if !content.is_empty() {
+                sections.insert(name, JsonValue::String(content));
+            }
+        }
+        let options = SystemPromptOptions {
+            custom_prompt: self.preamble_override.clone(),
+            force_system_prompt: None,
+            // The ACTIVE selection, not the declared-only surface: this is the
+            // value AgentSession's `system_prompt_options_snapshot` exposes
+            // (`selected_tools: active`), so codemode/deferred/hidden tools
+            // are visible to handlers in both hosts. `hidden_tools` below
+            // still describes the declared-vs-registered difference.
+            selected_tools: effective.to_vec(),
+            hidden_tools: hidden,
+            tool_snippets,
+            tool_guidelines,
+            prompt_guidelines: Vec::new(),
+            append_system_prompt: self.append.join("\n\n"),
+            sections,
+            cwd: self.cwd.display().to_string(),
+            context_files: self
+                .project_files
+                .iter()
+                .map(|(path, content)| ContextFileOption {
+                    path: path.display().to_string(),
+                    content: content.clone(),
+                })
+                .collect(),
+            skills: self.skills.iter().map(SkillOption::from_skill).collect(),
+        };
+        options.to_json()
     }
 
     /// The system prompt for one prompt run.
@@ -1636,6 +2590,24 @@ pub enum OutputMode {
     Json,
 }
 
+impl OutputMode {
+    /// The extension-runtime `mode` label for this print host. Both the print
+    /// host and the CLI's strict-validation/pre-trust bootstrap config use
+    /// this single mapping: a `"print"`/`"json"` mismatch makes
+    /// `take_validated_extension_runtime` reject the parked runtime, which
+    /// re-evaluates every extension factory (and, before the rejection path
+    /// suppressed it, emitted a startup-time `session_shutdown`).
+    ///
+    /// JSON is protocol-safe in the runtime's stdio routing
+    /// (`ext_stdio.rs`); it is a distinct mode upstream too (`ctx.mode`).
+    pub fn extension_mode(self) -> &'static str {
+        match self {
+            Self::Text => "print",
+            Self::Json => "json",
+        }
+    }
+}
+
 /// Finish a print run's diagnostics: when the collector was enabled
 /// (`PI_TIMING=1`), print the summary block to stderr and — in `--mode json` —
 /// emit the final `{"type":"run_diagnostics", ...}` frame on stdout after
@@ -1748,6 +2720,27 @@ pub async fn run_print(
     extension_paths: &[PathBuf],
 ) -> crate::Result<PrintOutcome> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let environment = crate::ai::providers::load_pi_environment(Some(&cwd))?;
+    run_print_with_environment(options, config, extension_paths, cwd, environment).await
+}
+
+/// [`run_print`] with an explicit working directory and pre-built model
+/// environment.
+///
+/// The CLI uses the public wrapper (cwd + `load_pi_environment`); integration
+/// tests use this entry point to run the REAL `run_print` pipeline against a
+/// deterministic provider registry, so the hook wiring (preamble lifecycle,
+/// settle re-projection, actionable notifications) is exercised end to end
+/// instead of through individual seams. `#[doc(hidden)]` keeps it out of the
+/// stable facade.
+#[doc(hidden)]
+pub async fn run_print_with_environment(
+    options: PrintOptions,
+    config: &crate::config::Config,
+    extension_paths: &[PathBuf],
+    cwd: PathBuf,
+    environment: crate::ai::providers::PiEnvironment,
+) -> crate::Result<PrintOutcome> {
     let cwd_text = cwd.to_string_lossy().into_owned();
 
     // Termination handlers (upstream print-mode.ts registerSignalHandlers):
@@ -1760,9 +2753,20 @@ pub async fn run_print(
     // foreground command the harness just stopped waiting for), and the
     // per-message persistence sink (see `persist_message` below) keeps
     // everything already streamed. `run_active` bounds the graceful window.
-    let run_signal = crate::ai::types::AbortSignal::new();
+    //
+    // This signal is SEPARATE from the per-prompt run signal below: a process
+    // termination owns the exit code, while an extension's `ctx.abort()` only
+    // cancels the current run (normal settle/drain/`agent_settled`, then the
+    // next positional prompt).
+    let termination = PrintTermination::new();
     let run_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    install_signal_handlers(run_signal.clone(), Arc::clone(&run_active));
+    install_signal_handlers(Arc::clone(&termination), Arc::clone(&run_active));
+
+    // An abort requested while the host is still starting (`session_start`)
+    // has no live run yet. Like AgentSession's pre-start run-abort request, it
+    // applies to the first prompt that actually starts a run; later prompts
+    // get a fresh signal after `clear_abort`.
+    let mut startup_abort = Some(crate::ai::types::AbortSignal::new());
 
     // Run diagnostics (crate::diagnostics): the collector is fed from the
     // event handler built below (the layer that already consumes the loop's
@@ -1773,7 +2777,8 @@ pub async fn run_print(
     ));
 
     // Model environment + settings (upstream `ModelRuntime` + SettingsManager).
-    let environment = crate::ai::providers::load_pi_environment(Some(&cwd))?;
+    // The caller supplies it: `run_print` loads it from the real agent dir;
+    // `run_print_with_environment` lets tests inject a deterministic registry.
     let settings = &environment.settings;
     let has_auth =
         |provider: &str| crate::ai::providers::has_configured_auth(provider, &environment.api_keys);
@@ -1809,7 +2814,7 @@ pub async fn run_print(
             "--api-key requires a model to be specified via --model, --provider/--model, or --models"
         ));
     }
-    let initial = find_initial_model(InitialModelOptions {
+    let initial = match find_initial_model(InitialModelOptions {
         cli_provider: options.cli_provider.as_deref(),
         cli_model: options.cli_model.as_deref(),
         cli_thinking: options.cli_thinking,
@@ -1830,30 +2835,75 @@ pub async fn run_print(
         // An inline `--api-key` goes to whichever provider the model selects,
         // so it must not break ties by stored credentials.
         inline_api_key: options.api_key_override.is_some(),
-    })
-    .map_err(anyhow::Error::msg)?;
+    }) {
+        Ok(initial) => initial,
+        // An extension provider only exists after the JS factories run. When
+        // extensions are present, defer the missing-model error until the
+        // merged registry (environment + plugin definitions) is resolved
+        // below; otherwise keep the historical immediate failure.
+        Err(error) if !extension_paths.is_empty() => {
+            eprintln!("pir: {error}");
+            crate::ai::providers::resolution::InitialModelResult {
+                model: None,
+                thinking_level: crate::ai::providers::resolution::DEFAULT_THINKING_LEVEL,
+                fallback_message: None,
+            }
+        }
+        Err(error) => return Err(anyhow::anyhow!(error)),
+    };
     // Chat-only, last-applied per-model overrides from models.json are
     // already merged into the environment model list.
-    let Some(model) = initial.model else {
-        let message = "no model available; configure a provider with `pir auth login` or ~/.pi/agent/models.json";
-        if options.mode == OutputMode::Json {
-            // Upstream json mode reports failures in-band and exits 0
-            // (print-mode.ts maps only TEXT-mode terminal errors onto the
-            // exit code): emit the error as a terminal message event.
-            crate::coding_agent::json::print_event(
-                &crate::agent::agent_loop::AgentEvent::TurnEnd {
-                    turn: 0,
-                    message: terminal_error_message(message),
-                    // Synthetic terminal turn: no tools ran.
-                    tool_results: Vec::new(),
+    let initial_model_missing = initial.model.is_none();
+    let mut model = match initial.model {
+        Some(model) => model,
+        None if !extension_paths.is_empty() => {
+            // Provisional model for the extension load: a factory that reads
+            // `pi.model` gets the CLI/settings selection, and the real
+            // resolution runs after the plugin providers are merged.
+            let provider = options
+                .cli_provider
+                .clone()
+                .or_else(|| settings.default_provider.clone())
+                .unwrap_or_else(|| "plugin".to_owned());
+            let id = options
+                .cli_model
+                .clone()
+                .or_else(|| settings.default_model.clone())
+                .unwrap_or_else(|| "pending".to_owned());
+            crate::ai::providers::construction::model(
+                crate::ai::providers::construction::ModelSpec {
+                    provider: &provider,
+                    id: &id,
+                    name: &id,
+                    api: "openai-completions",
+                    base_url: "",
+                    context_window: 128_000,
+                    max_tokens: 4_096,
+                    input: vec!["text"],
                 },
-            );
-            return Ok(PrintOutcome {
-                text: String::new(),
-                exit_code: 0,
-            });
+            )
         }
-        return Err(anyhow::anyhow!(message));
+        None => {
+            let message = "no model available; configure a provider with `pir auth login` or ~/.pi/agent/models.json";
+            if options.mode == OutputMode::Json {
+                // Upstream json mode reports failures in-band and exits 0
+                // (print-mode.ts maps only TEXT-mode terminal errors onto the
+                // exit code): emit the error as a terminal message event.
+                crate::coding_agent::json::print_event(
+                    &crate::agent::agent_loop::AgentEvent::TurnEnd {
+                        turn: 0,
+                        message: terminal_error_message(message),
+                        // Synthetic terminal turn: no tools ran.
+                        tool_results: Vec::new(),
+                    },
+                );
+                return Ok(PrintOutcome {
+                    text: String::new(),
+                    exit_code: 0,
+                });
+            }
+            return Err(anyhow::anyhow!(message));
+        }
     };
     // Starting thinking level, upstream `buildSessionOptions` (main.ts:465-523)
     // → `createAgentSession` (sdk.ts:250-278): an explicit CLI level
@@ -1867,7 +2917,7 @@ pub async fn run_print(
     // hard-code the shared default instead of consulting settings — resolving
     // through the shared helper keeps exactly one policy, the one the
     // interactive host applies.
-    let thinking_level = {
+    let mut thinking_level = {
         let explicit = match options.cli_model.as_deref() {
             Some(pattern) => {
                 // Same resolver call as `find_initial_model`: `--model`
@@ -1907,7 +2957,7 @@ pub async fn run_print(
     if let Some(message) = &initial.fallback_message {
         eprintln!("pir: {message}");
     }
-    let api_key = options
+    let mut api_key = options
         .api_key_override
         .clone()
         .or_else(|| environment.api_keys.get(&model.provider).cloned());
@@ -1953,12 +3003,10 @@ pub async fn run_print(
         ExtensionConfig {
             cwd: cwd.clone(),
             // JSON mode must not let extension stdout inject raw bytes into
-            // the JSONL frame stream; reuse the protocol-safe routing.
-            mode: if options.mode == OutputMode::Json {
-                "json".to_string()
-            } else {
-                "print".to_string()
-            },
+            // the JSONL frame stream; reuse the protocol-safe routing. The
+            // CLI's validation/bootstrap config derives the same label from
+            // this method, so the parked runtime is accepted by this host.
+            mode: options.mode.extension_mode().to_string(),
             has_ui: false,
             model: Some(model.id.clone()),
             session_id: None,
@@ -1972,13 +3020,18 @@ pub async fn run_print(
 
     let mut registry = ToolRegistry::new();
     crate::coding_agent::tools::register_core_tools(&mut registry);
-    let mut prompt_text = options.prompt.clone();
+    let prompt_text = options.prompt.clone();
     // The unified plugin host is built BEFORE `session_start`: the event is
     // dispatched through the host's ordered list, so its native plugins
     // observe the same startup event the JS face does (the JS adapter is
     // dispatched once, at its list position). It sources the MCP reach wait
     // hook below and owns the builtin plugin lifecycle for the run.
     let plugins = print_plugin_host(extensions.as_ref());
+    // Actionable notifications queued by `session_start` handlers (an idle
+    // `pi.sendMessage` is a setup message for the first prompt; appendEntry /
+    // setSessionName apply immediately). Print has no `AgentSession` drain, so
+    // the host's own queue is consumed here.
+    let mut pending_startup_messages: Vec<Message> = Vec::new();
     if let Some(runtime) = &extensions {
         // Mirror the AgentSession extension lifecycle for this host: one
         // `session_start` before the first prompt, then the input transform,
@@ -1991,9 +3044,108 @@ pub async fn run_print(
                 eprintln!("[ext] session_start dispatch failed: {error}");
             }
         }
-        crate::agent_session::drain_extension_notifications(runtime);
-        prompt_text = transform_print_input(plugins.as_deref(), Some(runtime), &prompt_text).await;
+        pending_startup_messages = drain_print_extension_notifications(
+            plugins.as_ref(),
+            Some(runtime),
+            &session,
+            PrintNotificationPhase::RunStart,
+            startup_abort.as_ref(),
+        )
+        .await;
+        // `input` runs per positional prompt inside the prompt loop (every
+        // prompt must pass through the transform, not only the first).
         crate::agent::tool_execution::merge_extension_tools(&mut registry, runtime);
+    }
+    // P2-06: apply `pi.registerProvider`/`pi.registerVirtualModel` definitions
+    // to the print host's provider registry, then re-resolve the model against
+    // the merged catalog. `session_start` handlers may have registered a
+    // provider above; factory-time registrations are already in the snapshot
+    // the host was built from. Without this pass print (and `--mode json`)
+    // silently ignored both, while TUI/RPC/SDK saw them.
+    if let Some(host) = plugins.as_deref() {
+        let plugin_has_provider_defs = !host.registry().provider_defs().is_empty()
+            || !host.registry().virtual_model_defs().is_empty();
+        if plugin_has_provider_defs {
+            sync_print_plugin_providers(host, &environment.registry);
+            let merged_models = environment.registry.get_models();
+            let (merged_scoped, _) = crate::ai::providers::resolution::resolve_model_scope(
+                &scoped_patterns,
+                &merged_models,
+            );
+            let merged_initial = find_initial_model(InitialModelOptions {
+                cli_provider: options.cli_provider.as_deref(),
+                cli_model: options.cli_model.as_deref(),
+                cli_thinking: options.cli_thinking,
+                scoped_models: &merged_scoped,
+                is_continuing: options.is_continuing,
+                default_provider: settings.default_provider.as_deref(),
+                default_model_id: settings.default_model.as_deref(),
+                default_thinking_level: settings
+                    .default_thinking_level
+                    .filter(|level| *level != crate::ai::types::ThinkingLevel::Off),
+                model_thinking_levels: settings
+                    .model_thinking_levels
+                    .as_ref()
+                    .unwrap_or(&empty_model_thinking_levels),
+                models: &merged_models,
+                has_auth: &has_auth,
+                inline_api_key: options.api_key_override.is_some(),
+            })
+            .map_err(anyhow::Error::msg)?;
+            match merged_initial.model {
+                Some(merged_model) => {
+                    if initial_model_missing
+                        || merged_model.provider != model.provider
+                        || merged_model.id != model.id
+                    {
+                        model = merged_model;
+                        thinking_level = merged_initial.thinking_level;
+                        api_key = options
+                            .api_key_override
+                            .clone()
+                            .or_else(|| environment.api_keys.get(&model.provider).cloned());
+                    }
+                }
+                None if initial_model_missing => {
+                    let message = "no model available; configure a provider with `pir auth login` or ~/.pi/agent/models.json";
+                    if options.mode == OutputMode::Json {
+                        crate::coding_agent::json::print_event(
+                            &crate::agent::agent_loop::AgentEvent::TurnEnd {
+                                turn: 0,
+                                message: terminal_error_message(message),
+                                tool_results: Vec::new(),
+                            },
+                        );
+                        return Ok(PrintOutcome {
+                            text: String::new(),
+                            exit_code: 0,
+                        });
+                    }
+                    return Err(anyhow::anyhow!(message));
+                }
+                None => {}
+            }
+        }
+    }
+    // Deferred no-model failure: extensions loaded but none registered a
+    // provider, so the provisional model never became a real one. Keep the
+    // historical error (and JSON-mode in-band terminal frame).
+    if initial_model_missing && model.base_url.is_empty() {
+        let message = "no model available; configure a provider with `pir auth login` or ~/.pi/agent/models.json";
+        if options.mode == OutputMode::Json {
+            crate::coding_agent::json::print_event(
+                &crate::agent::agent_loop::AgentEvent::TurnEnd {
+                    turn: 0,
+                    message: terminal_error_message(message),
+                    tool_results: Vec::new(),
+                },
+            );
+            return Ok(PrintOutcome {
+                text: String::new(),
+                exit_code: 0,
+            });
+        }
+        return Err(anyhow::anyhow!(message));
     }
     // The unified plugin host's OWN tools join the same registry: the Rust
     // builtins (`context-mode`'s nine `ctx_*` tools, `todo`, `python`,
@@ -2044,7 +3196,7 @@ pub async fn run_print(
         &cwd,
         &crate::coding_agent::context::agent_dir(),
     );
-    let resources = crate::coding_agent::resources::DiscoveredResources::discover(
+    let mut resources = crate::coding_agent::resources::DiscoveredResources::discover(
         &crate::coding_agent::resources::ResourceDiscoveryOptions {
             cwd: &cwd,
             agent_dir: &crate::coding_agent::context::agent_dir(),
@@ -2055,16 +3207,42 @@ pub async fn run_print(
             no_prompt_templates: options.resources.no_prompt_templates,
         },
     );
+    // `resources_discover` (startup): extension-contributed skill/prompt/theme
+    // paths merge into the discovered base first-wins, exactly like the
+    // AgentSession startup dispatch (`session_ctx::emit_resources_discover`).
+    // The event fires after `session_start` (handlers may have registered
+    // theirs) and before `/skill:` expansion, so a contributed skill/template
+    // is usable by this invocation's first prompt.
+    if let Some(host) = plugins.as_deref() {
+        if let Some(paths) =
+            crate::agent_session::dispatch_resources_discover_event(host, &cwd, "startup").await
+        {
+            let loaded = crate::extensions::resources::load_extension_resources(&cwd, &paths);
+            crate::extensions::resources::merge_skills(
+                &mut resources.skills,
+                loaded.skills,
+                &mut resources.diagnostics,
+            );
+            crate::extensions::resources::merge_prompt_templates(
+                &mut resources.prompt_templates,
+                loaded.prompt_templates,
+                &mut resources.diagnostics,
+            );
+            if !loaded.theme_files.is_empty() {
+                resources
+                    .diagnostics
+                    .extend(crate::extensions::resources::register_theme_files(
+                        &loaded.theme_files,
+                    ));
+            }
+            resources.diagnostics.extend(loaded.diagnostics);
+        }
+    }
     // Resource-load diagnostics (collisions, malformed skills/templates):
     // upstream startup-diagnostic style on stderr, once per run; never fatal.
     for diagnostic in &resources.diagnostics {
         eprintln!("pir: {diagnostic}");
     }
-    prompt_text = crate::coding_agent::resources::expand_prompt_commands(
-        &prompt_text,
-        &resources.skills,
-        &resources.prompt_templates,
-    );
 
     // Apply the resolved tool selection (`--tools` / `--exclude-tools` /
     // `--no-tools` / `--no-builtin-tools` / `settings.defaultTools`) through
@@ -2191,15 +3369,15 @@ pub async fn run_print(
     // of the status mirror, never a connect. `None` when MCP is off or has no
     // enabled server, which keeps the prompt byte-identical to before.
     let mcp_servers = crate::coding_agent::context::mcp_servers_prompt_section(plugins.as_deref());
-    let mut prompt_cache = PrintPromptCache::new_with_mcp_servers(
+    let mut prompt_cache = PrintPromptCache::new_with_mcp_servers(PrintPromptCacheInputs {
         preamble_override,
         append,
-        context_files,
-        resources.skills,
-        cwd.clone(),
+        project_files: context_files,
+        skills: resources.skills.clone(),
+        cwd: cwd.clone(),
         package_dir,
         mcp_servers,
-    );
+    });
     let prompt_build_started = crate::config::timings::start_phase();
     prompt_cache.sync(&registry, &active, None);
     crate::config::timings::log_phase_once_opt(
@@ -2261,6 +3439,16 @@ pub async fn run_print(
 
     let registry = Arc::new(registry);
     let provider_registry = Arc::new(environment.registry);
+    // The print host's provider-session scope (P2-S8-4 print residual). Print
+    // drives the agent loop without an `AgentSession`, so this invocation owns
+    // one standalone provider session for the whole run. Its key scopes the
+    // prompt's main-loop stream (and the branch summary), so a provider entry
+    // owned by another live session sharing this registry cannot capture
+    // print's requests. The scope owns the key's liveness token; it lives as
+    // long as this host does. `--no-session` still gets this run-scoped key
+    // (no session id/file is invented); owner-less shared registrations and
+    // static providers stay resolvable.
+    let print_provider_session = provider_registry.standalone_provider_session();
     // Remote catalog overlays (upstream model-runtime wraps every built-in
     // provider with `withRemoteCatalog`): background ETag revalidation,
     // delayed first hop, PI_OFFLINE-gated.
@@ -2286,6 +3474,11 @@ pub async fn run_print(
         plugins.update_session_context(print_model_snapshot(&model));
     }
 
+    // The print host's out-of-loop session-event channel: JSON mode writes
+    // the stdout frames, and a plugin host receives the same events through an
+    // ordered bridge (text mode with no plugin host stays silent).
+    let print_session_events = print_session_event_sink(options.mode, plugins.as_ref());
+
     // Per-request transport hooks shared by EVERY provider request this host
     // sends (loop stream, event stream, compaction/navigate summaries) —
     // routed through the plugin host so the Rust builtins participate the way
@@ -2308,36 +3501,27 @@ pub async fn run_print(
     // see `try_extension_command_with_events`) and the threshold compaction
     // hook through `with_threshold_compaction_retry_events` (source
     // `compaction`, reason `threshold`).
-    if options.mode == OutputMode::Json {
+    if let Some(sink) = &print_session_events {
+        let start_sink = Arc::clone(sink);
         transport_hooks.on_retry_start =
-            Some(Arc::new(|start: &crate::ai::types::AutoRetryStart| {
-                crate::coding_agent::json::print_session_event(
-                    &crate::agent_session::SessionEvent::AutoRetryStart {
-                        attempt: start.attempt,
-                        max_attempts: start.max_attempts,
-                        delay_ms: start.delay_ms,
-                        error_message: start.error_message.clone(),
-                    },
-                );
+            Some(Arc::new(move |start: &crate::ai::types::AutoRetryStart| {
+                start_sink(&crate::agent_session::SessionEvent::AutoRetryStart {
+                    attempt: start.attempt,
+                    max_attempts: start.max_attempts,
+                    delay_ms: start.delay_ms,
+                    error_message: start.error_message.clone(),
+                });
             }));
-        transport_hooks.on_retry_end = Some(Arc::new(|end: &crate::ai::types::AutoRetryEnd| {
-            crate::coding_agent::json::print_session_event(
-                &crate::agent_session::SessionEvent::AutoRetryEnd {
+        let end_sink = Arc::clone(sink);
+        transport_hooks.on_retry_end =
+            Some(Arc::new(move |end: &crate::ai::types::AutoRetryEnd| {
+                end_sink(&crate::agent_session::SessionEvent::AutoRetryEnd {
                     success: end.success,
                     attempt: end.attempt,
                     final_error: end.final_error.clone(),
-                },
-            );
-        }));
+                });
+            }));
     }
-
-    // The print host's out-of-loop session-event channel (JSON mode only,
-    // upstream text print mode is silent): shared by the agent-level retry
-    // sink, the navigate-summary retry observer, and the threshold compaction
-    // lifecycle below. Building it once keeps every frame on the same writer
-    // ([`crate::coding_agent::json::print_session_event`]).
-    let print_session_events: Option<PrintSessionEventSink> =
-        (options.mode == OutputMode::Json).then(json_session_event_sink);
 
     // Live `tool_execution_update` channel (upstream `emitToolExecutionUpdate`,
     // agent-loop.ts:779-788): the print host runs its own loop and builds no
@@ -2394,6 +3578,12 @@ pub async fn run_print(
         complete: {
             let complete_model = model.clone();
             let complete_registry = Arc::clone(&provider_registry);
+            // Standalone session scope (P2-S8-4 print residual): the branch
+            // summary must not resolve a provider entry owned by another live
+            // session sharing this registry. Print has no AgentSession, so it
+            // owns a scope for the run; this is the SAME key the prompt's
+            // main-loop stream below resolves through.
+            let complete_key = print_provider_session.key().clone();
             let complete_options = crate::ai::types::StreamOptions {
                 api_key: api_key.clone(),
                 reasoning: Some(thinking_level),
@@ -2402,10 +3592,12 @@ pub async fn run_print(
             };
             let complete: Arc<compaction::CompleteFn> = Arc::new(Box::new(move |context| {
                 let registry = Arc::clone(&complete_registry);
+                let key = complete_key.clone();
                 let model = complete_model.clone();
                 let options = complete_options.clone();
                 Box::pin(async move {
-                    let stream = registry.stream_resolving_auth(model, context, options);
+                    let stream =
+                        registry.stream_resolving_auth_for(Some(&key), model, context, options);
                     // Completion consumer: drain while waiting (bounded queue;
                     // see `drain_and_result`).
                     match stream.drain_and_result().await {
@@ -2449,13 +3641,25 @@ pub async fn run_print(
     // instead of dropping the whole turn.
     let persist_message: PersistMessageFn = Arc::new({
         let session = Arc::clone(&session);
+        let print_session_events = print_session_events.clone();
         move |message| {
             let session = Arc::clone(&session);
+            let print_session_events = print_session_events.clone();
             Box::pin(async move {
                 let mut guard = session.lock().await;
                 if let Some(session) = guard.as_mut() {
-                    if let Err(error) = session.append_message(message) {
-                        eprintln!("pir: failed to persist message: {error}");
+                    match session.append_message(message) {
+                        Ok(id) => {
+                            if let Some(sink) = &print_session_events {
+                                if let Some(entry) = session.entry(&id) {
+                                    sink(&SessionEvent::EntryAppended {
+                                        entry: serde_json::to_value(entry)
+                                            .unwrap_or(serde_json::Value::Null),
+                                    });
+                                }
+                            }
+                        }
+                        Err(error) => eprintln!("pir: failed to persist message: {error}"),
                     }
                 }
             })
@@ -2470,6 +3674,56 @@ pub async fn run_print(
     // previous turn's disposition stands, like upstream reading session state.
     let mut exit_code = 0;
     for (turn_index, prompt) in prompts.iter().enumerate() {
+        // Abort notifications queued after the previous run settled (for
+        // example by an `agent_settled` handler) have no live run to cancel;
+        // drop them so they cannot abort this fresh prompt. An `input` handler
+        // below may queue a new one for THIS run, which the
+        // `before_agent_start` drain applies.
+        if let Some(host) = plugins.as_deref() {
+            let _ = host.take_notifications(|notification| {
+                matches!(notification, crate::extensions::Notification::Abort)
+            });
+        }
+        // A fresh run starts with a cleared extension abort state, the same
+        // discipline AgentSession applies at every prompt start
+        // (prompt_loop.rs `plugins.clear_abort()`). Without it, `ctx.isAborted()`
+        // would stay true for every later positional prompt after one
+        // extension-initiated abort.
+        if let Some(runtime) = &extensions {
+            runtime.clear_abort().await;
+        }
+        // Every positional prompt runs the extension `input` transform
+        // (upstream `prompt()` → `emitInput`) before any command dispatch or
+        // model call. `initialImages` ride the FIRST prompt only; a transform
+        // may replace both text and images, and a `handled` outcome consumes
+        // the prompt without starting a turn.
+        let input_images: Vec<ContentBlock> = if turn_index == 0 {
+            options
+                .images
+                .iter()
+                .map(|image| ContentBlock::Image(image.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let input = transform_print_input_parts(
+            plugins.as_deref(),
+            extensions.as_ref(),
+            prompt,
+            input_images,
+        )
+        .await;
+        if input.handled {
+            continue;
+        }
+        // `/skill:name` / `/template` expansion runs after `input`, for every
+        // positional prompt (upstream `prompt()` expands each one).
+        let prompt = crate::coding_agent::resources::expand_prompt_commands(
+            &input.text,
+            &resources.skills,
+            &resources.prompt_templates,
+        );
+        let input_images = input.images;
         // Upstream `prompt()` runs a leading `/name args` that matches a
         // registered extension command through the extension runtime instead
         // of prompting the model (`_tryExecuteExtensionCommand`): the
@@ -2481,7 +3735,7 @@ pub async fn run_print(
         if let Some(runtime) = &extensions {
             if try_extension_command_with_events(
                 runtime,
-                prompt,
+                &prompt,
                 &session,
                 &session_dir_path,
                 Some(&navigate_summary),
@@ -2492,6 +3746,13 @@ pub async fn run_print(
                 continue;
             }
         }
+        // The run-scoped abort signal for THIS prompt. `ctx.abort()` (drained
+        // below and at the settle boundary) cancels only this signal; process
+        // termination uses `termination.signal` and owns the process exit.
+        // Taking `startup_abort` here (not at the loop top) keeps a
+        // `session_start` abort attached to the first prompt that actually
+        // starts a model run, even when earlier `/commands` consume a prompt.
+        let prompt_abort = startup_abort.take().unwrap_or_default();
         // Resume: persist the user message, then rebuild the transcript from
         // storage so a continued session carries its prior history. The
         // projection snapshot (cut entries + branch + snapshot length) feeds
@@ -2503,17 +3764,7 @@ pub async fn run_print(
                     text: prompt.clone(),
                     text_signature: None,
                 })];
-                // `initialImages` ride the FIRST prompt only (upstream
-                // `session.prompt(initialMessage, { images: initialImages })`
-                // attaches them to that one user message).
-                if turn_index == 0 {
-                    content.extend(
-                        options
-                            .images
-                            .iter()
-                            .map(|image| ContentBlock::Image(image.clone())),
-                    );
-                }
+                content.extend(input_images.clone());
                 content
             },
             tools_added: None,
@@ -2526,116 +3777,114 @@ pub async fn run_print(
         // after `agent_start` (upstream runAgentLoop emits the initial
         // messages' `message_start`/`message_end` pair). The message is also
         // in `messages`/storage; the preamble only carries the announcement.
-        let preamble_messages = vec![user.clone()];
+        // A handler `message_end` replacement rewrites the in-memory context
+        // (the host already persisted the original, like print always did).
+        let starting_preamble = PreambleMessage {
+            message: user.clone(),
+            wire: None,
+            append: false,
+            persist: None,
+        };
+        // `session_start`-queued sendMessage payloads join the FIRST prompt
+        // that actually starts a run (upstream `_pendingSetupMessages`; a
+        // `handled` earlier prompt must not swallow them).
+        let prompt_startup_messages: Vec<Message> = std::mem::take(&mut pending_startup_messages);
+        // A PAGED session holds a tail window only. When the threshold will
+        // not fire (a window that swallows the whole session, or compaction
+        // switched off) the model context must be the complete transcript.
+        // The former shape widened the session (parsing the whole file into
+        // `Vec<Arc<FileEntry>>`) and then built a projection that cloned every
+        // message — the transcript resident TWICE for the whole run. The
+        // linear paged builder instead materializes the complete message list
+        // straight from the file (one copy, moving each stored message into
+        // the aggregate) and leaves the manager paged; widening is deferred to
+        // the compaction hook, which only pays it when the threshold actually
+        // fires. Branch/compaction/context-edit sessions still widen here.
+        let prefer_paged_prompt_context = print_allows_paged_prompt_context(plugins.as_ref());
+        let mut paged_prompt_context_used = false;
+        // Set only on the widen fallback when the streamed OpenAI body can
+        // consume a file-backed transcript. `Context::messages` then carries
+        // only the messages THIS run produces (the user prompt is already in
+        // the session file the source pins), so the historical projection is
+        // never materialized.
+        let mut streamed_prompt_source: Option<Arc<crate::ai::api::openai::SessionMessageSource>> =
+            None;
+        let mut streamed_declared_tools: Option<std::collections::BTreeSet<String>> = None;
+        let stream_support_options = crate::ai::types::StreamOptions {
+            api_key: api_key.clone(),
+            reasoning: Some(thinking_level),
+            hooks: transport_hooks.clone(),
+            ..Default::default()
+        };
         let projected: Option<ProjectionSnapshot> = {
             let mut guard = session.lock().await;
             match guard.as_mut() {
                 Some(session) => {
-                    // A PAGED session holds a tail window only. When the
-                    // threshold will not fire (a window that swallows the whole
-                    // session, or compaction switched off) the model context
-                    // must be the complete transcript, so the session widens to
-                    // the full resident view here — the documented cost of the
-                    // fallback (`compaction::paged` module docs, `SDK-SCOPE.md`
-                    // §8: measured +1353 MB / one 79.4 MB request on a 100 MB
-                    // session with `--context-window 100000000`, i.e. upstream
-                    // pi's compaction-off behavior; NOT silently truncated).
                     let widening = match compaction_config.as_ref() {
                         Some(config) => {
                             compaction::paged_requires_widening(session, &model, config)
                         }
                         None => session.is_paged(),
                     };
-                    if widening {
-                        session.widen_to_full()?;
-                    }
+                    let stream_widen = widening
+                        && print_can_stream_widen(
+                            &model,
+                            plugins.as_ref(),
+                            extensions.as_ref(),
+                            compaction_config.as_ref(),
+                            &stream_support_options,
+                        );
                     session.append_message(user.clone())?;
-                    let projection = session.build_session_projection()?;
-                    let branch = session.branch_path_meta(None);
-                    // The snapshot keeps per-entry METADATA only (shared
-                    // source entries + message counts): the messages move into
-                    // the loop context below and the hook slices THAT list, so
-                    // the conversation is materialized once (the projection
-                    // aggregate) instead of once per entry plus once for the
-                    // aggregate plus once for the branch.
-                    let metas =
-                        compaction::ProjectionEntryMeta::from_projection(&projection.entries);
-                    messages = projection.messages;
-                    Some((Arc::new(metas), Arc::new(branch)))
+                    let paged_context = if widening && prefer_paged_prompt_context {
+                        session.build_paged_prompt_context()?
+                    } else {
+                        None
+                    };
+                    if let Some(context) = paged_context {
+                        messages = context.messages;
+                        paged_prompt_context_used = true;
+                        None
+                    } else if stream_widen {
+                        // The source pins the leaf AFTER this prompt's user
+                        // message, so it yields the complete model context.
+                        // Later appends (assistant/tool results) stay in
+                        // `Context::messages` and the OpenAI adapter chains
+                        // the two, one message at a time.
+                        let source = crate::ai::api::openai::SessionMessageSource::build(
+                            session,
+                            session.leaf_id(),
+                        )?;
+                        let summary = source.summary()?;
+                        streamed_declared_tools =
+                            Some(streamed_declared_tool_names(&summary.instruction_messages));
+                        streamed_prompt_source = Some(Arc::new(source));
+                        messages = Vec::new();
+                        None
+                    } else {
+                        if widening {
+                            session.widen_to_full()?;
+                        }
+                        let projection = session.build_session_projection()?;
+                        let branch = session.branch_path_meta(None);
+                        // The snapshot keeps per-entry METADATA only (shared
+                        // source entries + message counts): the messages move
+                        // into the loop context below and the hook slices THAT
+                        // list, so the conversation is materialized once (the
+                        // projection aggregate) instead of once per entry plus
+                        // once for the aggregate plus once for the branch.
+                        let metas =
+                            compaction::ProjectionEntryMeta::from_projection(&projection.entries);
+                        messages = projection.messages;
+                        Some((Arc::new(metas), Arc::new(branch)))
+                    }
                 }
                 None => None,
             }
         };
-        if messages.is_empty() {
+        if messages.is_empty() && streamed_prompt_source.is_none() {
             messages.push(user);
         }
 
-        let mut deps = print_loop_deps(
-            Arc::clone(&registry),
-            // The background host's `install` below replays the comment
-            // `print_loop_deps` carries: this builder starts sink-less, the
-            // host adds the detach sink + follow-up channel for every run of
-            // this invocation.
-            ToolScheduler::new(config.to_scheduler_config()),
-            cwd.clone(),
-            extensions.clone(),
-            tool_updates.clone(),
-            tool_call_wait.clone(),
-            // The loop's request level must equal the `reasoning` baked into
-            // the stream options below, or `registry_stream*` replaces the
-            // baked level with the `LoopDeps` default (`off`) and the request
-            // carries no reasoning at all.
-            thinking_level,
-        )
-        .with_provider_unchecked(
-            Arc::clone(&provider_registry),
-            model.clone(),
-            crate::ai::types::StreamOptions {
-                api_key: api_key.clone(),
-                reasoning: Some(thinking_level),
-                hooks: transport_hooks.clone(),
-                ..Default::default()
-            },
-        );
-        // `settings.retry` for this prompt run, through the same seam tests
-        // exercise: `None` means retries are disabled, so a retryable
-        // mid-stream failure ends the run after a single request.
-        print_apply_retry(&mut deps, &environment.settings);
-        // The non-interactive turn cap: `Config` defaults to the 1000-turn
-        // guard and carries the `PIR_MAX_TURNS` override. Applied per prompt
-        // run (the loop's `turns` counter is per run), like the retry policy.
-        print_apply_max_turns(&mut deps, config);
-        // Agent-level retry lifecycle → the same out-of-loop session-event
-        // channel the interactive host uses. The loop's sink only sees turns
-        // it re-issues itself, so it never duplicates the transport observer
-        // on `transport_hooks`; JSON mode writes `auto_retry_start` /
-        // `auto_retry_end`, text mode stays silent (sink-less, like the
-        // transport observers above).
-        install_print_retry_events(&mut deps, print_session_events.clone());
-        deps.message_end_repair = message_end_repair.clone();
-        // `ctx.executeTool` gating, the session host's exact set
-        // (`build_tool_loadout` → `LoopDeps::nested_callable`): active
-        // `direct` tools plus every registered `codemode`/`deferred` tool.
-        // Without it the loop's default (every registered tool callable)
-        // would make `model-only` tools reachable from other tools in print,
-        // which upstream never allows.
-        deps.nested_callable = Some(Arc::clone(&nested_callable));
-        // The loop's NATIVE event face: the print host built its unified
-        // plugin host before `session_start`, so every loop-level event
-        // (`agent_start`/`agent_end`, `turn_*`, `message_*`,
-        // `tool_execution_*`, `context`, `context_with_system`) reaches the
-        // non-JS plugins exactly once, alongside the direct JS handle in
-        // `deps.extensions` (the host's JS adapter is skipped by
-        // `emit_native`). Without a host the field stays `None` and dispatch
-        // is unchanged.
-        deps.plugin_events = plugins.clone();
-        // The background sink + the follow-up channel of this invocation: a
-        // `background: true` call is adopted by the host's registry from here
-        // on (limit, per-call abort, cross-prompt lifespan), and a completion
-        // settling while this run is live reaches the running model's next
-        // turn boundary through `LoopDeps::follow_up`.
-        background.install(&mut deps);
-        background.begin_run();
         // The print host's session environment: print drives the loop without
         // an `AgentSession`, so without this env the model-facing
         // `background_status` / `background_abort` tools (registered by
@@ -2645,29 +3894,119 @@ pub async fn run_print(
         // registry (one registry for the whole print process, so a status
         // call in a later prompt still sees earlier prompts' calls).
         // Session identity for the PI_SESSION_* child environment (upstream
-        // `ctx.sessionManager`): a `--no-session` run has neither.
-        let (session_id, session_file) = {
+        // `ctx.sessionManager`): a `--no-session` run has neither. The same
+        // identity binds `turn_end` / `agent_before_settle` draft commits.
+        let (session_id, session_file, run_session_id) = {
             let guard = session.lock().await;
             match guard.as_ref() {
-                Some(manager) => (
-                    Some(manager.id().to_owned()),
-                    manager.session_file().map(std::path::Path::to_path_buf),
-                ),
-                None => (None, None),
+                Some(manager) => {
+                    let id = manager.id().to_owned();
+                    (
+                        Some(id.clone()),
+                        manager.session_file().map(std::path::Path::to_path_buf),
+                        Some(id),
+                    )
+                }
+                None => (None, None, None),
             }
         };
-        deps.session_env = Some(print_tool_session_env_with_session(
-            Arc::clone(&provider_registry),
-            &model,
-            thinking_level,
-            Arc::clone(&registry),
-            Arc::clone(&resolved_active),
-            Some(
-                Arc::clone(&background) as Arc<dyn crate::agent::tool_execution::BackgroundControl>
-            ),
-            session_id,
-            session_file,
-        ));
+        // One prompt run may settle more than once: an `agent_before_settle`
+        // continuation re-runs the loop over the settled context (upstream
+        // runner boundary semantics). The deps are rebuilt per iteration —
+        // they own the hook handles and `LoopDeps` itself is not cloneable.
+        let build_deps = || {
+            let mut deps = print_loop_deps(
+                Arc::clone(&registry),
+                // The background host's `install` below replays the comment
+                // `print_loop_deps` carries: this builder starts sink-less, the
+                // host adds the detach sink + follow-up channel for every run
+                // of this invocation.
+                ToolScheduler::new(config.to_scheduler_config()),
+                cwd.clone(),
+                extensions.clone(),
+                tool_updates.clone(),
+                tool_call_wait.clone(),
+                // The loop's request level must equal the `reasoning` baked
+                // into the stream options below, or `registry_stream*`
+                // replaces the baked level with the `LoopDeps` default
+                // (`off`) and the request carries no reasoning at all.
+                thinking_level,
+            )
+            .with_provider_unchecked(
+                Arc::clone(&provider_registry),
+                model.clone(),
+                crate::ai::types::StreamOptions {
+                    api_key: api_key.clone(),
+                    reasoning: Some(thinking_level),
+                    hooks: transport_hooks.clone(),
+                    message_source: streamed_prompt_source
+                        .clone()
+                        .map(|source| source as Arc<dyn crate::ai::types::MessageSource>),
+                    ..Default::default()
+                },
+            );
+            // `settings.retry` for this prompt run, through the same seam
+            // tests exercise: `None` means retries are disabled, so a
+            // retryable mid-stream failure ends the run after a single
+            // request.
+            print_apply_retry(&mut deps, &environment.settings);
+            // The non-interactive turn cap: `Config` defaults to the 1000-turn
+            // guard and carries the `PIR_MAX_TURNS` override. Applied per
+            // prompt run (the loop's `turns` counter is per run), like the
+            // retry policy.
+            print_apply_max_turns(&mut deps, config);
+            // Agent-level retry lifecycle → the same out-of-loop session-event
+            // channel the interactive host uses. The loop's sink only sees
+            // turns it re-issues itself, so it never duplicates the transport
+            // observer on `transport_hooks`; JSON mode writes `auto_retry_start`
+            // / `auto_retry_end`, text mode stays silent (sink-less, like the
+            // transport observers above).
+            install_print_retry_events(&mut deps, print_session_events.clone());
+            deps.message_end_repair = message_end_repair.clone();
+            // `ctx.executeTool` gating, the session host's exact set
+            // (`build_tool_loadout` → `LoopDeps::nested_callable`): active
+            // `direct` tools plus every registered `codemode`/`deferred` tool.
+            // Without it the loop's default (every registered tool callable)
+            // would make `model-only` tools reachable from other tools in
+            // print, which upstream never allows.
+            deps.nested_callable = Some(Arc::clone(&nested_callable));
+            // The loop's NATIVE event face: the print host built its unified
+            // plugin host before `session_start`, so every loop-level event
+            // (`agent_start`/`agent_end`, `turn_*`, `message_*`,
+            // `tool_execution_*`, `context`, `context_with_system`) reaches
+            // the non-JS plugins exactly once, alongside the direct JS handle
+            // in `deps.extensions` (the host's JS adapter is skipped by
+            // `emit_native`). Without a host the field stays `None` and
+            // dispatch is unchanged.
+            deps.plugin_events = plugins.clone();
+            // `turn_end` boundary: the shared AgentSession adapter over the
+            // print host's shared session slot. `None` without a handler, so
+            // the loop is byte-identical for extension-free runs.
+            deps.finish_turn = print_turn_end_hook(
+                plugins.clone(),
+                Arc::clone(&session),
+                Some(Arc::clone(&background)),
+                run_session_id.clone(),
+            );
+            // The background sink + the follow-up channel of this invocation:
+            // a `background: true` call is adopted by the host's registry from
+            // here on (limit, per-call abort, cross-prompt lifespan), and a
+            // completion settling while this run is live reaches the running
+            // model's next turn boundary through `LoopDeps::follow_up`.
+            background.install(&mut deps);
+            deps.session_env = Some(print_tool_session_env_with_session(ToolSessionEnvInputs {
+                provider_registry: Arc::clone(&provider_registry),
+                model: &model,
+                thinking: thinking_level,
+                registry: Arc::clone(&registry),
+                resolved_active: Arc::clone(&resolved_active),
+                background: Some(Arc::clone(&background)
+                    as Arc<dyn crate::agent::tool_execution::BackgroundControl>),
+                session_id: session_id.clone(),
+                session_file: session_file.clone(),
+            }));
+            deps
+        };
 
         // This prompt's request declarations AND system prompt: the loadout's
         // first build, or — once a `tool_search` has loaded matches into the
@@ -2677,7 +4016,7 @@ pub async fn run_print(
         // NEXT prompt; the in-flight run's request list and prompt stay
         // fixed). [`PrintPromptCache::sync`] reuses the first prompt
         // byte-identically while the declared set is unchanged.
-        let (prompt_tools, run_system_prompt) = {
+        let (prompt_tools, mut run_system_prompt, prompt_options) = {
             let current = resolved_active
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2692,62 +4031,294 @@ pub async fn run_print(
             (
                 print_request_definitions(&registry, &tools, &active, current.as_deref()),
                 prompt_cache.sync(&registry, &active, current.as_deref()),
+                // `systemPromptOptions` is only readable by a JS runtime
+                // (`ctx.getSystemPromptOptions()`) or a `before_agent_start`
+                // handler (the event payload), exactly like AgentSession's
+                // snapshot gate. Building it unconditionally walked the
+                // registry and copied context files/skills for every prompt of
+                // an extension-free run.
+                if extensions
+                    .as_ref()
+                    .is_some_and(|extensions| extensions.has_js_runtime())
+                    || plugins
+                        .as_ref()
+                        .is_some_and(|plugins| plugins.has_handlers("before_agent_start"))
+                {
+                    prompt_cache.system_prompt_options(&registry, &active, current.as_deref())
+                } else {
+                    JsonValue::Null
+                },
             )
         };
+        // `before_agent_start` (per prompt, after `input`): handlers may
+        // replace the system prompt, mutate the structured options, or inject
+        // custom messages ahead of the turn. The injected messages are user
+        // messages appended after the starting prompt, the print projection
+        // of AgentSession's steering enqueue. They travel through
+        // `LoopOptions::preamble` (`append: true`) so the loop drives their
+        // full `message_start`/`message_end` lifecycle, applies a handler
+        // replacement, and persists the FINAL message — the same contract the
+        // AgentSession steering queue provides.
+        let mut before_agent_injected: Vec<Message> = Vec::new();
+        if let Some(host) = plugins.as_deref() {
+            let before = dispatch_print_before_agent_start(
+                Some(host),
+                &prompt,
+                &input_images,
+                run_system_prompt.clone(),
+                prompt_options,
+            )
+            .await;
+            if let Some(prompt) = before.system_prompt {
+                run_system_prompt = prompt;
+            }
+            for text in before.injected_messages {
+                before_agent_injected.push(Message::User(UserMessage {
+                    role: UserRole::User,
+                    content: vec![ContentBlock::Text(TextContent {
+                        text,
+                        text_signature: None,
+                    })],
+                    tools_added: None,
+                    tools_removed: None,
+                    sections: None,
+                    timestamp: crate::ai::util::now_ms(),
+                }));
+            }
+            // Actionable side effects queued by the handler (`pi.sendMessage`
+            // steers into this run; appendEntry/setSessionName persist). This
+            // is the print analogue of AgentSession's drain while the run is
+            // starting (it counts as busy, so sendMessage joins the first
+            // request instead of starting a second run).
+            before_agent_injected.extend(
+                drain_print_extension_notifications(
+                    plugins.as_ref(),
+                    None,
+                    &session,
+                    PrintNotificationPhase::RunStart,
+                    Some(&prompt_abort),
+                )
+                .await,
+            );
+        }
+
+        // The run signal the loop/compaction observe: process termination OR
+        // this prompt's extension abort. `AbortSignal::any` seeds itself from
+        // already-aborted inputs, so a `ctx.abort()` drained above (before the
+        // first request) deterministically cancels this run before its first
+        // turn; later aborts (e.g. from a `turn_end`/`tool_call` handler
+        // drained at the settle boundary) wake the same token through the
+        // watcher.
+        let run_signal =
+            crate::ai::types::AbortSignal::any([termination.signal.clone(), prompt_abort.clone()]);
+
+        // The threshold compaction hook is built ONCE for this prompt and
+        // re-wrapped per settle iteration (the hook itself is a boxed
+        // closure; the wrapper is a cheap refcount bump). It observes the
+        // combined run signal so `session_before_compact.signal.aborted`
+        // reflects either termination or an extension-initiated abort.
+        let compaction_hook: Option<Arc<CompactionFn>> = compaction_config.clone().map(|config| {
+            Arc::new(print_compaction_hook_with_signal(
+                PrintCompactionInputs {
+                    config,
+                    model: threshold_model.clone(),
+                    registry: Arc::clone(&provider_registry),
+                    api_key: api_key.clone(),
+                    thinking_level,
+                    hooks: transport_hooks.clone(),
+                    session: Arc::clone(&session),
+                    projected: projected.clone(),
+                    plugins: plugins.clone(),
+                    runtime: extensions.clone(),
+                    session_events: print_session_events.clone(),
+                },
+                run_signal.clone(),
+            ))
+        });
 
         // The signal handler's graceful window: aborting this signal cancels
         // the in-flight tool call (and its process tree) exactly like the TUI's
         // Esc/ctrl+c path, instead of exiting with the child still running.
         run_active.store(true, Ordering::SeqCst);
-        let result = agent_loop::run_with_options(
-            deps,
-            Context {
-                system_prompt: Some(run_system_prompt),
-                messages,
-                tools: Some(prompt_tools),
-            },
-            Some(run_signal.clone()),
-            LoopOptions {
-                events: Some(Arc::clone(&events)),
-                preamble_messages,
-                event_stream: Some(crate::agent_session::registry_event_stream(
-                    Arc::clone(&provider_registry),
-                    model.clone(),
-                    crate::ai::types::StreamOptions {
-                        api_key: api_key.clone(),
-                        reasoning: Some(thinking_level),
-                        hooks: transport_hooks.clone(),
-                        ..Default::default()
-                    },
-                )),
-                // Threshold compaction over the turn's projection snapshot; the
-                // hook persists the compaction entry to session storage so the
-                // next turn (and a later `--continue`) replays the summarized
-                // context (upstream `_runAutoCompaction("threshold")`). JSON
-                // mode also streams the `compaction_start` / `compaction_end`
-                // lifecycle through the same stdout frame writer the retry
-                // observers above install; text mode stays silent like
-                // upstream's text print mode.
-                compaction: compaction_config.clone().map(|config| {
-                    print_compaction_hook(
-                        config,
-                        threshold_model.clone(),
-                        Arc::clone(&provider_registry),
-                        api_key.clone(),
-                        thinking_level,
-                        transport_hooks.clone(),
-                        Arc::clone(&session),
-                        projected.clone(),
-                        extensions.clone(),
-                        print_session_events.clone(),
-                    )
+        background.begin_run();
+        let mut run_context = Context {
+            system_prompt: Some(run_system_prompt),
+            messages,
+            tools: Some(prompt_tools),
+        };
+        // Preamble messages are announced (and, with `append: true`, appended
+        // and persisted by the loop) at the top of each run: the starting user
+        // message (already in `messages`/storage) plus every injected message.
+        // Only the FIRST settle iteration announces them; later iterations
+        // rebuild from the session projection, which already contains them.
+        let mut run_preamble: Vec<PreambleMessage> = vec![starting_preamble];
+        run_preamble.extend(
+            prompt_startup_messages
+                .into_iter()
+                .map(|message| PreambleMessage {
+                    message,
+                    wire: None,
+                    append: true,
+                    persist: None,
                 }),
-                // Per-message persistence during the run (see the sink above).
-                persist_message: Some(Arc::clone(&persist_message)),
-                ..LoopOptions::default()
-            },
-        )
-        .await;
+        );
+        run_preamble.extend(
+            before_agent_injected
+                .into_iter()
+                .map(|message| PreambleMessage {
+                    message,
+                    wire: None,
+                    append: true,
+                    persist: None,
+                }),
+        );
+        // The settle loop: an `agent_before_settle` continuation re-runs the
+        // loop over the freshly projected session context (upstream runner
+        // boundary semantics), capped at AgentSession's 8 iterations
+        // (`settle_iterations` starts at 1 for this first run and the
+        // continuation gate is `< 8`).
+        let mut settle_iterations = 1usize;
+        let result = loop {
+            let deps = build_deps();
+            let compaction = compaction_hook.as_ref().map(|hook| {
+                let hook = Arc::clone(hook);
+                Box::new(move |context| hook(context)) as CompactionFn
+            });
+            let result = agent_loop::run_with_options(
+                deps,
+                // Hand the transcript to the loop by MOVE. The former shape
+                // deep-cloned `run_context.messages` here while the original
+                // stayed alive until the prompt ended, so every print turn on
+                // a large session held a second full copy of the conversation
+                // (tools and system prompt were cloned too). `run_context` is
+                // only rebuilt on an `agent_before_settle` continuation, so
+                // the empty placeholder left behind is never observed.
+                std::mem::replace(
+                    &mut run_context,
+                    Context {
+                        system_prompt: None,
+                        messages: Vec::new(),
+                        tools: None,
+                    },
+                ),
+                Some(run_signal.clone()),
+                LoopOptions {
+                    events: Some(Arc::clone(&events)),
+                    // The starting/injected messages are announced once, at
+                    // the top of the first iteration only (later iterations
+                    // rebuild from the session projection).
+                    preamble: std::mem::take(&mut run_preamble),
+                    preamble_messages: Vec::new(),
+                    // Session-scoped provider resolution (P2-S8-4 print
+                    // residual): print has no `AgentSession`, so the run's
+                    // standalone provider key scopes the prompt request exactly
+                    // like the branch/compaction summaries. Same baked model,
+                    // `StreamOptions` and transport hooks as before.
+                    event_stream: Some(print_registry_event_stream(
+                        Arc::clone(&provider_registry),
+                        print_provider_session.key().clone(),
+                        model.clone(),
+                        crate::ai::types::StreamOptions {
+                            api_key: api_key.clone(),
+                            reasoning: Some(thinking_level),
+                            hooks: transport_hooks.clone(),
+                            ..Default::default()
+                        },
+                    )),
+                    // Threshold compaction over the turn's projection snapshot;
+                    // the hook persists the compaction entry to session
+                    // storage so the next turn (and a later `--continue`)
+                    // replays the summarized context (upstream
+                    // `_runAutoCompaction("threshold")`). JSON mode also
+                    // streams the `compaction_start` / `compaction_end`
+                    // lifecycle through the same stdout frame writer the retry
+                    // observers above install; text mode stays silent like
+                    // upstream's text print mode.
+                    compaction,
+                    // A streamed transcript prefix sits outside
+                    // `Context::messages`, so the loop cannot derive the
+                    // already-declared tool loadout from it. Seed the
+                    // `declareToolChanges` state from the source's system
+                    // declarations; `None` keeps the resident behavior.
+                    initial_declared_tools: streamed_declared_tools.clone(),
+                    // Per-message persistence during the run (see the sink
+                    // above).
+                    persist_message: Some(Arc::clone(&persist_message)),
+                    ..LoopOptions::default()
+                },
+            )
+            .await;
+            // `agent_before_settle`: handlers may append entries and force one
+            // more provider request over the settled context. The shared
+            // AgentSession adapter owns the payload, `continue` gate and
+            // draft commits; print only re-runs the loop.
+            let continue_requested = match &plugins {
+                Some(host) if host.has_handlers("agent_before_settle") => {
+                    let boundary = crate::agent_session::BoundarySession::Shared(&session);
+                    let pending_messages = background.has_pending_follow_up().await;
+                    crate::agent_session::dispatch_agent_before_settle_boundary(
+                        host,
+                        Some(boundary),
+                        &result.context,
+                        &result.terminal,
+                        pending_messages,
+                        run_session_id.as_deref(),
+                    )
+                    .await
+                }
+                _ => false,
+            };
+            // An aborted run never continues: the signal stays aborted, so a
+            // continuation iteration would only spin to the cap. Extension
+            // aborts settle here and the next positional prompt gets a fresh
+            // signal.
+            if continue_requested && !result.aborted && settle_iterations < 8 {
+                settle_iterations += 1;
+                // A continuation MUST observe the transcript the boundary just
+                // wrote: `custom_message` drafts project as user messages,
+                // `context_edit` replaces/removes its target and `compaction`
+                // drafts cut the retained range. This is the same projection
+                // the AgentSession settle loop runs between iterations
+                // (widening included); the previous code reused
+                // `result.context`, so those drafts were persisted but never
+                // sent to the next request.
+                //
+                // A linear paged prompt deliberately left the manager
+                // tail-only; the continuation needs the full session view, so
+                // widen once here (the handler-driven continuation is the one
+                // case that genuinely reads the manager's entries).
+                if paged_prompt_context_used || streamed_prompt_source.is_some() {
+                    let mut guard = session.lock().await;
+                    if let Some(manager) = guard.as_mut() {
+                        manager.widen_to_full()?;
+                    }
+                }
+                let projected_messages =
+                    match crate::agent_session::project_optional_session_messages_off_thread(
+                        &session,
+                    )
+                    .await
+                    {
+                        Ok(Some(messages)) => messages,
+                        Ok(None) => result.context.messages.clone(),
+                        Err(error) => return Err(error),
+                    };
+                run_context = Context {
+                    system_prompt: result.context.system_prompt.clone(),
+                    messages: projected_messages,
+                    tools: result.context.tools.clone(),
+                };
+                continue;
+            }
+            if continue_requested && result.aborted {
+                crate::ext_diag!(
+                    "[ext] agent_before_settle continuation ignored: the run was aborted"
+                );
+            } else if continue_requested {
+                crate::ext_diag!("[ext] agent_before_settle continuation cap reached; settling");
+            }
+            break result;
+        };
         // The run settled (the aborted tool call has already killed its process
         // tree and persisted its result). Release the signal handler's grace.
         run_active.store(false, Ordering::SeqCst);
@@ -2755,23 +4326,31 @@ pub async fn run_print(
         // stored/reported for the next prompt (or the exit settle) instead of
         // being injected into a loop that is not running.
         background.end_run();
-        if run_signal.is_aborted() {
-            // A termination signal aborted this run. The signal handler owns
-            // the process exit (conventional 130/143/129) once `run_active`
-            // clears; park past its own bound instead of returning a normal
-            // outcome that could race it and mask the signal's exit code. The
-            // extra time is only a fallback for a handler that could not be
-            // installed.
-            tokio::time::sleep(SIGNAL_ABORT_GRACE + std::time::Duration::from_secs(3)).await;
-            break;
+        if termination.requested() {
+            // A PROCESS termination signal (SIGINT/SIGTERM/SIGHUP or the
+            // Windows console analog) aborted this run. Its handler owns the
+            // conventional exit code and exits after the bounded grace; return
+            // synchronously with the same code on this fast path instead of
+            // sleeping a fixed fallback window that could race (and mask) the
+            // handler's `process::exit`.
+            std::process::exit(termination.exit_code());
         }
 
         // Persistence now happens per message DURING the run (the
         // `persist_message` sink above), matching upstream's per-message
         // `message_end` writes — the whole-turn batch write is gone. The
-        // extension notifications still drain after the run settles.
-        if let Some(runtime) = &extensions {
-            crate::agent_session::drain_extension_notifications(runtime);
+        // extension notifications still drain after the run settles (actionable
+        // `appendEntry`/`sendMessage`/name/label side effects apply; Notify and
+        // Status keep their diagnostic routing).
+        if extensions.is_some() {
+            let _ = drain_print_extension_notifications(
+                plugins.as_ref(),
+                extensions.as_ref(),
+                &session,
+                PrintNotificationPhase::Settled,
+                Some(&prompt_abort),
+            )
+            .await;
         }
         // Upstream `_runAgentPrompt` emits `agent_settled` from its `finally`
         // (agent-session.ts:1849 → `_emitAgentSettled`), i.e. once per prompt
@@ -2802,6 +4381,16 @@ pub async fn run_print(
                         // results; this is the terminal re-emission.
                         tool_results: result.tool_results.clone(),
                     },
+                );
+            } else if result.aborted {
+                // A non-termination abort can only come from an extension's
+                // `ctx.abort()` (process termination is handled above). It
+                // settles normally — Settled drain + `agent_settled` already
+                // ran — and must not stop the remaining positional prompts;
+                // upstream's text-mode abort→exit-1 path is the operator
+                // cancellation path, which `termination` owns.
+                crate::ext_diag!(
+                    "[ext] prompt run aborted by an extension; continuing with the next prompt"
                 );
             } else {
                 // Upstream: `errorMessage || "Request " + stopReason`.
@@ -3043,17 +4632,58 @@ pub fn resolve_prompt_input(input: &str) -> String {
 /// conventional code.
 const SIGNAL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Process-termination state shared with the signal listeners.
+///
+/// This is deliberately NOT the per-prompt run signal: [`Self::signal`] only
+/// aborts when the OS asks the process to terminate, while `ctx.abort()` from
+/// an extension aborts the current prompt's own signal. The distinction is
+/// what lets an extension abort settle normally (`agent_settled`, drain) and
+/// continue with the next positional prompt instead of exiting the process.
+#[derive(Debug)]
+struct PrintTermination {
+    signal: crate::ai::types::AbortSignal,
+    requested: AtomicBool,
+    exit_code: AtomicI32,
+}
+
+impl PrintTermination {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            signal: crate::ai::types::AbortSignal::new(),
+            requested: AtomicBool::new(false),
+            exit_code: AtomicI32::new(0),
+        })
+    }
+
+    /// Record the termination request BEFORE aborting the run: the run's
+    /// post-settle path checks `requested` to distinguish a real process
+    /// termination from an extension abort.
+    fn request(&self, code: i32) {
+        self.exit_code.store(code, Ordering::SeqCst);
+        self.requested.store(true, Ordering::SeqCst);
+        self.signal.abort();
+    }
+
+    fn requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    fn exit_code(&self) -> i32 {
+        self.exit_code.load(Ordering::SeqCst)
+    }
+}
+
 /// Abort the in-flight run, give it [`SIGNAL_ABORT_GRACE`] to settle (the tool
 /// result, including the process-tree kill, is persisted during the run), then
 /// exit with the signal's conventional code.
 async fn terminate_after_abort(
-    abort: crate::ai::types::AbortSignal,
+    termination: Arc<PrintTermination>,
     run_active: Arc<std::sync::atomic::AtomicBool>,
     name: &'static str,
     code: i32,
 ) -> ! {
     eprintln!("pir: terminated by {name}");
-    abort.abort();
+    termination.request(code);
     let deadline = std::time::Instant::now() + SIGNAL_ABORT_GRACE;
     while run_active.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -3073,7 +4703,7 @@ async fn terminate_after_abort(
 /// already streamed — the upstream `disposeRuntime` counterpart that pir needs
 /// is the completed per-message writes themselves.
 fn install_signal_handlers(
-    abort: crate::ai::types::AbortSignal,
+    termination: Arc<PrintTermination>,
     run_active: Arc<std::sync::atomic::AtomicBool>,
 ) {
     #[cfg(unix)]
@@ -3088,11 +4718,11 @@ fn install_signal_handlers(
                 eprintln!("pir: cannot listen for {name}");
                 continue;
             };
-            let abort = abort.clone();
+            let termination = Arc::clone(&termination);
             let run_active = Arc::clone(&run_active);
             tokio::spawn(async move {
                 if stream.recv().await.is_some() {
-                    terminate_after_abort(abort, run_active, name, code).await;
+                    terminate_after_abort(termination, run_active, name, code).await;
                 }
             });
         }
@@ -3100,20 +4730,20 @@ fn install_signal_handlers(
     #[cfg(windows)]
     {
         if let Ok(mut stream) = tokio::signal::windows::ctrl_close() {
-            let abort = abort.clone();
+            let termination = Arc::clone(&termination);
             let run_active = Arc::clone(&run_active);
             tokio::spawn(async move {
                 if stream.recv().await.is_some() {
-                    terminate_after_abort(abort, run_active, "console close", 143).await;
+                    terminate_after_abort(termination, run_active, "console close", 143).await;
                 }
             });
         }
         if let Ok(mut stream) = tokio::signal::windows::ctrl_break() {
-            let abort = abort.clone();
+            let termination = Arc::clone(&termination);
             let run_active = Arc::clone(&run_active);
             tokio::spawn(async move {
                 if stream.recv().await.is_some() {
-                    terminate_after_abort(abort, run_active, "ctrl-break", 143).await;
+                    terminate_after_abort(termination, run_active, "ctrl-break", 143).await;
                 }
             });
         }
@@ -3121,7 +4751,7 @@ fn install_signal_handlers(
         // version; the abort (SIGINT) analog exits 130 (128+2).
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
-                terminate_after_abort(abort, run_active, "ctrl-c", 130).await;
+                terminate_after_abort(termination, run_active, "ctrl-c", 130).await;
             }
         });
     }
@@ -3470,6 +5100,75 @@ pub fn print_compaction_config(
 /// writing stdout.
 pub type PrintSessionEventSink = Arc<dyn Fn(&SessionEvent) + Send + Sync>;
 
+/// Ordered bridge from the print host's synchronous SessionEvent sink to the
+/// plugin faces. A dedicated thread owns a small current-thread runtime so the
+/// sink never blocks the print run (and never re-enters the print runtime),
+/// while events are dispatched in emission order.
+struct PrintPluginSessionBridge {
+    tx: std::sync::mpsc::SyncSender<SessionEvent>,
+}
+
+impl PrintPluginSessionBridge {
+    fn new(plugins: Arc<PluginHost>) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<SessionEvent>(256);
+        let spawned = std::thread::Builder::new()
+            .name("pir-print-session-events".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        eprintln!("[ext] print session-event bridge runtime failed: {error}");
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    while let Ok(event) = rx.recv() {
+                        crate::agent_session::dispatch_session_event_to_plugins(
+                            &plugins, &event, true,
+                        )
+                        .await;
+                    }
+                });
+            });
+        if let Err(error) = spawned {
+            eprintln!("[ext] print session-event bridge thread failed: {error}");
+        }
+        Self { tx }
+    }
+
+    fn send(&self, event: &SessionEvent) {
+        if self.tx.try_send(event.clone()).is_err() {
+            crate::ext_diag!("[ext] print session-event bridge queue full; event dropped");
+        }
+    }
+}
+
+/// Build the print host's SessionEvent sink: JSON mode writes stdout frames,
+/// and every plugin host receives the same events through the ordered bridge.
+/// Text mode with no plugin host stays `None` (upstream text print is silent).
+fn print_session_event_sink(
+    mode: OutputMode,
+    plugins: Option<&Arc<PluginHost>>,
+) -> Option<PrintSessionEventSink> {
+    let json_sink = (mode == OutputMode::Json).then(json_session_event_sink);
+    let plugin_bridge =
+        plugins.map(|plugins| Arc::new(PrintPluginSessionBridge::new(Arc::clone(plugins))));
+    if json_sink.is_none() && plugin_bridge.is_none() {
+        return None;
+    }
+    Some(Arc::new(move |event: &SessionEvent| {
+        if let Some(json_sink) = &json_sink {
+            json_sink(event);
+        }
+        if let Some(plugin_bridge) = &plugin_bridge {
+            plugin_bridge.send(event);
+        }
+    }))
+}
+
 /// The JSON-mode sink: the print host's stdout session-event frame writer
 /// (see [`crate::coding_agent::json::print_session_event`]).
 pub fn json_session_event_sink() -> PrintSessionEventSink {
@@ -3492,6 +5191,7 @@ fn emit_compaction_event(sink: &Option<PrintSessionEventSink>, event: SessionEve
 /// agent-session.ts:3272-3296; `agent_session/compact.rs`'s
 /// `emit_threshold_compaction_persistence_failure`).
 async fn report_threshold_compaction_failure(
+    plugins: &Option<Arc<PluginHost>>,
     runtime: &Option<crate::extensions::ExtensionHandle>,
     session_events: &Option<PrintSessionEventSink>,
     error: &str,
@@ -3500,22 +5200,46 @@ async fn report_threshold_compaction_failure(
     if started {
         emit_compaction_event(session_events, compaction_end_failure(error));
     }
-    if let Some(runtime) = runtime {
-        if runtime.has_handlers("session_compact_failed") {
-            let mut payload = serde_json::json!({
-                "type": "session_compact_failed",
-                "reason": "threshold",
-                "errorMessage": format!("Auto-compaction failed: {error}"),
-                "aborted": false,
-                "willRetry": false,
-                "fromExtension": false,
-            });
-            if let Err(dispatch_error) = runtime.emit("session_compact_failed", &mut payload).await
-            {
-                eprintln!("[ext] session_compact_failed dispatch failed: {dispatch_error}");
-            }
-        }
-    }
+    crate::agent_session::emit_session_compact_failed(
+        plugins.as_deref(),
+        runtime.as_ref(),
+        "threshold",
+        Some(&format!("Auto-compaction failed: {error}")),
+        false,
+        false,
+        false,
+    )
+    .await;
+}
+
+/// Report an extension-cancelled threshold compaction: the matching terminal
+/// `compaction_end` (aborted, no errorMessage) followed by
+/// `session_compact_failed`, exactly the AgentSession threshold-cancel order.
+async fn report_threshold_compaction_cancel(
+    plugins: &Option<Arc<PluginHost>>,
+    runtime: &Option<crate::extensions::ExtensionHandle>,
+    session_events: &Option<PrintSessionEventSink>,
+) {
+    emit_compaction_event(
+        session_events,
+        SessionEvent::CompactionEnd {
+            reason: "threshold",
+            result: None,
+            aborted: true,
+            will_retry: false,
+            error_message: None,
+        },
+    );
+    crate::agent_session::emit_session_compact_failed(
+        plugins.as_deref(),
+        runtime.as_ref(),
+        "threshold",
+        None,
+        true,
+        false,
+        false,
+    )
+    .await;
 }
 
 /// The session identity a paged compaction was captured from (see the paged
@@ -3632,12 +5356,13 @@ fn print_compaction_threshold_met(
 }
 
 /// Build the print host's loop compaction hook (agent_session
-/// `compaction_hook`, threshold reason, minus the extension
-/// `session_before_compact` gating the print host does not wire): when the
-/// trigger fires, the cut point is computed over the projection snapshot plus
-/// the run's newer messages, the summarizer call(s) run against the threshold
-/// model, and on success the compaction entry is appended to session storage
-/// with the cut point as `firstKeptEntryId`. Failure returns the original
+/// `compaction_hook`, threshold reason): when the trigger fires, the cut point
+/// is computed over the projection snapshot plus the run's newer messages, the
+/// extension `session_before_compact` event may cancel or replace the run, and
+/// otherwise the summarizer call(s) run against the threshold model. On
+/// success the compaction entry is appended to session storage with the cut
+/// point as `firstKeptEntryId`, `session_compact` is emitted, and the
+/// `compaction_end` session event closes the pair. Failure returns the original
 /// context unchanged (the run continues un-compacted) and reports the failure
 /// to extensions as `session_compact_failed` (reason `threshold`), the same
 /// event agent_session's hook emits.
@@ -3696,19 +5421,151 @@ async fn widen_paged_context(
     }))
 }
 
+/// The persisted `CompactionEntry` wire shape for a `session_compact` payload
+/// (`None` when the run has no storage or the entry id is unknown).
+async fn print_compaction_entry_wire(
+    session: &SharedSession,
+    entry_id: Option<&str>,
+) -> Option<JsonValue> {
+    let entry_id = entry_id?;
+    let guard = session.lock().await;
+    let entry = guard.as_ref()?.entry(entry_id)?;
+    serde_json::to_value(entry).ok()
+}
+
+/// Persist one successful threshold compaction and publish its full success
+/// surface: the extension `session_compact` event (with the persisted
+/// `compactionEntry`) followed by the `compaction_end` session event — the
+/// same order `agent_session/compact.rs` uses. A storage append failure is
+/// returned to the caller, which keeps the pre-compaction context.
+async fn apply_print_compaction_result(
+    compacted: compaction::CompactionResult,
+    from_extension: bool,
+    context: &Arc<Context>,
+    session: &SharedSession,
+    plugins: &Option<Arc<PluginHost>>,
+    session_events: &Option<PrintSessionEventSink>,
+) -> Result<Arc<Context>, String> {
+    let appended_entry_id = {
+        let mut guard = session.lock().await;
+        match guard.as_mut() {
+            Some(manager) => Some(
+                manager
+                    .append_compaction_with_usage(
+                        compacted.summary.clone(),
+                        compacted.first_kept_entry_id.as_deref(),
+                        compacted.tokens_before,
+                        Some(print_compaction_details(&compacted)),
+                        Some(compacted.usage),
+                        from_extension,
+                    )
+                    .map_err(|error| error.to_string())?,
+            ),
+            None => None,
+        }
+    };
+    let rebuilt = Arc::new(compaction::rebuilt_context(context, &compacted));
+    let estimated_tokens_after = compaction::estimate_context_tokens(&rebuilt.messages).tokens;
+    // No plugin host means `emit_session_compact_success` returns immediately;
+    // do not serialize the compaction entry (which carries the full system
+    // message/tool declarations) and the wire result on that path.
+    if plugins.is_some() {
+        crate::agent_session::emit_session_compact_success(
+            plugins.as_deref(),
+            "threshold",
+            print_compaction_result_wire(&compacted, estimated_tokens_after),
+            print_compaction_entry_wire(session, appended_entry_id.as_deref()).await,
+            from_extension,
+        )
+        .await;
+    }
+    emit_compaction_event(
+        session_events,
+        compaction_end_success(&compacted, &rebuilt.messages),
+    );
+    Ok(rebuilt)
+}
+
+/// Dispatch `session_before_compact` for the print threshold hook through the
+/// shared AgentSession adapter. `Proceed` when no handler exists (the common
+/// case: no branch read, no payload built).
+async fn dispatch_print_before_compact(
+    plugins: &Option<Arc<PluginHost>>,
+    preparation: &compaction::BorrowedCompactionPreparation<'_>,
+    session: &SharedSession,
+    aborted: bool,
+) -> crate::agent_session::BeforeCompactDecision {
+    let Some(plugins) = plugins.as_ref() else {
+        return crate::agent_session::BeforeCompactDecision::Proceed;
+    };
+    if !plugins.has_handlers("session_before_compact") {
+        return crate::agent_session::BeforeCompactDecision::Proceed;
+    }
+    let branch_entries = {
+        let guard = session.lock().await;
+        guard
+            .as_ref()
+            .map(|session| session.branch_entries(None).unwrap_or_default())
+            .unwrap_or_default()
+    };
+    crate::agent_session::dispatch_before_compact(crate::agent_session::BeforeCompactDispatch {
+        plugins: Some(plugins),
+        reason: "threshold",
+        will_retry: false,
+        custom_instructions: None,
+        preparation,
+        branch_entries: &branch_entries,
+        aborted,
+    })
+    .await
+}
+
+/// The run-scoped inputs shared by every [`print_compaction_hook`] variant.
+pub struct PrintCompactionInputs {
+    pub config: CompactionConfig,
+    pub model: crate::ai::types::Model,
+    pub registry: Arc<ProviderRegistry>,
+    pub api_key: Option<String>,
+    pub thinking_level: crate::ai::types::ThinkingLevel,
+    pub hooks: crate::ai::types::ProviderStreamHooks,
+    pub session: SharedSession,
+    pub projected: Option<ProjectionSnapshot>,
+    pub plugins: Option<Arc<PluginHost>>,
+    pub runtime: Option<crate::extensions::ExtensionHandle>,
+    pub session_events: Option<PrintSessionEventSink>,
+}
+
 /// Public for tests/.
-#[allow(clippy::too_many_arguments)]
-pub fn print_compaction_hook(
-    config: CompactionConfig,
-    model: crate::ai::types::Model,
-    registry: Arc<ProviderRegistry>,
-    api_key: Option<String>,
-    thinking_level: crate::ai::types::ThinkingLevel,
-    hooks: crate::ai::types::ProviderStreamHooks,
-    session: SharedSession,
-    projected: Option<ProjectionSnapshot>,
-    runtime: Option<crate::extensions::ExtensionHandle>,
-    session_events: Option<PrintSessionEventSink>,
+pub fn print_compaction_hook(inputs: PrintCompactionInputs) -> CompactionFn {
+    print_compaction_hook_impl(inputs, None)
+}
+
+/// [`print_compaction_hook`] with the run's abort signal: the
+/// `session_before_compact.signal.aborted` field reflects the live print run
+/// (AgentSession's threshold path passes `compaction_aborted()`; the plain
+/// wrapper keeps `false` for host-less callers/tests).
+pub fn print_compaction_hook_with_signal(
+    inputs: PrintCompactionInputs,
+    aborted: crate::ai::types::AbortSignal,
+) -> CompactionFn {
+    print_compaction_hook_impl(inputs, Some(aborted))
+}
+
+fn print_compaction_hook_impl(
+    PrintCompactionInputs {
+        config,
+        model,
+        registry,
+        api_key,
+        thinking_level,
+        hooks,
+        session,
+        projected,
+        plugins,
+        runtime,
+        session_events,
+    }: PrintCompactionInputs,
+    aborted: Option<crate::ai::types::AbortSignal>,
 ) -> CompactionFn {
     // The summarizer completes against the same (routed) model the threshold
     // was checked against (agent_session `complete_fn_for`), with the same
@@ -3716,8 +5573,15 @@ pub fn print_compaction_hook(
     // the session streamFn, so the extension transport hooks fire for them
     // too — sdk.ts:420-434).
     let complete_model = model.clone();
+    // P2-S8-4 print residual: the threshold summarizer is a session-scoped
+    // request even though print has no AgentSession. A standalone scope keeps
+    // a child/sibling's shared dynamic provider from capturing this request
+    // while leaving print's own (owner-less) registrations and static
+    // providers resolvable.
+    let complete_session = registry.standalone_provider_session();
     let complete: Arc<compaction::CompleteFn> = Arc::new(Box::new(move |context| {
         let registry = Arc::clone(&registry);
+        let key = complete_session.key().clone();
         let model = complete_model.clone();
         let options = crate::ai::types::StreamOptions {
             api_key: api_key.clone(),
@@ -3726,7 +5590,7 @@ pub fn print_compaction_hook(
             ..Default::default()
         };
         Box::pin(async move {
-            let stream = registry.stream_resolving_auth(model, context, options);
+            let stream = registry.stream_resolving_auth_for(Some(&key), model, context, options);
             // Completion consumer: drain while waiting (bounded queue; see
             // `drain_and_result`).
             match stream.drain_and_result().await {
@@ -3746,9 +5610,38 @@ pub fn print_compaction_hook(
         let session = Arc::clone(&session);
         let projected = projected.clone();
         let snapshot_stale = Arc::clone(&snapshot_stale);
+        let plugins = plugins.clone();
         let runtime = runtime.clone();
         let session_events = session_events.clone();
+        let aborted = aborted.clone();
         Box::pin(async move {
+            // LEAN PAGED CONTEXT (the linear paged prompt builder above):
+            // `projected` is None while the manager still holds only its tail
+            // window, and the live `context` is the complete transcript. The
+            // threshold is decided on that context directly; only a firing
+            // threshold pays `widen_to_full` (the per-entry cut basis and the
+            // compaction append need the resident entries). A sub-threshold
+            // turn — the compaction-disabled / huge-window case — returns the
+            // SAME Arc without touching the file again.
+            if projected.is_none() {
+                // Compaction disabled: every turn is a no-op; do not even
+                // scan the context's token estimate.
+                if !config.enabled {
+                    return context;
+                }
+                let mut guard = session.lock().await;
+                if let Some(manager) = guard.as_mut() {
+                    if manager.is_paged() {
+                        if !compaction::should_compact(context.as_ref(), &model, &config) {
+                            return context;
+                        }
+                        if let Err(error) = manager.widen_to_full() {
+                            eprintln!("[session] paged widening failed: {error}");
+                            return context;
+                        }
+                    }
+                }
+            }
             // PAGED fast path (a session opened tail-first, see
             // `SessionManager::open_paged`): the skipped prefix is summarized
             // straight from the file, chunk by chunk, so a 100 MB transcript
@@ -3782,7 +5675,20 @@ pub fn print_compaction_hook(
             let (paged_preparation, paged_stamp) = {
                 let guard = session.lock().await;
                 match guard.as_ref() {
-                    Some(paged_session) if paged_session.is_paged() => {
+                    // A `session_before_compact` handler must observe (and be
+                    // able to cancel/replace) every threshold run. The paged
+                    // fast path summarizes straight from the file without
+                    // materializing the borrowed preparation the event
+                    // carries, so with a handler registered the run takes the
+                    // widening fallback below — the same compaction, one
+                    // event-complete path. Handler-less paged runs keep the
+                    // streaming fast path.
+                    Some(paged_session)
+                        if paged_session.is_paged()
+                            && !plugins.as_ref().is_some_and(|plugins| {
+                                plugins.has_handlers("session_before_compact")
+                            }) =>
+                    {
                         let stamp = PagedStamp {
                             session_id: paged_session.id().to_owned(),
                             session_file: paged_session
@@ -3862,6 +5768,7 @@ pub fn print_compaction_hook(
                     // the new leaf: still valid) or changed identity/branch
                     // (stale: append nothing and report the failure).
                     let mut failure: Option<String> = None;
+                    let mut appended_entry_id: Option<String> = None;
                     {
                         let mut guard = session.lock().await;
                         match guard.as_mut() {
@@ -3875,7 +5782,7 @@ pub fn print_compaction_hook(
                                     }
                                 }
                                 if failure.is_none() {
-                                    if let Err(error) = current.append_compaction_with_usage(
+                                    match current.append_compaction_with_usage(
                                         compacted.summary.clone(),
                                         compacted.first_kept_entry_id.as_deref(),
                                         compacted.tokens_before,
@@ -3883,17 +5790,20 @@ pub fn print_compaction_hook(
                                         Some(compacted.usage),
                                         false,
                                     ) {
-                                        // Storage did not take the compaction:
-                                        // the context must stay the
-                                        // pre-compaction one, the snapshot
-                                        // fresh, and the next turn retries
-                                        // (agent_session/compact.rs's
-                                        // threshold persistence-failure
-                                        // contract).
-                                        eprintln!(
-                                            "[session] paged compaction persistence failed: {error}"
-                                        );
-                                        failure = Some(error.to_string());
+                                        Ok(entry_id) => appended_entry_id = Some(entry_id),
+                                        Err(error) => {
+                                            // Storage did not take the
+                                            // compaction: the context must stay
+                                            // the pre-compaction one, the
+                                            // snapshot fresh, and the next turn
+                                            // retries (agent_session/compact.rs's
+                                            // threshold persistence-failure
+                                            // contract).
+                                            eprintln!(
+                                                "[session] paged compaction persistence failed: {error}"
+                                            );
+                                            failure = Some(error.to_string());
+                                        }
                                     }
                                 }
                             }
@@ -3907,6 +5817,7 @@ pub fn print_compaction_hook(
                     }
                     if let Some(error) = failure {
                         report_threshold_compaction_failure(
+                            &plugins,
                             &runtime,
                             &session_events,
                             &error,
@@ -3922,9 +5833,21 @@ pub fn print_compaction_hook(
                     snapshot_stale.store(true, std::sync::atomic::Ordering::SeqCst);
                     // A real compaction returns a NEW shared context (the
                     // loop's `Arc::ptr_eq` check fires `Compaction`). The
-                    // lifecycle frame closes AFTER the entry is persisted and
-                    // the rebuilt context exists (`estimatedTokensAfter`).
+                    // lifecycle frames close AFTER the entry is persisted and
+                    // the rebuilt context exists (`estimatedTokensAfter`):
+                    // `session_compact` first, then `compaction_end`, the
+                    // AgentSession success order.
                     let rebuilt = Arc::new(compaction::rebuilt_context(&context, &compacted));
+                    let estimated_tokens_after =
+                        compaction::estimate_context_tokens(&rebuilt.messages).tokens;
+                    crate::agent_session::emit_session_compact_success(
+                        plugins.as_deref(),
+                        "threshold",
+                        print_compaction_result_wire(&compacted, estimated_tokens_after),
+                        print_compaction_entry_wire(&session, appended_entry_id.as_deref()).await,
+                        false,
+                    )
+                    .await;
                     emit_compaction_event(
                         &session_events,
                         compaction_end_success(&compacted, &rebuilt.messages),
@@ -3938,10 +5861,17 @@ pub fn print_compaction_hook(
                     // `ThresholdNotMet` after a met pre-check is closed
                     // defensively, so an emitted start can never dangle.
                     if paged_started {
-                        emit_compaction_event(
+                        // A start was emitted: close BOTH halves (the
+                        // `compaction_end` failure frame and the extension
+                        // `session_compact_failed`), never a dangling pair.
+                        report_threshold_compaction_failure(
+                            &plugins,
+                            &runtime,
                             &session_events,
-                            compaction_end_failure("the paged threshold no longer holds"),
-                        );
+                            "the paged threshold no longer holds",
+                            true,
+                        )
+                        .await;
                     }
                     if let Some(full) = widen_paged_context(&session, &context).await {
                         return full;
@@ -3955,6 +5885,7 @@ pub fn print_compaction_hook(
                     // pre-check projection failure reports through the
                     // extension event alone.
                     report_threshold_compaction_failure(
+                        &plugins,
                         &runtime,
                         &session_events,
                         &error,
@@ -4025,73 +5956,86 @@ pub fn print_compaction_hook(
                                 None => return context,
                             };
                         emit_compaction_event(&session_events, compaction_start_frame());
-                        return match with_threshold_compaction_retry_events(
-                            &session_events,
-                            compaction::compact_with_preparation_refs(
-                                prepared,
-                                &model,
-                                Arc::clone(&complete),
-                                None,
-                            ),
+                        let mut from_extension = false;
+                        let aborted_now =
+                            aborted.as_ref().is_some_and(|signal| signal.is_aborted());
+                        let compacted = match dispatch_print_before_compact(
+                            &plugins,
+                            &prepared,
+                            &session,
+                            aborted_now,
                         )
                         .await
                         {
-                            Ok(compacted) => {
-                                let mut persistence_error: Option<String> = None;
-                                if let Some(session) = session.lock().await.as_mut() {
-                                    if let Err(error) = session.append_compaction_with_usage(
-                                        compacted.summary.clone(),
-                                        compacted.first_kept_entry_id.as_deref(),
-                                        compacted.tokens_before,
-                                        Some(print_compaction_details(&compacted)),
-                                        Some(compacted.usage),
-                                        false,
-                                    ) {
-                                        // Same contract as the resident path:
-                                        // no rebuilt context, no stale
-                                        // snapshot — the next turn retries.
-                                        eprintln!(
-                                            "[session] widening compaction persistence failed: {error}"
-                                        );
-                                        persistence_error = Some(error.to_string());
-                                    }
-                                }
-                                match persistence_error {
-                                    Some(error) => {
+                            crate::agent_session::BeforeCompactDecision::Cancel => {
+                                report_threshold_compaction_cancel(
+                                    &plugins,
+                                    &runtime,
+                                    &session_events,
+                                )
+                                .await;
+                                return context;
+                            }
+                            crate::agent_session::BeforeCompactDecision::Replace(result) => {
+                                from_extension = true;
+                                *result
+                            }
+                            crate::agent_session::BeforeCompactDecision::Proceed => {
+                                match with_threshold_compaction_retry_events(
+                                    &session_events,
+                                    compaction::compact_with_preparation_refs(
+                                        prepared,
+                                        &model,
+                                        Arc::clone(&complete),
+                                        None,
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(compacted) => compacted,
+                                    Err(error) => {
+                                        // `compaction_end` first, then the
+                                        // extension `session_compact_failed`
+                                        // (agent_session's catch order); the
+                                        // run continues un-compacted with the
+                                        // original context.
                                         report_threshold_compaction_failure(
+                                            &plugins,
                                             &runtime,
                                             &session_events,
                                             &error,
                                             true,
                                         )
                                         .await;
-                                        context
-                                    }
-                                    None => {
-                                        // The widened session was compacted in
-                                        // place: a prompt-start snapshot (taken
-                                        // over the paged window) no longer
-                                        // describes the rebuilt context.
-                                        snapshot_stale
-                                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                                        let rebuilt = Arc::new(compaction::rebuilt_context(
-                                            &context, &compacted,
-                                        ));
-                                        emit_compaction_event(
-                                            &session_events,
-                                            compaction_end_success(&compacted, &rebuilt.messages),
-                                        );
-                                        rebuilt
+                                        return context;
                                     }
                                 }
                             }
+                        };
+                        return match apply_print_compaction_result(
+                            compacted,
+                            from_extension,
+                            &context,
+                            &session,
+                            &plugins,
+                            &session_events,
+                        )
+                        .await
+                        {
+                            Ok(rebuilt) => {
+                                // The widened session was compacted in place:
+                                // a prompt-start snapshot (taken over the
+                                // paged window) no longer describes the
+                                // rebuilt context.
+                                snapshot_stale.store(true, std::sync::atomic::Ordering::SeqCst);
+                                rebuilt
+                            }
                             Err(error) => {
-                                // `compaction_end` first, then the extension
-                                // `session_compact_failed` (agent_session's
-                                // catch order); the run continues un-compacted
-                                // with the original context, like
-                                // agent_session/compact.rs.
+                                eprintln!(
+                                    "[session] widening compaction persistence failed: {error}"
+                                );
                                 report_threshold_compaction_failure(
+                                    &plugins,
                                     &runtime,
                                     &session_events,
                                     &error,
@@ -4163,75 +6107,77 @@ pub fn print_compaction_hook(
             // the preparation succeeded and one `compaction_end` on every
             // exit).
             emit_compaction_event(&session_events, compaction_start_frame());
-            match with_threshold_compaction_retry_events(
+            let mut from_extension = false;
+            let aborted_now = aborted.as_ref().is_some_and(|signal| signal.is_aborted());
+            let compacted =
+                match dispatch_print_before_compact(&plugins, &prepared, &session, aborted_now)
+                    .await
+                {
+                    crate::agent_session::BeforeCompactDecision::Cancel => {
+                        report_threshold_compaction_cancel(&plugins, &runtime, &session_events)
+                            .await;
+                        return context;
+                    }
+                    crate::agent_session::BeforeCompactDecision::Replace(result) => {
+                        from_extension = true;
+                        *result
+                    }
+                    crate::agent_session::BeforeCompactDecision::Proceed => {
+                        match with_threshold_compaction_retry_events(
+                            &session_events,
+                            compaction::compact_with_preparation_refs(
+                                prepared, &model, complete, None,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(compacted) => compacted,
+                            Err(error) => {
+                                // `compaction_end` first, then the extension
+                                // `session_compact_failed` (agent_session's catch
+                                // order). The run continues un-compacted with the
+                                // original context.
+                                report_threshold_compaction_failure(
+                                    &plugins,
+                                    &runtime,
+                                    &session_events,
+                                    &error,
+                                    true,
+                                )
+                                .await;
+                                return context;
+                            }
+                        }
+                    }
+                };
+            match apply_print_compaction_result(
+                compacted,
+                from_extension,
+                &context,
+                &session,
+                &plugins,
                 &session_events,
-                compaction::compact_with_preparation_refs(prepared, &model, complete, None),
             )
             .await
             {
-                Ok(compacted) => {
-                    let mut persistence_error: Option<String> = None;
-                    if let Some(session) = session.lock().await.as_mut() {
-                        if let Err(error) = session.append_compaction_with_usage(
-                            compacted.summary.clone(),
-                            compacted.first_kept_entry_id.as_deref(),
-                            compacted.tokens_before,
-                            Some(print_compaction_details(&compacted)),
-                            Some(compacted.usage),
-                            false,
-                        ) {
-                            // Storage did not take the compaction: keep the
-                            // pre-compaction context and the fresh snapshot so
-                            // the next turn retries instead of sending a
-                            // context whose summary/leaf boundary is not
-                            // persisted (agent_session/compact.rs's threshold
-                            // persistence-failure contract).
-                            eprintln!("[session] compaction persistence failed: {error}");
-                            persistence_error = Some(error.to_string());
-                        }
-                    }
-                    match persistence_error {
-                        Some(error) => {
-                            report_threshold_compaction_failure(
-                                &runtime,
-                                &session_events,
-                                &error,
-                                true,
-                            )
-                            .await;
-                            context
-                        }
-                        None => {
-                            // The rebuilt context is shorter than the
-                            // prompt-start snapshot and the session leaf path
-                            // now carries this compaction boundary: the NEXT
-                            // threshold check of this run rebuilds its
-                            // metadata from the live session, never from the
-                            // pre-compaction snapshot (a second compaction over
-                            // stale counts/ids would cut at a pre-boundary
-                            // entry or a `None` id and lose the newest kept
-                            // messages).
-                            snapshot_stale.store(true, std::sync::atomic::Ordering::SeqCst);
-                            // A real compaction returns a NEW shared context
-                            // (the loop's `Arc::ptr_eq` check fires
-                            // `Compaction`).
-                            let rebuilt =
-                                Arc::new(compaction::rebuilt_context(&context, &compacted));
-                            emit_compaction_event(
-                                &session_events,
-                                compaction_end_success(&compacted, &rebuilt.messages),
-                            );
-                            rebuilt
-                        }
-                    }
+                Ok(rebuilt) => {
+                    // The rebuilt context is shorter than the prompt-start
+                    // snapshot and the session leaf path now carries this
+                    // compaction boundary: the NEXT threshold check of this
+                    // run rebuilds its metadata from the live session, never
+                    // from the pre-compaction snapshot.
+                    snapshot_stale.store(true, std::sync::atomic::Ordering::SeqCst);
+                    rebuilt
                 }
                 Err(error) => {
-                    // `compaction_end` first, then the extension
-                    // `session_compact_failed` (agent_session's catch order).
-                    // The run continues un-compacted with the original
-                    // context, like agent_session/compact.rs.
-                    report_threshold_compaction_failure(&runtime, &session_events, &error, true)
-                        .await;
+                    report_threshold_compaction_failure(
+                        &plugins,
+                        &runtime,
+                        &session_events,
+                        &error,
+                        true,
+                    )
+                    .await;
                     context
                 }
             }

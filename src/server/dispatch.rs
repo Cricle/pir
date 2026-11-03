@@ -316,12 +316,24 @@ async fn route_session_call(
                         .map(|s| s.to_owned());
                     // A remote client naming an arbitrary cwd points the
                     // whole agent (tools, context files, settings) at any
-                    // path on the host; the security policy gates it.
+                    // path on the host; the security policy gates it and
+                    // canonicalizes the accepted path (symlinks and
+                    // case-aliases inside an allowed root are rejected).
                     if let Some(cwd) = &cwd {
                         if !ctx.security.allows_cwd(cwd) {
                             return Err(RequestError::from(SessionCommandError::Policy));
                         }
                     }
+                    let cwd = match cwd {
+                        Some(cwd) => Some(
+                            ctx.security
+                                .resolve_cwd(&cwd)
+                                .ok_or_else(|| RequestError::from(SessionCommandError::Policy))?
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                        None => None,
+                    };
                     let name = args
                         .and_then(|o| field_opt(o, "name"))
                         .and_then(Value::as_str)

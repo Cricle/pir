@@ -543,7 +543,15 @@ fn strip_extended_prefix(path: PathBuf) -> PathBuf {
 }
 
 fn temp_trust_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    // Keep trust fixtures OUTSIDE the user profile: the temp root can inherit
+    // `~/.pi` / `~/.agents/skills` through the ancestor walk and make an empty
+    // project look trust-requiring. (`C:\pir-trust-tests` has no such
+    // ancestors on the Windows CI image; Unix `/tmp` is clean.)
+    #[cfg(windows)]
+    let base = PathBuf::from(r"C:\pir-trust-tests");
+    #[cfg(not(windows))]
+    let base = std::env::temp_dir();
+    let dir = base.join(format!(
         "pir-trust-tests-{}-{}",
         name,
         uuid::Uuid::new_v4().simple()

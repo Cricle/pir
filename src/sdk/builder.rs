@@ -1117,7 +1117,7 @@ impl AgentBuilder {
     /// endpoint) must declare a non-zero `context_window` and `max_tokens`.
     /// A builtin or extension path that cannot be attached also fails here —
     /// never as a silently incomplete agent.
-    pub async fn build(self) -> Result<Agent, SdkError> {
+    pub async fn build(mut self) -> Result<Agent, SdkError> {
         let cwd = self
             .cwd
             .clone()
@@ -1232,14 +1232,16 @@ impl AgentBuilder {
                     }
                     let api = endpoint.api.wire_id();
                     let stub = crate::ai::providers::construction::model(
-                        "sdk-endpoint",
-                        &endpoint.model_id,
-                        &endpoint.model_id,
-                        api,
-                        &endpoint.base_url,
-                        endpoint.context_window,
-                        endpoint.max_tokens,
-                        vec!["text"],
+                        crate::ai::providers::construction::ModelSpec {
+                            provider: "sdk-endpoint",
+                            id: &endpoint.model_id,
+                            name: &endpoint.model_id,
+                            api,
+                            base_url: &endpoint.base_url,
+                            context_window: endpoint.context_window,
+                            max_tokens: endpoint.max_tokens,
+                            input: vec!["text"],
+                        },
                     );
                     let registry = Arc::new(crate::ai::provider::ProviderRegistry::default());
                     crate::ai::providers::RegisterDynamicProviderShared::register_dynamic_provider_shared(
@@ -1278,14 +1280,20 @@ impl AgentBuilder {
                     } else {
                         crate::ai::providers::load_pi_environment(Some(cwd.as_path()))?
                     };
-                    let models = environment.models.clone();
-                    let settings = environment.settings.clone();
+                    // Destructure instead of cloning: the catalog can hold
+                    // hundreds of models and the settings snapshot is a
+                    // second full copy the build never needed to retain.
+                    let crate::ai::providers::PiEnvironment {
+                        registry: environment_registry,
+                        models,
+                        api_keys,
+                        settings,
+                    } = environment;
                     // `has_configured_auth` with the stored-credential read
                     // scoped to this agent's auth.json (identical to the
                     // shared check when the dir IS the environment's).
-                    let has_auth = |provider: &str| {
-                        has_configured_auth_in(&agent_dir, provider, &environment.api_keys)
-                    };
+                    let has_auth =
+                        |provider: &str| has_configured_auth_in(&agent_dir, provider, &api_keys);
                     // Settings `defaultTools` (upstream `createAgentSession`
                     // seeds the tool selection from
                     // `settingsManager.getDefaultTools()`); an explicit builder
@@ -1392,9 +1400,9 @@ impl AgentBuilder {
                             (model, Some(initial.thinking_level))
                         }
                     };
-                    let resolved_api_key = environment.api_keys.get(&model.provider).cloned();
-                    environment_api_keys = Some(environment.api_keys.clone());
-                    let provider_registry = Arc::new(environment.registry);
+                    let resolved_api_key = api_keys.get(&model.provider).cloned();
+                    environment_api_keys = Some(api_keys);
+                    let provider_registry = Arc::new(environment_registry);
                     // Remote catalog overlays (upstream model-runtime
                     // `withRemoteCatalog`): background ETag revalidation,
                     // delayed first hop, PI_OFFLINE-gated. Their
@@ -1464,13 +1472,13 @@ impl AgentBuilder {
             .unwrap_or_default();
         let recorded_settings = session
             .as_ref()
-            .and_then(|manager| manager.build_session_projection().ok());
+            .map(super::agent::session_recorded_settings)
+            .unwrap_or_default();
         let mut model = model;
         if !model_pinned {
-            if let Some((provider, model_id)) = recorded_settings
-                .as_ref()
-                .and_then(|projection| projection.model.clone())
-            {
+            // `recorded_settings.thinking` is `Copy`, so the model tuple can
+            // move out of the owned snapshot instead of cloning two strings.
+            if let Some((provider, model_id)) = recorded_settings.model {
                 if let Some(restored) = registry.get_model(&provider, &model_id) {
                     // The explicit key belongs to the initially resolved
                     // provider; a cross-provider restore must use that
@@ -1548,7 +1556,9 @@ impl AgentBuilder {
             }
             paths
         } else {
-            self.extension_paths.clone()
+            // `build` consumes the builder: move the paths out instead of
+            // cloning the vector.
+            std::mem::take(&mut self.extension_paths)
         };
         let extensions = if extension_paths.is_empty() {
             None
@@ -1951,10 +1961,7 @@ impl AgentBuilder {
             resolved_thinking.unwrap_or(crate::ai::providers::resolution::DEFAULT_THINKING_LEVEL)
         });
         if !thinking_pinned {
-            if let Some(level) = session
-                .as_ref()
-                .and_then(super::agent::session_recorded_thinking)
-            {
+            if let Some(level) = recorded_settings.thinking {
                 thinking = level;
             }
         }
@@ -2078,21 +2085,21 @@ impl AgentBuilder {
                     .set_prompt_resources_shared(resources.skills, resources.prompt_templates);
             }
         }
-        let agent = Agent::new(
-            session_facade,
+        let agent = Agent::new(super::agent::AgentInit {
+            session: session_facade,
             // The bridge plugin and the Agent share ONE sink slot: live
             // `tool_execution_update` payloads flow into the streaming
             // run's event stream.
-            sink_slot,
+            sink: sink_slot,
             // Paths the SDK lifecycle methods need after the build.
-            session_cwd,
+            cwd: session_cwd,
             session_dir,
             agent_dir,
             model_pinned,
             thinking_pinned,
             initial_usage,
             api_key_provider,
-        );
+        });
         if self.max_retries.is_some() || self.max_retry_delay_ms.is_some() {
             agent
                 .inner
@@ -2330,17 +2337,19 @@ pub(crate) fn load_environment_at(
                 .or_else(|| provider_config.models.first().map(|entry| entry.id.clone()))
                 .unwrap_or_else(|| "default".to_string());
             models.push(crate::ai::providers::construction::model(
-                provider_id,
-                &model_id,
-                &model_id,
-                provider_config.api.as_deref().unwrap_or("openai-chat"),
-                provider_config
-                    .base_url
-                    .as_deref()
-                    .unwrap_or("http://localhost:11434/v1"),
-                128_000,
-                16_384,
-                vec!["text"],
+                crate::ai::providers::construction::ModelSpec {
+                    provider: provider_id,
+                    id: &model_id,
+                    name: &model_id,
+                    api: provider_config.api.as_deref().unwrap_or("openai-chat"),
+                    base_url: provider_config
+                        .base_url
+                        .as_deref()
+                        .unwrap_or("http://localhost:11434/v1"),
+                    context_window: 128_000,
+                    max_tokens: 16_384,
+                    input: vec!["text"],
+                },
             ));
         }
         let display_name = provider_config

@@ -36,20 +36,9 @@ use cli_preprocess::{
 };
 #[cfg(feature = "tui")]
 use print_mode::resolve_interactive_tool_selection;
-use print_mode::run_print_mode;
+use print_mode::{run_print_mode, PrintModeRequest};
 use run_mode::run;
 use tui_trace::{rotate_tui_trace_log, validate_tui_mode, TUI_TRACE_LOG_MAX_BYTES};
-
-/// The runtime error for a command whose subsystem was compiled out of this
-/// build. `cargo` features are additive and the clap surface is shared by
-/// every profile, so the command must parse and then fail with the exact
-/// missing feature instead of failing to compile.
-#[allow(dead_code)] // a `full` build compiles every call site out
-fn missing_feature(command: &str, feature: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "`{command}` is unavailable: this build was built without the `{feature}` feature"
-    )
-}
 
 /// Windows gives the main thread a 1 MiB stack, and the clap command tree
 /// (`Cli`'s 60+ flags plus the subcommand trees) overflows it in debug

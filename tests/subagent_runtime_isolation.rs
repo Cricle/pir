@@ -727,6 +727,120 @@ async fn parent_without_path_plan_falls_back_to_the_shared_handle() {
     );
 }
 
+/// The shared-runtime fallback keeps the JS TOOL backend but must not deliver
+/// the child's events to the parent's `pi.on` handlers. Before the isolation
+/// guard, the child host wrapped the parent handle and the loop dispatched
+/// `session_start` / loop / tool events into it: the parent's counters fired
+/// for a session it does not own. The JS adapter stays registered (the shared
+/// tool still executes), only event dispatch is muted.
+#[tokio::test(flavor = "current_thread")]
+async fn shared_handle_fallback_does_not_deliver_child_events_to_parent_handlers() {
+    let _build_guard = BUILD_COUNT_LOCK.lock().await;
+    let temp = TempDir::new("fallback-events");
+    temp.write_agent(
+        "scout.md",
+        "name: scout\ndescription: event isolation probe\ntools: shared-tool\n",
+        "Use the shared-tool.",
+    );
+    let ext_path = temp.0.join("ext.ts");
+    std::fs::write(
+        &ext_path,
+        r#"
+        const seen = {
+            session_start: 0,
+            agent_start: 0,
+            message_start: 0,
+            message_update: 0,
+            message_end: 0,
+            tool_call: 0,
+            tool_result: 0,
+            agent_end: 0,
+        };
+        export default function (pi) {
+            for (const name of Object.keys(seen)) {
+                pi.on(name, () => { seen[name] += 1; });
+            }
+            pi.registerTool({
+                name: "shared-tool",
+                description: "runs through the shared JS actor",
+                parameters: { type: "object" },
+                execute: async () => ({
+                    content: [{ type: "text", text: "SHARED_OK" }],
+                }),
+            });
+            pi.registerTool({
+                name: "event-probe",
+                description: "reports the parent runtime's event counters",
+                parameters: { type: "object" },
+                execute: async () => ({
+                    content: [{ type: "text", text: "EVENTS:" + JSON.stringify(seen) }],
+                }),
+            });
+        }
+    "#,
+    )
+    .expect("write extension");
+
+    // No `set_path_plan`: the recorded plan is empty → shared-handle fallback.
+    let parent = pir::extensions::ExtensionHandle::start(pir::extensions::ExtensionConfig {
+        cwd: temp.0.clone(),
+        mode: "headless".to_string(),
+        has_ui: false,
+        model: Some("fake-model".to_string()),
+        session_id: Some("fallback-events-parent".to_string()),
+        system_prompt: String::new(),
+        is_idle: true,
+        limits: Some(Default::default()),
+    })
+    .expect("runtime start");
+    let load = parent.load(&[ext_path]).await.expect("load extension");
+    assert!(load.errors.is_empty(), "{:?}", load.errors);
+
+    let registry = fake_registry(Arc::new(|index, context| {
+        if index == 0 {
+            assistant(
+                vec![tool_call_block(
+                    "call-1",
+                    "shared-tool",
+                    serde_json::json!({}),
+                )],
+                StopReason::ToolUse,
+            )
+        } else {
+            let observed =
+                tool_result_text(context, "shared-tool").unwrap_or_else(|| "MISSING".to_owned());
+            assistant(vec![text(&format!("ECHO:{observed}"))], StopReason::Stop)
+        }
+    }));
+
+    let tool = subagent_tool_with_handle(parent.clone());
+    let env = session_env(registry, Some(temp.0.join("agents")));
+    let tool_ctx = tool_context(&temp.0, env);
+    let result = tool
+        .run(
+            &serde_json::json!({ "agent": "scout", "task": "call the shared tool" }),
+            &tool_ctx,
+        )
+        .await;
+    assert!(!result.is_error, "{}", result.content);
+    assert!(
+        result.content.contains("ECHO:SHARED_OK"),
+        "the shared JS tool must keep working in fallback mode: {}",
+        result.content
+    );
+
+    let probe = parent
+        .call_tool("event-probe", "event-probe", &serde_json::json!({}))
+        .await
+        .expect("parent event probe");
+    let probe = first_text_of(&probe);
+    assert_eq!(
+        probe,
+        "EVENTS:{\"session_start\":0,\"agent_start\":0,\"message_start\":0,\"message_update\":0,\"message_end\":0,\"tool_call\":0,\"tool_result\":0,\"agent_end\":0}",
+        "the child's events leaked into the parent runtime's handlers: {probe}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 5. A builtin-only plan does not start QuickJS per child
 // ---------------------------------------------------------------------------

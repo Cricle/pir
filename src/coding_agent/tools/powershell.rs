@@ -33,8 +33,9 @@ use crate::coding_agent::truncate::{
 use super::bash::{
     append_status, apply_session_env, apply_tree_kill_spawn_attributes, format_command_timed_out,
     resolve_command_timeout, run_with_operations, shell_heartbeat_payload, shell_output_schema,
-    spawn_pipe_reader, validate_timeout_secs, ShellCapture, TreeKillGuard, EXIT_STDIO_ABSOLUTE_CAP,
-    EXIT_STDIO_GRACE, SHELL_HEARTBEAT_INTERVAL, STRUCTURED_OUTPUT_MAX_BYTES, UPDATE_THROTTLE_MS,
+    spawn_pipe_reader, validate_timeout_secs, BashRun, ShellCapture, TreeKillGuard,
+    EXIT_STDIO_ABSOLUTE_CAP, EXIT_STDIO_GRACE, SHELL_HEARTBEAT_INTERVAL,
+    STRUCTURED_OUTPUT_MAX_BYTES, UPDATE_THROTTLE_MS,
 };
 
 /// Upstream `POWERSHELL_ARGS` (utils/shell.ts:122): the fixed argument block
@@ -212,16 +213,16 @@ impl AgentTool for PowerShellTool {
                 return ToolResult::error("Invalid command: command is required");
             }
             if let Some(operations) = operations {
-                return run_with_operations(
+                return run_with_operations(BashRun {
                     operations,
-                    &command,
-                    &cwd,
+                    command: &command,
+                    cwd: &cwd,
                     timeout_secs,
                     timeout_from_setting,
                     session_env,
                     on_update,
                     signal,
-                )
+                })
                 .await;
             }
             if !cwd.is_dir() {

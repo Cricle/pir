@@ -1050,22 +1050,23 @@ async fn run_threshold_compaction_probe(label: &str, drop_first: bool) -> Thresh
     let session: SharedSession = Arc::new(tokio::sync::Mutex::new(Some(
         SessionManager::in_memory(cwd.to_string_lossy().as_ref(), None).expect("in-memory session"),
     )));
-    let hook = print_compaction_hook(
-        CompactionConfig {
+    let hook = print_compaction_hook(pir::coding_agent::print::PrintCompactionInputs {
+        config: CompactionConfig {
             enabled: true,
             reserve_tokens: 4_000,
             keep_recent_tokens: 1,
         },
         model,
         registry,
-        None,
-        ThinkingLevel::Off,
-        pir::ai::types::ProviderStreamHooks::default(),
-        Arc::clone(&session),
-        None,
-        None,
-        Some(recording_sink(Arc::clone(&frames))),
-    );
+        api_key: None,
+        thinking_level: ThinkingLevel::Off,
+        hooks: pir::ai::types::ProviderStreamHooks::default(),
+        session: Arc::clone(&session),
+        projected: None,
+        plugins: None,
+        runtime: None,
+        session_events: Some(recording_sink(Arc::clone(&frames))),
+    });
     let context = Arc::new(Context {
         system_prompt: None,
         messages: vec![

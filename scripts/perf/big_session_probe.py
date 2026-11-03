@@ -246,7 +246,12 @@ def build_agent_dir(port, context_window):
     with open(os.path.join(agent, "models.json"), "w", encoding="utf-8") as fh:
         json.dump(models, fh, indent=2)
     settings = {"defaultProvider": "mock", "defaultModel": "mock-model",
-                "defaultThinkingLevel": "off"}
+                "defaultThinkingLevel": "off",
+                # The probe's scratch work dir is a fresh cwd on every run, so
+                # an interactive TUI leg would otherwise stop at the trust
+                # selector before loading the session (tui_session_probe uses
+                # this fixture). Trust is orthogonal to the memory measurement.
+                "defaultProjectTrust": "always"}
     with open(os.path.join(agent, "settings.json"), "w", encoding="utf-8") as fh:
         json.dump(settings, fh, indent=2)
     return agent

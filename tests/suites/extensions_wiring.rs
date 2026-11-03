@@ -749,7 +749,7 @@ mod shim_deflate {
         ),
         (
             "child_process_shim.js.txt",
-            "35bbc3403dfdf4188b0e80e71e68c63fe87d495d7f2e4cc78eeeb9c85ea16e4c",
+            "936b44e90fdb74d543c18d3dbefa68619eba1389c3db3639ae09a63515c5baaa",
         ),
         (
             "cluster_shim.js.txt",
@@ -944,7 +944,14 @@ mod shim_deflate {
             // HOST-EDGES: `ctx.shutdown()` no longer fires `notifyAbort()` —
             // upstream `ExtensionContext.shutdown` is a host exit request,
             // not an abort (agent-session.ts:3510-3512).
-            "564554f119b20f525d2c247153f2b2250dadc57303cc0b783e0d2919e592f097",
+            // Tool results: a bare string/array JS return normalizes to the
+            // content-block shape the Rust host expects.
+            // EVENT-BOUNDARY: `pi.on` now rejects unknown event names at load
+            // (central `coverage.rs` registry via the `isKnownEvent` host fn).
+            // TUI-INPUT: `pi.on("terminal_input")` registers on the dedicated
+            // terminalInputHandlers list (the same list
+            // `ctx.ui.onTerminalInput` uses) instead of ext.handlers.
+            "b76eb5a66ea2417ced1f2823572f8bc81410e4308a08021d911457a57fb4f586",
         ),
         (
             "process_global_stub.js.txt",
@@ -1123,6 +1130,11 @@ mod shim_deflate {
             let text = shim
                 .inflate()
                 .unwrap_or_else(|error| panic!("{name}: inflate failed: {error}"));
+            assert_eq!(
+                text.capacity(),
+                text.len(),
+                "{name}: inflate must return an exactly sized buffer (no cached slack)"
+            );
             let golden = GOLDEN
                 .iter()
                 .find(|(golden_name, _)| golden_name == name)

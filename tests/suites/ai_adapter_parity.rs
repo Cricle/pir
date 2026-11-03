@@ -1229,7 +1229,7 @@ fn message_shape_fields_skip_when_none_and_roundtrip() {
         usage: None,
         added_tool_names: Vec::new(),
         structured_content: Some(json!({"hits": 3})),
-        nested_calls: Some(NestedToolCalls {
+        nested_calls: Some(Box::new(NestedToolCalls {
             complete: false,
             calls: vec![NestedToolCallRecord {
                 id: "nested_1".into(),
@@ -1240,7 +1240,7 @@ fn message_shape_fields_skip_when_none_and_roundtrip() {
                 duration_ms: Some(12),
                 error: None,
             }],
-        }),
+        })),
         is_error: false,
         duration_ms: Some(50),
         timestamp: 0,

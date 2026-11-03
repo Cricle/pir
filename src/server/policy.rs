@@ -17,8 +17,12 @@
 //!   inside one of them (and `allow_remote_agent` is on). See
 //!   [`ServerSecurityConfig::allows_cwd`].
 
+use std::fmt;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use crate::config::RedactedToken;
 
 const DEFAULT_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_MAX_CONNECTION_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -64,7 +68,10 @@ pub(super) const ALLOWED_ROOTS_ENV: &str = "PIR_SERVER_ALLOWED_ROOTS";
 /// the original protocol handshake. Once a token is configured, clients must
 /// send the private preface before the normal CBOR protocol and unauthenticated
 /// sockets are closed without a protocol response.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` is hand-written so `auth_token` is never printed; this type is not
+/// `Serialize`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ServerSecurityConfig {
     pub auth_token: Option<String>,
     pub max_connections: usize,
@@ -80,6 +87,22 @@ pub struct ServerSecurityConfig {
     pub idle_timeout: Duration,
     pub allow_remote_bash: bool,
     pub allow_remote_agent: bool,
+}
+
+impl fmt::Debug for ServerSecurityConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerSecurityConfig")
+            .field("auth_token", &RedactedToken(self.auth_token.as_deref()))
+            .field("max_connections", &self.max_connections)
+            .field("max_request_body_bytes", &self.max_request_body_bytes)
+            .field("max_connection_body_bytes", &self.max_connection_body_bytes)
+            .field("max_sessions", &self.max_sessions)
+            .field("max_subscriptions", &self.max_subscriptions)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("allow_remote_bash", &self.allow_remote_bash)
+            .field("allow_remote_agent", &self.allow_remote_agent)
+            .finish()
+    }
 }
 
 impl Default for ServerSecurityConfig {
@@ -158,26 +181,73 @@ impl ServerSecurityConfig {
     /// directory.
     ///
     /// The default cwd (`"."` — the server's own working directory) is always
-    /// allowed. Any other cwd requires remote prompts to be enabled *and* an
-    /// explicit `PIR_SERVER_ALLOWED_ROOTS` allowlist (`;`-separated roots);
-    /// anything else is a policy rejection. Paths containing `.`/`..`
-    /// components are rejected outright — a purely textual prefix check would
-    /// otherwise be bypassable (`C:\root\a\..\..\Windows`).
+    /// allowed, including its absolute form (a persisted session header stores
+    /// the path `"."` resolved to). Any other cwd requires remote prompts to
+    /// be enabled *and* an explicit `PIR_SERVER_ALLOWED_ROOTS` allowlist
+    /// (`;`-separated roots); anything else is a policy rejection. Paths
+    /// containing `.`/`..` components are rejected outright — a purely textual
+    /// prefix check would otherwise be bypassable
+    /// (`C:\root\a\..\..\Windows`).
     pub(super) fn allows_cwd(&self, cwd: &str) -> bool {
+        self.resolve_cwd(cwd).is_some()
+    }
+
+    /// Resolve `cwd` to the canonical path a session should be created with,
+    /// or `None` when the policy rejects it.
+    ///
+    /// Both the candidate and every allowlist root are `canonicalize`d before
+    /// comparing path components: a symlink placed inside an allowed root
+    /// would otherwise point the session outside it, and on Windows a
+    /// differently-cased sibling directory would pass a folding comparison.
+    /// Comparison is component-wise (`Path::starts_with`), case-insensitive
+    /// only on Windows. This closes the static symlink/alias escape; it does
+    /// not claim to defeat a TOCTOU replacement of the path after the check.
+    ///
+    /// A relative path that is not the default `"."` is rejected before
+    /// `canonicalize`: resolving it against the server's own cwd could
+    /// accidentally place a remote `sub` inside an allowed root.
+    ///
+    /// The default cwd can also arrive in its ABSOLUTE form: a persisted
+    /// session header records the path that `SessionManager` resolved `"."`
+    /// to, so a restart/attach re-checks the absolute path of what was the
+    /// default cwd at create time. Equality (not containment) with the
+    /// server's current directory is treated exactly like the literal `"."`;
+    /// a subdirectory of the server cwd still needs the allowlist.
+    pub(super) fn resolve_cwd(&self, cwd: &str) -> Option<PathBuf> {
         if cwd == "." {
-            return true;
+            return Some(PathBuf::from("."));
+        }
+        if path_has_relative_components(cwd) || !Path::new(cwd).is_absolute() {
+            return None;
+        }
+        let candidate = std::fs::canonicalize(cwd).ok()?;
+        // "Default cwd" in absolute form: the header write resolves `"."`
+        // against the session manager's process cwd, so an attach after a
+        // restart sees an absolute path. Accept it only when it IS the
+        // server's own cwd (both directions of `path_within` = equality,
+        // case-insensitive on Windows) — never a path below it.
+        if let Some(server_cwd) = canonical_server_cwd() {
+            if path_within(&candidate, &server_cwd) && path_within(&server_cwd, &candidate) {
+                return Some(candidate);
+            }
         }
         if !self.allow_remote_agent {
-            return false;
+            return None;
         }
-        if path_has_relative_components(cwd) {
-            return false;
-        }
-        let Some(roots) = allowed_roots() else {
-            return false;
-        };
-        roots.iter().any(|root| path_within(cwd, root))
+        let roots = allowed_roots()?;
+        roots
+            .iter()
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .any(|root| path_within(&candidate, &root))
+            .then_some(candidate)
     }
+}
+
+/// The server's current working directory, canonicalized. `None` when it
+/// cannot be resolved; callers then fall back to the allowlist check (fail
+/// closed).
+fn canonical_server_cwd() -> Option<PathBuf> {
+    std::fs::canonicalize(std::env::current_dir().ok()?).ok()
 }
 
 /// Whether `path` contains `.` or `..` components (which a textual prefix
@@ -199,18 +269,21 @@ fn allowed_roots() -> Option<Vec<String>> {
     })
 }
 
-/// Whether `candidate` is `root` itself or a path below it. Textual,
-/// case-insensitive comparison with separator normalization — no filesystem
-/// access, so the check never fails open on an unreadable path.
-fn path_within(candidate: &str, root: &str) -> bool {
-    fn normalize(path: &str) -> String {
-        path.replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
+/// Whether `candidate` is `root` itself or a path below it, compared by
+/// whole path components on already-canonicalized paths.
+///
+/// Case-insensitive on Windows (the filesystem is), case-sensitive elsewhere
+/// so a differently-cased sibling directory cannot alias an allowed root on
+/// Unix.
+fn path_within(candidate: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let candidate = candidate.to_string_lossy().to_ascii_lowercase();
+        let root = root.to_string_lossy().to_ascii_lowercase();
+        Path::new(&candidate).starts_with(root)
     }
-    let (candidate, root) = (normalize(candidate), normalize(root));
-    if root.is_empty() {
-        return false;
+    #[cfg(not(windows))]
+    {
+        candidate.starts_with(root)
     }
-    candidate == root || candidate.starts_with(&(root + "\\"))
 }

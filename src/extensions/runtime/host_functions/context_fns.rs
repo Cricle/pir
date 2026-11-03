@@ -243,6 +243,22 @@ pub(super) fn register_context_host_fns(
             json_depth::push_field(&mut out, &mut first, "leafId", &session.leaf_id);
             json_depth::push_field(&mut out, &mut first, "labels", &session.labels);
             json_depth::push_field(&mut out, &mut first, "projection", &session.projection);
+            // The live context-usage cells the same snapshot carries. The
+            // envelope existed before these fields, so they are appended to
+            // keep the historical field order stable for consumers that rely
+            // on it; `ctx.getContextUsage()` reads the dedicated host fn.
+            json_depth::push_field(
+                &mut out,
+                &mut first,
+                "contextTokens",
+                &session.context_tokens,
+            );
+            json_depth::push_field(
+                &mut out,
+                &mut first,
+                "contextWindow",
+                &session.context_window,
+            );
             out.push('}');
             out
         });
@@ -376,8 +392,9 @@ pub(super) fn register_context_host_fns(
             let mut s = lock_state(&st);
             // Upstream returns false when the provider has no usable
             // credential and leaves the model unchanged. The authenticated
-            // list is host-pushed; an empty list means the host cannot check
-            // (permissive), a non-empty list is authoritative.
+            // list is host-pushed; an empty list keeps the historical
+            // permissive behavior for registry-only embedders/tests, while a
+            // non-empty list is authoritative.
             if let Some(provider) = provider.as_deref().filter(|p| !p.is_empty()) {
                 if !s.authenticated_providers.is_empty()
                     && !s.authenticated_providers.iter().any(|id| id == provider)
@@ -400,10 +417,10 @@ pub(super) fn register_context_host_fns(
                 let s = lock_state(&st);
                 // Backs `ctx.modelRegistry.hasConfiguredAuth(model)` (upstream
                 // ModelRegistry.hasConfiguredAuth, model-registry.ts:76-78). Same
-                // host-pushed authenticated-provider list and permissive-empty
-                // convention as `setModel`: an empty list means the host cannot
-                // check, a non-empty list is authoritative.
-                s.authenticated_providers.is_empty()
+                // host-pushed authenticated-provider list as `setModel`: before
+                // the first push the host cannot check (permissive), after one
+                // even an empty list is authoritative.
+                !s.authenticated_providers_known
                     || s.authenticated_providers.iter().any(|id| id == &provider)
             }
         );

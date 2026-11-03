@@ -182,6 +182,19 @@ pub fn discover_system_md(
         for dir in dirs {
             let path = dir.join(filename);
             if path.is_file() {
+                // pir hardening (FIX-C17): skip oversized files before reading
+                // them; an over-limit file is ignored in favour of the next
+                // candidate (and can never be pulled into memory whole).
+                let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                if size > MAX_CONTEXT_FILE_BYTES {
+                    tracing::warn!(
+                        path = %path.display(),
+                        size,
+                        limit = MAX_CONTEXT_FILE_BYTES,
+                        "skipping oversized system prompt file"
+                    );
+                    continue;
+                }
                 if let Some(content) = read_text_file(&path) {
                     return Some(content);
                 }

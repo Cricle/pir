@@ -1991,17 +1991,17 @@ async fn run_sandbox_report(
                 .enable_all()
                 .build()
             {
-                Ok(worker) => worker.block_on(execute_sandbox(
+                Ok(worker) => worker.block_on(execute_sandbox(SandboxRun {
                     code,
-                    allowed_tools,
+                    allowed_tools_json: allowed_tools,
                     routing,
                     signal,
-                    worker_output,
+                    output: worker_output,
                     loop_handle,
                     limits,
                     progress,
                     extras,
-                )),
+                })),
                 Err(error) => RunReport {
                     outcome: RunOutcome {
                         ok: false,
@@ -2104,10 +2104,9 @@ struct ExtensionRunExtras {
     session: Arc<SandboxSession>,
 }
 
-/// Execute one script end-to-end on the worker thread and assemble the
-/// `RunReport` (output items + error/timeout classification).
-#[allow(clippy::too_many_arguments)]
-async fn execute_sandbox(
+/// One sandbox execution's inputs, shared by the worker-thread entry
+/// ([`execute_sandbox`]) and its runtime half ([`execute_in_runtime`]).
+struct SandboxRun {
     code: String,
     allowed_tools_json: Option<String>,
     routing: ScriptRouting,
@@ -2117,19 +2116,14 @@ async fn execute_sandbox(
     limits: SandboxLimits,
     progress: Option<Arc<RunProgress>>,
     extras: Option<ExtensionRunExtras>,
-) -> RunReport {
-    let eval_result = execute_in_runtime(
-        code,
-        allowed_tools_json,
-        routing,
-        signal,
-        Arc::clone(&output),
-        loop_handle,
-        limits,
-        progress,
-        extras,
-    )
-    .await;
+}
+
+/// Execute one script end-to-end on the worker thread and assemble the
+/// `RunReport` (output items + error/timeout classification).
+async fn execute_sandbox(run: SandboxRun) -> RunReport {
+    let output = Arc::clone(&run.output);
+    let limits = run.limits;
+    let eval_result = execute_in_runtime(SandboxRun { ..run }).await;
 
     let outcome = match eval_result {
         Ok(Ok(EvalSuccess {
@@ -2217,18 +2211,18 @@ struct EvalFailure {
 /// The inner runtime execution: build the runtime, register the bridge, eval
 /// the prelude + script, and produce `Ok(Ok(success))` /
 /// `Ok(Err(script error))` / `Err(elapsed)`.
-#[allow(clippy::too_many_arguments)]
-async fn execute_in_runtime(
-    code: String,
-    allowed_tools_json: Option<String>,
-    routing: ScriptRouting,
-    signal: Option<AbortSignal>,
-    output: Arc<StdMutex<OutputBuffer>>,
-    loop_handle: tokio::runtime::Handle,
-    limits: SandboxLimits,
-    progress: Option<Arc<RunProgress>>,
-    extras: Option<ExtensionRunExtras>,
-) -> Result<Result<EvalSuccess, EvalFailure>, Duration> {
+async fn execute_in_runtime(run: SandboxRun) -> Result<Result<EvalSuccess, EvalFailure>, Duration> {
+    let SandboxRun {
+        code,
+        allowed_tools_json,
+        routing,
+        signal,
+        output,
+        loop_handle,
+        limits,
+        progress,
+        extras,
+    } = run;
     use rquickjs::prelude::{Async as JsAsync, Func};
     use rquickjs::promise::MaybePromise;
     use rquickjs::{AsyncContext, AsyncRuntime};
@@ -2360,7 +2354,7 @@ async fn execute_in_runtime(
                         let allowed = allowed.clone();
                         let loop_handle = loop_handle.clone();
                         async move {
-                            call_script_tool(
+                            call_script_tool(ScriptToolCall {
                                 target,
                                 name,
                                 args_json,
@@ -2370,7 +2364,7 @@ async fn execute_in_runtime(
                                 progress,
                                 allowed,
                                 loop_handle,
-                            )
+                            })
                             .await
                         }
                     }
@@ -2584,9 +2578,8 @@ async fn execute_in_runtime(
     }
 }
 
-/// One script call: the shared guard rails, then the routing's responder.
-#[allow(clippy::too_many_arguments)]
-async fn call_script_tool(
+/// One script-originated tool call handed to the host bridge.
+struct ScriptToolCall {
     target: ScriptTarget,
     name: String,
     args_json: String,
@@ -2596,7 +2589,21 @@ async fn call_script_tool(
     progress: Option<Arc<RunProgress>>,
     allowed: Option<Arc<[String]>>,
     loop_handle: tokio::runtime::Handle,
-) -> ToolCallReply {
+}
+
+/// One script call: the shared guard rails, then the routing's responder.
+async fn call_script_tool(call: ScriptToolCall) -> ToolCallReply {
+    let ScriptToolCall {
+        target,
+        name,
+        args_json,
+        routing,
+        calls,
+        signal,
+        progress,
+        allowed,
+        loop_handle,
+    } = call;
     if name == "codemode" {
         return ToolCallReply::failed("scripts must not start other scripts".to_owned());
     }

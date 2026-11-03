@@ -12,8 +12,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pir::config::settings::{
-    collect_settings_diagnostics, deduplicate_diagnostics, PackageSource, SettingsDiagnostic,
-    SettingsDiagnosticType, SettingsError, SettingsManager, SettingsScope, TerminalImagesMode,
+    collect_settings_diagnostics, deduplicate_diagnostics, AutoBool, PackageSource,
+    SettingsDiagnostic, SettingsDiagnosticType, SettingsError, SettingsManager, SettingsScope,
+    TerminalImagesMode,
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -529,6 +530,82 @@ fn unreadable_file_is_diagnosed_with_path() {
     );
 
     let _ = std::fs::set_permissions(&settings_path, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Runtime overrides (audit R1-L6-016)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn runtime_overrides_survive_writes_and_reloads_without_being_persisted() {
+    let dir = temp_dir("overrides");
+    let settings_path = dir.join("settings.json");
+    write_file(&settings_path, r#"{"theme": "dark"}"#);
+
+    let mut manager = SettingsManager::load(&dir, &dir.join(".pi"), &dir, true);
+    manager.apply_overrides(&serde_json::json!({ "terminal": { "trueColor": false } }));
+    assert_eq!(
+        manager
+            .settings
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.true_color),
+        Some(AutoBool::Enabled(false))
+    );
+
+    // A later field write rebuilds the merge from the file scopes; the
+    // runtime override must still win and stay visible in `raw`.
+    manager.set_global_field("theme", serde_json::json!("light"));
+    assert_eq!(manager.settings.theme.as_deref(), Some("light"));
+    assert_eq!(
+        manager
+            .raw
+            .get("terminal")
+            .and_then(|terminal| terminal.get("trueColor")),
+        Some(&serde_json::json!(false))
+    );
+    assert_eq!(
+        manager
+            .settings
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.true_color),
+        Some(AutoBool::Enabled(false))
+    );
+
+    // A full reload re-reads both scopes and keeps the override layer.
+    manager.reload();
+    assert_eq!(
+        manager
+            .settings
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.true_color),
+        Some(AutoBool::Enabled(false))
+    );
+
+    // The override layer is runtime-only: persisting a field writes only the
+    // file's own scope, never the override keys.
+    assert!(manager.persist_field(
+        SettingsScope::Global,
+        "theme",
+        serde_json::json!("solarized")
+    ));
+    let stored_text =
+        std::fs::read_to_string(&settings_path).expect("settings.json must stay readable");
+    let stored: serde_json::Value =
+        serde_json::from_str(&stored_text).expect("settings.json stays valid JSON");
+    assert_eq!(stored.get("theme"), Some(&serde_json::json!("solarized")));
+    assert!(
+        stored.get("terminal").is_none(),
+        "override leaked into settings.json: {stored}"
+    );
+    assert!(
+        !stored_text.contains("trueColor"),
+        "override leaked into settings.json: {stored_text}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

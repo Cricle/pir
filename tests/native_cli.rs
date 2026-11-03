@@ -5,8 +5,9 @@
 //! The commands are spawned as real processes (`CARGO_BIN_EXE_pir`) because
 //! their contract is process-level: argv in, stdio and exit code out.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 /// The binary under test. `option_env!` keeps this compiling for a library-only
 /// build (where cargo sets no `CARGO_BIN_EXE_pir`); every test then skips.
@@ -25,6 +26,52 @@ fn run_with_env(args: &[&str], env: &[(&str, &str)]) -> Output {
         command.env(name, value);
     }
     command.output().expect("pir binary should start")
+}
+
+/// Like [`run`], but feeds raw bytes through a pipe (no text-mode handling).
+fn run_with_stdin(args: &[&str], input: &[u8]) -> Output {
+    let mut command = Command::new(pir_bin().expect("pir binary"));
+    command
+        .args(args)
+        .env_remove("PIR_NATIVE_FALLBACK")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("pir binary should start");
+    {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin.write_all(input).expect("write child stdin");
+    }
+    child.wait_with_output().expect("wait for pir binary")
+}
+
+/// The first candidate that can be spawned, mirroring the native fallback's
+/// candidate order. `None` means the test's system tool is unavailable.
+fn system_program(candidates: &[&'static str]) -> Option<&'static str> {
+    candidates.iter().copied().find(|program| {
+        Command::new(program)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    })
+}
+
+fn run_program_with_stdin(program: &str, args: &[&str], input: &[u8]) -> Option<Output> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    {
+        let mut stdin = child.stdin.take()?;
+        stdin.write_all(input).ok()?;
+    }
+    child.wait_with_output().ok()
 }
 
 fn stdout(output: &Output) -> String {
@@ -191,9 +238,136 @@ fn grep_environment_switch_disables_fallback() {
     assert_eq!(stdout(&disabled), "");
 }
 
+#[test]
+fn global_flags_before_grep_keep_include_and_exclude() {
+    if skip_without_binary() {
+        return;
+    }
+    let dir = TempDir::new("grep-global-flags");
+    dir.write("match.rs", "needle\n");
+    dir.write("match.txt", "needle\n");
+    let path = dir.path.to_str().expect("utf-8 temp path");
+
+    // `--include` is stripped by `preprocess_args` before clap, so the native
+    // command must recover it from the raw argv even though the global flag
+    // makes the subcommand no longer the first token.
+    let included = run(&[
+        "--verbose",
+        "grep",
+        "--include=*.rs",
+        "needle",
+        path,
+        "--no-fallback",
+    ]);
+    assert_eq!(
+        included.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&included)
+    );
+    assert_eq!(
+        stdout(&included),
+        format!("{}/match.rs:needle\n", displayed(&dir.path))
+    );
+
+    let excluded = run(&[
+        "--verbose",
+        "grep",
+        "--exclude=*.rs",
+        "needle",
+        path,
+        "--no-fallback",
+    ]);
+    assert_eq!(
+        excluded.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&excluded)
+    );
+    assert_eq!(
+        stdout(&excluded),
+        format!("{}/match.txt:needle\n", displayed(&dir.path))
+    );
+
+    // A global flag's value that happens to spell the subcommand must not be
+    // taken for the subcommand itself (`--model grep grep …`).
+    let model_value = run(&[
+        "--model",
+        "grep",
+        "grep",
+        "--include=*.rs",
+        "needle",
+        path,
+        "--no-fallback",
+    ]);
+    assert_eq!(
+        model_value.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&model_value)
+    );
+    assert_eq!(
+        stdout(&model_value),
+        format!("{}/match.rs:needle\n", displayed(&dir.path))
+    );
+}
+
+#[test]
+fn extension_flag_value_that_spells_grep_is_not_taken_for_the_subcommand() {
+    if skip_without_binary() {
+        return;
+    }
+    let dir = TempDir::new("grep-ext-flag");
+    dir.write("match.rs", "needle\n");
+    let path = dir.path.to_str().expect("utf-8 temp path");
+
+    // `--ext-flag` is an extension-registered (unknown to clap) long flag;
+    // `preprocess_args` strips it together with the following `grep` as its
+    // value. The old raw-argv scan took that *value* for the subcommand and
+    // ran grep with pattern `grep`, silently searching the wrong target. The
+    // native dispatch must fall back to the clap argv here, which still has
+    // the real subcommand's pattern (`needle`).
+    let output = run(&[
+        "--ext-flag",
+        "grep",
+        "grep",
+        "--include=*.rs",
+        "needle",
+        path,
+        "--no-fallback",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!("{}/match.rs:needle\n", displayed(&dir.path))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // sed
 // ---------------------------------------------------------------------------
+
+#[test]
+fn global_flags_before_sed_keep_original_argv() {
+    if skip_without_binary() {
+        return;
+    }
+    let dir = TempDir::new("sed-global-flags");
+    let file = dir.write("one.txt", "a\nb\n");
+
+    // `-n` is normalized to `--name` for clap; the raw argv still carries the
+    // sed spelling and must win.
+    let output = run(&[
+        "--verbose",
+        "sed",
+        "-n",
+        "s/a/A/p",
+        file.to_str().expect("utf-8 temp path"),
+        "--no-fallback",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "A\n");
+}
 
 #[test]
 fn sed_native_quiet_substitute_prints_only_replaced_lines() {
@@ -253,6 +427,36 @@ fn sed_missing_file_exits_two_but_processes_the_rest() {
     assert!(stderr(&output).contains("can't read"));
 }
 
+#[test]
+fn sed_non_utf8_stdin_preserves_bytes_through_fallback() {
+    if skip_without_binary() {
+        return;
+    }
+    let Some(sed) = system_program(&["sed"]) else {
+        eprintln!("skipping: no system sed found");
+        return;
+    };
+    // The native subset reads stdin as UTF-8; these bytes are not, so the
+    // system sed must receive them verbatim through a pipe instead of
+    // inheriting the drained stdin (which silently produced empty output).
+    let input: &[u8] = b"\xff\xfea\n";
+    let expected =
+        run_program_with_stdin(sed, &["s/a/b/"], input).expect("system sed should start");
+
+    let output = run_with_stdin(&["sed", "s/a/b/"], input);
+    assert_eq!(
+        output.status.code(),
+        expected.status.code(),
+        "stderr: {}",
+        stderr(&output)
+    );
+    assert_eq!(
+        output.stdout, expected.stdout,
+        "fallback must preserve the raw stdin bytes"
+    );
+    assert_eq!(output.stdout, b"\xff\xfeb\n".as_slice());
+}
+
 // ---------------------------------------------------------------------------
 // python
 // ---------------------------------------------------------------------------
@@ -289,4 +493,109 @@ fn python_native_script_sets_argv_and_exit_code() {
     let failing = run(&["python", "-c", "raise ValueError('boom')", "--no-fallback"]);
     assert_eq!(failing.status.code(), Some(1));
     assert!(stderr(&failing).contains("ValueError"));
+}
+
+#[test]
+fn python_future_import_without_docstring_compiles() {
+    if skip_without_binary() {
+        return;
+    }
+    let dir = TempDir::new("python-future-plain");
+    let script = dir.write(
+        "script.py",
+        "from __future__ import annotations\nvalues: list[int] = [1, 2]\nprint(len(values))\n",
+    );
+
+    let output = run(&[
+        "python",
+        script.to_str().expect("utf-8 temp path"),
+        "--no-fallback",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "2\n");
+}
+
+#[test]
+fn python_future_import_after_docstring_compiles() {
+    if skip_without_binary() {
+        return;
+    }
+    let dir = TempDir::new("python-future-doc");
+    let script = dir.write(
+        "script.py",
+        "\"\"\"Module docstring.\"\"\"\nfrom __future__ import annotations\nprint(__doc__)\n",
+    );
+
+    let output = run(&[
+        "python",
+        script.to_str().expect("utf-8 temp path"),
+        "--no-fallback",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    // The preamble must follow the docstring, not displace it.
+    assert_eq!(stdout(&output), "Module docstring.\n");
+}
+
+#[test]
+fn python_multiple_future_imports_compile() {
+    if skip_without_binary() {
+        return;
+    }
+    let dir = TempDir::new("python-future-multi");
+    let script = dir.write(
+        "script.py",
+        "from __future__ import annotations\nfrom __future__ import division\nprint(7 / 2)\n",
+    );
+
+    let output = run(&[
+        "python",
+        script.to_str().expect("utf-8 temp path"),
+        "--no-fallback",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "3.5\n");
+}
+
+#[test]
+fn python_plain_script_without_future_is_unchanged() {
+    if skip_without_binary() {
+        return;
+    }
+    let dir = TempDir::new("python-no-future");
+    let script = dir.write("script.py", "print('plain')\n");
+
+    let output = run(&[
+        "python",
+        script.to_str().expect("utf-8 temp path"),
+        "--no-fallback",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "plain\n");
+}
+
+#[test]
+fn python_non_utf8_stdin_does_not_run_empty_script() {
+    if skip_without_binary() {
+        return;
+    }
+    let Some(python) = system_program(&["python3", "python"]) else {
+        eprintln!("skipping: no system python3/python found");
+        return;
+    };
+    // Invalid UTF-8 source: the old fallback inherited an already-drained
+    // stdin and ran an empty program, exiting 0 with no output.
+    let input: &[u8] = b"\xff\xfe\n";
+    let expected = run_program_with_stdin(python, &[], input).expect("system python should start");
+
+    let output = run_with_stdin(&["python"], input);
+    assert_eq!(
+        output.status.code(),
+        expected.status.code(),
+        "stderr: {}",
+        stderr(&output)
+    );
+    assert!(
+        !(output.status.code() == Some(0) && output.stdout.is_empty()),
+        "non-UTF-8 stdin must not be silently treated as an empty program"
+    );
 }

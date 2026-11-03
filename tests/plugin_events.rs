@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,11 +40,13 @@ use pir::agent::tool_scheduler::{ToolScheduler, ToolSchedulerConfig};
 use pir::agent_session::{
     AgentSession, AgentSessionConfig, Disposition, EventHandler, SessionEvent, SharedEventStreamFn,
 };
+use pir::ai::auth::ApiKeyAuth;
 use pir::ai::event_stream::AssistantMessageEventStream;
-use pir::ai::provider::ProviderRegistry;
+use pir::ai::provider::{Provider, ProviderRegistry};
 use pir::ai::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Model, ModelCost,
-    ModelCostRates, StopReason, TerminalReason, TextContent, ThinkingLevel, ToolCall,
+    ModelCostRates, StopReason, StreamOptions, TerminalReason, TextContent, ThinkingLevel,
+    ToolCall,
 };
 use pir::extensions::Notification;
 use pir::extensions::{ExtensionConfig, ExtensionHandle};
@@ -260,15 +263,27 @@ type RecordedEvents = Arc<Mutex<Vec<(String, Value)>>>;
 struct RecordingPlugin {
     info: PluginInfo,
     events: Arc<Mutex<Vec<(String, Value)>>>,
+    full_message_update_content: bool,
 }
 
 impl RecordingPlugin {
     fn new() -> (Self, RecordedEvents) {
+        Self::with_message_update_content(false)
+    }
+
+    /// A recorder whose `message_update` payloads carry the cumulative
+    /// `message.content` (the opt-in native parity mode).
+    fn with_full_message_update_content() -> (Self, RecordedEvents) {
+        Self::with_message_update_content(true)
+    }
+
+    fn with_message_update_content(full_message_update_content: bool) -> (Self, RecordedEvents) {
         let events = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
                 info: PluginInfo::inline("event-recorder"),
                 events: Arc::clone(&events),
+                full_message_update_content,
             },
             events,
         )
@@ -284,6 +299,10 @@ impl AgentPlugin for RecordingPlugin {
         // The documented phone set is a subset of All; a wildcard keeps the
         // recorder independent of the list under test.
         EventInterest::All
+    }
+
+    fn wants_message_update_content(&self) -> bool {
+        self.full_message_update_content
     }
 
     fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
@@ -501,6 +520,14 @@ async fn builtin_only_session_delivers_the_documented_event_set_once() {
         delta.get("assistantMessageEvent").is_some(),
         "message_update carries the raw stream event: {delta}"
     );
+    // Default (no opt-in) native payloads are the compact O(delta) wire: the
+    // hoisted message has scalars only, never the cumulative content.
+    for (_, payload) in events.iter().filter(|(event, _)| event == "message_update") {
+        assert!(
+            payload["message"].get("content").is_none(),
+            "default native message_update must omit cumulative content: {payload}"
+        );
+    }
 
     let end_payload = events
         .iter()
@@ -515,10 +542,81 @@ async fn builtin_only_session_delivers_the_documented_event_set_once() {
     );
 }
 
+/// `message_update` content is opt-in for the native face. A plugin that
+/// returns `wants_message_update_content() == true` sees the cumulative
+/// `message.content` exactly like JS; the default recorder (above) stays on
+/// the compact O(delta) wire. This pins the parity mode without moving the
+/// default hot path.
+#[tokio::test]
+async fn native_message_update_full_content_is_opt_in() {
+    let temp = TempDir::new("message-update-full");
+    let (recorder, recorded) = RecordingPlugin::with_full_message_update_content();
+    let handle = ExtensionHandle::start_plan_only(extension_config(&temp.0));
+
+    let session = AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: Arc::new(ProviderRegistry::default()),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: heartbeat_registry(),
+            session: None,
+            compaction: None,
+            max_turns: 4,
+            system_prompt: Some("message_update parity test".into()),
+            cwd: Some(temp.0.clone()),
+            event_stream: Some(shared_scripted_stream()),
+            extensions: Some(handle),
+            tool_selection: None,
+        },
+        vec![Arc::new(recorder)],
+    );
+
+    let handler: EventHandler = Arc::new(|_event| {});
+    session
+        .prompt("go", handler)
+        .await
+        .expect("the scripted turn completes");
+
+    let events = recorded
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let delta_with = |fragment: &str| {
+        events
+            .iter()
+            .find(|(event, payload)| {
+                event == "message_update"
+                    && payload["assistantMessageEvent"]["delta"]
+                        .as_str()
+                        .is_some_and(|delta| delta == fragment)
+            })
+            .map(|(_, payload)| payload)
+            .unwrap_or_else(|| panic!("missing message_update delta `{fragment}`: {events:?}"))
+    };
+
+    let checking = delta_with("checking");
+    assert_eq!(
+        checking["message"]["content"][0]["text"],
+        json!("checking"),
+        "opt-in native payload must carry the cumulative message content: {checking}"
+    );
+    assert_eq!(
+        checking["assistantMessageEvent"]["partial"]["content"][0]["text"],
+        json!("checking"),
+        "the raw stream event keeps its partial snapshot: {checking}"
+    );
+    let done = delta_with("done");
+    assert_eq!(
+        done["message"]["content"][0]["text"],
+        json!("done"),
+        "the second stream's cumulative content: {done}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 2. JS runtime + host: one dispatch per face
 // ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn js_runtime_and_native_plugins_each_observe_events_once() {
     let temp = TempDir::new("js-and-native");
@@ -993,5 +1091,367 @@ fn builtin_extensions_load_after_file_extensions() {
                 .position(|path| pir::plugins::builtin_name(&path.to_string_lossy()).is_some())
                 .unwrap(),
         "{ordered:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. `provider_stream_event`: a wedged native handler must not pin the stream
+// ---------------------------------------------------------------------------
+
+/// Native plugin that declares `provider_stream_event` and never resolves its
+/// handler (no actor-level timeout exists on the native face). `entered`
+/// counts handler entries so a test cannot pass on a host whose interest
+/// index/emit path never reached the plugin (false green).
+struct HangingProviderStreamPlugin {
+    info: PluginInfo,
+    entered: Arc<AtomicUsize>,
+}
+
+impl HangingProviderStreamPlugin {
+    fn new(entered: Arc<AtomicUsize>) -> Arc<Self> {
+        Arc::new(Self {
+            info: PluginInfo::inline("hanging-provider-stream"),
+            entered,
+        })
+    }
+}
+
+impl AgentPlugin for HangingProviderStreamPlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(vec!["provider_stream_event".to_owned()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        if event.name.as_ref() == "provider_stream_event" {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        } else {
+            Box::pin(async { PluginEventOutcome::None })
+        }
+    }
+}
+
+/// Provider that invokes the per-chunk `provider_stream_event` hook from its
+/// `stream()` (the same place the SSE parser feeds the sync hook).
+struct HookCallingProvider {
+    /// Provider events emitted before the terminal `done` event. Each call
+    /// blocks on the awaited hook exactly like the SSE feed loop.
+    events: usize,
+}
+
+impl Provider for HookCallingProvider {
+    fn id(&self) -> &str {
+        "test"
+    }
+
+    fn name(&self) -> &str {
+        "Hook-calling test provider"
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        vec![fake_model()]
+    }
+
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: Context,
+        options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        let hook = options
+            .hooks
+            .on_provider_stream_event
+            .as_ref()
+            .expect("the session must install the provider_stream_event hook");
+        for index in 0..self.events {
+            hook(&json!({ "probe": "provider_stream_event", "index": index }));
+        }
+        let stream = AssistantMessageEventStream::new();
+        stream.push(AssistantMessageEventStream::done_event(
+            TerminalReason::Stop,
+            assistant_text("done", StopReason::Stop),
+        ));
+        stream
+    }
+
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        Vec::new()
+    }
+}
+
+/// Build the hanging-provider session for the timeout tests; the returned
+/// `TempDir` keeps the cwd alive for the duration of the test.
+fn hanging_provider_session(
+    label: &str,
+    events: usize,
+    entered: &Arc<AtomicUsize>,
+) -> (Arc<AgentSession>, TempDir) {
+    let temp = TempDir::new(label);
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(HookCallingProvider { events }));
+    let session = AgentSession::new_arc_with_plugins(
+        AgentSessionConfig {
+            provider_registry: Arc::new(registry),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: None,
+            compaction: None,
+            max_turns: 2,
+            system_prompt: Some("provider stream timeout test".into()),
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        },
+        vec![HangingProviderStreamPlugin::new(Arc::clone(entered)) as Arc<dyn AgentPlugin>],
+    );
+    (session, temp)
+}
+
+/// Await a spawned prompt within `limit`, aborting it on timeout.
+///
+/// `session.prompt` blocks INSIDE the synchronous provider hook, so an outer
+/// `tokio::time::timeout` over the same future can never preempt it: the
+/// blocked task is the one that would have to poll the timer. Spawning moves
+/// the prompt to another worker; the JoinHandle then lets a regression fail
+/// the timeout assertion instead of hanging the test forever.
+async fn prompt_within(
+    mut task: tokio::task::JoinHandle<pir::Result<AssistantMessage>>,
+    limit: Duration,
+    message: &str,
+) -> pir::Result<AssistantMessage> {
+    match tokio::time::timeout(limit, &mut task).await {
+        Ok(joined) => joined.expect("the prompt task must join"),
+        Err(_) => {
+            task.abort();
+            panic!("{message}");
+        }
+    }
+}
+
+/// A native `provider_stream_event` handler returning `pending()` must be cut
+/// off by the dispatcher budget: the prompt returns instead of hanging the
+/// provider stream forever. The handler-entry assertion also proves the test
+/// exercises the timeout path rather than a plan that never dispatches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hanging_native_provider_stream_handler_releases_the_prompt() {
+    let entered = Arc::new(AtomicUsize::new(0));
+    let (session, _temp) = hanging_provider_session("provider-stream-timeout", 1, &entered);
+
+    // The dispatch budget is aligned with the 30s extension call timeout; the
+    // 45s bound exceeds one budget but stays well below two, so both a second
+    // dispatch wait and a wedged stream fail the test instead of hanging it.
+    let task = tokio::spawn(async move { session.prompt("go", Arc::new(|_event| {})).await });
+    let result = prompt_within(
+        task,
+        Duration::from_secs(45),
+        "the prompt must return after the dispatch timeout",
+    )
+    .await;
+    result.expect("the run still completes after the timed-out event");
+    assert_eq!(
+        entered.load(Ordering::SeqCst),
+        1,
+        "the hanging handler must actually be entered"
+    );
+}
+
+/// P2-01: the agent loop's `message_end` dispatch is ONE ordered walk of the
+/// host's list (JS adapter at its path-plan slot, inline native plugins last).
+/// A native handler's typed replacement is applied to the transcript exactly
+/// like a JS one, and the native handler observes the JS handler's replacement
+/// in its payload because the host writes each return value back before the
+/// next handler.
+#[tokio::test]
+async fn native_message_end_replacement_is_applied_and_chains_after_js() {
+    struct NativeReplacer {
+        info: PluginInfo,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl AgentPlugin for NativeReplacer {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec!["message_end".to_owned()])
+        }
+
+        fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            Box::pin(async move {
+                let text = event.payload["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                self.seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(text);
+                let mut message = event.payload["message"].clone();
+                message["content"] = json!([{ "type": "text", "text": "from-native" }]);
+                PluginEventOutcome::Generic(json!({ "message": message }))
+            })
+        }
+    }
+
+    let temp = TempDir::new("p2-01-native-message-end");
+    let extension_path = temp.0.join("message-end.ts");
+    std::fs::write(
+        &extension_path,
+        r#"
+        export default function (pi) {
+            pi.on("message_end", (event) => ({
+                message: {
+                    ...event.message,
+                    content: [{ type: "text", text: "from-js" }],
+                },
+            }));
+        }
+        "#,
+    )
+    .expect("write extension");
+    let Ok(runtime) = ExtensionHandle::start(extension_config(&temp.0)) else {
+        return;
+    };
+    let loaded = runtime
+        .load(std::slice::from_ref(&extension_path))
+        .await
+        .expect("load extension");
+    assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let host = PluginHost::build(
+        Some(runtime.clone()),
+        vec![Arc::new(NativeReplacer {
+            info: PluginInfo::inline("native-message-end-replacer"),
+            seen: Arc::clone(&seen),
+        }) as Arc<dyn AgentPlugin>],
+    );
+    let deps = LoopDeps {
+        stream: Box::new(|_request| {
+            Box::pin(async { assistant_text("original", StopReason::Stop) })
+        }),
+        tools: Arc::new(ToolRegistry::new()),
+        scheduler: ToolScheduler::new(ToolSchedulerConfig::default()),
+        extensions: Some(runtime),
+        plugin_events: Some(Arc::new(host)),
+        max_turns: 2,
+        cwd: temp.0.clone(),
+        ..LoopDeps::default()
+    };
+    let result = run_with_options(deps, Context::default(), None, LoopOptions::default()).await;
+
+    let assistant = result
+        .new_messages
+        .iter()
+        .find_map(|message| match message {
+            pir::ai::types::Message::Assistant(assistant) => Some(assistant),
+            _ => None,
+        })
+        .expect("the run produces an assistant message");
+    assert_eq!(
+        assistant.content,
+        vec![text_block("from-native")],
+        "the native replacement must be the transcript message"
+    );
+    assert_eq!(
+        *seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec!["from-js".to_owned()],
+        "the native handler runs after the JS adapter and sees its replacement"
+    );
+}
+
+/// P2-01: a native `tool_result` transform is applied to the finalized result
+/// through the same hosted dispatch the JS face uses (the scheduler's ordered
+/// `tool_result` walk), not dropped on the floor.
+#[tokio::test]
+async fn native_tool_result_transform_reaches_the_transcript() {
+    struct NativeToolResult {
+        info: PluginInfo,
+    }
+
+    impl AgentPlugin for NativeToolResult {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec!["tool_result".to_owned()])
+        }
+
+        fn on_event<'a>(&'a self, _event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            Box::pin(async {
+                PluginEventOutcome::ToolResult {
+                    content: Some(json!([{ "type": "text", "text": "native-result" }])),
+                    details: None,
+                    structured_content: None,
+                    is_error: Some(false),
+                    usage: None,
+                }
+            })
+        }
+    }
+
+    let temp = TempDir::new("p2-01-native-tool-result");
+    let host = PluginHost::build(
+        None,
+        vec![Arc::new(NativeToolResult {
+            info: PluginInfo::inline("native-tool-result"),
+        }) as Arc<dyn AgentPlugin>],
+    );
+    let deps = LoopDeps {
+        stream: Box::new(|_request| Box::pin(async { assistant_with_tool_call() })),
+        tools: Arc::new(heartbeat_registry()),
+        scheduler: ToolScheduler::new(ToolSchedulerConfig::default()),
+        plugin_events: Some(Arc::new(host)),
+        max_turns: 2,
+        cwd: temp.0.clone(),
+        ..LoopDeps::default()
+    };
+    let result = run_with_options(deps, Context::default(), None, LoopOptions::default()).await;
+    let tool_result = result
+        .tool_results
+        .first()
+        .expect("the tool call produces a result message");
+    assert_eq!(
+        tool_result.content,
+        vec![text_block("native-result")],
+        "the native tool_result overlay must reach the finalized message"
+    );
+    assert!(!tool_result.is_error);
+}
+
+/// After the first dispatch timeout the dispatcher is closed: a second
+/// provider stream event must be dropped before reaching the handler and must
+/// not pay another dispatch budget. The prompt therefore returns after ONE
+/// budget; a regression that keeps dispatching normally takes two and fails
+/// the 45s bound. The entered count (still 1) proves the second event never
+/// entered the wedged handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_stream_events_after_a_timeout_are_dropped() {
+    let entered = Arc::new(AtomicUsize::new(0));
+    let (session, _temp) = hanging_provider_session("provider-stream-timeout-pair", 2, &entered);
+
+    let task = tokio::spawn(async move { session.prompt("go", Arc::new(|_event| {})).await });
+    let result = prompt_within(
+        task,
+        Duration::from_secs(45),
+        "the prompt must return after ONE dispatch timeout, not one per event",
+    )
+    .await;
+    result.expect("the run still completes after the timed-out events");
+    assert_eq!(
+        entered.load(Ordering::SeqCst),
+        1,
+        "the event after the timeout must be dropped before the handler"
     );
 }

@@ -96,14 +96,16 @@ impl MinimalAgent {
     /// performs no async work).
     pub async fn build(config: MinimalConfig) -> crate::Result<Self> {
         let model = crate::ai::providers::construction::model(
-            "minimal",
-            &config.model,
-            &config.model,
-            "openai-completions",
-            &config.base_url,
-            128_000,
-            8_192,
-            vec!["text"],
+            crate::ai::providers::construction::ModelSpec {
+                provider: "minimal",
+                id: &config.model,
+                name: &config.model,
+                api: "openai-completions",
+                base_url: &config.base_url,
+                context_window: 128_000,
+                max_tokens: 8_192,
+                input: vec!["text"],
+            },
         );
         let provider =
             OpenAiCompatibleProvider::new("minimal", config.base_url.clone(), vec![model.clone()])?

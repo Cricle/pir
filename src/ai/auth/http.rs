@@ -21,8 +21,11 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
 fn client() -> AiResult<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::ai::transport::pi_reqwest_client_builder()?
         .timeout(REQUEST_TIMEOUT)
+        // OAuth endpoints carry credentials in headers; never follow a
+        // cross-host redirect that would replay them.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| AiError::Http(error.to_string()))
 }

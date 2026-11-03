@@ -109,8 +109,20 @@ fn take_session(handle: u64) -> Option<SessionHandle> {
 /// 2 MiB thread), so the forest is written by
 /// [`crate::session_manager::TreeNode::forest_to_json_iterative`] directly.
 fn session_snapshot_json_text(session: &SessionManager) -> String {
-    let entries = session.entries();
-    let branch = session.branch_entries(None).unwrap_or_default();
+    // Borrowed views: `entries()`/`branch_entries()` deep-clone every
+    // entry (messages, tool results included) just to serialize them. The
+    // resident slice and the borrowed path walk produce the identical JSON
+    // without the transcript-sized copies.
+    let entries: Vec<&crate::session_manager::FileEntry> = session
+        .resident_entries()
+        .iter()
+        .filter(|entry| !entry.is_header())
+        .map(|entry| entry.as_ref())
+        .collect();
+    let branch = crate::session_manager::projection::build_session_path(
+        session.resident_entries(),
+        session.leaf_id(),
+    );
     // The upstream `SessionHeader` carries the `type: "session"` tag (the
     // FileEntry variant marker pir keeps on the enum, not the inner struct).
     let mut header = serde_json::to_value(session.header()).unwrap_or(JsonValue::Null);

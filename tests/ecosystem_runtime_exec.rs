@@ -74,7 +74,6 @@ const BEFORE_AGENT_START_TIMEOUT: Duration = Duration::from_secs(10);
 /// process-global, so the directory is created exactly once and every runtime
 /// in this harness points at it.
 struct TestEnv {
-    root: PathBuf,
     /// The real agent dir captured before `PIR_AGENT_DIR` was redirected; the
     /// installed npm tree is read from here, in place and read-only.
     installed_npm_root: PathBuf,
@@ -119,7 +118,6 @@ fn test_env() -> &'static TestEnv {
             config_home.display()
         );
         TestEnv {
-            root,
             installed_npm_root,
             agent_dir,
             cwd,
@@ -128,12 +126,6 @@ fn test_env() -> &'static TestEnv {
 }
 
 impl TestEnv {
-    /// Root that holds the loaded package files, retained for diagnostics.
-    #[allow(dead_code)]
-    fn root(&self) -> &Path {
-        &self.root
-    }
-
     fn agent_dir(&self) -> &Path {
         &self.agent_dir
     }

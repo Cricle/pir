@@ -25,7 +25,8 @@
 //!   the application's own file) and the SHA-256-named deployment path.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use pir::env_client::connection::{checked_protocol, StreamParser, MAX_FRAME};
 use pir::env_client::errors::{
@@ -33,7 +34,10 @@ use pir::env_client::errors::{
     RemoteError,
 };
 use pir::env_client::paths::{file_url_to_path, RemotePathFlavor};
-use pir::env_client::ssh::{daemon_path, local_daemon, sha256_hex, ssh_arguments, SshTarget};
+use pir::env_client::ssh::{
+    daemon_path, local_daemon, read_all, run_ssh, sha256_hex, ssh_arguments, RunSshOptions,
+    SshFailure, SshTarget,
+};
 use pir::env_client::{
     Connection, ConnectionOptions, RemoteExecutionEnv, RemoteExecutionEnvOptions,
 };
@@ -1010,6 +1014,124 @@ fn ssh_fields_that_could_be_read_as_options_are_rejected() {
     let mut target = ssh_target();
     target.host_key_alias = "two words".to_string();
     assert!(ssh_arguments(&target, true, None).is_err());
+}
+
+/// argv that makes [`run_ssh`] run `script` instead of a real `ssh`: a shell
+/// script on Unix, a PowerShell `-Command` string on Windows (a batch file
+/// cannot be spawned directly, and `cmd`/PowerShell must be the only child so
+/// `start_kill` reaches the sleeper).
+#[cfg(unix)]
+fn fake_ssh(target: &mut SshTarget, script_path: &Path, _script: &str) -> Vec<String> {
+    target.ssh = Some("/bin/sh".to_string());
+    vec![script_path.to_string_lossy().into_owned()]
+}
+
+#[cfg(windows)]
+fn fake_ssh(target: &mut SshTarget, _script_path: &Path, script: &str) -> Vec<String> {
+    target.ssh = Some("powershell".to_string());
+    vec![
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        script.to_string(),
+    ]
+}
+
+/// The stdin write and the wait share one deadline: a fake `ssh` that never
+/// reads its stdin (the old code blocked in `write_all` before the timeout
+/// even started) returns a timeout error, not a hang.
+#[tokio::test]
+async fn ssh_that_never_reads_stdin_still_times_out() {
+    let tree = Tree::new("ssh-stdin-deadline");
+    let script_path = tree.path("fake-ssh");
+    let script = if cfg!(windows) {
+        "Start-Sleep -Seconds 600"
+    } else {
+        "#!/bin/sh\nexec sleep 600\n"
+    };
+    std::fs::write(&script_path, script).expect("write the fake ssh");
+    let mut target = ssh_target();
+    let args = fake_ssh(&mut target, Path::new(&script_path), script);
+    let started = Instant::now();
+    let error = run_ssh(
+        &target,
+        "# ignored by the fake ssh",
+        RunSshOptions {
+            args: Some(args),
+            // Larger than any pipe buffer, so the write cannot finish while
+            // the fake ssh ignores its stdin.
+            stdin: vec![b'x'; 2 * 1024 * 1024],
+            timeout: Some(Duration::from_millis(300)),
+        },
+    )
+    .await
+    .expect_err("a fake ssh that never reads stdin must time out");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the shared deadline must bound the whole invocation (took {:?})",
+        started.elapsed()
+    );
+    assert!(
+        matches!(
+            &error,
+            SshFailure::Ssh { message, .. } if message.contains("did not finish within")
+        ),
+        "expected the timeout error: {error:?}"
+    );
+}
+
+/// `read_all` retains at most 8 MiB and marks the cut; a shorter stream is
+/// unchanged. The cap bounds a malicious remote host's output.
+#[tokio::test]
+async fn ssh_output_reader_caps_and_marks_truncation() {
+    const MAX: usize = 8 * 1024 * 1024;
+    let oversized = read_all(std::io::Cursor::new(vec![b'x'; MAX + 4096])).await;
+    assert_eq!(
+        oversized.len(),
+        MAX + b"\n[output truncated]".len(),
+        "the reader must stop at the cap plus the marker"
+    );
+    assert!(oversized[..MAX].iter().all(|byte| *byte == b'x'));
+    assert_eq!(&oversized[MAX..], b"\n[output truncated]");
+    let short = read_all(std::io::Cursor::new(b"hello".to_vec())).await;
+    assert_eq!(short, b"hello", "short output is untouched");
+}
+
+/// End to end through `run_ssh`: a fake ssh emitting 9 MiB is cut at 8 MiB
+/// with the truncation marker (the process tolerates the closed pipe so the
+/// invocation itself still succeeds).
+#[tokio::test]
+async fn ssh_output_over_the_cap_is_truncated() {
+    const MAX: usize = 8 * 1024 * 1024;
+    let tree = Tree::new("ssh-output-cap");
+    let script_path = tree.path("fake-ssh");
+    #[cfg(windows)]
+    let script = "try { [Console]::Out.Write('x' * 9437184) } catch { }; exit 0";
+    #[cfg(unix)]
+    let script = "#!/bin/sh\ntrap '' PIPE\ndd if=/dev/zero bs=1048576 count=9 2>/dev/null | tr '\\0' x || true\nexit 0\n";
+    std::fs::write(&script_path, script).expect("write the fake ssh");
+    let mut target = ssh_target();
+    let args = fake_ssh(&mut target, Path::new(&script_path), script);
+    let output = run_ssh(
+        &target,
+        "# ignored by the fake ssh",
+        RunSshOptions {
+            args: Some(args),
+            stdin: Vec::new(),
+            timeout: Some(Duration::from_secs(120)),
+        },
+    )
+    .await
+    .expect("the fake ssh tolerates the closed pipe and exits 0");
+    assert_eq!(
+        output.len(),
+        MAX + "\n[output truncated]".len(),
+        "9 MiB of remote output must arrive cut at 8 MiB plus the marker"
+    );
+    assert!(
+        output.ends_with("[output truncated]"),
+        "the cut must be visible in the captured output"
+    );
 }
 
 #[test]

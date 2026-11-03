@@ -4,7 +4,7 @@
 //! `overflow`: changes in between were not seen.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
@@ -79,6 +79,61 @@ pub struct RemoteWatcher {
     /// Interrupts a reconnect backoff wait.
     wake: Mutex<Option<oneshot::Sender<()>>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// The runtime the runner was spawned on. `Drop` schedules the grace abort
+    /// through this handle rather than `Handle::try_current()`: the last
+    /// handle is often released from a thread without a runtime (a sync
+    /// teardown path), and the abort guard that writes the protocol CANCEL
+    /// lives on the runner's runtime.
+    runtime: tokio::runtime::Handle,
+    /// Set when the runner task exits; the drop regression test observes the
+    /// task really ending (not just the last `Arc` being released).
+    runner_done: Arc<AtomicBool>,
+}
+
+/// Marks a runner task as finished when its future is dropped, including when
+/// the runtime cancels it (`JoinHandle::abort`).
+struct RunnerFinished(Arc<AtomicBool>);
+
+impl Drop for RunnerFinished {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for RemoteWatcher {
+    /// The last handle going away must stop the runner: a watcher created and
+    /// then dropped without `close()` (a failed initialization, a `?` return,
+    /// an upper layer going away) has nobody left to consume changes, and its
+    /// reconnect loop would otherwise outlive every owner forever. The runner
+    /// itself holds only a [`Weak`] reference; this drop aborts the in-flight
+    /// `watch` request, wakes a backoff wait and stops the task.
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::SeqCst);
+        if let Some(wake) = lock(&self.wake).take() {
+            let _ = wake.send(());
+        }
+        if let Some(signal) = lock(&self.signal).take() {
+            signal.abort();
+        }
+        if let Some(task) = lock(&self.task).take() {
+            // Aborting the task immediately would drop the request future
+            // before its abort guard can write the protocol CANCEL (that
+            // guard is a detached task that needs the request future's
+            // `done` channel to stay alive). Give it a short grace period,
+            // then abort as the backstop for a daemon that never answers.
+            //
+            // The grace task is scheduled on the runner's runtime, not on the
+            // dropping thread's: the last handle may be released from a
+            // non-runtime thread (a sync teardown path), where
+            // `Handle::try_current()` fails and aborting immediately could
+            // lose the CANCEL written by the abort guard on the runner side.
+            let runtime = self.runtime.clone();
+            runtime.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                task.abort();
+            });
+        }
+    }
 }
 
 impl RemoteWatcher {
@@ -102,11 +157,20 @@ impl RemoteWatcher {
             signal: Mutex::new(None),
             wake: Mutex::new(None),
             task: Mutex::new(None),
+            runtime: tokio::runtime::Handle::current(),
+            runner_done: Arc::new(AtomicBool::new(false)),
         });
         let (ready_sender, ready_receiver) = oneshot::channel();
         *lock(&watcher.ready) = Some(ready_sender);
-        let runner = watcher.clone();
-        *lock(&watcher.task) = Some(tokio::spawn(async move { runner.run().await }));
+        // The runner holds a WEAK handle: the watcher owns the JoinHandle, so
+        // a strong reference inside the task would be a cycle and the last
+        // external handle could never stop the watch/reconnect loop.
+        let runner = Arc::downgrade(&watcher);
+        let runner_done = Arc::clone(&watcher.runner_done);
+        *lock(&watcher.task) = Some(tokio::spawn(async move {
+            let _finished = RunnerFinished(runner_done);
+            RemoteWatcher::run(runner).await;
+        }));
         match ready_receiver.await {
             Ok(Ok(())) => Ok(watcher),
             Ok(Err(error)) => Err(error),
@@ -139,56 +203,81 @@ impl RemoteWatcher {
         }
     }
 
+    /// `#[doc(hidden)]` test seam: a flag set when the runner task exits.
+    #[doc(hidden)]
+    pub fn runner_done_for_tests(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.runner_done)
+    }
+
     /// The task's life: one attempt, reconnects while the connection is lost.
-    async fn run(self: Arc<Self>) {
+    ///
+    /// The loop upgrades `watcher` only to build an attempt or to handle its
+    /// result; the attempt future itself owns everything it needs, so no
+    /// strong handle is held across the long-lived `watch` request. When the
+    /// last external handle goes away, [`Drop`] aborts the task and the next
+    /// upgrade fails.
+    async fn run(watcher: Weak<Self>) {
         let mut first = true;
         let mut delay = RECONNECT_FIRST;
         loop {
-            if self.closed.load(Ordering::SeqCst) {
+            let Some(this) = watcher.upgrade() else {
+                return;
+            };
+            if this.closed.load(Ordering::SeqCst) {
                 return;
             }
             let ready = Arc::new(AtomicBool::new(false));
-            let result = self.attempt(&ready).await;
+            let attempt = this.attempt(&ready);
+            drop(this);
+            let result = attempt.await;
             let was_first = first;
             first = false;
+            let Some(this) = watcher.upgrade() else {
+                return;
+            };
             match result {
                 // The request finished (cancelled by `close()`, or the daemon
                 // ended the watch).
                 Ok(()) => return,
                 Err(error) => {
-                    if !ready.load(Ordering::SeqCst) {
-                        if was_first {
-                            // The opener sees it; there is no watcher to report to.
-                            self.signal_ready(Err(error));
+                    let ready_now = ready.load(Ordering::SeqCst);
+                    // The opener's first failure is reported, not retried.
+                    let reconnect = is_connection_lost(&error) && (ready_now || !was_first);
+                    if reconnect {
+                        if this.closed.load(Ordering::SeqCst) {
                             return;
                         }
-                        if is_connection_lost(&error) {
-                            if !self.backoff(&mut delay).await {
-                                return;
-                            }
-                            continue;
-                        }
-                        self.fail(error);
-                        return;
-                    }
-                    if self.closed.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    if is_connection_lost(&error) {
-                        if !self.backoff(&mut delay).await {
+                        // No strong handle may be held across the wait: the
+                        // runner must not keep the watcher alive while sleeping.
+                        drop(this);
+                        if !Self::backoff(&watcher, delay).await {
                             return;
                         }
+                        delay = (delay * 2).min(RECONNECT_MAX);
                         continue;
                     }
-                    self.fail(error);
+                    if !ready_now && was_first {
+                        // The opener sees it; there is no watcher to report to.
+                        this.signal_ready(Err(error));
+                        return;
+                    }
+                    if ready_now && this.closed.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    this.fail(error);
                     return;
                 }
             }
         }
     }
 
-    /// One `watch` request; returns when it settles or is lost.
-    async fn attempt(self: &Arc<Self>, ready: &Arc<AtomicBool>) -> Result<(), RemoteError> {
+    /// One `watch` request. The returned future owns the request (connection,
+    /// signal and event callback); only the callback keeps a `Weak` handle, so
+    /// the runner does not keep the watcher alive while the daemon watches.
+    fn attempt(
+        self: &Arc<Self>,
+        ready: &Arc<AtomicBool>,
+    ) -> impl std::future::Future<Output = Result<(), RemoteError>> + 'static {
         let targets: Vec<Value> = self
             .targets
             .iter()
@@ -206,9 +295,13 @@ impl RemoteWatcher {
         let signal = AbortSignal::new();
         *lock(&self.signal) = Some(signal.clone());
         let on_event: EventFn = {
-            let this = self.clone();
+            let this = Arc::downgrade(self);
             let ready_flag = ready.clone();
             Arc::new(move |event: &Value, _payload: &[u8]| {
+                // The watcher (and every consumer) may be gone already.
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
                 match event["kind"].as_str() {
                     Some("ready") => {
                         ready_flag.store(true, Ordering::SeqCst);
@@ -262,20 +355,23 @@ impl RemoteWatcher {
                 }
             }) as EventFn
         };
-        self.connection
-            .request(
-                "watch",
-                Value::Object(fields),
-                RequestOptions {
-                    signal: Some(signal),
-                    on_event: Some(on_event),
-                    on_start: None,
-                    payload: Vec::new(),
-                    session: None,
-                },
-            )
-            .await
-            .map(|_| ())
+        let connection = self.connection.clone();
+        async move {
+            connection
+                .request(
+                    "watch",
+                    Value::Object(fields),
+                    RequestOptions {
+                        signal: Some(signal),
+                        on_event: Some(on_event),
+                        on_start: None,
+                        payload: Vec::new(),
+                        session: None,
+                    },
+                )
+                .await
+                .map(|_| ())
+        }
     }
 
     /// Report the outcome to the opener, once.
@@ -297,21 +393,30 @@ impl RemoteWatcher {
         (self.on_change)(change);
     }
 
-    /// Wait before reconnecting; `false` when the watcher was closed meanwhile.
-    async fn backoff(self: &Arc<Self>, delay: &mut Duration) -> bool {
+    /// Wait before reconnecting; `false` when the watcher was closed or
+    /// dropped meanwhile. Like the attempt, the wait holds no strong handle:
+    /// `Drop` wakes it through `wake`, so a dropped watcher leaves no task
+    /// sleeping out its 30 s backoff.
+    async fn backoff(watcher: &Weak<Self>, delay: Duration) -> bool {
+        let Some(this) = watcher.upgrade() else {
+            return false;
+        };
         let (wake_sender, wake_receiver) = oneshot::channel();
-        *lock(&self.wake) = Some(wake_sender);
+        *lock(&this.wake) = Some(wake_sender);
+        drop(this);
         let slept = tokio::select! {
-            _ = tokio::time::sleep(*delay) => true,
+            _ = tokio::time::sleep(delay) => true,
             _ = wake_receiver => false,
         };
-        *lock(&self.wake) = None;
-        if !slept || self.closed.load(Ordering::SeqCst) {
+        let Some(this) = watcher.upgrade() else {
+            return false;
+        };
+        *lock(&this.wake) = None;
+        if !slept || this.closed.load(Ordering::SeqCst) {
             return false;
         }
-        *delay = (*delay * 2).min(RECONNECT_MAX);
         // The next attempt's `ready` reports the overflow this gap caused.
-        self.reconnecting.store(true, Ordering::SeqCst);
+        this.reconnecting.store(true, Ordering::SeqCst);
         true
     }
 }

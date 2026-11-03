@@ -30,17 +30,29 @@ use crate::ai::error::{AiError, AiResult};
 use crate::ai::provider::ProviderBox;
 use crate::ai::types::{Model, ModelCost, ModelCostRates, ModelKind};
 
-#[allow(clippy::too_many_arguments)]
-pub fn model(
-    provider: &str,
-    id: &str,
-    name: &str,
-    api: &str,
-    base_url: &str,
-    context_window: u64,
-    max_tokens: u64,
-    input: Vec<&str>,
-) -> Model {
+/// Inputs for [`model`]: one catalog/endpoint model description.
+pub struct ModelSpec<'a> {
+    pub provider: &'a str,
+    pub id: &'a str,
+    pub name: &'a str,
+    pub api: &'a str,
+    pub base_url: &'a str,
+    pub context_window: u64,
+    pub max_tokens: u64,
+    pub input: Vec<&'a str>,
+}
+
+pub fn model(spec: ModelSpec<'_>) -> Model {
+    let ModelSpec {
+        provider,
+        id,
+        name,
+        api,
+        base_url,
+        context_window,
+        max_tokens,
+        input,
+    } = spec;
     Model {
         id: id.to_string(),
         name: name.to_string(),
@@ -84,24 +96,18 @@ pub fn model(
 /// identical to the constants.
 ///
 /// `display_name` is consumed by the google, openai-family and mistral arms
-/// only; a build with just the other families sees it untouched.
-#[cfg_attr(
-    not(any(
-        feature = "provider-google",
-        feature = "provider-openai",
-        feature = "provider-mistral"
-    )),
-    allow(unused_variables)
-)]
+/// only.
 pub(super) fn build_provider_from_models(
     provider_id: &str,
     display_name: &str,
     models: &[Model],
 ) -> AiResult<ProviderBox> {
+    let _ = display_name;
     let first = models
         .first()
         .ok_or_else(|| AiError::UnknownProvider(provider_id.to_string()))?;
     let base_url = first.base_url.clone();
+    let _ = &base_url;
     if first.api == "anthropic-messages" {
         #[cfg(feature = "provider-anthropic")]
         {
@@ -269,10 +275,7 @@ pub(super) fn build_provider_from_models(
 /// Resolve the api-key env names for a provider from the runtime env-api-key
 /// registry, falling back to the given defaults. Used by the openai-family
 /// and mistral arms.
-#[cfg_attr(
-    not(any(feature = "provider-openai", feature = "provider-mistral")),
-    allow(dead_code)
-)]
+#[cfg(any(feature = "provider-openai", feature = "provider-mistral"))]
 fn env_keys_for(provider_id: &str, registry_id: &str, defaults: &[&str]) -> Vec<String> {
     env_api_keys::all()
         .into_iter()

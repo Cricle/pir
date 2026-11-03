@@ -203,6 +203,12 @@ pub struct ExtensionHandle {
     /// the TUI reads per physical input; see
     /// [`Self::has_terminal_input_handlers`]).
     terminal_input_handlers: Arc<std::sync::atomic::AtomicUsize>,
+    /// Disposable trust-bootstrap runtimes must not emit `session_shutdown`
+    /// when their mailbox closes: that handler belongs to the real session,
+    /// whose shutdown the host emits exactly once at the end. Set only by
+    /// [`ExtensionHandle::start_disposable`]; every normal handle keeps the
+    /// upstream lifecycle.
+    suppress_session_shutdown: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ExtensionHandle {
@@ -221,6 +227,28 @@ impl ExtensionHandle {
     /// [`Self::start_plan_only`]).
     pub fn has_js_runtime(&self) -> bool {
         self.tx.is_some()
+    }
+
+    /// Turn an already-started handle into a disposable one: closing its
+    /// mailbox (dropping the last clone) will NOT dispatch
+    /// `session_shutdown` to the JS handlers.
+    ///
+    /// Used when a parked strict-validation runtime is discarded without ever
+    /// becoming a live host runtime (a config/path mismatch in
+    /// `take_validated_extension_runtime`). That runtime only proved the
+    /// extension set loads; its teardown must not look like the real session
+    /// ending. [`Self::start_disposable`] sets the same flag at construction.
+    pub(crate) fn suppress_session_shutdown_on_drop(&self) {
+        self.suppress_session_shutdown
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Test seam: a clone of the shared actor-readiness flag. Lets a test
+    /// observe a DROPPED handle's actor exit without holding a sender clone
+    /// (which would keep the mailbox open and the actor alive).
+    #[doc(hidden)]
+    pub fn ready_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.ready)
     }
 
     /// Test seam: how many per-runtime session-streaming cells are currently

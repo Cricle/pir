@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::config::settings::Settings;
 
 use super::config_value::{resolve_config_value, resolve_headers_in};
-use super::construction::{build_provider_from_models, model};
+use super::construction::{build_provider_from_models, model, ModelSpec};
 use super::settings;
 use crate::ai::error::{AiError, AiResult};
 use crate::ai::provider::ProviderRegistry;
@@ -230,6 +230,12 @@ pub struct PiConfiguredModel {
     pub settings: Settings,
 }
 
+/// Upper bound on the `models.json` source size. [`strip_jsonc`] materializes
+/// the whole source as a `Vec<char>` (~4 bytes per ASCII char) plus the input
+/// and output strings, so an unbounded read of a hostile file multiplies its
+/// size several times over; 8 MiB keeps that peak around 48 MiB.
+pub const MAX_PI_MODELS_JSON_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Strip a UTF-8 BOM, `//` and `/* */` comments, and trailing commas so pi's
 /// JSONC models.json parses with plain `serde_json` (upstream allows JSONC and
 /// strips the BOM).
@@ -428,16 +434,16 @@ fn pi_model_from_config(
         .or_else(|| provider_base_url.map(str::to_string))
         .or_else(|| defaults.map(|model| model.base_url.clone()))
         .unwrap_or_else(|| "http://localhost:11434/v1".to_string());
-    let mut target = model(
-        provider_id,
-        &entry.id,
-        entry.id.as_str(),
-        &api,
-        &base_url,
-        128_000,
-        16_384,
-        vec!["text"],
-    );
+    let mut target = model(ModelSpec {
+        provider: provider_id,
+        id: &entry.id,
+        name: entry.id.as_str(),
+        api: &api,
+        base_url: &base_url,
+        context_window: 128_000,
+        max_tokens: 16_384,
+        input: vec!["text"],
+    });
     target.id = entry.id.clone();
     target.provider = provider_id.to_string();
     if let Some(name) = &entry.name {
@@ -707,10 +713,10 @@ pub fn load_pi_config_with_settings(
 fn load_pi_config_from(mut pi_settings: Settings) -> AiResult<Option<PiConfiguredModel>> {
     // models.json is optional: the Claude Code environment can configure the
     // anthropic provider on its own.
-    let config = match std::fs::read_to_string(pi_models_path()) {
-        Ok(contents) => parse_pi_config(&contents)
+    let config = match read_pi_models_json() {
+        Some(contents) => parse_pi_config(&contents)
             .map_err(|error| AiError::Authentication(format!("invalid pi models.json: {error}")))?,
-        Err(_) => PiModelsConfig::default(),
+        None => PiModelsConfig::default(),
     };
     let mut registry = auth_backed_registry();
 
@@ -839,16 +845,16 @@ fn load_pi_config_from(mut pi_settings: Settings) -> AiResult<Option<PiConfigure
         .find(|m| m.id == model_id)
         .cloned()
         .unwrap_or_else(|| {
-            model(
-                &provider_id,
-                &model_id,
-                &model_id,
-                "openai-chat",
-                "http://localhost:11434/v1",
-                128_000,
-                16_384,
-                vec!["text"],
-            )
+            model(ModelSpec {
+                provider: &provider_id,
+                id: &model_id,
+                name: &model_id,
+                api: "openai-chat",
+                base_url: "http://localhost:11434/v1",
+                context_window: 128_000,
+                max_tokens: 16_384,
+                input: vec!["text"],
+            })
         });
     Ok(Some(PiConfiguredModel {
         registry,
@@ -869,6 +875,25 @@ fn load_pi_config_from(mut pi_settings: Settings) -> AiResult<Option<PiConfigure
 /// for `PIR_AGENT_DIR`/`PI_CODING_AGENT_DIR` overrides).
 fn pi_models_path() -> PathBuf {
     settings::agent_dir().join("models.json")
+}
+
+/// Read the `models.json` source from [`pi_models_path`], treating a file
+/// above [`MAX_PI_MODELS_JSON_BYTES`] as absent (and diagnosing it once per
+/// load).
+fn read_pi_models_json() -> Option<String> {
+    read_pi_models_json_from(&pi_models_path())
+}
+
+/// [`read_pi_models_json`] for an explicit path. `None` means "no usable
+/// file": missing, unreadable, or above the size cap.
+fn read_pi_models_json_from(path: &Path) -> Option<String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > MAX_PI_MODELS_JSON_BYTES => {
+            crate::ext_diag!("[pi-config] models.json exceeds 8MiB; ignoring");
+            None
+        }
+        _ => std::fs::read_to_string(path).ok(),
+    }
 }
 
 /// A provider registry backed by the session agent dir's `auth.json`, so a
@@ -1054,16 +1079,16 @@ fn apply_claude_code_env(
         if models.iter().any(|model| model.id == *id) {
             continue;
         }
-        let mut synthesized = model(
-            "anthropic",
+        let mut synthesized = model(ModelSpec {
+            provider: "anthropic",
             id,
-            id,
-            "anthropic-messages",
-            &fallback_base,
-            env.context_window,
-            env.max_tokens,
-            vec!["text", "image"],
-        );
+            name: id,
+            api: "anthropic-messages",
+            base_url: &fallback_base,
+            context_window: env.context_window,
+            max_tokens: env.max_tokens,
+            input: vec!["text", "image"],
+        });
         synthesized.reasoning = true;
         models.push(synthesized);
     }
@@ -1200,8 +1225,7 @@ fn register_builtin_catalog_excluding(
 }
 
 fn load_pi_environment_from(mut settings_snapshot: Settings) -> AiResult<PiEnvironment> {
-    let models_json = std::fs::read_to_string(pi_models_path())
-        .ok()
+    let models_json = read_pi_models_json()
         .map(|contents| {
             parse_pi_config(&contents).map_err(|error| {
                 AiError::Authentication(format!("invalid pi models.json: {error}"))

@@ -158,16 +158,27 @@ async fn send_raw_request(port: u16, request: &str) -> RawResponse {
     RawResponse { status, headers }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn upgrade_request(
+/// Named inputs for [`upgrade_request`].
+struct UpgradeRequest<'a> {
     port: u16,
-    path: &str,
-    method: &str,
-    upgrade: &str,
-    connection: &str,
-    key: &str,
-    version: &str,
-) -> String {
+    path: &'a str,
+    method: &'a str,
+    upgrade: &'a str,
+    connection: &'a str,
+    key: &'a str,
+    version: &'a str,
+}
+
+fn upgrade_request(request: UpgradeRequest<'_>) -> String {
+    let UpgradeRequest {
+        port,
+        path,
+        method,
+        upgrade,
+        connection,
+        key,
+        version,
+    } = request;
     format!(
         "{method} {path} HTTP/1.1\r\n\
          Host: 127.0.0.1:{port}\r\n\
@@ -179,7 +190,15 @@ fn upgrade_request(
 }
 
 fn valid_upgrade_request(port: u16) -> String {
-    upgrade_request(port, "/ws", "GET", "websocket", "Upgrade", SAMPLE_KEY, "13")
+    upgrade_request(UpgradeRequest {
+        port,
+        path: "/ws",
+        method: "GET",
+        upgrade: "websocket",
+        connection: "Upgrade",
+        key: SAMPLE_KEY,
+        version: "13",
+    })
 }
 
 /// Complete a valid handshake and drain the two boot frames (status +
@@ -298,25 +317,41 @@ async fn handshake_requires_a_valid_websocket_key() {
     assert_eq!(send_raw_request(port, &missing).await.status, 400);
 
     // Not base64 at all.
-    let garbage = upgrade_request(
+    let garbage = upgrade_request(UpgradeRequest {
         port,
-        "/ws",
-        "GET",
-        "websocket",
-        "Upgrade",
-        "not-base64!!",
-        "13",
-    );
+        path: "/ws",
+        method: "GET",
+        upgrade: "websocket",
+        connection: "Upgrade",
+        key: "not-base64!!",
+        version: "13",
+    });
     assert_eq!(send_raw_request(port, &garbage).await.status, 400);
 
     // Valid base64 that decodes to 15 bytes (not 16).
     let fifteen = "A".repeat(20);
-    let short = upgrade_request(port, "/ws", "GET", "websocket", "Upgrade", &fifteen, "13");
+    let short = upgrade_request(UpgradeRequest {
+        port,
+        path: "/ws",
+        method: "GET",
+        upgrade: "websocket",
+        connection: "Upgrade",
+        key: &fifteen,
+        version: "13",
+    });
     assert_eq!(send_raw_request(port, &short).await.status, 400);
 
     // Valid base64 that decodes to 17 bytes (not 16).
     let seventeen = format!("{}=", "A".repeat(23));
-    let long = upgrade_request(port, "/ws", "GET", "websocket", "Upgrade", &seventeen, "13");
+    let long = upgrade_request(UpgradeRequest {
+        port,
+        path: "/ws",
+        method: "GET",
+        upgrade: "websocket",
+        connection: "Upgrade",
+        key: &seventeen,
+        version: "13",
+    });
     assert_eq!(send_raw_request(port, &long).await.status, 400);
 
     // The RFC sample key still upgrades.
@@ -337,15 +372,15 @@ async fn handshake_version_must_be_exactly_13() {
     let port = plugin.start_for_test("0 -").await.expect("ephemeral start");
 
     for version in ["8", "12", "13, 8", ""] {
-        let request = upgrade_request(
+        let request = upgrade_request(UpgradeRequest {
             port,
-            "/ws",
-            "GET",
-            "websocket",
-            "Upgrade",
-            SAMPLE_KEY,
+            path: "/ws",
+            method: "GET",
+            upgrade: "websocket",
+            connection: "Upgrade",
+            key: SAMPLE_KEY,
             version,
-        );
+        });
         let response = send_raw_request(port, &request).await;
         assert_eq!(
             response.status, 426,
@@ -386,15 +421,15 @@ async fn handshake_requires_the_get_method() {
     let port = plugin.start_for_test("0 -").await.expect("ephemeral start");
 
     for method in ["POST", "PUT", "HEAD"] {
-        let request = upgrade_request(
+        let request = upgrade_request(UpgradeRequest {
             port,
-            "/ws",
+            path: "/ws",
             method,
-            "websocket",
-            "Upgrade",
-            SAMPLE_KEY,
-            "13",
-        );
+            upgrade: "websocket",
+            connection: "Upgrade",
+            key: SAMPLE_KEY,
+            version: "13",
+        });
         assert_eq!(
             send_raw_request(port, &request).await.status,
             400,
@@ -412,61 +447,69 @@ async fn handshake_upgrade_and_connection_are_token_lists() {
     let port = plugin.start_for_test("0 -").await.expect("ephemeral start");
 
     // Token lists are parsed element-wise and case-insensitively.
-    let request = upgrade_request(
+    let request = upgrade_request(UpgradeRequest {
         port,
-        "/ws",
-        "GET",
-        "h2c, websocket",
-        "keep-alive, Upgrade",
-        SAMPLE_KEY,
-        "13",
-    );
+        path: "/ws",
+        method: "GET",
+        upgrade: "h2c, websocket",
+        connection: "keep-alive, Upgrade",
+        key: SAMPLE_KEY,
+        version: "13",
+    });
     assert_eq!(send_raw_request(port, &request).await.status, 101);
 
-    let request = upgrade_request(port, "/ws", "GET", "WebSocket", "upgrade", SAMPLE_KEY, "13");
+    let request = upgrade_request(UpgradeRequest {
+        port,
+        path: "/ws",
+        method: "GET",
+        upgrade: "WebSocket",
+        connection: "upgrade",
+        key: SAMPLE_KEY,
+        version: "13",
+    });
     assert_eq!(send_raw_request(port, &request).await.status, 101);
 
     // Lookalike tokens are not accepted (the request falls through to normal
     // HTTP routing, so only "not an upgrade" matters).
-    let request = upgrade_request(
+    let request = upgrade_request(UpgradeRequest {
         port,
-        "/ws",
-        "GET",
-        "websocketX",
-        "Upgrade",
-        SAMPLE_KEY,
-        "13",
-    );
+        path: "/ws",
+        method: "GET",
+        upgrade: "websocketX",
+        connection: "Upgrade",
+        key: SAMPLE_KEY,
+        version: "13",
+    });
     assert_ne!(
         send_raw_request(port, &request).await.status,
         101,
         "Upgrade: websocketX must not upgrade"
     );
 
-    let request = upgrade_request(
+    let request = upgrade_request(UpgradeRequest {
         port,
-        "/ws",
-        "GET",
-        "websocket",
-        "UpgradeX",
-        SAMPLE_KEY,
-        "13",
-    );
+        path: "/ws",
+        method: "GET",
+        upgrade: "websocket",
+        connection: "UpgradeX",
+        key: SAMPLE_KEY,
+        version: "13",
+    });
     assert_ne!(
         send_raw_request(port, &request).await.status,
         101,
         "Connection: UpgradeX must not upgrade"
     );
 
-    let request = upgrade_request(
+    let request = upgrade_request(UpgradeRequest {
         port,
-        "/ws",
-        "GET",
-        "websocket",
-        "keep-alive",
-        SAMPLE_KEY,
-        "13",
-    );
+        path: "/ws",
+        method: "GET",
+        upgrade: "websocket",
+        connection: "keep-alive",
+        key: SAMPLE_KEY,
+        version: "13",
+    });
     assert_ne!(
         send_raw_request(port, &request).await.status,
         101,

@@ -12,12 +12,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pir::ai::auth::{InMemoryCredentialStore, MapAuthContext};
+use pir::ai::error::AiError;
 use pir::ai::provider::ProviderRegistry;
 use pir::ai::providers::catalog::load_provider;
 use pir::ai::providers::models_store::{read_models_store_entry, write_models_store_entry};
 use pir::ai::providers::{
     remote_catalog_is_newer, ModelsStoreEntry, PersonalizeCatalog, RemoteCatalogOverlay,
-    RemoteCatalogOverlayConfig, REMOTE_CATALOG_REFRESH_INTERVAL, REMOTE_CATALOG_REQUEST_TIMEOUT,
+    RemoteCatalogOverlayConfig, REMOTE_CATALOG_MAX_BODY_BYTES, REMOTE_CATALOG_REFRESH_INTERVAL,
+    REMOTE_CATALOG_REQUEST_TIMEOUT,
 };
 use pir::ai::types::Model;
 
@@ -922,4 +924,101 @@ fn repaired_entries_register_into_a_fresh_registry() {
         .get_model("openrouter", "auto")
         .expect("auto registered");
     assert_eq!(auto.max_tokens, 30_000);
+}
+
+// ---------------------------------------------------------------------------
+// Chunked oversized bodies (no Content-Length): bounded incremental reads
+// ---------------------------------------------------------------------------
+
+/// A local server that answers every request with the same chunked body
+/// (`total_bytes` of `a`, no `Content-Length`). Returns its base URL.
+fn spawn_chunked_body_server(total_bytes: usize) -> String {
+    use std::io::Write;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind chunked mock listener");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = read_request_head(&mut stream);
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            if stream.write_all(header.as_bytes()).is_err() {
+                continue;
+            }
+            let chunk = vec![b'a'; 64 * 1024];
+            let mut written = 0usize;
+            while written < total_bytes {
+                let take = (total_bytes - written).min(chunk.len());
+                if write!(stream, "{take:x}\r\n").is_err()
+                    || stream.write_all(&chunk[..take]).is_err()
+                    || stream.write_all(b"\r\n").is_err()
+                {
+                    break;
+                }
+                written += take;
+                // A client that enforces its cap stops reading after ~8 MiB;
+                // swallow the resulting broken pipe and move on.
+            }
+            let _ = stream.write_all(b"0\r\n\r\n");
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+#[test]
+fn overlay_rejects_a_chunked_body_over_the_limit() {
+    let base = spawn_chunked_body_server(REMOTE_CATALOG_MAX_BODY_BYTES + 1);
+    let agent_dir = overlay_agent_dir("chunked-limit");
+    let registry = test_registry();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let overlay = RemoteCatalogOverlay::new(
+            overlay_config(
+                "chunked-provider",
+                format!("{base}/api/models/providers/test"),
+                agent_dir.clone(),
+            ),
+            Arc::clone(&registry),
+        )
+        .expect("overlay");
+        let error = overlay
+            .refresh_once()
+            .await
+            .expect_err("a chunked body over the cap must fail");
+        assert!(
+            matches!(
+                error,
+                AiError::ResponseTooLarge {
+                    limit: REMOTE_CATALOG_MAX_BODY_BYTES
+                }
+            ),
+            "expected ResponseTooLarge, got {error:?}"
+        );
+    });
+    let _ = std::fs::remove_dir_all(&agent_dir);
+}
+
+#[test]
+fn openrouter_personalize_rejects_a_chunked_body_over_the_limit() {
+    let base = spawn_chunked_body_server(REMOTE_CATALOG_MAX_BODY_BYTES + 1);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let error = pir::ai::providers::catalog::openrouter::personalize_openrouter_catalog(
+            Vec::new(),
+            &base,
+            Some("test-key"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a chunked body over the cap must fail");
+        assert!(
+            matches!(
+                error,
+                AiError::ResponseTooLarge {
+                    limit: REMOTE_CATALOG_MAX_BODY_BYTES
+                }
+            ),
+            "expected ResponseTooLarge, got {error:?}"
+        );
+    });
 }

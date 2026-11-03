@@ -1,9 +1,8 @@
 # Themes
 
-Custom themes are JSON files in `<agentDir>/themes` (and package
-contributions, see [packages.md](packages.md)). Files are loaded at startup
-before the theme resolves; invalid files are reported and skipped; name
-collisions resolve first-wins.
+Custom themes are JSON files in `<agentDir>/themes` (and package contributions, see [packages.md](packages.md)).
+Files load at startup before theme resolution; invalid files are reported and skipped; collisions resolve
+first-wins.
 
 ## Shape
 
@@ -18,18 +17,11 @@ collisions resolve first-wins.
 }
 ```
 
-Colors accept `oklch()`, `okhsl()`, hex, and plain names; unknown fields are
-rejected (fail-closed, matching upstream's schema). The sixteen semantic
-roles (accent, error, toolTitle, toolOutput, muted, ...) come from
-upstream's theme schema.
+Colors accept `oklch()`, `okhsl()`, hex, and plain names; unknown fields are rejected (fail-closed, matching
+upstream). The sixteen semantic roles (accent, error, toolTitle, toolOutput, muted, ...) come from upstream's
+schema.
 
-## Selection and export
-
-- `settings.theme` selects the theme at startup; OSC 11 auto-detect picks a
-  dark/light default when the terminal reports its background (env-gated).
-- Extensions can switch themes with `ctx.ui.setTheme(name)`.
-- `/theme` renders the current theme; export blocks support copying the
-  active palette.
-
-The theme registry is global (one per process); extension `getAllThemes`
-returns every registered entry with its source file.
+Selection: `settings.theme` selects the theme at startup; OSC 11 auto-detect picks a dark/light default when the
+terminal reports its background.
+- Extensions switch themes with `ctx.ui.setTheme(name)`; `/theme` renders the current theme and export blocks copy
+  the palette. The theme registry is global; extension `getAllThemes` returns every entry with its source file.

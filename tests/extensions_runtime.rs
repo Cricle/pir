@@ -224,6 +224,189 @@ async fn spike_ts_extension_registers_session_start_hook() {
 }
 
 // ---------------------------------------------------------------------------
+// `pi.on` fail-closed event-name validation
+// ---------------------------------------------------------------------------
+
+/// A typo in `pi.on` is a LOAD error, not a handler that can never fire.
+/// The known set is the central registry (`src/plugins/coverage.rs`), exposed
+/// to the prelude through the `isKnownEvent` host function.
+#[tokio::test(flavor = "current_thread")]
+async fn pi_on_rejects_unknown_event_names_at_load() {
+    let rt = new_runtime().await;
+    rt.seed_module(
+        "pir-ext:unknown-event.ts",
+        r#"
+        export default (pi) => {
+            pi.on("compaction_ends", () => { globalThis.__never = true; });
+        };
+        "#,
+    )
+    .expect("seed");
+    let error = rt
+        .seeded_load("pir-ext:unknown-event.ts")
+        .await
+        .expect_err("an unknown event name must fail the extension load");
+    let error = format!("{:#}", error);
+    assert!(
+        error.contains("unknown event") && error.contains("compaction_ends"),
+        "clear TypeError expected, got: {error}"
+    );
+}
+
+/// Every documented family stays accepted: upstream names, the session-event
+/// bridge names, pir synthics, native-only presentation names and the
+/// in-tree test synthetics. `pi.events.on` (the custom in-process bus) is not
+/// affected.
+#[tokio::test(flavor = "current_thread")]
+async fn pi_on_accepts_documented_and_synthetic_event_names() {
+    let rt = new_runtime().await;
+    rt.seed_module(
+        "pir-ext:known-events.ts",
+        r#"
+        export default (pi) => {
+            for (const name of [
+                "session_start",
+                "message_update",
+                "tool_result",
+                "entry_appended",
+                "thinking_level_changed",
+                "summarization_retry_scheduled",
+                "summarization_retry_attempt_start",
+                "summarization_retry_finished",
+                "run_failed",
+                "provider:refreshModels",
+                "status",
+                "extension_ui_request",
+                "gate_probe",
+                "probe_event",
+                "q3_large_payload",
+                "late_event",
+            ]) {
+                pi.on(name, () => {});
+            }
+            pi.events.on("extension-private-event", () => {});
+        };
+        "#,
+    )
+    .expect("seed");
+    rt.seeded_load("pir-ext:known-events.ts")
+        .await
+        .expect("all documented names must remain registrable");
+    let counts: serde_json::Value = rt
+        .eval_json("__pir_handlerCountsJson()")
+        .await
+        .expect("handler counts");
+    assert_eq!(
+        counts["late_event"],
+        json!(1),
+        "the synthetic test-only name must reach the handler table: {counts}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `pi.on("terminal_input")` — the dedicated raw-input dispatch list
+// ---------------------------------------------------------------------------
+
+/// The terminal-input bridge reads `state.terminalInputHandlers`, a list shared
+/// with `ctx.ui.onTerminalInput`; generic event handlers live per extension in
+/// `ext.handlers`. Before this regression `pi.on("terminal_input", ...)` only
+/// filled the latter, so the handler was accepted (the name is in the central
+/// registry) but never called. Registration, dispatch, consume and unsubscribe
+/// must all work through the shared list.
+#[tokio::test(flavor = "current_thread")]
+async fn pi_on_terminal_input_registers_on_the_terminal_input_dispatch_list() {
+    let rt = new_runtime().await;
+    rt.seed_module(
+        "pir-ext:terminal-input.ts",
+        r#"
+        export default (pi) => {
+            globalThis.__terminal_seen = [];
+            const unsubscribe = pi.on("terminal_input", (data) => {
+                globalThis.__terminal_seen.push(data);
+                if (data === "!") return { consume: true };
+                return undefined;
+            });
+            globalThis.__terminal_unsubscribe = unsubscribe;
+        };
+        "#,
+    )
+    .expect("seed");
+    rt.seeded_load("pir-ext:terminal-input.ts")
+        .await
+        .expect("pi.on(\"terminal_input\") must load");
+
+    // The fast-path count and the dispatch list move together: a session with
+    // no JS terminal handler must not pay the mailbox round-trip.
+    let counts: serde_json::Value = rt
+        .eval_json("__pir_handlerCountsJson()")
+        .await
+        .expect("handler counts");
+    assert_eq!(
+        counts["terminal_input"],
+        json!(1),
+        "pi.on must publish the terminal-input handler count: {counts}"
+    );
+
+    let mut payload = json!({ "data": "!" });
+    let outcome = rt
+        .emit("terminal_input", &mut payload)
+        .await
+        .expect("terminal_input dispatch");
+    assert!(
+        outcome.errors.is_empty(),
+        "the handler ran without errors: {:?}",
+        outcome.errors
+    );
+    assert_eq!(
+        outcome.result,
+        json!({ "consume": true, "data": "!" }),
+        "the handler's {{consume}} decision must reach the host"
+    );
+    let seen: serde_json::Value = rt
+        .eval_json("JSON.stringify(globalThis.__terminal_seen)")
+        .await
+        .expect("eval terminal seen");
+    assert_eq!(
+        seen,
+        json!(["!"]),
+        "the pi.on handler must receive the raw chunk"
+    );
+
+    // Same unsubscribe semantics as every other pi.on handler: idempotent,
+    // removes the handler, and the next dispatch sees nothing.
+    rt.eval_json("__terminal_unsubscribe(); __terminal_unsubscribe(); JSON.stringify(globalThis.__terminal_seen)")
+        .await
+        .expect("unsubscribe");
+    let counts: serde_json::Value = rt
+        .eval_json("__pir_handlerCountsJson()")
+        .await
+        .expect("handler counts after unsubscribe");
+    assert!(
+        counts.get("terminal_input").is_none(),
+        "unsubscribe must clear the published count: {counts}"
+    );
+    let mut payload = json!({ "data": "?" });
+    let outcome = rt
+        .emit("terminal_input", &mut payload)
+        .await
+        .expect("terminal_input dispatch after unsubscribe");
+    assert_eq!(
+        outcome.result,
+        json!(null),
+        "an unsubscribed handler must not decide the input"
+    );
+    let seen: serde_json::Value = rt
+        .eval_json("JSON.stringify(globalThis.__terminal_seen)")
+        .await
+        .expect("eval terminal seen after unsubscribe");
+    assert_eq!(
+        seen,
+        json!(["!"]),
+        "an unsubscribed handler must not be called again"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Discovery + load from fixtures
 // ---------------------------------------------------------------------------
 

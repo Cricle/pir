@@ -228,6 +228,16 @@ fn parse_braced(rest: &str, args: &[String], all_args: &str) -> Option<(String, 
 /// parse — the file is rejected either way, with the warning surfaced
 /// upstream as a `ResourceDiagnostic` (prompt-templates.ts:121-127).
 pub fn load_template_file(path: &Path) -> Result<PromptTemplate, String> {
+    // pir hardening (FIX-C17): reject oversized templates before reading them;
+    // the warning lands in the caller's `ResourceDiagnostic` list.
+    let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    if size > crate::config::settings::MAX_CONTEXT_FILE_BYTES {
+        return Err(format!(
+            "prompt template file is {size} bytes, exceeding the {} byte limit; skipped ({})",
+            crate::config::settings::MAX_CONTEXT_FILE_BYTES,
+            path.display()
+        ));
+    }
     let raw = fs::read_to_string(path).map_err(|e| {
         format!(
             "failed to read prompt template file: {e} ({})",

@@ -127,8 +127,21 @@ pub enum PluginEventOutcome {
         /// prompt's current images untouched.
         images: Option<JsonValue>,
     },
-    /// `session_before_switch|fork|compact|tree`: cancel decision.
+    /// `session_before_switch|fork|tree`: cancel decision.
     SessionBefore { cancel: bool },
+    /// `session_before_compact`: cancel decision plus the optional
+    /// replacement compaction (upstream `SessionBeforeCompactResult`).
+    ///
+    /// `compaction` is kept in its wire shape (`{summary, firstKeptEntryId,
+    /// tokensBefore, usage?, details?}`) for the compaction host to parse
+    /// verbatim. It needs its own variant because the shared merge layer must
+    /// carry it through the adapter boundary: reducing the event to
+    /// [`Self::SessionBefore`] dropped the replacement and made the JS face
+    /// unable to replace a compaction while a native `Generic` result could.
+    SessionBeforeCompact {
+        cancel: bool,
+        compaction: Option<JsonValue>,
+    },
     /// `resources_discover`: contributed resource paths.
     Discover {
         skill_paths: Vec<String>,
@@ -166,6 +179,27 @@ pub enum PluginEventOutcome {
 }
 
 impl PluginEventOutcome {
+    /// Whether this outcome carries a result the merge layer must mirror back
+    /// into the event payload for the next handler. `None` (a mutation-only
+    /// handler) and isolated errors must not re-apply an earlier handler's
+    /// stale result; a `Generic(null)` is likewise "no opinion". Every other
+    /// variant is a real return value (possibly empty, e.g. `{cancel: false}`).
+    pub fn carries_payload_result(&self) -> bool {
+        match self {
+            Self::None | Self::Error { .. } => false,
+            Self::Generic(value) => !value.is_null(),
+            Self::Js { result, .. } => result.carries_payload_result(),
+            Self::ToolCall { .. }
+            | Self::BeforeAgentStart { .. }
+            | Self::Input { .. }
+            | Self::SessionBefore { .. }
+            | Self::SessionBeforeCompact { .. }
+            | Self::Discover { .. }
+            | Self::ToolResult { .. }
+            | Self::TerminalInput { .. } => true,
+        }
+    }
+
     /// Interpret a raw JS-merged outcome JSON (`{block, reason}`,
     /// `{systemPrompt, message}`, ...) per event family. This is the seam the
     /// QuickJS adapter rides: the JS runtime already merged its handlers'
@@ -226,11 +260,20 @@ impl PluginEventOutcome {
             // `label`), which a `SessionBefore { cancel }` outcome would
             // discard. The merge layer still short-circuits on its
             // `cancel: true` (see `MergedEmit::merge`).
-            "session_before_switch" | "session_before_fork" | "session_before_compact" => {
-                Self::SessionBefore {
-                    cancel: result.get("cancel").and_then(JsonValue::as_bool) == Some(true),
-                }
-            }
+            "session_before_switch" | "session_before_fork" => Self::SessionBefore {
+                cancel: result.get("cancel").and_then(JsonValue::as_bool) == Some(true),
+            },
+            // The compact result carries the replacement compaction beside the
+            // cancel flag (upstream `SessionBeforeCompactResult.compaction`).
+            // `SessionBefore { cancel }` used to drop it at this boundary, so
+            // `compact.rs` never saw a JS handler's replacement.
+            "session_before_compact" => Self::SessionBeforeCompact {
+                cancel: result.get("cancel").and_then(JsonValue::as_bool) == Some(true),
+                compaction: result
+                    .get("compaction")
+                    .cloned()
+                    .filter(|value| !value.is_null()),
+            },
             "resources_discover" => {
                 let paths = |key: &str| -> Vec<String> {
                     result
@@ -384,6 +427,12 @@ impl<'a> RegistrationContext<'a> {
     }
 
     /// Register a native Rust tool (upsert by name at resolution time).
+    ///
+    /// The registration record mirrors the live `AgentTool` metadata
+    /// (`label`, `promptSnippet`, `promptGuidelines`, `prepareLoadout`) so
+    /// `pi.getAllTools()` / `ctx.tools` expose the same definition the run
+    /// registry uses. The tool OBJECT keeps every live hook; only plain data
+    /// and markers can ride [`ToolDef`] (the JS-visible snapshot).
     pub fn register_tool(&mut self, tool: Arc<dyn crate::agent::tool_execution::AgentTool>) {
         use crate::agent::tool_execution::ToolReach;
         let description = tool.description();
@@ -401,12 +450,17 @@ impl<'a> RegistrationContext<'a> {
                     ToolReach::Names(words) => serde_json::json!(words),
                 })
             });
+        // `AgentTool::label()` defaults to the tool name, so this is always
+        // the same human-readable value the run registry/UI uses.
+        let label = tool.label().to_owned();
+        let prompt_snippet = tool.prompt_snippet();
+        let prompt_guidelines = tool.prompt_guidelines();
         let def = ToolDef {
             name: tool.name().to_owned(),
-            label: None,
+            label: Some(label),
             description: description.to_owned(),
-            prompt_snippet: None,
-            prompt_guidelines: Vec::new(),
+            prompt_snippet,
+            prompt_guidelines,
             parameters: tool.parameters().unwrap_or(JsonValue::Null),
             output_schema: tool.output_schema().unwrap_or(JsonValue::Null),
             source_info: Default::default(),
@@ -428,7 +482,12 @@ impl<'a> RegistrationContext<'a> {
                 open_world_hint: annotations.open_world_hint,
             }),
             default_active: tool.default_active(),
-            prepare_loadout: false,
+            // The native tool OBJECT always exposes its loadout hook
+            // (`AgentTool::prepare_loadout`, invoked directly by the session);
+            // unlike the JS marker there is no in-engine function to route to,
+            // so the registration advertises the capability rather than the
+            // old hard-coded `false`.
+            prepare_loadout: true,
             reaches_tools,
         };
         self.registrations
@@ -450,22 +509,56 @@ impl<'a> RegistrationContext<'a> {
 
     /// Register a slash command. A `None` backend is a JS command (the
     /// adapter path); Rust plugins pass a [`CommandHandler`].
+    ///
+    /// This is the no-argument-completions shorthand; a native plugin that
+    /// registers a `CompletionService` provider for the command uses
+    /// [`Self::register_command_with_completions`] so the exported
+    /// `CommandDef` carries the same marker the JS `getArgumentCompletions`
+    /// path carries.
     pub fn register_command(
         &mut self,
         name: &str,
         description: Option<&str>,
         handler: Option<CommandBackend>,
     ) {
-        self.registrations.commands.push((
+        self.register_command_with_completions(name, description, false, handler);
+    }
+
+    /// [`Self::register_command`] with the `argument_completions` marker
+    /// forwarded into the exported [`CommandDef`].
+    ///
+    /// Native plugins serve completions through
+    /// `CompletionService::register_argument`; setting this marker keeps the
+    /// registry record symmetric with the JS adapter's wire
+    /// `argumentCompletions` field. The old three-argument convenience form
+    /// stays source-compatible and means `false`.
+    pub fn register_command_with_completions(
+        &mut self,
+        name: &str,
+        description: Option<&str>,
+        argument_completions: bool,
+        handler: Option<CommandBackend>,
+    ) {
+        self.register_command_def(
             CommandDef {
                 name: name.to_owned(),
                 description: description.map(String::from),
                 source: "extension".to_owned(),
                 source_info: Default::default(),
-                argument_completions: false,
+                argument_completions,
+                ext_id: None,
             },
             handler,
-        ));
+        );
+    }
+
+    /// Register a fully-formed command definition. The JS adapter uses this
+    /// to preserve the wire `extId` (duplicate-name dispatch); the
+    /// `argumentCompletions` marker also has the convenience form
+    /// [`Self::register_command_with_completions`], but only this entry keeps
+    /// the `ext_id`.
+    pub fn register_command_def(&mut self, def: CommandDef, handler: Option<CommandBackend>) {
+        self.registrations.commands.push((def, handler));
     }
 
     /// Register a CLI flag (`boolean` or `string`).
@@ -503,6 +596,16 @@ impl<'a> RegistrationContext<'a> {
     }
 
     /// Register a provider definition (`{id, config}` JSON as upstream).
+    ///
+    /// This is the declarative JSON path: the session host applies it on the
+    /// next provider sync (including `refreshModels`/`streamSimple` handling
+    /// when a JS runtime is attached). A plugin that needs a fully typed
+    /// provider — a Rust `stream` implementation, model discovery, filters,
+    /// OAuth, or deferred responses — registers it through the live service
+    /// from [`AgentPlugin::on_context`]:
+    /// `ctx.providers().expect("providers bound").register_provider_impl(Arc::new(my_provider))`.
+    /// That is the Rust equivalent of a JS `pi.registerProvider({...})` with
+    /// callbacks, and it is applied immediately to the session registry.
     pub fn register_provider(&mut self, id: &str, config: JsonValue) {
         self.registrations
             .providers
@@ -550,6 +653,47 @@ pub trait AgentPlugin: Send + Sync {
     /// Which events this plugin handles (fast-path `has_handlers`).
     fn events(&self) -> EventInterest {
         EventInterest::None
+    }
+
+    /// Whether this plugin's handler for `event` could change anything for a
+    /// request running under `model` (the model id, when the caller knows it).
+    ///
+    /// This is the precise fast-path twin of [`Self::events`]: the host
+    /// consults it before installing a per-request transport hook whose
+    /// payload contract forces a full `serde_json::Value` request body
+    /// (`before_provider_request`). A plugin that answers `false` promises the
+    /// handler is a no-op for EVERY payload of that event under `model` — an
+    /// in-place mutation or a returned replacement both count as a possible
+    /// change, so only a provably inert handler may say `false`.
+    ///
+    /// The default is conservative: `true` means "assume it can change
+    /// something", which keeps the value-body path for every implementation
+    /// that does not override this (all third-party and inline native
+    /// plugins). The JS runtime is not consulted here at all — its handlers
+    /// receive an opaque payload and cannot be introspected, so the host keeps
+    /// the value path whenever a live JS handler exists.
+    ///
+    /// `model == None` means the caller does not know the request model; the
+    /// host then falls back to [`Self::events`] alone and never uses this
+    /// predicate to skip a dispatch.
+    fn handler_active_for_event(&self, event: &str, model: Option<&str>) -> bool {
+        let _ = (event, model);
+        true
+    }
+
+    /// Whether this plugin's `message_update` handler needs the cumulative
+    /// `message.content` in the payload.
+    ///
+    /// The native fan-out is O(delta) by default: the hoisted `message` keeps
+    /// every scalar field but omits `content` (the same contract the JS face
+    /// documents for its live object). A plugin that needs the accumulated
+    /// reply DURING the stream opts in here; the loop then builds the full
+    /// reference payload per delta. That is O(reply) per delta / O(reply²)
+    /// per reply, so only implementations that actually read
+    /// `message.content` should return `true`. The default (`false`) keeps
+    /// the hot path allocation-free of the accumulated snapshot.
+    fn wants_message_update_content(&self) -> bool {
+        false
     }
 
     /// Handle one event on the unified dispatch. The payload may be mutated

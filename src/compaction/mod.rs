@@ -1684,16 +1684,16 @@ async fn compact_with_preparation_refs_in_span(
         settings,
     } = preparation;
 
-    let (summary, summary_usage) = summarize_and_merge(
-        messages_to_summarize.as_slice(),
-        turn_prefix_messages.as_slice(),
+    let (summary, summary_usage) = summarize_and_merge(SummaryRequest {
+        messages_to_summarize: messages_to_summarize.as_slice(),
+        turn_prefix_messages: turn_prefix_messages.as_slice(),
         is_split_turn,
-        previous_summary.as_deref(),
+        previous_summary: previous_summary.as_deref(),
         custom_instructions,
         model,
-        &settings,
+        settings: &settings,
         complete,
-    )
+    })
     .await?;
     let mut summary = summary;
     let (read_files, modified_files) = compute_file_lists(&file_ops);
@@ -1715,20 +1715,41 @@ async fn compact_with_preparation_refs_in_span(
     })
 }
 
+/// One summarize-and-merge request: the spans to summarize and the settings
+/// the summary runs with.
+struct SummaryRequest<'a> {
+    /// Messages that become the history checkpoint.
+    messages_to_summarize: &'a [&'a Message],
+    /// The new-turn prefix when the cut splits a turn.
+    turn_prefix_messages: &'a [&'a Message],
+    /// Whether the cut splits a turn.
+    is_split_turn: bool,
+    /// Summary of the history before this compaction, if any.
+    previous_summary: Option<&'a str>,
+    /// User-supplied summary instructions.
+    custom_instructions: Option<&'a str>,
+    /// The model that writes the summary.
+    model: &'a Model,
+    /// Compaction settings (prompt template, token budgets).
+    settings: &'a CompactionConfig,
+    /// The completion function the summary runs through.
+    complete: Arc<CompleteFn>,
+}
+
 /// The shared summarize-and-merge body of both compaction entry points
 /// (upstream `compact`): the history checkpoint, the split-turn checkpoint,
 /// and the `**Turn Context (split turn):**` merge.
-#[allow(clippy::too_many_arguments)]
-async fn summarize_and_merge(
-    messages_to_summarize: &[&Message],
-    turn_prefix_messages: &[&Message],
-    is_split_turn: bool,
-    previous_summary: Option<&str>,
-    custom_instructions: Option<&str>,
-    model: &Model,
-    settings: &CompactionConfig,
-    complete: Arc<CompleteFn>,
-) -> Result<(String, Usage), String> {
+async fn summarize_and_merge(request: SummaryRequest<'_>) -> Result<(String, Usage), String> {
+    let SummaryRequest {
+        messages_to_summarize,
+        turn_prefix_messages,
+        is_split_turn,
+        previous_summary,
+        custom_instructions,
+        model,
+        settings,
+        complete,
+    } = request;
     if is_split_turn && !turn_prefix_messages.is_empty() {
         let mut history_text = previous_summary.unwrap_or("No prior history.").to_owned();
         let mut history_usage: Option<Usage> = None;
@@ -1798,16 +1819,16 @@ async fn compact_with_preparation_in_span(
     // for it (no copy is made to call it).
     let history_refs: Vec<&Message> = messages_to_summarize.iter().collect();
     let turn_prefix_refs: Vec<&Message> = turn_prefix_messages.iter().collect();
-    let (summary_text, summary_usage) = summarize_and_merge(
-        history_refs.as_slice(),
-        turn_prefix_refs.as_slice(),
+    let (summary_text, summary_usage) = summarize_and_merge(SummaryRequest {
+        messages_to_summarize: history_refs.as_slice(),
+        turn_prefix_messages: turn_prefix_refs.as_slice(),
         is_split_turn,
-        previous_summary.as_deref(),
+        previous_summary: previous_summary.as_deref(),
         custom_instructions,
         model,
-        &settings,
+        settings: &settings,
         complete,
-    )
+    })
     .await?;
     let mut summary = summary_text;
 

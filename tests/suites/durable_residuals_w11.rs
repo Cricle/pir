@@ -37,7 +37,9 @@ use pir::durable::harness::scheduler::runtime::TaskRuntime;
 use pir::durable::harness::scheduler::{NextTaskState, TaskScheduler, TaskSchedulerOptions};
 use pir::durable::harness::submissions::SubmissionDraft;
 use pir::durable::harness::task::{define_task, phase_handler, RunningTask, Task};
-use pir::durable::harness::telemetry::{HarnessTelemetry, SpanHandle, SpanStatus, TraceCarrier};
+use pir::durable::harness::telemetry::{
+    HarnessTelemetry, PhaseSpanEnd, PhaseSpanStart, SpanHandle, SpanStatus, TraceCarrier,
+};
 use pir::durable::ids::{EntryId, ROOT_CONVERSATION_ID};
 use pir::durable::pi_format::export::stable_pi_id;
 use pir::durable::pi_format::{import_session_text, render_session, ExportInput, OpaqueEntry};
@@ -191,7 +193,18 @@ fn disabled_core_installs_no_sink() {
         "no sink object exists on the default path"
     );
     assert_eq!(
-        telemetry.start_phase_span(1, "t", "p", "run", None, false, None, &[]),
+        telemetry.start_phase_span(
+            PhaseSpanStart {
+                task_id: 1,
+                task_name: "t",
+                phase: "p",
+                kind: "run",
+                attempt: None,
+                resumed: false,
+            },
+            None,
+            &[],
+        ),
         SpanHandle::NONE
     );
     assert!(telemetry.inject(SpanHandle::NONE).is_none());
@@ -216,12 +229,14 @@ fn native_sink_forwards_spans_links_and_events() {
         .expect("the link carrier extracts");
 
     let span = telemetry.start_phase_span(
-        7,
-        "generation",
-        "start",
-        "run",
-        Some(2),
-        false,
+        PhaseSpanStart {
+            task_id: 7,
+            task_name: "generation",
+            phase: "start",
+            kind: "run",
+            attempt: Some(2),
+            resumed: false,
+        },
         Some(parent),
         &[pir::durable::harness::telemetry::SpanLink::new(link)],
     );
@@ -229,13 +244,15 @@ fn native_sink_forwards_spans_links_and_events() {
     telemetry.checkpoint_changed(Some(span), "tools");
     telemetry.end_phase_span(
         span,
-        "generation",
-        "start",
-        Some("next=tools"),
-        None,
-        None,
+        PhaseSpanEnd {
+            task_name: "generation",
+            phase: "start",
+            outcome: Some("next=tools"),
+            tool_name: None,
+            tool_call_id: None,
+            duration_millis: Some(12.5),
+        },
         SpanStatus::Ok,
-        Some(12.5),
     );
 
     let phase = recorder.span("pi.durable.phase").expect("phase span");
@@ -301,17 +318,30 @@ fn native_sink_forwards_capped_error_status() {
     let recorder = TestTelemetry::new();
     let telemetry = HarnessTelemetry::from_telemetry(Telemetry::from_recorder(recorder.clone()));
 
-    let span = telemetry.start_phase_span(1, "t", "p", "run", None, false, None, &[]);
+    let span = telemetry.start_phase_span(
+        PhaseSpanStart {
+            task_id: 1,
+            task_name: "t",
+            phase: "p",
+            kind: "run",
+            attempt: None,
+            resumed: false,
+        },
+        None,
+        &[],
+    );
     let long = "x".repeat(900);
     telemetry.end_phase_span(
         span,
-        "t",
-        "p",
-        Some("faulted"),
-        None,
-        None,
+        PhaseSpanEnd {
+            task_name: "t",
+            phase: "p",
+            outcome: Some("faulted"),
+            tool_name: None,
+            tool_call_id: None,
+            duration_millis: None,
+        },
         SpanStatus::error_capped("task_faulted", &long),
-        None,
     );
 
     let phase = recorder.span("pi.durable.phase").expect("phase span");
@@ -391,8 +421,30 @@ fn native_sink_carries_a_trace_across_an_inject_extract_round_trip() {
     let other_recorder = TestTelemetry::new();
     let other = HarnessTelemetry::from_telemetry(Telemetry::from_recorder(other_recorder.clone()));
     let parent = other.extract(Some(&carrier)).expect("the carrier extracts");
-    let child = other.start_phase_span(1, "t", "p", "run", None, false, Some(parent), &[]);
-    other.end_phase_span(child, "t", "p", None, None, None, SpanStatus::Ok, None);
+    let child = other.start_phase_span(
+        PhaseSpanStart {
+            task_id: 1,
+            task_name: "t",
+            phase: "p",
+            kind: "run",
+            attempt: None,
+            resumed: false,
+        },
+        Some(parent),
+        &[],
+    );
+    other.end_phase_span(
+        child,
+        PhaseSpanEnd {
+            task_name: "t",
+            phase: "p",
+            outcome: None,
+            tool_name: None,
+            tool_call_id: None,
+            duration_millis: None,
+        },
+        SpanStatus::Ok,
+    );
 
     let submit = recorder.span("pi.durable.submit").expect("submit span");
     let phase = other_recorder.span("pi.durable.phase").expect("phase span");

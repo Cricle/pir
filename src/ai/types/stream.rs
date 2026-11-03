@@ -469,6 +469,17 @@ pub type HeaderTransform = std::sync::Arc<
         + Sync,
 >;
 
+/// Async `before_provider_headers` hook: observes/mutates the caller-visible
+/// request headers BEFORE auth headers are applied. Returning the original
+/// map on failure keeps the request alive (fail-open, like the JS hook).
+pub type BeforeProviderHeadersHook = std::sync::Arc<
+    dyn Fn(
+            ProviderHeaders,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ProviderHeaders> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Optional [`HeaderTransform`] slot with a non-`dyn` `Debug`.
 #[derive(Clone, Default)]
 pub struct HeaderTransformHook {
@@ -674,6 +685,12 @@ pub struct ProviderStreamHooks {
     /// Transport-level async `after_provider_response` observer (per-request,
     /// same rationale as [`ProviderStreamHooks::before_provider_request`]).
     pub after_provider_response: Option<crate::ai::transport::AfterProviderResponseHook>,
+    /// Per-request `before_provider_headers` transform. Runs after the
+    /// caller/model/provider header layers but BEFORE auth headers are added,
+    /// so extension handlers never see the resolved API key while their
+    /// additions still reach every request (prompt, compaction summary,
+    /// branch summary, print).
+    pub before_provider_headers: Option<BeforeProviderHeadersHook>,
     /// The retry-wait seam (upstream auto-retry countdown + `abortRetry`):
     /// when installed, the transport hands each scheduled retry to the hook,
     /// which performs the wait and may cancel it. Unset = the transport
@@ -704,6 +721,10 @@ impl std::fmt::Debug for ProviderStreamHooks {
             .field(
                 "after_provider_response",
                 &self.after_provider_response.is_some(),
+            )
+            .field(
+                "before_provider_headers",
+                &self.before_provider_headers.is_some(),
             )
             .field("on_retry", &self.on_retry)
             .field("on_retry_start", &self.on_retry_start.is_some())
@@ -847,6 +868,19 @@ pub struct StreamOptions {
     /// the parent span rides the request options. Keeping it off `Context`
     /// preserves the context's serde shape and its `PartialEq` comparison.
     pub telemetry: Option<crate::telemetry::Span>,
+    /// Historical transcript streamed from storage instead of a resident
+    /// `Vec<Message>` prefix.
+    ///
+    /// When set, the OpenAI-compatible streamed body serializes this source's
+    /// messages followed by `Context::messages` (the messages this run
+    /// produced). It is a runtime-only field (never serialized) and ONLY the
+    /// OpenAI-compatible `/chat/completions` streamed body consumes it; every
+    /// other adapter ignores it, so a host must set it only when that adapter
+    /// is selected and the streamed body path is available
+    /// (`openai::openai_streamed_body_supported`). The value-body fallbacks
+    /// (payload hooks, Anthropic-style cache markers) cannot consume it and
+    /// report an error instead of silently sending a truncated transcript.
+    pub message_source: Option<Arc<dyn super::message_source::MessageSource>>,
 }
 
 /// Redacting `Debug`: `api_key` is replaced by a marker. Request-scoped

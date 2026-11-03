@@ -59,7 +59,12 @@ globalThis.__pirScriptRun = async (moduleName) => {
 /// Boot a script-mode runtime, run the test entry module (top-level await
 /// included), drain the loop, and read back `globalThis.__testResult`.
 async fn run_worker_test(test_name: &str, source: &str) -> Value {
-    let cwd = fixture_dir(test_name);
+    run_worker_test_in(fixture_dir(test_name), source).await
+}
+
+/// [`run_worker_test`] against an already prepared fixture directory (the
+/// caller may place files there before the runtime starts).
+async fn run_worker_test_in(cwd: PathBuf, source: &str) -> Value {
     let rt = ExtensionRuntime::new(test_config_at(&cwd))
         .await
         .expect("runtime construction");
@@ -459,6 +464,48 @@ async fn worker_startup_cost() {
     assert!(
         elapsed < 30_000,
         "worker startup took {elapsed}ms (expected well under 30s)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Source cap: `require()` shares `fs.readFile`'s 32 MiB read limit
+// ---------------------------------------------------------------------------
+
+/// A CommonJS module over the 32 MiB source cap must fail with `E2BIG`
+/// (the `fs.readFile` error code) instead of buffering the whole file on the
+/// host heap. The fixture is a sparse file: the bytes exist but cost no disk.
+#[tokio::test(flavor = "current_thread")]
+async fn require_of_oversized_module_is_capped_with_e2big() {
+    let cwd = fixture_dir("worker_huge_require");
+    let huge = cwd.join("huge.cjs");
+    let file = std::fs::File::create(&huge).expect("create huge module");
+    file.set_len(32 * 1024 * 1024 + 1)
+        .expect("set sparse module length");
+    drop(file);
+
+    let result = run_worker_test_in(
+        cwd,
+        r#"
+        import { createRequire } from "node:module";
+        const require = createRequire(process.cwd() + "/entry.cjs");
+        let outcome;
+        try {
+          require("./huge.cjs");
+          outcome = { ok: true };
+        } catch (error) {
+          outcome = { code: error.code, message: String(error.message) };
+        }
+        globalThis.__testResult = outcome;
+        "#,
+    )
+    .await;
+    assert_eq!(result["code"], "E2BIG", "{result}");
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("32-MiB"),
+        "the cap error names the limit: {result}"
     );
 }
 

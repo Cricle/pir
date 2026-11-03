@@ -3009,6 +3009,151 @@ async fn user_message_events_carry_the_message_json() {
 }
 
 // ---------------------------------------------------------------------------
+// `turn_end` payload (R1-L1-009): one full `contextMessages` view, unchanged
+// field set/order, and persisted entry ids resolved from the turn.
+// ---------------------------------------------------------------------------
+
+/// Inline plugin recording every `turn_end` payload.
+struct TurnEndRecordingPlugin {
+    info: PluginInfo,
+    seen: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl TurnEndRecordingPlugin {
+    fn new(seen: Arc<Mutex<Vec<serde_json::Value>>>) -> Self {
+        Self {
+            info: PluginInfo::inline("turn-end-recorder"),
+            seen,
+        }
+    }
+}
+
+impl AgentPlugin for TurnEndRecordingPlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> pir::plugins::EventInterest {
+        pir::plugins::EventInterest::List(vec!["turn_end".into()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        let seen = Arc::clone(&self.seen);
+        Box::pin(async move {
+            seen.lock().unwrap().push(event.payload.clone());
+            PluginEventOutcome::None
+        })
+    }
+}
+
+#[tokio::test]
+async fn turn_end_payload_keeps_its_field_contract() {
+    let temp = TempDir::new("turn-end-payload");
+    let registry = fake_registry(Arc::new(|index, _context| match index {
+        0 => assistant(vec![tool_call("call-1", "echo")], StopReason::ToolUse),
+        _ => assistant(vec![text("done")], StopReason::Stop),
+    }));
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let path = session.path().to_path_buf();
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool));
+    let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools,
+            session: Some(session),
+            compaction: None,
+            max_turns: 4,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        },
+        vec![Arc::new(TurnEndRecordingPlugin::new(Arc::clone(&seen)))],
+    ));
+
+    agent
+        .prompt("hi", event_handler(EventLog::default()))
+        .await
+        .expect("prompt");
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "one turn_end per turn: {seen:?}");
+    let tool_turn = &seen[0];
+    // Field set AND order: existing handlers read these keys by name, but the
+    // serialized payload order is part of the observable wire shape.
+    let keys: Vec<&str> = tool_turn
+        .as_object()
+        .expect("turn_end payload object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "type",
+            "turnIndex",
+            "message",
+            "toolResults",
+            "toolResultEntryIds",
+            "entries",
+            "continue",
+            "outcome",
+            "context",
+            "messageEntryId",
+        ],
+        "turn_end payload field order changed: {tool_turn}"
+    );
+    assert_eq!(tool_turn["type"], serde_json::json!("turn_end"));
+    assert_eq!(tool_turn["message"]["role"], serde_json::json!("assistant"));
+    assert_eq!(tool_turn["toolResults"].as_array().map(Vec::len), Some(1));
+    let result_ids = tool_turn["toolResultEntryIds"]
+        .as_array()
+        .expect("toolResultEntryIds array");
+    assert_eq!(
+        result_ids.len(),
+        1,
+        "the persisted tool result id: {tool_turn}"
+    );
+    // `contextMessages` is the full live context preview, serialized once.
+    let context_messages = tool_turn["context"]["contextMessages"]
+        .as_array()
+        .expect("contextMessages array");
+    assert!(
+        context_messages.len() >= 3,
+        "expected the user, assistant and tool-result messages: {tool_turn}"
+    );
+    assert_eq!(
+        context_messages.last().expect("last context message")["role"],
+        serde_json::json!("toolResult")
+    );
+    assert_eq!(tool_turn["context"]["canContinue"], serde_json::json!(true));
+    assert_eq!(tool_turn["entries"], serde_json::json!([]));
+    assert_eq!(tool_turn["continue"], serde_json::json!(false));
+    assert_eq!(tool_turn["outcome"], serde_json::json!("completed"));
+
+    // The advertised ids name real entries in the persisted transcript.
+    let reopened = SessionManager::open(&path).expect("reopen session");
+    let message_entry_id = tool_turn["messageEntryId"]
+        .as_str()
+        .expect("messageEntryId string");
+    assert!(
+        reopened.entry(message_entry_id).is_some(),
+        "messageEntryId {message_entry_id} is not a persisted entry"
+    );
+    let result_id = result_ids[0].as_str().expect("tool result id string");
+    assert!(
+        reopened.entry(result_id).is_some(),
+        "toolResultEntryIds entry {result_id} is not a persisted entry"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Deferred compaction-projection materialization (per provider request)
 // ---------------------------------------------------------------------------
 
@@ -3634,6 +3779,57 @@ impl AgentPlugin for GatePlugin {
     }
 }
 
+/// Inline plugin recording selected plugin events (name + payload) without
+/// parking dispatch, so tests can assert the terminal failure event that the
+/// host emits alongside the session event stream.
+struct PluginEventRecorder {
+    info: PluginInfo,
+    events: Vec<String>,
+    seen: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+}
+
+impl PluginEventRecorder {
+    #[allow(clippy::type_complexity)]
+    fn new(name: &str, events: &[&str]) -> (Self, Arc<Mutex<Vec<(String, serde_json::Value)>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                info: PluginInfo::inline(name),
+                events: events.iter().map(|event| (*event).to_owned()).collect(),
+                seen: Arc::clone(&seen),
+            },
+            seen,
+        )
+    }
+}
+
+impl AgentPlugin for PluginEventRecorder {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> pir::plugins::EventInterest {
+        pir::plugins::EventInterest::List(self.events.clone())
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        if !self
+            .events
+            .iter()
+            .any(|watched| watched.as_str() == event.name.as_ref())
+        {
+            return Box::pin(async { PluginEventOutcome::None });
+        }
+        let seen = Arc::clone(&self.seen);
+        Box::pin(async move {
+            seen.lock()
+                .unwrap()
+                .push((event.name.to_string(), event.payload.clone()));
+            PluginEventOutcome::None
+        })
+    }
+}
+
 /// A prompt submitted while a MANUAL COMPACTION is in flight is rejected with
 /// the upstream message — the compaction claim is the mutual exclusion, so a
 /// run can never start mid-compaction (and a queued prompt is handled by the
@@ -3696,6 +3892,123 @@ async fn prompt_while_compacting_is_rejected_like_upstream() {
     assert_eq!(
         text_of_message(&Message::Assistant(terminal.clone())).as_deref(),
         Some("late")
+    );
+}
+
+/// FIX-A04 (R1-L1-003): a stale manual-compaction claim's `Drop` must not
+/// clear a NEWER compaction's claim. The first compaction fails and parks in
+/// its `session_compact_failed` dispatch (its explicit release has already
+/// returned the session to idle). While it is parked, a second compaction
+/// claims the session and parks at `session_before_compact` still holding
+/// COMPACTING. Releasing the first then runs its claim guard's `Drop`; the
+/// owner check must make it a no-op against the second claim.
+#[tokio::test]
+async fn stale_manual_compaction_claim_does_not_clear_a_newer_compaction() {
+    let temp = TempDir::new("stale-compact-claim");
+    let (before_tx, before_rx) = tokio::sync::watch::channel(false);
+    let (failed_tx, failed_rx) = tokio::sync::watch::channel(false);
+    let before_entered = Arc::new(AtomicUsize::new(0));
+    let failed_entered = Arc::new(AtomicUsize::new(0));
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+
+    let registry = fake_registry(Arc::new(|_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            let mut message = assistant(Vec::new(), StopReason::Error);
+            message.error_message = Some("summarizer exploded".into());
+            return message;
+        }
+        assistant(vec![text("late")], StopReason::Stop)
+    }));
+
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        race_agent_config(registry, session, &temp, None),
+        vec![
+            Arc::new(GatePlugin {
+                info: PluginInfo::inline("before-compact-gate"),
+                event: "session_before_compact",
+                entered: Arc::clone(&before_entered),
+                gate: before_rx,
+            }),
+            Arc::new(GatePlugin {
+                info: PluginInfo::inline("failed-compact-gate"),
+                event: "session_compact_failed",
+                entered: Arc::clone(&failed_entered),
+                gate: failed_rx,
+            }),
+        ],
+    ));
+
+    // First compaction: fail the summarizer call, then park in the failed
+    // event dispatch AFTER the claim's explicit release.
+    let first = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.compact(None).await }
+    });
+    wait_for_counter(&before_entered, 1, "first session_before_compact").await;
+    let _ = before_tx.send(true);
+    wait_for_counter(&failed_entered, 1, "first session_compact_failed").await;
+    assert!(
+        !agent.is_compacting(),
+        "the first claim is released before its failed event is dispatched"
+    );
+
+    // Re-arm the before gate and let a second compaction claim the session.
+    // It parks in `session_before_compact` while still holding COMPACTING.
+    let _ = before_tx.send(false);
+    let second = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.compact(None).await }
+    });
+    wait_for_counter(&before_entered, 2, "second session_before_compact").await;
+    assert!(
+        agent.is_compacting(),
+        "the second compaction must hold the claim"
+    );
+    let rejected = agent
+        .prompt("blocked", event_handler(EventLog::default()))
+        .await;
+    assert_eq!(
+        rejected
+            .expect_err("a prompt during the second compaction must be rejected")
+            .to_string(),
+        "Cannot submit a prompt while compaction is in progress. \
+         Wait for compaction to finish and retry."
+    );
+
+    // Release the first failed event: its claim guard drops while the second
+    // compaction is still active. The stale Drop must not touch the new claim.
+    let _ = failed_tx.send(true);
+    assert!(
+        first.await.expect("first compact task").is_err(),
+        "the first compaction failed as scripted"
+    );
+    assert!(
+        agent.is_compacting(),
+        "a stale claim's Drop must not clear the newer compaction"
+    );
+    let rejected = agent
+        .prompt("blocked", event_handler(EventLog::default()))
+        .await;
+    assert_eq!(
+        rejected
+            .expect_err("the newer compaction still holds the session")
+            .to_string(),
+        "Cannot submit a prompt while compaction is in progress. \
+         Wait for compaction to finish and retry."
+    );
+
+    // Release the second compaction: it fails the same way and returns to idle.
+    let _ = before_tx.send(true);
+    assert!(
+        second.await.expect("second compact task").is_err(),
+        "the second compaction failed as scripted"
+    );
+    assert!(
+        !agent.is_compacting(),
+        "the live claim releases the session when its compaction ends"
     );
 }
 
@@ -4697,6 +5010,170 @@ async fn paged_run_widens_off_the_runtime_thread() {
     );
 }
 
+/// A tool that terminates the low-level loop run, leaving the context on a
+/// tool result — the shape an `agent_before_settle` continuation needs
+/// (`context_can_continue`).
+struct TerminatingTool;
+
+impl AgentTool for TerminatingTool {
+    fn name(&self) -> &'static str {
+        "stop"
+    }
+
+    fn description(&self) -> &'static str {
+        "stop the loop run"
+    }
+
+    fn parameters(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({ "type": "object" }))
+    }
+
+    fn run(&self, _args: &serde_json::Value, _ctx: &ToolContext) -> BoxFuture<'static, ToolResult> {
+        Box::pin(async {
+            let mut result = ToolResult::ok("stop now");
+            result.terminate = true;
+            result
+        })
+    }
+}
+
+/// `agent_before_settle` handler that parks the settle boundary and then asks
+/// for exactly one continuation. The first call waits on the gate and returns
+/// `{continue: true}`; later calls settle normally.
+struct SettleContinuationGate {
+    info: PluginInfo,
+    entered: Arc<AtomicUsize>,
+    gate: tokio::sync::watch::Receiver<bool>,
+}
+
+impl AgentPlugin for SettleContinuationGate {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> pir::plugins::EventInterest {
+        pir::plugins::EventInterest::List(vec!["agent_before_settle".into()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        if event.name != "agent_before_settle" {
+            return Box::pin(async { PluginEventOutcome::None });
+        }
+        let first = self.entered.fetch_add(1, Ordering::SeqCst) == 0;
+        let mut gate = self.gate.clone();
+        Box::pin(async move {
+            if !first {
+                return PluginEventOutcome::None;
+            }
+            // Bounded wait: a never-released gate must fail the test instead of
+            // hanging the suite.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if *gate.borrow() {
+                        break;
+                    }
+                    if gate.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+            PluginEventOutcome::Generic(serde_json::json!({ "continue": true }))
+        })
+    }
+}
+
+/// FIX-A08 (R1-L1-007): a projection read failure on a settle CONTINUATION
+/// must abort the run instead of silently sending an empty context. A paged
+/// session is swapped in while the first run is parked at the
+/// `agent_before_settle` boundary; its file is then replaced by a directory so
+/// the continuation's `widen_to_full` fails. The prompt must return `Err`
+/// with no second provider request.
+#[tokio::test]
+async fn settle_continuation_projection_failure_aborts_the_run() {
+    let temp = TempDir::new("settle-projection-failure");
+
+    // A paged fixture with a skipped prefix. The path stays valid until the
+    // test swaps it in; `open_paged` does not hold the file mapping.
+    let mut full = SessionManager::create(".", &temp.0).expect("create paged fixture");
+    for index in 0..40 {
+        full.append_message(Message::User(UserMessage {
+            role: UserRole::User,
+            content: vec![text(&format!("paged user {index} {}", "x".repeat(512)))],
+            tools_added: None,
+            tools_removed: None,
+            timestamp: 1,
+            sections: None,
+        }))
+        .expect("append paged user");
+        full.append_message(Message::Assistant(assistant(
+            vec![text(&format!("paged reply {index}"))],
+            StopReason::Stop,
+        )))
+        .expect("append paged assistant");
+    }
+    let paged_path = full.path().to_path_buf();
+    drop(full);
+    let paged = SessionManager::open_paged(&paged_path, 1024, 4).expect("paged open");
+    assert!(paged.is_paged(), "the fixture must exceed the page caps");
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_for_responder = Arc::clone(&requests);
+    let registry = fake_registry(Arc::new(move |_index, _context| {
+        if requests_for_responder.fetch_add(1, Ordering::SeqCst) == 0 {
+            assistant(vec![tool_call("stop-1", "stop")], StopReason::ToolUse)
+        } else {
+            assistant(vec![text("must not run")], StopReason::Stop)
+        }
+    }));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(TerminatingTool));
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let mut config = race_agent_config(registry, session, &temp, None);
+    config.tools = tools;
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        config,
+        vec![Arc::new(SettleContinuationGate {
+            info: PluginInfo::inline("settle-continuation-gate"),
+            entered: Arc::clone(&entered),
+            gate: gate_rx,
+        })],
+    ));
+
+    let prompt = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            agent
+                .prompt("start", event_handler(EventLog::default()))
+                .await
+        }
+    });
+    wait_for_counter(&entered, 1, "agent_before_settle gate").await;
+
+    // Install the paged store, then make its backing path unreadable: the
+    // continuation's projection must fail, not fall back to an empty context.
+    assert!(
+        agent.replace_session_storage(paged).await,
+        "the paged store must be installed"
+    );
+    std::fs::remove_file(&paged_path).expect("remove paged session file");
+    std::fs::create_dir(&paged_path).expect("replace paged session file with a directory");
+
+    let _ = gate_tx.send(true);
+    let result = prompt.await.expect("prompt task");
+    assert!(
+        result.is_err(),
+        "a settle-continuation projection failure must abort the run"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "no second provider request may run with an empty projected context"
+    );
+}
+
 /// Declares `before_agent_start` so the prompt run drains the notifications a
 /// handler queued at the handler boundary (the run only drains when some
 /// plugin claims that event).
@@ -4816,5 +5293,2279 @@ async fn before_agent_start_append_invalidates_the_reused_projection() {
         )),
         "the handler-appended custom message must reach this run's first \
          request instead of being hidden by the reused projection: {second:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R1-L1-002: an in-flight prompt must not persist into a swapped-in session
+// ---------------------------------------------------------------------------
+
+/// Provider whose response stays in flight until the test releases it: the
+/// run is genuinely streaming (no assistant message produced yet) when the
+/// storage swap lands, so the per-message sink is the live write path the
+/// swap must isolate. The first response asks for the always-ready `gate`
+/// tool so the post-swap tail also covers a persisted tool result.
+struct HangingProvider {
+    started: Arc<AtomicUsize>,
+    release: tokio::sync::watch::Receiver<bool>,
+    calls: AtomicUsize,
+}
+
+impl Provider for HangingProvider {
+    fn id(&self) -> &str {
+        "fake"
+    }
+    fn name(&self) -> &str {
+        "Fake provider"
+    }
+    fn get_models(&self) -> Vec<Model> {
+        vec![fake_model()]
+    }
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        vec![ApiKeyAuth::new("fake key", vec!["FAKE_TEST_KEY".into()])]
+    }
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: Context,
+        _options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.fetch_add(1, Ordering::SeqCst);
+        let stream = AssistantMessageEventStream::new();
+        let producer = stream.producer();
+        let mut release = self.release.clone();
+        let message = if call == 0 {
+            assistant(vec![tool_call("call-1", "gate")], StopReason::ToolUse)
+        } else {
+            assistant(vec![text("old run answer")], StopReason::Stop)
+        };
+        tokio::spawn(async move {
+            while !*release.borrow() {
+                if release.changed().await.is_err() {
+                    return;
+                }
+            }
+            producer.push(AssistantMessageEventStream::done_event(
+                TerminalReason::Stop,
+                message,
+            ));
+        });
+        stream
+    }
+}
+
+async fn wait_for_provider_start(started: &Arc<AtomicUsize>) {
+    for _ in 0..2000 {
+        if started.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("provider request never started");
+}
+
+/// Message roles persisted in one JSONL session file, in entry order.
+fn persisted_message_roles(path: &std::path::Path) -> Vec<String> {
+    let text = std::fs::read_to_string(path).expect("session file");
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry["type"] == "message")
+        .filter_map(|entry| entry["message"]["role"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Number of compaction entries persisted in one JSONL session file.
+fn persisted_compaction_entries(path: &std::path::Path) -> usize {
+    let text = std::fs::read_to_string(path).expect("session file");
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry["type"] == "compaction")
+        .count()
+}
+
+/// Assert a session file holds no compaction entry. The outgoing transcript
+/// must drop the old cut (its manager no longer owns the slot); the
+/// replacement must never receive a `firstKeptEntryId` that only exists in
+/// another file.
+fn assert_no_compaction_entry(path: &std::path::Path, what: &str) {
+    assert_eq!(
+        persisted_compaction_entries(path),
+        0,
+        "{what} must not receive a compaction entry"
+    );
+}
+
+fn seed_user_message(text_value: &str, timestamp: u64) -> Message {
+    Message::User(UserMessage {
+        role: UserRole::User,
+        content: vec![text(text_value)],
+        tools_added: None,
+        tools_removed: None,
+        timestamp,
+        sections: None,
+    })
+}
+
+/// R1-L1-002: a prompt that is still waiting on its provider when
+/// `replace_session_storage` installs a new manager must not append its
+/// assistant/tool-result `message_end` writes to the replacement transcript.
+/// On the old sink (which held the stable session SLOT, not the concrete
+/// manager identity) the late assistant landed in the new session — an
+/// assistant without its user prompt.
+#[tokio::test]
+async fn in_flight_prompt_does_not_persist_into_replaced_session_storage() {
+    let temp = TempDir::new("swap-in-flight-prompt");
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(HangingProvider {
+        started: Arc::clone(&started),
+        release: release_rx,
+        calls: AtomicUsize::new(0),
+    }));
+    // The gate is already open: the post-swap tool batch runs immediately, so
+    // its tool-result `message_end` is a post-swap sink write too.
+    let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+    let entered = Arc::new(AtomicUsize::new(0));
+
+    let mut first = SessionManager::create(".", &temp.0).expect("create session");
+    first
+        .append_message(seed_user_message("old seed", 1))
+        .expect("seed outgoing");
+    let first_path = first.path().to_path_buf();
+
+    let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        provider_registry: Arc::new(registry),
+        model: fake_model(),
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: tool_registry_with(Some((gate_rx, Arc::clone(&entered)))),
+        session: Some(first),
+        compaction: None,
+        max_turns: 4,
+        system_prompt: None,
+        cwd: Some(temp.0.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    }));
+
+    // The prompt run is parked INSIDE its first provider request: the sink
+    // already exists and no assistant message has been produced yet.
+    let prompt_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            agent
+                .prompt("old prompt", event_handler(EventLog::default()))
+                .await
+        }
+    });
+    wait_for_provider_start(&started).await;
+
+    // Swap the storage while the run is in flight (the reported bug window).
+    let mut second = SessionManager::create(".", &temp.0).expect("create replacement");
+    second
+        .append_message(seed_user_message("new seed", 2))
+        .expect("seed replacement");
+    let second_path = second.path().to_path_buf();
+    assert!(
+        agent.replace_session_storage(second).await,
+        "the swap must succeed"
+    );
+    assert!(
+        persisted_message_roles(&second_path) == vec!["user".to_owned()],
+        "the outgoing run must not have leaked before its response arrived"
+    );
+
+    // Let the old run complete against its now-detached transcript.
+    let _ = release_tx.send(true);
+    let answer = prompt_task
+        .await
+        .expect("prompt task")
+        .expect("prompt result");
+    assert_eq!(answer.stop_reason, StopReason::Stop);
+    assert!(
+        entered.load(Ordering::SeqCst) > 0,
+        "the post-swap tool batch never ran; the tool-result assertion would be vacuous"
+    );
+
+    // The replacement session holds ONLY its own seed; neither the old
+    // run's assistant nor a tool result may appear in it.
+    let replacement_roles = persisted_message_roles(&second_path);
+    assert_eq!(
+        replacement_roles,
+        vec!["user".to_owned()],
+        "the in-flight old run persisted into the replacement session"
+    );
+    let replacement = std::fs::read_to_string(&second_path).expect("replacement file");
+    assert!(
+        !replacement.contains("gate open"),
+        "the old run's tool result leaked into the replacement session: {replacement}"
+    );
+    assert!(
+        !replacement.contains("old run answer"),
+        "the old run's assistant leaked into the replacement session: {replacement}"
+    );
+    let replacement_entries = agent
+        .with_session_manager(|manager| manager.entries())
+        .await
+        .expect("replacement manager");
+    assert!(
+        replacement_entries.iter().all(|entry| match entry {
+            pir::session_manager::FileEntry::Message(message) => matches!(
+                &message.message,
+                pir::session_manager::types::StoredMessage::User(_)
+            ),
+            _ => true,
+        }),
+        "the replacement manager gained a non-user entry from the old run"
+    );
+
+    // The outgoing transcript keeps what it persisted before the swap (its
+    // seed, the starting user message, and the run's tool declaration); by
+    // design the post-swap assistant/tool result are discarded and
+    // debug-logged rather than redirected anywhere.
+    let outgoing_roles = persisted_message_roles(&first_path);
+    assert_eq!(
+        outgoing_roles
+            .iter()
+            .filter(|role| role.as_str() == "user")
+            .count(),
+        2,
+        "the outgoing transcript must keep its own pre-swap user entries: {outgoing_roles:?}"
+    );
+    assert!(
+        !outgoing_roles.iter().any(|role| role == "assistant"),
+        "a post-swap assistant must not be redirected into the outgoing session: {outgoing_roles:?}"
+    );
+    assert!(
+        !outgoing_roles.iter().any(|role| role == "toolResult"),
+        "a post-swap tool result must not be redirected into the outgoing session: {outgoing_roles:?}"
+    );
+    let outgoing = std::fs::read_to_string(&first_path).expect("outgoing file");
+    assert!(
+        outgoing.contains("old prompt"),
+        "the starting user message belongs to the outgoing transcript: {outgoing}"
+    );
+    assert!(
+        !outgoing.contains("old run answer"),
+        "a post-swap assistant must not be redirected into the outgoing session: {outgoing}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R1-L1-002 P1-01 / P2-01 / P2-03: run-start, post-run batch and compaction
+// writes must all stay on the transcript the run bound at its start
+// ---------------------------------------------------------------------------
+
+/// Provider whose single response is a final assistant that stays in flight
+/// until the test releases it. The prompt run is genuinely streaming (the
+/// starting message is already persisted, no assistant exists yet) when the
+/// test arms an append failure or swaps storage.
+struct HangingFinalProvider {
+    started: Arc<AtomicUsize>,
+    calls: AtomicUsize,
+    release: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Provider for HangingFinalProvider {
+    fn id(&self) -> &str {
+        "fake"
+    }
+    fn name(&self) -> &str {
+        "Fake provider"
+    }
+    fn get_models(&self) -> Vec<Model> {
+        vec![fake_model()]
+    }
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        vec![ApiKeyAuth::new("fake key", vec!["FAKE_TEST_KEY".into()])]
+    }
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: Context,
+        _options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.fetch_add(1, Ordering::SeqCst);
+        let stream = AssistantMessageEventStream::new();
+        let producer = stream.producer();
+        let mut release = self.release.clone();
+        tokio::spawn(async move {
+            while !*release.borrow() {
+                if release.changed().await.is_err() {
+                    return;
+                }
+            }
+            producer.push(AssistantMessageEventStream::done_event(
+                TerminalReason::Stop,
+                assistant(vec![text("old run answer")], StopReason::Stop),
+            ));
+        });
+        stream
+    }
+}
+
+/// P1-01 regression: the run binds its session identity BEFORE the
+/// `before_agent_start` dispatch, so a swap landing there cannot let the
+/// starting prompt (the unguarded `preamble_persist_fn` slot write in the old
+/// implementation) enter the replacement transcript. The run fails before its
+/// first provider request instead of answering into a session it must not
+/// write.
+#[tokio::test]
+async fn run_start_swap_does_not_persist_into_replaced_session_storage() {
+    let temp = TempDir::new("swap-run-start");
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_responder = Arc::clone(&provider_calls);
+    let registry = fake_registry(Arc::new(move |_index, _context| {
+        calls_for_responder.fetch_add(1, Ordering::SeqCst);
+        assistant(vec![text("old run answer")], StopReason::Stop)
+    }));
+
+    let mut first = SessionManager::create(".", &temp.0).expect("create session");
+    first
+        .append_message(seed_user_message("old seed", 1))
+        .expect("seed outgoing");
+    let first_path = first.path().to_path_buf();
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: Some(first),
+            compaction: None,
+            max_turns: 4,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        },
+        vec![Arc::new(GatePlugin {
+            info: PluginInfo::inline("before-agent-start-gate"),
+            event: "before_agent_start",
+            entered: Arc::clone(&entered),
+            gate: gate_rx,
+        })],
+    ));
+
+    let prompt_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            agent
+                .prompt("old prompt", event_handler(EventLog::default()))
+                .await
+        }
+    });
+    wait_for_counter(&entered, 1, "before_agent_start gate").await;
+
+    // The swap lands between run-start identity capture and the preamble
+    // write / first provider request: exactly the P1-01 window.
+    let mut second = SessionManager::create(".", &temp.0).expect("create replacement");
+    second
+        .append_message(seed_user_message("new seed", 2))
+        .expect("seed replacement");
+    let second_id = second.id().to_owned();
+    let second_path = second.path().to_path_buf();
+    assert!(
+        agent.replace_session_storage(second).await,
+        "the swap must succeed"
+    );
+    // P2-02: the cached identity is refreshed in the swap critical section,
+    // not after the (transcript-sized) tree build.
+    assert_eq!(
+        agent.session_id().as_deref(),
+        Some(second_id.as_str()),
+        "the cached session identity must name the replacement immediately after the swap"
+    );
+
+    let _ = gate_tx.send(true);
+    let result = prompt_task.await.expect("prompt task");
+    assert!(
+        result.is_err(),
+        "a run whose starting message cannot be persisted must fail before its first request"
+    );
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        0,
+        "the aborted run must not issue a provider request"
+    );
+
+    let replacement_roles = persisted_message_roles(&second_path);
+    assert_eq!(
+        replacement_roles,
+        vec!["user".to_owned()],
+        "the run-start swap leaked the old prompt/answer into the replacement: {replacement_roles:?}"
+    );
+    let replacement = std::fs::read_to_string(&second_path).expect("replacement file");
+    assert!(
+        !replacement.contains("old prompt"),
+        "the old run's starting prompt entered the replacement: {replacement}"
+    );
+    assert!(
+        !replacement.contains("old run answer"),
+        "the old run's assistant entered the replacement: {replacement}"
+    );
+
+    // The outgoing transcript keeps what it persisted before the swap (its
+    // seed); the starting prompt was never written anywhere because the run
+    // aborted at the guard.
+    let outgoing_roles = persisted_message_roles(&first_path);
+    assert_eq!(
+        outgoing_roles,
+        vec!["user".to_owned()],
+        "the outgoing transcript must keep its own pre-swap entries only: {outgoing_roles:?}"
+    );
+}
+
+/// P2-01 regression: when the per-message sink fails, the ledger leaves the
+/// ordinal (and the tail) to the post-run batch. A storage swap landing
+/// between the failure and the batch must not let the batch replay the old
+/// run's assistant into the replacement session.
+#[tokio::test]
+async fn post_run_batch_does_not_replay_into_replaced_session_storage() {
+    let temp = TempDir::new("swap-post-run-batch");
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(HangingFinalProvider {
+        started: Arc::clone(&started),
+        calls: AtomicUsize::new(0),
+        release: release_rx,
+    }));
+    let (turn_tx, turn_rx) = tokio::sync::watch::channel(false);
+    let turn_entered = Arc::new(AtomicUsize::new(0));
+
+    let mut first = SessionManager::create(".", &temp.0).expect("create session");
+    first
+        .append_message(seed_user_message("old seed", 1))
+        .expect("seed outgoing");
+    let first_path = first.path().to_path_buf();
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: Arc::new(registry),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: Some(first),
+            compaction: None,
+            max_turns: 4,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        },
+        vec![Arc::new(GatePlugin {
+            info: PluginInfo::inline("turn-end-gate"),
+            event: "turn_end",
+            entered: Arc::clone(&turn_entered),
+            gate: turn_rx,
+        })],
+    ));
+
+    let prompt_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            agent
+                .prompt("old prompt", event_handler(EventLog::default()))
+                .await
+        }
+    });
+    wait_for_provider_start(&started).await;
+
+    // The starting message is persisted; make the terminal assistant's
+    // per-message sink write fail so the ledger installs its barrier and the
+    // post-run batch owns that message.
+    agent
+        .with_session_manager(|manager| {
+            manager.fail_next_append_for_test(pir::session_manager::AppendFailure::BeforeWrite)
+        })
+        .await
+        .expect("session manager");
+    let _ = release_tx.send(true);
+    wait_for_counter(&turn_entered, 1, "turn_end gate").await;
+
+    // Swap AFTER the failed sink write and BEFORE the post-run batch.
+    let mut second = SessionManager::create(".", &temp.0).expect("create replacement");
+    second
+        .append_message(seed_user_message("new seed", 2))
+        .expect("seed replacement");
+    let second_path = second.path().to_path_buf();
+    assert!(
+        agent.replace_session_storage(second).await,
+        "the swap must succeed"
+    );
+    let _ = turn_tx.send(true);
+
+    let answer = prompt_task
+        .await
+        .expect("prompt task")
+        .expect("prompt result");
+    assert_eq!(
+        text_of_message(&Message::Assistant(answer)).as_deref(),
+        Some("old run answer")
+    );
+
+    let replacement_roles = persisted_message_roles(&second_path);
+    assert_eq!(
+        replacement_roles,
+        vec!["user".to_owned()],
+        "the post-run batch replayed the old run's tail into the replacement: {replacement_roles:?}"
+    );
+    let replacement = std::fs::read_to_string(&second_path).expect("replacement file");
+    assert!(
+        !replacement.contains("old run answer"),
+        "the post-run batch replayed the old assistant into the replacement: {replacement}"
+    );
+
+    let outgoing_roles = persisted_message_roles(&first_path);
+    assert_eq!(
+        outgoing_roles
+            .iter()
+            .filter(|role| role.as_str() == "user")
+            .count(),
+        2,
+        "the outgoing transcript must keep its seed + starting prompt: {outgoing_roles:?}"
+    );
+    assert!(
+        !outgoing_roles.iter().any(|role| role == "assistant"),
+        "the failed sink append must not be redirected into the outgoing session: {outgoing_roles:?}"
+    );
+}
+
+/// Summarizer provider for the overflow-recovery compaction test: the main
+/// model call terminates with a context-overflow error, and the summarization
+/// call stays in flight until the test releases it (the swap window).
+struct HangingSummarizerProvider {
+    summarizer_started: Arc<AtomicUsize>,
+    summarizer_release: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Provider for HangingSummarizerProvider {
+    fn id(&self) -> &str {
+        "fake"
+    }
+    fn name(&self) -> &str {
+        "Fake provider"
+    }
+    fn get_models(&self) -> Vec<Model> {
+        vec![fake_model()]
+    }
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        vec![ApiKeyAuth::new("fake key", vec!["FAKE_TEST_KEY".into()])]
+    }
+    fn stream(
+        &self,
+        _model: &Model,
+        context: Context,
+        _options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        let stream = AssistantMessageEventStream::new();
+        let producer = stream.producer();
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            self.summarizer_started.fetch_add(1, Ordering::SeqCst);
+            let mut release = self.summarizer_release.clone();
+            tokio::spawn(async move {
+                while !*release.borrow() {
+                    if release.changed().await.is_err() {
+                        return;
+                    }
+                }
+                producer.push(AssistantMessageEventStream::done_event(
+                    TerminalReason::Stop,
+                    assistant(vec![text("compacted summary")], StopReason::Stop),
+                ));
+            });
+        } else {
+            let mut message = assistant(Vec::new(), StopReason::Error);
+            message.error_message =
+                Some("prompt is too long: 200000 tokens > 16384 maximum".into());
+            producer.push(AssistantMessageEventStream::done_event(
+                TerminalReason::Stop,
+                message,
+            ));
+        }
+        stream
+    }
+}
+
+/// P2-03 regression: the prompt-internal overflow-recovery compaction is
+/// generated while the run is parked in the summarizer request. A swap in
+/// that window must not append the outgoing transcript's compaction (with a
+/// `firstKeptEntryId` that only exists in the old file) to the replacement
+/// session.
+#[tokio::test]
+async fn overflow_compaction_does_not_write_into_replaced_session_storage() {
+    let temp = TempDir::new("swap-overflow-compaction");
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let summarizer_started = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(HangingSummarizerProvider {
+        summarizer_started: Arc::clone(&summarizer_started),
+        summarizer_release: release_rx,
+    }));
+
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+    let first_path = session.path().to_path_buf();
+    let agent = Arc::new(AgentSession::new(race_agent_config(
+        Arc::new(registry),
+        session,
+        &temp,
+        None,
+    )));
+
+    let prompt_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            agent
+                .prompt("trigger overflow", event_handler(EventLog::default()))
+                .await
+        }
+    });
+    wait_for_counter(&summarizer_started, 1, "overflow summarizer request").await;
+
+    // Swap while the summarizer is in flight: the upcoming compaction append
+    // must target the outgoing transcript only.
+    let mut second = SessionManager::create(".", &temp.0).expect("create replacement");
+    second
+        .append_message(seed_user_message("new seed", 2))
+        .expect("seed replacement");
+    let second_path = second.path().to_path_buf();
+    assert!(
+        agent.replace_session_storage(second).await,
+        "the swap must succeed"
+    );
+    let _ = release_tx.send(true);
+
+    let terminal = prompt_task
+        .await
+        .expect("prompt task")
+        .expect("the overflow terminal still settles the prompt");
+    assert_eq!(
+        terminal.stop_reason,
+        StopReason::Error,
+        "the recovery compaction was dropped, so the run settles on its overflow terminal"
+    );
+
+    let replacement_roles = persisted_message_roles(&second_path);
+    assert_eq!(
+        replacement_roles,
+        vec!["user".to_owned()],
+        "the recovery compaction/messages leaked into the replacement: {replacement_roles:?}"
+    );
+    let replacement = std::fs::read_to_string(&second_path).expect("replacement file");
+    assert!(
+        !replacement.contains("compacted summary"),
+        "the old run's compaction summary entered the replacement: {replacement}"
+    );
+
+    // The outgoing transcript keeps the raw failed attempt (persisted as a
+    // pair by design) but receives no recovery compaction after the swap.
+    let outgoing = std::fs::read_to_string(&first_path).expect("outgoing file");
+    assert!(
+        outgoing.contains("prompt is too long"),
+        "the outgoing transcript must keep its raw overflow attempt: {outgoing}"
+    );
+    let reopened = SessionManager::open(&first_path).expect("reopen outgoing session");
+    let branch = reopened.branch_entries(None).expect("branch entries");
+    assert!(
+        !branch
+            .iter()
+            .any(|entry| matches!(entry, pir::session_manager::FileEntry::Compaction(_))),
+        "the outgoing transcript must not receive a compaction entry from the aborted recovery"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-03 (lane SESSION3): manual / threshold / extension-replacement
+// compaction appends must be bound to the manager the compaction started on
+// ---------------------------------------------------------------------------
+
+/// Plugin for the extension-replacement regression: parks in
+/// `session_before_compact` (the test swaps storage while it waits) and then
+/// returns an extension-provided `compaction` replacement whose
+/// `firstKeptEntryId` names an entry of the OUTGOING transcript.
+struct ReplacementCompactionPlugin {
+    info: PluginInfo,
+    entered: Arc<AtomicUsize>,
+    gate: tokio::sync::watch::Receiver<bool>,
+    summary: &'static str,
+    first_kept_entry_id: &'static str,
+}
+
+impl AgentPlugin for ReplacementCompactionPlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> pir::plugins::EventInterest {
+        pir::plugins::EventInterest::List(vec!["session_before_compact".into()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        if event.name != "session_before_compact" {
+            return Box::pin(async { PluginEventOutcome::None });
+        }
+        let entered = Arc::clone(&self.entered);
+        let mut gate = self.gate.clone();
+        let summary = self.summary;
+        let first_kept_entry_id = self.first_kept_entry_id;
+        Box::pin(async move {
+            entered.fetch_add(1, Ordering::SeqCst);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if *gate.borrow() {
+                        break;
+                    }
+                    if gate.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+            PluginEventOutcome::Generic(serde_json::json!({
+                "compaction": {
+                    "summary": summary,
+                    "firstKeptEntryId": first_kept_entry_id,
+                    "tokensBefore": 1234,
+                }
+            }))
+        })
+    }
+}
+
+/// P2-03 regression (MANUAL path): `/compact` parks in
+/// `session_before_compact`; a storage swap before the summarizer returns
+/// must not append the outgoing transcript's compaction (whose
+/// `firstKeptEntryId` only exists in the old file) to the replacement
+/// session. The manual compaction reports the failure instead of a summary
+/// that was never persisted.
+#[tokio::test]
+async fn manual_compaction_swap_does_not_write_into_replaced_session_storage() {
+    let temp = TempDir::new("swap-manual-compaction");
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let registry = fake_registry(Arc::new(|_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            return assistant(vec![text("MANUAL SUMMARY")], StopReason::Stop);
+        }
+        assistant(vec![text("late")], StopReason::Stop)
+    }));
+
+    let mut first = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut first);
+    let first_path = first.path().to_path_buf();
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        race_agent_config(registry, first, &temp, None),
+        vec![Arc::new(GatePlugin {
+            info: PluginInfo::inline("manual-compact-gate"),
+            event: "session_before_compact",
+            entered: Arc::clone(&entered),
+            gate: gate_rx,
+        })],
+    ));
+
+    let compact_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.compact(None).await }
+    });
+    wait_for_counter(&entered, 1, "session_before_compact gate").await;
+
+    // Swap while the compaction is parked before its summarizer request:
+    // the upcoming append must target the outgoing transcript only.
+    let mut second = SessionManager::create(".", &temp.0).expect("create replacement");
+    second
+        .append_message(seed_user_message("new seed", 2))
+        .expect("seed replacement");
+    let second_path = second.path().to_path_buf();
+    assert!(
+        agent.replace_session_storage(second).await,
+        "the swap must succeed"
+    );
+    let _ = gate_tx.send(true);
+
+    let error = compact_task
+        .await
+        .expect("compact task")
+        .expect_err("a compaction whose storage was swapped must fail");
+    assert!(
+        error.to_string().contains("session storage was replaced"),
+        "unexpected compaction error: {error}"
+    );
+    assert!(
+        !agent.is_compacting(),
+        "the failed compaction must release its claim"
+    );
+
+    assert_no_compaction_entry(&second_path, "the replacement");
+    let replacement = std::fs::read_to_string(&second_path).expect("replacement file");
+    assert!(
+        !replacement.contains("MANUAL SUMMARY"),
+        "the old compaction summary entered the replacement: {replacement}"
+    );
+    let replacement_roles = persisted_message_roles(&second_path);
+    assert_eq!(
+        replacement_roles,
+        vec!["user".to_owned()],
+        "the replacement must keep only its own seed: {replacement_roles:?}"
+    );
+
+    // The outgoing transcript keeps its seeded history; the compaction ran
+    // after the swap, so its append is dropped by design.
+    assert_no_compaction_entry(&first_path, "the outgoing transcript");
+    let outgoing_roles = persisted_message_roles(&first_path);
+    assert_eq!(
+        outgoing_roles,
+        vec![
+            "user".to_owned(),
+            "assistant".to_owned(),
+            "user".to_owned(),
+            "assistant".to_owned()
+        ],
+        "the outgoing transcript must keep its seeded history only: {outgoing_roles:?}"
+    );
+}
+
+/// P2-03 regression (THRESHOLD normal path): the prompt-start threshold gate
+/// parks in `session_before_compact`; a storage swap during the summarizer
+/// must drop the old transcript's compaction instead of writing its cut into
+/// the replacement session.
+#[tokio::test]
+async fn threshold_compaction_swap_does_not_write_into_replaced_session_storage() {
+    let temp = TempDir::new("swap-threshold-compaction");
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let registry = fake_registry(Arc::new(|_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            return assistant(vec![text("THRESHOLD SUMMARY")], StopReason::Stop);
+        }
+        assistant(vec![text("model reply")], StopReason::Stop)
+    }));
+
+    let mut first = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut first);
+    let first_path = first.path().to_path_buf();
+    let mut model = fake_model();
+    // Tiny window: the seeded history is over the threshold at prompt start.
+    model.context_window = 64;
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model,
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: tool_registry_with(None),
+            session: Some(first),
+            compaction: Some(pir::compaction::CompactionConfig {
+                enabled: true,
+                reserve_tokens: 1,
+                keep_recent_tokens: 8,
+            }),
+            max_turns: 4,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        },
+        vec![Arc::new(GatePlugin {
+            info: PluginInfo::inline("threshold-compact-gate"),
+            event: "session_before_compact",
+            entered: Arc::clone(&entered),
+            gate: gate_rx,
+        })],
+    ));
+
+    let prompt_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            agent
+                .prompt("trigger threshold", event_handler(EventLog::default()))
+                .await
+        }
+    });
+    wait_for_counter(&entered, 1, "threshold session_before_compact gate").await;
+
+    let mut second = SessionManager::create(".", &temp.0).expect("create replacement");
+    second
+        .append_message(seed_user_message("new seed", 2))
+        .expect("seed replacement");
+    let second_path = second.path().to_path_buf();
+    assert!(
+        agent.replace_session_storage(second).await,
+        "the swap must succeed"
+    );
+    let _ = gate_tx.send(true);
+
+    // The threshold compaction is dropped; the run then fails when its
+    // starting message cannot be persisted into the replacement either.
+    let error = prompt_task
+        .await
+        .expect("prompt task")
+        .expect_err("the run must abort after its storage was replaced");
+    assert!(
+        error.to_string().contains("session storage was replaced"),
+        "unexpected prompt error: {error}"
+    );
+    assert!(
+        !agent.is_compacting(),
+        "the failed compaction must release its claim"
+    );
+
+    assert_no_compaction_entry(&second_path, "the replacement");
+    let replacement = std::fs::read_to_string(&second_path).expect("replacement file");
+    assert!(
+        !replacement.contains("THRESHOLD SUMMARY"),
+        "the old threshold compaction entered the replacement: {replacement}"
+    );
+    let replacement_roles = persisted_message_roles(&second_path);
+    assert_eq!(
+        replacement_roles,
+        vec!["user".to_owned()],
+        "the replacement must keep only its own seed: {replacement_roles:?}"
+    );
+
+    assert_no_compaction_entry(&first_path, "the outgoing transcript");
+    let outgoing = std::fs::read_to_string(&first_path).expect("outgoing file");
+    assert!(
+        !outgoing.contains("THRESHOLD SUMMARY"),
+        "the outgoing transcript must not receive the dropped compaction: {outgoing}"
+    );
+}
+
+/// P2-03 regression (THRESHOLD extension-replacement path): a
+/// `session_before_compact` handler replaces the compaction with its own
+/// result while the test swaps storage. The replacement's
+/// `firstKeptEntryId` belongs to the outgoing transcript and must not be
+/// appended to the replacement session.
+#[tokio::test]
+async fn extension_compaction_swap_does_not_write_into_replaced_session_storage() {
+    let temp = TempDir::new("swap-extension-compaction");
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("model reply")], StopReason::Stop)
+    }));
+
+    let mut first = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut first);
+    let first_path = first.path().to_path_buf();
+    let mut model = fake_model();
+    model.context_window = 64;
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model,
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: tool_registry_with(None),
+            session: Some(first),
+            compaction: Some(pir::compaction::CompactionConfig {
+                enabled: true,
+                reserve_tokens: 1,
+                keep_recent_tokens: 8,
+            }),
+            max_turns: 4,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        },
+        vec![Arc::new(ReplacementCompactionPlugin {
+            info: PluginInfo::inline("extension-compaction-replacement"),
+            entered: Arc::clone(&entered),
+            gate: gate_rx,
+            summary: "EXTENSION SUMMARY",
+            first_kept_entry_id: "entry-only-in-the-outgoing-transcript",
+        })],
+    ));
+
+    let prompt_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            agent
+                .prompt(
+                    "trigger extension threshold",
+                    event_handler(EventLog::default()),
+                )
+                .await
+        }
+    });
+    wait_for_counter(&entered, 1, "extension session_before_compact gate").await;
+
+    let mut second = SessionManager::create(".", &temp.0).expect("create replacement");
+    second
+        .append_message(seed_user_message("new seed", 2))
+        .expect("seed replacement");
+    let second_path = second.path().to_path_buf();
+    assert!(
+        agent.replace_session_storage(second).await,
+        "the swap must succeed"
+    );
+    let _ = gate_tx.send(true);
+
+    let error = prompt_task
+        .await
+        .expect("prompt task")
+        .expect_err("the run must abort after its storage was replaced");
+    assert!(
+        error.to_string().contains("session storage was replaced"),
+        "unexpected prompt error: {error}"
+    );
+    assert!(
+        !agent.is_compacting(),
+        "the failed compaction must release its claim"
+    );
+
+    assert_no_compaction_entry(&second_path, "the replacement");
+    let replacement = std::fs::read_to_string(&second_path).expect("replacement file");
+    assert!(
+        !replacement.contains("EXTENSION SUMMARY"),
+        "the extension compaction entered the replacement: {replacement}"
+    );
+    assert!(
+        !replacement.contains("entry-only-in-the-outgoing-transcript"),
+        "the dangling firstKeptEntryId entered the replacement: {replacement}"
+    );
+
+    assert_no_compaction_entry(&first_path, "the outgoing transcript");
+    let outgoing = std::fs::read_to_string(&first_path).expect("outgoing file");
+    assert!(
+        !outgoing.contains("EXTENSION SUMMARY"),
+        "the outgoing transcript must not receive the dropped compaction: {outgoing}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-03 residual (lane SESSION4): the in-loop threshold hook must bind its
+// compaction to the RUN-START transcript identity, not to the manager that
+// occupies the storage slot when the threshold fires. These runs swap the
+// session storage WHILE the prompt is in flight (inside a gated tool call or
+// a `session_before_compact` handler), so the stale prompt-start snapshot /
+// rebuilt context is later paired with the replacement manager.
+// ---------------------------------------------------------------------------
+
+/// The first model turn's answer: a long text (so the NEXT turn's threshold
+/// check is far over the tiny test window) plus the `gate` tool call whose
+/// run parks the prompt until the test has swapped storage.
+fn gated_long_assistant() -> AssistantMessage {
+    assistant(
+        vec![
+            text(&format!("in-loop-assistant-{}", "a".repeat(4000))),
+            tool_call("call-1", "gate"),
+        ],
+        StopReason::ToolUse,
+    )
+}
+
+/// P2-03 residual regression (in-loop threshold, FRESH prompt-start
+/// snapshot): the prompt-start gate stays under the threshold, the storage
+/// swap happens during the first turn's gated tool call, and the SECOND
+/// turn's threshold hook must not write the outgoing transcript's compaction
+/// into the replacement. On the pre-fix hook, the snapshot basis was still
+/// fresh and `expectedSessionId` was read from the CURRENT slot — the
+/// replacement — so the append passed and the old summary/cut landed in the
+/// new session.
+#[tokio::test]
+async fn in_loop_threshold_swap_with_fresh_snapshot_does_not_write_into_replaced_storage() {
+    let temp = TempDir::new("swap-inloop-threshold-fresh");
+    let (tool_gate_tx, tool_gate_rx) = tokio::sync::watch::channel(false);
+    let tool_entered = Arc::new(AtomicUsize::new(0));
+    let model_turns = Arc::new(AtomicUsize::new(0));
+    let registry = {
+        let model_turns = Arc::clone(&model_turns);
+        fake_registry(Arc::new(move |_index, context| {
+            if context.system_prompt.as_deref()
+                == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+            {
+                return assistant(vec![text("FRESH-SNAPSHOT SUMMARY")], StopReason::Stop);
+            }
+            if model_turns.fetch_add(1, Ordering::SeqCst) == 0 {
+                gated_long_assistant()
+            } else {
+                assistant(vec![text("done")], StopReason::Stop)
+            }
+        }))
+    };
+
+    let mut first = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut first);
+    let first_path = first.path().to_path_buf();
+    let mut model = fake_model();
+    // Seed history ~408 tokens: BELOW the prompt-start threshold (499) and
+    // below the first turn's check (~415 with the starting prompt); the
+    // ~1000-token gated assistant response pushes the next turn far over.
+    model.context_window = 500;
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model,
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: tool_registry_with(Some((tool_gate_rx, Arc::clone(&tool_entered)))),
+            session: Some(first),
+            compaction: Some(pir::compaction::CompactionConfig {
+                enabled: true,
+                reserve_tokens: 1,
+                keep_recent_tokens: 8,
+            }),
+            max_turns: 6,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        },
+        Vec::new(),
+    ));
+
+    let session_log: SessionEventLog = Arc::new(Mutex::new(Vec::new()));
+    agent.on_session_event(session_event_handler(Arc::clone(&session_log)));
+
+    let prompt_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            agent
+                .prompt(
+                    "trigger the in-loop threshold",
+                    event_handler(EventLog::default()),
+                )
+                .await
+        }
+    });
+    wait_for_tool_entry(&tool_entered).await;
+
+    let mut second = SessionManager::create(".", &temp.0).expect("create replacement");
+    seed_compactable_history(&mut second);
+    let second_path = second.path().to_path_buf();
+    assert!(
+        agent.replace_session_storage(second).await,
+        "the swap must succeed"
+    );
+    let _ = tool_gate_tx.send(true);
+
+    let terminal = prompt_task
+        .await
+        .expect("prompt task")
+        .expect("the run continues on its old context after the swap");
+    assert_eq!(
+        text_of_message(&Message::Assistant(terminal)).as_deref(),
+        Some("done")
+    );
+    assert!(
+        compaction_event_kinds(&session_log).is_empty(),
+        "the swapped slot must be rejected before a compaction can start: {:?}",
+        compaction_event_kinds(&session_log)
+    );
+
+    assert_no_compaction_entry(&second_path, "the replacement");
+    let replacement = std::fs::read_to_string(&second_path).expect("replacement file");
+    assert!(
+        !replacement.contains("FRESH-SNAPSHOT SUMMARY"),
+        "the stale-snapshot threshold summary entered the replacement: {replacement}"
+    );
+    assert_eq!(
+        persisted_message_roles(&second_path),
+        vec![
+            "user".to_owned(),
+            "assistant".to_owned(),
+            "user".to_owned(),
+            "assistant".to_owned()
+        ],
+        "the replacement must keep only its own seeded history"
+    );
+
+    // The outgoing transcript owns the run's pre-swap messages and must not
+    // receive a compaction from the later (post-swap) trigger either.
+    assert_no_compaction_entry(&first_path, "the outgoing transcript");
+    let outgoing = std::fs::read_to_string(&first_path).expect("outgoing file");
+    assert!(
+        outgoing.contains("in-loop-assistant"),
+        "the outgoing transcript must keep the pre-swap assistant turn: {outgoing}"
+    );
+    assert!(
+        !outgoing.contains("FRESH-SNAPSHOT SUMMARY"),
+        "the outgoing transcript must not receive the dropped compaction: {outgoing}"
+    );
+}
+
+/// P2-03 residual regression (in-loop threshold, STALE REBUILT context): the
+/// first turn's threshold compaction succeeds against the outgoing
+/// transcript; after a gated tool call the storage is swapped and the next
+/// turn's hook runs over the REBUILT context with live (compaction-stale)
+/// metadata. Pre-fix, the live path captured the replacement's id together
+/// with its metadata, so the old rebuilt context was summarized against the
+/// replacement and appended to it. The replacement must stay untouched; the
+/// outgoing transcript keeps exactly its own successful compaction.
+#[tokio::test]
+async fn in_loop_threshold_swap_with_stale_rebuilt_context_does_not_write_into_replaced_storage() {
+    let temp = TempDir::new("swap-inloop-threshold-stale");
+    let (tool_gate_tx, tool_gate_rx) = tokio::sync::watch::channel(false);
+    let tool_entered = Arc::new(AtomicUsize::new(0));
+    let model_turns = Arc::new(AtomicUsize::new(0));
+    let registry = {
+        let model_turns = Arc::clone(&model_turns);
+        fake_registry(Arc::new(move |_index, context| {
+            if context.system_prompt.as_deref()
+                == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+            {
+                return assistant(vec![text("STALE-BASE SUMMARY")], StopReason::Stop);
+            }
+            if model_turns.fetch_add(1, Ordering::SeqCst) == 0 {
+                gated_long_assistant()
+            } else {
+                assistant(vec![text("done")], StopReason::Stop)
+            }
+        }))
+    };
+
+    let mut first = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut first);
+    let first_path = first.path().to_path_buf();
+    let mut model = fake_model();
+    // Seed history ~408 tokens < 411: the prompt-start gate stays idle, the
+    // first loop turn (seed + starting prompt ~415) compacts successfully.
+    model.context_window = 412;
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model,
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: tool_registry_with(Some((tool_gate_rx, Arc::clone(&tool_entered)))),
+            session: Some(first),
+            compaction: Some(pir::compaction::CompactionConfig {
+                enabled: true,
+                reserve_tokens: 1,
+                keep_recent_tokens: 8,
+            }),
+            max_turns: 6,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        },
+        Vec::new(),
+    ));
+
+    let session_log: SessionEventLog = Arc::new(Mutex::new(Vec::new()));
+    agent.on_session_event(session_event_handler(Arc::clone(&session_log)));
+
+    let prompt_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            agent
+                .prompt("loop threshold", event_handler(EventLog::default()))
+                .await
+        }
+    });
+    // The tool call can only run after the first turn's compaction succeeded;
+    // swapping here leaves the rebuilt context paired with the replacement.
+    wait_for_tool_entry(&tool_entered).await;
+
+    let mut second = SessionManager::create(".", &temp.0).expect("create replacement");
+    seed_compactable_history(&mut second);
+    let second_path = second.path().to_path_buf();
+    assert!(
+        agent.replace_session_storage(second).await,
+        "the swap must succeed"
+    );
+    let _ = tool_gate_tx.send(true);
+
+    let terminal = prompt_task
+        .await
+        .expect("prompt task")
+        .expect("the run continues on its old rebuilt context after the swap");
+    assert_eq!(
+        text_of_message(&Message::Assistant(terminal)).as_deref(),
+        Some("done")
+    );
+    assert_eq!(
+        compaction_event_kinds(&session_log),
+        vec!["compaction_start".to_owned(), "compaction_end".to_owned()],
+        "only the pre-swap compaction may start; the post-swap rebuilt context must be refused"
+    );
+
+    assert_no_compaction_entry(&second_path, "the replacement");
+    let replacement = std::fs::read_to_string(&second_path).expect("replacement file");
+    assert!(
+        !replacement.contains("STALE-BASE SUMMARY"),
+        "the rebuilt context's summary entered the replacement: {replacement}"
+    );
+    assert_eq!(
+        persisted_message_roles(&second_path),
+        vec![
+            "user".to_owned(),
+            "assistant".to_owned(),
+            "user".to_owned(),
+            "assistant".to_owned()
+        ],
+        "the replacement must keep only its own seeded history"
+    );
+
+    // The outgoing transcript keeps the compaction that succeeded BEFORE the
+    // swap; the post-swap trigger must not add a second one.
+    assert_eq!(
+        persisted_compaction_entries(&first_path),
+        1,
+        "the outgoing transcript must keep exactly its pre-swap compaction"
+    );
+    let outgoing = std::fs::read_to_string(&first_path).expect("outgoing file");
+    assert!(
+        outgoing.contains("STALE-BASE SUMMARY"),
+        "the outgoing transcript must keep its own compaction summary: {outgoing}"
+    );
+}
+
+/// P2-03 residual regression (FAILED-append retry window): the first
+/// threshold attempt is parked in `session_before_compact`, the test swaps
+/// storage, and the attempt's append is dropped. The next turn retries the
+/// threshold with the old context. Pre-fix, the failed path left
+/// `snapshot_stale` unset and the retry captured the replacement's id, so
+/// the old summary/cut was written into the replacement. The retry must be
+/// refused by the run-start identity, and the dropped attempt must still
+/// emit the terminal end+failed event pair.
+#[tokio::test]
+async fn threshold_compaction_retry_after_failed_append_does_not_write_into_replaced_storage() {
+    let temp = TempDir::new("swap-threshold-retry");
+    let (compaction_gate_tx, compaction_gate_rx) = tokio::sync::watch::channel(false);
+    let compaction_entered = Arc::new(AtomicUsize::new(0));
+    // The tool gate is already open: the run only needs a second turn after
+    // the failed compaction so the retry window becomes observable.
+    let (_tool_gate_tx, tool_gate_rx) = tokio::sync::watch::channel(true);
+    let tool_entered = Arc::new(AtomicUsize::new(0));
+    let model_turns = Arc::new(AtomicUsize::new(0));
+    let registry = {
+        let model_turns = Arc::clone(&model_turns);
+        fake_registry(Arc::new(move |_index, context| {
+            if context.system_prompt.as_deref()
+                == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+            {
+                return assistant(vec![text("RETRY-SUMMARY")], StopReason::Stop);
+            }
+            if model_turns.fetch_add(1, Ordering::SeqCst) == 0 {
+                gated_long_assistant()
+            } else {
+                assistant(vec![text("done")], StopReason::Stop)
+            }
+        }))
+    };
+
+    let mut first = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut first);
+    let first_path = first.path().to_path_buf();
+    let mut model = fake_model();
+    model.context_window = 412;
+    let (failed_recorder, plugin_failures) =
+        PluginEventRecorder::new("threshold-failed-recorder", &["session_compact_failed"]);
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model,
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: tool_registry_with(Some((tool_gate_rx, Arc::clone(&tool_entered)))),
+            session: Some(first),
+            compaction: Some(pir::compaction::CompactionConfig {
+                enabled: true,
+                reserve_tokens: 1,
+                keep_recent_tokens: 8,
+            }),
+            max_turns: 6,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        },
+        vec![
+            Arc::new(GatePlugin {
+                info: PluginInfo::inline("in-loop-threshold-retry-gate"),
+                event: "session_before_compact",
+                entered: Arc::clone(&compaction_entered),
+                gate: compaction_gate_rx,
+            }),
+            Arc::new(failed_recorder),
+        ],
+    ));
+    let session_log: SessionEventLog = Arc::new(Mutex::new(Vec::new()));
+    agent.on_session_event(session_event_handler(Arc::clone(&session_log)));
+
+    let prompt_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            agent
+                .prompt("loop threshold retry", event_handler(EventLog::default()))
+                .await
+        }
+    });
+    wait_for_counter(
+        &compaction_entered,
+        1,
+        "in-loop threshold session_before_compact gate",
+    )
+    .await;
+
+    // Swap while the FIRST threshold attempt is parked before its summarizer:
+    // its append (old snapshot + old cut) must be dropped, and the following
+    // turn must not retry the old context against the replacement.
+    let mut second = SessionManager::create(".", &temp.0).expect("create replacement");
+    seed_compactable_history(&mut second);
+    let second_path = second.path().to_path_buf();
+    assert!(
+        agent.replace_session_storage(second).await,
+        "the swap must succeed"
+    );
+    let _ = compaction_gate_tx.send(true);
+
+    let terminal = prompt_task
+        .await
+        .expect("prompt task")
+        .expect("the run continues on its unchanged context after the failed append");
+    assert_eq!(
+        text_of_message(&Message::Assistant(terminal)).as_deref(),
+        Some("done")
+    );
+    assert!(
+        tool_entered.load(Ordering::SeqCst) > 0,
+        "the run must reach the second turn (tool call) so the retry window exists"
+    );
+
+    // Exactly one terminal pair for the dropped attempt; the refused retry
+    // must not start another compaction.
+    assert_eq!(
+        compaction_event_kinds(&session_log),
+        vec!["compaction_start".to_owned(), "compaction_end".to_owned()],
+        "the dropped attempt must emit exactly one start/end pair"
+    );
+    let end = session_log
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(kind, _)| kind == "compaction_end")
+        .map(|(_, json)| json.clone())
+        .expect("compaction_end event");
+    assert_eq!(end["aborted"], serde_json::Value::Bool(false));
+    assert!(
+        end["errorMessage"]
+            .as_str()
+            .is_some_and(|message| message.contains("session storage was replaced")),
+        "unexpected compaction_end errorMessage: {end}"
+    );
+    let plugin_failures = plugin_failures.lock().unwrap();
+    assert_eq!(
+        plugin_failures.len(),
+        1,
+        "the dropped append must emit exactly one session_compact_failed plugin event"
+    );
+    let failure = &plugin_failures[0].1;
+    assert_eq!(failure["reason"], serde_json::json!("threshold"));
+    assert_eq!(failure["aborted"], serde_json::Value::Bool(false));
+    assert!(
+        failure["errorMessage"]
+            .as_str()
+            .is_some_and(|message| message.contains("session storage was replaced")),
+        "unexpected session_compact_failed payload: {failure}"
+    );
+    drop(plugin_failures);
+
+    assert_no_compaction_entry(&second_path, "the replacement");
+    let replacement = std::fs::read_to_string(&second_path).expect("replacement file");
+    assert!(
+        !replacement.contains("RETRY-SUMMARY"),
+        "the retried compaction entered the replacement: {replacement}"
+    );
+    assert_eq!(
+        persisted_message_roles(&second_path),
+        vec![
+            "user".to_owned(),
+            "assistant".to_owned(),
+            "user".to_owned(),
+            "assistant".to_owned()
+        ],
+        "the replacement must keep only its own seeded history"
+    );
+
+    assert_no_compaction_entry(&first_path, "the outgoing transcript");
+    let outgoing = std::fs::read_to_string(&first_path).expect("outgoing file");
+    assert!(
+        !outgoing.contains("RETRY-SUMMARY"),
+        "the outgoing transcript must not receive the dropped compaction: {outgoing}"
+    );
+}
+
+/// P2-03 residual control (in-loop threshold, NO swap): the run-start
+/// identity wiring must not block an ordinary threshold compaction. The
+/// prompt-start gate stays below the threshold; the first loop check (~487
+/// tokens) exceeds the 469-token budget and must persist its summary on the
+/// run's own transcript.
+#[tokio::test]
+async fn in_loop_threshold_compaction_still_succeeds_without_swap() {
+    let temp = TempDir::new("inloop-threshold-normal");
+    let registry = fake_registry(Arc::new(|_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            return assistant(vec![text("NORMAL-INLOOP SUMMARY")], StopReason::Stop);
+        }
+        assistant(vec![text("done")], StopReason::Stop)
+    }));
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+    let path = session.path().to_path_buf();
+    let mut model = fake_model();
+    // Seed history ~408 tokens < 469; the ~315-char starting prompt pushes
+    // the first loop turn to ~487, comfortably over the 469-token budget.
+    model.context_window = 470;
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model,
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: tool_registry_with(None),
+            session: Some(session),
+            compaction: Some(pir::compaction::CompactionConfig {
+                enabled: true,
+                reserve_tokens: 1,
+                keep_recent_tokens: 8,
+            }),
+            max_turns: 2,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        },
+        Vec::new(),
+    ));
+    let session_log: SessionEventLog = Arc::new(Mutex::new(Vec::new()));
+    agent.on_session_event(session_event_handler(Arc::clone(&session_log)));
+
+    let prompt = format!("loop threshold {}", "z".repeat(300));
+    let terminal = agent
+        .prompt(&prompt, event_handler(EventLog::default()))
+        .await
+        .expect("the in-loop threshold compaction must not fail the run");
+    assert_eq!(
+        text_of_message(&Message::Assistant(terminal)).as_deref(),
+        Some("done")
+    );
+    assert_eq!(
+        compaction_event_kinds(&session_log),
+        vec!["compaction_start".to_owned(), "compaction_end".to_owned()],
+        "the normal in-loop threshold compaction must emit exactly one pair"
+    );
+    assert_eq!(
+        persisted_compaction_entries(&path),
+        1,
+        "the run's own transcript must receive exactly one compaction"
+    );
+    let reopened = SessionManager::open(&path).expect("reopen session");
+    let rendered = reopened
+        .build_context_entries()
+        .expect("context entries")
+        .iter()
+        .filter_map(text_of_message)
+        .collect::<Vec<_>>();
+    assert!(
+        rendered
+            .iter()
+            .any(|text| text.contains("NORMAL-INLOOP SUMMARY")),
+        "the in-loop compaction summary is missing after reopen: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|text| text == "done"),
+        "the post-compaction assistant message is missing: {rendered:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P1-1: `agent_settled` / `entry_appended` exactly once per face
+// ---------------------------------------------------------------------------
+
+/// Native counter for the exactly-once regression: records every
+/// `agent_settled` / `entry_appended` payload the ordered host dispatches.
+struct SettledEntryCounter {
+    info: PluginInfo,
+    seen: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+}
+
+impl AgentPlugin for SettledEntryCounter {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> pir::plugins::EventInterest {
+        pir::plugins::EventInterest::List(vec![
+            "agent_settled".to_owned(),
+            "entry_appended".to_owned(),
+        ])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        let seen = Arc::clone(&self.seen);
+        Box::pin(async move {
+            seen.lock()
+                .unwrap()
+                .push((event.name.to_string(), event.payload.clone()));
+            PluginEventOutcome::None
+        })
+    }
+}
+
+/// Both faces observe one `agent_settled` and each persisted entry's
+/// `entry_appended` exactly once. The old session-event bridge forwarded the
+/// same `SessionEvent`s on top of the direct plugin dispatch, so the default
+/// host (JS + native) delivered every one of them twice.
+#[tokio::test]
+async fn agent_settled_and_entry_appended_reach_each_face_once_per_run() {
+    let temp = TempDir::new("settled-entry-once");
+    let handle = load_message_lifecycle_extension(
+        "settled-entry-once",
+        r#"
+        export default function (pi) {
+            globalThis.__counts = {};
+            globalThis.__entryIds = [];
+            for (const name of ["agent_settled", "entry_appended"]) {
+                pi.on(name, (event) => {
+                    globalThis.__counts[name] = (globalThis.__counts[name] ?? 0) + 1;
+                    if (name === "entry_appended" && event.entry) {
+                        globalThis.__entryIds.push(event.entry.id);
+                    }
+                });
+            }
+        }
+        "#,
+    )
+    .await;
+    let native_seen: Arc<Mutex<Vec<(String, serde_json::Value)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let agent = AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: Some(session),
+            compaction: None,
+            max_turns: 2,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: Some(handle.clone()),
+            tool_selection: None,
+        },
+        vec![Arc::new(SettledEntryCounter {
+            info: PluginInfo::inline("settled-entry-counter"),
+            seen: Arc::clone(&native_seen),
+        })],
+    );
+
+    agent
+        .prompt("original", event_handler(EventLog::default()))
+        .await
+        .expect("prompt");
+
+    // The session-event bridge dispatches on a separate ordered worker. Give
+    // it time to drain so an accidental second delivery cannot hide behind
+    // the test's exit.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let probe = handle
+        .eval_json(
+            "JSON.stringify({ counts: globalThis.__counts ?? {}, ids: globalThis.__entryIds ?? [] })",
+        )
+        .await
+        .expect("probe JS counts");
+    let js_counts: BTreeMap<String, usize> =
+        serde_json::from_value(probe["counts"].clone()).expect("JS counts");
+    let js_ids: Vec<String> = serde_json::from_value(probe["ids"].clone()).expect("JS entry ids");
+
+    let native = native_seen.lock().unwrap();
+    let native_settled = native
+        .iter()
+        .filter(|(name, _)| name == "agent_settled")
+        .count();
+    let native_ids: Vec<String> = native
+        .iter()
+        .filter(|(name, _)| name == "entry_appended")
+        .filter_map(|(_, payload)| {
+            payload
+                .get("entry")
+                .and_then(|entry| entry.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+
+    assert_eq!(
+        js_counts.get("agent_settled").copied().unwrap_or(0),
+        1,
+        "JS `agent_settled` must fire exactly once: {js_counts:?}"
+    );
+    assert_eq!(
+        native_settled, 1,
+        "native `agent_settled` must fire exactly once: {native:?}"
+    );
+    assert_eq!(
+        js_counts.get("entry_appended").copied().unwrap_or(0),
+        js_ids.len(),
+        "JS `entry_appended` count must match its recorded ids: {js_counts:?} / {js_ids:?}"
+    );
+    assert_eq!(
+        native_ids, js_ids,
+        "both faces must observe the same appended entries in the same order"
+    );
+    let mut unique_ids = js_ids.clone();
+    unique_ids.sort();
+    unique_ids.dedup();
+    assert_eq!(
+        unique_ids.len(),
+        js_ids.len(),
+        "duplicate `entry_appended` delivery: {js_ids:?}"
+    );
+    assert_eq!(
+        js_ids.len(),
+        native_ids.len(),
+        "JS and native must observe the same number of appends: {js_ids:?} / {native_ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P1-3: a JS-only plan receives the bridged session-level events
+// ---------------------------------------------------------------------------
+
+/// Poll the JS extension's `globalThis.__events` counts until `name` reaches
+/// `expected` (the bridge dispatches on its ordered worker).
+async fn wait_for_js_session_event(handle: &ExtensionHandle, name: &str, expected: usize) {
+    for _ in 0..500 {
+        if let Ok(probe) = handle
+            .eval_json("JSON.stringify(globalThis.__events ?? {})")
+            .await
+        {
+            let counts: BTreeMap<String, usize> = serde_json::from_value(probe).unwrap_or_default();
+            if counts.get(name).copied().unwrap_or(0) >= expected {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("JS handler `{name}` never observed {expected} session event(s)");
+}
+
+/// `--no-extensions -e ext.ts` is a JS-only plugin plan: no non-JS plugin
+/// exists, so the old bridge install gate (`has_non_js_plugins`) returned
+/// `None` and `pi.on("compaction_start")` / `compaction_end` /
+/// `background_tool_end` never fired. This drives a REAL threshold compaction
+/// through a JS-only host, then the background completion through the same
+/// `SessionEvent` seam, and asserts both JS handler counts.
+#[tokio::test]
+async fn js_only_plan_receives_compaction_and_background_session_events() {
+    let temp = TempDir::new("js-only-session-events");
+    let handle = load_message_lifecycle_extension(
+        "js-only-session-events",
+        r#"
+        export default function (pi) {
+            globalThis.__events = {};
+            for (const name of ["compaction_start", "compaction_end", "background_tool_end"]) {
+                pi.on(name, () => {
+                    globalThis.__events[name] = (globalThis.__events[name] ?? 0) + 1;
+                });
+            }
+        }
+        "#,
+    )
+    .await;
+
+    let registry = fake_registry(Arc::new(|_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            return assistant(vec![text("JS-ONLY SUMMARY")], StopReason::Stop);
+        }
+        assistant(vec![text("model reply")], StopReason::Stop)
+    }));
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+    let mut model = fake_model();
+    // Tiny window: the seeded history crosses the threshold at prompt start.
+    model.context_window = 64;
+    let agent = AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model,
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: Some(session),
+            compaction: Some(pir::compaction::CompactionConfig {
+                enabled: true,
+                reserve_tokens: 1,
+                keep_recent_tokens: 8,
+            }),
+            max_turns: 2,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: Some(handle.clone()),
+            tool_selection: None,
+        },
+        // JS-only: no inline native plugin, so `has_non_js_plugins()` is false.
+        Vec::new(),
+    );
+
+    agent
+        .prompt("trigger threshold", event_handler(EventLog::default()))
+        .await
+        .expect("the JS-only prompt completes");
+
+    wait_for_js_session_event(&handle, "compaction_start", 1).await;
+    wait_for_js_session_event(&handle, "compaction_end", 1).await;
+
+    agent.emit_session_event_for_test(SessionEvent::BackgroundToolEnd {
+        call_id: "bg-call".to_owned(),
+        tool_name: "demo".to_owned(),
+        parent_call_id: None,
+        is_error: false,
+        duration_ms: Some(5),
+        output: "done".to_owned(),
+        images: Vec::new(),
+        details: None,
+        structured_content: None,
+        usage: None,
+    });
+    wait_for_js_session_event(&handle, "background_tool_end", 1).await;
+
+    let probe = handle
+        .eval_json("JSON.stringify(globalThis.__events ?? {})")
+        .await
+        .expect("probe JS session event counts");
+    let counts: BTreeMap<String, usize> = serde_json::from_value(probe).expect("counts");
+    assert_eq!(
+        counts.get("compaction_start").copied().unwrap_or(0),
+        1,
+        "JS `compaction_start` must fire exactly once: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("compaction_end").copied().unwrap_or(0),
+        1,
+        "JS `compaction_end` must fire exactly once: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("background_tool_end").copied().unwrap_or(0),
+        1,
+        "JS `background_tool_end` must fire exactly once: {counts:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P1-D1: the session-event bridge is installed at construction
+// ---------------------------------------------------------------------------
+
+/// Read the JS extension's recorded `bash_execution_update` deltas.
+async fn js_bash_deltas(handle: &ExtensionHandle) -> Vec<String> {
+    let probe = handle
+        .eval_json("JSON.stringify(globalThis.__bashDeltas ?? [])")
+        .await
+        .expect("probe JS bash deltas");
+    serde_json::from_value(probe).expect("JS bash deltas")
+}
+
+/// Poll until the recorded bash deltas concatenate to `expected` (the bridge
+/// dispatches on its ordered worker, not on the emitting task). Equality (not
+/// a substring check) also catches a duplicate subscription, which would hand
+/// the handler each chunk twice.
+async fn wait_for_js_bash_output(handle: &ExtensionHandle, expected: &str) {
+    for _ in 0..500 {
+        if js_bash_deltas(handle).await.concat() == expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "JS handler never observed the full bash output `{expected}`: {:?}",
+        js_bash_deltas(handle).await
+    );
+}
+
+/// Read the JS extension's session-event counts.
+async fn js_session_event_counts(handle: &ExtensionHandle) -> BTreeMap<String, usize> {
+    let probe = handle
+        .eval_json("JSON.stringify(globalThis.__events ?? {})")
+        .await
+        .expect("probe JS session event counts");
+    serde_json::from_value(probe).expect("JS session event counts")
+}
+
+/// A JS-only plan must already have the `SessionEvent` bridge when a public
+/// API emits before the first prompt/idle drain: `compact()` and
+/// `execute_bash()` emit `compaction_start`/`_end` and
+/// `bash_execution_update` directly (the manual compaction also owns the
+/// `summarization_retry_*` lifecycle). The old lazy installer only ran in
+/// `start_run` / the idle drain, so `pi.on` saw none of these until a run.
+///
+/// The post-run half pins idempotence: `start_run` still calls the installer,
+/// which must NOT add a second subscriber (that would double every later
+/// compaction/bash event). The counts and the byte-for-byte delta
+/// concatenation catch both a missing install and a duplicate one.
+#[tokio::test]
+async fn js_only_manual_compact_and_bash_before_first_run_reach_pi_on_exactly_once() {
+    let temp = TempDir::new("js-only-pre-run-events");
+    let handle = load_message_lifecycle_extension(
+        "js-only-pre-run-events",
+        r#"
+        export default function (pi) {
+            globalThis.__events = {};
+            globalThis.__bashDeltas = [];
+            for (const name of ["compaction_start", "compaction_end", "bash_execution_update"]) {
+                pi.on(name, (event) => {
+                    globalThis.__events[name] = (globalThis.__events[name] ?? 0) + 1;
+                    if (name === "bash_execution_update" && typeof event.delta === "string") {
+                        globalThis.__bashDeltas.push(event.delta);
+                    }
+                });
+            }
+        }
+        "#,
+    )
+    .await;
+
+    let registry = fake_registry(Arc::new(|_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            return assistant(vec![text("PRE-RUN COMPACT SUMMARY")], StopReason::Stop);
+        }
+        assistant(vec![text("model reply")], StopReason::Stop)
+    }));
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+    let mut model = fake_model();
+    // The manual compaction is the only one in play: a huge window keeps the
+    // prompt-start threshold hook idle.
+    model.context_window = 1_000_000;
+    let agent = AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model,
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: Some(session),
+            compaction: Some(pir::compaction::CompactionConfig {
+                enabled: true,
+                reserve_tokens: 1,
+                keep_recent_tokens: 8,
+            }),
+            max_turns: 2,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: Some(handle.clone()),
+            tool_selection: None,
+        },
+        // JS-only: no inline native plugin -> `has_non_js_plugins()` is false.
+        Vec::new(),
+    );
+
+    // NO prompt yet: the manual compaction must already reach `pi.on`.
+    agent
+        .compact(None)
+        .await
+        .expect("manual compact before the first run");
+    wait_for_js_session_event(&handle, "compaction_start", 1).await;
+    wait_for_js_session_event(&handle, "compaction_end", 1).await;
+
+    // NO prompt yet: the bash stream must already reach `pi.on`.
+    let pre_run = agent.execute_bash("echo lane-dispatch2-pre-run").await;
+    assert_eq!(pre_run.exit_code, Some(0), "pre-run bash: {pre_run:?}");
+    wait_for_js_bash_output(&handle, &pre_run.output).await;
+    let pre_run_deltas = js_bash_deltas(&handle).await;
+    assert_eq!(
+        pre_run_deltas.concat(),
+        pre_run.output,
+        "pre-run bash chunks must be delivered exactly once: {pre_run_deltas:?}"
+    );
+
+    // First run: its idempotent install must not add a second subscriber.
+    agent
+        .prompt("first run", event_handler(EventLog::default()))
+        .await
+        .expect("prompt");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let counts_after_run = js_session_event_counts(&handle).await;
+    assert_eq!(
+        counts_after_run
+            .get("compaction_start")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "the first run must not duplicate the pre-run compaction_start: {counts_after_run:?}"
+    );
+    assert_eq!(
+        counts_after_run.get("compaction_end").copied().unwrap_or(0),
+        1,
+        "the first run must not duplicate the pre-run compaction_end: {counts_after_run:?}"
+    );
+
+    // Post-run producers still deliver exactly once (no second subscriber).
+    let post_run = agent.execute_bash("echo lane-dispatch2-post-run").await;
+    assert_eq!(post_run.exit_code, Some(0), "post-run bash: {post_run:?}");
+    wait_for_js_bash_output(&handle, &format!("{}{}", pre_run.output, post_run.output)).await;
+    let all_deltas = js_bash_deltas(&handle).await;
+    assert_eq!(
+        all_deltas[pre_run_deltas.len()..].concat(),
+        post_run.output,
+        "post-run bash chunks must be delivered exactly once: {all_deltas:?}"
+    );
+
+    // `compact()` emits its start/end pair even when the post-run transcript
+    // has nothing left to summarize; the point is the exactly-once delivery of
+    // the second invocation after the run path's installer call.
+    let _ = agent.compact(None).await;
+    wait_for_js_session_event(&handle, "compaction_start", 2).await;
+    wait_for_js_session_event(&handle, "compaction_end", 2).await;
+
+    let counts = js_session_event_counts(&handle).await;
+    assert_eq!(
+        counts.get("compaction_start").copied().unwrap_or(0),
+        2,
+        "two manual compactions must deliver two compaction_start events, not more: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("compaction_end").copied().unwrap_or(0),
+        2,
+        "two manual compactions must deliver two compaction_end events, not more: {counts:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-D1: one ordered compaction lifecycle across both delivery channels
+// ---------------------------------------------------------------------------
+
+/// Extension recording the four compaction lifecycle events `pi.on` observes.
+/// `compaction_start`/`compaction_end` arrive through the ordered
+/// `SessionEvent` backlog; `session_before_compact`/`session_compact` are
+/// dispatched directly by the compaction task. The shared array pins their
+/// relative order.
+const COMPACTION_ORDER_EXTENSION: &str = r#"
+    export default function (pi) {
+        globalThis.__compactionOrder = [];
+        for (const name of [
+            "compaction_start",
+            "session_before_compact",
+            "session_compact",
+            "compaction_end",
+        ]) {
+            pi.on(name, () => {
+                globalThis.__compactionOrder.push(name);
+            });
+        }
+        // Delay the bridge worker long enough that a direct
+        // `session_before_compact` dispatch without a queue flush overtakes
+        // the queued `compaction_start` on the JS actor. Only the first
+        // update pays the delay (a threshold prompt emits several).
+        pi.on("queue_update", () => {
+            if (globalThis.__queueDelayed) return;
+            globalThis.__queueDelayed = true;
+            const until = Date.now() + 100;
+            while (Date.now() < until) {}
+        });
+    }
+"#;
+
+async fn js_compaction_order(handle: &ExtensionHandle) -> Vec<String> {
+    let probe = handle
+        .eval_json("JSON.stringify(globalThis.__compactionOrder ?? [])")
+        .await
+        .expect("probe JS compaction order");
+    serde_json::from_value(probe).expect("JS compaction order")
+}
+
+async fn wait_for_js_compaction_order(handle: &ExtensionHandle, expected: usize) -> Vec<String> {
+    for _ in 0..500 {
+        let order = js_compaction_order(handle).await;
+        if order.len() >= expected {
+            return order;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "JS compaction lifecycle never reached {expected} events: {:?}",
+        js_compaction_order(handle).await
+    );
+}
+
+/// Both faces must see `compaction_start → session_before_compact →
+/// session_compact → compaction_end` even when the JS runtime is the only
+/// plugin face and the bridge is the only `SessionEvent` subscriber. Before
+/// the flush barrier the start event could be dispatched after the direct
+/// `session_before_compact` emit.
+#[tokio::test]
+async fn js_only_manual_compaction_orders_its_lifecycle_events() {
+    let temp = TempDir::new("js-only-manual-compaction-order");
+    let handle =
+        load_message_lifecycle_extension("js-only-manual-order", COMPACTION_ORDER_EXTENSION).await;
+
+    let registry = fake_registry(Arc::new(|_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            return assistant(vec![text("MANUAL ORDER SUMMARY")], StopReason::Stop);
+        }
+        assistant(vec![text("model reply")], StopReason::Stop)
+    }));
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+    let mut model = fake_model();
+    // A huge window keeps the automatic threshold hook idle: only the manual
+    // compaction under test runs.
+    model.context_window = 1_000_000;
+    let agent = AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model,
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: Some(session),
+            compaction: Some(pir::compaction::CompactionConfig {
+                enabled: true,
+                reserve_tokens: 1,
+                keep_recent_tokens: 8,
+            }),
+            max_turns: 2,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: Some(handle.clone()),
+            tool_selection: None,
+        },
+        // JS-only: no inline native plugin.
+        Vec::new(),
+    );
+
+    // Occupy the bridge worker with a JS handler for 100 ms, so the queued
+    // `compaction_start` cannot win merely by being scheduled first: without
+    // the flush barrier the direct `session_before_compact` emit reaches the
+    // JS actor first and the asserted order goes red.
+    agent.emit_session_event_for_test(SessionEvent::QueueUpdate {
+        steering: Vec::new(),
+        follow_up: Vec::new(),
+        delivered_steering: Vec::new(),
+        delivered_follow_up: Vec::new(),
+    });
+
+    agent.compact(None).await.expect("manual compact");
+
+    let expected = vec![
+        "compaction_start".to_owned(),
+        "session_before_compact".to_owned(),
+        "session_compact".to_owned(),
+        "compaction_end".to_owned(),
+    ];
+    let order = wait_for_js_compaction_order(&handle, expected.len()).await;
+    assert_eq!(
+        order, expected,
+        "JS-only manual compaction must preserve the upstream lifecycle order"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        js_compaction_order(&handle).await,
+        expected,
+        "the lifecycle events must be delivered exactly once"
+    );
+}
+
+/// Threshold counterpart: the prompt-start/per-turn threshold hook uses the
+/// same two delivery channels, so a JS-only face must observe the identical
+/// order without a manual trigger.
+#[tokio::test]
+async fn js_only_threshold_compaction_orders_its_lifecycle_events() {
+    let temp = TempDir::new("js-only-threshold-compaction-order");
+    let handle =
+        load_message_lifecycle_extension("js-only-threshold-order", COMPACTION_ORDER_EXTENSION)
+            .await;
+
+    let registry = fake_registry(Arc::new(|_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            return assistant(vec![text("THRESHOLD ORDER SUMMARY")], StopReason::Stop);
+        }
+        assistant(vec![text("model reply")], StopReason::Stop)
+    }));
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+    let mut model = fake_model();
+    // Tiny window: the seeded history crosses the threshold at prompt start.
+    model.context_window = 64;
+    let agent = AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model,
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: Some(session),
+            compaction: Some(pir::compaction::CompactionConfig {
+                enabled: true,
+                reserve_tokens: 1,
+                keep_recent_tokens: 8,
+            }),
+            max_turns: 2,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: Some(handle.clone()),
+            tool_selection: None,
+        },
+        Vec::new(),
+    );
+
+    agent
+        .prompt("trigger threshold", event_handler(EventLog::default()))
+        .await
+        .expect("the JS-only threshold prompt completes");
+
+    let expected = vec![
+        "compaction_start".to_owned(),
+        "session_before_compact".to_owned(),
+        "session_compact".to_owned(),
+        "compaction_end".to_owned(),
+    ];
+    let order = wait_for_js_compaction_order(&handle, expected.len()).await;
+    assert_eq!(
+        order, expected,
+        "JS-only threshold compaction must preserve the upstream lifecycle order"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        js_compaction_order(&handle).await,
+        expected,
+        "the lifecycle events must be delivered exactly once"
     );
 }

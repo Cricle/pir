@@ -455,6 +455,13 @@ pub struct CommandDef {
     /// the async completion round-trip only when this is set.
     #[serde(rename = "argumentCompletions", default)]
     pub argument_completions: bool,
+    /// Owning JS extension id (`extId`) for extension commands. Host-side
+    /// dispatch uses it to pick the exact registration when two extensions
+    /// register the same command name (`name:2` invocation dedup); native
+    /// commands leave it `None`. Deliberately not serialized back into
+    /// `getCommands()` — the upstream command shape has no `extId` field.
+    #[serde(rename = "extId", default, skip_serializing)]
+    pub ext_id: Option<u64>,
 }
 
 /// A CLI flag registered by an extension.

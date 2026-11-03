@@ -172,18 +172,18 @@ async fn ctx_execute_tool_round_trips_nested_calls() {
     merge_extension_tools(&mut registry, &handle);
     let sink: pir::agent::nested_tool_calls::NestedEventSink =
         Arc::new(|_event| Box::pin(async {}));
-    let shared = NestedShared::new(
-        Arc::new(registry),
-        pir::agent::tool_scheduler::ToolScheduler::new(Default::default()),
-        None,
-        Some(handle.clone()),
-        dir.clone(),
-        None,
-        false,
+    let shared = NestedShared::new(pir::agent::nested_tool_calls::NestedSharedConfig {
+        registry: Arc::new(registry),
+        scheduler: pir::agent::tool_scheduler::ToolScheduler::new(Default::default()),
+        hooks: None,
+        extensions: Some(handle.clone()),
+        cwd: dir.clone(),
+        signal: None,
+        sequential: false,
         sink,
-        None,
-        None,
-    );
+        session_env: None,
+        callable: None,
+    });
     let executor = NestedToolExecutor::root(Arc::clone(&shared)).for_call("call-parent");
     handle.bind_nested_executor("call-parent", Arc::new(executor));
 
@@ -246,18 +246,18 @@ async fn nested_call_usage_is_summed_in_the_recorder() {
     merge_extension_tools(&mut registry, &handle);
     let sink: pir::agent::nested_tool_calls::NestedEventSink =
         Arc::new(|_event| Box::pin(async {}));
-    let shared = NestedShared::new(
-        Arc::new(registry),
-        pir::agent::tool_scheduler::ToolScheduler::new(Default::default()),
-        None,
-        Some(handle.clone()),
-        dir.clone(),
-        None,
-        false,
+    let shared = NestedShared::new(pir::agent::nested_tool_calls::NestedSharedConfig {
+        registry: Arc::new(registry),
+        scheduler: pir::agent::tool_scheduler::ToolScheduler::new(Default::default()),
+        hooks: None,
+        extensions: Some(handle.clone()),
+        cwd: dir.clone(),
+        signal: None,
+        sequential: false,
         sink,
-        None,
-        None,
-    );
+        session_env: None,
+        callable: None,
+    });
     let executor = NestedToolExecutor::root(Arc::clone(&shared)).for_call("call-parent");
     handle.bind_nested_executor("call-parent", Arc::new(executor));
 
@@ -463,6 +463,7 @@ async fn get_settings_get_commands_and_flags_surface() {
             ..Default::default()
         },
         argument_completions: false,
+        ext_id: None,
     }]);
     seed_and_load(&handle, &dir, "surface.ts", SETTINGS_COMMANDS_TS).await;
 
@@ -740,18 +741,18 @@ async fn payload_parity_and_renderers() {
     merge_extension_tools(&mut registry, &handle);
     let sink: pir::agent::nested_tool_calls::NestedEventSink =
         Arc::new(|_event| Box::pin(async {}));
-    let shared = NestedShared::new(
-        Arc::new(registry),
-        pir::agent::tool_scheduler::ToolScheduler::new(Default::default()),
-        None,
-        Some(handle.clone()),
-        dir.clone(),
-        None,
-        false,
+    let shared = NestedShared::new(pir::agent::nested_tool_calls::NestedSharedConfig {
+        registry: Arc::new(registry),
+        scheduler: pir::agent::tool_scheduler::ToolScheduler::new(Default::default()),
+        hooks: None,
+        extensions: Some(handle.clone()),
+        cwd: dir.clone(),
+        signal: None,
+        sequential: false,
         sink,
-        None,
-        None,
-    );
+        session_env: None,
+        callable: None,
+    });
     handle.bind_nested_executor(
         "call-p",
         Arc::new(NestedToolExecutor::root(Arc::clone(&shared)).for_call("call-p")),

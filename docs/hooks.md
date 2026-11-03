@@ -1,99 +1,142 @@
 # Hook coverage: upstream pi → pir (native + JS faces)
 
-This is the coverage matrix for pi's extension hook surface, derived from the
-installed upstream `types.d.ts` (`ExtensionEvent`, `ExtensionAPI.on`,
-`ExtensionUIContext`) and audited against pir's actual dispatch sites. Every
-row names the emit site so a drift can be checked mechanically; the two marker
-blocks at the bottom are compared against `src/plugins/coverage.rs` by
-`tests/hook_coverage.rs`.
+Coverage matrix for pi's extension hook surface (upstream `types.d.ts`: `ExtensionEvent`,
+`ExtensionAPI.on`, `ExtensionUIContext`), audited against pir's dispatch sites; emit-site
+`file:line` references are indicative and drift. `tests/hook_coverage.rs` compares the marker blocks
+with `src/plugins/coverage.rs` and statically checks every wired name's emit site.
 
-Two faces receive hooks in pir:
+Two faces receive hooks: **JS** (`pi.on` via `ExtensionHandle::emit` / `dispatch_hosted_event`) and
+**native** (Rust/inline plugins via `AgentPlugin::on_event`, through `PluginHost::emit` — ordered,
+JS adapter once — or `emit_native` where JS has its own lifecycle). Delivery is ordered per face: a
+site dispatching JS directly uses `emit_native` for the Rust half; otherwise `emit` includes the JS
+adapter as one ordered plugin. Exactly-once holds only for direct lifecycle paths owning both faces
+(`agent_settled` / `entry_appended` / `session_info_changed`, per-dialog `ui_prompt_*`);
+`SessionEvent` and `message_update` use bounded per-face queues (best-effort/at-most-once under
+overflow or dispatch failure).
 
-- **JS face** — the embedded QuickJS runtime (`pi.on(...)`), reached through
-  `ExtensionHandle::emit` / `dispatch_hosted_event`.
-- **Native face** — Rust builtins and inline plugins
-  (`AgentPlugin::on_event`), reached through `PluginHost::emit` (ordered list,
-  JS adapter included once) or `PluginHost::emit_native` (native plugins
-  only, used where the JS face has its own lifecycle path).
+### Delivery limits
 
-"Exactly one delivery per face" is the invariant: a site that already
-dispatches the JS runtime directly uses `emit_native` for the Rust half; a
-site with no separate JS path uses `emit`, whose JS adapter is one plugin in
-the ordered list.
+- `SessionEvent` bridge: one ordered queue per session (64 entries; overflow drops the newest,
+  dispatch capped at 10 s). Bridge events (`queue_update`, `compaction_start`/`compaction_end`,
+  `auto_retry_*`, `bash_execution_update`, `background_tool_end`) are at-most-once per face.
+- `message_update`: separate bounded queue per face (16 deltas); both drain before `message_end` in
+  stream order, but a failed dispatch is logged and skipped (no cross-face exactly-once claim).
+- `ui_prompt_start` / `ui_prompt_end` are per-face: a native dialog emits only to native plugins, a
+  JS dialog only to the JS handler; each pair is once per dialog on its owning face.
+- Other multi-face events are delivered once per face per emit call unless a handler fails or the
+  host tears down mid-dispatch.
 
 ## Event matrix
 
-Capability abbreviations: **O** observe, **M** mutate payload in place,
-**T** transform the result the host applies, **B** block/cancel,
-**R** replace the provider request/response payload.
+Capability abbreviations: **O** observe, **M** mutate payload in place, **T** transform the result
+the host applies, **B** block/cancel, **R** replace the provider request/response payload.
 
 | Event | JS face | Native face | Emit site (file:line) | Capability | Status |
 |---|---|---|---|---|---|
-| `project_trust` | runtime loader, pre-host | `emit_native` | `agent_session/build.rs:61`, `agent_session/runtime_loader.rs:774` | O | wired (native is supplemental; host owns trust) |
-| `resources_discover` | `plugins.emit` | `plugins.emit` | `agent_session/session_ctx.rs:589` | O (paths collected) | wired |
-| `session_start` | `plugins.emit` | `plugins.emit` | `agent_session/prompt_loop.rs:297`; print `coding_agent/print.rs:260` | O | wired (reasons: `startup`; see deviations) |
-| `session_info_changed` | `plugins.emit` | `plugins.emit` | `agent_session/notifications.rs:443` | O | wired |
-| `session_before_switch` | `plugins.emit` | `plugins.emit` | `agent_session/session_store.rs:69` | B | wired (reason `switch`; see deviations) |
-| `session_before_fork` | `plugins.emit` | `plugins.emit` | `agent_session/session_store.rs:493` | B | wired |
-| `session_before_compact` | `plugins.emit` | `plugins.emit` | `agent_session/compact.rs:273`, `:525` | B, T (compaction) | wired |
-| `session_compact` | `plugins.emit` | `plugins.emit` | `agent_session/compact.rs:336`, `:607`, `:703`; `prompt_loop.rs:1086` | O | wired |
-| `session_compact_failed` | `plugins.emit` | `plugins.emit` | `agent_session/notifications.rs:400`; `compact.rs:538`, `:644` | O | wired |
-| `session_shutdown` | actor mailbox close / reload (`extensions/handle/actor.rs:302`, `:362`) | `emit_native` | `plugins/host.rs:1442` (`emit_native_session_shutdown`), called at `:1461` (reload) and `:1499` (shutdown) | O | wired (native; JS has its own lifecycle, never double-emitted) |
-| `session_before_tree` | `plugins.emit` | `plugins.emit` | `agent_session/session_store.rs:361` (after the read-only collection, before summarize/leaf move) | B, M, T (cancel; instructions/summary/label overrides) | wired |
-| `session_tree` | `emit_read_only_json` | `emit_read_only_json` | `agent_session/session_store.rs:172`, `:185`; navigation `:414` | O | wired |
-| `context` | runtime emit | `emit_native` | `agent/agent_loop.rs:269` (native at `:272`) | T (replace messages) | wired (native mutation + JS return; JS return wins) |
-| `context_with_system` | runtime emit | `emit_native` | `agent/agent_loop.rs:360` (native at `:363`) | T (messages + system prompt) | wired (native mutation + JS return; JS return wins) |
-| `cache_warming_decision` | `plugins.emit` | `plugins.emit` | `agent_session/cache_warm.rs:62` | T | wired |
-| `before_provider_request` | `plugins.emit` | `plugins.emit` | `agent_session/stream.rs:164`; print `coding_agent/print.rs:169` | R | wired (returned payload replaces) |
-| `before_provider_headers` | `plugins.emit` | `plugins.emit` | `agent_session/prompt_loop.rs:428` | M | wired |
-| `after_provider_response` | `plugins.emit` | `plugins.emit` | `agent_session/stream.rs:194`; print `print.rs:196` | O | wired |
-| `provider_stream_event` | `plugins.emit` | `plugins.emit` | `agent_session/stream.rs:361`; print `coding_agent/print.rs:1418` | O | wired |
-| `before_agent_start` | `plugins.emit` | `plugins.emit` | `agent_session/prompt_loop.rs:374` | T (system prompt, injected message) | wired |
-| `agent_start` | `emit_extension` | `emit_native` | `agent/agent_loop.rs:941` | O | wired |
-| `agent_end` | `emit_extension_lazy` | `emit_native` | `agent/agent_loop.rs:1986` | O | wired |
-| `agent_before_settle` | `plugins.emit` | `plugins.emit` | `agent_session/settle.rs:85` | T (continue/entries) | wired |
-| `agent_settled` | `plugins.emit` | `plugins.emit` | `agent_session/prompt_loop.rs:1219`; print `coding_agent/print.rs:1803` | O | wired |
-| `turn_start` | `emit_extension` | `emit_native` | `agent/agent_loop.rs:1070` | O | wired |
-| `turn_end` | `plugins.emit` | `plugins.emit` | `agent_session/settle.rs:275` | T (continue) | wired |
-| `message_start` | `emit_extension_lazy` | `emit_native` | `agent/agent_loop.rs:1095`, `:1180`, `:1364`, `:1732` | O | wired |
-| `message_update` | runtime direct | `emit_native` | `agent/agent_loop.rs:2491` (native), `:2652` (JS) | O | wired |
-| `message_end` | runtime direct | `emit_native` | `agent/agent_loop.rs:181`; loop `:1810` | T (replace message) | wired |
-| `tool_execution_start` | `emit_extension_lazy` | `emit_native` | `agent/agent_loop.rs:1314`, `:1620` | O | wired |
-| `tool_execution_update` | runtime / `plugins.emit` | `emit_native` | `agent_session/tools.rs:254`, `:285`, `:308`; `notifications.rs:714` | O | wired |
-| `tool_execution_end` | `emit_extension_lazy` | `emit_native` | `agent/agent_loop.rs:1344`, `:1670` | O | wired |
-| `tool_call` | `dispatch_hosted_event` | `plugins.emit` | `agent/tool_execution.rs:1382` | B, M (input) | wired |
-| `tool_result` | `dispatch_hosted_event` | `plugins.emit` | `agent/tool_execution.rs:1569` | T (content/details/error) | wired |
-| `model_select` | `plugins.emit` | `plugins.emit` | `agent_session/notifications.rs:483` | O | wired |
-| `thinking_level_select` | `plugins.emit` | `plugins.emit` | `agent_session/notifications.rs:518` | O | wired |
-| `user_bash` | runtime emit | `emit_native` | `agent_session/runtime_loader.rs:827` | T (operations/result) | wired |
-| `input` | `plugins.emit` | `plugins.emit` | `agent_session/prompt_input.rs:88` | T (text/images) | wired |
-| `terminal_input` | `ExtensionHandle::emit_with_timeout` (prelude `ctx.ui.onTerminalInput` list) | `PluginHost::dispatch_terminal_input` (native event; `UiService::on_terminal_input` registry first) | `tui/terminal.rs:8835` (input gate) → `plugins/host.rs:969` (`dispatch_terminal_input_with_timeout`) | B, M (consume / replace `data`) | wired (bridge for upstream `ExtensionUIContext.onTerminalInput`; one chunk per physical input; 5 ms inline decision, deferred answer with a 5 s fail-open backstop) |
-| `ui_prompt_start` | prelude `withUIPrompt` | `emit_native` | `agent_session/plugin_services.rs:1373` (native dialogs) | O | wired |
-| `ui_prompt_end` | prelude `withUIPrompt` | `emit_native` | `agent_session/plugin_services.rs:1387`, `:1407` (drop path) | O | wired |
-| `mcp_servers_change` | `js.emit` (direct handle) | `emit_native` | `plugins/builtin/mcp.rs:698` (native at `:702`) | O | wired (one copy per face; coalesced per registry rebuild) |
+| `project_trust` | runtime loader, pre-host | `emit_native` | `agent_session/runtime_loader.rs:953` (JS), `:973` (native); `agent_session/build.rs:62` | O | wired (native supplemental; host owns trust; final loads do not dispatch) |
+| `resources_discover` | `plugins.emit` | `plugins.emit` | `agent_session/session_ctx.rs:332`; print `coding_agent/print.rs:3026` | O (paths collected) | wired |
+| `session_start` | `plugins.emit` | `plugins.emit` | `agent_session/prompt_loop.rs:978`, `session_store.rs:949`; native reload `session_commands.rs:1092`; print `coding_agent/print.rs:553`, `:2851` | O | wired (reasons `startup`/`new`/`resume`/`fork`/`reload`; see deviations) |
+| `session_info_changed` | `plugins.emit` | `plugins.emit` | `agent_session/transcript.rs:143` | O | wired |
+| `session_before_switch` | `plugins.emit` | `plugins.emit` | `agent_session/session_store.rs:100` | B | wired (reason `switch`; see deviations) |
+| `session_before_fork` | `plugins.emit` | `plugins.emit` | `agent_session/session_store.rs:786` | B | wired |
+| `session_before_compact` | `plugins.emit` | `plugins.emit` | `agent_session/compact.rs:398`, `:851`, `:1752`; print `coding_agent/print.rs:5581`, `:5732` | B, T (compaction) | wired (both faces cancel/replace; print: threshold only) |
+| `session_compact` | `plugins.emit` | `plugins.emit` | `agent_session/compact.rs:545`, `:1072`, `:1272`; `prompt_loop.rs:2474`; print `coding_agent/print.rs:5093`, `:5462` | O | wired |
+| `session_compact_failed` | `plugins.emit` | `plugins.emit` | `agent_session/compact.rs:876`, `:919`, `:1138`, `:1322`; `notifications.rs:646`; print `coding_agent/print.rs:4827`, `:4857` | O | wired |
+| `session_shutdown` | actor mailbox close / reload (`extensions/handle/actor.rs:450`, `:672`) | `emit_native` for quit/reload; both faces for switch | `plugins/host.rs:3138` (`emit_session_shutdown` → `self.emit`, both faces; switch caller `agent_session/session_store.rs:117`); `plugins/host.rs:3065` (`emit_native_session_shutdown`, reload `:3203`, quit `:3247`) | O | wired (switch sees both faces; quit/reload native-only; JS actor closes its own lifecycle, never double-emitted) |
+| `session_before_tree` | `plugins.emit` | `plugins.emit` | `agent_session/session_store.rs:509` (after the read-only collection, before summarize/leaf move) | B, M, T (cancel; instructions/summary/label overrides) | wired |
+| `session_tree` | `emit_read_only_json` | `emit_read_only_json` | `agent_session/session_store.rs:297`, `:332`, `:1042` | O | wired |
+| `context` | runtime emit | `emit_native` | `agent/agent_loop.rs:286` (native at `:281`) | T (replace messages) | wired (native mutation + JS return; JS return wins) |
+| `context_with_system` | runtime emit | `emit_native` | `agent/agent_loop.rs:380` (native at `:375`) | T (messages + system prompt) | wired (native mutation + JS return; JS return wins) |
+| `cache_warming_decision` | `plugins.emit` | `plugins.emit` | `agent_session/cache_warm.rs:70` | T | wired |
+| `before_provider_request` | `plugins.emit` | `plugins.emit` | `agent_session/stream.rs:208`; print `coding_agent/print.rs:185` | R | wired (returned payload replaces) |
+| `before_provider_headers` | `plugins.emit` | `plugins.emit` | `agent_session/stream.rs:276`; print `coding_agent/print.rs:219` | M | wired per provider request (prompt, compaction/branch summary, print) before auth headers are added |
+| `after_provider_response` | `plugins.emit` | `plugins.emit` | `agent_session/stream.rs:249`; print `print.rs:212` | O | wired |
+| `provider_stream_event` | `plugins.emit` | `plugins.emit` | `agent_session/stream.rs:847`; print `coding_agent/print.rs:220` | O | wired |
+| `before_agent_start` | `plugins.emit` | `plugins.emit` | `agent_session/prompt_loop.rs:81`; print `coding_agent/print.rs:3792` | T (system prompt, injected message) | wired (print injections ride the loop preamble) |
+| `agent_start` | `emit_extension` | `emit_native` | `agent/agent_loop.rs:1432` | O | wired |
+| `agent_end` | `emit_extension_lazy` | `emit_native` | `agent/agent_loop.rs:3105` | O | wired |
+| `agent_before_settle` | `plugins.emit` | `plugins.emit` | `agent_session/settle.rs:1067`; print `coding_agent/print.rs:3963` | T (continue/entries) | wired (print re-projects the session before continuing) |
+| `agent_settled` | `plugins.emit` | `plugins.emit` | `agent_session/prompt_loop.rs:724`, `:2629`; print `coding_agent/print.rs:4057` | O | wired |
+| `turn_start` | `emit_extension` | `emit_native` | `agent/agent_loop.rs:1467`, `:1789` | O | wired |
+| `turn_end` | `plugins.emit` | `plugins.emit` | `agent_session/settle.rs:1016`; print `coding_agent/print.rs:3713` (hook builder `:1037`) | T (continue) | wired |
+| `message_start` | `emit_extension_lazy` | `emit_native` | `agent/agent_loop.rs:1826`, `:2276`, `:2689`, `:4415`, `:4496` | O | wired |
+| `message_update` | runtime direct | `emit_native` | `agent/agent_loop.rs:4204` (native), `extensions/handle/mailbox.rs:569` (JS) | O | wired (native compact by default; `wants_message_update_content` opts into `message.content`) |
+| `message_end` | runtime direct | `emit_native` | `agent/agent_loop.rs:190` (native), `:194` (JS) | T (replace message) | wired |
+| `tool_execution_start` | `emit_extension_lazy` | `emit_native` | `agent/agent_loop.rs:2222`, `:3318` | O | wired |
+| `tool_execution_update` | runtime / `plugins.emit` | `emit_native` | `agent_session/tools.rs:390`, `:422`, `:445`; `notifications.rs:981` | O | wired |
+| `tool_execution_end` | `emit_extension_lazy` | `emit_native` | `agent/agent_loop.rs:2252`, `:3369` | O | wired |
+| `tool_call` | `dispatch_hosted_event` | `plugins.emit` | `agent/tool_execution.rs:1918` | B, M (input) | wired |
+| `tool_result` | `dispatch_hosted_event` | `plugins.emit` | `agent/tool_execution.rs:2197` | T (content/details/error) | wired |
+| `model_select` | `plugins.emit` | `plugins.emit` | `agent_session/models.rs:59` | O | wired |
+| `thinking_level_select` | `plugins.emit` | `plugins.emit` | `agent_session/models.rs:211` | O | wired |
+| `user_bash` | runtime emit | `emit_native` | `agent_session/runtime_loader.rs:1057` | T (operations/result) | wired |
+| `input` | `plugins.emit` | `plugins.emit` | `agent_session/prompt_input.rs:90` (JS), `:149` (both); print `coding_agent/print.rs:3491` | T (text/images) | wired (every positional prompt) |
+| `terminal_input` | `ExtensionHandle::emit_with_timeout` (prelude `ctx.ui.onTerminalInput` list) | `PluginHost::dispatch_terminal_input` (native event; `UiService::on_terminal_input` registry first) | `tui/terminal.rs:11224` (input gate) → `tui/terminal_input.rs:479` → `plugins/host.rs:1481` (`dispatch_terminal_input_with_timeout`) | B, M (consume / replace `data`) | wired (bridge for upstream `onTerminalInput`; one chunk per physical input; 5 ms inline, 5 s deferred fail-open) |
+| `ui_prompt_start` | prelude `withUIPrompt` | `emit_native` | `agent_session/plugin_services.rs:1762` (native dialogs) | O | wired |
+| `ui_prompt_end` | prelude `withUIPrompt` | `emit_native` | `agent_session/plugin_services.rs:1779`, `:1803` (drop path) | O | wired |
+| `mcp_servers_change` | `js.emit` (direct handle) | `emit_native` | `plugins/builtin/mcp.rs:1437` (native at `:1442`) | O | wired (one copy per face; coalesced per registry rebuild) |
 
-Session-event bridge (upstream `AgentSessionEvent` names outside the
-`ExtensionEvent` union; both faces through the ordered session event queue,
-`agent_session/notifications.rs:58` / `:62`):
+`session_before_compact` is a typed outcome: `PluginEventOutcome::SessionBeforeCompact` carries
+`{cancel, compaction}` through the shared merge layer (`plugins/plugin.rs:130-145`,
+`plugins/merge.rs:197-214`), so JS and native handlers both cancel and replace; `print` consumes the
+same `dispatch_before_compact` decision (`agent_session/compact.rs:1725`).
+
+**`pir print` host.** The one-shot host drives the agent loop without an `AgentSession` but emits
+the same lifecycle through shared adapters: `session_start` (`coding_agent/print.rs`),
+`resources_discover` at startup, `input` for **every** positional prompt (`source` is print's
+historical `"rpc"`), `before_agent_start` per prompt (injected messages ride the loop preamble, so
+`message_start`/`message_end` and replacement apply), `turn_end` (`print_turn_end_hook`),
+`agent_before_settle` (`continue` re-projects the transcript so `custom_message` / `context_edit` /
+`compaction` drafts reach the next request), `session_before_compact`, `session_compact`,
+`session_compact_failed`, `agent_settled`; loop-level events reach native plugins through the host.
+
+Print limitations: compaction is **threshold-only** (`reason` always `"threshold"`), and the
+notification drain applies a safe **actionable subset** (`print.rs:850-978`): `sendMessage` steers
+into the preparing run or persists a custom message entry, `sendUserMessage` steers only while
+preparing, `appendEntry` / `setSessionName` / `setLabel` persist, and `abort` cancels the current
+run; `setModel` / `setThinkingLevel` / `compact` / `shutdown` are logged and ignored (print resolves
+model and compaction config once per invocation). Paged sessions use a **widening fallback**: print
+widens to the full resident view when threshold compaction cannot fire (`:3581-3596`) and after a
+paged compaction failure (`:5024-5052`), so the request sees the complete transcript instead of a
+truncated tail. An extension `abort` settles only the current run; later prompts continue with a
+fresh signal (`:3455-3470`, `:3691-3700`). `notify` / `status` keep their stderr diagnostic routing.
+**Print SessionEvents** feed an ordered, non-blocking plugin bridge, so
+`compaction_start`/`end`, `auto_retry_*`, `bash_execution_update`, `background_tool_end`,
+`summarization_retry_*` and `entry_appended` reach plugin handlers and the JSON stdout sink.
+
+Session-event bridge (upstream `AgentSessionEvent` names outside the `ExtensionEvent` union;
+installed for native-only, JS-only and mixed hosts — `agent_session/notifications.rs:108-115` —
+one ordered queue). Direct `agent_settled` / `entry_appended` / `session_info_changed` sites own
+both faces; the bridge skips them to avoid double delivery (`notifications.rs:147-158`). Compaction
+hooks flush the queued bridge first (`plugins/host.rs:2114`, `flush_session_event_backlog`), so both
+faces observe `compaction_start → session_before_compact → session_compact → compaction_end` (and
+`compaction_end → session_compact_failed` on failure):
 
 | Event | JS face | Native face | Source | Status |
 |---|---|---|---|---|
-| `queue_update` | `plugins.emit` | `plugins.emit` | `agent_session/events.rs:129` | wired |
-| `compaction_start` | `plugins.emit` | `plugins.emit` | `agent_session/events.rs:134` | wired |
-| `compaction_end` | `plugins.emit` | `plugins.emit` | `agent_session/events.rs:145` | wired |
-| `auto_retry_start` | `plugins.emit` | `plugins.emit` | `agent_session/events.rs:231` | wired |
-| `auto_retry_end` | `plugins.emit` | `plugins.emit` | `agent_session/events.rs:243` | wired |
-| `bash_execution_update` | `plugins.emit` | `plugins.emit` | `agent_session/events.rs:158` | wired |
-| `background_tool_end` | `plugins.emit` | `plugins.emit` | `agent_session/events.rs:181` | wired |
+| `queue_update` | `plugins.emit` | `plugins.emit` | `agent_session/queue.rs:81`; `build.rs:1117` | wired |
+| `compaction_start` | `plugins.emit` | `plugins.emit` | `agent_session/events.rs:518` | wired |
+| `compaction_end` | `plugins.emit` | `plugins.emit` | `agent_session/compact.rs:163`; `prompt_loop.rs:1875` | wired |
+| `auto_retry_start` | `plugins.emit` | `plugins.emit` | `agent_session/stream.rs:100` | wired |
+| `auto_retry_end` | `plugins.emit` | `plugins.emit` | `agent_session/stream.rs:112` | wired |
+| `bash_execution_update` | `plugins.emit` | `plugins.emit` | `agent_session/bash.rs:145` | wired |
+| `background_tool_end` | `plugins.emit` | `plugins.emit` | `agent_session/background.rs:784` | wired |
 
-Native-only presentation events (no upstream `on` counterpart; headless
-projection of `ctx.ui.*` notifications): `status`, `extension_ui_request`
-(`agent_session/notifications.rs:220`, `:347`).
+Native-only presentation events (no upstream `on` counterpart; headless projection of `ctx.ui.*`
+notifications): `status`, `extension_ui_request` (`agent_session/notifications.rs:357`, `:365`).
+
+`pi.on` is fail-closed against the central registry (`src/plugins/coverage.rs::is_known_event`; the
+prelude calls `isKnownEvent`). The accepted set is exactly `WIRED_NATIVE_EVENTS` +
+`NATIVE_ONLY_EVENTS` (`status`, `extension_ui_request`) + `SYNTHETIC_EVENTS` (`entry_appended`,
+`thinking_level_changed`, the three `summarization_retry_*` names, `run_failed`,
+`provider:refreshModels`) + hidden `TEST_ONLY_EVENTS` used by in-tree harnesses. An unknown name is
+a load-time `TypeError` (`pi.on: unknown event name ...`); custom bus events use `pi.events.on`.
 
 ## Marker blocks (machine-checked)
 
-`tests/hook_coverage.rs` requires these two blocks to match
-`src/plugins/coverage.rs` exactly (set equality, one event per line).
+`tests/hook_coverage.rs` requires both blocks to match `src/plugins/coverage.rs` exactly (set
+equality, one event per line). `WIRED_NATIVE_EVENTS` has 49 entries; `UNSUPPORTED_NATIVE_EVENTS` is
+empty.
 
 <!-- wired-native-events -->
 project_trust
@@ -152,75 +195,57 @@ background_tool_end
 
 ## TUI capability matrix
 
-Upstream `ExtensionUIContext` → pir's native `UiService` / `PluginContext`.
-The JS face is the prelude's `ctx.ui.*`; the native face is the bound
-service (`PluginContext::ui()`), with `StatusService` for status cells.
+Upstream `ExtensionUIContext` → pir's native `UiService` / `PluginContext`. JS face: the prelude's
+`ctx.ui.*`; native face: the bound service (`PluginContext::ui()`), with `StatusService` for status
+cells.
 
 | Capability | JS face | Native face | Parity / reason |
 |---|---|---|---|
-| `select` | prelude → `DialogRequest` | `UiService::select` | full; same request/reply queue, native id range |
-| `confirm` | prelude | `UiService::confirm` | full |
-| `input` | prelude | `UiService::input` | full |
-| `editor` | prelude | `UiService::editor` | full |
+| `select` / `confirm` / `input` / `editor` | prelude (`select` → `DialogRequest`) | `UiService::{select, confirm, input, editor}` | full; shared request/reply queue, native id range |
 | `notify` | `notify` host fn | `UiService::notify` | full |
-| `setStatus` | `setStatus` host fn | `StatusService::set_status` (via `ctx.status()`) | full, different accessor (status is a live cell, not a UI notification) |
-| `setWidget(key, string[])` | `setWidgetJson` | `UiService::set_widget_static` | full (static lines, above/below slots) |
-| `setWidget(key, factory)` | `widgetRenderers` round-trip | `UiService::set_widget` / `clear_widget` | wired: native factories render through the same `FactoryWidget` cache (`FactoryRendererInvoker`, native wins at the slot; removal reveals the JS factory) |
-| `setFooter(factory)` | `footerRenderers` round-trip | `UiService::set_footer` | wired: native bar factory replaces the footer; `None` restores the built-in |
-| `setHeader(factory)` | `headerRenderers` round-trip | `UiService::set_header` | wired: native bar factory replaces the header; `None` restores the built-in |
-| `setWorkingMessage` | notification | `UiService::set_working_message` | full |
-| `setWorkingVisible` | notification | `UiService::set_working_visible` | full |
-| `setWorkingIndicator` | notification | `UiService::set_working_indicator` | full |
-| `setHiddenThinkingLabel` | notification | `UiService::set_hidden_thinking_label` | full |
-| `setTitle` | notification | `UiService::set_title` | full |
-| `pasteToEditor` | notification | `UiService::paste_to_editor` | full |
+| `setStatus` | `setStatus` host fn | `StatusService::set_status` (via `ctx.status()`) | full; different accessor (live status cell, not a notification) |
+| `setWidget(key, string[] or factory)` | `setWidgetJson` / `widgetRenderers` round-trip | `UiService::set_widget_static` / `set_widget` / `clear_widget` | full for static lines; native factories render through the shared `FactoryWidget` cache (`FactoryRendererInvoker`, native wins; removal reveals the JS factory) |
+| `setFooter(factory)` / `setHeader(factory)` | `footerRenderers` / `headerRenderers` round-trip | `UiService::set_footer` / `set_header` | wired: native bar factory replaces the footer/header; `None` restores built-in |
+| `setWorkingMessage` / `setWorkingVisible` / `setWorkingIndicator` / `setHiddenThinkingLabel` | notification | `UiService::set_working_message` / `set_working_visible` / `set_working_indicator` / `set_hidden_thinking_label` | full |
+| `setTitle` / `pasteToEditor` | notification | `UiService::set_title` / `paste_to_editor` | full |
 | `setEditorText` / `getEditorText` | host fn / shared cell | `UiService::set_editor_text` / `editor_text` | full |
 | `setTheme` / `theme` / `getAllThemes` | theme registry | `UiService::set_theme` / `theme` / `themes` | full |
 | `getToolsExpanded` / `setToolsExpanded` | shared runtime cell | `UiService::tools_expanded` / `set_tools_expanded` | full (same `RuntimeState::tools_expanded` cell the TUI's Ctrl+O writes) |
-| `onTerminalInput` | prelude handler list, dispatched through the `terminal_input` bridge | `UiService::on_terminal_input` + `AgentPlugin::on_event("terminal_input")` | full: every key/mouse/paste chunk dispatches once per physical input before built-in handling; `{consume}` stops it, `{data}` replaces it; 5 ms inline wait, deferred fallback with a 5 s backstop (`PIR_TUI_TERMINAL_INPUT_BUDGET_MS`). See deviation 6 |
-| `custom` (overlay component) | async stub: emits `ui_prompt_start`/`ui_prompt_end`, returns `undefined`, warns once | not supported | **intentional deviation**: non-TUI/RPC/print match upstream (`undefined`/no-op). pir renders arbitrary JS components as dock/footer/header widgets through the existing renderer bridge, but does not host modal/overlay components with input/focus. Workaround: use `select`/`confirm`/`input`/`editor`, or the `setWidget`/`setFooter`/`setHeader` widget factories |
+| `onTerminalInput` | prelude handler list, dispatched through the `terminal_input` bridge | `UiService::on_terminal_input` + `AgentPlugin::on_event("terminal_input")` | full: each chunk dispatches once before built-in handling; `{consume}` stops, `{data}` replaces; see deviation 6 |
+| `custom` (overlay component) | prelude `custom`: builds the component and routes `uiDialog("custom")` through the shared overlay funnel (`prelude.js.txt:695`) | `UiService::custom` (`plugin_services.rs:2333`, `start_custom_overlay` `:2011`) | wired in TUI: same dialog slot/queue/deadline; components render and take input/focus, `done(value)` settles on the shared funnel. Non-UI hosts: JS `undefined`, native `capability("ui","custom")` |
 | `setEditorComponent` | recorded for `getEditorComponent` bookkeeping, never rendered | not bound | **unsupported by design**: pir's editor is a native Rust component with no byte-level editor factory seam (documented in the prelude) |
 | dialogs (`ui_prompt_start/end`) | prelude `withUIPrompt` | native `native_ui_prompt` guard | full for each native dialog (start on first poll, end exactly once on ok/cancel/timeout/error/drop) |
 
 ## Intentional deviations
 
-1. **No npm module loading.** pir embeds QuickJS and shims the SDK packages
-   (`@earendil-works/pi-coding-agent`, `pi-agent-core`, `pi-tui`, `pi-ai`,
-   …) as virtual modules; Node built-ins and arbitrary npm dependencies do
-   not resolve (`docs/packages.md`, `docs/extensions.md`). Hook *names and
-   payloads* are unaffected.
-2. **`session_start` reasons.** pir emits `startup` (first prompt / print
-   start); `new` / `resume` / `fork` are not emitted on session replacement.
-   `session_shutdown` reasons are `quit` (host teardown) and `reload`; the
-   replacement reasons are not emitted.
-3. **`session_before_switch` reason.** pir emits `switch` (storage swap);
-   upstream's `new` / `resume` split is not represented because the swap
-   API does not carry the distinction.
-4. **`session_before_tree`'s `signal` is a state snapshot.** Upstream passes
-   a live `AbortSignal`; pir's JSON wire carries `{aborted: false}` (the same
-   shape `session_before_compact` uses). Host-side Esc during branch
-   summarization remains the live cancellation seam
-   (`abort_branch_summary`).
-5. **Native dialogs' `ui_prompt_*` events go to native plugins only.** The
-   JS prelude emits the pair for JS dialogs; a native dialog is not a JS
-   prompt, so `emit_native` keeps exactly-one delivery per face. The pair is
-   per-dialog, not outermost-only (upstream's `withUIPrompt` nesting counter
-   applies to the JS face's recursive prompts).
-6. **`terminal_input` dispatch is asynchronous with a deferred decision.**
-   Upstream listeners run synchronously on the TUI input thread and can block
-   typing/rendering indefinitely. pir runs them on a dedicated thread and waits
-   **5 ms inline**; a miss holds the physical event deferred (later input
-   queues behind it, rendering continues), and the late answer applies to the
-   original chunk (`pass`/`consume`/`replace`; replacement events are
-   bypass-marked). The deferral is bounded by **5 s**
-   (`TERMINAL_INPUT_DEFER_BUDGET`, `PIR_TUI_TERMINAL_INPUT_BUDGET_MS`, positive
-   values capped at 60000, invalid/zero/negative → 5000); expiry fails open and
-   discards the late answer. The request queue is bounded (64; overflow fails
-   open; over-cap replacement 4 KiB/256 events is consumed with a diagnostic).
-   Face order: native registry → native plugin handlers → JS
-   `ctx.ui.onTerminalInput`. pir re-encodes crossterm events into canonical
-   escape spelling, so handlers matching `"!"`, `"\x1b[A"` or
-   `"\x1b[200~…\x1b[201~"` behave identically; mouse/focus reports included.
-7. **`setEditorComponent` is bookkeeping-only upstream in pir.** The JS
-   face records the factory for `getEditorComponent()` but never renders a
-   custom editor; a native equivalent is therefore not missing behavior.
+1. **No npm module loading.** QuickJS shims the SDK packages (`@earendil-works/pi-coding-agent`,
+   `pi-agent-core`, `pi-tui`, `pi-ai`, …) as virtual modules; Node built-ins and npm deps do not
+   resolve ([packages.md](packages.md), [extensions.md](extensions.md)). Hook names/payloads are unaffected.
+2. **`session_start` reasons.** `startup` (first prompt / print start), `reload` (native reload
+   face; the JS actor reloads itself), and `new`/`resume`/`fork` when storage is replaced
+   (`session_store.rs:949`); `session_shutdown` reasons: `quit`, `reload`, `switch` (storage
+   replacement, `session_store.rs:117`).
+3. **`session_before_switch` reason.** `switch` only; upstream's `new`/`resume` split rides the
+   post-swap `session_start` reason.
+4. **`session_before_tree`'s `signal` is a state snapshot.** Upstream passes a live `AbortSignal`;
+   pir's JSON wire carries `{aborted: false}` (same shape as `session_before_compact`); host-side
+   Esc during branch summarization remains the live seam (`abort_branch_summary`).
+5. **Native dialogs' `ui_prompt_*` go to native plugins only.** The JS prelude emits the pair for JS
+   dialogs; per-dialog, not outermost-only (upstream's nesting counter applies to JS recursive prompts).
+6. **`terminal_input` dispatch is asynchronous with a deferred decision.** Upstream listeners run
+   synchronously on the TUI thread and can block typing/rendering; pir runs them on a dedicated
+   thread and waits **5 ms inline**, deferring a miss (later input queues behind it) until the late
+   answer applies to the original chunk (`pass`/`consume`/`replace`; replacements bypass-marked).
+   Deferral is bounded by **5 s** (`TERMINAL_INPUT_DEFER_BUDGET`, `PIR_TUI_TERMINAL_INPUT_BUDGET_MS`;
+   positive capped at 60000, invalid/zero/negative → 5000); expiry fails open and discards the answer.
+   Request queue bounded at 64; overflow fails open; over-cap replacement (4 KiB/256 events) is
+   consumed with a diagnostic. Face order: native registry → native plugin handlers → JS
+   `ctx.ui.onTerminalInput`. Crossterm events are re-encoded into canonical escape spelling, so `"!"`,
+   `"\x1b[A"` and `"\x1b[200~…\x1b[201~"` match identically; mouse/focus included.
+7. **`setEditorComponent` is bookkeeping-only.** The JS face records the factory for
+   `getEditorComponent()` but never renders a custom editor; no native equivalent is missing.
+8. **Native `message_update` payload is compact by default, with per-plugin content opt-in.** The
+   hoisted `message` keeps scalar fields but omits cumulative `message.content` (O(delta) hot path).
+   A native plugin overrides `AgentPlugin::wants_message_update_content()` to `true`; the host
+   snapshots that at build and the loop builds the full payload per delta (O(reply)); `message_end`
+   carries the final message, and the JS face keeps full payloads.

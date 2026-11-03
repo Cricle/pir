@@ -237,6 +237,9 @@ unicode-segmentation = { version = "1.13", optional = true }
 # Clean tree: MIT, MSRV 1.92, three deps (ascii-dag, chrono, unicode-width).
 mermaid-text = { version = "0.57", optional = true }
 similar = "2"
+# SIMD newline search for session-file scanning/listing. Already in the lock as
+# a transitive dependency; promoting it to a direct edge adds no new crate.
+memchr = "2"
 unicode-normalization = "0.1"
 # Extension runtime (feature `extensions`): QuickJS + the swc transpile stack.
 rquickjs = { version = "0.14.0", features = ["futures", "loader"], optional = true }
@@ -687,6 +690,9 @@ crossterm_winapi = { version = "0.9", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
+# Heap profiling harness (`tests/startup_heap_profile.rs`, ignored by default):
+# dhat tracks every allocation site without changing the product binary.
+dhat = "0.3"
 # Provider-adapter test modernization: insta golden snapshots + proptest for
 # SSE chunk-boundary robustness (quality wave Q9).
 insta = { version = "1", features = ["json"] }
@@ -703,6 +709,10 @@ ignored = ["md-5", "openssl-sys"]
 # cargo compiles the bench under libtest and runs 0 benchmarks.
 [[bench]]
 name = "benchmark"
+harness = false
+
+[[bench]]
+name = "sdk_benchmark"
 harness = false
 
 # Size posture, measured (Q55): the default release profile is fat LTO + one

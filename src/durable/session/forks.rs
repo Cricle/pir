@@ -96,41 +96,58 @@ pub async fn prepare_fork_document_copies(
     let mut copies: Vec<ForkDocumentCopy> = Vec::new();
     collect_fork_copies(
         storage,
-        entry.entry.conversation_id,
-        DocumentPoint::Seq(at_seq),
-        DocumentFork::AsOf,
-        at_seq,
-        child_id,
-        context,
+        ForkCopyPass {
+            conversation_id: entry.entry.conversation_id,
+            at: DocumentPoint::Seq(at_seq),
+            policy: DocumentFork::AsOf,
+            at_seq,
+            child_id,
+            context,
+        },
         &mut copies,
     )
     .await?;
     collect_fork_copies(
         storage,
-        parent_conversation_id,
-        DocumentPoint::Current,
-        DocumentFork::Current,
-        at_seq,
-        child_id,
-        context,
+        ForkCopyPass {
+            conversation_id: parent_conversation_id,
+            at: DocumentPoint::Current,
+            policy: DocumentFork::Current,
+            at_seq,
+            child_id,
+            context,
+        },
         &mut copies,
     )
     .await?;
     Ok(copies)
 }
 
-/// One upstream `collectCopies` pass (`forks.ts:62-92`).
-#[allow(clippy::too_many_arguments)]
-async fn collect_fork_copies(
-    storage: &GuardedStorage,
+/// One `collectCopies` scan: the source conversation at a point, and the child
+/// the copies are planned for.
+struct ForkCopyPass<'a> {
     conversation_id: ConversationId,
     at: DocumentPoint,
     policy: DocumentFork,
     at_seq: Seq,
     child_id: ConversationId,
-    context: &Context,
+    context: &'a Context,
+}
+
+/// One upstream `collectCopies` pass (`forks.ts:62-92`).
+async fn collect_fork_copies(
+    storage: &GuardedStorage,
+    pass: ForkCopyPass<'_>,
     copies: &mut Vec<ForkDocumentCopy>,
 ) -> Result<(), StorageError> {
+    let ForkCopyPass {
+        conversation_id,
+        at,
+        policy,
+        at_seq,
+        child_id,
+        context,
+    } = pass;
     let mut cursor = None;
     loop {
         let page = storage

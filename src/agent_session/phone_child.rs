@@ -70,7 +70,10 @@ impl InlinePromptImage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InlineContent {
     pub content: JsonValue,
-    /// Tokens actually paired with an image (`min(tokens, images)`).
+    /// Tokens actually paired with a USABLE image (`data` and `mimeType`
+    /// both non-empty). Tokens that only met unusable images stay literal and
+    /// are not counted, so `plan_inline_prompt` can leave such prompts
+    /// unchanged.
     pub matched_count: usize,
 }
 
@@ -143,6 +146,10 @@ pub fn build_inline_content(text: &str, images: &[InlinePromptImage]) -> InlineC
     let mut content = Vec::new();
     let mut last_index = 0usize;
     let mut image_index = 0usize;
+    // Only pairs where the image is actually consumed count as matches:
+    // unusable images keep their token literal (and are skipped at the end),
+    // so they must not make `plan_inline_prompt` believe a prompt was built.
+    let mut matched_count = 0usize;
 
     for (index, token) in matches.iter().copied() {
         if image_index >= images.len() {
@@ -156,6 +163,7 @@ pub fn build_inline_content(text: &str, images: &[InlinePromptImage]) -> InlineC
         if image.is_usable() {
             content.push(image_part(image));
             image_index += 1;
+            matched_count += 1;
         } else {
             // Keep the token as text and retry the same image at the next
             // token (the reference's `else` branch).
@@ -178,7 +186,7 @@ pub fn build_inline_content(text: &str, images: &[InlinePromptImage]) -> InlineC
 
     InlineContent {
         content: JsonValue::Array(content),
-        matched_count: matches.len().min(images.len()),
+        matched_count,
     }
 }
 

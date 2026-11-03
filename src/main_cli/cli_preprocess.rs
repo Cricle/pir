@@ -50,14 +50,33 @@ pub(super) fn resolve_extension_paths(
     cli: &Cli,
     settings: &pir::config::settings::SettingsManager,
     project_trusted: bool,
+    app_mode: AppMode,
 ) -> ResolvedExtensionPaths {
     resolve_extension_paths_in(
         cli,
         settings,
         project_trusted,
+        app_mode,
         pir::coding_agent::context::agent_dir(),
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
     )
+}
+
+/// Whether this run's host consumes package-contributed resources.
+///
+/// `package_resources.extensions` only matters when extension discovery is
+/// on; `package_resources.themes` is only read by the interactive TUI host.
+/// Without extensions, print/RPC/JSON (and every subcommand) would still pay
+/// the package scan — which can install missing npm/git packages — for
+/// resources they never read, so only the resolved interactive TUI host scans.
+/// `app_mode` is the run's already-resolved host (`-p`, `--mode rpc/json` and
+/// the non-TTY auto-print rule are all folded in); `Command::Print` is checked
+/// separately because `pir print` on a TTY resolves to `Interactive`.
+fn package_scan_needed(cli: &Cli, app_mode: AppMode) -> bool {
+    if !cli.no_extensions {
+        return true;
+    }
+    app_mode == AppMode::Interactive && matches!(cli.command, None | Some(Command::Interactive))
 }
 
 /// [`resolve_extension_paths`] with the ambient agent/project directories
@@ -67,6 +86,7 @@ fn resolve_extension_paths_in(
     cli: &Cli,
     settings: &pir::config::settings::SettingsManager,
     project_trusted: bool,
+    app_mode: AppMode,
     agent_dir: std::path::PathBuf,
     project_dir: std::path::PathBuf,
 ) -> ResolvedExtensionPaths {
@@ -119,19 +139,21 @@ fn resolve_extension_paths_in(
         // own paths; package paths load warn-only (a Node-runtime package
         // pir's QuickJS can never load must not block startup — upstream
         // reports load errors and continues).
-        package_resources = pir::coding_agent::package_manager::resolve_package_resources(
-            settings,
-            &agent_dir,
-            &project_dir,
-            trust_project,
-        );
+        if package_scan_needed(cli, app_mode) {
+            package_resources = pir::coding_agent::package_manager::resolve_package_resources(
+                settings,
+                &agent_dir,
+                &project_dir,
+                trust_project,
+            );
+        }
 
         let mut defaults: Vec<std::path::PathBuf> = Vec::new();
         // `--no-extensions` keeps only explicit `-e` paths: every default
         // source below is dropped (`order_extension_paths(..., true)`), so
         // skip the settings/auto-directory scan instead of gathering a list
-        // that is discarded. Package resources were still collected above
-        // because themes are not extensions.
+        // that is discarded. With `--no-extensions` the package scan above
+        // ran only when the TUI host consumes its themes.
         if !cli.no_extensions {
             // One entry list per scope, like the upstream `resolve()` pass (an
             // untrusted project scope is already empty in the manager).
@@ -374,35 +396,58 @@ pub(super) fn resolve_session_dir(
 /// `-e` paths, user/global settings extensions, user auto-discovery and
 /// user-scope packages — and load it so the `project_trust` handlers can
 /// decide the project BEFORE the trust store / `defaultProjectTrust` policy
-/// is consulted. The runtime is deliberately disposable: only the recorded
-/// decision (and a `remember: true` store write) outlives it, and the host
-/// later loads the FINAL plan with the resolved trust. Upstream runs the same
-/// two passes.
+/// is consulted. Upstream runs the same two passes and reuses
+/// `preTrustExtensions.runtime` for the final set; this pass therefore returns
+/// its handle so the caller can adopt it as the LIVE runtime when the final
+/// plan is identical (see
+/// [`pir::agent_session::adopt_pre_trust_extension_runtime`]). Otherwise the
+/// handle is dropped and its mailbox-close `session_shutdown` stays
+/// suppressed: it must not look like a real session ending.
 ///
-/// No-op when the untrusted plan is empty. Load errors stay non-fatal here:
-/// the strict validation pass against the final plan reports them once with
-/// the upstream `-ne` hint.
+/// This is the ONLY pass that dispatches `project_trust` to the extension
+/// handlers: the final host loads deliberately stay silent, so each face
+/// observes the event exactly once.
+///
+/// Returns the runtime with the config it was loaded under (its plan paths
+/// live in [`pir::extensions::ExtensionHandle::path_plan`]); `None` when the
+/// untrusted plan is empty or the runtime cannot start. Load errors stay
+/// non-fatal here: the strict validation pass against the final plan reports
+/// them once with the upstream `-ne` hint.
 pub(super) async fn bootstrap_project_trust_extensions(
     cli: &Cli,
     settings: &SettingsManager,
     config: pir::extensions::ExtensionConfig,
-) {
-    let plan = resolve_extension_paths(cli, settings, false);
+    app_mode: AppMode,
+) -> Option<(
+    pir::extensions::ExtensionConfig,
+    pir::extensions::ExtensionHandle,
+)> {
+    let plan = resolve_extension_paths(cli, settings, false, app_mode);
     if plan.paths.is_empty() {
-        return;
+        return None;
     }
-    // Drop the handle immediately; the recorder in
-    // `extensions::project_trust` already holds the decision.
-    let _ = pir::agent_session::load_extension_runtime(&plan.paths, config).await;
+    let runtime =
+        pir::agent_session::load_extension_runtime_bootstrap(&plan.paths, config.clone()).await?;
+    Some((config, runtime))
 }
 
 /// The `ExtensionConfig` every CLI host uses for the strict validation load
 /// (and for the pre-trust bootstrap pass, which must match it): RPC and the
 /// interactive TUI carry a UI, print/json do not; all three receive the
 /// project cwd so `ctx.cwd` is right even before a session exists.
+///
+/// `print_output` is the ACTUAL output mode of the resolved headless host
+/// (`Text` → `"print"`, `Json` → `"json"`). The strict validation parks its
+/// runtime for the host's own load, and the handoff requires every
+/// construction field — including `mode` — to match; deriving the label from
+/// the same [`pir::coding_agent::OutputMode::extension_mode`] mapping the
+/// print host uses is what keeps `--mode json` from dropping the validation
+/// runtime (which re-ran every factory and emitted a startup
+/// `session_shutdown`).
 pub(super) fn extension_runtime_config(
     rpc_command: bool,
     interactive: bool,
+    print_output: pir::coding_agent::OutputMode,
     project_dir: &std::path::Path,
 ) -> pir::extensions::ExtensionConfig {
     if rpc_command {
@@ -420,9 +465,23 @@ pub(super) fn extension_runtime_config(
     } else {
         pir::extensions::ExtensionConfig {
             cwd: project_dir.to_path_buf(),
-            mode: "print".to_string(),
+            mode: print_output.extension_mode().to_string(),
             ..Default::default()
         }
+    }
+}
+
+/// Resolve the headless host's output mode from the entry plan's app mode.
+///
+/// `AppMode::Json` is the only JSON entry shape (`--mode json`, for both the
+/// bare CLI form and `pir print`); every other headless app mode prints text.
+/// The run uses this for the extension runtime config so `--mode json`
+/// validates/park under exactly the label the print host later requests.
+pub(super) fn headless_output_mode(app_mode: AppMode) -> pir::coding_agent::OutputMode {
+    if app_mode == AppMode::Json {
+        pir::coding_agent::OutputMode::Json
+    } else {
+        pir::coding_agent::OutputMode::Text
     }
 }
 
@@ -484,4 +543,226 @@ pub(super) fn resolve_project_trust_for_run(
         }
     })
     .trusted
+}
+
+/// Unit tests for the extension-plan host decision. `main_cli` is a binary
+/// module (not part of the `pir` library), so these cannot live under
+/// `tests/`; keeping them in the module is the only way to exercise the
+/// private resolver.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pir-cli-preprocess-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn parsed(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("pir").chain(args.iter().copied())).expect("argv")
+    }
+
+    /// `--no-extensions` skips the package scan for every headless host and
+    /// keeps it for the resolved interactive TUI (whose theme list consumes
+    /// it). The host decision uses the SAME resolved `AppMode` the run uses:
+    /// `-p`, `--mode rpc`/`json`, the non-TTY auto-print rule and the
+    /// `pir print` subcommand all count as headless.
+    #[test]
+    fn package_scan_is_skipped_only_for_headless_hosts_without_extensions() {
+        let tui = parsed(&["--no-extensions"]);
+        assert_eq!(tui.entry_plan(true, true).app_mode, AppMode::Interactive);
+        assert!(package_scan_needed(
+            &tui,
+            tui.entry_plan(true, true).app_mode
+        ));
+        // Non-TTY stdin/stdout auto-print: `Command::None` on a TTY would be
+        // interactive, but either non-TTY side downgrades it to Print.
+        assert_eq!(tui.entry_plan(false, true).app_mode, AppMode::Print);
+        assert!(!package_scan_needed(
+            &tui,
+            tui.entry_plan(false, true).app_mode
+        ));
+        assert_eq!(tui.entry_plan(true, false).app_mode, AppMode::Print);
+        assert!(!package_scan_needed(
+            &tui,
+            tui.entry_plan(true, false).app_mode
+        ));
+
+        let print_flag = parsed(&["--no-extensions", "-p"]);
+        assert_eq!(print_flag.entry_plan(true, true).app_mode, AppMode::Print);
+        assert!(!package_scan_needed(
+            &print_flag,
+            print_flag.entry_plan(true, true).app_mode
+        ));
+
+        let rpc = parsed(&["--no-extensions", "rpc"]);
+        assert!(!package_scan_needed(
+            &rpc,
+            rpc.entry_plan(true, true).app_mode
+        ));
+        let mode_rpc = parsed(&["--no-extensions", "--mode", "rpc"]);
+        assert!(!package_scan_needed(
+            &mode_rpc,
+            mode_rpc.entry_plan(true, true).app_mode
+        ));
+        // `--mode json` is a headless host even on a TTY.
+        let json = parsed(&["--no-extensions", "--mode", "json"]);
+        assert_eq!(json.entry_plan(true, true).app_mode, AppMode::Json);
+        assert!(!package_scan_needed(
+            &json,
+            json.entry_plan(true, true).app_mode
+        ));
+        // `pir print` on a TTY still resolves to Interactive; the command
+        // shape must exclude it from the theme scan.
+        let print_cmd = parsed(&["--no-extensions", "print", "hello"]);
+        assert_eq!(
+            print_cmd.entry_plan(true, true).app_mode,
+            AppMode::Interactive
+        );
+        assert!(!package_scan_needed(
+            &print_cmd,
+            print_cmd.entry_plan(true, true).app_mode
+        ));
+        // `pir interactive` keeps the scan on a TTY and skips it when piped.
+        let interactive = parsed(&["--no-extensions", "interactive"]);
+        assert!(package_scan_needed(
+            &interactive,
+            interactive.entry_plan(true, true).app_mode
+        ));
+        assert!(!package_scan_needed(
+            &interactive,
+            interactive.entry_plan(false, true).app_mode
+        ));
+
+        // Without `--no-extensions` every host keeps the scan.
+        assert!(package_scan_needed(
+            &parsed(&["-p"]),
+            parsed(&["-p"]).entry_plan(true, true).app_mode
+        ));
+    }
+
+    /// `--mode json` must validate and pre-trust under the SAME extension
+    /// runtime `mode` the print host later requests (`"json"`, not `"print"`).
+    /// A mismatch made `take_validated_extension_runtime` drop the parked
+    /// runtime: one extra factory evaluation and a startup-time
+    /// `session_shutdown`.
+    #[test]
+    fn extension_runtime_config_uses_the_print_hosts_output_mode() {
+        let dir = temp_dir("runtime-config");
+        let json = parsed(&["--mode", "json"]);
+        assert_eq!(
+            headless_output_mode(json.entry_plan(true, true).app_mode),
+            pir::coding_agent::OutputMode::Json
+        );
+        assert_eq!(
+            extension_runtime_config(
+                false,
+                false,
+                headless_output_mode(json.entry_plan(true, true).app_mode),
+                &dir,
+            )
+            .mode,
+            "json"
+        );
+
+        let print_cmd = parsed(&["print", "hello"]);
+        assert_eq!(
+            headless_output_mode(print_cmd.entry_plan(true, true).app_mode),
+            pir::coding_agent::OutputMode::Text
+        );
+        assert_eq!(
+            extension_runtime_config(
+                false,
+                false,
+                headless_output_mode(print_cmd.entry_plan(true, true).app_mode),
+                &dir,
+            )
+            .mode,
+            "print"
+        );
+
+        // RPC and interactive keep their UI-bearing labels; the print output
+        // mode is irrelevant there.
+        let rpc = extension_runtime_config(true, false, pir::coding_agent::OutputMode::Json, &dir);
+        assert_eq!(rpc.mode, "rpc");
+        assert!(rpc.has_ui);
+        let interactive =
+            extension_runtime_config(false, true, pir::coding_agent::OutputMode::Json, &dir);
+        assert_eq!(interactive.mode, "interactive");
+        assert!(interactive.has_ui);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The behavior the helper guards: a `--no-extensions -p` run leaves
+    /// `package_resources` empty (no scan, no install), while the TUI host
+    /// still collects a package's themes.
+    #[test]
+    fn no_extensions_print_skips_package_resources_while_tui_collects_themes() {
+        let root = temp_dir("packages");
+        let agent_dir = root.join("agent");
+        let project_dir = root.join("project");
+        let package_dir = root.join("theme-package");
+        std::fs::create_dir_all(package_dir.join("themes")).expect("themes dir");
+        std::fs::write(package_dir.join("themes").join("night.json"), "{}").expect("theme file");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({ "packages": [package_dir] }).to_string(),
+        )
+        .expect("settings");
+        let settings =
+            SettingsManager::load(&agent_dir, &project_dir.join(".pi"), &project_dir, false);
+
+        let print_plan = resolve_extension_paths_in(
+            &parsed(&["--no-extensions", "-p"]),
+            &settings,
+            false,
+            AppMode::Print,
+            agent_dir.clone(),
+            project_dir.clone(),
+        );
+        assert!(
+            print_plan.package_resources.extensions.is_empty()
+                && print_plan.package_resources.themes.is_empty(),
+            "the print host must not scan packages under --no-extensions"
+        );
+
+        // `--mode json` is headless even on a TTY: no package scan.
+        let json_plan = resolve_extension_paths_in(
+            &parsed(&["--no-extensions", "--mode", "json"]),
+            &settings,
+            false,
+            AppMode::Json,
+            agent_dir.clone(),
+            project_dir.clone(),
+        );
+        assert!(
+            json_plan.package_resources.extensions.is_empty()
+                && json_plan.package_resources.themes.is_empty(),
+            "the JSON host must not scan packages under --no-extensions"
+        );
+
+        let tui_plan = resolve_extension_paths_in(
+            &parsed(&["--no-extensions"]),
+            &settings,
+            false,
+            AppMode::Interactive,
+            agent_dir,
+            project_dir,
+        );
+        assert_eq!(
+            tui_plan.package_resources.themes,
+            vec![package_dir.join("themes").join("night.json")],
+            "the TUI host still needs the package theme list"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

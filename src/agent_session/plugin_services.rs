@@ -13,9 +13,9 @@
 //! |---|---|
 //! | [`SessionService`] | session `Arc`s (cwd, model/thinking cells, idle/pending cells, scoped models, tool registry) plus the plugin host's live registry |
 //! | [`MessageService`] | a bounded native-action queue on [`AgentSession`] drained by `apply_extension_notifications` through the SAME `consume_send_message` / `consume_send_user_message` / `consume_append_entry` handlers as the JS host functions; the queued payloads are byte-identical to the JS wire shapes |
-//! | [`ToolService`] | `callable_tools` from the session's merged-registry memo; `execute_tool` through `PluginHost::call_tool_with_context` with the session's live [`ToolContext`] (abort signal, session environment, nested-call executor, update channel, background flag, cwd) for plugin tools and the merged registry with the same context for core tools; image blocks survive into the returned result; `exec` as a direct subprocess with cwd/timeout/abort; `update` through the one `tool_execution_update` dispatcher |
+//! | [`ToolService`] | `callable_tools` from the session's merged-registry memo; `execute_tool` through a session-rooted [`NestedToolExecutor`] so the FIRST call runs the same scheduler/gate path as a model-issued call (`tool_call`/`tool_result` hooks, execution mode, per-file mutation queue, `background: true` detach) with the session's live abort signal, session environment and update channel; image blocks survive into the returned result; `exec` as a direct subprocess with cwd/timeout/abort; `update` through the one `tool_execution_update` dispatcher |
 //! | [`UiService`] | the JS runtime's bounded notification queue (shared with `ctx.ui.*`), bound only when that presentation sink exists; `select`/`confirm`/`input`/`editor` enqueue the SAME `DialogRequest` notification the JS host fn produces and await a one-shot reply registered on the host's native dialog cell, resolved by the SAME TUI overlay responder (`respond_dialog`'s native branch); native widget/footer/header factories write the host-scoped factory registries and emit the SAME registration/removal notifications as the JS prelude; terminal input stays on the TUI boundary |
-//! | [`ProviderService`] | the session's `Arc<ProviderRegistry>` (physical model, auth environment), the `mcp` builtin's shared registry, and the process-wide native provider-auth hook table (login/refresh/logout seam; registrations are last-wins, bounded, and removed on this binding's teardown) |
+//! | [`ProviderService`] | the session's `Arc<ProviderRegistry>` (physical model, auth environment), its plugin-owned typed-provider table, the shared dynamic overlay for runtime JSON registrations, the virtual-model overlay, the `mcp` builtin's shared registry, and the process-wide native provider-auth hook table (login/refresh/logout seam; registrations are last-wins, bounded, and removed on this binding's teardown) |
 //! | [`RendererService`] | host-owned native renderer registries (message/entry by custom type, markdown transformers in registration order, tool resolver chains + fallback); panic-isolated and exposed to the TUI through the bound context |
 //! | [`CompletionService`] | host-owned native completion registries (per-command argument providers, global autocomplete providers); `suggest` merges/dedupes in provider order and isolates panics |
 //! | [`FlagService`] | the JS runtime's flag store (CLI value > default) or the unified registry's native `FlagDef`s |
@@ -32,18 +32,37 @@
 //! TUI, one refresh path, no second cache. Native factories win at a slot the
 //! JS face also registered; removing the native registration reveals the JS
 //! one (see `tui::renderers`).
-//! `ProviderService` is read-only
-//! here: the registration mutators stay default no-ops because the session
-//! host applies provider/virtual-model definitions from the unified plugin
-//! registry at the next rebuild. On [`SessionService`], every mutator with a
+//! `ProviderService` registration and completion are live here. A typed
+//! [`ProviderBox`](crate::ai::provider::ProviderBox) registered through
+//! `register_provider_impl` lands in a plugin-owned table keyed by this
+//! binding's owner id: the registry immediately lists its models and every
+//! session stream/complete path dispatches through it, while teardown removes
+//! only this binding's slots (parent/sibling registrations of the same id are
+//! revealed again instead of being deleted). Runtime JSON
+//! `register_provider`/`unregister_provider` use the shared dynamic overlay
+//! with the same identity-checked teardown and restore the displaced entry;
+//! `register_virtual_model` writes the virtual overlay and restores the
+//! displaced registration/route callback on teardown; and `complete` projects
+//! virtual selections exactly like a session request (physical route, route
+//! callback, system prompt, token override) and streams through the session
+//! registry (resolved credentials included). Declarative
+//! [`RegistrationContext`](crate::plugins::RegistrationContext) provider
+//! definitions still flow through the unified plugin registry's next sync.
+//! On [`SessionService`], every mutator with a
 //! real backing is live: `abort` and `set_active_tools` write synchronously,
 //! while `set_model`, `set_thinking_level`, `set_session_name`, `set_label`,
 //! `compact` and `shutdown` schedule the existing async session operation on
 //! the caller's tokio runtime (never blocking the caller). `wait_for_idle`
 //! polls the run claim on a 25 ms tick. `new_session`, `fork`,
-//! `navigate_tree` and `switch_session` keep the trait defaults:
-//! they need UI/session replacement (or return values) that this trait cannot
-//! express — the missing seam, named here so no adapter fakes them.
+//! `navigate_tree` and `switch_session` are bound too: each records the SAME
+//! [`SessionCommandAction`] the JS `commandAction` host fn builds, stamped
+//! with this binding's [`SessionOrigin`], and the owning session host applies
+//! it after the handler settles
+//! ([`AgentSession::apply_session_command_actions`]). A storage-less session
+//! records nothing — its session-control plane has no storage to replace.
+//! The trait still returns `()` and carries no cancellation channel, so typed
+//! results and caller cancellation remain
+//! [`NativeSessionHost`](crate::agent_session::NativeSessionHost)'s job.
 //! `reload` IS bound: it schedules [`AgentSession::reload`], which reloads
 //! extensions, native plugins, tools, skills, prompts and themes in place
 //! without moving the session (a refusal while a run is in flight is logged).
@@ -133,17 +152,20 @@
 //!   dispatcher merges them with the JS chain (`tui::autocomplete`).
 //! - `SessionService::reload` is bound to [`AgentSession::reload`]
 //!   (fire-and-forget on the caller's runtime). `SessionService::new_session`
-//!   / `fork` / `navigate_tree` / `switch_session` stay documented no-ops by
-//!   ABI contract: the trait returns `()` (no verdict) and carries no
-//!   cancellation channel. The honest native face is
+//!   / `fork` / `navigate_tree` / `switch_session` are bound to the SAME
+//!   recording seam the JS `commandAction` host fn uses: each call queues one
+//!   [`SessionCommandAction`] stamped with this session's [`SessionOrigin`],
+//!   applied by the owning host after the handler settles
+//!   ([`AgentSession::apply_session_command_actions`]); a storage-less session
+//!   records nothing. The trait still returns `()` (no verdict) and carries
+//!   no cancellation channel, so the typed native face remains
 //!   [`crate::agent_session::NativeSessionHost`] (resolved from a
 //!   `PluginContext` with
 //!   [`native_session_host`](crate::agent_session::native_session_host)):
 //!   typed [`SessionReplacement`](crate::agent_session::SessionReplacement)
 //!   results, caller `AbortSignal` cancellation, and an explicit
 //!   `capability()` probe that reports `Unsupported` instead of a silent
-//!   success. The JS command ctx keeps its own working path
-//!   (`ctx.newSession` / `fork` / `navigateTree` / `switchSession`).
+//!   success.
 //! - Native floating `ctx.ui.custom` carries `overlayOptions`: a factory
 //!   wrapped with
 //!   [`NativeOverlayFactory`](crate::agent_session::NativeOverlayFactory)
@@ -217,12 +239,18 @@ use serde_json::Value as JsonValue;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 
-use crate::agent::nested_tool_calls::{NestedShared, NestedToolExecutor, NestedToolOutcome};
-use crate::agent::tool_batch::ToolResult as BatchToolResult;
-use crate::agent::tool_execution::{ToolContext, ToolExposure, ToolRegistry, ToolSessionEnv};
-use crate::agent_session::{AgentSession, NativeActionKind, SESSION_RUNNING};
-use crate::ai::provider::ProviderRegistry;
-use crate::ai::types::{Model, ThinkingLevel};
+use crate::agent::nested_tool_calls::{
+    NestedShared, NestedSharedConfig, NestedToolExecutor, NestedToolOutcome,
+};
+use crate::agent::tool_execution::{ToolExposure, ToolRegistry, ToolSessionEnv};
+use crate::agent_session::{
+    record_session_command_action, AgentSession, NativeActionKind, SessionCommandAction,
+    SessionOrigin, SESSION_COMPACTING, SESSION_RUNNING,
+};
+use crate::ai::provider::{ProviderBox, ProviderRegistry};
+use crate::ai::providers::RegisterDynamicProviderShared as _;
+use crate::ai::types::{AbortSignal, Model, StreamOptions, ThinkingLevel};
+use crate::ai::virtual_::VirtualModelRegistration;
 use crate::extensions::{
     ExtensionHandle, FlagValue, NativeOverlayHandle, NativeOverlayOptions, Notification,
     RendererCallOutcome, RendererOutcome, SessionContextSnapshot,
@@ -232,15 +260,16 @@ use crate::plugins::plugin::services::{
     provider_auth_hook_registry, ArgumentCompletions, AutocompleteItem, AutocompleteProvider,
     BarFactory, CancellationHandle, CommandInfo, CompletionContext, CompletionService,
     CustomMessage, DialogOptions, EntryRenderer, EventCallback, EventService, ExecOptions,
-    ExecResult, ExecuteToolOptions, ExtensionMode, FactoryRenderContext, FlagService,
-    MarkdownTransformer, MessageRenderer, MessageService, NotifyLevel, OverlayComponent,
-    OverlayComponentFactory, OverlayDone, PluginServiceError, PluginServices, ProviderAuthHooks,
-    ProviderService, RegisteredMcpServer, RendererKind, RendererService, ScopedModel, SelectOption,
-    SendMessageOptions, SendUserMessageOptions, ServiceFuture, ServiceResult, SessionService,
-    StatusEntry, StatusService, StatusSnapshot, Subscription, SystemPromptOptions, ThemeInfo,
-    ThemeSetResult, ThemeSnapshot, ToolCallRef, ToolInfo, ToolRenderRequest, ToolRendererResolver,
-    ToolService, UiService, UserContent, WidgetFactory, WidgetPlacement, WorkingIndicator,
-    CUSTOM_OVERLAY_EVENT_KEY, FACTORY_RENDER_REQUEST_KEY,
+    ExecResult, ExecuteToolOptions, ExtensionMode, FactoryRenderContext, FlagService, ForkOptions,
+    MarkdownTransformer, MessageRenderer, MessageService, NavigateTreeOptions, NewSessionOptions,
+    NotifyLevel, OverlayComponent, OverlayComponentFactory, OverlayDone, PluginServiceError,
+    PluginServices, ProviderAuthHooks, ProviderService, RegisteredMcpServer, RendererKind,
+    RendererService, ScopedModel, SelectOption, SendMessageOptions, SendUserMessageOptions,
+    ServiceFuture, ServiceResult, SessionService, StatusEntry, StatusService, StatusSnapshot,
+    Subscription, SystemPromptOptions, ThemeInfo, ThemeSetResult, ThemeSnapshot, ToolCallRef,
+    ToolInfo, ToolRenderRequest, ToolRendererResolver, ToolService, UiService, UserContent,
+    WidgetFactory, WidgetPlacement, WorkingIndicator, CUSTOM_OVERLAY_EVENT_KEY,
+    FACTORY_RENDER_REQUEST_KEY,
 };
 use crate::plugins::plugin::PluginContext;
 use crate::plugins::PluginHost;
@@ -374,7 +403,12 @@ pub(super) fn live_services(session: &AgentSession, host: &Arc<PluginHost>) -> L
         }))
         .with_providers(Arc::new(LiveProviderService {
             state: Arc::clone(&state),
+            session_key: state.provider_session_key(),
             registered_auth_hooks: Mutex::new(HashMap::new()),
+            binding_id: next_provider_binding_id(),
+            binding_lifetime: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            registered_json_providers: Mutex::new(HashMap::new()),
+            registered_virtual_models: Mutex::new(HashMap::new()),
         }))
         .with_events(state.events.clone())
         .with_status(state.status.clone())
@@ -480,6 +514,16 @@ impl LiveSessionState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .and_then(Weak::upgrade)
+    }
+
+    /// This session's provider-resolution identity in its registry (SNAP8
+    /// P2-1): the native `ProviderService` registrations and `complete` path
+    /// use the same key as the session's provider sync and request dispatch.
+    fn provider_session_key(&self) -> crate::ai::provider::ProviderSessionKey {
+        crate::ai::provider::ProviderSessionKey::new(
+            self.registry.refresh_scope_id(),
+            &self.session_state,
+        )
     }
 
     fn host(&self) -> Option<Arc<PluginHost>> {
@@ -605,6 +649,24 @@ impl LiveSessionService {
         drop(runtime.spawn(work(session)));
         true
     }
+
+    /// Record one command-context action for THIS session's host.
+    ///
+    /// Mirrors the JS `commandAction` host fn's origin stamp: the runtime's
+    /// mode plus this binding's live session id. A storage-less session has no
+    /// id, so it records nothing (the JS face refuses the same call with
+    /// `no attached session storage`); every recorded action waits for the
+    /// owning host's settle drain, exactly like a JS-face action.
+    fn record_command_action(&self, action: SessionCommandAction) {
+        let Some(session) = self.state.session() else {
+            return;
+        };
+        let Some(session_id) = session.session_id() else {
+            return;
+        };
+        let origin = SessionOrigin::for_runtime_mode(self.state.mode.as_str(), Some(session_id));
+        record_session_command_action(origin, action);
+    }
 }
 
 impl SessionService for LiveSessionService {
@@ -671,6 +733,53 @@ impl SessionService for LiveSessionService {
             if let Err(error) = session.reload().await {
                 crate::ext_diag!("[plugins] native ctx.reload() failed: {error}");
             }
+        });
+    }
+
+    /// `ctx.newSession` (native face): queue a
+    /// [`SessionCommandAction::NewSession`] stamped with this binding's
+    /// origin. The trait cannot carry a `withSession` callback token, so the
+    /// action always runs with `with_session: None`.
+    fn new_session(&self, options: NewSessionOptions) {
+        self.record_command_action(SessionCommandAction::NewSession {
+            parent_session: options.parent_session.as_deref().map(str::to_owned),
+            with_session: None,
+        });
+    }
+
+    /// `ctx.fork` (native face): queue a [`SessionCommandAction::Fork`].
+    /// `entry_id: None` is fork-at-current (new file, storage replaced);
+    /// `Some(id)` branches at the entry, with `options.position` following
+    /// upstream's `before` default when absent.
+    fn fork(&self, entry_id: Option<&str>, options: ForkOptions) {
+        self.record_command_action(SessionCommandAction::Fork {
+            entry_id: entry_id.map(str::to_owned),
+            position: options
+                .position
+                .map(|position| position.as_str().to_owned()),
+            with_session: None,
+        });
+    }
+
+    /// `ctx.navigateTree` (native face): queue a
+    /// [`SessionCommandAction::NavigateTree`], including summarization and the
+    /// post-move label.
+    fn navigate_tree(&self, target_id: &str, options: NavigateTreeOptions) {
+        self.record_command_action(SessionCommandAction::NavigateTree {
+            target_id: target_id.to_owned(),
+            summarize: options.summarize,
+            custom_instructions: options.custom_instructions,
+            replace_instructions: options.replace_instructions,
+            label: options.label,
+        });
+    }
+
+    /// `ctx.switchSession` (native face): queue a
+    /// [`SessionCommandAction::SwitchSession`] for the target session file.
+    fn switch_session(&self, path: &Path) {
+        self.record_command_action(SessionCommandAction::SwitchSession {
+            session_path: path.to_string_lossy().into_owned(),
+            with_session: None,
         });
     }
 
@@ -1119,53 +1228,46 @@ impl ToolService for LiveToolService {
             let tool_call_id = format!("{caller_id}/{sequence}");
             let started = Instant::now();
             let host = state.host();
-            // Core/session tools win the merged registry's first-name-wins
-            // precedence, so they are never routed to a same-name plugin
-            // registration.
-            let core_tool = state.tools.get(&name).is_some();
-            let plugin_tool = !core_tool
-                && host.as_ref().is_some_and(|host| {
-                    host.registry()
-                        .resolved_tools()
-                        .iter()
-                        .any(|(def, _)| def.name == name)
-                });
-            let result = if plugin_tool {
-                let host = host
-                    .as_ref()
-                    .ok_or_else(|| PluginServiceError::failed("plugin tool host is gone"))?;
-                // Reuse the host's backend dispatch: Rust plugin tools run
-                // natively, JS tools cross into QuickJS, and a failure is the
-                // host's typed error. The call carries the session's live
-                // ToolContext (not the host's cwd-only synthetic one), so a
-                // native plugin tool observes the same abort signal, session
-                // environment, nested-call capability, update channel and
-                // background flag a model-issued call receives.
-                let context =
-                    session.native_service_tool_context(&tool_call_id, options.background);
-                let outcome = host
-                    .call_tool_with_context(&name, &tool_call_id, &args, &context)
-                    .await
-                    .map_err(|error| {
-                        PluginServiceError::failed(format!("tool `{name}` failed: {error}"))
-                    })?;
-                batch_result_from_extension(outcome)
-            } else {
-                // Core/session tool: run the merged registry tool with the
-                // loop's cwd/abort/update wiring.
-                session
-                    .run_native_service_tool(&name, &args, options.background, &tool_call_id)
-                    .await
-                    .map_err(PluginServiceError::failed)?
+            // The merged registry decides existence (core and plugin tools
+            // share one first-name-wins surface) and is the registry the
+            // scheduler executes from. An absent name keeps the historical
+            // typed failure instead of a synthesized error result.
+            let registered = match host.as_ref() {
+                Some(host) => session.merged_tool_registry(host).get(&name).is_some(),
+                None => state.tools.get(&name).is_some(),
             };
+            if !registered {
+                return Err(PluginServiceError::failed(format!(
+                    "tool `{name}` is not registered by the session"
+                )));
+            }
+            // Run the first call through the SAME scheduler/gate path a
+            // model-issued call takes: `tool_call`/`tool_result` hooks in the
+            // documented plugin order, the tool's execution mode, the
+            // session's per-file mutation queues and `background: true`
+            // detach. The executor is session-rooted (no parent call) and its
+            // child sequence continues the service's session-wide counter, so
+            // `<caller>/<n>` ids stay unique when a caller reuses its id.
+            let executor = session.native_service_tool_executor(&caller_id, sequence);
+            let outcome = executor
+                .execute_with_options(
+                    &name,
+                    args,
+                    crate::agent::nested_tool_calls::ExecuteToolOptions {
+                        background: options.background,
+                    },
+                )
+                .await;
+            // A service call has no model-issued caller to consume the
+            // nested-call record; drop the root scope the executor registered
+            // instead of pinning one recorder per caller id for the session's
+            // lifetime.
+            let _ = executor.shared().take_record(&caller_id);
             let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             Ok(NestedToolOutcome {
                 tool_call_id,
-                tool_name: name,
-                is_error: result.is_error,
-                result,
                 duration_ms: Some(duration_ms),
-                usage: None,
+                ..outcome
             })
         })
     }
@@ -1199,36 +1301,6 @@ impl ToolService for LiveToolService {
         drop(runtime.spawn(async move {
             session.dispatch_native_tool_update(call, partial).await;
         }));
-    }
-}
-
-/// Map the plugin host's ordered native-call outcome onto the agent-batch
-/// result the nested outcome carries.
-///
-/// Text items become the single text body; the host's structured
-/// [`ToolCallOutcome::images`] become the batch result's `{type:"image"}`
-/// blocks; `details` / `structuredContent` are preserved only when the tool
-/// supplied them (the host stores absent values as JSON `null`).
-fn batch_result_from_extension(outcome: crate::plugins::ToolCallOutcome) -> BatchToolResult {
-    let crate::plugins::ToolCallOutcome { result, images } = outcome;
-    let crate::extensions::ToolResult {
-        content,
-        details,
-        structured_content,
-        terminate,
-    } = result;
-    BatchToolResult {
-        content: content
-            .iter()
-            .filter(|item| item.kind == "text")
-            .map(|item| item.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        images,
-        details: (!details.is_null()).then_some(details),
-        structured_content: (!structured_content.is_null()).then_some(structured_content),
-        is_error: false,
-        terminate,
     }
 }
 
@@ -1376,27 +1448,35 @@ async fn read_exec_pipe<R: tokio::io::AsyncRead + Unpin>(mut pipe: R) -> String 
 }
 
 impl AgentSession {
-    /// The [`ToolContext`] a native [`ToolService`] call runs under.
+    /// Build the [`NestedShared`] a native [`ToolService`] call executes
+    /// through.
     ///
-    /// [`ToolService::execute_tool`] carries only the caller's call id and
-    /// the per-call options (there is no context parameter on the service
-    /// trait), so the context is rebuilt from the session's live wiring —
-    /// every field a scheduled call receives:
+    /// Every field a scheduled call receives is wired from the session's live
+    /// state:
     ///
-    /// - `cwd`: the session working directory;
-    /// - `signal`: the session's live abort signal (fired by
-    ///   [`AgentSession::abort`], observed by the tool);
+    /// - the merged tool registry (core + plugin tools, first registration
+    ///   per name wins);
+    /// - the session's scheduler (execution mode, per-file mutation queues,
+    ///   background detach sink);
+    /// - `signal`: the in-flight run/compaction's abort signal (fired by
+    ///   [`AgentSession::abort`], observed by the tool). While the session is
+    ///   IDLE a fresh never-aborted signal is used instead: an abort between
+    ///   runs is a no-op for the next run, so an idle service call (bash,
+    ///   write, edit, ...) must not inherit a previously aborted slot;
     /// - `session_env`: the same model/thinking/tool/background environment
     ///   the agent loop builds for a run, so tools that spawn agent runs
     ///   (`subagent`) see the real session;
-    /// - `nested`: a nested-call executor rooted at `call_id`, so a native
-    ///   plugin tool may itself execute further tools (`<call_id>/<n>`);
-    /// - `on_update`: the live partial-result channel (TUI streaming and the
-    ///   plugin `tool_execution_update` fan-out);
-    /// - `background`: the caller's `options.background`;
-    /// - `held_mutation_keys`: empty — a service call is not a batch member
-    ///   carrying an ancestor's per-file queue locks.
-    fn native_service_tool_context(&self, call_id: &str, background: bool) -> ToolContext {
+    /// - the live partial-result channel (TUI streaming and the plugin
+    ///   `tool_execution_update` fan-out);
+    /// - the unified plugin host, installed through
+    ///   [`NestedShared::configure_plugins`], so nested `tool_call` /
+    ///   `tool_result` gates dispatch in the documented plugin order, exactly
+    ///   like a model-issued call.
+    ///
+    /// A service call has no agent-loop event sink, so the
+    /// `tool_execution_start`/`end` events it would emit are discarded; the
+    /// scheduler/gate path itself is the same.
+    fn native_service_tool_shared(&self) -> Arc<NestedShared> {
         let live_tools = match &self.plugins {
             Some(plugins) => self.merged_tool_registry(plugins),
             None => {
@@ -1405,11 +1485,21 @@ impl AgentSession {
                 Arc::new(registry)
             }
         };
-        let signal = self
-            .signal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        // The slot is only replaced by a run/compaction start and is NOT
+        // reset when the run ends, so an idle caller must not read it: after
+        // an aborted run the stored signal stays aborted and would make every
+        // later native service tool (bash/write/edit/...) fail with
+        // "Operation aborted". An abort between runs is a no-op; only
+        // RUNNING/COMPACTING carry the live cancellation semantics. An idle
+        // service call therefore gets a fresh unaborted signal.
+        let signal = match self.session_state() {
+            SESSION_RUNNING | SESSION_COMPACTING => self
+                .signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            _ => AbortSignal::new(),
+        };
         let on_update = self.tool_update_channel();
         let session_env = Arc::new(ToolSessionEnv {
             provider_registry: Arc::clone(&self.registry),
@@ -1438,71 +1528,43 @@ impl AgentSession {
             )
                 as Arc<dyn crate::agent::tool_execution::BackgroundControl>),
         });
-        // A service call has no agent-loop event sink, so nested calls it
-        // makes run without `tool_execution_start`/`end` observers; the
-        // executor still routes through the session's scheduler (gates,
-        // lanes, detach sink) and carries the session environment.
         let sink: crate::agent::nested_tool_calls::NestedEventSink =
             Arc::new(|_event| Box::pin(async {}));
-        let shared = NestedShared::new(
-            Arc::clone(&live_tools),
-            self.scheduler.clone(),
-            None,
-            self.extensions.clone(),
-            self.cwd.clone(),
-            Some(signal.clone()),
-            true,
+        let shared = NestedShared::new(NestedSharedConfig {
+            registry: Arc::clone(&live_tools),
+            scheduler: self.scheduler.clone(),
+            hooks: None,
+            extensions: self.extensions.clone(),
+            cwd: self.cwd.clone(),
+            signal: Some(signal),
+            sequential: true,
             sink,
-            Some(Arc::clone(&session_env)),
-            None,
-        );
+            session_env: Some(Arc::clone(&session_env)),
+            callable: None,
+        });
         // Install the unified host so nested `tool_call`/`tool_result` gates
         // dispatch in the documented plugin order, exactly like a
         // model-issued call.
         if let Some(plugins) = &self.plugins {
             shared.configure_plugins(Some(Arc::clone(plugins)), None);
         }
-        let nested = NestedToolExecutor::root(shared).for_call(call_id);
-        ToolContext {
-            cwd: self.cwd.clone(),
-            signal: Some(signal),
-            nested: Some(Arc::new(nested)),
-            session_env: Some(session_env),
-            held_mutation_keys: None,
-            on_update,
-            background,
-        }
+        shared
     }
 
-    /// Run one CORE/session tool from the merged registry for the native
-    /// [`ToolService`] (plugin-registered tools go through
-    /// [`PluginHost::call_tool_with_context`] instead).
+    /// A session-rooted [`NestedToolExecutor`] for one native [`ToolService`]
+    /// call.
     ///
-    /// The context is [`Self::native_service_tool_context`] — the same
-    /// abort/session/update/background wiring a scheduled call gets. There
-    /// is no batch scheduler here, so `background` only marks the context
-    /// (shell tools use it to skip the settings timeout) rather than
-    /// detaching the call.
-    pub(crate) async fn run_native_service_tool(
-        &self,
-        name: &str,
-        args: &JsonValue,
-        background: bool,
-        call_id: &str,
-    ) -> Result<BatchToolResult, String> {
-        let registry = match &self.plugins {
-            Some(plugins) => self.merged_tool_registry(plugins),
-            None => {
-                let mut registry = (*self.tools).clone();
-                registry.remove_exposure(ToolExposure::Hidden);
-                Arc::new(registry)
-            }
-        };
-        let Some(tool) = registry.get(name) else {
-            return Err(format!("tool `{name}` is not registered by the session"));
-        };
-        let context = self.native_service_tool_context(call_id, background);
-        Ok(tool.run(args, &context).await)
+    /// The executor is a top-level call (no parent tool): running
+    /// [`NestedToolExecutor::execute_with_options`] on it applies the same
+    /// scheduler/gate path a model-issued call receives — `tool_call` /
+    /// `tool_result` hooks, execution mode, the session's per-file mutation
+    /// queue and `background: true` detach. `sequence` seeds the call id
+    /// counter with the service's session-wide next value, preserving the
+    /// `<caller_id>/<n>` ids the pre-scheduler implementation minted even when
+    /// a caller reuses its id.
+    fn native_service_tool_executor(&self, caller_id: &str, sequence: u64) -> NestedToolExecutor {
+        NestedToolExecutor::root(self.native_service_tool_shared())
+            .for_call_with_child_sequence(caller_id, sequence)
     }
 }
 
@@ -1965,8 +2027,10 @@ fn string_dialog_reply(reply: Option<JsonValue>) -> Option<String> {
 /// registers its option bag during `create`; it is consumed immediately after
 /// the factory returns, which lets the EXISTING trait method float without
 /// extending its signature.
-#[allow(clippy::too_many_arguments)]
-fn start_custom_overlay(
+/// One `ui.custom` request's inputs: the runtime handle, the plugin host, the
+/// UI state, and the overlay spec (`options` + optional pre-allocated
+/// `handle`).
+struct CustomOverlayRequest {
     js: Option<ExtensionHandle>,
     host: Option<Arc<PluginHost>>,
     has_ui: bool,
@@ -1975,7 +2039,21 @@ fn start_custom_overlay(
     timeout: Option<Duration>,
     overlay: Option<NativeOverlayOptions>,
     handle: Option<NativeOverlayHandle>,
+}
+
+fn start_custom_overlay(
+    request: CustomOverlayRequest,
 ) -> ServiceFuture<'static, ServiceResult<Option<JsonValue>>> {
+    let CustomOverlayRequest {
+        js,
+        host,
+        has_ui,
+        registries,
+        factory,
+        timeout,
+        overlay,
+        handle,
+    } = request;
     let Some(queue) = js else {
         return Box::pin(async move { Err(PluginServiceError::capability("ui", "custom")) });
     };
@@ -2107,16 +2185,16 @@ pub(crate) fn native_custom_overlay_request(
         return Box::pin(async move { Err(PluginServiceError::capability("ui", "custom")) });
     };
     let registries = shared_native_registries(&host);
-    start_custom_overlay(
+    start_custom_overlay(CustomOverlayRequest {
         js,
-        Some(host),
+        host: Some(host),
         has_ui,
         registries,
         factory,
         timeout,
-        Some(options),
-        Some(handle),
-    )
+        overlay: Some(options),
+        handle: Some(handle),
+    })
 }
 
 impl UiService for LiveUiService {
@@ -2296,16 +2374,16 @@ impl UiService for LiveUiService {
         // Floating options ride the factory when it is a native
         // `NativeOverlayFactory` (see `start_custom_overlay`); without one the
         // long-standing editor-slot default is unchanged.
-        start_custom_overlay(
-            self.js().cloned(),
-            self.state.host(),
-            self.state.has_ui,
-            Arc::clone(&self.state.factories),
+        start_custom_overlay(CustomOverlayRequest {
+            js: self.js().cloned(),
+            host: self.state.host(),
+            has_ui: self.state.has_ui,
+            registries: Arc::clone(&self.state.factories),
             factory,
-            options.timeout,
-            None,
-            None,
-        )
+            timeout: options.timeout,
+            overlay: None,
+            handle: None,
+        })
     }
 
     fn set_title(&self, title: &str) {
@@ -2523,8 +2601,23 @@ impl UiService for LiveUiService {
 // ProviderService
 // ---------------------------------------------------------------------------
 
+/// Process-unique owner id for one live provider service binding.
+///
+/// The provider registry keys typed registrations by this value, so two
+/// sessions sharing a registry (parent + subagent child, or two SDK sessions)
+/// can register the same provider id and each teardown removes only its own
+/// slot.
+fn next_provider_binding_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 struct LiveProviderService {
     state: Arc<LiveSessionState>,
+    /// This binding's provider-resolution identity: runtime JSON/typed
+    /// registrations are visible only to requests/lookups made for the same
+    /// session while it is alive (SNAP8 P2-1).
+    session_key: crate::ai::provider::ProviderSessionKey,
     /// The native auth hooks this binding registered, kept for teardown.
     ///
     /// The process-wide [`provider_auth_hook_registry`] is the lookup table
@@ -2532,9 +2625,131 @@ struct LiveProviderService {
     /// dropping the binding removes exactly its registrations (never a newer
     /// session's last-wins replacement).
     registered_auth_hooks: Mutex<HashMap<String, Arc<dyn ProviderAuthHooks>>>,
+    /// Owner key for the registry's plugin-owned typed provider table. Every
+    /// `register_provider_impl` call installs under this id; teardown removes
+    /// exactly this owner's entries.
+    binding_id: u64,
+    /// Liveness token for this binding's runtime JSON/virtual installations.
+    /// The restore chains in `providers.rs` record a `Weak` to it, so a chain
+    /// node installed by a binding that has already torn down is skipped
+    /// instead of being restored as a dead parent (the same owner rule the
+    /// SNAP7 session stamps use).
+    binding_lifetime: Arc<std::sync::atomic::AtomicU8>,
+    /// Runtime JSON registrations (`register_provider`) this binding installed
+    /// into the shared dynamic overlay, with the restore chain each
+    /// installation displaced. The map is last-writer-wins across sessions,
+    /// so teardown removes/restores an entry only while it is still the exact
+    /// allocation this binding installed (SNAP7's owner/chained-previous
+    /// pattern, extended to native bindings).
+    registered_json_providers: Mutex<HashMap<String, JsonProviderInstallation>>,
+    /// Virtual models this binding installed, keyed by `(provider, id)`, with
+    /// the registration and route-callback restore chain each one displaced.
+    /// Teardown restores the nearest still-live owner's entry instead of
+    /// leaving the key empty or resurrecting a finished one.
+    registered_virtual_models: Mutex<HashMap<(String, String), VirtualModelInstallation>>,
+}
+
+/// One runtime JSON provider installation plus the dynamic-map restore chain
+/// it displaced. Each node is a STRONG provider reference: once this binding
+/// overwrites the shared map, only the chain keeps the displaced allocations
+/// alive until teardown restores the nearest live one.
+#[derive(Clone)]
+struct JsonProviderInstallation {
+    installed: std::sync::Weak<dyn crate::ai::provider::Provider>,
+    previous: Vec<super::providers::PreviousProvider>,
+}
+
+/// One virtual-model installation plus the registration / route-callback
+/// restore chain it displaced. Restoring both keeps a parent or JS definition
+/// fully visible after a child/sibling unregisters the same `(provider, id)`
+/// key, while skipping owners that already tore down.
+#[derive(Clone)]
+struct VirtualModelInstallation {
+    registration: VirtualModelRegistration,
+    previous: Vec<super::providers::PreviousVirtualModel>,
 }
 
 impl LiveProviderService {
+    /// Undo one runtime JSON installation: restore the displaced dynamic
+    /// entry when this binding's allocation is still current, or remove the
+    /// entry when it displaced nothing. A later JS/parent/sibling
+    /// registration wins over the restore (identity check inside the
+    /// registry).
+    fn restore_json_provider(&self, id: &str, installation: &JsonProviderInstallation) {
+        // Remove this binding's ownership record FIRST (one-shot teardown),
+        // then resolve the chain: every node whose session/binding already
+        // finished is skipped and only the nearest live displaced entry is
+        // restored; an all-dead chain removes the key.
+        super::providers::forget_native_dynamic_installation(
+            &self.state.registry,
+            &self.binding_lifetime,
+            id,
+        );
+        let previous = super::providers::resolve_previous_provider(id, &installation.previous);
+        let _ = self
+            .state
+            .registry
+            .restore_dynamic_provider_shared_if_installed(
+                id,
+                &installation.installed,
+                previous.as_ref(),
+            );
+    }
+
+    /// Undo one virtual-model installation under the same ownership rule:
+    /// only while the registry still holds this binding's exact registration.
+    /// The nearest still-live displaced registration and route callback are
+    /// put back; with no live displaced entry the key (and its callback) is
+    /// removed.
+    fn restore_virtual_model(
+        &self,
+        provider: &str,
+        id: &str,
+        installation: &VirtualModelInstallation,
+    ) {
+        super::providers::forget_native_virtual_installation(
+            &self.state.registry,
+            &self.binding_lifetime,
+            provider,
+            id,
+        );
+        let current = self
+            .state
+            .registry
+            .virtual_model_registry()
+            .get(provider, id);
+        if current.as_ref() != Some(&installation.registration) {
+            return;
+        }
+        match super::providers::resolve_previous_virtual_model(&installation.previous) {
+            Some((previous, previous_route)) => {
+                match self.state.registry.register_virtual_model(previous) {
+                    Ok(()) => {
+                        // `register` leaves the callback untouched. Install
+                        // the displaced owner's callback explicitly so a
+                        // restored JS route resumes with its registration.
+                        self.state
+                            .registry
+                            .virtual_model_registry()
+                            .set_route_callback(provider, id, previous_route);
+                    }
+                    Err(error) => {
+                        crate::ext_diag!(
+                            "[ext] virtual model {provider}/{id} restore failed: {error}"
+                        );
+                        // A failed restore must not leave this binding's dead
+                        // registration paired with the previous owner's
+                        // callback (P3-REVIEW2-04).
+                        self.state.registry.unregister_virtual_model(provider, id);
+                    }
+                }
+            }
+            None => {
+                self.state.registry.unregister_virtual_model(provider, id);
+            }
+        }
+    }
+
     /// Provider ids with configured auth, under the host's permissive-empty
     /// convention (no readable environment = "cannot check", `has_auth` then
     /// answers `true`, exactly like the JS `hasConfiguredAuth`).
@@ -2655,9 +2870,127 @@ fn load_authenticated_providers(registry: &ProviderRegistry, cwd: &Path) -> Arc<
 }
 
 impl ProviderService for LiveProviderService {
+    fn register_provider(&self, id: &str, config: JsonValue) {
+        // Runtime JSON registration is applied immediately to the shared
+        // dynamic overlay (the same map JS definitions land in), so a native
+        // plugin's `registerProvider` is visible to the very next
+        // `models`/stream lookup instead of waiting for the next prompt sync.
+        let dynamic = match super::providers::runtime_dynamic_provider_config(
+            &self.state.registry,
+            id,
+            &config,
+        ) {
+            Ok(dynamic) => dynamic,
+            Err(error) => {
+                crate::ext_diag!("[ext] provider `{id}` runtime registration skipped: {error}");
+                return;
+            }
+        };
+        // Snapshot the entry this installation displaces BEFORE writing the
+        // overlay (SNAP7's previous-chain pattern). A parent/sibling or JS
+        // definition with the same id is restored on teardown instead of
+        // being lost, and the chain records each displaced owner's liveness so
+        // a parent that tore down first is skipped. When the displaced entry
+        // is this binding's own earlier allocation, the chain recorded by the
+        // FIRST install is kept so re-registering cannot make teardown
+        // restore a dead intermediate.
+        let displaced = self.state.registry.dynamic_provider(id);
+        let previous = super::providers::native_dynamic_previous_chain(
+            &self.state.registry,
+            &self.binding_lifetime,
+            id,
+            displaced.as_ref(),
+        );
+        match self
+            .state
+            .registry
+            .register_dynamic_provider_shared(id.to_owned(), dynamic)
+        {
+            Ok(provider) => {
+                super::providers::record_native_dynamic_installation(
+                    &self.state.registry,
+                    &self.binding_lifetime,
+                    id,
+                    Arc::downgrade(&provider),
+                    previous.clone(),
+                );
+                // SNAP8 P2-1: the runtime JSON/OAuth provider belongs to THIS
+                // session's overlay. Parent/sibling lookups skip the shared
+                // entry this session owns while it is alive.
+                self.state.registry.register_session_dynamic_provider(
+                    &self.session_key,
+                    id,
+                    &provider,
+                );
+                self.registered_json_providers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        id.to_owned(),
+                        JsonProviderInstallation {
+                            installed: Arc::downgrade(&provider),
+                            previous,
+                        },
+                    );
+            }
+            Err(error) => {
+                crate::ext_diag!("[ext] provider `{id}` runtime registration failed: {error}");
+            }
+        }
+    }
+
+    fn unregister_provider(&self, id: &str) {
+        // Typed registrations are owner-keyed in the plugin-owned table.
+        let _ = self
+            .state
+            .registry
+            .unregister_plugin_provider(self.binding_id, id);
+        // Runtime JSON registrations live in the shared dynamic overlay; undo
+        // this binding's installation only while it is still the exact
+        // allocation this binding installed. The displaced entry (JS
+        // definition or parent/sibling pass) is put back; a registration that
+        // replaced ours is untouched.
+        let owned = self
+            .registered_json_providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+        if let Some(installation) = owned {
+            self.restore_json_provider(id, &installation);
+            self.state
+                .registry
+                .remove_session_dynamic_provider_if_installed(
+                    &self.session_key,
+                    id,
+                    &installation.installed,
+                );
+        }
+    }
+
+    fn register_provider_impl(&self, provider: ProviderBox) {
+        // Typed providers go into the plugin-owned table keyed by this
+        // binding's owner id. Unlike the dynamic overlay, that table stacks
+        // registrations per id, so a parent/sibling sharing this registry can
+        // register the same id and neither teardown deletes the other's entry.
+        // The session tag keeps the entry invisible to other sessions
+        // (SNAP8 P2-1).
+        self.state.registry.register_plugin_provider_for_session(
+            self.binding_id,
+            &self.session_key,
+            provider,
+        );
+    }
+
     fn register_auth_hooks(&self, provider_id: &str, hooks: Arc<dyn ProviderAuthHooks>) {
         // Process-wide table (auth entry points run outside a session) plus a
         // per-binding ownership record for teardown. Last registration wins.
+        //
+        // SNAP9 residual: this table has no session dimension. While a child
+        // is alive, a child native hook registered under the same provider id
+        // shadows the parent's hook even for `login_for_session` /
+        // `resolve_auth_for`, because `ai::auth::resolve` consults the global
+        // table before the provider's own flow. Fixing it needs a
+        // session-scoped hook lookup in that module (outside this lane).
         provider_auth_hook_registry().register(provider_id, Arc::clone(&hooks));
         self.registered_auth_hooks
             .lock()
@@ -2684,6 +3017,103 @@ impl ProviderService for LiveProviderService {
         provider_auth_hook_registry().get(provider_id)
     }
 
+    fn register_virtual_model(&self, definition: JsonValue) {
+        // The per-binding source tag keeps this registration out of the
+        // plugin-registry sync's `plugin:` stale sweep and makes teardown's
+        // value comparison session-specific (two sessions registering the
+        // same provider/id never match each other's value).
+        let source = format!("native-plugin:{}", self.binding_id);
+        let registration = match VirtualModelRegistration::from_wire(&definition, &source) {
+            Ok(registration) => registration,
+            Err(error) => {
+                crate::ext_diag!("[ext] virtual model runtime registration skipped: {error}");
+                return;
+            }
+        };
+        let key = (registration.provider.clone(), registration.id.clone());
+        // Snapshot what this installation displaces before the upsert: a
+        // parent/sibling registration or a JS definition under the same key
+        // is restored when this binding unregisters. The route callback is
+        // part of the entry: the native upsert leaves it in place, so the
+        // registration below explicitly clears it while THIS binding owns the
+        // key, and the chain restores the displaced owner's callback on
+        // teardown (SNAP7 owner-chain semantics, P2-REVIEW2-02).
+        let displaced_registration = self
+            .state
+            .registry
+            .virtual_model_registry()
+            .get(&key.0, &key.1);
+        let displaced_route = self
+            .state
+            .registry
+            .virtual_model_registry()
+            .route_callback(&key.0, &key.1);
+        let previous = super::providers::native_virtual_previous_chain(
+            &self.state.registry,
+            &self.binding_lifetime,
+            &key.0,
+            &key.1,
+            displaced_registration.as_ref(),
+            displaced_route.as_ref(),
+        );
+        match self
+            .state
+            .registry
+            .register_virtual_model(registration.clone())
+        {
+            Ok(()) => {
+                // A native registration carries no route callback. Clearing
+                // the displaced callback here prevents a parent/JS route from
+                // continuing to decide this binding's requests; teardown
+                // restores it from the chain.
+                self.state
+                    .registry
+                    .virtual_model_registry()
+                    .set_route_callback(&key.0, &key.1, None);
+                super::providers::record_native_virtual_installation(
+                    &self.state.registry,
+                    &self.binding_lifetime,
+                    &key.0,
+                    &key.1,
+                    registration.clone(),
+                    previous.clone(),
+                );
+                self.registered_virtual_models
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        key,
+                        VirtualModelInstallation {
+                            registration,
+                            previous,
+                        },
+                    );
+            }
+            Err(error) => {
+                crate::ext_diag!(
+                    "[ext] virtual model `{}/{}` runtime registration failed: {error}",
+                    registration.provider,
+                    registration.id
+                );
+            }
+        }
+    }
+
+    fn unregister_virtual_model(&self, provider: &str, id: &str) {
+        let key = (provider.to_owned(), id.to_owned());
+        let owned = self
+            .registered_virtual_models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key);
+        // Restore only while the registry still holds this binding's exact
+        // registration: a JS/definition sync or a sibling that re-registered
+        // the same key keeps its value (and its route callback).
+        if let Some(installation) = owned {
+            self.restore_virtual_model(provider, id, &installation);
+        }
+    }
+
     fn physical_model(&self, provider: &str, id: &str) -> Option<Arc<Model>> {
         // The registry resolves virtual -> physical and returns the typed
         // model; one `Arc` wraps it for the ABI.
@@ -2696,6 +3126,121 @@ impl ProviderService for LiveProviderService {
     fn has_auth(&self, provider: &str) -> bool {
         let authenticated = self.authenticated_providers();
         authenticated.is_empty() || authenticated.iter().any(|id| id.as_ref() == provider)
+    }
+
+    fn complete(
+        &self,
+        model: &Model,
+        context: Arc<crate::ai::types::Context>,
+        options: crate::plugins::plugin::services::CompleteOptions,
+    ) -> ServiceFuture<'static, ServiceResult<crate::ai::types::AssistantMessage>> {
+        let registry = Arc::clone(&self.state.registry);
+        let session = self.state.session();
+        let session_key = self.session_key.clone();
+        let model = model.clone();
+        Box::pin(async move {
+            // Fail closed for a model the session registry does not know:
+            // streaming it would produce a provider-unknown error event and
+            // obscure the real boundary. Resolve this through the session
+            // when one is live: `registry.get_model` is process-global and
+            // compares against the shared last writer, so a parent/child pair
+            // registering the same provider id with different model ids made
+            // the parent's own model look "unknown" while the child was alive
+            // (SNAP9 P2-S8-3). A model installed by `register_provider_impl`
+            // is in the session's typed table, so it passes.
+            let known = match session.as_ref() {
+                Some(_) => registry
+                    .get_model_for_session(&session_key, &model.provider, &model.id)
+                    .is_some(),
+                None => registry.get_model(&model.provider, &model.id).is_some(),
+            };
+            if !known {
+                return Err(PluginServiceError::failed(format!(
+                    "providers: cannot complete unknown model {}/{} (register the provider first)",
+                    model.provider, model.id
+                )));
+            }
+
+            // A virtual model is a catalog entry, not a provider. Reuse the
+            // session request projection (`resolve_virtual_request`): static
+            // physical route, per-request `route` callback with fallback, and
+            // the registration's `systemPrompt` prepended to the context. A
+            // missing/unresolvable physical model keeps the requested model,
+            // which then fails through the normal unknown-provider path
+            // instead of silently completing something else.
+            let thinking_level = session
+                .as_ref()
+                .map(|session| session.current_thinking().to_string());
+            let mut context = context;
+            let request_model = match super::providers::resolve_virtual_request(
+                &registry,
+                &model,
+                &mut context,
+                thinking_level.as_deref(),
+            )
+            .await
+            {
+                // `resolve_virtual_request` already applies the virtual
+                // registration's `modelOverride.maxTokens` to the routed
+                // physical model — the same projection the session prompt
+                // uses, so the two paths cannot diverge.
+                Ok(Some((_registration, physical))) => physical,
+                Ok(None) => model.clone(),
+                Err(error) => {
+                    crate::ext_diag!(
+                        "[ext] virtual model {}/{} complete routing failed: {error}",
+                        model.provider,
+                        model.id
+                    );
+                    model.clone()
+                }
+            };
+            // Build the request through the session's own option path
+            // (explicit API key for THIS provider, retry knobs, session
+            // identity, provider stream hooks). `actor_hooks: false` is the
+            // `modelRegistry.complete` contract: dispatching provider hooks
+            // inline from inside a plugin call would re-enter the extension
+            // actor. Without a live session the request still runs on the
+            // registry with the caller's options.
+            let signal = options
+                .signal
+                .as_ref()
+                .map(CancellationHandle::abort_signal);
+            let mut stream_options = match &session {
+                Some(session) => {
+                    session.stream_options_with_actor_hooks(&request_model, signal, false)
+                }
+                None => StreamOptions {
+                    signal,
+                    ..StreamOptions::default()
+                },
+            };
+            if options.max_tokens.is_some() {
+                // The caller's explicit cap wins over the registration's
+                // `modelOverride.maxTokens` carried by `request_model`.
+                stream_options.max_tokens = options.max_tokens;
+            }
+            if options.temperature.is_some() {
+                stream_options.temperature = options.temperature;
+            }
+            // `stream_resolving_auth` is the session request path: it resolves
+            // auth.json/models.json/ambient credentials for THIS model's
+            // provider and dispatches keyless providers without requiring a
+            // credential. That is the same capability `modelRegistry.complete`
+            // has on the JS side.
+            let stream = registry.stream_resolving_auth_for(
+                Some(&session_key),
+                request_model,
+                context,
+                stream_options,
+            );
+            match stream.drain_and_result().await {
+                Some(message) => Ok((*message).clone()),
+                None => Err(PluginServiceError::failed(
+                    "providers: completion stream did not terminate",
+                )),
+            }
+        })
     }
 
     fn mcp_servers(&self) -> Arc<[RegisteredMcpServer]> {
@@ -2750,6 +3295,53 @@ impl Drop for LiveProviderService {
         for (provider_id, hooks) in owned {
             let _ = provider_auth_hook_registry().unregister_if(&provider_id, &hooks);
         }
+
+        // Typed providers: remove exactly this binding's owner slots. Other
+        // owners' registrations of the same id remain visible.
+        self.state
+            .registry
+            .unregister_plugin_provider_owner(self.binding_id);
+
+        // Runtime JSON registrations: identity-check the shared dynamic map so
+        // a JS definition or sibling pass that replaced the entry survives,
+        // and restore the entry this binding displaced when it is still ours.
+        let json_providers = std::mem::take(
+            &mut *self
+                .registered_json_providers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (id, installation) in json_providers {
+            self.restore_json_provider(&id, &installation);
+            self.state
+                .registry
+                .remove_session_dynamic_provider_if_installed(
+                    &self.session_key,
+                    &id,
+                    &installation.installed,
+                );
+        }
+
+        // Virtual models: value-check per installation so only this binding's
+        // exact entry is undone; the displaced registration and route
+        // callback are restored for a parent/JS definition under the same key.
+        let virtual_models = std::mem::take(
+            &mut *self
+                .registered_virtual_models
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for ((provider, id), installation) in virtual_models {
+            self.restore_virtual_model(&provider, &id, &installation);
+        }
+
+        // Defensive sweep: any ownership record this binding left outside the
+        // per-entry maps (a failed mid-registration, a future registration
+        // path) must not outlive its liveness token.
+        super::providers::forget_native_binding_installations(
+            &self.state.registry,
+            &self.binding_lifetime,
+        );
     }
 }
 

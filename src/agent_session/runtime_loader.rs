@@ -26,8 +26,9 @@ pub(super) fn load_settings_for_in(agent_dir: &Path, cwd: &Path) -> SettingsMana
 /// A validated extension runtime parked for handoff by the CLI's strict
 /// pre-validation ([`load_extension_runtime_strict`] via `main.rs`): the very
 /// runtime that proved the extension set loads is reused by the mode host so
-/// discovery, swc transpile, top-level evaluation, `project_trust` and flag
-/// application run once instead of twice.
+/// discovery, swc transpile, top-level evaluation and flag application run
+/// once instead of twice. (`project_trust` belongs to the separate disposable
+/// pre-trust bootstrap pass; neither of these loads dispatches it.)
 struct ValidatedRuntime {
     paths: Vec<PathBuf>,
     config: ExtensionConfig,
@@ -48,11 +49,61 @@ pub fn stash_validated_extension_runtime(
     let mut slot = VALIDATED_RUNTIME
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *slot = Some(ValidatedRuntime {
+    let previous = slot.replace(ValidatedRuntime {
         paths: paths.to_vec(),
         config,
         runtime,
     });
+    if let Some(previous) = previous {
+        // A replaced parked runtime also never became the live session; its
+        // teardown must stay silent for the same reason as a config mismatch.
+        previous.runtime.suppress_session_shutdown_on_drop();
+    }
+}
+
+/// Whether a parked runtime's construction config can serve a host that asks
+/// for `requested`. The resolved `model` is the one deliberate exclusion: the
+/// validation/pre-trust load does not know it yet, so it is pushed through the
+/// session snapshot at handoff, matching what a fresh host load exposes.
+pub fn extension_config_matches_for_handoff(
+    parked: &ExtensionConfig,
+    requested: &ExtensionConfig,
+) -> bool {
+    parked.mode == requested.mode
+        && parked.has_ui == requested.has_ui
+        && parked.cwd == requested.cwd
+        && parked.session_id == requested.session_id
+        && parked.system_prompt == requested.system_prompt
+        && parked.is_idle == requested.is_idle
+        && parked.limits == requested.limits
+}
+
+/// Adopt the CLI's disposable pre-trust bootstrap runtime as the LIVE host
+/// runtime.
+///
+/// Upstream `ResourceLoader.reload` passes `preTrustExtensions.runtime` into
+/// `loadFinalExtensionSet`, so the instance that observed `project_trust`
+/// continues into `session_start` and the session; its module/closure state
+/// and queued `ctx.ui` notifications are not thrown away. pir cannot append
+/// more paths to an already-loaded runtime, so the CLI adopts only when the
+/// final extension plan is exactly the bootstrap plan (same paths and
+/// construction config). Otherwise the bootstrap instance is disposed and the
+/// strict-validation runtime serves the host.
+///
+/// Re-enables the normal teardown event: this handle now represents the real
+/// session, unlike a disposable pass that is dropped after recording trust.
+pub fn adopt_pre_trust_extension_runtime(runtime: ExtensionHandle) -> ExtensionHandle {
+    runtime.allow_session_shutdown_on_drop();
+    runtime
+}
+
+/// Dispose an extension runtime that will never become the live session
+/// without letting its mailbox-close tail masquerade as a real
+/// `session_shutdown` (the duplicate strict-validation runtime when the
+/// pre-trust runtime is adopted).
+pub fn discard_extension_runtime(runtime: ExtensionHandle) {
+    runtime.suppress_session_shutdown_on_drop();
+    drop(runtime);
 }
 
 /// Take the parked validation runtime when `paths` match and every config
@@ -60,10 +111,8 @@ pub fn stash_validated_extension_runtime(
 /// one of those construction inputs: `ExtensionRuntime::new_with_state`
 /// resolves `config.limits` into `RuntimeState::limits` and applies it to the
 /// QuickJS engine, so a parked runtime built under different limits must not
-/// be reused. The resolved `model` is the one deliberate exclusion: the
-/// validation host does not know it yet, so it is pushed through the session
-/// snapshot below, matching what a fresh host load exposes. `None` (handoff
-/// absent or incompatible) keeps the caller's own load path.
+/// be reused. `None` (handoff absent or incompatible) keeps the caller's own
+/// load path.
 fn take_validated_extension_runtime(
     paths: &[PathBuf],
     config: &ExtensionConfig,
@@ -72,15 +121,16 @@ fn take_validated_extension_runtime(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let validated = slot.take()?;
-    let matches = validated.paths == paths
-        && validated.config.mode == config.mode
-        && validated.config.has_ui == config.has_ui
-        && validated.config.cwd == config.cwd
-        && validated.config.session_id == config.session_id
-        && validated.config.system_prompt == config.system_prompt
-        && validated.config.is_idle == config.is_idle
-        && validated.config.limits == config.limits;
+    let matches =
+        validated.paths == paths && extension_config_matches_for_handoff(&validated.config, config);
     if !matches {
+        // The parked runtime never became the live session (different
+        // paths/config), so its teardown must not dispatch a startup-time
+        // `session_shutdown` to its JS handlers. Before this, a `--mode json`
+        // host (whose final config used `"json"` while the validation config
+        // said `"print"`) dropped the strict runtime here and the extension
+        // observed a fake shutdown before `session_start`.
+        validated.runtime.suppress_session_shutdown_on_drop();
         return None;
     }
     if let Some(model) = &config.model {
@@ -203,13 +253,15 @@ fn summarize_extension_failure(reason: &str) -> String {
 }
 
 /// Whether the negative cache may skip paths for this load: only the one-shot
-/// headless hosts (`print` covers `--mode json`, which validates under the
-/// same `print` config). Interactive/TUI/RPC hosts never skip — an
-/// interactive session must be able to retry a fixed extension, and a
-/// long-lived RPC host should not bake a startup-time failure into its whole
-/// lifetime. `PI_EXT_RELOAD=1` forces every host through a real load.
+/// headless hosts (`print` covers both text print and `--mode json`, which
+/// validate under their host's exact extension runtime mode). Interactive/
+/// TUI/RPC hosts never skip — an interactive session must be able to retry a
+/// fixed extension, and a long-lived RPC host should not bake a startup-time
+/// failure into its whole lifetime. `PI_EXT_RELOAD=1` forces every host
+/// through a real load.
 fn extension_negative_cache_enabled(host_mode: &str) -> bool {
-    host_mode == "print" && !std::env::var_os("PI_EXT_RELOAD").is_some_and(|value| value == "1")
+    matches!(host_mode, "print" | "json")
+        && !std::env::var_os("PI_EXT_RELOAD").is_some_and(|value| value == "1")
 }
 
 /// Split the on-disk load list into (still-to-load, cached-failures): a path
@@ -319,8 +371,11 @@ pub struct ModelCatalog {
 impl ModelCatalog {
     /// Serialize the registry's current catalog (models + providers).
     pub fn from_registry(registry: &ProviderRegistry) -> Self {
-        let models: Vec<JsonValue> = registry
-            .get_models()
+        Self::from_models(registry.get_models(), registry)
+    }
+
+    fn from_models(models: Vec<Model>, registry: &ProviderRegistry) -> Self {
+        let models: Vec<JsonValue> = models
             .iter()
             .filter_map(|model| serde_json::to_value(model).ok())
             .collect();
@@ -382,6 +437,23 @@ impl ModelCatalog {
         }
     }
 
+    /// [`Self::apply`] that MOVES the serialized catalog into the runtime
+    /// instead of deep-copying it. The per-prompt session push rebuilds the
+    /// catalog only when its fingerprint changes and then applies it once, so
+    /// the cached copy is not retained: consuming the values removes the
+    /// final `Vec<Value>` clone from that path.
+    pub(crate) fn apply_owned(self, runtime: &ExtensionHandle) {
+        let Self {
+            models,
+            providers,
+            authenticated_providers,
+        } = self;
+        runtime.update_model_registry(models, providers);
+        if let Some(providers) = authenticated_providers {
+            runtime.update_authenticated_providers(providers);
+        }
+    }
+
     /// The serialized model array (`models` key of the wire snapshot).
     pub fn models(&self) -> &JsonValue {
         &self.models
@@ -417,7 +489,29 @@ pub async fn load_extension_runtime(
     paths: &[PathBuf],
     config: ExtensionConfig,
 ) -> Option<ExtensionHandle> {
-    load_extension_runtime_with_catalog(paths, config, None).await
+    load_extension_runtime_impl(paths, config, None, false).await
+}
+
+/// Load the CLI's DISPOSABLE pre-trust extension pass (upstream
+/// `ResourceLoader.loadProjectTrustExtensions`): the same loading as
+/// [`load_extension_runtime`], but
+///
+/// - `project_trust` is dispatched to the JS face here, exactly once per
+///   face — final host loads ([`load_extension_runtime`],
+///   [`load_extension_runtime_with_catalog`], the strict variants) never
+///   dispatch it;
+/// - the returned runtime is created with
+///   [`ExtensionHandle::start_disposable`], so dropping it does NOT emit
+///   `session_shutdown` to the extension handlers. That event belongs to the
+///   real session runtime, whose teardown emits it exactly once.
+///
+/// The caller is expected to drop the handle as soon as the recorded trust
+/// decision has been read (see [`crate::extensions::project_trust`]).
+pub async fn load_extension_runtime_bootstrap(
+    paths: &[PathBuf],
+    config: ExtensionConfig,
+) -> Option<ExtensionHandle> {
+    load_extension_runtime_impl(paths, config, None, true).await
 }
 
 /// [`load_extension_runtime`] with a model catalog pushed onto the runtime
@@ -432,26 +526,45 @@ pub async fn load_extension_runtime_with_catalog(
     config: ExtensionConfig,
     catalog: Option<&ModelCatalog>,
 ) -> Option<ExtensionHandle> {
+    load_extension_runtime_impl(paths, config, catalog, false).await
+}
+
+/// Shared implementation of the host and pre-trust bootstrap loads.
+///
+/// `bootstrap` selects the disposable pre-trust runtime: it dispatches
+/// `project_trust` after loading and suppresses the mailbox-close
+/// `session_shutdown`; a host load does neither.
+async fn load_extension_runtime_impl(
+    paths: &[PathBuf],
+    config: ExtensionConfig,
+    catalog: Option<&ModelCatalog>,
+    bootstrap: bool,
+) -> Option<ExtensionHandle> {
     if paths.is_empty() {
         return None;
     }
     // A CLI strict-validation handoff replaces the second full load: the
-    // parked runtime already ran discovery, transpile, top-level evaluation,
-    // `project_trust` and flag application for this exact path set. Flag
-    // application is repeated defensively (idempotent) so a future stash
-    // site that skipped it can never silently drop the CLI's `--flag=value`
-    // values.
-    if let Some(runtime) = take_validated_extension_runtime(paths, &config) {
-        let _ = apply_cli_extension_flags(Some(&runtime));
-        // The validation load ran before the host's catalog existed; push it
-        // now so handlers and later factory-free resolution see it. A factory
-        // that resolved models during that first load cannot be retroactively
-        // fixed (see `load_extension_runtime_strict`), but the consuming
-        // host's own loads do not have that limitation.
-        if let Some(catalog) = catalog {
-            catalog.apply(&runtime);
+    // parked runtime already ran discovery, transpile, top-level evaluation
+    // and flag application for this exact path set. Flag application is
+    // repeated defensively (idempotent) so a future stash site that skipped
+    // it can never silently drop the CLI's `--flag=value` values.
+    //
+    // A bootstrap load must never adopt the parked host runtime: it needs its
+    // own disposable actor (so its drop cannot shut the host runtime down) and
+    // it is the pass that owns the single `project_trust` dispatch.
+    if !bootstrap {
+        if let Some(runtime) = take_validated_extension_runtime(paths, &config) {
+            let _ = apply_cli_extension_flags(Some(&runtime));
+            // The validation load ran before the host's catalog existed; push
+            // it now so handlers and later factory-free resolution see it. A
+            // factory that resolved models during that first load cannot be
+            // retroactively fixed (see `load_extension_runtime_strict`), but
+            // the consuming host's own loads do not have that limitation.
+            if let Some(catalog) = catalog {
+                catalog.apply(&runtime);
+            }
+            return Some(runtime);
         }
-        return Some(runtime);
     }
     let cwd_display = config.cwd.display().to_string();
     // The negative-cache gate reads the host mode after `config` has moved
@@ -478,7 +591,12 @@ pub async fn load_extension_runtime_with_catalog(
         // state) and the recorded path plan the unified plugin host consumes.
         ExtensionHandle::start_plan_only(config)
     } else {
-        match ExtensionHandle::start(config) {
+        let started = if bootstrap {
+            ExtensionHandle::start_disposable(config)
+        } else {
+            ExtensionHandle::start(config)
+        };
+        match started {
             Ok(runtime) => runtime,
             Err(error) => {
                 crate::ext_diag!("[ext] failed to start the extension runtime: {error}");
@@ -521,17 +639,24 @@ pub async fn load_extension_runtime_with_catalog(
         }
         Err(error) => crate::ext_diag!("[ext] extension load failed: {error}"),
     }
-    // `project_trust`: extensions are consulted once at runtime startup and
-    // the decision is recorded process-wide; every trust consumer
-    // ([`self::load_settings_for_in`], the session snapshot, the SDK builder)
-    // reads it through
-    // [`crate::extensions::project_trust::resolve_project_trust`], ahead of
-    // the trust store / `defaultProjectTrust` policy. The CLI's pre-trust
-    // bootstrap pass calls this same loader against the untrusted plan so a
-    // handler can grant/deny the project before the final settings load; the
-    // native plugins are fanned out by their owning host once it exists (see
+    // `project_trust`: the JS face is consulted ONLY by the pre-trust
+    // bootstrap pass — exactly once per face, before the trust store /
+    // `defaultProjectTrust` policy is read. The final host loads deliberately
+    // stay silent: the bootstrap decision is recorded process-wide and every
+    // trust consumer ([`self::load_settings_for_in`], the session snapshot,
+    // the SDK builder) reads it through
+    // [`crate::extensions::project_trust::resolve_project_trust`]. Native
+    // plugins are fanned out once by their owning host (see
     // [`dispatch_project_trust`]).
-    dispatch_project_trust(Some(&runtime), None, &cwd_display).await;
+    if bootstrap {
+        // P2-EVENT3-02: this pass owns the only `project_trust` dispatch and
+        // has no presentation sink (interactive/RPC configs carry
+        // `has_ui: true`). Fail `ctx.ui.*` dialogs fast for the dispatch, then
+        // clear the flag: the same handle may be adopted as the live host.
+        runtime.set_ui_fail_fast(true);
+        dispatch_project_trust(Some(&runtime), None, &cwd_display).await;
+        runtime.set_ui_fail_fast(false);
+    }
     // Extension-registered CLI flags: apply the unknown `--flag[=value]`
     // arguments the CLI collected (registered type decides the parse). The
     // CLI entry point validates the returned diagnostics separately.
@@ -595,7 +720,6 @@ pub async fn load_extension_runtime_strict_with_catalog(
     if paths.is_empty() {
         return Ok((None, failures));
     }
-    let cwd_display = config.cwd.display().to_string();
     // The negative-cache gate reads the host mode after `config` has moved
     // into the runtime handle below.
     let config_mode = config.mode.clone();
@@ -685,17 +809,10 @@ pub async fn load_extension_runtime_strict_with_catalog(
             });
         }
     }
-    // `project_trust`: extensions are consulted once at runtime startup and
-    // the decision is recorded process-wide; every trust consumer
-    // ([`self::load_settings_for_in`], the session snapshot, the SDK builder)
-    // reads it through
-    // [`crate::extensions::project_trust::resolve_project_trust`], ahead of
-    // the trust store / `defaultProjectTrust` policy. The CLI's pre-trust
-    // bootstrap pass calls this same loader against the untrusted plan so a
-    // handler can grant/deny the project before the final settings load; the
-    // native plugins are fanned out by their owning host once it exists (see
-    // [`dispatch_project_trust`]).
-    dispatch_project_trust(Some(&runtime), None, &cwd_display).await;
+    // `project_trust` is deliberately NOT dispatched here: this is a final
+    // (host) load, and the event is owned by the CLI's pre-trust bootstrap
+    // pass ([`load_extension_runtime_bootstrap`]) so each face observes it
+    // exactly once, before trust is resolved.
     let _ = apply_cli_extension_flags(Some(&runtime));
     Ok((Some(runtime), failures))
 }
@@ -797,9 +914,10 @@ pub fn apply_cli_extension_flags(
 /// Dispatch the `project_trust` event to both plugin faces and record the
 /// decision.
 ///
-/// `runtime` is the JS face (the runtime loader consults it once at load
-/// time, before any plugin host exists). `host` is the unified plugin host
-/// built from that loaded plan: its native plugins observe the event through
+/// `runtime` is the JS face (only the disposable pre-trust bootstrap load —
+/// [`load_extension_runtime_bootstrap`] — passes it, before any plugin host
+/// exists; final host loads never dispatch this event). `host` is the unified
+/// plugin host built from the final plan: its native plugins observe it through
 /// [`crate::plugins::PluginHost::emit_native`] — the host's JS adapter is
 /// skipped, so a host that also carries the same runtime handle never
 /// dispatches the JS face twice.

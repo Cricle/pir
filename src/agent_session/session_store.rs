@@ -135,13 +135,19 @@ impl AgentSession {
         // completion that lands after the swap would persist its
         // `backgroundToolResult` frame into the NEW store (the persist closure
         // holds the session slot, not the manager), attributing a call the new
-        // transcript never made. The batch barrier is held across the abort +
-        // swap, so a completion already delivering finishes against the OLD
-        // manager (it acquired the barrier first) and none can observe the
-        // half-swapped state; `abort_all` then bumps the registry generation,
-        // so every later reservation from the old transcript delivers nothing.
+        // transcript never made. `abort_all` bumps the generation so later
+        // reservations deliver nothing. If a tool batch is already open it is
+        // the CURRENT run's own barrier (`begin_batch` is not reentrant);
+        // waiting on it here deadlocks the swap, so skip the wait — the
+        // generation bump still drops that batch's parked completions. With no
+        // batch open, take the barrier to order against an in-flight
+        // background completion.
         let tracker = self.background.commit_tracker();
-        let _swap_barrier = tracker.begin_batch().await;
+        let _swap_barrier = if tracker.batch_is_open() {
+            None
+        } else {
+            Some(tracker.wait_for_batch_boundary().await)
+        };
         let cancelled = self.background.abort_all();
         if cancelled > 0 {
             tracing::debug!(
@@ -208,17 +214,43 @@ impl AgentSession {
         // manager (fresh create / opened file / fork of the outgoing file).
         let start_reason = reason
             .unwrap_or_else(|| infer_session_start_reason(&session, old_session_file.as_deref()));
-        *slot.lock().await = session;
+        let (session_id, session_path) = {
+            let mut slot_guard = slot.lock().await;
+            *slot_guard = session;
+            // P2-02: read the replacement's identity in the SAME critical
+            // section as the assignment and refresh the cache before the
+            // (potentially transcript-sized) tree build below. Updating the
+            // cache only after the tree walk left a window in which a
+            // concurrent run start could still read the OUTGOING id from the
+            // cache while the slot already named the replacement (its sink
+            // then bound the old id and silently dropped every write). The
+            // prompt path now also binds from the manager itself, but the
+            // cached identity must never lag the slot by a whole tree build.
+            (
+                Some(slot_guard.id().to_owned()),
+                Some(slot_guard.path().to_path_buf()),
+            )
+        };
+        *self
+            .session_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = session_id;
+        *self
+            .session_path
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = session_path;
         // The transcript behind this slot changed: long-running work that
         // captured the previous generation must not persist into the new
-        // session (checked by its recording seam).
+        // session (checked by its recording seam). The per-message persistence
+        // sink is pinned to the manager identity bound at run start
+        // (settle.rs `persist_message_sink`), so it drops an in-flight old
+        // run's `message_end`/tool-result writes once this swap lands instead
+        // of appending them to the replacement transcript.
         self.session_storage_generation
             .fetch_add(1, Ordering::SeqCst);
-        let (session_id, session_path, tree, leaf_id) = {
+        let (tree, leaf_id) = {
             let identity = slot.lock().await;
             (
-                Some(identity.id().to_owned()),
-                Some(identity.path().to_path_buf()),
                 if !dispatch_tree {
                     None
                 } else if rust_consumers {
@@ -240,14 +272,6 @@ impl AgentSession {
                 identity.leaf_id().map(str::to_owned),
             )
         };
-        *self
-            .session_id
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = session_id;
-        *self
-            .session_path
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = session_path;
         // `session_tree`: the JS side merges the tree of the session that
         // just became active. `newLeafId`/`oldLeafId` follow the upstream
         // event contract (agent-session.ts:4140-4146); `summaryEntry` /
@@ -471,23 +495,52 @@ impl AgentSession {
         let mut label: Option<String> = None;
         if let Some(plugins) = &self.plugins {
             if plugins.has_handlers("session_before_tree") {
-                let mut payload = serde_json::json!({
-                    "type": "session_before_tree",
-                    "preparation": {
-                        "targetId": target_id,
-                        "oldLeafId": old_leaf_id,
-                        "commonAncestorId": collected.common_ancestor_id,
-                        "entriesToSummarize": serde_json::to_value(&collected.entries)
-                            .unwrap_or(JsonValue::Null),
-                        "userWantsSummary": summarize,
-                        "customInstructions": custom_instructions,
-                        "replaceInstructions": replace_instructions,
-                    },
-                    // Upstream passes a live `AbortSignal`; the JSON wire
-                    // carries its observable state (the same shape
-                    // `session_before_compact` uses).
-                    "signal": { "aborted": false },
-                });
+                // The entries span is serialized ONCE and moved into the
+                // preparation object; `json!` would deep-copy the whole
+                // summarized span a second time.
+                let entries_json =
+                    serde_json::to_value(&collected.entries).unwrap_or(JsonValue::Null);
+                let mut preparation = serde_json::Map::with_capacity(7);
+                preparation.insert(
+                    "targetId".to_owned(),
+                    JsonValue::String(target_id.to_owned()),
+                );
+                preparation.insert(
+                    "oldLeafId".to_owned(),
+                    old_leaf_id
+                        .as_ref()
+                        .map_or(JsonValue::Null, |id| JsonValue::String(id.clone())),
+                );
+                preparation.insert(
+                    "commonAncestorId".to_owned(),
+                    collected
+                        .common_ancestor_id
+                        .clone()
+                        .map_or(JsonValue::Null, JsonValue::String),
+                );
+                preparation.insert("entriesToSummarize".to_owned(), entries_json);
+                preparation.insert("userWantsSummary".to_owned(), JsonValue::Bool(summarize));
+                preparation.insert(
+                    "customInstructions".to_owned(),
+                    custom_instructions
+                        .as_deref()
+                        .map_or(JsonValue::Null, |text| JsonValue::String(text.to_owned())),
+                );
+                preparation.insert(
+                    "replaceInstructions".to_owned(),
+                    JsonValue::Bool(replace_instructions),
+                );
+                let mut payload_map = serde_json::Map::with_capacity(3);
+                payload_map.insert(
+                    "type".to_owned(),
+                    JsonValue::String("session_before_tree".to_owned()),
+                );
+                payload_map.insert("preparation".to_owned(), JsonValue::Object(preparation));
+                // Upstream passes a live `AbortSignal`; the JSON wire
+                // carries its observable state (the same shape
+                // `session_before_compact` uses).
+                payload_map.insert("signal".to_owned(), serde_json::json!({ "aborted": false }));
+                let mut payload = JsonValue::Object(payload_map);
                 match plugins.emit("session_before_tree", &mut payload).await {
                     Ok(outcome) => {
                         if outcome.result.get("cancel").and_then(JsonValue::as_bool) == Some(true) {
@@ -562,7 +615,12 @@ impl AgentSession {
             let signal = self.branch_summary_abort.arm();
             if !collected.entries.is_empty() {
                 let model = self.current_model();
-                let complete = self.complete_fn_for_signal(&model, signal.clone());
+                // SNAP11 P2-S8-4 residual: branch summarization is a session
+                // request like any other. Resolve the provider (and any OAuth
+                // credential refresh) through THIS session's overlay so a live
+                // subagent child sharing the registry cannot redirect the
+                // parent's `/tree` summary to its own extension runtime.
+                let complete = self.complete_fn_for_signal_session_scoped(&model, signal.clone());
                 let retry_observer = Some(self.summarization_retry_observer(
                     super::events::SummarizationRetrySource::BranchSummary,
                 ));

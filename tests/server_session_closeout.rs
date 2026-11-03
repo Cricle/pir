@@ -78,6 +78,45 @@ fn thinking_change(id: &str, parent_id: &str, level: &str) -> String {
     )
 }
 
+/// Serializes the tests in this binary that point the process-wide
+/// `PIR_SERVER_ALLOWED_ROOTS` at their own temp session dir (the attach cwd
+/// policy re-reads the variable on every call).
+static ALLOWED_ROOTS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Allows the test's temp session dir as the persisted-session cwd for as
+/// long as it is held: the header cwd written by [`write_session_file`] must
+/// pass the same `allows_cwd` check as `create` when attach reopens it, and
+/// the default configuration has no allowlist. The previous variable value is
+/// restored on drop (or the variable removed when it was unset), so an
+/// ambient CI/developer setting is not clobbered; the env lock is released
+/// afterwards.
+struct AllowedRootsGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl Drop for AllowedRootsGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("PIR_SERVER_ALLOWED_ROOTS", value),
+            None => std::env::remove_var("PIR_SERVER_ALLOWED_ROOTS"),
+        }
+    }
+}
+
+async fn allow_session_dir_as_root(dir: &Path) -> AllowedRootsGuard {
+    let lock = ALLOWED_ROOTS_ENV_LOCK.lock().await;
+    let previous = std::env::var_os("PIR_SERVER_ALLOWED_ROOTS");
+    std::env::set_var(
+        "PIR_SERVER_ALLOWED_ROOTS",
+        dir.to_string_lossy().to_string(),
+    );
+    AllowedRootsGuard {
+        _lock: lock,
+        previous,
+    }
+}
+
 /// Bind a state with the session dir and serve it in the background.
 async fn spawn_server(dir: PathBuf) -> std::net::SocketAddr {
     let state = ServerState::default().with_session_dir(dir);
@@ -99,6 +138,7 @@ fn server_error_code(error: ClientError) -> String {
 #[tokio::test]
 async fn remove_session_hides_lists_blocks_attach_deletes_file_and_broadcasts_closed() {
     let dir = temp_session_dir("remove");
+    let _allowed_roots = allow_session_dir_as_root(&dir).await;
     let session_id = "closeout-remove-target";
     let path = write_session_file(&dir, session_id, &[user_message("m1", "ma", "hello")]);
     assert!(path.exists());
@@ -185,6 +225,7 @@ async fn remove_session_hides_lists_blocks_attach_deletes_file_and_broadcasts_cl
 #[tokio::test]
 async fn remove_session_is_attachment_fenced_and_missing_sessions_are_not_found() {
     let dir = temp_session_dir("fence");
+    let _allowed_roots = allow_session_dir_as_root(&dir).await;
     let session_id = "closeout-fence-target";
     let path = write_session_file(&dir, session_id, &[user_message("m1", "ma", "hello")]);
 
@@ -241,6 +282,7 @@ async fn remove_session_is_attachment_fenced_and_missing_sessions_are_not_found(
 #[tokio::test]
 async fn reopen_restores_model_and_thinking_along_the_projection_path() {
     let dir = temp_session_dir("projection");
+    let _allowed_roots = allow_session_dir_as_root(&dir).await;
     let session_id = "closeout-projection-target";
     // Tree (file order = append order):
     //   ma(root) <- m1 <- mb <- m2   active path, leaf = m2

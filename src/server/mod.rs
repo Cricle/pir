@@ -112,6 +112,17 @@ impl Server {
     ) -> io::Result<Self> {
         security.validate()?;
         let listener = TcpListener::bind(address).await?;
+        // A non-loopback listener without authentication would let any host
+        // on the network create a session in the server's default cwd and
+        // read/write/edit there. Refuse at bind time (the listener is closed
+        // when it drops out of scope); loopback keeps token-less embedding.
+        let local_addr = listener.local_addr()?;
+        if !local_addr.ip().is_loopback() && security.auth_token.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing non-loopback bind without PIR_SERVER_AUTH_TOKEN",
+            ));
+        }
         // The state carries the policy its sessions enforce (bash exclusion,
         // caps, cwd policy); the connection layer reads the same config.
         let state = state.with_security(security.clone());
@@ -167,10 +178,21 @@ impl Server {
         .map_err(|error| io::Error::other(error.to_string()))
     }
 
-    /// Return the security config the server enforces (embedded hosts reuse
-    /// it for a matching client setup).
-    pub fn security(&self) -> &ServerSecurityConfig {
-        &self.security
+    /// Return a redacted copy of the security settings the server enforces
+    /// (embedded hosts reuse the limits and policy flags). `auth_token` is
+    /// always `None` here — the secret never leaves the server; use
+    /// [`Self::auth_required`] to test whether clients must authenticate.
+    pub fn security(&self) -> ServerSecurityConfig {
+        ServerSecurityConfig {
+            auth_token: None,
+            ..self.security.clone()
+        }
+    }
+
+    /// Whether the server requires the authentication preface (a token is
+    /// configured). The token itself is never exposed by [`Self::security`].
+    pub fn auth_required(&self) -> bool {
+        self.security.auth_token.is_some()
     }
 }
 

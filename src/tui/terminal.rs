@@ -1971,6 +1971,34 @@ struct FooterSubscriptionCache {
 struct App {
     core: TuiCore,
     chat: Arc<Mutex<ChatContainer>>,
+    /// Per-entry block cache behind `SharedChat` (see [`ChatBlockCache`]):
+    /// updated on slice installs and live-stream patches, so a content frame
+    /// re-renders only the changed entry blocks.
+    chat_blocks: Arc<Mutex<ChatBlockCache>>,
+    /// Monotone content revision of the `ChatContainer` behind `chat`.
+    /// Bumped by every path that changes what the transcript renders —
+    /// `set_entries` installs, in-place streaming patches, hide-thinking /
+    /// hidden-label toggles, tool-expansion state moves. `SharedChat` exposes
+    /// it as [`super::core::Component::content_revision`], so the frame
+    /// renderer re-renders the transcript only when this moved (a spinner
+    /// tick leaves it untouched and reuses the cached band rows).
+    chat_revision: Arc<AtomicU64>,
+    /// Monotone revision of the ENTRY LIST (not of frame-time rendering).
+    /// Bumped whenever a drained worker event may have appended, replaced or
+    /// mutated an entry (and by the in-place streaming patch / reset paths).
+    /// `TranscriptWindow` keys its payload-byte and render-identity memos on
+    /// this, so a settled transcript answers `tail_start` / `window_bytes` /
+    /// `install_key` without scanning entries, while a cursor tick does not
+    /// invalidate them.
+    transcript_epoch: Arc<AtomicU64>,
+    /// Per-entry mutations since the last transcript sync (see
+    /// [`EntryDelta`]): the cache re-reads only these entries plus appended
+    /// ones instead of revalidating the whole band on every epoch move.
+    entry_delta: EntryDelta,
+    /// Last quantized live-tool timer tick published into `chat_revision`
+    /// (pending tool blocks render an `Elapsed` tail from `Instant::now`; a
+    /// content-revision cache must still refresh them ~10x/s).
+    live_timer_tick: u64,
     editor: Arc<Editor>,
     /// Monotone revision of the editor text, bumped by every edit path
     /// (keys, paste, programmatic `set_text`). The notification drain pushes
@@ -2173,6 +2201,13 @@ struct App {
     /// their native handler through [`WorkerCommand::DispatchPluginCommand`]
     /// instead of being submitted to the model as a prompt.
     native_commands: Arc<Mutex<Vec<String>>>,
+    /// The worker's one live `AgentSession`, published once after construction
+    /// ([`WorkerEvent::AgentSessionReady`]). Session-scoped `/login`, provider
+    /// model refresh and Radius token auth resolve through this session's
+    /// provider overlay, so a live subagent child sharing the registry cannot
+    /// redirect the parent's OAuth flow. `None` before the session exists;
+    /// those callers keep the static/native path.
+    session: Option<std::sync::Weak<crate::agent_session::AgentSession>>,
     /// Cached shortcut registry (refreshed each loop iteration from `ext`).
     extension_shortcuts: Arc<Mutex<Vec<ShortcutDef>>>,
     /// Where the session storage root comes from (`/resume` and `/sessions`
@@ -2433,7 +2468,6 @@ pub fn apply_extension_status(
 }
 
 impl App {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         configured: Option<PiConfiguredModel>,
         extension_paths: &[std::path::PathBuf],
@@ -2469,7 +2503,12 @@ impl App {
 
         let terminal = super::core::Terminal::new();
         let mut core = TuiCore::new(terminal);
-        enable_raw_mode()?;
+        // FIX-B05: raw mode first, then clear the Windows console's QuickEdit
+        // flag; with it still set, a mouse selection suspends console output
+        // and freezes the TUI. Best-effort; non-Windows is a no-op. The
+        // sequence lives in `startup_terminal_modes`, so a recorder test pins
+        // the order without needing a real console (P3-新-2).
+        startup_terminal_modes(&mut RealTerminalModeOps)?;
         let mut out = std::io::stdout();
         // Upstream `tuiMode`: fullscreen (default) owns the alternate screen;
         // regular keeps the main screen so the terminal's native scrollback
@@ -2489,7 +2528,11 @@ impl App {
         // P2-6: never leak raw mode when the alternate screen is unavailable.
         if fullscreen {
             if let Err(error) = out.execute(EnterAlternateScreen) {
-                let _ = disable_raw_mode();
+                // FIX-B05: startup failed after raw mode — restore the
+                // QuickEdit flag (and the VT input bit, a no-op before the
+                // opt-in step below), or the user's console stays in the
+                // no-selection mode for the rest of the session.
+                let _ = teardown_terminal_modes(&mut RealTerminalModeOps);
                 return Err(error.into());
             }
         }
@@ -2544,9 +2587,10 @@ impl App {
         // `stdin_buffer` module docs already accept. `PIR_TUI_VT_INPUT=1`
         // opts back into upstream's mode for a future raw-byte stdin reader;
         // `cleanup_terminal` then restores the previous console mode.
-        if vt_input_opt_in(std::env::var("PIR_TUI_VT_INPUT").ok().as_deref()) {
-            let _ = super::stdin_buffer::enable_windows_vt_input();
-        }
+        enable_vt_input_if(
+            &mut RealTerminalModeOps,
+            vt_input_opt_in(std::env::var("PIR_TUI_VT_INPUT").ok().as_deref()),
+        );
 
         // Ctrl+O tool expansion, shared with the transcript blocks
         // (upstream `app.tools.expand`). When an extension runtime exists this
@@ -2566,6 +2610,14 @@ impl App {
             chat.set_tools_expanded(Arc::clone(&tools_expanded));
             Arc::new(Mutex::new(chat))
         };
+        let chat_blocks = Arc::new(Mutex::new(ChatBlockCache::new(
+            Arc::clone(&tools_expanded),
+            configured
+                .as_ref()
+                .is_some_and(|c| c.settings.hide_thinking_block.unwrap_or(false)),
+        )));
+        let chat_revision = Arc::new(AtomicU64::new(0));
+        let transcript_epoch = Arc::new(AtomicU64::new(0));
         let editor = Arc::new(Editor::new());
         let autocomplete_provider = Arc::new(CombinedAutocompleteProvider::with_builtin_commands(
             std::env::current_dir().unwrap_or_default(),
@@ -2666,7 +2718,11 @@ impl App {
             builtin: builtin_header,
             custom: Arc::clone(&factory_header),
         });
-        content.add_child(SharedChat(Arc::clone(&chat)));
+        content.add_child(SharedChat {
+            chat: Arc::clone(&chat),
+            revision: Arc::clone(&chat_revision),
+            blocks: Arc::clone(&chat_blocks),
+        });
         // Upstream `createChatViewport` wraps the document container in the
         // transcript `ScrollView`; with `scrollbar: "always"` that view renders
         // its child one column narrower and pads the freed column, which the
@@ -2848,6 +2904,11 @@ impl App {
         Ok(Self {
             core,
             chat,
+            chat_blocks,
+            chat_revision,
+            transcript_epoch,
+            entry_delta: EntryDelta::default(),
+            live_timer_tick: 0,
             editor,
             editor_rev: AtomicU64::new(0),
             raw_render_epoch: std::sync::Mutex::new(None),
@@ -2914,6 +2975,7 @@ impl App {
             ext,
             ext_dispatcher,
             native_commands: Arc::new(Mutex::new(Vec::new())),
+            session: None,
             extension_shortcuts: Arc::new(Mutex::new(Vec::new())),
             session_dir,
             scoped_refs: Arc::new(Mutex::new(Vec::new())),
@@ -2985,6 +3047,15 @@ impl App {
         let expanded = self.tools_expanded.load(Ordering::SeqCst);
         if expanded != self.tools_expanded_seen {
             self.tools_expanded_seen = expanded;
+            // Tool blocks restyle live from the shared cell; the transcript's
+            // rendered rows move without an entry edit, so publish a content
+            // revision for the frame cache AND move every per-entry block
+            // revision (the block cache cannot infer this from the entries).
+            self.chat_blocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .bump_render_epoch();
+            self.chat_revision.fetch_add(1, Ordering::Relaxed);
             applied = true;
         }
         // The shared extension handle is the same runtime the worker's
@@ -3326,7 +3397,13 @@ impl App {
                     self.chat
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .set_hidden_thinking_label(label);
+                        .set_hidden_thinking_label(label.clone());
+                    self.chat_blocks
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .set_hidden_label(label);
+                    // The label is rendered into every collapsed thinking row.
+                    self.chat_revision.fetch_add(1, Ordering::Relaxed);
                 }
                 crate::extensions::Notification::WorkingMessage(message) => {
                     // `setWorkingMessage(undefined)` arrives as the empty
@@ -3851,15 +3928,72 @@ impl App {
         reporter.reset();
     }
 
+    /// Record an in-place entry mutation for the next transcript sync. The
+    /// payload/render caches re-read only this entry instead of revalidating
+    /// the materialized band.
+    fn note_entry_changed(&mut self, index: usize) {
+        self.entry_delta.note_changed(index);
+        self.transcript_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an in-place mutation range (a streaming finalize replaces a
+    /// contiguous run, a reset can touch several entries).
+    fn note_entry_range(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        self.entry_delta.note_range(start, end);
+        self.transcript_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an append/shrink between two event-loop checkpoints.
+    fn note_entries_resized(&mut self, old_len: usize, new_len: usize) {
+        if old_len == new_len {
+            return;
+        }
+        if new_len > old_len {
+            self.entry_delta.note_appended(old_len);
+        } else {
+            self.entry_delta.note_range(new_len, old_len);
+        }
+        self.transcript_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn take_entry_delta(&mut self) -> Option<EntryDelta> {
+        let delta = std::mem::take(&mut self.entry_delta);
+        (!delta.is_empty()).then_some(delta)
+    }
+
     /// Per-token fast path: hand the final live `Streaming` entry to the
     /// retained component for an in-place text patch. False when the entry is
     /// not committed yet or the last entry is not a live stream (the caller
     /// then runs the full transcript diff).
-    fn patch_last_streaming(&mut self, entries: &[ChatEntry], window_start: usize) -> bool {
-        self.chat
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .patch_last_streaming(entries, window_start)
+    ///
+    /// The entry epoch/delta are published whether or not the retained
+    /// component accepted the patch: a refused patch (text arrived before the
+    /// first thinking delta, so the committed child has no thinking block)
+    /// still mutated the entry in place and the fallback `set_entries` pass
+    /// must observe it. `batch` carries the exact delta bytes for the block
+    /// cache's incremental update; without it the block cache falls back to
+    /// the full entry copy.
+    fn patch_last_streaming(
+        &mut self,
+        entries: &[ChatEntry],
+        window_start: usize,
+        batch: Option<&LiveStreamBatch>,
+    ) -> bool {
+        commit_live_stream_batch(
+            LiveStreamCommit {
+                chat: &self.chat,
+                chat_blocks: &self.chat_blocks,
+                entries,
+                window_start,
+            },
+            batch,
+            &mut self.entry_delta,
+            &self.transcript_epoch,
+            &self.chat_revision,
+        )
     }
 
     /// Materialize the transcript window (P0.3, see the module note above
@@ -3882,24 +4016,82 @@ impl App {
         entries: &[ChatEntry],
         window: &mut TranscriptWindow,
     ) -> bool {
+        // A pending tool block's `Elapsed` tail is derived from wall time, not
+        // from the entry payload: publish a quantized tick so the transcript
+        // row cache refreshes it even when no entry changed. The scan covers
+        // the MATERIALIZED band, not a blind last-512 tail: a tool scrolled
+        // into an older band must keep ticking, and a pending block outside
+        // the band must not invalidate the visible frame every 100 ms. The
+        // tick is computed AFTER the window plan below so a regular window
+        // that just moved uses this frame's band (no one-frame lag).
+        let delta = self.take_entry_delta();
         if !self.core.windowed_viewport() {
-            let start = regular_window_start(entries, window.start());
+            let entry_epoch = self.transcript_epoch.load(Ordering::Relaxed);
+            let start = window.regular_start_tracked_with_delta(
+                entries,
+                window.start(),
+                Some(entry_epoch),
+                delta,
+            );
             let moved = start != window.start();
             window.set_start(start);
+            let live_tick = live_tool_timer_tick(entries, start);
+            if live_tick != self.live_timer_tick {
+                self.live_timer_tick = live_tick;
+                self.chat_revision.fetch_add(1, Ordering::Relaxed);
+            }
+            self.chat_blocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_live_tick(live_tick);
             if moved && self.core.frame_buffer_length() > 0 {
                 self.core.invalidate_frame();
             }
-            self.chat
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .set_entries(&entries[start..]);
+            if window.should_install(entries, entry_epoch) {
+                self.chat
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .set_entries(&entries[start..]);
+                self.chat_blocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .set_entries(&entries[start..]);
+                self.chat_revision.fetch_add(1, Ordering::Relaxed);
+                window.mark_installed(entries, entry_epoch);
+            }
             return moved;
         }
         let mut alt = self
             .alt
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sync_windowed_band(entries, window, &mut self.core, &mut alt, &self.chat)
+        let moved = sync_windowed_band_tracked_with_epochs(
+            entries,
+            window,
+            &mut self.core,
+            &mut alt,
+            &self.chat,
+            BandSyncInputs {
+                chat_revision: Some(&self.chat_revision),
+                entry_epoch: Some(&self.transcript_epoch),
+                blocks: Some(&self.chat_blocks),
+                delta,
+            },
+        );
+        drop(alt);
+        // Use the band the sync just planned (not last frame's start) so a
+        // window that moved this frame does not leave its pending tool's
+        // Elapsed ticking one frame late.
+        let live_tick = live_tool_timer_tick(entries, window.start());
+        if live_tick != self.live_timer_tick {
+            self.live_timer_tick = live_tick;
+            self.chat_revision.fetch_add(1, Ordering::Relaxed);
+        }
+        self.chat_blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_live_tick(live_tick);
+        moved
     }
 
     /// Poll the worker-published native status snapshot
@@ -4424,9 +4616,16 @@ pub fn distinct_catalog_providers(registry: &crate::ai::provider::ProviderRegist
     ids.len()
 }
 
-/// `(provider, id)` pairs from the configured model registry (the selector
-/// and `/model <term>` matching operate on these).
+/// `(provider, id)` pairs for the selector and `/model <term>` matching.
+///
+/// The live session's registry is authoritative once the worker has published
+/// it (D8; same snapshot the session streams with) and its pairs resolve each
+/// provider through the session overlay. Before that (startup, no worker) the
+/// configured snapshot is used exactly as before.
 fn model_pairs(app: &App) -> Vec<(String, String)> {
+    if let Some(session) = live_session(app) {
+        return session.provider_model_pairs();
+    }
     app.configured
         .as_ref()
         .map(|configured| {
@@ -4438,6 +4637,25 @@ fn model_pairs(app: &App) -> Vec<(String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Refresh the live session's provider model lists through the session-aware
+/// registry entry (`AgentSession::refresh_provider_models` →
+/// `ProviderRegistry::refresh_for_session`), then return the session's current
+/// pairs. Returns `None` when no live session exists, leaving the caller on
+/// the static catalog path.
+fn refresh_session_provider_models(
+    session: &Option<std::sync::Weak<crate::agent_session::AgentSession>>,
+) -> Option<Vec<(String, String)>> {
+    let session = session.as_ref()?.upgrade()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let _ = runtime.block_on(
+        session.refresh_provider_models(crate::ai::provider::ModelsRefreshOptions::default()),
+    );
+    Some(session.provider_model_pairs())
 }
 
 /// The thinking levels the ACTIVE model supports, as wire names in ladder
@@ -4466,6 +4684,38 @@ pub fn active_thinking_levels(model: Option<&crate::ai::types::Model>) -> Vec<St
 
 fn thinking_levels_for_active_model(app: &App) -> Vec<String> {
     active_thinking_levels(app.configured.as_ref().map(|configured| &configured.model))
+}
+
+/// Apply a thinking level chosen by a command to the session and the footer.
+/// `/thinking <level>` and a `/model <ref>:<level>` suffix both come through
+/// here, so a level picked either way is validated and applied identically.
+///
+/// The level is checked against the ACTIVE model's supported ladder first:
+/// accepting a level the model maps to null would silently clamp
+/// (medium → high). `requested` is the text echoed in the rejection notice —
+/// the raw argument for `/thinking`, the level key for a `/model` suffix.
+fn apply_thinking_level_command(
+    app: &App,
+    entries: &mut Vec<ChatEntry>,
+    worker: &WorkerHandle,
+    level: crate::ai::types::ThinkingLevel,
+    requested: &str,
+) {
+    let key = level.wire_key();
+    let levels = thinking_levels_for_active_model(app);
+    if levels.iter().any(|candidate| candidate == key) {
+        worker.set_thinking(key.to_string(), true);
+        app.apply_local_thinking(key);
+    } else {
+        entries.push(ChatEntry::Notice {
+            kind: super::app::NoticeKind::Error,
+            text: format!(
+                "Unknown thinking level \"{}\". Available levels: {}.",
+                requested,
+                levels.join(", ")
+            ),
+        });
+    }
 }
 
 /// Refresh the `/model` argument candidates from the current scope (upstream
@@ -4660,6 +4910,31 @@ impl Component for ExtensionHeaderSlot {
         for line in &self.builtin {
             line.render_into(width, out);
         }
+    }
+
+    /// The header is small and its rows depend on live inputs the slot does
+    /// not otherwise model (the keybinding registry behind the built-in
+    /// hints, a registered factory header, the palette). Hash the ACTUAL
+    /// rendered rows at the cache's reference width: a few hundred bytes per
+    /// frame, and any input move (including a `/reload` keybinding swap)
+    /// invalidates the transcript wrapper's frame cache. Width is part of the
+    /// frame-cache key, so the reference width only needs to distinguish
+    /// content states.
+    fn content_revision(&self) -> Option<u64> {
+        let mut lines = Vec::new();
+        {
+            let mut rows = Rows::unmeasured(&mut lines);
+            self.render_into(256, &mut rows);
+            rows.trim();
+        }
+        let mut state = 0xcbf2_9ce4_8422_2325u64;
+        for line in &lines {
+            state = super::core::mix_content_revision(state, line.len() as u64);
+            for byte in line.bytes() {
+                state = (state ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3);
+            }
+        }
+        Some(super::core::mix_content_revision(state, lines.len() as u64))
     }
 }
 
@@ -5477,6 +5752,761 @@ pub fn window_payload_bytes(entries: &[ChatEntry], start: usize, end: usize) -> 
         .sum()
 }
 
+/// Work counters behind [`TranscriptWindow::sync`]'s payload-byte cache — and
+/// the honesty seam for fingerprint scans that the old counters hid.
+///
+/// - `entries_measured` / `payload_bytes_measured`: recursive
+///   [`entry_payload_bytes`] calls (the args/details/images traversal) and
+///   their summed bytes. A steady window reports zero; one changed entry
+///   reports one.
+/// - `revision_scans`: [`entry_payload_revision`] calls (the cheap per-entry
+///   identity reads). These are NOT recursive payload measurements: the old
+///   `PayloadScanWork` did not count them, so a "zero work" sync could still
+///   walk the whole 512-entry band.
+/// - `fingerprinted_entries`: entries visited by an exact delta / a full-range
+///   revalidation. Block-summary range queries do not visit entries, so a
+///   content frame with an [`EntryDelta`] reports only the changed entries.
+///
+/// A settled window (same entry epoch, same length) must report every field
+/// zero: the range memos answer the tail/window/install queries without
+/// touching the entries. With a delta the first sync after a one-entry change
+/// reports `revision_scans == 1`; every later settled sync reports zero.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PayloadScanWork {
+    pub entries_measured: u64,
+    pub payload_bytes_measured: u64,
+    pub revision_scans: u64,
+    pub fingerprinted_entries: u64,
+}
+
+/// The entry-list delta since the last settled sync: the exact per-entry
+/// version contract the window cache uses to avoid re-reading a settled band.
+///
+/// The app records in-place mutations by index and append/shrink transitions
+/// by length (see `App::note_entry_changed` / `note_entries_resized`). A
+/// cache sync that receives a delta re-reads only those entries and trusts the
+/// cached per-entry revisions for the rest; a caller that omits the delta
+/// (direct tests / third-party drivers) keeps the conservative full-range
+/// revalidation. This is what makes `PayloadScanWork::revision_scans` grow by
+/// a constant (the changed entries) instead of O(band) after a content change.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EntryDelta {
+    /// `[start, end)` absolute entries replaced or mutated in place.
+    pub changed: Option<(usize, usize)>,
+    /// First absolute index of a contiguous append (`old_len..`).
+    pub appended_from: Option<usize>,
+}
+
+impl EntryDelta {
+    pub fn is_empty(&self) -> bool {
+        self.changed.is_none() && self.appended_from.is_none()
+    }
+
+    pub fn note_changed(&mut self, index: usize) {
+        self.note_range(index, index.saturating_add(1));
+    }
+
+    pub fn note_range(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        self.changed = Some(match self.changed {
+            Some((old_start, old_end)) => (old_start.min(start), old_end.max(end)),
+            None => (start, end),
+        });
+    }
+
+    pub fn note_appended(&mut self, from: usize) {
+        self.appended_from = Some(match self.appended_from {
+            Some(old) => old.min(from),
+            None => from,
+        });
+    }
+}
+
+/// The cheap per-entry identity [`PayloadCache`] keys on: the fields that
+/// [`entry_payload_bytes`] actually sums, without traversing any JSON string
+/// bodies. String payloads contribute their length; structured payloads
+/// contribute their cached allocation identity (an update replaces the
+/// `Arc`), so an unchanged entry costs a handful of pointer/length reads.
+fn entry_payload_revision(entry: &ChatEntry) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+    let mut hash = FNV_OFFSET;
+    let mut mix = |value: u64| {
+        hash = (hash ^ value).wrapping_mul(FNV_PRIME);
+    };
+    match entry {
+        ChatEntry::User(text) => {
+            mix(1);
+            mix(text.as_ptr() as usize as u64);
+            mix(text.len() as u64);
+        }
+        ChatEntry::Assistant(message) => {
+            mix(2);
+            mix(Arc::as_ptr(message) as usize as u64);
+            // `ContentBlock` text/thinking lengths are part of the byte
+            // budget; a same-Arc mutation is impossible (the payload is
+            // immutable behind the Arc), but include block count so a
+            // rebuilt message with a recycled pointer still misses.
+            mix(message.content.len() as u64);
+        }
+        ChatEntry::ToolExecution {
+            call_id,
+            tool_name,
+            args,
+            output,
+            details,
+            preview,
+            images,
+            ..
+        } => {
+            mix(3);
+            mix(call_id.as_ref().map_or(0, |id| id.len() as u64));
+            mix(tool_name.len() as u64);
+            mix(Arc::as_ptr(args) as usize as u64);
+            mix(output.as_ptr() as usize as u64);
+            mix(output.len() as u64);
+            mix(details
+                .as_ref()
+                .map_or(0, |value| Arc::as_ptr(value) as usize as u64));
+            if let Some(preview) = preview {
+                mix(preview.args_key.as_ptr() as usize as u64);
+                mix(preview.args_key.len() as u64);
+                mix(preview.diff.as_ref().map_or(0, |diff| {
+                    (diff.as_ptr() as usize as u64) ^ (diff.len() as u64)
+                }));
+                mix(preview.error.as_ref().map_or(0, |error| {
+                    (error.as_ptr() as usize as u64) ^ (error.len() as u64)
+                }));
+            }
+            mix(Arc::as_ptr(images) as usize as u64);
+            mix(images.len() as u64);
+        }
+        ChatEntry::Notice { text, .. } => {
+            mix(4);
+            mix(text.as_ptr() as usize as u64);
+            mix(text.len() as u64);
+        }
+        ChatEntry::Raw { lines, .. } => {
+            mix(5);
+            mix(lines.as_ptr() as usize as u64);
+            mix(lines.len() as u64);
+            mix(lines.iter().map(String::len).sum::<usize>() as u64);
+        }
+        ChatEntry::Streaming { thinking, text, .. } => {
+            mix(6);
+            mix(thinking.as_ptr() as usize as u64);
+            mix(thinking.len() as u64);
+            mix(text.as_ptr() as usize as u64);
+            mix(text.len() as u64);
+        }
+    }
+    hash
+}
+
+/// Render identity of one entry: the fields [`ChatContainer::set_entries`]
+/// compares through its private `EntryTag` / `ToolTag` / `RawRender::tag`
+/// (owned text by buffer, shared payloads by `Arc` pointer, and the scalars
+/// `is_error`, `duration_ms`, `pending`, `started_at`, `live`), folded into one
+/// hash. Unlike [`entry_payload_revision`], this is NOT a byte-budget identity:
+/// a pending→settled tool flip or an elapsed-duration update moves it even
+/// when every payload pointer and length stays put. The transcript window's
+/// installed-slice key uses it so an in-place render-state change reinstalls
+/// the container instead of leaving the old pending/settled paint on screen.
+///
+/// [`ChatContainer::set_entries`]: crate::tui::app::ChatContainer::set_entries
+#[doc(hidden)]
+pub fn entry_render_revision(entry: &ChatEntry) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+    fn mix_text(mix: &mut impl FnMut(u64), text: &str) {
+        mix(text.as_ptr() as usize as u64);
+        mix(text.len() as u64);
+    }
+    fn mix_optional_string(mix: &mut impl FnMut(u64), text: Option<&String>) {
+        match text {
+            Some(text) => {
+                mix(1);
+                mix(text.as_ptr() as usize as u64);
+                mix(text.len() as u64);
+                mix(text.capacity() as u64);
+            }
+            None => mix(0),
+        }
+    }
+    fn mix_optional_arc(mix: &mut impl FnMut(u64), value: Option<&serde_json::Value>) {
+        match value {
+            Some(value) => {
+                mix(1);
+                mix(value as *const serde_json::Value as usize as u64);
+            }
+            None => mix(0),
+        }
+    }
+    fn mix_instant(mix: &mut impl FnMut(u64), instant: Option<std::time::Instant>) {
+        match instant {
+            Some(instant) => {
+                // `Instant` is opaque; its `Hash` impl is stable across calls
+                // for the same instant, which is exactly the identity the
+                // retained-child diff compares.
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                instant.hash(&mut hasher);
+                mix(1);
+                mix(hasher.finish());
+            }
+            None => mix(0),
+        }
+    }
+
+    let mut hash = FNV_OFFSET;
+    let mut mix = |value: u64| {
+        hash = (hash ^ value).wrapping_mul(FNV_PRIME);
+    };
+    match entry {
+        ChatEntry::User(text) => {
+            mix(1);
+            mix(text.as_ptr() as usize as u64);
+            mix(text.len() as u64);
+            mix(text.capacity() as u64);
+        }
+        ChatEntry::Assistant(message) => {
+            mix(2);
+            mix(Arc::as_ptr(message) as usize as u64);
+            mix(message.content.len() as u64);
+        }
+        ChatEntry::ToolExecution {
+            call_id,
+            tool_name,
+            args,
+            output,
+            is_error,
+            duration_ms,
+            pending,
+            details,
+            started_at,
+            preview,
+            images,
+        } => {
+            mix(3);
+            mix_optional_string(&mut mix, call_id.as_ref());
+            mix_text(&mut mix, tool_name);
+            mix(tool_name.capacity() as u64);
+            mix(Arc::as_ptr(args) as usize as u64);
+            mix(output.as_ptr() as usize as u64);
+            mix(output.len() as u64);
+            mix(u64::from(*is_error));
+            match duration_ms {
+                Some(duration) => {
+                    mix(1);
+                    mix(*duration);
+                }
+                None => mix(0),
+            }
+            mix(u64::from(*pending));
+            mix_optional_arc(&mut mix, details.as_deref());
+            mix_instant(&mut mix, *started_at);
+            match preview {
+                Some(preview) => {
+                    mix(1);
+                    mix_text(&mut mix, &preview.args_key);
+                    mix(preview.args_key.capacity() as u64);
+                    match &preview.diff {
+                        Some(diff) => {
+                            mix(1);
+                            mix_text(&mut mix, diff);
+                        }
+                        None => mix(0),
+                    }
+                    match preview.first_changed_line {
+                        Some(line) => {
+                            mix(1);
+                            mix(line as u64);
+                        }
+                        None => mix(0),
+                    }
+                    match &preview.error {
+                        Some(error) => {
+                            mix(1);
+                            mix_text(&mut mix, error);
+                        }
+                        None => mix(0),
+                    }
+                }
+                None => mix(0),
+            }
+            mix(Arc::as_ptr(images) as usize as u64);
+            mix(images.len() as u64);
+        }
+        ChatEntry::Notice { kind, text } => {
+            mix(4);
+            mix(*kind as u64);
+            mix(text.as_ptr() as usize as u64);
+            mix(text.len() as u64);
+            mix(text.capacity() as u64);
+        }
+        ChatEntry::Raw { lines, render, .. } => {
+            mix(5);
+            mix(lines.as_ptr() as usize as u64);
+            mix(lines.len() as u64);
+            match render {
+                Some(render) => {
+                    mix(1);
+                    let (call_id, expanded, width, theme, pending, default_shell) = render.tag();
+                    mix(call_id as u64);
+                    mix(u64::from(expanded));
+                    mix(width as u64);
+                    mix(theme);
+                    mix(u64::from(pending));
+                    mix(u64::from(default_shell));
+                    // `RawRender::tag` predates the error background as a
+                    // retained-child input: a Raw default-shell block can flip
+                    // `is_error` in place after it already settled (same
+                    // lines/pending/shell). Fold it in here so the installed
+                    // slice identity cannot skip that repaint. (`Raw` blocks
+                    // are rebuilt from the entry when their block identity
+                    // moves; see `ChatBlockCache`.)
+                    if let super::app::RawRender::Tool(tool) = render {
+                        mix(u64::from(tool.is_error));
+                    } else {
+                        mix(0);
+                    }
+                }
+                None => mix(0),
+            }
+        }
+        ChatEntry::Streaming {
+            live,
+            thinking,
+            text,
+        } => {
+            mix(6);
+            mix(u64::from(*live));
+            mix_text(&mut mix, thinking);
+            mix(thinking.capacity() as u64);
+            mix_text(&mut mix, text);
+            mix(text.capacity() as u64);
+        }
+    }
+    hash
+}
+
+/// On-demand payload-byte cache for one [`TranscriptWindow`].
+///
+/// The window only needs bytes for the materialized band and for the tail
+/// candidates it pages over (`[len - MAX_ENTRIES, len)` under the tail
+/// budget), so entries above the band are never inspected. Each requested
+/// entry is fingerprinted by [`entry_payload_revision`]; [`entry_payload_bytes`]
+/// (the recursive JSON walk) runs only when that fingerprint moves or the
+/// entry is first seen. [`EntryDelta`] names the entries the app mutated since
+/// the previous sync, so a content frame re-reads those entries only; the
+/// remaining per-entry versions feed 64-entry XOR block summaries
+/// (`payload_blocks` / `render_blocks`), and a range fingerprint costs one
+/// read per covering block plus the two partial edge blocks — never a
+/// per-entry walk over the band. Range fingerprints and window results are
+/// memoized on `(start, end, epoch)`, so a settled window answers `tail_start`
+/// / `window_bytes` / `install_key` without touching an entry.
+///
+/// The per-entry vectors are indexed by absolute transcript index and grow
+/// with the resident list (payload/render revisions, bytes, measured flags and
+/// two validated-epoch arrays plus the block summaries), not a fixed
+/// ~512-entry ring: the review corrected the old claim. Appending reuses the
+/// prefix instead of resetting every entry; a prepend or session reset drops
+/// the cache explicitly.
+#[derive(Default)]
+struct PayloadCache {
+    len: usize,
+    revisions: Vec<u64>,
+    bytes: Vec<usize>,
+    measured: Vec<bool>,
+    /// Cached render identity per entry ([`entry_render_revision`]), kept
+    /// alongside the payload revision so an install key in a settled window
+    /// does not have to walk the band.
+    render_revisions: Vec<u64>,
+    /// Block-level XOR summaries of the payload revisions, 64 entries per
+    /// block. A changed entry updates one block; a range fingerprint reads
+    /// only the covering block summaries plus at most two partial blocks — a
+    /// per-entry rolling fingerprint instead of an O(band) pointer walk.
+    payload_blocks: Vec<u64>,
+    render_blocks: Vec<u64>,
+    /// The entry epoch (`App::transcript_epoch`) each entry's cached revision
+    /// / bytes were last validated against. A query in the same epoch skips the
+    /// per-entry `entry_payload_revision` read entirely; a new epoch refreshes
+    /// only the entries the queried range covers (or the delta entries).
+    validated: Vec<Option<u64>>,
+    render_validated: Vec<Option<u64>>,
+    /// Pending delta for the current epoch transition (see [`EntryDelta`]).
+    delta: Option<EntryDelta>,
+    /// Epoch whose unchanged-entry revisions are trusted globally (set after
+    /// applying a delta). A later range query can then skip the re-read even
+    /// though it covers entries the delta did not name.
+    trusted_epoch: Option<u64>,
+    /// `(start, end, revision fingerprint, bytes)` of the last window sum.
+    last_window: Option<(usize, usize, u64, usize)>,
+    /// `(entry count, max entries, budget, tail-range fingerprint, start)`.
+    last_tail: Option<(usize, usize, usize, u64, usize)>,
+    /// Small LRU of range fingerprints for the current and recent epochs. A
+    /// settled sync re-asks the same tail/window/install ranges every frame;
+    /// the memo answers them without a per-entry walk.
+    range_memos: Vec<RangeMemo>,
+    /// `(start, end, epoch, render fingerprint)` of the installed-slice
+    /// identity. Render fields (`pending`, `duration_ms`, `is_error`,
+    /// `RawRender::pending`, ...) are folded in; see
+    /// [`entry_render_revision`].
+    render_memo: Option<(usize, usize, Option<u64>, u64)>,
+    /// The entry epoch of the current sync (see [`PayloadCache::begin_sync`]).
+    epoch: Option<u64>,
+    work: PayloadScanWork,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RangeMemo {
+    start: usize,
+    end: usize,
+    epoch: Option<u64>,
+    fingerprint: u64,
+}
+
+impl PayloadCache {
+    /// Start a new `sync` measurement (the counters are per-sync). `epoch` is
+    /// the caller's transcript content revision: equal consecutive epochs let
+    /// the cache trust its per-entry revisions without re-reading them.
+    fn begin_sync(&mut self, epoch: Option<u64>, delta: Option<EntryDelta>) {
+        self.work = PayloadScanWork::default();
+        if epoch != self.epoch {
+            // An epoch without a delta has no per-entry version contract; do
+            // not let a previous epoch's global trust survive it.
+            if delta.is_none() || epoch.is_none() {
+                self.trusted_epoch = None;
+            }
+        }
+        self.epoch = epoch;
+        self.delta = delta;
+    }
+
+    /// Adopt a new epoch without resetting the per-sync counters (used after
+    /// an install bumped the app's revision: the entry data itself did not
+    /// move).
+    fn set_epoch(&mut self, epoch: Option<u64>) {
+        if epoch != self.epoch && self.delta.is_none() {
+            self.trusted_epoch = None;
+        }
+        self.epoch = epoch;
+    }
+
+    fn reset(&mut self) {
+        self.len = 0;
+        self.revisions.clear();
+        self.bytes.clear();
+        self.measured.clear();
+        self.render_revisions.clear();
+        self.payload_blocks.clear();
+        self.render_blocks.clear();
+        self.validated.clear();
+        self.render_validated.clear();
+        self.delta = None;
+        self.trusted_epoch = None;
+        self.last_window = None;
+        self.last_tail = None;
+        self.range_memos.clear();
+        self.render_memo = None;
+        self.work = PayloadScanWork::default();
+    }
+
+    /// Grow/truncate the per-entry cache in place. Appending entries keeps the
+    /// prefix's measurements (the old implementation reset all three vectors
+    /// on every length change, an O(transcript) initialization per message);
+    /// a prepend shifts indices and goes through [`Self::reset`] explicitly
+    /// (`prepend_older_entries` / the session-reset hook).
+    fn ensure_len(&mut self, len: usize) {
+        if self.len == len {
+            return;
+        }
+        let old_len = self.len;
+        if len > old_len {
+            self.revisions.resize(len, 0);
+            self.bytes.resize(len, 0);
+            self.measured.resize(len, false);
+            self.render_revisions.resize(len, 0);
+            self.validated.resize(len, None);
+            self.render_validated.resize(len, None);
+            let blocks = len.div_ceil(64);
+            self.payload_blocks.resize(blocks, 0);
+            self.render_blocks.resize(blocks, 0);
+            self.len = len;
+            // New leaves are zero until measured; refresh only the blocks
+            // they landed in (the prefix keeps its summaries).
+            let first = old_len / 64;
+            let last = (len - 1) / 64;
+            for block in first..=last {
+                self.recompute_block(block);
+            }
+        } else {
+            self.revisions.truncate(len);
+            self.bytes.truncate(len);
+            self.measured.truncate(len);
+            self.render_revisions.truncate(len);
+            self.validated.truncate(len);
+            self.render_validated.truncate(len);
+            self.payload_blocks.truncate(len.div_ceil(64));
+            self.render_blocks.truncate(len.div_ceil(64));
+            self.len = len;
+            if len > 0 {
+                self.recompute_block((len - 1) / 64);
+            }
+            // A shrink may have removed entries that a trusted delta did not
+            // name; the next query revalidates conservatively.
+            self.trusted_epoch = None;
+        }
+        self.last_window = None;
+        self.last_tail = None;
+        self.range_memos.clear();
+        self.render_memo = None;
+    }
+
+    fn entry_leaf(index: usize, revision: u64) -> u64 {
+        super::core::mix_content_revision(revision, index as u64)
+    }
+
+    fn recompute_block(&mut self, block: usize) {
+        let start = block * 64;
+        let end = (start + 64).min(self.len);
+        let mut payload = 0u64;
+        let mut render = 0u64;
+        for index in start..end {
+            payload ^= Self::entry_leaf(index, self.revisions[index]);
+            render ^= Self::entry_leaf(index, self.render_revisions[index]);
+        }
+        if block < self.payload_blocks.len() {
+            self.payload_blocks[block] = payload;
+            self.render_blocks[block] = render;
+        }
+    }
+
+    /// One cheap per-entry refresh: payload identity + render identity, with
+    /// the recursive byte walk only when the payload identity moved.
+    fn refresh_entry(&mut self, entries: &[ChatEntry], index: usize, epoch: Option<u64>) {
+        self.work.fingerprinted_entries += 1;
+        let revision = entry_payload_revision(&entries[index]);
+        let render_revision = entry_render_revision(&entries[index]);
+        self.work.revision_scans += 1;
+        if !self.measured[index] || self.revisions[index] != revision {
+            let bytes = entry_payload_bytes(&entries[index]);
+            self.revisions[index] = revision;
+            self.bytes[index] = bytes;
+            self.measured[index] = true;
+            self.work.entries_measured += 1;
+            self.work.payload_bytes_measured += bytes as u64;
+            // The measured set moved: memoized totals and earlier range
+            // fingerprints are stale.
+            self.last_window = None;
+            self.last_tail = None;
+            self.range_memos.clear();
+        }
+        if self.render_validated[index] != epoch || self.render_revisions[index] != render_revision
+        {
+            self.render_memo = None;
+        }
+        self.revisions[index] = revision;
+        self.render_revisions[index] = render_revision;
+        self.validated[index] = epoch;
+        self.render_validated[index] = epoch;
+        self.recompute_block(index / 64);
+    }
+
+    /// Apply the one pending [`EntryDelta`] for this epoch transition, then
+    /// trust every unnamed entry's cached revisions.
+    fn apply_pending_delta(&mut self, entries: &[ChatEntry]) {
+        self.ensure_len(entries.len());
+        let Some(epoch) = self.epoch else {
+            return;
+        };
+        let Some(delta) = self.delta.take() else {
+            return;
+        };
+        if let Some((start, end)) = delta.changed {
+            for index in start..end.min(entries.len()) {
+                self.refresh_entry(entries, index, Some(epoch));
+            }
+        }
+        if let Some(from) = delta.appended_from {
+            for index in from.min(entries.len())..entries.len() {
+                self.refresh_entry(entries, index, Some(epoch));
+            }
+        }
+        self.trusted_epoch = Some(epoch);
+    }
+
+    /// Make `[start, end)`'s per-entry revisions current. With a trusted
+    /// delta only never-measured entries are read; without one (direct
+    /// callers) every entry whose validation is not this epoch is read.
+    fn ensure_range(&mut self, entries: &[ChatEntry], start: usize, end: usize) {
+        let Some(epoch) = self.epoch else {
+            for index in start..end {
+                self.refresh_entry(entries, index, None);
+            }
+            return;
+        };
+        let trust_unnamed = self.trusted_epoch == Some(epoch);
+        for index in start..end {
+            let trusted = self.validated[index] == Some(epoch)
+                || (trust_unnamed && self.validated[index].is_some());
+            if !trusted {
+                self.refresh_entry(entries, index, Some(epoch));
+            }
+        }
+    }
+
+    /// XOR fingerprint of `[start, end)` over the block summaries. Full
+    /// blocks cost one read each; only the two partial edge blocks touch
+    /// per-entry values (never the entries themselves).
+    fn range_hash(&self, render: bool, start: usize, end: usize) -> u64 {
+        let revisions = if render {
+            &self.render_revisions
+        } else {
+            &self.revisions
+        };
+        let blocks = if render {
+            &self.render_blocks
+        } else {
+            &self.payload_blocks
+        };
+        let mut fingerprint = 0xcbf2_9ce4_8422_2325u64;
+        fingerprint = super::core::mix_content_revision(fingerprint, start as u64);
+        fingerprint = super::core::mix_content_revision(fingerprint, end as u64);
+        let mut index = start;
+        while index < end {
+            if index.is_multiple_of(64) && index + 64 <= end {
+                fingerprint ^= blocks[index / 64];
+                index += 64;
+            } else {
+                fingerprint ^= Self::entry_leaf(index, revisions[index]);
+                index += 1;
+            }
+        }
+        fingerprint
+    }
+
+    /// Refresh `start..end`'s revisions and return their rolling fingerprint.
+    /// A delta names the only entries that may have moved, so a content frame
+    /// reads those entries; the block summaries fold the rest in O(band/64)
+    /// reads with no entry access. A range already fingerprinted in this
+    /// epoch is answered by the memo. `revision_scans` therefore grows by the
+    /// changed-entry count (a constant for a one-entry update), not by the
+    /// band length.
+    fn range_fingerprint(&mut self, entries: &[ChatEntry], start: usize, end: usize) -> u64 {
+        self.apply_pending_delta(entries);
+        let end = end.min(entries.len());
+        let start = start.min(end);
+        if let Some(epoch) = self.epoch {
+            if let Some(memo) =
+                self.range_memos.iter().rev().find(|memo| {
+                    memo.start == start && memo.end == end && memo.epoch == Some(epoch)
+                })
+            {
+                return memo.fingerprint;
+            }
+        }
+        self.ensure_range(entries, start, end);
+        let fingerprint = self.range_hash(false, start, end);
+        self.range_memos.push(RangeMemo {
+            start,
+            end,
+            epoch: self.epoch,
+            fingerprint,
+        });
+        if self.range_memos.len() > 8 {
+            self.range_memos.remove(0);
+        }
+        fingerprint
+    }
+
+    /// Render identity of `[start, end)` (see [`entry_render_revision`]) from
+    /// the same per-entry rolling version store. A content frame refreshes
+    /// only the delta entries and folds block summaries; a settled frame
+    /// reuses the memo and touches no entry.
+    fn render_fingerprint(&mut self, entries: &[ChatEntry], start: usize, end: usize) -> u64 {
+        self.apply_pending_delta(entries);
+        let end = end.min(entries.len());
+        let start = start.min(end);
+        if let (Some(epoch), Some((cached_start, cached_end, cached_epoch, fingerprint))) =
+            (self.epoch, self.render_memo)
+        {
+            if cached_start == start && cached_end == end && cached_epoch == Some(epoch) {
+                return fingerprint;
+            }
+        }
+        self.ensure_range(entries, start, end);
+        let fingerprint = self.range_hash(true, start, end);
+        if self.epoch.is_some() {
+            self.render_memo = Some((start, end, self.epoch, fingerprint));
+        }
+        fingerprint
+    }
+
+    /// Payload bytes of `[start, end)`, memoized by range + revisions.
+    fn window_bytes(&mut self, entries: &[ChatEntry], start: usize, end: usize) -> usize {
+        let end = end.min(entries.len());
+        let start = start.min(end);
+        let fingerprint = self.range_fingerprint(entries, start, end);
+        if let Some((cached_start, cached_end, cached_fingerprint, bytes)) = self.last_window {
+            if cached_start == start && cached_end == end && cached_fingerprint == fingerprint {
+                return bytes;
+            }
+        }
+        let bytes = (start..end).map(|index| self.bytes[index]).sum();
+        self.last_window = Some((start, end, fingerprint, bytes));
+        bytes
+    }
+
+    /// [`tail_window_start`] over the cached per-entry bytes: the scan is the
+    /// same backward walk but reads cached integers instead of recursively
+    /// measuring every entry; an unchanged tail range returns the memoized
+    /// start without the walk and without a per-entry fingerprint scan.
+    fn tail_start(&mut self, entries: &[ChatEntry], max_entries: usize, budget: usize) -> usize {
+        let total = entries.len();
+        if total == 0 {
+            return 0;
+        }
+        let max_entries = max_entries.max(1);
+        let from = total.saturating_sub(max_entries);
+        let fingerprint = self.range_fingerprint(entries, from, total);
+        if let Some((cached_len, cached_max, cached_budget, cached_fingerprint, start)) =
+            self.last_tail
+        {
+            if cached_len == total
+                && cached_max == max_entries
+                && cached_budget == budget
+                && cached_fingerprint == fingerprint
+            {
+                return start;
+            }
+        }
+        let mut start = total;
+        let mut bytes = 0usize;
+        let mut count = 0usize;
+        while start > from && count < max_entries {
+            let entry_bytes = self.bytes[start - 1];
+            if bytes.saturating_add(entry_bytes) > budget {
+                if count == 0 {
+                    start -= 1;
+                }
+                break;
+            }
+            start -= 1;
+            bytes += entry_bytes;
+            count += 1;
+        }
+        self.last_tail = Some((total, max_entries, budget, fingerprint, start));
+        start
+    }
+}
+
 /// The tail window's start under the tail budget: scan back from the end
 /// until the byte budget binds. The budget ALWAYS binds; `_min_entries` is
 /// retained for callers' intent and API stability but cannot force an
@@ -5620,6 +6650,54 @@ pub fn should_load_older(
     window_start == 0 && visible_top <= viewport_rows.saturating_mul(2).max(1)
 }
 
+/// How many viewports before the materialized top the UI asks the worker to
+/// prefetch the next older page. Deliberately earlier than
+/// [`should_load_older`]'s two-viewport trigger: the page is usually parsed by
+/// the time the user reaches the top, so the scroll does not wait on disk.
+pub const OLDER_PREFETCH_VIEWPORTS: usize = 5;
+
+/// Whether the scrolled view is close enough to the materialized top to
+/// prefetch the next older page (the smooth-scroll companion of
+/// [`should_load_older`]; pure, regression-tested).
+///
+/// Same windowed/scrolled/cursor gates as the load trigger, but fires with
+/// [`OLDER_PREFETCH_VIEWPORTS`] of runway and takes `already_prefetched` so the
+/// caller issues one command per cursor, not one per frame. The worker's page
+/// cache also dedupes, so a duplicated command is harmless — this gate just
+/// keeps the command queue quiet.
+#[derive(Debug, Clone, Copy)]
+pub struct OlderPrefetchGate {
+    pub windowed: bool,
+    pub scrolled: bool,
+    pub window_start: usize,
+    pub visible_top: usize,
+    pub viewport_rows: usize,
+    pub cursor_available: bool,
+    pub request_in_flight: bool,
+    pub already_prefetched: bool,
+}
+
+pub fn should_prefetch_older(gate: OlderPrefetchGate) -> bool {
+    let OlderPrefetchGate {
+        windowed,
+        scrolled,
+        window_start,
+        visible_top,
+        viewport_rows,
+        cursor_available,
+        request_in_flight,
+        already_prefetched,
+    } = gate;
+    if !windowed || !scrolled || request_in_flight || !cursor_available || already_prefetched {
+        return false;
+    }
+    window_start == 0
+        && visible_top
+            <= viewport_rows
+                .saturating_mul(OLDER_PREFETCH_VIEWPORTS)
+                .max(1)
+}
+
 /// Prepend an older transcript chunk to the live entry list, shifting every
 /// stored index by the inserted count.
 ///
@@ -5649,6 +6727,9 @@ pub fn prepend_older_entries(
         *index += inserted;
     }
     window.shift_start(inserted);
+    // The splice shifts every stored index; the per-entry payload cache
+    // (aligned with the vector) is no longer valid.
+    window.reset_payload_cache();
     entries.splice(0..0, chunk);
     inserted
 }
@@ -5733,6 +6814,11 @@ pub struct OlderPages {
     /// session's history to the new transcript (see
     /// [`OlderPages::mark_session_reset`]).
     pub discard_reply: bool,
+    /// Cursor whose older page the UI already asked the worker to prefetch.
+    /// Reset when the cursor advances (the prefetched page was consumed) or a
+    /// read fails, so the near-top trigger issues at most one command per
+    /// cursor.
+    pub prefetched_cursor: Option<u64>,
 }
 
 impl OlderPages {
@@ -5751,6 +6837,7 @@ impl OlderPages {
         self.failed = false;
         self.exhausted = false;
         self.notice_shown = false;
+        self.prefetched_cursor = None;
         self.discard_reply = self.loading;
     }
 }
@@ -5776,22 +6863,56 @@ pub enum OlderPageEffect {
 /// reset is still prepended (real history) but can neither complete the live
 /// walk nor move the selection. Returns what the caller must do about the
 /// frame.
-#[allow(clippy::too_many_arguments)]
+/// One `OlderTranscript` reply's payload.
+pub struct OlderPageReply {
+    pub chunk: Vec<ChatEntry>,
+    pub cursor: Option<u64>,
+    pub failed: bool,
+}
+
+/// The live transcript state an applied older page mutates.
+pub struct OlderPageTranscript<'a> {
+    pub entries: &'a mut Vec<ChatEntry>,
+    pub window: &'a mut TranscriptWindow,
+    pub streaming_entry: &'a mut Option<usize>,
+    pub tool_entries: &'a mut std::collections::HashMap<String, usize>,
+}
+
+/// The search-walk state a page probe borrows.
+pub struct OlderPageSearch<'a> {
+    pub search: &'a mut altscreen_search::SearchState,
+    pub probe: &'a mut ChatContainer,
+    pub probe_width: usize,
+    pub hide_thinking: bool,
+}
+
 pub fn apply_older_page(
     pages: &mut OlderPages,
-    chunk: Vec<ChatEntry>,
-    cursor: Option<u64>,
-    failed: bool,
-    entries: &mut Vec<ChatEntry>,
-    window: &mut TranscriptWindow,
-    streaming_entry: &mut Option<usize>,
-    tool_entries: &mut std::collections::HashMap<String, usize>,
-    search: &mut altscreen_search::SearchState,
-    probe: &mut ChatContainer,
-    probe_width: usize,
-    hide_thinking: bool,
+    reply: OlderPageReply,
+    transcript: OlderPageTranscript<'_>,
+    search_state: OlderPageSearch<'_>,
 ) -> OlderPageEffect {
+    let OlderPageReply {
+        chunk,
+        cursor,
+        failed,
+    } = reply;
+    let OlderPageTranscript {
+        entries,
+        window,
+        streaming_entry,
+        tool_entries,
+    } = transcript;
+    let OlderPageSearch {
+        search,
+        probe,
+        probe_width,
+        hide_thinking,
+    } = search_state;
     pages.loading = false;
+    // The reply advances (or fails) the cursor this prefetch belonged to; the
+    // next near-top frame may prefetch the new cursor.
+    pages.prefetched_cursor = None;
     if pages.discard_reply {
         // The read was issued before a session switch (`mark_session_reset`).
         // At most one read is ever outstanding and the reset held the new
@@ -5923,26 +7044,30 @@ impl SearchWalkStep {
 /// SearchWalkPlan::ProbeResident`), or materialize the slice that holds the
 /// query. The overlay/non-windowed cancellation stays with the caller (it
 /// needs the app's dialog state).
-// The eight parameters are the transcript's live state for one step (each a
-// distinct borrow the caller already holds), and this function is the loop's
-// own walk block lifted verbatim so the tests drive the shipped code rather
-// than a copy — grouping them into a struct would only rename one call site's
-// locals.
-#[allow(clippy::too_many_arguments)]
+/// The transcript slice a search walk step plans against.
+pub struct SearchWalkView<'a> {
+    pub entries: &'a [ChatEntry],
+    pub window: &'a mut TranscriptWindow,
+}
+
+/// The scratch render a resident-prefix probe paints into.
+pub struct SearchWalkProbe<'a> {
+    pub probe: &'a mut ChatContainer,
+    pub width: usize,
+    pub hide_thinking: bool,
+}
+
 pub fn search_walk_step(
     search: &mut altscreen_search::SearchState,
     windowed: bool,
     pages: &mut OlderPages,
-    entries: &[ChatEntry],
-    window: &mut TranscriptWindow,
-    probe: &mut ChatContainer,
-    probe_width: usize,
-    hide_thinking: bool,
+    view: &mut SearchWalkView<'_>,
+    probe: &mut SearchWalkProbe<'_>,
 ) -> SearchWalkStep {
     let action = altscreen_search::plan_search_walk(
         search,
         windowed,
-        window.start(),
+        view.window.start(),
         pages.cursor,
         pages.loading,
     );
@@ -5956,26 +7081,32 @@ pub fn search_walk_step(
             // One page-sized slice of the resident prefix immediately above
             // the band top, probed in the scratch render (no materialization
             // until it hits).
-            let to = window
+            let to = view
+                .window
                 .start()
                 .saturating_sub(search.walk.probed_entries())
-                .min(entries.len());
+                .min(view.entries.len());
             let (from, bytes) = resident_probe_slice(
-                entries,
+                view.entries,
                 to,
                 TRANSCRIPT_WINDOW_MAX_ENTRIES,
                 TRANSCRIPT_TAIL_BYTES,
             );
-            probe.set_hide_thinking(hide_thinking);
+            probe.probe.set_hide_thinking(probe.hide_thinking);
             let hit = from < to
-                && probe_older_page(probe, &entries[from..to], &search.query, probe_width);
+                && probe_older_page(
+                    probe.probe,
+                    &view.entries[from..to],
+                    &search.query,
+                    probe.width,
+                );
             search.walk.note_probe(to - from, bytes);
             if hit {
                 // The match sits in a resident slice: materialize from that
                 // slice (everything resident below it is older and stays out
                 // of the band) and let the post-render band check land the
                 // reveal.
-                window.materialize_from(from);
+                view.window.materialize_from(from);
                 search.walk.note_reveal();
                 SearchWalkStep::Materialized
             } else {
@@ -5998,6 +7129,72 @@ pub fn sync_windowed_band(
     alt: &mut AltScreenState,
     chat: &Mutex<ChatContainer>,
 ) -> bool {
+    sync_windowed_band_tracked(entries, window, core, alt, chat, None)
+}
+
+/// [`sync_windowed_band`] with the frame-content revision used as the entry
+/// epoch too (test-facing convenience): when the slice identity (window
+/// start, entries, theme) is unchanged, `ChatContainer::set_entries` is
+/// skipped entirely — the spinner tick no longer walks the committed entry
+/// list. `None` keeps the unconditional install.
+#[doc(hidden)]
+pub fn sync_windowed_band_tracked(
+    entries: &[ChatEntry],
+    window: &mut TranscriptWindow,
+    core: &mut TuiCore,
+    alt: &mut AltScreenState,
+    chat: &Mutex<ChatContainer>,
+    chat_revision: Option<&AtomicU64>,
+) -> bool {
+    sync_windowed_band_tracked_with_epochs(
+        entries,
+        window,
+        core,
+        alt,
+        chat,
+        BandSyncInputs {
+            chat_revision,
+            entry_epoch: chat_revision,
+            blocks: None,
+            delta: None,
+        },
+    )
+}
+
+/// [`sync_windowed_band_tracked`] with SEPARATE epochs:
+///
+/// - `chat_revision` (frame cache): bumped after every install so
+///   `SharedChat::content_revision` re-renders the transcript; also bumped by
+///   frame-only changes (live tool timer, hidden label);
+/// - `entry_epoch` (window identity): only advances when the entry list may
+///   have changed. A settled epoch answers `tail_start` / `window_bytes` /
+///   `install_key` from memos without scanning entries; a content revision
+///   that only moved frame-time state must not force a band fingerprint walk.
+/// The optional installation tracking inputs of
+/// [`sync_windowed_band_tracked_with_epochs`].
+#[doc(hidden)]
+pub struct BandSyncInputs<'a> {
+    pub chat_revision: Option<&'a AtomicU64>,
+    pub entry_epoch: Option<&'a AtomicU64>,
+    pub blocks: Option<&'a Mutex<ChatBlockCache>>,
+    pub delta: Option<EntryDelta>,
+}
+
+#[doc(hidden)]
+pub fn sync_windowed_band_tracked_with_epochs(
+    entries: &[ChatEntry],
+    window: &mut TranscriptWindow,
+    core: &mut TuiCore,
+    alt: &mut AltScreenState,
+    chat: &Mutex<ChatContainer>,
+    inputs: BandSyncInputs<'_>,
+) -> bool {
+    let BandSyncInputs {
+        chat_revision,
+        entry_epoch,
+        blocks,
+        delta,
+    } = inputs;
     // The live search walk's hold (see `altscreen_search::search_holds_band`):
     // a completed walk materialized an older page, and the window's own
     // tail/release rules must not unmaterialize the match the reveal put in
@@ -6009,10 +7206,27 @@ pub fn sync_windowed_band(
     );
     window.set_hold_top(hold);
     let before = window.start();
-    let moved = window.sync(entries, core);
-    chat.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .set_entries(window.slice(entries));
+    let entry_epoch = entry_epoch.map(|cell| cell.load(Ordering::Relaxed));
+    let moved = window.sync_tracked_with_delta(entries, core, entry_epoch, delta);
+    let install = match entry_epoch {
+        Some(epoch) => window.should_install(entries, epoch),
+        None => true,
+    };
+    if install {
+        chat.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_entries(window.slice(entries));
+        if let Some(blocks) = blocks {
+            blocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_entries(window.slice(entries));
+        }
+        if let Some(cell) = chat_revision {
+            cell.fetch_add(1, Ordering::Relaxed);
+        }
+        window.mark_installed(entries, entry_epoch.unwrap_or(0));
+    }
     if moved {
         // The band's row count changed at the top: the offset-from-end is
         // invariant under that, so the pin baseline must not add the growth
@@ -6050,6 +7264,29 @@ pub struct TranscriptWindow {
     /// the window from moving the top FORWARD (releasing rows); extending the
     /// band upward stays allowed.
     hold_top: bool,
+    /// Per-entry payload-byte cache (see [`PayloadCache`]): the window's
+    /// tail/advance decisions read byte totals from here instead of running
+    /// the recursive `entry_payload_bytes` walk over the band every frame.
+    payload: PayloadCache,
+    /// The slice identity last handed to `ChatContainer::set_entries`:
+    /// window start, slice length, per-entry RENDER fingerprint (the
+    /// container's `EntryTag` inputs, including pending/duration/error) and
+    /// theme generation. `sync_windowed_band` skips a redundant `set_entries`
+    /// when this still matches.
+    installed: Option<InstalledSliceKey>,
+}
+
+/// Identity of one installed transcript slice (see
+/// [`TranscriptWindow::should_install`]): window origin/length, the entries'
+/// render identity and the theme. The frame-cache revision is deliberately
+/// absent — a content revision that only changes frame-time state (the live
+/// tool timer, a hidden-label relabel) must not reinstall the container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstalledSliceKey {
+    start: usize,
+    len: usize,
+    fingerprint: u64,
+    theme: u64,
 }
 
 impl Default for TranscriptWindow {
@@ -6064,7 +7301,114 @@ impl TranscriptWindow {
             start: 0,
             following: false,
             hold_top: false,
+            payload: PayloadCache::default(),
+            installed: None,
         }
+    }
+
+    /// [`regular_window_start`] over the cached payload bytes: same hysteresis
+    /// (keep the current start until the exact tail drifts a full window),
+    /// but the tail budget is planned from cached per-entry sizes instead of
+    /// re-measuring up to 512 entries per frame.
+    pub fn regular_start(&mut self, entries: &[ChatEntry], current: usize) -> usize {
+        self.regular_start_tracked(entries, current, None)
+    }
+
+    /// [`Self::regular_start`] with the transcript content epoch: a settled
+    /// epoch reuses the range/tail memos without a per-entry revision scan.
+    pub fn regular_start_tracked(
+        &mut self,
+        entries: &[ChatEntry],
+        current: usize,
+        entry_epoch: Option<u64>,
+    ) -> usize {
+        self.regular_start_tracked_with_delta(entries, current, entry_epoch, None)
+    }
+
+    /// [`Self::regular_start_tracked`] with the per-entry delta the app
+    /// recorded since the previous sync (see [`EntryDelta`]).
+    pub fn regular_start_tracked_with_delta(
+        &mut self,
+        entries: &[ChatEntry],
+        current: usize,
+        entry_epoch: Option<u64>,
+        delta: Option<EntryDelta>,
+    ) -> usize {
+        self.payload.begin_sync(entry_epoch, delta);
+        if entries.len() <= TRANSCRIPT_WINDOW_MAX_ENTRIES {
+            return 0;
+        }
+        let current = current.min(entries.len().saturating_sub(1));
+        let exact = self.payload.tail_start(
+            entries,
+            TRANSCRIPT_WINDOW_MAX_ENTRIES,
+            TRANSCRIPT_WINDOW_MAX_BYTES,
+        );
+        if exact < current || exact.saturating_sub(current) >= TRANSCRIPT_WINDOW_MAX_ENTRIES {
+            exact
+        } else {
+            current
+        }
+    }
+
+    /// Whether the current slice differs from the last installed one. The
+    /// fingerprint is the entries' RENDER identity (the same fields the
+    /// container's private `EntryTag` compares, including
+    /// `ToolExecution::{pending, duration_ms, is_error, started_at}` and the
+    /// `RawRender` phase), not the payload-byte identity: an in-place
+    /// pending→settled flip or a duration update reinstalls even when every
+    /// payload pointer/length is unchanged. `entry_epoch` is the transcript
+    /// content epoch that lets a settled window answer from the memo without a
+    /// scan; it must move whenever the entry list may have changed.
+    pub fn should_install(&mut self, entries: &[ChatEntry], entry_epoch: u64) -> bool {
+        self.payload.set_epoch(Some(entry_epoch));
+        Some(self.install_key(entries)) != self.installed
+    }
+
+    /// Record that the current slice is now committed to the container under
+    /// `entry_epoch`. The entry data did not move at install time, so the
+    /// render memo stays valid.
+    pub fn mark_installed(&mut self, entries: &[ChatEntry], entry_epoch: u64) {
+        self.payload.set_epoch(Some(entry_epoch));
+        self.installed = Some(self.install_key(entries));
+    }
+
+    fn install_key(&mut self, entries: &[ChatEntry]) -> InstalledSliceKey {
+        let start = self.start.min(entries.len());
+        let fingerprint = self
+            .payload
+            .render_fingerprint(entries, start, entries.len());
+        InstalledSliceKey {
+            start,
+            len: entries.len() - start,
+            fingerprint,
+            theme: super::theme::Theme::generation(),
+        }
+    }
+
+    /// Drop the per-entry caches (a prepend shifts every index; a reset
+    /// replaces the list).
+    pub fn reset_payload_cache(&mut self) {
+        self.payload.reset();
+    }
+
+    /// Forget all per-session window state: `/clear`, `/new`, fork or a
+    /// session switch replaces the transcript wholesale, and the outgoing
+    /// session's payload cache and installed-slice key must not survive even
+    /// when the incoming list happens to reach the same length (the old
+    /// `ensure_len` early return left stale per-entry bytes behind).
+    pub fn reset_for_session(&mut self) {
+        self.start = 0;
+        self.following = false;
+        self.hold_top = false;
+        self.payload.reset();
+        self.installed = None;
+    }
+
+    /// Payload traversal work of the most recent [`Self::sync`] call
+    /// (test/probe seam; a steady window reports all zeroes).
+    pub fn last_payload_work(&self) -> PayloadScanWork {
+        self.payload.work
     }
 
     /// First entry index of the materialized window.
@@ -6128,12 +7472,44 @@ impl TranscriptWindow {
     /// when the window MOVED (the caller re-slices the container and
     /// re-anchors the scroll pin through [`TuiCore::resync_window`]).
     pub fn sync(&mut self, entries: &[ChatEntry], core: &TuiCore) -> bool {
+        self.sync_tracked(entries, core, None)
+    }
+
+    /// [`Self::sync`] with the transcript content epoch. The app passes its
+    /// content revision so a settled window's tail/window planning answers
+    /// from the range memos without a per-entry fingerprint scan; `None`
+    /// keeps the conservative per-call scan (test/direct callers).
+    pub fn sync_tracked(
+        &mut self,
+        entries: &[ChatEntry],
+        core: &TuiCore,
+        entry_epoch: Option<u64>,
+    ) -> bool {
+        self.sync_tracked_with_delta(entries, core, entry_epoch, None)
+    }
+
+    /// [`Self::sync_tracked`] with the app's per-entry mutation delta since
+    /// the previous sync (see [`EntryDelta`]); the delta lets the payload /
+    /// install caches re-read only the entries that moved.
+    pub fn sync_tracked_with_delta(
+        &mut self,
+        entries: &[ChatEntry],
+        core: &TuiCore,
+        entry_epoch: Option<u64>,
+        delta: Option<EntryDelta>,
+    ) -> bool {
+        self.payload.begin_sync(entry_epoch, delta);
         let total = entries.len();
         if self.start > total {
             // Transcript reset (`/clear`, session switch): both the window
-            // and the container snap back to empty and grow from there.
+            // and the container snap back to empty and grow from there. The
+            // defense-in-depth branch also drops the installed-slice key: a
+            // stale key would otherwise short-circuit the first install of
+            // the incoming (shorter/same-length) list.
             self.start = 0;
             self.following = false;
+            self.payload.reset();
+            self.installed = None;
             return true;
         }
         if total == 0 {
@@ -6143,9 +7519,8 @@ impl TranscriptWindow {
         let following = core.is_following();
         let previous_following = self.following;
         let next = if following {
-            let exact = tail_window_start(
+            let exact = self.payload.tail_start(
                 entries,
-                TRANSCRIPT_TAIL_MIN_ENTRIES,
                 TRANSCRIPT_WINDOW_MAX_ENTRIES,
                 TRANSCRIPT_TAIL_BYTES,
             );
@@ -6161,7 +7536,7 @@ impl TranscriptWindow {
                 // entry otherwise keeps the window over budget for many
                 // chunks).
                 let over_budget =
-                    window_payload_bytes(entries, self.start, total) > TRANSCRIPT_TAIL_BYTES;
+                    self.payload.window_bytes(entries, self.start, total) > TRANSCRIPT_TAIL_BYTES;
                 if over_budget {
                     exact
                 } else {
@@ -6176,7 +7551,7 @@ impl TranscriptWindow {
             }
         } else {
             let count = total - self.start;
-            let bytes = window_payload_bytes(entries, self.start, total);
+            let bytes = self.payload.window_bytes(entries, self.start, total);
             let rows = core.rows().max(1);
             let dock = core.dock_height().min(rows.saturating_sub(1));
             let viewport_rows = rows.saturating_sub(dock).max(1);
@@ -6210,29 +7585,581 @@ impl TranscriptWindow {
     }
 }
 
+/// Quantized wall-clock tick of the newest pending tool block (`Elapsed`
+/// tail) in the MATERIALIZED band, or 0 when none is running.
+///
+/// The scan starts at the window's first materialized entry, so a pending
+/// block in an older scrolled band keeps ticking instead of freezing when it
+/// falls out of the last [`TRANSCRIPT_WINDOW_MAX_ENTRIES`] entries. The
+/// pre-window default start (0 before the first sync) costs one O(transcript)
+/// scan on the first dirty frame; every later frame uses the planned band.
+fn live_tool_timer_tick(entries: &[ChatEntry], band_start: usize) -> u64 {
+    let start = band_start.min(entries.len());
+    let mut tick = 0u64;
+    for entry in &entries[start..] {
+        if let ChatEntry::ToolExecution {
+            pending: true,
+            duration_ms: None,
+            started_at: Some(started),
+            ..
+        } = entry
+        {
+            tick = tick.max(started.elapsed().as_millis() as u64 / 100);
+        }
+    }
+    tick
+}
+
+/// Per-entry (changed-block) cache behind [`SharedChat`].
+///
+/// The transcript used to be ONE frame-cache component: any content revision
+/// (a streaming delta, one tool's 10 Hz `Elapsed`, one install) re-rendered
+/// the whole materialized band. This cache keeps one block per materialized
+/// `ChatEntry`, each with its own single-entry [`ChatContainer`] (so the
+/// container's retained-child diff, streaming grow-in-place patch and tool
+/// memo caches still do their normal per-block work) and exposes the blocks
+/// through [`Component::content_blocks`]. `TuiCore` then re-renders only the
+/// blocks whose render identity moved and serves the rest from its per-block
+/// row caches; [`FrameWork::rebuilt_blocks`] proves the count.
+///
+/// The block key is [`entry_render_revision`] plus the `user_before` spacer
+/// state and the cache's settings epoch (hide-thinking / hidden label). A
+/// `Raw` block is rebuilt from a fresh container when its identity moves so a
+/// field the container's private `EntryTag` does not compare (Raw
+/// `is_error`, app.rs) still repaints; streaming and tool blocks reuse their
+/// container so the in-place accumulators survive.
+#[doc(hidden)]
+pub struct ChatBlockCache {
+    /// False until the app publishes the first materialized slice; a
+    /// non-primed cache leaves `SharedChat` on the whole-container path.
+    primed: bool,
+    settings_epoch: u64,
+    /// Quantized `Elapsed` tick for pending tool blocks (see
+    /// [`live_tool_timer_tick`]): part of a pending block's revision so the
+    /// 10 Hz timer re-renders that block alone (the whole-frame
+    /// `chat_revision` bump cannot reach a per-entry cache).
+    live_tick: u64,
+    hide_thinking: bool,
+    hidden_label: Option<String>,
+    tools_expanded: Arc<AtomicBool>,
+    blocks: Vec<ChatBlockSlot>,
+}
+
+struct ChatBlockSlot {
+    entry: ChatEntry,
+    revision: u64,
+    user_before: bool,
+    container: ChatContainer,
+}
+
+impl ChatBlockCache {
+    pub fn new(tools_expanded: Arc<AtomicBool>, hide_thinking: bool) -> Self {
+        Self {
+            primed: false,
+            settings_epoch: 0,
+            live_tick: 0,
+            hide_thinking,
+            hidden_label: None,
+            tools_expanded,
+            blocks: Vec::new(),
+        }
+    }
+
+    fn fresh_container(&self) -> ChatContainer {
+        let mut container = ChatContainer::new();
+        container.set_tools_expanded(Arc::clone(&self.tools_expanded));
+        if self.hide_thinking {
+            container.set_hide_thinking(true);
+        }
+        if let Some(label) = &self.hidden_label {
+            container.set_hidden_thinking_label(Some(label.clone()));
+        }
+        container
+    }
+
+    fn revision(&self, entry: &ChatEntry, user_before: bool) -> u64 {
+        Self::revision_for(entry, user_before, self.settings_epoch, self.live_tick)
+    }
+
+    fn revision_for(
+        entry: &ChatEntry,
+        user_before: bool,
+        settings_epoch: u64,
+        live_tick: u64,
+    ) -> u64 {
+        let mut hash =
+            super::core::mix_content_revision(entry_render_revision(entry), u64::from(user_before));
+        hash = super::core::mix_content_revision(hash, settings_epoch);
+        if let ChatEntry::ToolExecution {
+            pending: true,
+            started_at: Some(_),
+            ..
+        } = entry
+        {
+            // The pending block's Elapsed tail is wall-clock state that is not
+            // part of the entry payload; the quantized tick is a render input.
+            hash = super::core::mix_content_revision(hash, live_tick);
+        }
+        hash
+    }
+
+    /// Rebuild every block container for a changed render posture
+    /// (`hideThinkingBlock` / hidden label). The old implementation reset the
+    /// cache (`primed = false`), which left `SharedChat` on the whole-container
+    /// path until the next structural install — every streaming token then
+    /// re-rendered the entire materialized band. Rebuilding in place keeps the
+    /// cache primed: the settings epoch moves every block revision, so the
+    /// next frame re-renders all blocks once and streaming resumes per block.
+    fn rebuild_for_settings(&mut self) {
+        if !self.primed {
+            return;
+        }
+        let tools = Arc::clone(&self.tools_expanded);
+        let hide_thinking = self.hide_thinking;
+        let hidden_label = self.hidden_label.clone();
+        let settings_epoch = self.settings_epoch;
+        let live_tick = self.live_tick;
+        for slot in &mut self.blocks {
+            let mut container = ChatContainer::new();
+            container.set_tools_expanded(Arc::clone(&tools));
+            if hide_thinking {
+                container.set_hide_thinking(true);
+            }
+            if let Some(label) = &hidden_label {
+                container.set_hidden_thinking_label(Some(label.clone()));
+            }
+            container.set_entries(std::slice::from_ref(&slot.entry));
+            slot.container = container;
+            slot.revision =
+                Self::revision_for(&slot.entry, slot.user_before, settings_epoch, live_tick);
+        }
+    }
+
+    /// Bump the frame-time render epoch (Ctrl+O / `ctx.ui.setToolsExpanded`):
+    /// every block's rendered rows can move without an entry edit, so every
+    /// block revision moves and TuiCore re-renders the blocks (the tool
+    /// components read the live expansion cell during render).
+    pub fn bump_render_epoch(&mut self) {
+        self.settings_epoch = self.settings_epoch.wrapping_add(1);
+        let settings_epoch = self.settings_epoch;
+        let live_tick = self.live_tick;
+        for slot in &mut self.blocks {
+            slot.revision =
+                Self::revision_for(&slot.entry, slot.user_before, settings_epoch, live_tick);
+        }
+    }
+
+    /// Publish the quantized live-tool tick. Pending tool blocks get a new
+    /// revision, so the frame renderer re-renders only those blocks.
+    pub fn set_live_tick(&mut self, tick: u64) {
+        if self.live_tick == tick {
+            return;
+        }
+        self.live_tick = tick;
+        let settings_epoch = self.settings_epoch;
+        let live_tick = self.live_tick;
+        for slot in &mut self.blocks {
+            if !matches!(
+                &slot.entry,
+                ChatEntry::ToolExecution {
+                    pending: true,
+                    started_at: Some(_),
+                    ..
+                }
+            ) {
+                continue;
+            }
+            slot.revision =
+                Self::revision_for(&slot.entry, slot.user_before, settings_epoch, live_tick);
+        }
+    }
+
+    /// Publish the materialized entry slice (window start first). Called when
+    /// the app installs a slice / moves the window — not on steady frames.
+    pub fn set_entries(&mut self, entries: &[ChatEntry]) {
+        let mut user_before = false;
+        let mut rebuilt = 0u64;
+        for (index, entry) in entries.iter().enumerate() {
+            let revision = self.revision(entry, user_before);
+            let reuse = self
+                .blocks
+                .get(index)
+                .is_some_and(|slot| slot.revision == revision && slot.user_before == user_before);
+            if !reuse {
+                let mut container = match self.blocks.get(index) {
+                    // Raw blocks are recreated from scratch: the private
+                    // EntryTag does not compare `RawToolRender::is_error`, so
+                    // a reused container would retain the old error/success
+                    // paint.
+                    Some(_) if !matches!(entry, ChatEntry::Raw { .. }) => {
+                        let mut container = std::mem::replace(
+                            &mut self.blocks[index].container,
+                            ChatContainer::new(),
+                        );
+                        container.set_tools_expanded(Arc::clone(&self.tools_expanded));
+                        container
+                    }
+                    _ => self.fresh_container(),
+                };
+                let new_entry = entry.clone();
+                if !matches!(entry, ChatEntry::Raw { .. }) {
+                    // Feed the retained child diff while the OLD slot entry is
+                    // still alive: its committed `TextTag` points at that
+                    // buffer, so dropping it first would leave a tag whose
+                    // pointer the allocator could recycle.
+                    container.set_entries(std::slice::from_ref(&new_entry));
+                }
+                let slot = ChatBlockSlot {
+                    entry: new_entry,
+                    revision,
+                    user_before,
+                    container,
+                };
+                if index < self.blocks.len() {
+                    self.blocks[index] = slot;
+                } else {
+                    self.blocks.push(slot);
+                }
+                rebuilt += 1;
+            }
+            user_before |= matches!(entry, ChatEntry::User(_));
+        }
+        self.blocks.truncate(entries.len());
+        self.primed = true;
+        let _ = rebuilt;
+    }
+
+    /// Patch one materialized slot in place (the per-token streaming fast path
+    /// bypasses `set_entries`). `block_index` is relative to the window slice.
+    pub fn patch_entry(&mut self, block_index: usize, entry: &ChatEntry) {
+        if !self.primed {
+            return;
+        }
+        let Some(slot) = self.blocks.get_mut(block_index) else {
+            return;
+        };
+        let revision =
+            Self::revision_for(entry, slot.user_before, self.settings_epoch, self.live_tick);
+        if slot.revision == revision {
+            return;
+        }
+        if matches!(entry, ChatEntry::Raw { .. }) {
+            let mut container = ChatContainer::new();
+            container.set_tools_expanded(Arc::clone(&self.tools_expanded));
+            if self.hide_thinking {
+                container.set_hide_thinking(true);
+            }
+            if let Some(label) = &self.hidden_label {
+                container.set_hidden_thinking_label(Some(label.clone()));
+            }
+            slot.container = container;
+        } else {
+            // Apply the new entry before replacing (and dropping) the old
+            // slot-owned text buffer the container's committed tag points at.
+            slot.container.set_entries(std::slice::from_ref(entry));
+        }
+        slot.entry = entry.clone();
+        slot.revision = revision;
+    }
+
+    /// Incremental live-stream patch: append the exact bytes the event loop
+    /// appended to the transcript entry onto this slot's OWN accumulator, then
+    /// feed the container its retained entry. The slot buffer keeps its
+    /// allocation identity across deltas, so `ChatContainer`'s
+    /// `appended_text` fast path receives the delta alone instead of
+    /// re-parsing the whole accumulated body (`patch_entry` used to replace
+    /// the slot with a fresh clone, which defeated that pointer check).
+    ///
+    /// The length check is the resync guard: if this slot missed an install
+    /// (or the caller passed the wrong deltas) the fast path falls back to the
+    /// full copy in [`Self::patch_entry`].
+    pub fn patch_streaming_delta(
+        &mut self,
+        block_index: usize,
+        entry: &ChatEntry,
+        text_delta: &str,
+        thinking_delta: &str,
+    ) {
+        if !self.primed {
+            return;
+        }
+        let Some(slot) = self.blocks.get(block_index) else {
+            return;
+        };
+        let in_sync = match (&slot.entry, entry) {
+            (
+                ChatEntry::Streaming {
+                    text: slot_text,
+                    thinking: slot_thinking,
+                    ..
+                },
+                ChatEntry::Streaming { text, thinking, .. },
+            ) => {
+                slot_text.len().checked_add(text_delta.len()) == Some(text.len())
+                    && slot_thinking.len().checked_add(thinking_delta.len()) == Some(thinking.len())
+            }
+            _ => false,
+        };
+        if !in_sync {
+            self.patch_entry(block_index, entry);
+            return;
+        }
+        let revision = {
+            let slot = &mut self.blocks[block_index];
+            let ChatEntry::Streaming { text, thinking, .. } = &mut slot.entry else {
+                return;
+            };
+            text.push_str(text_delta);
+            thinking.push_str(thinking_delta);
+            let revision = Self::revision_for(
+                &slot.entry,
+                slot.user_before,
+                self.settings_epoch,
+                self.live_tick,
+            );
+            slot.container
+                .set_entries(std::slice::from_ref(&slot.entry));
+            revision
+        };
+        self.blocks[block_index].revision = revision;
+    }
+
+    pub fn reset(&mut self) {
+        self.blocks.clear();
+        self.primed = false;
+    }
+
+    pub fn set_hide_thinking(&mut self, hide_thinking: bool) {
+        if self.hide_thinking == hide_thinking {
+            return;
+        }
+        self.hide_thinking = hide_thinking;
+        self.settings_epoch = self.settings_epoch.wrapping_add(1);
+        self.rebuild_for_settings();
+    }
+
+    pub fn set_hidden_label(&mut self, label: Option<String>) {
+        if self.hidden_label == label {
+            return;
+        }
+        self.hidden_label = label;
+        self.settings_epoch = self.settings_epoch.wrapping_add(1);
+        self.rebuild_for_settings();
+    }
+
+    pub fn is_primed(&self) -> bool {
+        self.primed
+    }
+
+    /// Test seam: `(ptr, len, capacity)` of one slot's live text accumulator.
+    /// [`Self::patch_streaming_delta`] must keep this allocation alive across
+    /// deltas (a clone-per-delta replacement resets `capacity` to `len`).
+    #[doc(hidden)]
+    pub fn block_streaming_text_tag(&self, index: usize) -> Option<(usize, usize, usize)> {
+        let ChatEntry::Streaming { text, .. } = &self.blocks.get(index)?.entry else {
+            return None;
+        };
+        Some((text.as_ptr() as usize, text.len(), text.capacity()))
+    }
+
+    pub fn block_revisions(&self) -> Option<Vec<u64>> {
+        self.primed
+            .then(|| self.blocks.iter().map(|slot| slot.revision).collect())
+    }
+
+    /// Render one block into the frame's recycled canvas. `TuiCore` calls this
+    /// only when the block's revision moved or its frame position changed.
+    pub fn render_block(&mut self, index: usize, width: usize, out: &mut Rows<'_>) {
+        let Some(slot) = self.blocks.get_mut(index) else {
+            return;
+        };
+        slot.container
+            .set_entries(std::slice::from_ref(&slot.entry));
+        if slot.user_before && matches!(slot.entry, ChatEntry::User(_)) {
+            // The full container inserts `Spacer::new(1)` before a USER entry
+            // when an earlier user message exists; the per-entry container
+            // sees no prefix, so the block cache owns that spacer row. The
+            // other entry kinds ignore `user_before` in `build_entry` (their
+            // Notice/Raw/Streaming branches push their own unconditional
+            // Spacer), so injecting one here would duplicate that row.
+            super::core::push_blank(out, width);
+        }
+        slot.container.render_into(width, out);
+    }
+}
+
+/// The exact in-place appends one drained token batch made to the live
+/// streaming entry. `index` is the ABSOLUTE transcript index; the block cache
+/// index is derived from the window origin at the commit site.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct LiveStreamBatch {
+    pub index: usize,
+    pub text: String,
+    pub thinking: String,
+}
+
+/// Commit one token batch to the retained live-stream component and the
+/// per-entry block cache. Returns whether the container took the in-place
+/// patch (false means the caller must run the full transcript sync).
+///
+/// The entry delta/epoch are published even when the patch is REFUSED: the
+/// event-loop arms mutated the entry in place first (text-first → thinking
+/// later rebuilds the committed children instead of appending to a missing
+/// thinking child). Not publishing that mutation left `should_install`
+/// answering from its old render memo, so the thinking text could stay
+/// invisible until an unrelated structural event.
+/// The retained components one live-stream batch patches, plus the window
+/// origin that maps absolute entry indices to block indices.
+#[doc(hidden)]
+pub struct LiveStreamCommit<'a> {
+    pub chat: &'a Mutex<ChatContainer>,
+    pub chat_blocks: &'a Mutex<ChatBlockCache>,
+    pub entries: &'a [ChatEntry],
+    pub window_start: usize,
+}
+
+#[doc(hidden)]
+pub fn commit_live_stream_batch(
+    target: LiveStreamCommit<'_>,
+    batch: Option<&LiveStreamBatch>,
+    entry_delta: &mut EntryDelta,
+    transcript_epoch: &AtomicU64,
+    chat_revision: &AtomicU64,
+) -> bool {
+    let LiveStreamCommit {
+        chat,
+        chat_blocks,
+        entries,
+        window_start,
+    } = target;
+    let patched = chat
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .patch_last_streaming(entries, window_start);
+    let Some(absolute_index) = entries.len().checked_sub(1) else {
+        return patched;
+    };
+    // `EntryDelta` indexes the ABSOLUTE transcript; `ChatBlockCache` indexes
+    // the materialized window slice. They differ whenever a huge session has
+    // scrolled its tail window, and mixing them revalidated the wrong entry.
+    if let Some(batch) = batch {
+        entry_delta.note_changed(batch.index.min(absolute_index));
+        transcript_epoch.fetch_add(1, Ordering::Relaxed);
+    } else if patched {
+        entry_delta.note_changed(absolute_index);
+        transcript_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+    if patched {
+        let entry = &entries[absolute_index];
+        if let Some(block_index) = entries.len().checked_sub(1 + window_start) {
+            let mut blocks = chat_blocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match batch {
+                Some(batch) => {
+                    blocks.patch_streaming_delta(block_index, entry, &batch.text, &batch.thinking)
+                }
+                None => blocks.patch_entry(block_index, entry),
+            }
+        }
+        chat_revision.fetch_add(1, Ordering::Relaxed);
+    }
+    patched
+}
+
+/// Test seam: the production [`SharedChat`] wrapper over a [`ChatBlockCache`]
+/// (integration tests pin the real block path, not a synthetic component).
+#[doc(hidden)]
+pub fn shared_chat_component(
+    chat: Arc<Mutex<ChatContainer>>,
+    revision: Arc<AtomicU64>,
+    blocks: Arc<Mutex<ChatBlockCache>>,
+) -> Box<dyn super::core::Component> {
+    Box::new(SharedChat {
+        chat,
+        revision,
+        blocks,
+    })
+}
+
 /// Shared chat wrapper so the scroll view and entries stay in sync.
-struct SharedChat(Arc<Mutex<ChatContainer>>);
+struct SharedChat {
+    chat: Arc<Mutex<ChatContainer>>,
+    /// The app's [`App::chat_revision`]: the frame renderer's cache key for
+    /// the transcript rows.
+    revision: Arc<AtomicU64>,
+    /// Per-entry block decomposition (see [`ChatBlockCache`]).
+    blocks: Arc<Mutex<ChatBlockCache>>,
+}
 
 impl Component for SharedChat {
     /// Canvas-first (the frame bridge would allocate a `Vec<String>` per row
     /// only to re-parse it into the canvas): the transcript is the frame's
     /// biggest row producer, so it writes into the pooled rows directly.
     fn render_into(&self, width: usize, out: &mut super::core::Rows<'_>) {
-        self.0
+        let mut blocks = self
+            .blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if blocks.is_primed() {
+            let count = blocks
+                .block_revisions()
+                .map_or(0, |revisions| revisions.len());
+            for index in 0..count {
+                blocks.render_block(index, width, out);
+            }
+            return;
+        }
+        drop(blocks);
+        self.chat
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .render_into(width, out);
     }
 
     fn render(&self, width: usize) -> Vec<String> {
-        self.0
+        let mut lines = Vec::new();
+        {
+            let mut rows = super::core::Rows::new(&mut lines);
+            self.render_into(width, &mut rows);
+            rows.trim();
+        }
+        lines
+    }
+
+    /// The transcript's rendered rows depend on the committed `ChatEntry`
+    /// set and every per-block state cell; all mutation paths publish through
+    /// `App::chat_revision`. `None` before the first publish would disable
+    /// the cache — revision 0 is a valid initial state.
+    fn content_revision(&self) -> Option<u64> {
+        Some(self.revision.load(Ordering::Relaxed))
+    }
+
+    /// Per-entry decomposition: `TuiCore` caches one row block per materialized
+    /// entry and re-renders only the blocks whose identity moved. Unprimed
+    /// (before the first app slice install) returns `None`, keeping the
+    /// whole-container cache path.
+    fn content_blocks(&self) -> Option<Vec<u64>> {
+        self.blocks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .render(width)
+            .block_revisions()
+    }
+
+    fn render_block_into(&self, index: usize, width: usize, out: &mut Rows<'_>) {
+        self.blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .render_block(index, width, out);
     }
 
     fn invalidate(&self) {
-        self.0
+        self.blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reset();
+        self.chat
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .invalidate();
@@ -6650,24 +8577,38 @@ fn spawn_ui_watchdog(heartbeat: Arc<UiHeartbeat>) {
 /// each becomes a `Warning: …` chat notice before the crash notice, matching
 /// the interactive upstream host (the CLI prints them to stderr only for
 /// non-interactive modes).
-// The signature mirrors the upstream `createInteractiveTui` options object
-// one-to-one; collapsing it into a struct would churn every caller for no
-// behavioral gain, so the lint is tolerated here.
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    extension_paths: Vec<std::path::PathBuf>,
-    theme: Option<String>,
-    session: crate::coding_agent::session_resolve::SessionPlan,
-    session_dir: String,
-    resource_paths: crate::coding_agent::resources::ResourcePathOptions,
-    initial_messages: Vec<String>,
-    tool_selection: Option<crate::coding_agent::ToolSelection>,
-    cli_tui_mode: Option<String>,
-    settings: &crate::config::settings::SettingsManager,
-    package_themes: &[std::path::PathBuf],
-    settings_diagnostics: Vec<crate::config::settings::SettingsDiagnostic>,
-    overrides: super::TuiOverrides,
-) -> crate::Result<()> {
+// The options mirror the upstream `createInteractiveTui` options object
+// one-to-one; they travel as one struct so every caller names its fields.
+pub struct TuiRunOptions<'a> {
+    pub extension_paths: Vec<std::path::PathBuf>,
+    pub theme: Option<String>,
+    pub session: crate::coding_agent::session_resolve::SessionPlan,
+    pub session_dir: String,
+    pub resource_paths: crate::coding_agent::resources::ResourcePathOptions,
+    pub initial_messages: Vec<String>,
+    pub tool_selection: Option<crate::coding_agent::ToolSelection>,
+    pub cli_tui_mode: Option<String>,
+    pub settings: &'a crate::config::settings::SettingsManager,
+    pub package_themes: &'a [std::path::PathBuf],
+    pub settings_diagnostics: Vec<crate::config::settings::SettingsDiagnostic>,
+    pub overrides: super::TuiOverrides,
+}
+
+pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
+    let TuiRunOptions {
+        extension_paths,
+        theme,
+        session,
+        session_dir,
+        resource_paths,
+        initial_messages,
+        tool_selection,
+        cli_tui_mode,
+        settings,
+        package_themes,
+        settings_diagnostics,
+        overrides,
+    } = options;
     // TUI phase timings (PI_TIMING=1 / PI_STARTUP_BENCHMARK): the startup
     // slice run_mode's pre-mode report cannot see (config/theme/extension
     // loads, first frame) plus the exit slice; reported after the terminal
@@ -7090,20 +9031,22 @@ pub fn run(
     }
     let mut worker = WorkerHandle::spawn(
         event_tx.clone(),
-        app.configured.clone(),
-        ext.clone(),
-        session,
-        app.session_dir.clone(),
-        std::sync::Arc::clone(&resources),
-        tool_selection,
-        std::sync::Arc::clone(&app.native_statuses),
-        WorkerOverrides {
-            thinking: resolved_thinking,
-            session_name: overrides.session_name.clone(),
-            scoped_refs: scoped_refs_from_cli,
-            system_prompt: overrides.system_prompt.clone(),
-            append_system_prompt: overrides.append_system_prompt.clone(),
-            session_cwd_override,
+        WorkerParts {
+            configured: app.configured.clone(),
+            extensions: ext.clone(),
+            session_plan: session,
+            session_dir: app.session_dir.clone(),
+            resources: std::sync::Arc::clone(&resources),
+            tool_selection,
+            native_statuses: std::sync::Arc::clone(&app.native_statuses),
+            overrides: WorkerOverrides {
+                thinking: resolved_thinking,
+                session_name: overrides.session_name.clone(),
+                scoped_refs: scoped_refs_from_cli,
+                system_prompt: overrides.system_prompt.clone(),
+                append_system_prompt: overrides.append_system_prompt.clone(),
+                session_cwd_override,
+            },
         },
     );
 
@@ -7115,6 +9058,7 @@ pub fn run(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .set_hide_thinking(true);
+            app.chat_revision.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -7283,6 +9227,9 @@ pub fn run(
     // whole committed prefix.
     let mut saw_stream_delta = false;
     let mut batch_has_non_delta = false;
+    // The exact bytes this batch appended to the live entry (the block cache
+    // applies the same delta to its own retained accumulator).
+    let mut live_stream_batch: Option<LiveStreamBatch> = None;
     // Last rendered countdown second of the open timed extension dialog —
     // repaint on each `(Ns)` tick (upstream CountdownTimer requestRender).
     let mut dialog_countdown: Option<u64> = None;
@@ -7424,6 +9371,11 @@ pub fn run(
             } else {
                 batch_has_non_delta = true;
             }
+            // Entry-list length changes (append/remove) are one exact delta.
+            // In-place mutations publish their index in the matching arm; a
+            // footer-only event no longer bumps the transcript epoch (the old
+            // blanket bump made every such event re-scan the band).
+            let entries_len_before_event = entries.len();
             match event {
                 WorkerEvent::TranscriptEntry(entry) => {
                     // Replay of the attached session's stored history
@@ -7474,17 +9426,23 @@ pub fn run(
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let effect = apply_older_page(
                         &mut older,
-                        chunk,
-                        cursor,
-                        failed,
-                        &mut entries,
-                        &mut transcript_window,
-                        &mut streaming_entry,
-                        &mut tool_entries,
-                        &mut alt.search,
-                        &mut search_probe,
-                        app.core.columns().max(1),
-                        app.hide_thinking,
+                        OlderPageReply {
+                            chunk,
+                            cursor,
+                            failed,
+                        },
+                        OlderPageTranscript {
+                            entries: &mut entries,
+                            window: &mut transcript_window,
+                            streaming_entry: &mut streaming_entry,
+                            tool_entries: &mut tool_entries,
+                        },
+                        OlderPageSearch {
+                            search: &mut alt.search,
+                            probe: &mut search_probe,
+                            probe_width: app.core.columns().max(1),
+                            hide_thinking: app.hide_thinking,
+                        },
                     );
                     drop(alt);
                     if effect == OlderPageEffect::Materialized {
@@ -7498,7 +9456,7 @@ pub fn run(
                     // (text → tool → text in one assistant message) appends
                     // its card after the streaming entry, and continuing text
                     // must render BELOW the card, not jump above it.
-                    match live_streaming_index(&streaming_entry, &entries) {
+                    let index = match live_streaming_index(&streaming_entry, &entries) {
                         Some(index) => {
                             // Append into the live entry IN PLACE instead of
                             // rebuilding it: the replacement cloned the entire
@@ -7512,6 +9470,7 @@ pub fn run(
                             {
                                 entry_text.push_str(&text);
                             }
+                            index
                         }
                         None => {
                             // A fresh stream replaces any stale live entry; the
@@ -7521,11 +9480,30 @@ pub fn run(
                             entries.push(ChatEntry::Streaming {
                                 live: true,
                                 thinking: String::new(),
-                                text,
+                                text: text.clone(),
                             });
                             streaming_entry = Some(entries.len() - 1);
+                            entries.len() - 1
                         }
+                    };
+                    // Publish the in-place append immediately. The fast path
+                    // below may take it in place, but a mixed batch (or a
+                    // refused patch: text first, thinking later) runs the
+                    // full sync, and without this delta/epoch move the
+                    // install key would still answer from its old render
+                    // memo and the appended text would never be installed.
+                    app.note_entry_changed(index);
+                    let batch = live_stream_batch.get_or_insert_with(|| LiveStreamBatch {
+                        index,
+                        ..LiveStreamBatch::default()
+                    });
+                    if batch.index != index {
+                        *batch = LiveStreamBatch {
+                            index,
+                            ..LiveStreamBatch::default()
+                        };
                     }
+                    batch.text.push_str(&text);
                 }
                 WorkerEvent::ThinkingDelta { text } => {
                     // Live thinking streaming (upstream renders the thinking
@@ -7534,21 +9512,35 @@ pub fn run(
                     // thinking-only reply grows this entry and therefore
                     // repaints, where the TUI previously dropped thinking
                     // deltas entirely and stayed blank until message_done.
-                    match live_streaming_index(&streaming_entry, &entries) {
+                    let index = match live_streaming_index(&streaming_entry, &entries) {
                         Some(index) => {
                             if let ChatEntry::Streaming { thinking, .. } = &mut entries[index] {
                                 thinking.push_str(&text);
                             }
+                            index
                         }
                         None => {
                             entries.push(ChatEntry::Streaming {
                                 live: true,
-                                thinking: text,
+                                thinking: text.clone(),
                                 text: String::new(),
                             });
                             streaming_entry = Some(entries.len() - 1);
+                            entries.len() - 1
                         }
+                    };
+                    app.note_entry_changed(index);
+                    let batch = live_stream_batch.get_or_insert_with(|| LiveStreamBatch {
+                        index,
+                        ..LiveStreamBatch::default()
+                    });
+                    if batch.index != index {
+                        *batch = LiveStreamBatch {
+                            index,
+                            ..LiveStreamBatch::default()
+                        };
                     }
+                    batch.thinking.push_str(&text);
                 }
                 WorkerEvent::AssistantDone(mut message) => {
                     // The live streaming entry becomes the final
@@ -7603,7 +9595,15 @@ pub fn run(
                     // rendered the content twice. No `live == true` entry
                     // survives the turn.
                     streaming_entry = None;
-                    finalize_streaming_segments(&mut entries, Some(message));
+                    let (_, changed) =
+                        finalize_streaming_segments_tracked(&mut entries, Some(message));
+                    if let Some((start, end)) = changed {
+                        // Live segments were replaced/removed at arbitrary
+                        // indices; mark the affected tail only (the live
+                        // segment is normally at the end, so this is O(tail),
+                        // not the 100k-entry full-range delta).
+                        app.note_entry_range(start, end);
+                    }
                     // Usage/model/routed markers moved: both footer faces.
                     app.refresh_footer_caches();
                 }
@@ -7631,20 +9631,22 @@ pub fn run(
                 } => {
                     // Live args while the call streams (upstream
                     // `message_update` → `ToolExecutionComponent.updateArgs`).
-                    upsert_pending_tool_entry(
+                    if let Some(index) = upsert_pending_tool_entry(
                         &mut entries,
                         &mut tool_entries,
                         &call_id,
                         &tool_name,
                         Some(args),
-                    );
+                    ) {
+                        app.note_entry_changed(index);
+                    }
                 }
                 WorkerEvent::ToolExecutionStarted { call_id, tool_name } => {
                     // `tool_execution_start`: the block exists even when the
                     // stream never announced the call (upstream creates the
                     // component here from `event.args`; pir's event carries no
                     // args, so the streamed args — when seen — are reused).
-                    upsert_pending_tool_entry(
+                    let _ = upsert_pending_tool_entry(
                         &mut entries,
                         &mut tool_entries,
                         &call_id,
@@ -7704,6 +9706,15 @@ pub fn run(
                                 tool.is_error = is_error;
                             }
                             tool_entries.insert(call_id, index);
+                            // The flip/duration above is an IN-PLACE render
+                            // change (payload pointers and lengths do not
+                            // move). Publish the content epoch and the exact
+                            // entry delta so the frame cache and the window's
+                            // installed-slice key re-read THIS entry instead
+                            // of serving the old pending paint (or scanning
+                            // the whole band).
+                            app.note_entry_changed(index);
+                            app.chat_revision.fetch_add(1, Ordering::Relaxed);
                         }
                         None => {
                             entries.push(ChatEntry::ToolExecution {
@@ -7774,7 +9785,10 @@ pub fn run(
                             )
                         });
                         match pending_index {
-                            Some(index) => entries[index] = entry,
+                            Some(index) => {
+                                entries[index] = entry;
+                                app.note_entry_changed(index);
+                            }
                             None => entries.push(entry),
                         }
                     } else {
@@ -7795,13 +9809,15 @@ pub fn run(
                         let render_digest = js_renderer.then(|| {
                             tool_render_digest(
                                 &app,
-                                &tool_name,
-                                &args,
-                                &output,
-                                is_error,
-                                details.as_ref(),
-                                &images,
-                                partial,
+                                ToolRenderDigest {
+                                    tool_name: &tool_name,
+                                    args: &args,
+                                    output: &output,
+                                    is_error,
+                                    details: details.as_ref(),
+                                    images: &images,
+                                    partial,
+                                },
                             )
                         });
                         let cached_slot = call_id.as_ref().and_then(|id| {
@@ -7822,14 +9838,16 @@ pub fn run(
                             ui_heartbeat.beat(UI_PHASE_EXTENSION_RENDER);
                             let mut entry = render_tool_entry(
                                 &app,
-                                call_id.clone(),
-                                tool_name,
-                                args,
-                                output,
-                                is_error,
-                                details,
-                                Arc::new(images),
-                                partial,
+                                ToolRenderPayload {
+                                    call_id: call_id.clone(),
+                                    tool_name,
+                                    args: Arc::new(args),
+                                    output: Arc::from(output),
+                                    is_error,
+                                    details: details.map(Arc::new),
+                                    images: Arc::new(images),
+                                    pending: partial,
+                                },
                                 &mut entries,
                             );
                             // Cache only a rendered RESULT: a fallback or
@@ -7903,6 +9921,7 @@ pub fn run(
                                         }
                                     }
                                     entries[index] = entry;
+                                    app.note_entry_changed(index);
                                     tool_entries.insert(id, index);
                                 }
                                 None => entries.push(entry),
@@ -7919,29 +9938,32 @@ pub fn run(
                     // args (upstream `previewArgsKey` guard): a stale preview
                     // must never overwrite a resolved result.
                     let index = locate_tool_entry(&entries, &tool_entries, &call_id);
-                    if let Some(ChatEntry::ToolExecution {
-                        args,
-                        preview,
-                        pending,
-                        ..
-                    }) = index.and_then(|index| entries.get_mut(index))
-                    {
-                        let current_key = super::messages::edit_preview_input(args.as_ref())
-                            .map(|input| input.args_key);
-                        if current_key.as_deref() == Some(args_key.as_str()) && *pending {
-                            let (diff, first_changed_line, error) = match result {
-                                Ok((diff, first_changed_line)) => {
-                                    (Some(diff), first_changed_line, None)
-                                }
-                                Err(error) => (None, None, Some(error)),
-                            };
-                            *preview = Some(super::app::ToolPreview {
-                                args_key,
-                                diff,
-                                first_changed_line,
-                                error,
-                            });
-                            dirty = true;
+                    if let Some(index) = index {
+                        if let Some(ChatEntry::ToolExecution {
+                            args,
+                            preview,
+                            pending,
+                            ..
+                        }) = entries.get_mut(index)
+                        {
+                            let current_key = super::messages::edit_preview_input(args.as_ref())
+                                .map(|input| input.args_key);
+                            if current_key.as_deref() == Some(args_key.as_str()) && *pending {
+                                let (diff, first_changed_line, error) = match result {
+                                    Ok((diff, first_changed_line)) => {
+                                        (Some(diff), first_changed_line, None)
+                                    }
+                                    Err(error) => (None, None, Some(error)),
+                                };
+                                *preview = Some(super::app::ToolPreview {
+                                    args_key,
+                                    diff,
+                                    first_changed_line,
+                                    error,
+                                });
+                                app.note_entry_changed(index);
+                                dirty = true;
+                            }
                         }
                     }
                 }
@@ -7965,12 +9987,16 @@ pub fn run(
                     outcome,
                 } => {
                     if apply_custom_render_result(
-                        &app,
+                        &app.custom_renders,
                         &mut entries,
-                        entry_key,
-                        token,
-                        inputs,
-                        outcome,
+                        CustomRenderResult {
+                            entry_key,
+                            token,
+                            inputs,
+                            outcome,
+                        },
+                        &mut app.entry_delta,
+                        &app.transcript_epoch,
                     ) {
                         dirty = true;
                     }
@@ -7986,7 +10012,8 @@ pub fn run(
                     // receives the error text as its result (upstream
                     // message_end, interactive-mode.ts:3575-3585).
                     let message: Arc<str> = Arc::from(message);
-                    for entry in &mut entries {
+                    let mut changed: Option<(usize, usize)> = None;
+                    for (index, entry) in entries.iter_mut().enumerate() {
                         if let ChatEntry::ToolExecution {
                             output,
                             is_error,
@@ -7998,14 +10025,24 @@ pub fn run(
                                 *output = Arc::clone(&message);
                                 *is_error = true;
                                 *pending = false;
+                                changed = Some(match changed {
+                                    Some((start, _)) => (start, index + 1),
+                                    None => (index, index + 1),
+                                });
                             }
                         }
                     }
                     // The abort rewrote the pending blocks' visible output
                     // outside the renderer path: drop the digest cache so a
                     // later identical update re-renders (and re-applies its
-                    // result) exactly like the pre-cache shape.
+                    // result) exactly like the pre-cache shape, and publish
+                    // only the entries this abort actually changed (a 100k
+                    // transcript must not re-read every entry per turn end).
                     tool_render_digests.clear();
+                    if let Some((start, end)) = changed {
+                        app.note_entry_range(start, end);
+                        app.chat_revision.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 WorkerEvent::ClipboardText { target, text } => {
                     // The pending slot is retired by the reader thread's exit
@@ -8048,7 +10085,8 @@ pub fn run(
                 WorkerEvent::Reloaded(outcome) => {
                     // The off-thread half of `/reload` finished: apply
                     // keybindings/themes/resources, hot-swap the session's
-                    // resource set and reload the extension runtime.
+                    // resource set and hand the unified cross-face plugin
+                    // reload to the worker.
                     apply_reload_outcome(&mut app, &mut entries, &worker, outcome);
                 }
                 WorkerEvent::ExtensionsReloaded => {
@@ -8171,8 +10209,13 @@ pub fn run(
                     // clears `live`, so the streamed text stays on screen while
                     // no in-place update handle outlives the turn.
                     end_run_state(&app);
-                    if finalize_streaming_segments(&mut entries, None) > 0 {
+                    let (finalized, changed) =
+                        finalize_streaming_segments_tracked(&mut entries, None);
+                    if finalized > 0 {
                         streaming_entry = None;
+                        if let Some((start, end)) = changed {
+                            app.note_entry_range(start, end);
+                        }
                         dirty = true;
                     }
                 }
@@ -8266,18 +10309,30 @@ pub fn run(
                             .fork = Some(ForkSelector::new(&messages));
                     }
                 }
-                WorkerEvent::SessionRenamed { name } => {
-                    // `/name <name>` → terminal title + footer name + the
-                    // active tab's title.
-                    app.session_name = Some(name.clone());
-                    super::app::set_active_title(&mut app.tabs, app.active_path.as_deref(), &name);
+                WorkerEvent::SessionInfoChanged { name } => {
+                    // `session_info_changed` → terminal title + footer name +
+                    // the active tab's title. Covers `/name <name>` and every
+                    // out-of-band caller (extension `pi.setSessionName`, RPC),
+                    // including a clear (`None`), which falls back to the tab's
+                    // first-user preview / file stem.
+                    let first_user = entries.iter().find_map(|entry| match entry {
+                        ChatEntry::User(text) => Some(text.as_str()),
+                        _ => None,
+                    });
+                    app.session_name = name.clone();
+                    apply_session_info_changed(
+                        &mut app.tabs,
+                        app.active_path.as_deref(),
+                        name.as_deref(),
+                        first_user,
+                    );
                     // OSC 7501: working/done reports carry the session name
                     // as their message (upstream `session_info_changed`).
                     let reporter_name = name.clone();
                     app.core
                         .program_status_reporter()
-                        .set_session_name(Arc::new(move || Some(reporter_name.clone())));
-                    let title = terminal_title(Some(&name), &app.core_title_cwd());
+                        .set_session_name(Arc::new(move || reporter_name.clone()));
+                    let title = terminal_title(name.as_deref(), &app.core_title_cwd());
                     app.core.set_title(&title);
                     app.refresh_footer_caches();
                 }
@@ -8301,7 +10356,7 @@ pub fn run(
                     // The outgoing session's name (footer/terminal title/OSC
                     // reports) must not leak into the attached one. A named
                     // attach re-announces its name right after this event
-                    // (`SessionRenamed`), which re-applies it to this tab.
+                    // (`SessionInfoChanged`), which re-applies it to this tab.
                     app.session_name = None;
                     app.core
                         .program_status_reporter()
@@ -8383,20 +10438,35 @@ pub fn run(
                     let mut reporter = app.core.program_status_reporter();
                     reporter.assistant_message_end(true, Some(&error));
                     reporter.agent_settled(false);
+                    drop(reporter);
                     if osc_progress {
                         write_osc_progress(false);
                     }
                     // No `message_done` follows a dead run: settle the live
                     // segment(s) here so the entries do not keep streaming
                     // state (and its retained update handles) past the turn.
-                    if finalize_streaming_segments(&mut entries, None) > 0 {
+                    let (finalized, changed) =
+                        finalize_streaming_segments_tracked(&mut entries, None);
+                    if finalized > 0 {
                         streaming_entry = None;
+                        if let Some((start, end)) = changed {
+                            app.note_entry_range(start, end);
+                        }
                         dirty = true;
                     }
                 }
                 WorkerEvent::CompactionStarted => {
                     // OSC 7501: compaction began (upstream `compaction_start`).
                     app.core.program_status_reporter().compaction_start();
+                    // The editor-border indicator carries the upstream
+                    // compaction label while the summarizer runs (manual
+                    // `/compact` used to set this in the command path; the
+                    // session event now covers every automatic threshold/
+                    // overflow run too).
+                    *app.working_message
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some("Compacting context... (working)".to_string());
                     if osc_progress {
                         write_osc_progress(true);
                     }
@@ -8412,7 +10482,35 @@ pub fn run(
                         error.as_deref(),
                         manual,
                     );
-                    if osc_progress {
+                    // Leave the compaction label only while it is still the
+                    // one this pair installed (a nested Working update wins).
+                    {
+                        let mut working = app
+                            .working_message
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if working
+                            .as_deref()
+                            .is_some_and(|message| message.starts_with("Compacting"))
+                        {
+                            // Inside a run the generic label resumes; an
+                            // idle manual compaction (extension `ctx.compact`)
+                            // must clear it — no run end will follow.
+                            *working = worker.is_streaming().then(|| "Working".to_string());
+                        }
+                    }
+                    if !aborted && error.is_none() {
+                        // The compaction replaced the model context: the
+                        // footer's pre-compaction percentage is stale, and the
+                        // session has no projected post-compaction usage until
+                        // the next response (same rule as `WorkerEvent::Usage`).
+                        app.context_percent = None;
+                        app.refresh_footer_caches();
+                    }
+                    // A compaction inside a run is not the end of the run's
+                    // OSC 9;4 progress; only an idle manual compaction clears
+                    // it here (`RunSettled` clears the run's own progress).
+                    if osc_progress && !worker.is_streaming() {
                         write_osc_progress(false);
                     }
                 }
@@ -8490,6 +10588,63 @@ pub fn run(
                     }
                     for text in delivered_follow_up {
                         entries.push(ChatEntry::User(text));
+                    }
+                }
+                WorkerEvent::EntryAppended { entry } => {
+                    // `entry_appended` for a user message. The typed-prompt
+                    // path already owns its bubble (optimistic submit) and a
+                    // delivered steer/follow-up bubble is pushed by
+                    // `QueueUpdate`; only an extension's `sendUserMessage`
+                    // reaches the TUI for the first time here. The worker
+                    // filtered every other entry shape out, so this is a
+                    // ONE-ENTRY append — never a transcript reload.
+                    if let Some(raw) = entry_appended_user_text(&entry) {
+                        // Fast path: a typed prompt with no markdown transform
+                        // and a queue-delivered bubble both already carry the
+                        // raw text, so the visible-projection check needs no
+                        // renderer round-trip.
+                        let already_visible = user_message_already_rendered(&entries, &raw, &raw);
+                        let display = if already_visible {
+                            None
+                        } else {
+                            let (display, transform_error) =
+                                transform_markdown(&app, &raw, "user", false);
+                            if let Some(error) = transform_error {
+                                entries.push(ChatEntry::Notice {
+                                    kind: super::app::NoticeKind::Warning,
+                                    text: error,
+                                });
+                            }
+                            // A transformed typed prompt stores the display
+                            // spelling; compare it before deciding this is a
+                            // new message.
+                            if user_message_already_rendered(&entries, &raw, &display) {
+                                None
+                            } else {
+                                Some(display)
+                            }
+                        };
+                        if let Some(display) = display {
+                            // Append only the new row. A pinned (scrolled-away)
+                            // viewport keeps its band: `TranscriptWindow`
+                            // materializes the tail again when the view returns
+                            // to follow, so no screen-wide rebuild happens for
+                            // an off-screen append.
+                            entries.push(ChatEntry::User(display.clone()));
+                            // A tab still showing its file stem takes the
+                            // first-user preview now. `RunStarted` can have
+                            // fired before an extension-started user message
+                            // existed, so the usual title refresh seam missed
+                            // it.
+                            if refresh_active_tab_title(
+                                &mut app.tabs,
+                                app.active_path.as_deref(),
+                                app.session_name.as_deref(),
+                                Some(&display),
+                            ) {
+                                app.refresh_footer_caches();
+                            }
+                        }
                     }
                 }
                 WorkerEvent::Dequeued {
@@ -8676,6 +10831,14 @@ pub fn run(
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 }
+                WorkerEvent::AgentSessionReady(session) => {
+                    // One live session for the whole interactive run (the
+                    // worker rebuilds storage in place on switches). Keep only
+                    // the weak handle: the UI must not extend the session's
+                    // lifetime, and an upgrade after teardown falls back to
+                    // the static/native login path.
+                    app.session = Some(session);
+                }
                 WorkerEvent::NativeCommands(commands) => {
                     // Native plugin commands are static (builtins register at
                     // host build), so one startup snapshot is the whole
@@ -8732,6 +10895,7 @@ pub fn run(
                     }
                 }
             }
+            app.note_entries_resized(entries_len_before_event, entries.len());
         }
         // P0.3: the batch cap stopped the drain with worker events still
         // queued. Do not wait out the poll this iteration — render the batch
@@ -8754,7 +10918,14 @@ pub fn run(
         // a width, palette or Ctrl+O expansion move must re-run the renderer,
         // or the block keeps lines built for the old inputs. The pass itself
         // is gated on the render-key triple, so a steady frame only compares.
-        if rerender_stale_raw_entries(&app, &mut entries) {
+        let entries_len_before_stale = entries.len();
+        if let Some((start, end)) = rerender_stale_raw_entries(&app, &mut entries) {
+            // The stale-output pass replaces Raw entries with freshly
+            // rendered lines (potentially different payload sizes); mark only
+            // the entries it actually rewrote, plus any warning rows it
+            // appended.
+            app.note_entry_range(start, end);
+            app.note_entries_resized(entries_len_before_stale, entries.len());
             dirty = true;
         }
         // Background threads (the login flow's internal dialogs) request a
@@ -8788,7 +10959,9 @@ pub fn run(
             // window has scrolled. Regular mode's huge-session fallback also
             // materializes a bounded tail through the same window.
             let window_start = transcript_window.start();
-            if !(streaming_tail_only && app.patch_last_streaming(&entries, window_start)) {
+            if !(streaming_tail_only
+                && app.patch_last_streaming(&entries, window_start, live_stream_batch.as_ref()))
+            {
                 // P0.3: only the materialized window reaches the chat container.
                 app.sync_transcript_window(&entries, &mut transcript_window);
             }
@@ -8803,6 +10976,7 @@ pub fn run(
         }
         saw_stream_delta = false;
         batch_has_non_delta = false;
+        live_stream_batch = None;
 
         // OSC 7501: expire an unanswered support query after the grace window
         // (upstream clears `programStatusQueryPending` when the DA1 answer
@@ -9170,6 +11344,11 @@ pub fn run(
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .set_hide_thinking(app.hide_thinking);
+                            app.chat_blocks
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .set_hide_thinking(app.hide_thinking);
+                            app.chat_revision.fetch_add(1, Ordering::Relaxed);
                             dirty = true;
                         }
                         Some(AltKeyRoute::Consumed) => dirty = true,
@@ -9381,6 +11560,10 @@ pub fn run(
                 .search
                 .walk
                 .cancel();
+            // The payload cache and installed-slice key are indexed by the
+            // outgoing list; reset them even if the incoming session happens
+            // to grow back to the same entry count.
+            transcript_window.reset_for_session();
             dirty = true;
         }
 
@@ -9515,11 +11698,15 @@ pub fn run(
                         &mut alt.search,
                         windowed,
                         &mut older,
-                        &entries,
-                        &mut transcript_window,
-                        &mut search_probe,
-                        app.core.columns().max(1),
-                        app.hide_thinking,
+                        &mut SearchWalkView {
+                            entries: &entries,
+                            window: &mut transcript_window,
+                        },
+                        &mut SearchWalkProbe {
+                            probe: &mut search_probe,
+                            width: app.core.columns().max(1),
+                            hide_thinking: app.hide_thinking,
+                        },
                     )
                 } else {
                     SearchWalkStep::Idle
@@ -9658,6 +11845,25 @@ pub fn run(
                     .max(1)
                     .saturating_sub(app.core.dock_height())
                     .max(1);
+                // Smooth-scroll prefetch: a few viewports before the
+                // materialized top, ask the worker to parse the next page in
+                // the background. One command per cursor; the manager cache
+                // also coalesces duplicates.
+                if should_prefetch_older(OlderPrefetchGate {
+                    windowed: true,
+                    scrolled: scroll_offset > 0,
+                    window_start: transcript_window.start(),
+                    visible_top: app.core.visible_top(),
+                    viewport_rows,
+                    cursor_available: older.cursor.is_some() && !older.failed,
+                    request_in_flight: older.loading,
+                    already_prefetched: older.prefetched_cursor == older.cursor,
+                }) {
+                    if let Some(cursor) = older.cursor {
+                        older.prefetched_cursor = Some(cursor);
+                        worker.prefetch_older(cursor);
+                    }
+                }
                 if should_load_older(
                     true,
                     scroll_offset > 0,
@@ -9747,6 +11953,14 @@ pub fn run(
 #[cfg(unix)]
 fn suspend_to_background(app: &mut App) {
     use crossterm::ExecutableCommand;
+    // FIX-B18: `Terminal::write` only queues the frame; the `pir-tui-writer`
+    // thread owns the actual stdout write. Drain the queue before the
+    // synchronous leave sequence, or a queued frame can land on the main
+    // screen after `LeaveAlternateScreen` and leave an ANSI residue.
+    let _ = app
+        .core
+        .terminal()
+        .flush_bounded(Duration::from_millis(100));
     let _ = disable_raw_mode();
     let mut out = std::io::stdout();
     let _ = out.execute(DisableMouseCapture);
@@ -9942,16 +12156,21 @@ fn external_editor_command(configured: &Option<PiConfiguredModel>) -> String {
 /// the TUI (leave raw mode + the alternate screen), spawn the editor, then
 /// re-import. `Ok(None)` = the editor exited non-zero (content unchanged,
 /// upstream `{ status: "failed" }`).
-fn open_external_editor(
-    command: &str,
-    content: &str,
-    fullscreen: bool,
-) -> std::io::Result<Option<String>> {
+fn open_external_editor(app: &App, content: &str) -> std::io::Result<Option<String>> {
+    let command = external_editor_command(&app.configured);
+    let fullscreen = app.fullscreen;
     let directory = std::env::temp_dir().join(format!("pir-editor-{}", std::process::id()));
     std::fs::create_dir_all(&directory)?;
     let file_path = directory.join("prompt.md");
     std::fs::write(&file_path, content)?;
 
+    // FIX-B18: drain the async frame writer before the synchronous leave
+    // sequence (same race as `suspend_to_background`: a queued frame would be
+    // written to the main screen after `LeaveAlternateScreen`).
+    let _ = app
+        .core
+        .terminal()
+        .flush_bounded(Duration::from_millis(100));
     let _ = disable_raw_mode();
     let mut out = std::io::stdout();
     let _ = out.execute(LeaveAlternateScreen);
@@ -9973,7 +12192,7 @@ fn open_external_editor(
         // The command is the user's own editor configuration (upstream splits
         // on whitespace; a shell resolves the rest).
         let mut parts = command.split_whitespace();
-        let program = parts.next().unwrap_or(command).to_string();
+        let program = parts.next().unwrap_or(command.as_str()).to_string();
         let args: Vec<String> = parts.map(str::to_string).collect();
         std::process::Command::new(program)
             .args(args)
@@ -10234,20 +12453,27 @@ fn drain_internal_replies(
                 } else {
                     // The write takes the bounded (up to 30 s) auth file lock;
                     // run it off the render thread and report through the loop's
-                    // Status/Error notice events.
+                    // Status/Error notice events. A live session resolves the
+                    // provider's api-key capability through its overlay and
+                    // writes the session's own auth.json; the direct storage
+                    // write remains the no-session fallback.
                     let events = app
                         .event_tx
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
-                    spawn_auth_storage_write(
-                        events,
-                        provider.clone(),
-                        provider,
-                        AuthStorageWrite::Store(crate::ai::auth::StoredCredential::ApiKey(
-                            crate::ai::types::ApiKeyCredential::new(Some(key)),
-                        )),
-                    );
+                    if let Some(session) = live_session(app) {
+                        spawn_session_api_key_login(events, session, provider, key);
+                    } else {
+                        spawn_auth_storage_write(
+                            events,
+                            provider.clone(),
+                            provider,
+                            AuthStorageWrite::Store(crate::ai::auth::StoredCredential::ApiKey(
+                                crate::ai::types::ApiKeyCredential::new(Some(key)),
+                            )),
+                        );
+                    }
                 }
             }
         }
@@ -10307,11 +12533,7 @@ fn handle_key(
                     guard.as_ref().and_then(|overlay| overlay.text())
                 };
                 if let Some(content) = content {
-                    match open_external_editor(
-                        &external_editor_command(&app.configured),
-                        &content,
-                        app.fullscreen,
-                    ) {
+                    match open_external_editor(app, &content) {
                         Ok(Some(edited)) => {
                             let mut guard = app
                                 .dialog
@@ -10327,6 +12549,9 @@ fn handle_key(
                             text: format!("External editor failed: {error}"),
                         }),
                     }
+                    // The screen was left and re-entered: force a full
+                    // repaint instead of diffing against the pre-editor frame.
+                    app.core.invalidate_frame();
                 }
                 return false;
             }
@@ -10531,11 +12756,8 @@ fn handle_key(
         // `externalEditor` setting. Upstream edits the EXPANDED text
         // (`getExpandedText?.() ?? getText()`, interactive-mode.ts:4598) so
         // the editor never sees the paste markers.
-        match open_external_editor(
-            &external_editor_command(&app.configured),
-            &app.editor.expanded_text(),
-            app.fullscreen,
-        ) {
+        let content = app.editor.expanded_text();
+        match open_external_editor(app, &content) {
             Ok(Some(content)) => app.editor.set_text(&content),
             Ok(None) => {}
             Err(error) => entries.push(ChatEntry::Notice {
@@ -10543,6 +12765,7 @@ fn handle_key(
                 text: format!("External editor failed: {error}"),
             }),
         }
+        app.core.invalidate_frame();
         None
     } else if kb.matches(TuiAction::Abort, key) {
         // Esc semantics (upstream onAbort): streaming → interrupt; a running
@@ -10767,6 +12990,11 @@ fn handle_key(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .set_hide_thinking(app.hide_thinking);
+        app.chat_blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_hide_thinking(app.hide_thinking);
+        app.chat_revision.fetch_add(1, Ordering::Relaxed);
         None
     } else if kb.matches_id("tui.editor.jumpForward", key) {
         // Character jump mode (upstream `editor.ts:971-978`): the next
@@ -11234,18 +13462,121 @@ impl crate::ai::auth::AuthInteraction for TuiLoginInteraction {
     }
 }
 
+/// Interaction for a settled `/login` API-key paste: the key is already in
+/// hand, so `AgentSession::login_provider(AuthType::ApiKey, ..)` only needs the
+/// `Secret` prompt answered (and validates `provider.api_key_auth()` through
+/// the session overlay first).
+struct PasteApiKeyInteraction {
+    key: String,
+}
+
+impl crate::ai::auth::AuthInteraction for PasteApiKeyInteraction {
+    fn prompt<'a>(
+        &'a self,
+        prompt: crate::ai::auth::AuthPrompt,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::ai::error::AiResult<String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            match prompt {
+                crate::ai::auth::AuthPrompt::Secret { .. }
+                | crate::ai::auth::AuthPrompt::Text { .. } => Ok(self.key.clone()),
+                _ => Err(crate::ai::error::AiError::Authentication(
+                    "unexpected prompt during API-key login".to_string(),
+                )),
+            }
+        })
+    }
+
+    fn notify(&self, _event: crate::ai::auth::AuthEvent) {}
+}
+
+/// Store a pasted API key through the live session (SNAP10 P2-S8-2): the
+/// provider's `api_key_auth` capability is resolved through the session
+/// overlay and the credential lands in the session's own `auth.json`.
+/// Falls back to the plain storage write only when no session exists.
+fn spawn_session_api_key_login(
+    events: Option<WorkerEventSender>,
+    session: Arc<crate::agent_session::AgentSession>,
+    provider: String,
+    key: String,
+) {
+    let fallback = events.clone();
+    let fallback_provider = provider.clone();
+    let spawned = std::thread::Builder::new()
+        .name("pir-session-api-key".to_owned())
+        .spawn(move || {
+            let storage_path = session.auth_storage().path().to_path_buf();
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    if let Some(events) = events {
+                        let _ = events.send(WorkerEvent::Error(format!(
+                            "Failed to store the API key: {error}"
+                        )));
+                    }
+                    return;
+                }
+            };
+            let interaction = PasteApiKeyInteraction { key };
+            let result = runtime.block_on(session.login_provider(
+                &provider,
+                crate::ai::types::AuthType::ApiKey,
+                &interaction,
+                &crate::ai::auth::LoginOptions::default(),
+            ));
+            let event = match result {
+                Ok(_) => WorkerEvent::Status(format!(
+                    "API key saved for {provider} ({}).",
+                    storage_path.display()
+                )),
+                Err(error) => WorkerEvent::Error(format!("Failed to store the API key: {error}")),
+            };
+            if let Some(events) = events {
+                let _ = events.send(event);
+            }
+        });
+    if spawned.is_err() {
+        if let Some(events) = fallback {
+            events.try_send_notice(WorkerEvent::Error(format!(
+                "Failed to store the API key for {fallback_provider}: could not start the session login thread"
+            )));
+        }
+    }
+}
+
 /// Start the OAuth login for `provider` on a background thread (upstream
 /// `showLoginDialog` → `loginProvider`): the selector stays open showing the
-/// flow's progress; the credential lands in `~/.pi/agent/auth.json` on
-/// success.
+/// flow's progress; the credential lands in the session agent dir's
+/// `auth.json` (or `~/.pi/agent/auth.json` when no session is published yet).
+///
+/// With a live session the login runs through
+/// [`crate::agent_session::AgentSession::login_provider`] →
+/// `ProviderRegistry::login_for_session` so the OWNER session's provider
+/// overlay and OAuth flow are used (SNAP10 P2-S8-2). Without one, the old
+/// static/native `oauth_flow_for` + `login_and_store` path is unchanged.
 fn start_tui_login(app: &mut App, entries: &mut Vec<ChatEntry>, provider: AuthProviderOption) {
-    let Some(flow) = crate::ai::auth::oauth_flow_for(&provider.id, None) else {
-        entries.push(ChatEntry::Notice {
-            kind: super::app::NoticeKind::Error,
-            text: format!("unknown OAuth provider \"{}\"", provider.id),
-        });
-        return;
+    let session = live_session(app);
+    let static_flow = if session.is_none() {
+        match crate::ai::auth::oauth_flow_for(&provider.id, None) {
+            Some(flow) => Some(flow),
+            None => {
+                entries.push(ChatEntry::Notice {
+                    kind: super::app::NoticeKind::Error,
+                    text: format!("unknown OAuth provider \"{}\"", provider.id),
+                });
+                return;
+            }
+        }
+    } else {
+        None
     };
+    let session_storage_path = session
+        .as_ref()
+        .map(|session| session.auth_storage().path().to_path_buf());
     let overlay = Arc::clone(&app.overlay);
     {
         let guard = overlay
@@ -11283,7 +13614,6 @@ fn start_tui_login(app: &mut App, entries: &mut Vec<ChatEntry>, provider: AuthPr
                     return;
                 }
             };
-            let storage = crate::ai::auth::FileAuthStorage::default_storage();
             let options = crate::ai::auth::LoginOptions {
                 get_device_id: Some(Arc::new(|| {
                     let path = crate::ai::providers::agent_dir().join("device-id");
@@ -11310,24 +13640,50 @@ fn start_tui_login(app: &mut App, entries: &mut Vec<ChatEntry>, provider: AuthPr
                 internal_next_id,
                 ui_dirty,
             };
-            let result = runtime.block_on(crate::ai::auth::login_and_store(
-                &storage,
-                &provider_id,
-                flow.as_ref(),
-                &interaction,
-                &options,
-            ));
+            // Session-first (SNAP10 P2-S8-2); the static/native path below
+            // only runs when the worker has not published a session.
+            let result: crate::ai::error::AiResult<(i64, std::path::PathBuf)> =
+                match (session.as_ref(), static_flow.as_ref()) {
+                    (Some(session), _) => runtime
+                        .block_on(session.login_provider(
+                            &provider_id,
+                            crate::ai::types::AuthType::OAuth,
+                            &interaction,
+                            &options,
+                        ))
+                        .map(|auth| {
+                            (
+                                auth.expires,
+                                session_storage_path.clone().unwrap_or_default(),
+                            )
+                        }),
+                    (None, Some(flow)) => {
+                        let storage = crate::ai::auth::FileAuthStorage::default_storage();
+                        runtime
+                            .block_on(crate::ai::auth::login_and_store(
+                                &storage,
+                                &provider_id,
+                                flow.as_ref(),
+                                &interaction,
+                                &options,
+                            ))
+                            .map(|credential| (credential.expires, storage.path().to_path_buf()))
+                    }
+                    (None, None) => Err(crate::ai::error::AiError::Authentication(
+                        "no live session and no static OAuth provider".to_string(),
+                    )),
+                };
             let guard = overlay
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(selector) = &guard.auth {
                 match result {
-                    Ok(credential) => selector.set_progress(
+                    Ok((expires, path)) => selector.set_progress(
                         format!(
                             "Signed in to {}. Credentials saved to {} (expires {}).",
                             provider_id,
-                            storage.path().display(),
-                            credential.expires
+                            path.display(),
+                            expires
                         ),
                         true,
                     ),
@@ -11990,6 +14346,28 @@ fn handle_auth_key(key: &KeyEvent, app: &mut App, entries: &mut Vec<ChatEntry>) 
     }
 }
 
+/// The worker's live session, when the UI has already received it. Callers
+/// that need session-scoped provider auth (`/login`, model refresh, Radius
+/// token) upgrade this weak handle; `None` keeps the static/native path.
+fn live_session(app: &App) -> Option<Arc<crate::agent_session::AgentSession>> {
+    app.session.as_ref().and_then(std::sync::Weak::upgrade)
+}
+
+/// Resolve an OAuth flow for a TUI login/list row: the live session's provider
+/// overlay when one exists (SNAP10 P2-S8-2), otherwise the process-static
+/// provider table exactly as before. Public as a display-layer/test seam so
+/// the session-overlay selection can be asserted without a terminal.
+#[doc(hidden)]
+pub fn tui_oauth_flow_for(
+    session: Option<&crate::agent_session::AgentSession>,
+    provider_id: &str,
+) -> Option<crate::ai::auth::OAuthFlowBox> {
+    match session {
+        Some(session) => session.oauth_flow_for_provider(provider_id),
+        None => crate::ai::auth::oauth_flow_for(provider_id, None),
+    }
+}
+
 /// The `/login` provider rows (upstream `getLoginProviderOptions`,
 /// interactive-mode.ts:5788-5821): one OAuth row AND one API-key row per
 /// OAuth-capable provider, sorted by display name, each carrying the
@@ -11997,8 +14375,17 @@ fn handle_auth_key(key: &KeyEvent, app: &mut App, entries: &mut Vec<ChatEntry>) 
 /// the registry `isSubscription` flag (model-runtime.ts:540-542). The Radius
 /// row carries the RADIUS_LOGIN_INTRO description
 /// (interactive-mode.ts:6269).
-fn login_provider_options() -> Vec<AuthProviderOption> {
-    let storage = crate::ai::auth::FileAuthStorage::default_storage();
+///
+/// The storage and OAuth metadata come from the live session when available
+/// (its agent dir and provider overlay), so a child's registration cannot
+/// change a parent row; without a session both fall back to the process
+/// static storage/providers.
+fn login_provider_options(app: &App) -> Vec<AuthProviderOption> {
+    let session = live_session(app);
+    let storage = match session.as_deref() {
+        Some(session) => session.auth_storage(),
+        None => crate::ai::auth::FileAuthStorage::default_storage(),
+    };
     let mut providers: Vec<AuthProviderOption> = Vec::new();
     for provider in crate::ai::auth::OAUTH_PROVIDERS {
         let id = (*provider).to_string();
@@ -12013,7 +14400,7 @@ fn login_provider_options() -> Vec<AuthProviderOption> {
             ),
             _ => (String::new(), None),
         };
-        let subscription = crate::ai::auth::oauth_flow_for(provider, None)
+        let subscription = tui_oauth_flow_for(session.as_deref(), provider)
             .is_some_and(|flow| flow.is_subscription());
         let description =
             (*provider == "radius").then(|| super::command_dialogs::RADIUS_LOGIN_INTRO.to_string());
@@ -12113,7 +14500,7 @@ fn handle_auth_type_key(key: &KeyEvent, app: &mut App, entries: &mut Vec<ChatEnt
                         // Radius started its flow above.
                         AuthTypeChoice::Radius => return,
                     };
-                    let providers: Vec<AuthProviderOption> = login_provider_options()
+                    let providers: Vec<AuthProviderOption> = login_provider_options(app)
                         .into_iter()
                         .filter(|provider| provider.kind == kind)
                         .collect();
@@ -14295,19 +16682,27 @@ fn transform_assistant_markdown(
 /// remaining request options and the native face's identity. The `ToolUpdate`
 /// arm uses it to skip the renderer bridge when a repeated update would
 /// reproduce the same lines.
-// The digest hashes the tool-call contract field by field; wrapping them in a
-// struct would just move the same reads behind one more construction.
-#[allow(clippy::too_many_arguments)]
-fn tool_render_digest(
-    app: &App,
-    tool_name: &str,
-    args: &serde_json::Value,
-    output: &str,
+/// The renderer-visible tool-call fields the digest covers.
+struct ToolRenderDigest<'a> {
+    tool_name: &'a str,
+    args: &'a serde_json::Value,
+    output: &'a str,
     is_error: bool,
-    details: Option<&serde_json::Value>,
-    images: &[crate::ai::types::ImageContent],
+    details: Option<&'a serde_json::Value>,
+    images: &'a [crate::ai::types::ImageContent],
     partial: bool,
-) -> u64 {
+}
+
+fn tool_render_digest(app: &App, input: ToolRenderDigest<'_>) -> u64 {
+    let ToolRenderDigest {
+        tool_name,
+        args,
+        output,
+        is_error,
+        details,
+        images,
+        partial,
+    } = input;
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     app.renderer_defs_generation.hash(&mut hasher);
@@ -14373,46 +16768,10 @@ fn hash_json_into(value: &serde_json::Value, hasher: &mut impl std::hash::Hasher
 /// Render one tool-update transcript entry: a registered tool renderer's
 /// lines win; failures/absences degrade to the default tool block. Renderer
 /// failures surface as transcript warnings (P2-10: never stderr mid-frame).
-// Batch 5 added the `details` arg — mirrors upstream
-// `rebuildToolRenderComponent`'s wide signature; the codebase's established
-// pattern (WorkerHandle::spawn) is the allow, not a refactor.
-#[allow(clippy::too_many_arguments)]
-fn render_tool_entry(
-    app: &App,
-    call_id: Option<String>,
-    tool_name: String,
-    args: serde_json::Value,
-    output: String,
-    is_error: bool,
-    details: Option<serde_json::Value>,
-    images: Arc<Vec<crate::ai::types::ImageContent>>,
-    pending: bool,
-    entries: &mut Vec<ChatEntry>,
-) -> ChatEntry {
-    let width = app.core.columns();
-    let expanded = app.tools_expanded.load(Ordering::SeqCst);
-    render_tool_entry_shared(
-        app,
-        call_id,
-        tool_name,
-        Arc::new(args),
-        Arc::from(output),
-        is_error,
-        details.map(Arc::new),
-        images,
-        width,
-        expanded,
-        pending,
-        entries,
-    )
-}
-
-/// [`render_tool_entry`] over shared payloads and an EXPLICIT render key
-/// (`width` / `expanded`), so the stale-output pass can rebuild a block for the
-/// new inputs without re-cloning its arguments or output.
-#[allow(clippy::too_many_arguments)]
-fn render_tool_entry_shared(
-    app: &App,
+// Batch 5 added the `details` field — mirrors upstream
+// `rebuildToolRenderComponent`'s wide payload.
+/// The tool-call payload both render paths paint.
+struct ToolRenderPayload {
     call_id: Option<String>,
     tool_name: String,
     args: Arc<serde_json::Value>,
@@ -14420,11 +16779,39 @@ fn render_tool_entry_shared(
     is_error: bool,
     details: Option<Arc<serde_json::Value>>,
     images: Arc<Vec<crate::ai::types::ImageContent>>,
-    width: usize,
-    expanded: bool,
     pending: bool,
+}
+
+fn render_tool_entry(
+    app: &App,
+    payload: ToolRenderPayload,
     entries: &mut Vec<ChatEntry>,
 ) -> ChatEntry {
+    let width = app.core.columns();
+    let expanded = app.tools_expanded.load(Ordering::SeqCst);
+    render_tool_entry_shared(app, payload, width, expanded, entries)
+}
+
+/// [`render_tool_entry`] over shared payloads and an EXPLICIT render key
+/// (`width` / `expanded`), so the stale-output pass can rebuild a block for the
+/// new inputs without re-cloning its arguments or output.
+fn render_tool_entry_shared(
+    app: &App,
+    payload: ToolRenderPayload,
+    width: usize,
+    expanded: bool,
+    entries: &mut Vec<ChatEntry>,
+) -> ChatEntry {
+    let ToolRenderPayload {
+        call_id,
+        tool_name,
+        args,
+        output,
+        is_error,
+        details,
+        images,
+        pending,
+    } = payload;
     let image_lines = Arc::new(super::messages::tool_image_lines(images.as_ref(), width));
     let default_entry = || ChatEntry::ToolExecution {
         call_id: call_id.clone(),
@@ -14542,7 +16929,8 @@ fn render_tool_entry_shared(
 /// restyles extension tool output instead of leaving bytes built for the old
 /// inputs on screen.
 ///
-/// Returns whether any block was rebuilt (the caller marks the frame dirty).
+/// Returns the inclusive-exclusive index range of the rebuilt entries (the
+/// caller publishes that exact delta and marks the frame dirty).
 /// A block whose re-render now yields a plain [`ChatEntry::ToolExecution`]
 /// (the resolver went away, or answered "unhandled" for the new inputs) is
 /// replaced with it — the default block is exactly what a fresh render would
@@ -14553,7 +16941,7 @@ fn render_tool_entry_shared(
 /// The epoch guard keeps the common frame free: when the triple did not move
 /// since the last pass, one compare replaces the transcript scan (the scan
 /// only costs an entry walk, but it runs on every rendered frame otherwise).
-fn rerender_stale_raw_entries(app: &App, entries: &mut Vec<ChatEntry>) -> bool {
+fn rerender_stale_raw_entries(app: &App, entries: &mut Vec<ChatEntry>) -> Option<(usize, usize)> {
     let width = app.core.columns();
     let expanded = app.tools_expanded.load(Ordering::SeqCst);
     let epoch = (width, super::theme::Theme::generation(), expanded);
@@ -14563,13 +16951,13 @@ fn rerender_stale_raw_entries(app: &App, entries: &mut Vec<ChatEntry>) -> bool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if seen.as_ref() == Some(&epoch) {
-            return false;
+            return None;
         }
         *seen = Some(epoch);
     }
-    let mut changed = false;
+    let mut changed: Option<(usize, usize)> = None;
     let mut warnings: Vec<ChatEntry> = Vec::new();
-    for entry in entries.iter_mut() {
+    for (index, entry) in entries.iter_mut().enumerate() {
         let ChatEntry::Raw {
             call_id,
             lines,
@@ -14585,16 +16973,18 @@ fn rerender_stale_raw_entries(app: &App, entries: &mut Vec<ChatEntry>) -> bool {
         let replacement = match provenance {
             super::app::RawRender::Tool(tool) => render_tool_entry_shared(
                 app,
-                call_id.clone(),
-                tool.tool_name.clone(),
-                Arc::clone(&tool.args),
-                Arc::clone(&tool.output),
-                tool.is_error,
-                tool.details.clone(),
-                Arc::clone(&tool.images),
+                ToolRenderPayload {
+                    call_id: call_id.clone(),
+                    tool_name: tool.tool_name.clone(),
+                    args: Arc::clone(&tool.args),
+                    output: Arc::clone(&tool.output),
+                    is_error: tool.is_error,
+                    details: tool.details.clone(),
+                    images: Arc::clone(&tool.images),
+                    pending: tool.pending,
+                },
                 width,
                 expanded,
-                tool.pending,
                 &mut warnings,
             ),
             super::app::RawRender::Custom(custom) => {
@@ -14611,13 +17001,15 @@ fn rerender_stale_raw_entries(app: &App, entries: &mut Vec<ChatEntry>) -> bool {
             }
         };
         *entry = replacement;
-        changed = true;
+        changed = Some(match changed {
+            Some((start, _)) => (start, index + 1),
+            None => (index, index + 1),
+        });
     }
     // Renderer failures surface as transcript warnings, exactly like the live
     // path (P2-10: never stderr mid-frame).
     if !warnings.is_empty() {
         entries.extend(warnings);
-        changed = true;
     }
     changed
 }
@@ -14662,15 +17054,17 @@ fn upsert_pending_tool_entry(
     call_id: &str,
     tool_name: &str,
     args: Option<serde_json::Value>,
-) {
+) -> Option<usize> {
     if let Some(index) = locate_tool_entry(entries, tool_entries, call_id) {
+        let mut changed = false;
         if let Some(args) = args {
             if let Some(ChatEntry::ToolExecution { args: current, .. }) = entries.get_mut(index) {
                 *current = Arc::new(args);
+                changed = true;
             }
         }
         tool_entries.insert(call_id.to_string(), index);
-        return;
+        return changed.then_some(index);
     }
     entries.push(ChatEntry::ToolExecution {
         call_id: Some(call_id.to_string()),
@@ -14686,6 +17080,7 @@ fn upsert_pending_tool_entry(
         images: Arc::new(Vec::new()),
     });
     tool_entries.insert(call_id.to_string(), entries.len() - 1);
+    None
 }
 
 /// Spawn the off-thread edit-preview computation (upstream `computeEditsDiff`
@@ -14927,19 +17322,33 @@ fn request_custom_entry_render(
 /// the scheduler, then replace the lines IN PLACE (transcript order is
 /// never disturbed). A failure degrades to the warning line + default body
 /// and appends the same warning notice the synchronous path produced.
-fn apply_custom_render_result(
-    app: &App,
+#[doc(hidden)]
+pub struct CustomRenderResult {
+    pub entry_key: u64,
+    pub token: u64,
+    pub inputs: RenderInputs,
+    pub outcome: CustomRenderOutcome,
+}
+
+#[doc(hidden)]
+pub fn apply_custom_render_result(
+    scheduler: &RenderScheduler<u64>,
     entries: &mut Vec<ChatEntry>,
-    entry_key: u64,
-    token: u64,
-    inputs: RenderInputs,
-    outcome: CustomRenderOutcome,
+    result: CustomRenderResult,
+    entry_delta: &mut EntryDelta,
+    transcript_epoch: &AtomicU64,
 ) -> bool {
+    let CustomRenderResult {
+        entry_key,
+        token,
+        inputs,
+        outcome,
+    } = result;
     // Same stale-palette guard as the factory path.
     if inputs.theme_generation != super::theme::Theme::generation() {
         return false;
     }
-    if !app.custom_renders.accept(&entry_key, token, inputs) {
+    if !scheduler.accept(&entry_key, token, inputs) {
         return false;
     }
     let index = entries.iter().position(|entry| {
@@ -15009,6 +17418,14 @@ fn apply_custom_render_result(
             text,
         });
     }
+    // The renderer result rewrote the Raw entry in place (lines and/or the
+    // width/theme/expansion inputs baked into `RawRender::tag`). Publish the
+    // mutation so the next sync's install key cannot answer from the render
+    // memo it built before this result landed; the block cache is refreshed
+    // by the install (`set_entries`) or, on the streaming fast path, by the
+    // explicit `patch_entry` call.
+    entry_delta.note_changed(index);
+    transcript_epoch.fetch_add(1, Ordering::Relaxed);
     changed
 }
 
@@ -15430,6 +17847,12 @@ fn run_action(
         Action::ToolExpand => {
             let expanded = !app.tools_expanded.load(Ordering::SeqCst);
             app.tools_expanded.store(expanded, Ordering::SeqCst);
+            // Tool blocks restyle from the shared cell on the next frame.
+            app.chat_blocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .bump_render_epoch();
+            app.chat_revision.fetch_add(1, Ordering::Relaxed);
             false
         }
     }
@@ -16018,9 +18441,25 @@ fn handle_command(
                 // selector only when absent/ambiguous.
                 let models = selector_model_pairs(app);
                 match super::slash::resolve_model_argument(args, &models) {
-                    super::slash::ModelMatch::Found { provider, model_id } => {
+                    super::slash::ModelMatch::Found {
+                        provider,
+                        model_id,
+                        thinking_level,
+                    } => {
                         worker.set_model(provider.clone(), model_id.clone(), true);
                         app.apply_local_model(&provider, &model_id);
+                        // A `:level` suffix on the reference rides the
+                        // `/thinking <level>` path, resolved against the
+                        // model just applied (upstream `d7f7e0dfe`).
+                        if let Some(level) = thinking_level {
+                            apply_thinking_level_command(
+                                app,
+                                entries,
+                                worker,
+                                level,
+                                level.wire_key(),
+                            );
+                        }
                     }
                     super::slash::ModelMatch::Ambiguous(matches) => {
                         let list = matches
@@ -16053,6 +18492,7 @@ fn handle_command(
                         let query = args.to_string();
                         let agent_dir = global_agent_dir();
                         let scoped = has_model_scope(app);
+                        let session = app.session.clone();
                         let _ = std::thread::Builder::new()
                             .name("pir-catalog-refresh".to_owned())
                             .spawn(move || {
@@ -16070,6 +18510,11 @@ fn handle_command(
                                         format!("Could not refresh model catalogs: {error}")
                                     })
                                 };
+                                // Provider-owned model lists refresh through
+                                // the live session (overlay first); the
+                                // `CatalogRefreshed` handler re-reads
+                                // `model_pairs`, which is session-scoped.
+                                let _ = refresh_session_provider_models(&session);
                                 if let Some(event_tx) = event_tx {
                                     let _ = event_tx
                                         .send(WorkerEvent::CatalogRefreshed { error, query });
@@ -16105,21 +18550,7 @@ fn handle_command(
                 // model maps to null would silently clamp (medium → high).
                 match super::slash::thinking_level_argument(args) {
                     Ok(level) => {
-                        let key = level.wire_key();
-                        let levels = thinking_levels_for_active_model(app);
-                        if levels.iter().any(|candidate| candidate == key) {
-                            worker.set_thinking(key.to_string(), true);
-                            app.apply_local_thinking(key);
-                        } else {
-                            entries.push(ChatEntry::Notice {
-                                kind: super::app::NoticeKind::Error,
-                                text: format!(
-                                    "Unknown thinking level \"{}\". Available levels: {}.",
-                                    args.trim(),
-                                    levels.join(", ")
-                                ),
-                            });
-                        }
+                        apply_thinking_level_command(app, entries, worker, level, args.trim());
                     }
                     Err(message) => entries.push(ChatEntry::Notice {
                         kind: super::app::NoticeKind::Error,
@@ -16364,6 +18795,7 @@ fn handle_command(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             let agent_dir = global_agent_dir();
+            let session = app.session.clone();
             let _ = std::thread::Builder::new()
                 .name("pir-scoped-models-refresh".to_owned())
                 .spawn(move || {
@@ -16372,6 +18804,12 @@ fn handle_command(
                             &agent_dir,
                         ) {
                             Ok(()) => {
+                                // Refresh the live session's provider lists
+                                // through `refresh_for_session` (its overlay,
+                                // never the process-shared last writer) and
+                                // list the refreshed session catalog.
+                                let models =
+                                    refresh_session_provider_models(&session).unwrap_or(models);
                                 let store = catalog_store_ids(&agent_dir, &models);
                                 (merged_catalog_pairs(&models, &store), None, false)
                             }
@@ -16456,7 +18894,7 @@ fn handle_command(
             // (upstream `getLoginProviderOptions`, :5788-5821): one OAuth row
             // AND one API-key row per provider, each carrying the
             // stored-credential status markers and the subscription flag.
-            let providers = login_provider_options();
+            let providers = login_provider_options(app);
             let requested = args.trim().to_lowercase();
             let matching: Vec<AuthProviderOption> = providers
                 .iter()
@@ -16476,7 +18914,8 @@ fn handle_command(
                 // selector (upstream interactive-mode.ts:5860-5869).
                 if first.id == second.id {
                     let oauth_row = first.kind == super::command_dialogs::AuthProviderKind::OAuth;
-                    let subscription_label = crate::ai::auth::oauth_flow_for(&first.id, None)
+                    let session = live_session(app);
+                    let subscription_label = tui_oauth_flow_for(session.as_deref(), &first.id)
                         .and_then(|flow| flow.login_label().map(str::to_string));
                     app.overlay
                         .lock()
@@ -16997,6 +19436,12 @@ fn reset_session_transcript(app: &mut App, entries: &mut Vec<ChatEntry>) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .set_entries(&[]);
+    app.chat_blocks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .reset();
+    app.transcript_epoch.fetch_add(1, Ordering::Relaxed);
+    app.chat_revision.fetch_add(1, Ordering::Relaxed);
     // The event loop drops streaming_entry / tool_entries on
     // its next tick (they are loop locals; the flag is the seam).
     app.transcript_reset = true;
@@ -17381,8 +19826,14 @@ fn session_switch_drops_event(event: &WorkerEvent) -> bool {
             | WorkerEvent::ToolPreviewReady { .. }
             | WorkerEvent::ToolCallsAborted { .. }
             | WorkerEvent::QueueUpdate { .. }
+            | WorkerEvent::EntryAppended { .. }
             | WorkerEvent::Dequeued { .. }
             | WorkerEvent::BackgroundCalls(_)
+            | WorkerEvent::CompactionStarted
+            | WorkerEvent::CompactionEnded { .. }
+            // A rename belongs to the session being replaced; the attach
+            // announces the incoming session's own name after the gate opens.
+            | WorkerEvent::SessionInfoChanged { .. }
     )
 }
 
@@ -17416,6 +19867,27 @@ pub fn refresh_active_tab_title(
     }
     tabs[index].title = title;
     true
+}
+
+/// Apply one `session_info_changed` name to the open tab list.
+///
+/// `Some(name)` renames the active tab exactly like `/name`; `None` (a clear
+/// from an extension/RPC caller) falls back to the normal tab-title
+/// precedence (`first_user_message` preview, then the file stem) instead of
+/// leaving the cleared name behind. Returns the active tab's title, or
+/// `None` when no tab matches `active_path` (e.g. `--no-session`).
+#[doc(hidden)]
+pub fn apply_session_info_changed(
+    tabs: &mut [super::app::SessionTab],
+    active_path: Option<&str>,
+    name: Option<&str>,
+    first_user_message: Option<&str>,
+) -> Option<String> {
+    let path = active_path?;
+    let title = super::app::session_tab_title(name, first_user_message, path);
+    let index = super::app::active_tab_index(tabs, active_path)?;
+    tabs[index].title = title.clone();
+    Some(title)
 }
 
 /// Activate the next/previous open tab (wrapping), attaching its session file
@@ -17781,7 +20253,7 @@ pub fn prompt_arms_working_label(worker_active: bool, streaming: bool) -> bool {
 
 /// Extension dispatcher request queue.
 ///
-/// User-initiated control requests (`Command`/`Shortcut`/`Reload`) are never
+/// User-initiated control requests (`Command`/`Shortcut`) are never
 /// coalesced or dropped. The queue is UNBOUNDED (`std::sync::mpsc::Sender`):
 /// these sends run on the UI thread, which is also the consumer of the worker
 /// event queue; a bounded queue would let the UI block while the dispatcher
@@ -17818,9 +20290,6 @@ enum ExtRequest {
     Shortcut {
         key: String,
     },
-    /// `/reload`: re-run the extension runtime reload (upstream
-    /// `handleReloadCommand`).
-    Reload,
     /// Async slash-command argument completions (JS `getArgumentCompletions`).
     ArgCompletions {
         command: String,
@@ -17845,12 +20314,6 @@ impl ExtDispatcher {
 
     fn invoke_shortcut(&self, key: String) {
         let _ = self.tx.send(ExtRequest::Shortcut { key });
-    }
-
-    /// `/reload`: re-run the extension runtime reload on the dispatcher
-    /// thread; the outcome arrives as a Status/Error worker event.
-    fn reload_extensions(&self) {
-        let _ = self.tx.send(ExtRequest::Reload);
     }
 
     fn request_argument_completions(&self, command: String, prefix: String) {
@@ -18120,29 +20583,6 @@ fn spawn_ext_dispatcher(
                                 }
                             }
                         }
-                        ExtRequest::Reload => {
-                            if let Some(handle) = handle.as_ref() {
-                                match handle.reload().await {
-                                    Ok(result) => {
-                                        let _ = events.send(WorkerEvent::Status(format!(
-                                            "Reloaded extensions: {} loaded",
-                                            result.loaded.len()
-                                        )));
-                                    }
-                                    Err(error) => {
-                                        let _ = events.send(WorkerEvent::Error(format!(
-                                            "extension reload failed: {error}"
-                                        )));
-                                    }
-                                }
-                            }
-                            // Whether the reload succeeded or failed, the
-                            // registered-command snapshot may have moved (a
-                            // partial load still replaces the runtime state).
-                            // Re-query an open popup so extension command
-                            // candidates reflect the reload immediately.
-                            let _ = events.send(WorkerEvent::ExtensionsReloaded);
-                        }
                         ExtRequest::ArgCompletions { .. } | ExtRequest::Suggestions { .. } => {
                             dispatch_completion_request(
                                 request,
@@ -18328,22 +20768,135 @@ impl CommandProvider for NativeCommandProvider {
     }
 }
 
+/// One console-mode transition the TUI performs around raw mode. The
+/// recorder seam [`cleanup_terminal_surface`] uses; kept tiny so a test can
+/// assert the startup/teardown ORDER without a real console.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalModeStep {
+    EnableRawMode,
+    DisableQuickEdit,
+    EnableVtInput,
+    DisableRawMode,
+    RestoreVtInput,
+    RestoreQuickEdit,
+}
+
+/// The console-mode operations `App::new`/`cleanup` drive. Production uses
+/// [`RealTerminalModeOps`]; integration tests inject a recorder and assert the
+/// sequence without a console (the event loop itself needs a TTY, so
+/// `App::new`/`cleanup` cannot be driven end-to-end in CI).
+#[doc(hidden)]
+pub trait TerminalModeOps {
+    fn enable_raw_mode(&mut self) -> std::io::Result<()>;
+    fn disable_raw_mode(&mut self) -> std::io::Result<()>;
+    fn disable_quick_edit(&mut self);
+    fn restore_quick_edit(&mut self);
+    fn enable_vt_input(&mut self);
+    fn restore_vt_input(&mut self);
+}
+
+/// The real console operations behind [`TerminalModeOps`].
+struct RealTerminalModeOps;
+
+impl TerminalModeOps for RealTerminalModeOps {
+    fn enable_raw_mode(&mut self) -> std::io::Result<()> {
+        enable_raw_mode()
+    }
+
+    fn disable_raw_mode(&mut self) -> std::io::Result<()> {
+        disable_raw_mode()
+    }
+
+    fn disable_quick_edit(&mut self) {
+        super::stdin_buffer::disable_windows_quick_edit();
+    }
+
+    fn restore_quick_edit(&mut self) {
+        super::stdin_buffer::restore_windows_quick_edit();
+    }
+
+    fn enable_vt_input(&mut self) {
+        let _ = super::stdin_buffer::enable_windows_vt_input();
+    }
+
+    fn restore_vt_input(&mut self) {
+        super::stdin_buffer::restore_windows_vt_input();
+    }
+}
+
+/// `App::new`'s console-mode startup: raw mode first, then the QuickEdit
+/// clear (which must observe the console mode after raw mode cleared
+/// line/echo/processed). Raw-mode failure is fatal; QuickEdit is best-effort.
+#[doc(hidden)]
+pub fn startup_terminal_modes(ops: &mut dyn TerminalModeOps) -> std::io::Result<()> {
+    ops.enable_raw_mode()?;
+    ops.disable_quick_edit();
+    Ok(())
+}
+
+/// The `PIR_TUI_VT_INPUT=1` opt-in step, after raw mode (and after the
+/// alternate-screen/mouse setup at the call site).
+#[doc(hidden)]
+pub fn enable_vt_input_if(ops: &mut dyn TerminalModeOps, opt_in: bool) {
+    if opt_in {
+        ops.enable_vt_input();
+    }
+}
+
+/// Teardown: disable raw mode FIRST (crossterm restores
+/// line/echo/processed), then restore the two opt-in console bits on the
+/// freshly read mode. VT input is restored too — the happy-path `cleanup`
+/// used to restore only QuickEdit, leaving `ENABLE_VIRTUAL_TERMINAL_INPUT`
+/// set in the parent console when `PIR_TUI_VT_INPUT=1` enabled it (P3-新-1).
+#[doc(hidden)]
+pub fn teardown_terminal_modes(ops: &mut dyn TerminalModeOps) -> std::io::Result<()> {
+    let raw = ops.disable_raw_mode();
+    ops.restore_vt_input();
+    ops.restore_quick_edit();
+    raw
+}
+
 /// Normal-exit teardown. `fullscreenExitOutput` decides what the primary
 /// screen keeps (upstream `stopInteractiveTui`): `transcript` (default)
 /// dumps the last painted frame below the shell's restored content, while
 /// `resume-hint` leaves the alt screen without a transcript (the shell's own
 /// `?1049l` restore — upstream `ui.stop({ preserveScreen: true })`).
 fn cleanup(app: &mut App) -> crate::Result<()> {
+    let mut out = std::io::stdout();
+    cleanup_terminal_surface(
+        &mut app.core,
+        app.fullscreen,
+        app.exit_output,
+        &mut RealTerminalModeOps,
+        &mut out,
+    )
+}
+
+/// [`cleanup`]'s body over the pieces it touches. `#[doc(hidden)]` seam: an
+/// integration test drives it with a captured output sink and a recording
+/// [`TerminalModeOps`], so deleting a console-mode restore call (or restoring
+/// before `disable_raw_mode`) turns that test red without a real TTY.
+#[doc(hidden)]
+pub fn cleanup_terminal_surface(
+    core: &mut TuiCore,
+    fullscreen: bool,
+    exit_output: FullscreenExitOutput,
+    ops: &mut dyn TerminalModeOps,
+    out: &mut dyn Write,
+) -> crate::Result<()> {
     use crossterm::cursor::Show;
     // Teardown routes through the core: `stop` drains the bounded writer
     // queue, clears the OSC status, places the cursor below the last frame
     // (upstream `beforeTerminalStop`) and closes the writer, so no queued
     // frame can interleave with the surface restore below (or land on the
     // restored main screen after it).
-    app.core.stop();
-    let _ = disable_raw_mode();
-    let mut out = std::io::stdout();
-    let transcript_dump = app.fullscreen && app.exit_output == FullscreenExitOutput::Transcript;
+    core.stop();
+    // FIX-B05: the happy-path teardown does not go through
+    // `cleanup_terminal`, so it runs the same raw-mode/VT/QuickEdit restore
+    // sequence here (idempotent: a no-op when `App::new` captured nothing).
+    let _ = teardown_terminal_modes(ops);
+    let transcript_dump = fullscreen && exit_output == FullscreenExitOutput::Transcript;
     let _ = out.execute(LeaveAlternateScreen);
     // Leave a clean console: the terminal's restored screen may still hold
     // the shell's pre-TUI output or a reused alternate buffer. The transcript
@@ -18360,10 +20913,10 @@ fn cleanup(app: &mut App) -> crate::Result<()> {
         // `fullscreenExitOutput=transcript` shape (the whole transcript on
         // small sessions; the materialized window's blocks, oldest to
         // newest, on a huge one).
-        let lines = if app.core.windowed_viewport() {
-            app.core.last_frame_lines().to_vec()
+        let lines = if core.windowed_viewport() {
+            core.last_frame_lines().to_vec()
         } else {
-            app.core.last_screen_lines()
+            core.last_screen_lines()
         };
         if !lines.is_empty() {
             let mut dump = String::from("\r");
@@ -18381,7 +20934,7 @@ fn cleanup(app: &mut App) -> crate::Result<()> {
     let _ = out.execute(DisableMouseCapture);
     // Idempotent: `core.stop` closed the writer; this covers a stop that
     // returned early (empty frame) and documents the teardown order.
-    app.core.terminal().close_writer();
+    core.terminal().close_writer();
     Ok(())
 }
 
@@ -18394,15 +20947,17 @@ fn cleanup(app: &mut App) -> crate::Result<()> {
 pub fn cleanup_terminal() -> std::io::Result<()> {
     use crossterm::cursor::Show;
     TUI_OWNS_TERMINAL.with(|owns| owns.set(false));
-    let raw = disable_raw_mode();
     // Balance the startup `enable_windows_vt_input`, which the default startup
     // path no longer installs (it runs only behind the `PIR_TUI_VT_INPUT`
     // opt-in). With the opt-in off this is a pure no-op: `stdin_buffer`'s
     // captured previous mode starts unset, so the restore returns without
     // touching the console. When the opt-in did run it restores the console's
     // previous input mode (upstream leaves the console-global flag set; pir
-    // restores it so it cannot leak into the parent shell).
-    super::stdin_buffer::restore_windows_vt_input();
+    // restores it so it cannot leak into the parent shell). FIX-B05:
+    // `App::new` also clears the console's QuickEdit flag (a mouse selection
+    // otherwise suspends output and looks like a dead TUI); the shared
+    // teardown restores it on every cleanup path. Non-Windows is a no-op.
+    let raw = teardown_terminal_modes(&mut RealTerminalModeOps);
     let mut out = std::io::stdout();
     let screen = out.execute(LeaveAlternateScreen).map(|_| ());
     // A panic/early exit must not leave the previous frame on either screen.
@@ -18438,10 +20993,32 @@ impl TerminalRestoreGuard {
 
 impl Drop for TerminalRestoreGuard {
     fn drop(&mut self) {
-        if self.armed.get() {
+        // FIX-B04: `cleanup_terminal` clears `TUI_OWNS_TERMINAL` on entry. The
+        // panic hook runs it BEFORE printing the panic message, so the guard
+        // left armed by the unwind must skip a second cleanup — its
+        // `Clear(All)` would erase the panic text.
+        if restore_guard_should_cleanup(self.armed.get()) {
             let _ = cleanup_terminal();
         }
     }
+}
+
+/// Whether [`TerminalRestoreGuard::drop`] may restore the terminal: the guard
+/// is still armed AND this thread still owns the live TUI surface.
+fn restore_guard_should_cleanup(armed: bool) -> bool {
+    restore_guard_decision(armed, TUI_OWNS_TERMINAL.with(|owns| owns.get()))
+}
+
+fn restore_guard_decision(armed: bool, owns: bool) -> bool {
+    armed && owns
+}
+
+/// Test seam for [`restore_guard_decision`] (FIX-B04): the guard table
+/// without touching the process terminal. `owns == false` is the state the
+/// panic hook leaves behind before it prints the panic text.
+#[doc(hidden)]
+pub fn restore_guard_should_cleanup_for_test(armed: bool, owns: bool) -> bool {
+    restore_guard_decision(armed, owns)
 }
 
 thread_local! {
@@ -18855,19 +21432,17 @@ fn apply_reload_outcome(
     push_resource_diagnostic_notices(entries, &outcome.resources.diagnostics);
     register_resource_commands(&app.configured, &outcome.resources);
     worker.reload_resources(std::sync::Arc::new(outcome.resources));
-    if let Some(dispatcher) = &app.ext_dispatcher {
+    if app.ext_dispatcher.is_some() {
         app.extension_statuses
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         app.refresh_footer_caches();
-        dispatcher.reload_extensions();
     }
     // Skill/prompt-template commands were just replaced: re-query an open
     // popup so a removed skill disappears and a new one is offered without
-    // another keystroke. (Extension commands refresh again when the
-    // dispatcher reports the reload finished — see
-    // `WorkerEvent::ExtensionsReloaded`.)
+    // another keystroke. (Extension commands refresh again when the worker's
+    // unified reload reports `WorkerEvent::ExtensionsReloaded`.)
     update_autocomplete(app);
     entries.push(ChatEntry::Notice {
         kind: super::app::NoticeKind::Status,
@@ -18884,8 +21459,8 @@ enum WorkerEvent {
     /// The UI applies it on the render thread; the heavy settings/theme/
     /// resource reads happened on the helper thread.
     Reloaded(ReloadOutcome),
-    /// The extension dispatcher finished a `/reload` (`ExtRequest::Reload`).
-    /// The registered command list may have moved; the UI re-queries an open
+    /// The worker's unified `/reload` (`AgentSession::reload`) finished. The
+    /// registered command list may have moved; the UI re-queries an open
     /// autocomplete popup so extension commands appear/disappear at once.
     ExtensionsReloaded,
     /// One off-thread TEXT-ONLY clipboard read finished (alt-screen
@@ -19055,9 +21630,12 @@ enum WorkerEvent {
     UserMessages {
         messages: Vec<(String, String)>,
     },
-    /// `/name <name>` success — the terminal title + footer follow.
-    SessionRenamed {
-        name: String,
+    /// `session_info_changed` (upstream `AgentSessionEvent`): the session's
+    /// display name moved — including a clear (`None`) made by an extension
+    /// or an RPC caller, not just the local `/name` command. The terminal
+    /// title, footer and active tab follow.
+    SessionInfoChanged {
+        name: Option<String>,
     },
     /// A session attach finished (startup, `/resume`, `/new`, `/fork`,
     /// `/clone`, `/import`, or a tab switch): the newly live session's file
@@ -19137,6 +21715,15 @@ enum WorkerEvent {
         delivered_steering: Vec<String>,
         delivered_follow_up: Vec<String>,
     },
+    /// `entry_appended` for a USER message: the one persisted-entry shape the
+    /// live `AgentEvent` stream does not already render. Assistant and
+    /// tool-result entries arrive through `AssistantDone`/`ToolUpdate`, and
+    /// custom/compaction/session-info entries have their own paths (or no
+    /// transcript row), so the worker forwards only user messages here.
+    /// `entry` is the upstream `{id, message}` wire entry.
+    EntryAppended {
+        entry: serde_json::Value,
+    },
     /// `app.thinking.cycle` through the worker: the capability-aware result
     /// (`None` = the model does not reason, upstream's "Current model does
     /// not support thinking").
@@ -19202,6 +21789,12 @@ enum WorkerEvent {
         /// thread.
         plugins: Option<Arc<crate::plugins::PluginHost>>,
     },
+    /// The worker's one live session, handed to the TUI once after it is
+    /// built. `/login`, provider model refresh and Radius token auth upgrade
+    /// this weak handle and call the session-scoped registry entry points, so
+    /// a subagent child's provider overlay cannot redirect the parent's OAuth
+    /// flow (SNAP10 P2-S8-2). `None` (no event yet) keeps the static path.
+    AgentSessionReady(std::sync::Weak<crate::agent_session::AgentSession>),
     /// The session's `/tree` branch-summarization cancellation latch
     /// (upstream `_branchSummaryAbortController`), handed to the TUI once
     /// after the session is built.
@@ -19525,7 +22118,8 @@ enum WorkerCommand {
     /// `session.abortRetry()` on Esc during the countdown).
     AbortRetry,
     /// `/reload`: hot-refresh the running session's discovered skills +
-    /// prompt templates (upstream `session.reload` re-discovery).
+    /// prompt templates (upstream `session.reload` re-discovery) and run the
+    /// ONE unified cross-face plugin reload (`AgentSession::reload`).
     ReloadResources {
         resources: std::sync::Arc<crate::coding_agent::resources::DiscoveredResources>,
     },
@@ -19550,6 +22144,14 @@ enum WorkerCommand {
     /// reply is [`WorkerEvent::OlderTranscript`]; the UI triggers this while
     /// scrolling up at the materialized top of a tail-window session.
     LoadOlder {
+        cursor: u64,
+    },
+    /// Paged load-more, optimistic half: parse the page at `cursor` on the
+    /// session manager's background thread and leave it in the bounded page
+    /// cache, without producing a reply. Issued while the view approaches the
+    /// materialized top so the later [`Self::LoadOlder`] is a cache hit. The
+    /// command is idempotent: the cache dedupes a repeated cursor.
+    PrefetchOlder {
         cursor: u64,
     },
     /// A NATIVE plugin slash command (`/phone-start 8799`, `/todos`, ...):
@@ -19585,19 +22187,20 @@ struct WorkerOverrides {
     session_cwd_override: Option<String>,
 }
 
+/// The session/build inputs handed from the UI thread to the worker thread.
+struct WorkerParts {
+    configured: Option<PiConfiguredModel>,
+    extensions: Option<Arc<ExtensionHandle>>,
+    session_plan: crate::coding_agent::session_resolve::SessionPlan,
+    session_dir: SessionDirSource,
+    resources: std::sync::Arc<crate::coding_agent::resources::DiscoveredResources>,
+    tool_selection: Option<crate::coding_agent::ToolSelection>,
+    native_statuses: Arc<Mutex<Vec<(String, String)>>>,
+    overrides: WorkerOverrides,
+}
+
 impl WorkerHandle {
-    #[allow(clippy::too_many_arguments)]
-    fn spawn(
-        events: WorkerEventSender,
-        configured: Option<PiConfiguredModel>,
-        extensions: Option<Arc<ExtensionHandle>>,
-        session: crate::coding_agent::session_resolve::SessionPlan,
-        session_dir: SessionDirSource,
-        resources: std::sync::Arc<crate::coding_agent::resources::DiscoveredResources>,
-        tool_selection: Option<crate::coding_agent::ToolSelection>,
-        native_statuses: Arc<Mutex<Vec<(String, String)>>>,
-        overrides: WorkerOverrides,
-    ) -> Self {
+    fn spawn(events: WorkerEventSender, parts: WorkerParts) -> Self {
         let (submit_tx, submit_rx) =
             tokio::sync::mpsc::channel::<WorkerCommand>(WORKER_COMMAND_QUEUE_BOUND);
         let streaming = Arc::new(AtomicBool::new(false));
@@ -19629,21 +22232,7 @@ impl WorkerHandle {
                         }
                     };
                     runtime.block_on(async move {
-                        worker_loop(
-                            configured,
-                            events,
-                            submit_rx,
-                            extensions,
-                            session,
-                            session_dir,
-                            resources,
-                            tool_selection,
-                            native_statuses,
-                            streaming,
-                            pulse,
-                            overrides,
-                        )
-                        .await;
+                        worker_loop(events, submit_rx, streaming, pulse, parts).await;
                     });
                     // Report completion AFTER the loop's bounded teardown
                     // (also on the runtime-build-error early return above,
@@ -19907,6 +22496,14 @@ impl WorkerHandle {
         }
     }
 
+    /// Paged load-more prefetch: parse the page at `cursor` in the background
+    /// and cache it (see [`WorkerCommand::PrefetchOlder`]).
+    fn prefetch_older(&self, cursor: u64) {
+        if let Some(tx) = &self.submit_tx {
+            let _ = tx.send(WorkerCommand::PrefetchOlder { cursor });
+        }
+    }
+
     fn fork_from_entry(&self, entry_id: String, switch_epoch: u64) -> bool {
         if let Some(tx) = &self.submit_tx {
             return tx
@@ -20055,8 +22652,15 @@ pub fn initial_interactive_thinking(
 /// storage per the resolved plan, core + shared-extension tools, compaction,
 /// and the context-file system prompt (the facade injects AGENTS.md /
 /// CLAUDE.md unless `--no-context-files` is set).
+///
+/// Takes the worker's `PiConfiguredModel` BY VALUE: the worker owns the copy
+/// handed over at spawn (`WorkerParts.configured`) and uses it for nothing
+/// else, so the registry and model move into the session instead of being
+/// cloned a second time. The UI thread keeps its own snapshot (`App
+/// .configured`) for footer/catalog views — the two copies are deliberate
+/// (D8), but there is no reason for a third.
 fn build_agent_session(
-    configured: &PiConfiguredModel,
+    configured: PiConfiguredModel,
     extensions: Option<&ExtensionHandle>,
     plan: &crate::coding_agent::session_resolve::SessionPlan,
     session_dir: &str,
@@ -20096,7 +22700,11 @@ fn build_agent_session(
     }
     let mut tools = crate::agent::tool_execution::ToolRegistry::new();
     crate::coding_agent::tools::register_core_tools(&mut tools);
-    let provider_registry = Arc::new(configured.registry.clone());
+    // Move the worker's registry into the session's shared handle (the UI's
+    // `App.configured` snapshot stays a separate copy by design, D8). The
+    // scoped-model pairs below resolve against this handle before it moves
+    // into the session config.
+    let provider_registry = Arc::new(configured.registry);
     // Remote catalog overlays (upstream model-runtime `withRemoteCatalog`):
     // background ETag revalidation, delayed first hop, PI_OFFLINE-gated.
     crate::ai::providers::install_remote_catalog_overlays(&provider_registry);
@@ -20105,11 +22713,33 @@ fn build_agent_session(
     let thinking = overrides.thinking.unwrap_or_else(|| {
         initial_interactive_thinking(configured.settings.default_thinking_level)
     });
+    // The `--models` scope drives Ctrl+P cycling and `/model` matching
+    // (upstream `session.setScopedModels`). Resolved before the config takes
+    // the registry handle; `set_scoped_models` applies after construction.
+    let scoped_models = (!overrides.scoped_refs.is_empty()).then(|| {
+        overrides
+            .scoped_refs
+            .iter()
+            .filter_map(|reference| {
+                let (provider, id) = reference.split_once('/')?;
+                let model = provider_registry
+                    .get_models()
+                    .into_iter()
+                    .find(|model| model.provider == provider && model.id == id)?;
+                Some(crate::ai::providers::ScopedModel {
+                    model,
+                    thinking_level: None,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
     let mut agent_session =
         crate::agent_session::AgentSession::new(crate::agent_session::AgentSessionConfig {
             provider_registry,
-            model: configured.model.clone(),
-            api_key: configured.api_key.clone(),
+            // The worker's configured snapshot moves in: no second Model /
+            // api-key clone for the session's own copy.
+            model: configured.model,
+            api_key: configured.api_key,
             thinking,
             tools,
             session,
@@ -20125,27 +22755,8 @@ fn build_agent_session(
             extensions: extensions.cloned(),
             tool_selection,
         });
-    // The `--models` scope drives Ctrl+P cycling and `/model` matching
-    // (upstream `session.setScopedModels`).
-    if !overrides.scoped_refs.is_empty() {
-        let pairs = overrides.scoped_refs.clone();
-        agent_session.set_scoped_models(
-            pairs
-                .iter()
-                .filter_map(|reference| {
-                    let (provider, id) = reference.split_once('/')?;
-                    let model = configured
-                        .registry
-                        .get_models()
-                        .into_iter()
-                        .find(|model| model.provider == provider && model.id == id)?;
-                    Some(crate::ai::providers::ScopedModel {
-                        model,
-                        thinking_level: None,
-                    })
-                })
-                .collect(),
-        );
+    if let Some(scoped_models) = scoped_models {
+        agent_session.set_scoped_models(scoped_models);
     }
     agent_session
         .set_prompt_resources(resources.skills.clone(), resources.prompt_templates.clone());
@@ -20235,10 +22846,30 @@ fn report_session_outcome(events: &WorkerEventSender, outcome: Result<String, St
 /// requires the provider to be registered in the session's model runtime
 /// (`getProvider("radius")`); pir's built-in catalog always carries `radius`,
 /// so the stored credential is the binding condition at this seam.
-async fn radius_share_token() -> Option<String> {
+///
+/// With a live session the credential is resolved through
+/// `AgentSession::get_auth_for_provider` → `get_auth_for_session`, so a child
+/// that overwrote the shared `radius` entry cannot run the parent's OAuth
+/// refresh against its own extension runtime. Without one the pre-SNAP10
+/// static storage path below is unchanged.
+async fn radius_share_token(
+    session: Option<&crate::agent_session::AgentSession>,
+) -> Option<String> {
     use crate::ai::auth::{oauth_expires_soon, FileAuthStorage, StoredCredential};
     /// Upstream's `minOAuthValidityMs` for the share path.
     const MIN_OAUTH_VALIDITY_MS: i64 = 5 * 60_000;
+
+    if let Some(session) = session {
+        // `get_auth_for_session` uses the same five-minute minimum validity
+        // and refreshes under the credential-store lock; the resolved
+        // `ModelAuth` carries the OAuth access token as `api_key`.
+        let auth = session
+            .get_auth_for_provider("radius")
+            .await
+            .ok()
+            .flatten()?;
+        return auth.auth.api_key;
+    }
 
     let storage = std::sync::Arc::new(FileAuthStorage::default_storage());
     match storage.read_stored("radius").ok().flatten()? {
@@ -20819,7 +23450,7 @@ async fn announce_session_attached(
     // attach (the UI applies it to the now-active tab): the footer and
     // terminal title describe the session on screen, not the outgoing one.
     if let Some(name) = name {
-        let _ = events.send(WorkerEvent::SessionRenamed { name });
+        let _ = events.send(WorkerEvent::SessionInfoChanged { name: Some(name) });
     }
 }
 
@@ -21443,6 +24074,205 @@ impl NativeStatusCache {
     }
 }
 
+/// Translate the session's out-of-loop [`crate::agent_session::SessionEvent`]s
+/// onto the TUI worker channel.
+///
+/// This is the ONE `on_session_event` subscriber the interactive worker
+/// installs. It carries every event with a TUI frame consequence:
+///
+/// - `queue_update`: the authoritative pending steering/follow-up display;
+/// - `thinking_level_changed`: the EFFECTIVE level (local apply may clamp it,
+///   and extensions/RPC/phone change it out of band);
+/// - `background_tool_end`: replace a settled background call's placeholder
+///   through the same `ToolUpdate` path a foreground result uses;
+/// - `compaction_start` / `compaction_end`: the OSC status transition plus
+///   the in-editor compaction label. Both automatic (`threshold`/`overflow`)
+///   and manual (`/compact`, extension `ctx.compact`) runs flow through this
+///   one seam, so the manual command must not re-send the pair itself;
+/// - `entry_appended`: only USER messages are forwarded. Every other visible
+///   shape is already streamed by the run's `AgentEvent`s (`AssistantDone` /
+///   `ToolUpdate`), and non-message entries (custom/session-info/compaction/
+///   label) have their own handling or no transcript row;
+/// - `session_info_changed`: the terminal title/footer/tab name, including a
+///   clear (`None`) from an out-of-band caller.
+///
+/// Events with no TUI surface (retries ride the session's host retry notice,
+/// `bash_execution_update` is streamed as a tool block, summarization retries
+/// have no UI row) are ignored here.
+fn session_event_bridge(
+    events: WorkerEventSender,
+    pulse: Arc<StatusPulse>,
+    background_count: Arc<dyn Fn() -> usize + Send + Sync>,
+) -> crate::agent_session::SessionEventHandler {
+    Arc::new(move |event| {
+        use crate::agent_session::SessionEvent;
+        match event {
+            SessionEvent::QueueUpdate {
+                steering,
+                follow_up,
+                delivered_steering,
+                delivered_follow_up,
+            } => {
+                let _ = events.send(WorkerEvent::QueueUpdate {
+                    steering,
+                    follow_up,
+                    delivered_steering,
+                    delivered_follow_up,
+                });
+            }
+            SessionEvent::ThinkingLevelChanged { level } => {
+                let _ = events.send(WorkerEvent::ThinkingLevelChanged(level));
+            }
+            // Background tool completions (`TOOL-BACKGROUND-SCOPE.md` §2.4.5):
+            // the batch that started a `background: true` call answered with a
+            // placeholder, so its block stays pending while the turn moves on.
+            // The real result arrives here, out of band, and replaces that
+            // block in place by call id through the SAME `ToolUpdate` path a
+            // foreground result uses.
+            SessionEvent::BackgroundToolEnd {
+                call_id,
+                tool_name,
+                parent_call_id,
+                is_error,
+                duration_ms,
+                output,
+                images,
+                details,
+                ..
+            } => {
+                // Nested completions (`parentToolCallId` set) have no
+                // transcript block of their own: their start/end events were
+                // skipped above (`parent_call_id.is_some()`), so the block
+                // lookup by call id would miss and this handler would append a
+                // bogus TOP-LEVEL block for a call the transcript never
+                // showed. Only the running-count refresh below applies to
+                // them.
+                if parent_call_id.is_none() {
+                    // `tool_execution_end` parity: record the real duration
+                    // and flip the block's phase before the output lands.
+                    let _ = events.send(WorkerEvent::ToolExecutionFinished {
+                        call_id: call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        is_error,
+                        duration_ms,
+                    });
+                    let _ = events.send(WorkerEvent::ToolUpdate {
+                        call_id: Some(call_id),
+                        request_id: None,
+                        tool_name,
+                        // The marker (the only shape a background completion
+                        // carries) tells the UI to KEEP the block's streamed
+                        // arguments: the completion has no arguments of its
+                        // own, and the placeholder block already shows the
+                        // real command/input.
+                        args: serde_json::json!({ "background": true }),
+                        output,
+                        is_error,
+                        details,
+                        // The completion event carries the real result's image
+                        // blocks (`SessionEvent::BackgroundToolEnd.images`): a
+                        // detached call has no transcript message, so this is
+                        // the only delivery surface. Forwarding them keeps a
+                        // background `read`/screenshot result rendering exactly
+                        // like the foreground path.
+                        images,
+                        partial: false,
+                    });
+                }
+                // Running-count refresh (`bg: N`): the session registry
+                // settled this call BEFORE the event fired, so this snapshot
+                // is the post-completion count.
+                let _ = events.send(WorkerEvent::BackgroundCalls(background_count()));
+                // Out-of-band session event: a plugin may have flipped a
+                // status while settling it, so publish before the next safety
+                // re-read.
+                pulse.signal();
+            }
+            SessionEvent::CompactionStart { .. } => {
+                // Automatic (threshold/overflow) and manual runs both report
+                // the session-owned truth. `/compact` no longer sends its own
+                // `CompactionStarted`, so this single path owns the OSC
+                // transition; the reason is not needed by the UI state
+                // machine (the end event carries it for the manual flag).
+                let _ = events.send(WorkerEvent::CompactionStarted);
+            }
+            SessionEvent::CompactionEnd {
+                reason,
+                aborted,
+                error_message,
+                ..
+            } => {
+                let _ = events.send(WorkerEvent::CompactionEnded {
+                    aborted,
+                    error: error_message,
+                    manual: reason == "manual",
+                });
+            }
+            SessionEvent::EntryAppended { entry } => {
+                // The wire payload is already materialized for this session
+                // (the TUI is a session-event subscriber regardless), so this
+                // filter only avoids channel traffic for the per-turn
+                // assistant/toolResult appends the live stream already
+                // rendered. User messages appended outside a TUI prompt (an
+                // extension's `sendUserMessage`) are the one visible gap.
+                if entry_appended_user_text(&entry).is_some() {
+                    let _ = events.send(WorkerEvent::EntryAppended { entry });
+                }
+            }
+            SessionEvent::SessionInfoChanged { name } => {
+                let _ = events.send(WorkerEvent::SessionInfoChanged { name });
+            }
+            _ => {}
+        }
+    })
+}
+
+/// The text of a `entry_appended` USER message, or `None` for every entry that
+/// must not produce a transcript bubble.
+///
+/// `entry` is the upstream `{id, message}` wire shape. Only `message.role ==
+/// "user"` with at least one non-empty text block qualifies: assistant/
+/// toolResult messages are already rendered by the live run stream, custom
+/// entries ride `WorkerEvent::CustomEntry`, and non-message entries
+/// (compaction/session-info/label/model-change/…) have no chat row.
+#[doc(hidden)]
+pub fn entry_appended_user_text(entry: &serde_json::Value) -> Option<String> {
+    let message = entry.get("message")?;
+    if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+        return None;
+    }
+    let text = message
+        .get("content")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Whether `raw`/`display` are already represented by the trailing user
+/// bubbles of `entries` (the optimistic prompt bubble, or the bubbles a
+/// `queue_update` delivery pushed).
+///
+/// Only a trailing RUN of `ChatEntry::User` rows is scanned: a multi-message
+/// delivery pushes its bubbles together, while an assistant/tool/notice row
+/// after the last user row means this is a new message and must enter the
+/// transcript. Comparing both spellings covers the markdown-transformed
+/// display text of a typed prompt and the raw text used by queue delivery and
+/// the `entry_appended` wire.
+#[doc(hidden)]
+pub fn user_message_already_rendered(entries: &[ChatEntry], raw: &str, display: &str) -> bool {
+    for entry in entries.iter().rev() {
+        match entry {
+            ChatEntry::User(existing) if existing == raw || existing == display => return true,
+            ChatEntry::User(_) => continue,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// The native-status publisher loop, shared by the worker task and tests.
 ///
 /// `read` snapshots the plugin host and `publish` mirrors a CHANGED snapshot
@@ -21495,21 +24325,23 @@ fn spawn_native_status_publisher(
     ));
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn worker_loop(
-    configured: Option<PiConfiguredModel>,
     events: WorkerEventSender,
     mut commands: tokio::sync::mpsc::Receiver<WorkerCommand>,
-    extensions: Option<Arc<ExtensionHandle>>,
-    session_plan: crate::coding_agent::session_resolve::SessionPlan,
-    session_dir: SessionDirSource,
-    resources: std::sync::Arc<crate::coding_agent::resources::DiscoveredResources>,
-    tool_selection: Option<crate::coding_agent::ToolSelection>,
-    native_statuses: Arc<Mutex<Vec<(String, String)>>>,
     streaming: Arc<AtomicBool>,
     pulse: Arc<StatusPulse>,
-    overrides: WorkerOverrides,
+    parts: WorkerParts,
 ) {
+    let WorkerParts {
+        configured,
+        extensions,
+        session_plan,
+        session_dir,
+        resources,
+        tool_selection,
+        native_statuses,
+        overrides,
+    } = parts;
     let Some(configured) = configured else {
         let message = "No pi model configured. Add ~/.pi/agent/models.json and set defaultProvider/defaultModel in ~/.pi/agent/settings.json.".to_string();
         // F2: the error notice AND the run-end signal — the UI's optimistic
@@ -21529,7 +24361,7 @@ async fn worker_loop(
     // prompt-command expansion inside the facade.
     let startup_session_dir = session_dir.resolve(&current_cwd_text());
     let session = match build_agent_session(
-        &configured,
+        configured,
         extensions.as_deref(),
         &session_plan,
         &startup_session_dir,
@@ -21556,6 +24388,13 @@ async fn worker_loop(
             return;
         }
     };
+    // Session-scoped auth/refresh handle for the UI (SNAP10 P2-S8-2): `/login`,
+    // provider model refresh and Radius token auth upgrade this weak handle
+    // and call `AgentSession`'s session-scoped entry points instead of the
+    // process-shared static/native path. One session for the whole run.
+    let _ = events.send(WorkerEvent::AgentSessionReady(std::sync::Arc::downgrade(
+        &session,
+    )));
     // Native plugin command snapshot for the slash router AND the slash menu:
     // the session's PluginHost registry is built synchronously with the
     // session, so one send is the whole (static) native command set. The TUI
@@ -21642,117 +24481,22 @@ async fn worker_loop(
             }
         }));
     }
-    // `queue_update` (upstream `_emitQueueUpdate` → `updatePendingMessagesDisplay`):
-    // the session owns both queues; every enqueue, drain and clear re-emits
-    // their full snapshot. The pending display must follow it, or a delivered
-    // steering message leaves its dim line on screen until the run ends.
-    {
-        let events = events.clone();
-        session.on_session_event(std::sync::Arc::new(move |event| {
-            if let crate::agent_session::SessionEvent::QueueUpdate {
-                steering,
-                follow_up,
-                delivered_steering,
-                delivered_follow_up,
-            } = event
-            {
-                let _ = events.send(WorkerEvent::QueueUpdate {
-                    steering,
-                    follow_up,
-                    delivered_steering,
-                    delivered_follow_up,
-                });
-            }
-        }));
-    }
-    // `thinking_level_changed` (upstream `AgentSessionEvent` 212 →
-    // interactive-mode.ts:3452 `footer.invalidate()`): the session owns the
-    // EFFECTIVE level (a request may be clamped to the model's supported
-    // ladder, and extensions/RPC/phone can change it out of band). Without
-    // this bridge the TUI footer keeps the last value it applied locally
-    // until some unrelated event refreshes the caches — the reported stale
-    // status rows after selecting a thinking level.
-    {
-        let events = events.clone();
-        session.on_session_event(std::sync::Arc::new(move |event| {
-            if let crate::agent_session::SessionEvent::ThinkingLevelChanged { level } = event {
-                let _ = events.send(WorkerEvent::ThinkingLevelChanged(level));
-            }
-        }));
-    }
-    // Background tool completions (`TOOL-BACKGROUND-SCOPE.md` §2.4.5): the
-    // batch that started a `background: true` call answered with a placeholder,
-    // so its block stays pending while the turn moves on. The real result
-    // arrives here, out of band, and replaces that block in place by call id
-    // through the SAME `ToolUpdate` path a foreground result uses.
-    {
-        let events = events.clone();
-        let session_handle = std::sync::Arc::clone(&session);
-        let pulse = std::sync::Arc::clone(&pulse);
-        session.on_session_event(std::sync::Arc::new(move |event| {
-            let crate::agent_session::SessionEvent::BackgroundToolEnd {
-                call_id,
-                tool_name,
-                parent_call_id,
-                is_error,
-                duration_ms,
-                output,
-                images,
-                details,
-                ..
-            } = event
-            else {
-                return;
-            };
-            // Nested completions (`parentToolCallId` set) have no transcript
-            // block of their own: their start/end events were skipped above
-            // (`parent_call_id.is_some()`), so the block lookup by call id
-            // would miss and this handler would append a bogus TOP-LEVEL block
-            // for a call the transcript never showed. Only the running-count
-            // refresh below applies to them.
-            if parent_call_id.is_none() {
-                // `tool_execution_end` parity: record the real duration and
-                // flip the block's phase before the output lands.
-                let _ = events.send(WorkerEvent::ToolExecutionFinished {
-                    call_id: call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    is_error,
-                    duration_ms,
-                });
-                let _ = events.send(WorkerEvent::ToolUpdate {
-                    call_id: Some(call_id),
-                    request_id: None,
-                    tool_name,
-                    // The marker (the only shape a background completion
-                    // carries) tells the UI to KEEP the block's streamed
-                    // arguments: the completion has no arguments of its own,
-                    // and the placeholder block already shows the real
-                    // command/input.
-                    args: serde_json::json!({ "background": true }),
-                    output,
-                    is_error,
-                    details,
-                    // The completion event carries the real result's image
-                    // blocks (`SessionEvent::BackgroundToolEnd.images`): a
-                    // detached call has no transcript message, so this is the
-                    // only delivery surface. Forwarding them keeps a
-                    // background `read`/screenshot result rendering exactly
-                    // like the foreground path.
-                    images,
-                    partial: false,
-                });
-            }
-            // Running-count refresh (`bg: N`): the session registry settled
-            // this call BEFORE the event fired, so this snapshot is the
-            // post-completion count.
-            let _ = events.send(WorkerEvent::BackgroundCalls(
-                session_handle.background_calls().len(),
-            ));
-            // Out-of-band session event: a plugin may have flipped a status
-            // while settling it, so publish before the next safety re-read.
-            pulse.signal();
-        }));
-    }
+    // Session-level events (upstream `AgentSessionEvent`, emitted outside the
+    // agent-loop `AgentEvent` stream). ONE subscriber covers every TUI-visible
+    // kind: the session fans an event out by cloning it per handler, so a
+    // single closure keeps the per-event cost at zero clones (and keeps the
+    // `queue_update` pending display, the effective thinking level, background
+    // completions, automatic compaction, out-of-band user appends and the
+    // session name on the same ordered channel). See [`session_event_bridge`].
+    let background_count: Arc<dyn Fn() -> usize + Send + Sync> = {
+        let session = std::sync::Arc::clone(&session);
+        Arc::new(move || session.background_calls().len())
+    };
+    session.on_session_event(session_event_bridge(
+        events.clone(),
+        std::sync::Arc::clone(&pulse),
+        background_count,
+    ));
 
     // Live tool-output streaming: route every call-id-carrying partial into
     // the matching tool block (upstream tool_execution_update rendering —
@@ -21888,14 +24632,16 @@ async fn worker_loop(
             WorkerCommand::Prompt(text) => {
                 run_prompt(
                     WorkerRun::Prompt(text),
-                    &session,
-                    &events,
+                    RunServices {
+                        session: &session,
+                        events: &events,
+                        streaming: &streaming,
+                        session_dir: &session_dir,
+                        debug_mode: &debug_mode,
+                        pulse: &pulse,
+                    },
                     &mut commands,
                     &mut queued_prompts,
-                    &streaming,
-                    &session_dir,
-                    &debug_mode,
-                    &pulse,
                 )
                 .await;
             }
@@ -21925,14 +24671,16 @@ async fn worker_loop(
         while let Some(message) = session.take_pending_custom_run() {
             run_prompt(
                 WorkerRun::Custom(message),
-                &session,
-                &events,
+                RunServices {
+                    session: &session,
+                    events: &events,
+                    streaming: &streaming,
+                    session_dir: &session_dir,
+                    debug_mode: &debug_mode,
+                    pulse: &pulse,
+                },
                 &mut commands,
                 &mut queued_prompts,
-                &streaming,
-                &session_dir,
-                &debug_mode,
-                &pulse,
             )
             .await;
         }
@@ -21958,18 +24706,31 @@ enum WorkerRun {
 /// follow-up input and aborts must reach the running agent (upstream
 /// `session.steer` during streaming); further prompts queue behind the
 /// active run.
-#[allow(clippy::too_many_arguments)]
+/// The shared worker services one run borrows (everything except the run
+/// input and the command queues it also services).
+struct RunServices<'a> {
+    session: &'a std::sync::Arc<crate::agent_session::AgentSession>,
+    events: &'a WorkerEventSender,
+    streaming: &'a AtomicBool,
+    session_dir: &'a SessionDirSource,
+    debug_mode: &'a DebugMode,
+    pulse: &'a Arc<StatusPulse>,
+}
+
 async fn run_prompt(
     run: WorkerRun,
-    session: &std::sync::Arc<crate::agent_session::AgentSession>,
-    events: &WorkerEventSender,
+    services: RunServices<'_>,
     commands: &mut tokio::sync::mpsc::Receiver<WorkerCommand>,
     queued_prompts: &mut std::collections::VecDeque<String>,
-    streaming: &AtomicBool,
-    session_dir: &SessionDirSource,
-    debug_mode: &DebugMode,
-    pulse: &Arc<StatusPulse>,
 ) {
+    let RunServices {
+        session,
+        events,
+        streaming,
+        session_dir,
+        debug_mode,
+        pulse,
+    } = services;
     let _ = events.send(WorkerEvent::Working(Some("Working".to_string())));
     streaming.store(true, Ordering::SeqCst);
     // F12: `AgentEnd` (RunSettled) can be followed by an Err return from
@@ -22477,21 +25238,17 @@ async fn handle_session_command(
             if !widen_for_whole_history(session, events).await {
                 return;
             }
-            // OSC 7501: compaction start/end (upstream `compaction_start` /
-            // `compaction_end` with reason=manual). The working indicator
-            // carries the upstream compaction status text
-            // (status-indicator.ts:85-99) with its live spinner.
-            let _ = events.send(WorkerEvent::CompactionStarted);
+            // The compaction start/end pair itself comes from the session's
+            // own `compaction_start`/`compaction_end` events
+            // (`session_event_bridge`), so this command must not send a
+            // duplicate. The working indicator carries the upstream
+            // compaction status text (status-indicator.ts:85-99) with its
+            // live spinner; the later session start event keeps it set.
             let _ = events.send(WorkerEvent::Working(Some(
                 "Compacting context... (working)".to_string(),
             )));
             match session.compact(instructions.as_deref()).await {
                 Ok(result) => {
-                    let _ = events.send(WorkerEvent::CompactionEnded {
-                        aborted: false,
-                        error: None,
-                        manual: true,
-                    });
                     // Compaction replaced the transcript: refresh the context
                     // percentage immediately instead of waiting for the next
                     // run's settle seam.
@@ -22547,11 +25304,9 @@ async fn handle_session_command(
                     }
                 }
                 Err(error) => {
-                    let _ = events.send(WorkerEvent::CompactionEnded {
-                        aborted: false,
-                        error: Some(error.to_string()),
-                        manual: true,
-                    });
+                    // The session's failed `compaction_end` already reached the
+                    // UI through the bridge; report the command-level failure
+                    // as the transcript notice only.
                     let _ = events.send(WorkerEvent::Error(format!("compact failed: {error}")));
                 }
             }
@@ -22767,6 +25522,18 @@ async fn handle_session_command(
                 }
             };
             report_session_outcome(events, outcome);
+        }
+        WorkerCommand::PrefetchOlder { cursor } => {
+            // Optimistic half of the paged load-more: parse the next older
+            // page and put it in the manager's bounded page cache. No reply is
+            // sent (the page is invisible to the transcript until `LoadOlder`
+            // actually consumes it), and the manager dedupes repeated calls.
+            // The parse runs on a helper thread; this arm only hands off.
+            const LOAD_OLDER_MAX_BYTES: usize = TRANSCRIPT_TAIL_BYTES;
+            const LOAD_OLDER_MAX_ENTRIES: usize = TRANSCRIPT_WINDOW_MAX_ENTRIES;
+            let _ = session
+                .prefetch_older_transcript(cursor, LOAD_OLDER_MAX_BYTES, LOAD_OLDER_MAX_ENTRIES)
+                .await;
         }
         WorkerCommand::LoadOlder { cursor } => {
             // Paged load-more (scroll-up streaming of the on-disk prefix):
@@ -23004,10 +25771,10 @@ async fn handle_session_command(
             } else {
                 match session.set_session_name(&name).await {
                     Ok(Some(normalized)) => {
-                        // The terminal title + footer follow the rename.
-                        let _ = events.send(WorkerEvent::SessionRenamed {
-                            name: normalized.clone(),
-                        });
+                        // The terminal title + footer follow the rename via
+                        // the session's own `session_info_changed` event (the
+                        // same path as extension/RPC renames); sending a
+                        // local duplicate here would double-apply it.
                         Ok(format!("Session name: {normalized}"))
                     }
                     Ok(None) => Err(NO_SESSION_STORAGE.to_string()),
@@ -23420,7 +26187,7 @@ async fn handle_session_command(
                 let destination = settings.session_share_destination();
                 let radius_token = match destination {
                     crate::config::settings::SessionShareDestination::Gist => None,
-                    _ => radius_share_token().await,
+                    _ => radius_share_token(Some(session.as_ref())).await,
                 };
                 match super::slash::share_route(destination, radius_token.is_some()) {
                     super::slash::ShareRoute::RadiusUnconfigured => {
@@ -23616,28 +26383,32 @@ async fn handle_session_command(
                 resources.skills.clone(),
                 resources.prompt_templates.clone(),
             );
-            // Native plugin state (the product caller the plugin host lacked):
-            // every `on_reload` hook — codemode's settings cache, the MCP
-            // manager's teardown, todo's replay cache — plus one registry
-            // rebuild. The JS runtime half is reloaded by the extension
-            // dispatcher (`ExtRequest::Reload`) exactly as before, so each
-            // face reloads once. Plugin failures are logged by the host and
-            // never abort this command; a reload refused because a run still
-            // owns the session is reported as a warning (the resources half
-            // above already landed, and the next `/reload` retries it).
-            match session.reload_plugins().await {
-                Ok(()) => {}
-                Err(error) => {
+            // ONE unified reload, in the required cross-face order: native
+            // `session_shutdown {reason:"reload"}`, every `on_reload` hook,
+            // the JS runtime reload (old JS shutdown -> factories re-run ->
+            // new JS session_start), then native `session_start
+            // {reason:"reload"}`. `AgentSession::reload` owns that sequence
+            // through `PluginHost::reload`, so the dispatcher must NOT start
+            // a second, racing JS reload. Plugin failures are logged by the
+            // host and never abort this command; a reload refused because a
+            // run still owns the session is reported as an error (the
+            // resources half above already landed, and the next `/reload`
+            // retries it).
+            match session.reload().await {
+                Ok(_) => {
                     let _ = events.send(WorkerEvent::Status(format!(
-                        "Native plugin reload skipped: {error}"
+                        "Reloaded session resources: {} skills, {} prompt templates",
+                        resources.skills.len(),
+                        resources.prompt_templates.len()
                     )));
                 }
+                Err(error) => {
+                    let _ = events.send(WorkerEvent::Error(format!("Reload failed: {error}")));
+                }
             }
-            let _ = events.send(WorkerEvent::Status(format!(
-                "Reloaded session resources: {} skills, {} prompt templates",
-                resources.skills.len(),
-                resources.prompt_templates.len()
-            )));
+            // The registered-command snapshot may have moved (a partial JS
+            // load still replaces the runtime state): re-query an open popup.
+            let _ = events.send(WorkerEvent::ExtensionsReloaded);
         }
         WorkerCommand::NavigateTreeWithSummary {
             entry_id,
@@ -23952,6 +26723,23 @@ pub fn finalize_streaming_segments(
     entries: &mut Vec<ChatEntry>,
     message: Option<crate::ai::types::AssistantMessage>,
 ) -> usize {
+    finalize_streaming_segments_tracked(entries, message).0
+}
+
+/// [`finalize_streaming_segments`] plus the entry range whose content moved
+/// in place (or was shifted by a removal). The app publishes that exact
+/// range instead of a `0..entries.len()` delta: the live segment sits at the
+/// turn's tail, so `AssistantDone` / `Idle` must not re-read a 100k-entry
+/// transcript.
+///
+/// The range is expressed against the FINAL list; removals mark
+/// `first_changed..old_len` (the caller clamps to the new length), because
+/// every entry after the removed segment shifted down.
+#[doc(hidden)]
+pub fn finalize_streaming_segments_tracked(
+    entries: &mut Vec<ChatEntry>,
+    message: Option<crate::ai::types::AssistantMessage>,
+) -> (usize, Option<(usize, usize)>) {
     let live: Vec<usize> = entries
         .iter()
         .enumerate()
@@ -23959,17 +26747,20 @@ pub fn finalize_streaming_segments(
             matches!(entry, ChatEntry::Streaming { live: true, .. }).then_some(index)
         })
         .collect();
+    let mut changed = None;
     match message {
         Some(message) => {
             let message = Arc::new(message);
             match live.split_first() {
                 Some((&first, rest)) => {
+                    let old_len = entries.len();
                     // High index first: removing a later entry never shifts
                     // the surviving first slot.
                     for &index in rest.iter().rev() {
                         entries.remove(index);
                     }
                     entries[first] = ChatEntry::Assistant(message);
+                    changed = Some((first, old_len));
                 }
                 // No deltas at all (a tool-only message): append, exactly as
                 // the pre-fix shape did.
@@ -23977,6 +26768,9 @@ pub fn finalize_streaming_segments(
             }
         }
         None => {
+            if let (Some(first), Some(last)) = (live.first(), live.last()) {
+                changed = Some((*first, last + 1));
+            }
             for index in &live {
                 if let ChatEntry::Streaming { live, .. } = &mut entries[*index] {
                     *live = false;
@@ -23984,7 +26778,7 @@ pub fn finalize_streaming_segments(
             }
         }
     }
-    live.len()
+    (live.len(), changed)
 }
 
 /// The transcript index of the live streaming entry, when `entries` still ends
@@ -24016,6 +26810,227 @@ fn is_background_completion_marker(args: &serde_json::Value) -> bool {
     })
 }
 
+/// Per-session cache of streamed tool-call arguments used by the worker event
+/// bridge, keyed by call id.
+///
+/// `known_args` holds the latest arguments seen for a call (from
+/// `toolcall_start`/`delta`/`end` and finalized turns); `raw_json` accumulates
+/// the raw JSON fragments of in-flight calls for adapters that do not mirror
+/// their parsed arguments into the partial block. Both maps are cleared when a
+/// run settles (`AgentEvent::AgentEnd`): the handler closure lives for the
+/// whole TUI session, so without the reset every historical call's arguments
+/// (a `write`/`edit` call carries file bodies) stayed resident forever.
+///
+/// Public as a test seam: the cache lifecycle is plain map bookkeeping, and
+/// the TUI event loop itself is not unit-testable.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ToolArgCache {
+    known_args: std::collections::HashMap<String, serde_json::Value>,
+    raw_json: std::collections::HashMap<String, String>,
+}
+
+impl ToolArgCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the latest arguments for `call_id` (streamed or finalized).
+    pub fn insert(&mut self, call_id: impl Into<String>, args: serde_json::Value) {
+        self.known_args.insert(call_id.into(), args);
+    }
+
+    /// The arguments cached for `call_id`, if any.
+    pub fn get(&self, call_id: &str) -> Option<&serde_json::Value> {
+        self.known_args.get(call_id)
+    }
+
+    /// The raw JSON buffer accumulating `call_id`'s streamed deltas.
+    pub fn raw_buffer(&mut self, call_id: &str) -> &mut String {
+        self.raw_json.entry(call_id.to_string()).or_default()
+    }
+
+    /// Drop the raw buffer of a call whose `toolcall_end` arrived (its parsed
+    /// arguments are authoritative from then on).
+    pub fn remove_raw(&mut self, call_id: &str) {
+        self.raw_json.remove(call_id);
+    }
+
+    /// Release every cached entry; called once a run settles.
+    pub fn clear(&mut self) {
+        self.known_args.clear();
+        self.raw_json.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.known_args.is_empty() && self.raw_json.is_empty()
+    }
+
+    /// Number of cached entries across both maps (test seam).
+    pub fn len(&self) -> usize {
+        self.known_args.len() + self.raw_json.len()
+    }
+
+    /// Number of raw JSON buffers (test seam).
+    pub fn raw_len(&self) -> usize {
+        self.raw_json.len()
+    }
+}
+
+/// Live worker-event bridge for the D9 lifecycle test.
+///
+/// The TUI event loop is not unit-testable, so this `#[doc(hidden)]` probe
+/// constructs the REAL [`worker_event_handler`] over a fresh cache and a
+/// drained event queue. Feeding an `AgentEvent` through [`Self::handle`]
+/// exercises the production match arms — including the `AgentEnd` cleanup —
+/// so deleting that cleanup makes the test fail instead of silently passing.
+#[doc(hidden)]
+pub struct WorkerEventBridgeProbe {
+    handler: crate::agent_session::EventHandler,
+    tool_args: Arc<Mutex<ToolArgCache>>,
+    events: std::sync::mpsc::Receiver<WorkerEvent>,
+}
+
+#[doc(hidden)]
+impl WorkerEventBridgeProbe {
+    pub fn new() -> Self {
+        let (tx, events) = std::sync::mpsc::sync_channel(WORKER_EVENT_QUEUE_BOUND);
+        let tool_args = Arc::new(Mutex::new(ToolArgCache::new()));
+        let handler = worker_event_handler_with_cache(
+            WorkerEventSender::new(tx),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|| 0),
+            StatusPulse::new(),
+            Arc::clone(&tool_args),
+        );
+        Self {
+            handler,
+            tool_args,
+            events,
+        }
+    }
+
+    /// Feed one agent-loop event through the production handler.
+    pub fn handle(&self, event: crate::agent::agent_loop::AgentEvent) {
+        (self.handler)(event);
+    }
+
+    /// The live cache the handler mutates (seed it with the state a run's
+    /// streaming events would leave behind, or inspect it after an event).
+    pub fn tool_args(&self) -> &Arc<Mutex<ToolArgCache>> {
+        &self.tool_args
+    }
+
+    /// Drain the emitted `ToolUpdate` frames as `(call_id, args)`, which is
+    /// all the D9 assertions need from the private `WorkerEvent` contract.
+    pub fn take_tool_updates(&mut self) -> Vec<(Option<String>, serde_json::Value)> {
+        let mut updates = Vec::new();
+        while let Ok(event) = self.events.try_recv() {
+            if let WorkerEvent::ToolUpdate { call_id, args, .. } = event {
+                updates.push((call_id, args));
+            }
+        }
+        updates
+    }
+}
+
+impl Default for WorkerEventBridgeProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One UI-facing event produced by `session_event_bridge`, projected into a
+/// test-visible shape (the `WorkerEvent` enum itself stays private).
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionBridgeEvent {
+    CompactionStarted,
+    CompactionEnded {
+        aborted: bool,
+        error: Option<String>,
+        manual: bool,
+    },
+    EntryAppended {
+        entry: serde_json::Value,
+    },
+    SessionInfoChanged {
+        name: Option<String>,
+    },
+    Other,
+}
+
+/// Deterministic harness for the production `session_event_bridge`: feed a
+/// `SessionEvent` and inspect the `WorkerEvent`s it queued. The TUI event loop
+/// itself is not unit-testable (it owns the terminal), so this pins the
+/// worker-side mapping of the events that create a frame/refresh.
+#[doc(hidden)]
+pub struct SessionEventBridgeProbe {
+    handler: crate::agent_session::SessionEventHandler,
+    events: std::sync::mpsc::Receiver<WorkerEvent>,
+}
+
+#[doc(hidden)]
+impl SessionEventBridgeProbe {
+    pub fn new() -> Self {
+        let (tx, events) = std::sync::mpsc::sync_channel(WORKER_EVENT_QUEUE_BOUND);
+        let background_count: Arc<dyn Fn() -> usize + Send + Sync> = Arc::new(|| 0);
+        let handler = session_event_bridge(
+            WorkerEventSender::new(tx),
+            StatusPulse::new(),
+            background_count,
+        );
+        Self { handler, events }
+    }
+
+    /// Feed one session-level event through the production bridge.
+    pub fn handle(&self, event: crate::agent_session::SessionEvent) {
+        (self.handler)(event);
+    }
+
+    /// Drain every queued `WorkerEvent` as its test-visible projection.
+    pub fn take_events(&mut self) -> Vec<SessionBridgeEvent> {
+        let mut mapped = Vec::new();
+        while let Ok(event) = self.events.try_recv() {
+            mapped.push(match event {
+                WorkerEvent::CompactionStarted => SessionBridgeEvent::CompactionStarted,
+                WorkerEvent::CompactionEnded {
+                    aborted,
+                    error,
+                    manual,
+                } => SessionBridgeEvent::CompactionEnded {
+                    aborted,
+                    error,
+                    manual,
+                },
+                WorkerEvent::EntryAppended { entry } => SessionBridgeEvent::EntryAppended { entry },
+                WorkerEvent::SessionInfoChanged { name } => {
+                    SessionBridgeEvent::SessionInfoChanged { name }
+                }
+                _ => SessionBridgeEvent::Other,
+            });
+        }
+        mapped
+    }
+}
+
+impl Default for SessionEventBridgeProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Release the streamed tool-argument cache once `AgentEvent::AgentEnd` has
+/// emitted every `ToolUpdate` that needs it. Extracted from the handler so the
+/// lifecycle has one named production operation; the probe test drives that
+/// handler rather than calling this directly.
+fn release_tool_args_on_agent_end(tool_args: &Mutex<ToolArgCache>) {
+    tool_args
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
 /// Map `AgentSession`'s loop events onto the TUI `WorkerEvent` contract:
 /// per-turn assistant messages (with usage) become `AssistantDone`, streamed
 /// tool-call arguments become live pending blocks, tool progress becomes live
@@ -24028,21 +27043,35 @@ fn worker_event_handler(
     background_count: Arc<dyn Fn() -> usize + Send + Sync>,
     pulse: Arc<StatusPulse>,
 ) -> crate::agent_session::EventHandler {
+    worker_event_handler_with_cache(
+        events,
+        run_settled,
+        background_count,
+        pulse,
+        Arc::new(Mutex::new(ToolArgCache::new())),
+    )
+}
+
+/// [`worker_event_handler`] over an externally owned tool-argument cache.
+///
+/// Split out so the D9 lifecycle test can build the REAL handler and observe
+/// the same cache the production closure mutates (`WorkerEventBridgeProbe`),
+/// instead of re-testing [`ToolArgCache`]'s methods in isolation.
+fn worker_event_handler_with_cache(
+    events: WorkerEventSender,
+    run_settled: Arc<AtomicBool>,
+    background_count: Arc<dyn Fn() -> usize + Send + Sync>,
+    pulse: Arc<StatusPulse>,
+    tool_args: Arc<Mutex<ToolArgCache>>,
+) -> crate::agent_session::EventHandler {
     use crate::agent::agent_loop::AgentEvent;
     use crate::ai::types::{AssistantMessageEvent, ContentBlock, StopReason};
     // Live tool-call args seen on the stream, keyed by call id. Upstream keeps
     // them on the streaming message; pir's event surface delivers them on
     // `toolcall_start`/`delta`/`end`, so the handler caches them for
     // `tool_execution_start` (its event carries no args) and for calls whose
-    // `toolcall_end` was cut off (length-terminated streams).
-    let known_args: Arc<Mutex<std::collections::HashMap<String, serde_json::Value>>> =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
-    // Partial JSON accumulated from `toolcall_delta` chunks, parsed
-    // best-effort so a pending block's arguments update live (upstream
-    // `ToolExecutionComponent.updateArgs`); only adapters that materialize the
-    // call block at block start (e.g. anthropic) resolve a call id here.
-    let raw_json: Arc<Mutex<std::collections::HashMap<String, String>>> =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    // `toolcall_end` was cut off (length-terminated streams). The cache is
+    // cleared when the run settles (see the `AgentEnd` arm).
     Arc::new(move |event| {
         match event {
             AgentEvent::AgentStart { .. } => {
@@ -24056,7 +27085,7 @@ fn worker_event_handler(
                 // calls refresh the args cache (the finalized call is the
                 // authoritative argument source, tool-execution.ts).
                 {
-                    let mut args_cache = known_args
+                    let mut args_cache = tool_args
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     for call in tool_calls_of(&message) {
@@ -24093,7 +27122,7 @@ fn worker_event_handler(
             } => {
                 for call in tool_calls_of(&partial) {
                     let args = tool_args_json(call);
-                    known_args
+                    tool_args
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(call.id.clone(), args.clone());
@@ -24128,10 +27157,10 @@ fn worker_event_handler(
                 // that do not mirror (their block stays an empty object).
                 if let Some(ContentBlock::ToolCall(call)) = partial.content.get(content_index) {
                     let parsed = {
-                        let mut buffers = raw_json
+                        let mut cache = tool_args
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let buffer = buffers.entry(call.id.clone()).or_default();
+                        let buffer = cache.raw_buffer(&call.id);
                         streamed_tool_call_args(call, &delta, buffer)
                     };
                     if let Some(parsed) = parsed {
@@ -24141,7 +27170,7 @@ fn worker_event_handler(
                         // `toolcall_end`, so this per-delta write is its only
                         // live source (the completed-stream case is covered by
                         // `toolcall_end`/`turn_end`).
-                        known_args
+                        tool_args
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .insert(call.id.clone(), parsed.clone());
@@ -24158,14 +27187,13 @@ fn worker_event_handler(
                 ..
             } => {
                 let args = tool_args_json(&tool_call);
-                known_args
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(tool_call.id.clone(), args.clone());
-                raw_json
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&tool_call.id);
+                {
+                    let mut cache = tool_args
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    cache.insert(tool_call.id.clone(), args.clone());
+                    cache.remove_raw(&tool_call.id);
+                }
                 let _ = events.send(WorkerEvent::ToolCallArgs {
                     call_id: tool_call.id,
                     tool_name: tool_call.name,
@@ -24187,7 +27215,7 @@ fn worker_event_handler(
                 if parent_call_id.is_none() {
                     let _ =
                         events.send(WorkerEvent::Working(Some(format!("Running {tool_name}…"))));
-                    let args = known_args
+                    let args = tool_args
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .get(&call_id)
@@ -24258,7 +27286,7 @@ fn worker_event_handler(
                                     .join("\n")
                             })
                             .unwrap_or_default();
-                        let args = known_args
+                        let args = tool_args
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .get(&call_id)
@@ -24304,7 +27332,7 @@ fn worker_event_handler(
                         .get(&tool_result.tool_call_id)
                         .cloned()
                         .or_else(|| {
-                            known_args
+                            tool_args
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .get(&tool_result.tool_call_id)
@@ -24361,6 +27389,15 @@ fn worker_event_handler(
                 if result.aborted {
                     let _ = events.send(WorkerEvent::Status("Interrupted".to_string()));
                 }
+                // Run ended: every `ToolUpdate` above has consumed the live
+                // arguments it needed, so release the whole cache now. The
+                // handler closure outlives the run, and without this reset each
+                // call's full arguments (whole file bodies for `write`/`edit`)
+                // stayed resident for the rest of the TUI session. Do NOT
+                // remove entries per `ToolExecutionEnd` instead: a call whose
+                // result is only rendered at `AgentEnd` relies on the
+                // `args_by_call.or_else(known_args)` fallback above.
+                release_tool_args_on_agent_end(&tool_args);
                 // OSC 7501: the agent loop settled (upstream reporter
                 // `agent_settled` with the abort flag). F12: mark the run
                 // settled BEFORE the event goes out so run_prompt's
@@ -24373,10 +27410,10 @@ fn worker_event_handler(
                 pulse.signal();
             }
             AgentEvent::Compaction { .. } => {
-                // pir's agent loop only emits the post-compaction event (no
-                // start/end pair like upstream `auto_compaction_*`), so there
-                // is no faithful compaction_start here; the manual `/compact`
-                // path carries the pair instead.
+                // The agent loop only emits the post-compaction loop event;
+                // the faithful `compaction_start`/`compaction_end` pair rides
+                // the session-event bridge (`session_event_bridge`). Keep the
+                // transcript status line for the automatic threshold run.
                 let _ = events.send(WorkerEvent::Status("Context compacted".to_string()));
             }
             _ => {}

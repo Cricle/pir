@@ -16,8 +16,17 @@ mod common;
 
 use pir::sdk::{AgentBuilder, ProxyEndpoint, ProxyProvider};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    common::run_big_stack(async {
+        if let Err(error) = run().await {
+            eprintln!("error: {error:?}");
+            return std::process::ExitCode::FAILURE;
+        }
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let proxy_url =
         std::env::var("PIR_PROXY_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
     let auth_token = std::env::var("PIR_PROXY_TOKEN").unwrap_or_default();

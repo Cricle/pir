@@ -9,11 +9,12 @@ smallest useful template for a custom provider.
 ## Run them
 
 The SDK / default-on surfaces are separate cargo features. Each example
-declares only the features its own command needs (`required-features` in
-`Cargo.toml`): `sdk` is required everywhere, `sessions` adds `session`, the
-builtin/extension examples add their own runtime feature, and `real_endpoint`
-declares the common `sdk,session,skills` set. TUI, CLI, Python, and MCP stay
-off; only the `extension` example turns on the embedded QuickJS runtime:
+declares only the features needed to compile it (`required-features` in
+`Cargo.toml`): `sdk` for most, `sdk,session` for `sessions`, `sdk,subagent`
+for `builtin`, `sdk,extensions` for `extension`, and `sdk,session,skills` for
+`real_endpoint`. The `tools` example compiles with `sdk` and its documented
+command adds the optional `tools` feature. TUI, CLI, Python, and MCP stay off;
+only the `extension` example turns on the embedded QuickJS runtime:
 
 ```bash
 # Offline: no network, no credentials.
@@ -58,6 +59,14 @@ scripts/run_examples.sh
 
 It exits nonzero on the first failure. The two network examples are
 compile-checked only (no request is sent).
+
+Every example's `main` runs its async body through
+`common::run_big_stack` (a 64 MiB thread). The GNU/Windows linker starts the
+main thread at 2 MiB and unoptimized agent futures run deeper than that on a
+tool round-trip (`plugin.rs` overflowed before the wrapper); the wrapper keeps
+`cargo run --example …` working out of the box. A real embedder on this
+platform should use the same shape (or raise the PE stack) until the SDK
+boxes the remaining deep futures.
 
 ## What each example shows
 
@@ -125,7 +134,7 @@ pir-sdk = { version = "0.0.1", default-features = false, features = [
 
 futures-util = "0.3"
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 ```
 
 Start from `quickstart.rs`, then copy `common/mod.rs` and replace

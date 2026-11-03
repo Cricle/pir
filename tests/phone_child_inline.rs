@@ -4,7 +4,9 @@
 //! Direct coverage of the token parser/builder plus two in-process RPC
 //! integration tests: a child session (env set at construction) turns an idle
 //! token prompt into a displayed `phone-inline-user-message` with interleaved
-//! content, while a parent session (no env) keeps the prompt byte-for-byte.
+//! content, while a parent session (no env) keeps the prompt text
+//! byte-for-byte and only carries the attachment through the plain RPC image
+//! path.
 
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -82,6 +84,32 @@ fn more_images_than_tokens_append_the_rest_at_the_end() {
     assert_eq!(parts[0]["data"], "A");
     assert_eq!(parts[1]["text"], " tail");
     assert_eq!(parts[2]["data"], "B");
+}
+
+#[test]
+fn unusable_images_do_not_count_as_token_matches() {
+    // An image with empty data (and one with empty mimeType) is not usable:
+    // its token stays literal, the image is not appended, and the pair must
+    // NOT count as a match — otherwise `plan_inline_prompt` would rebuild an
+    // unchanged prompt.
+    let empty_data = InlinePromptImage::new("", "image/png");
+    let built = build_inline_content("⟦img1⟧ hi", std::slice::from_ref(&empty_data));
+    assert_eq!(built.matched_count, 0);
+    assert_eq!(part_types(&built.content), ["text", "text"]);
+    assert_eq!(flatten_text(&built.content), "⟦img1⟧ hi");
+    assert_eq!(
+        plan_inline_prompt("⟦img1⟧ hi", &[empty_data], false),
+        InlinePromptAction::Unchanged
+    );
+
+    let empty_mime = InlinePromptImage::new("aGVsbG8=", "");
+    let built = build_inline_content("⟦img1⟧ hi", std::slice::from_ref(&empty_mime));
+    assert_eq!(built.matched_count, 0);
+    assert_eq!(flatten_text(&built.content), "⟦img1⟧ hi");
+    assert_eq!(
+        plan_inline_prompt("⟦img1⟧ hi", &[empty_mime], true),
+        InlinePromptAction::Unchanged
+    );
 }
 
 #[test]
@@ -507,9 +535,11 @@ async fn child_idle_prompt_persists_interleaved_custom_message() {
 }
 
 /// Without `PI_PHONE_CHILD=1` the exact same prompt is untouched: no custom
-/// message, and the literal token text reaches the transcript.
+/// message, the literal token text reaches the transcript, and the attachment
+/// rides the plain RPC image path (a non-child session never rebuilds tokens —
+/// `handle_prompt` only rewrites them for a phone child — but its `images`
+/// array still joins the user message, like every RPC prompt).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "phone parent-image fixture expects images to be dropped; tracked separately"]
 async fn parent_prompt_is_not_transformed_without_the_env() {
     let contexts: Contexts = Arc::new(Mutex::new(Vec::new()));
     let env = PhoneChildEnv::set(None);
@@ -537,8 +567,15 @@ async fn parent_prompt_is_not_transformed_without_the_env() {
     let content = user["message"]["content"]
         .as_array()
         .expect("content array");
-    assert_eq!(content.len(), 1, "images stay ignored: {content:?}");
+    assert_eq!(
+        content.len(),
+        2,
+        "the token text stays literal and the attachment rides the prompt: {content:?}"
+    );
     assert_eq!(content[0]["type"], "text");
     assert_eq!(content[0]["text"], prompt);
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["data"], "AQID");
+    assert_eq!(content[1]["mimeType"], "image/png");
     drop(temp);
 }

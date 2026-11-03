@@ -564,7 +564,9 @@ fn run_stream(options: &Options, commands: &[Command]) -> RunOutcome {
         }
         match String::from_utf8(bytes) {
             Ok(text) => contents.push(text),
-            Err(_) => return RunOutcome::Unsupported,
+            // stdin is already at EOF here, so the fallback must receive the
+            // original bytes through a pipe instead of inheriting it.
+            Err(error) => return RunOutcome::UnsupportedWithStdin(error.into_bytes()),
         }
     } else {
         for file in &options.files {

@@ -165,7 +165,7 @@ pub async fn personalize_openrouter_catalog(
         return Ok(catalog);
     };
     let url = format!("{}/models/user", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
+    let client = crate::ai::transport::pi_reqwest_client_builder()?
         .timeout(timeout)
         .connect_timeout(timeout)
         .build()
@@ -186,10 +186,12 @@ pub async fn personalize_openrouter_catalog(
             "OpenRouter model list request failed: {status}"
         )));
     }
-    let body = response
-        .text()
-        .await
-        .map_err(|error| AiError::Http(error.to_string()))?;
+    let body = crate::ai::transport::read_bounded_response_body(
+        response,
+        crate::ai::providers::dynamic::REMOTE_CATALOG_MAX_BODY_BYTES,
+        "OpenRouter model list",
+    )
+    .await?;
     let parsed: Value = serde_json::from_str(&body)
         .map_err(|_| AiError::NonRetryable("Invalid OpenRouter model list response".to_string()))?;
     let Some(entries) = parsed.get("data").and_then(Value::as_array) else {

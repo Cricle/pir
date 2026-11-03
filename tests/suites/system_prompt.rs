@@ -1119,6 +1119,43 @@ fn prompt_template_frontmatter_parse_failures_are_rejected_with_a_warning() {
     );
 }
 
+/// FIX-C17: a 2 MiB prompt template is rejected before reading, with a
+/// warning that names the file and the limit.
+#[test]
+fn oversized_prompt_template_is_skipped_with_a_warning() {
+    let root = TempDir::new("tmpl-oversized");
+    let dir = root.child("prompts");
+    fs::write(dir.join("good.md"), "plain body\n").unwrap();
+    let mut oversized = String::from("---\ndescription: huge\n---\n");
+    oversized.push_str(&"x".repeat(2 * 1024 * 1024));
+    fs::write(dir.join("huge.md"), oversized).unwrap();
+
+    let resources = DiscoveredResources::discover(&ResourceDiscoveryOptions {
+        cwd: root.path(),
+        agent_dir: &root.child("agent"),
+        project_trusted: true,
+        cli_skill_paths: &[],
+        cli_prompt_paths: &[dir],
+        no_skills: true,
+        no_prompt_templates: false,
+    });
+
+    let names: Vec<&str> = resources
+        .prompt_templates
+        .iter()
+        .map(|template| template.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["good"], "the oversized template is skipped");
+    assert!(
+        resources
+            .diagnostics
+            .iter()
+            .any(|warning| warning.contains("huge") && warning.contains("1048576")),
+        "the skip warning names the path and the limit: {:?}",
+        resources.diagnostics
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SYSTEM.md / APPEND_SYSTEM.md
 // ---------------------------------------------------------------------------
@@ -1152,6 +1189,39 @@ fn system_md_discovery_prefers_project_over_global() {
     // Missing files yield None.
     let empty_cwd = root.child("bare");
     let (preamble, append) = discover_system_md(&empty_cwd, &root.child("no-agent-dir"), true);
+    assert_eq!(preamble, None);
+    assert_eq!(append, None);
+}
+
+/// FIX-C17: 2 MiB `SYSTEM.md`/`APPEND_SYSTEM.md` files are skipped before
+/// reading (project copy first, then the global fallback), so the discovery
+/// answer degrades to `None` instead of loading the whole file.
+#[test]
+fn oversized_system_md_files_are_skipped() {
+    let root = TempDir::new("system-md-oversized");
+    let global_dir = root.child("agent");
+    let cwd = root.child("work");
+    let oversized = "x".repeat(2 * 1024 * 1024);
+
+    root.write("work/.pi/SYSTEM.md", &oversized);
+    root.write("work/.pi/APPEND_SYSTEM.md", &oversized);
+    let (preamble, append) = discover_system_md(&cwd, &global_dir, true);
+    assert_eq!(preamble, None, "oversized project SYSTEM.md is skipped");
+    assert_eq!(
+        append, None,
+        "oversized project APPEND_SYSTEM.md is skipped"
+    );
+
+    // A small global copy is still used as the fallback behind an oversized
+    // project file.
+    fs::write(global_dir.join("SYSTEM.md"), "global preamble").unwrap();
+    let (preamble, _) = discover_system_md(&cwd, &global_dir, true);
+    assert_eq!(preamble.as_deref(), Some("global preamble"));
+
+    // Oversized global files are skipped too.
+    fs::write(global_dir.join("SYSTEM.md"), &oversized).unwrap();
+    fs::write(global_dir.join("APPEND_SYSTEM.md"), &oversized).unwrap();
+    let (preamble, append) = discover_system_md(&cwd, &global_dir, false);
     assert_eq!(preamble, None);
     assert_eq!(append, None);
 }

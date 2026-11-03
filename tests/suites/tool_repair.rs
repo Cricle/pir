@@ -1329,7 +1329,7 @@ use pir::ai::types::{
     ThinkingLevel,
 };
 use pir::plugins::builtin::instantiate_builtin;
-use pir::plugins::{AgentPlugin, PluginInfo};
+use pir::plugins::{AgentPlugin, EventInterest, PluginInfo};
 use pir::session_manager::SessionManager;
 
 /// The scripted provider's responder: request index -> finalized message.
@@ -2400,4 +2400,100 @@ async fn area0_host_dispatch_gates_and_replaces_the_request_payload() {
         .expect("emit");
     assert!(outcome.result.is_null());
     assert_eq!(event["payload"], anchored_body());
+}
+
+/// A third-party/inline native plugin that DECLARES the same event interest
+/// without overriding [`AgentPlugin::handler_active_for_event`]. The host must
+/// treat it as live for every model (the trait default is conservative), so
+/// the payload-hook gate can only skip a host where `tool-repair` is the sole
+/// interested handler and its model list excludes the request model.
+struct PayloadInterestedPlugin {
+    info: PluginInfo,
+}
+
+impl PayloadInterestedPlugin {
+    fn new() -> Self {
+        Self {
+            info: PluginInfo::builtin("test-payload-interested"),
+        }
+    }
+}
+
+impl AgentPlugin for PayloadInterestedPlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(vec!["before_provider_request".to_owned()])
+    }
+}
+
+/// The host fast-path gate behind the print/session payload-hook install:
+/// `has_active_handlers_for` may be false ONLY while `tool-repair` is the sole
+/// interested native handler and neither the caller's model nor the cached
+/// session model is in `anchorBleedModels`.
+#[test]
+fn area0_active_handler_gate_skips_only_provably_inert_tool_repair() {
+    let host = PluginHost::build(None, vec![tool_repair_builtin()]);
+
+    // No cached model, caller model outside `anchorBleedModels`: provably
+    // inert, so the host would omit the per-request `Value` hook.
+    assert!(!host.has_active_handlers_for("before_provider_request", Some("gpt-4.1")));
+
+    // A gated caller model is enough to keep the hook, even before the
+    // session-context push (the handler's cache may lag the request).
+    assert!(host.has_active_handlers_for("before_provider_request", Some("glm-4.6")));
+    assert!(host.has_active_handlers_for("before_provider_request", Some("kimi-k2-instruct")));
+
+    // A gated CACHED model also keeps the hook for a non-gated request model:
+    // a summarizer/compaction request can run under a different model, and
+    // the handler always reads the cache.
+    host.update_session_context(SessionContextSnapshot {
+        model: JsonValue::String("kimi-k2-instruct".to_owned()),
+        ..SessionContextSnapshot::default()
+    });
+    assert!(host.has_active_handlers_for("before_provider_request", Some("gpt-4.1")));
+
+    // A non-gated cache turns the gate off again.
+    host.update_session_context(SessionContextSnapshot {
+        model: json!({"id": "gpt-4.1", "provider": "openai"}),
+        ..SessionContextSnapshot::default()
+    });
+    assert!(!host.has_active_handlers_for("before_provider_request", Some("gpt-4.1")));
+
+    // Unknown model: the historical coarse interest gate is kept (`None`
+    // proves nothing inert, so the old behavior — hook installed — holds).
+    assert!(host.has_active_handlers_for("before_provider_request", None));
+
+    // An unrelated event keeps the ordinary interest answer.
+    assert!(!host.has_active_handlers_for("session_start", Some("glm-4.6")));
+
+    // Any OTHER native plugin with the same interest is never skipped: the
+    // default trait predicate answers `true` for every model.
+    let other: Arc<dyn AgentPlugin> = Arc::new(PayloadInterestedPlugin::new());
+    let host = PluginHost::build(None, vec![tool_repair_builtin(), other]);
+    assert!(host.has_active_handlers_for("before_provider_request", Some("gpt-4.1")));
+}
+
+/// The session twin of the print fast path: `AgentSession` builds per-request
+/// stream options from the same host gate, so a session whose only
+/// `before_provider_request` handler is an inert `tool-repair` carries no
+/// payload hook either. Retry/auth/abort options are untouched — only the
+/// `Value`-forcing hook is absent.
+#[tokio::test]
+async fn area0_session_transport_skips_the_inert_payload_hook() {
+    let harness = repair_harness(
+        vec![tool_repair_builtin()],
+        scripted_read_call(json!({"path": "x"})),
+    );
+    let hooks = harness.session.provider_stream_hooks_for_test();
+    assert!(
+        hooks.before_provider_request.is_none(),
+        "a non-gated model must not force the session's value-body path"
+    );
+    assert!(
+        hooks.after_provider_response.is_none(),
+        "tool-repair registers no response observer"
+    );
 }

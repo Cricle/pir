@@ -32,8 +32,20 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
+use futures_util::StreamExt;
+
+use pir::ai::auth::ApiKeyAuth;
+use pir::ai::event_stream::AssistantMessageEventStream;
+use pir::ai::provider::{Provider, ProviderRegistry};
+use pir::ai::types::{
+    AssistantMessage, Context, Model, ModelCost, ModelCostRates, StopReason, StreamOptions,
+    TerminalReason, ThinkingLevel, Usage,
+};
 use pir::extensions::{ExtensionConfig, ExtensionRuntime};
+use pir::sdk::{AgentBuilder, SdkEvent, SessionMode};
 use serde_json::{json, Value};
 
 /// Per-test temp directory removed on drop.
@@ -386,4 +398,356 @@ async fn agent_session_prompt_rejects_on_failed_and_aborted_turns() {
         v["abortReply"].is_null(),
         "the aborted prompt must not resolve: {v}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `prompt_stream` admission must be released when the RUN settles, not when
+// the consumer has drained the terminal events (R1-L6-015 / FIX-C16):
+// a consumer that keeps a small-capacity stream open but never polls it would
+// otherwise hold the agent's streaming slot forever.
+// ---------------------------------------------------------------------------
+
+/// In-process scripted provider: one stop turn per request, no network.
+struct ScriptedProvider {
+    calls: AtomicUsize,
+}
+
+impl Provider for ScriptedProvider {
+    fn id(&self) -> &str {
+        "scripted"
+    }
+
+    fn name(&self) -> &str {
+        "Scripted provider"
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        vec![scripted_model()]
+    }
+
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        // `with_registry` streams unchecked, so no key source is required.
+        Vec::new()
+    }
+
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: Context,
+        _options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let stream = AssistantMessageEventStream::new();
+        stream.push(AssistantMessageEventStream::done_event(
+            TerminalReason::Stop,
+            AssistantMessage {
+                api: "scripted".into(),
+                provider: "scripted".into(),
+                model: "scripted-model".into(),
+                stop_reason: StopReason::Stop,
+                timestamp: 1,
+                usage: Usage::default(),
+                ..Default::default()
+            },
+        ));
+        stream
+    }
+}
+
+fn scripted_model() -> Model {
+    Model {
+        id: "scripted-model".into(),
+        name: "Scripted model".into(),
+        api: "scripted-api".into(),
+        provider: "scripted".into(),
+        base_url: "http://127.0.0.1:1".into(),
+        reasoning: false,
+        thinking_level_map: None,
+        input: vec!["text".into()],
+        cost: ModelCost {
+            rates: ModelCostRates {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            tiers: Vec::new(),
+        },
+        context_window: 8_192,
+        max_tokens: 512,
+        sampling_params: None,
+        headers: None,
+        thinking_token_budget_field: None,
+        input_limits: None,
+        prompt_cache: None,
+        sampling_params_by_thinking_level: None,
+        model_type: None,
+        compat: None,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn prompt_stream_releases_admission_when_the_run_settles_without_polling() {
+    let agent_dir = TempDir::new("admission-agent");
+    let provider = Arc::new(ScriptedProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let mut registry = ProviderRegistry::default();
+    let provider_box: Arc<dyn Provider> = provider.clone();
+    registry.set_provider(provider_box);
+    let agent = AgentBuilder::new()
+        .with_registry(Arc::new(registry), scripted_model())
+        .agent_dir(agent_dir.path())
+        .no_session()
+        .no_compaction()
+        .thinking_level(ThinkingLevel::Off)
+        .build()
+        .await
+        .expect("scripted agent builds");
+
+    // A capacity-1 channel: intermediate events fill it, so the terminal
+    // sends park on backpressure until someone polls the stream.
+    agent.set_event_channel_capacity(1);
+
+    // Start the first run and never poll its stream.
+    let first = agent.prompt_stream("first");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    // `is_idle()` is also true BEFORE the spawned task claims the session, so
+    // first wait until the run has actually reached the provider...
+    while provider.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first scripted run never reached the provider"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // ... then until the whole session run has settled.
+    while !agent.is_idle() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first scripted run never settled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Let the spawned task run past `session.prompt`, release admission and
+    // park on the backpressured terminal send (pre-fix it would still hold
+    // admission there, because the guard only released it on Drop).
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The first stream is still open and unpolled, but its run is over: the
+    // second stream must be ADMITTED (pre-fix, `stream_active` stayed true
+    // until the unpolled terminal pair was delivered).
+    let second: Vec<SdkEvent> = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent.prompt_stream("second").collect(),
+    )
+    .await
+    .expect("the second stream timed out");
+    assert!(
+        !second
+            .iter()
+            .any(|event| matches!(event, SdkEvent::PromptRejected { .. })),
+        "a settled, unpolled stream must not hold the streaming admission \
+         ('another stream is already streaming'): {second:?}"
+    );
+    assert!(
+        matches!(second.last(), Some(SdkEvent::AgentSettled { .. })),
+        "the second stream must deliver its own terminal pair: {second:?}"
+    );
+
+    // The old stream still delivers its terminal events once drained.
+    let first_events: Vec<SdkEvent> =
+        tokio::time::timeout(std::time::Duration::from_secs(10), first.collect())
+            .await
+            .expect("the first stream timed out");
+    assert!(
+        matches!(first_events.last(), Some(SdkEvent::AgentSettled { .. })),
+        "the old stream must still end with AgentSettled: {first_events:?}"
+    );
+
+    agent.shutdown().await.expect("shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// A dropping OLD stream must not tear down a NEWER stream's sink/admission
+// (P1-01): `StreamRunGuard` is generation-scoped and detaches only its own
+// channel.
+// ---------------------------------------------------------------------------
+
+/// In-process scripted provider whose FIRST request completes immediately and
+/// whose later requests wait for a test-issued permit. Lets a test hold a
+/// newer stream running while it drains/drops an older one.
+struct GatedProvider {
+    calls: AtomicUsize,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl GatedProvider {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+
+    fn release_one(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+impl Provider for GatedProvider {
+    fn id(&self) -> &str {
+        "scripted"
+    }
+
+    fn name(&self) -> &str {
+        "Gated provider"
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        vec![scripted_model()]
+    }
+
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        // `with_registry` streams unchecked, so no key source is required.
+        Vec::new()
+    }
+
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: Context,
+        _options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let stream = AssistantMessageEventStream::new();
+        let done = AssistantMessageEventStream::done_event(
+            TerminalReason::Stop,
+            AssistantMessage {
+                api: "gated".into(),
+                provider: "gated".into(),
+                model: "scripted-model".into(),
+                stop_reason: StopReason::Stop,
+                timestamp: 1,
+                usage: Usage::default(),
+                ..Default::default()
+            },
+        );
+        if call == 0 {
+            stream.push(done);
+        } else {
+            let producer = stream.producer();
+            let release = Arc::clone(&self.release);
+            tokio::spawn(async move {
+                let _permit = release.acquire().await;
+                producer.push(done);
+            });
+        }
+        stream
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_an_old_stream_keeps_the_newer_streams_sink_and_admission() {
+    let agent_dir = TempDir::new("generation-agent");
+    let provider = Arc::new(GatedProvider::new());
+    let mut registry = ProviderRegistry::default();
+    let provider_box: Arc<dyn Provider> = provider.clone();
+    registry.set_provider(provider_box);
+    let agent = AgentBuilder::new()
+        .with_registry(Arc::new(registry), scripted_model())
+        .agent_dir(agent_dir.path())
+        // A real (temp) session store: session-level `EntryAppended` events
+        // are what proves the shared sink still belongs to the new stream.
+        .session(SessionMode::Dir(agent_dir.path().join("sessions")))
+        .no_compaction()
+        .thinking_level(ThinkingLevel::Off)
+        .build()
+        .await
+        .expect("gated agent builds");
+
+    // A capacity-1 channel: the first run's intermediate events fill it, so
+    // its terminal sends park on backpressure with the stream unpolled.
+    agent.set_event_channel_capacity(1);
+    let first = agent.prompt_stream("first");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while provider.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first gated run never reached the provider"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    while !agent.is_idle() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first gated run never settled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Let the first task release admission and park on the terminal send.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The second stream gets a full-capacity channel (the first keeps its
+    // capacity-1 backlog) and stays RUNNING on the provider gate.
+    agent.set_event_channel_capacity(1024);
+    let second = agent.prompt_stream("second");
+    while provider.calls.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the second gated run never reached the provider"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Drop the OLD stream while the NEW one is still running: the old task
+    // wakes from its failed terminal send and its guard runs while the new
+    // stream owns the slot.
+    drop(first);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The new stream's admission must still be held: a third stream is
+    // rejected by the streaming slot, not by the session-busy check.
+    let third: Vec<SdkEvent> = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent.prompt_stream("third").collect(),
+    )
+    .await
+    .expect("the rejected third stream timed out");
+    match third.first() {
+        Some(SdkEvent::PromptRejected { message }) => assert!(
+            message.contains("another stream is already streaming"),
+            "the third stream must be rejected by the streaming ADMISSION \
+             (a released one would hit the session-busy branch instead): {message}"
+        ),
+        other => panic!("the third stream must be rejected, got {other:?}"),
+    }
+
+    // Release the running second stream and collect it: its late session
+    // events (the assistant EntryAppended) must still flow through the sink
+    // the old stream's Drop previously cleared.
+    provider.release_one();
+    let second_events: Vec<SdkEvent> =
+        tokio::time::timeout(std::time::Duration::from_secs(10), second.collect())
+            .await
+            .expect("the second stream timed out");
+    assert!(
+        second_events.iter().any(|event| matches!(
+            event,
+            SdkEvent::EntryAppended { entry }
+                if entry
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+                    .and_then(|role| role.as_str())
+                    == Some("assistant")
+        )),
+        "the running stream must keep receiving session-level events after \
+         the old stream is dropped: {second_events:?}"
+    );
+    assert!(
+        matches!(second_events.last(), Some(SdkEvent::AgentSettled { .. })),
+        "the second stream must still deliver its terminal pair: {second_events:?}"
+    );
+
+    agent.shutdown().await.expect("shutdown");
 }

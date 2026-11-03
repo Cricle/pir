@@ -112,7 +112,10 @@ pub(super) fn register_tool_exec_host_fns(
             Func::from(JsAsync(move |kind: String, payload_json: String| {
                 let st = st.clone();
                 async move {
-                    let has_ui = { lock_state(&st).config.has_ui };
+                    let has_ui = {
+                        let state = lock_state(&st);
+                        state.config.has_ui && !state.ui_fail_fast
+                    };
                     if !has_ui {
                         return "null".to_string();
                     }

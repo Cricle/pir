@@ -1065,8 +1065,7 @@ struct ServerHandle {
     busy_changed: Condvar,
     /// Held (never read) so dropping the handle from `serverClose` releases
     /// the listening socket; the accept thread runs on its own clone.
-    #[allow(dead_code)]
-    listener: TcpListener,
+    _listener: TcpListener,
 }
 
 impl ServerHandle {
@@ -1194,7 +1193,7 @@ fn server_listen(payload: &JsonValue, generation: u64) -> OpResult {
         pending_waits: AtomicU64::new(0),
         busy: StdMutex::new(std::collections::HashSet::new()),
         busy_changed: Condvar::new(),
-        listener: listener
+        _listener: listener
             .try_clone()
             .map_err(|error| FnError::new("EIO", format!("listener clone failed: {error}")))?,
     });

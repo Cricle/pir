@@ -113,6 +113,31 @@ impl Drop for Tree {
     }
 }
 
+/// Wait until `pid` is gone (`kill(pid, 0)` reports `ESRCH`). A zombie still
+/// counts as present, so this also proves the daemon reaped the command.
+#[cfg(unix)]
+async fn wait_for_process_gone(pid: i32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        // SAFETY: signal 0 performs the existence/permission check only.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ESRCH),
+                "the process must be gone, not merely unreadable: {error}"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process {pid} survived after its `exec` future was dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Run one core tool by name (the registry `register_core_tools` builds).
 async fn run_tool(
     name: &str,
@@ -434,6 +459,148 @@ async fn exec_reports_timeouts_aborts_and_non_zero_exit_codes() {
     environment.connection.close();
 }
 
+/// A request that settles without a reply — a timeout, an abort, or a caller
+/// that drops the future — must leave `running` as soon as `exec` returns (or
+/// the future is dropped); otherwise a later `cleanup()` would send a kill for
+/// a request the daemon has already answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settled_exec_requests_do_not_linger_for_cleanup() {
+    let tree = Tree::new("exec-running");
+    let environment = local_environment(Some(tree.root()));
+    let slow = if cfg!(windows) {
+        "ping -n 30 127.0.0.1 > nul"
+    } else {
+        "sleep 30"
+    };
+    for _ in 0..3 {
+        let error = environment
+            .exec(
+                &ExecCommand::Shell(slow.to_string()),
+                &ExecOptions {
+                    cwd: Some(tree.root()),
+                    timeout_secs: Some(0.3),
+                    ..Default::default()
+                },
+                &Context::default(),
+            )
+            .await
+            .expect_err("a timeout");
+        assert_eq!(error.code, ExecutionErrorCode::Timeout);
+        assert_eq!(
+            environment.running_len_for_tests(),
+            0,
+            "a timed-out request must already be removed from `running`"
+        );
+    }
+
+    let signal = AbortSignal::new();
+    let context = Context::new(Some(signal.clone()));
+    let abort_after = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        signal.abort();
+    });
+    let error = environment
+        .exec(
+            &ExecCommand::Shell(slow.to_string()),
+            &ExecOptions {
+                cwd: Some(tree.root()),
+                ..Default::default()
+            },
+            &context,
+        )
+        .await
+        .expect_err("an abort");
+    abort_after.await.expect("the abort task");
+    assert_eq!(error.code, ExecutionErrorCode::Aborted);
+    assert_eq!(
+        environment.running_len_for_tests(),
+        0,
+        "an aborted request must already be removed from `running`"
+    );
+
+    // The caller stops waiting: dropping the `exec` future must run the guard.
+    let dropped = tokio::time::timeout(
+        Duration::from_secs(1),
+        environment.exec(
+            &ExecCommand::Shell(slow.to_string()),
+            &ExecOptions {
+                cwd: Some(tree.root()),
+                ..Default::default()
+            },
+            &Context::default(),
+        ),
+    )
+    .await;
+    assert!(dropped.is_err(), "the caller stops waiting");
+    assert_eq!(
+        environment.running_len_for_tests(),
+        0,
+        "a dropped exec future must already be removed from `running`"
+    );
+
+    // Nothing stale remains, so cleanup has no kills to send.
+    environment.cleanup(&Context::default()).await;
+    assert_eq!(environment.running_len_for_tests(), 0);
+    environment.connection.close();
+}
+
+/// A caller that drops an `exec` future without an abort signal (an outer
+/// task cancelled, an ad-hoc timeout) is not "settled": the daemon may still
+/// be running the command, and `cleanup()` can no longer see its id. The
+/// guard must therefore send the daemon's `{ mode: "kill" }` itself. The
+/// assertion is the remote process actually disappearing (`kill(pid, 0)`
+/// reports `ESRCH`), not just `running_len_for_tests() == 0`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_exec_future_kills_the_remote_process() {
+    let tree = Tree::new("exec-drop-kill");
+    let environment = local_environment(Some(tree.root()));
+    let pid_file = tree.slash_path("dropped.pid");
+    // `exec` keeps the shell's pid, so the recorded pid is the sleeping
+    // command's own (a direct child of the daemon).
+    let command = ExecCommand::Shell(format!("echo $$ > '{pid_file}'; exec sleep 60"));
+    let options = ExecOptions {
+        cwd: Some(tree.root()),
+        ..Default::default()
+    };
+    let context = Context::default();
+    let mut exec = Box::pin(environment.exec(&command, &options, &context));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if tree.exists("dropped.pid") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon never started the command"
+        );
+        tokio::select! {
+            result = &mut exec => {
+                panic!("exec settled before the pid file was written: {result:?}")
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+    }
+    let pid: i32 = tree
+        .read("dropped.pid")
+        .trim()
+        .parse()
+        .expect("the shell wrote a numeric pid");
+
+    // No abort signal: only the guard's Drop can stop the command.
+    drop(exec);
+    wait_for_process_gone(pid).await;
+
+    assert_eq!(
+        environment.running_len_for_tests(),
+        0,
+        "the dropped request is no longer left for cleanup"
+    );
+    environment.cleanup(&Context::default()).await;
+    environment.connection.close();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watch_reports_changes_and_stops_on_close() {
     let tree = Tree::new("watch");
@@ -486,6 +653,212 @@ async fn watch_reports_changes_and_stops_on_close() {
         "a change after coverage must be reported: {paths:?}"
     );
     // `close()` cancels the request and waits for the daemon to finish it.
+    watcher.close().await;
+    environment.connection.close();
+}
+
+/// Dropping the last watcher handle without `close()` must stop the runner.
+/// The runner holds only a `Weak<Self>`: on the old implementation the task
+/// kept a strong `Arc` and the watch/reconnect loop outlived every owner, so
+/// the `Weak` probe below would still upgrade forever and `runner_done` would
+/// never be set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_watcher_stops_its_runner_task() {
+    let tree = Tree::new("watch-drop");
+    let environment = local_environment_with_watch(
+        Some(tree.root()),
+        WatchOptions {
+            mode: Some("polling".to_string()),
+            poll_interval_ms: Some(100),
+            ..Default::default()
+        },
+    );
+    let watcher = environment
+        .watch(
+            &[WatchTarget {
+                path: tree.root(),
+                recursive: false,
+                exclude: None,
+            }],
+            Arc::new(|_| {}),
+            &Context::default(),
+        )
+        .await
+        .expect("watch coverage");
+    let runner_done = watcher.runner_done_for_tests();
+    let probe = Arc::downgrade(&watcher);
+
+    drop(watcher);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !runner_done.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher runner kept running after the last handle was dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        probe.upgrade().is_none(),
+        "the runner must not keep a strong reference to the watcher"
+    );
+    // Dropping one watcher leaves the connection usable.
+    let info = environment
+        .info()
+        .await
+        .expect("the connection still answers");
+    assert_eq!(info.protocol, 1);
+    environment.connection.close();
+}
+
+/// Dropping the last watcher handle on a thread with **no Tokio runtime** must
+/// still cancel the watch on the daemon. The abort guard that writes the
+/// protocol CANCEL lives on the runtime the watcher was opened on, so `Drop`
+/// must schedule the grace abort there — the old `Handle::try_current()`
+/// fallback aborted the runner immediately on a non-runtime thread, racing the
+/// guard and potentially losing the CANCEL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_watcher_without_a_runtime_context_cancels_the_remote_watch() {
+    let tree = Tree::new("watch-drop-off-runtime");
+    let connection = mock_env_connection(
+        &tree.0,
+        "reply",
+        Duration::from_millis(100),
+        Duration::from_secs(10),
+    );
+    let environment =
+        RemoteExecutionEnv::new(RemoteExecutionEnvOptions::new("pi-env:mock", connection));
+    let watcher = environment
+        .watch(
+            &[WatchTarget {
+                path: tree.root(),
+                recursive: false,
+                exclude: None,
+            }],
+            Arc::new(|_| {}),
+            &Context::default(),
+        )
+        .await
+        .expect("watch coverage");
+    let runner_done = watcher.runner_done_for_tests();
+    let probe = Arc::downgrade(&watcher);
+
+    // A plain thread has no Tokio runtime context, like a sync teardown path.
+    std::thread::spawn(move || drop(watcher))
+        .join()
+        .expect("the drop thread does not panic");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let cancelled = std::fs::read_to_string(tree.0.join("watch-cancels.log"))
+            .map(|log| log.lines().any(|line| line == "watch"))
+            .unwrap_or(false);
+        if cancelled {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon never received the watch CANCEL after an off-runtime drop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    while !runner_done.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher runner kept running after an off-runtime drop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        probe.upgrade().is_none(),
+        "the runner must not keep a strong reference to the watcher"
+    );
+    environment.connection.close();
+}
+
+/// `pollIntervalMs` is client-controlled: zero must not spin the daemon's
+/// watcher at full speed, and `u64::MAX` must not overflow
+/// `Instant + Duration` in the watcher thread (a panic there would leave the
+/// request unanswered). The clamp to `[50 ms, 24 h]` lives in
+/// `env_daemon::watch`; both extremes must still open and serve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_poll_interval_extremes_are_clamped() {
+    let tree = Tree::new("watch-poll-max");
+    let environment = local_environment_with_watch(
+        Some(tree.root()),
+        WatchOptions {
+            mode: Some("polling".to_string()),
+            poll_interval_ms: Some(u64::MAX),
+            ..Default::default()
+        },
+    );
+    let watcher = environment
+        .watch(
+            &[WatchTarget {
+                path: tree.root(),
+                recursive: false,
+                exclude: None,
+            }],
+            Arc::new(|_| {}),
+            &Context::default(),
+        )
+        .await
+        .expect("a huge poll interval is clamped instead of panicking the watcher");
+    assert_eq!(watcher.mode(), "polling");
+    // A panicked watcher thread would never answer the cancel request.
+    tokio::time::timeout(Duration::from_secs(10), watcher.close())
+        .await
+        .expect("a watch with u64::MAX must still settle after the clamp");
+    environment.connection.close();
+
+    let tree = Tree::new("watch-poll-zero");
+    let environment = local_environment_with_watch(
+        Some(tree.root()),
+        WatchOptions {
+            mode: Some("polling".to_string()),
+            poll_interval_ms: Some(0),
+            ..Default::default()
+        },
+    );
+    let changes = Arc::new(Mutex::new(Vec::<WatchChange>::new()));
+    let seen = changes.clone();
+    let watcher = environment
+        .watch(
+            &[WatchTarget {
+                path: tree.root(),
+                recursive: false,
+                exclude: None,
+            }],
+            Arc::new(move |change| {
+                if let Ok(mut guard) = seen.lock() {
+                    guard.push(change);
+                }
+            }),
+            &Context::default(),
+        )
+        .await
+        .expect("a zero poll interval is clamped to the floor");
+    assert_eq!(watcher.mode(), "polling");
+    std::fs::write(tree.path("zero.txt"), "x").expect("write the watched file");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut names = Vec::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(guard) = changes.lock() {
+            for change in guard.iter() {
+                if let WatchChange::Paths(found) = change {
+                    names.extend(found.iter().cloned());
+                }
+            }
+        }
+        if !names.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !names.is_empty(),
+        "a 0 ms request still delivers changes at the 50 ms floor: {names:?}"
+    );
     watcher.close().await;
     environment.connection.close();
 }
@@ -897,7 +1270,7 @@ fn mock_env_daemon_child() {
     if std::env::var("PIR_MOCK_ENV_DAEMON").as_deref() != Ok("1") {
         return;
     }
-    use pir::env_daemon::frame::{self, Frame, PING, REQUEST, RESULT};
+    use pir::env_daemon::frame::{self, Frame, CANCEL, EVENT, PING, REQUEST, RESULT};
     use std::io::Write as _;
 
     let token = std::env::var("PIR_MOCK_ENV_TOKEN").unwrap_or_default();
@@ -912,9 +1285,22 @@ fn mock_env_daemon_child() {
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut answered_hello = false;
+    // Watch requests are held open (the daemon watches until cancelled): the
+    // `ready` event resolves `open`, and the id is recorded so a CANCEL can be
+    // observed on the wire.
+    let mut watch_ids = std::collections::HashSet::new();
     while let Ok(Some(request)) = frame::read_frame(&mut input) {
         match request.kind {
             PING => mock_env_append(&dir, "pings.log", b"ping\n"),
+            CANCEL => {
+                if watch_ids.remove(&request.id) {
+                    mock_env_append(&dir, "watch-cancels.log", b"watch\n");
+                }
+                // Answer so the client's pending request settles.
+                let mut out = stdout.lock();
+                frame::write_frame(&mut out, &Frame::new(RESULT, request.id, json!({})))
+                    .expect("cancel reply");
+            }
             REQUEST => {
                 let op = request
                     .json
@@ -949,6 +1335,19 @@ fn mock_env_daemon_child() {
                         ),
                     )
                     .expect("hello reply");
+                } else if op == "watch" {
+                    mock_env_append(&dir, "requests.log", b"watch\n");
+                    watch_ids.insert(request.id);
+                    let mut out = stdout.lock();
+                    frame::write_frame(
+                        &mut out,
+                        &Frame::new(
+                            EVENT,
+                            request.id,
+                            json!({ "kind": "ready", "mode": "polling" }),
+                        ),
+                    )
+                    .expect("watch ready event");
                 } else if mode != "stall" {
                     mock_env_append(&dir, "requests.log", format!("{op}\n").as_bytes());
                     let mut out = stdout.lock();

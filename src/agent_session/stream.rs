@@ -155,7 +155,8 @@ impl AgentSession {
     /// resolved for THAT model's provider (`AgentSession::request_api_key_for`).
     ///
     /// `actor_hooks: false` is used by the `ctx.modelRegistry.complete` host
-    /// op ([`Self::complete_fn_for_host_op`]): `before_provider_request` /
+    /// op ([`Self::complete_fn_for_host_op_session_scoped`] in
+    /// `providers.rs`): `before_provider_request` /
     /// `after_provider_response` are awaited INLINE by the transport and
     /// their dispatch (`PluginHost::emit` → `ExtensionHandle::emit`) needs
     /// the extension actor's command loop, which is suspended inside the
@@ -193,10 +194,20 @@ impl AgentSession {
         // dispatch and a settled run leaves nothing behind for cache-warm /
         // compaction requests to trip over. Only populated when a handler
         // exists, so extension-free runs never touch the transport.
+        //
+        // The payload hook uses the model-qualified gate
+        // (`PluginHost::has_active_handlers_for`): when the only interested
+        // handler is provably inert for this request's model (the builtin
+        // `tool-repair` outside its `anchorBleedModels` set, with no JS or
+        // other native handler) the hook is omitted and the adapter keeps its
+        // streamed body path instead of building a full `Value` request tree.
+        // Any handler that could run keeps the historical behavior.
         let mut hooks = crate::ai::types::ProviderStreamHooks::default();
         if actor_hooks {
             if let Some(plugins) = &self.plugins {
-                if plugins.has_handlers("before_provider_request") {
+                if plugins
+                    .has_active_handlers_for("before_provider_request", Some(model.id.as_str()))
+                {
                     let plugins = Arc::clone(plugins);
                     hooks.before_provider_request = Some(Arc::new(move |payload: JsonValue| {
                         let plugins = Arc::clone(&plugins);
@@ -270,6 +281,51 @@ impl AgentSession {
                         plugins,
                         model,
                         signal.clone(),
+                    ));
+                }
+                if plugins.has_handlers("before_provider_headers") {
+                    // Runs per request on the caller/model/provider layers
+                    // BEFORE auth headers are added (see
+                    // `ProviderRegistry::assemble_dispatch_headers`), so this
+                    // fires for prompts, compaction/branch summaries and every
+                    // other request built here without ever exposing the API
+                    // key. `null`/removed keys delete; string values replace.
+                    let plugins = Arc::clone(plugins);
+                    hooks.before_provider_headers = Some(Arc::new(
+                        move |headers: crate::ai::types::ProviderHeaders| {
+                            let plugins = Arc::clone(&plugins);
+                            Box::pin(async move {
+                                let original = headers.clone();
+                                let mut event = serde_json::json!({
+                                    "type": "before_provider_headers",
+                                    "headers": headers,
+                                });
+                                if let Err(error) =
+                                    plugins.emit("before_provider_headers", &mut event).await
+                                {
+                                    crate::ext_diag!(
+                                        "[ext] before_provider_headers dispatch failed: {error}"
+                                    );
+                                    return original;
+                                }
+                                let Some(updated) =
+                                    event.get("headers").and_then(JsonValue::as_object)
+                                else {
+                                    return original;
+                                };
+                                let mut merged = crate::ai::types::ProviderHeaders::new();
+                                for (name, value) in updated {
+                                    if let Some(value) = value.as_str() {
+                                        crate::ai::types::insert_header(
+                                            &mut merged,
+                                            name,
+                                            value.to_owned(),
+                                        );
+                                    }
+                                }
+                                merged
+                            })
+                        },
                     ));
                 }
             }
@@ -416,90 +472,6 @@ impl AgentSession {
             websocket_connect_timeout_ms: manager.websocket_connect_timeout_ms(),
         }
     }
-
-    /// Non-streaming completion callback used by compaction; drains a
-    /// registry stream and resolves the final message. Uses the current
-    /// session model.
-    pub(super) fn complete_fn(&self) -> Arc<CompleteFn> {
-        self.complete_fn_for(&self.current_model())
-    }
-
-    /// [`Self::complete_fn`] against an explicit model — compaction under a
-    /// virtual selection completes against the ROUTED model (a virtual model
-    /// never reaches a provider).
-    ///
-    /// The request carries the session's live abort signal — the run signal
-    /// while a threshold/overflow compaction runs inside a prompt, or the
-    /// fresh compaction signal a manual [`AgentSession::compact`] installs
-    /// before summarizing. `abort()` aborts that signal, so a long
-    /// summarization request is cancelled mid-stream instead of only being
-    /// observed between turns.
-    pub(super) fn complete_fn_for(&self, model: &Model) -> Arc<CompleteFn> {
-        let signal = self
-            .signal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        self.complete_fn_for_signal(model, signal)
-    }
-
-    /// [`Self::complete_fn_for`] with an explicit abort signal: `/tree`
-    /// branch summarization and compaction summarization are cancellable
-    /// mid-flight (upstream `GenerateBranchSummaryOptions.signal` → the
-    /// summarizer stream's `options.signal`), so a cancellation reaches the
-    /// in-flight provider request instead of only the next retry decision.
-    pub(super) fn complete_fn_for_signal(
-        &self,
-        model: &Model,
-        signal: AbortSignal,
-    ) -> Arc<CompleteFn> {
-        let options = self.stream_options_with_actor_hooks(model, Some(signal), true);
-        self.complete_closure(model, options, "summarization stream did not terminate")
-    }
-
-    /// [`Self::complete_fn_for`] for the `ctx.modelRegistry.complete` host op
-    /// (`__pir_host.modelCompleteJson`): same registry/model routing, but the
-    /// INLINE transport hooks (`before_provider_request` /
-    /// `after_provider_response` / the awaited `provider_stream_event`) are
-    /// omitted — see [`Self::stream_options_with_actor_hooks`] for why
-    /// dispatching into the extension actor from inside the host op would
-    /// wedge it.
-    pub(super) fn complete_fn_for_host_op(&self, model: &Model) -> Arc<CompleteFn> {
-        let options = self.stream_options_with_actor_hooks(model, None, false);
-        self.complete_closure(model, options, "completion stream did not terminate")
-    }
-
-    /// Shared tail of [`Self::complete_fn_for`] /
-    /// [`Self::complete_fn_for_host_op`]: build the closure that streams
-    /// through the session's provider registry. The per-chunk
-    /// `provider_stream_event` hook was already installed by
-    /// [`Self::stream_options_with_actor_hooks`] for the model the request
-    /// runs under (and intentionally omitted on the host-op path).
-    fn complete_closure(
-        &self,
-        model: &Model,
-        options: StreamOptions,
-        missing_message: &'static str,
-    ) -> Arc<CompleteFn> {
-        let registry = self.registry.clone();
-        let model = model.clone();
-        Arc::new(Box::new(move |context| {
-            let registry = registry.clone();
-            let model = model.clone();
-            let options = options.clone();
-            Box::pin(async move {
-                let stream = registry.stream_resolving_auth(model, context, options);
-                // Completion consumer: drain while waiting. With the bounded
-                // event queue, a consumer that never pops an event parks the
-                // provider producer forever (`drain_and_result` discards the
-                // events this caller will never read).
-                match stream.drain_and_result().await {
-                    Some(message) => Ok((*message).clone()),
-                    None => Err(missing_message.to_owned()),
-                }
-            })
-        }))
-    }
 }
 
 /// Close the pooled Codex WebSocket connections of a superseded session id
@@ -562,6 +534,16 @@ impl std::fmt::Debug for ProviderApiKey {
 /// event.
 const PROVIDER_STREAM_EVENT_BACKLOG_BOUND: usize = 1;
 
+/// Upper bound on ONE `provider_stream_event` dispatch: the handler call and
+/// the hook's ack wait. Aligned with [`crate::extensions::DEFAULT_CALL_TIMEOUT`]
+/// (30s), the per-call budget the JS actor already applies, so a legitimate
+/// native handler is not cut off earlier than a JS one. A wedged native
+/// handler (one that never resolves and has no actor-level timeout) can
+/// therefore pin the provider stream for at most this budget; after it the
+/// event is counted as failed and the stream returns.
+const PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT: std::time::Duration =
+    crate::extensions::DEFAULT_CALL_TIMEOUT;
+
 /// Dispatch counters of one [`ProviderStreamEventDispatcher`] (diagnostics and
 /// tests read them; every field is a relaxed atomic so the hot path stays
 /// lock-free).
@@ -571,7 +553,10 @@ struct ProviderStreamEventStats {
     events: AtomicU64,
     /// Events whose `plugins.emit` completed successfully.
     dispatched: AtomicU64,
-    /// Events whose `plugins.emit` returned an error (timeout, actor gone).
+    /// Events whose dispatch failed (handler error or dispatch timeout).
+    /// A timeout is counted exactly ONCE, by the hook's ack wait: the worker
+    /// reports its own timeout through a `false` ack instead of incrementing
+    /// this counter, so the two bounded waits cannot double-count one event.
     failed: AtomicU64,
     /// Events skipped because the request's abort signal fired.
     dropped_aborted: AtomicU64,
@@ -588,7 +573,13 @@ struct ProviderStreamEventJob {
     event: JsonValue,
     /// Rendezvous ack: the worker sends it after the dispatch finished; the
     /// hook waits on it — that wait IS the awaited dispatch.
-    done: std::sync::mpsc::SyncSender<()>,
+    ///
+    /// `true` = the dispatch completed (success, handler error, or an
+    /// abort-time skip), so later events may proceed. `false` = the worker's
+    /// own timeout abandoned a wedged handler: the dispatcher counts the
+    /// event failed and closes instead of accepting further events (which
+    /// would each pay the same budget).
+    done: std::sync::mpsc::SyncSender<bool>,
 }
 
 /// Awaited per-chunk `provider_stream_event` dispatcher (one per request).
@@ -626,9 +617,13 @@ struct ProviderStreamEventJob {
 /// on its own OS thread, so it makes progress regardless of the caller's
 /// runtime. A per-request thread is only started once the hook actually fires
 /// and exits when the request (and with it the hook's sender) is dropped.
-/// Each dispatch is additionally bounded by the extension host's per-call
-/// timeout, so a wedged handler cannot pin the provider stream forever; the
-/// failure is counted and logged, and later events keep flowing.
+/// Each dispatch is additionally bounded by
+/// [`PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT`] on BOTH sides of the handshake
+/// (the worker's `plugins.emit` future and the hook's ack wait), so a wedged
+/// handler cannot pin the provider stream forever. Whichever side times out
+/// first, the event is counted failed ONCE and the dispatcher closes: later
+/// events are dropped without paying the budget again, so one stuck handler
+/// costs the stream one budget total, not one per event.
 struct ProviderStreamEventDispatcher {
     plugins: Arc<PluginHost>,
     provider: JsonValue,
@@ -703,9 +698,35 @@ impl ProviderStreamEventDispatcher {
         }
         // The sync `await`: only return once the handler dispatch completed
         // (success, failure or abort all ack). A vanished worker drops the ack
-        // sender, which is reported rather than ignored.
-        if ack.recv().is_err() {
-            self.note_unavailable();
+        // sender, which is reported rather than ignored. The wait is bounded:
+        // a wedged handler must not pin the provider stream forever. On timeout
+        // the event is counted as failed ONCE and the dispatcher stops
+        // accepting later events, so the stream returns instead of paying the
+        // budget again for every following event.
+        match ack.recv_timeout(PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT) {
+            // Dispatch finished; the run continues (handler errors were
+            // already counted by the worker and do not close the dispatcher).
+            Ok(true) => {}
+            // The worker abandoned a wedged handler and reported the verdict.
+            // It did NOT increment `failed` (one count per event): account
+            // for it here and close, so the next event is dropped without
+            // waiting out another dispatch budget.
+            Ok(false) => {
+                self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                self.note_unavailable();
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                crate::ext_diag!(
+                    "[ext] provider_stream_event dispatch timed out after {:?}; releasing the \
+                     provider stream",
+                    PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT
+                );
+                self.note_unavailable();
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.note_unavailable();
+            }
         }
     }
 
@@ -777,9 +798,11 @@ fn start_provider_stream_event_worker(
                         "[ext] provider_stream_event dispatcher runtime failed: {error}"
                     );
                     // Ack while draining so no hook waits on a channel whose
-                    // worker cannot dispatch.
+                    // worker cannot dispatch. `true` keeps the pre-existing
+                    // "not a handler timeout" meaning; the worker exits after
+                    // draining, so later sends report Disconnected.
                     while let Ok(job) = receiver.recv() {
-                        let _ = job.done.send(());
+                        let _ = job.done.send(true);
                     }
                     return;
                 }
@@ -789,22 +812,43 @@ fn start_provider_stream_event_worker(
                     // Abort cleanup: a queued event must not reach extensions
                     // after the run was cancelled.
                     worker_stats.dropped_aborted.fetch_add(1, Ordering::Relaxed);
-                    let _ = job.done.send(());
+                    let _ = job.done.send(true);
                     continue;
                 }
                 let mut event = job.event;
-                match runtime.block_on(plugins.emit("provider_stream_event", &mut event)) {
-                    Ok(_) => {
+                let dispatch = plugins.emit("provider_stream_event", &mut event);
+                let mut timed_out = false;
+                match runtime.block_on(async {
+                    tokio::time::timeout(PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT, dispatch).await
+                }) {
+                    Ok(Ok(_)) => {
                         worker_stats.dispatched.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         worker_stats.failed.fetch_add(1, Ordering::Relaxed);
                         crate::ext_diag!("[ext] provider_stream_event dispatch failed: {error}");
                     }
+                    Err(_elapsed) => {
+                        // A wedged handler (a native `on_event` future that
+                        // never resolves has no actor-level timeout): abandon
+                        // it and report `false` so the hook's bounded wait
+                        // releases the provider stream AND closes the
+                        // dispatcher. The `failed` counter belongs to the
+                        // hook's ack wait (one count per event, see
+                        // [`ProviderStreamEventStats::failed`]); the worker
+                        // must not increment it here or a single timeout would
+                        // count twice.
+                        timed_out = true;
+                        crate::ext_diag!(
+                            "[ext] provider_stream_event dispatch timed out after {:?}",
+                            PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT
+                        );
+                    }
                 }
                 // Always ack, including after a handler error: the run
-                // continues, and the next event may still be dispatched.
-                let _ = job.done.send(());
+                // continues, and the next event may still be dispatched. A
+                // timeout acks `false`, making the dispatcher close.
+                let _ = job.done.send(!timed_out);
             }
         });
     match spawned {

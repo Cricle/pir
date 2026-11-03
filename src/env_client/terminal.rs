@@ -275,8 +275,18 @@ pub fn writer_queue_limits() -> (usize, usize) {
 /// A program running in a pseudo-terminal of a pi-env daemon. It ends when
 /// the program exits, [`RemoteTerminal::close`] kills it, or the connection
 /// is lost (the daemon then kills it).
+///
+/// Every clone shares one [`TerminalInner`]; dropping the LAST clone runs the
+/// same teardown as [`RemoteTerminal::close`] (cancel the `pty` request, stop
+/// the serial writer and settle [`RemoteTerminal::exited`]), so forgetting the
+/// explicit `close()` no longer leaks the remote program. The teardown is
+/// idempotent: a terminal that was already closed is not aborted twice.
 #[derive(Clone)]
 pub struct RemoteTerminal {
+    inner: Arc<TerminalInner>,
+}
+
+struct TerminalInner {
     connection: Connection,
     id: u32,
     session: u32,
@@ -299,19 +309,46 @@ pub struct RemoteTerminal {
     /// Set by [`RemoteTerminal::close`]: input is refused from then on, even
     /// before the writer task has observed the abort.
     closed: Arc<AtomicBool>,
+    /// The terminal's settlement channel. The task that owns the `pty` request
+    /// normally fills it with the daemon's outcome; [`TerminalInner::drop`]
+    /// fills it locally when the last handle goes away, so a retained
+    /// [`Exited`] never waits forever for a daemon that may not answer.
+    exit_tx: watch::Sender<Option<Result<i32, RemoteError>>>,
+}
+
+impl Drop for TerminalInner {
+    fn drop(&mut self) {
+        // Last owner: cancel the `pty` request (the daemon kills the program
+        // and its session) exactly as `close()` does. The swap keeps the
+        // teardown idempotent: `close()` then drop must not cancel twice.
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.abort.abort();
+        }
+        // Dropping `writer` (the only sender) closes the serial writer's queue.
+        // Settle `exited` locally too: the daemon's reply may never arrive if
+        // the request was cancelled or the connection went away.
+        let _ = self.exit_tx.send_if_modified(|settled| {
+            if settled.is_none() {
+                *settled = Some(Err(closed_error()));
+                true
+            } else {
+                false
+            }
+        });
+    }
 }
 
 impl RemoteTerminal {
     /// The program's process id (also its process group's: it leads the
     /// terminal's session).
     pub fn pid(&self) -> u32 {
-        self.pid
+        self.inner.pid
     }
 
     /// The exit code; errors with the daemon's error (`aborted` after
     /// [`RemoteTerminal::close`]).
     pub fn exited(&self) -> Exited {
-        self.exited.clone()
+        self.inner.exited.clone()
     }
 
     /// Send input; once the terminal has ended, input is dropped (upstream
@@ -411,16 +448,16 @@ impl RemoteTerminal {
     /// the refused chunk (it has no error channel) and the diagnostic records
     /// it; the fallible variants propagate the error.
     fn enqueue(&self, op: TerminalOp) -> Result<(), RemoteError> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.inner.closed.load(Ordering::SeqCst) {
             return Err(closed_error());
         }
         let bytes = op.payload_bytes();
-        let depth = self.queued.fetch_add(1, Ordering::Relaxed) + 1;
-        let queued_bytes = self.queued_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let depth = self.inner.queued.fetch_add(1, Ordering::Relaxed) + 1;
+        let queued_bytes = self.inner.queued_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         if depth > WRITER_QUEUE_MAX_DEPTH || queued_bytes > WRITER_QUEUE_MAX_BYTES {
-            self.queued.fetch_sub(1, Ordering::Relaxed);
-            self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
-            let refused = self.refused.fetch_add(1, Ordering::Relaxed) + 1;
+            self.inner.queued.fetch_sub(1, Ordering::Relaxed);
+            self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            let refused = self.inner.refused.fetch_add(1, Ordering::Relaxed) + 1;
             if refused == 1 || refused.is_multiple_of(WRITER_QUEUE_REPORT_EVERY) {
                 crate::ext_diag!(
                     "[env-client] terminal writer queue full ({depth} ops / \
@@ -430,15 +467,15 @@ impl RemoteTerminal {
             }
             return Err(overloaded_error());
         }
-        if self.writer.send(op).is_err() {
-            self.queued.fetch_sub(1, Ordering::Relaxed);
-            self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        if self.inner.writer.send(op).is_err() {
+            self.inner.queued.fetch_sub(1, Ordering::Relaxed);
+            self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
             // The only way to lose the receiver while a sender is alive is
             // close() (or a writer panic); either way input no longer flows.
             return Err(closed_error());
         }
         if depth >= WRITER_QUEUE_WARN_DEPTH {
-            let crossings = self.warn_crossings.fetch_add(1, Ordering::Relaxed) + 1;
+            let crossings = self.inner.warn_crossings.fetch_add(1, Ordering::Relaxed) + 1;
             if crossings == 1 || crossings.is_multiple_of(WRITER_QUEUE_REPORT_EVERY) {
                 crate::ext_diag!(
                     "[env-client] terminal writer queue at {depth} operations \
@@ -454,7 +491,7 @@ impl RemoteTerminal {
     /// writer could answer: `aborted` after a close, otherwise the connection
     /// went away with the writer task.
     fn enqueue_failure(&self) -> RemoteError {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.inner.closed.load(Ordering::SeqCst) {
             closed_error()
         } else {
             RemoteError::lost("pi-env connection lost")
@@ -467,7 +504,7 @@ impl RemoteTerminal {
     /// [`RemoteTerminal::write_async`] / [`RemoteTerminal::resize_async`]
     /// calls have been answered by then.
     pub async fn writer_closed(&self) {
-        self.writer.closed().await;
+        self.inner.writer.closed().await;
     }
 
     /// Kill the program and everything in its session.
@@ -477,8 +514,9 @@ impl RemoteTerminal {
     /// operations are answered with `aborted`, and the writer task exits. The
     /// `pty` request is cancelled as before, so the daemon kills the program.
     pub fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        self.abort.abort();
+        if !self.inner.closed.swap(true, Ordering::SeqCst) {
+            self.inner.abort.abort();
+        }
     }
 
     /// The job in the terminal's foreground when it is not the program
@@ -486,12 +524,13 @@ impl RemoteTerminal {
     /// is in front (a shell at its prompt). Fails once the terminal ended.
     pub async fn foreground(&self) -> Result<Option<TerminalForeground>, RemoteError> {
         let options = RequestOptions {
-            session: Some(self.session),
+            session: Some(self.inner.session),
             ..Default::default()
         };
         let reply = self
+            .inner
             .connection
-            .request("ptyForeground", json!({ "target": self.id }), options)
+            .request("ptyForeground", json!({ "target": self.inner.id }), options)
             .await?;
         let foreground = reply.json.get("foreground");
         let Some(Value::Object(foreground)) = foreground else {
@@ -571,6 +610,7 @@ pub async fn open_terminal(
     let request_json = options.request_json();
     let request_connection = connection.clone();
     let exit_sender = Arc::clone(&started_sender);
+    let exit_settlement = exit_tx.clone();
     tokio::spawn(async move {
         let result = request_connection
             .request("pty", request_json, request_options)
@@ -595,7 +635,16 @@ pub async fn open_terminal(
                 let _ = sender.send(Err(error.clone()));
             }
         }
-        let _ = exit_tx.send(Some(outcome));
+        // The first settlement wins: `TerminalInner::drop` may already have
+        // reported `aborted` for a terminal whose last handle went away.
+        let _ = exit_settlement.send_if_modified(|settled| {
+            if settled.is_none() {
+                *settled = Some(outcome);
+                true
+            } else {
+                false
+            }
+        });
     });
 
     let (id, session, pid) = match started_rx.await {
@@ -721,18 +770,21 @@ pub async fn open_terminal(
         });
     }
     Ok(RemoteTerminal {
-        connection,
-        id,
-        session,
-        pid,
-        abort,
-        exited: Exited { receiver: exit_rx },
-        writer,
-        queued,
-        queued_bytes,
-        refused,
-        warn_crossings,
-        closed,
+        inner: Arc::new(TerminalInner {
+            connection,
+            id,
+            session,
+            pid,
+            abort,
+            exited: Exited { receiver: exit_rx },
+            writer,
+            queued,
+            queued_bytes,
+            refused,
+            warn_crossings,
+            closed,
+            exit_tx,
+        }),
     })
 }
 
@@ -746,9 +798,9 @@ impl std::fmt::Debug for RemoteTerminal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RemoteTerminal")
-            .field("pid", &self.pid)
-            .field("id", &self.id)
-            .field("session", &self.session)
+            .field("pid", &self.inner.pid)
+            .field("id", &self.inner.id)
+            .field("session", &self.inner.session)
             .finish_non_exhaustive()
     }
 }

@@ -431,7 +431,7 @@ impl Provider for MockProvider {
             return None;
         }
         let mut message = assistant(model);
-        message.deferred = Some(handle);
+        message.deferred = Some(Box::new(handle));
         Some(done(message))
     }
 
@@ -915,7 +915,7 @@ async fn deferred_stream_fetch_and_cancel() {
     let message = stream.drain_and_result().await.expect("terminal message");
     assert_eq!(message.stop_reason, StopReason::Stop);
     assert_eq!(
-        message.deferred.as_ref().map(|handle| handle.id.as_str()),
+        message.deferred.as_deref().map(|handle| handle.id.as_str()),
         Some("deferred-1")
     );
 

@@ -37,19 +37,21 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
+use serde_json::Value as JsonValue;
+
 use crate::ai::types::{Message, Model};
 use crate::session_manager::{
     parse_entry_line_with_version, FileEntry, PagedWindow, SessionManager, SessionProjection,
     MAX_PREFIX_ENTRY_LINE_BYTES, SESSION_READ_BUFFER_SIZE,
 };
 
-use super::algorithm::estimate_context_tokens;
+use super::algorithm::{estimate_context_tokens, estimate_projected_context_tokens};
 use super::chunking::StreamingChunker;
 use super::{
-    compute_file_lists, extract_file_ops_from_message_refs, format_file_operations,
-    prepare_compaction_refs, should_compact_tokens, BorrowedCompactionPreparation,
-    CompactionConfig, CompactionResult, CompleteFn, FileOperations, PathEntryMeta,
-    ProjectionEntryMeta, SpanFraming,
+    carry_previous_file_ops, compute_file_lists, extract_file_ops_from_message_refs,
+    format_file_operations, prepare_compaction_refs, should_compact_tokens,
+    BorrowedCompactionPreparation, CompactionConfig, CompactionResult, CompleteFn, FileOperations,
+    PathEntryMeta, ProjectedEntry, ProjectionEntryMeta, SpanFraming,
 };
 use crate::session_manager::projection::session_entry_to_context_messages;
 
@@ -137,7 +139,7 @@ impl PagedCompactionInputs {
     /// `compaction_start` frame) asks this instead of building a second
     /// projection.
     pub fn threshold_met(&self, model: &Model, config: &CompactionConfig) -> bool {
-        threshold_tokens(&self.projection.messages, model, config).1
+        projected_threshold_tokens(&self.projection, &self.branch, model, config).1
     }
 }
 
@@ -180,7 +182,7 @@ pub async fn compact_paged_inputs(
     // The estimator+gate pair is shared with [`threshold_met`], so a caller
     // that must know the decision BEFORE the run (the print host's lifecycle
     // events) applies exactly this rule.
-    let (tokens_before, met) = threshold_tokens(&projection.messages, model, config);
+    let (tokens_before, met) = projected_threshold_tokens(&projection, &branch, model, config);
     if !met {
         return Err(PagedCompactionError::ThresholdNotMet);
     }
@@ -212,7 +214,11 @@ pub async fn compact_paged_inputs(
         resumed_from_prefix_compaction: scan.last_compaction.is_some() && !window_has_compaction,
         ..PagedCompactionStats::default()
     };
-    let mut file_ops = FileOperations::default();
+    // The plan already carries the previous compaction's details
+    // (`carry_previous_file_ops`) and the split-turn prefix span; starting
+    // from an empty set re-extracted only `messages_to_summarize` and lost
+    // both, breaking the cumulative `details` chain across compactions.
+    let mut file_ops = preparation.file_ops;
 
     // The running summary: the window's own previous summary wins (it is the
     // newest compaction on the leaf path); otherwise the prefix's newest
@@ -223,10 +229,19 @@ pub async fn compact_paged_inputs(
         (None, preparation.previous_summary.clone())
     } else {
         match &scan.last_compaction {
-            Some(compaction) => (
-                Some(prefix_span_start(&path, compaction)?),
-                Some(compaction.summary.clone()),
-            ),
+            Some(compaction) => {
+                // The window has no compaction of its own, so the resident
+                // plan could not see any previous details. The newest PREFIX
+                // checkpoint is the newest one on the leaf path: inherit its
+                // cumulative file tracking before the span starts, or the
+                // `details` chain breaks at this compaction (the streaming
+                // loop below skips the checkpoint line itself).
+                carry_previous_file_ops(compaction.details.as_ref(), &mut file_ops);
+                (
+                    Some(prefix_span_start(&path, compaction)?),
+                    Some(compaction.summary.clone()),
+                )
+            }
             None => (None, preparation.previous_summary.clone()),
         }
     };
@@ -307,9 +322,9 @@ pub async fn compact_paged_inputs(
         usage = super::combine_usage(usage, turn_prefix_usage);
     }
 
-    // File-operation tracking: the prefix's tool calls (collected while
-    // streaming) plus the window's own span (already tracked by the plan).
-    extract_file_ops_from_message_refs(preparation.messages_to_summarize.as_slice(), &mut file_ops);
+    // File-operation tracking: `file_ops` started from the plan's full
+    // accounting and the streamed prefix added its tool calls on top; no
+    // second extraction of the window span (the plan already did it).
     let (read_files, modified_files) = compute_file_lists(&file_ops);
     summary.push_str(&format_file_operations(&read_files, &modified_files));
 
@@ -337,6 +352,11 @@ struct PrefixCompaction {
     id: String,
     line_start: u64,
     summary: String,
+    /// The checkpoint's cumulative file tracking (`readFiles`/`modifiedFiles`)
+    /// in the on-disk `details` shape. Carried into the next compaction when
+    /// this checkpoint is the newest one but no longer part of the resident
+    /// window.
+    details: Option<JsonValue>,
     /// The checkpoint's cut point: the first entry its summary does NOT
     /// cover. It normally precedes the checkpoint on the leaf path.
     first_kept_entry_id: String,
@@ -346,6 +366,7 @@ struct PrefixCompaction {
 struct ParsedCompactionLine {
     id: String,
     summary: String,
+    details: Option<JsonValue>,
     first_kept_entry_id: String,
 }
 
@@ -416,6 +437,7 @@ fn scan_prefix(path: &std::path::Path, limit: u64) -> Result<PrefixScan, PagedCo
                     id: parsed.id,
                     line_start,
                     summary: parsed.summary,
+                    details: parsed.details,
                     first_kept_entry_id: parsed.first_kept_entry_id,
                 });
                 break;
@@ -578,6 +600,14 @@ fn parse_compaction_line(
         Some(FileEntry::Compaction(compaction)) => Ok(Some(ParsedCompactionLine {
             id: compaction.id,
             summary: compaction.summary,
+            // The resident plan only carries pi-generated details
+            // (`!fromHook`, upstream `extractFileOperations`); a hook-owned
+            // checkpoint must not leak its details into the next one.
+            details: if compaction.from_hook == Some(true) {
+                None
+            } else {
+                compaction.details
+            },
             first_kept_entry_id: compaction.first_kept_entry_id,
         })),
         // The marker was inside a valid non-compaction entry (for example a
@@ -857,15 +887,41 @@ pub fn paged_requires_widening(
         // re-read an already-summarized prefix.
         return false;
     }
-    !threshold_tokens(&projection.messages, model, config).1
+    let branch = session.branch_path_meta(None);
+    !projected_threshold_tokens(&projection, &branch, model, config).1
 }
 
 /// The paged trigger's estimator+gate pair over one already-built window
-/// projection: the exact rule [`compact_paged`] decides with, shared with
-/// [`threshold_met`] and [`paged_requires_widening`] so the trigger never
-/// exists in two versions. Returns `(estimated tokens before, trigger met)`.
-fn threshold_tokens(messages: &[Message], model: &Model, config: &CompactionConfig) -> (u64, bool) {
-    let tokens = estimate_context_tokens(messages).tokens;
+/// projection: the SAME rule the resident pipeline decides with
+/// ([`estimate_projected_context_tokens`] invalidates a usage record that
+/// predates the newest context-edit/compaction boundary on the leaf path),
+/// shared with [`PagedCompactionInputs::threshold_met`] and
+/// [`paged_requires_widening`] so the trigger never exists in two versions.
+/// Returns `(estimated tokens before, trigger met)`.
+fn projected_threshold_tokens(
+    projection: &SessionProjection,
+    branch: &[PathEntryMeta],
+    model: &Model,
+    config: &CompactionConfig,
+) -> (u64, bool) {
+    let metas = ProjectionEntryMeta::from_projection(&projection.entries);
+    let refs = ProjectionEntryMeta::cut_refs(&metas, &projection.messages);
+    let plain_estimate = branch.is_empty() && refs.iter().all(|entry| !entry.is_compaction());
+    let tokens = if plain_estimate {
+        estimate_context_tokens(&projection.messages).tokens
+    } else {
+        estimate_projected_context_tokens(&refs, branch).tokens
+    };
+    if std::env::var_os("PIR_PAGED_DEBUG").is_some() {
+        eprintln!(
+            "DBG paged threshold: messages={} tokens={} window={} reserve={} enabled={}",
+            projection.messages.len(),
+            tokens,
+            model.context_window,
+            config.reserve_tokens,
+            config.enabled,
+        );
+    }
     (
         tokens,
         should_compact_tokens(tokens, model.context_window, config),
@@ -895,7 +951,8 @@ pub fn threshold_met(
     config: &CompactionConfig,
 ) -> crate::Result<bool> {
     let projection = session.build_session_projection()?;
-    Ok(threshold_tokens(&projection.messages, model, config).1)
+    let branch = session.branch_path_meta(None);
+    Ok(projected_threshold_tokens(&projection, &branch, model, config).1)
 }
 
 /// The chunk budget a paged compaction will use (diagnostics/hosts).

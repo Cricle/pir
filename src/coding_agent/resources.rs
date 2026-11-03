@@ -273,6 +273,26 @@ fn find_git_repo_root(dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// One resource-kind root resolution request.
+struct ResourceRootsRequest<'a, 'o> {
+    /// The discovery options (cwd, agent dir, trust gate).
+    options: &'a ResourceDiscoveryOptions<'o>,
+    /// The project scope's settings entries.
+    project: &'a ScopeEntries,
+    /// The user scope's settings entries.
+    user: &'a ScopeEntries,
+    /// The auto directory name for this resource kind (`skills`/`prompts`).
+    default_dir: &'a str,
+    /// The CLI-provided paths for this kind.
+    cli_paths: &'a [PathBuf],
+    /// Whether the project/user auto directories participate.
+    include_defaults: bool,
+    /// The `.agents/skills` dirs to rank with each scope.
+    agents: &'a AgentsSkillDirs,
+    /// The caller's resolved home directory (`None` = unavailable).
+    home: Option<&'a Path>,
+}
+
 /// Ordered, deduplicated directory/file search roots for one resource kind,
 /// in the upstream precedence order (upstream `resourcePrecedenceRank` +
 /// `mergePaths`): the CLI paths FIRST, then the project scope (settings
@@ -292,19 +312,17 @@ fn find_git_repo_root(dir: &Path) -> Option<PathBuf> {
 /// `home` is the caller's already-resolved home directory: every `~`-prefixed
 /// CLI path, plain entry and override pattern expands against it (`None` = no
 /// home available), so no step of this chain reads the process environment.
-// The eight parameters are this call's inputs in upstream order; bundling
-// them into a struct would only rename the single call site.
-#[allow(clippy::too_many_arguments)]
-fn resource_roots(
-    options: &ResourceDiscoveryOptions<'_>,
-    project: &ScopeEntries,
-    user: &ScopeEntries,
-    default_dir: &str,
-    cli_paths: &[PathBuf],
-    include_defaults: bool,
-    agents: &AgentsSkillDirs,
-    home: Option<&Path>,
-) -> Vec<ResourceRoot> {
+fn resource_roots(request: ResourceRootsRequest<'_, '_>) -> Vec<ResourceRoot> {
+    let ResourceRootsRequest {
+        options,
+        project,
+        user,
+        default_dir,
+        cli_paths,
+        include_defaults,
+        agents,
+        home,
+    } = request;
     let mut roots: Vec<ResourceRoot> = Vec::new();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     let push = |path: PathBuf,
@@ -590,16 +608,16 @@ impl DiscoveredResources {
         } else {
             let (project, user) = settings_entries_for(options, "skills");
             let agents = AgentsSkillDirs::resolve(options.cwd, options.project_trusted, home);
-            let mut roots = resource_roots(
+            let mut roots = resource_roots(ResourceRootsRequest {
                 options,
-                &project,
-                &user,
-                "skills",
-                options.cli_skill_paths,
-                !options.no_skills,
-                &agents,
+                project: &project,
+                user: &user,
+                default_dir: "skills",
+                cli_paths: options.cli_skill_paths,
+                include_defaults: !options.no_skills,
+                agents: &agents,
                 home,
-            );
+            });
             roots.extend(
                 package_resources
                     .skills
@@ -614,16 +632,16 @@ impl DiscoveredResources {
             Vec::new()
         } else {
             let (project, user) = settings_entries_for(options, "prompts");
-            let mut roots = resource_roots(
+            let mut roots = resource_roots(ResourceRootsRequest {
                 options,
-                &project,
-                &user,
-                "prompts",
-                options.cli_prompt_paths,
-                !options.no_prompt_templates,
-                &AgentsSkillDirs::default(),
+                project: &project,
+                user: &user,
+                default_dir: "prompts",
+                cli_paths: options.cli_prompt_paths,
+                include_defaults: !options.no_prompt_templates,
+                agents: &AgentsSkillDirs::default(),
                 home,
-            );
+            });
             roots.extend(
                 package_resources
                     .prompts

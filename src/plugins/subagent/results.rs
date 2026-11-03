@@ -87,13 +87,24 @@ impl SingleResult {
         } else {
             0
         };
-        let mut value = serde_json::json!({
-            "agent": self.agent,
-            "agentSource": self.agent_source,
-            "task": self.task,
-            "exitCode": exit_code,
-            "messages": serde_json::to_value(&self.messages).unwrap_or(JsonValue::Null),
-            "usage": {
+        // Build the object by inserts and MOVE the serialized child
+        // transcript: `json!` re-serializes every `Value` expression, copying
+        // the full child transcript a second time.
+        let mut value = serde_json::Map::with_capacity(10);
+        value.insert("agent".to_owned(), JsonValue::String(self.agent.clone()));
+        value.insert(
+            "agentSource".to_owned(),
+            JsonValue::String(self.agent_source.to_owned()),
+        );
+        value.insert("task".to_owned(), JsonValue::String(self.task.clone()));
+        value.insert("exitCode".to_owned(), JsonValue::from(exit_code));
+        value.insert(
+            "messages".to_owned(),
+            serde_json::to_value(&self.messages).unwrap_or(JsonValue::Null),
+        );
+        value.insert(
+            "usage".to_owned(),
+            serde_json::json!({
                 "input": self.usage.input,
                 "output": self.usage.output,
                 "cacheRead": self.usage.cache_read,
@@ -101,25 +112,36 @@ impl SingleResult {
                 "cost": self.usage.cost,
                 "contextTokens": self.usage.context_tokens,
                 "turns": self.usage.turns,
-            },
-            "stderr": self.stderr,
-        });
+            }),
+        );
+        value.insert(
+            "stderr".to_owned(),
+            self.stderr
+                .as_ref()
+                .map_or(JsonValue::Null, |text| JsonValue::String(text.clone())),
+        );
         if let Some(model) = &self.model {
-            value["model"] = JsonValue::String(model.clone());
+            value.insert("model".to_owned(), JsonValue::String(model.clone()));
         }
         if let Some(stop_reason) = &self.stop_reason {
-            value["stopReason"] = JsonValue::String(stop_reason.clone());
+            value.insert(
+                "stopReason".to_owned(),
+                JsonValue::String(stop_reason.clone()),
+            );
         }
         if let Some(error_message) = &self.error_message {
-            value["errorMessage"] = JsonValue::String(error_message.clone());
+            value.insert(
+                "errorMessage".to_owned(),
+                JsonValue::String(error_message.clone()),
+            );
         }
         if let Some(step) = self.step {
-            value["step"] = JsonValue::from(step);
+            value.insert("step".to_owned(), JsonValue::from(step));
         }
         if self.pending {
-            value["pending"] = JsonValue::Bool(true);
+            value.insert("pending".to_owned(), JsonValue::Bool(true));
         }
-        value
+        JsonValue::Object(value)
     }
 }
 
@@ -237,17 +259,26 @@ pub(super) struct DetailsBuilder {
 
 impl DetailsBuilder {
     pub(super) fn build(&self, results: &[SingleResult]) -> JsonValue {
-        serde_json::json!({
-            "mode": self.mode,
-            "agentScope": self.agent_scope.as_str(),
-            "projectAgentsDir": self
-                .project_agents_dir
+        // Move the per-result objects: `json!` would re-serialize the whole
+        // `Vec<Value>` (each result carries its child transcript) again.
+        let mut value = serde_json::Map::with_capacity(4);
+        value.insert("mode".to_owned(), JsonValue::String(self.mode.to_owned()));
+        value.insert(
+            "agentScope".to_owned(),
+            JsonValue::String(self.agent_scope.as_str().to_owned()),
+        );
+        value.insert(
+            "projectAgentsDir".to_owned(),
+            self.project_agents_dir
                 .as_ref()
-                .map(|path| path.display().to_string()),
-            "results": results
-                .iter()
-                .map(SingleResult::to_json)
-                .collect::<Vec<_>>(),
-        })
+                .map_or(JsonValue::Null, |path| {
+                    JsonValue::String(path.display().to_string())
+                }),
+        );
+        value.insert(
+            "results".to_owned(),
+            JsonValue::Array(results.iter().map(SingleResult::to_json).collect()),
+        );
+        JsonValue::Object(value)
     }
 }
