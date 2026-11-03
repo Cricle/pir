@@ -530,6 +530,8 @@ impl OAuthFlow for GitHubCopilotOAuth {
             interaction.notify(AuthEvent::DeviceCode {
                 user_code: device.user_code.clone(),
                 verification_uri: device.verification_uri.clone(),
+                open_browser_on_confirm: None,
+                copy_code_on_confirm: None,
                 interval_seconds: device.interval,
                 expires_in_seconds: Some(device.expires_in),
             });

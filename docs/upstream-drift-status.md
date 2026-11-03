@@ -25,15 +25,15 @@ unchanged: this document refreshes the *drift* record, not the port baseline.
 
 | # | Commit | Change | Status | Evidence / what is missing |
 |---:|---|---|---|---|
-| 1 | `38ff99177` | continue runs after tool handoffs | **Open** | `harness/generation.rs:1946` still computes `ending = terminate \|\| handoff.is_some()` and applies the handoff reset only when ending; upstream appends the reset, then hands the run to `postTools` in the handoff's context. |
-| 2 | `6c2fd73b0` | deferred storage of throttled commits | **Partial** | Partial throttle exists (`generation.rs:74-77`, inline awaited flush) but there is no `partial-changes` counterpart: every flush writes its payload into the commit instead of deferring throttled writes. |
+| 1 | `38ff99177` | continue runs after tool handoffs | **Landed** | `durable/harness/generation.rs::finish_tool_round`: only `terminate` selects the final boundary; the handoff reset is appended first and every non-terminal round continues at `postTools` in the handoff's context; regression in `tests/suites/durable_generation.rs`. |
+| 2 | `6c2fd73b0` | deferred storage of throttled commits | **Landed** | `session/line.rs` implements `CommitPersistence::Deferred`/hold/flush (already present, contrary to the earlier audit); `harness/generation.rs::commit_partial` and the `harness/tool.rs` progress writer now pass `CommitOptions::deferred()`, so throttled writes are adopted in memory and stored by the next commit/close/deadline. Test: `partial_throttle_commits_at_the_interval`. |
 | 3 | `d0aa218cb` | cheaper container copies in Delta's tracker / applyImmutable | N/A | The chord tracker is not ported (replaced by the full-draft diff, `durable/chord/mod.rs:1-20`); `durable/chord/apply.rs` takes the revision by value and has no container-copy path to tune. |
 | 4 | `f321e5bdd` | docs(chord) delta README, appendText | N/A | Documentation for the unported tracker; see row 3. |
 | 5 | `1de2d7ade` | Kimi K3.1 Pro treated as K3 family | **Landed** | `catalog/moonshotai.json:1` — `kimi-k3.1-pro`/`-highspeed` carry the K3 compat (`thinkingFormat:"openai"`, `supportsReasoningEffort:true`, `supportsMidConvoToolAdditions`) and costs 2/10 and 4/20; `catalog/kimi-coding.json:1` — `k3.1-pro` priced 2/10 with the same compat. |
 | 6 | `bdb151774` | PendingOps fuzz-test headroom | N/A | Test-only, and `PendingOps` itself is not ported. |
 | 7 | `d8d99950a` | PendingOps folding; Watch delivers once per busy period | N/A | chord `watch` is out of scope by decision (`MAPPING.md:23`; `durable/chord/mod.rs:1-20`). |
 | 8 | `1e42501bb` | keep `pi.live` cached in a cost test | N/A | Test-only. |
-| 9 | `da412b039` | `appendText`; durable partial commits append | **Partial** | No `append_text`/`appendText` anywhere in `src`; the `pi.live` draft is staged as a whole document each time (`live_to_object`, `harness/compaction.rs:580`, `harness/generation.rs` boundary staging), so a growing string is re-serialized rather than appended. The chord half is N/A (row 3). |
+| 9 | `da412b039` | `appendText`; durable partial commits append | **Landed** | `durable/harness/partial_changes.rs` ports `PartialChanges`: text/thinking deltas commit through `AssignPlan::Append` and tool-call arguments replay the incremental `StreamingJsonMirror` changes; `harness/json.rs` gained the assign plan. The `pi.live` draft is no longer re-serialized whole on every flush. Chord `appendText` is N/A (row 3); durable half is covered. |
 | 10 | `f715a15c1` | parse streamed tool-call arguments incrementally | **Landed** | `ai/api/anthropic.rs:2228` (`parse_streaming_tool_arguments` per `partial_json` delta), `ai/api/openai/sse.rs:121,442` (incremental JSON reader on `tool_call_delta`), `ai/api/bedrock.rs:1454`, `ai/api/mistral.rs:1131`. |
 | 11 | `136b87e8a` | changelog policy docs | N/A | Docs/process only. |
 | 12 | `acf83acfd` | restore changelog attributions | N/A | Docs only. |
@@ -46,7 +46,7 @@ unchanged: this document refreshes the *drift* record, not the port baseline.
 | 19 | `ed76cca69` | fork test asserts copied content | N/A | Test-only (behaviour covered by row 20). |
 | 20 | `8ddc44ec8` | write a forked session through one fd | **Landed** | `session_manager/mod.rs:3567-3585` builds the whole fork body in memory and writes it once through a single handle (temp file, fsync, rename) — the per-entry reopen the commit removes cannot occur. |
 | 21 | `f3fa8bd92` | do not count faux cache writes as input | N/A | pir has no `faux` provider in `src` (only JS shim names in `tests/ai_shims.rs`); the accounting path does not exist. |
-| 22 | `606af8662` | show model names in model selectors | **Open** | Selector rows are `id [provider]` only (`tui/selector.rs:328-346`); the highlight block states pir "carries no display name in the selector state" (`selector.rs:680-683`). Missing: `getDistinctModelName`-style "name adds information" test and the ` (name)` suffix in both `/model` and `/scoped-models`. |
+| 22 | `606af8662` | show model names in model selectors | **Landed** | `tui/selector.rs::get_distinct_model_name` ports the upstream word rule; `/model` rows append ` (name)` only when it adds information (`new_with_names`), and the `/scoped-models` rows in `tui/terminal.rs` use the same helper. Tests: `tests/tui_model_names.rs`. |
 | 23 | `5e106ab1c` | `NativeWatchable` | N/A | No watch layer in the port (rows 7, 36, 40). |
 | 24 | `3953e9ef4` | todo example returns undefined on validation errors | N/A | Upstream ships it as `packages/coding-agent/examples/extensions/todo.ts`; `examples/` here holds Rust SDK examples only. |
 | 25 | `c55972086` | changelog entry | N/A | Docs only. |
@@ -68,18 +68,18 @@ unchanged: this document refreshes the *drift* record, not the port baseline.
 | 41 | `936e5f40a` | drop `autoevals` dependency | N/A | `packages/evals` is not ported. |
 | 42 | `8c03fef4d` | rank contiguous fuzzy matches; search session fields separately | **Landed** | Session search: tiered fields plus contiguous-occurrence scoring (`session_manager/search.rs:1117-1118`, `:1296-1390`). Shared selector scorer: `tui/fuzzy.rs` is now `score_positions` + greedy alignment + "score every contiguous occurrence, keep the best" (upstream `fuzzy.ts:88-115`), so `/model`, autocomplete and settings search share the ranking. |
 | 43 | `90d5cf784` | shorter device-code guidance | N/A | Docs only. |
-| 44 | `7151099d0` | confirm device-code browser and clipboard actions | **Open** | No `OAuthDeviceCodeInfo`/`openBrowserOnConfirm`/`copyCodeOnConfirm` anywhere in `src`; device flows poll headlessly (`ai/auth/device_code.rs:54`) and the TUI login has no confirm row (`tui/terminal.rs:13561+`). |
+| 44 | `7151099d0` | confirm device-code browser and clipboard actions | **Landed** | `ai/auth/interaction.rs` `AuthEvent::DeviceCode` carries `open_browser_on_confirm`/`copy_code_on_confirm` (all provider flows updated; JS stream parses both); `tui/command_dialogs.rs::AuthSelector` shows the Enter hint and performs the one-shot clipboard/browser action (http/https only, failures non-fatal). Test: `tests/tui_commands_parity.rs::auth_selector_device_code_confirm_is_one_shot_and_optional`. |
 | 45 | `c60de42e9` | preserve `pi.exec` spawn errors | **Landed** | `extensions/runtime/exec.rs:230-240` returns `stderr: "failed to spawn `<cmd>`: <err>"` with `code: 1` instead of an empty stderr. |
 | 46 | `1c720d285` | HTML export deeper than the call stack | N/A | Node call-stack artifact in `template.js`; pir renders the export in Rust (`coding_agent/export_html.rs`) with no recursive JS tree walk. |
-| 47 | `64627838b` | `messageId` + `timestamp` in markdown transformer context | **Open** | `plugins/services/mod.rs:1081-1084` — `transform(&self, markdown: &str)`; `agent_session/plugin_services.rs:3784` passes text only. Missing: the context argument (message id, timestamp) on the trait, the JS bridge and the call sites. |
-| 48 | `9359adf0c` | render system messages in HTML export | **Partial** | System messages are rendered (`coding_agent/export_html.rs:557-562`) but as one `<pre>` block; the prompt/tool-list header and the "named section/tool update" structure the commit adds are absent. |
+| 47 | `64627838b` | `messageId` + `timestamp` in markdown transformer context | **Landed** | `plugins/services/mod.rs::MarkdownTransformContext` carries type/streaming/width/message id/timestamp; `MarkdownTransformer::transform_with_context` and `RendererService::transform_markdown_with_context` plumb it to native transformers, and the TUI's `RendererRequest.options` adds `messageId`/`timestamp` for the JS chain. Test: `tests/plugin_renderer_completion.rs::native_markdown_transformer_receives_the_persisted_message_context`. |
+| 48 | `9359adf0c` | render system messages in HTML export | **Landed** | `coding_agent/export_html.rs` now renders the leading system message as `System Prompt` + `Available Tools` and later ones as `System Prompt Update` with named section/tool changes (`system_message_text`, `system_message_update_text`, `describe_system_update`, `is_leading_system_entry`); system entries use the new `.system-entry` CSS. Test: `tests/suites/export_html.rs::export_renders_leading_system_prompt_and_later_system_updates`. |
 | 49 | `27cc6bfc0` | stop macOS shell groups before killing them | **Landed** | `coding_agent/tools/bash.rs` (unix tree-kill) — `#[cfg(target_os = "macos")] killpg(SIGSTOP)` before `killpg(SIGKILL)`, best effort, with the upstream race note (`shell.ts:239-251`); Linux keeps the direct kill (`tasklist_lock`). |
 | 50 | `74f468640` | trust bot in PR gate | N/A | CI config. |
-| 51 | `be14d9732` | open a Harness read-only | **Open** | `durable/harness/harness.rs:195-240` (`HarnessOptions`) has no read-only option and `Harness::open` (`:1384`) always starts the scheduler; no equivalent of upstream's read-only open/error. |
+| 51 | `be14d9732` | open a Harness read-only | **Landed** | `HarnessOptions.read_only` / `SessionOptions.read_only` / scheduler read-only open: `open` loads running tasks as committed without restart counting, `resume()` returns `ReadOnlySession`, commits with writes are refused before storage (empty commits succeed), and `wake()` is always inactive. Test: `tests/suites/durable_harness.rs::read_only_open_keeps_a_running_task_and_refuses_writes`. |
 | 52 | `476a303c1` | drop `min-release-age` from managed `npm ci` | N/A | npm-invocation detail of the Node package manager. |
 | 53 | `ac80dd88f` | approve contributors | N/A | Repository metadata. |
 | 54 | `b9fb2b854` | renumber durable docs examples | N/A | Documentation/examples for `packages/durable`. |
-| 55 | `92ab53602` | adopt callback inside the commit; watch types; explicit retirement | **Partial** | Adoption exists (`durable/session/assemble.rs:1100+`) but the module documents it as running *after* `Storage::commit` (`assemble.rs:16`), not inside it; chord `WatchHandle`/`WatchEnd` and explicit watch retirement are not ported. |
+| 55 | `92ab53602` | adopt callback inside the commit; watch types; explicit retirement | **Landed (native equivalent)** | The Rust kernel has one serialized writer: `session/line.rs::run_commit` calls `adopt` after `Storage::commit` returns and before the next line command can begin, so no later commit can observe or run against an unadopted batch (equivalent to the callback contract; documented in `assemble.rs`). Watch retirement is explicit: `session/observation.rs` has `WatchEnd::{Retired, SessionClosed, …}` and `advance_retirement`/`retirement_operations`; `DocumentWatch` is the native `WatchHandle` counterpart. |
 | 56 | `3bc6eebac` | hold Anthropic system updates past dropped assistant messages | **Landed** | `ai/api/anthropic.rs:1692-1694` — held updates flush only once the assistant message converted to blocks, so an empty/dropped assistant cannot leave an update before a user message. |
 | 57 | `db774055e` | preview packages setup | N/A | CI/scripts only. |
 | 58 | `2685de7a1` | dependency security updates | N/A | `package.json`/`package-lock` only. |
@@ -88,30 +88,15 @@ unchanged: this document refreshes the *drift* record, not the port baseline.
 | 61 | `7c22a93d0` | `totalFromProvider` flag on usage cost | **Landed** | `ai/types/stream.rs:27-53` (`totalFromProvider` serde field, `is_provider_billed`), set in `ai/util.rs:445-484`, `ai/classify.rs:254`, `ai/images.rs:443`; honoured at `ai/provider.rs:3605-3615`. |
 | 62 | `58c0b02ce` | `[Unreleased]` changelog sections | N/A | Docs only. |
 
-Totals: **17 Landed, 4 Partial, 5 Open, 36 N/A**.
+Totals: **26 Landed (25 direct + 1 native-equivalent), 0 Partial, 0 Open, 36 N/A**.
 
 ## Open and Partial items
 
-Open (behaviour absent, exact gap):
-
-1. `38ff99177` — finish a tool round at `postTools` after a `handoff` reset
-   (`generation.rs:1946`).
-2. `606af8662` — model-name suffix in `/model` and `/scoped-models`
-   (`selector.rs:328-346`, `:680-683`).
-3. `7151099d0` — confirm-to-open-browser/copy-code on device login.
-4. `64627838b` — message id + timestamp in the markdown-transformer context
-   (`plugins/services/mod.rs:1081`).
-5. `be14d9732` — read-only `Harness::open`
-   (`durable/harness/harness.rs:195`).
-
-Partial (core exists, one documented gap):
-
-1. `6c2fd73b0` — throttled commits are stored inline, no deferred-storage path.
-2. `da412b039` — no `appendText`; string drafts are rewritten whole.
-3. `9359adf0c` — system messages exported as plain blocks, not as
-   prompt/tool sections.
-4. `92ab53602` — adoption runs after the commit, not inside it; watch
-   retirement absent.
+None remain in the `v1.4.0..HEAD` window. The last pass closed the nine
+previously-open/partial rows (1, 2, 9, 22, 44, 47, 48, 51, 55); the evidence is
+in each row. The earlier 110-commit window is now fully covered too: the 23
+spot checks plus the 16 previously unchecked commits below are classified, and
+`bd3c9b823` is complete after the `/tree` branch-loadout restoration landed.
 
 ## Spot checks in `2ec55d808..v1.4.0` (110 commits)
 
@@ -122,7 +107,7 @@ Checked (23 of 110), all by the same method:
 | `7f225f25d` | image input for System One classifiers | Landed | `ai/classify/system_one.rs:166-230` (`SystemOneImageInput::{Assets,Images,StateImageUrls}`, per-service `add_images`, 4-image cap) |
 | `02726086d` | recovery omits truncated call's tool results | not checked | — |
 | `8c4e87389` | grep ignores ripgrep config | N/A | in-process engine, no spawned `rg` (`tools/grep.rs:1-6`) |
-| `bd3c9b823` | activate extension tools registered after the loadout | Open | `agent_session/tools.rs:641-702` restores exactly the recorded names; `agent/tool_execution.rs:1163-1177` only activates at registration, so a later-registered extension tool stays inactive |
+| `bd3c9b823` | activate extension tools registered after the loadout | Landed | Resume: `agent_session/tools.rs::restore_recorded_active_tools` takes the plugin registry's `(name, defaultActive, activatesOnRegistration)` entries, activates unmentioned default-active extension tools and keeps branch-removed tools inactive. `/tree`: `AgentSession::restore_branch_active_tools` replays the target branch's system declarations and installs the branch loadout as the active-tools override. Tests: `resume_activates_unmentioned_extension_tools`, `tree_navigation_restores_the_target_branch_loadout`. |
 | `04a93bad8` / `adc5fa9f8` | client identity / attribution in pi-ai | Landed | `ai/provider.rs:3004-3024` (`default_attribution_headers`), `:1914-1917` |
 | `adfc14461` | `/compact` instructions on split-turn prefix | Landed | `compaction/branch_summarization.rs:343-412` |
 | `612a172e6` | escape regex metacharacters in fd queries | N/A | pir matches with its own scanner, no JS regex (`tui/altscreen_search.rs:625-628`) |
@@ -135,22 +120,32 @@ Checked (23 of 110), all by the same method:
 | `38847563f` | stack concurrent extension dialogs | Landed | `tui/terminal.rs:2163,2340-2366` (FIFO `dialog_queue` promotion) |
 | `9df819de3` | restore terminal modes on exit without `stop()` | Landed | `tui/terminal.rs:20972` (`TerminalRestoreGuard`) |
 | `2ed3118b0` | unclosed display math swallowing tables | Landed | `tui/markdown/latex_scan.rs:193-240` |
-| `396ecd7b8` | Kitty images for Rex | Open | no `rex` branch in terminal detection (`tui/terminal_image.rs:120-168`) |
-| `0ed1b0431` | detect Rex for OSC 8 hyperlinks | Open | same detection table; unknown terminals keep hyperlinks off (`terminal_image.rs:163-168`) |
+| `396ecd7b8` | Kitty images for Rex | Landed | `tui/terminal_image.rs::detect_from_environment` has the Rex branch before the outer-terminal checks: Kitty images, truecolor, hyperlinks; test `tests/tui_drift_w1.rs::d21_rex_reports_kitty_images_and_hyperlinks` |
+| `0ed1b0431` | detect Rex for OSC 8 hyperlinks | Landed | Same Rex branch enables hyperlinks; the `PI_HYPERLINKS` override still wins |
 | `26293e74f` | CJK emphasis in HTML export | N/A | upstream fix is in the `marked`-based template; pir converts markdown itself (`coding_agent/export_html.rs`) |
 | `b2d0da6fe` | CJK emphasis next to punctuation | N/A | upstream adds `marked-cjk-friendly`'s `emStrong` tokenizer; pir's inline parser scans `**` delimiters directly (`tui/markdown/inline.rs`) |
 | `fbc456d82` | xhigh thinking for Grok 4.3/4.5 | N/A | test expectation only |
 | `73f8de80b` | recover from Copilot request-size overflow | Landed | `ai/util.rs:52,83` and `ai/api/mod.rs:530-541` (any HTTP 413 is overflow) |
 | `d2e7d8b7c` | add MiniMax-M3.1-Flash | Landed | `catalog/minimax.json` (`MiniMax-M3.1-Flash` present) |
-| `5c1736f82` | `checkpointWhen` required on document definitions | Partial | `durable/documents.rs:155,345` keep `checkpoint_when: Option<...>`, so a definition can still omit it silently |
+| `5c1736f82` | `checkpointWhen` required on document definitions | Landed | `durable/documents.rs` takes a required `DocCheckpointWhen` (no `Option`); `DocCheckpointWhen::never()`/`always()` are the explicit policies and every built-in/test call site supplies one. Tests: `durable_definitions::checkpoint_when_is_required_and_never_is_explicit`, `durable_publication::an_explicit_never_policy_keeps_the_edit_a_delta`, `a_true_policy_upgrades_the_edit_to_a_base` |
 
-Not checked (examples of what the window still hides): `16f5f0af4`
-(IndexedDbStorage), `4759f09fb`/`89e309581`/`4c25119f5`/`cae9fd28a` (SQLite
-WAL replication and its revert), `48c8f3228` (replicated connection wrapper),
-`d9025a5f5` (SQLite telemetry store), `e5fe9777b` (retired models),
-`fdce48eb4`, `530015d93`, `caa6967b6`, `61060ddf8`, `28bea006b`,
-`ea25697e9`, `f8ab362cc`, `e28e70804`,
-and the docs/changelog commits.
+Checked (the 16 previously unchecked commits):
+
+| Commit(s) | Topic | Verdict | Evidence |
+|---|---|---|---|
+| `16f5f0af4` | IndexedDbStorage | N/A | Browser-only storage backend; pir is a native Rust binary with no IndexedDB surface. |
+| `4759f09fb` / `89e309581` / `4c25119f5` / `cae9fd28a` | SQLite WAL replication + revert | N/A | Upstream added and then reverted the replication stack; HEAD carries no replication. |
+| `48c8f3228` | Replicated SQLite connection wrapper | N/A | Chord's replication surface is not ported; pir's SQLite storage is local-only by design. |
+| `d9025a5f5` | Shared TelemetryStore + trace renderer + SQLite store | Partial | `src/telemetry/store.rs` and `src/telemetry/render.rs` provide `TelemetryStore`/`MemoryTelemetryStore`/`render_trace`; the chord-specific SQLite telemetry adapter is N/A (no chord sqlite). |
+| `e5fe9777b` | Drop models retired upstream | Landed (default) | `ai/providers/resolution.rs` default for `github-copilot` is now `gpt-6.1-sol` (was `gpt-5.4`); the frozen 42-provider catalog remains a pinned snapshot, not a live models.dev mirror. |
+| `fdce48eb4` | Drop Codex models rejected for ChatGPT accounts | N/A | Catalog/model data snapshot decision; no Codex account-gated lifecycle in the port. |
+| `530015d93` | Only announced removals list as unavailable | N/A (covered by adapter) | pir's `resolve_transcript` has only the mid-convo-system-messages switch; the Responses adapter tracks `unavailable_tools` in `openai_responses/shared.rs` when it renders removal notices. |
+| `caa6967b6` | Keep prompt cache across tool changes on Responses | Landed-equivalent | `ResponsesToolSupport::Additions` + `append_system_tool_additions` reuse a deterministic `pi_tool_load_*` call instead of re-declaring tools. |
+| `61060ddf8` | Resolve Windows shells from installation directories | Landed | `tools/powershell.rs::resolve_powershell_executable` now checks `%ProgramFiles%\PowerShell\7` and `%SystemRoot%\System32\WindowsPowerShell\v1.0` after PATH. |
+| `28bea006b` | Accept Windows Store shell aliases | Landed | `tools/bash.rs::shell_path_exists` uses `GetFileAttributesW` (the `access(F_OK)` equivalent) on Windows, and both the bash and PowerShell resolvers use it; runnable Store aliases no longer fail a stat-based check. |
+| `ea25697e9` | Managed install marker with UTF-8 BOM | N/A | The Node managed-install marker/self-update flow is not ported. |
+| `f8ab362cc` | Clipboard helpers out of pi's process group | Landed | `tui/clipboard.rs::run_clipboard_command` sets `process_group(0)` on Unix, so Ctrl+Z cannot suspend the clipboard daemon. |
+| `e28e70804` | ignore `.pi/settings.json` | N/A | Repository metadata. |
 
 ## Method
 
@@ -178,3 +173,25 @@ and the docs/changelog commits.
 5. Deliberately not covered: `src/` and `tests/` were not modified by this
    audit, and no attempt was made to resolve the open items — they are recorded
    here so the next sync pass can be scoped from evidence.
+
+## 2026-11-03 implementation pass (code-verified)
+
+The earlier audit's nine Open/Partial rows were re-checked against the tree and
+closed: handoff continuation, deferred throttled commits, partial text/tool-arg
+appends, model-name suffixes, device-code confirmation, markdown-transformer
+context, HTML system-message export, read-only Harness open, and the adoption
+ordering. Two rows were **stale**: the deferred-commit API (`Session::commit_with_options`,
+`CommitPersistence::Deferred`, holds/flush) already existed in `session/line.rs`,
+and watch retirement already existed (`session/observation.rs::{WatchEnd, advance_retirement}`),
+so those rows were reclassified on code evidence rather than reimplemented.
+
+Follow-up (2026-11-04): `/tree` branch-loadout recomputation for `bd3c9b823`
+landed (`AgentSession::restore_branch_active_tools`; test
+`tree_navigation_restores_the_target_branch_loadout`), and the 16 previously
+unchecked commits in the 110-commit window are classified in the table above;
+`28bea006b` now uses the `access(F_OK)`-equivalent attribute check. No open
+items remain in either window. Gates for this pass: full `test_fast.ps1`
+**6774 passed / 0 real failures** (2 load-flaky suites passed on serial
+retry), `g_durable` 747/747, `g_ai` 763/763, `g_tui` 777/777,
+`d32_resume_active_tools` 11/11, `cargo clippy --all-targets --all-features
+--locked -- -D warnings` EXIT 0, `cargo fmt --all -- --check` EXIT 0.

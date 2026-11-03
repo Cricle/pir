@@ -152,7 +152,7 @@ impl DocDefinition {
         self,
         initial: DocInitial,
         migrate: Option<DocMigrate>,
-        checkpoint_when: Option<DocCheckpointWhen>,
+        checkpoint_when: DocCheckpointWhen,
     ) -> AnyDocDefinition {
         AnyDocDefinition::from_definition(self, initial, migrate, checkpoint_when)
     }
@@ -213,7 +213,7 @@ impl DocFamilyDefinition {
         self,
         initial: DocInitial,
         migrate: Option<DocMigrate>,
-        checkpoint_when: Option<DocCheckpointWhen>,
+        checkpoint_when: DocCheckpointWhen,
     ) -> AnyDocFamilyDefinition {
         AnyDocFamilyDefinition::from_definition(self, initial, migrate, checkpoint_when)
     }
@@ -263,11 +263,40 @@ pub type DocMigrate = fn(i64, Value) -> Result<Value, DocumentError>;
 /// Decide whether a prepared value is committed as a complete base.
 ///
 /// `true` means "commit this change as a base instead of a delta", matching
-/// upstream `checkpointWhen`. The Session kernel calls it after every
-/// successful prepare; `None` never forces a checkpoint. Upstream also passes
-/// the pending operations and the stored-delta count; that state belongs to
-/// the caller here, which can capture it when it builds the definition.
+/// upstream `checkpointWhen`. The policy is **required** on every definition:
+/// upstream's `CommonDocDefinition.checkpointWhen` has no default, and a
+/// definition that genuinely never checkpoints must say so explicitly with
+/// `DocCheckpointWhen::never()` (upstream `() => false`). The Session kernel
+/// always calls the policy after a successful prepare; there is no fallback.
+///
+/// Upstream also passes the pending operations and the stored-delta count;
+/// that state belongs to the caller here, which can capture it when it builds
+/// the definition (for example a `deltas_since_base >= 64` policy).
 pub type DocCheckpointWhen = fn(&JsonObject) -> bool;
+
+/// Named policies for [`DocCheckpointWhen`].
+///
+/// Rust cannot put inherent constructors on a function-pointer alias, so the
+/// two canonical upstream policies live on this extension trait:
+/// `DocCheckpointWhen::never()` is upstream `() => false` — the explicit
+/// opt-out a document that retires with its task uses — and
+/// `DocCheckpointWhen::always()` is `() => true`.
+pub trait DocCheckpointWhenExt {
+    /// The explicit "never checkpoint" policy (upstream `() => false`).
+    fn never() -> Self;
+    /// A policy that checkpoints on every change (upstream `() => true`).
+    fn always() -> Self;
+}
+
+impl DocCheckpointWhenExt for DocCheckpointWhen {
+    fn never() -> Self {
+        |_| false
+    }
+
+    fn always() -> Self {
+        |_| true
+    }
+}
 
 /// Definition fields shared by singleton documents and document families.
 ///
@@ -342,7 +371,7 @@ impl CommonDocDefinition {
         self,
         initial: DocInitial,
         migrate: Option<DocMigrate>,
-        checkpoint_when: Option<DocCheckpointWhen>,
+        checkpoint_when: DocCheckpointWhen,
     ) -> AnyDocDefinition {
         AnyDocDefinition::define(self, initial, migrate, checkpoint_when)
     }
@@ -352,7 +381,7 @@ impl CommonDocDefinition {
         self,
         initial: DocInitial,
         migrate: Option<DocMigrate>,
-        checkpoint_when: Option<DocCheckpointWhen>,
+        checkpoint_when: DocCheckpointWhen,
     ) -> AnyDocFamilyDefinition {
         AnyDocFamilyDefinition::define(self, initial, migrate, checkpoint_when)
     }
@@ -371,8 +400,9 @@ pub struct AnyDocDefinition {
     pub initial: DocInitial,
     /// Transform a value stored at an older version; `None` rejects them.
     pub migrate: Option<DocMigrate>,
-    /// Whether a prepared change must be committed as a complete base.
-    pub checkpoint_when: Option<DocCheckpointWhen>,
+    /// Required policy deciding whether a prepared change is committed as a
+    /// complete base.
+    pub checkpoint_when: DocCheckpointWhen,
 }
 
 impl std::fmt::Debug for AnyDocDefinition {
@@ -380,7 +410,7 @@ impl std::fmt::Debug for AnyDocDefinition {
         f.debug_struct("AnyDocDefinition")
             .field("common", &self.common)
             .field("has_migrate", &self.migrate.is_some())
-            .field("has_checkpoint_when", &self.checkpoint_when.is_some())
+            .field("checkpoint_when", &self.checkpoint_when)
             .finish()
     }
 }
@@ -392,7 +422,7 @@ impl AnyDocDefinition {
         common: CommonDocDefinition,
         initial: DocInitial,
         migrate: Option<DocMigrate>,
-        checkpoint_when: Option<DocCheckpointWhen>,
+        checkpoint_when: DocCheckpointWhen,
     ) -> Self {
         Self {
             common,
@@ -413,11 +443,11 @@ impl AnyDocDefinition {
     }
 
     /// Whether a prepared value must be committed as a complete base.
+    ///
+    /// Always evaluates the definition's required [`DocCheckpointWhen`]
+    /// policy; there is no implicit false fallback.
     pub fn forces_checkpoint(&self, value: &JsonObject) -> bool {
-        match self.checkpoint_when {
-            Some(predicate) => predicate(value),
-            None => false,
-        }
+        (self.checkpoint_when)(value)
     }
 
     /// Reject a stored version this definition cannot use.
@@ -497,7 +527,7 @@ impl AnyDocDefinition {
         definition: DocDefinition,
         initial: DocInitial,
         migrate: Option<DocMigrate>,
-        checkpoint_when: Option<DocCheckpointWhen>,
+        checkpoint_when: DocCheckpointWhen,
     ) -> Self {
         Self {
             common: CommonDocDefinition {
@@ -528,8 +558,9 @@ pub struct AnyDocFamilyDefinition {
     /// Transform a member value stored at an older version; `None` rejects
     /// them.
     pub migrate: Option<DocMigrate>,
-    /// Whether a prepared change must be committed as a complete base.
-    pub checkpoint_when: Option<DocCheckpointWhen>,
+    /// Required policy deciding whether a prepared change is committed as a
+    /// complete base.
+    pub checkpoint_when: DocCheckpointWhen,
 }
 
 impl std::fmt::Debug for AnyDocFamilyDefinition {
@@ -537,7 +568,7 @@ impl std::fmt::Debug for AnyDocFamilyDefinition {
         f.debug_struct("AnyDocFamilyDefinition")
             .field("common", &self.common)
             .field("has_migrate", &self.migrate.is_some())
-            .field("has_checkpoint_when", &self.checkpoint_when.is_some())
+            .field("checkpoint_when", &self.checkpoint_when)
             .finish()
     }
 }
@@ -549,7 +580,7 @@ impl AnyDocFamilyDefinition {
         common: CommonDocDefinition,
         initial: DocInitial,
         migrate: Option<DocMigrate>,
-        checkpoint_when: Option<DocCheckpointWhen>,
+        checkpoint_when: DocCheckpointWhen,
     ) -> Self {
         Self {
             common,
@@ -576,11 +607,11 @@ impl AnyDocFamilyDefinition {
     }
 
     /// Whether a prepared value must be committed as a complete base.
+    ///
+    /// Always evaluates the definition's required [`DocCheckpointWhen`]
+    /// policy; there is no implicit false fallback.
     pub fn forces_checkpoint(&self, value: &JsonObject) -> bool {
-        match self.checkpoint_when {
-            Some(predicate) => predicate(value),
-            None => false,
-        }
+        (self.checkpoint_when)(value)
     }
 
     /// Reject a stored version this definition cannot use.
@@ -629,7 +660,7 @@ impl AnyDocFamilyDefinition {
         definition: DocFamilyDefinition,
         initial: DocInitial,
         migrate: Option<DocMigrate>,
-        checkpoint_when: Option<DocCheckpointWhen>,
+        checkpoint_when: DocCheckpointWhen,
     ) -> Self {
         Self {
             common: CommonDocDefinition {

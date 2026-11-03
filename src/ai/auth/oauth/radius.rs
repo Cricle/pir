@@ -375,6 +375,8 @@ async fn login_with_device_code(
     interaction.notify(AuthEvent::DeviceCode {
         user_code,
         verification_uri,
+        open_browser_on_confirm: None,
+        copy_code_on_confirm: None,
         interval_seconds: interval,
         expires_in_seconds: Some(expires_in),
     });

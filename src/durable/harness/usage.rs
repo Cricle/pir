@@ -155,6 +155,6 @@ pub static USAGE_DEFINITION: LazyLock<AnyDocDefinition> = LazyLock::new(|| {
             .expect("the pi.usage definition version is valid"),
         usage_initial,
         None,
-        Some(usage_checkpoint_when),
+        usage_checkpoint_when,
     )
 });

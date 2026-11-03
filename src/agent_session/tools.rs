@@ -111,6 +111,56 @@ impl AgentSession {
         (registry, active)
     }
 
+    /// Extension-tool rows `(name, default_active, activates_on_registration)`
+    /// for the branch-loadout rules: every plugin definition that is not a
+    /// base tool and not a compiled builtin.
+    fn extension_tool_rows(&self) -> Vec<(String, bool, bool)> {
+        let base: std::collections::HashSet<String> = self
+            .tools
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect();
+        self.plugins
+            .as_ref()
+            .map(|plugins| {
+                plugins
+                    .tool_defs()
+                    .into_iter()
+                    .filter(|def| !base.contains(&def.name))
+                    .filter(|def| def.source_info.source != "builtin")
+                    .map(|def| {
+                        let exposure =
+                            crate::agent::tool_execution::ToolExposure::parse(&def.exposure)
+                                .unwrap_or(crate::agent::tool_execution::ToolExposure::Direct);
+                        (
+                            def.name,
+                            def.default_active,
+                            exposure.active_on_registration(def.default_active),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Recompute the active tools for the branch a tree navigation just moved
+    /// to (upstream `_restoreToolsFromTranscript`'s `/tree` half, #11075).
+    /// Keeps the current set when the selection is explicit or the branch
+    /// records no loadout; otherwise installs the branch's recorded names as
+    /// the runtime active-tools override.
+    pub(super) fn restore_branch_active_tools(&self, history: &[Message]) {
+        let Some(names) = recorded_active_names(
+            self.tool_selection.as_ref(),
+            history,
+            &self.extension_tool_rows(),
+        ) else {
+            return;
+        };
+        if let Ok(mut override_names) = self.active_tools_override.write() {
+            *override_names = Some(names);
+        }
+    }
+
     /// Whether the session's active set derives from the DEFAULT tools instead
     /// of an explicit selection (upstream `AgentSessionConfig.usesDefaultTools`).
     ///
@@ -609,8 +659,9 @@ pub(crate) fn mcp_direct_tool_names_for(
 /// tools. Only a record that opens with a declaration is complete, which is the
 /// shape every pir transcript has (the first request of a session declares the
 /// whole loadout).
-fn recorded_tool_loadout(messages: &[Message]) -> Option<Vec<String>> {
+fn recorded_tool_loadout(messages: &[Message]) -> Option<(Vec<String>, Vec<String>)> {
     let mut declared: Option<Vec<String>> = None;
+    let mut removed: Vec<String> = Vec::new();
     for message in messages {
         let Message::System(system) = message else {
             continue;
@@ -627,12 +678,18 @@ fn recorded_tool_loadout(messages: &[Message]) -> Option<Vec<String>> {
             if !names.iter().any(|name| name == &tool.name) {
                 names.push(tool.name.clone());
             }
+            // Re-adding a tool clears an earlier removal (the whole branch is
+            // searched, in order; upstream `_restoreToolsFromTranscript`).
+            removed.retain(|name| name != &tool.name);
         }
         for tool in system.tools_removed.iter().flatten() {
             names.retain(|name| name != &tool.name);
+            if !removed.contains(&tool.name) {
+                removed.push(tool.name.clone());
+            }
         }
     }
-    declared
+    declared.map(|names| (names, removed))
 }
 
 /// Apply the transcript's recorded loadout to a session's base tool selection
@@ -648,22 +705,29 @@ fn recorded_tool_loadout(messages: &[Message]) -> Option<Vec<String>> {
 /// `--no-tools` or `--no-builtin-tools` — or when the transcript records no
 /// loadout: upstream's `usesDefaultTools` gate. A `None` selection (no
 /// settings/CLI change) is a default-tools session and restores too.
-pub(super) fn restore_recorded_active_tools(
-    selection: Option<crate::coding_agent::ToolSelection>,
+///
+/// `extension_tools` carries every tool the unified plugin registry knows
+/// about, with its `default_active` flag and whether it activates on
+/// registration. Extension tools the branch never added or removed were
+/// registered after it recorded its loadout (for example after installing an
+/// extension); they activate unless `defaultActive: false`, matching upstream
+/// `_restoreToolsFromTranscript` (#11062). Tools the branch removed stay
+/// inactive.
+/// The active tool names a branch's transcript records, with the selection's
+/// modifiers and late-registered extension tools applied. `None` means the
+/// caller keeps its current set (an explicit selection or no recorded
+/// loadout).
+fn recorded_active_names(
+    selection: Option<&crate::coding_agent::ToolSelection>,
     history: &[Message],
-) -> Option<crate::coding_agent::ToolSelection> {
-    let uses_default_tools = match selection.as_ref() {
-        Some(selection) => selection.uses_default_tools,
-        None => true,
-    };
+    extension_tools: &[(String, bool, bool)],
+) -> Option<Vec<String>> {
+    let uses_default_tools = selection.is_none_or(|selection| selection.uses_default_tools);
     if !uses_default_tools {
-        return selection;
+        return None;
     }
-    let Some(recorded) = recorded_tool_loadout(history) else {
-        return selection;
-    };
+    let (recorded, removed) = recorded_tool_loadout(history)?;
     let modifiers: &[String] = selection
-        .as_ref()
         .map(|selection| selection.modifiers.as_slice())
         .unwrap_or_default();
     // Exact `-name` entries apply in list order; `-pattern` entries are
@@ -671,7 +735,17 @@ pub(super) fn restore_recorded_active_tools(
     // late discovery), so they are applied to the recorded loadout after the
     // exact modifiers — a resumed session must exclude exactly the names a
     // fresh build excludes.
-    let mut names = crate::config::settings::apply_tool_modifiers(&recorded, modifiers);
+    let mut candidates = recorded;
+    for (name, default_active, activates_on_registration) in extension_tools {
+        if *default_active
+            && *activates_on_registration
+            && !candidates.iter().any(|candidate| candidate == name)
+            && !removed.iter().any(|removed| removed == name)
+        {
+            candidates.push(name.clone());
+        }
+    }
+    let mut names = crate::config::settings::apply_tool_modifiers(&candidates, modifiers);
     let patterns: Vec<String> = modifiers
         .iter()
         .filter_map(|entry| entry.strip_prefix('-'))
@@ -682,6 +756,21 @@ pub(super) fn restore_recorded_active_tools(
         names
             .retain(|name| !crate::coding_agent::tool_selection::tool_excluded_by(&patterns, name));
     }
+    Some(names)
+}
+
+pub(super) fn restore_recorded_active_tools(
+    selection: Option<crate::coding_agent::ToolSelection>,
+    history: &[Message],
+    extension_tools: &[(String, bool, bool)],
+) -> Option<crate::coding_agent::ToolSelection> {
+    let Some(names) = recorded_active_names(selection.as_ref(), history, extension_tools) else {
+        return selection;
+    };
+    let modifiers: &[String] = selection
+        .as_ref()
+        .map(|selection| selection.modifiers.as_slice())
+        .unwrap_or_default();
     Some(crate::coding_agent::ToolSelection {
         enabled: names,
         // The `+name`/`-name` entries are applied above (the restored set is

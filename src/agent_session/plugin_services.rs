@@ -261,15 +261,15 @@ use crate::plugins::plugin::services::{
     BarFactory, CancellationHandle, CommandInfo, CompletionContext, CompletionService,
     CustomMessage, DialogOptions, EntryRenderer, EventCallback, EventService, ExecOptions,
     ExecResult, ExecuteToolOptions, ExtensionMode, FactoryRenderContext, FlagService, ForkOptions,
-    MarkdownTransformer, MessageRenderer, MessageService, NavigateTreeOptions, NewSessionOptions,
-    NotifyLevel, OverlayComponent, OverlayComponentFactory, OverlayDone, PluginServiceError,
-    PluginServices, ProviderAuthHooks, ProviderService, RegisteredMcpServer, RendererKind,
-    RendererService, ScopedModel, SelectOption, SendMessageOptions, SendUserMessageOptions,
-    ServiceFuture, ServiceResult, SessionService, StatusEntry, StatusService, StatusSnapshot,
-    Subscription, SystemPromptOptions, ThemeInfo, ThemeSetResult, ThemeSnapshot, ToolCallRef,
-    ToolInfo, ToolRenderRequest, ToolRendererResolver, ToolService, UiService, UserContent,
-    WidgetFactory, WidgetPlacement, WorkingIndicator, CUSTOM_OVERLAY_EVENT_KEY,
-    FACTORY_RENDER_REQUEST_KEY,
+    MarkdownTransformContext, MarkdownTransformer, MessageRenderer, MessageService,
+    NavigateTreeOptions, NewSessionOptions, NotifyLevel, OverlayComponent, OverlayComponentFactory,
+    OverlayDone, PluginServiceError, PluginServices, ProviderAuthHooks, ProviderService,
+    RegisteredMcpServer, RendererKind, RendererService, ScopedModel, SelectOption,
+    SendMessageOptions, SendUserMessageOptions, ServiceFuture, ServiceResult, SessionService,
+    StatusEntry, StatusService, StatusSnapshot, Subscription, SystemPromptOptions, ThemeInfo,
+    ThemeSetResult, ThemeSnapshot, ToolCallRef, ToolInfo, ToolRenderRequest, ToolRendererResolver,
+    ToolService, UiService, UserContent, WidgetFactory, WidgetPlacement, WorkingIndicator,
+    CUSTOM_OVERLAY_EVENT_KEY, FACTORY_RENDER_REQUEST_KEY,
 };
 use crate::plugins::plugin::PluginContext;
 use crate::plugins::PluginHost;
@@ -3860,6 +3860,14 @@ impl RendererService for NativeRendererService {
     }
 
     fn transform_markdown(&self, markdown: &str) -> Option<String> {
+        self.transform_markdown_with_context(markdown, &MarkdownTransformContext::default())
+    }
+
+    fn transform_markdown_with_context(
+        &self,
+        markdown: &str,
+        context: &MarkdownTransformContext,
+    ) -> Option<String> {
         let transformers: Vec<Arc<dyn MarkdownTransformer>> = self
             .registries
             .markdown_transformers
@@ -3874,9 +3882,9 @@ impl RendererService for NativeRendererService {
         for transformer in transformers {
             // `None` keeps the current text; `Some` feeds the next
             // transformer in registration order.
-            if let Some(Some(next)) =
-                catch_native_callback("markdown transformer", || transformer.transform(&text))
-            {
+            if let Some(Some(next)) = catch_native_callback("markdown transformer", || {
+                transformer.transform_with_context(&text, context)
+            }) {
                 text = next;
                 changed = true;
             }

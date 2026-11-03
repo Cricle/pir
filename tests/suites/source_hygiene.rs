@@ -160,7 +160,7 @@ fn src_tree_contains_only_expected_file_kinds() {
 // programming error surfaced immediately rather than a runtime condition.
 // The serde sites serialize the crate's own derive-only message/checkpoint
 // types into memory.
-const EXPECT_SITE_ALLOWLIST: [(&str, u32); 28] = [
+const EXPECT_SITE_ALLOWLIST: [(&str, u32); 27] = [
     ("plugins/tool_repair/grammar.rs", 196),
     ("ai/api/constrained_sampling.rs", 178),
     // These three shifted down when the queue-bounds work added the
@@ -192,23 +192,22 @@ const EXPECT_SITE_ALLOWLIST: [(&str, u32); 28] = [
     ("plugins/builtin/context_mode/fetch.rs", 228),
     ("durable/harness/documents.rs", 128),
     ("durable/harness/documents.rs", 145),
-    ("durable/harness/generation.rs", 315),
+    ("durable/harness/generation.rs", 317),
     // The task definition build, the `pi.user` draft and the
     // `pi.assistant` draft: same invariants as before, shifted by the
     // handoff/continuation and streamed-projection edits above them
-    // (598 → 609, 2525 → 2586, 2752 → 2815).
-    ("durable/harness/generation.rs", 609),
-    ("durable/harness/generation.rs", 2586),
-    ("durable/harness/generation.rs", 2815),
-    ("durable/harness/harness.rs", 1795),
+    // (598 → 611, 2525 → 2638, 2752 → 2867).
+    ("durable/harness/generation.rs", 611),
+    ("durable/harness/generation.rs", 2638),
+    ("durable/harness/generation.rs", 2867),
     ("durable/harness/inbox.rs", 289),
     ("durable/harness/live.rs", 320),
     ("durable/harness/prompt.rs", 197),
     ("durable/harness/provider.rs", 70),
     ("durable/harness/registry.rs", 524),
     ("durable/harness/registry.rs", 564),
-    ("durable/harness/tool.rs", 520),
-    ("durable/harness/tool.rs", 528),
+    ("durable/harness/tool.rs", 521),
+    ("durable/harness/tool.rs", 529),
     ("durable/harness/usage.rs", 155),
     ("durable/harness/view.rs", 223),
 ];

@@ -6,10 +6,10 @@
 
 use pir::durable::{
     define_doc, define_doc_family, delay_steps, CommonDocDefinition, DocCheckpointWhen,
-    DocDefinition, DocFamilyDefinition, DocMigrate, DocTokenKind, DocumentError, DocumentFork,
-    DocumentHistory, DocumentRecord, DocumentScope, DocumentSemantics, HostCallback, ReportInfo,
-    ReportTask, SetTimer, SetTimerFn, StorageError, TaskFaultReason, TaskOutdatedReason,
-    TimerCancel, TimerOptions, Timers, MAX_TIMER_DELAY_MS,
+    DocCheckpointWhenExt, DocDefinition, DocFamilyDefinition, DocMigrate, DocTokenKind,
+    DocumentError, DocumentFork, DocumentHistory, DocumentRecord, DocumentScope, DocumentSemantics,
+    HostCallback, ReportInfo, ReportTask, SetTimer, SetTimerFn, StorageError, TaskFaultReason,
+    TaskOutdatedReason, TimerCancel, TimerOptions, Timers, MAX_TIMER_DELAY_MS,
 };
 use pir::durable::{ConversationId, DocumentId, Seq, TaskId};
 use serde_json::{json, Map, Value};
@@ -106,7 +106,7 @@ fn version_must_be_a_positive_integer() {
 #[test]
 fn identity_definition_lifts_into_behaviour_form() {
     let identity = DocDefinition::session("demo", 2).expect("valid");
-    let behaviour = identity.behaviour(initial_session, None, None);
+    let behaviour = identity.behaviour(initial_session, None, DocCheckpointWhen::never());
     assert_eq!(behaviour.common.kind, "demo");
     assert_eq!(behaviour.common.version, 2);
     assert_eq!(behaviour.initial_value().get("count"), Some(&json!(0)));
@@ -119,7 +119,7 @@ fn identity_definition_lifts_into_behaviour_form() {
 fn family_definition_is_marked_as_family() {
     let identity =
         DocFamilyDefinition::conversation_latest("board", 1, DocumentFork::Current).expect("valid");
-    let behaviour = identity.behaviour(initial_session, None, None);
+    let behaviour = identity.behaviour(initial_session, None, DocCheckpointWhen::never());
     assert!(behaviour.is_family());
     assert_eq!(behaviour.common.semantics.scope_kind(), "conversation");
     assert_eq!(
@@ -129,16 +129,19 @@ fn family_definition_is_marked_as_family() {
 }
 
 #[test]
-fn checkpoint_when_some_and_none() {
+fn checkpoint_when_is_required_and_never_is_explicit() {
     fn always(_: &Map<String, Value>) -> bool {
         true
     }
     let forced =
-        session_definition(1).behaviour(initial_session, None, Some(always as DocCheckpointWhen));
+        session_definition(1).behaviour(initial_session, None, always as DocCheckpointWhen);
     assert!(forced.forces_checkpoint(&initial_session()));
 
-    let never = session_definition(1).behaviour(initial_session, None, None);
+    // `never()` is the explicit opt-out upstream spells `() => false`; it is a
+    // required policy, not an absent one, and it never forces a base.
+    let never = session_definition(1).behaviour(initial_session, None, DocCheckpointWhen::never());
     assert!(!never.forces_checkpoint(&initial_session()));
+    assert!(!never.forces_checkpoint(&json!({ "count": 42 }).as_object().unwrap().clone()));
 }
 
 #[test]
@@ -146,7 +149,7 @@ fn migrate_runs_for_older_versions_only() {
     let definition = session_definition(2).behaviour(
         initial_session,
         Some(migrate_v1_to_v2 as DocMigrate),
-        None,
+        DocCheckpointWhen::never(),
     );
 
     // Older stored version with a migration: accepted and transformed.
@@ -172,7 +175,8 @@ fn migrate_runs_for_older_versions_only() {
 
 #[test]
 fn older_version_without_migrate_is_rejected() {
-    let definition = session_definition(2).behaviour(initial_session, None, None);
+    let definition =
+        session_definition(2).behaviour(initial_session, None, DocCheckpointWhen::never());
     assert!(definition
         .check_record_version(DocumentId::from_raw(1), "demo", 1)
         .is_err());
@@ -187,7 +191,7 @@ fn definition_materialize_applies_migration_and_checks_scope() {
     let definition = session_definition(2).behaviour(
         initial_session,
         Some(migrate_v1_to_v2 as DocMigrate),
-        None,
+        DocCheckpointWhen::never(),
     );
     let record = conversation_record("demo");
     let value = definition
@@ -210,20 +214,24 @@ fn definition_materialize_applies_migration_and_checks_scope() {
 
 #[test]
 fn tokens_derive_their_owner_kind() {
-    let session = define_doc(session_definition(1).behaviour(initial_session, None, None));
+    let session = define_doc(session_definition(1).behaviour(
+        initial_session,
+        None,
+        DocCheckpointWhen::never(),
+    ));
     assert_eq!(session.kind, DocTokenKind::Session);
 
     let task = define_doc(CommonDocDefinition::task("demo", 1).unwrap().behaviour(
         initial_session,
         None,
-        None,
+        DocCheckpointWhen::never(),
     ));
     assert_eq!(task.kind, DocTokenKind::Task);
 
     let family = define_doc_family(
         DocFamilyDefinition::conversation_rewindable("board", 1, DocumentFork::AsOf)
             .unwrap()
-            .behaviour(initial_session, None, None),
+            .behaviour(initial_session, None, DocCheckpointWhen::never()),
     );
     assert_eq!(family.kind, DocTokenKind::Conversation);
 }

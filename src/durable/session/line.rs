@@ -59,7 +59,7 @@ use futures_util::FutureExt;
 use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::durable::context::Context;
-use crate::durable::errors::{HostCallback, ReportInfo, StorageError};
+use crate::durable::errors::{HostCallback, ReadOnlySession, ReportInfo, StorageError};
 use crate::durable::harness::telemetry::{HarnessTelemetry, SpanHandle};
 use crate::durable::ids::{DocumentId, Seq};
 use crate::durable::session::assemble::{
@@ -415,6 +415,14 @@ pub struct SessionOptions {
     /// [`CommitPersistence::Deferred`] carries [`DeferDeadline::Default`];
     /// `None` uses [`DEFAULT_PERSIST_WITHIN_MS`] (1,000 ms).
     pub persist_within_ms: Option<u64>,
+    /// Open as a viewer of a session another process drives
+    /// (upstream `HarnessOptions.readOnly`).
+    ///
+    /// A commit with writes is refused before it reaches storage with
+    /// [`ReadOnlySession`](crate::durable::errors::ReadOnlySession); a commit
+    /// that writes nothing succeeds and reads, watches and close work as
+    /// usual. The Session stays healthy after a refusal.
+    pub read_only: bool,
     /// Document-definition behaviours assembly consults (`checkpointWhen`).
     ///
     /// The line owns assembly ([`run_commit`]), so it — not the caller's
@@ -441,6 +449,7 @@ impl std::fmt::Debug for SessionOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionOptions")
             .field("document_retention_ms", &self.document_retention_ms)
+            .field("read_only", &self.read_only)
             .finish_non_exhaustive()
     }
 }
@@ -701,6 +710,9 @@ pub struct SessionInner {
     pub timers: Timers,
     /// Documents whose deferred commits are held in memory, by incarnation.
     pub holds: std::collections::BTreeMap<DocumentId, HeldDocument>,
+    /// Refuse every commit with writes before storage
+    /// (upstream `SessionImpl.#readOnly`).
+    pub read_only: bool,
     /// Deferred deadline used by [`DeferDeadline::Default`].
     persist_within_ms: u64,
     /// The held-commit count, published to handles so a read can skip a
@@ -1631,6 +1643,7 @@ pub fn open_with_report_and_timers(
         telemetry: options.telemetry,
         timers: timers.unwrap_or_else(|| Timers::native(timer_report)),
         holds: std::collections::BTreeMap::new(),
+        read_only: options.read_only,
         persist_within_ms: options
             .persist_within_ms
             .unwrap_or(DEFAULT_PERSIST_WITHIN_MS),
@@ -1731,6 +1744,9 @@ async fn run_line_loop(
                                 }));
                             match outcome {
                                 Ok(writes) if writes.is_empty() => Ok(()),
+                                Ok(_) if inner.read_only => Err(StorageError::ReadOnly(
+                                    ReadOnlySession::new("a close-time write"),
+                                )),
                                 Ok(writes) => {
                                     let storage = inner.storage.storage();
                                     inner
@@ -2321,6 +2337,19 @@ async fn run_commit(inner: &mut SessionInner, job: CommitJob) {
     if writes.is_empty() && plans.is_empty() {
         inner.sweep_documents();
         let _ = job.reply.send(Ok(value));
+        return;
+    }
+    // A read-only Session refuses every commit with writes before any storage
+    // call, so the batch can neither be held nor stored and the failure guard
+    // never sees it (upstream `#readOnly` in `#runCommit`). A commit that
+    // writes nothing already returned above and succeeds.
+    if inner.read_only && !writes.is_empty() {
+        inner.sweep_documents();
+        let _ = job
+            .reply
+            .send(Err(StorageError::ReadOnly(ReadOnlySession::new(
+                "a commit with writes",
+            ))));
         return;
     }
     // ── deferred commit (upstream `CommitPersistence`) ──────────────────────

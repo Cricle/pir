@@ -25,7 +25,20 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
+        // Use a neutral Windows root when the process temp dir lives under a
+        // developer profile: the trust scan walks every ancestor and would
+        // otherwise find the user's real `.agents/skills`.
+        let base = if cfg!(windows) {
+            let public = PathBuf::from("C:\\Users\\Public");
+            if public.is_dir() {
+                public
+            } else {
+                std::env::temp_dir()
+            }
+        } else {
+            std::env::temp_dir()
+        };
+        let path = base.join(format!(
             "pir-lane-event3-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -341,12 +354,11 @@ fn projects_without_trust_requiring_resources_skip_the_bootstrap_pass() {
     let fixture = Fixture::new("skip", port, false);
 
     // `has_trust_requiring_project_resources` also scans ancestor
-    // `.agents/skills` dirs and skips only the one under HOME. This Windows
-    // image keeps `.agents/skills` in the system temp dir (the fixture's
-    // ancestor), so point HOME at that same dir: the only ancestor hit then
-    // equals the user-scope dir and is skipped, leaving the project with no
-    // trust-requiring resources (the branch this test pins).
-    let ancestor_home = std::env::temp_dir();
+    // `.agents/skills` dirs and skips only the one under HOME. The fixture
+    // root is a neutral temp dir (see `TempDir::new`), so HOME=root and no
+    // ancestor carries `.agents/skills`: the project has no trust-requiring
+    // resources (the branch this test pins).
+    let ancestor_home = fixture.root.0.clone();
     let json = run_host(
         &fixture.agent,
         &ancestor_home,

@@ -253,6 +253,8 @@ async fn login_device_code(interaction: &dyn AuthInteraction) -> AiResult<OAuthC
     interaction.notify(AuthEvent::DeviceCode {
         user_code: device.user_code.clone(),
         verification_uri: DEVICE_VERIFICATION_URI.to_string(),
+        open_browser_on_confirm: None,
+        copy_code_on_confirm: None,
         interval_seconds: Some(device.interval_seconds),
         expires_in_seconds: Some(DEVICE_CODE_TIMEOUT_SECONDS),
     });

@@ -22,7 +22,7 @@
 #   cargo test --test unsafe_gate -- --ignored --nocapture print_current_unsafe_allowlist
 # The helper prints bare counts; re-add each per-entry boundary comment during
 # review (they are part of the reviewed inventory, not decoration).
-coding_agent/tools/bash.rs 4 0 0  # Win32 Job Object FFI; Unix killpg on the shell's process group
+coding_agent/tools/bash.rs 5 0 0  # Win32 Job Object FFI; Win32 GetFileAttributesW shell-path check; Unix killpg on the shell's process group
 coding_agent/tools/confine.rs 27 0 0  # Unix openat/mkdirat/fstatat/renameat/unlinkat; Win32 reparse-point-aware open
 coding_agent/tools/shell_pool.rs 28 1 0  # Win32 Job Object/console FFI, Unix geteuid; one unsafe fn (ACL check)
 coding_agent/tools/spill.rs 16 0 0  # Win32 security-descriptor/ACL + CreateFileW FFI

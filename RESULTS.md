@@ -301,3 +301,38 @@ http_poll_pacing 的连接上限回归、phone 父会话图片断言、mcp 阻�
 上弦、响应循环的 `notifications/cancelled` 改为 detach 发送，定时器不再被阻塞的传输写挡住。
 `cargo test --test mcp_integration`：**70 passed / 0 failed / 0 ignored**。
 
+
+## 8. 2026-11-03 上游漂移收口（代码核实）
+
+`docs/upstream-drift-status.md` 的 9 项 Open/Partial 已全部关闭并按代码证据
+修正：handoff 后的 postTools 续跑、deferred 节流提交与 partial append、
+`getDistinctModelName`、device-code 确认、markdown transformer context、
+HTML 导出 system prompt/update、只读 Harness、adoption 顺序（单写者等价）
+与 watch retirement（原文档两项过期结论已改正）。Rex 检测与
+`checkpointWhen` 必填同时落地。
+
+门禁：`cargo test --test g_durable` **747/747**；定向
+`tui_model_names` 2/2、`tui_drift_w1` 19/19、`tui_commands_parity` 22/22、
+`plugin_renderer_completion` 8/8、`d32_resume_active_tools` 11/11、
+`export_html` 15/15、`source_hygiene` 3/3；`cargo test --doc` 33/0；
+`cargo clippy --all-targets --all-features --locked -- -D warnings` EXIT 0；
+`cargo fmt --all -- --check` EXIT 0。
+
+全量 `test_fast.ps1`（318 suites，2026-11-04 复跑）：**6774 passed / 0 real
+failures**（并行阶段 2 个 load-flaky，串行重试全部通过：`g_agent` 940/940、
+`lane_event3_json_host` 3/3；13 个空 harness 不计入）。本轮修复了
+`unsafe_gate` 的 allowlist、`tui_render_parity` 的 scratch-pool helper、
+`tool_repair` 的 mutation-only result 同步、native-only
+`extension_ui_request` 镜像，以及 `session_lock_scopes`/`sdk_units`/
+`lane_event3_json_host` 的测试隔离问题。
+
+**2026-11-04 续作**：`bd3c9b823` 的 `/tree` 分支 loadout 已由
+`AgentSession::restore_branch_active_tools` 补全（`d32` 11/11，含
+`tree_navigation_restores_the_target_branch_loadout`）；110-commit 窗口
+16 个未检查提交已全部给出结论（详见 drift 文档“Checked”表）。同时补上
+Windows PowerShell 安装目录回退（`61060ddf8`）、Unix 剪贴板 helper 独立
+进程组（`f8ab362cc`）和 GitHub Copilot 默认模型 `gpt-6.1-sol`
+（`e5fe9777b`）。回归：`g_ai` 763/763、`g_tui` 777/777、`g_durable` 747/747。
+
+`28bea006b` 的 Windows Store shell alias 校验也改用
+`GetFileAttributesW`（`shell_path_exists`）；两个窗口已无未处理项。

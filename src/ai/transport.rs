@@ -688,6 +688,11 @@ impl SerializedPayloadFile {
     pub fn len(&self) -> u64 {
         self.len
     }
+
+    /// Whether the serialized body is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 impl Drop for SerializedPayloadFile {

@@ -320,7 +320,7 @@ pub static LIVE_DEFINITION: LazyLock<AnyDocDefinition> = LazyLock::new(|| {
             .expect("the pi.live definition version is valid"),
         live_initial,
         None,
-        Some(live_checkpoint_when),
+        live_checkpoint_when,
     )
 });
 

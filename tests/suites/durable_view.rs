@@ -41,8 +41,9 @@ use pir::durable::session::{
     CommitPublication, ConversationOwnership, Session, SessionOptions, TaskOptions,
 };
 use pir::durable::{
-    CommonDocDefinition, Context, ConversationId, DocOwner, DocumentSemantics, EntryRecord,
-    JsonObject, MemoryStorage, ResolvedAddress, Storage, StorageError, TaskDefinition,
+    CommonDocDefinition, Context, ConversationId, DocCheckpointWhen, DocCheckpointWhenExt,
+    DocOwner, DocumentSemantics, EntryRecord, JsonObject, MemoryStorage, ResolvedAddress, Storage,
+    StorageError, TaskDefinition,
 };
 
 // ── session / conversation helpers ─────────────────────────────────────────
@@ -383,7 +384,7 @@ async fn docs_are_the_mounted_conversations_built_ins_only() {
         .expect("create task");
     let task_definition = CommonDocDefinition::task(LIVE_KIND, 1)
         .expect("task document definition")
-        .behaviour(empty_document, None, None);
+        .behaviour(empty_document, None, DocCheckpointWhen::never());
     let task_address = ResolvedAddress::new(
         LIVE_KIND,
         DocumentSemantics::Task,
@@ -405,7 +406,7 @@ async fn docs_are_the_mounted_conversations_built_ins_only() {
 
     let session_definition = CommonDocDefinition::session(LIVE_KIND, 1)
         .expect("session document definition")
-        .behaviour(empty_document, None, None);
+        .behaviour(empty_document, None, DocCheckpointWhen::never());
     let session_address = ResolvedAddress::new(LIVE_KIND, DocumentSemantics::Session, None, None)
         .expect("session document address");
     session
@@ -560,7 +561,7 @@ async fn a_task_document_with_a_builtin_kind_never_overrides_a_conversation_docu
         .expect("create task");
     let task_definition = CommonDocDefinition::task(LIVE_KIND, 1)
         .expect("task document definition")
-        .behaviour(empty_document, None, None);
+        .behaviour(empty_document, None, DocCheckpointWhen::never());
     let task_address = ResolvedAddress::new(
         LIVE_KIND,
         DocumentSemantics::Task,

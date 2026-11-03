@@ -14,7 +14,10 @@
 //! submissions, and produces the exact write batch. Nothing here reaches
 //! storage except **reads**, and no plan is observable until
 //! [`adopt`] runs after [`Storage::commit`](crate::durable::Storage::commit)
-//! succeeded.
+//! succeeded. The session line is the single serialized writer: `adopt` runs
+//! before the next line command can begin, which is upstream's
+//! adopt-before-the-next-commit contract in a single-threaded kernel. No later
+//! commit can read or write against an unadopted batch.
 //!
 //! # Ordering rules (spec §4)
 //!

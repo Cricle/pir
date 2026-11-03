@@ -319,6 +319,14 @@ fn run_clipboard_command(program: &str, args: &[impl AsRef<std::ffi::OsStr>], te
         use std::os::windows::process::CommandExt as _;
         command.creation_flags(0x0800_0000);
     }
+    // A clipboard writer may daemonize. Give it its own process group so a
+    // Ctrl+Z (SIGTSTP to pi's group) cannot suspend the clipboard owner
+    // (upstream `clipboard-command.ts:10-13`, #11179).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
     let Ok(mut child) = command.spawn() else {
         return false;
     };

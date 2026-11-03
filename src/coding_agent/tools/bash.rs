@@ -714,6 +714,31 @@ fn bash_shell_config(shell: &str) -> ShellConfig {
     }
 }
 
+/// Whether a shell path exists (upstream `shellPathExists`). On Windows this
+/// uses `GetFileAttributesW`, the `access(F_OK)` equivalent: Node's
+/// `existsSync` extra stat rejects runnable Windows Store aliases with EACCES
+/// (nodejs/node#36790), while the attribute query accepts them (#11131 /
+/// `28bea006b`). Unix keeps the plain file check.
+#[allow(unsafe_code)] // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that lives across the call; `GetFileAttributesW` only reads it.
+pub(crate) fn shell_path_exists(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let attributes =
+            unsafe { windows_sys::Win32::Storage::FileSystem::GetFileAttributesW(wide.as_ptr()) };
+        attributes != u32::MAX
+    }
+    #[cfg(not(windows))]
+    {
+        path.is_file()
+    }
+}
+
 /// Locate an executable on `PATH` (upstream `findExecutableOnPath`: `where` on
 /// Windows, `which` elsewhere; the first existing match wins).
 fn find_executable_on_path(executable: &str) -> Option<String> {
@@ -736,7 +761,7 @@ fn find_executable_on_path(executable: &str) -> Option<String> {
     stdout
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty() && std::path::Path::new(line).exists())
+        .find(|line| !line.is_empty() && shell_path_exists(std::path::Path::new(line)))
         .map(|line| line.to_string())
 }
 
@@ -755,7 +780,7 @@ fn find_executable_on_path(executable: &str) -> Option<String> {
 /// zero-install fallback.
 pub fn resolve_shell_config(shell_path: Option<&std::path::Path>) -> Result<ShellConfig, String> {
     if let Some(path) = shell_path {
-        if !path.exists() {
+        if !shell_path_exists(path) {
             return Err(format!("Custom shell path not found: {}", path.display()));
         }
         return Ok(bash_shell_config(&path.to_string_lossy()));
@@ -786,7 +811,7 @@ pub fn resolve_shell_config(shell_path: Option<&std::path::Path>) -> Result<Shel
             );
         }
         for candidate in &candidates {
-            if candidate.exists() {
+            if shell_path_exists(candidate) {
                 return Ok(bash_shell_config(&candidate.to_string_lossy()));
             }
         }

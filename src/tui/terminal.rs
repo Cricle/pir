@@ -963,6 +963,8 @@ pub enum ScopedModelsRefreshKind {
 struct ScopedModelsState {
     /// Every `(provider, id)` ref the registry can serve, in registry order.
     all_refs: Vec<String>,
+    /// `provider/id` → display name, for the `(name)` suffix.
+    names: std::collections::BTreeMap<String, String>,
     /// The session-only enabled set (`None` = all enabled).
     enabled: super::slash::EnabledModels,
     /// Highlighted row (an index into the filtered display order).
@@ -998,12 +1000,22 @@ impl ScopedModelsSelector {
     /// `pairs`: the cached `(provider, id)` catalog; `enabled`: the
     /// session-only enabled set.
     pub fn new(pairs: &[(String, String)], enabled: super::slash::EnabledModels) -> Self {
+        Self::new_with_names(pairs, &std::collections::BTreeMap::new(), enabled)
+    }
+
+    /// [`Self::new`] with `provider/id` → display-name entries.
+    pub fn new_with_names(
+        pairs: &[(String, String)],
+        names: &std::collections::BTreeMap<String, String>,
+        enabled: super::slash::EnabledModels,
+    ) -> Self {
         Self {
             state: Mutex::new(ScopedModelsState {
                 all_refs: pairs
                     .iter()
                     .map(|(provider, id)| format!("{provider}/{id}"))
                     .collect(),
+                names: names.clone(),
                 enabled,
                 selected: 0,
                 query: String::new(),
@@ -1022,6 +1034,16 @@ impl ScopedModelsSelector {
         pairs: &[(String, String)],
         enabled: Option<super::slash::EnabledModels>,
     ) {
+        self.update_models_with_names(pairs, &std::collections::BTreeMap::new(), enabled);
+    }
+
+    /// [`Self::update_models`] with display names.
+    pub fn update_models_with_names(
+        &self,
+        pairs: &[(String, String)],
+        names: &std::collections::BTreeMap<String, String>,
+        enabled: Option<super::slash::EnabledModels>,
+    ) {
         let mut state = self
             .state
             .lock()
@@ -1031,6 +1053,7 @@ impl ScopedModelsSelector {
             .iter()
             .map(|(provider, id)| format!("{provider}/{id}"))
             .collect();
+        state.names = names.clone();
         if let Some(enabled) = enabled {
             state.enabled = enabled;
         }
@@ -1336,8 +1359,14 @@ impl ScopedModelsSelector {
             } else {
                 "  "
             };
+            let name = reference
+                .split_once('/')
+                .and_then(|(_, id)| state.names.get(reference).map(|name| (id, name)))
+                .and_then(|(id, name)| super::selector::get_distinct_model_name(id, name))
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default();
             lines.push(ansi::pad_to_width(
-                &format!("{cursor}{check}{reference}"),
+                &format!("{cursor}{check}{reference}{name}"),
                 width,
             ));
         }
@@ -4637,6 +4666,23 @@ fn model_pairs(app: &App) -> Vec<(String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// `provider/id` → display name for the selectors. The registry entries carry
+/// the names `models.json` overrides rename (upstream `model.name`).
+fn model_names(app: &App) -> std::collections::BTreeMap<String, String> {
+    let models = if let Some(session) = live_session(app) {
+        session.available_models()
+    } else {
+        app.configured
+            .as_ref()
+            .map(|configured| configured.registry.get_models())
+            .unwrap_or_default()
+    };
+    models
+        .into_iter()
+        .map(|model| (format!("{}/{}", model.provider, model.id), model.name))
+        .collect()
 }
 
 /// Refresh the live session's provider model lists through the session-aware
@@ -10607,8 +10653,14 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                         let display = if already_visible {
                             None
                         } else {
-                            let (display, transform_error) =
-                                transform_markdown(&app, &raw, "user", false);
+                            let (display, transform_error) = transform_markdown(
+                                &app,
+                                &raw,
+                                "user",
+                                false,
+                                entry.get("id").and_then(serde_json::Value::as_str),
+                                entry.get("timestamp").and_then(serde_json::Value::as_str),
+                            );
                             if let Some(error) = transform_error {
                                 entries.push(ChatEntry::Notice {
                                     kind: super::app::NoticeKind::Warning,
@@ -10759,13 +10811,15 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     }
                     let models = model_pairs(&app);
                     let scoped_models = scoped_model_pairs(&app);
+                    let names = model_names(&app);
                     let current = app
                         .configured
                         .as_ref()
                         .map(|c| format!("{}/{}", c.model.provider, c.model.id));
-                    let selector = ModelSelector::new(&models, current.as_deref(), None);
+                    let selector =
+                        ModelSelector::new_with_names(&models, &names, current.as_deref(), None);
                     if !scoped_models.is_empty() {
-                        selector.set_scoped_models(&scoped_models);
+                        selector.set_scoped_models_with_names(&scoped_models, &names);
                     }
                     if !query.is_empty() {
                         selector.set_query(&query);
@@ -10795,7 +10849,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some(selector) = &overlay.scoped_models {
                         if !pairs.is_empty() {
-                            selector.update_models(&pairs, None);
+                            selector.update_models_with_names(&pairs, &model_names(&app), None);
                         }
                         selector.set_refresh_status(message, kind);
                         dirty = true;
@@ -13424,6 +13478,7 @@ impl crate::ai::auth::AuthInteraction for TuiLoginInteraction {
     }
 
     fn notify(&self, event: crate::ai::auth::AuthEvent) {
+        let mut device_code = None;
         let message = match event {
             crate::ai::auth::AuthEvent::Info { message, links } => {
                 let mut text = message;
@@ -13444,8 +13499,18 @@ impl crate::ai::auth::AuthInteraction for TuiLoginInteraction {
             crate::ai::auth::AuthEvent::DeviceCode {
                 user_code,
                 verification_uri,
+                open_browser_on_confirm,
+                copy_code_on_confirm,
                 ..
-            } => format!("Open {verification_uri} and enter code: {user_code}"),
+            } => {
+                device_code = Some((
+                    user_code.clone(),
+                    verification_uri.clone(),
+                    open_browser_on_confirm,
+                    copy_code_on_confirm,
+                ));
+                format!("Open {verification_uri} and enter code: {user_code}")
+            }
             crate::ai::auth::AuthEvent::Progress { message } => message,
         };
         {
@@ -13454,6 +13519,9 @@ impl crate::ai::auth::AuthInteraction for TuiLoginInteraction {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(selector) = &guard.auth {
+                if let Some((user_code, verification_uri, open, copy)) = device_code {
+                    selector.show_device_code(user_code, verification_uri, open, copy);
+                }
                 selector.set_progress(message, false);
             }
         }
@@ -16589,10 +16657,19 @@ fn transform_markdown(
     markdown: &str,
     message_type: &str,
     is_streaming: bool,
+    message_id: Option<&str>,
+    timestamp: Option<&str>,
 ) -> (String, Option<String>) {
     if markdown.is_empty() {
         return (markdown.to_string(), None);
     }
+    let context = crate::plugins::services::MarkdownTransformContext {
+        message_type: message_type.to_owned(),
+        is_streaming,
+        available_width: app.core.columns(),
+        message_id: message_id.map(str::to_owned),
+        timestamp: timestamp.map(str::to_owned),
+    };
     let defs = app
         .renderer_defs
         .lock()
@@ -16621,6 +16698,8 @@ fn transform_markdown(
                     "messageType": message_type,
                     "isStreaming": is_streaming,
                     "availableWidth": app.core.columns(),
+                    "messageId": message_id,
+                    "timestamp": timestamp,
                 }),
             };
             match invoker.invoke(&request) {
@@ -16634,7 +16713,7 @@ fn transform_markdown(
     if native_count > 0 {
         if let Some(service) = native {
             if let Some(transformed) =
-                with_native_render_guard(app, || native_markdown(service.as_ref(), &text))
+                with_native_render_guard(app, || native_markdown(service.as_ref(), &text, &context))
             {
                 text = transformed;
             }
@@ -16664,7 +16743,7 @@ fn transform_assistant_markdown(
     for block in &mut message.content {
         if let crate::ai::types::ContentBlock::Text(text_block) = block {
             let (transformed, error) =
-                transform_markdown(app, &text_block.text, "assistant", false);
+                transform_markdown(app, &text_block.text, "assistant", false, None, None);
             if let Some(error) = error {
                 entries.push(ChatEntry::Notice {
                     kind: super::app::NoticeKind::Warning,
@@ -17818,9 +17897,14 @@ fn run_action(
                     c.settings.default_model.as_deref().unwrap_or("")
                 )
             });
-            let selector = ModelSelector::new(&models, current.as_deref(), default.as_deref());
+            let selector = ModelSelector::new_with_names(
+                &models,
+                &model_names(app),
+                current.as_deref(),
+                default.as_deref(),
+            );
             if scoped && !scoped_models.is_empty() {
-                selector.set_scoped_models(&scoped_models);
+                selector.set_scoped_models_with_names(&scoped_models, &model_names(app));
             }
             overlay.model = Some(selector);
             false
@@ -18424,13 +18508,15 @@ fn handle_command(
                 let scoped = has_model_scope(app);
                 let models = model_pairs(app);
                 let scoped_models = scoped_model_pairs(app);
+                let names = model_names(app);
                 let current = app
                     .configured
                     .as_ref()
                     .map(|c| format!("{}/{}", c.model.provider, c.model.id));
-                let selector = ModelSelector::new(&models, current.as_deref(), None);
+                let selector =
+                    ModelSelector::new_with_names(&models, &names, current.as_deref(), None);
                 if scoped && !scoped_models.is_empty() {
-                    selector.set_scoped_models(&scoped_models);
+                    selector.set_scoped_models_with_names(&scoped_models, &names);
                 }
                 overlay.model = Some(selector);
             } else {
@@ -18773,7 +18859,8 @@ fn handle_command(
                 .overlay
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let selector = ScopedModelsSelector::new(&models, enabled);
+            let selector =
+                ScopedModelsSelector::new_with_names(&models, &model_names(app), enabled);
             // Live in-selector catalog refresh (upstream
             // `showModelsSelector`, interactive-mode.ts:5447-5494): the
             // selector opens on the cached catalog with the pending status
@@ -20173,7 +20260,7 @@ fn submit_user_prompt(
     text: &str,
     follow_up: bool,
 ) {
-    let (transformed, error) = transform_markdown(app, text, "user", false);
+    let (transformed, error) = transform_markdown(app, text, "user", false, None, None);
     if let Some(error) = error {
         entries.push(ChatEntry::Notice {
             kind: super::app::NoticeKind::Warning,

@@ -22,12 +22,12 @@ use pir::durable::session::{
 use pir::durable::types::StorageFuture;
 use pir::durable::{
     address_id, CommonDocDefinition, Context, ConversationId, ConversationQuery,
-    ConversationRecord, Cursor, DocOwner, DocumentAddress, DocumentContent, DocumentCreate,
-    DocumentFork, DocumentId, DocumentPoint, DocumentQuery, DocumentRecord, DocumentScope,
-    DocumentSemantics, EntryId, EntryQuery, EntryRecord, EntryWithSeq, JsonObject, MemoryStorage,
-    Page, ResolvedAddress, Seq, Storage, StorageError, StorageWrite, StoredDocument, SubmissionId,
-    SubmissionQuery, SubmissionRecord, SubmissionStatus, SubmissionType, TaskDefinition, TaskId,
-    TaskQuery, TaskRecord, TaskState,
+    ConversationRecord, Cursor, DocCheckpointWhen, DocCheckpointWhenExt, DocOwner, DocumentAddress,
+    DocumentContent, DocumentCreate, DocumentFork, DocumentId, DocumentPoint, DocumentQuery,
+    DocumentRecord, DocumentScope, DocumentSemantics, EntryId, EntryQuery, EntryRecord,
+    EntryWithSeq, JsonObject, MemoryStorage, Page, ResolvedAddress, Seq, Storage, StorageError,
+    StorageWrite, StoredDocument, SubmissionId, SubmissionQuery, SubmissionRecord,
+    SubmissionStatus, SubmissionType, TaskDefinition, TaskId, TaskQuery, TaskRecord, TaskState,
 };
 
 /// Open a facade over one shared storage instance.
@@ -376,7 +376,7 @@ async fn doc_loads_the_committed_value_and_snapshot_returns_it() {
 
     let definition = CommonDocDefinition::new("counter", 1, DocumentSemantics::Session)
         .expect("definition")
-        .behaviour(initial_counter, None, None);
+        .behaviour(initial_counter, None, DocCheckpointWhen::never());
     let edited = session
         .doc(resolved.clone(), definition, ctx.clone(), |draft| {
             let count = draft.get("count").and_then(Value::as_i64).unwrap_or(0);
@@ -577,7 +577,7 @@ fn probe_definition() -> pir::durable::AnyDocDefinition {
         },
     )
     .expect("definition")
-    .behaviour(probe_initial, None, None)
+    .behaviour(probe_initial, None, DocCheckpointWhen::never())
 }
 
 /// A rewindable conversation document: never holdable, so a deferred edit
@@ -603,7 +603,7 @@ fn rewindable_definition() -> pir::durable::AnyDocDefinition {
         },
     )
     .expect("definition")
-    .behaviour(probe_initial, None, None)
+    .behaviour(probe_initial, None, DocCheckpointWhen::never())
 }
 
 /// Create a conversation and commit its probe document at `count: 0`.

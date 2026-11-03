@@ -110,7 +110,8 @@ use tokio::sync::{oneshot, Notify};
 use crate::ai::types::AbortSignal;
 use crate::durable::context::Context;
 use crate::durable::errors::{
-    HostCallback, ReportInfo, ReportTask, StorageError, TaskFaultReason, TaskOutdatedReason,
+    HostCallback, ReadOnlySession, ReportInfo, ReportTask, StorageError, TaskFaultReason,
+    TaskOutdatedReason,
 };
 use crate::durable::harness::settings::{RestartLimit, Settings, DEFAULT_RESTART_LIMIT};
 use crate::durable::harness::task::{ErasedTask, Task};
@@ -879,6 +880,11 @@ pub struct TaskSchedulerOptions {
     pub on_wake: Option<Arc<dyn Fn(Wake) + Send + Sync>>,
     /// Receives failures that do not fail the calling operation.
     pub report: Option<ReportFn>,
+    /// Open as a viewer: load live tasks as committed, run nothing, commit
+    /// nothing, and never ask for a wakeup (upstream
+    /// `TaskSchedulerOptions.readOnly`). [`SessionOptions::read_only`] is
+    /// normally set from the same flag; either one enables the behavior.
+    pub read_only: bool,
     /// Options for the session the scheduler opens over the storage. Its
     /// `telemetry` handle is also the scheduler's emission handle.
     pub session: Option<SessionOptions>,
@@ -1021,6 +1027,8 @@ pub struct SchedulerInner {
     pub(super) timers: Timers,
     pub(super) on_wake: Option<Arc<dyn Fn(Wake) + Send + Sync>>,
     pub(super) report: ReportFn,
+    /// Never commit, run a task, reconcile or ask for a wakeup.
+    pub(super) read_only: bool,
     /// The host telemetry handle; [`HarnessTelemetry::none`] when absent.
     pub(super) telemetry: HarnessTelemetry,
     pub(super) state: Mutex<Indexes>,
@@ -1595,6 +1603,9 @@ impl SchedulerInner {
 
     /// Mark scheduling dirty and start a drain pass.
     pub(super) fn kick(self: &Arc<Self>) {
+        if self.read_only {
+            return;
+        }
         self.schedule_wake();
         let start = self.with_state(|state| {
             state.dirty = true;
@@ -1888,14 +1899,19 @@ impl TaskScheduler {
     ) -> Result<Self, StorageError> {
         let now: Arc<dyn Fn() -> i64 + Send + Sync> =
             options.now.clone().unwrap_or_else(|| Arc::new(system_now));
-        let session_options = options.session.clone().unwrap_or(SessionOptions {
+        let mut session_options = options.session.clone().unwrap_or(SessionOptions {
             now: Some(now.clone()),
             document_retention_ms: None,
             persist_within_ms: None,
+            read_only: false,
             behaviours: None,
             telemetry: None,
             conversation_created: None,
         });
+        // The scheduler option and the session option are two spellings of the
+        // same viewer mode; either enables both.
+        let read_only = options.read_only || session_options.read_only;
+        session_options.read_only = read_only;
         // The scheduler shares the session's handle: `Harness` puts its
         // `HarnessOptions.telemetry` into `SessionOptions`, so phase spans,
         // counters and report events land in the same host sink as the
@@ -1953,6 +1969,7 @@ impl TaskScheduler {
             timers,
             on_wake: options.on_wake.clone(),
             report,
+            read_only,
             telemetry,
             state: Mutex::new(Indexes::default()),
             task_waiters: Mutex::new(HashMap::new()),
@@ -2018,11 +2035,16 @@ impl TaskScheduler {
         }));
 
         scheduler.inner.open_commit().await?;
-        scheduler
-            .inner
-            .with_state(|state| state.cascade_pending = true);
-        scheduler.inner.schedule_reconcile();
-        scheduler.inner.schedule_wake();
+        // A viewer reconciles nothing: its own commits would be refused, and
+        // the process that drives the session owns recovery (upstream returns
+        // before the cascade and both schedules).
+        if !scheduler.inner.read_only {
+            scheduler
+                .inner
+                .with_state(|state| state.cascade_pending = true);
+            scheduler.inner.schedule_reconcile();
+            scheduler.inner.schedule_wake();
+        }
         Ok(scheduler)
     }
 
@@ -2057,8 +2079,23 @@ impl TaskScheduler {
 
     /// Enable scheduling and make due sleeps runnable (spec §5.6).
     ///
-    /// Idempotent. A host wakeup, such as an alarm, calls this.
+    /// Idempotent. A host wakeup, such as an alarm, calls this. A read-only
+    /// scheduler runs nothing; [`Self::try_resume`] reports that refusal. This
+    /// infallible form is the internal/test convenience (the Harness uses
+    /// [`Self::try_resume`] so the upstream `ReadOnlySession` reaches callers).
     pub fn resume(&self) {
+        let _ = self.try_resume();
+    }
+
+    /// [`Self::resume`] with the read-only refusal visible. Rejects with
+    /// [`ReadOnlySession`](crate::durable::errors::ReadOnlySession) before any
+    /// state changes (upstream `resume()`).
+    pub fn try_resume(&self) -> Result<(), StorageError> {
+        if self.inner.read_only {
+            return Err(StorageError::ReadOnly(ReadOnlySession::new(
+                "running tasks",
+            )));
+        }
         self.inner.with_state(|state| {
             if !state.closing {
                 state.enabled = true;
@@ -2066,6 +2103,7 @@ impl TaskScheduler {
         });
         self.inner.wake_due();
         self.inner.kick();
+        Ok(())
     }
 
     /// Pause scheduling without closing. Dispatch already started finishes; no
@@ -2110,7 +2148,7 @@ impl TaskScheduler {
                 })
             })
             .await?;
-        self.resume();
+        self.try_resume()?;
         Ok(())
     }
 
@@ -2443,6 +2481,7 @@ impl SchedulerInner {
     async fn open_commit(self: &Arc<Self>) -> Result<(), StorageError> {
         let inner = self.clone();
         let limit = self.restart_limit();
+        let read_only = self.read_only;
         let parked: Arc<Mutex<Vec<TaskRecord>>> = Arc::new(Mutex::new(Vec::new()));
         let parked_out = parked.clone();
         self.commit(move |tx, state| {
@@ -2469,6 +2508,13 @@ impl SchedulerInner {
                 for record in records {
                     inner.track(&mut indexes, None, &record);
                     indexes.resumed.insert(record.id);
+                    // A viewer loads live tasks as committed: a `running` task
+                    // stays running in the process that owns it. No restart is
+                    // counted, no abandon mark is armed, and no fail-fast check
+                    // is scheduled (upstream `if (this.#readOnly) continue`).
+                    if read_only {
+                        continue;
+                    }
                     if record.abandon_on_restart == Some(true) {
                         indexes.abandoned.insert(record.id);
                     }

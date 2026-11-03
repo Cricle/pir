@@ -11,7 +11,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::ai::types::{ContentBlock, Message, Usage};
-use crate::session_manager::{types::FileEntry, SessionManager};
+use crate::session_manager::{
+    types::{FileEntry, StoredMessage, StoredSystemMessage},
+    SessionManager,
+};
 
 // ---------------------------------------------------------------------------
 // HTML helpers
@@ -576,6 +579,257 @@ fn format_tokens(count: u64) -> String {
     }
 }
 
+// ─── System prompt entries (upstream template.js system helpers) ───────────
+
+/// Full prompt text of a system message (upstream `getSystemMessageText`):
+/// content plus every non-null named section.
+fn system_message_text(message: &StoredSystemMessage) -> String {
+    let mut parts = Vec::new();
+    if !message.content.is_empty() {
+        parts.push(message.content.clone());
+    }
+    if let Some(serde_json::Value::Object(sections)) = &message.sections {
+        for value in sections.values() {
+            if let Some(text) = value.as_str() {
+                if !text.is_empty() {
+                    parts.push(text.to_owned());
+                }
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
+/// Text of a later system message (upstream `renderSystemMessageUpdate`).
+fn system_message_update_text(message: &StoredSystemMessage) -> String {
+    let mut parts = Vec::new();
+    if !message.content.is_empty() {
+        parts.push(message.content.clone());
+    }
+    if let Some(serde_json::Value::Object(sections)) = &message.sections {
+        for (name, value) in sections {
+            match value {
+                serde_json::Value::Null => {
+                    parts.push(format!("Removed system prompt section \"{name}\"."));
+                }
+                serde_json::Value::String(text) => {
+                    parts.push(format!(
+                        "Updated system prompt section \"{name}\":\n\n{text}"
+                    ));
+                }
+                other => {
+                    parts.push(format!(
+                        "Updated system prompt section \"{name}\":\n\n{}",
+                        serde_json::to_string_pretty(other).unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
+/// Short description of what a later system message changes (upstream
+/// `describeSystemUpdate`), e.g. `project_context, -rules, tools +bash`.
+fn describe_system_update(message: &StoredSystemMessage) -> String {
+    let mut parts = Vec::new();
+    if !message.content.is_empty() {
+        parts.push("instructions".to_owned());
+    }
+    if let Some(serde_json::Value::Object(sections)) = &message.sections {
+        for (name, value) in sections {
+            parts.push(if value.is_null() {
+                format!("-{name}")
+            } else {
+                name.clone()
+            });
+        }
+    }
+    let mut tool_changes = Vec::new();
+    for tool in system_tools(message.tools_added.as_deref()) {
+        if let Some(name) = tool_name(tool) {
+            tool_changes.push(format!("+{name}"));
+        }
+    }
+    for tool in system_tools(message.tools_removed.as_ref()) {
+        if let Some(name) = tool_name(tool) {
+            tool_changes.push(format!("-{name}"));
+        }
+    }
+    if !tool_changes.is_empty() {
+        parts.push(format!("tools {}", tool_changes.join(" ")));
+    }
+    parts.join(", ")
+}
+
+fn system_tools(value: Option<&serde_json::Value>) -> Vec<&serde_json::Value> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|tools| tools.iter().collect())
+        .unwrap_or_default()
+}
+
+fn tool_name(tool: &serde_json::Value) -> Option<&str> {
+    tool.get("name").and_then(serde_json::Value::as_str)
+}
+
+/// Whether an entry carries system prompt state (upstream
+/// `carriesSystemState`).
+fn carries_system_state(entry: &FileEntry) -> bool {
+    match entry {
+        FileEntry::Message(message) => matches!(message.message, StoredMessage::System(_)),
+        FileEntry::Compaction(compaction) => compaction.system_message.is_some(),
+        _ => false,
+    }
+}
+
+/// Whether a system entry starts the prompt on its branch (upstream
+/// `isLeadingSystemEntry`): a later system entry patches the prompt.
+fn is_leading_system_entry(entries: &[FileEntry], entry: &FileEntry) -> bool {
+    let by_id: BTreeMap<&str, &FileEntry> = entries
+        .iter()
+        .filter_map(|candidate| candidate.id().map(|id| (id, candidate)))
+        .collect();
+    let mut current = entry
+        .parent_id()
+        .and_then(|parent| by_id.get(parent).copied());
+    while let Some(candidate) = current {
+        if carries_system_state(candidate) {
+            return false;
+        }
+        match (candidate.parent_id(), candidate.id()) {
+            (Some(parent), Some(id)) if parent != id => {
+                current = by_id.get(parent).copied();
+            }
+            _ => break,
+        }
+    }
+    true
+}
+
+/// A collapsible full prompt block (upstream `renderSystemPromptBlock`).
+fn render_system_prompt_block(title: &str, text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    if lines.len() > 10 {
+        let preview = lines[..10].join("\n");
+        let remaining = lines.len() - 10;
+        format!(
+            "<div class=\"system-prompt expandable\" onclick=\"if(window.getSelection().toString())return;this.classList.toggle('expanded')\">\
+             <div class=\"system-prompt-header\">{}</div>\
+             <div class=\"system-prompt-preview\">{}</div>\
+             <div class=\"system-prompt-expand-hint\">... ({} more lines, click to expand)</div>\
+             <div class=\"system-prompt-full\">{}</div></div>",
+            escape_html(title),
+            escape_html(&preview),
+            remaining,
+            escape_html(text)
+        )
+    } else {
+        format!(
+            "<div class=\"system-prompt\"><div class=\"system-prompt-header\">{}</div>\
+             <div class=\"system-prompt-full\" style=\"display: block\">{}</div></div>",
+            escape_html(title),
+            escape_html(text)
+        )
+    }
+}
+
+/// The tool list of a system entry (upstream `renderToolsList`).
+fn render_system_tools(title: &str, tools: &[&serde_json::Value]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let items = tools
+        .iter()
+        .filter_map(|tool| {
+            let name = tool_name(tool)?;
+            let description = tool
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let parameters = tool
+                .get("parameters")
+                .and_then(|parameters| parameters.get("properties"))
+                .and_then(serde_json::Value::as_object)
+                .map(|properties| {
+                    properties
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let params = if parameters.is_empty() {
+                String::new()
+            } else {
+                format!("<div class=\"tool-item-params\">({})</div>", escape_html(&parameters))
+            };
+            Some(format!(
+                "<div class=\"tool-item\"><span class=\"tool-item-name\">{}</span><span class=\"tool-item-desc\">{}</span>{}</div>",
+                escape_html(name),
+                escape_html(description),
+                params
+            ))
+        })
+        .collect::<String>();
+    format!(
+        "<div class=\"tools-list\"><div class=\"tools-header\">{}</div><div class=\"tools-content\">{}</div></div>",
+        escape_html(title),
+        items
+    )
+}
+
+/// One system entry as the transcript renders it.
+fn render_system_entry(entry: &FileEntry, message: &StoredSystemMessage, leading: bool) -> String {
+    let timestamp = match entry {
+        FileEntry::Message(message) => message.timestamp.as_str(),
+        _ => "",
+    };
+    let ts_html = if timestamp.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<div class=\"message-timestamp\">{}</div>",
+            escape_html(timestamp)
+        )
+    };
+    let mut body = String::new();
+    if leading {
+        let text = system_message_text(message);
+        if !text.is_empty() {
+            body.push_str(&render_system_prompt_block("System Prompt", &text));
+        }
+        body.push_str(&render_system_tools(
+            "Available Tools",
+            &system_tools(message.tools_added.as_deref()),
+        ));
+    } else {
+        let text = system_message_update_text(message);
+        let changes = describe_system_update(message);
+        if !text.is_empty() {
+            let title = if changes.is_empty() {
+                "System Prompt Update".to_owned()
+            } else {
+                format!("System Prompt Update: {changes}")
+            };
+            body.push_str(&render_system_prompt_block(&title, &text));
+        }
+        body.push_str(&render_system_tools(
+            "Tools Added",
+            &system_tools(message.tools_added.as_deref()),
+        ));
+        body.push_str(&render_system_tools(
+            "Tools Removed",
+            &system_tools(message.tools_removed.as_ref()),
+        ));
+    }
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"system-entry\">{ts_html}{body}</div>")
+    }
+}
+
 /// Build the self-contained HTML document (upstream `generateHtml`, rendered
 /// server-side instead of through the JS template).
 fn generate_html(
@@ -669,6 +923,14 @@ fn generate_html(
         match entry {
             FileEntry::Message(message_entry) => {
                 let stored = &message_entry.message;
+                if let StoredMessage::System(system) = stored {
+                    // System entries render where they occur: the leading one
+                    // as the prompt/tool list, later ones as named updates
+                    // (upstream `export-html` system messages).
+                    let leading = is_leading_system_entry(entries, entry);
+                    html.push_str(&render_system_entry(entry, system, leading));
+                    continue;
+                }
                 let message: Message = stored.clone().into();
                 if matches!(message, Message::ToolResult(_)) {
                     continue;
@@ -753,6 +1015,23 @@ body { font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Con
 .message-image { width: fit-content; }
 .error-text { color: #ff9aa5; margin: 6px 0; }
 .system-message { color: #8a8a95; margin: 8px 0; }
+.system-entry { background: var(--pir-export-card-bg, #1e1e24); border: 1px solid #33333c; border-radius: 6px; padding: 10px 14px; margin: 14px 0; color: #b7b7c2; }
+.system-entry > .message-timestamp { padding-left: 14px; margin-bottom: 4px; color: #8a8a95; }
+.system-entry > :last-child { margin-bottom: 0; }
+.system-prompt-header, .tools-header { font-weight: bold; color: #c9c9d4; margin-bottom: 4px; }
+.system-prompt-preview, .system-prompt-full { white-space: pre-wrap; word-break: break-word; }
+.system-prompt-full { display: none; }
+.system-prompt.expandable { cursor: pointer; }
+.system-prompt.expandable .system-prompt-preview { display: block; }
+.system-prompt.expandable .system-prompt-full { display: none; }
+.system-prompt.expandable.expanded .system-prompt-preview { display: none; }
+.system-prompt.expandable.expanded .system-prompt-full { display: block; }
+.system-prompt-expand-hint { color: #7ab8ff; margin-top: 2px; }
+.tools-list { margin-top: 8px; }
+.tool-item { margin: 2px 0; }
+.tool-item-name { color: #9fe0a9; margin-right: 6px; }
+.tool-item-desc { color: #9a9aa6; }
+.tool-item-params { color: #8a8a95; font-size: 11px; }
 .model-change { color: #8a8a95; margin: 12px 0; }
 .model-name { color: #c9c9d4; }
 .compaction, .branch-summary, .hook-message { background: var(--pir-export-info-bg, #3a3428); border: 1px solid #55503f; border-radius: 6px; padding: 8px 12px; margin: 12px 0; color: #d8d2c0; }

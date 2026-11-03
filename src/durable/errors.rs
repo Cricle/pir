@@ -114,6 +114,32 @@ pub struct SessionFailed {
     pub cause: StorageError,
 }
 
+/// The Session was opened read-only (`SessionOptions::read_only`) and refused
+/// a commit with writes or a call that would run tasks.
+///
+/// Upstream `ReadOnlySession`. Nothing was written, the Session stays healthy,
+/// and the caller can keep reading and watching it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOnlySession {
+    /// What was refused, such as `a commit with writes` or `running tasks`.
+    pub what: String,
+}
+
+impl ReadOnlySession {
+    /// Build a refusal naming `what`.
+    pub fn new(what: impl Into<String>) -> Self {
+        Self { what: what.into() }
+    }
+}
+
+impl fmt::Display for ReadOnlySession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Read-only Harness: {} refused", self.what)
+    }
+}
+
+impl std::error::Error for ReadOnlySession {}
+
 /// A submission reached a busy conversation and was not admitted.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub struct ConversationBusy {
@@ -130,8 +156,9 @@ impl fmt::Display for ConversationBusy {
 /// Every error a [`Storage`](crate::durable::Storage) operation can return.
 ///
 /// Reads may fail with [`StorageError::Request`] only for an invalid request;
-/// any other variant is fatal for the storage instance (the JSONL backend
-/// poisons itself).
+/// [`StorageError::ReadOnly`] is a Session-side refusal that never reaches a
+/// backend. Every other variant is fatal for the storage instance (the JSONL
+/// backend poisons itself).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StorageError {
     /// The request was invalid and had no durable effect.
@@ -152,6 +179,10 @@ pub enum StorageError {
     /// A record was rejected by the storage contract.
     #[error("{0}")]
     Invalid(String),
+    /// A read-only Session refused a write before it reached storage
+    /// (upstream `ReadOnlySession`). The Session stays healthy.
+    #[error(transparent)]
+    ReadOnly(#[from] ReadOnlySession),
     /// The open Session failed; every call rejects with this until it is
     /// reopened (upstream `SessionFailed`, caused by an earlier fatal error).
     ///
@@ -189,8 +220,10 @@ impl StorageError {
     ///
     /// A `SessionFailed` is the *consequence* of a fatal error, not a new one;
     /// callers that ask "may I keep using this backend?" treat it as fatal too.
+    /// A read-only refusal is produced by the Session before storage is called,
+    /// so it says nothing about the backend either.
     pub fn is_fatal(&self) -> bool {
-        !matches!(self, Self::Request(_))
+        !matches!(self, Self::Request(_) | Self::ReadOnly(_))
     }
 }
 

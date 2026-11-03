@@ -51,12 +51,13 @@ use crate::durable::harness::task::RunningTask;
 use crate::durable::harness::telemetry::SpanHandle;
 use crate::durable::harness::tool::ToolHost;
 use crate::durable::ids::{ConversationId, DocumentId, TaskId};
+use crate::durable::session::documents::LoadedDocument;
 use crate::durable::session::observation::{CommittedWatch, WatchEnd};
 use crate::durable::session::publication::{
     CommitChange as SessionCommitChange, CommitPublication,
 };
 use crate::durable::session::transaction::TransactionScope;
-use crate::durable::session::Transaction;
+use crate::durable::session::{CommitOptions, Transaction};
 use crate::durable::timers::TimerHandle;
 use crate::durable::types::{
     DocumentCommitChange, DocumentPoint, JsonObject, StoredDocument, TaskOutcome, TaskRecord,
@@ -240,6 +241,26 @@ impl TaskRuntime {
             + Send
             + 'static,
     {
+        self.commit_with_options(change, context, CommitOptions::default())
+            .await
+    }
+
+    /// [`TaskRuntime::commit`] with explicit commit options.
+    ///
+    /// `options.persistence = CommitPersistence::Deferred { .. }` holds the
+    /// commit in memory until the next document read or immediate commit, the
+    /// session's deferred deadline, or close (upstream `PROGRESS_COMMIT`).
+    pub async fn commit_with_options<F>(
+        &self,
+        change: F,
+        context: Context,
+        options: CommitOptions,
+    ) -> Result<(), TaskRuntimeError>
+    where
+        F: for<'a> FnOnce(&'a mut Transaction, &'a RunningTask) -> CommitFuture<'a>
+            + Send
+            + 'static,
+    {
         self.gated(
             move |tx, record| {
                 Box::pin(async move {
@@ -251,6 +272,7 @@ impl TaskRuntime {
                 })
             },
             context,
+            options,
         )
         .await
         .map(|_| ())
@@ -273,6 +295,7 @@ impl TaskRuntime {
                 )
             },
             context,
+            CommitOptions::default(),
         )
         .await
         .map(|_| ())
@@ -318,6 +341,7 @@ impl TaskRuntime {
                 })
             },
             context,
+            CommitOptions::default(),
         )
         .await
     }
@@ -529,6 +553,37 @@ impl TaskRuntime {
             .await?)
     }
 
+    /// The cached incarnation at `resolved`, when the session holds one.
+    ///
+    /// A deferred commit is adopted in the session's document cache before it
+    /// reaches storage, and its held value is pinned there. A commit that
+    /// stages an edit from this value therefore keeps every held change
+    /// instead of diffing against an older stored revision.
+    pub async fn cached_document(
+        &self,
+        resolved: &ResolvedAddress,
+    ) -> Result<Option<LoadedDocument>, TaskRuntimeError> {
+        self.check_live()?;
+        let address_id = resolved.id.clone();
+        let slot: Arc<Mutex<Option<LoadedDocument>>> = Arc::new(Mutex::new(None));
+        let write = slot.clone();
+        self.inner
+            .session
+            .handle()
+            .maintain(move |inner| {
+                *write
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    inner.documents.get(&address_id).cloned();
+            })
+            .await
+            .map_err(TaskRuntimeError::Storage)?;
+        let mut guard = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(guard.take())
+    }
+
     /// Watch one document incarnation.
     ///
     /// The listener receives every committed revision of the current
@@ -635,7 +690,12 @@ impl TaskRuntime {
     // ─── Gated commit ───────────────────────────────────────────────────────
 
     /// Run one gated commit. The change receives the freshly read record.
-    async fn gated<T, F>(&self, change: F, context: Context) -> Result<T, TaskRuntimeError>
+    async fn gated<T, F>(
+        &self,
+        change: F,
+        context: Context,
+        options: CommitOptions,
+    ) -> Result<T, TaskRuntimeError>
     where
         T: Send + 'static,
         F: for<'a> FnOnce(&'a mut Transaction, &'a TaskRecord) -> ResultFuture<'a, T>
@@ -672,7 +732,7 @@ impl TaskRuntime {
         let outcome: Result<T, StorageError> = self
             .inner
             .session
-            .commit_scoped(scope, context, move |tx, _state| {
+            .commit_scoped_with_options(scope, context, options, move |tx, _state| {
                 let inner = inner.clone();
                 let invocation = invocation.clone();
                 let typed = typed_out.clone();

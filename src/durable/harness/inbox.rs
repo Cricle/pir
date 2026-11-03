@@ -289,7 +289,7 @@ pub static INBOX_DEFINITION: LazyLock<AnyDocDefinition> = LazyLock::new(|| {
             .expect("the pi.inbox definition version is valid"),
         inbox_initial,
         None,
-        Some(inbox_checkpoint_when),
+        inbox_checkpoint_when,
     )
 });
 

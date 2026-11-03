@@ -273,8 +273,12 @@ pub fn native_tool_outcome(
 
 /// Apply the native markdown transformer chain to `markdown`; `None` = no
 /// transformer changed the text.
-pub fn native_markdown(service: &dyn RendererService, markdown: &str) -> Option<String> {
-    service.transform_markdown(markdown)
+pub fn native_markdown(
+    service: &dyn RendererService,
+    markdown: &str,
+    context: &crate::plugins::services::MarkdownTransformContext,
+) -> Option<String> {
+    service.transform_markdown_with_context(markdown, context)
 }
 
 /// Production invoker: round-trips the request through the extension actor

@@ -37,6 +37,7 @@ pub mod generation;
 pub mod inbox;
 pub mod json;
 pub mod live;
+pub mod partial_changes;
 pub mod prompt;
 pub mod registry;
 pub mod settings;

@@ -374,6 +374,33 @@ impl AgentSession {
         let tool_selection = config.tool_selection;
         let mut tools = config.tools;
         tools.remove_exposure(crate::agent::tool_execution::ToolExposure::Hidden);
+        // Extension tools the branch never recorded (an extension installed
+        // after the session started) activate on resume unless they opt out
+        // with `defaultActive: false` (upstream #11062). Builtins are part of
+        // the base definitions and are handled by the normal selection.
+        let base_tool_names: std::collections::HashSet<String> =
+            tools.iter().map(|tool| tool.name().to_owned()).collect();
+        let extension_tools: Vec<(String, bool, bool)> = plugins
+            .as_ref()
+            .map(|plugins| {
+                plugins
+                    .tool_defs()
+                    .into_iter()
+                    .filter(|def| !base_tool_names.contains(&def.name))
+                    .filter(|def| def.source_info.source != "builtin")
+                    .map(|def| {
+                        let exposure =
+                            crate::agent::tool_execution::ToolExposure::parse(&def.exposure)
+                                .unwrap_or(crate::agent::tool_execution::ToolExposure::Direct);
+                        (
+                            def.name,
+                            def.default_active,
+                            exposure.active_on_registration(def.default_active),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         // Session resume (upstream `_restoreToolsFromTranscript`, gated on
         // `usesDefaultTools`; 6f2f164ab → agent-session.ts:523-527): a session
         // that uses the default tools replaces them with the loadout its
@@ -401,7 +428,8 @@ impl AgentSession {
                 (Some(session), true) => session_recorded_system_messages(session),
                 _ => Vec::new(),
             };
-        let tool_selection = tools::restore_recorded_active_tools(tool_selection, &tool_history);
+        let tool_selection =
+            tools::restore_recorded_active_tools(tool_selection, &tool_history, &extension_tools);
         // Context-file injection for hosts that pass no explicit system
         // prompt (RPC mode; the SDK's append-only form, where the addendum is
         // applied to this prompt afterwards): the full structured system

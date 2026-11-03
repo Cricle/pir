@@ -525,6 +525,33 @@ struct AuthState {
     selected: usize,
     /// Live login progress (login mode only; updated by the login thread).
     progress: LoginProgress,
+    /// The device-code convenience action awaiting Enter (upstream
+    /// `LoginDialogComponent.deviceCodeAction`).
+    device_code: Option<DeviceCodeAction>,
+}
+
+/// One device-code login's optional browser/clipboard action.
+#[derive(Debug, Clone)]
+struct DeviceCodeAction {
+    user_code: String,
+    verification_uri: String,
+    open_browser: bool,
+    copy_code: bool,
+    /// Consumed after the first Enter so a repeated press cannot run twice.
+    done: bool,
+}
+
+impl DeviceCodeAction {
+    /// The hint text after `Enter ` (upstream's `to open browser and copy
+    /// code` / `to open browser` / `to copy code`).
+    fn hint(&self) -> &'static str {
+        match (self.open_browser, self.copy_code) {
+            (true, true) => "to open browser and copy code",
+            (true, false) => "to open browser",
+            (false, true) => "to copy code",
+            (false, false) => "",
+        }
+    }
 }
 
 impl AuthSelector {
@@ -551,6 +578,7 @@ impl AuthSelector {
                 providers,
                 selected: 0,
                 progress: LoginProgress::default(),
+                device_code: None,
             }),
         }
     }
@@ -590,6 +618,80 @@ impl AuthSelector {
         state.progress = LoginProgress { status, finished };
     }
 
+    /// Show a device-code login's optional action (upstream
+    /// `LoginDialogComponent.showDeviceCode`, login-dialog.ts:138-170).
+    /// `open_browser_on_confirm`/`copy_code_on_confirm` default to true.
+    pub fn show_device_code(
+        &self,
+        user_code: String,
+        verification_uri: String,
+        open_browser_on_confirm: Option<bool>,
+        copy_code_on_confirm: Option<bool>,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let open_browser = open_browser_on_confirm.unwrap_or(true);
+        let copy_code = copy_code_on_confirm.unwrap_or(true);
+        state.device_code = (open_browser || copy_code).then_some(DeviceCodeAction {
+            user_code,
+            verification_uri,
+            open_browser,
+            copy_code,
+            done: false,
+        });
+    }
+
+    /// The device-code hint awaiting Enter, when one is pending (test/render
+    /// seam).
+    pub fn pending_device_code_hint(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .device_code
+            .as_ref()
+            .filter(|action| !action.done)
+            .map(|action| format!("(enter {})", action.hint()))
+    }
+
+    /// Run the pending device-code action once. Returns `true` when this
+    /// Enter was consumed.
+    fn activate_device_code(state: &mut AuthState) -> bool {
+        let Some(action) = state.device_code.as_mut() else {
+            return false;
+        };
+        if action.done || state.progress.finished {
+            return false;
+        }
+        action.done = true;
+        let mut status = Vec::new();
+        if action.copy_code {
+            if crate::tui::clipboard::write_text(&action.user_code) {
+                status.push("Code copied to clipboard".to_string());
+            } else {
+                status.push("Copy code manually".to_string());
+            }
+        }
+        if action.open_browser {
+            let url = action.verification_uri.trim();
+            let lower = url.to_ascii_lowercase();
+            let valid = (lower.starts_with("https://") || lower.starts_with("http://"))
+                && url.len() > "https://".len();
+            if valid {
+                crate::ai::auth::oauth::open_browser(url);
+                status.push("Browser open requested".to_string());
+            } else {
+                status.push("Open the URL manually".to_string());
+            }
+        }
+        state.progress = LoginProgress {
+            status: status.join(" · "),
+            finished: false,
+        };
+        true
+    }
+
     pub fn handle_key(&self, key: AuthKey) -> AuthOutcome {
         let mut state = self
             .state
@@ -612,7 +714,15 @@ impl AuthSelector {
                 state.selected = (state.selected + 1).min(last);
                 AuthOutcome::None
             }
-            AuthKey::Enter => AuthOutcome::Select(state.selected),
+            AuthKey::Enter => {
+                if Self::activate_device_code(&mut state) {
+                    // The Enter was consumed by the device-code action, not
+                    // the provider row (upstream login-dialog.ts:301-315).
+                    AuthOutcome::None
+                } else {
+                    AuthOutcome::Select(state.selected)
+                }
+            }
             AuthKey::Esc => AuthOutcome::Cancel,
         }
     }
@@ -688,6 +798,16 @@ impl Component for AuthSelector {
                     } else {
                         theme.fg(ThemeColor::Muted, &state.progress.status)
                     }
+                }),
+                1,
+                0,
+            ));
+        }
+        if let Some(action) = state.device_code.as_ref().filter(|action| !action.done) {
+            frame.add_child(Spacer::new(1));
+            frame.add_child(Text::with_padding(
+                with_theme(|theme| {
+                    theme.fg(ThemeColor::Muted, &format!("  (Enter {})", action.hint()))
                 }),
                 1,
                 0,

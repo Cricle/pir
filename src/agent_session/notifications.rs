@@ -516,11 +516,14 @@ impl AgentSession {
         if !plugins.has_non_js_plugins() {
             return;
         }
-        let Some(js) = plugins.js_handle() else {
-            return;
-        };
-        if js.config().has_ui {
-            return;
+        // A native-only host (no JS runtime) still has listeners for the
+        // notification-shaped events; only a JS runtime with its own UI drain
+        // owns them. The old `js_handle() == None` return dropped every
+        // `extension_ui_request` for native-only hosts.
+        if let Some(js) = plugins.js_handle() {
+            if js.config().has_ui {
+                return;
+            }
         }
         let Some(host) = self.plugins.as_ref() else {
             return;

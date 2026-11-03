@@ -102,8 +102,8 @@ pub use documents::{
     address_id, check_record_scope, check_record_version, check_stored_record_scope, define_doc,
     define_doc_family, document_create, materialize_document, materialize_document_value,
     AnyDocDefinition, AnyDocFamilyDefinition, CommonDocDefinition, DocCheckpointWhen,
-    DocDefinition, DocFamilyDefinition, DocFamilyToken, DocInitial, DocMigrate, DocOwner, DocToken,
-    DocTokenKind, DocumentSemantics, ResolvedAddress,
+    DocCheckpointWhenExt, DocDefinition, DocFamilyDefinition, DocFamilyToken, DocInitial,
+    DocMigrate, DocOwner, DocToken, DocTokenKind, DocumentSemantics, ResolvedAddress,
 };
 pub use entries::{
     is_entry_kind, is_kind, AssistantEntry, CompactionData, CompactionEntry, EntryKind, ResetEntry,

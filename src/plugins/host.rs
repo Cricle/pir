@@ -2046,6 +2046,10 @@ impl PluginHost {
         let mut acc = MergedEmit::new();
         for index in self.native_events.dispatch_indices(event, false) {
             let plugin = &self.plugins[index];
+            // A mutation-only `before_provider_request` handler may return
+            // `None`; only a body it actually changed may become the merged
+            // result (the tool-repair gate test: no model push, no repair).
+            let before = (event == "before_provider_request").then(|| payload.clone());
             let outcome =
                 dispatch_native_event(plugin, event, payload, self.native_call_timeout()).await;
             if let PluginEventOutcome::Error { error } = &outcome {
@@ -2058,7 +2062,9 @@ impl PluginHost {
             // value in the shared payload.
             if carried {
                 apply_merged_result_to_payload(event, payload, &acc.result);
-            } else {
+            } else if event != "before_provider_request"
+                || before.as_ref().is_none_or(|before| before != payload)
+            {
                 sync_payload_into_result(event, payload, &mut acc.result);
             }
             // `emit_native` is `emit` minus the JS adapter: a cancel/handled/
@@ -2166,6 +2172,9 @@ impl PluginHost {
         let include_js = self.js_event_dispatch_enabled();
         for index in self.native_events.dispatch_indices(event, include_js) {
             let plugin = &self.plugins[index];
+            // See `emit_native`: only a `before_provider_request` body a
+            // mutation-only handler actually changed may enter the result.
+            let before = (event == "before_provider_request").then(|| payload.clone());
             let outcome =
                 dispatch_native_event(plugin, event, payload, self.native_call_timeout()).await;
             let carried = outcome.carries_payload_result();
@@ -2176,7 +2185,9 @@ impl PluginHost {
             // instead pulls its in-place edits back into the merged result.
             if carried {
                 apply_merged_result_to_payload(event, payload, &acc.result);
-            } else {
+            } else if event != "before_provider_request"
+                || before.as_ref().is_none_or(|before| before != payload)
+            {
                 sync_payload_into_result(event, payload, &mut acc.result);
             }
             if acc.stop {

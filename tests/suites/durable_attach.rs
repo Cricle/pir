@@ -36,8 +36,9 @@ use pir::durable::types::{
     TaskRecord,
 };
 use pir::durable::{
-    AnyDocDefinition, CommonDocDefinition, Context, DocDefinition, DocOwner, DocumentFork,
-    DocumentSemantics, JsonObject, MemoryStorage, ResolvedAddress, Storage, StorageError,
+    AnyDocDefinition, CommonDocDefinition, Context, DocCheckpointWhen, DocCheckpointWhenExt,
+    DocDefinition, DocOwner, DocumentFork, DocumentSemantics, JsonObject, MemoryStorage,
+    ResolvedAddress, Storage, StorageError,
 };
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -405,7 +406,7 @@ fn facade_counter_initial() -> JsonObject {
 fn facade_counter_definition() -> AnyDocDefinition {
     CommonDocDefinition::new(FACADE_COUNTER_KIND, 1, DocumentSemantics::Session)
         .expect("definition")
-        .behaviour(facade_counter_initial, None, None)
+        .behaviour(facade_counter_initial, None, DocCheckpointWhen::never())
 }
 
 async fn facade_doc_set(session: &Session, count: i64) {
@@ -1342,7 +1343,7 @@ fn hold_counter_definition() -> AnyDocDefinition {
         },
     )
     .expect("definition")
-    .behaviour(hold_counter_initial, None, None)
+    .behaviour(hold_counter_initial, None, DocCheckpointWhen::never())
 }
 
 fn hold_counter_set(draft: &mut JsonObject, value: i64) {

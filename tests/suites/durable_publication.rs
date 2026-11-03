@@ -17,10 +17,13 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use pir::durable::session::{CommitChange, CommitPublication, Session, SessionOptions};
+use pir::durable::session::{
+    CommitChange, CommitPublication, DocBehaviours, Session, SessionOptions,
+};
 use pir::durable::{
-    AnyDocDefinition, CommonDocDefinition, Context, DocumentCommitChange, DocumentSemantics,
-    JsonObject, MemoryStorage, ResolvedAddress, Storage,
+    AnyDocDefinition, CommonDocDefinition, Context, DocCheckpointWhen, DocCheckpointWhenExt,
+    DocumentCommitChange, DocumentPoint, DocumentSemantics, JsonObject, MemoryStorage,
+    ResolvedAddress, Storage,
 };
 
 fn open(storage: Arc<MemoryStorage>) -> Session {
@@ -47,7 +50,7 @@ fn watch(session: &Session) -> Arc<Mutex<Vec<CommitPublication>>> {
 fn counter_definition() -> AnyDocDefinition {
     CommonDocDefinition::new("counter", 1, DocumentSemantics::Session)
         .expect("definition")
-        .behaviour(initial_counter, None, None)
+        .behaviour(initial_counter, None, DocCheckpointWhen::never())
 }
 
 fn initial_empty() -> JsonObject {
@@ -202,6 +205,118 @@ async fn a_document_edit_publishes_the_exact_operations() {
     session.close().await.expect("close");
 }
 
+/// A fixed checkpoint policy for every document, standing in for a
+/// definition's required `checkpointWhen`.
+struct StaticCheckpoint(DocCheckpointWhen);
+
+impl DocBehaviours for StaticCheckpoint {
+    fn checkpoint_when(&self, _address_id: &str, _kind: &str) -> Option<DocCheckpointWhen> {
+        Some(self.0)
+    }
+}
+
+fn open_with_checkpoint(policy: DocCheckpointWhen) -> (Session, Arc<MemoryStorage>) {
+    let storage = Arc::new(MemoryStorage::new());
+    let session = Session::open(
+        Arc::clone(&storage) as Arc<dyn Storage>,
+        SessionOptions {
+            behaviours: Some(Arc::new(StaticCheckpoint(policy))),
+            ..SessionOptions::default()
+        },
+    );
+    (session, storage)
+}
+
+#[tokio::test]
+async fn an_explicit_never_policy_keeps_the_edit_a_delta() {
+    let (session, storage) = open_with_checkpoint(DocCheckpointWhen::never());
+    let ctx = Context::background();
+    let seen = watch(&session);
+
+    for count in [0, 1] {
+        session
+            .doc(
+                counter_address(),
+                counter_definition(),
+                ctx.clone(),
+                move |draft| {
+                    draft.insert("count".to_owned(), json!(count));
+                },
+            )
+            .await
+            .expect("commit counter");
+    }
+
+    let publications = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let edit = document_changes(&publications[1]);
+    assert_eq!(edit.len(), 1);
+    assert!(
+        !edit[0].ops.is_empty(),
+        "an explicit never() policy must keep the edit as a delta"
+    );
+    assert_eq!(
+        edit[0].value.as_ref().and_then(|value| value.get("count")),
+        Some(&json!(1))
+    );
+    let stored = storage
+        .document(edit[0].record.id, DocumentPoint::Current)
+        .await
+        .expect("read stored document")
+        .expect("document exists");
+    assert_eq!(
+        stored.deltas_since_base, 1,
+        "never() stores the edit as a delta"
+    );
+
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn a_true_policy_upgrades_the_edit_to_a_base() {
+    let (session, storage) = open_with_checkpoint(DocCheckpointWhen::always());
+    let ctx = Context::background();
+    let seen = watch(&session);
+
+    for count in [0, 1] {
+        session
+            .doc(
+                counter_address(),
+                counter_definition(),
+                ctx.clone(),
+                move |draft| {
+                    draft.insert("count".to_owned(), json!(count));
+                },
+            )
+            .await
+            .expect("commit counter");
+    }
+
+    let publications = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let edit = document_changes(&publications[1]);
+    assert_eq!(edit.len(), 1);
+    assert_eq!(
+        edit[0].value.as_ref().and_then(|value| value.get("count")),
+        Some(&json!(1))
+    );
+    let stored = storage
+        .document(edit[0].record.id, DocumentPoint::Current)
+        .await
+        .expect("read stored document")
+        .expect("document exists");
+    assert_eq!(
+        stored.deltas_since_base, 0,
+        "a true checkpoint policy must upgrade the delta to a base"
+    );
+
+    session.close().await.expect("close");
+}
+
 #[tokio::test]
 async fn a_growing_string_is_published_as_one_append() {
     // `pi.live` retains a streaming answer's text and relies on the differ
@@ -218,7 +333,7 @@ async fn a_growing_string_is_published_as_one_append() {
     let definition = || {
         CommonDocDefinition::new("assistant", 1, DocumentSemantics::Session)
             .expect("definition")
-            .behaviour(initial_empty, None, None)
+            .behaviour(initial_empty, None, DocCheckpointWhen::never())
     };
 
     session
@@ -272,7 +387,11 @@ async fn a_version_transition_publishes_a_base_with_no_operations() {
     let seen = watch(&session);
     let v2 = CommonDocDefinition::new("counter", 2, DocumentSemantics::Session)
         .expect("v2 definition")
-        .behaviour(initial_counter, Some(migrate_identity), None);
+        .behaviour(
+            initial_counter,
+            Some(migrate_identity),
+            DocCheckpointWhen::never(),
+        );
     session
         .doc(counter_address(), v2, ctx.clone(), |_draft| {})
         .await

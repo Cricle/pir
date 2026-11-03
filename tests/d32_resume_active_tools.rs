@@ -27,11 +27,14 @@ use pir::ai::event_stream::AssistantMessageEventStream;
 use pir::ai::provider::{Provider, ProviderRegistry};
 use pir::ai::types::{
     AssistantMessage, ContentBlock, Context, Message, Model, ModelCost, ModelCostRates, StopReason,
-    StreamOptions, TerminalReason, TextContent, ThinkingLevel, Tool, Usage, UserMessage, UserRole,
+    StreamOptions, TerminalReason, TextContent, ThinkingLevel, Tool, ToolReference, Usage,
+    UserMessage, UserRole,
 };
 use pir::coding_agent::tool_selection::resolve_tool_selection;
 use pir::coding_agent::ToolSelection;
 use pir::config::settings::DEFAULT_TOOL_NAMES;
+use pir::plugins::plugin::{AgentPlugin, RegistrationContext};
+use pir::plugins::PluginInfo;
 use pir::session_manager::SessionManager;
 use serde_json::{json, Value};
 
@@ -112,6 +115,21 @@ impl AgentTool for NamedTool {
     }
     fn run(&self, _args: &Value, _ctx: &ToolContext) -> BoxFuture<'static, ToolResult> {
         Box::pin(async { ToolResult::ok("ok") })
+    }
+}
+
+/// A plugin that registers one extension tool, as an extension installed after
+/// the session's recorded loadout would.
+struct ExtensionToolPlugin(&'static str);
+
+impl AgentPlugin for ExtensionToolPlugin {
+    fn info(&self) -> &PluginInfo {
+        static INFO: std::sync::OnceLock<PluginInfo> = std::sync::OnceLock::new();
+        INFO.get_or_init(|| PluginInfo::inline("d32-extension"))
+    }
+    fn register(&self, ctx: &mut RegistrationContext<'_>) -> anyhow::Result<()> {
+        ctx.register_tool(Arc::new(NamedTool { name: self.0 }));
+        Ok(())
     }
 }
 
@@ -259,8 +277,44 @@ fn session_with(
     Fixture { session, captured }
 }
 
-/// Run one prompt and report the tool names the request declared, sorted (the
-/// active set: `context.tools` is exactly the declared loadout).
+/// [`session_with`] plus one inline extension plugin; its tools live in the
+/// plugin registry, not in `config.tools`.
+fn session_with_plugin(
+    cwd: &Path,
+    registered: &[&'static str],
+    storage: Option<SessionManager>,
+    plugin: Arc<dyn AgentPlugin>,
+) -> Fixture {
+    let captured: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(CapturingProvider {
+        calls: AtomicUsize::new(0),
+        captured: Arc::clone(&captured),
+    }));
+    let mut tools = ToolRegistry::new();
+    for name in registered {
+        tools.register(Arc::new(NamedTool { name }));
+    }
+    let session = Arc::new(AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: Arc::new(registry),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools,
+            session: storage,
+            compaction: None,
+            max_turns: 4,
+            system_prompt: Some("base system prompt".into()),
+            cwd: Some(cwd.to_path_buf()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        },
+        vec![plugin],
+    ));
+    Fixture { session, captured }
+}
 async fn declared_tools(fixture: &Fixture) -> Vec<String> {
     fixture
         .session
@@ -271,7 +325,7 @@ async fn declared_tools(fixture: &Fixture) -> Vec<String> {
         .captured
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .first()
+        .last()
         .cloned()
         .unwrap_or_default();
     names.sort();
@@ -320,6 +374,105 @@ async fn resume_restores_the_recorded_loadout() {
         None,
     );
     assert_eq!(declared_tools(&fixture).await, names(&["read", "write"]));
+}
+
+/// #11062: an extension tool the branch never mentioned (registered after the
+/// loadout was recorded) activates on resume; a tool the branch removed stays
+/// inactive.
+#[tokio::test(flavor = "current_thread")]
+async fn resume_activates_unmentioned_extension_tools() {
+    let dir = TempDir::new("extension");
+    let mut storage = recorded_storage(&dir.0, &["read", "write"]);
+    storage
+        .append_message(Message::System(UserMessage {
+            role: UserRole::System,
+            content: Vec::new(),
+            tools_added: None,
+            tools_removed: Some(vec![ToolReference {
+                name: "removed_ext".into(),
+            }]),
+            timestamp: 3,
+            sections: None,
+        }))
+        .expect("append removal");
+    let fixture = session_with_plugin(
+        &dir.0,
+        REGISTERED,
+        Some(storage),
+        Arc::new(ExtensionToolPlugin("late_ext")),
+    );
+    assert_eq!(
+        declared_tools(&fixture).await,
+        names(&["late_ext", "read", "write"])
+    );
+}
+
+/// #11075: `/tree` navigation restores the TARGET branch's loadout, including
+/// extension tools that branch never mentioned.
+#[tokio::test(flavor = "current_thread")]
+async fn tree_navigation_restores_the_target_branch_loadout() {
+    let dir = TempDir::new("tree-branch");
+    let mut storage = recorded_storage(&dir.0, &["read", "grep", "active_tool"]);
+    let target = storage
+        .append_message(Message::User(UserMessage {
+            role: UserRole::User,
+            content: vec![ContentBlock::Text(TextContent {
+                text: "first".into(),
+                text_signature: None,
+            })],
+            tools_added: None,
+            tools_removed: None,
+            timestamp: 3,
+            sections: None,
+        }))
+        .expect("append target");
+    storage
+        .append_message(Message::System(UserMessage {
+            role: UserRole::System,
+            content: Vec::new(),
+            tools_added: Some(vec![Tool {
+                name: "inactive_tool".into(),
+                description: "inactive tool".into(),
+                parameters: json!({ "type": "object" }),
+                constrained_sampling: None,
+            }]),
+            tools_removed: Some(vec![ToolReference {
+                name: "active_tool".into(),
+            }]),
+            timestamp: 4,
+            sections: None,
+        }))
+        .expect("append loadout change");
+
+    let fixture = session_with_plugin(
+        &dir.0,
+        &[
+            "read",
+            "bash",
+            "edit",
+            "write",
+            "grep",
+            "active_tool",
+            "inactive_tool",
+        ],
+        Some(storage),
+        Arc::new(ExtensionToolPlugin("late_ext")),
+    );
+    assert_eq!(
+        declared_tools(&fixture).await,
+        names(&["grep", "inactive_tool", "late_ext", "read"])
+    );
+
+    fixture
+        .session
+        .navigate_tree(&target, false, None, false, 0)
+        .await
+        .expect("navigate returns a result")
+        .expect("navigation succeeds");
+    assert_eq!(
+        declared_tools(&fixture).await,
+        names(&["active_tool", "grep", "late_ext", "read"])
+    );
 }
 
 /// Upstream "applies +name and -name tool options to the recorded loadout":

@@ -537,6 +537,24 @@ fn d21_herdr_reports_kitty_images() {
     assert_eq!(caps.images, Some(ImageProtocol::Kitty));
 }
 
+/// Rex supports OSC 8 hyperlinks and Kitty images (upstream `396ecd7b8` /
+/// `0ed1b0431`), and detection precedes the outer-terminal checks.
+#[test]
+fn d21_rex_reports_kitty_images_and_hyperlinks() {
+    let caps = caps_of(&[
+        ("TERM_PROGRAM", "rex"),
+        ("TERM", "xterm-256color"),
+        ("KITTY_WINDOW_ID", "1"),
+    ]);
+    assert_eq!(caps.images, Some(ImageProtocol::Kitty));
+    assert!(caps.hyperlinks);
+    assert!(caps.true_color);
+
+    let caps = caps_of(&[("TERM_PROGRAM", "rex"), ("PI_HYPERLINKS", "0")]);
+    assert!(!caps.hyperlinks, "the hyperlink override still wins");
+    assert_eq!(caps.images, Some(ImageProtocol::Kitty));
+}
+
 /// The surrounding detection table (unchanged by D21) still holds: tmux and
 /// screen get no image protocol, the kitty/ghostty/wezterm/warp terminals do,
 /// iTerm2 uses its own protocol.

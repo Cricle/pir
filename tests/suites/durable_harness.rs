@@ -43,7 +43,7 @@ use pir::durable::{
     Context, ConversationId, DocumentCommitChange, DocumentFork, DocumentSemantics, EntryId,
     EntryQuery, EntryRecord, JsonObject, MemoryStorage, ReportInfo, ResolvedAddress, ScanOrder,
     Storage, StorageError, StorageWrite, SubmissionId, SubmissionStatus, TaskDefinition, TaskId,
-    ROOT_CONVERSATION_ID,
+    TaskState, ROOT_CONVERSATION_ID,
 };
 
 // ── harness ────────────────────────────────────────────────────────────────
@@ -609,6 +609,102 @@ async fn open_rejects_an_aborted_context() {
 }
 
 #[tokio::test]
+async fn read_only_open_keeps_a_running_task_and_refuses_writes() {
+    let clock = Clock::new(1_000);
+    let storage = Arc::new(MemoryStorage::new());
+    let harness = open_harness(&clock, Arc::clone(&storage)).await;
+    let ctx = Context::background();
+    let root = harness.root(ctx.clone()).await.expect("root");
+
+    let definition =
+        TaskDefinition::define("demo", 1, vec!["run".to_owned()]).expect("task definition");
+    let task_id = harness
+        .session()
+        .create_task(
+            &definition,
+            json!({}),
+            TaskOptions {
+                conversation_id: Some(root.id()),
+                ..TaskOptions::default()
+            },
+            ctx.clone(),
+        )
+        .await
+        .expect("create task");
+    let mut record = storage
+        .task(task_id)
+        .await
+        .expect("read task")
+        .expect("task exists");
+    record.state = TaskState::Running {
+        checkpoint: json!({ "phase": "run" }),
+    };
+    record.restarts = Some(5);
+    record.started_at = Some(1_000);
+    let _: () = harness
+        .session()
+        .commit(ctx.clone(), move |tx, _state| {
+            Box::pin(async move {
+                tx.stage_task(record, false);
+                Ok(Box::new(()) as JobValue)
+            })
+        })
+        .await
+        .expect("store running task");
+    // Drop the writable harness without close: the record stays `running`,
+    // exactly what a viewer of another process's session finds.
+    drop(harness);
+
+    let storage_dyn: Arc<dyn Storage> = storage;
+    let read_only = Harness::open(
+        storage_dyn,
+        HarnessOptions {
+            read_only: true,
+            ..HarnessOptions::default()
+        },
+        ctx.clone(),
+    )
+    .await
+    .expect("read-only open");
+    assert!(!read_only.wake().active, "a viewer never arms a wakeup");
+    assert!(
+        matches!(read_only.resume(), Err(HarnessError::ReadOnly(_))),
+        "resume rejects in a read-only Harness"
+    );
+
+    let inspection = read_only.inspect(&ctx).await.expect("inspect");
+    let task = inspection
+        .tasks
+        .iter()
+        .find(|task| task.record.id == task_id)
+        .expect("task loaded");
+    assert!(
+        matches!(task.record.state, TaskState::Running { .. }),
+        "a running task stays as committed: {:?}",
+        task.record.state
+    );
+    assert_eq!(task.record.restarts, Some(5), "no restart was counted");
+
+    // A commit with writes is refused before storage, and the session stays
+    // readable; an empty commit succeeds.
+    let error = read_only
+        .create_conversation(ConversationOwnership::Ownerless, ctx.clone())
+        .await
+        .expect_err("a read-only write is refused");
+    assert!(matches!(error, HarnessError::ReadOnly(_)), "{error:?}");
+    let _: () = read_only
+        .session()
+        .commit(ctx.clone(), |_tx, _state| {
+            Box::pin(async move { Ok(Box::new(()) as JobValue) })
+        })
+        .await
+        .expect("an empty commit succeeds");
+    assert!(read_only.inspect(&ctx).await.is_ok(), "still readable");
+
+    read_only.close().await.expect("close");
+}
+
+#[tokio::test]
 async fn resume_wake_and_settings_compose_the_scheduler() {
     let clock = Clock::new(1_000);
     let harness = open_harness(&clock, Arc::new(MemoryStorage::new())).await;
@@ -617,7 +713,7 @@ async fn resume_wake_and_settings_compose_the_scheduler() {
         harness.scheduler().scheduling_state(),
         pir::durable::harness::scheduler::SchedulingState::Paused
     );
-    harness.resume();
+    harness.resume().expect("resume");
     assert_eq!(
         harness.scheduler().scheduling_state(),
         pir::durable::harness::scheduler::SchedulingState::Running

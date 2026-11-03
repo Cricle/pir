@@ -24,8 +24,8 @@ use pir::ai::types::{Model, ModelCost, ModelCostRates, ThinkingLevel};
 use pir::extensions::RendererOutcome;
 use pir::plugins::plugin::services::{
     ArgumentCompletions, AutocompleteItem as ServiceItem, AutocompleteProvider, CompletionContext,
-    MarkdownTransformer, MessageRenderer, RendererKind, ServiceFuture, ToolRenderRequest,
-    ToolRendererResolver,
+    MarkdownTransformContext, MarkdownTransformer, MessageRenderer, RendererKind, ServiceFuture,
+    ToolRenderRequest, ToolRendererResolver,
 };
 use pir::plugins::plugin::PluginContext;
 use pir::plugins::{AgentPlugin, PluginInfo};
@@ -275,6 +275,51 @@ fn native_markdown_transformers_compose_in_registration_order_after_js() {
         Some("text-js-one-two".to_owned()),
         "native transformers compose AFTER the JS chain"
     );
+
+    drop(session);
+}
+
+/// Upstream `64627838b`: a markdown transformer receives the persisted entry's
+/// id and timestamp (plus type/streaming/width) alongside the markdown.
+struct ContextTransformer(Arc<Mutex<Option<MarkdownTransformContext>>>);
+
+impl MarkdownTransformer for ContextTransformer {
+    fn transform(&self, markdown: &str) -> Option<String> {
+        Some(markdown.to_owned())
+    }
+
+    fn transform_with_context(
+        &self,
+        markdown: &str,
+        context: &MarkdownTransformContext,
+    ) -> Option<String> {
+        *self.0.lock().unwrap() = Some(context.clone());
+        Some(format!("{markdown}-ctx"))
+    }
+}
+
+#[test]
+fn native_markdown_transformer_receives_the_persisted_message_context() {
+    let plugin = ProbePlugin::new("markdown-context-probe");
+    let session = build_session(Arc::clone(&plugin));
+    let ctx = probe_context(&plugin);
+    let renderers = ctx.renderers().expect("renderer service bound");
+    let captured = Arc::new(Mutex::new(None));
+    renderers.register_markdown(Arc::new(ContextTransformer(Arc::clone(&captured))));
+
+    let context = MarkdownTransformContext {
+        message_type: "assistant".to_owned(),
+        is_streaming: false,
+        available_width: 120,
+        message_id: Some("entry-7".to_owned()),
+        timestamp: Some("2026-11-03T12:00:00.000Z".to_owned()),
+    };
+    assert_eq!(
+        renderers.transform_markdown_with_context("text", &context),
+        Some("text-ctx".to_owned())
+    );
+    let seen = captured.lock().unwrap().clone().expect("context captured");
+    assert_eq!(seen, context);
 
     drop(session);
 }

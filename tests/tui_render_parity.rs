@@ -78,7 +78,8 @@ fn render_into_lines_with_pool(
     let mut rows = Rows::new(&mut scratch);
     component.render_into(width, &mut rows);
     rows.trim();
-    pool
+    drop(rows);
+    scratch
 }
 
 /// The stale pool the frame renderer's scratch holds after a wide/tall frame:

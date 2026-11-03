@@ -5,11 +5,13 @@
 //! outputs, ANSI stripping, HTML escaping, markdown subset) and the flag
 //! wiring end-to-end through the built binary.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use pir::ai::types::{
     AssistantMessage, ContentBlock, ImageContent, Message, StopReason, TextContent,
-    ThinkingContent, ToolCall, ToolResultMessage, ToolResultRole, UserMessage, UserRole,
+    ThinkingContent, Tool, ToolCall, ToolReference, ToolResultMessage, ToolResultRole, UserMessage,
+    UserRole,
 };
 use pir::coding_agent::export_html::{escape_html, export_session_to_html, markdown_to_html};
 use pir::session_manager::SessionManager;
@@ -72,6 +74,34 @@ fn tool_result(call_id: &str, name: &str, text: &str, is_error: bool) -> Message
         duration_ms: None,
         timestamp: 1_700_000_000_002,
     })
+}
+
+fn system_message(
+    content: &str,
+    sections: Option<BTreeMap<String, Option<String>>>,
+    tools_added: Option<Vec<Tool>>,
+    tools_removed: Option<Vec<ToolReference>>,
+) -> Message {
+    Message::System(UserMessage {
+        role: UserRole::System,
+        content: vec![text_block(content)],
+        tools_added,
+        tools_removed,
+        sections,
+        timestamp: 1_700_000_000_003,
+    })
+}
+
+fn read_tool() -> Tool {
+    Tool {
+        name: "read".into(),
+        description: "Read a file".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } }
+        }),
+        constrained_sampling: None,
+    }
 }
 
 /// A session file with a user message, an assistant tool call, its result,
@@ -436,4 +466,91 @@ fn export_flag_help_lists_the_export_option() {
     assert!(result.status.success());
     let help = String::from_utf8_lossy(&result.stdout);
     assert!(help.contains("--export"), "help omitted --export: {help}");
+}
+
+#[test]
+fn export_renders_leading_system_prompt_and_later_system_updates() {
+    let dir = temp_dir("system");
+    let mut manager =
+        SessionManager::create(&dir.to_string_lossy(), dir.as_path()).expect("create session");
+    manager
+        .append_message(system_message(
+            "You are a coding agent.",
+            Some(BTreeMap::from([
+                ("project_context".to_owned(), Some("v1 context".to_owned())),
+                ("rules".to_owned(), Some("keep answers short".to_owned())),
+            ])),
+            Some(vec![read_tool()]),
+            None,
+        ))
+        .expect("append leading system message");
+    manager
+        .append_message(user_message("hello"))
+        .expect("append user");
+    manager
+        .append_message(system_message(
+            "",
+            Some(BTreeMap::from([
+                ("project_context".to_owned(), Some("v2 context".to_owned())),
+                ("rules".to_owned(), None),
+            ])),
+            Some(vec![Tool {
+                name: "bash".into(),
+                description: "Run a shell command".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } }
+                }),
+                constrained_sampling: None,
+            }]),
+            Some(vec![ToolReference {
+                name: "read".into(),
+            }]),
+        ))
+        .expect("append system update");
+    manager
+        .append_message(assistant_message(vec![text_block("done")]))
+        .expect("append assistant");
+
+    let output = dir.join("out.html");
+    export_session_to_html(manager.path(), Some(&output)).expect("export");
+    let html = std::fs::read_to_string(&output).expect("read html");
+
+    // The leading system entry becomes the prompt and the tool list, not a
+    // plain `<pre>` block.
+    assert!(
+        html.contains("class=\"system-entry\""),
+        "missing system entry: {html}"
+    );
+    assert!(html.contains("System Prompt"), "missing leading prompt");
+    assert!(
+        html.contains("You are a coding agent."),
+        "missing prompt text"
+    );
+    assert!(html.contains("v1 context"), "missing section text");
+    assert!(html.contains("Available Tools"), "missing tool list");
+    assert!(html.contains("Read a file"), "missing tool description");
+    assert!(!html.contains("system-message\"><pre>You are a coding agent."));
+
+    // Later system entries render as named updates with add/remove lists.
+    assert!(
+        html.contains("System Prompt Update"),
+        "missing update title"
+    );
+    assert!(
+        html.contains("project_context"),
+        "missing update section name"
+    );
+    assert!(html.contains("-rules"), "missing removed section name");
+    assert!(
+        html.contains("Updated system prompt section"),
+        "missing section update"
+    );
+    assert!(
+        html.contains("Removed system prompt section"),
+        "missing section removal"
+    );
+    assert!(html.contains("Tools Added"), "missing tools-added list");
+    assert!(html.contains("Tools Removed"), "missing tools-removed list");
+    assert!(html.contains("Run a shell command"), "missing added tool");
 }

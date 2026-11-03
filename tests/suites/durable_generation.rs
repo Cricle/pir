@@ -975,6 +975,17 @@ impl World {
     }
 
     async fn live(&self) -> LiveState {
+        // The commit listener mirrors the newest adopted revision, including a
+        // deferred partial that storage has not received yet (the throttle's
+        // `PROGRESS_COMMIT` semantics). Fall back to storage for a document the
+        // listener never saw.
+        if let Ok(Some(loaded)) = self
+            .store
+            .committed(self.conversation, DocumentKind::Live)
+            .await
+        {
+            return live_from_object(&loaded.value);
+        }
         read_document(&self.storage, self.conversation, LIVE_KIND)
             .await
             .map(|value| live_from_object(&value))

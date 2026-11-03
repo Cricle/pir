@@ -55,18 +55,42 @@ const UTF8_OUTPUT_PREFIX: &str =
 
 /// Resolve the PowerShell executable (upstream `getPowerShellConfig`):
 /// prefer PowerShell 7 (`pwsh.exe`), fall back to Windows PowerShell
-/// (`powershell.exe`), both found on `PATH`. `None` off-Windows or when no
-/// executable exists.
+/// (`powershell.exe`). PATH first, then the standard installation directories
+/// (`%ProgramFiles%\PowerShell\7`, `%SystemRoot%\System32\WindowsPowerShell\v1.0`),
+/// which Windows does not always put on PATH (upstream `61060ddf8`). `None`
+/// off-Windows or when no executable exists.
 pub(crate) fn resolve_powershell_executable() -> Option<String> {
     if !cfg!(windows) {
         return None;
     }
-    for name in ["pwsh.exe", "powershell.exe"] {
-        if let Some(path) = find_on_path(name) {
-            return Some(path);
+    let mut shell = find_on_path("pwsh.exe");
+    if shell.is_none() {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            let candidate = std::path::PathBuf::from(program_files)
+                .join("PowerShell")
+                .join("7")
+                .join("pwsh.exe");
+            if super::bash::shell_path_exists(&candidate) {
+                shell = Some(candidate.to_string_lossy().into_owned());
+            }
         }
     }
-    None
+    if shell.is_none() {
+        shell = find_on_path("powershell.exe");
+    }
+    if shell.is_none() {
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            let candidate = std::path::PathBuf::from(system_root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe");
+            if super::bash::shell_path_exists(&candidate) {
+                shell = Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    shell
 }
 
 /// Search `PATH` for an executable (upstream `findExecutableOnPath` Windows
@@ -75,7 +99,7 @@ fn find_on_path(executable: &str) -> Option<String> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(executable);
-        if candidate.is_file() {
+        if super::bash::shell_path_exists(&candidate) {
             return Some(candidate.to_string_lossy().into_owned());
         }
     }

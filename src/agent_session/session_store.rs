@@ -710,11 +710,22 @@ impl AgentSession {
         // BEFORE dispatch — a handler's `ctx.appendEntry` / `ctx.navigateTree`
         // host fns take the same lock.
         let new_leaf_id_after = session.leaf_id().map(str::to_owned);
+        // #11075: the branch the navigation moved to owns the active tool set.
+        // Replay its system declarations after the leaf switch; an explicit
+        // selection or a branch without a recorded loadout keeps the current
+        // set (upstream `_restoreToolsFromTranscript`).
+        let branch_history: Vec<Message> = session
+            .branch_entries(new_leaf_id_after.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .flat_map(crate::session_manager::projection::session_entry_to_context_messages)
+            .collect();
         let summary_entry = summary_entry_id
             .as_deref()
             .and_then(|id| session.entry(id))
             .and_then(|entry| serde_json::to_value(entry).ok());
         drop(session);
+        self.restore_branch_active_tools(&branch_history);
         if let Some(plugins) = &self.plugins {
             if session_tree_consumers(plugins) {
                 let mut payload = serde_json::json!({

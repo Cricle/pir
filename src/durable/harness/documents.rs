@@ -126,7 +126,7 @@ fn provider_checkpoint_when(_value: &JsonObject) -> bool {
 pub fn agent_definition() -> AnyDocDefinition {
     CommonDocDefinition::conversation_rewindable(AGENT_KIND, AGENT_VERSION, DocumentFork::AsOf)
         .expect("the pi.agent definition version is valid")
-        .behaviour(agent_initial, None, Some(agent_checkpoint_when))
+        .behaviour(agent_initial, None, agent_checkpoint_when)
 }
 
 /// The `pi.provider` conversation document: one distinct provider session id
@@ -143,7 +143,7 @@ pub fn agent_definition() -> AnyDocDefinition {
 pub fn provider_definition() -> AnyDocDefinition {
     CommonDocDefinition::conversation_latest(PROVIDER_KIND, PROVIDER_VERSION, DocumentFork::Initial)
         .expect("the pi.provider definition version is valid")
-        .behaviour(provider_initial, None, Some(provider_checkpoint_when))
+        .behaviour(provider_initial, None, provider_checkpoint_when)
 }
 
 /// Every built-in conversation document, in creation order.

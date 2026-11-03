@@ -2,6 +2,7 @@
 //! and `thinking-selector.ts`: DynamicBorder-framed, search input on top,
 //! windowed list with `→` cursor and `✓` current marker, footer hints.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use super::core::{Component, Container, DynamicBorder, Spacer, Text};
@@ -247,6 +248,11 @@ impl<T> SelectList<T> {
             } else {
                 item.id.clone()
             };
+            let name_text = if item.description.is_empty() {
+                String::new()
+            } else {
+                with_theme(|theme| theme.fg(ThemeColor::Muted, &format!(" ({})", item.description)))
+            };
             let provider_badge =
                 with_theme(|theme| theme.fg(ThemeColor::Muted, &format!("[{}]", item.provider)));
             let default_badge = if item.is_default {
@@ -255,7 +261,9 @@ impl<T> SelectList<T> {
                 String::new()
             };
             lines.push(truncate_to_width(
-                &format!("{cursor}{current_marker}{model_text} {provider_badge}{default_badge}"),
+                &format!(
+                    "{cursor}{current_marker}{model_text}{name_text} {provider_badge}{default_badge}"
+                ),
                 width,
                 "…",
             ));
@@ -323,10 +331,47 @@ impl ModelScope {
     }
 }
 
+/// Split a model label into lower-case letter/number words (upstream
+/// `splitModelLabel`).
+fn split_model_label(value: &str) -> Vec<String> {
+    value
+        .to_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The model's display name when it adds words the id lacks (upstream
+/// `getDistinctModelName`, model-search.ts:13-28). Names that only restate
+/// the id with different casing, separators, or a dropped namespace/version
+/// suffix stay hidden.
+pub fn get_distinct_model_name(id: &str, name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let id_words = split_model_label(id);
+    let id_tokens: std::collections::BTreeSet<&str> = id_words.iter().map(String::as_str).collect();
+    let compact_id = id_words.concat();
+    let covered = |word: &String| {
+        id_tokens.contains(word.as_str())
+            || (word.chars().count() > 1 && compact_id.contains(word.as_str()))
+    };
+    split_model_label(name)
+        .iter()
+        .all(covered)
+        .then_some(())
+        .map_or(Some(name.to_owned()), |()| None)
+}
+
 /// One `(provider, id)` pair list rendered as model selector items (the
 /// current/default markers are matched by full `provider/id` reference).
+/// `names` maps `provider/id` to the model's display name; a distinct name is
+/// carried in `description` and rendered in parentheses.
 fn model_items(
     models: &[(String, String)],
+    names: &BTreeMap<String, String>,
     current: Option<&str>,
     default: Option<&str>,
 ) -> Vec<SelectItem<String>> {
@@ -338,7 +383,10 @@ fn model_items(
                 value: key.clone(),
                 id: id.clone(),
                 provider: provider.clone(),
-                description: String::new(),
+                description: names
+                    .get(&key)
+                    .and_then(|name| get_distinct_model_name(id, name))
+                    .unwrap_or_default(),
                 is_current: current == Some(key.as_str()),
                 is_default: default == Some(key.as_str()),
             }
@@ -408,9 +456,22 @@ impl SelectorContainer {
 
 impl ModelSelector {
     /// `models`: `(provider, id)` pairs; `current`: the active
-    /// `provider/id`; `default`: the persisted default.
+    /// `provider/id`; `default`: the persisted default. Without display names
+    /// the rows show the id alone (upstream callers always pass names; this
+    /// keeps the existing test/host seam).
     pub fn new(models: &[(String, String)], current: Option<&str>, default: Option<&str>) -> Self {
-        let all_items = model_items(models, current, default);
+        Self::new_with_names(models, &BTreeMap::new(), current, default)
+    }
+
+    /// [`Self::new`] with `provider/id` → display-name entries so a name that
+    /// adds words the id lacks renders in parentheses.
+    pub fn new_with_names(
+        models: &[(String, String)],
+        names: &BTreeMap<String, String>,
+        current: Option<&str>,
+        default: Option<&str>,
+    ) -> Self {
+        let all_items = model_items(models, names, current, default);
         let list = model_select_list(all_items.clone());
         let mut frame = Container::new();
         frame.add_child(DynamicBorder::new());
@@ -454,6 +515,15 @@ impl ModelSelector {
     /// scopedModels.length > 0 ? "scoped" : "all"`, model-selector.ts:94).
     /// An empty list leaves the selector scope-less (login warning row).
     pub fn set_scoped_models(&self, scoped_models: &[(String, String)]) {
+        self.set_scoped_models_with_names(scoped_models, &BTreeMap::new());
+    }
+
+    /// [`Self::set_scoped_models`] with display names.
+    pub fn set_scoped_models_with_names(
+        &self,
+        scoped_models: &[(String, String)],
+        names: &BTreeMap<String, String>,
+    ) {
         let mut container = self
             .container
             .lock()
@@ -471,7 +541,8 @@ impl ModelSelector {
             .iter()
             .find(|item| item.is_default)
             .map(|item| item.value.clone());
-        container.scoped_items = model_items(scoped_models, current.as_deref(), default.as_deref());
+        container.scoped_items =
+            model_items(scoped_models, names, current.as_deref(), default.as_deref());
         if container.scoped_items.is_empty() {
             return;
         }

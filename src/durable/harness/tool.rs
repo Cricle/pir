@@ -127,7 +127,7 @@ use crate::durable::harness::usage::{
     usage_add, UsageScope, UsageState, USAGE_KIND, USAGE_VERSION,
 };
 use crate::durable::ids::{ConversationId, EntryId, TaskId};
-use crate::durable::session::{LoadedDocument, StagedDocument, Transaction};
+use crate::durable::session::{CommitOptions, LoadedDocument, StagedDocument, Transaction};
 use crate::durable::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use crate::durable::types::{
     DocumentAddress, DocumentFork, EntryRecord, JsonObject, StorageWrite, StoredDocument,
@@ -516,9 +516,10 @@ pub struct NestedCallState {
 /// with the caller.
 #[must_use]
 pub fn nested_call_definition() -> AnyDocFamilyDefinition {
+    use crate::durable::documents::{DocCheckpointWhen, DocCheckpointWhenExt as _};
     CommonDocDefinition::task(NESTED_CALL_KIND, NESTED_CALL_VERSION)
         .expect("the pi.tool.nested-call definition version is valid")
-        .behaviour_family(JsonObject::new, None, None)
+        .behaviour_family(JsonObject::new, None, DocCheckpointWhen::never())
 }
 
 /// The identity form of [`nested_call_definition`], as staging needs it.
@@ -1403,6 +1404,19 @@ impl Draft {
         address: &ResolvedAddress,
         kind: DocKind,
     ) -> Result<Self, TaskRuntimeError> {
+        // A deferred progress commit lives in the session's document cache
+        // before storage; staging from it keeps the held changes.
+        if let Some(loaded) = runtime.cached_document(address).await? {
+            return Ok(Self {
+                address_id: address.id.clone(),
+                address: address.address.clone(),
+                value: loaded.value.clone(),
+                created: false,
+                loaded: Some(loaded),
+                kind,
+                family: None,
+            });
+        }
         let stored = runtime.document(address).await?;
         let version = match kind {
             DocKind::Live => LIVE_VERSION,
@@ -1442,6 +1456,17 @@ impl Draft {
         key: &str,
     ) -> Result<Self, TaskRuntimeError> {
         let address = nested_call_address(parent, key).map_err(TaskRuntimeError::Invalid)?;
+        if let Some(loaded) = runtime.cached_document(&address).await? {
+            return Ok(Self {
+                address_id: address.id.clone(),
+                address: address.address.clone(),
+                value: loaded.value.clone(),
+                created: false,
+                loaded: Some(loaded),
+                kind: DocKind::NestedCall,
+                family: Some(nested_call_identity()),
+            });
+        }
         let stored = runtime.document(&address).await?;
         let (value, created, loaded) = match stored {
             Some(stored) => {
@@ -3204,7 +3229,8 @@ fn publish_progress(
                         }
                     }
                 }
-                stage_draft(&runtime, draft, None, context).await?;
+                stage_draft_with_options(&runtime, draft, None, context, CommitOptions::deferred())
+                    .await?;
                 *written
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = current;
@@ -3235,8 +3261,20 @@ async fn stage_draft(
     next: Option<NextTaskState>,
     context: Context,
 ) -> Result<(), String> {
+    stage_draft_with_options(runtime, draft, next, context, CommitOptions::default()).await
+}
+
+/// [`stage_draft`] with explicit commit options; the progress throttle defers
+/// its writes (`PROGRESS_COMMIT`).
+async fn stage_draft_with_options(
+    runtime: &TaskRuntime,
+    draft: Draft,
+    next: Option<NextTaskState>,
+    context: Context,
+    options: CommitOptions,
+) -> Result<(), String> {
     runtime
-        .commit(
+        .commit_with_options(
             move |tx, _record| {
                 Box::pin(async move {
                     draft.stage(tx);
@@ -3244,6 +3282,7 @@ async fn stage_draft(
                 })
             },
             context,
+            options,
         )
         .await
         .map_err(|error| error.to_string())

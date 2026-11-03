@@ -86,7 +86,9 @@ use crate::durable::delta::Op;
 use crate::durable::documents::{
     address_id, AnyDocDefinition, DocCheckpointWhen, DocDefinition, ResolvedAddress,
 };
-use crate::durable::errors::{ReportInfo, StorageError, TaskFaultReason, TaskOutdatedReason};
+use crate::durable::errors::{
+    ReadOnlySession, ReportInfo, StorageError, TaskFaultReason, TaskOutdatedReason,
+};
 use crate::durable::harness::agent::{configure, resolve_agent, Agent, AgentChange, AgentState};
 use crate::durable::harness::compaction::{
     create_compaction_in_state, CompactionInput, CompactionReason,
@@ -149,7 +151,12 @@ pub const SCAN_PAGE_SIZE: usize = 256;
 pub enum HarnessError {
     /// A storage or session failure.
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Storage(StorageError),
+    /// The Harness was opened read-only: a commit with writes, or a call that
+    /// would run tasks, was refused. Nothing was written, and the Harness
+    /// stays usable for reads.
+    #[error(transparent)]
+    ReadOnly(#[from] ReadOnlySession),
     /// A method whose upstream implementation needs a module this port does
     /// not have yet.
     ///
@@ -168,6 +175,15 @@ pub enum HarnessError {
     /// The request was invalid.
     #[error("{0}")]
     Invalid(String),
+}
+
+impl From<StorageError> for HarnessError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::ReadOnly(error) => Self::ReadOnly(error),
+            error => Self::Storage(error),
+        }
+    }
 }
 
 impl From<crate::durable::errors::DocumentError> for HarnessError {
@@ -230,6 +246,18 @@ pub struct HarnessOptions {
     /// which forwards spans, links, events and metrics to the crate's portable
     /// telemetry core.
     pub telemetry: Option<HarnessTelemetry>,
+    /// Open for reading only, as a viewer of a session another process drives,
+    /// for example a synced copy on a device that only shows it
+    /// (upstream `HarnessOptions.readOnly`).
+    ///
+    /// Open loads live tasks as committed — a `running` task stays running —
+    /// and reconciles nothing. Every commit with writes rejects with
+    /// [`ReadOnlySession`](crate::durable::errors::ReadOnlySession) before it
+    /// reaches storage, so the Session stays healthy; a commit that writes
+    /// nothing succeeds. [`Harness::resume`] and every call that would run
+    /// tasks reject with the same error. [`Harness::wake`] is always inactive
+    /// and `on_wake` is never called. Reopen without this flag to write.
+    pub read_only: bool,
 }
 
 impl std::fmt::Debug for HarnessOptions {
@@ -239,6 +267,7 @@ impl std::fmt::Debug for HarnessOptions {
             .field("tasks", &self.tasks.len())
             .field("on_wake", &self.on_wake.is_some())
             .field("on_report", &self.on_report.is_some())
+            .field("read_only", &self.read_only)
             .finish_non_exhaustive()
     }
 }
@@ -313,7 +342,7 @@ impl Conversation {
     pub async fn wait_for_idle(&self) -> Result<(), HarnessError> {
         // Upstream `Conversation.waitForIdle` resumes first; otherwise a
         // pending task behind a paused scheduler would never reach idle.
-        self.harness.inner.scheduler.resume();
+        self.harness.inner.scheduler.try_resume()?;
         self.harness
             .scheduler()
             .wait_for_idle(Some(self.id))
@@ -930,7 +959,7 @@ impl Submission {
     /// submission only settles when the run that consumes it makes progress.
     pub async fn wait(&self, context: Context) -> Result<SubmissionRecord, HarnessError> {
         self.harness.assert_usable()?;
-        self.harness.inner.scheduler.resume();
+        self.harness.inner.scheduler.try_resume()?;
         let id = self.id;
         let waiters = self.harness.inner.submission_waiters.clone();
         let read_context = context.clone();
@@ -1435,6 +1464,7 @@ impl Harness {
             now: Some(now.clone()),
             document_retention_ms,
             persist_within_ms: None,
+            read_only: options.read_only,
             behaviours: Some(Arc::new(BuiltinBehaviours)),
             // The line records committed-entry and settled-submission events
             // through the same handle the harness emits through.
@@ -1465,6 +1495,7 @@ impl Harness {
             timers: options.timers.clone(),
             on_wake: options.on_wake.clone(),
             report: Some(report_scheduler),
+            read_only: options.read_only,
             session: Some(session_options),
         };
         let scheduler = TaskScheduler::open_with(scheduler_options, storage.clone(), Vec::new())
@@ -1693,10 +1724,18 @@ impl Harness {
     }
 
     /// Enable task scheduling (spec §5.6). Idempotent; a no-op after close.
-    pub fn resume(&self) {
-        if !self.closed() {
-            self.inner.scheduler.resume();
+    ///
+    /// A read-only Harness refuses the call with
+    /// [`ReadOnlySession`](crate::durable::errors::ReadOnlySession), upstream's
+    /// `Harness.resume()` contract.
+    pub fn resume(&self) -> Result<(), HarnessError> {
+        if self.closed() {
+            return Ok(());
         }
+        self.inner
+            .scheduler
+            .try_resume()
+            .map_err(HarnessError::from)
     }
 
     /// When this session next needs a running process.
@@ -1876,7 +1915,7 @@ impl Harness {
         self.assert_usable()?;
         // Upstream `Submissions.submit` resumes before admitting: a submission
         // that starts a run must not sit behind a paused scheduler.
-        self.inner.scheduler.resume();
+        self.inner.scheduler.try_resume()?;
         let telemetry = &self.inner.telemetry;
         let (span, context) = submit_span(telemetry, context, &draft, conversation);
         let now = self.now();
@@ -2057,7 +2096,7 @@ impl Harness {
         context: Context,
     ) -> Result<TaskId, HarnessError> {
         self.assert_usable()?;
-        self.inner.scheduler.resume();
+        self.inner.scheduler.try_resume()?;
         let input = CompactionInput {
             reason: CompactionReason::Manual,
             instructions,
@@ -2095,7 +2134,7 @@ impl Harness {
         self.assert_usable()?;
         // Upstream `Conversation.abort` resumes before marking, so the abort
         // handlers can actually run when the scheduler was paused.
-        self.inner.scheduler.resume();
+        self.inner.scheduler.try_resume()?;
         self.inner
             .scheduler
             .abort_conversation(conversation, background)
@@ -2808,13 +2847,13 @@ struct BuiltinBehaviours;
 impl DocBehaviours for BuiltinBehaviours {
     fn checkpoint_when(&self, _address_id: &str, kind: &str) -> Option<DocCheckpointWhen> {
         match kind {
-            AGENT_KIND => agent_definition().checkpoint_when,
-            LIVE_KIND => crate::durable::harness::live::LIVE_DEFINITION.checkpoint_when,
-            INBOX_KIND => crate::durable::harness::inbox::INBOX_DEFINITION.checkpoint_when,
+            AGENT_KIND => Some(agent_definition().checkpoint_when),
+            LIVE_KIND => Some(crate::durable::harness::live::LIVE_DEFINITION.checkpoint_when),
+            INBOX_KIND => Some(crate::durable::harness::inbox::INBOX_DEFINITION.checkpoint_when),
             PROVIDER_KIND => {
-                crate::durable::harness::documents::provider_definition().checkpoint_when
+                Some(crate::durable::harness::documents::provider_definition().checkpoint_when)
             }
-            USAGE_KIND => crate::durable::harness::usage::USAGE_DEFINITION.checkpoint_when,
+            USAGE_KIND => Some(crate::durable::harness::usage::USAGE_DEFINITION.checkpoint_when),
             _ => None,
         }
     }

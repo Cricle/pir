@@ -585,6 +585,12 @@ async fn create_agent_session_builds_a_hermetic_session_and_runtime() {
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(IdleProvider));
     let registry = ModelRegistry::from_registry(Arc::new(registry));
+    // Hermetic discovery: pin the user-global `.agents/skills` scan to the
+    // temp home, not the developer's real profile.
+    let resource_loader = || {
+        pir::sdk::DefaultResourceLoader::new(dir.0.clone(), agent_dir.clone())
+            .with_home(dir.0.clone())
+    };
 
     let created = create_agent_session(CreateAgentSessionOptions {
         cwd: Some(dir.0.clone()),
@@ -594,6 +600,7 @@ async fn create_agent_session_builds_a_hermetic_session_and_runtime() {
         thinking_level: Some(ThinkingLevel::Off),
         no_session: true,
         no_tools: true,
+        resource_loader: Some(resource_loader()),
         ..Default::default()
     })
     .await
@@ -604,12 +611,13 @@ async fn create_agent_session_builds_a_hermetic_session_and_runtime() {
 
     let result = create_agent_session_runtime(CreateAgentSessionOptions {
         cwd: Some(dir.0.clone()),
-        agent_dir: Some(agent_dir),
+        agent_dir: Some(agent_dir.clone()),
         model_registry: Some(registry),
         model: Some(test_model()),
         thinking_level: Some(ThinkingLevel::Off),
         no_session: true,
         no_tools: true,
+        resource_loader: Some(resource_loader()),
         ..Default::default()
     })
     .await

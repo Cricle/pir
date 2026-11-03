@@ -1077,10 +1077,39 @@ pub trait EntryRenderer: Send + Sync {
     fn render(&self, entry: &JsonValue, width: usize) -> RendererOutcome;
 }
 
+/// The context handed to a markdown transformer (upstream
+/// `MarkdownTransformContext`, extensions/types.ts:1542).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarkdownTransformContext {
+    /// `"user"`, `"assistant"` or `"assistant-thinking"`.
+    pub message_type: String,
+    /// Whether the message is still streaming.
+    pub is_streaming: bool,
+    /// The render width.
+    pub available_width: usize,
+    /// The persisted session-entry id; `None` for a live message or live
+    /// rendering (upstream `messageId`).
+    pub message_id: Option<String>,
+    /// The persisted session-entry ISO timestamp; `None` for live rendering
+    /// (upstream `timestamp`).
+    pub timestamp: Option<String>,
+}
+
 /// Native markdown transformer (upstream `registerMarkdownTransformer`).
 pub trait MarkdownTransformer: Send + Sync {
     /// Transform markdown text; `None` keeps the input unchanged.
     fn transform(&self, markdown: &str) -> Option<String>;
+
+    /// [`Self::transform`] with the upstream `MarkdownTransformContext`.
+    /// The default preserves transformers written before the context
+    /// argument existed.
+    fn transform_with_context(
+        &self,
+        markdown: &str,
+        _context: &MarkdownTransformContext,
+    ) -> Option<String> {
+        self.transform(markdown)
+    }
 }
 
 /// One tool render request handed to a native resolver.
@@ -2002,6 +2031,16 @@ pub trait RendererService: Send + Sync {
     /// `None` keeps the input unchanged.
     fn transform_markdown(&self, _markdown: &str) -> Option<String> {
         None
+    }
+
+    /// [`Self::transform_markdown`] with the upstream context. The default
+    /// drops the context for services written before it existed.
+    fn transform_markdown_with_context(
+        &self,
+        markdown: &str,
+        _context: &MarkdownTransformContext,
+    ) -> Option<String> {
+        self.transform_markdown(markdown)
     }
 
     /// Number of registered markdown transformers (the TUI's cheap pre-check

@@ -47,3 +47,7 @@ pnpm-lock.yaml
 # OS
 .DS_Store
 Thumbs.db
+# Process evidence / local audit artifacts (never push)
+/.audit/
+**/__pycache__/
+*.pyc

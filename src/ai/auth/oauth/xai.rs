@@ -121,6 +121,8 @@ async fn login(interaction: &dyn AuthInteraction) -> AiResult<OAuthCredential> {
             .verification_uri_complete
             .clone()
             .unwrap_or_else(|| device.verification_uri.clone()),
+        open_browser_on_confirm: None,
+        copy_code_on_confirm: None,
         interval_seconds: device.interval_seconds,
         expires_in_seconds: Some(device.expires_in_seconds),
     });

@@ -124,6 +124,12 @@ pub fn detect_from_environment(
     if term_program == "herdr" {
         return images(Some(ImageProtocol::Kitty), has_true_color_hint, true);
     }
+    // Rex supports OSC 8 hyperlinks and enough of the Kitty graphics protocol
+    // for Pi (upstream 396ecd7b8 / 0ed1b0431). Check it before the outer
+    // terminal checks so a leaked KITTY_WINDOW_ID cannot change the answer.
+    if term_program == "rex" {
+        return images(Some(ImageProtocol::Kitty), true, true);
+    }
     if env_present(env, "KITTY_WINDOW_ID") || term_program == "kitty" {
         return images(Some(ImageProtocol::Kitty), true, true);
     }

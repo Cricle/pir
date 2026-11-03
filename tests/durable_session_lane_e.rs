@@ -23,10 +23,10 @@ use pir::durable::session::{
     LoadedDocument, Session, SessionOptions, StagedDocument,
 };
 use pir::durable::{
-    address_id, CommonDocDefinition, Context, ConversationId, DocDefinition, DocOwner,
-    DocumentAddress, DocumentContent, DocumentFork, DocumentId, DocumentPoint, DocumentRecord,
-    DocumentScope, DocumentSemantics, JsonObject, MemoryStorage, ResolvedAddress, Seq, Storage,
-    StorageWrite,
+    address_id, CommonDocDefinition, Context, ConversationId, DocCheckpointWhen,
+    DocCheckpointWhenExt, DocDefinition, DocOwner, DocumentAddress, DocumentContent, DocumentFork,
+    DocumentId, DocumentPoint, DocumentRecord, DocumentScope, DocumentSemantics, JsonObject,
+    MemoryStorage, ResolvedAddress, Seq, Storage, StorageWrite,
 };
 use pir::session_manager::projection::build_session_path;
 use pir::session_manager::{CustomEntry, FileEntry};
@@ -67,7 +67,7 @@ fn probe_initial() -> JsonObject {
 fn probe_definition() -> pir::durable::AnyDocDefinition {
     CommonDocDefinition::conversation_latest("probe", 1, DocumentFork::Initial)
         .expect("definition")
-        .behaviour(probe_initial, None, None)
+        .behaviour(probe_initial, None, DocCheckpointWhen::never())
 }
 
 fn probe_address(conversation: ConversationId) -> ResolvedAddress {

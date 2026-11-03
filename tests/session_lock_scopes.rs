@@ -263,11 +263,16 @@ async fn paged_compaction_releases_the_shared_session_lock() {
     let session_dir = dir.0.join("sessions");
 
     // A session large enough to open TAIL-FIRST (more than the entry cap), so
-    // the print hook takes the paged fast path.
+    // the print hook takes the paged fast path. The complete live context is
+    // the same 1100 messages: the hook decides the threshold on it when no
+    // projection is supplied.
+    let messages: Vec<pir::ai::types::Message> = (0..1100u64)
+        .map(|index| user_message(format!("turn {index}"), index))
+        .collect();
     let mut manager = SessionManager::create(&cwd, &session_dir).expect("create session");
-    for index in 0..1100u64 {
+    for message in &messages {
         manager
-            .append_message(user_message(format!("turn {index}"), index))
+            .append_message(message.clone())
             .expect("append message");
     }
     manager.sync_now().expect("sync session");
@@ -315,7 +320,7 @@ async fn paged_compaction_releases_the_shared_session_lock() {
     });
     let context = Arc::new(Context {
         system_prompt: None,
-        messages: Vec::new(),
+        messages,
         tools: None,
     });
     let task = tokio::spawn(hook(Arc::clone(&context)));

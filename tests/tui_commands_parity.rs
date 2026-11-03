@@ -645,6 +645,47 @@ fn auth_selector_login_flow_keys() {
 }
 
 #[test]
+fn auth_selector_device_code_confirm_is_one_shot_and_optional() {
+    let selector = AuthSelector::login(vec![AuthProviderOption {
+        id: "openai".to_string(),
+        label: "openai".to_string(),
+        status: "stored credential".to_string(),
+        status_kind: Some(AuthProviderKind::OAuth),
+        kind: AuthProviderKind::OAuth,
+        subscription: false,
+        description: None,
+    }]);
+
+    // Both flags false: no action row, Enter selects the provider.
+    selector.show_device_code(
+        "ABCD-EFGH".to_string(),
+        "not-a-url".to_string(),
+        Some(false),
+        Some(false),
+    );
+    assert_eq!(selector.pending_device_code_hint(), None);
+    assert_eq!(selector.handle_key(AuthKey::Enter), AuthOutcome::Select(0));
+
+    // Default (None = true) offers both; an invalid URL never reaches the
+    // browser launcher, and the first Enter is consumed.
+    selector.show_device_code(
+        "ABCD-EFGH".to_string(),
+        "not-a-url".to_string(),
+        None,
+        Some(false),
+    );
+    assert_eq!(
+        selector.pending_device_code_hint().as_deref(),
+        Some("(enter to open browser)")
+    );
+    assert_eq!(selector.handle_key(AuthKey::Enter), AuthOutcome::None);
+    assert_eq!(selector.progress().status, "Open the URL manually");
+    assert_eq!(selector.pending_device_code_hint(), None);
+    // A repeated Enter is a normal provider selection again.
+    assert_eq!(selector.handle_key(AuthKey::Enter), AuthOutcome::Select(0));
+}
+
+#[test]
 fn auth_selector_logout_lists_stored_credentials() {
     let selector = AuthSelector::logout(vec![AuthProviderOption {
         id: "anthropic".to_string(),

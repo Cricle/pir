@@ -21,9 +21,10 @@ use pir::durable::session::{
 };
 use pir::durable::{
     AnyDocDefinition, CommonDocDefinition, Context, ConversationId, ConversationParent,
-    ConversationQuery, ConversationRecord, DocDefinition, DocOwner, DocumentAddress, DocumentFork,
-    DocumentHistory, DocumentId, DocumentPoint, DocumentScope, DocumentSemantics, EntryId,
-    JsonObject, MemoryStorage, ResolvedAddress, Storage, StorageError,
+    ConversationQuery, ConversationRecord, DocCheckpointWhen, DocCheckpointWhenExt, DocDefinition,
+    DocOwner, DocumentAddress, DocumentFork, DocumentHistory, DocumentId, DocumentPoint,
+    DocumentScope, DocumentSemantics, EntryId, JsonObject, MemoryStorage, ResolvedAddress, Storage,
+    StorageError,
 };
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -65,7 +66,7 @@ fn initial() -> JsonObject {
 fn definition(kind: &str, semantics: DocumentSemantics) -> AnyDocDefinition {
     CommonDocDefinition::new(kind, 1, semantics)
         .expect("valid document definition")
-        .behaviour(initial, None, None)
+        .behaviour(initial, None, DocCheckpointWhen::never())
 }
 
 fn address(

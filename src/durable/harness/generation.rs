@@ -113,6 +113,7 @@ use crate::durable::harness::live::{
     live_from_object, live_to_object, DeferredStatus, GenerationState, LiveState, RetryStatus,
     RunState, SlotProgress, SlotStatus, ToolSlot, LIVE_DEFINITION,
 };
+use crate::durable::harness::partial_changes::PartialChanges;
 use crate::durable::harness::prompt::{plan_system_entries, render_sections, replay_sections};
 use crate::durable::harness::registry::{PromptInput, ToolRegistration};
 use crate::durable::harness::scheduler::runtime::{TaskRuntime, TaskRuntimeError};
@@ -128,6 +129,7 @@ use crate::durable::session::line::SessionState;
 use crate::durable::session::transaction::{
     EntryDraft, HeadTarget, StagedDocument, SubmissionChange, Transaction,
 };
+use crate::durable::session::CommitOptions;
 use crate::durable::types::{
     ContextEdit, DocumentAddress, DocumentPoint, DocumentScope, EntryRecord, JoinPolicy,
     JsonObject, StoredDocument, TaskOutcome, TaskOutcomeError,
@@ -1019,9 +1021,15 @@ async fn ensure_provider_session_id(
 /// Stream one request and return the terminal message.
 ///
 /// Partials commit at most every `progress.partial_interval_ms`, one flush at a
-/// time. The throttle stops before the caller's classification commit, and
-/// because every flush is awaited inline there is never a detached commit to
-/// wait for.
+/// time, deferred (`PROGRESS_COMMIT` semantics): watches see each at once and
+/// storage receives them together, at the next commit that reads or writes
+/// `pi.live`, at close, or at the session's deferred deadline. The throttle
+/// stops before the caller's classification commit, and because every flush is
+/// awaited inline there is never a detached commit to wait for.
+///
+/// A commit appends what text and thinking grew by and applies the argument
+/// changes since the last one ([`PartialChanges`]), so its cost follows the new
+/// text, not the strings' length.
 ///
 /// `None` means the invocation was aborted mid-stream.
 async fn stream_response(
@@ -1049,6 +1057,7 @@ async fn stream_response(
     // one, so a flush needs no copy of its own.
     let mut pending: Option<Arc<AssistantMessage>> = None;
     let mut terminal: Option<AssistantMessage> = None;
+    let changes = Arc::new(Mutex::new(PartialChanges::new()));
 
     loop {
         tokio::select! {
@@ -1067,6 +1076,10 @@ async fn stream_response(
                         // never gets past it, so it never leaves a partial.
                         if let Some(partial) = event_partial(&event) {
                             if !partial.content.is_empty() {
+                                changes
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .observe(&event);
                                 pending = Some(Arc::clone(partial));
                             }
                         }
@@ -1080,8 +1093,15 @@ async fn stream_response(
                     }
                     // A rejected commit (the invocation ended) stops the
                     // throttle; the committed state stays consistent.
-                    let _ = commit_partial(harness, runtime, attempt, partial.as_ref(), context)
-                        .await;
+                    let _ = commit_partial(
+                        harness,
+                        runtime,
+                        attempt,
+                        changes.clone(),
+                        partial.as_ref(),
+                        context,
+                    )
+                    .await;
                 }
                 next_flush = tokio::time::Instant::now() + Duration::from_millis(interval);
             }
@@ -1106,23 +1126,43 @@ async fn stream_response(
 }
 
 /// Commit one throttled partial into `pi.live.generation.message`.
+///
+/// Deferred: the partial is adopted in memory and published, and storage
+/// receives it together with the next commit that reads or writes `pi.live`
+/// (the terminal classification commit, for one), at close, or at the session's
+/// deferred deadline.
 async fn commit_partial(
     harness: &Arc<GenerationHarness>,
     runtime: &TaskRuntime,
     attempt: i64,
+    changes: Arc<Mutex<PartialChanges>>,
     partial: &AssistantMessage,
     context: &DurableContext,
 ) -> Result<(), TaskRuntimeError> {
     let host = harness.clone();
     let conversation = runtime.conversation_id();
-    let message = serde_json::to_value(partial).unwrap_or(Value::Null);
-    runtime
-        .commit(
+    // Copy once: the provider keeps mutating its partial, and the changes since
+    // the last commit belong to this copy.
+    let mut message = match serde_json::to_value(partial) {
+        Ok(Value::Object(message)) => message,
+        _ => return Ok(()),
+    };
+    let taken = changes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take(&mut message);
+    let taken = Arc::new(taken);
+    let taken_for_commit = taken.clone();
+    let changes_for_commit = changes.clone();
+    let result = runtime
+        .commit_with_options(
             move |tx, _current| {
+                let changes = changes_for_commit.clone();
+                let taken = taken_for_commit.clone();
                 Box::pin(async move {
                     // A flush only changes `generation.attempt` and
                     // `generation.message`. Reading the draft and writing those
-                    // two keys leaves every other field of `pi.live` untouched;
+                    // keys leaves every other field of `pi.live` untouched;
                     // decoding and re-encoding the whole document would copy
                     // the rest of it on every throttled flush.
                     let mut live = host
@@ -1139,7 +1179,10 @@ async fn commit_partial(
                     }
                     if let Some(generation) = generation.as_object_mut() {
                         generation.insert("attempt".to_owned(), Value::from(attempt));
-                        generation.insert("message".to_owned(), message);
+                        changes
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .commit(generation, message, &taken);
                     }
                     host.store
                         .stage_document(tx, conversation, DocumentKind::Live, live)
@@ -1148,8 +1191,16 @@ async fn commit_partial(
                 })
             },
             context.clone(),
+            CommitOptions::deferred(),
         )
-        .await
+        .await;
+    if result.is_err() {
+        changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .restore(&taken);
+    }
+    result
 }
 
 /// The cumulative partial snapshot of one non-terminal event.
@@ -1877,8 +1928,10 @@ async fn tools(
         .await;
 }
 
-/// The round's tools are terminal: apply their controls and either end the run
-/// at the final boundary or hand it to the next generation (spec §8.5).
+/// The round's tools are terminal: apply their controls, append a `handoff`'s
+/// reset, and then end the run at the final boundary (`terminate`), end it at a
+/// queued reset, or hand it to the next generation at the `postTools` boundary
+/// — in the handoff's new context when there is one (spec §8.5).
 async fn finish_tool_round(
     harness: &Arc<GenerationHarness>,
     runtime: &TaskRuntime,
@@ -1943,7 +1996,6 @@ async fn finish_tool_round(
         .flatten()
         .filter_map(|control| control.handoff.clone())
         .next_back();
-    let ending = terminate || handoff.is_some();
 
     let host = harness.clone();
     let catalogue = runtime.registry();
@@ -1985,7 +2037,7 @@ async fn finish_tool_round(
                                 .map_err(TaskRuntimeError::Invalid)?;
                         }
                     }
-                    let at = if ending {
+                    let at = if terminate {
                         Boundary::Final
                     } else {
                         Boundary::PostTools
@@ -2006,7 +2058,7 @@ async fn finish_tool_round(
                     let outcome = TaskOutcome::Completed {
                         result: json!({ "entryId": assistant }),
                     };
-                    if ending {
+                    if terminate {
                         end_run_in(
                             &host,
                             tx,

@@ -24,6 +24,12 @@ pub enum AuthEvent {
     DeviceCode {
         user_code: String,
         verification_uri: String,
+        /// Offer best-effort browser opening on user confirmation (upstream
+        /// `openBrowserOnConfirm`). `None` means the default, true.
+        open_browser_on_confirm: Option<bool>,
+        /// Offer copying `user_code` on user confirmation (upstream
+        /// `copyCodeOnConfirm`). `None` means the default, true.
+        copy_code_on_confirm: Option<bool>,
         interval_seconds: Option<u64>,
         expires_in_seconds: Option<u64>,
     },

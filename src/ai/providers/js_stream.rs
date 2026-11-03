@@ -629,6 +629,10 @@ fn auth_event_from_json(event: &JsonValue) -> Option<crate::ai::auth::AuthEvent>
                 .and_then(JsonValue::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            open_browser_on_confirm: event
+                .get("openBrowserOnConfirm")
+                .and_then(JsonValue::as_bool),
+            copy_code_on_confirm: event.get("copyCodeOnConfirm").and_then(JsonValue::as_bool),
             interval_seconds: event.get("intervalSeconds").and_then(JsonValue::as_u64),
             expires_in_seconds: event.get("expiresInSeconds").and_then(JsonValue::as_u64),
         }),
