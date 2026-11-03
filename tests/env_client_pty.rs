@@ -361,6 +361,7 @@ fn printed_pid(output: &Arc<Mutex<Vec<u8>>>) -> i32 {
 
 /// Wait until `pid` is gone (`kill(pid, 0)` reports `ESRCH`).
 #[cfg(unix)]
+#[allow(unsafe_code)] // test-only existence probe; SAFETY is documented inline
 async fn wait_for_process_gone(pid: i32) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {

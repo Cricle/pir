@@ -116,6 +116,7 @@ impl Drop for Tree {
 /// Wait until `pid` is gone (`kill(pid, 0)` reports `ESRCH`). A zombie still
 /// counts as present, so this also proves the daemon reaped the command.
 #[cfg(unix)]
+#[allow(unsafe_code)] // test-only existence probe; SAFETY is documented inline
 async fn wait_for_process_gone(pid: i32) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {

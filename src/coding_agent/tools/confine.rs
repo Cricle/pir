@@ -492,7 +492,9 @@ mod imp {
         /// link so the ordinary replacement path handles it.
         // `mode_t`/`nlink_t` are `u32`/`u64` on Linux but `u16` on macOS, so
         // `From` widens where required and stays identity where the target type
-        // is already the same.
+        // is already the same. Clippy sees only the active target, where the
+        // identity conversions are "useless" but still needed for portability.
+        #[allow(clippy::useless_conversion)]
         pub(super) fn target_info(&self, name: &OsStr) -> io::Result<super::TargetInfo> {
             use std::os::unix::fs::PermissionsExt;
 
