@@ -5751,9 +5751,6 @@ async fn per_request_progress_reaches_the_callback_and_resets_the_idle_deadline(
 /// only waits for the scenario's report, bounded, so a regression fails here
 /// instead of hanging the harness.
 #[test]
-#[ignore = "known limitation: rmcp's send_cancellable_request blocks inside its first poll on a
-            stalled peer pipe, so the request timer cannot fire; the harness fails in ~21s
-            instead of hanging. See src/mcp/client.rs request_cancellable"]
 fn request_deadline_bounds_a_blocked_dispatch() {
     let (report_tx, report_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

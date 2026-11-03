@@ -1164,8 +1164,13 @@ fn map_thinking_level_to_effort(model: &Model, level: Option<ThinkingLevel>) -> 
 
 /// The effort managed-effort models are pinned at while
 /// `configuration_update`-style markers carry the level (upstream
-/// `options?.effort ?? "high"` in `buildParams`).
-const ANTHROPIC_MANAGED_EFFORT: &str = "high";
+/// `params.output_config = { effort: "low" }` in `buildParams`,
+/// `anthropic-messages.ts:1288`).
+///
+/// It is `low` because the top-level effort is part of the cached prompt and
+/// organizations can cap effort: a request carrying anything above the cap is
+/// rejected.
+const ANTHROPIC_MANAGED_EFFORT: &str = "low";
 
 /// Upstream `thinkingLevelMap?.off !== null`: true when the model has no
 /// thinking-level map or its "off" entry is a value (not an explicit null).

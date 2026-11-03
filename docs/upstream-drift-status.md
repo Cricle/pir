@@ -55,10 +55,10 @@ unchanged: this document refreshes the *drift* record, not the port baseline.
 | 28 | `bc73eb8b1` | remove stale Rex comment | N/A | Comment removal in the image module. |
 | 29 | `ede2c9b46` | docs + `--help` text fixes | N/A | Documentation/`--help` copy for the Node CLI; pir documents its own `--export <file> [output]` (`coding_agent/cli.rs:654`). |
 | 30 | `36be9c612` | decode `pi.exec` output across UTF-8 chunk boundaries | N/A | Node-only defect. pir captures raw bytes and decodes once at the end (`extensions/runtime/exec.rs:161-176`), so a split code point cannot be replaced by U+FFFD. |
-| 31 | `8a2ebd385` | stop nested blockquote rendering growing exponentially | **Open** | `tui/markdown/render.rs:239` renders children at `width.saturating_sub(2).max(1)` and `:249` re-wraps at the same clamped width with no `width < 3` guard, so deep `>` runs still triple per level. |
+| 31 | `8a2ebd385` | stop nested blockquote rendering growing exponentially | **Landed** | `tui/markdown/render.rs` — both quote renderers (`render_block_range` and `render_markdown_block_one`) now take the upstream `width < 3` branch: children render at the current width with no border and no re-wrap, so nesting cannot triple per level. Widths `>= 3` use `width - 2` directly (no `.max(1)` clamp). |
 | 32 | `6dfb54678` | start when a configured package fails to install | **Landed** | `coding_agent/package_manager.rs:2992-2996` — an install error is recorded in `failures`, the package is skipped, startup continues; `:2507` warns instead of failing. |
-| 33 | `9ffd27cfa` | accept only http/https OAuth URLs | **Open** | `mcp/oauth.rs:310-317` (`safe_url`) still blocks only `javascript`/`data`/`vbscript`; the parsed `authorization_endpoint` (`:378`, used at `:936`) is passed to the URL handler unvalidated, so `file:`/custom schemes still pass. |
-| 34 | `e3bc05e87` | fixed low top-level effort with Anthropic per-message effort | **Open** | `ai/api/anthropic.rs:1169` pins `ANTHROPIC_MANAGED_EFFORT = "high"` (doc still cites upstream's old `?? "high"`). Missing: the value is `"low"` and the doc comment updated. |
+| 33 | `9ffd27cfa` | accept only http/https OAuth URLs | **Landed** | `mcp/oauth.rs` — `safe_url` accepts only `http`/`https` (upstream `oauth/types.ts:126-134`), so `issuer`, `authorization_endpoint`, `token_endpoint` and `registration_endpoint` are all validated before the URL handler sees them; `authorization_servers` entries go through the same helper instead of a bare `Url::parse`. |
+| 34 | `e3bc05e87` | fixed low top-level effort with Anthropic per-message effort | **Landed** | `ai/api/anthropic.rs:1173` — `ANTHROPIC_MANAGED_EFFORT = "low"` with the upstream rationale (organizations cap effort and reject higher values) on the constant; the trailing marker replays the same constant. `tests/suites/ai_adapters_w11.rs`, `tests/suites/ai_adapter_fixes.rs` assert `"low"`. |
 | 35 | `3141dfdcf` | merge commit (watchable) | N/A | Merge only; both sides are classified in rows 36 and 37. |
 | 36 | `a2fd25f56` | `Watchable` | N/A | chord watch out of scope (`MAPPING.md:23`). |
 | 37 | `a1836b06c` | npm 12 `pack --json` in preview-packages | N/A | Release script (`scripts/preview-packages.mjs`); no counterpart here. |
@@ -66,14 +66,14 @@ unchanged: this document refreshes the *drift* record, not the port baseline.
 | 39 | `906e1302f` | Bun 1.4.4 for standalone binaries | N/A | CI workflow only. |
 | 40 | `42cb822f1` | shared watch-handle implementation | N/A | chord watch out of scope (rows 7, 36). |
 | 41 | `936e5f40a` | drop `autoevals` dependency | N/A | `packages/evals` is not ported. |
-| 42 | `8c03fef4d` | rank contiguous fuzzy matches; search session fields separately | **Partial** | Session search is ported: tiered fields plus "score every contiguous occurrence" (`session_manager/search.rs:1117-1118`, `:1296-1390`). The shared selector scorer is not: `tui/fuzzy.rs:39-62` still scores only the greedy leftmost alignment, so `/model`, autocomplete and settings search keep the old ranking. |
+| 42 | `8c03fef4d` | rank contiguous fuzzy matches; search session fields separately | **Landed** | Session search: tiered fields plus contiguous-occurrence scoring (`session_manager/search.rs:1117-1118`, `:1296-1390`). Shared selector scorer: `tui/fuzzy.rs` is now `score_positions` + greedy alignment + "score every contiguous occurrence, keep the best" (upstream `fuzzy.ts:88-115`), so `/model`, autocomplete and settings search share the ranking. |
 | 43 | `90d5cf784` | shorter device-code guidance | N/A | Docs only. |
 | 44 | `7151099d0` | confirm device-code browser and clipboard actions | **Open** | No `OAuthDeviceCodeInfo`/`openBrowserOnConfirm`/`copyCodeOnConfirm` anywhere in `src`; device flows poll headlessly (`ai/auth/device_code.rs:54`) and the TUI login has no confirm row (`tui/terminal.rs:13561+`). |
 | 45 | `c60de42e9` | preserve `pi.exec` spawn errors | **Landed** | `extensions/runtime/exec.rs:230-240` returns `stderr: "failed to spawn `<cmd>`: <err>"` with `code: 1` instead of an empty stderr. |
 | 46 | `1c720d285` | HTML export deeper than the call stack | N/A | Node call-stack artifact in `template.js`; pir renders the export in Rust (`coding_agent/export_html.rs`) with no recursive JS tree walk. |
 | 47 | `64627838b` | `messageId` + `timestamp` in markdown transformer context | **Open** | `plugins/services/mod.rs:1081-1084` — `transform(&self, markdown: &str)`; `agent_session/plugin_services.rs:3784` passes text only. Missing: the context argument (message id, timestamp) on the trait, the JS bridge and the call sites. |
 | 48 | `9359adf0c` | render system messages in HTML export | **Partial** | System messages are rendered (`coding_agent/export_html.rs:557-562`) but as one `<pre>` block; the prompt/tool-list header and the "named section/tool update" structure the commit adds are absent. |
-| 49 | `27cc6bfc0` | stop macOS shell groups before killing them | **Open** | `coding_agent/tools/bash.rs:1122-1136` signals the group with `SIGKILL` directly; no darwin `SIGSTOP` pre-freeze, so the "child wakes its shell before the shell is signalled" race is unchanged. |
+| 49 | `27cc6bfc0` | stop macOS shell groups before killing them | **Landed** | `coding_agent/tools/bash.rs` (unix tree-kill) — `#[cfg(target_os = "macos")] killpg(SIGSTOP)` before `killpg(SIGKILL)`, best effort, with the upstream race note (`shell.ts:239-251`); Linux keeps the direct kill (`tasklist_lock`). |
 | 50 | `74f468640` | trust bot in PR gate | N/A | CI config. |
 | 51 | `be14d9732` | open a Harness read-only | **Open** | `durable/harness/harness.rs:195-240` (`HarnessOptions`) has no read-only option and `Harness::open` (`:1384`) always starts the scheduler; no equivalent of upstream's read-only open/error. |
 | 52 | `476a303c1` | drop `min-release-age` from managed `npm ci` | N/A | npm-invocation detail of the Node package manager. |
@@ -88,7 +88,7 @@ unchanged: this document refreshes the *drift* record, not the port baseline.
 | 61 | `7c22a93d0` | `totalFromProvider` flag on usage cost | **Landed** | `ai/types/stream.rs:27-53` (`totalFromProvider` serde field, `is_provider_billed`), set in `ai/util.rs:445-484`, `ai/classify.rs:254`, `ai/images.rs:443`; honoured at `ai/provider.rs:3605-3615`. |
 | 62 | `58c0b02ce` | `[Unreleased]` changelog sections | N/A | Docs only. |
 
-Totals: **12 Landed, 5 Partial, 9 Open, 36 N/A**.
+Totals: **17 Landed, 4 Partial, 5 Open, 36 N/A**.
 
 ## Open and Partial items
 
@@ -98,28 +98,19 @@ Open (behaviour absent, exact gap):
    (`generation.rs:1946`).
 2. `606af8662` — model-name suffix in `/model` and `/scoped-models`
    (`selector.rs:328-346`, `:680-683`).
-3. `8a2ebd385` — no-border branch for nested blockquotes below width 3
-   (`markdown/render.rs:239,249`).
-4. `9ffd27cfa` — http/https-only OAuth URL validation
-   (`mcp/oauth.rs:310-317`, `:936`).
-5. `e3bc05e87` — top-level Anthropic effort `"low"`
-   (`anthropic.rs:1169`).
-6. `7151099d0` — confirm-to-open-browser/copy-code on device login.
-7. `64627838b` — message id + timestamp in the markdown-transformer context
+3. `7151099d0` — confirm-to-open-browser/copy-code on device login.
+4. `64627838b` — message id + timestamp in the markdown-transformer context
    (`plugins/services/mod.rs:1081`).
-8. `27cc6bfc0` — darwin group `SIGSTOP` before `SIGKILL`
-   (`tools/bash.rs:1122-1136`).
-9. `be14d9732` — read-only `Harness::open`
+5. `be14d9732` — read-only `Harness::open`
    (`durable/harness/harness.rs:195`).
 
 Partial (core exists, one documented gap):
 
 1. `6c2fd73b0` — throttled commits are stored inline, no deferred-storage path.
 2. `da412b039` — no `appendText`; string drafts are rewritten whole.
-3. `8c03fef4d` — session search ported, shared `tui/fuzzy.rs` scorer not.
-4. `9359adf0c` — system messages exported as plain blocks, not as
+3. `9359adf0c` — system messages exported as plain blocks, not as
    prompt/tool sections.
-5. `92ab53602` — adoption runs after the commit, not inside it; watch
+4. `92ab53602` — adoption runs after the commit, not inside it; watch
    retirement absent.
 
 ## Spot checks in `2ec55d808..v1.4.0` (110 commits)

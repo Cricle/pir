@@ -1124,13 +1124,25 @@ impl ProcessTreeKill {
             // group that is already gone falls back to the direct kill.
             #[expect(
                 unsafe_code,
-                reason = "libc::killpg on the shell child's own process group"
+                reason = "libc::killpg/libc::kill on the shell child's own process group"
             )]
             // SAFETY: `pid` is the shell child spawned as its own process-group
-            // leader; both calls take plain integer ids and no pointers. A
-            // failed group signal falls back to the direct child pid, which is
-            // equally valid for this process.
+            // leader; all calls take plain integer ids and no pointers. A failed
+            // group signal falls back to the direct child pid, which is equally
+            // valid for this process.
             unsafe {
+                // macOS signals group members individually after releasing the
+                // group lock, so a killed child can wake its waiting shell
+                // before that shell is signalled and `a; b` starts `b` during
+                // cancellation (upstream #11252). Freezing the group first
+                // narrows that race; it is best effort, not an atomic freeze
+                // (`SIGKILL` also kills stopped processes). Linux holds
+                // `tasklist_lock` across group signalling, so it needs no
+                // pre-freeze.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = libc::killpg(pid as libc::pid_t, libc::SIGSTOP);
+                }
                 if libc::killpg(pid as libc::pid_t, libc::SIGKILL) != 0 {
                     let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
                 }

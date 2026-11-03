@@ -307,12 +307,18 @@ fn optional_strings(value: Option<&JsonValue>, name: &str) -> OAuthResult<Option
     Ok(Some(strings))
 }
 
+/// Accepts only `http:` and `https:` URLs (upstream `safeUrl`,
+/// `oauth/types.ts:126-134`).
+///
+/// Servers supply these URLs and the authorization endpoint is opened with the
+/// platform URL handler, so a `file:` or custom-protocol URL would launch local
+/// programs.
 fn safe_url(value: Option<&JsonValue>, name: &str) -> OAuthResult<String> {
     let text = required_string(value, name)?;
     let url = reqwest::Url::parse(&text).map_err(|_| fatal(format!("Invalid {name}")))?;
     match url.scheme() {
-        "javascript" | "data" | "vbscript" => Err(fatal(format!("Invalid {name}"))),
-        _ => Ok(text),
+        "http" | "https" => Ok(text),
+        _ => Err(fatal(format!("Invalid {name}"))),
     }
 }
 
@@ -336,11 +342,7 @@ fn parse_protected_resource_metadata(
         optional_strings(input.get("authorization_servers"), "authorization_servers")?
             .map(|urls| {
                 urls.into_iter()
-                    .map(|url| {
-                        reqwest::Url::parse(&url)
-                            .map_err(|_| fatal("Invalid authorization server URL"))
-                            .map(|_| url)
-                    })
+                    .map(|url| safe_url(Some(&JsonValue::String(url)), "authorization server URL"))
                     .collect::<OAuthResult<Vec<String>>>()
             })
             .transpose()?;

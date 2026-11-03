@@ -24,6 +24,46 @@ fn is_word_boundary(prev: char) -> bool {
     prev.is_whitespace() || matches!(prev, '-' | '_' | '.' | '/' | ':')
 }
 
+/// Score one alignment (upstream `scorePositions`): consecutive matches are
+/// rewarded, gaps penalized, word boundaries rewarded and later matches
+/// slightly penalized.
+fn score_positions(text: &[char], positions: &[usize]) -> f64 {
+    let mut score = 0.0f64;
+    let mut last_match_index: Option<usize> = None;
+    let mut consecutive = 0i64;
+
+    for &i in positions {
+        match last_match_index {
+            Some(prev) if prev + 1 == i => {
+                consecutive += 1;
+                score -= (consecutive * 5) as f64;
+            }
+            _ => {
+                consecutive = 0;
+                if let Some(prev) = last_match_index {
+                    score += ((i - prev - 1) * 2) as f64;
+                }
+            }
+        }
+        if i == 0 || is_word_boundary(text[i - 1]) {
+            score -= 10.0;
+        }
+        score += i as f64 * 0.1;
+        last_match_index = Some(i);
+    }
+
+    score
+}
+
+/// The first index at or after `from` where `needle` occurs contiguously.
+fn find_from(haystack: &[char], needle: &[char], from: usize) -> Option<usize> {
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    (from..=haystack.len() - needle.len())
+        .find(|&start| haystack[start..start + needle.len()] == *needle)
+}
+
 fn match_query(query: &[char], text: &[char]) -> FuzzyMatch {
     if query.is_empty() {
         return FuzzyMatch {
@@ -35,40 +75,32 @@ fn match_query(query: &[char], text: &[char]) -> FuzzyMatch {
         return FuzzyMatch::miss();
     }
 
-    let mut query_index = 0usize;
-    let mut score = 0.0f64;
+    // Greedy alignment: each query character at its first occurrence after the
+    // previous one (upstream `matchQuery`).
+    let mut positions: Vec<usize> = Vec::with_capacity(query.len());
     let mut last_match_index: Option<usize> = None;
-    let mut consecutive = 0i64;
-
-    for (i, &c) in text.iter().enumerate() {
-        if query_index >= query.len() {
-            break;
-        }
-        if c == query[query_index] {
-            let boundary = i == 0 || text[i - 1].is_whitespace() || is_word_boundary(text[i - 1]);
-            match last_match_index {
-                Some(prev) if prev + 1 == i => {
-                    consecutive += 1;
-                    score -= (consecutive * 5) as f64;
-                }
-                _ => {
-                    consecutive = 0;
-                    if let Some(prev) = last_match_index {
-                        score += ((i - prev - 1) * 2) as f64;
-                    }
-                }
-            }
-            if boundary {
-                score -= 10.0;
-            }
-            score += i as f64 * 0.1;
-            last_match_index = Some(i);
-            query_index += 1;
-        }
+    for &wanted in query {
+        let Some(i) = find_from(text, &[wanted], last_match_index.map_or(0, |prev| prev + 1))
+        else {
+            return FuzzyMatch::miss();
+        };
+        positions.push(i);
+        last_match_index = Some(i);
     }
 
-    if query_index < query.len() {
-        return FuzzyMatch::miss();
+    let mut score = score_positions(text, &positions);
+
+    // The greedy alignment can scatter the query over an earlier, unrelated
+    // part of the text, e.g. "opus" in "openrouter openrouter/anthropic/claude-opus"
+    // takes o, p, u from "openrouter". Also score every contiguous occurrence
+    // and keep the best alignment.
+    let mut start = find_from(text, query, 0);
+    while let Some(offset) = start {
+        for (k, slot) in positions.iter_mut().enumerate() {
+            *slot = offset + k;
+        }
+        score = score.min(score_positions(text, &positions));
+        start = find_from(text, query, offset + 1);
     }
 
     if query == text {

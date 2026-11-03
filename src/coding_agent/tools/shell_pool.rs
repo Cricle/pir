@@ -2909,7 +2909,7 @@ thread_local! {
 /// starts the member from the first real `build_tool_loadout` (and from print's
 /// loadout pass), so the first bash call keeps its warm member. A nested
 /// suppression is counted, and the guard restores the depth on panic.
-pub(crate) fn without_prewarm<T>(f: impl FnOnce() -> T) -> T {
+pub fn without_prewarm<T>(f: impl FnOnce() -> T) -> T {
     struct Guard;
 
     impl Drop for Guard {
@@ -2927,7 +2927,7 @@ pub(crate) fn without_prewarm<T>(f: impl FnOnce() -> T) -> T {
 
 /// Whether this thread is currently deriving a prompt (see
 /// [`without_prewarm`]).
-fn prewarm_suppressed() -> bool {
+pub fn prewarm_suppressed() -> bool {
     PREWARM_SUPPRESSED.with(|depth| depth.get() > 0)
 }
 
@@ -2972,25 +2972,6 @@ pub fn prewarm(protocol: ShellProtocol) {
             .ensure_member(protocol, shell.program(), &cwd)
             .await;
     });
-}
-
-#[cfg(test)]
-mod prewarm_suppression_tests {
-    use super::{prewarm_suppressed, without_prewarm};
-
-    /// The prompt-render guard must be scoped: nested render passes stay
-    /// suppressed, and the guard restores the prior depth on exit so the first
-    /// run loadout warms normally.
-    #[test]
-    fn without_prewarm_scopes_and_restores_the_gate() {
-        assert!(!prewarm_suppressed());
-        without_prewarm(|| {
-            assert!(prewarm_suppressed());
-            without_prewarm(|| assert!(prewarm_suppressed()));
-            assert!(prewarm_suppressed());
-        });
-        assert!(!prewarm_suppressed());
-    }
 }
 
 /// Test/inspection outcome of one pooled run.

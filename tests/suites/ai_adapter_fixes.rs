@@ -1175,7 +1175,7 @@ fn anthropic_managed_effort_betas_and_fixed_effort() {
             .as_array()
             .and_then(|messages| messages.last())
             .cloned(),
-        Some(json!({"role": "system", "content": [], "output_config": {"effort": "high"}})),
+        Some(json!({"role": "system", "content": [], "output_config": {"effort": "low"}})),
         "the active effort marker keeps replaying the managed effort"
     );
 }

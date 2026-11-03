@@ -193,9 +193,13 @@ const EXPECT_SITE_ALLOWLIST: [(&str, u32); 28] = [
     ("durable/harness/documents.rs", 128),
     ("durable/harness/documents.rs", 145),
     ("durable/harness/generation.rs", 315),
-    ("durable/harness/generation.rs", 598),
-    ("durable/harness/generation.rs", 2525),
-    ("durable/harness/generation.rs", 2752),
+    // The task definition build, the `pi.user` draft and the
+    // `pi.assistant` draft: same invariants as before, shifted by the
+    // handoff/continuation and streamed-projection edits above them
+    // (598 → 609, 2525 → 2586, 2752 → 2815).
+    ("durable/harness/generation.rs", 609),
+    ("durable/harness/generation.rs", 2586),
+    ("durable/harness/generation.rs", 2815),
     ("durable/harness/harness.rs", 1795),
     ("durable/harness/inbox.rs", 289),
     ("durable/harness/live.rs", 320),

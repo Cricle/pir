@@ -365,3 +365,88 @@ fn streamed_source_matches_projection_on_an_empty_session() {
     assert_streamed_matches_projection("single", &path, &leaf);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The transport serializes bodies >= 8 MiB through `serde_json::to_writer`
+/// into a temp file, one message at a time. The writer seam must produce the
+/// same bytes as the buffered `to_vec` — the streamed body never needs a
+/// materialized buffer to be correct — and the estimate the transport
+/// reserves its capacity from must never undershoot the real size.
+#[test]
+fn streamed_body_serializes_identically_through_a_writer() {
+    let (path, leaf) = write_compacted_fixture();
+    let model = mock_model();
+    let compat = OpenAiCompat::default();
+    let options = StreamOptions {
+        message_source: Some(Arc::new(
+            SessionMessageSource::build_from_file(&path, Some(&leaf)).expect("streamed source"),
+        )),
+        ..Default::default()
+    };
+    let context = Context {
+        system_prompt: Some("base system prompt".to_owned()),
+        messages: Vec::new(),
+        tools: None,
+    };
+    let body =
+        build_openai_body_streamed(&model, &context, &options, &compat).expect("streamed body");
+    let buffered = serde_json::to_vec(&body).expect("buffered bytes");
+    let mut written = Vec::new();
+    serde_json::to_writer(&mut written, &body).expect("written bytes");
+    assert_eq!(
+        written, buffered,
+        "writer and buffered serialization must be byte-identical"
+    );
+    assert!(
+        body.estimated_json_bytes() >= buffered.len(),
+        "the transport capacity estimate must not undershoot ({} < {})",
+        body.estimated_json_bytes(),
+        buffered.len()
+    );
+    let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+}
+
+/// The print widen arm chains the file-backed prefix with the resident tail
+/// (`Context::messages`: the messages this run produced). The chained body
+/// must be byte-identical to the projection body with the same tail appended.
+#[test]
+fn chained_streamed_source_matches_projection_with_run_tail() {
+    let (path, leaf) = write_compacted_fixture();
+    let model = mock_model();
+    let compat = OpenAiCompat::default();
+    let tail = assistant_message("run answer");
+
+    let manager = SessionManager::open(&path).expect("open full");
+    let projection = manager.build_session_projection().expect("projection");
+    let mut baseline_messages = projection.messages;
+    baseline_messages.push(tail.clone());
+    let baseline_context = Context {
+        system_prompt: Some("base system prompt".to_owned()),
+        messages: baseline_messages,
+        tools: None,
+    };
+    let baseline_options = StreamOptions::default();
+    let baseline =
+        build_openai_body_streamed(&model, &baseline_context, &baseline_options, &compat)
+            .expect("baseline streamed body");
+    let baseline_bytes = serde_json::to_vec(&baseline).expect("baseline bytes");
+
+    let options = StreamOptions {
+        message_source: Some(Arc::new(
+            SessionMessageSource::build_from_file(&path, Some(&leaf)).expect("streamed source"),
+        )),
+        ..Default::default()
+    };
+    let chained_context = Context {
+        system_prompt: Some("base system prompt".to_owned()),
+        messages: vec![tail],
+        tools: None,
+    };
+    let chained = build_openai_body_streamed(&model, &chained_context, &options, &compat)
+        .expect("chained streamed body");
+    let chained_bytes = serde_json::to_vec(&chained).expect("chained bytes");
+    assert_eq!(
+        chained_bytes, baseline_bytes,
+        "the chained streamed body must be byte-identical to the projection + tail"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+}

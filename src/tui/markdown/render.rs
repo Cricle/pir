@@ -230,6 +230,25 @@ pub(super) fn render_block_range(
                 // Nested spans inside the quote restore the quote style
                 // (upstream `quoteInlineStyleContext`, markdown.ts:583-586).
                 let quote_prefix = quote_style_prefix(theme);
+                if width < 3 {
+                    // Upstream `width < 3` guard (markdown.ts:600-611): the
+                    // `"│ "` border plus a one-column body leaves no room, so
+                    // every extra nesting level would re-wrap each child line at
+                    // width 1 and the output would grow exponentially with
+                    // depth. Render the children at the current width with no
+                    // border instead.
+                    for inner in &inner_blocks {
+                        lines.extend(render_markdown_block(
+                            inner,
+                            width,
+                            theme,
+                            options,
+                            &quote_prefix,
+                        ));
+                    }
+                    continue;
+                }
+                let inner_width = width - 2;
                 let mut inner_lines: Vec<String> = Vec::new();
                 for inner in &inner_blocks {
                     if matches!(inner, Block::Space) {
@@ -237,7 +256,7 @@ pub(super) fn render_block_range(
                     }
                     inner_lines.extend(render_markdown_block(
                         inner,
-                        width.saturating_sub(2).max(1),
+                        inner_width,
                         theme,
                         options,
                         &quote_prefix,
@@ -248,8 +267,7 @@ pub(super) fn render_block_range(
                     inner_lines.pop();
                 }
                 for inner_line in inner_lines {
-                    for wrapped in wrap_text_with_ansi(&inner_line, width.saturating_sub(2).max(1))
-                    {
+                    for wrapped in wrap_text_with_ansi(&inner_line, inner_width) {
                         lines.push(format!(
                             "{}{}",
                             (theme.quote_border)("│ "),
@@ -395,19 +413,30 @@ fn render_markdown_block_one(
             // (upstream `quoteInlineStyleContext`, markdown.ts:583-586).
             let quote_prefix = quote_style_prefix(theme);
             let mut lines = Vec::new();
+            // Upstream `width < 3` guard (markdown.ts:600-611): the `"│ "`
+            // border plus a one-column body leaves no room, so deeper nesting
+            // would re-wrap every child line at width 1 and the output would
+            // grow exponentially with depth. Render the children unbordered.
+            if width < 3 {
+                for block in &inner {
+                    lines.extend(render_markdown_block_one(
+                        block,
+                        width,
+                        theme,
+                        options,
+                        &quote_prefix,
+                    ));
+                }
+                return lines;
+            }
             for block in &inner {
                 if matches!(block, Block::Space) {
                     continue;
                 }
-                for quote_line in render_markdown_block_one(
-                    block,
-                    width.saturating_sub(2).max(1),
-                    theme,
-                    options,
-                    &quote_prefix,
-                ) {
-                    for wrapped in wrap_text_with_ansi(&quote_line, width.saturating_sub(2).max(1))
-                    {
+                for quote_line in
+                    render_markdown_block_one(block, width - 2, theme, options, &quote_prefix)
+                {
+                    for wrapped in wrap_text_with_ansi(&quote_line, width - 2) {
                         lines.push(format!(
                             "{}{}",
                             (theme.quote_border)("│ "),

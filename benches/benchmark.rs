@@ -1267,17 +1267,58 @@ fn write_linear_session_fixture(
     std::fs::metadata(path).expect("fixture metadata").len()
 }
 
+/// An `openai-completions` model for the streamed widen probe: the request
+/// body builder needs a model (API family, compat resolution), never a real
+/// endpoint — the body is written to a temp file, not sent.
+fn bench_openai_model() -> Model {
+    Model {
+        id: "bench-openai".into(),
+        name: "Bench openai".into(),
+        api: "openai-completions".into(),
+        provider: "bench".into(),
+        base_url: "http://127.0.0.1:1/v1".into(),
+        reasoning: false,
+        thinking_level_map: None,
+        input: vec!["text".into()],
+        cost: ModelCost {
+            rates: ModelCostRates {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            tiers: Vec::new(),
+        },
+        context_window: 1_000_000,
+        max_tokens: 4096,
+        sampling_params: None,
+        headers: None,
+        thinking_token_budget_field: None,
+        input_limits: None,
+        prompt_cache: None,
+        sampling_params_by_thinking_level: None,
+        model_type: None,
+        compat: None,
+    }
+}
+
 /// The print widen path (100 MB session, compaction off): a paged linear
 /// session's complete model context must not materialize the transcript twice.
 ///
-/// The former path (`widen_to_full` + `build_session_projection`) holds the
-/// parsed `Vec<Arc<FileEntry>>` AND the cloned `Vec<Message>` at once. The
-/// linear paged builder streams the file and MOVES each stored message into
-/// the aggregate, so its probe peak must stay below one-and-a-half times the
-/// file size while the old path exceeds it. Both probes run over the same
-/// fixture in the same process, so the assertion is an A/B on the real code
-/// paths, not a size special case. The timed criterion function is the new
-/// builder (the path print now runs for a linear paged session).
+/// The lean probe is the linear paged builder (the path print runs for a
+/// linear paged session): it streams the file and moves each stored message
+/// into the aggregate, so its peak must stay below one-and-a-half times the
+/// file size. The `print_widen_projection_100mb` probe is the widen fallback
+/// print now runs for non-linear sessions: the file-backed
+/// `SessionMessageSource` streams the transcript straight from the JSONL file
+/// and the request body is serialized one message at a time into a temp file
+/// (the transport's shape for bodies >= 8 MiB). Its predecessor probe called
+/// `widen_to_full` + `build_session_projection` and measured ~206 MB (the
+/// parsed entry aggregate plus the projection's cloned `Vec<Message>`);
+/// print no longer materializes that aggregate on the streamed path, so the
+/// probe pins the streamed widen fallback absolutely: under 100 MB, with no
+/// transcript-sized single allocation. Both probes run over the same fixture
+/// in the same process.
 fn print_paged_prompt_context_100mb(c: &mut Criterion) {
     use pir::session_manager::SessionManager;
 
@@ -1318,27 +1359,67 @@ fn print_paged_prompt_context_100mb(c: &mut Criterion) {
         lean_stats.max_allocation_bytes
     );
 
-    // A/B reference: the pre-change widen + projection over the same file.
-    let mut widened = SessionManager::open_paged(&path, PAGE_BYTES, PAGE_ENTRIES)
-        .expect("open the widen fixture paged for the reference");
-    let old_probe = AllocProbe::begin();
-    widened
-        .widen_to_full()
-        .expect("widen the reference session");
-    let projection = widened
-        .build_session_projection()
-        .expect("project the widened reference session");
-    let old_stats = old_probe.finish();
-    assert_eq!(projection.messages.len(), MESSAGE_PAIRS * 2);
-    drop(projection);
-    drop(widened);
-    report_alloc_probe("print_widen_projection_100mb", old_stats);
+    // The widen fallback print now runs for non-linear sessions: stream the
+    // transcript from the session file (`SessionMessageSource`), chain the
+    // empty resident tail, and serialize the body one message at a time into
+    // a temp file — the same shape the transport uses for bodies >= 8 MiB.
+    // No `widen_to_full`, no projection `Vec<Message>`.
+    use pir::ai::api::openai::{build_openai_body_streamed, SessionMessageSource};
+    use pir::ai::types::{
+        Context as BenchContext, MessageSource as _, OpenAiCompat,
+        StreamOptions as BenchStreamOptions,
+    };
+
+    let model = bench_openai_model();
+    let widen_probe = AllocProbe::begin();
+    let source = SessionMessageSource::build(&paged, paged.leaf_id())
+        .expect("build the streamed widen source");
+    let summary = source
+        .summary()
+        .expect("summarize the streamed widen source");
+    assert_eq!(
+        summary.message_count,
+        MESSAGE_PAIRS * 2,
+        "the streamed widen source must cover the whole linear transcript"
+    );
+    let widen_context = BenchContext {
+        system_prompt: None,
+        messages: Vec::new(),
+        tools: None,
+    };
+    let widen_options = BenchStreamOptions {
+        message_source: Some(Arc::new(source)),
+        ..Default::default()
+    };
+    let compat = OpenAiCompat::default();
+    let body = build_openai_body_streamed(&model, &widen_context, &widen_options, &compat)
+        .expect("build the streamed widen body");
+    let body_path = fixture.file("widen-request.json");
+    let body_file = std::fs::File::create(&body_path).expect("create widen request body file");
+    serde_json::to_writer(std::io::BufWriter::new(body_file), &body)
+        .expect("serialize the streamed widen body");
+    let widen_stats = widen_probe.finish();
+    let body_bytes = std::fs::metadata(&body_path)
+        .expect("widen request body metadata")
+        .len();
+    drop(body);
+    drop(widen_options);
+    report_alloc_probe("print_widen_projection_100mb", widen_stats);
     assert!(
-        lean_stats.peak_bytes + file_bytes / 4 < old_stats.peak_bytes,
-        "the streaming builder must remove the second transcript copy \
-         (lean {} vs widened {} bytes)",
-        lean_stats.peak_bytes,
-        old_stats.peak_bytes
+        widen_stats.peak_bytes < 100 * 1024 * 1024,
+        "the streamed widen path must stay under 100 MB (got {} bytes)",
+        widen_stats.peak_bytes
+    );
+    assert!(
+        widen_stats.max_allocation_bytes < 8 * 1024 * 1024,
+        "no transcript-sized buffer may be allocated on the streamed widen path (largest {} bytes)",
+        widen_stats.max_allocation_bytes
+    );
+    assert!(
+        body_bytes as usize >= summary.approximate_json_bytes / 2,
+        "the serialized widen body must carry the transcript ({} bytes vs ~{} estimated)",
+        body_bytes,
+        summary.approximate_json_bytes
     );
 
     c.bench_function("print_paged_prompt_context_100mb", |b| {

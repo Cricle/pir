@@ -256,8 +256,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_fast.ps1 -Concu
 
 本轮关闭/暴露的项：TUI `/model <ref>:<level>`（thinking 后缀）、原生插件 SessionService
 的 new_session/fork/navigate_tree/switch_session（改为记录 SessionCommandAction）、
-http_poll_pacing 的连接上限回归、phone 父会话图片断言、mcp 阻塞派发用例（见下方遗留）、
-上游漂移重审计（`docs/upstream-drift-status.md`：184 / 110 / 62）。
+http_poll_pacing 的连接上限回归、phone 父会话图片断言、mcp 阻塞派发用例、
+上游漂移重审计（`docs/upstream-drift-status.md`：184 / 110 / 62，其中 31/33/34/42/49 本轮落地）。
 
 | bench（debug） | median |
 |---|---:|
@@ -288,12 +288,16 @@ http_poll_pacing 的连接上限回归、phone 父会话图片断言、mcp 阻�
 门禁（本轮实跑）：`cargo fmt --all -- --check` EXIT 0；
 `cargo clippy --all-targets --all-features --locked -- -D warnings` EXIT 0；
 定向测试 `tui::slash::tests` 4/4、`plugin_session_actions` 4/4、`http_poll_pacing` 6/6、
-`phone_child_inline` 11/11、`mcp_integration` 67/68。
+`phone_child_inline` 11/11、`mcp_integration` 70/70（含此前 ignored 的阻塞派发用例）。
 
-**遗留（本轮未修）**：`tests/mcp_integration.rs` 的
-`plugin_registers_lazily_and_exposes_tools` 在本机稳定失败（`host.reload()` 后
-`connection_states` 仍为 Connected；该断言在 HEAD 已存在，属工作树既有问题，非本轮引入）；
-`request_deadline_bounds_a_blocked_dispatch` 仍为 ignored —— rmcp 的
-`send_cancellable_request` 在 peer 管道停写时阻塞在首次 poll 内，定时器无法被 poll 到，
-已写入 `src/mcp/client.rs` 的已知限制注释。
+**源码卫生门禁**：`src/ai/transport.rs`、`src/coding_agent/tools/shell_pool.rs`、
+`src/tui/slash.rs` 的内联 `#[cfg(test)]` 模块已迁到独立测试二进制
+（`tests/lane_e_streaming_file_body.rs`、`tests/shell_pool_prewarm.rs`、
+`tests/tui_slash_model_argument.rs`），`source_hygiene` 两项恢复绿。
+
+**遗留项已清零**：`plugin_registers_lazily_and_exposes_tools` 由
+`3022965`（`/reload` 不再经自身 `session_start` 重新发现）修复；
+`request_deadline_bounds_a_blocked_dispatch` 已解除 ignored —— 截止时间在派发**之前**
+上弦、响应循环的 `notifications/cancelled` 改为 detach 发送，定时器不再被阻塞的传输写挡住。
+`cargo test --test mcp_integration`：**70 passed / 0 failed / 0 ignored**。
 

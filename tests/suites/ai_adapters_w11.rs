@@ -379,8 +379,8 @@ fn anthropic_managed_effort_replays_per_message_effort_markers() {
     );
     assert_eq!(
         messages.last().cloned(),
-        Some(json!({"role": "system", "content": [], "output_config": {"effort": "high"}})),
-        "the active effort is pinned in the trailing marker"
+        Some(json!({"role": "system", "content": [], "output_config": {"effort": "low"}})),
+        "the active effort is pinned in the trailing marker (the managed constant, not the request level)"
     );
     // The managed-effort thinking branch is independent of the level.
     assert_eq!(

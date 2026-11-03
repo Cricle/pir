@@ -41,9 +41,10 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig, ClientNotification,
-    ClientRequest, ElicitRequestParams, ElicitResult, GetPromptRequestParams, Implementation,
-    ListToolsResult, ProgressToken, ReadResourceRequestParams, RootsCapabilities, ServerResult,
+    CallToolRequestParams, CallToolResponse, CancelledNotification, CancelledNotificationParam,
+    ClientCapabilities, ClientConfig, ClientNotification, ClientRequest, ElicitRequestParams,
+    ElicitResult, GetPromptRequestParams, Implementation, ListToolsResult, ProgressToken,
+    ReadResourceRequestParams, RequestId, RootsCapabilities, ServerResult,
 };
 use rmcp::service::{
     NotificationContext, RequestContext, RequestHandle, RoleClient, RunningService,
@@ -1265,7 +1266,37 @@ impl McpClient {
             None => self.timeout,
         }
     }
+}
 
+/// Tell the server that one request is over, WITHOUT making the caller wait
+/// for the transport. rmcp's `RequestHandle::cancel` builds exactly this
+/// `notifications/cancelled` but then awaits `Peer::send_notification`, which
+/// resolves only when the service loop's transport write completes — under a
+/// stalled peer (a server that stopped reading stdin) that responder never
+/// fires, so awaiting the cancel inside a `select!` arm kept the request
+/// deadline from ever being reported (see `tests/mcp_integration.rs`
+/// `request_deadline_bounds_a_blocked_dispatch`). The same notification is
+/// built here, but the send runs detached: best effort, best latency.
+fn spawn_request_cancel(peer: Peer<RoleClient>, id: RequestId, reason: &'static str) {
+    tokio::spawn(async move {
+        // rmcp's `Notification` is `#[non_exhaustive]`: `new` fills the
+        // method (its default) and the extensions.
+        let notification = CancelledNotification::new(CancelledNotificationParam::new(
+            Some(id),
+            Some(reason.to_string()),
+        ));
+        let _ = peer.send_notification(notification.into()).await;
+    });
+}
+
+/// The `PIR_MCP_DEBUG` gate for the dispatch-deadline diagnosis prints (see
+/// `request_deadline_bounds_a_blocked_dispatch`); read once per process.
+fn deadline_debug_enabled() -> bool {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var_os("PIR_MCP_DEBUG").is_some())
+}
+
+impl McpClient {
     /// Run one CANCELLABLE request against the live peer, bounded by the
     /// request's idle deadline (upstream `McpClient.requestInternal`,
     /// `packages/mcp/src/client.ts:403-445`).
@@ -1327,13 +1358,22 @@ impl McpClient {
         // progress can only restart it once the request has a token.
         let timeout = self.effective_timeout(options);
         let deadline = tokio::time::sleep(timeout);
+        // Pinned once: the progress arm resets it in place through
+        // `deadline.as_mut().reset(..)`, so the idle deadline is the same
+        // timer for the dispatch wait and the response loop.
         tokio::pin!(deadline);
-        // Known limitation (see `tests/mcp_integration.rs`
-        // `request_deadline_bounds_a_blocked_dispatch`): rmcp's
-        // `send_cancellable_request` can block INSIDE its first poll when the
-        // peer pipe is stalled, and a future that blocks in `poll` keeps this
-        // `select!` from polling the deadline. The deadline therefore bounds
-        // an async-pending dispatch, not a synchronously blocked one.
+        // Nothing in either select below blocks inside a poll: rmcp's
+        // `send_cancellable_request` awaits a bounded (1024-slot) tokio mpsc,
+        // and the transport writes run as spawned send tasks in the service
+        // loop, so a stalled peer parks the WRITERS without ever blocking a
+        // poll of this future. Both selects therefore keep observing the
+        // deadline even against a blocked dispatch (proven by
+        // `tests/mcp_integration.rs`
+        // `request_deadline_bounds_a_blocked_dispatch`). The only
+        // synchronously waiting step used to be the response-loop cancel,
+        // which awaits the transport write's responder and never resolves
+        // against a stalled peer — that send is now detached (see
+        // `spawn_request_cancel`).
         let mut handle = tokio::select! {
             dispatched = operation(peer) => match dispatched {
                 Ok(handle) => handle,
@@ -1389,9 +1429,17 @@ impl McpClient {
                     });
                 }
                 () = &mut deadline => {
-                    // The deadline elapsed: tell the server, then report the
-                    // timeout (upstream `armTimeout` -> `cancelPending`).
-                    let _ = handle.cancel(Some("Request timed out".to_string())).await;
+                    if deadline_debug_enabled() {
+                        eprintln!("[mcp-deadline] response-loop deadline elapsed, detaching cancel");
+                    }
+                    // The deadline elapsed: tell the server (detached — see
+                    // `spawn_request_cancel`), then report the timeout
+                    // (upstream `armTimeout` -> `cancelPending`).
+                    spawn_request_cancel(
+                        handle.peer.clone(),
+                        handle.id.clone(),
+                        "Request timed out",
+                    );
                     return Err(frame_cap_violation(&self.frame_cap).unwrap_or(McpError::Timeout {
                         timeout_ms: timeout.as_millis() as u64,
                     }));
@@ -1404,15 +1452,14 @@ impl McpClient {
                         progress_live = false;
                     } else {
                         // Progress for this request: restart the idle deadline.
-                        deadline
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + timeout);
+                        deadline.as_mut().reset(tokio::time::Instant::now() + timeout);
                     }
                 }
                 () = &mut cancelled => {
                     // The caller gave up: stop the server-side work (upstream
-                    // `onAbort` -> `cancelPending(..., reason)`).
-                    let _ = handle.cancel(Some("Aborted".to_string())).await;
+                    // `onAbort` -> `cancelPending(..., reason)`), detached for
+                    // the same reason as the deadline arm above.
+                    spawn_request_cancel(handle.peer.clone(), handle.id.clone(), "Aborted");
                     return Err(McpError::Aborted);
                 }
             }
