@@ -27075,6 +27075,25 @@ impl SessionEventBridgeProbe {
         (self.handler)(event);
     }
 
+    /// Drain the `ToolUpdate` frames this bridge queued as
+    /// `(call_id, output, is_error)` — the completion surfaces a background
+    /// `BackgroundToolEnd` must produce.
+    pub fn take_tool_updates(&mut self) -> Vec<(Option<String>, String, bool)> {
+        let mut updates = Vec::new();
+        while let Ok(event) = self.events.try_recv() {
+            if let WorkerEvent::ToolUpdate {
+                call_id,
+                output,
+                is_error,
+                ..
+            } = event
+            {
+                updates.push((call_id, output, is_error));
+            }
+        }
+        updates
+    }
+
     /// Drain every queued `WorkerEvent` as its test-visible projection.
     pub fn take_events(&mut self) -> Vec<SessionBridgeEvent> {
         let mut mapped = Vec::new();
@@ -27406,6 +27425,23 @@ fn worker_event_handler_with_cache(
                 // command it actually ran.
                 let args_by_call = tool_args_from_run(&result.new_messages);
                 for tool_result in &result.tool_results {
+                    // A background call's transcript result is the
+                    // synthesized PLACEHOLDER, not the real output. Its card
+                    // flips through `SessionEvent::BackgroundToolEnd`; replaying
+                    // the placeholder here (with `partial: false`) would set
+                    // the block back to the placeholder text and pending
+                    // phase, losing a completion that arrived before this
+                    // run-settle replay. `ToolExecutionEnd` above already
+                    // skips the same marker.
+                    let background_placeholder = tool_result
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("background"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if background_placeholder {
+                        continue;
+                    }
                     let output = tool_result
                         .content
                         .iter()

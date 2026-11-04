@@ -497,6 +497,114 @@ fn tool_arg_cache_survives_a_run_and_is_released_at_agent_end() {
     assert!(cache.get("call-1").is_none());
 }
 
+/// A background call's persisted tool result is the synthesized PLACEHOLDER.
+/// The TUI card is flipped by `SessionEvent::BackgroundToolEnd`; the
+/// `AgentEnd` replay must not overwrite a real completion (or re-open the
+/// pending phase) with that placeholder. `ToolExecutionEnd` already skips the
+/// `details.background` marker; this pins the same rule on the run-settle
+/// replay through the REAL worker handler.
+#[test]
+fn agent_end_does_not_replay_a_background_placeholder_result() {
+    use pir::agent::agent_loop::{AgentEvent, LoopResult};
+    use pir::ai::types::{
+        AssistantMessage, ContentBlock, Context, TextContent, ToolResultMessage, ToolResultRole,
+    };
+    use pir::tui::terminal::WorkerEventBridgeProbe;
+
+    let mut bridge = WorkerEventBridgeProbe::new();
+    bridge.handle(AgentEvent::AgentEnd {
+        result: std::sync::Arc::new(LoopResult {
+            terminal: AssistantMessage::default(),
+            context: std::sync::Arc::new(Context::default()),
+            tool_results: vec![
+                ToolResultMessage {
+                    role: ToolResultRole::ToolResult,
+                    tool_call_id: "call-bg".to_owned(),
+                    tool_name: "bash".to_owned(),
+                    content: vec![ContentBlock::Text(TextContent {
+                        text: "Tool 'bash' is running in the background (callId: call-bg). Its result will arrive as a separate message; do not wait for it.".to_owned(),
+                        text_signature: None,
+                    })],
+                    details: Some(json!({
+                        "background": true,
+                        "callId": "call-bg",
+                        "toolName": "bash"
+                    })),
+                    usage: None,
+                    added_tool_names: Vec::new(),
+                    structured_content: None,
+                    nested_calls: None,
+                    is_error: false,
+                    duration_ms: None,
+                    timestamp: 0,
+                },
+                ToolResultMessage {
+                    role: ToolResultRole::ToolResult,
+                    tool_call_id: "call-fg".to_owned(),
+                    tool_name: "bash".to_owned(),
+                    content: vec![ContentBlock::Text(TextContent {
+                        text: "foreground done".to_owned(),
+                        text_signature: None,
+                    })],
+                    details: None,
+                    usage: None,
+                    added_tool_names: Vec::new(),
+                    structured_content: None,
+                    nested_calls: None,
+                    is_error: false,
+                    duration_ms: Some(3),
+                    timestamp: 0,
+                },
+            ],
+            new_messages: Vec::new(),
+            preamble: Vec::new(),
+            turns: 1,
+            aborted: false,
+            usage_total: 0,
+            will_retry: false,
+        }),
+    });
+
+    let updates = bridge.take_tool_updates();
+    assert_eq!(
+        updates.len(),
+        1,
+        "only the real result is replayed: {updates:?}"
+    );
+    assert_eq!(updates[0].0.as_deref(), Some("call-fg"));
+}
+
+/// A background completion is the TUI's only "result arrived" signal (the
+/// turn ended on a placeholder). The production session-event bridge must
+/// turn `BackgroundToolEnd` into the same `ToolUpdate` a foreground result
+/// uses, carrying the REAL output so the card flips in place.
+#[test]
+fn background_tool_end_bridge_reports_the_real_output() {
+    use pir::agent_session::SessionEvent;
+    use pir::tui::terminal::SessionEventBridgeProbe;
+
+    let mut probe = SessionEventBridgeProbe::new();
+    probe.handle(SessionEvent::BackgroundToolEnd {
+        call_id: "call-bg".to_owned(),
+        tool_name: "subagent".to_owned(),
+        parent_call_id: None,
+        is_error: false,
+        duration_ms: Some(12),
+        output: "CHILD_DONE".to_owned(),
+        images: Vec::new(),
+        details: Some(json!({ "mode": "single" })),
+        structured_content: None,
+        usage: None,
+    });
+
+    let updates = probe.take_tool_updates();
+    assert_eq!(
+        updates,
+        vec![(Some("call-bg".to_owned()), "CHILD_DONE".to_owned(), false)],
+        "the bridge must update the placeholder card with the real result"
+    );
+}
+
 /// The two maps are keyed independently: `remove_raw` only drops the raw
 /// fallback buffer of the finished call, never another call's entries.
 #[test]

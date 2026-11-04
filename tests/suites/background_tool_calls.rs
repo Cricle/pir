@@ -40,14 +40,16 @@ use pir::agent::tool_scheduler::{DetachSink, ToolScheduler, ToolSchedulerConfig}
 use pir::agent_session::{
     AgentSession, AgentSessionConfig, EventHandler, SessionEvent, SharedEventStreamFn,
 };
+use pir::ai::auth::ApiKeyAuth;
 use pir::ai::event_stream::AssistantMessageEventStream;
-use pir::ai::provider::ProviderRegistry;
+use pir::ai::provider::{Provider, ProviderRegistry};
 use pir::ai::types::{
-    AbortSignal, AssistantMessage, ContentBlock, Model, ModelCost, ModelCostRates, StopReason,
-    TerminalReason, TextContent, ThinkingLevel, ToolCall, Usage,
+    AbortSignal, AssistantMessage, ContentBlock, Context, Model, ModelCost, ModelCostRates,
+    StopReason, StreamOptions, TerminalReason, TextContent, ThinkingLevel, ToolCall, Usage,
 };
 use pir::config::settings::FollowUpMode;
 use pir::extensions::{ExtensionConfig, ExtensionHandle, ToolResult as ExtensionToolResult};
+use pir::plugins::subagent::SubagentTool;
 use pir::session_manager::{CustomMessageEntry, FileEntry, SessionManager};
 
 // ---------------------------------------------------------------------------
@@ -1089,6 +1091,233 @@ async fn session_registry_reflects_and_aborts_background_calls() {
         1,
         "abort_all_background must cancel the call's own signal"
     );
+}
+
+/// A provider for the subagent CHILD session: it parks until the test
+/// releases it, then answers with `CHILD_DONE`. The parent run in the test
+/// below is driven by the scripted `event_stream`, so this provider is only
+/// ever reached by the detached child prompt.
+struct GatedChildProvider {
+    entered: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl Provider for GatedChildProvider {
+    fn id(&self) -> &str {
+        "fake"
+    }
+    fn name(&self) -> &str {
+        "Gated child provider"
+    }
+    fn get_models(&self) -> Vec<Model> {
+        vec![session_model()]
+    }
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        vec![ApiKeyAuth::new("fake key", vec!["FAKE_TEST_KEY".into()])]
+    }
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: Context,
+        _options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let stream = AssistantMessageEventStream::new();
+        let pusher = stream.clone();
+        let release = Arc::clone(&self.release);
+        tokio::spawn(async move {
+            release.notified().await;
+            let mut message = AssistantMessage {
+                api: "fake".into(),
+                provider: "fake".into(),
+                model: "bg-test-model".into(),
+                content: vec![ContentBlock::Text(TextContent {
+                    text: "CHILD_DONE".to_owned(),
+                    text_signature: None,
+                })],
+                stop_reason: StopReason::Stop,
+                timestamp: 1,
+                ..Default::default()
+            };
+            message.usage = Usage {
+                input: 10,
+                output: 5,
+                total_tokens: 15,
+                ..Default::default()
+            };
+            pusher.push(AssistantMessageEventStream::done_event(
+                TerminalReason::Stop,
+                message,
+            ));
+        });
+        stream
+    }
+}
+
+/// `subagent` with `background: true` through the REAL session registry and
+/// delivery: the batch answers with the placeholder, the child runs detached
+/// (the parent prompt has already settled), the completion is persisted as a
+/// `backgroundToolResult` entry and reported through
+/// `SessionEvent::BackgroundToolEnd`, and the NEXT parent turn's request
+/// context carries the frame.
+///
+/// This is the builtin `subagent` tool on the generic scheduler detach path:
+/// it must not depend on any subagent-specific wiring, and its default
+/// `supports_background()` must be honored by the real registry (a policy
+/// refusal here answers the placeholder with the opt-out error instead).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_background_call_runs_detached_and_reaches_the_next_parent_turn() {
+    let dir = fixture_dir("subagent-background");
+    std::fs::create_dir_all(dir.join("agents")).expect("agents dir");
+    std::fs::write(
+        dir.join("agents/worker.md"),
+        "---\nname: worker\ndescription: background regression worker\n---\nYou are a worker.",
+    )
+    .expect("agent file");
+
+    let entered = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(GatedChildProvider {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    }));
+
+    let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let turns = vec![
+        scripted_message(
+            vec![tool_call_block(
+                "call-sub",
+                "subagent",
+                json!({ "agent": "worker", "task": "delegate me", "background": true }),
+            )],
+            StopReason::ToolUse,
+        ),
+        finished_message("dispatched"),
+    ];
+    let mut tools = ToolRegistry::new();
+    let subagent = SubagentTool::default();
+    assert!(
+        subagent.supports_background(),
+        "the builtin subagent tool must keep its default background capability"
+    );
+    tools.register(Arc::new(subagent));
+
+    let cwd = dir.to_string_lossy().into_owned();
+    let session = AgentSession::new_with_agent_dir(
+        AgentSessionConfig {
+            provider_registry: Arc::new(registry),
+            model: session_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools,
+            session: Some(SessionManager::in_memory(&cwd, None).expect("in-memory session")),
+            compaction: None,
+            max_turns: 6,
+            system_prompt: Some("subagent background regression".to_owned()),
+            cwd: Some(dir.clone()),
+            event_stream: Some(scripted_turn_stream(turns, Arc::clone(&requests), None)),
+            extensions: None,
+            tool_selection: None,
+        },
+        &dir,
+    );
+    let ends: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let ends_for_handler = Arc::clone(&ends);
+    session.on_session_event(Arc::new(move |event| {
+        if matches!(event, SessionEvent::BackgroundToolEnd { .. }) {
+            ends_for_handler.lock().unwrap().push(event);
+        }
+    }));
+
+    let handler: EventHandler = Arc::new(|_event: AgentEvent| {});
+    session
+        .prompt("start", handler)
+        .await
+        .expect("the parent run must settle on the placeholder");
+
+    // The real registry adopted the subagent call: the parent turn is over
+    // while the child is still parked in its provider.
+    assert_eq!(
+        session.background_call_count(),
+        1,
+        "the session registry must own the detached subagent call"
+    );
+    let in_flight = session.background_calls();
+    assert_eq!(in_flight[0].call_id, "call-sub");
+    assert_eq!(in_flight[0].tool_name, "subagent");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while entered.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the detached child prompt never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    release.notify_one();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if session.background_call_count() == 0 && !ends.lock().unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the detached subagent call never delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let events = ends.lock().unwrap().clone();
+    assert_eq!(events.len(), 1, "events: {events:?}");
+    let (tool_name, is_error, duration_ms, output, details, parent) =
+        background_end_for(&events, "call-sub");
+    assert_eq!(tool_name, "subagent");
+    assert!(!is_error, "the child run succeeded: {output}");
+    assert!(duration_ms.is_some());
+    assert_eq!(output, "CHILD_DONE");
+    assert!(parent.is_none(), "a model-issued detach has no parent");
+    assert_eq!(
+        details
+            .as_ref()
+            .and_then(|details| details["mode"].as_str()),
+        Some("single"),
+        "the completion carries the subagent details payload: {details:?}"
+    );
+
+    let stored = stored_background_results(&session).await;
+    assert_eq!(stored.len(), 1, "stored: {stored:?}");
+    assert_eq!(stored[0].custom_type, "backgroundToolResult");
+    assert!(
+        stored[0]
+            .content
+            .as_str()
+            .is_some_and(|content| content.contains("CHILD_DONE")),
+        "the durable entry carries the child output: {:?}",
+        stored[0].content
+    );
+
+    // The parent's next prompt projects the durable entry into the request:
+    // the model receives the child result even though the originating turn
+    // had already settled when it arrived (no auto-wake; the next turn is the
+    // delivery point).
+    session
+        .prompt("again", Arc::new(|_event: AgentEvent| {}))
+        .await
+        .expect("the follow-up prompt must succeed");
+    let captured = requests.lock().unwrap().clone();
+    let last = captured.last().expect("the follow-up request is captured");
+    assert!(
+        last.contains("<background-tool-result tool=\\\"subagent\\\" callId=\\\"call-sub\\\""),
+        "the next parent request must carry the background result frame: {last}"
+    );
+    assert!(
+        last.contains("CHILD_DONE"),
+        "the next parent request must carry the child output: {last}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A background-capable probe that completes when the test releases it,
