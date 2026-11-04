@@ -281,6 +281,23 @@ pub fn close_codex_websocket_sessions_sync(session_id: Option<&str>) {
     }
 }
 
+/// Number of pooled WebSocket connections currently held for the RAW session
+/// id. Public for tests/ that must observe when the previous turn's socket has
+/// returned to the pool: the terminal `Done` event reaches the consumer before
+/// the producer task runs [`Lease::release`], so a turn started immediately
+/// after `Done` would otherwise race that insert.
+#[doc(hidden)]
+pub fn pooled_websocket_count(session_id: &str) -> usize {
+    let Some(key) = session_continuation_key(session_id) else {
+        return 0;
+    };
+    lock_pool()
+        .connections
+        .keys()
+        .filter(|pooled| pooled.session_id.as_str() == key)
+        .count()
+}
+
 /// Close `session_id`'s pooled connections from a teardown path that cannot
 /// wait for them (the session's `Drop`): the close runs on the runtime that is
 /// driving the process. Without a runtime the process is already on its way

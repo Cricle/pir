@@ -457,6 +457,19 @@ async fn codex_ws_handshake_headers_and_previous_response_id_continuation() {
     let first_done = done_message(&first_events);
     assert_eq!(first_done.response_id.as_deref(), Some("resp_1"));
 
+    // The terminal Done event wakes this consumer before the producer task
+    // runs `Lease::release`; wait for the socket to land in the pool instead
+    // of racing it. A fixed sleep loses under 16-way CI load, and this test
+    // pins pool CONTINUITY: a fresh handshake makes the mock replay turn 1.
+    let pool_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while codex_ws::pooled_websocket_count("sess-ws-1") == 0 {
+        assert!(
+            tokio::time::Instant::now() < pool_deadline,
+            "turn 1 never returned its WebSocket to the pool"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
     let second_context = Context {
         messages: vec![
             Message::User(UserMessage {
