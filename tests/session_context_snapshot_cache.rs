@@ -2539,3 +2539,75 @@ async fn single_session_plain_provider_keeps_registry_visibility() {
         "the unchanged plain definition must keep its provider allocation"
     );
 }
+
+/// B-line P1-1: a snapshot push handed the prompt run's already-built
+/// projection must not build another full transcript projection.
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_push_with_prebuilt_projection_reuses_it() {
+    let temp = TempDir::new("prebuilt-projection");
+    let cwd = temp.path().to_string_lossy().into_owned();
+    let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
+    manager
+        .append_message(user_message("first user"))
+        .expect("append user");
+    manager
+        .append_message(assistant_message("first reply"))
+        .expect("append assistant");
+
+    let handle = ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
+    let mut config = agent_config(temp.path(), manager);
+    config.extensions = Some(handle.clone());
+    let agent = AgentSession::new_with_plugins(config, Vec::new());
+
+    let session = agent.session_manager().expect("persisted session");
+    let projection = session
+        .lock()
+        .await
+        .build_session_projection()
+        .expect("projection");
+    let before = session.lock().await.projection_build_count();
+
+    assert!(
+        agent
+            .push_session_context_with_projection_for_test(&projection)
+            .await,
+        "the first push must build the snapshot"
+    );
+    let after = session.lock().await.projection_build_count();
+    assert_eq!(
+        after, before,
+        "a snapshot push with a prebuilt projection must not rebuild it"
+    );
+    let snapshot = snapshot_json(&handle).await;
+    assert_eq!(
+        snapshot["entries"].as_array().map(Vec::len),
+        Some(2),
+        "the prebuilt projection still feeds the pushed entries: {snapshot}"
+    );
+
+    // A concurrent append makes the projection stale: the push must detect
+    // the moved leaf and rebuild instead of publishing an old transcript.
+    session
+        .lock()
+        .await
+        .append_message(user_message("second user"))
+        .expect("append second user");
+    let stale_before = session.lock().await.projection_build_count();
+    assert!(
+        agent
+            .push_session_context_with_projection_for_test(&projection)
+            .await,
+        "the moved leaf must invalidate the prebuilt projection"
+    );
+    let stale_after = session.lock().await.projection_build_count();
+    assert!(
+        stale_after > stale_before,
+        "a stale prebuilt projection must fall back to live rebuild(s)"
+    );
+    let snapshot = snapshot_json(&handle).await;
+    assert_eq!(
+        snapshot["entries"].as_array().map(Vec::len),
+        Some(3),
+        "the rebuilt snapshot carries the appended entry: {snapshot}"
+    );
+}

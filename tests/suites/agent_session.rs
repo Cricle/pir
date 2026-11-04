@@ -4928,6 +4928,62 @@ async fn prompt_builds_one_projection_when_no_compaction_runs() {
     );
 }
 
+/// B-line P1-1: with a JS extension runtime attached, the prompt-start
+/// snapshot push and the compaction gate must share ONE projection. Before
+/// the fix the push built a second full projection internally, doubling the
+/// transcript materialization on every prompt.
+#[tokio::test]
+async fn prompt_with_extension_builds_one_projection_for_snapshot_and_gate() {
+    let temp = TempDir::new("one-projection-extension");
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let handle = ExtensionHandle::start(ExtensionConfig {
+        cwd: temp.0.clone(),
+        mode: "headless".to_string(),
+        has_ui: false,
+        model: None,
+        session_id: None,
+        system_prompt: String::new(),
+        is_idle: true,
+        limits: Some(Default::default()),
+    })
+    .expect("extension runtime");
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        AgentSessionConfig {
+            provider_registry: registry,
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: tool_registry_with(None),
+            session: Some(session),
+            // Enabled but far from the threshold, so the gate's projection is
+            // reused as the run context exactly like the non-extension case.
+            compaction: Some(pir::compaction::CompactionConfig::default()),
+            max_turns: 4,
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: Some(handle),
+            tool_selection: None,
+        },
+        Vec::new(),
+    ));
+
+    agent.prompt("hi", Arc::new(|_| {})).await.expect("prompt");
+
+    let builds = agent
+        .with_session_manager(|manager| manager.projection_build_count())
+        .await;
+    assert!(
+        builds.is_some_and(|builds| builds <= 3),
+        "with an extension runtime the snapshot pushes must not add their own \
+         projection builds on top of the gate + post-run snapshot (baseline \
+         before the fix was 4); got {builds:?}"
+    );
+}
+
 /// D6: a PAGED session's run-start widen happens on the blocking pool, not on
 /// the async runtime worker (the stall seam runs on the widening thread).
 #[tokio::test]

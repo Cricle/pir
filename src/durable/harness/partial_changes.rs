@@ -21,7 +21,7 @@ use serde_json::{Map, Value};
 
 use crate::ai::api::partial_mirror::streaming_json::JsonPathSegment;
 use crate::ai::api::partial_mirror::{JsonChange, StreamingJsonMirror};
-use crate::ai::types::AssistantMessageEvent;
+use crate::ai::types::{AssistantMessage, AssistantMessageEvent};
 use crate::durable::types::JsonObject;
 
 use super::json::{assign_json_with_plan, AssignPlan, PlanKey};
@@ -39,6 +39,10 @@ pub(crate) struct PartialCommit {
     /// Each tracked tool call by content index: its argument changes since the
     /// last commit, in order, and its snapshot.
     pub tool_calls: BTreeMap<usize, ToolCallCommit>,
+    /// The text/thinking deltas this commit consumed. Kept so a failed commit
+    /// can put them back: a later flush reads the last COMMITTED message as
+    /// its base, so dropped deltas would otherwise be lost forever.
+    pub(crate) text: BTreeMap<usize, TextDelta>,
 }
 
 /// One tracked tool call's share of a [`PartialCommit`].
@@ -67,7 +71,8 @@ impl TextField {
 }
 
 /// Text accumulated for one block since the last commit.
-struct TextDelta {
+#[derive(Clone, Debug)]
+pub(crate) struct TextDelta {
     field: TextField,
     text: String,
 }
@@ -88,6 +93,19 @@ struct ToolCallState {
 pub struct PartialChanges {
     text: BTreeMap<usize, TextDelta>,
     tool_calls: BTreeMap<usize, ToolCallState>,
+    /// First block content per content index, captured on the block START
+    /// events. A later flush reads the last COMMITTED message as its base, so
+    /// a block that did not exist there yet must be seeded from the event's
+    /// partial snapshot.
+    block_seeds: BTreeMap<usize, Value>,
+    /// A block's final content (text/thinking end, tool-call end). The provider
+    /// may replace the accumulated text there; replacing the block keeps the
+    /// committed base exact without serializing the whole message again.
+    block_overrides: BTreeMap<usize, Value>,
+    /// Whether `pi.live.generation.message` already holds a base this tracker
+    /// can incrementally update. False until the first successful flush; a
+    /// reset/missing committed message flips it back.
+    has_base: bool,
 }
 
 impl PartialChanges {
@@ -95,6 +113,62 @@ impl PartialChanges {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the next commit needs a full message serialization because no
+    /// committed base exists yet (first flush, or the document's message slot
+    /// disappeared).
+    pub(crate) fn needs_full_snapshot(&self) -> bool {
+        !self.has_base
+    }
+
+    /// Record that the last commit landed in `pi.live.generation.message`.
+    pub(crate) fn mark_base_committed(&mut self) {
+        self.has_base = true;
+    }
+
+    /// The committed base disappeared (document reset by another writer);
+    /// fall back to one full snapshot on the next flush.
+    pub(crate) fn invalidate_base(&mut self) {
+        self.has_base = false;
+    }
+
+    /// Apply the pending text deltas to a committed message base, creating
+    /// blocks the base does not carry yet. O(new text): no full message walk
+    /// and no JSON serialization.
+    pub(crate) fn apply_pending_to_message(&self, message: &mut PartialMessage) {
+        let content = message
+            .entry("content".to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Some(content) = content.as_array_mut() else {
+            return;
+        };
+        for (index, block) in &self.block_seeds {
+            ensure_block(content, *index, block.clone());
+        }
+        for (index, delta) in &self.text {
+            let field = delta.field.key();
+            let missing = content.get(*index).is_none_or(|block| !block.is_object());
+            if missing {
+                let mut block = JsonObject::new();
+                block.insert("type".to_owned(), Value::String(field.to_owned()));
+                block.insert(field.to_owned(), Value::String(String::new()));
+                ensure_block(content, *index, Value::Object(block));
+            }
+            if let Some(Value::String(text)) = content
+                .get_mut(*index)
+                .and_then(Value::as_object_mut)
+                .and_then(|block| block.get_mut(field))
+            {
+                text.push_str(&delta.text);
+            }
+        }
+        for (index, block) in &self.block_overrides {
+            if *index >= content.len() {
+                content.resize(*index + 1, Value::Null);
+            }
+            content[*index] = block.clone();
+        }
     }
 
     /// Record what `event` changed.
@@ -110,13 +184,42 @@ impl PartialChanges {
                 delta,
                 ..
             } => self.push_text(*content_index, TextField::Thinking, delta),
-            AssistantMessageEvent::TextEnd { content_index, .. }
-            | AssistantMessageEvent::ThinkingEnd { content_index, .. } => {
+            AssistantMessageEvent::TextEnd {
+                content_index,
+                partial,
+                ..
+            }
+            | AssistantMessageEvent::ThinkingEnd {
+                content_index,
+                partial,
+                ..
+            } => {
                 // Providers may replace the text when a block ends; the final
                 // commit assigns what they ended with.
                 self.text.remove(content_index);
+                if let Some(block) = block_value(partial, *content_index) {
+                    self.block_overrides.insert(*content_index, block);
+                }
             }
-            AssistantMessageEvent::ToolCallStart { content_index, .. } => {
+            AssistantMessageEvent::TextStart {
+                content_index,
+                partial,
+            }
+            | AssistantMessageEvent::ThinkingStart {
+                content_index,
+                partial,
+            } => {
+                if let Some(block) = block_value(partial, *content_index) {
+                    self.block_seeds.insert(*content_index, block);
+                }
+            }
+            AssistantMessageEvent::ToolCallStart {
+                content_index,
+                partial,
+            } => {
+                if let Some(block) = block_value(partial, *content_index) {
+                    self.block_seeds.insert(*content_index, block);
+                }
                 self.tool_calls.insert(
                     *content_index,
                     ToolCallState {
@@ -147,13 +250,18 @@ impl PartialChanges {
                     self.tool_calls.remove(content_index);
                 }
             }
-            AssistantMessageEvent::ToolCallEnd { content_index, .. } => {
+            AssistantMessageEvent::ToolCallEnd {
+                content_index,
+                partial,
+                ..
+            } => {
                 // The call's last commit assigns its final arguments.
                 self.tool_calls.remove(content_index);
+                if let Some(block) = block_value(partial, *content_index) {
+                    self.block_overrides.insert(*content_index, block);
+                }
             }
             AssistantMessageEvent::Start { .. }
-            | AssistantMessageEvent::TextStart { .. }
-            | AssistantMessageEvent::ThinkingStart { .. }
             | AssistantMessageEvent::Done { .. }
             | AssistantMessageEvent::Error { .. } => {}
         }
@@ -180,13 +288,16 @@ impl PartialChanges {
     /// if the commit fails.
     pub(crate) fn take(&mut self, message: &mut PartialMessage) -> PartialCommit {
         let mut blocks: BTreeMap<PlanKey, AssignPlan> = BTreeMap::new();
-        for (index, delta) in std::mem::take(&mut self.text) {
+        let text = std::mem::take(&mut self.text);
+        for (index, delta) in &text {
             let mut fields = BTreeMap::new();
             fields.insert(
                 PlanKey::Key(delta.field.key().to_owned()),
-                AssignPlan::Append { text: delta.text },
+                AssignPlan::Append {
+                    text: delta.text.clone(),
+                },
             );
-            blocks.insert(PlanKey::Index(index), AssignPlan::Fields(fields));
+            blocks.insert(PlanKey::Index(*index), AssignPlan::Fields(fields));
         }
         let mut tool_calls = BTreeMap::new();
         for (index, call) in &mut self.tool_calls {
@@ -225,6 +336,7 @@ impl PartialChanges {
         PartialCommit {
             plan: AssignPlan::Fields(fields),
             tool_calls,
+            text,
         }
     }
 
@@ -239,13 +351,8 @@ impl PartialChanges {
         generation: &mut JsonObject,
         mut message: PartialMessage,
         commit: &PartialCommit,
+        committed_blocks: usize,
     ) {
-        let committed_blocks = generation
-            .get("message")
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_array)
-            .map(Vec::len)
-            .unwrap_or(0);
         let mut apply: Vec<(usize, &[JsonChange])> = Vec::new();
         for (index, taken) in &commit.tool_calls {
             let Some(tracked) = self.tool_calls.get(index) else {
@@ -313,6 +420,39 @@ impl PartialChanges {
             merged.append(&mut tracked.changes);
             tracked.changes = merged;
         }
+        // Put the consumed text back IN FRONT of anything accumulated since
+        // (normally nothing: the stream awaits this commit).
+        for (index, taken) in &commit.text {
+            match self.text.get_mut(index) {
+                Some(pending) if pending.field == taken.field => {
+                    let mut merged = taken.text.clone();
+                    merged.push_str(&pending.text);
+                    pending.text = merged;
+                }
+                _ => {
+                    self.text.insert(*index, taken.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Serialize one content block from a partial snapshot (small: START seeds are
+/// empty, END overrides are produced once per block).
+fn block_value(partial: &AssistantMessage, index: usize) -> Option<Value> {
+    partial
+        .content
+        .get(index)
+        .and_then(|block| serde_json::to_value(block).ok())
+}
+
+/// Ensure `content[index]` exists and is an object, seeding it when absent.
+fn ensure_block(content: &mut Vec<Value>, index: usize, seed: Value) {
+    if index >= content.len() {
+        content.resize(index + 1, Value::Null);
+    }
+    if !content[index].is_object() {
+        content[index] = seed;
     }
 }
 

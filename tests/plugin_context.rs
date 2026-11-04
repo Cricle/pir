@@ -117,7 +117,7 @@ impl FakeSession {
         });
         let snapshot = Arc::new(SessionContextSnapshot {
             model: json!({ "id": "fake-model", "provider": "fake-provider" }),
-            entries: json!([{ "type": "message", "id": "entry-1" }]),
+            entries: json!([{ "type": "message", "id": "entry-1" }]).into(),
             session_id: Some("session-fake".to_owned()),
             cwd: Some(cwd.to_owned()),
             ..Default::default()

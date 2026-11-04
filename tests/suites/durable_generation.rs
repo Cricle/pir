@@ -1389,6 +1389,78 @@ async fn partial_throttle_commits_at_the_interval() {
     );
 }
 
+/// B-line P1-2: after the first full snapshot, every throttled flush must
+/// append only the new text to the COMMITTED partial. A regression that does
+/// not carry the committed base forward leaves the message stuck at the first
+/// flush's prefix.
+#[tokio::test]
+async fn throttled_partials_accumulate_on_the_committed_base() {
+    let mut settings = base_settings();
+    settings.progress = pir::durable::harness::settings::ProgressPolicy {
+        partial_interval_ms: 1,
+        output_interval_ms: 1,
+    };
+    let models = Models::new(vec![Reply::Text {
+        deltas: vec!["a", "b", "c", "d"],
+        gap_ms: 40,
+    }]);
+    let world = World::new(models, Arc::new(Tools::default()), settings).await;
+    let task = world
+        .create_with(json!({ "phase": "prepare", "attempt": 1 }))
+        .await;
+    world.start_run(task).await;
+    world.scheduler.resume();
+
+    let expected = "abcd";
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..500 {
+        let live = world.live().await;
+        let Some(message) = live
+            .generation
+            .as_ref()
+            .and_then(|generation| generation.message.as_ref())
+        else {
+            if seen.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            break;
+        };
+        let text = message
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|content| content.first())
+            .and_then(|block| block.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        assert!(
+            expected.starts_with(&text),
+            "a committed partial must be a prefix of the answer, got {text:?}"
+        );
+        if seen.last() != Some(&text) {
+            seen.push(text);
+        }
+        if seen.iter().any(|text| text == expected) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert!(
+        seen.len() >= 2,
+        "multiple throttled flushes must accumulate on the committed base; \
+         observed {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|text| text.len() >= 2 && text.len() < expected.len()),
+        "an intermediate flush must carry text from more than the first flush; \
+         observed {seen:?}"
+    );
+    world.wait_terminal(task).await;
+}
+
 #[tokio::test]
 async fn retry_backoff_sleeps_then_prepares_next_attempt() {
     let models = Models::new(vec![

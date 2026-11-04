@@ -143,7 +143,7 @@ async fn run_probe(temp: &TempDir, snapshot: SessionContextSnapshot) -> Value {
 fn full_snapshot() -> SessionContextSnapshot {
     SessionContextSnapshot {
         model: json!({ "id": "fake-model", "provider": "fake" }),
-        entries: json!([{ "role": "user", "content": [{ "type": "text", "text": "hi" }] }]),
+        entries: json!([{ "role": "user", "content": [{ "type": "text", "text": "hi" }] }]).into(),
         sessions: json!([{ "id": "sess-1", "path": "C:/sessions/sess-1.jsonl" }]),
         session_id: Some("sess-1".into()),
         session_path: Some("C:/sessions/sess-1.jsonl".into()),

@@ -113,7 +113,7 @@ use crate::durable::harness::live::{
     live_from_object, live_to_object, DeferredStatus, GenerationState, LiveState, RetryStatus,
     RunState, SlotProgress, SlotStatus, ToolSlot, LIVE_DEFINITION,
 };
-use crate::durable::harness::partial_changes::PartialChanges;
+use crate::durable::harness::partial_changes::{PartialChanges, PartialCommit};
 use crate::durable::harness::prompt::{plan_system_entries, render_sections, replay_sections};
 use crate::durable::harness::registry::{PromptInput, ToolRegistration};
 use crate::durable::harness::scheduler::runtime::{TaskRuntime, TaskRuntimeError};
@@ -1141,24 +1141,38 @@ async fn commit_partial(
 ) -> Result<(), TaskRuntimeError> {
     let host = harness.clone();
     let conversation = runtime.conversation_id();
-    // Copy once: the provider keeps mutating its partial, and the changes since
-    // the last commit belong to this copy.
-    let mut message = match serde_json::to_value(partial) {
-        Ok(Value::Object(message)) => message,
-        _ => return Ok(()),
-    };
-    let taken = changes
+    // The first flush (or a lost base) serializes the accumulated message
+    // once. Later flushes start from the last COMMITTED
+    // `pi.live.generation.message` and append only the deltas: serializing the
+    // whole partial every `partial_interval_ms` made a long reply O(n²).
+    let needs_full = changes
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take(&mut message);
-    let taken = Arc::new(taken);
-    let taken_for_commit = taken.clone();
+        .needs_full_snapshot();
+    let full_message = if needs_full {
+        match serde_json::to_value(partial) {
+            Ok(Value::Object(message)) => Some(message),
+            _ => return Ok(()),
+        }
+    } else {
+        None
+    };
+    // Only the scalar fields that can move during one stream; the content and
+    // the stable identity fields are already in the committed base.
+    let scalars = partial_scalars(partial);
+    let taken_slot: Arc<Mutex<Option<PartialCommit>>> = Arc::new(Mutex::new(None));
+    let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let taken_slot_for_commit = Arc::clone(&taken_slot);
+    let applied_for_commit = Arc::clone(&applied);
     let changes_for_commit = changes.clone();
     let result = runtime
         .commit_with_options(
             move |tx, _current| {
                 let changes = changes_for_commit.clone();
-                let taken = taken_for_commit.clone();
+                let taken_slot = Arc::clone(&taken_slot_for_commit);
+                let applied = Arc::clone(&applied_for_commit);
+                let mut full_message = full_message;
+                let scalars = scalars.clone();
                 Box::pin(async move {
                     // A flush only changes `generation.attempt` and
                     // `generation.message`. Reading the draft and writing those
@@ -1179,10 +1193,44 @@ async fn commit_partial(
                     }
                     if let Some(generation) = generation.as_object_mut() {
                         generation.insert("attempt".to_owned(), Value::from(attempt));
-                        changes
+                        let committed_blocks = generation
+                            .get("message")
+                            .and_then(|message| message.get("content"))
+                            .and_then(Value::as_array)
+                            .map(Vec::len)
+                            .unwrap_or(0);
+                        let mut changes = changes
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .commit(generation, message, &taken);
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let base = match full_message.take() {
+                            // First flush / lost base: the serialized partial
+                            // is the authoritative message.
+                            Some(message) => Some(message),
+                            // Incremental flush: the committed message is the
+                            // base; apply the pending text and scalar updates
+                            // to it in O(delta).
+                            None => match generation.remove("message") {
+                                Some(Value::Object(mut message)) => {
+                                    changes.apply_pending_to_message(&mut message);
+                                    apply_partial_scalars(&mut message, &scalars);
+                                    Some(message)
+                                }
+                                _ => {
+                                    // Another writer reset the document slot;
+                                    // take one full snapshot on the next flush.
+                                    changes.invalidate_base();
+                                    None
+                                }
+                            },
+                        };
+                        if let Some(mut message) = base {
+                            let taken = changes.take(&mut message);
+                            changes.commit(generation, message, &taken, committed_blocks);
+                            applied.store(true, std::sync::atomic::Ordering::SeqCst);
+                            *taken_slot
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(taken);
+                        }
                     }
                     host.store
                         .stage_document(tx, conversation, DocumentKind::Live, live)
@@ -1195,12 +1243,62 @@ async fn commit_partial(
         )
         .await;
     if result.is_err() {
+        if let Some(taken) = taken_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            changes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .restore(&taken);
+        }
+    } else if applied.load(std::sync::atomic::Ordering::SeqCst) {
         changes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .restore(&taken);
+            .mark_base_committed();
     }
     result
+}
+
+/// The scalar fields of a partial that can change while the stream runs. Content
+/// and the stable identity fields are already in the committed message base;
+/// terminal classification writes the complete message.
+fn partial_scalars(partial: &AssistantMessage) -> JsonObject {
+    let mut scalars = JsonObject::new();
+    if let Ok(usage) = serde_json::to_value(partial.usage) {
+        scalars.insert("usage".to_owned(), usage);
+    }
+    if let Ok(stop_reason) = serde_json::to_value(partial.stop_reason) {
+        scalars.insert("stopReason".to_owned(), stop_reason);
+    }
+    scalars.insert("timestamp".to_owned(), Value::from(partial.timestamp));
+    for (key, value) in [
+        ("responseModel", partial.response_model.as_ref()),
+        ("responseId", partial.response_id.as_ref()),
+    ] {
+        match value {
+            Some(value) => {
+                scalars.insert(key.to_owned(), Value::String(value.clone()));
+            }
+            None => {
+                scalars.insert(key.to_owned(), Value::Null);
+            }
+        }
+    }
+    scalars
+}
+
+/// Overwrite the scalar slots of a committed partial message.
+fn apply_partial_scalars(message: &mut JsonObject, scalars: &JsonObject) {
+    for (key, value) in scalars {
+        if value.is_null() {
+            message.remove(key);
+        } else {
+            message.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 /// The cumulative partial snapshot of one non-terminal event.

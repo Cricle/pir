@@ -81,7 +81,7 @@ async fn run_tool(host: &PluginHost, args: Value) -> pir::agent::tool_batch::Too
 
 fn snapshot(entries: Value, session_id: Option<&str>) -> SessionContextSnapshot {
     SessionContextSnapshot {
-        entries,
+        entries: entries.into(),
         session_id: session_id.map(str::to_owned),
         ..SessionContextSnapshot::default()
     }

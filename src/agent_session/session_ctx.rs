@@ -348,7 +348,7 @@ pub(crate) async fn dispatch_resources_discover_event(
 }
 
 /// Named inputs for [`AgentSession::build_session_context_snapshot`].
-struct SessionSnapshotInputs {
+struct SessionSnapshotInputs<'a> {
     model: JsonValue,
     context_window: u64,
     trusted_project: bool,
@@ -357,6 +357,63 @@ struct SessionSnapshotInputs {
     sessions_modified: Option<SystemTime>,
     cached_sessions: Option<CachedSessions>,
     cached_tree: Option<Arc<CachedTree>>,
+    /// The prompt-start projection this run already built. Reused instead of
+    /// calling `build_session_projection` a second time for the snapshot.
+    prebuilt_projection: Option<&'a crate::session_manager::SessionProjection>,
+}
+
+/// Serialize one projection into the snapshot's `entries` aggregate and its
+/// `{entries, messages}` projection object. Borrowed: the prompt loop keeps
+/// the typed projection as its run context after the snapshot is built.
+fn serialize_projection_snapshot(
+    projection: &crate::session_manager::SessionProjection,
+) -> (Arc<JsonValue>, JsonValue) {
+    let message_values = serde_json::to_value(&projection.messages).unwrap_or(JsonValue::Null);
+    match &message_values {
+        JsonValue::Array(message_items) => {
+            let entry_views: Vec<JsonValue> = projection
+                .entries
+                .iter()
+                .map(|entry| {
+                    let end = entry.messages.end.min(message_items.len());
+                    let start = entry.messages.start.min(end);
+                    let mut view = serde_json::Map::new();
+                    view.insert(
+                        String::from("entry"),
+                        serde_json::to_value(entry.source_entry.as_ref())
+                            .unwrap_or(JsonValue::Null),
+                    );
+                    view.insert(
+                        String::from("messages"),
+                        JsonValue::Array(message_items[start..end].to_vec()),
+                    );
+                    JsonValue::Object(view)
+                })
+                .collect();
+            let mut projection_map = serde_json::Map::new();
+            projection_map.insert(String::from("entries"), JsonValue::Array(entry_views));
+            projection_map.insert(String::from("messages"), message_values.clone());
+            (Arc::new(message_values), JsonValue::Object(projection_map))
+        }
+        // `to_value` only fails on non-string map keys (`Message` has none);
+        // keep the old Null fallback if it ever does.
+        _ => (Arc::new(JsonValue::Null), JsonValue::Null),
+    }
+}
+
+/// Whether `projection` was built from the session's current leaf. Empty
+/// projections match an empty leaf; a concurrent append invalidates the match.
+fn projection_leaf_matches(
+    session: &crate::session_manager::SessionManager,
+    projection: &crate::session_manager::SessionProjection,
+) -> bool {
+    let live_leaf = session.leaf_id().map(str::to_owned);
+    let projected_leaf = projection
+        .entries
+        .last()
+        .and_then(|entry| entry.source_entry.id())
+        .map(str::to_owned);
+    live_leaf == projected_leaf
 }
 
 impl AgentSession {
@@ -627,6 +684,20 @@ session does not have"
     /// runtime/plugin host already holds the identical snapshot and the push
     /// is skipped.
     pub(super) async fn push_session_context(&self, model: &Model) -> bool {
+        self.push_session_context_with_projection(model, None).await
+    }
+
+    /// [`Self::push_session_context`] with a projection the caller already
+    /// built for this run. The projection is serialized into the snapshot
+    /// instead of rebuilding the whole transcript through
+    /// `build_session_projection`. The caller must only pass one whose leaf
+    /// still matches the live session (the prompt loop checks that before
+    /// handing it over).
+    pub(super) async fn push_session_context_with_projection(
+        &self,
+        model: &Model,
+        prebuilt_projection: Option<&crate::session_manager::SessionProjection>,
+    ) -> bool {
         let Some(runtime) = self.event_extensions() else {
             // No JS face for this session (no runtime at all, or the
             // subagent shared-runtime fallback whose parent handle must not
@@ -838,7 +909,10 @@ session does not have"
         // and a rebuilt snapshot always agree. The counter is the P3-01
         // regression seam: a hit returns above and must not move it.
         CONTEXT_USAGE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
-        let context_tokens = self.context_usage().await.and_then(|usage| usage.tokens);
+        let context_tokens = self
+            .context_usage_with_projection(prebuilt_projection)
+            .await
+            .and_then(|usage| usage.tokens);
         fingerprint.context_tokens = context_tokens.unwrap_or(0);
 
         let (snapshot, sessions, tree) = self
@@ -851,6 +925,7 @@ session does not have"
                 sessions_modified: fingerprint.sessions_modified,
                 cached_sessions,
                 cached_tree,
+                prebuilt_projection,
             })
             .await;
         // Unified push: with a plugin host (always present alongside an
@@ -886,6 +961,19 @@ session does not have"
     pub async fn push_session_context_for_test(&self) -> bool {
         let model = self.current_model();
         self.push_session_context(&model).await
+    }
+
+    /// Test/profiling seam for the prompt-loop projection handoff: push the
+    /// snapshot using an already materialized projection; the push must not
+    /// build another one.
+    #[doc(hidden)]
+    pub async fn push_session_context_with_projection_for_test(
+        &self,
+        projection: &crate::session_manager::SessionProjection,
+    ) -> bool {
+        let model = self.current_model();
+        self.push_session_context_with_projection(&model, Some(projection))
+            .await
     }
 
     /// Test seam for the P3-01 cache-hit short circuit: how many
@@ -1084,7 +1172,7 @@ session does not have"
     /// go with it.
     async fn build_session_context_snapshot(
         &self,
-        inputs: SessionSnapshotInputs,
+        inputs: SessionSnapshotInputs<'_>,
     ) -> (
         SessionContextSnapshot,
         CachedSessions,
@@ -1099,6 +1187,7 @@ session does not have"
             sessions_modified,
             cached_sessions,
             cached_tree,
+            prebuilt_projection,
         } = inputs;
         // Session-manager snapshot extensions: header, branch, full tree,
         // leaf, labels, and the session projection backing the new
@@ -1202,55 +1291,19 @@ session does not have"
                 // ONCE here; `entries` and `projection.messages` share
                 // that value and each per-entry slice clones the already
                 // built values instead of re-serializing the messages.
-                let (entries, projection) = match session.build_session_projection() {
-                    Ok(projection) => {
-                        let crate::session_manager::SessionProjection {
-                            entries: projected_entries,
-                            messages: projected_messages,
-                            ..
-                        } = projection;
-                        let message_values =
-                            serde_json::to_value(&projected_messages).unwrap_or(JsonValue::Null);
-                        // The typed conversation has served its only purpose
-                        // (the aggregate JSON above). Dropping it here keeps
-                        // the peak at "JSON snapshots" instead of holding the
-                        // full `Vec<Message>` alongside the three serialized
-                        // copies while the per-entry views are built.
-                        drop(projected_messages);
-                        match &message_values {
-                            JsonValue::Array(message_items) => {
-                                let entry_views: Vec<JsonValue> = projected_entries
-                                    .iter()
-                                    .map(|entry| {
-                                        let end = entry.messages.end.min(message_items.len());
-                                        let start = entry.messages.start.min(end);
-                                        let mut view = serde_json::Map::new();
-                                        view.insert(
-                                            String::from("entry"),
-                                            serde_json::to_value(entry.source_entry.as_ref())
-                                                .unwrap_or(JsonValue::Null),
-                                        );
-                                        view.insert(
-                                            String::from("messages"),
-                                            JsonValue::Array(message_items[start..end].to_vec()),
-                                        );
-                                        JsonValue::Object(view)
-                                    })
-                                    .collect();
-                                let mut projection_map = serde_json::Map::new();
-                                projection_map
-                                    .insert(String::from("entries"), JsonValue::Array(entry_views));
-                                projection_map
-                                    .insert(String::from("messages"), message_values.clone());
-                                (message_values, JsonValue::Object(projection_map))
-                            }
-                            // `to_value` only fails on non-string map keys
-                            // (`Message` has none); keep the old
-                            // Null fallback if it ever does.
-                            _ => (JsonValue::Null, JsonValue::Null),
-                        }
+                let (entries, projection) = match prebuilt_projection {
+                    // The prompt run already built this projection for its
+                    // context; serialize it instead of rebuilding the whole
+                    // transcript for the snapshot. A concurrent append between
+                    // that build and this lock makes the projection stale, so
+                    // fall back unless its leaf is still the live leaf.
+                    Some(projection) if projection_leaf_matches(&session, projection) => {
+                        serialize_projection_snapshot(projection)
                     }
-                    Err(_) => (JsonValue::Null, JsonValue::Null),
+                    _ => match session.build_session_projection() {
+                        Ok(projection) => serialize_projection_snapshot(&projection),
+                        Err(_) => (Arc::new(JsonValue::Null), JsonValue::Null),
+                    },
                 };
                 (
                     entries,
@@ -1265,7 +1318,10 @@ session does not have"
                 )
             }
             None => (
-                serde_json::to_value(self.history_snapshot().as_slice()).unwrap_or(JsonValue::Null),
+                Arc::new(
+                    serde_json::to_value(self.history_snapshot().as_slice())
+                        .unwrap_or(JsonValue::Null),
+                ),
                 Some(self.cwd.display().to_string()),
                 JsonValue::Null,
                 JsonValue::Null,

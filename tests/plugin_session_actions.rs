@@ -341,7 +341,7 @@ async fn pushed_snapshot_and_entries_are_arc_identical_until_the_next_push() {
         "a repeated entries read returns the same Arc"
     );
     // The entries read is the snapshot's own field, retained separately.
-    assert_eq!(*entries, snapshot.entries);
+    assert!(Arc::ptr_eq(&entries, &snapshot.entries));
     let first_entries = (*entries).clone();
 
     // A prompt appends session entries; its post-run push replaces the cells.
@@ -364,7 +364,7 @@ async fn pushed_snapshot_and_entries_are_arc_identical_until_the_next_push() {
     assert_ne!(*new_entries, first_entries, "the run appended entries");
     // The old Arc is an immutable view of the pre-push payload.
     assert_eq!(*entries, first_entries);
-    assert_eq!(snapshot.entries, first_entries);
+    assert_eq!(*snapshot.entries, first_entries);
 }
 
 // ---------------------------------------------------------------------------

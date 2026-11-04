@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Default timeout applied to async JS calls (tool execution, dispatch).
@@ -512,7 +513,11 @@ pub struct SessionContextSnapshot {
     /// Serialized current `Model` object (or `Null`).
     pub model: JsonValue,
     /// Serialized session entries (`Vec<Message>` JSON, `Null` when none).
-    pub entries: JsonValue,
+    ///
+    /// `Arc` so the host's `ctx.sessionManager.getEntries()` slot can share
+    /// the exact allocation the snapshot carries; a rebuild used to clone the
+    /// whole transcript JSON once more per push.
+    pub entries: Arc<JsonValue>,
     /// Serialized session list (`[{id, path, cwd, modifiedMs}]`, `Null`).
     pub sessions: JsonValue,
     pub session_id: Option<String>,

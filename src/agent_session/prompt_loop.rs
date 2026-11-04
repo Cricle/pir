@@ -945,10 +945,32 @@ impl AgentSession {
             widen_session_off_thread(session).await?;
         }
 
+        // Build the run's context projection ONCE, before the snapshot push.
+        // The snapshot used to call `build_session_projection` internally and
+        // the compaction gate immediately afterwards built the same projection
+        // again, so every prompt with a JS extension runtime materialized the
+        // whole transcript twice before anything reached the model. The
+        // prompt-start gate below reuses this projection when session_start /
+        // input handlers did not move the leaf.
+        let mut snapshot_projection = if self.event_extensions().is_some() {
+            match &self.session {
+                Some(session) => project_session_off_thread(session).await.ok(),
+                None => None,
+            }
+        } else {
+            None
+        };
+
         // Back the ctx facade with the live session/model state before any
         // event handler runs this prompt (session_start handlers read
         // `ctx.model` too).
-        self.push_session_context(&model).await;
+        self.push_session_context_with_projection(
+            &model,
+            snapshot_projection
+                .as_ref()
+                .map(|(projection, _branch)| projection),
+        )
+        .await;
 
         // Extension lifecycle: `session_start` fires exactly once, before the
         // first prompt reaches the model, and a fresh run always starts with a
@@ -1049,8 +1071,31 @@ impl AgentSession {
         if self.compaction_config().is_some() {
             match &self.session {
                 Some(session) => {
-                    if let Ok((mut projection, branch)) = project_session_off_thread(session).await
-                    {
+                    // Reuse the projection built for the snapshot push when no
+                    // extension handler moved the leaf since. This is the
+                    // common case: session_start/input handlers registered
+                    // tools or rewrote the prompt but appended no entry.
+                    let prebuilt = match snapshot_projection.take() {
+                        Some((projection, branch)) => {
+                            let live_leaf = session.lock().await.leaf_id().map(str::to_owned);
+                            let projected_leaf = projection
+                                .entries
+                                .last()
+                                .and_then(|entry| entry.source_entry.id())
+                                .map(str::to_owned);
+                            if live_leaf == projected_leaf {
+                                Some((projection, branch))
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    };
+                    let built = match prebuilt {
+                        Some(value) => Some(value),
+                        None => project_session_off_thread(session).await.ok(),
+                    };
+                    if let Some((mut projection, branch)) = built {
                         // The MATERIALIZED projection decides whether the gate
                         // has an assistant usage record to inspect: a context
                         // edit can omit every assistant entry, and a trailing

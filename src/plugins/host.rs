@@ -3342,7 +3342,7 @@ impl PluginHost {
             .session_entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(Arc::new(snapshot.entries.clone()));
+            Some(Arc::clone(&snapshot.entries));
         for plugin in &self.plugins {
             // Isolated like the event fan-out: a panicking context observer
             // must not keep the snapshot from later plugins (or the JS face).

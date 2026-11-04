@@ -85,6 +85,17 @@ impl AgentSession {
     /// stale usage but no compaction (a newer context edit) the projection is
     /// re-estimated by characters over the materialized messages.
     pub async fn context_usage(&self) -> Option<ContextUsage> {
+        self.context_usage_with_projection(None).await
+    }
+
+    /// [`Self::context_usage`] with a projection the caller already built for
+    /// this exact leaf. The character-reestimate fallback (no usable usage
+    /// record) reuses it instead of materializing the transcript a second
+    /// time.
+    pub(super) async fn context_usage_with_projection(
+        &self,
+        prebuilt_projection: Option<&crate::session_manager::SessionProjection>,
+    ) -> Option<ContextUsage> {
         let model = self.current_model();
         if model.context_window == 0 {
             return None;
@@ -94,6 +105,15 @@ impl AgentSession {
                 // Borrowed metadata: one `Arc` bump per retained entry, no
                 // message materialization.
                 let session = session.lock().await;
+                let prebuilt_projection = prebuilt_projection.filter(|projection| {
+                    let live_leaf = session.leaf_id().map(str::to_owned);
+                    let projected_leaf = projection
+                        .entries
+                        .last()
+                        .and_then(|entry| entry.source_entry.id())
+                        .map(str::to_owned);
+                    live_leaf == projected_leaf
+                });
                 let metas = session.projection_entry_meta();
                 let path = session.branch_path_meta(None);
                 // Upstream `getContextUsage`: the latest assistant usage
@@ -110,8 +130,26 @@ impl AgentSession {
                 match projected_context_tokens(&metas, &path) {
                     Some(tokens) => Some(tokens),
                     // No usage record, or one predating the latest compaction
-                    // or context edit: re-estimate the whole projection.
-                    None => projected_context_reestimate(&session, &metas, &path),
+                    // or context edit: re-estimate the whole projection. Reuse
+                    // the caller's materialization when it describes this
+                    // leaf; otherwise build one (cold path).
+                    None => match prebuilt_projection {
+                        Some(projection) => {
+                            let refs = compaction::ProjectionEntryMeta::cut_refs(
+                                &metas,
+                                &projection.messages,
+                            );
+                            Some(
+                                compaction::estimate_projected_context_tokens_with_tail(
+                                    &refs,
+                                    &[],
+                                    &path,
+                                )
+                                .tokens,
+                            )
+                        }
+                        None => projected_context_reestimate(&session, &metas, &path),
+                    },
                 }
             }
             // Ephemeral history is already a shared, zero-copy snapshot.

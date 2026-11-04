@@ -983,7 +983,7 @@ async fn todo_builtin_declares_its_tool_and_replays_the_session_transcript() {
     use pir::plugins::AgentPlugin as _;
     let plugin = Arc::new(pir::plugins::builtin::todo::TodoPlugin::new());
     plugin.on_session_context(&pir::extensions::SessionContextSnapshot {
-        entries: entries_json,
+        entries: entries_json.into(),
         session_id: Some("round-trip".to_owned()),
         ..Default::default()
     });

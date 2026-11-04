@@ -1308,16 +1308,22 @@ impl CommitShared {
             .await);
         }
 
-        let seq = match self.memory.apply_prepared(prepared.clone()).await {
-            Ok(seq) => seq,
-            Err(error) => return Err(poison_error(&self.poison, error).await),
-        };
+        // Adopt the sidecar bookkeeping from a BORROW of the prepared batch:
+        // `apply_prepared` consumes the writes, and cloning the whole
+        // `PreparedCommit` just to keep this slice alive copied every entry
+        // and document payload a second time per durable commit. A failed
+        // apply poisons the storage, so the bookkeeping it would leave
+        // behind can never be observed through a later successful commit.
         adopt_sidecar_state(
             &self.current_only_documents,
             &self.live_task_sidecars,
             &prepared.writes,
         )
         .await;
+        let seq = match self.memory.apply_prepared(prepared).await {
+            Ok(seq) => seq,
+            Err(error) => return Err(poison_error(&self.poison, error).await),
+        };
         reclaim_sidecars_files(&self.directory, self.fsync, &reclamations).await;
         Ok(seq)
     }

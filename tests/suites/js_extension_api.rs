@@ -548,7 +548,7 @@ async fn session_manager_methods_backed_by_snapshot() {
     let tree_json = serde_json::to_string(&tree).expect("tree text");
     handle.update_session_context(SessionContextSnapshot {
         model: json!({ "id": "test-model" }),
-        entries: json!([{ "role": "user" }, { "role": "assistant" }]),
+        entries: json!([{ "role": "user" }, { "role": "assistant" }]).into(),
         sessions: json!([]),
         session_id: Some("s-1".to_string()),
         session_path: Some("/tmp/session.jsonl".to_string()),
