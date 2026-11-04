@@ -22835,7 +22835,7 @@ fn build_agent_session(
             // `None` lets the facade build the structured system prompt with
             // the discovered context files (env-gated by --no-context-files).
             system_prompt: None,
-            cwd: Some(cwd),
+            cwd: Some(cwd.clone()),
             event_stream: None,
             // The same runtime handle the UI thread uses for commands and
             // shortcuts: one extension runtime for the whole interactive run.
@@ -22849,11 +22849,30 @@ fn build_agent_session(
         .set_prompt_resources(resources.skills.clone(), resources.prompt_templates.clone());
     // `--system-prompt` / `--append-system-prompt`: applied to the structured
     // prompt after the resources are installed, so the rebuilt render already
-    // carries the skills section.
-    agent_session.apply_prompt_overrides(
-        overrides.system_prompt.clone(),
-        overrides.append_system_prompt.clone(),
+    // carries the skills section. SYSTEM.md / APPEND_SYSTEM.md discovery joins
+    // the same override with print's exact precedence (print.rs:3315-3337):
+    // `--system-prompt` wins, then the `PIR_SYSTEM_PROMPT_FILE` env file, then
+    // a discovered SYSTEM.md; discovered APPEND_SYSTEM.md entries precede the
+    // CLI entries. Project-level files are trust-gated like the resource
+    // discovery above.
+    let agent_dir = crate::coding_agent::context::agent_dir();
+    let system_prompt_file = std::env::var_os("PIR_SYSTEM_PROMPT_FILE")
+        .map(std::path::PathBuf::from)
+        .map(std::fs::read_to_string)
+        .transpose()?;
+    let discovered = crate::config::settings::discover_system_md(
+        &cwd,
+        &agent_dir,
+        crate::config::trust::resolve_cwd_trust(&cwd, &agent_dir),
     );
+    let preamble_override = overrides
+        .system_prompt
+        .clone()
+        .or(system_prompt_file)
+        .or(discovered.0);
+    let mut append: Vec<String> = discovered.1.into_iter().collect();
+    append.extend(overrides.append_system_prompt.iter().cloned());
+    agent_session.apply_prompt_overrides(preamble_override, append);
     Ok(agent_session)
 }
 
@@ -27605,5 +27624,224 @@ struct ResourceCommandProvider {
 impl super::autocomplete::CommandProvider for ResourceCommandProvider {
     fn commands(&self) -> Vec<super::autocomplete::SlashCommand> {
         self.commands.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SYSTEM.md / APPEND_SYSTEM.md discovery (print's precedence, host parity)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod system_md_tests {
+    use super::*;
+    use crate::coding_agent::resources::ResourceDiscoveryOptions;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    /// Serializes the process-global state this test pins (cwd,
+    /// PIR_AGENT_DIR, PIR_SYSTEM_PROMPT_FILE, PI_OFFLINE) against itself.
+    /// The RPC factory test (rpc.rs) pins the same env surface, so share its
+    /// env_lock helper: two env pins in one process must exclude each other.
+    // The RPC factory test (rpc.rs) pins the same process-global env surface,
+    // so both tests share its lock (two env pins must exclude each other).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::coding_agent::rpc::tests::env_lock()
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "pir-tui-system-md-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// RAII pin of the agent dir plus removal of the prompt-file env
+    /// override; restores on drop.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn pin(agent_dir: &Path) -> Self {
+            let saved = vec![
+                ("PIR_AGENT_DIR", std::env::var_os("PIR_AGENT_DIR")),
+                (
+                    "PIR_SYSTEM_PROMPT_FILE",
+                    std::env::var_os("PIR_SYSTEM_PROMPT_FILE"),
+                ),
+                ("PI_OFFLINE", std::env::var_os("PI_OFFLINE")),
+            ];
+            std::env::set_var("PIR_AGENT_DIR", agent_dir);
+            std::env::remove_var("PIR_SYSTEM_PROMPT_FILE");
+            std::env::set_var("PI_OFFLINE", "1");
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, previous) in self.saved.iter().rev() {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// Restores the process cwd on drop (panic included).
+    struct CwdGuard {
+        previous: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let previous = std::env::current_dir().expect("read cwd");
+            std::env::set_current_dir(dir).expect("enter fixture cwd");
+            Self { previous }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
+
+    fn configured() -> PiConfiguredModel {
+        let model: crate::ai::types::Model = serde_json::from_value(serde_json::json!({
+            "id": "tui-test-model",
+            "name": "TUI test model",
+            "api": "openai-completions",
+            "provider": "tui-test",
+            "baseUrl": "http://127.0.0.1:1",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 4096,
+            "maxTokens": 1024
+        }))
+        .expect("fixture model");
+        PiConfiguredModel {
+            registry: crate::ai::provider::ProviderRegistry::default(),
+            model,
+            api_key: None,
+            api_keys: std::collections::BTreeMap::new(),
+            settings: crate::config::settings::Settings::default(),
+        }
+    }
+
+    /// The TUI half of the SYSTEM.md host parity: with no CLI override the
+    /// workspace SYSTEM.md becomes the preamble override and APPEND_SYSTEM.md
+    /// the addendum; a CLI --system-prompt wins over the discovered preamble
+    /// while the discovered append stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tui_factory_discovers_system_md_and_cli_override_wins() {
+        let _env_lock = env_lock();
+        let root = TempDir::new("m1");
+        let workspace = root.0.join("proj");
+        let agent_dir = root.0.join("agent");
+        let sessions = root.0.join("sessions");
+        for dir in [&workspace, &agent_dir, &sessions] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        std::fs::write(workspace.join(".pi").join("SYSTEM.md"), "TUI SYSTEM MARKER").unwrap();
+        std::fs::write(
+            workspace.join(".pi").join("APPEND_SYSTEM.md"),
+            "TUI APPEND MARKER",
+        )
+        .unwrap();
+        // Project-level SYSTEM.md is trust-gated: the "always" policy grants
+        // the fixture workspace without touching the trust store.
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"defaultProjectTrust":"always"}"#,
+        )
+        .unwrap();
+        let _env = EnvGuard::pin(&agent_dir);
+        // The TUI factory discovers against the process cwd (its session
+        // config carries it), so the fixture becomes the process cwd.
+        let _cwd = CwdGuard::enter(&workspace);
+
+        let build = |system_prompt: Option<String>| {
+            let resources = crate::coding_agent::resources::DiscoveredResources::discover(
+                &ResourceDiscoveryOptions {
+                    cwd: &workspace,
+                    agent_dir: &agent_dir,
+                    project_trusted: true,
+                    cli_skill_paths: &[],
+                    cli_prompt_paths: &[],
+                    no_skills: false,
+                    no_prompt_templates: false,
+                },
+            );
+            let overrides = WorkerOverrides {
+                thinking: None,
+                session_name: None,
+                scoped_refs: Vec::new(),
+                system_prompt,
+                append_system_prompt: Vec::new(),
+                session_cwd_override: None,
+            };
+            build_agent_session(
+                configured(),
+                None,
+                &crate::coding_agent::session_resolve::SessionPlan::New { id: None },
+                sessions.to_str().unwrap(),
+                &resources,
+                None,
+                &overrides,
+            )
+        };
+
+        let agent_session = build(None).expect("build TUI session");
+        let prompt = agent_session
+            .system_prompt_snapshot()
+            .expect("the derived prompt is installed");
+        assert!(
+            prompt.contains("TUI SYSTEM MARKER"),
+            "the workspace SYSTEM.md becomes the preamble override: {prompt}"
+        );
+        assert!(
+            prompt.contains("TUI APPEND MARKER"),
+            "the workspace APPEND_SYSTEM.md renders as the addendum: {prompt}"
+        );
+
+        // The CLI --system-prompt wins over the discovered SYSTEM.md; the
+        // discovered APPEND_SYSTEM.md still applies (print precedence).
+        let agent_session =
+            build(Some("CLI PREAMBLE WINS".to_owned())).expect("build TUI session with override");
+        let prompt = agent_session
+            .system_prompt_snapshot()
+            .expect("the override keeps the prompt context-derived");
+        assert!(
+            prompt.contains("CLI PREAMBLE WINS"),
+            "the CLI preamble override wins: {prompt}"
+        );
+        assert!(
+            !prompt.contains("TUI SYSTEM MARKER"),
+            "the discovered SYSTEM.md must not survive a CLI override: {prompt}"
+        );
+        assert!(
+            prompt.contains("TUI APPEND MARKER"),
+            "the discovered append still applies under a CLI preamble override: {prompt}"
+        );
     }
 }

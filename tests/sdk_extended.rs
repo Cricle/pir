@@ -1403,3 +1403,99 @@ async fn set_session_name_is_visible_through_session_name_and_session_metadata()
     let manager = SessionManager::open(&path).expect("reopen session file after clear");
     assert_eq!(manager.session_name(), None);
 }
+
+// ---------------------------------------------------------------------------
+// SYSTEM.md / APPEND_SYSTEM.md discovery (print's precedence, host parity)
+// ---------------------------------------------------------------------------
+
+/// With no explicit prompt the SDK build discovers the workspace
+/// SYSTEM.md / APPEND_SYSTEM.md (project files trust-gated against the
+/// build's own agent dir) and applies print's precedence: a discovered
+/// SYSTEM.md becomes the preamble override and APPEND_SYSTEM.md the addendum.
+/// An explicit `.system_prompt(..)` pins the whole prompt, so the discovery
+/// does not fire and the pinned text wins.
+#[tokio::test]
+async fn sdk_discovers_workspace_system_md_and_explicit_prompt_wins() {
+    let root = TempDir::new("sdk-system-md");
+    let workspace = root.path().join("proj");
+    let agent_dir = root.path().join("agent");
+    std::fs::create_dir_all(workspace.join(".pi")).expect("create .pi");
+    std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+    std::fs::write(workspace.join(".pi").join("SYSTEM.md"), "SDK SYSTEM MARKER")
+        .expect("write SYSTEM.md");
+    std::fs::write(
+        workspace.join(".pi").join("APPEND_SYSTEM.md"),
+        "SDK APPEND MARKER",
+    )
+    .expect("write APPEND_SYSTEM.md");
+    // The project-level files are trust-gated: the "always" policy on the
+    // build's own agent dir grants the fixture workspace.
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"defaultProjectTrust":"always"}"#,
+    )
+    .expect("write settings.json");
+
+    let seen: Arc<Mutex<Vec<Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    let registry = registry(Arc::new(move |_index, context| {
+        recorded.lock().unwrap().push(context.clone());
+        assistant(vec![text_block("ok")], StopReason::Stop)
+    }));
+
+    // Derived prompt: the discovered files join it.
+    let agent = agent_builder(Arc::clone(&registry), &workspace)
+        .agent_dir(&agent_dir)
+        .no_session()
+        .build()
+        .await
+        .expect("build agent");
+    agent.prompt("hi").await.expect("prompt");
+    let context = seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the provider saw one request");
+    let system = context
+        .system_prompt
+        .as_deref()
+        .expect("the request carries a system prompt");
+    assert!(
+        system.contains("SDK SYSTEM MARKER"),
+        "the workspace SYSTEM.md becomes the preamble override: {system}"
+    );
+    assert!(
+        system.contains("SDK APPEND MARKER"),
+        "the workspace APPEND_SYSTEM.md renders as the addendum: {system}"
+    );
+
+    // Explicit prompt: the pinned text wins, the discovered SYSTEM.md is out.
+    seen.lock().unwrap().clear();
+    let pinned = agent_builder(registry, &workspace)
+        .agent_dir(&agent_dir)
+        .no_session()
+        .system_prompt("SDK PINNED WINS")
+        .build()
+        .await
+        .expect("build pinned agent");
+    pinned.prompt("hi").await.expect("prompt");
+    let context = seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the provider saw the second request");
+    let system = context
+        .system_prompt
+        .as_deref()
+        .expect("the pinned request carries a system prompt");
+    assert!(
+        system.contains("SDK PINNED WINS"),
+        "the explicit prompt is sent as-is: {system}"
+    );
+    assert!(
+        !system.contains("SDK SYSTEM MARKER"),
+        "the discovered SYSTEM.md must not survive an explicit prompt: {system}"
+    );
+}

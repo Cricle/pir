@@ -1977,7 +1977,7 @@ impl AgentBuilder {
         // handed to the session AFTER construction (still before the first
         // prompt) so the derived prompt keeps its cache and the addendum is
         // re-applied on every rebuild.
-        let append_to_derived = self.system_prompt.is_none() && self.append_system_prompt.is_some();
+        let explicit_system_prompt = self.system_prompt.is_some();
         let append_system_prompt = self.append_system_prompt;
         let system_prompt = match (self.system_prompt, append_system_prompt.as_deref()) {
             (Some(prompt), Some(appendix)) => Some(format!("{prompt}\n\n{appendix}")),
@@ -2063,11 +2063,29 @@ impl AgentBuilder {
         if tool_hooks.is_some() {
             session_facade.set_tool_hooks(tool_hooks);
         }
-        // Append-only form: extend the just-derived base prompt and record the
-        // addendum on its cache, so active-set rebuilds and `/reload` keep it
-        // as the last section (upstream re-renders the `addendum` section from
-        // the resource loader's append list on every `_rebuildSystemPrompt`).
-        if append_to_derived {
+        // Derived-prompt form: the SYSTEM.md / APPEND_SYSTEM.md discovery
+        // joins the just-derived base prompt with print's exact precedence
+        // (print.rs:3315-3337): the `PIR_SYSTEM_PROMPT_FILE` env file or a
+        // discovered SYSTEM.md becomes the preamble override and a discovered
+        // APPEND_SYSTEM.md renders as the `addendum` section, re-applied on
+        // every active-set/`/reload` rebuild. The builder's
+        // `.append_system_prompt(..)` keeps its own trailing form (upstream
+        // appends the caller's addendum after the whole rendered prompt, not
+        // as a tagged section). The explicit-prompt form stays hermetic: the
+        // caller pinned the whole prompt, so no ambient file discovery
+        // applies.
+        if !explicit_system_prompt {
+            let system_prompt_file = std::env::var_os("PIR_SYSTEM_PROMPT_FILE")
+                .map(std::path::PathBuf::from)
+                .map(std::fs::read_to_string)
+                .transpose()?;
+            let discovered = crate::config::settings::discover_system_md(
+                &session_cwd,
+                &agent_dir,
+                crate::config::trust::resolve_cwd_trust(&session_cwd, &agent_dir),
+            );
+            let append: Vec<String> = discovered.1.into_iter().collect();
+            session_facade.apply_prompt_overrides(system_prompt_file.or(discovered.0), append);
             if let Some(appendix) = append_system_prompt {
                 session_facade.append_derived_system_prompt(appendix);
             }
