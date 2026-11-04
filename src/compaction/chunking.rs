@@ -14,8 +14,9 @@
 //!
 //! - a chunk's weight is the **exact serialized length** of the text
 //!   [`serialize_conversation`](super::serialize_conversation) would produce
-//!   for it (so the request the summarizer sends is bounded by construction,
-//!   not by an estimate that ignores the role labels);
+//!   for it, weighted by the shared Unicode-aware token estimator (CJK is
+//!   charged ≈1 token/char, ASCII 4 chars/token), so the request the
+//!   summarizer sends is bounded in TOKENS, not just in characters;
 //! - a chunk never *opens* on a tool result: the trailing tool results of the
 //!   last accepted assistant tool call stay in the same chunk (a turn/tool
 //!   pair is never split at its seam);
@@ -73,6 +74,8 @@ pub struct SummarizationChunk {
     pub end: usize,
     /// Exact serialized length (characters) of `[start, end)`.
     pub chars: usize,
+    /// Serialized weight in quarter-token units (the splitter's real budget).
+    pub weight_units: u64,
     /// The chunk holds a single message that alone exceeds the cap: its
     /// serialized text is truncated to the cap with the standard marker.
     pub oversize: bool,
@@ -98,9 +101,12 @@ impl SummarizationChunk {
 /// Token and character form of the per-chunk budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SummarizationChunkBudget {
-    /// Chunk weight in estimated tokens (`chars / 4`).
+    /// Chunk weight in estimated tokens.
     pub tokens: u64,
-    /// Chunk weight in serialized characters.
+    /// Chunk weight in quarter-token units. Under the Unicode-aware estimator
+    /// an ASCII character weighs one unit, so this equals the old
+    /// `tokens * 4` character budget for pure-ASCII content; CJK characters
+    /// weigh four units and consume the budget four times faster.
     pub chars: usize,
 }
 
@@ -136,11 +142,11 @@ pub fn summarization_chunk_budget(model: &Model, reserve_tokens: u64) -> Summari
     }
 }
 
-/// Estimated tokens of one chunk (its serialized weight under the module's
-/// chars/4 estimator) — the number to compare against
-/// [`SummarizationChunkBudget::tokens`] and the model window.
+/// Estimated tokens of one chunk under the shared Unicode-aware estimator —
+/// the number to compare against [`SummarizationChunkBudget::tokens`] and the
+/// model window.
 pub fn chunk_estimated_tokens(chunk: &SummarizationChunk) -> u64 {
-    (chunk.chars as f64 / CHARS_PER_TOKEN).ceil() as u64
+    chunk.weight_units.div_ceil(4)
 }
 
 /// Estimated tokens of a whole span under the same chars/4 weighting the
@@ -157,10 +163,9 @@ fn is_turn_start(message: &Message) -> bool {
     matches!(message, Message::User(_))
 }
 
-/// Serialized characters of a message list under the streamer's per-message
-/// accounting (each message's parts plus one `"\n\n"` between messages) — the
-/// same measure [`StreamingChunker::window_chars`] maintains incrementally.
-/// Used to re-derive the closed chunk's weight after a turn-boundary cut.
+/// Exact serialized character length of a message list (role labels, parts
+/// and `"\n\n"` separators included). Chunk boundaries use
+/// [`serialized_units`] instead; this remains the reported `chars` field.
 fn serialized_chars(messages: &[Message]) -> usize {
     messages
         .iter()
@@ -169,19 +174,34 @@ fn serialized_chars(messages: &[Message]) -> usize {
         + PART_SEPARATOR_CHARS * messages.len().saturating_sub(1)
 }
 
+/// Serialized quarter-token units of a message list under the streamer's
+/// per-message accounting (each message's parts plus one `"\n\n"` between
+/// messages) — the same measure [`StreamingChunker::window_units`] maintains
+/// incrementally. Used to re-derive the closed chunk's weight after a
+/// turn-boundary cut.
+fn serialized_units(messages: &[Message]) -> u64 {
+    messages
+        .iter()
+        .map(|message| super::message_parts_weight_units(message).0)
+        .sum::<u64>()
+        + (PART_SEPARATOR_CHARS as u64) * messages.len().saturating_sub(1) as u64
+}
+
 /// Prefix sums over the serialized parts, so any range's exact serialized
-/// length is O(1) and the splitter never re-serializes the span.
+/// weight is O(1) and the splitter never re-serializes the span.
 ///
 /// MEMORY SHAPE (pir extension): the weights are computed **one message at a
-/// time** ([`ChunkWeights::new`] serializes a message, records its counts, and
+/// time** ([`ChunkWeights::new`] inspects a message, records its counts, and
 /// drops the text) — the former shape collected `Vec<Vec<String>>` for the
 /// whole span first, which materialized the entire serialized conversation
 /// (tens of megabytes on a huge session) just to weight it.
 struct ChunkWeights {
-    /// Serialized character length of the parts each message contributes.
-    chars_per_message: Vec<usize>,
     /// `chars_per_message[0..i]` summed.
     prefix_chars: Vec<usize>,
+    /// Quarter-token units each message contributes.
+    units_per_message: Vec<u64>,
+    /// `units_per_message[0..i]` summed.
+    prefix_units: Vec<u64>,
     /// Number of serialized parts in `[0, i)` (an assistant message with text
     /// AND tool calls contributes two, joined by the separator).
     prefix_parts: Vec<usize>,
@@ -190,24 +210,30 @@ struct ChunkWeights {
 impl ChunkWeights {
     fn new<M: MessageSequence + ?Sized>(messages: &M) -> Self {
         let count = messages.message_count();
-        let mut chars_per_message = Vec::with_capacity(count);
         let mut prefix_chars = Vec::with_capacity(count + 1);
+        let mut units_per_message = Vec::with_capacity(count);
+        let mut prefix_units = Vec::with_capacity(count + 1);
         let mut prefix_parts = Vec::with_capacity(count + 1);
         prefix_chars.push(0usize);
+        prefix_units.push(0u64);
         prefix_parts.push(0usize);
         for index in 0..count {
             // Count ONE message's serialized weight without materializing its
             // text: the peak is a handful of counters, never a copy of the
             // message (a 256 KiB tool result used to be copied and truncated
             // here just to learn its 2 015-character serialized length).
-            let (chars, part_count) = super::message_parts_chars(messages.message_at(index));
-            chars_per_message.push(chars);
+            let message = messages.message_at(index);
+            let (chars, part_count) = super::message_parts_chars(message);
+            let (units, _) = super::message_parts_weight_units(message);
             prefix_chars.push(prefix_chars[prefix_chars.len() - 1] + chars);
+            units_per_message.push(units);
+            prefix_units.push(prefix_units[prefix_units.len() - 1] + units);
             prefix_parts.push(prefix_parts[prefix_parts.len() - 1] + part_count);
         }
         Self {
-            chars_per_message,
             prefix_chars,
+            units_per_message,
+            prefix_units,
             prefix_parts,
         }
     }
@@ -220,9 +246,16 @@ impl ChunkWeights {
         chars + PART_SEPARATOR_CHARS * parts.saturating_sub(1)
     }
 
-    /// Serialized length of the parts one message contributes.
-    fn message_chars(&self, index: usize) -> usize {
-        self.chars_per_message[index]
+    /// Serialized quarter-token weight of `[start, end)`.
+    fn range_units(&self, start: usize, end: usize) -> u64 {
+        let units = self.prefix_units[end].saturating_sub(self.prefix_units[start]);
+        let parts = self.prefix_parts[end].saturating_sub(self.prefix_parts[start]);
+        units + (PART_SEPARATOR_CHARS as u64) * parts.saturating_sub(1) as u64
+    }
+
+    /// Serialized quarter-token weight of the parts one message contributes.
+    fn message_units(&self, index: usize) -> u64 {
+        self.units_per_message[index]
     }
 }
 
@@ -263,10 +296,11 @@ pub struct StreamingChunker<'a> {
     chunk_text: String,
     /// Reused prompt buffer; the finished prompt is MOVED into the request.
     prompt_text: String,
-    /// Serialized characters of `window` including the `"\n\n"` separators.
-    window_chars: usize,
-    /// Characters of trailing tool results carried beyond the fit.
-    carried: usize,
+    /// Serialized quarter-token units of `window` including the `"\n\n"`
+    /// separators.
+    window_units: u64,
+    /// Quarter-token units of trailing tool results carried beyond the fit.
+    carried: u64,
     running: Option<String>,
     total_usage: Option<super::Usage>,
     chunks_emitted: usize,
@@ -300,7 +334,7 @@ impl<'a> StreamingChunker<'a> {
             window: Vec::new(),
             chunk_text: String::new(),
             prompt_text: String::new(),
-            window_chars: 0,
+            window_units: 0,
             carried: 0,
             running: previous_summary.map(str::to_owned),
             total_usage: None,
@@ -350,32 +384,35 @@ impl<'a> StreamingChunker<'a> {
         // Count-only weight: the message is serialized for real only if it
         // lands in a chunk that closes (the paged prefix reader parses one
         // entry at a time; weighting used to copy every parsed tool result).
-        let (weight, _) = super::message_parts_chars(&message);
+        let (weight, _) = super::message_parts_weight_units(&message);
         let separator = if self.window.is_empty() {
             0
         } else {
-            PART_SEPARATOR_CHARS
+            PART_SEPARATOR_CHARS as u64
         };
 
-        if !self.window.is_empty() && self.window_chars + separator + weight > self.budget.chars {
-            let window_oversize = self.window.len() == 1 && self.window_chars > self.budget.chars;
+        if !self.window.is_empty()
+            && self.window_units + separator + weight > self.budget.chars as u64
+        {
+            let window_oversize =
+                self.window.len() == 1 && self.window_units > self.budget.chars as u64;
             let carry = matches!(message, Message::ToolResult(_))
                 && !window_oversize
-                && self.carried < self.budget.chars;
+                && self.carried < self.budget.chars as u64;
             if carry {
                 // The closing chunk keeps the trailing tool results of its last
                 // accepted assistant call (bounded by one extra cap).
-                self.window_chars += separator + weight;
+                self.window_units += separator + weight;
                 self.carried += separator + weight;
                 self.window.push(message);
                 return Ok(());
             }
             self.emit_chunk(false).await?;
         }
-        self.window_chars += if self.window.is_empty() {
+        self.window_units += if self.window.is_empty() {
             weight
         } else {
-            PART_SEPARATOR_CHARS + weight
+            PART_SEPARATOR_CHARS as u64 + weight
         };
         self.window.push(message);
         Ok(())
@@ -412,12 +449,12 @@ impl<'a> StreamingChunker<'a> {
     /// `final_chunk` marks the span's TAIL: no boundary cut is applied there
     /// (nothing follows it), matching [`split_summarization_chunks`].
     async fn emit_chunk(&mut self, final_chunk: bool) -> Result<(), String> {
-        let oversize = self.window.len() == 1 && self.window_chars > self.budget.chars;
+        let oversize = self.window.len() == 1 && self.window_units > self.budget.chars as u64;
         // Prefer a turn boundary: the LAST user message inside the accepted
         // span ends this chunk and opens the next one (skipped when tool
         // results were carried, for the indivisible case, and for the tail).
         let mut remainder: Vec<Message> = Vec::new();
-        let mut remainder_chars = 0usize;
+        let mut remainder_units = 0u64;
         if self.carried == 0 && !oversize && !final_chunk && self.window.len() > 1 {
             let cut = self.window[1..]
                 .iter()
@@ -425,22 +462,22 @@ impl<'a> StreamingChunker<'a> {
                 .map(|relative| relative + 1);
             if let Some(cut) = cut {
                 remainder = self.window.split_off(cut);
-                remainder_chars = serialized_chars(&remainder);
+                remainder_units = serialized_units(&remainder);
                 // The chunk constructed below is the POST-split window (`end`
                 // is its new length): drop the remainder's serialized weight
-                // plus the separator that joined it, so `chars` is the closed
-                // chunk's own weight — exactly what the resident splitter
-                // records for its post-cut range (only the oversize warning
-                // reads this number, but the two paths must not disagree).
-                self.window_chars = self
-                    .window_chars
-                    .saturating_sub(remainder_chars + PART_SEPARATOR_CHARS);
+                // plus the separator that joined it, so `weight_units` is the
+                // closed chunk's own weight — exactly what the resident
+                // splitter records for its post-cut range.
+                self.window_units = self
+                    .window_units
+                    .saturating_sub(remainder_units + PART_SEPARATOR_CHARS as u64);
             }
         }
         let chunk = super::chunking::SummarizationChunk {
             start: 0,
             end: self.window.len(),
-            chars: self.window_chars,
+            chars: serialized_chars(&self.window),
+            weight_units: self.window_units,
             oversize,
         };
         let mut chunk_text = std::mem::take(&mut self.chunk_text);
@@ -474,7 +511,8 @@ impl<'a> StreamingChunker<'a> {
         self.chunk_text = chunk_text;
         tracing::debug!(
             chunk = self.chunks_emitted + 1,
-            chars = self.window_chars,
+            weight_units = self.window_units,
+            chars = chunk.chars,
             label,
             "streamed summarizer call"
         );
@@ -510,26 +548,27 @@ impl<'a> StreamingChunker<'a> {
         });
         self.window = remainder;
         self.carried = 0;
-        self.window_chars = remainder_chars;
+        self.window_units = remainder_units;
         Ok(())
     }
 }
 
-/// Split a summarization span into chunks no heavier than `max_chars` of
-/// serialized text (see the module docs for the boundary rules). The span is
+/// Split a summarization span into chunks no heavier than `max_units` of
+/// serialized weight (quarter-token units; an ASCII char is one unit, a CJK
+/// char four). See the module docs for the boundary rules. The span is
 /// weighted one message at a time (see [`ChunkWeights::new`]) — the peak is
 /// one message's text, never the span's.
 ///
-/// `max_chars == 0` is treated as 1 so the splitter always makes progress.
+/// `max_units == 0` is treated as 1 so the splitter always makes progress.
 pub fn split_summarization_chunks<M: MessageSequence + ?Sized>(
     messages: &M,
-    max_chars: usize,
+    max_units: usize,
 ) -> Vec<SummarizationChunk> {
     let len = messages.message_count();
     if len == 0 {
         return Vec::new();
     }
-    let max_chars = max_chars.max(1);
+    let max_units = max_units.max(1) as u64;
     let weights = ChunkWeights::new(messages);
 
     let mut chunks: Vec<SummarizationChunk> = Vec::new();
@@ -538,23 +577,23 @@ pub fn split_summarization_chunks<M: MessageSequence + ?Sized>(
         // Greedy fit: the first message always enters (even when it alone is
         // over the cap — that is the indivisible case).
         let mut end = start + 1;
-        while end < len && weights.range_chars(start, end + 1) <= max_chars {
+        while end < len && weights.range_units(start, end + 1) <= max_units {
             end += 1;
         }
-        let oversize = weights.range_chars(start, end) > max_chars;
+        let oversize = weights.range_units(start, end) > max_units;
 
         // A chunk must never OPEN on a tool result: the trailing tool results
         // of the last accepted assistant tool call stay with it. Bounded by
         // one extra cap worth of results (each result is truncated to
         // `TOOL_RESULT_MAX_CHARS` in the serialized text), so a pathological
         // transcript cannot make a chunk unbounded.
-        let mut carried = 0usize;
+        let mut carried = 0u64;
         while !oversize
             && end < len
             && matches!(messages.message_at(end), Message::ToolResult(_))
-            && carried < max_chars
+            && carried < max_units
         {
-            carried += weights.message_chars(end) + PART_SEPARATOR_CHARS;
+            carried += weights.message_units(end) + PART_SEPARATOR_CHARS as u64;
             end += 1;
         }
 
@@ -580,10 +619,12 @@ pub fn split_summarization_chunks<M: MessageSequence + ?Sized>(
             cut = end;
         }
         let chars = weights.range_chars(start, cut);
+        let weight_units = weights.range_units(start, cut);
         chunks.push(SummarizationChunk {
             start,
             end: cut,
             chars,
+            weight_units,
             oversize: oversize && cut == end,
         });
         start = cut;

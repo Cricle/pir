@@ -35,10 +35,11 @@
 //!   call byte for byte; the chunked shape is a pir extension (the session
 //!   format and the persisted summary shape are unchanged).
 //!
-//! Token estimation (`CHARS_PER_TOKEN`): the fix-list brief cited an upstream
-//! `estimate.ts` with a 3.5 chars/token constant, but the checked-in upstream
-//! (`core/compaction/compaction.ts:298-349`, `estimateTokens`) divides by 4 —
-//! pir's 4.0 constant already matches upstream, so it is kept unchanged.
+//! Token estimation: the upstream `chars / 4` heuristic underestimates CJK
+//! transcripts by up to 4x. All production estimators now share the
+//! Unicode-aware unit counter in [`algorithm`] (CJK ≈1 token/char, ASCII
+//! ≈4 chars/token, emoji weighted separately); `CHARS_PER_TOKEN` remains only
+//! as a legacy compatibility constant.
 
 pub mod algorithm;
 pub mod branch_summarization;
@@ -58,13 +59,18 @@ use crate::ai::types::{
 use crate::ai::util::now_ms;
 use crate::session_manager::projection::{user_text_message, user_text_message_owned};
 pub use algorithm::{
-    calculate_context_tokens, estimate_context_tokens, estimate_message_tokens,
-    estimate_projected_context_tokens, estimate_projected_context_tokens_with_tail,
-    find_projected_cut_point, is_cut_point_message, is_turn_start_message,
-    materialize_projected_tail, projection_materializations, reset_projection_materializations,
-    should_compact, should_compact_tokens, CompactionConfig, ContextUsageEstimate, CutEntry,
-    CutEntryRef, CutPointResult, MessageSequence, PathEntry, PathEntryMeta, ProjectedEntry,
-    ProjectionEntryMeta, CHARS_PER_TOKEN,
+    calculate_context_tokens, char_token_units, estimate_context_tokens,
+    estimate_context_tokens_conservative, estimate_message_tokens,
+    estimate_message_tokens_conservative, estimate_projected_context_tokens,
+    estimate_projected_context_tokens_with_tail, estimate_prompt_tokens,
+    estimate_prompt_tokens_conservative, estimate_request_context_tokens,
+    estimate_request_context_tokens_conservative, estimate_text_tokens,
+    estimate_text_tokens_conservative, find_projected_cut_point, is_cut_point_message,
+    is_turn_start_message, materialize_projected_tail, projection_materializations,
+    reset_projection_materializations, should_compact, should_compact_tokens, text_token_units,
+    CompactionConfig, ContextUsageEstimate, CutEntry, CutEntryRef, CutPointResult, MessageSequence,
+    PathEntry, PathEntryMeta, ProjectedEntry, ProjectionEntryMeta, CHARS_PER_TOKEN,
+    CONSERVATIVE_CHARS_PER_TOKEN,
 };
 pub use branch_summarization::{
     branch_summary_max_tokens, collect_entries_for_branch_summary, generate_branch_summary,
@@ -448,6 +454,138 @@ pub(crate) fn message_parts_chars(message: &Message) -> (usize, usize) {
     }
 }
 
+/// Quarter-token weight of one message's serialized form — the exact same
+/// labels/truncation rules as [`message_parts_chars`], but every text run is
+/// weighted by the shared Unicode-aware estimator (CJK 4 units/char, ASCII 1
+/// unit/char, emoji 8). Chunking therefore budgets in TOKENS, not raw chars.
+pub(crate) fn message_parts_weight_units(message: &Message) -> (u64, usize) {
+    match message {
+        Message::User(user) => {
+            let chars = content_text_chars(&user.content);
+            if chars == 0 {
+                (0, 0)
+            } else {
+                (8 + content_text_units(&user.content), 1)
+            }
+        }
+        Message::Assistant(assistant) => {
+            let mut text_units = 0u64;
+            let mut text_blocks = 0usize;
+            let mut tool_calls_units = 0u64;
+            let mut tool_calls = 0usize;
+            for block in &assistant.content {
+                match block {
+                    ContentBlock::Text(text) => {
+                        text_units = text_units.saturating_add(text_token_units(&text.text));
+                        text_blocks += 1;
+                    }
+                    ContentBlock::ToolCall(call) => {
+                        let mut args_units = 0u64;
+                        let mut args = 0usize;
+                        for (key, value) in &call.arguments {
+                            let json = serde_json::to_string(value).unwrap_or_default();
+                            args_units = args_units.saturating_add(
+                                text_token_units(key) + 1 + text_token_units(&json),
+                            );
+                            args += 1;
+                        }
+                        if args > 0 {
+                            args_units = args_units.saturating_add(2 * (args as u64 - 1));
+                        }
+                        tool_calls_units = tool_calls_units
+                            .saturating_add(text_token_units(&call.name) + 2 + args_units);
+                        tool_calls += 1;
+                    }
+                    _ => {}
+                }
+            }
+            let mut units = 0u64;
+            let mut parts = 0usize;
+            if text_blocks > 0 {
+                units = units.saturating_add(13 + text_units + text_blocks as u64 - 1);
+                parts += 1;
+            }
+            if tool_calls > 0 {
+                units = units.saturating_add(24 + tool_calls_units + 2 * (tool_calls as u64 - 1));
+                parts += 1;
+            }
+            (units, parts)
+        }
+        Message::ToolResult(result) => {
+            let total_chars = content_text_chars(&result.content);
+            if total_chars == 0 {
+                (0, 0)
+            } else {
+                (
+                    15 + content_text_units_truncated(
+                        &result.content,
+                        prompts::TOOL_RESULT_MAX_CHARS,
+                    ),
+                    1,
+                )
+            }
+        }
+        Message::System(_) | Message::Developer(_) => (0, 0),
+    }
+}
+
+/// Quarter-token weight of joined text content (without materializing it).
+fn content_text_units(content: &[ContentBlock]) -> u64 {
+    let mut units = 0u64;
+    let mut blocks = 0usize;
+    for block in content {
+        if let ContentBlock::Text(text) = block {
+            units = units.saturating_add(text_token_units(&text.text));
+            blocks += 1;
+        }
+    }
+    if blocks == 0 {
+        0
+    } else {
+        units.saturating_add(blocks as u64 - 1)
+    }
+}
+
+/// Weight of [`content_text`] after the serializer truncates it to
+/// `max_chars` characters (the "[... N more characters truncated]" marker is
+/// accounted for in ASCII units).
+fn content_text_units_truncated(content: &[ContentBlock], max_chars: usize) -> u64 {
+    let total_chars = content_text_chars(content);
+    if total_chars <= max_chars {
+        return content_text_units(content);
+    }
+    let mut remaining = max_chars;
+    let mut units = 0u64;
+    let mut blocks = 0usize;
+    for block in content {
+        let ContentBlock::Text(text) = block else {
+            continue;
+        };
+        if blocks > 0 && remaining > 0 {
+            // The joined "\n" separator between blocks.
+            units = units.saturating_add(1);
+            remaining = remaining.saturating_sub(1);
+        }
+        blocks += 1;
+        if remaining == 0 {
+            break;
+        }
+        let mut taken = 0usize;
+        for ch in text.text.chars() {
+            if taken >= remaining {
+                break;
+            }
+            units = units.saturating_add(crate::compaction::algorithm::char_token_units(ch));
+            taken += 1;
+        }
+        remaining = remaining.saturating_sub(taken);
+        if remaining == 0 {
+            break;
+        }
+    }
+    units.saturating_add(truncated_summary_chars(total_chars, max_chars) as u64 - max_chars as u64)
+}
+
 /// Serialize ONE message into the part(s) [`serialize_conversation`] would
 /// contribute for it (empty when the message contributes nothing: system and
 /// developer messages, empty content, ...). A message that carries both
@@ -605,7 +743,7 @@ fn write_chunk_body<M: MessageSequence + ?Sized>(
     out: &mut String,
     messages: &M,
     chunk: &chunking::SummarizationChunk,
-    max_chars: usize,
+    max_units: usize,
     first: &mut bool,
 ) {
     let len = messages.message_count();
@@ -624,30 +762,64 @@ fn write_chunk_body<M: MessageSequence + ?Sized>(
         return;
     }
     tracing::warn!(
+        oversize_units = chunk.weight_units,
+        cap_units = max_units,
+        // Common-case phrasing: for ASCII one unit is one character.
         oversize_chars = chunk.chars,
-        cap_chars = max_chars,
+        cap_chars = max_units,
         "a single message exceeds the summarizer chunk budget; truncating it for the summary          (the session keeps the full message)"
     );
-    let mut used = 0usize;
+    let mut used_units = 0u64;
     for index in start..end {
         for part in serialize_message_parts(messages.message_at(index)) {
             if !*first {
                 out.push_str("\n\n");
-                used += 2;
+                used_units += 2;
             }
             *first = false;
-            let part_chars = part.chars().count();
-            if used + part_chars > max_chars {
-                let remaining = max_chars.saturating_sub(used);
+            let part_units = text_token_units(&part);
+            if used_units + part_units > max_units as u64 {
+                let remaining = (max_units as u64).saturating_sub(used_units);
                 if remaining > 0 {
-                    out.push_str(&prompts::truncate_for_summary(&part, remaining));
+                    out.push_str(&truncate_for_summary_units(&part, remaining));
                 }
                 return;
             }
-            used += part_chars;
+            used_units += part_units;
             out.push_str(&part);
         }
     }
+}
+
+/// [`prompts::truncate_for_summary`] measured in quarter-token units rather
+/// than characters. Used only for an indivisible oversize message: its
+/// serialized part is cut where the SAME Unicode-aware estimator says the
+/// budget is exhausted, so a CJK message cannot smuggle four times its token
+/// budget through a character-based truncation.
+fn truncate_for_summary_units(text: &str, max_units: u64) -> String {
+    if text_token_units(text) <= max_units {
+        return text.to_string();
+    }
+    // Reserve room for the "[... N more characters truncated]" marker.
+    let reserve = 64u64.min(max_units.saturating_sub(1));
+    let prefix_budget = max_units.saturating_sub(reserve);
+    let mut used = 0u64;
+    let mut prefix = String::new();
+    let mut prefix_chars = 0usize;
+    for ch in text.chars() {
+        let units = crate::compaction::algorithm::char_token_units(ch);
+        if used + units > prefix_budget {
+            break;
+        }
+        used += units;
+        prefix.push(ch);
+        prefix_chars += 1;
+    }
+    let truncated_chars = text.chars().count().saturating_sub(prefix_chars);
+    format!(
+        "{}\n\n[... {} more characters truncated]",
+        prefix, truncated_chars
+    )
 }
 
 // ============================================================================

@@ -4,11 +4,25 @@
 //! Rust port of upstream `packages/coding-agent/src/core/compaction/compaction.ts`
 //! (`calculateContextTokens`, `estimateContextTokens`, `estimateTokens`,
 //! `estimateProjectedContextTokens`, `shouldCompact`, `findProjectedCutPoint`).
-//! Estimation uses upstream compaction's `chars / 4` heuristic
-//! (`compaction.ts` `estimateTokens`; the `/3.5` figure belongs to
-//! `utils/estimate.ts` semantics only); the cut point walks *projected*
-//! entries so omitted (context-edited) entries and the newest-compaction-only
-//! rule are respected.
+//! TOKEN ESTIMATION (pir extension): upstream's `chars / 4` heuristic
+//! severely under-estimates CJK transcripts — a Han character is roughly one
+//! token, not a quarter token. Every production estimator in this module (and
+//! its callers: compaction trigger, chunking, prompt/max_tokens clamps,
+//! `context_usage`, cost projection) now runs through the SAME Unicode-aware
+//! unit counter below:
+//!
+//! - ASCII: 1 unit/char (4 chars per token);
+//! - CJK (Han, Hiragana, Katakana, Hangul): 4 units/char (≈1 token/char);
+//! - emoji: 8 units/char (≈2 tokens/char), other symbols: 4 units/char;
+//! - other non-ASCII (Cyrillic, Greek, accented Latin, …): 2 units/char.
+//!
+//! Units are quarter-tokens, so `tokens = ceil(units / 4)`. The conservative
+//! path divides by 3.5 instead, which keeps the old `estimate.ts` safety
+//! margin for every character class (and is never below the normal estimate).
+//! This stays dependency-free (no tokenizer crate required offline).
+//!
+//! The cut point walks *projected* entries so omitted (context-edited)
+//! entries and the newest-compaction-only rule are respected.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,12 +30,25 @@ use crate::ai::types::{ContentBlock, Context, Message, Model, StopReason, Usage}
 use crate::session_manager::{FileEntry, StoredMessage};
 
 /// Estimated character weight of an image content block (upstream
-/// `ESTIMATED_IMAGE_CHARS`).
+/// `ESTIMATED_IMAGE_CHARS`). Images are charged as if they were this many
+/// ASCII characters.
 pub const ESTIMATED_IMAGE_CHARS: usize = 4800;
 
-/// Chars-per-token heuristic (upstream `compaction.ts` `estimateTokens`
-/// divides by 4).
+/// Legacy chars-per-token constant, retained for API compatibility. New code
+/// must use [`estimate_text_tokens`] / [`estimate_message_tokens`]: plain
+/// character counts are not token counts for CJK content.
 pub const CHARS_PER_TOKEN: f64 = 4.0;
+
+/// Quarter-token units in an ASCII character (4 chars/token).
+const ASCII_UNITS: u64 = 1;
+/// Quarter-token units in a CJK character (≈1 token/char).
+const CJK_UNITS: u64 = 4;
+/// Quarter-token units in a non-CJK non-ASCII letter (≈0.5 token/char).
+const OTHER_UNITS: u64 = 2;
+/// Quarter-token units in a symbol (≈1 token/char).
+const SYMBOL_UNITS: u64 = 4;
+/// Quarter-token units in an emoji / pictograph (≈2 tokens/char).
+const EMOJI_UNITS: u64 = 8;
 
 // ============================================================================
 // Configuration
@@ -140,27 +167,204 @@ pub struct ContextUsageEstimate {
     pub last_usage_index: Option<usize>,
 }
 
-/// Text-and-image character count of user-side content (upstream
-/// `estimateTextAndImageContentChars`): text blocks contribute their length,
-/// image blocks a fixed 4800 characters, everything else nothing. Character
-/// (not byte) counting approximates upstream's UTF-16 `.length`, so CJK
-/// content is not overestimated 2-3x.
-fn estimate_text_and_image_chars(content: &[ContentBlock]) -> usize {
+/// Whether `ch` belongs to a CJK script (Han, Hiragana, Katakana, Hangul and
+/// their punctuation/compatibility blocks).
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1100..=0x11FF // Hangul Jamo
+            | 0x2E80..=0x2FFF // CJK radicals / Kangxi
+            | 0x3000..=0x303F // CJK symbols and punctuation
+            | 0x3040..=0x309F // Hiragana
+            | 0x30A0..=0x30FF // Katakana
+            | 0x3130..=0x318F // Hangul compatibility Jamo
+            | 0x31F0..=0x31FF // Katakana phonetic extensions
+            | 0x3400..=0x4DBF // CJK Extension A
+            | 0x4E00..=0x9FFF // CJK Unified Ideographs
+            | 0xA960..=0xA97F // Hangul Jamo Extended-A
+            | 0xAC00..=0xD7AF // Hangul Syllables
+            | 0xD7B0..=0xD7FF // Hangul Jamo Extended-B
+            | 0xF900..=0xFAFF // CJK compatibility ideographs
+            | 0xFE30..=0xFE4F // CJK compatibility forms
+            | 0xFF00..=0xFFEF // Halfwidth/fullwidth forms
+            | 0x1AFF0..=0x1B16F // Kana supplement / extended
+            | 0x20000..=0x2FA1F // CJK Extensions B–F
+            | 0x30000..=0x3134F // CJK Extension G
+    )
+}
+
+/// Whether `ch` is an emoji / pictographic symbol (charged at [`EMOJI_UNITS`]).
+fn is_emoji(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1F000..=0x1FAFF // emoji, pictographs, regional indicators
+            | 0x2600..=0x27BF // misc symbols / dingbats
+    )
+}
+
+/// Whether `ch` is a non-emoji symbol/punctuation outside ASCII
+/// (charged at [`SYMBOL_UNITS`]).
+fn is_symbol(ch: char) -> bool {
+    if ch.is_ascii() {
+        return false;
+    }
+    if is_emoji(ch) || is_cjk(ch) {
+        return false;
+    }
+    matches!(
+        ch as u32,
+        0x2000..=0x206F // general punctuation
+            | 0x2070..=0x209F // super/subscripts
+            | 0x20A0..=0x20CF // currency symbols
+            | 0x2100..=0x214F // letterlike symbols
+            | 0x2150..=0x218F // number forms
+            | 0x2190..=0x21FF // arrows
+            | 0x2200..=0x22FF // mathematical operators
+            | 0x2300..=0x23FF // misc technical
+            | 0x2460..=0x24FF // enclosed alphanumerics
+            | 0x2500..=0x259F // box drawing / block elements
+            | 0x25A0..=0x25FF // geometric shapes
+            | 0x2900..=0x297F // supplemental arrows-B
+    )
+}
+
+/// Quarter-token units of one character (see the module docs).
+pub fn char_token_units(ch: char) -> u64 {
+    if ch.is_ascii() {
+        ASCII_UNITS
+    } else if is_cjk(ch) {
+        CJK_UNITS
+    } else if is_emoji(ch) {
+        EMOJI_UNITS
+    } else if is_symbol(ch) {
+        SYMBOL_UNITS
+    } else {
+        OTHER_UNITS
+    }
+}
+
+/// Quarter-token weight of `text` under the shared Unicode-aware estimator.
+/// Zero-width joiner/variation selectors contribute nothing (they ride along
+/// with the emoji that owns them).
+pub fn text_token_units(text: &str) -> u64 {
+    text.chars()
+        .map(|ch| match ch as u32 {
+            0x200D | 0xFE0E | 0xFE0F => 0,
+            _ => char_token_units(ch),
+        })
+        .sum()
+}
+
+/// Normal (4 chars/token for ASCII) token estimate of `text`.
+pub fn estimate_text_tokens(text: &str) -> u64 {
+    ceil_units(text_token_units(text))
+}
+
+/// Conservative (`3.5 chars/token` for ASCII) token estimate of `text`.
+pub fn estimate_text_tokens_conservative(text: &str) -> u64 {
+    ceil_units_conservative(text_token_units(text))
+}
+
+fn ceil_units(units: u64) -> u64 {
+    units.div_ceil(4)
+}
+
+fn ceil_units_conservative(units: u64) -> u64 {
+    (units as f64 / 3.5).ceil() as u64
+}
+
+/// Quarter-token weight of user-side content (upstream
+/// `estimateTextAndImageContentChars`): text blocks contribute their weighted
+/// length, image blocks a fixed [`ESTIMATED_IMAGE_CHARS`] ASCII characters,
+/// everything else nothing.
+fn estimate_text_and_image_units(content: &[ContentBlock]) -> u64 {
     content
         .iter()
         .map(|block| match block {
-            ContentBlock::Text(text) => text.text.chars().count(),
-            ContentBlock::Image(_) => ESTIMATED_IMAGE_CHARS,
+            ContentBlock::Text(text) => text_token_units(&text.text),
+            ContentBlock::Image(_) => ESTIMATED_IMAGE_CHARS as u64,
             _ => 0,
         })
         .sum()
 }
 
-fn ceil_div_chars(chars: usize) -> u64 {
-    (chars as f64 / CHARS_PER_TOKEN).ceil() as u64
+/// Quarter-token weight of the request's leading prompt state: the prompt text
+/// plus the JSON-serialized tool declarations.
+///
+/// `Context.system_prompt` and `Context.tools` live outside `messages` in pir,
+/// while upstream folds them into a leading system message before the provider
+/// sees the context. Callers that estimate a request must add this prefix
+/// exactly when the message list does not already carry a usage record (a
+/// usage record includes the leading prompt).
+fn prompt_token_units(
+    system_prompt: Option<&str>,
+    tools: Option<&[crate::ai::types::Tool]>,
+) -> u64 {
+    let prompt_units = system_prompt.map_or(0, text_token_units);
+    let tool_units = tools
+        .filter(|tools| !tools.is_empty())
+        .and_then(|tools| serde_json::to_string(tools).ok())
+        .map_or(0, |json| text_token_units(&json));
+    prompt_units.saturating_add(tool_units)
 }
 
-/// Character weight of a single message, before the chars-per-token rounding.
+/// Estimated tokens of the request's leading prompt state: the prompt text
+/// plus the JSON-serialized tool declarations, using the same Unicode-aware
+/// estimator as the transcript.
+pub fn estimate_prompt_tokens(
+    system_prompt: Option<&str>,
+    tools: Option<&[crate::ai::types::Tool]>,
+) -> u64 {
+    ceil_units(prompt_token_units(system_prompt, tools))
+}
+
+/// Upstream's AI-side estimator (`estimateTextTokens`, `utils/estimate.ts`)
+/// uses 3.5 chars/token; the compaction estimator uses 4.0. The
+/// `max_tokens` clamp is a safety boundary, so it uses the MORE
+/// conservative 3.5 for the prompt prefix (an under-estimate there lets a
+/// request exceed the window; the transcript estimate already carries
+/// usage-grounded numbers when a usage record exists).
+pub const CONSERVATIVE_CHARS_PER_TOKEN: f64 = 3.5;
+
+/// [`estimate_prompt_tokens`] at the conservative 3.5-units-per-token rate.
+pub fn estimate_prompt_tokens_conservative(
+    system_prompt: Option<&str>,
+    tools: Option<&[crate::ai::types::Tool]>,
+) -> u64 {
+    ceil_units_conservative(prompt_token_units(system_prompt, tools))
+}
+
+/// Estimate a full request [`Context`]: the transcript estimate plus the
+/// leading prompt (`system_prompt` + `tools`) exactly when the transcript
+/// carries no usage record (a usage record already includes the leading
+/// prompt).
+pub fn estimate_request_context_tokens(context: &Context) -> ContextUsageEstimate {
+    let mut estimate = estimate_context_tokens(&context.messages);
+    if estimate.last_usage_index.is_none() {
+        let prefix =
+            estimate_prompt_tokens(context.system_prompt.as_deref(), context.tools.as_deref());
+        estimate.tokens = estimate.tokens.saturating_add(prefix);
+        estimate.trailing_tokens = estimate.trailing_tokens.saturating_add(prefix);
+    }
+    estimate
+}
+
+/// [`estimate_request_context_tokens`] with the conservative 3.5
+/// units/token rate — the variant the `max_tokens` clamp uses.
+pub fn estimate_request_context_tokens_conservative(context: &Context) -> ContextUsageEstimate {
+    let mut estimate = estimate_context_tokens_conservative(&context.messages);
+    if estimate.last_usage_index.is_none() {
+        let prefix = estimate_prompt_tokens_conservative(
+            context.system_prompt.as_deref(),
+            context.tools.as_deref(),
+        );
+        estimate.tokens = estimate.tokens.saturating_add(prefix);
+        estimate.trailing_tokens = estimate.trailing_tokens.saturating_add(prefix);
+    }
+    estimate
+}
+
+/// Quarter-token weight of a single message, before the final rounding.
 ///
 /// A system message counts its text/image content PLUS its named prompt
 /// sections and its declared tool definitions, exactly like upstream
@@ -168,48 +372,52 @@ fn ceil_div_chars(chars: usize) -> u64 {
 /// `JSON.stringify(toolsAdded).length`). Leaving those out under-estimated a
 /// session whose prompt is mostly tool declarations, so a compaction could
 /// trigger late; `toolsRemoved` is not counted upstream either.
-fn estimate_message_chars(message: &Message) -> usize {
+fn estimate_message_units(message: &Message) -> u64 {
     match message {
         Message::System(system) => {
-            let sections: usize = system
+            let sections: u64 = system
                 .sections
                 .iter()
                 .flat_map(|sections| sections.values())
                 .filter_map(|text| text.as_ref())
-                .map(|text| text.chars().count())
+                .map(|text| text_token_units(text))
                 .sum();
             let tools = system
                 .tools_added
                 .as_ref()
                 .and_then(|tools| serde_json::to_string(tools).ok())
-                .map_or(0, |json| json.chars().count());
-            estimate_text_and_image_chars(&system.content) + sections + tools
+                .map_or(0, |json| text_token_units(&json));
+            estimate_text_and_image_units(&system.content) + sections + tools
         }
         Message::User(user) | Message::Developer(user) => {
-            estimate_text_and_image_chars(&user.content)
+            estimate_text_and_image_units(&user.content)
         }
         Message::Assistant(assistant) => assistant
             .content
             .iter()
             .map(|block| match block {
-                ContentBlock::Text(text) => text.text.chars().count(),
-                ContentBlock::Thinking(thinking) => thinking.thinking.chars().count(),
+                ContentBlock::Text(text) => text_token_units(&text.text),
+                ContentBlock::Thinking(thinking) => text_token_units(&thinking.thinking),
                 ContentBlock::ToolCall(call) => {
                     let arguments = serde_json::to_string(&call.arguments).unwrap_or_default();
-                    call.name.chars().count() + arguments.chars().count()
+                    text_token_units(&call.name) + text_token_units(&arguments)
                 }
                 _ => 0,
             })
             .sum(),
-        Message::ToolResult(result) => estimate_text_and_image_chars(&result.content),
+        Message::ToolResult(result) => estimate_text_and_image_units(&result.content),
     }
 }
 
-/// Estimate the token count of a single message using the chars/4 heuristic
-/// (upstream compaction `estimateTokens`). Conservative (overestimates
-/// tokens).
+/// Estimate the token count of a single message with the shared Unicode-aware
+/// estimator (CJK ≈1 token/char, ASCII ≈4 chars/token).
 pub fn estimate_message_tokens(message: &Message) -> u64 {
-    ceil_div_chars(estimate_message_chars(message))
+    ceil_units(estimate_message_units(message))
+}
+
+/// [`estimate_message_tokens`] at the conservative 3.5-units-per-token rate.
+pub fn estimate_message_tokens_conservative(message: &Message) -> u64 {
+    ceil_units_conservative(estimate_message_units(message))
 }
 
 /// Borrowed message-sequence view: either a contiguous owned message slice or
@@ -258,25 +466,36 @@ impl MessageSequence for [&Message] {
 /// the projection-level invalidation in [`estimate_projected_context_tokens`]
 /// (compaction.ts:227-262).
 pub fn estimate_context_tokens(messages: &[Message]) -> ContextUsageEstimate {
-    estimate_context_tokens_over(messages)
+    estimate_context_tokens_over(messages, false)
+}
+
+/// [`estimate_context_tokens`] at the conservative 3.5-units-per-token rate.
+pub fn estimate_context_tokens_conservative(messages: &[Message]) -> ContextUsageEstimate {
+    estimate_context_tokens_over(messages, true)
 }
 
 /// [`estimate_context_tokens`] over any borrowed [`MessageSequence`]: the same
 /// estimate with no message materialization. The projection estimator feeds it
 /// the entry messages plus the live context tail as one virtual sequence.
-fn estimate_context_tokens_over<M: MessageSequence + ?Sized>(messages: &M) -> ContextUsageEstimate {
+fn estimate_context_tokens_over<M: MessageSequence + ?Sized>(
+    messages: &M,
+    conservative: bool,
+) -> ContextUsageEstimate {
     let usage_info = last_assistant_usage_info(messages);
 
     let Some((index, usage)) = usage_info else {
         // No usage record describes this context: estimate the WHOLE context
-        // by character count and round once. Rounding per message instead
+        // by weighted units and round once. Rounding per message instead
         // adds up to a token of rounding slack per message, systematically
-        // inflating a long transcript; the context is a single token budget,
-        // so its estimate is `ceil(total_chars / 4)`.
-        let chars: usize = (0..messages.message_count())
-            .map(|i| estimate_message_chars(messages.message_at(i)))
+        // inflating a long transcript; the context is a single token budget.
+        let units: u64 = (0..messages.message_count())
+            .map(|i| estimate_message_units(messages.message_at(i)))
             .sum();
-        let estimated = ceil_div_chars(chars);
+        let estimated = if conservative {
+            ceil_units_conservative(units)
+        } else {
+            ceil_units(units)
+        };
         return ContextUsageEstimate {
             tokens: estimated,
             usage_tokens: 0,
@@ -287,7 +506,14 @@ fn estimate_context_tokens_over<M: MessageSequence + ?Sized>(messages: &M) -> Co
 
     let usage_tokens = calculate_context_tokens(usage);
     let trailing_tokens: u64 = (index + 1..messages.message_count())
-        .map(|i| estimate_message_tokens(messages.message_at(i)))
+        .map(|i| {
+            let message = messages.message_at(i);
+            if conservative {
+                estimate_message_tokens_conservative(message)
+            } else {
+                estimate_message_tokens(message)
+            }
+        })
         .sum();
     ContextUsageEstimate {
         tokens: usage_tokens.saturating_add(trailing_tokens),
@@ -921,7 +1147,7 @@ pub fn estimate_projected_context_tokens_with_tail<E: ProjectedEntry, P: PathEnt
         refs.extend(entry.messages().iter());
     }
     refs.extend(tail.iter());
-    let estimate = estimate_context_tokens_over(refs.as_slice());
+    let estimate = estimate_context_tokens_over(refs.as_slice(), false);
     if let Some(usage_index) = estimate.last_usage_index {
         // Map the usage message back to its projected entry id. A usage inside
         // the tail walks past every projected entry and stays `None`.
@@ -952,8 +1178,8 @@ pub fn estimate_projected_context_tokens_with_tail<E: ProjectedEntry, P: PathEnt
     }
 
     // Stale (or no) usage: estimate every message, plus the current system
-    // message, by character count.
-    let mut tokens = current_system_chars(projected, tail).map_or(0, ceil_div_chars);
+    // message, with the shared Unicode-aware estimator.
+    let mut tokens = current_system_units(projected, tail).map_or(0, ceil_units);
     for message in &refs {
         if !matches!(message, Message::System(_)) {
             tokens = tokens.saturating_add(estimate_message_tokens(message));
@@ -967,14 +1193,14 @@ pub fn estimate_projected_context_tokens_with_tail<E: ProjectedEntry, P: PathEnt
     }
 }
 
-/// Character count of the CURRENT system message over the projection + tail
-/// sequence (the last `Message::System`): its text blocks joined with `"\n"`,
-/// exactly the text
+/// Quarter-token weight of the CURRENT system message over the projection +
+/// tail sequence (the last `Message::System`): its text blocks joined with
+/// `"\n"`, exactly the text
 /// `session_manager::projection::current_system_message` builds from a
 /// materialized slice. The materializing twin needs the owned slice this
 /// borrowed estimator avoids building, so the join is reproduced here (only
-/// the character count is consumed).
-fn current_system_chars<E: ProjectedEntry>(projected: &[E], tail: &[Message]) -> Option<usize> {
+/// the estimated weight is consumed).
+fn current_system_units<E: ProjectedEntry>(projected: &[E], tail: &[Message]) -> Option<u64> {
     let mut system: Option<&Message> = None;
     for message in projected
         .iter()
@@ -986,17 +1212,18 @@ fn current_system_chars<E: ProjectedEntry>(projected: &[E], tail: &[Message]) ->
         }
     }
     system.map(|message| match message {
-        Message::System(user) => user
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .chars()
-            .count(),
+        Message::System(user) => {
+            let text = user
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            text_token_units(&text)
+        }
         _ => 0,
     })
 }
