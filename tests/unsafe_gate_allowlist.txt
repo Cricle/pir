@@ -37,6 +37,7 @@ extensions/runtime/host_functions/buffer_ops.rs 3 0 0  # QuickJS raw typed-array
 # polling; keep this ceiling at 1, do not raise it for that block again.
 extensions/runtime/host_functions/child_fns.rs 1 0 0  # libc::kill on a child this process spawned
 extensions/runtime/host_functions/node_fns.rs 3 0 0  # Win32 GetProcessTimes + libc getrusage out-parameters
+jobs.rs 1 0 0  # libc kill(pid, 0) process-liveness probe; Win32 handle block uses function-level allow
 mcp/stdio.rs 1 0 0  # libc::killpg on the spawned MCP server's process group
 plugins/builtin/phone/session.rs 1 0 0  # libc::kill on the phone session's child process group
 session_manager/mod.rs 2 0 0  # Win32 GetFileInformationByHandle identity probe (BY_HANDLE_FILE_INFORMATION)

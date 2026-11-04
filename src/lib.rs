@@ -128,6 +128,9 @@ pub mod env_daemon;
 // core tool implementations; the daemon half of the wire is behind
 // `env-daemon` (which implies `env` for its `notify`/`ignore` backend).
 pub mod env_client;
+// Persistent cross-process background jobs (P0-2): a detached supervisor
+// records command/status/pid/exit-code under `<agent-dir>/jobs/<job-id>/`.
+pub mod jobs;
 // Extension *data* types ([`extensions::types`]) are always compiled; the JS
 // engine inside is behind the `extensions` feature.
 pub mod extensions;

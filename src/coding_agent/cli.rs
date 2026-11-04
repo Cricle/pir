@@ -755,6 +755,11 @@ pub enum Command {
         #[command(subcommand)]
         command: SessionsCommand,
     },
+    /// Persistent background job management
+    Jobs {
+        #[command(subcommand)]
+        command: JobsCommand,
+    },
     /// MCP server management (upstream `pi mcp` surface)
     Mcp {
         #[command(subcommand)]
@@ -1018,6 +1023,77 @@ pub enum McpCommand {
 pub enum ModelsCommand {
     /// Show the configured model
     List,
+}
+
+/// `pir jobs` — persistent cross-process background jobs (pir extension).
+#[cfg(feature = "cli")]
+#[derive(Debug, Clone, Subcommand)]
+pub enum JobsCommand {
+    /// Start a detached command and print its job id
+    Start {
+        /// Working directory (defaults to the current directory)
+        #[arg(long = "cwd", value_name = "DIR")]
+        cwd: Option<String>,
+        /// Shell executable (defaults to the bash tool's resolution)
+        #[arg(long = "shell", value_name = "PATH")]
+        shell: Option<String>,
+        /// Command and arguments (after `--`)
+        #[arg(last = true, required = true, value_name = "COMMAND [ARGS...]")]
+        command: Vec<String>,
+    },
+    /// List jobs, newest first
+    List {
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// Show one job's persisted status
+    Status {
+        id: String,
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// Wait for a job to reach a terminal state
+    Wait {
+        id: String,
+        /// Maximum wait in seconds
+        #[arg(long = "timeout", value_name = "SECS", default_value_t = 600)]
+        timeout_secs: u64,
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// Print a job's output tail
+    Log {
+        id: String,
+        /// Maximum bytes from the end of the log
+        #[arg(long = "bytes", value_name = "BYTES", default_value_t = 262_144)]
+        bytes: u64,
+        /// Maximum lines from the end of the log
+        #[arg(long = "lines", value_name = "N", default_value_t = 4096)]
+        lines: usize,
+    },
+    /// Collect a terminal job's status + output and mark it reaped
+    Reap {
+        id: String,
+        #[arg(long = "bytes", value_name = "BYTES", default_value_t = 262_144)]
+        bytes: u64,
+        #[arg(long = "lines", value_name = "N", default_value_t = 4096)]
+        lines: usize,
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// Kill a running job (supervisor process tree)
+    Kill { id: String },
+    /// Remove reaped/terminal job directories
+    Clean {
+        /// Only remove terminal jobs older than this many days
+        #[arg(long = "older-than-days", value_name = "DAYS", default_value_t = 7)]
+        older_than_days: u64,
+        /// Remove every terminal job regardless of age
+        #[arg(long = "all")]
+        all: bool,
+        #[arg(long = "json")]
+        json: bool,
+    },
 }
 
 /// `pir sessions` — session-store maintenance (pir extension).

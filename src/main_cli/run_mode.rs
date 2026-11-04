@@ -17,6 +17,13 @@ pub(super) async fn run() -> Result<()> {
     // conversion: `env::args` panics on non-UTF-8 argv.
     let mut benchmark = pir::config::timings::StartupTimings::new();
     let raw_args: Vec<String> = std::env::args_os().skip(1).map(lossy_arg).collect();
+    // `pir __jobs-supervise`: the detached supervisor spawned by
+    // `JobStore::spawn`. Intercepted on the RAW argv before settings/tracing
+    // setup: it owns the job's log and must not contend for the parent's
+    // terminal or config locks.
+    if raw_args.first().map(String::as_str) == Some("__jobs-supervise") {
+        std::process::exit(pir::jobs::run_supervisor(&raw_args[1..]));
+    }
     // `pir js <file> [args...]`: the subprocess script runner (node-compat
     // roadmap item B). Intercepted BEFORE argv preprocessing — script
     // arguments are verbatim `process.argv` material, so an unknown
@@ -1167,6 +1174,7 @@ pub(super) async fn run() -> Result<()> {
         Some(Command::Sessions { command }) => {
             run_sessions_command(command, &config, &settings_manager)
         }
+        Some(Command::Jobs { command }) => run_jobs_command(command),
         None => {
             // Upstream entry shapes (no subcommand given): print / json / rpc
             // per `resolveAppMode`, with the piped-stdin and positional
@@ -1426,6 +1434,215 @@ fn maybe_prune_sessions_on_startup(
             "session retention: {}",
             pir::session_manager::format_prune_report(&report)
         );
+    }
+}
+
+/// `pir jobs ...`: persistent background job management.
+fn run_jobs_command(command: pir::coding_agent::cli::JobsCommand) -> Result<()> {
+    use pir::coding_agent::cli::JobsCommand;
+    use pir::jobs::{JobSpec, JobStore, DEFAULT_CLEAN_AGE_DAYS};
+
+    let store = JobStore::with_root(pir::coding_agent::context::agent_dir().join("jobs"));
+    match command {
+        JobsCommand::Start {
+            cwd,
+            shell,
+            command,
+        } => {
+            let cwd = cwd
+                .map(std::path::PathBuf::from)
+                .map(|path| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                            .join(path)
+                    }
+                })
+                .unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                });
+            let shell_path = shell.as_deref().map(std::path::Path::new);
+            let config = pir::coding_agent::tools::resolve_shell_config(shell_path)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            if config.stdin_transport() {
+                return Err(anyhow::anyhow!(
+                    "the selected shell uses stdin transport; `pir jobs start` requires a `-c` shell"
+                ));
+            }
+            let spec = JobSpec {
+                command: command.join(" "),
+                cwd,
+                program: config.program().to_owned(),
+                args: config.args().iter().map(|arg| (*arg).to_owned()).collect(),
+                env: Vec::new(),
+            };
+            let meta = store.spawn(&spec).map_err(|error| anyhow::anyhow!(error))?;
+            println!("{}", meta.id);
+            Ok(())
+        }
+        JobsCommand::List { json } => {
+            let jobs = store.list();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&jobs).unwrap_or_else(|_| "[]".to_owned())
+                );
+            } else if jobs.is_empty() {
+                println!("no jobs");
+            } else {
+                for job in jobs {
+                    println!(
+                        "{}  {:<8} exit={:<4} {}",
+                        job.id,
+                        job.status_line(),
+                        job.exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "-".to_owned()),
+                        job.spec.command
+                    );
+                }
+            }
+            Ok(())
+        }
+        JobsCommand::Status { id, json } => {
+            let meta = store
+                .status(&id)
+                .ok_or_else(|| anyhow::anyhow!("job not found: {id}"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&meta).unwrap_or_else(|_| "{}".to_owned())
+                );
+            } else {
+                println!("id: {}", meta.id);
+                println!("status: {}", meta.status_line());
+                println!("command: {}", meta.spec.command);
+                println!("cwd: {}", meta.spec.cwd.display());
+                println!(
+                    "pid: {}  supervisor: {}",
+                    meta.pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    meta.supervisor_pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "-".to_owned())
+                );
+                println!(
+                    "log bytes: {}{}",
+                    meta.log_bytes,
+                    if meta.log_truncated {
+                        " (truncated)"
+                    } else {
+                        ""
+                    }
+                );
+                if let Some(error) = &meta.error {
+                    println!("error: {error}");
+                }
+            }
+            Ok(())
+        }
+        JobsCommand::Wait {
+            id,
+            timeout_secs,
+            json,
+        } => {
+            let meta = store
+                .wait(&id, std::time::Duration::from_secs(timeout_secs))
+                .ok_or_else(|| anyhow::anyhow!("job not found: {id}"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&meta).unwrap_or_else(|_| "{}".to_owned())
+                );
+            } else {
+                println!("{} {}", meta.id, meta.status_line());
+            }
+            Ok(())
+        }
+        JobsCommand::Log { id, bytes, lines } => {
+            let log = store
+                .read_log(&id, bytes, lines)
+                .ok_or_else(|| anyhow::anyhow!("job not found or log missing: {id}"))?;
+            print!("{}", log.text);
+            if !log.text.ends_with('\n') && !log.text.is_empty() {
+                println!();
+            }
+            Ok(())
+        }
+        JobsCommand::Reap {
+            id,
+            bytes,
+            lines,
+            json,
+        } => {
+            let reaped = store
+                .reap(&id, bytes, lines)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "id": reaped.meta.id,
+                        "status": reaped.meta.status.as_str(),
+                        "exitCode": reaped.meta.exit_code,
+                        "output": reaped.log.text,
+                        "logBytes": reaped.log.bytes,
+                        "logTruncated": reaped.log.truncated,
+                    }))
+                    .unwrap_or_else(|_| "{}".to_owned())
+                );
+            } else {
+                println!("{} {}", reaped.meta.id, reaped.meta.status_line());
+                if !reaped.log.text.is_empty() {
+                    println!("{}", reaped.log.text);
+                }
+            }
+            Ok(())
+        }
+        JobsCommand::Kill { id } => {
+            let killed = store.kill(&id).map_err(|error| anyhow::anyhow!(error))?;
+            println!("{}", if killed { "killed" } else { "already finished" });
+            Ok(())
+        }
+        JobsCommand::Clean {
+            older_than_days,
+            all,
+            json,
+        } => {
+            let days = if older_than_days == 0 {
+                DEFAULT_CLEAN_AGE_DAYS
+            } else {
+                older_than_days
+            };
+            let report = store.clean(std::time::Duration::from_secs(days * 86_400), all);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "removed": report.removed,
+                        "errors": report.errors,
+                    }))
+                    .unwrap_or_else(|_| "{}".to_owned())
+                );
+            } else {
+                println!(
+                    "removed {} job(s){}",
+                    report.removed.len(),
+                    if report.errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} error(s)", report.errors.len())
+                    }
+                );
+                for error in report.errors {
+                    println!("  warning: {error}");
+                }
+            }
+            Ok(())
+        }
     }
 }
 
