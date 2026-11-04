@@ -821,8 +821,27 @@ fn start_provider_stream_event_worker(
                 match runtime.block_on(async {
                     tokio::time::timeout(PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT, dispatch).await
                 }) {
-                    Ok(Ok(_)) => {
-                        worker_stats.dispatched.fetch_add(1, Ordering::Relaxed);
+                    Ok(Ok(outcome)) => {
+                        // A native handler is already bounded by the host's
+                        // `native_call_timeout`, which can fire just before
+                        // this outer timeout. `emit` then returns Ok with a
+                        // timeout entry in `errors`; treating that as success
+                        // would leave the dispatcher open and charge the next
+                        // event another full budget (the CI-only 60s case).
+                        // Any provider-stream handler timeout closes the
+                        // dispatcher exactly like the outer timeout below.
+                        timed_out = outcome.errors.iter().any(|error| {
+                            error.event == "provider_stream_event"
+                                && error.error.contains("timed out after")
+                        });
+                        if timed_out {
+                            crate::ext_diag!(
+                                "[ext] provider_stream_event handler timed out; closing the \
+                                 dispatcher"
+                            );
+                        } else {
+                            worker_stats.dispatched.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     Ok(Err(error)) => {
                         worker_stats.failed.fetch_add(1, Ordering::Relaxed);
