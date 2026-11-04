@@ -96,6 +96,9 @@ pub mod agent;
 pub mod agent_session;
 pub mod ai;
 pub mod cache_warmer;
+// File-level checkpoint / undo for mutating tools (P0-3): per-session
+// content-addressed snapshots under `<session>.jsonl.checkpoints/`.
+pub mod checkpoints;
 // The remote protocol client (`pir client`). Feature-gated, not stubbed: when
 // `client` is off the module does not exist and `src/main_cli/run_mode.rs`
 // reports the missing feature for the command instead of failing to compile.

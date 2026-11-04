@@ -1175,6 +1175,7 @@ pub(super) async fn run() -> Result<()> {
             run_sessions_command(command, &config, &settings_manager)
         }
         Some(Command::Jobs { command }) => run_jobs_command(command),
+        Some(Command::Checkpoint { command }) => run_checkpoint_command(command, &config),
         None => {
             // Upstream entry shapes (no subcommand given): print / json / rpc
             // per `resolveAppMode`, with the piped-stdin and positional
@@ -1434,6 +1435,89 @@ fn maybe_prune_sessions_on_startup(
             "session retention: {}",
             pir::session_manager::format_prune_report(&report)
         );
+    }
+}
+
+/// `pir checkpoint ...`: inspect/restore a session's file checkpoints.
+fn run_checkpoint_command(
+    command: pir::coding_agent::cli::CheckpointCommand,
+    config: &pir::config::Config,
+) -> Result<()> {
+    use pir::checkpoints::CheckpointStore;
+    use pir::coding_agent::cli::CheckpointCommand;
+
+    let resolve_session =
+        |explicit: Option<String>| -> std::result::Result<std::path::PathBuf, String> {
+            if let Some(path) = explicit {
+                return Ok(std::path::PathBuf::from(path));
+            }
+            let dir = std::path::Path::new(&config.session_dir);
+            pir::session_manager::SessionManager::list_sessions(dir, None)
+                .into_iter()
+                .next()
+                .map(|session| session.path)
+                .ok_or_else(|| format!("no session found in {}", dir.display()))
+        };
+
+    match command {
+        CheckpointCommand::List {
+            session,
+            limit,
+            json,
+        } => {
+            let session = resolve_session(session).map_err(|error| anyhow::anyhow!(error))?;
+            let store = CheckpointStore::open(&session).map_err(|error| anyhow::anyhow!(error))?;
+            let checkpoints = store.list(limit);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&checkpoints).unwrap_or_else(|_| "[]".to_owned())
+                );
+            } else if checkpoints.is_empty() {
+                println!("no checkpoints for {}", session.display());
+            } else {
+                for checkpoint in checkpoints {
+                    println!(
+                        "{}  {}  {} file(s)",
+                        checkpoint.id,
+                        checkpoint.tool,
+                        checkpoint.files.len()
+                    );
+                }
+            }
+            Ok(())
+        }
+        CheckpointCommand::Restore {
+            id,
+            session,
+            dry_run,
+            json,
+        } => {
+            let session = resolve_session(session).map_err(|error| anyhow::anyhow!(error))?;
+            let store = CheckpointStore::open(&session).map_err(|error| anyhow::anyhow!(error))?;
+            let report = store
+                .restore(&id, dry_run)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+                );
+            } else {
+                println!(
+                    "{} {}: restored {}, deleted {}, unchanged {}",
+                    if dry_run { "would restore" } else { "restored" },
+                    report.id,
+                    report.restored,
+                    report.deleted,
+                    report.unchanged
+                );
+                for error in &report.errors {
+                    println!("  warning: {error}");
+                }
+            }
+            Ok(())
+        }
     }
 }
 

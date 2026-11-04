@@ -22,6 +22,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ai::types::AbortSignal;
 
+/// Snapshot a mutation tool's target paths before the mutation. Checkpoint
+/// failures are best-effort: they never block the actual write/edit (the
+/// transcript itself still records the tool result). Sessions without a
+/// session file (in-memory/read-only) have no checkpoint store and are
+/// skipped.
+pub(super) fn checkpoint_before_mutation(
+    ctx: &crate::agent::tool_execution::ToolContext,
+    tool: &str,
+    paths: &[PathBuf],
+) {
+    let Some(session_file) = ctx
+        .session_env
+        .as_ref()
+        .and_then(|env| env.session_file.as_deref())
+    else {
+        return;
+    };
+    let Some(store) =
+        crate::checkpoints::CheckpointStore::for_session_file(Path::new(session_file))
+    else {
+        return;
+    };
+    if let Err(error) = store.snapshot(tool, paths) {
+        tracing::warn!(%error, tool, "file checkpoint failed; the mutation proceeds");
+    }
+}
+
 /// Default ceiling for a tool read that must materialize the whole source
 /// file (`edit`, image decode, grep context). Text reads from the `read` tool
 /// stream instead and are not capped by this value.

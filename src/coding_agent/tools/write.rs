@@ -20,8 +20,8 @@ use crate::ai::types::AbortSignal;
 
 use super::confine::{confinement_error, ConfinedTarget};
 use super::util::{
-    single_path_arg, workspace_path_parts, workspace_path_remote_checked,
-    write_remote_file_atomically,
+    checkpoint_before_mutation, single_path_arg, workspace_path_parts,
+    workspace_path_remote_checked, write_remote_file_atomically,
 };
 
 /// Local writes are chunked so a large payload observes cancellation between
@@ -110,13 +110,14 @@ impl AgentTool for WriteTool {
         })
     }
     fn run(&self, args: &serde_json::Value, ctx: &ToolContext) -> BoxFuture<'static, ToolResult> {
-        let (path, _) = single_path_arg(args, &ctx.cwd);
+        let (path, mutation_paths) = single_path_arg(args, &ctx.cwd);
         let content = args
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
         let cwd = ctx.cwd.clone();
+        let checkpoint_ctx = ctx.clone();
         let aborted = ctx.is_aborted();
         let signal = ctx.signal.clone();
         // The env indirection layer (`env_client::selection`): `None` — the
@@ -157,6 +158,7 @@ impl AgentTool for WriteTool {
                     ))
                 }
             };
+            checkpoint_before_mutation(&checkpoint_ctx, "write", &mutation_paths);
             match target
                 .write_atomically(content.as_bytes(), signal.as_ref(), LOCAL_WRITE_CHUNK_BYTES)
                 .await

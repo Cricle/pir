@@ -760,6 +760,11 @@ pub enum Command {
         #[command(subcommand)]
         command: JobsCommand,
     },
+    /// File checkpoint inspection / restore
+    Checkpoint {
+        #[command(subcommand)]
+        command: CheckpointCommand,
+    },
     /// MCP server management (upstream `pi mcp` surface)
     Mcp {
         #[command(subcommand)]
@@ -1023,6 +1028,37 @@ pub enum McpCommand {
 pub enum ModelsCommand {
     /// Show the configured model
     List,
+}
+
+/// `pir checkpoint` — per-session file checkpoint inspection / restore
+/// (pir extension).
+#[cfg(feature = "cli")]
+#[derive(Debug, Clone, Subcommand)]
+pub enum CheckpointCommand {
+    /// List recent checkpoints for a session (default: this project's newest)
+    List {
+        /// Explicit session `.jsonl` path
+        #[arg(long = "session", value_name = "PATH")]
+        session: Option<String>,
+        /// Maximum rows
+        #[arg(long = "limit", value_name = "N", default_value_t = 20)]
+        limit: usize,
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// Restore a checkpoint id (or `latest`)
+    Restore {
+        /// Checkpoint id, or `latest`
+        id: String,
+        /// Explicit session `.jsonl` path
+        #[arg(long = "session", value_name = "PATH")]
+        session: Option<String>,
+        /// Show what would change without writing anything
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long = "json")]
+        json: bool,
+    },
 }
 
 /// `pir jobs` — persistent cross-process background jobs (pir extension).

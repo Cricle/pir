@@ -21,8 +21,8 @@ use super::confine::ConfinedTarget;
 #[cfg(feature = "tool-edit")]
 use super::util::single_path_arg;
 use super::util::{
-    max_source_bytes, source_limit_error, workspace_path_parts, workspace_path_remote_checked,
-    write_remote_file_atomically,
+    checkpoint_before_mutation, max_source_bytes, source_limit_error, workspace_path_parts,
+    workspace_path_remote_checked, write_remote_file_atomically,
 };
 
 // ---------------------------------------------------------------------------
@@ -759,12 +759,13 @@ impl AgentTool for EditTool {
         })
     }
     fn run(&self, args: &serde_json::Value, ctx: &ToolContext) -> BoxFuture<'static, ToolResult> {
-        let (path, _) = single_path_arg(args, &ctx.cwd);
+        let (path, mutation_paths) = single_path_arg(args, &ctx.cwd);
         let edits = match parse_edit_requests(args) {
             Ok(edits) => edits,
             Err(error) => return Box::pin(async move { ToolResult::error(error) }),
         };
         let cwd = ctx.cwd.clone();
+        let checkpoint_ctx = ctx.clone();
         let aborted = ctx.is_aborted();
         let signal = ctx.signal.clone();
         // The env indirection layer (`env_client::selection`): `None` — the
@@ -801,6 +802,7 @@ impl AgentTool for EditTool {
                     ))
                 }
             };
+            checkpoint_before_mutation(&checkpoint_ctx, "edit", &mutation_paths);
             // Read as bytes so an invalid-UTF-8 (binary) file is reported
             // cleanly instead of surfacing a lossy conversion error. The
             // source-size cap bounds the whole-file buffer this path needs.
