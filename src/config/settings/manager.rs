@@ -893,6 +893,27 @@ impl SettingsManager {
             .unwrap_or(defaults::COMPACTION_ENABLED)
     }
 
+    /// Resolved session-retention policy (pir extension). Absent fields fall
+    /// back to the conservative defaults; `enabled` is false unless the user
+    /// opted in.
+    pub fn session_retention_policy(&self) -> crate::session_manager::SessionRetentionPolicy {
+        let configured = self.settings.session_retention.as_ref();
+        crate::session_manager::SessionRetentionPolicy {
+            enabled: configured
+                .and_then(|retention| retention.enabled)
+                .unwrap_or(defaults::SESSION_RETENTION_ENABLED),
+            max_age_days: configured
+                .and_then(|retention| retention.max_age_days)
+                .or(Some(defaults::SESSION_RETENTION_MAX_AGE_DAYS)),
+            max_sessions: configured
+                .and_then(|retention| retention.max_sessions)
+                .or(Some(defaults::SESSION_RETENTION_MAX_SESSIONS)),
+            max_bytes: configured
+                .and_then(|retention| retention.max_bytes)
+                .or(Some(defaults::SESSION_RETENTION_MAX_BYTES)),
+        }
+    }
+
     /// Resolve one compaction token setting through the model override, the
     /// ordinary setting, then the built-in default (upstream
     /// `getCompactionTokenSetting`).

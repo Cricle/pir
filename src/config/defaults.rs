@@ -41,6 +41,12 @@ pub mod settings_defaults {
     pub const COMPACTION_ENABLED: bool = true;
     pub const COMPACTION_RESERVE_TOKENS: u64 = 16_384;
     pub const COMPACTION_KEEP_RECENT_TOKENS: u64 = 20_000;
+    /// Session retention is opt-in: a startup pass never deletes anything
+    /// unless `sessionRetention.enabled` is explicitly true.
+    pub const SESSION_RETENTION_ENABLED: bool = false;
+    pub const SESSION_RETENTION_MAX_AGE_DAYS: u64 = 30;
+    pub const SESSION_RETENTION_MAX_SESSIONS: usize = 500;
+    pub const SESSION_RETENTION_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
     pub const BRANCH_SUMMARY_RESERVE_TOKENS: u64 = 16_384;
     pub const BRANCH_SUMMARY_SKIP_PROMPT: bool = false;
     pub const RETRY_ENABLED: bool = true;

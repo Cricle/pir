@@ -97,6 +97,34 @@ pub struct BranchSummarySettings {
     pub skip_prompt: Option<bool>,
 }
 
+/// Session retention / garbage collection settings (pir extension). All
+/// bounds are optional; `enabled` gates the automatic startup pass, while the
+/// explicit `pir sessions prune` command can run a one-shot pass regardless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRetentionSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_age_days: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_sessions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+}
+
+impl SessionRetentionSettings {
+    /// The merged defaults (opt-in; 30 days / 500 sessions / 2 GiB).
+    pub fn defaults() -> Self {
+        Self {
+            enabled: Some(defaults::SESSION_RETENTION_ENABLED),
+            max_age_days: Some(defaults::SESSION_RETENTION_MAX_AGE_DAYS),
+            max_sessions: Some(defaults::SESSION_RETENTION_MAX_SESSIONS),
+            max_bytes: Some(defaults::SESSION_RETENTION_MAX_BYTES),
+        }
+    }
+}
+
 /// Provider/SDK retry settings (upstream `ProviderRetrySettings`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]

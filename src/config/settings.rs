@@ -82,6 +82,10 @@ pub struct Settings {
     pub theme: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionSettings>,
+    /// Session retention / GC (pir extension). Absent = opt-in defaults
+    /// (disabled; 30 days / 500 sessions / 2 GiB when explicitly run).
+    #[serde(rename = "sessionRetention", skip_serializing_if = "Option::is_none")]
+    pub session_retention: Option<SessionRetentionSettings>,
     #[serde(rename = "branchSummary", skip_serializing_if = "Option::is_none")]
     pub branch_summary: Option<BranchSummarySettings>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -929,6 +929,7 @@ pub(super) async fn run() -> Result<()> {
                     // The user cancelled the resume picker; nothing to attach.
                     return Ok(());
                 }
+                maybe_prune_sessions_on_startup(&settings_manager, &config, &plan);
                 // `startup_settings_diagnostics` moves into the TUI as chat
                 // warning notices; interactive mode intentionally does not
                 // print them to stderr (see the collection site above).
@@ -972,6 +973,7 @@ pub(super) async fn run() -> Result<()> {
             // Headless resolution never yields the picker plan: `--resume`
             // selects this project's most recent session instead.
             let plan = resolve_run_session_plan(&cli, &config, false)?;
+            maybe_prune_sessions_on_startup(&settings_manager, &config, &plan);
             run_print_mode(PrintModeRequest {
                 cli: &cli,
                 config: &config,
@@ -1161,6 +1163,9 @@ pub(super) async fn run() -> Result<()> {
             println!("Exists: {exists}");
             println!("Entries: {count}");
             Ok(())
+        }
+        Some(Command::Sessions { command }) => {
+            run_sessions_command(command, &config, &settings_manager)
         }
         None => {
             // Upstream entry shapes (no subcommand given): print / json / rpc
@@ -1392,6 +1397,150 @@ fn interactive_overrides(cli: &Cli) -> Result<pir::tui::TuiOverrides> {
             .map(|entry| pir::coding_agent::overrides::resolve_text_or_file(entry))
             .collect::<Result<Vec<_>>>()?,
     })
+}
+
+/// Automatic startup retention pass. Only runs when the user explicitly
+/// enabled `sessionRetention.enabled`; the session the run is about to open
+/// (or fork from) is always protected.
+fn maybe_prune_sessions_on_startup(
+    settings: &SettingsManager,
+    config: &pir::config::Config,
+    plan: &SessionPlan,
+) {
+    let policy = settings.session_retention_policy();
+    if !policy.enabled || policy.is_noop() {
+        return;
+    }
+    let active = match plan {
+        SessionPlan::Open(path) => Some(path.as_path()),
+        SessionPlan::Fork { source, .. } => Some(source.as_path()),
+        _ => None,
+    };
+    let report = pir::session_manager::prune_session_dir(
+        std::path::Path::new(&config.session_dir),
+        &policy,
+        active,
+    );
+    if !report.removed.is_empty() || !report.errors.is_empty() {
+        eprintln!(
+            "session retention: {}",
+            pir::session_manager::format_prune_report(&report)
+        );
+    }
+}
+
+/// `pir sessions prune`: one-shot retention pass. The policy comes from
+/// `sessionRetention` settings; explicit flags override individual bounds.
+fn run_sessions_command(
+    command: pir::coding_agent::cli::SessionsCommand,
+    config: &pir::config::Config,
+    settings: &SettingsManager,
+) -> Result<()> {
+    use pir::coding_agent::cli::SessionsCommand;
+    use pir::session_manager::{format_prune_report, prune_session_dir, prune_sessions_root};
+
+    let SessionsCommand::Prune {
+        dry_run,
+        max_age_days,
+        max_sessions,
+        max_bytes,
+        all,
+        json,
+    } = command;
+    let mut policy = settings.session_retention_policy();
+    if max_age_days.is_some() {
+        policy.max_age_days = max_age_days;
+    }
+    if max_sessions.is_some() {
+        policy.max_sessions = max_sessions;
+    }
+    if max_bytes.is_some() {
+        policy.max_bytes = max_bytes;
+    }
+    let session_dir = std::path::Path::new(&config.session_dir);
+    let target = if all {
+        session_dir.parent().unwrap_or(session_dir)
+    } else {
+        session_dir
+    };
+
+    let report = if dry_run {
+        dry_run_report(target, all, &policy)
+    } else if all {
+        prune_sessions_root(target, &policy, None)
+    } else {
+        prune_session_dir(target, &policy, None)
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+        );
+    } else if dry_run {
+        println!("dry run: {}", format_prune_report(&report));
+    } else {
+        println!("{}", format_prune_report(&report));
+    }
+    Ok(())
+}
+
+/// Dry-run counterpart of [`prune_sessions_root`] / [`prune_session_dir`]:
+/// computes plans without deleting anything.
+fn dry_run_report(
+    target: &std::path::Path,
+    recursive: bool,
+    policy: &pir::session_manager::SessionRetentionPolicy,
+) -> pir::session_manager::PruneReport {
+    use pir::session_manager::{
+        plan_session_prune, scan_session_files, PruneReport, SessionRetentionPolicy,
+    };
+
+    fn visit(
+        dir: &std::path::Path,
+        policy: &SessionRetentionPolicy,
+        report: &mut PruneReport,
+        depth: usize,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        let plan = plan_session_prune(
+            scan_session_files(dir),
+            policy,
+            std::time::SystemTime::now(),
+            None,
+        );
+        report.kept += plan.kept;
+        report.removed.extend(plan.remove);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                visit(&path, policy, report, depth + 1);
+            }
+        }
+    }
+
+    let mut report = PruneReport::default();
+    if recursive {
+        visit(target, policy, &mut report, 0);
+    } else {
+        let plan = plan_session_prune(
+            scan_session_files(target),
+            policy,
+            std::time::SystemTime::now(),
+            None,
+        );
+        report.kept = plan.kept;
+        report.removed = plan.remove;
+    }
+    report
 }
 
 /// The CLI flags the RPC host applies to every session its factory builds,

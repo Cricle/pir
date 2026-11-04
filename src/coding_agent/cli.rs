@@ -750,6 +750,11 @@ pub enum Command {
     },
     /// Show session storage status
     Session,
+    /// Session-store maintenance (prune old transcripts)
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
+    },
     /// MCP server management (upstream `pi mcp` surface)
     Mcp {
         #[command(subcommand)]
@@ -1013,6 +1018,34 @@ pub enum McpCommand {
 pub enum ModelsCommand {
     /// Show the configured model
     List,
+}
+
+/// `pir sessions` — session-store maintenance (pir extension).
+#[cfg(feature = "cli")]
+#[derive(Debug, Clone, Subcommand)]
+pub enum SessionsCommand {
+    /// Delete sessions beyond the configured retention bounds
+    Prune {
+        /// Print the plan without deleting anything
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Override `sessionRetention.maxAgeDays` (omit to use settings)
+        #[arg(long = "max-age-days", value_name = "DAYS")]
+        max_age_days: Option<u64>,
+        /// Override `sessionRetention.maxSessions`
+        #[arg(long = "max-sessions", value_name = "N")]
+        max_sessions: Option<usize>,
+        /// Override `sessionRetention.maxBytes`
+        #[arg(long = "max-bytes", value_name = "BYTES")]
+        max_bytes: Option<u64>,
+        /// Prune every project directory under the sessions root, not only
+        /// the current working directory's
+        #[arg(long = "all")]
+        all: bool,
+        /// Emit a JSON report
+        #[arg(long = "json")]
+        json: bool,
+    },
 }
 
 /// The `pir auth` subcommands (upstream `cli/auth-command.ts` surface:

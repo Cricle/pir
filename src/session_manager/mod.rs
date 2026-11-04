@@ -56,6 +56,8 @@ pub mod projection;
 // regex parsing plus tiered exact/fuzzy scoring over id/name/cwd and every
 // user/assistant message.
 pub mod search;
+// Retention / garbage collection for persisted session files (P0-4).
+pub mod retention;
 // The tail-first memory-mapped reader (`memmap2`) is the only persistence
 // piece that needs an external crate; it rides the `session` feature.
 #[cfg(feature = "session")]
@@ -189,6 +191,11 @@ impl SessionTailPage {
         false
     }
 }
+pub use retention::{
+    format_prune_report, plan_session_prune, prune_session_dir, prune_sessions_root,
+    scan_session_files, session_sidecar_paths, PlannedPrune, PrunePlan, PruneReason, PruneReport,
+    SessionFileInfo, SessionRetentionPolicy,
+};
 pub use types::{
     assert_valid_session_id, iso_from_ms, ms_from_iso, new_entry_id, new_session_id,
     BranchSummaryEntry, CompactionEntry, ContextEditEntry, ContextEditReplacement, CustomEntry,
