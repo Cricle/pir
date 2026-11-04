@@ -22873,6 +22873,7 @@ fn build_agent_session(
     let mut append: Vec<String> = discovered.1.into_iter().collect();
     append.extend(overrides.append_system_prompt.iter().cloned());
     agent_session.apply_prompt_overrides(preamble_override, append);
+    agent_session.set_event_interest(crate::agent::agent_loop::AgentEventInterest::UI);
     Ok(agent_session)
 }
 

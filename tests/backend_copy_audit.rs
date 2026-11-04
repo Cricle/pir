@@ -43,8 +43,9 @@ use pir::agent::agent_loop::{
     run_with_options, AgentEvent, EventStreamFn, FinishTurnAction, FinishTurnContext,
     FinishTurnHook, LoopDeps, LoopOptions,
 };
-use pir::agent::tool_batch::ToolResult;
+use pir::agent::tool_batch::{AgentToolCall, ToolResult};
 use pir::agent::tool_execution::{AgentTool, BoxFuture, ToolContext, ToolRegistry};
+use pir::agent::tool_scheduler::{ToolScheduler, ToolSchedulerConfig};
 use pir::agent_session::EventHandler;
 use pir::ai::api::openai::{
     build_openai_body, build_openai_body_streamed, convert_messages,
@@ -263,6 +264,34 @@ impl AgentTool for EchoTool {
         self.runs.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { ToolResult::ok("echoed") })
     }
+}
+
+/// The scheduler's no-update fast path must not deep-clone the call's
+/// arguments. The old `Arc::new(call.validated_args.clone())` allocated a
+/// second 64 KiB payload on every tool call even though `on_update` was
+/// absent; the borrowed path stays far below one argument copy.
+#[tokio::test(flavor = "current_thread")]
+async fn tool_batch_without_update_does_not_clone_arguments() {
+    const ARG_BYTES: usize = 64 * 1024;
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool {
+        runs: Arc::new(AtomicUsize::new(0)),
+    }));
+    let scheduler = ToolScheduler::new(ToolSchedulerConfig::default());
+    let context = ToolContext::new(".");
+    let call = AgentToolCall::new(
+        0,
+        "call-1",
+        "echo",
+        serde_json::json!({ "payload": "x".repeat(ARG_BYTES) }),
+    );
+    let (outcome, stats) =
+        measure_async(scheduler.execute_batch(vec![call], &tools, &context, None)).await;
+    assert!(!outcome.results[0].is_error());
+    assert!(
+        stats.bytes < (ARG_BYTES as u64) / 2,
+        "the no-update path must not clone the 64 KiB arguments: {stats:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -734,6 +763,86 @@ fn message_update_tool_argument_wire_is_patch_sized_not_block_sized() {
     assert!(
         large_patch * 8 < large_block,
         "a patchable fragment must cost far less than the block:          patch={large_patch} block={large_block}"
+    );
+}
+
+/// An unchanged parsed mirror must ship only the raw delta: no `block`, no
+/// `patch`, and no growth with the argument size. Before the tri-state diff
+/// every unchanged `toolcall_delta` re-serialized the whole arguments object.
+#[test]
+fn message_update_tool_argument_unchanged_wire_is_delta_sized() {
+    fn partial(argument_bytes: usize) -> Arc<AssistantMessage> {
+        let mut arguments = BTreeMap::new();
+        arguments.insert(
+            "file".to_string(),
+            serde_json::json!("x".repeat(argument_bytes)),
+        );
+        Arc::new(AssistantMessage {
+            role: pir::ai::types::AssistantRole::Assistant,
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: "call-1".into(),
+                name: "write".into(),
+                arguments,
+                thought_signature: None,
+                namespace: None,
+                arguments_error: None,
+            })],
+            api: "test".into(),
+            provider: "test".into(),
+            model: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: Vec::new(),
+            usage: pir::ai::types::Usage::default(),
+            stop_reason: StopReason::Pending,
+            deferred: None,
+            error_message: None,
+            raw_stop_reason: None,
+            end_turn: None,
+            provider_thinking_level: None,
+            thinking_level: None,
+            duration_ms: None,
+            timestamp: 0,
+        })
+    }
+
+    fn unchanged_wire(argument_bytes: usize) -> serde_json::Value {
+        let mut baselines = pir::agent::agent_loop::ToolArgumentBaselines::new();
+        let first = AssistantMessageEvent::ToolCallDelta {
+            content_index: 0,
+            delta: "x".into(),
+            partial: partial(argument_bytes),
+        };
+        let _ = pir::extensions::runtime::message_update_stream_json(&first, 1, &mut baselines);
+        let unchanged = AssistantMessageEvent::ToolCallDelta {
+            content_index: 0,
+            delta: "x".into(),
+            partial: partial(argument_bytes),
+        };
+        let wire =
+            pir::extensions::runtime::message_update_stream_json(&unchanged, 1, &mut baselines);
+        serde_json::from_str(&wire).expect("unchanged wire parses")
+    }
+
+    let small = unchanged_wire(1_024);
+    let large = unchanged_wire(65_536);
+    for value in [&small, &large] {
+        let event = &value["assistantMessageEvent"];
+        assert_eq!(event["__pirUnchanged"], serde_json::json!(true));
+        assert!(
+            event.get("block").is_none(),
+            "an unchanged delta must not ship the whole block: {event}"
+        );
+        assert!(
+            event.get("patch").is_none(),
+            "an unchanged delta must not ship a patch: {event}"
+        );
+    }
+    let small_len = serde_json::to_string(&small).unwrap().len();
+    let large_len = serde_json::to_string(&large).unwrap().len();
+    assert!(
+        large_len <= small_len + 64,
+        "an unchanged wire must stay delta-sized: small={small_len} large={large_len}"
     );
 }
 

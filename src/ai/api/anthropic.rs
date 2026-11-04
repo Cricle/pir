@@ -501,7 +501,7 @@ async fn anthropic_stream(
             // Fresh chunk sink per attempt: it borrows the parser mutably, and
             // the borrow must end before a retry inspects the parser
             // (diagnostic) and resends.
-            let mut on_chunk = crate::ai::api::EventChunkSink::new(
+            let mut on_chunk = crate::ai::api::EventChunkSink::new_sse(
                 |chunk: &[u8], ready: &mut Vec<AssistantMessageEvent>| {
                     // Every consumer handle gone: stop parsing at the next
                     // chunk. The `Err` closes the HTTP response through the

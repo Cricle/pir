@@ -232,7 +232,7 @@ pub(crate) use dispatch::message_update_snapshot_json_for_partial;
 #[cfg(feature = "extensions")]
 pub use dispatch::{message_update_snapshot_json, message_update_stream_json};
 #[cfg(feature = "extensions")]
-pub(crate) use dispatch::{tool_argument_patch, ToolArgumentPatch};
+pub(crate) use dispatch::{tool_argument_diff, ToolArgumentDiff, ToolArgumentPatch};
 // Definition/data types are engine-free and live in the always-compiled
 // `crate::extensions::types` (SDK-SCOPE.md): re-exported here so the
 // existing `runtime::<Type>` paths and the `use super::*` globs in this

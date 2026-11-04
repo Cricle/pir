@@ -4111,6 +4111,11 @@ const MESSAGE_UPDATE_BLOCK_KEY = "block";
 // (`{key, tail}`). Must match `MESSAGE_UPDATE_PATCH_KEY` in dispatch.rs.
 const MESSAGE_UPDATE_PATCH_KEY = "patch";
 
+// The wire key marking a `toolcall_delta` whose parsed arguments equal the
+// live block; no block/patch helper is needed. Must match
+// `MESSAGE_UPDATE_UNCHANGED_KEY` in dispatch.rs.
+const MESSAGE_UPDATE_UNCHANGED_KEY = "__pirUnchanged";
+
 // The wire key marking a delta line. Must match `MESSAGE_UPDATE_DELTA_KEY` in
 // dispatch.rs.
 const MESSAGE_UPDATE_DELTA_KEY = "__pirDelta";
@@ -4307,9 +4312,13 @@ function applyMessageUpdateDelta(stream, event, type) {
       if (!isPlainObject(block)) return `${type} without an authoritative block`;
       return setAccumulatedBlock(stream, index, block, "start");
     case "toolcall_delta":
+      // Unchanged parsed arguments: the live block is already authoritative.
+      // The raw delta still belongs to the stream's JSON accumulation, but no
+      // block/patch helper is needed (host-side `tool_argument_diff`).
+      if (event[MESSAGE_UPDATE_UNCHANGED_KEY] === true) return null;
       // The host ships the O(delta) patch when exactly one string argument
       // gained a suffix and nothing else changed (host-side
-      // `tool_argument_patch`), the whole parsed block otherwise.
+      // `tool_argument_diff`), the whole parsed block otherwise.
       if (isPlainObject(event[MESSAGE_UPDATE_PATCH_KEY])) {
         return applyToolArgumentPatch(stream, index, event[MESSAGE_UPDATE_PATCH_KEY]);
       }
@@ -4413,6 +4422,7 @@ function applyLiveMessageUpdate(payload) {
     }
     delete assistantEvent[MESSAGE_UPDATE_BLOCK_KEY];
     delete assistantEvent[MESSAGE_UPDATE_PATCH_KEY];
+    delete assistantEvent[MESSAGE_UPDATE_UNCHANGED_KEY];
     return;
   }
   const wireMessage = isPlainObject(payload.message) ? payload.message : null;
@@ -4433,6 +4443,7 @@ function applyLiveMessageUpdate(payload) {
     messageUpdateFallbackDiag(stream, reason);
     delete assistantEvent[MESSAGE_UPDATE_BLOCK_KEY];
     delete assistantEvent[MESSAGE_UPDATE_PATCH_KEY];
+    delete assistantEvent[MESSAGE_UPDATE_UNCHANGED_KEY];
     return;
   }
   if (wireMessage === null) {
@@ -4442,6 +4453,7 @@ function applyLiveMessageUpdate(payload) {
     messageUpdateFallbackDiag(null, "message_update delta line without a wire message");
     delete assistantEvent[MESSAGE_UPDATE_BLOCK_KEY];
     delete assistantEvent[MESSAGE_UPDATE_PATCH_KEY];
+    delete assistantEvent[MESSAGE_UPDATE_UNCHANGED_KEY];
     return;
   }
   let stream = getLiveMessageUpdate(streamKey);
@@ -4465,6 +4477,7 @@ function applyLiveMessageUpdate(payload) {
   if (reason !== null) messageUpdateFallbackDiag(stream, reason);
   delete assistantEvent[MESSAGE_UPDATE_BLOCK_KEY];
   delete assistantEvent[MESSAGE_UPDATE_PATCH_KEY];
+  delete assistantEvent[MESSAGE_UPDATE_UNCHANGED_KEY];
   payload.message = stream.message;
   assistantEvent.partial = stream.message;
 }

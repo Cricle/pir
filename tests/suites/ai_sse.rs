@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -1331,4 +1331,53 @@ fn shared_sse_framing_caps_complete_lines_for_every_parser() {
     anthropic
         .feed(&at_cap, &mut events)
         .expect("a cap-sized complete line is accepted");
+}
+
+/// SSE mode must feed one line per parser call: a multi-event 4 KiB burst
+/// otherwise leaves every delta's cumulative `Arc` snapshot in `ready` until
+/// the whole parser call returns, forcing a copy-on-write per delta.
+#[tokio::test]
+async fn event_chunk_sink_sse_mode_feeds_one_line_at_a_time() {
+    use pir::ai::api::EventChunkSink;
+    use pir::ai::event_stream::AssistantMessageEventStream;
+    use pir::ai::transport::ChunkSink as _;
+
+    let sink = AssistantMessageEventStream::with_capacity(16);
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen_by_feed = Arc::clone(&seen);
+    let mut chunk_sink = EventChunkSink::new_sse(
+        move |chunk: &[u8], ready: &mut Vec<AssistantMessageEvent>| {
+            seen_by_feed
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(chunk).into_owned());
+            ready.push(AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "x".into(),
+                partial: Arc::new(AssistantMessage::default()),
+            });
+            Ok(())
+        },
+        &sink,
+    );
+
+    chunk_sink
+        .send(b"event: content_block_delta\ndata: {\"x\":1}\n\n")
+        .await
+        .expect("SSE chunk feed");
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            "event: content_block_delta\n".to_owned(),
+            "data: {\"x\":1}\n".to_owned(),
+            "\n".to_owned(),
+        ],
+        "each parser call receives exactly one SSE line"
+    );
+    assert_eq!(
+        sink.pending_count(),
+        3,
+        "one event per line is pushed before the next line is parsed"
+    );
 }

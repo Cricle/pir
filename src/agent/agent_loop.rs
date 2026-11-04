@@ -894,6 +894,51 @@ pub enum AgentEvent {
 /// Event listener for [`AgentEvent`] values.
 pub type EventHandler = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 
+/// Which host-facing event payloads this run needs. The loop still performs
+/// the full internal lifecycle; this only suppresses payloads a host has
+/// declared it ignores, so the clone inside [`emit_lazy`] never runs.
+///
+/// `message_lifecycle` covers `StreamStart` / `StreamEnd` and the
+/// `MessageStart` / `MessageEnd` pair for non-assistant messages. The TUI
+/// renders live text/tool events and `TurnEnd`; it has no arm for these
+/// message lifecycle events.
+/// `turn_tool_results` controls the `TurnEnd.toolResults` vector, which the
+/// TUI also ignores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentEventInterest {
+    pub message_lifecycle: bool,
+    pub turn_tool_results: bool,
+}
+
+impl Default for AgentEventInterest {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl AgentEventInterest {
+    pub const ALL: Self = Self {
+        message_lifecycle: true,
+        turn_tool_results: true,
+    };
+    /// The TUI subset: turn/stream/tool deltas only.
+    pub const UI: Self = Self {
+        message_lifecycle: false,
+        turn_tool_results: false,
+    };
+
+    pub const fn bits(self) -> u8 {
+        (self.message_lifecycle as u8) | ((self.turn_tool_results as u8) << 1)
+    }
+
+    pub const fn from_bits(bits: u8) -> Self {
+        Self {
+            message_lifecycle: bits & 1 != 0,
+            turn_tool_results: bits & 2 != 0,
+        }
+    }
+}
+
 /// Async sink called with every message the run appends (upstream persists
 /// each `message_end` DURING the run, agent-session.ts:1144-1163).
 pub type PersistMessageFn = Arc<dyn Fn(Message) -> BoxFuture<'static, ()> + Send + Sync>;
@@ -929,11 +974,27 @@ pub type ToolCallWaitFn =
 pub struct ActiveToolSchemas {
     tools: Arc<ToolRegistry>,
     materialized: Arc<std::sync::OnceLock<MaterializedToolSchemas>>,
+    /// Repair-facing view, built once per run from the same materialization.
+    /// The builtin `tool-repair` hook reads every assistant message; without
+    /// this cache it cloned the full name set + every schema per message.
+    #[cfg(feature = "tool-repair")]
+    repair: Arc<std::sync::OnceLock<Arc<RepairToolSet>>>,
 }
 
 /// One materialized `(tool name, input schema)` snapshot, shared by every clone
 /// of an [`ActiveToolSchemas`] view.
 type MaterializedToolSchemas = Arc<Vec<(String, JsonValue)>>;
+
+/// The `tool-repair`-specific view of [`ActiveToolSchemas`], built once per run
+/// and shared across every `message_end` dispatch. The repair core needs owned
+/// `LiveToolSchema` values and a name set today; keeping them here avoids
+/// rebuilding both for every assistant message.
+#[cfg(feature = "tool-repair")]
+#[derive(Clone)]
+pub struct RepairToolSet {
+    pub schemas: Arc<Vec<crate::plugins::tool_repair::repair::LiveToolSchema>>,
+    pub names: Arc<std::collections::BTreeSet<String>>,
+}
 
 impl ActiveToolSchemas {
     /// A lazy view over `tools`; nothing is cloned until the first
@@ -942,6 +1003,8 @@ impl ActiveToolSchemas {
         Self {
             tools,
             materialized: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "tool-repair")]
+            repair: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -966,6 +1029,32 @@ impl ActiveToolSchemas {
     /// only needs names never clones a schema.
     pub fn iter(&self) -> std::slice::Iter<'_, (String, JsonValue)> {
         self.materialize().iter()
+    }
+
+    /// The repair-facing schema/name snapshot, materialized once per run and
+    /// returned by refcount bump. `None` in builds without the builtin (the
+    /// field is cfg-gated).
+    #[cfg(feature = "tool-repair")]
+    pub fn repair_tool_set(&self) -> Arc<RepairToolSet> {
+        Arc::clone(self.repair.get_or_init(|| {
+            let schemas: Vec<crate::plugins::tool_repair::repair::LiveToolSchema> = self
+                .iter()
+                .map(|(name, parameters)| {
+                    crate::plugins::tool_repair::repair::LiveToolSchema::new(
+                        name.clone(),
+                        parameters.clone(),
+                    )
+                })
+                .collect();
+            let names = schemas
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<std::collections::BTreeSet<String>>();
+            Arc::new(RepairToolSet {
+                schemas: Arc::new(schemas),
+                names: Arc::new(names),
+            })
+        }))
     }
 }
 
@@ -1092,6 +1181,10 @@ pub struct PreambleMessage {
 #[derive(Default)]
 pub struct LoopOptions {
     pub events: Option<EventHandler>,
+    /// Host event payload subset; defaults to [`AgentEventInterest::ALL`].
+    /// Hosts that ignore the message lifecycle (the TUI) can avoid the owned
+    /// message clones those events would otherwise require.
+    pub event_interest: AgentEventInterest,
     pub steering: Option<FollowUpFn>,
     pub compaction: Option<CompactionFn>,
     /// `transform_context` (upstream `transformContext`): transforms the
@@ -1690,13 +1783,17 @@ async fn run_with_options_in_span_inner(
                 max_turns = deps.max_turns,
                 "agent loop: stopping at the turn cap (incomplete run)"
             );
-            emit_lazy(&options.events, || AgentEvent::StreamStart {
-                turn: turns,
-                message: stop.clone(),
+            emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+                AgentEvent::StreamStart {
+                    turn: turns,
+                    message: stop.clone(),
+                }
             });
-            emit_lazy(&options.events, || AgentEvent::StreamEnd {
-                turn: turns,
-                message: stop.clone(),
+            emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+                AgentEvent::StreamEnd {
+                    turn: turns,
+                    message: stop.clone(),
+                }
             });
             // The synthetic message is a real transcript message, so it goes
             // through the SAME `message_end` chain a provider message gets:
@@ -1876,9 +1973,11 @@ async fn run_with_options_in_span_inner(
             // Host lifecycle pair for the declaration message: announced before
             // the extension dispatch and finalized (with any `message_end`
             // replacement applied) before it enters the transcript.
-            emit_lazy(&options.events, || AgentEvent::MessageStart {
-                turn: turns,
-                message: declaration.clone(),
+            emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+                AgentEvent::MessageStart {
+                    turn: turns,
+                    message: declaration.clone(),
+                }
             });
             emit_extension_lazy(&deps, "message_start", || {
                 serde_json::json!({
@@ -1901,9 +2000,11 @@ async fn run_with_options_in_span_inner(
             if let Some(replaced) = declaration_replacement {
                 declaration = replaced;
             }
-            emit_lazy(&options.events, || AgentEvent::MessageEnd {
-                turn: turns,
-                message: declaration.clone(),
+            emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+                AgentEvent::MessageEnd {
+                    turn: turns,
+                    message: declaration.clone(),
+                }
             });
             Arc::make_mut(&mut context)
                 .messages
@@ -1978,16 +2079,25 @@ async fn run_with_options_in_span_inner(
             }
             let mut message = if let Some(event_stream) = options.event_stream.as_ref() {
                 let stream = event_stream(request).await;
-                consume_stream(&deps, stream, turns, &options.events, run_started_at)
-                    .instrument(turn_span.clone())
-                    .await
+                consume_stream(
+                    &deps,
+                    stream,
+                    turns,
+                    &options.events,
+                    options.event_interest,
+                    run_started_at,
+                )
+                .instrument(turn_span.clone())
+                .await
             } else {
                 // No stream lifecycle events: the assistant `message_start` still
                 // fires at stream start, with the empty message (upstream emits
                 // `message_start` with the first partial, agent-loop.ts:416-421).
-                emit_lazy(&options.events, || AgentEvent::StreamStart {
-                    turn: turns,
-                    message: AssistantMessage::default(),
+                emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+                    AgentEvent::StreamStart {
+                        turn: turns,
+                        message: AssistantMessage::default(),
+                    }
                 });
                 emit_extension(
                     &deps,
@@ -2028,9 +2138,11 @@ async fn run_with_options_in_span_inner(
             last_turn_retry_class = turn_retry_class;
             // Single post-finalization `StreamEnd` (the stream's own tail event
             // carries the pre-finalization message; only this one is emitted).
-            emit_lazy(&options.events, || AgentEvent::StreamEnd {
-                turn: turns,
-                message: message.clone(),
+            emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+                AgentEvent::StreamEnd {
+                    turn: turns,
+                    message: message.clone(),
+                }
             });
             // Assistant `message_end` (mergeable: handlers may replace the
             // finalized message, keeping the role). The chained replacement is
@@ -2326,9 +2438,11 @@ async fn run_with_options_in_span_inner(
                     // listener is awaited), so a `message_end` replacement is
                     // what the context, the tool-result list, the run's
                     // new-message list and the persistence sink record.
-                    emit_lazy(&options.events, || AgentEvent::MessageStart {
-                        turn: turns,
-                        message: Message::ToolResult(result.clone()),
+                    emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+                        AgentEvent::MessageStart {
+                            turn: turns,
+                            message: Message::ToolResult(result.clone()),
+                        }
                     });
                     emit_extension_lazy(&deps, "message_start", || {
                         serde_json::json!({
@@ -2347,9 +2461,11 @@ async fn run_with_options_in_span_inner(
                     if let Some(Message::ToolResult(replaced)) = result_replacement {
                         result = replaced;
                     }
-                    emit_lazy(&options.events, || AgentEvent::MessageEnd {
-                        turn: turns,
-                        message: Message::ToolResult(result.clone()),
+                    emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+                        AgentEvent::MessageEnd {
+                            turn: turns,
+                            message: Message::ToolResult(result.clone()),
+                        }
                     });
                     Arc::make_mut(&mut context)
                         .messages
@@ -2371,7 +2487,10 @@ async fn run_with_options_in_span_inner(
             emit_lazy(&options.events, || AgentEvent::TurnEnd {
                 turn: turns,
                 message: message.clone(),
-                tool_results: tool_results[turn_results_start..].to_vec(),
+                tool_results: turn_tool_results_event(
+                    options.event_interest,
+                    &tool_results[turn_results_start..],
+                ),
             });
             // No loop-level `turn_end` extension dispatch: the settle boundary
             // (settle.rs `turn_end_boundary_hook`) is the single dispatch site.
@@ -2739,9 +2858,11 @@ async fn run_with_options_in_span_inner(
                 // `message_end` listener is awaited), so a `message_end`
                 // replacement is what the context, the tool-result list, the
                 // run's new-message list and the persistence sink record.
-                emit_lazy(&options.events, || AgentEvent::MessageStart {
-                    turn: turns,
-                    message: Message::ToolResult(result.clone()),
+                emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+                    AgentEvent::MessageStart {
+                        turn: turns,
+                        message: Message::ToolResult(result.clone()),
+                    }
                 });
                 emit_extension_lazy(&deps, "message_start", || {
                     serde_json::json!({
@@ -2760,9 +2881,11 @@ async fn run_with_options_in_span_inner(
                 if let Some(Message::ToolResult(replaced)) = result_replacement {
                     result = replaced;
                 }
-                emit_lazy(&options.events, || AgentEvent::MessageEnd {
-                    turn: turns,
-                    message: Message::ToolResult(result.clone()),
+                emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+                    AgentEvent::MessageEnd {
+                        turn: turns,
+                        message: Message::ToolResult(result.clone()),
+                    }
                 });
                 if outcome.results.len() == 1 {
                     repeat_result =
@@ -2866,13 +2989,17 @@ async fn run_with_options_in_span_inner(
                         timestamp: crate::ai::util::now_ms(),
                         ..AssistantMessage::default()
                     };
-                    emit_lazy(&options.events, || AgentEvent::StreamStart {
-                        turn: turns,
-                        message: stop.clone(),
+                    emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+                        AgentEvent::StreamStart {
+                            turn: turns,
+                            message: stop.clone(),
+                        }
                     });
-                    emit_lazy(&options.events, || AgentEvent::StreamEnd {
-                        turn: turns,
-                        message: stop.clone(),
+                    emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+                        AgentEvent::StreamEnd {
+                            turn: turns,
+                            message: stop.clone(),
+                        }
                     });
                     // The synthetic assistant message is a real transcript
                     // message, so it goes through the SAME `message_end` chain
@@ -2918,7 +3045,10 @@ async fn run_with_options_in_span_inner(
             emit_lazy(&options.events, || AgentEvent::TurnEnd {
                 turn: turns,
                 message: message.clone(),
-                tool_results: tool_results[turn_results_start..].to_vec(),
+                tool_results: turn_tool_results_event(
+                    options.event_interest,
+                    &tool_results[turn_results_start..],
+                ),
             });
             // NOTE: `turn_end` extension dispatch is NOT emitted here: the
             // session-level boundary hook (agent_session/settle.rs
@@ -3777,9 +3907,11 @@ async fn emit_message_lifecycle(
     mut message: Message,
     wire: Option<&JsonValue>,
 ) -> Message {
-    emit_lazy(&options.events, || AgentEvent::MessageStart {
-        turn,
-        message: message.clone(),
+    emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+        AgentEvent::MessageStart {
+            turn,
+            message: message.clone(),
+        }
     });
     let start_wire = match wire {
         Some(wire) => wire.clone(),
@@ -3809,9 +3941,11 @@ async fn emit_message_lifecycle(
     {
         message = replacement;
     }
-    emit_lazy(&options.events, || AgentEvent::MessageEnd {
-        turn,
-        message: message.clone(),
+    emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
+        AgentEvent::MessageEnd {
+            turn,
+            message: message.clone(),
+        }
     });
     message
 }
@@ -4032,6 +4166,33 @@ fn emit_lazy(handler: &Option<EventHandler>, build: impl FnOnce() -> AgentEvent)
     }
 }
 
+/// [`emit_lazy`] for the message-lifecycle events a host may declare it does
+/// not render. The build closure (and its owned message clones) never runs
+/// when the host opted out.
+fn emit_lazy_if_message_lifecycle(
+    handler: &Option<EventHandler>,
+    interest: AgentEventInterest,
+    build: impl FnOnce() -> AgentEvent,
+) {
+    if interest.message_lifecycle {
+        emit_lazy(handler, build);
+    }
+}
+
+/// `TurnEnd.toolResults` payload: borrows the turn's result slice when the host
+/// wants it, otherwise returns an empty vector without deep-cloning every
+/// result message.
+fn turn_tool_results_event(
+    interest: AgentEventInterest,
+    results: &[ToolResultMessage],
+) -> Vec<ToolResultMessage> {
+    if interest.turn_tool_results {
+        results.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Bound on queued `message_update` events awaiting their QuickJS dispatch
 /// (see [`MessageUpdateDispatcher`]). The stream loop keeps at most this many
 /// events buffered ahead of the JS side; beyond it the loop waits for the
@@ -4067,10 +4228,10 @@ fn next_message_update_stream_id() -> u64 {
 ///
 /// The baseline is MUTATED in place instead of being replaced with a clone of
 /// the partial's current map: the common argument delta is one string value
-/// gaining a suffix, so after the patch wire is built only that string is
-/// refreshed (`String::clone_from` reuses its allocation). Before, every
-/// `toolcall_delta` cloned the whole `BTreeMap` (one allocation per key plus
-/// one per value) just to keep the next diff's "previous" side.
+/// gaining a suffix, so after the patch wire is built only that string's
+/// suffix is appended (`push_str`). Before, every `toolcall_delta` either
+/// cloned the whole `BTreeMap` or copied the whole grown string back into the
+/// baseline (`String::clone_from`), which is still O(args) per delta.
 #[cfg(feature = "extensions")]
 #[derive(Debug, Default)]
 pub struct ToolArgumentBaselines {
@@ -4091,48 +4252,58 @@ impl ToolArgumentBaselines {
         self.arguments.clear();
     }
 
-    /// The one-string-suffix patch between the stored baseline and `current`,
-    /// or `None` when the change is absent/not expressible as a patch. The
-    /// returned key/tail borrow `current` only, so the caller can serialize
-    /// the wire and then call [`Self::commit`] with a mutable baseline.
+    /// The tri-state change between the stored baseline and `current`. The
+    /// returned patch borrows `current` only, so the caller can serialize the
+    /// wire and then apply the matching baseline update. A missing baseline is
+    /// `Full` (the JS side has no previous block to patch against).
     pub(crate) fn diff<'a>(
         &self,
         index: usize,
         current: &'a std::collections::BTreeMap<String, serde_json::Value>,
-    ) -> Option<crate::extensions::runtime::ToolArgumentPatch<'a>> {
-        let previous = self.arguments.get(index)?.as_ref()?;
-        crate::extensions::runtime::tool_argument_patch(previous, current)
+    ) -> crate::extensions::runtime::ToolArgumentDiff<'a> {
+        let Some(previous) = self.arguments.get(index).and_then(Option::as_ref) else {
+            return crate::extensions::runtime::ToolArgumentDiff::Full;
+        };
+        crate::extensions::runtime::tool_argument_diff(previous, current)
     }
 
-    /// Refresh the stored baseline after the wire for `current` was built.
-    /// `patched` is the key the shipped patch described: only that string value
-    /// moved, so only it is rewritten; every other change (or an unchanged
-    /// baseline) replaces the map wholesale.
-    pub(crate) fn commit(
+    /// Refresh the baseline after a shipped `Patch`: append only the suffix to
+    /// the existing string value. No whole-map clone and no whole-string copy.
+    pub(crate) fn commit_patch(
         &mut self,
         index: usize,
         current: &std::collections::BTreeMap<String, serde_json::Value>,
-        patched: Option<&str>,
+        patch: crate::extensions::runtime::ToolArgumentPatch<'_>,
     ) {
-        let previous = self.arguments.get_mut(index).and_then(Option::as_mut);
-        if let Some(previous) = previous {
-            match patched {
-                Some(key) => {
-                    if let (
-                        Some(serde_json::Value::String(value)),
-                        Some(serde_json::Value::String(current_value)),
-                    ) = (previous.get_mut(key), current.get(key))
-                    {
-                        if value != current_value {
-                            value.clone_from(current_value);
-                        }
-                    }
-                }
-                None => {
-                    if previous != current {
-                        previous.clone_from(current);
-                    }
-                }
+        let Some(previous) = self.arguments.get_mut(index).and_then(Option::as_mut) else {
+            self.put(index, current.clone());
+            return;
+        };
+        if let (
+            Some(serde_json::Value::String(value)),
+            Some(serde_json::Value::String(current_value)),
+        ) = (previous.get_mut(patch.key), current.get(patch.key))
+        {
+            if current_value.starts_with(value.as_str()) {
+                value.push_str(patch.tail);
+            } else {
+                // Defensive: the diff said suffix-only, but never leave a
+                // stale baseline if a caller reused a mutated map.
+                value.clone_from(current_value);
+            }
+        }
+    }
+
+    /// Refresh the baseline after a shipped full block: the map changed in a
+    /// way the patch cannot express, so replace it wholesale.
+    pub(crate) fn commit_replace(
+        &mut self,
+        index: usize,
+        current: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        if let Some(previous) = self.arguments.get_mut(index).and_then(Option::as_mut) {
+            if previous != current {
+                previous.clone_from(current);
             }
         } else {
             self.put(index, current.clone());
@@ -4548,6 +4719,7 @@ async fn consume_stream(
     mut stream: AssistantMessageEventStream,
     turn: usize,
     handler: &Option<EventHandler>,
+    event_interest: AgentEventInterest,
     run_started_at: Option<std::time::Instant>,
 ) -> AssistantMessage {
     let mut final_message = AssistantMessage::default();
@@ -4585,13 +4757,15 @@ async fn consume_stream(
         if !message_start_emitted {
             if let Some(partial) = assistant_event_partial(&event) {
                 message_start_emitted = true;
-                emit(
-                    handler,
-                    AgentEvent::StreamStart {
-                        turn,
-                        message: partial.clone(),
-                    },
-                );
+                if event_interest.message_lifecycle {
+                    emit(
+                        handler,
+                        AgentEvent::StreamStart {
+                            turn,
+                            message: partial.clone(),
+                        },
+                    );
+                }
                 emit_extension_lazy(deps, "message_start", || {
                     serde_json::json!({
                         "type": "message_start",
@@ -4669,13 +4843,15 @@ async fn consume_stream(
         // returned `final_message`).
         let mut started = final_message.clone();
         let _ = crate::ai::error::take_turn_retry_class(&mut started);
-        emit(
-            handler,
-            AgentEvent::StreamStart {
-                turn,
-                message: started.clone(),
-            },
-        );
+        if event_interest.message_lifecycle {
+            emit(
+                handler,
+                AgentEvent::StreamStart {
+                    turn,
+                    message: started.clone(),
+                },
+            );
+        }
         emit_extension_lazy(deps, "message_start", || {
             serde_json::json!({
                 "type": "message_start",

@@ -685,6 +685,7 @@ impl AgentSession {
             prompt_context: std::sync::RwLock::new(prompt_context),
             package_dir,
             event_stream: config.event_stream,
+            event_interest: AtomicU8::new(AgentEventInterest::ALL.bits()),
             extensions: config.extensions,
             plugins,
             session_start_sent: AtomicBool::new(false),
@@ -1555,6 +1556,19 @@ impl AgentSession {
             .finish_turn
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    /// Select the host-facing event payload subset for subsequent prompt runs.
+    /// Defaults to [`AgentEventInterest::ALL`]; the TUI uses
+    /// [`AgentEventInterest::UI`] because it renders no message-lifecycle
+    /// events and no `TurnEnd.toolResults`.
+    pub fn set_event_interest(&self, interest: AgentEventInterest) {
+        self.event_interest
+            .store(interest.bits(), Ordering::Relaxed);
+    }
+
+    pub(super) fn event_interest(&self) -> AgentEventInterest {
+        AgentEventInterest::from_bits(self.event_interest.load(Ordering::Relaxed))
     }
 }
 

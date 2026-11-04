@@ -625,10 +625,28 @@ pub(crate) fn finish_provider_stream(
 /// freeze hundreds of full-message snapshots before the first `push_await`
 /// even runs, i.e. the retention would scale with the socket read size
 /// instead of the queue capacity.
-pub(crate) struct EventChunkSink<'a, F> {
+///
+/// SSE adapters use [`Self::new_sse`]: the chunk is additionally split at
+/// newline boundaries and each line is fed + drained before the next line, so
+/// one `feed` call can materialize at most one SSE event block. This keeps the
+/// parser's `Arc<AssistantMessage>` accumulator from being shared by a whole
+/// 4 KiB burst of deltas (`ready: Vec` copies) and yields once after each
+/// event so an in-flight consumer can pop its snapshot before the next delta.
+/// Binary event-stream adapters (Bedrock) keep `new`/byte slices.
+#[doc(hidden)]
+pub struct EventChunkSink<'a, F> {
     feed: F,
     sink: &'a AssistantMessageEventStream,
     ready: Vec<crate::ai::types::AssistantMessageEvent>,
+    mode: FeedMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedMode {
+    /// Opaque byte chunks (binary event streams).
+    ByteSlices,
+    /// SSE line framing: one line per `feed` call, one yielded event batch.
+    SseLines,
 }
 
 impl<'a, F> EventChunkSink<'a, F>
@@ -638,11 +656,24 @@ where
     /// Slice size for oversized body chunks (see the type docs).
     pub(crate) const FEED_SLICE_BYTES: usize = 4096;
 
-    pub(crate) fn new(feed: F, sink: &'a AssistantMessageEventStream) -> Self {
+    #[doc(hidden)]
+    pub fn new(feed: F, sink: &'a AssistantMessageEventStream) -> Self {
         Self {
             feed,
             sink,
             ready: Vec::new(),
+            mode: FeedMode::ByteSlices,
+        }
+    }
+
+    /// SSE parser sink: line-framed feeding (see the type docs).
+    #[doc(hidden)]
+    pub fn new_sse(feed: F, sink: &'a AssistantMessageEventStream) -> Self {
+        Self {
+            feed,
+            sink,
+            ready: Vec::new(),
+            mode: FeedMode::SseLines,
         }
     }
 
@@ -663,6 +694,34 @@ where
         }
         result
     }
+
+    /// SSE-specific feed: one newline-terminated line per parser call. The
+    /// parser state machine already buffers partial lines across transport
+    /// chunks, so a chunk boundary in the middle of a line is unchanged; the
+    /// only difference is that `ready` can never hold a multi-delta burst.
+    async fn feed_sse_chunk(&mut self, chunk: &[u8]) -> AiResult<()> {
+        let mut start = 0usize;
+        while start < chunk.len() {
+            let end = chunk[start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|relative| start + relative + 1)
+                .unwrap_or(chunk.len());
+            self.ready.clear();
+            let result = (self.feed)(&chunk[start..end], &mut self.ready);
+            for event in self.ready.drain(..) {
+                self.sink.push_await(event).await;
+                // Let a consumer pop the snapshot before the parser mutates
+                // the same accumulator for the next line. This is the
+                // cooperative half of the mitigation; the queue's own
+                // push_await bound handles the slow-consumer case.
+                tokio::task::yield_now().await;
+            }
+            result?;
+            start = end;
+        }
+        Ok(())
+    }
 }
 
 impl<F> crate::ai::transport::ChunkSink for EventChunkSink<'_, F>
@@ -674,6 +733,9 @@ where
         chunk: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AiResult<()>> + Send + 'a>> {
         Box::pin(async move {
+            if self.mode == FeedMode::SseLines {
+                return self.feed_sse_chunk(chunk).await;
+            }
             if chunk.len() <= Self::FEED_SLICE_BYTES {
                 return self.feed_slice(chunk).await;
             }

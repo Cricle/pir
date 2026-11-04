@@ -41,8 +41,6 @@
 use super::*;
 
 #[cfg(feature = "tool-repair")]
-use crate::plugins::tool_repair::repair::LiveToolSchema;
-#[cfg(feature = "tool-repair")]
 use crate::plugins::tool_repair::ToolRepairPlugin;
 
 impl AgentSession {
@@ -65,24 +63,14 @@ impl AgentSession {
                     let plugin = tool_repair_plugin_of(&plugins)?;
                     let config = plugin.config();
                     let model = context.model.as_ref().map(|model| model.id.clone());
-                    let known_tools: std::collections::BTreeSet<String> = context
-                        .active_tools
-                        .iter()
-                        .map(|(name, _)| name.clone())
-                        .collect();
+                    let repair_tools = context.active_tools.repair_tool_set();
                     let mut message = context.message;
                     let outcome = crate::plugins::tool_repair::repair::repair_message_with_grammar(
                         &mut message,
                         model.as_deref(),
-                        &context
-                            .active_tools
-                            .iter()
-                            .map(|(name, parameters)| {
-                                LiveToolSchema::new(name.clone(), parameters.clone())
-                            })
-                            .collect::<Vec<LiveToolSchema>>(),
+                        repair_tools.schemas.as_slice(),
                         &config.grammar,
-                        &known_tools,
+                        &repair_tools.names,
                         &crate::agent::tool_scheduler::tool_repair_schema_check,
                         config.debug,
                     );
@@ -141,24 +129,14 @@ pub(crate) fn host_tool_repair_hook(
                 let plugin = tool_repair_plugin_of(&plugins)?;
                 let config = plugin.config();
                 let model = context.model.as_ref().map(|model| model.id.clone());
-                let known_tools: std::collections::BTreeSet<String> = context
-                    .active_tools
-                    .iter()
-                    .map(|(name, _)| name.clone())
-                    .collect();
+                let repair_tools = context.active_tools.repair_tool_set();
                 let mut message = context.message;
                 let outcome = crate::plugins::tool_repair::repair::repair_message_with_grammar(
                     &mut message,
                     model.as_deref(),
-                    &context
-                        .active_tools
-                        .iter()
-                        .map(|(name, parameters)| {
-                            LiveToolSchema::new(name.clone(), parameters.clone())
-                        })
-                        .collect::<Vec<LiveToolSchema>>(),
+                    repair_tools.schemas.as_slice(),
                     &config.grammar,
-                    &known_tools,
+                    &repair_tools.names,
                     &crate::agent::tool_scheduler::tool_repair_schema_check,
                     config.debug,
                 );

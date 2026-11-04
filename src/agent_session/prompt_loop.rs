@@ -1631,6 +1631,7 @@ impl AgentSession {
             };
             let loop_options = LoopOptions {
                 events: Some(on_event.clone()),
+                event_interest: self.event_interest(),
                 steering: Some(steering_fn(
                     steering.clone(),
                     Arc::clone(&self.pending_messages),

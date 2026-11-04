@@ -452,6 +452,24 @@ fn run_closure<'a>(
     }
 }
 
+/// Borrowed-argument variant of [`run_closure`] for calls that have NO live
+/// update channel: the tool reads the call's own validated payload directly,
+/// so no `Arc<JsonValue>` (and no full arguments clone) is allocated. This is
+/// the common path — most tools never emit an update.
+fn run_closure_ref<'a>(
+    args: &'a serde_json::Value,
+    context: &'a ToolContext,
+    tool: &'a Arc<dyn crate::agent::tool_execution::AgentTool>,
+) -> impl FnOnce() -> crate::agent::tool_execution::BoxFuture<'static, ToolResult> + 'a {
+    move || {
+        let ctx = context.clone();
+        let tool = Arc::clone(tool);
+        // `AgentTool::run` consumes the borrowed args/context synchronously
+        // and returns an owned `'static` future, so no reference escapes here.
+        tool.run(args, &ctx)
+    }
+}
+
 /// Await one tool future with panic isolation: a panicking third-party or
 /// plugin tool becomes a regular error result for that call instead of
 /// unwinding the batch future (and, in parallel mode, every sibling's).
@@ -825,11 +843,14 @@ fn run_call_body<'a>(
         let call_id = call.call_id.clone();
         let tool_name = call.tool_name.clone();
 
-        // One shared payload: the tool future reads it through the `Arc`, and
-        // the partial-update binding below holds another handle instead of a
-        // second full clone of arguments that may never be used (most tools
-        // never emit an update).
-        let args = std::sync::Arc::new(call.validated_args.clone());
+        // The shared payload exists only when a live-update observer needs the
+        // exact arguments after the tool consumed them. Without an update
+        // channel (the common path) the tool reads `call.validated_args`
+        // directly: no full map clone and no `Arc` allocation per call.
+        let update_args = context
+            .on_update
+            .is_some()
+            .then(|| std::sync::Arc::new(call.validated_args.clone()));
         // Bind the nested-call scope to this call so tools executing further
         // tool calls record against it (upstream scopes by tool call id).
         let mut context = context.with_call_scope(&call.call_id);
@@ -840,7 +861,10 @@ fn run_call_body<'a>(
         if let Some(on_update) = context.on_update.take() {
             let call_id = call.call_id.clone();
             let tool_name = call.tool_name.clone();
-            let args = std::sync::Arc::clone(&args);
+            let args = update_args
+                .as_ref()
+                .map(std::sync::Arc::clone)
+                .expect("update_args exists when on_update is installed");
             context.on_update = Some(std::sync::Arc::new(
                 move |mut partial: serde_json::Value| {
                     if let Some(object) = partial.as_object_mut() {
@@ -864,8 +888,11 @@ fn run_call_body<'a>(
         let started_at = std::time::Instant::now();
         let result = {
             if call.mutation_paths.is_empty() {
-                let run = run_closure(std::sync::Arc::clone(&args), &context, tool);
-                run_tool_isolated(&tool_name, run()).await
+                let run = match update_args.as_ref() {
+                    Some(args) => run_closure(std::sync::Arc::clone(args), &context, tool)(),
+                    None => run_closure_ref(&call.validated_args, &context, tool)(),
+                };
+                run_tool_isolated(&tool_name, run).await
             } else {
                 // The mutation lock spans the whole execution, so a nested
                 // mutation tool on a path this call chain already locks must
@@ -893,15 +920,18 @@ fn run_call_body<'a>(
                     .cloned()
                     .collect();
                 if pending.is_empty() {
-                    let run = run_closure(std::sync::Arc::clone(&args), &context, tool);
-                    run_tool_isolated(&tool_name, run()).await
+                    let run = match update_args.as_ref() {
+                        Some(args) => run_closure(std::sync::Arc::clone(args), &context, tool)(),
+                        None => run_closure_ref(&call.validated_args, &context, tool)(),
+                    };
+                    run_tool_isolated(&tool_name, run).await
                 } else {
                     let mut key_strings: Vec<String> =
                         pending.iter().map(|key| key.as_str().to_owned()).collect();
                     key_strings.sort();
                     key_strings.dedup();
                     let tool = Arc::clone(tool);
-                    let args = std::sync::Arc::clone(&args);
+                    let update_args = update_args.clone();
                     let mut run_context = context.clone();
                     // Acquire the queue locks first; only a call that holds
                     // them may publish them to its descendants, and the
@@ -922,8 +952,15 @@ fn run_call_body<'a>(
                                 .nested
                                 .take()
                                 .map(|executor| Arc::new(executor.with_held_mutation_keys(held)));
-                            let run = run_closure(args, &run_context, &tool);
-                            run_tool_isolated(&call.tool_name, run()).await
+                            let run = match update_args.as_ref() {
+                                Some(args) => {
+                                    run_closure(std::sync::Arc::clone(args), &run_context, &tool)()
+                                }
+                                None => {
+                                    run_closure_ref(&call.validated_args, &run_context, &tool)()
+                                }
+                            };
+                            run_tool_isolated(&call.tool_name, run).await
                         })
                         .await
                 }

@@ -410,7 +410,7 @@ async fn stream_codex_sse(
     let mut request_hooks = options.hooks.clone();
     request_hooks.before_provider_request = None;
     let (status, response_headers) = {
-        let mut on_chunk = crate::ai::api::EventChunkSink::new(
+        let mut on_chunk = crate::ai::api::EventChunkSink::new_sse(
             |chunk: &[u8], ready: &mut Vec<AssistantMessageEvent>| {
                 // Every consumer handle is gone: release the HTTP response
                 // instead of draining a body nobody reads (normal abandon).

@@ -20,8 +20,9 @@ use serde_json::Value as JsonValue;
 use tokio::sync::{mpsc, Notify};
 
 use crate::agent::agent_loop::{
-    self, AgentEvent, CompactionFn, EventStreamFn, FinishTurnAction, FinishTurnContext,
-    FinishTurnHook, FollowUpFn, LoopDeps, LoopOptions, PrepareRequestHook, ProviderRequest,
+    self, AgentEvent, AgentEventInterest, CompactionFn, EventStreamFn, FinishTurnAction,
+    FinishTurnContext, FinishTurnHook, FollowUpFn, LoopDeps, LoopOptions, PrepareRequestHook,
+    ProviderRequest,
 };
 use crate::agent::tool_execution::ToolRegistry;
 use crate::agent::tool_scheduler::{ToolScheduler, ToolSchedulerConfig};
@@ -651,6 +652,9 @@ pub struct AgentSession {
     /// installations (D1's pin applied to the prompt's `docs` section).
     package_dir: Option<PathBuf>,
     event_stream: Option<SharedEventStreamFn>,
+    /// Host event payload subset for the loop; defaults to
+    /// [`AgentEventInterest::ALL`]. The TUI sets [`AgentEventInterest::UI`].
+    event_interest: AtomicU8,
     extensions: Option<ExtensionHandle>,
     /// The unified plugin host wrapping the JS runtime plus every enabled
     /// Rust builtin plugin: ONE ordered dispatch list, ONE shared registry

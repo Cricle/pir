@@ -22,9 +22,16 @@ const MESSAGE_UPDATE_BLOCK_KEY: &str = "block";
 /// Internal wire key carrying the O(delta) patch of one tool-call block's
 /// `arguments` object (`{"key", "tail"}`: `arguments[key]` gained `tail`). It
 /// replaces the reply-sized `block` helper for the common "one string argument
-/// grows" case; see [`tool_argument_patch`]. Deleted by the JS entry (the
+/// grows" case; see [`tool_argument_diff`]. Deleted by the JS entry (the
 /// accumulator applies it and `delete`s it) exactly like `block`.
 const MESSAGE_UPDATE_PATCH_KEY: &str = "patch";
+
+/// Internal wire key marking a `toolcall_delta` whose PARSED `arguments` did
+/// not change since the previous delta of the same block. The raw `delta` is
+/// still applied by the JS accumulator (it is part of the stream's raw JSON
+/// accumulation), but no `block`/`patch` helper is needed: the authoritative
+/// block is exactly the one already held. Deleted before any handler runs.
+const MESSAGE_UPDATE_UNCHANGED_KEY: &str = "__pirUnchanged";
 
 /// Internal top-level wire key marking a DELTA line: the per-delta view
 /// (`message` without the accumulated `content`, the raw event without
@@ -164,15 +171,29 @@ pub fn message_update_stream_json(
                 // change is one string gaining a suffix, so only that string
                 // is rewritten (`commit`) instead of cloning the whole map.
                 let current = block_arguments(partial, index);
-                let patch = current.and_then(|current| tool_arguments.diff(index, current));
+                let change = match current {
+                    Some(current) => tool_arguments.diff(index, current),
+                    None => ToolArgumentDiff::Full,
+                };
+                let patch = match change {
+                    ToolArgumentDiff::Patch(patch) => Some(patch),
+                    ToolArgumentDiff::Unchanged | ToolArgumentDiff::Full => None,
+                };
                 let wire = serde_json::to_string(&MessageUpdateStreamWire {
                     event,
                     stream,
                     patch,
+                    unchanged: matches!(change, ToolArgumentDiff::Unchanged),
                 })
                 .unwrap_or_else(|_| "{}".to_owned());
                 match current {
-                    Some(current) => tool_arguments.commit(index, current, patch.map(|p| p.key)),
+                    Some(current) => match change {
+                        ToolArgumentDiff::Unchanged => {}
+                        ToolArgumentDiff::Patch(patch) => {
+                            tool_arguments.commit_patch(index, current, patch)
+                        }
+                        ToolArgumentDiff::Full => tool_arguments.commit_replace(index, current),
+                    },
                     None => tool_arguments.forget(index),
                 }
                 return wire;
@@ -181,6 +202,7 @@ pub fn message_update_stream_json(
                 event,
                 stream,
                 patch: None,
+                unchanged: false,
             })
             .unwrap_or_else(|_| "{}".to_owned());
             // Every other delta line ships the block whole (or none): the JS
@@ -233,38 +255,63 @@ pub struct ToolArgumentPatch<'a> {
     pub tail: &'a str,
 }
 
+/// Tri-state result of comparing one tool-call block's parsed `arguments`
+/// against the value the JS side already holds.
+///
+/// `Unchanged` is NOT the same as "not expressible as a patch": for an
+/// unchanged map the wire only needs the raw `delta` (the previous block is
+/// authoritative), while `Full` needs the whole parsed block. Conflating the
+/// two made every unchanged `toolcall_delta` re-serialize the full argument
+/// object (O(args) bytes/CPU per delta, O(args²) per call).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolArgumentDiff<'a> {
+    /// The parsed arguments are byte-for-byte equal to the baseline.
+    Unchanged,
+    /// Exactly one string value gained the `tail` suffix.
+    Patch(ToolArgumentPatch<'a>),
+    /// The change cannot be expressed as a single string suffix.
+    Full,
+}
+
 /// The parsed `arguments` of one tool-call block on two consecutive deltas:
-/// see [`ToolArgumentPatch`]. `previous` is the value the JS side already holds,
+/// see [`ToolArgumentDiff`]. `previous` is the value the JS side already holds,
 /// `current` the one the partial now carries. Every change that is not exactly
 /// "one string value gained a suffix, everything else deep-equal" returns
-/// `None` (the caller ships the whole block instead), so a patch can never
-/// misdescribe the block.
+/// [`ToolArgumentDiff::Full`] (the caller ships the whole block instead), so a
+/// patch can never misdescribe the block.
 ///
 /// Cost: O(args) comparison and no allocation; the two sides are compared
 /// structurally (map entries, `Value` equality), never as raw JSON text, so a
 /// fragment that only changes the escaping of a value still compares equal.
-pub fn tool_argument_patch<'a>(
+pub fn tool_argument_diff<'a>(
     previous: &std::collections::BTreeMap<String, JsonValue>,
     current: &'a std::collections::BTreeMap<String, JsonValue>,
-) -> Option<ToolArgumentPatch<'a>> {
+) -> ToolArgumentDiff<'a> {
     let mut previous_entries = previous.iter();
     let mut grew: Option<ToolArgumentPatch<'a>> = None;
     for (key, current_value) in current {
         // Lockstep iteration over the two sorted maps pins the key SETS equal
         // (an added or removed key is a change the patch cannot express).
-        let (previous_key, previous_value) = previous_entries.next()?;
+        let Some((previous_key, previous_value)) = previous_entries.next() else {
+            return ToolArgumentDiff::Full;
+        };
         if previous_key != key {
-            return None;
+            return ToolArgumentDiff::Full;
         }
         if previous_value == current_value {
             continue;
         }
         // The one changed key must be a string the new value extends.
-        let previous_text = previous_value.as_str()?;
-        let current_text = current_value.as_str()?;
-        let tail = current_text.strip_prefix(previous_text)?;
+        let (Some(previous_text), Some(current_text)) =
+            (previous_value.as_str(), current_value.as_str())
+        else {
+            return ToolArgumentDiff::Full;
+        };
+        let Some(tail) = current_text.strip_prefix(previous_text) else {
+            return ToolArgumentDiff::Full;
+        };
         if grew.is_some() {
-            return None;
+            return ToolArgumentDiff::Full;
         }
         grew = Some(ToolArgumentPatch {
             key: key.as_str(),
@@ -272,9 +319,12 @@ pub fn tool_argument_patch<'a>(
         });
     }
     if previous_entries.next().is_some() {
-        return None;
+        return ToolArgumentDiff::Full;
     }
-    grew
+    match grew {
+        Some(patch) => ToolArgumentDiff::Patch(patch),
+        None => ToolArgumentDiff::Unchanged,
+    }
 }
 
 /// The authoritative cumulative snapshot of one `message_update` event: the
@@ -334,6 +384,9 @@ struct MessageUpdateStreamWire<'a> {
     event: &'a AssistantMessageEvent,
     stream: u64,
     patch: Option<ToolArgumentPatch<'a>>,
+    /// The parsed arguments equal the JS side's current block; the raw delta
+    /// still applies, but no block/patch helper is needed.
+    unchanged: bool,
 }
 
 impl serde::Serialize for MessageUpdateStreamWire<'_> {
@@ -369,6 +422,7 @@ impl serde::Serialize for MessageUpdateStreamWire<'_> {
             &MessageUpdateEventWire {
                 event: self.event,
                 patch: self.patch,
+                unchanged: self.unchanged,
             },
         )?;
         // The internal markers ride LAST: the JS read-only entry deletes them
@@ -475,6 +529,7 @@ fn slice_is_empty<T>(value: &&[T]) -> bool {
 struct MessageUpdateEventWire<'a> {
     event: &'a AssistantMessageEvent,
     patch: Option<ToolArgumentPatch<'a>>,
+    unchanged: bool,
 }
 
 impl serde::Serialize for MessageUpdateEventWire<'_> {
@@ -562,18 +617,24 @@ impl serde::Serialize for MessageUpdateEventWire<'_> {
                 map.serialize_entry("content_index", content_index)?;
                 map.serialize_entry("delta", delta)?;
                 // The authoritative value of this delta is either the O(delta)
-                // patch (one string argument gained `tail`) or the whole block
-                // (the raw fragment is not the block: the provider mirrors the
-                // PARSED in-flight JSON). See `tool_argument_patch`.
-                match self.patch {
-                    Some(patch) => map.serialize_entry(
-                        MESSAGE_UPDATE_PATCH_KEY,
-                        &ToolArgumentPatchWire {
-                            key: patch.key,
-                            tail: patch.tail,
-                        },
-                    )?,
-                    None => serialize_block(&mut map, partial, *content_index)?,
+                // patch (one string argument gained `tail`), an unchanged
+                // baseline (no helper: the JS side already holds the block), or
+                // the whole block (the raw fragment is not the block: the
+                // provider mirrors the PARSED in-flight JSON). See
+                // `tool_argument_diff`.
+                if self.unchanged {
+                    map.serialize_entry(MESSAGE_UPDATE_UNCHANGED_KEY, &true)?;
+                } else {
+                    match self.patch {
+                        Some(patch) => map.serialize_entry(
+                            MESSAGE_UPDATE_PATCH_KEY,
+                            &ToolArgumentPatchWire {
+                                key: patch.key,
+                                tail: patch.tail,
+                            },
+                        )?,
+                        None => serialize_block(&mut map, partial, *content_index)?,
+                    }
                 }
             }
             AssistantMessageEvent::ToolCallEnd {

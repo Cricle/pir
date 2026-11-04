@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pir::agent::agent_loop::{
-    run, run_with_options, AgentEvent, EventStreamFn, FinishTurnAction, FinishTurnContext,
-    LoopDeps, LoopOptions, MessageEndRepairContext, PersistMessageFn, PrepareNextTurnUpdate,
-    PromptMessage,
+    run, run_with_options, AgentEvent, EventHandler, EventStreamFn, FinishTurnAction,
+    FinishTurnContext, LoopDeps, LoopOptions, MessageEndRepairContext, PersistMessageFn,
+    PrepareNextTurnUpdate, PromptMessage,
 };
 use pir::agent::tool_batch::ToolExecutionEvent;
 use pir::agent::tool_batch::ToolResult;
@@ -2152,6 +2152,32 @@ async fn message_end_repair_ignoring_active_tools_materializes_nothing() {
     );
 }
 
+/// The repair-facing schema/name snapshot is built from the same one-time
+/// materialization and shared by refcount across every message of the run.
+#[cfg(feature = "tool-repair")]
+#[test]
+fn active_tool_schemas_repair_set_is_materialized_once() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(SchemaAccountingTool {
+        parameters_calls: Arc::clone(&reads),
+    }));
+    let schemas = pir::agent::agent_loop::ActiveToolSchemas::new(Arc::new(tools));
+    let first = schemas.repair_tool_set();
+    let second = schemas.repair_tool_set();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "the repair-facing schema/name set is shared across messages"
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "one parameters() materialization for the whole run"
+    );
+    assert_eq!(first.schemas.len(), 1);
+    assert!(first.names.contains("accounted"));
+}
+
 /// A handler that reads `active_tools` materializes the map ONCE for the
 /// whole run: the second message shares the first message's snapshot.
 #[tokio::test]
@@ -2204,6 +2230,97 @@ fn event_label(event: AgentEvent) -> &'static str {
         AgentEvent::StreamEvent { .. } => "stream_event",
         AgentEvent::Compaction { .. } => "compaction",
     }
+}
+
+/// A UI host that opts out of the message lifecycle must not receive those
+/// payloads (and their owned-message clones), nor `TurnEnd.toolResults`.
+#[tokio::test]
+async fn ui_event_interest_skips_message_lifecycle_and_turn_tool_results() {
+    let seen: Arc<Mutex<Vec<(&'static str, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_by_handler = Arc::clone(&seen);
+    let handler: EventHandler = Arc::new(move |event| {
+        let (label, tool_results) = match event {
+            AgentEvent::AgentStart { .. } => ("agent_start", 0),
+            AgentEvent::AgentEnd { .. } => ("agent_end", 0),
+            AgentEvent::TurnStart { .. } => ("turn_start", 0),
+            AgentEvent::TurnEnd { tool_results, .. } => ("turn_end", tool_results.len()),
+            AgentEvent::MessageStart { .. } => ("message_start", 0),
+            AgentEvent::MessageEnd { .. } => ("message_end", 0),
+            AgentEvent::StreamStart { .. } => ("stream_start", 0),
+            AgentEvent::StreamEnd { .. } => ("stream_end", 0),
+            AgentEvent::ToolExecutionStart { .. } => ("tool_start", 0),
+            AgentEvent::ToolExecutionUpdate { .. } => ("tool_update", 0),
+            AgentEvent::ToolExecutionEnd { .. } => ("tool_end", 0),
+            AgentEvent::StreamEvent { .. } => ("stream_event", 0),
+            AgentEvent::Compaction { .. } => ("compaction", 0),
+        };
+        seen_by_handler.lock().unwrap().push((label, tool_results));
+    });
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stream_calls = Arc::clone(&calls);
+    let stream: EventStreamFn = Box::new(move |_request| {
+        let call_index = stream_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let stream = AssistantMessageEventStream::new();
+            if call_index == 0 {
+                stream.push(AssistantMessageEventStream::done_event(
+                    TerminalReason::ToolUse,
+                    assistant(
+                        vec![ContentBlock::ToolCall(ToolCall {
+                            id: "call-1".into(),
+                            name: "echo".into(),
+                            arguments: BTreeMap::from([("n".into(), serde_json::json!(1))]),
+                            thought_signature: None,
+                            namespace: None,
+                            arguments_error: None,
+                        })],
+                        StopReason::ToolUse,
+                    ),
+                ));
+            } else {
+                stream.push(AssistantMessageEventStream::done_event(
+                    TerminalReason::Stop,
+                    assistant(vec![text("done")], StopReason::Stop),
+                ));
+            }
+            stream
+        })
+    });
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ProgressTool {
+        runs: Arc::new(AtomicUsize::new(0)),
+    }));
+    let deps = LoopDeps {
+        tools: Arc::new(tools),
+        scheduler: ToolScheduler::new(ToolSchedulerConfig::default()),
+        max_turns: 2,
+        ..LoopDeps::default()
+    };
+    let options = LoopOptions {
+        event_stream: Some(stream),
+        events: Some(handler),
+        event_interest: pir::agent::agent_loop::AgentEventInterest::UI,
+        ..LoopOptions::default()
+    };
+    let result = run_with_options(deps, Context::default(), None, options).await;
+    assert_eq!(result.turns, 2);
+
+    let seen = seen.lock().unwrap();
+    let labels: Vec<&str> = seen.iter().map(|(label, _)| *label).collect();
+    for suppressed in ["stream_start", "stream_end", "message_start", "message_end"] {
+        assert!(
+            !labels.contains(&suppressed),
+            "UI interest must suppress {suppressed}: {labels:?}"
+        );
+    }
+    assert!(labels.contains(&"turn_end"));
+    assert!(
+        seen.iter()
+            .all(|(label, tool_results)| *label != "turn_end" || *tool_results == 0),
+        "UI interest must not clone TurnEnd.toolResults: {seen:?}"
+    );
 }
 
 /// The turn cap's synthetic terminal is a real transcript message: a JS
@@ -3974,6 +4091,16 @@ async fn message_update_tool_argument_deltas_patch_or_fall_back_exactly() {
             .routes
             .push(if index == 0 { "block" } else { "patch" });
     }
+    // Phase 1b: the provider repeats the same parsed arguments (a transport
+    // chunk split at a boundary where the parsed mirror has not refreshed).
+    // The raw delta still arrives, but the JS block is already authoritative:
+    // the wire must ship the unchanged marker, never the whole block.
+    script.events.push(AssistantMessageEvent::ToolCallDelta {
+        content_index: 0,
+        delta: "ab".into(),
+        partial: partial(&arguments),
+    });
+    script.routes.push("unchanged");
     // Phase 2: a second key appears — a key the JS side does not hold is not an
     // extension of one string value, so the whole block must ship.
     arguments.insert("mode".into(), serde_json::json!("r"));
@@ -4098,17 +4225,22 @@ async fn message_update_tool_argument_deltas_patch_or_fall_back_exactly() {
                         && Object.prototype.hasOwnProperty.call(assistantEvent, "patch");
                     const hasBlock = assistantEvent
                         && Object.prototype.hasOwnProperty.call(assistantEvent, "block");
+                    const hasUnchanged = assistantEvent
+                        && Object.prototype.hasOwnProperty.call(assistantEvent, "__pirUnchanged");
                     // The HOST route of this dispatch (`MessageUpdateStreamShape`
                     // + the helper the wire carries):
                     //   "patch"     -> delta line with the O(delta) arguments patch
                     //   "block"     -> delta line carrying the whole block
+                    //   "unchanged" -> delta line whose parsed args equal the live block
                     //   "delta"     -> delta line with no helper (the stream's
                     //                  `start`: its initial content rides
                     //                  `message.content`, so no block is needed)
                     //   "reference" -> the full reference payload (terminal events)
                     globalThis.__seen.push({
                         route: payload.__pirDelta === true
-                            ? (hasPatch ? "patch" : (hasBlock ? "block" : "delta"))
+                            ? (hasUnchanged
+                                ? "unchanged"
+                                : (hasPatch ? "patch" : (hasBlock ? "block" : "delta")))
                             : "reference",
                     });
                 }
@@ -4127,7 +4259,8 @@ async fn message_update_tool_argument_deltas_patch_or_fall_back_exactly() {
                 const assistantEvent = event.assistantMessageEvent;
                 if (assistantEvent
                     && (Object.prototype.hasOwnProperty.call(assistantEvent, "patch")
-                        || Object.prototype.hasOwnProperty.call(assistantEvent, "block"))) {
+                        || Object.prototype.hasOwnProperty.call(assistantEvent, "block")
+                        || Object.prototype.hasOwnProperty.call(assistantEvent, "__pirUnchanged"))) {
                     globalThis.__leaks += 1;
                 }
                 globalThis.__live.push(JSON.stringify(event.message));
@@ -4238,6 +4371,7 @@ async fn message_update_tool_argument_deltas_patch_or_fall_back_exactly() {
     );
     let mut patches = 0usize;
     let mut blocks = 0usize;
+    let mut unchanged = 0usize;
     let mut deltas = 0usize;
     let mut references = 0usize;
     for (index, ((entry, message), expected)) in seen
@@ -4254,6 +4388,7 @@ async fn message_update_tool_argument_deltas_patch_or_fall_back_exactly() {
         match *expected {
             "patch" => patches += 1,
             "block" => blocks += 1,
+            "unchanged" => unchanged += 1,
             "delta" => deltas += 1,
             _ => references += 1,
         }
@@ -4276,6 +4411,10 @@ async fn message_update_tool_argument_deltas_patch_or_fall_back_exactly() {
     // (phase 2's new key, phase 4's first numeric key), phase 4's four numeric
     // steps and the finalizing `toolcall_end`.
     assert_eq!(blocks, 9, "only non-extension changes ship the whole block");
+    assert_eq!(
+        unchanged, 1,
+        "an unchanged parsed mirror ships no block/patch, only the raw delta"
+    );
     assert_eq!(
         deltas, 1,
         "the stream's `start` is a delta line whose message carries the initial content"
