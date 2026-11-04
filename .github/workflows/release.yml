@@ -1,9 +1,9 @@
 name: Release
 
 # The only release entry point: tags starting with `v` (v0.0.1, v0.1.0-rc.1).
-# The tag must equal Cargo.toml's `[package].version` (checked by the `version`
-# job); the remaining jobs still run `cargo set-version` to keep generated
-# Cargo.lock/package metadata consistent inside the ephemeral runner.
+# The tag must equal Cargo.toml's `[package].version` and `.migration-info`
+# (checked by the `version` job), so the checked-in Cargo.lock is already
+# consistent and the build/publish jobs never rewrite versions.
 on:
   push:
     tags:
@@ -60,9 +60,8 @@ jobs:
               ;;
           esac
           version="${tag#v}"
-          # Strict semver (no build metadata: `cargo set-version` and crates.io
-          # both drop/ignore `+build`, so a tag carrying it would silently
-          # become a different version).
+          # Strict semver (no build metadata: crates.io drops/ignores `+build`,
+          # so a tag carrying it would silently become a different version).
           if ! printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
             echo "::error title=Invalid release tag::$tag does not derive a semver version (expected vMAJOR.MINOR.PATCH[-PRERELEASE])"
             exit 1
@@ -110,7 +109,6 @@ jobs:
             os: macos-latest
             target: universal-apple-darwin
     env:
-      VERSION: ${{ needs.version.outputs.version }}
       TAG: ${{ needs.version.outputs.tag }}
       # Static musl Linux artifact. The target is musl (not glibc); musl-gcc
       # builds the bundled C dependencies (SQLite, zstd) against musl too.
@@ -137,23 +135,11 @@ jobs:
           # linux-stable-test cache). Restore-only.
           save-if: false
 
-      - uses: taiki-e/install-action@cargo-edit
-
-      # The version baked into the binary, `--version`, User-Agent, MCP client
-      # and crash logs comes from Cargo.toml at compile time; applying the tag
-      # version here (and in `test`/`publish`) is what makes the tag the source
-      # of truth. `--locked` below then builds against the Cargo.lock that
-      # cargo-edit just updated.
-      - name: Apply tag version
-        shell: bash
-        run: |
-          cargo set-version "$VERSION"
-          applied="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
-          if [ "$applied" != "$VERSION" ]; then
-            echo "::error title=Version not applied::cargo set-version left Cargo.toml at $applied, expected $VERSION"
-            exit 1
-          fi
-          echo "Cargo.toml version = $applied"
+      # No version rewrite step: the `version` job already fails unless the tag
+      # equals Cargo.toml and .migration-info, so `Cargo.toml` is the version
+      # baked into the binary, `--version`, User-Agent, MCP client and crash
+      # logs. `--locked` builds against the committed Cargo.lock (which carries
+      # the same version).
 
       - name: Add Rust targets (macOS universal)
         if: matrix.name == 'macos-universal'
@@ -251,18 +237,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # No rust-cache here: `cargo publish`'s verification build happens in
       # `target/package/<crate>-<version>/`, a fresh target dir that the
-      # workspace cache cannot seed.
-      - uses: taiki-e/install-action@cargo-edit
-
-      - name: Apply tag version
-        shell: bash
-        run: |
-          cargo set-version "$VERSION"
-          applied="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
-          if [ "$applied" != "$VERSION" ]; then
-            echo "::error title=Version not applied::cargo set-version left Cargo.toml at $applied, expected $VERSION"
-            exit 1
-          fi
+      # workspace cache cannot seed. The `version` job has already proven that
+      # tag == Cargo.toml == .migration-info, so no version rewrite is needed.
 
       # Idempotency: re-running a release (or re-tagging a version that was
       # published by an earlier attempt) must not fail the run.
@@ -313,8 +289,8 @@ jobs:
         shell: bash
         # The token is read from the environment only. `--token` is required by
         # the task contract; GitHub masks secret values in logs, and the value
-        # is never written to a file. `--locked` publishes the Cargo.lock that
-        # cargo-edit updated from the tag version.
+        # is never written to a file. `--locked` publishes against the
+        # checked-in Cargo.lock.
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
