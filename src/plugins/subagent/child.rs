@@ -422,7 +422,21 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
         let system_prompt = match (base_prompt, body.is_empty()) {
             (_, true) => None,
             (Some(base), false) => Some(format!("{base}\n\n{body}")),
-            (None, false) => Some(body.to_owned()),
+            // Upstream always gives the child the default prompt, with the
+            // agent body as `appendSystemPrompt` (system-prompt.ts:60-199 has
+            // no empty-resources arm): a bare workspace must not collapse to
+            // a body-only prompt with no preamble, `<cwd>` or
+            // `<tools>`/`<rules>` (audit M5).
+            (None, false) => {
+                let base =
+                    crate::coding_agent::context::context_system_prompt_with_hidden_in_unconditional(
+                        &cwd,
+                        &prompt_tools,
+                        &hidden_tools,
+                        &agent_dir,
+                    );
+                Some(format!("{base}\n\n{body}"))
+            }
         };
         // The child's own depth rides its base tool registry as metadata (see
         // [`install_subagent_depth`]): out-of-band, so it survives the session

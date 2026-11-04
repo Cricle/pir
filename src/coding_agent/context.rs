@@ -404,6 +404,40 @@ pub(crate) fn context_system_prompt_with_hidden_in(
     build_context_prompt(cwd, tools, hidden_tools, &skills, &options)
 }
 
+/// [`context_system_prompt_with_hidden_in`] with NO "nothing to inject"
+/// check: the base preamble, `<tools>`/`<rules>` (from the declared set) and
+/// `<cwd>` are always produced (upstream `buildSystemPrompt`,
+/// system-prompt.ts:60-199, has no empty-resources arm — audit M5).
+///
+/// The subagent child builds its body-bearing prompt from this: the agent
+/// body rides the always-present default prompt as `appendSystemPrompt`, it
+/// must not become the entire prompt when the workspace is bare.
+#[cfg(feature = "subagent")]
+pub(crate) fn context_system_prompt_with_hidden_in_unconditional(
+    cwd: &Path,
+    tools: &[ToolInfo],
+    hidden_tools: &[String],
+    agent_dir: &Path,
+) -> String {
+    let package_dir = crate::config::env::package_dir();
+    let options = ContextOptions {
+        disabled: !context_files_enabled(),
+        agent_dir,
+        package_dir: package_dir.as_deref(),
+    };
+    let files = resolve_context_files_with(cwd, &options);
+    let skills = discover_prompt_skills_with(cwd, &options);
+    context_system_prompt_unconditional(
+        cwd,
+        tools,
+        hidden_tools,
+        &files,
+        &skills,
+        package_dir.as_deref(),
+        None,
+    )
+}
+
 /// Build the structured system prompt from an already-discovered skill list.
 /// A host that installed the run's resources on the session
 /// ([`crate::agent_session::AgentSession::set_prompt_resources`]) passes the
@@ -689,8 +723,9 @@ struct PromptOverrides<'a> {
 /// This is what the SESSION hosts use (P7): the TUI/RPC/server build kept
 /// `system_prompt: None` on a bare workspace, so the model got no preamble, no
 /// tool list, no rules and no `<cwd>`. Print builds its own prompt
-/// (`coding_agent/print.rs`) and the subagent child keeps the
-/// append-to-nothing semantics, so both stay on [`context_system_prompt_with_hidden`].
+/// (`coding_agent/print.rs`) and the subagent child body-bearing prompt now
+/// uses the explicit `_in` unconditional wrapper below, so both produce a
+/// full prompt on a bare workspace too.
 fn context_system_prompt_unconditional(
     cwd: &Path,
     tools: &[ToolInfo],
