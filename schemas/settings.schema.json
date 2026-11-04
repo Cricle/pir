@@ -134,6 +134,38 @@
       },
       "additionalProperties": false
     },
+    "sessionRetention": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Run the retention pass automatically at startup.",
+          "default": false
+        },
+        "maxAgeDays": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Delete sessions older than this many days.",
+          "default": 30
+        },
+        "maxSessions": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Keep at most this many sessions per directory.",
+          "default": 500
+        },
+        "maxBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Keep newest sessions until this many bytes are retained.",
+          "default": 2147483648
+        }
+      },
+      "additionalProperties": false
+    },
     "branchSummary": {
       "type": "object",
       "properties": {
