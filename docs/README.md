@@ -23,3 +23,5 @@ diagnostics; upstream-relative pages with no counterpart are in [MAPPING.md](../
 | [FEATURES.md](FEATURES.md) | Feature graph, profiles, off-error contract |
 | [upstream-drift-status.md](upstream-drift-status.md) | Verified upstream drift: 184 commits since the recorded baseline, 62 after v1.4.0, with per-commit Landed/Partial/Open/N-A evidence |
 | [todo-builtin.md](todo-builtin.md) | `todo` builtin: contract, `/todos`, persistence |
+| [cm-rs-integration-plan.md](cm-rs-integration-plan.md) | cm-rs memory engine integration research: blockers, API refactor, plugin design, phased plan (not implemented) |
+| [system-prompt-audit.md](system-prompt-audit.md) | System prompt audit vs upstream: aligned sections, deviations, missing host wiring, fix priorities (not implemented) |

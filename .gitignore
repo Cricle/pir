@@ -8,6 +8,7 @@ Cargo.lock.bak
 /target-alt/
 /target-exp-*/
 /target-release-*/
+/target-perf-*/
 /scripts/tui_conpty/out/
 /.pi/
 /AGENT.md
