@@ -668,6 +668,34 @@ pub fn settings_schema() -> Value {
         }),
     );
     properties.insert(
+        "sessionRetention".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "enabled": bool_prop_with_default(
+                    "Run the retention pass automatically at startup.",
+                    crate::config::defaults::settings_defaults::SESSION_RETENTION_ENABLED,
+                ),
+                "maxAgeDays": non_negative_safe_integer(
+                    Some("Delete sessions older than this many days."),
+                    Some(crate::config::defaults::settings_defaults::SESSION_RETENTION_MAX_AGE_DAYS),
+                ),
+                "maxSessions": non_negative_safe_integer(
+                    Some("Keep at most this many sessions per directory."),
+                    Some(
+                        crate::config::defaults::settings_defaults::SESSION_RETENTION_MAX_SESSIONS
+                            as u64,
+                    ),
+                ),
+                "maxBytes": non_negative_safe_integer(
+                    Some("Keep newest sessions until this many bytes are retained."),
+                    Some(crate::config::defaults::settings_defaults::SESSION_RETENTION_MAX_BYTES),
+                ),
+            },
+            "additionalProperties": false,
+        }),
+    );
+    properties.insert(
         "branchSummary".into(),
         json!({
             "type": "object",
