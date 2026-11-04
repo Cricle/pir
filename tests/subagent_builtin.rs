@@ -857,6 +857,86 @@ async fn single_mode_agent_body_is_appended_to_system_prompt() {
 }
 
 #[tokio::test]
+async fn bare_workspace_child_still_gets_the_default_preamble() {
+    // Audit M5: upstream always gives the child the default prompt, with the
+    // agent body as `appendSystemPrompt`, so a bare workspace — no context
+    // files, no skills, no MCP — must not collapse the child's system prompt
+    // to the agent body alone.
+    let temp = TempDir::new("bare-sysprompt");
+    // The skill scan also reads `~/.agents/skills` (home-anchored, NOT gated
+    // by the agent dir), so point `HOME` at an empty dir for this test —
+    // otherwise a developer machine's global skills make the workspace
+    // non-bare and the body-only arm below is never exercised. Restored on
+    // drop so the other tests keep their ambient environment.
+    struct HomeGuard(Option<std::ffi::OsString>);
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+    let empty_home = temp.0.join("home");
+    std::fs::create_dir_all(&empty_home).expect("create empty home");
+    let _home = HomeGuard(std::env::var_os("HOME"));
+    std::env::set_var("HOME", &empty_home);
+    temp.write_agent(
+        "scout.md",
+        "name: scout\ndescription: recon\n",
+        "SCOUT_SYSTEM_PROMPT_MARKER",
+    );
+    let observed: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_for_responder = observed.clone();
+    let registry = fake_registry(Arc::new(move |_, context| {
+        observed_for_responder
+            .lock()
+            .unwrap()
+            .push(context.system_prompt.clone());
+        assistant(vec![text("done")], StopReason::Stop)
+    }));
+    // `agent_dir` points at the same (otherwise empty) temp dir so the
+    // prompt's global skill/context discovery finds nothing either.
+    let env = Arc::new(ToolSessionEnv {
+        provider_registry: registry,
+        model: fake_model(),
+        thinking: ThinkingLevel::Off,
+        session_id: None,
+        session_file: None,
+        base_tools: Arc::new(ToolRegistry::new()),
+        has_ui: false,
+        project_trusted: true,
+        user_agents_dir: Some(temp.0.join("agents")),
+        agent_dir: Some(temp.0.clone()),
+        credential: None,
+        on_update: None,
+        live_tools: None,
+        active_override: None,
+        background: None,
+    });
+    let ctx = tool_context(&temp.0, env, None);
+    let result = run_tool(serde_json::json!({ "agent": "scout", "task": "t" }), &ctx).await;
+    assert!(!result.is_error, "content: {}", result.content);
+    let prompts = observed.lock().unwrap().clone();
+    let prompt = prompts
+        .last()
+        .expect("child request")
+        .clone()
+        .expect("system prompt");
+    assert!(
+        prompt.starts_with("You are an expert coding assistant"),
+        "prompt: {prompt}"
+    );
+    assert!(prompt.contains("<cwd>"), "prompt: {prompt}");
+    assert!(prompt.contains("<tools>"), "prompt: {prompt}");
+    assert!(prompt.contains("<rules>"), "prompt: {prompt}");
+    assert!(
+        prompt.ends_with("SCOUT_SYSTEM_PROMPT_MARKER"),
+        "prompt: {prompt}"
+    );
+}
+
+#[tokio::test]
 async fn unknown_agent_fails_with_available_list() {
     let temp = TempDir::new("unknown-agent");
     temp.write_agent("scout.md", "name: scout\ndescription: d\n", "b");
