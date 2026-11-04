@@ -3573,7 +3573,7 @@ pub fn clamp_max_tokens_to_context(model: &Model, context: &Context, max_tokens:
     if model.context_window == 0 {
         return max_tokens.max(MIN_MAX_TOKENS);
     }
-    let estimated = crate::compaction::estimate_request_context_tokens_conservative(context).tokens;
+    let estimated = crate::compaction::estimate_request_context_tokens(context).tokens;
     let available = model
         .context_window
         .saturating_sub(estimated)
