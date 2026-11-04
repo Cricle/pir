@@ -3424,7 +3424,11 @@ async fn message_update_live_object_matches_the_reference_at_every_delta() {
         "at most one window may carry the single load-time publication (trigger located at \
          {located}): {probe:?}"
     );
-    assert_eq!(probe["fallbacks"].as_u64(), Some(0));
+    assert_eq!(
+        probe["fallbacks"].as_u64(),
+        Some(0),
+        "the accumulator must apply every delta exactly: {probe:?}"
+    );
     let routes = probe["routes"].as_array().expect("routes array");
     assert_eq!(routes.len(), events.len(), "one route per dispatch");
     for (index, (route, event)) in routes.iter().zip(events.iter()).enumerate() {
@@ -4356,7 +4360,11 @@ async fn message_update_tool_argument_deltas_patch_or_fall_back_exactly() {
         "at most one window may carry the single load-time publication (trigger located at \
          {located}): {probe:?}"
     );
-    assert_eq!(probe["fallbacks"].as_u64(), Some(0));
+    assert_eq!(
+        probe["fallbacks"].as_u64(),
+        Some(0),
+        "the accumulator must apply every delta exactly: {probe:?}"
+    );
     assert_eq!(
         probe["leaks"].as_u64(),
         Some(0),

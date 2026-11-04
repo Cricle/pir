@@ -858,13 +858,12 @@ fn run_call_body<'a>(
         // them to the right tool block (upstream `tool_execution_update`
         // events carry toolCallId/toolName/args; the tool-level payload has no
         // ids of its own).
-        if let Some(on_update) = context.on_update.take() {
+        if let (Some(on_update), Some(args)) = (
+            context.on_update.take(),
+            update_args.as_ref().map(std::sync::Arc::clone),
+        ) {
             let call_id = call.call_id.clone();
             let tool_name = call.tool_name.clone();
-            let args = update_args
-                .as_ref()
-                .map(std::sync::Arc::clone)
-                .expect("update_args exists when on_update is installed");
             context.on_update = Some(std::sync::Arc::new(
                 move |mut partial: serde_json::Value| {
                     if let Some(object) = partial.as_object_mut() {

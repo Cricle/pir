@@ -154,7 +154,7 @@ fn active_session_survives_every_bound() {
     assert!(
         plan.remove
             .iter()
-            .all(|entry| entry.path != PathBuf::from("active.jsonl")),
+            .all(|entry| entry.path != Path::new("active.jsonl")),
         "the active session must never be scheduled: {plan:?}"
     );
     assert_eq!(plan.remove.len(), 1);

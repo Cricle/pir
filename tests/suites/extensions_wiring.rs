@@ -951,7 +951,10 @@ mod shim_deflate {
             // TUI-INPUT: `pi.on("terminal_input")` registers on the dedicated
             // terminalInputHandlers list (the same list
             // `ctx.ui.onTerminalInput` uses) instead of ext.handlers.
-            "b76eb5a66ea2417ced1f2823572f8bc81410e4308a08021d911457a57fb4f586",
+            // 2026-11-04 A-line hot paths: `__pirUnchanged` tool-call delta
+            // marker (the accumulator keeps the held block when parsed
+            // arguments did not move).
+            "0e5ddb8dc6ce6f43f1bad9e647fd200536eb867c8b2512213ce5f8389dc77808",
         ),
         (
             "process_global_stub.js.txt",
