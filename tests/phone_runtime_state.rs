@@ -610,3 +610,48 @@ async fn shutdown_uses_the_injected_runner_and_removes_our_route() {
     );
     cleanup(&store);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_auto_stop_removes_the_record_and_the_serve_route() {
+    let _serial = TEST_LOCK.lock().await;
+    let store = temp_store("idle-stop");
+    let port = free_port().await;
+    let fake = FakeTailscale::new(vec![
+        // enable (start)
+        status_json(),
+        empty_web(),
+        ok(""),
+        status_json(),
+        active_web(port),
+        // idle cleanup: disable probe + off
+        status_json(),
+        active_web(port),
+        ok(""),
+    ]);
+    let plugin = PhonePlugin::with_tailscale_runner(Arc::new(fake.clone()));
+    plugin.set_runtime_store_for_test(store.clone());
+    plugin
+        .start_for_test(&format!("{port} --idle-secs 1"))
+        .await
+        .expect("explicit-port start");
+    let path = store.path_for(HOST, port);
+    assert!(path.exists(), "start must persist {}", path.display());
+
+    // The accept loop checks every 5 s; allow one full tick plus cleanup.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while plugin.is_running() || fake.calls().len() < 8 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle auto-stop did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(!plugin.is_running());
+    assert!(
+        !path.exists(),
+        "an idle auto-stop must remove the runtime record"
+    );
+    assert_eq!(fake.calls()[7], disable_args(port));
+    cleanup(&store);
+}

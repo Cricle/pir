@@ -2535,7 +2535,29 @@ impl SessionHandle {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&response_id);
                 if let Some(sender) = sender {
-                    let _ = sender.send(Ok(payload.clone()));
+                    // A JSON-RPC response can be a protocol success with
+                    // `success:false` (unknown command, no attached session,
+                    // ...). Correlated callers must see that as a failure;
+                    // otherwise `refresh` would cache a null `data` object and
+                    // report a healthy parallel session.
+                    let result = if payload.get("success").and_then(Value::as_bool) == Some(false) {
+                        Err(payload
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "pi rpc command `{}` failed",
+                                    payload
+                                        .get("command")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("unknown")
+                                )
+                            }))
+                    } else {
+                        Ok(payload.clone())
+                    };
+                    let _ = sender.send(result);
                 }
             }
 

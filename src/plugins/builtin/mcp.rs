@@ -557,6 +557,17 @@ impl McpSessionState {
             .collect();
         let needs_codemode = exposures.contains(&McpExposure::Codemode);
         let needs_tool_search = exposures.contains(&McpExposure::Deferred);
+        // A `--exclude-tools` / `-name` exclusion outranks discovery
+        // activation: upstream resolves `_excludedTools` at registration, so
+        // the excluded tool is not registered at all and `has_*` is false.
+        let discovery_exclusions: Vec<String> = session
+            .default_tool_exclusions()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let discovery_excluded = |name: &str| {
+            crate::coding_agent::tool_selection::tool_excluded_by(&discovery_exclusions, name)
+        };
         // Upstream never activates another extension's same-named tool: the
         // registered tool must declare a reach (`reachesTools`).
         let declares_reach = |name: &str| {
@@ -564,8 +575,10 @@ impl McpSessionState {
                 .iter()
                 .any(|tool| tool.name == name && tool.reaches_tools.is_some())
         };
-        let has_codemode = declares_reach(crate::plugins::builtin::CODEMODE_TOOL_NAME);
-        let has_tool_search = declares_reach(crate::plugins::builtin::TOOL_SEARCH_TOOL_NAME);
+        let has_codemode = declares_reach(crate::plugins::builtin::CODEMODE_TOOL_NAME)
+            && !discovery_excluded(crate::plugins::builtin::CODEMODE_TOOL_NAME);
+        let has_tool_search = declares_reach(crate::plugins::builtin::TOOL_SEARCH_TOOL_NAME)
+            && !discovery_excluded(crate::plugins::builtin::TOOL_SEARCH_TOOL_NAME);
         let mut next = active.clone();
         let mut bridge_owned = self
             .bridge_owned
@@ -3288,6 +3301,28 @@ pub struct DiscoveryActivation {
     pub has_tool_search: bool,
     /// The `mcp.json` `autoEnableCodemode` flag (default true).
     pub auto_enable_codemode: bool,
+}
+
+impl DiscoveryActivation {
+    /// Whether at least one enabled server's configured exposure cannot be
+    /// reached through the `reachable` active set (the tools this decision
+    /// activates already applied). Each exposure is checked independently:
+    /// a codemode server needs an active reaching `codemode` tool, and a
+    /// deferred server needs an active reaching `tool_search` tool — the
+    /// presence of one says nothing about the other. This is the session's
+    /// one-shot "unreachable" warning gate.
+    pub fn has_unreachable_discovery(&self, reachable: &[String]) -> bool {
+        let codemode_reachable = self.has_codemode
+            && reachable
+                .iter()
+                .any(|name| name == crate::plugins::builtin::CODEMODE_TOOL_NAME);
+        let tool_search_reachable = self.has_tool_search
+            && reachable
+                .iter()
+                .any(|name| name == crate::plugins::builtin::TOOL_SEARCH_TOOL_NAME);
+        (self.needs_codemode && !codemode_reachable)
+            || (self.needs_tool_search && !tool_search_reachable)
+    }
 }
 
 impl McpPlugin {

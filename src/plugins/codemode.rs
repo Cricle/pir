@@ -1471,15 +1471,18 @@ globalThis.__pir_run = async function (code) {
         // / a bare `return`, which JSON cannot tell apart from `null`.
         var json;
         try { json = JSON.stringify(value); } catch (e) { json = undefined; }
-        return JSON.stringify({
-            ok: true,
-            value: __pir_fmt(value === undefined ? null : value),
-            json: json === undefined ? null : json,
-            undefined: json === undefined,
-        });
+        // `value` is OMITTED for `undefined` (exit() / a bare return): the
+        // host appends a top-level return value only when one exists, so an
+        // explicit `return null` must render "null" like upstream
+        // `outputText(null)` instead of being mistaken for `undefined`.
+        var reply = { ok: true };
+        if (value !== undefined) { reply.value = __pir_fmt(value); }
+        reply.json = json === undefined ? null : json;
+        reply.undefined = json === undefined;
+        return JSON.stringify(reply);
     } catch (error) {
         if (error === __pir_exitSentinel) {
-            return JSON.stringify({ ok: true, value: null });
+            return JSON.stringify({ ok: true });
         }
         // Upstream describeError(): Error instances carry their name and
         // message; a thrown non-Error becomes { message: format(value) } —

@@ -14,11 +14,15 @@
 //!   even a moment under the inherited directory ACL.
 //! - **Bounded lifetime.** An *advertised* file is kept for the follow-up read,
 //!   but not forever: every creation (i.e. at tool start, including the first
-//!   truncated command after a process start) sweeps files older than
-//!   [`SPILL_MAX_AGE`], trims the set down to [`SPILL_MAX_FILES`] and enforces
-//!   a [`SPILL_MAX_BYTES`] total-bytes cap, oldest first. A capture that never
-//!   advertises its file (the run aborted, or the file turned out incomplete)
-//!   deletes it through its own RAII guard instead of leaving garbage behind.
+//!   truncated command after a process start) sweeps this process's registered
+//!   files older than [`SPILL_MAX_AGE`], trims the set down to
+//!   [`SPILL_MAX_FILES`] and enforces a [`SPILL_MAX_BYTES`] total-bytes cap,
+//!   oldest first. The common sweep iterates only paths this process recorded
+//!   at creation; a full temp-directory scan for files left by crashed
+//!   processes runs on the first sweep and then at most every
+//!   [`ORPHAN_SWEEP_INTERVAL`]. A capture that never advertises its file (the
+//!   run aborted, or the file turned out incomplete) deletes it through its
+//!   own RAII guard instead of leaving garbage behind.
 //!
 //! The name shape (`pir-shell-{pid}-{seq}-{uuid-v4}`) is load-bearing: it is
 //! what the security regression test pins, what makes a pre-planted name
@@ -54,9 +58,15 @@ const SPILL_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// truncated instead of advertising an incomplete file).
 pub const SPILL_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Minimum spacing between sweeps: the sweep walks the whole temp directory,
-/// and spill creation sits on the output path, so it must not run per file.
+/// Minimum spacing between sweeps: the common sweep only walks this process's
+/// registered spill paths, and spill creation sits on the output path, so it
+/// must not run per file.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Spacing between fallback scans of the whole temp directory. The fallback
+/// exists to reclaim files left by crashed processes; it is deliberately rare
+/// because a temp directory can hold thousands of unrelated entries.
+const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Process-unique sequence for spill temp-file names: combined with a
 /// fixed-length random suffix it keeps concurrent runs from colliding and
@@ -65,6 +75,16 @@ static SPILL_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The throttle for [`sweep_spills`] (`None` until the first sweep).
 static LAST_SWEEP: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+/// Throttle for the full temp-directory orphan scan (separate from the common
+/// registry sweep).
+static LAST_ORPHAN_SWEEP: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+/// Absolute paths of spill files this process created. The common sweep walks
+/// this list instead of `read_dir(temp_dir())`; entries are pruned as their
+/// files disappear. A crashed process cannot leave an entry here, which is
+/// why the rare directory fallback still exists.
+static CREATED_SPILLS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 
 /// One restricted spill file with a cumulative per-file byte cap.
 ///
@@ -140,6 +160,7 @@ pub fn create_spill_file_with_limit(limit: u64) -> Option<SpillFile> {
         uuid::Uuid::new_v4().simple()
     ));
     let file = platform::create_restricted(&path)?;
+    register_created_spill(&path);
     Some(SpillFile {
         file,
         path,
@@ -148,13 +169,33 @@ pub fn create_spill_file_with_limit(limit: u64) -> Option<SpillFile> {
     })
 }
 
-/// Force one sweep now, bypassing [`SWEEP_INTERVAL`]. Production calls
-/// [`create_spill_file`] (which sweeps on its own throttle); this seam exists
-/// so the security regression tests can pin the age/count/bytes policy
-/// deterministically.
+fn created_spills() -> &'static Mutex<Vec<PathBuf>> {
+    CREATED_SPILLS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_created_spill(path: &Path) {
+    let mut paths = created_spills()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    paths.push(path.to_path_buf());
+}
+
+/// Force one explicit sweep now, bypassing [`SWEEP_INTERVAL`] and including
+/// the full orphan scan. Production calls [`create_spill_file`] (which sweeps
+/// on its own throttle); this seam exists so the security regression tests can
+/// pin the age/count/bytes policy deterministically.
 #[doc(hidden)]
 pub fn sweep_spills_now() {
     sweep_spills_inner(true);
+}
+
+/// Registry-only sweep now, bypassing [`SWEEP_INTERVAL`]. This is the common
+/// production pass without the rare temp-directory fallback, exposed so tests
+/// can prove the fast path still reaps this process's expired files without
+/// relying on a directory scan.
+#[doc(hidden)]
+pub fn sweep_spills_owned_now() {
+    sweep_owned_spills(SystemTime::now());
 }
 
 /// Sweep expired and excess spill files (throttled to [`SWEEP_INTERVAL`]).
@@ -246,24 +287,73 @@ fn process_is_alive(_pid: u32) -> bool {
     true
 }
 
-fn sweep_spills_inner(force: bool) {
-    let throttle = LAST_SWEEP.get_or_init(|| Mutex::new(None));
-    {
-        let Ok(mut last) = throttle.lock() else {
-            return;
-        };
-        if !force {
-            match *last {
-                Some(at) if at.elapsed() < SWEEP_INTERVAL => return,
-                _ => {}
-            }
-        }
-        *last = Some(Instant::now());
+fn spill_is_expired(now: SystemTime, modified: SystemTime) -> bool {
+    now.duration_since(modified)
+        .map(|age| age > SPILL_MAX_AGE)
+        .unwrap_or(false)
+}
+
+/// Trim the oldest entries until both the count and byte caps hold. Returns
+/// the paths to remove; the caller deletes them and unregisters them.
+fn excess_spills(mut own: Vec<(SystemTime, PathBuf, u64)>) -> Vec<PathBuf> {
+    // Oldest first: the excess (by count or by bytes) is the front of the
+    // list. Both caps are enforced because one huge spill must not survive
+    // just because it is one of few files.
+    own.sort_by_key(|(modified, _, _)| *modified);
+    let mut remove = own.len().saturating_sub(SPILL_MAX_FILES);
+    let mut total_bytes: u64 = own.iter().skip(remove).map(|(_, _, size)| *size).sum();
+    while total_bytes > SPILL_MAX_BYTES && remove < own.len() {
+        total_bytes = total_bytes.saturating_sub(own[remove].2);
+        remove += 1;
     }
+    own.into_iter()
+        .take(remove)
+        .map(|(_, path, _)| path)
+        .collect()
+}
+
+/// Common sweep: visit only spill files this process registered at creation.
+/// No directory listing and no process-liveness probe are needed because every
+/// path is owned by this process by construction.
+fn sweep_owned_spills(now: SystemTime) {
+    let mut paths = created_spills()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut own = Vec::with_capacity(paths.len());
+    paths.retain(|path| {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if spill_is_expired(now, modified) {
+            // A failure keeps the entry so a later sweep can retry it.
+            return match std::fs::remove_file(path) {
+                Ok(()) => false,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            };
+        }
+        own.push((modified, path.clone(), metadata.len()));
+        true
+    });
+    for path in excess_spills(own) {
+        let _ = std::fs::remove_file(&path);
+        if let Some(position) = paths.iter().position(|candidate| candidate == &path) {
+            paths.swap_remove(position);
+        }
+    }
+}
+
+/// Rare fallback: scan the whole temp directory to reclaim files left by a
+/// process that died before its registry could sweep them. Existing safety
+/// rules are unchanged: only this process's files or a provably dead pid's
+/// expired files are removed.
+fn sweep_orphan_spills(now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
     };
-    let now = SystemTime::now();
     let own_pid = std::process::id();
     // Only THIS process's files count toward the count/byte caps. A
     // concurrent pir session has its own budget; a global cap made one busy
@@ -289,11 +379,7 @@ fn sweep_spills_inner(force: bool) {
             continue;
         }
         let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        let expired = now
-            .duration_since(modified)
-            .map(|age| age > SPILL_MAX_AGE)
-            .unwrap_or(false);
-        if expired {
+        if spill_is_expired(now, modified) {
             // Age alone is not ownership: reclaim only our own files or a
             // provably dead process's, so a long-running foreign session keeps
             // the file it still advertises.
@@ -306,18 +392,45 @@ fn sweep_spills_inner(force: bool) {
             own.push((modified, entry.path(), metadata.len()));
         }
     }
-    // Oldest first: the excess (by count or by bytes) is the front of the
-    // list. Both caps are enforced because one huge spill must not survive
-    // just because it is one of few files.
-    own.sort_by_key(|(modified, _, _)| *modified);
-    let mut remove = own.len().saturating_sub(SPILL_MAX_FILES);
-    let mut total_bytes: u64 = own.iter().skip(remove).map(|(_, _, size)| *size).sum();
-    while total_bytes > SPILL_MAX_BYTES && remove < own.len() {
-        total_bytes = total_bytes.saturating_sub(own[remove].2);
-        remove += 1;
-    }
-    for (_, path, _) in own.into_iter().take(remove) {
+    for path in excess_spills(own) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+fn orphan_sweep_due() -> bool {
+    let throttle = LAST_ORPHAN_SWEEP.get_or_init(|| Mutex::new(None));
+    let Ok(mut last) = throttle.lock() else {
+        return false;
+    };
+    match *last {
+        Some(at) if at.elapsed() < ORPHAN_SWEEP_INTERVAL => false,
+        _ => {
+            *last = Some(Instant::now());
+            true
+        }
+    }
+}
+
+fn sweep_spills_inner(force: bool) {
+    let throttle = LAST_SWEEP.get_or_init(|| Mutex::new(None));
+    {
+        let Ok(mut last) = throttle.lock() else {
+            return;
+        };
+        if !force {
+            match *last {
+                Some(at) if at.elapsed() < SWEEP_INTERVAL => return,
+                _ => {}
+            }
+        }
+        *last = Some(Instant::now());
+    }
+    let now = SystemTime::now();
+    sweep_owned_spills(now);
+    // The first production sweep performs one orphan scan at process start;
+    // later scans are six hours apart (or explicitly forced by the test seam).
+    if force || orphan_sweep_due() {
+        sweep_orphan_spills(now);
     }
 }
 

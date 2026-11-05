@@ -470,14 +470,20 @@ fn run_closure_ref<'a>(
     }
 }
 
-/// Await one tool future with panic isolation: a panicking third-party or
+/// Run one tool closure with panic isolation: a panicking third-party or
 /// plugin tool becomes a regular error result for that call instead of
 /// unwinding the batch future (and, in parallel mode, every sibling's).
-async fn run_tool_isolated<F>(tool_name: &str, future: F) -> ToolResult
+///
+/// The CLOSURE is invoked inside the isolated future, not at the call site:
+/// `AgentTool::run` builds its future synchronously (and may itself panic while
+/// doing so, for example when a tool unwraps its arguments), so construction
+/// must be covered by `catch_unwind` just like polling.
+async fn run_tool_isolated<F>(tool_name: &str, run: F) -> ToolResult
 where
-    F: std::future::Future<Output = ToolResult>,
+    F: FnOnce() -> crate::agent::tool_execution::BoxFuture<'static, ToolResult>,
 {
-    match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+    let isolated = std::panic::AssertUnwindSafe(async move { run().await });
+    match isolated.catch_unwind().await {
         Ok(result) => result,
         Err(payload) => {
             let message = panic_payload_message(payload.as_ref());
@@ -887,11 +893,22 @@ fn run_call_body<'a>(
         let started_at = std::time::Instant::now();
         let result = {
             if call.mutation_paths.is_empty() {
-                let run = match update_args.as_ref() {
-                    Some(args) => run_closure(std::sync::Arc::clone(args), &context, tool)(),
-                    None => run_closure_ref(&call.validated_args, &context, tool)(),
-                };
-                run_tool_isolated(&tool_name, run).await
+                match update_args.as_ref() {
+                    Some(args) => {
+                        run_tool_isolated(
+                            &tool_name,
+                            run_closure(std::sync::Arc::clone(args), &context, tool),
+                        )
+                        .await
+                    }
+                    None => {
+                        run_tool_isolated(
+                            &tool_name,
+                            run_closure_ref(&call.validated_args, &context, tool),
+                        )
+                        .await
+                    }
+                }
             } else {
                 // The mutation lock spans the whole execution, so a nested
                 // mutation tool on a path this call chain already locks must
@@ -919,11 +936,22 @@ fn run_call_body<'a>(
                     .cloned()
                     .collect();
                 if pending.is_empty() {
-                    let run = match update_args.as_ref() {
-                        Some(args) => run_closure(std::sync::Arc::clone(args), &context, tool)(),
-                        None => run_closure_ref(&call.validated_args, &context, tool)(),
-                    };
-                    run_tool_isolated(&tool_name, run).await
+                    match update_args.as_ref() {
+                        Some(args) => {
+                            run_tool_isolated(
+                                &tool_name,
+                                run_closure(std::sync::Arc::clone(args), &context, tool),
+                            )
+                            .await
+                        }
+                        None => {
+                            run_tool_isolated(
+                                &tool_name,
+                                run_closure_ref(&call.validated_args, &context, tool),
+                            )
+                            .await
+                        }
+                    }
                 } else {
                     let mut key_strings: Vec<String> =
                         pending.iter().map(|key| key.as_str().to_owned()).collect();
@@ -951,15 +979,26 @@ fn run_call_body<'a>(
                                 .nested
                                 .take()
                                 .map(|executor| Arc::new(executor.with_held_mutation_keys(held)));
-                            let run = match update_args.as_ref() {
+                            match update_args.as_ref() {
                                 Some(args) => {
-                                    run_closure(std::sync::Arc::clone(args), &run_context, &tool)()
+                                    run_tool_isolated(
+                                        &call.tool_name,
+                                        run_closure(
+                                            std::sync::Arc::clone(args),
+                                            &run_context,
+                                            &tool,
+                                        ),
+                                    )
+                                    .await
                                 }
                                 None => {
-                                    run_closure_ref(&call.validated_args, &run_context, &tool)()
+                                    run_tool_isolated(
+                                        &call.tool_name,
+                                        run_closure_ref(&call.validated_args, &run_context, &tool),
+                                    )
+                                    .await
                                 }
-                            };
-                            run_tool_isolated(&call.tool_name, run).await
+                            }
                         })
                         .await
                 }

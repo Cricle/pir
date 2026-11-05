@@ -111,9 +111,11 @@ jobs:
               i=$((i + 1))
             done
             echo "test group ${shard}/8: ${#args[@]} selectors over ${i} files"
+            # Record a failure but keep going: stopping at the first red group
+            # hides every later group's result, turning one flake into a
+            # misleading "suite never ran" red build.
             if ! cargo nextest run --locked --profile ci "${args[@]}"; then
               status=1
-              break
             fi
             # Each group links ~10 GiB of test binaries. Drop only THIS group's
             # linked executables; keep the pir-sdk rlib and shared dependency

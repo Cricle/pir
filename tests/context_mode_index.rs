@@ -57,6 +57,8 @@ impl Drop for TestDir {
 
 struct Harness {
     cwd: PathBuf,
+    /// Direct handle for tests that seed legacy rows the tool APIs normalize.
+    db_path: PathBuf,
     tools: BTreeMap<String, Arc<dyn AgentTool>>,
     /// Keeps the temp directory alive until the tools (and their SQLite
     /// handle) have dropped.
@@ -69,6 +71,7 @@ impl Harness {
         let cwd = dir.path().join("cwd");
         std::fs::create_dir_all(&cwd).unwrap_or_else(|error| panic!("cwd: {error}"));
         let plugin = ContextModePlugin::with_db_path(dir.path().join("context-mode.db"));
+        let db_path = plugin.resolved_db_path();
         let mut registrations = PluginRegistrations::default();
         plugin
             .register(&mut RegistrationContext::new(&mut registrations))
@@ -84,6 +87,7 @@ impl Harness {
         Self {
             _dir: dir,
             cwd,
+            db_path,
             tools,
         }
     }
@@ -543,6 +547,157 @@ async fn purge_requires_confirm_and_reports_rows() {
     let after_all = stats(&harness).await;
     assert_eq!(after_all["chunks"], 0);
     assert_eq!(after_all["sources"], 0);
+}
+
+#[tokio::test]
+async fn purge_blank_or_non_string_source_cannot_widen_to_global() {
+    let harness = Harness::new("purge-scope-guard");
+    harness.index("# Keep\n\nkeepbody", "keep", None).await;
+    harness.index("# Drop\n\ndropbody", "drop", None).await;
+
+    // A present-but-unusable source must be rejected, never treated as
+    // "omitted" (which would wipe the whole knowledge base).
+    for source in [
+        json!(""),
+        json!("   "),
+        json!(null),
+        json!(123),
+        json!(["drop"]),
+    ] {
+        let result = harness
+            .run(
+                CTX_PURGE_TOOL_NAME,
+                json!({ "confirm": true, "source": source }),
+            )
+            .await;
+        assert!(
+            result.is_error,
+            "source {source} must be rejected, got {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("non-empty string"),
+            "got: {}",
+            result.content
+        );
+        assert_eq!(
+            stats(&harness).await["chunks"],
+            2,
+            "a rejected purge must not delete anything"
+        );
+    }
+
+    // Omitting `source` keeps the documented global-scope behavior.
+    let all = harness
+        .run(CTX_PURGE_TOOL_NAME, json!({ "confirm": true }))
+        .await;
+    assert!(!all.is_error, "{}", all.content);
+    assert_eq!(parse_json(&all)["purged"], 2);
+    assert_eq!(stats(&harness).await["chunks"], 0);
+}
+
+#[tokio::test]
+async fn indexed_source_is_trimmed_so_scoped_search_and_purge_can_address_it() {
+    let harness = Harness::new("source-trim");
+    harness
+        .index("# Doc\n\nneedle body", "  docs  ", Some(" Markdown "))
+        .await;
+
+    let snapshot = stats(&harness).await;
+    assert_eq!(snapshot["sourceList"][0]["source"], "docs", "{snapshot}");
+    assert_eq!(
+        snapshot["sourceList"][0]["contentType"], "markdown",
+        "{snapshot}"
+    );
+
+    let search = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "query": "needle", "source": "docs" }),
+        )
+        .await;
+    assert!(!search.is_error, "{}", search.content);
+    assert_eq!(results_of(&parse_json(&search), 0).len(), 1);
+
+    let purged = harness
+        .run(
+            CTX_PURGE_TOOL_NAME,
+            json!({ "confirm": true, "source": " docs " }),
+        )
+        .await;
+    assert!(!purged.is_error, "{}", purged.content);
+    assert_eq!(parse_json(&purged)["purged"], 1);
+    assert_eq!(stats(&harness).await["chunks"], 0);
+}
+
+#[tokio::test]
+async fn search_content_type_filter_is_case_insensitive() {
+    let harness = Harness::new("ct-case");
+    harness
+        .index("# Doc\n\nneedle body", "docs", Some("Markdown"))
+        .await;
+
+    for filter in ["markdown", "Markdown", "MARKDOWN", " markdown "] {
+        let search = harness
+            .run(
+                CTX_SEARCH_TOOL_NAME,
+                json!({ "query": "needle", "contentType": filter }),
+            )
+            .await;
+        assert!(!search.is_error, "{filter}: {}", search.content);
+        assert_eq!(
+            results_of(&parse_json(&search), 0).len(),
+            1,
+            "contentType filter {filter:?} must match the stored lowercase type"
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_content_type_filter_matches_legacy_mixed_case_rows() {
+    let harness = Harness::new("ct-legacy");
+    // Open the DB/schema through the tool path, then seed a pre-migration row
+    // whose stored `content_type` was never lowercased.
+    harness
+        .index("# Fresh\n\nneedle fresh", "fresh", Some("text"))
+        .await;
+    {
+        let connection =
+            rusqlite::Connection::open(&harness.db_path).expect("raw context-mode connection");
+        connection
+            .execute(
+                "INSERT INTO chunks \
+                 (source, content_type, title, content, line_start, line_end, indexed_at) \
+                 VALUES ('legacy', 'Markdown', 'Legacy', 'needle legacy', 1, 1, 0)",
+                [],
+            )
+            .expect("insert legacy row");
+        let id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO chunks_fts (rowid, title, content) \
+                 VALUES (?1, 'Legacy', 'needle legacy')",
+                [id],
+            )
+            .expect("insert legacy fts row");
+    }
+
+    let search = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "query": "needle", "contentType": "markdown" }),
+        )
+        .await;
+    assert!(!search.is_error, "{}", search.content);
+    let value = parse_json(&search);
+    let results = results_of(&value, 0);
+    assert_eq!(
+        results.len(),
+        1,
+        "legacy mixed-case row must match: {value}"
+    );
+    assert_eq!(results[0]["source"], "legacy");
+    assert_eq!(results[0]["contentType"], "Markdown");
 }
 
 #[tokio::test]

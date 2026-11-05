@@ -1555,3 +1555,109 @@ async fn read_counts_real_lines_and_offers_the_continuation_offset() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The registry-only channel sweep reaps a channel file this process created
+/// once it is no longer live, without scanning the temp directory, and never
+/// touches another live pid's channel file (registry or forced full sweep).
+#[test]
+fn channel_registry_sweep_reaps_owned_expired_files_and_spares_live_pids() {
+    use pir::coding_agent::tools::shell_pool::{
+        create_channel_probe_for_tests, register_output_file_for_tests, sweep_output_files_now,
+        sweep_owned_output_files_now,
+    };
+
+    let _temp_root = isolate_process_temp("channel-registry-sweep");
+    let temp = std::env::temp_dir();
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let pid = std::process::id();
+    let age = |path: &Path| {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open channel to age");
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60)),
+        )
+        .expect("age the channel");
+    };
+
+    let own_dir = temp.join(format!("pir-pool-{pid}-{tag}-own"));
+    assert!(
+        create_channel_probe_for_tests(&own_dir),
+        "create private own channel dir"
+    );
+    let owned = own_dir.join(format!("pir-pool-out-{pid}-0-{tag}"));
+    std::fs::write(&owned, b"owned channel").expect("create owned channel");
+    age(&owned);
+    assert!(
+        register_output_file_for_tests(owned.clone()),
+        "register the owned channel"
+    );
+    // Same-pid but never registered: the fast path must not discover it.
+    let unregistered = own_dir.join(format!("pir-pool-out-{pid}-1-{tag}"));
+    std::fs::write(&unregistered, b"unregistered channel").expect("create unregistered channel");
+    age(&unregistered);
+
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn live helper");
+    #[cfg(unix)]
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn live helper");
+    let foreign_pid = child.id();
+
+    let foreign_dir = temp.join(format!("pir-pool-{foreign_pid}-{tag}-foreign"));
+    assert!(
+        create_channel_probe_for_tests(&foreign_dir),
+        "create private foreign channel dir"
+    );
+    let foreign = foreign_dir.join(format!("pir-pool-out-{foreign_pid}-0-{tag}"));
+    std::fs::write(&foreign, b"live foreign channel").expect("create foreign channel");
+    age(&foreign);
+    let foreign_flat = temp.join(format!("pir-pool-out-{foreign_pid}-0-{tag}-flat"));
+    std::fs::write(&foreign_flat, b"live legacy channel").expect("create legacy channel");
+    age(&foreign_flat);
+
+    sweep_owned_output_files_now();
+    assert!(
+        !owned.exists(),
+        "the registry sweep must reap this process's dead expired channel"
+    );
+    assert!(
+        unregistered.exists(),
+        "the registry sweep must not scan/delete unregistered temp entries"
+    );
+    assert!(
+        foreign.exists(),
+        "the registry sweep must never delete another live pid's channel"
+    );
+
+    sweep_output_files_now();
+    assert!(
+        foreign.exists() && foreign_dir.exists(),
+        "the full sweep must leave another live pid's channel directory alone"
+    );
+    assert!(
+        foreign_flat.exists(),
+        "the full sweep must leave another live pid's legacy flat channel alone"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&unregistered);
+    let _ = std::fs::remove_file(&foreign);
+    let _ = std::fs::remove_file(&foreign_flat);
+    let _ = std::fs::remove_dir(&own_dir);
+    let _ = std::fs::remove_dir(&foreign_dir);
+}

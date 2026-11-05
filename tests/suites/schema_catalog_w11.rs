@@ -733,6 +733,7 @@ fn settings_schema_nested_objects_match_their_structs() {
         ("ProviderRetrySettings", "provider"),
         ("CompactionSettings", "compaction"),
         ("BranchSummarySettings", "branchSummary"),
+        ("SessionRetentionSettings", "sessionRetention"),
         ("ThinkingBudgetsSettings", "thinkingBudgets"),
     ];
 

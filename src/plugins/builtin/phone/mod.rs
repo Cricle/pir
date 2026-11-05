@@ -281,8 +281,14 @@ impl PhonePlugin {
     }
 
     fn with_tailscale(tailscale: Tailscale) -> Self {
+        let mut info = PluginInfo::builtin("phone");
+        // Mirror the builtin table's `replaceable` flag: a user extension
+        // registering a phone command must omit this builtin (upstream
+        // `omitReplacedExtensions`) instead of producing `phone-start:2`.
+        info.replaceable = crate::plugins::builtin::builtin_extension_def("phone")
+            .is_some_and(|def| def.replaceable);
         Self {
-            info: PluginInfo::builtin("phone"),
+            info,
             state: Arc::new(PhoneState::from_env_with_tailscale(tailscale)),
             shared: Arc::new(PhoneShared::default()),
         }

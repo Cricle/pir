@@ -37,6 +37,7 @@ pub const DEFAULT_READ_BYTES: u64 = 256 * 1024;
 pub const DEFAULT_CLEAN_AGE_DAYS: u64 = 7;
 
 static JOB_SEQ: AtomicU64 = AtomicU64::new(0);
+static META_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -50,6 +51,31 @@ fn now_secs() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+/// Validate a caller-supplied job id before it is joined to the store root.
+/// Only one plain path component of `[A-Za-z0-9._-]` is accepted, which also
+/// rejects separators, absolute paths, drive/UNC prefixes, `.` and `..`.
+fn validate_job_id(id: &str) -> Result<(), String> {
+    let invalid = || format!("invalid job id: {id:?}");
+    if id.is_empty() || id == "." || id == ".." {
+        return Err(invalid());
+    }
+    if !id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(invalid());
+    }
+    let mut components = Path::new(id).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(component)), None)
+            if component == std::ffi::OsStr::new(id) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid()),
+    }
 }
 
 /// Lifecycle state of one job.
@@ -108,8 +134,18 @@ pub struct JobMeta {
     pub status: JobStatus,
     /// Supervisor process id (the process that waits and records the exit).
     pub supervisor_pid: Option<u32>,
+    /// Platform process start token for `supervisor_pid` (see the private
+    /// `process_start_token` helper). Guards against a recycled pid being
+    /// mistaken for the original supervisor. `None` on legacy records, which
+    /// fall back to a pid-existence probe.
+    #[serde(default)]
+    pub supervisor_start_token: Option<u64>,
     /// Child process id (the actual command shell).
     pub pid: Option<u32>,
+    /// Platform process start token for `pid`; same semantics as
+    /// `supervisor_start_token`.
+    #[serde(default)]
+    pub child_start_token: Option<u64>,
     pub created_at_ms: u64,
     pub started_at_ms: Option<u64>,
     pub ended_at_ms: Option<u64>,
@@ -185,8 +221,18 @@ impl JobStore {
         &self.root
     }
 
-    fn job_dir(&self, id: &str) -> PathBuf {
-        self.root.join(id)
+    fn job_dir(&self, id: &str) -> Result<PathBuf, String> {
+        validate_job_id(id)?;
+        let candidate = self.root.join(id);
+        // Lexical validation already guarantees one normal component; when the
+        // candidate exists, also resolve it so a symlink planted inside the
+        // store cannot redirect a caller outside the root.
+        if let (Ok(root), Ok(resolved)) = (self.root.canonicalize(), candidate.canonicalize()) {
+            if !resolved.starts_with(&root) {
+                return Err(format!("job id escapes the store root: {id:?}"));
+            }
+        }
+        Ok(candidate)
     }
 
     /// Start a detached job. Returns after the supervisor process was
@@ -201,7 +247,7 @@ impl JobStore {
             std::process::id(),
             JOB_SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        let dir = self.job_dir(&id);
+        let dir = self.job_dir(&id)?;
         std::fs::create_dir_all(&dir).map_err(|error| format!("create job dir: {error}"))?;
         let meta = JobMeta {
             version: 1,
@@ -209,7 +255,9 @@ impl JobStore {
             spec: spec.clone(),
             status: JobStatus::Starting,
             supervisor_pid: None,
+            supervisor_start_token: None,
             pid: None,
+            child_start_token: None,
             created_at_ms: now_ms(),
             started_at_ms: None,
             ended_at_ms: None,
@@ -249,15 +297,20 @@ impl JobStore {
             // the supervisor must outlive the TUI and must not flash a console.
             command.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // Put the supervisor in its own process group so terminal signals
+            // (Ctrl-C/SIGHUP) do not reach it and `kill` can target the whole
+            // job tree with one negative-pid signal.
+            command.process_group(0);
+        }
         let child = command
             .spawn()
             .map_err(|error| format!("spawn job supervisor: {error}"))?;
-        let mut meta = meta;
-        meta.status = JobStatus::Running;
-        meta.supervisor_pid = Some(child.id());
-        meta.started_at_ms = Some(now_ms());
-        write_meta(&dir, &meta)?;
-        Ok(meta)
+        // The re-read in `record_supervisor_start` keeps a fast supervisor's
+        // child-pid/terminal record instead of overwriting it with `Starting`.
+        record_supervisor_start(&dir, child.id(), process_start_token(child.id()))
     }
 
     /// All jobs, newest first.
@@ -282,13 +335,14 @@ impl JobStore {
     /// Read one job's persisted record. Reconciles a crashed supervisor: a
     /// stale `running` record with no live supervisor/child becomes `lost`.
     pub fn status(&self, id: &str) -> Option<JobMeta> {
-        let dir = self.job_dir(id);
+        let dir = self.job_dir(id).ok()?;
         let mut meta = read_meta(&dir)?;
         if meta.status.is_terminal() {
             return Some(meta);
         }
-        let supervisor_alive = meta.supervisor_pid.is_some_and(process_is_alive);
-        let child_alive = meta.pid.is_some_and(process_is_alive);
+        let supervisor_alive =
+            recorded_process_is_alive(meta.supervisor_pid, meta.supervisor_start_token);
+        let child_alive = recorded_process_is_alive(meta.pid, meta.child_start_token);
         if supervisor_alive || child_alive {
             if meta.status == JobStatus::Starting {
                 meta.status = JobStatus::Running;
@@ -300,6 +354,13 @@ impl JobStore {
         if now_ms().saturating_sub(meta.started_at_ms.unwrap_or(meta.created_at_ms)) < 2_000 {
             return Some(meta);
         }
+        // Re-read before publishing `Lost`: the supervisor may have written
+        // the terminal record between our first read and this point.
+        if let Some(latest) = read_meta(&dir) {
+            if latest.status.is_terminal() {
+                return Some(latest);
+            }
+        }
         meta.status = JobStatus::Lost;
         meta.ended_at_ms = Some(now_ms());
         meta.error = Some("supervisor and child are gone without a terminal record".to_owned());
@@ -310,7 +371,7 @@ impl JobStore {
     /// Read the tail of a job's log. `max_bytes` is clamped to the file size;
     /// `max_lines` is clamped to [`MAX_LOG_LINES`].
     pub fn read_log(&self, id: &str, max_bytes: u64, max_lines: usize) -> Option<JobLog> {
-        let dir = self.job_dir(id);
+        let dir = self.job_dir(id).ok()?;
         let path = dir.join("output.log");
         let metadata = std::fs::metadata(&path).ok()?;
         let len = metadata.len();
@@ -351,13 +412,20 @@ impl JobStore {
     /// Kill the supervisor and its child tree (explicit abort path). A job
     /// that already exited is a no-op.
     pub fn kill(&self, id: &str) -> Result<bool, String> {
-        let dir = self.job_dir(id);
+        let dir = self.job_dir(id)?;
         let mut meta = read_meta(&dir).ok_or_else(|| format!("job not found: {id}"))?;
         if meta.status.is_terminal() {
             return Ok(false);
         }
-        let pid = meta.supervisor_pid.or(meta.pid);
-        let Some(pid) = pid else {
+        // Never signal a recycled pid: only accept a recorded pid whose start
+        // token still matches (legacy token-less records keep the old probe).
+        let supervisor_pid = meta
+            .supervisor_pid
+            .filter(|pid| recorded_process_is_alive(Some(*pid), meta.supervisor_start_token));
+        let child_pid = meta
+            .pid
+            .filter(|pid| recorded_process_is_alive(Some(*pid), meta.child_start_token));
+        let Some(pid) = supervisor_pid.or(child_pid) else {
             return Ok(false);
         };
         #[cfg(windows)]
@@ -372,12 +440,21 @@ impl JobStore {
         }
         #[cfg(unix)]
         {
+            // The supervisor is a process-group leader (see `spawn`), so a
+            // negative pid reaches it and every child in the job tree.
+            let group = format!("-{pid}");
             let _ = std::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
+                .args(["-TERM", "--", &group])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
+        }
+        // Do not overwrite a terminal record written while we were signalling.
+        if let Some(latest) = read_meta(&dir) {
+            if latest.status.is_terminal() {
+                return Ok(true);
+            }
         }
         meta.status = JobStatus::Killed;
         meta.ended_at_ms = Some(now_ms());
@@ -389,7 +466,7 @@ impl JobStore {
     /// Collect a terminal job's output and mark it reaped. Running jobs are
     /// refused (use [`Self::wait`] first).
     pub fn reap(&self, id: &str, max_bytes: u64, max_lines: usize) -> Result<JobReap, String> {
-        let dir = self.job_dir(id);
+        let dir = self.job_dir(id)?;
         let mut meta = read_meta(&dir).ok_or_else(|| format!("job not found: {id}"))?;
         if !meta.status.is_terminal() {
             return Err(format!(
@@ -404,11 +481,30 @@ impl JobStore {
     }
 
     /// Remove terminal job directories older than `older_than` (or every
-    /// terminal job when `all`). Running jobs are never touched.
+    /// terminal job when `all`). Running jobs are never touched. Directory
+    /// names are the only trusted ids here: `meta.id` is never joined to a
+    /// path, so a forged record cannot point `clean` outside the store root.
     pub fn clean(&self, older_than: Duration, all: bool) -> CleanReport {
         let mut report = CleanReport::default();
         let now = now_ms();
-        for meta in self.list() {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return report;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            // A symlink is not a job directory, even if it points at one.
+            if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                continue;
+            }
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if validate_job_id(&id).is_err() {
+                continue;
+            }
+            let Some(meta) = read_meta(&dir) else {
+                continue;
+            };
             if !meta.status.is_terminal() {
                 continue;
             }
@@ -417,9 +513,8 @@ impl JobStore {
             if !all && age_ms < older_than.as_millis() as u64 {
                 continue;
             }
-            let dir = self.job_dir(&meta.id);
             match std::fs::remove_dir_all(&dir) {
-                Ok(()) => report.removed.push(meta.id),
+                Ok(()) => report.removed.push(id),
                 Err(error) => report
                     .errors
                     .push(format!("failed to remove {}: {error}", dir.display())),
@@ -432,18 +527,109 @@ impl JobStore {
 fn write_meta(dir: &Path, meta: &JobMeta) -> Result<(), String> {
     let json = serde_json::to_vec_pretty(meta).map_err(|error| error.to_string())?;
     let target = dir.join("meta.json");
-    let tmp = dir.join("meta.json.tmp");
-    std::fs::write(&tmp, &json).map_err(|error| format!("write job meta: {error}"))?;
-    // Windows rename-over-existing is not guaranteed by std; remove first.
-    if target.exists() {
-        let _ = std::fs::remove_file(&target);
+    // A unique temp name per writer: two supervisors/rewriters must never
+    // share one temp file, or their bytes would interleave before publish.
+    let tmp = dir.join(format!(
+        "meta.json.tmp-{}-{}-{}",
+        std::process::id(),
+        META_TMP_SEQ.fetch_add(1, Ordering::Relaxed),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let publish = (|| -> Result<(), String> {
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|error| format!("create job meta temp: {error}"))?;
+        file.write_all(&json)
+            .map_err(|error| format!("write job meta: {error}"))?;
+        file.flush()
+            .map_err(|error| format!("flush job meta: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("sync job meta: {error}"))?;
+        // The handle must be closed before the rename: Windows cannot rename
+        // a file whose handle is still open without delete sharing.
+        drop(file);
+        // `std::fs::rename` replaces an existing destination atomically on
+        // Unix and on Windows (the standard library maps it to
+        // `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`). Removing the target
+        // first would open a window where readers see no `meta.json`.
+        std::fs::rename(&tmp, &target).map_err(|error| format!("publish job meta: {error}"))?;
+        Ok(())
+    })();
+    if publish.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, &target).map_err(|error| format!("publish job meta: {error}"))
+    publish?;
+    sync_dir(dir);
+    Ok(())
+}
+
+/// Publish the freshly spawned supervisor into a record that is still
+/// `Starting`. The supervisor may already have advanced the record (child pid,
+/// or even a terminal state) before the parent regains the CPU; in that case
+/// leave the newer record untouched instead of overwriting it with the
+/// parent's stale snapshot.
+fn record_supervisor_start(
+    dir: &Path,
+    supervisor_pid: u32,
+    supervisor_start_token: Option<u64>,
+) -> Result<JobMeta, String> {
+    let mut meta = read_meta(dir)
+        .ok_or_else(|| "job meta disappeared after spawning the supervisor".to_owned())?;
+    if meta.status != JobStatus::Starting {
+        return Ok(meta);
+    }
+    meta.status = JobStatus::Running;
+    meta.supervisor_pid = Some(supervisor_pid);
+    meta.supervisor_start_token = supervisor_start_token;
+    meta.started_at_ms = Some(now_ms());
+    write_meta(dir, &meta)?;
+    Ok(meta)
+}
+
+/// Fsync the job directory on Unix so the rename is durable; a no-op where
+/// directory fsync is not supported.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 fn read_meta(dir: &Path) -> Option<JobMeta> {
     let bytes = std::fs::read(dir.join("meta.json")).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Test-only visibility hook: rewrites a job's `meta.json` through the exact
+/// atomic publish path used by the supervisor.
+#[doc(hidden)]
+pub fn __test_write_meta(dir: &Path, meta: &JobMeta) -> Result<(), String> {
+    write_meta(dir, meta)
+}
+
+/// Test-only visibility hook: reads a job's `meta.json` directly.
+#[doc(hidden)]
+pub fn __test_read_meta(dir: &Path) -> Option<JobMeta> {
+    read_meta(dir)
+}
+
+/// Test-only visibility hook: the platform process start token for `pid`.
+#[doc(hidden)]
+pub fn __test_process_start_token(pid: u32) -> Option<u64> {
+    process_start_token(pid)
+}
+
+/// Test-only visibility hook: the conditional post-spawn supervisor update.
+#[doc(hidden)]
+pub fn __test_record_supervisor_start(
+    dir: &Path,
+    supervisor_pid: u32,
+    supervisor_start_token: Option<u64>,
+) -> Result<JobMeta, String> {
+    record_supervisor_start(dir, supervisor_pid, supervisor_start_token)
 }
 
 #[cfg(unix)]
@@ -486,6 +672,81 @@ fn process_is_alive(pid: u32) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn process_is_alive(_pid: u32) -> bool {
     true
+}
+
+/// A recorded pid is only this job's process when its start token still
+/// matches. A legacy record without a token keeps the old pid-only probe.
+#[cfg(any(unix, windows))]
+fn recorded_process_is_alive(pid: Option<u32>, token: Option<u64>) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    match token {
+        // Identity alone is not liveness: a terminated process can still have
+        // an openable process object (notably on Windows, where `OpenProcess`
+        // succeeds until the last handle closes), so require both.
+        Some(expected) => process_is_alive(pid) && process_start_token(pid) == Some(expected),
+        None => process_is_alive(pid),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn recorded_process_is_alive(pid: Option<u32>, _token: Option<u64>) -> bool {
+    pid.is_some_and(process_is_alive)
+}
+
+/// Platform-specific process start token used to detect pid reuse.
+///
+/// Unix: field 22 (`starttime`) of `/proc/<pid>/stat`, in clock ticks since
+/// boot. Windows: the process creation time from `GetProcessTimes`, as a
+/// 100 ns FILETIME value. Other platforms have no portable equivalent and
+/// return `None` (legacy pid-only behavior).
+#[cfg(unix)]
+fn process_start_token(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field (2) may contain spaces and parentheses, so split after
+    // its last ')'. The remainder starts at field 3 (state); `starttime` is
+    // field 22, i.e. index 19 in that remainder.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(windows)]
+fn process_start_token(pid: u32) -> Option<u64> {
+    #![allow(unsafe_code)]
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: plain pid; the returned handle is checked and closed below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle == 0 {
+        return None;
+    }
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    // SAFETY: `handle` was opened above and the four FILETIME locals are live
+    // out-parameters.
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    // SAFETY: closing the handle opened above.
+    unsafe {
+        CloseHandle(handle);
+    }
+    if ok == 0 {
+        return None;
+    }
+    Some((creation.dwHighDateTime as u64) << 32 | creation.dwLowDateTime as u64)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_start_token(_pid: u32) -> Option<u64> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -536,7 +797,9 @@ pub fn run_supervisor(args: &[String]) -> i32 {
         return 2;
     };
     meta.status = JobStatus::Running;
-    meta.supervisor_pid = Some(std::process::id());
+    let supervisor_pid = std::process::id();
+    meta.supervisor_pid = Some(supervisor_pid);
+    meta.supervisor_start_token = process_start_token(supervisor_pid);
     meta.started_at_ms = Some(now_ms());
     let _ = write_meta(&dir, &meta);
 
@@ -574,6 +837,7 @@ pub fn run_supervisor(args: &[String]) -> i32 {
         }
     };
     meta.pid = Some(child.id());
+    meta.child_start_token = process_start_token(child.id());
     let _ = write_meta(&dir, &meta);
 
     let mut readers = Vec::new();

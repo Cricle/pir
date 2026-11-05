@@ -33,10 +33,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use uuid::Uuid;
 
+use crate::protocol::framing::FrameBuilder;
 use crate::protocol::schemas::ProtocolError;
 use crate::protocol::{
-    encode_cbor, encode_frame, encode_server_envelope, CborOptions, ClientMessageDecoder,
-    FrameOptions, ProtocolError as CodecProtocolError, RpcTarget, ServerEnvelope, ServerHelloError,
+    encode_cbor, encode_server_envelope, CborOptions, ClientMessageDecoder, FrameOptions,
+    ProtocolError as CodecProtocolError, RpcTarget, ServerEnvelope, ServerHelloError,
     SESSION_SERVICE_ID,
 };
 
@@ -339,23 +340,28 @@ fn encode_service_update_frame(
     update_cbor: &[u8],
     options: FrameOptions,
 ) -> Result<Vec<u8>, CodecProtocolError> {
-    let mut payload = Vec::with_capacity(update_cbor.len() + subscription_id.len() + 64);
-    write_cbor_head(&mut payload, 5, 3);
-    write_cbor_text(&mut payload, "type");
-    write_cbor_text(&mut payload, SERVICE_UPDATE_TYPE);
-    write_cbor_text(&mut payload, "subscriptionId");
-    write_cbor_text(&mut payload, subscription_id);
-    write_cbor_text(&mut payload, "update");
-    payload.extend_from_slice(update_cbor);
-    if payload.len() > options.max_frame_length {
+    // The frame is queued as an owned `Vec`, but it does not need a second
+    // allocation: build the CBOR payload directly after the reserved header.
+    let mut frame = FrameBuilder::with_capacity(update_cbor.len() + subscription_id.len() + 64);
+    {
+        let payload = frame.payload_mut();
+        write_cbor_head(payload, 5, 3);
+        write_cbor_text(payload, "type");
+        write_cbor_text(payload, SERVICE_UPDATE_TYPE);
+        write_cbor_text(payload, "subscriptionId");
+        write_cbor_text(payload, subscription_id);
+        write_cbor_text(payload, "update");
+        payload.extend_from_slice(update_cbor);
+    }
+    if frame.payload_len() > options.max_frame_length {
         return Err(CodecProtocolError::Framing(
             crate::protocol::FrameError::Limit {
-                length: payload.len(),
+                length: frame.payload_len(),
                 limit: options.max_frame_length,
             },
         ));
     }
-    Ok(encode_frame(&payload)?)
+    Ok(frame.finish()?)
 }
 
 /// Definite-length CBOR item head (`major` + argument in the minimal width),

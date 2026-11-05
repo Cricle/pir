@@ -802,7 +802,7 @@ impl AgentTool for EditTool {
                     ))
                 }
             };
-            checkpoint_before_mutation(&checkpoint_ctx, "edit", &mutation_paths);
+            checkpoint_before_mutation(&checkpoint_ctx, "edit", &mutation_paths).await;
             // Read as bytes so an invalid-UTF-8 (binary) file is reported
             // cleanly instead of surfacing a lossy conversion error. The
             // source-size cap bounds the whole-file buffer this path needs.

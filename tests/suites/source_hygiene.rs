@@ -195,11 +195,12 @@ const EXPECT_SITE_ALLOWLIST: [(&str, u32); 27] = [
     ("durable/harness/generation.rs", 317),
     // The task definition build, the `pi.user` draft and the
     // `pi.assistant` draft: same invariants as before, shifted by the
-    // handoff/continuation and streamed-projection edits above them
-    // (598 → 611, 2525 → 2736, 2752 → 2965).
+    // handoff/continuation and streamed-projection edits above them, then by
+    // the incremental-partial clone fix (2525 → 2736 → 2740,
+    // 2752 → 2965 → 2969).
     ("durable/harness/generation.rs", 611),
-    ("durable/harness/generation.rs", 2736),
-    ("durable/harness/generation.rs", 2965),
+    ("durable/harness/generation.rs", 2740),
+    ("durable/harness/generation.rs", 2969),
     ("durable/harness/inbox.rs", 289),
     ("durable/harness/live.rs", 320),
     ("durable/harness/prompt.rs", 197),
@@ -229,14 +230,26 @@ fn src_tree_expect_sites_match_the_allowlist() {
     for path in &files {
         let relative = path.strip_prefix(&root).unwrap();
         let relative_text = relative.to_string_lossy().replace('\\', "/");
-        // Inline test modules are tracked migration debt above; their
-        // `.expect(` sites are test assertions, not production contracts.
-        if PREEXISTING_INLINE_TEST_ALLOWLIST.contains(&relative_text.as_str()) {
-            continue;
-        }
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|error| panic!("cannot read src file {}: {error}", path.display()));
+        // Inline test modules are tracked migration debt above; their
+        // `.expect(` sites are test assertions, not production contracts.
+        // Scope the exemption to the module itself: a new `.expect(` in the
+        // production half of an allowlisted file must still fail the gate.
+        // All current inline modules are the last item in their file, so the
+        // first `#[cfg(test)]` line marks the start of the exempt region.
+        let inline_test_start =
+            if PREEXISTING_INLINE_TEST_ALLOWLIST.contains(&relative_text.as_str()) {
+                text.lines()
+                    .position(|line| line.trim_start().starts_with("#[cfg(test)]"))
+                    .map(|index| index + 1)
+            } else {
+                None
+            };
         for (index, line) in text.lines().enumerate() {
+            if inline_test_start.is_some_and(|start| index + 1 >= start) {
+                continue;
+            }
             // Documentation examples are prose, not executable production
             // code; skip line comments and doc comments.
             if line.trim_start().starts_with("//") {

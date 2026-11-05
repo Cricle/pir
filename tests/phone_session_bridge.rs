@@ -652,6 +652,30 @@ async fn pool_stop_during_restart_backoff_cancels_the_restart() {
     assert!(pool.list().is_empty());
 }
 
+#[tokio::test]
+async fn pool_propagates_a_failed_rpc_response() {
+    let (pool, _events) = SessionPool::new(mock_pool_config());
+    let session_id = pool.spawn(None).expect("spawn");
+
+    // A child can answer a correlated request with `success:false` (unknown
+    // command, no attached session, ...). `request` must return that as a
+    // `ChildError`, not as a successful response object.
+    let error = pool
+        .request(
+            &session_id,
+            json!({ "type": "fail_me" }),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect_err("a failed rpc response must not look successful");
+    assert!(
+        matches!(&error, PoolError::ChildError(message) if message == "mock failure"),
+        "{error:?}"
+    );
+
+    pool.stop(&session_id).await.expect("stop");
+}
+
 /// When re-entered by the pool with `PIR_PHONE_TEST_CHILD=1`, act as a
 /// `pir --mode rpc` child. In the parent test process the variable is unset
 /// and this is a no-op test.
@@ -697,6 +721,19 @@ fn mock_rpc_child_entry() {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
+
+        if command == "fail_me" {
+            let response = json!({
+                "type": "response",
+                "id": request_id,
+                "command": command,
+                "success": false,
+                "error": "mock failure",
+            });
+            let _ = writeln!(stdout, "{response}");
+            let _ = stdout.flush();
+            continue;
+        }
 
         let data = match command.as_str() {
             "get_state" => json!({

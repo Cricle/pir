@@ -61,6 +61,53 @@ pub fn encode_frame(payload: &[u8]) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
+/// Single-allocation frame builder for callers that already produce their
+/// payload in a `Vec` and need to hand the resulting frame to a queue.
+///
+/// [`encode_frame`] allocates the frame and copies the payload into it. This
+/// builder reserves the four header bytes up front, so writing the payload
+/// through [`payload_mut`](Self::payload_mut) and calling
+/// [`finish`](Self::finish) yields the identical wire bytes without a second
+/// allocation or a payload copy.
+pub struct FrameBuilder {
+    bytes: Vec<u8>,
+}
+
+impl FrameBuilder {
+    /// A builder whose payload can grow to `payload_capacity` bytes without
+    /// reallocating (the four header bytes are already reserved).
+    pub fn with_capacity(payload_capacity: usize) -> Self {
+        let mut bytes = Vec::with_capacity(FRAME_HEADER_LENGTH + payload_capacity);
+        bytes.extend_from_slice(&[0; FRAME_HEADER_LENGTH]);
+        Self { bytes }
+    }
+
+    /// The payload buffer following the reserved header. Callers must only
+    /// append payload bytes; the header is filled in by
+    /// [`finish`](Self::finish).
+    pub fn payload_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.bytes
+    }
+
+    /// Length of the payload written so far.
+    pub fn payload_len(&self) -> usize {
+        self.bytes.len().saturating_sub(FRAME_HEADER_LENGTH)
+    }
+
+    /// Fill in the big-endian length header and return the complete frame.
+    pub fn finish(mut self) -> Result<Vec<u8>, FrameError> {
+        if self.bytes.len() < FRAME_HEADER_LENGTH {
+            return Err(FrameError::LengthOverflow);
+        }
+        let payload_len = self.payload_len();
+        if payload_len > u32::MAX as usize {
+            return Err(FrameError::LengthOverflow);
+        }
+        self.bytes[..FRAME_HEADER_LENGTH].copy_from_slice(&(payload_len as u32).to_be_bytes());
+        Ok(self.bytes)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Open,

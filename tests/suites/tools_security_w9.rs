@@ -459,3 +459,74 @@ fn spill_sweep_never_deletes_another_live_processes_file() {
     let _ = child.wait();
     let _ = std::fs::remove_file(&path);
 }
+
+/// The registry-only fast path reaps a spill file this process actually
+/// created (without listing the temp directory), while a file naming another
+/// live pid is preserved by both the fast path and the forced full sweep.
+#[test]
+fn spill_registry_sweep_reaps_owned_files_and_preserves_live_foreign_files() {
+    use pir::coding_agent::tools::spill::{
+        create_spill_file_with_limit, sweep_spills_now, sweep_spills_owned_now, SPILL_PREFIX,
+    };
+
+    let age = |path: &Path| {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open spill to age");
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60)),
+        )
+        .expect("age the spill");
+    };
+
+    let created = create_spill_file_with_limit(64).expect("create owned spill");
+    let owned = created.path().to_path_buf();
+    drop(created);
+    age(&owned);
+
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn live helper");
+    #[cfg(unix)]
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn live helper");
+    let foreign = std::env::temp_dir().join(format!(
+        "{SPILL_PREFIX}{}-w9b-registry-live-{tag}",
+        child.id()
+    ));
+    std::fs::write(&foreign, b"live foreign").expect("create foreign spill");
+    age(&foreign);
+
+    sweep_spills_owned_now();
+    assert!(
+        !owned.exists(),
+        "the registry sweep must reap this process's expired spill"
+    );
+    assert!(
+        foreign.exists(),
+        "the registry sweep must never delete another live pid's file"
+    );
+
+    sweep_spills_now();
+    assert!(
+        foreign.exists(),
+        "the full sweep must never delete another live pid's file"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&foreign);
+}

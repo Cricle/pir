@@ -473,6 +473,33 @@ async fn text_console_and_return_items_render() {
 }
 
 #[tokio::test]
+async fn explicit_null_return_renders_but_undefined_exit_and_bare_return_do_not() {
+    // Upstream appends the top-level return value to the output whenever it
+    // is not `undefined`; `outputText(null)` is "null". The prelude used to
+    // send `null` for BOTH `return null` and `undefined`, so the host
+    // dropped explicit nulls.
+    let null_result = run_codemode_script("return null;", None).await;
+    let content = text_of(codemode_result(&null_result));
+    assert!(
+        content.starts_with("Script completed"),
+        "content: {content}"
+    );
+    assert!(
+        content.ends_with("Output:\nnull"),
+        "an explicit `return null` must render as output: {content}"
+    );
+
+    for code in ["return undefined;", "exit();", "return;"] {
+        let result = run_codemode_script(code, None).await;
+        let content = text_of(codemode_result(&result));
+        assert!(
+            content.ends_with("Output:"),
+            "`{code}` must not add a return-value item: {content}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn script_error_keeps_partial_output_and_fails_result() {
     let result =
         run_codemode_script("text('partial output');\nthrow new Error('boom');", None).await;

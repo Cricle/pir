@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pir::agent::tool_execution::ToolRegistry;
+use pir::agent::tool_execution::{merge_plugin_tools, ToolRegistry};
 use pir::agent_session::{AgentSession, AgentSessionConfig};
 use pir::ai::auth::ApiKeyAuth;
 use pir::ai::event_stream::AssistantMessageEventStream;
@@ -38,7 +38,7 @@ use pir::ai::types::{
 };
 use pir::coding_agent::ToolSelection;
 use pir::config::mcp::McpServerConfig;
-use pir::plugins::builtin::McpPlugin;
+use pir::plugins::builtin::{McpPlugin, CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME};
 use pir::plugins::{instantiate_builtin, AgentPlugin, PluginHost};
 use serde_json::{json, Value};
 
@@ -377,6 +377,50 @@ async fn auto_enable_codemode_false_leaves_codemode_inactive() {
     session.shutdown().await;
 }
 
+/// The session's unreachable warning gate must check each needed discovery
+/// tool independently. With `autoEnableCodemode: false` and a deferred
+/// sibling, only `tool_search` is activated; an active `tool_search` does not
+/// make the codemode-exposure server callable, so the warning must still fire
+/// (it used to be suppressed by the first matching active tool).
+#[tokio::test(flavor = "current_thread")]
+async fn unreachable_discovery_warns_per_needed_tool() {
+    let _guard = env_guard().await;
+    let dir = TempDir::new("unreachable-warning");
+    std::env::set_var("PIR_AGENT_DIR", &dir.0);
+    write_mcp_json(
+        &dir.0,
+        false,
+        json!({
+            "docs": server("codemode"),
+            "search": server("deferred"),
+        }),
+    );
+
+    let mcp = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
+    let host = PluginHost::build(
+        None,
+        vec![builtin("codemode"), builtin("tool-search"), mcp.clone()],
+    );
+    let mut registry = ToolRegistry::new();
+    merge_plugin_tools(&mut registry, &host, None);
+
+    let decision = mcp.discovery_activation(&registry, &[]);
+    assert!(
+        decision.needs_codemode && decision.needs_tool_search,
+        "both exposures are configured: {decision:?}"
+    );
+    assert_eq!(decision.activate, names(&[TOOL_SEARCH_TOOL_NAME]));
+    assert!(
+        decision.has_unreachable_discovery(&names(&[TOOL_SEARCH_TOOL_NAME])),
+        "the codemode server stays unreachable without an active codemode tool"
+    );
+    assert!(
+        !decision.has_unreachable_discovery(&names(&[CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME])),
+        "both exposures reachable means no warning"
+    );
+    mcp.manager().shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Ownership: removal, stability, precedence
 // ---------------------------------------------------------------------------
@@ -571,6 +615,58 @@ async fn mcp_command_lists_servers_with_tool_counts_and_updates_activation() {
     assert!(outcome.ok, "{outcome:?}");
     assert!(mcp.manager().registry().get("docs").is_some());
     assert_eq!(mcp.auto_activated_tools(), names(&["codemode"]));
+    session.shutdown().await;
+}
+
+/// `-codemode` / `-tool_search` exclusions must outrank the deferred-server
+/// discovery activation (upstream `_excludedTools` is applied at registration,
+/// so an excluded discovery tool is not registered and its `has_*` flag is
+/// false). Both exposures are configured here, so either name being
+/// auto-activated or declared would fail the test.
+#[tokio::test(flavor = "current_thread")]
+async fn excluded_discovery_tool_is_not_activated() {
+    let _guard = env_guard().await;
+    let dir = TempDir::new("discovery-excluded");
+    std::env::set_var("PIR_AGENT_DIR", &dir.0);
+    write_mcp_json(
+        &dir.0,
+        true,
+        json!({
+            "docs": server("codemode"),
+            "search": server("deferred"),
+        }),
+    );
+
+    let mcp = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
+    let selection = ToolSelection {
+        enabled: names(&["read"]),
+        modifiers: names(&["-codemode", "-tool_search"]),
+        uses_default_tools: true,
+    };
+    let (session, captured) = build_session(
+        &dir.0,
+        vec![builtin("codemode"), builtin("tool-search"), mcp.clone()],
+        Some(selection),
+    );
+
+    let active = mcp.active_tools_snapshot().expect("a context is bound");
+    assert!(
+        !active.iter().any(|name| name == "tool_search"),
+        "an excluded tool_search must not be discovery-activated: {active:?}"
+    );
+    assert!(
+        !active.iter().any(|name| name == "codemode"),
+        "an excluded codemode must not be discovery-activated: {active:?}"
+    );
+    let declared = declared_tools(&session, &captured).await;
+    assert!(
+        !declared.iter().any(|name| name == "tool_search"),
+        "the loadout must not declare an excluded tool_search: {declared:?}"
+    );
+    assert!(
+        !declared.iter().any(|name| name == "codemode"),
+        "the loadout must not declare an excluded codemode: {declared:?}"
+    );
     session.shutdown().await;
 }
 

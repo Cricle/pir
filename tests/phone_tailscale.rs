@@ -185,6 +185,30 @@ async fn enable_reports_replaced_existing_config_on_command_failure() {
 }
 
 #[tokio::test]
+async fn enable_never_reports_ready_when_the_route_is_absent_from_status() {
+    // `tailscale serve` exits 0 but the follow-up `serve status` probe still
+    // has no `/phone-8787` handler (for example a missing privilege or a
+    // concurrent config rewrite). Reporting "ready" would send the user to a
+    // 502, so the result must stay disabled with an actionable error.
+    let fake = FakeRunner::new(vec![
+        status_json(),
+        empty_web(),
+        ok(""),
+        status_json(),
+        empty_web(),
+    ]);
+    let result = fake.client().enable(8787).await;
+
+    assert!(!result.enabled, "{result:?}");
+    assert!(result.changed, "{result:?}");
+    assert_eq!(result.url, format!("https://{DNS_NAME}/phone-8787/"));
+    assert!(
+        result.error.contains("absent from `serve status`"),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
 async fn disable_removes_only_our_path_scoped_route() {
     let fake = FakeRunner::new(vec![status_json(), active_web(8787), ok("")]);
     let result = fake.client().disable(8787).await;

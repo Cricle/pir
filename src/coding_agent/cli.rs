@@ -600,10 +600,11 @@ pub struct Cli {
     pub no_extensions: bool,
 
     /// Load ONLY the Rust builtin plugins (subagent, mcp, codemode, python,
-    /// context-mode, tool-search, tool-repair, todo): no JS extension files,
-    /// no installed packages, no settings/default discovery. An explicit
-    /// `-e builtin:<name>` still works (`-e <file>` is ignored). Combined
-    /// with `--no-extensions`, `--no-extensions` wins.
+    /// context-mode, tool-search, tool-repair, todo; phone only via `-e
+    /// builtin:phone`): no JS extension files, no installed packages, no
+    /// settings/default discovery. An explicit `-e builtin:<name>` still works
+    /// (`-e <file>` is ignored). Combined with `--no-extensions`,
+    /// `--no-extensions` wins.
     #[arg(long = "only-builtin", global = true)]
     pub only_builtin: bool,
 

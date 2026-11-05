@@ -186,6 +186,9 @@ impl AgentPlugin for DeferredToolsPlugin {
 enum Turn {
     /// Emit one `tool_search` call for `deferred widget`.
     Search,
+    /// Emit one `tool_search` call with exactly these arguments (error-surface
+    /// probes: the schema only requires `query`, the executor validates).
+    RawSearch(Value),
     /// Emit `count` `tool_search` calls in ONE assistant message: the batch
     /// scheduler runs them together, the upstream repeated-search shape.
     RepeatedSearches(usize),
@@ -332,6 +335,10 @@ impl Provider for ScriptedProvider {
                     json!({ "query": "deferred widget" }),
                     sequence,
                 )
+            }
+            Some(Turn::RawSearch(arguments)) => {
+                let sequence = self.call_seq.fetch_add(1, Ordering::SeqCst);
+                tool_call_message("tool_search", arguments, sequence)
             }
             Some(Turn::RepeatedSearches(count)) => {
                 let sequence = self.call_seq.fetch_add(count, Ordering::SeqCst);
@@ -1005,6 +1012,10 @@ impl PrintProvider {
                     sequence,
                 )
             }
+            Some(Turn::RawSearch(arguments)) => {
+                let sequence = self.call_seq.fetch_add(1, Ordering::SeqCst);
+                tool_call_message("tool_search", arguments, sequence)
+            }
             Some(Turn::Call { name, arguments }) => {
                 let sequence = self.call_seq.fetch_add(1, Ordering::SeqCst);
                 tool_call_message(&name, arguments, sequence)
@@ -1466,4 +1477,98 @@ async fn print_no_search_run_keeps_the_first_prompt_byte_identical() {
         !tools.contains("deferred_widget"),
         "the deferred tool is not in the prompt before a search loads it: {tools}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Declaration shape and executor error surfaces
+// ---------------------------------------------------------------------------
+
+/// The registered tool carries upstream's exact declaration: `model-only`
+/// exposure, `defaultActive: false`, the `number` limit (the integer check is
+/// an executor concern, not the schema's), and the fixed description/snippet.
+#[tokio::test(flavor = "current_thread")]
+async fn tool_search_declaration_shape_matches_upstream() {
+    let fixture = fixture("declaration-shape", 0);
+    let host = fixture.session.plugin_host().expect("plugin host");
+    let (registry, _) = fixture.session.merged_tool_registry_for_test(host);
+    let tool = registry.get("tool_search").expect("tool_search registered");
+
+    assert_eq!(tool.exposure(), ToolExposure::ModelOnly);
+    assert!(!tool.default_active());
+    assert_eq!(
+        tool.prompt_snippet().as_deref(),
+        Some("Search for tools that are not loaded yet and load the matches")
+    );
+    assert_eq!(
+        tool.parameters(),
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query for deferred tools."
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum number of tools to return. Defaults to 8."
+                }
+            },
+            "required": ["query"]
+        }))
+    );
+    fixture.session.shutdown().await;
+}
+
+/// Upstream `execute` (`tool.ts:230-233`) rejects an empty/whitespace query
+/// and every non-positive/non-integer `limit` with the exact messages; those
+/// refusals are ordinary error tool results and do not disturb the active set.
+#[tokio::test(flavor = "current_thread")]
+async fn tool_search_error_surfaces_are_stable() {
+    let turns = vec![
+        (json!({ "query": "" }), "query must not be empty"),
+        (json!({ "query": "   " }), "query must not be empty"),
+        (
+            json!({ "query": "widget", "limit": 0 }),
+            "limit must be a positive integer",
+        ),
+        (
+            json!({ "query": "widget", "limit": 1.5 }),
+            "limit must be a positive integer",
+        ),
+        (
+            json!({ "query": "widget", "limit": -2 }),
+            "limit must be a positive integer",
+        ),
+    ];
+    let fixture = fixture_with(
+        "error-surfaces",
+        ScriptedProvider::scripted(
+            turns
+                .iter()
+                .map(|(arguments, _)| Turn::RawSearch(arguments.clone()))
+                .collect(),
+        ),
+        Some(activated_selection()),
+    );
+
+    for (arguments, message) in &turns {
+        prompt(&fixture).await;
+        let results = tool_results(&fixture, "tool_search").await;
+        let result = results.last().expect("a tool result per prompt");
+        assert!(result.is_error, "{} must be refused: {result:?}", arguments);
+        assert_eq!(result_text(result), *message, "for {arguments}");
+        assert_eq!(result.details, None, "a refusal carries no details");
+    }
+    // Refusals never wrote the active-set cell: every request's declaration
+    // still carries `tool_search`.
+    assert!(
+        fixture
+            .provider
+            .declared()
+            .iter()
+            .all(|declared| declared.iter().any(|name| name == "tool_search")),
+        "refusals leave the declaration alone: {:?}",
+        fixture.provider.declared()
+    );
+    fixture.session.shutdown().await;
 }

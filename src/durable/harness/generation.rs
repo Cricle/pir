@@ -1208,8 +1208,12 @@ async fn commit_partial(
                             Some(message) => Some(message),
                             // Incremental flush: the committed message is the
                             // base; apply the pending text and scalar updates
-                            // to it in O(delta).
-                            None => match generation.remove("message") {
+                            // to it in O(delta). The slot itself MUST stay in
+                            // place: `take` clears the tool-call arguments in
+                            // this clone and plans `Keep` for them, which only
+                            // preserves the committed arguments when
+                            // `assign_json_with_plan` sees the existing slot.
+                            None => match generation.get("message").cloned() {
                                 Some(Value::Object(mut message)) => {
                                     changes.apply_pending_to_message(&mut message);
                                     apply_partial_scalars(&mut message, &scalars);

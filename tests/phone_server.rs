@@ -840,6 +840,37 @@ async fn host_and_origin_validation() {
         "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{wrong_port}\r\nConnection: close\r\n\r\n"
     );
     assert_eq!(send_raw_request(port, &request, false).await.status, 403);
+    // A port-less Host must not unlock the Tailscale exception for an
+    // arbitrary DNS name (DNS rebinding: evil.example resolving to loopback).
+    let request = "GET /api/health HTTP/1.1\r\nHost: evil.example\r\n\
+                   Origin: https://evil.example\r\nConnection: close\r\n\r\n";
+    assert_eq!(
+        send_raw_request(port, request, false).await.status,
+        403,
+        "portless foreign Host must not bypass host_matches_bind"
+    );
+
+    // Tailscale Serve terminates TLS on :443 and preserves the public
+    // hostname in Host/Origin while proxying to this loopback listener.
+    let tailnet = "phone-box.tailnet.ts.net";
+    let request = format!(
+        "GET /phone-{port}/api/health HTTP/1.1\r\nHost: {tailnet}\r\n\
+         Origin: https://{tailnet}\r\nConnection: close\r\n\r\n"
+    );
+    assert_eq!(
+        send_raw_request(port, &request, false).await.status,
+        200,
+        "a Tailscale Serve request must reach the mounted app"
+    );
+    let request = format!(
+        "GET /api/health HTTP/1.1\r\nHost: {tailnet}\r\n\
+         Origin: https://evil.example\r\nConnection: close\r\n\r\n"
+    );
+    assert_eq!(
+        send_raw_request(port, &request, false).await.status,
+        403,
+        "the proxied Host must still match the Origin hostname"
+    );
 
     // Absolute-form targets must agree with Host.
     let request = format!(

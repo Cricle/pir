@@ -13,7 +13,7 @@ rust-version = "1.97"
 description = "Pi coding agent, reimagined in Rust"
 license = "MIT OR Apache-2.0"
 authors = ["Earendil Works <team@earendil.works>"]
-repository = "https://github.com/earendil-works/pir"
+repository = "https://github.com/Cricle/pir"
 readme = "README.md"
 # docs.rs indexes crates by *package* name, so this follows [package].name
 # (`pir-sdk`), not the `pir` library name.

@@ -21,10 +21,11 @@ use pir::agent::tool_execution::ToolContext;
 use pir::extensions::SessionContextSnapshot;
 use pir::plugins::builtin::todo::{
     apply_mutation, build_tool_result, derive_blocks, detect_cycle, format_content,
-    is_transition_valid, replay_from_entries, sanitize_terminal_text, todos_command_outcome, Task,
-    TaskAction, TaskStatus, TodoOp, TodoParams, TodoPlugin, TodoState, TodoStore, COMMAND_NAME,
-    ERR_REQUIRES_INTERACTIVE, MAX_METADATA_BYTES, MAX_OWNER_CHARS, MAX_SESSION_SLOTS,
-    MAX_SUBJECT_CHARS, MAX_TASKS_PER_SESSION, MSG_NO_TODOS, TOOL_NAME,
+    is_transition_valid, replay_from_entries, sanitize_terminal_text, todos_command_outcome,
+    widget_lines_for_tests, Task, TaskAction, TaskStatus, TodoOp, TodoParams, TodoPlugin,
+    TodoState, TodoStore, COMMAND_NAME, ERR_REQUIRES_INTERACTIVE, MAX_METADATA_BYTES,
+    MAX_OWNER_CHARS, MAX_SESSION_SLOTS, MAX_SUBJECT_CHARS, MAX_TASKS_PER_SESSION, MSG_NO_TODOS,
+    TOOL_NAME,
 };
 use pir::plugins::{AgentPlugin, EventInterest, PluginHost, ToolBackend};
 
@@ -224,6 +225,11 @@ fn tool_definition_matches_the_contract() {
     }
     assert_eq!(def.execution_mode, "sequential");
     assert_eq!(def.exposure, "direct");
+    assert_eq!(
+        def.label.as_deref(),
+        Some("Todo"),
+        "the upstream tool label is `Todo`, not the lower-case tool name"
+    );
     assert!(
         def.default_active,
         "the todo tool is active on registration"
@@ -748,6 +754,37 @@ async fn todos_command_groups_by_status_through_the_plugin_registry() {
         todos_command_outcome(&empty_store, true).error.as_deref(),
         Some(MSG_NO_TODOS)
     );
+}
+
+/// The overlay factory renders the same grouped list as `/todos`; collapsed
+/// mode keeps only the counts line plus the collapse-key hint.
+#[tokio::test(flavor = "current_thread")]
+async fn todo_overlay_renders_grouped_list_and_collapsed_summary() {
+    let plugin = plugin();
+    let host = host_with(Arc::clone(&plugin));
+    run_tool(&host, json!({ "action": "create", "subject": "one" })).await;
+    run_tool(&host, json!({ "action": "create", "subject": "two" })).await;
+    run_tool(
+        &host,
+        json!({ "action": "update", "id": 2, "status": "completed" }),
+    )
+    .await;
+
+    assert_eq!(
+        widget_lines_for_tests(plugin.store(), false),
+        vec![
+            "1/2 completed · 1 pending",
+            "── Pending ──",
+            "  ○ #1 one",
+            "── Completed ──",
+            "  ✓ #2 two",
+        ]
+    );
+    assert_eq!(
+        widget_lines_for_tests(plugin.store(), true),
+        vec!["Todos · 1/2 completed · 1 pending · ctrl+shift+t"]
+    );
+    assert!(widget_lines_for_tests(&Arc::new(TodoStore::new()), false).is_empty());
 }
 
 /// The real tool path for inputs the JSON Schema would reject: an unknown
@@ -1846,4 +1883,52 @@ fn session_slots_are_bounded_by_lru() {
     }
     let slots = store.session_slot_count();
     assert!(slots <= MAX_SESSION_SLOTS, "{slots} slots");
+}
+
+/// Touching a slot that already exists must never evict an unrelated session:
+/// the cap is an insertion bound, not a per-write eviction trigger. Regression
+/// for the old `evict_over_capacity` call that ran even for existing slots at
+/// exactly `MAX_SESSION_SLOTS`, silently dropping the LRU neighbour on every
+/// live tool call / replay into a full map.
+#[test]
+fn existing_session_writes_do_not_evict_other_slots() {
+    let store = TodoStore::new();
+    for index in 0..MAX_SESSION_SLOTS {
+        let session = format!("s{index}");
+        store.set_active_session(&session);
+        store.replace_state(
+            &session,
+            TodoState {
+                tasks: vec![Task {
+                    id: 1,
+                    subject: session.clone(),
+                    status: TaskStatus::Pending,
+                    ..Task::default()
+                }],
+                next_id: 2,
+            },
+        );
+    }
+    assert_eq!(store.session_slot_count(), MAX_SESSION_SLOTS);
+
+    store.replace_state("s0", store.state("s0"));
+    assert_eq!(store.session_slot_count(), MAX_SESSION_SLOTS);
+    for index in 0..MAX_SESSION_SLOTS {
+        let session = format!("s{index}");
+        assert!(
+            !store.state(&session).tasks.is_empty(),
+            "write to s0 evicted {session}"
+        );
+    }
+
+    // The replay path shares the eviction helper.
+    store.set_active_session("s0");
+    store.replay("s0", &[]);
+    for index in 1..MAX_SESSION_SLOTS {
+        let session = format!("s{index}");
+        assert!(
+            !store.state(&session).tasks.is_empty(),
+            "replay into s0 evicted {session}"
+        );
+    }
 }

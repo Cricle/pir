@@ -308,8 +308,9 @@ fn subagent_description(user_agents_dir: &std::path::Path) -> String {
     format!(
         "Delegate tasks to specialized subagents with isolated context. Modes: single (agent + task), \
          parallel (tasks array), chain (sequential with {{previous}} placeholder). Default agent scope \
-         is \"user\" (from {}). To enable project-local agents in .pi/agents, set agentScope: \"both\" \
-         (or \"project\").",
+         is \"user\" (from {}); when no user/project agents are configured, the built-in agents \
+         scout, planner, reviewer and worker are available and inherit the parent's model. To enable \
+         project-local agents in .pi/agents, set agentScope: \"both\" (or \"project\").",
         user_agents_dir.display()
     )
 }

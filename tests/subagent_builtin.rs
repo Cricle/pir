@@ -532,11 +532,33 @@ fn discovery_rereads_on_every_call() {
     let user_dir = temp.0.join("agents");
     let empty = TempDir::new("reread-empty");
     let first = discover_agents(&empty.0, AgentScope::User, &user_dir);
-    assert!(first.agents.is_empty());
+    // No user/project files anywhere: the shipped built-in agents are offered
+    // so a fresh install can use `subagent` out of the box.
+    let mut first_names: Vec<&str> = first.agents.iter().map(|a| a.name.as_str()).collect();
+    first_names.sort_unstable();
+    assert_eq!(first_names, vec!["planner", "reviewer", "scout", "worker"]);
     temp.write_agent("late.md", "name: late\ndescription: added later\n", "b");
     let second = discover_agents(&empty.0, AgentScope::User, &user_dir);
     assert_eq!(second.agents.len(), 1);
     assert_eq!(second.agents[0].name, "late");
+}
+
+#[test]
+fn builtin_agents_are_offered_only_when_no_agent_files_exist() {
+    let temp = TempDir::new("builtin-defaults");
+    let user_dir = temp.0.join("agents");
+    let empty = TempDir::new("builtin-empty");
+    let builtins = discover_agents(&empty.0, AgentScope::User, &user_dir);
+    assert_eq!(builtins.agents.len(), 4);
+    assert!(builtins
+        .agents
+        .iter()
+        .all(|agent| agent.model.is_none() && agent.file_path.starts_with("<builtin>")));
+
+    temp.write_agent("scout.md", "name: scout\ndescription: mine\n", "b");
+    let configured = discover_agents(&empty.0, AgentScope::User, &user_dir);
+    assert_eq!(configured.agents.len(), 1);
+    assert_eq!(configured.agents[0].description, "mine");
 }
 
 #[test]

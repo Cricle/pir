@@ -1386,8 +1386,14 @@ impl Provider for ScriptedLoopProvider {
 /// deliberately avoids the `/glm/i` strip-pass gate, so only the model-free
 /// passes can fire.
 fn loop_model() -> Model {
+    loop_model_with_id("repair-loop-model")
+}
+
+/// [`loop_model`] with an explicit id, so a loop test can land inside the
+/// `/glm/i` token-leak gate or the `anchorBleedModels` set.
+fn loop_model_with_id(id: &str) -> Model {
     Model {
-        id: "repair-loop-model".into(),
+        id: id.into(),
         name: "Tool-repair loop model".into(),
         api: "fake-api".into(),
         provider: "repair-loop".into(),
@@ -1557,6 +1563,17 @@ fn repair_harness_with_extensions(
     extensions: Option<pir::extensions::ExtensionHandle>,
     respond: LoopResponder,
 ) -> RepairHarness {
+    repair_harness_with_model(plugins, extensions, respond, loop_model())
+}
+
+/// [`repair_harness_with_extensions`] with an explicit model (the id drives
+/// the two model-gated strip passes and the grammar `leakModels` gate).
+fn repair_harness_with_model(
+    plugins: Vec<Arc<dyn AgentPlugin>>,
+    extensions: Option<pir::extensions::ExtensionHandle>,
+    respond: LoopResponder,
+    model: Model,
+) -> RepairHarness {
     let dir = LoopTempDir::new("loop");
     let received = Arc::new(Mutex::new(Vec::new()));
     let mut tools = ToolRegistry::new();
@@ -1572,7 +1589,6 @@ fn repair_harness_with_extensions(
     }));
     let registry = Arc::new(registry);
 
-    let model = loop_model();
     let session = SessionManager::create(".", &dir.0).expect("create session");
     let transcript = session.path().to_path_buf();
     let config = AgentSessionConfig {
@@ -2495,5 +2511,100 @@ async fn area0_session_transport_skips_the_inert_payload_hook() {
     assert!(
         hooks.after_provider_response.is_none(),
         "tool-repair registers no response observer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gated strip passes and grammar recovery through the REAL session loop
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn token_leak_strip_through_the_loop() {
+    let raw = json!({
+        "<arg_key>path</arg_key>": "<arg_value>/x</arg_value>",
+        "<arg_key>limit</arg_key>": "<arg_value>5</arg_value>",
+    });
+    let harness = repair_harness_with_model(
+        vec![tool_repair_builtin()],
+        None,
+        scripted_read_call(raw.clone()),
+        loop_model_with_id("glm-4.6"),
+    );
+    let terminal = harness
+        .session
+        .prompt("call the read probe", noop_events())
+        .await
+        .expect("prompt");
+    assert_eq!(terminal.stop_reason, StopReason::Stop);
+    let received = harness
+        .received
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(received.len(), 1, "the repaired read call must execute");
+    assert_eq!(received[0], json!({ "path": "/x", "limit": 5 }));
+}
+
+#[tokio::test]
+async fn anchor_bleed_through_the_loop() {
+    let harness = repair_harness_with_model(
+        vec![tool_repair_builtin()],
+        None,
+        scripted_read_call(json!({ "path": "^/x$" })),
+        loop_model_with_id("moonshotai/kimi-k2-instruct"),
+    );
+    let terminal = harness
+        .session
+        .prompt("call the read probe", noop_events())
+        .await
+        .expect("prompt");
+    assert_eq!(terminal.stop_reason, StopReason::Stop);
+    let received = harness
+        .received
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(received, vec![json!({ "path": "/x" })]);
+}
+
+#[tokio::test]
+async fn grammar_recovery_through_the_loop() {
+    let guard = crate::common::AgentDirEnvGuard::scratch("tool-repair-grammar", None).await;
+    let dir = guard.dir().expect("scratch agent dir").to_path_buf();
+    std::fs::create_dir_all(dir.join("extensions")).expect("extensions dir");
+    std::fs::write(
+        dir.join("extensions").join("pi-tool-repair.json"),
+        r#"{"grammarRepair":{"enabled":true}}"#,
+    )
+    .expect("write config");
+
+    let respond: LoopResponder = Arc::new(|index, _context| {
+        if index == 0 {
+            loop_assistant(
+                vec![loop_text(
+                    "<function=read>\n<parameter=path>/x</parameter>\n</function>",
+                )],
+                StopReason::Stop,
+            )
+        } else {
+            loop_assistant(vec![loop_text("done")], StopReason::Stop)
+        }
+    });
+    let harness = repair_harness(vec![tool_repair_builtin()], respond);
+    let terminal = harness
+        .session
+        .prompt("leaked call", noop_events())
+        .await
+        .expect("prompt");
+    assert_eq!(terminal.stop_reason, StopReason::Stop);
+    let received = harness
+        .received
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        received,
+        vec![json!({ "path": "/x" })],
+        "grammar recovery must execute the call"
     );
 }

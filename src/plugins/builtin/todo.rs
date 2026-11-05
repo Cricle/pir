@@ -133,7 +133,7 @@
 //!   the same host gap `/mcp` has.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -143,9 +143,10 @@ use crate::agent::tool_batch::{ToolExecutionMode, ToolResult};
 use crate::agent::tool_execution::{AgentTool, BoxFuture, ToolContext};
 use crate::extensions::{CommandOutcome, SessionContextSnapshot};
 use crate::plugins::plugin::{
-    AgentPlugin, CommandBackend, EventInterest, PluginEvent, PluginEventOutcome, PluginFuture,
-    RegistrationContext, ShortcutBackend,
+    AgentPlugin, CommandBackend, EventInterest, PluginContext, PluginEvent, PluginEventOutcome,
+    PluginFuture, RegistrationContext, ShortcutBackend,
 };
+use crate::plugins::services::{FactoryRenderContext, UiService, WidgetFactory, WidgetPlacement};
 use crate::plugins::source::PluginInfo;
 
 // ---------------------------------------------------------------------------
@@ -1593,8 +1594,13 @@ impl TodoStore {
     }
 
     /// LRU-evict the least recently touched slot when the map is at capacity
-    /// (never the slot being written).
+    /// and the slot being written is new (never the slot being written, and
+    /// never when an existing slot is merely being touched: an update must
+    /// not evict an unrelated session).
     fn evict_over_capacity(sessions: &mut BTreeMap<String, SessionSlot>, keep: &str) {
+        if sessions.contains_key(keep) {
+            return;
+        }
         while sessions.len() >= MAX_SESSION_SLOTS {
             let victim = sessions
                 .iter()
@@ -1688,11 +1694,16 @@ impl TodoStore {
 /// semantics assume.
 struct TodoTool {
     store: Arc<TodoStore>,
+    ui: Arc<TodoUi>,
 }
 
 impl AgentTool for TodoTool {
     fn name(&self) -> &'static str {
         TOOL_NAME
+    }
+
+    fn label(&self) -> &'static str {
+        TOOL_LABEL
     }
 
     fn description(&self) -> &'static str {
@@ -1727,6 +1738,7 @@ impl AgentTool for TodoTool {
         // `'static`; the mutation itself is synchronous under the store lock.
         let args = args.clone();
         let store = Arc::clone(&self.store);
+        let ui = Arc::clone(&self.ui);
         Box::pin(async move {
             let action_name = args.get("action").and_then(JsonValue::as_str).unwrap_or("");
             let Some(action) = TaskAction::parse(action_name) else {
@@ -1753,7 +1765,12 @@ impl AgentTool for TodoTool {
                     return build_tool_result(action, &args, &state, &TodoOp::Error { message });
                 }
             };
-            store.execute(&args, action, &params)
+            let result = store.execute(&args, action, &params);
+            // Upstream repaints the overlay at `tool_execution_end`; the
+            // native widget is registered through the same UI service, so a
+            // re-registration marks it dirty for the next TUI tick.
+            ui.repaint(&store);
+            result
         })
     }
 }
@@ -1927,6 +1944,128 @@ fn format_command_task_line(task: &Task, glyph: &str) -> String {
 // The plugin
 // ---------------------------------------------------------------------------
 
+/// Widget key used by the todo overlay (upstream `ctx.ui.setWidget("todos", …)`).
+const WIDGET_KEY: &str = "todos";
+
+/// Shared UI cell: the bound [`UiService`] plus the collapse state. The tool
+/// and the shortcut both hold this, so a task mutation or `ctrl+shift+t`
+/// repaints the same overlay without re-plumbing the plugin host.
+struct TodoUi {
+    service: RwLock<Option<Arc<dyn UiService>>>,
+    collapsed: Arc<AtomicBool>,
+    has_ui: Arc<AtomicBool>,
+}
+
+impl TodoUi {
+    fn new(has_ui: Arc<AtomicBool>) -> Self {
+        Self {
+            service: RwLock::new(None),
+            collapsed: Arc::new(AtomicBool::new(false)),
+            has_ui,
+        }
+    }
+
+    fn bind(&self, service: Option<Arc<dyn UiService>>) {
+        *self
+            .service
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = service;
+    }
+
+    fn repaint(&self, store: &Arc<TodoStore>) {
+        if !self.has_ui.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(ui) = self
+            .service
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        ui.set_widget(
+            WIDGET_KEY,
+            Arc::new(TodoWidget {
+                store: Arc::clone(store),
+                collapsed: Arc::clone(&self.collapsed),
+            }),
+            WidgetPlacement::Overlay,
+        );
+    }
+
+    fn toggle(&self, store: &Arc<TodoStore>) {
+        self.collapsed.fetch_xor(true, Ordering::SeqCst);
+        self.repaint(store);
+    }
+
+    fn clear(&self) {
+        let Some(ui) = self
+            .service
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        ui.clear_widget(WIDGET_KEY);
+    }
+}
+
+/// The overlay renderer (upstream `rpiv-todo`'s widget factory): the same
+/// grouped list `/todos` prints, or one summary line when collapsed.
+struct TodoWidget {
+    store: Arc<TodoStore>,
+    collapsed: Arc<AtomicBool>,
+}
+
+impl WidgetFactory for TodoWidget {
+    fn render(&self, context: &FactoryRenderContext<'_>) -> Vec<String> {
+        let state = self.store.state(&self.store.active_session());
+        let Some(text) = format_todos_command(&state) else {
+            return Vec::new();
+        };
+        let width = context.width.max(10);
+        let clip = |line: &str| -> String {
+            if line.chars().count() <= width {
+                return line.to_owned();
+            }
+            let mut clipped: String = line.chars().take(width.saturating_sub(1)).collect();
+            clipped.push('…');
+            clipped
+        };
+        if self.collapsed.load(Ordering::Relaxed) {
+            let header = text.lines().next().unwrap_or("Todos");
+            return vec![clip(&format!("Todos · {header} · ctrl+shift+t"))];
+        }
+        let mut lines: Vec<String> = text.lines().map(clip).collect();
+        // Keep the overlay from taking the whole dock on a large list.
+        const MAX_ROWS: usize = 12;
+        if lines.len() > MAX_ROWS {
+            let omitted = lines.len() - (MAX_ROWS - 1);
+            lines.truncate(MAX_ROWS - 1);
+            lines.push(format!("… {omitted} more"));
+        }
+        lines
+    }
+}
+
+/// Test seam for the overlay renderer: expose the widget lines without
+/// constructing a UI service.
+#[doc(hidden)]
+pub fn widget_lines_for_tests(store: &Arc<TodoStore>, collapsed: bool) -> Vec<String> {
+    TodoWidget {
+        store: Arc::clone(store),
+        collapsed: Arc::new(AtomicBool::new(collapsed)),
+    }
+    .render(&FactoryRenderContext {
+        width: 80,
+        theme: None,
+        footer_data: None,
+        request_render: None,
+    })
+}
+
 /// The `todo` builtin plugin.
 pub struct TodoPlugin {
     info: PluginInfo,
@@ -1939,6 +2078,8 @@ pub struct TodoPlugin {
     /// The JS runtime handle, when the session has one (kept for parity with
     /// the `mcp` builtin's attach seam and for future notify routing).
     js: RwLock<Option<crate::extensions::ExtensionHandle>>,
+    /// Bound UI service + overlay collapse state.
+    ui: Arc<TodoUi>,
 }
 
 impl Default for TodoPlugin {
@@ -1953,11 +2094,13 @@ impl TodoPlugin {
         // Replaceable: a user extension registering a `todo` tool or `todos`
         // command omits this builtin (upstream `replaceable` factory flag).
         info.replaceable = super::builtin_extension_def("todo").is_some_and(|def| def.replaceable);
+        let has_ui = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Self {
             info,
             store: Arc::new(TodoStore::new()),
-            has_ui: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            has_ui: Arc::clone(&has_ui),
             js: RwLock::new(None),
+            ui: Arc::new(TodoUi::new(has_ui)),
         }
     }
 
@@ -1994,7 +2137,12 @@ impl TodoPlugin {
             return;
         };
         let session = self.store.active_session();
-        self.store.replay(&session, entries);
+        if self.store.replay(&session, entries) {
+            // A transcript rewrite (`/tree`, compaction, branch switch) may
+            // change the last todo snapshot without any tool call; the cached
+            // widget lines must follow it.
+            self.ui.repaint(&self.store);
+        }
     }
 }
 
@@ -2031,14 +2179,21 @@ impl AgentPlugin for TodoPlugin {
     fn register(&self, ctx: &mut RegistrationContext<'_>) -> anyhow::Result<()> {
         ctx.register_tool(Arc::new(TodoTool {
             store: Arc::clone(&self.store),
+            ui: Arc::clone(&self.ui),
         }));
 
         let store = Arc::clone(&self.store);
         let has_ui = Arc::clone(&self.has_ui);
+        let ui = Arc::clone(&self.ui);
         let handler: crate::plugins::CommandHandler = Arc::new(move |_args: &str| {
             let store = Arc::clone(&store);
             let has_ui = Arc::clone(&has_ui);
-            Box::pin(async move { todos_command_outcome(&store, has_ui.load(Ordering::Relaxed)) })
+            let ui = Arc::clone(&ui);
+            Box::pin(async move {
+                let outcome = todos_command_outcome(&store, has_ui.load(Ordering::Relaxed));
+                ui.repaint(&store);
+                outcome
+            })
         });
         ctx.register_command(
             COMMAND_NAME,
@@ -2046,11 +2201,15 @@ impl AgentPlugin for TodoPlugin {
             Some(CommandBackend::Rust(handler)),
         );
 
-        // The collapse/expand hotkey: registered as a DEFINITION only (no
-        // overlay renderer exists in v1 — see the module docs). A Rust no-op
-        // handler keeps the registry entry well-formed for a UI lane to bind.
-        let shortcut: crate::plugins::ShortcutHandler = Arc::new(|| {
-            Box::pin(async {
+        // The collapse/expand hotkey toggles the native overlay and repaints
+        // it immediately.
+        let store = Arc::clone(&self.store);
+        let ui = Arc::clone(&self.ui);
+        let shortcut: crate::plugins::ShortcutHandler = Arc::new(move || {
+            let store = Arc::clone(&store);
+            let ui = Arc::clone(&ui);
+            Box::pin(async move {
+                ui.toggle(&store);
                 CommandOutcome {
                     ok: true,
                     error: None,
@@ -2096,6 +2255,7 @@ impl AgentPlugin for TodoPlugin {
                     // entries push is authoritative (idempotent — replay only
                     // replaces).
                     self.store.invalidate_replay_cache();
+                    self.ui.repaint(&self.store);
                 }
                 "tool_result"
                     // Defensive second source, never a dependency: this
@@ -2137,17 +2297,27 @@ impl AgentPlugin for TodoPlugin {
     fn on_reload(&self) -> PluginFuture<'_, anyhow::Result<()>> {
         Box::pin(async {
             self.store.invalidate_replay_cache();
+            self.ui.repaint(&self.store);
             Ok(())
         })
     }
 
     /// Session teardown: drop every slot (bounded memory; a reused instance
-    /// starts clean).
+    /// starts clean) and retire the overlay.
     fn on_shutdown(&self) -> PluginFuture<'_, anyhow::Result<()>> {
         Box::pin(async {
             self.store.clear();
+            self.ui.clear();
             Ok(())
         })
+    }
+
+    /// Bind the UI service and install the overlay factory. The context is
+    /// rebound after every `/reload`/session replacement, so the latest
+    /// service wins.
+    fn on_context(&self, ctx: &PluginContext) {
+        self.ui.bind(ctx.ui_arc());
+        self.ui.repaint(&self.store);
     }
 
     /// Host hook: cache the UI posture and keep the runtime handle (only the

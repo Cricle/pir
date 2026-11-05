@@ -550,3 +550,41 @@ fn worker_process_enforces_the_output_caps() {
         }
     }
 }
+
+/// Regression: the child's `done` frame must distinguish `return null` from
+/// `undefined` (`exit()` / a bare return). The prelude used to send "null"
+/// for both, and the parent dropped it, so an explicit null return vanished
+/// from the codemode tool output.
+#[test]
+fn worker_process_distinguishes_explicit_null_from_undefined_returns() {
+    for (code, expected) in [
+        ("return null;", Some("null")),
+        // Upstream `outputText("")` yields an empty text item; an empty
+        // string must not be classified like `undefined` and suppressed.
+        (r#"return "";"#, Some("")),
+        ("return undefined;", None),
+        ("exit();", None),
+        ("return;", None),
+    ] {
+        let Some(mut proc) = spawn_worker() else {
+            return;
+        };
+        send_request(&mut proc, &init_frame(code, 20_000, 1024 * 1024));
+        consume_ready(&proc);
+        match recv_event(&proc, Duration::from_secs(20), "return-value done") {
+            WorkerEvent::Done {
+                ok, value, head, ..
+            } => {
+                assert!(ok, "`{code}` must complete: {head:?}");
+                assert_eq!(
+                    value.as_deref(),
+                    expected,
+                    "`{code}` return-value classification"
+                );
+            }
+            other => panic!("unexpected frame for `{code}`: {other:?}"),
+        }
+        let _ = proc.child.kill();
+        let _ = proc.child.wait();
+    }
+}

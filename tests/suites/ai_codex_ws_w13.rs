@@ -585,9 +585,9 @@ async fn codex_transport_websocket_pools_without_sending_a_continuation() {
     assert_eq!(done.response_id.as_deref(), Some("resp_1"));
 
     // The terminal Done event wakes the consumer before the producer runs
-    // `Lease::release`; give the release a scheduling turn so the second turn
-    // observes the pooled socket instead of racing it.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // `Lease::release`; wait for the socket to land in the pool so the second
+    // turn observes it instead of racing the insert.
+    crate::common::wait_for_pooled_codex_websocket("w13-plain-ws").await;
 
     let second_context = Context {
         messages: vec![
@@ -636,10 +636,6 @@ async fn codex_transport_websocket_pools_without_sending_a_continuation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "websocket continuation cache race under 16-way CI load; covered on Windows"
-)]
 async fn codex_transport_websocket_cached_reuses_the_pooled_continuation() {
     // Pool continuity: see the guard in the test above.
     let _pool = crate::common::codex_ws_pool_guard().await;
@@ -671,9 +667,9 @@ async fn codex_transport_websocket_cached_reuses_the_pooled_continuation() {
     assert_eq!(done.response_id.as_deref(), Some("resp_1"));
 
     // The terminal Done event wakes the consumer before the producer runs
-    // `Lease::release`; give the release a scheduling turn so the second turn
-    // observes the pooled socket instead of racing it.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // `Lease::release`; wait for the socket to land in the pool so the second
+    // turn observes it instead of racing the insert.
+    crate::common::wait_for_pooled_codex_websocket("w13-cached").await;
 
     let second_context = Context {
         messages: vec![

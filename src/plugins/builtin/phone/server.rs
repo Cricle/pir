@@ -834,9 +834,15 @@ pub struct HostPublishedState {
 pub struct PhoneState {
     inner: Mutex<Inner>,
     /// Serializes start/stop so two concurrent invocations cannot both bind.
-    lifecycle: Mutex<()>,
+    /// Shared with the accept loop so its idle-timeout cleanup cannot race a
+    /// start/stop command.
+    lifecycle: Arc<Mutex<()>>,
     running: Arc<AtomicBool>,
-    addr: StdMutex<Option<SocketAddr>>,
+    addr: Arc<StdMutex<Option<SocketAddr>>>,
+    /// Incremented for every successfully bound listener. The accept loop's
+    /// cleanup checks it before touching shared state, so a new server started
+    /// in the meantime is never mistaken for the old one.
+    generation: Arc<AtomicU64>,
     images: Arc<StdMutex<ImageStore>>,
     /// Best-effort status channel: when the host attached a JS runtime, the
     /// status entry is pushed through `__pir_host.setStatus` (the only status
@@ -891,9 +897,10 @@ impl PhoneState {
                 server: None,
                 runtime_state_path: None,
             }),
-            lifecycle: Mutex::new(()),
+            lifecycle: Arc::new(Mutex::new(())),
             running: Arc::new(AtomicBool::new(false)),
-            addr: StdMutex::new(None),
+            addr: Arc::new(StdMutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
             images: Arc::new(StdMutex::new(ImageStore::default())),
             runtime: StdMutex::new(None),
             host_commands: Arc::new(StdMutex::new(None)),
@@ -1235,14 +1242,25 @@ impl PhoneState {
             return Err(message);
         }
 
-        let running_now = {
+        let had_server = {
             let inner = self.inner.lock().await;
             inner.server.is_some()
-        } && self.running.load(Ordering::SeqCst);
+        };
+        let running_now = had_server && self.running.load(Ordering::SeqCst);
         let changed = config != current;
 
         if running_now && changed {
             self.stop_inner().await;
+        } else if had_server && !running_now {
+            // The listener stopped itself (idle timeout or a finished task)
+            // but its row is still in `Inner`. Join it before binding a new
+            // one so a late cleanup cannot clobber the new address/record.
+            let old_config = {
+                let inner = self.inner.lock().await;
+                inner.config.clone()
+            };
+            self.stop_inner().await;
+            let _ = self.tailscale_client().disable(old_config.port).await;
         }
 
         let mut notes: Vec<String> = Vec::new();
@@ -1317,6 +1335,24 @@ impl PhoneState {
                 }
             };
 
+            // Persist this start for cross-session stale detection. Only a
+            // digest of a fresh runtime control token is written; best effort,
+            // because a failed temp-file write must never fail the server.
+            // Written before the listener starts so the accept loop's idle
+            // cleanup always has the exact path of this generation.
+            let runtime_control_token = generate_token();
+            let runtime_state_path =
+                match self
+                    .runtime_store()
+                    .write(&config.host, config.port, &runtime_control_token)
+                {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        tracing::warn!("failed to persist Pi Phone runtime state: {error}");
+                        None
+                    }
+                };
+
             // One bridge per listener: the WS transport feeds it every inbound
             // JSON line and drains each client's bounded queue. The host slot
             // is shared with `set_host_commands`, so installing the live
@@ -1342,6 +1378,11 @@ impl PhoneState {
             ));
             let (bridge, host_tx) = SessionBridge::start(BridgeConfig::default(), phone_host);
 
+            // Every bound listener gets a fresh generation. The idle cleanup
+            // below only acts while this is still the current generation, so
+            // a fast restart can never have its new record/route removed by
+            // the previous listener.
+            let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
             let meta = Arc::new(ServerMeta {
                 status,
                 images: Arc::clone(&self.images),
@@ -1351,6 +1392,14 @@ impl PhoneState {
                 host_published: Arc::clone(&self.host_published),
                 // `strip_mount` derives the same prefix from the port.
                 gzip: GzipAssets::build(&format!("/phone-{}", config.port)),
+                lifecycle: Arc::clone(&self.lifecycle),
+                generation,
+                generation_counter: Arc::clone(&self.generation),
+                phone_addr: Arc::clone(&self.addr),
+                phone_bridge: Arc::clone(&self.bridge),
+                runtime_store: self.runtime_store(),
+                runtime_state_path: runtime_state_path.clone(),
+                tailscale: self.tailscale_client(),
             });
             self.running.store(true, Ordering::SeqCst);
             let (shutdown, shutdown_rx) = watch::channel(false);
@@ -1359,22 +1408,6 @@ impl PhoneState {
                 bridge: bridge.clone(),
                 host_tx,
             });
-
-            // Persist this start for cross-session stale detection. Only a
-            // digest of a fresh runtime control token is written; best effort,
-            // because a failed temp-file write must never fail the server.
-            let runtime_control_token = generate_token();
-            let runtime_state_path =
-                match self
-                    .runtime_store()
-                    .write(&config.host, config.port, &runtime_control_token)
-                {
-                    Ok(path) => Some(path),
-                    Err(error) => {
-                        tracing::warn!("failed to persist Pi Phone runtime state: {error}");
-                        None
-                    }
-                };
 
             {
                 let mut inner = self.inner.lock().await;
@@ -1514,13 +1547,16 @@ impl PhoneState {
     }
 
     async fn reap_finished(&self) {
-        let mut inner = self.inner.lock().await;
-        let finished = inner
-            .server
-            .as_ref()
-            .map(|server| server.task.is_finished())
-            .unwrap_or(false);
-        if finished {
+        let config = {
+            let mut inner = self.inner.lock().await;
+            let finished = inner
+                .server
+                .as_ref()
+                .map(|server| server.task.is_finished())
+                .unwrap_or(false);
+            if !finished {
+                return;
+            }
             if let Some(server) = inner.server.take() {
                 server.bridge.close();
             }
@@ -1530,7 +1566,12 @@ impl PhoneState {
             self.running.store(false, Ordering::SeqCst);
             *self.addr.lock().unwrap_or_else(PoisonError::into_inner) = None;
             *self.bridge.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        }
+            inner.config.clone()
+        };
+        // The task may have exited without reaching the idle branch (for
+        // example a panic or an aborted listener). Reconcile its Serve route
+        // when we reap it; a no-op when the idle cleanup already did this.
+        let _ = self.tailscale_client().disable(config.port).await;
     }
 
     /// Stop without taking the lifecycle lock (callers hold it).
@@ -1907,6 +1948,20 @@ struct ServerMeta {
     /// Cached gzip representations of the embedded client (mount-specific for
     /// `index.html`).
     gzip: GzipAssets,
+    /// Lifecycle lock shared with [`PhoneState`]; the idle-timeout cleanup
+    /// takes it so it can never race a start/stop command.
+    lifecycle: Arc<Mutex<()>>,
+    /// This listener's generation (see [`PhoneState::generation`]).
+    generation: u64,
+    generation_counter: Arc<AtomicU64>,
+    /// Shared lifecycle state cleared when the idle timer stops this listener.
+    phone_addr: Arc<StdMutex<Option<SocketAddr>>>,
+    phone_bridge: Arc<StdMutex<Option<BridgeRuntime>>>,
+    /// Where this listener's persisted runtime record lives, and the client
+    /// that removes its Tailscale Serve route on an idle stop.
+    runtime_store: RuntimeStore,
+    runtime_state_path: Option<PathBuf>,
+    tailscale: Tailscale,
 }
 
 impl ServerMeta {
@@ -1989,6 +2044,7 @@ async fn accept_loop(
 ) {
     let mut idle_tick = tokio::time::interval(Duration::from_secs(5));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut idle_stop = false;
 
     loop {
         tokio::select! {
@@ -2005,6 +2061,7 @@ async fn accept_loop(
                         4010,
                         "idle-timeout",
                     );
+                    idle_stop = true;
                     break;
                 }
             }
@@ -2046,6 +2103,33 @@ async fn accept_loop(
     request_client_close(&meta.status.client, 1001, "server-stopped");
     meta.bridge.close();
     meta.status.running.store(false, Ordering::SeqCst);
+
+    // An idle auto-stop is a real stop: remove this listener's persisted
+    // record and Tailscale Serve route, exactly like `/phone-stop`. A
+    // start/stop command holding the lifecycle lock owns the cleanup itself;
+    // a newer listener has a different generation and must never be touched.
+    if idle_stop {
+        if let Ok(_lifecycle) = meta.lifecycle.try_lock() {
+            if meta.generation_counter.load(Ordering::SeqCst) == meta.generation {
+                if let Some(path) = meta.runtime_state_path.as_ref() {
+                    let _ = meta.runtime_store.remove_path(path);
+                }
+                *meta
+                    .phone_addr
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
+                if let Some(runtime) = meta
+                    .phone_bridge
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+                {
+                    runtime.bridge.close();
+                }
+                let _ = meta.tailscale.disable(meta.status.port).await;
+            }
+        }
+    }
 }
 
 /// Decrements the admitted-connection counter on every exit path.
@@ -2654,6 +2738,13 @@ fn host_matches_bind(bound: &str, candidate: &str) -> bool {
     }
 }
 
+/// Whether `host` is a Tailscale MagicDNS name (`<machine>.<tailnet>.ts.net`).
+/// Tailscale owns `ts.net`; a public DNS-rebinding name cannot end in it.
+fn is_tailscale_dns_name(host: &str) -> bool {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    host.len() > ".ts.net".len() && host.ends_with(".ts.net")
+}
+
 fn default_origin_port(scheme: &str) -> u16 {
     match scheme {
         "https" | "wss" => 443,
@@ -2661,7 +2752,12 @@ fn default_origin_port(scheme: &str) -> u16 {
     }
 }
 
-fn validate_origin(origin: &str, host: Option<&str>, port: u16) -> Result<(), (u16, String)> {
+fn validate_origin(
+    origin: &str,
+    host: Option<&str>,
+    port: u16,
+    allow_terminated_tls: bool,
+) -> Result<(), (u16, String)> {
     if origin.eq_ignore_ascii_case("null") {
         return Err((403, "Origin `null` is not accepted".to_owned()));
     }
@@ -2674,7 +2770,15 @@ fn validate_origin(origin: &str, host: Option<&str>, port: u16) -> Result<(), (u
     }
     let (origin_host, origin_port) =
         split_authority(authority).ok_or_else(|| (403, "Invalid Origin header".to_owned()))?;
-    if origin_port.unwrap_or(default_origin_port(&scheme)) != port {
+    let origin_port = origin_port.unwrap_or(default_origin_port(&scheme));
+    // Tailscale Serve terminates TLS on :443 and preserves the browser's
+    // `https://<machine>.<tailnet>.ts.net` Origin while proxying to the
+    // loopback listener. A port-less Host header is the reverse-proxy case;
+    // direct browser access to `http://127.0.0.1:<port>` always carries the
+    // explicit port, so this exception cannot be reached by a rebinding page.
+    let terminated_tls =
+        allow_terminated_tls && origin_port == 443 && matches!(scheme.as_str(), "https" | "wss");
+    if origin_port != port && !terminated_tls {
         return Err((403, "Cross-origin request rejected".to_owned()));
     }
     if let Some(host) = host {
@@ -2695,23 +2799,33 @@ fn validate_request_authority(
     let Some(host_header) = request.header("host") else {
         // HTTP/1.0 clients may omit Host; a present Origin still has to match.
         if let Some(origin) = request.header("origin") {
-            validate_origin(origin, None, bound_port)?;
+            validate_origin(origin, None, bound_port, false)?;
         }
         return Ok(());
     };
     let (host, port) =
         split_authority(host_header).ok_or_else(|| (400, "Invalid Host header".to_owned()))?;
-    if port.unwrap_or(80) != bound_port {
-        return Err((
-            403,
-            format!("Host `{host_header}` is not this phone server (port {bound_port})"),
-        ));
-    }
-    if !host_matches_bind(&meta.status.host, &host) {
-        return Err((
-            403,
-            format!("Host `{host}` is not accepted by this phone server"),
-        ));
+    // Tailscale Serve preserves the public Host header (`<machine>.<tailnet>
+    // .ts.net`, no explicit port: it terminates TLS on 443). Only a port-less
+    // Tailscale MagicDNS name gets the reverse-proxy exemption: accepting any
+    // port-less Host would let a DNS-rebinding page present
+    // `Host: evil.example` + `Origin: https://evil.example` and bypass
+    // `host_matches_bind` entirely. Direct local access always carries an
+    // explicit `:port`, so every other case keeps the strict checks.
+    let reverse_proxied_tls = port.is_none() && is_tailscale_dns_name(&host);
+    if !reverse_proxied_tls {
+        if port.unwrap_or(80) != bound_port {
+            return Err((
+                403,
+                format!("Host `{host_header}` is not this phone server (port {bound_port})"),
+            ));
+        }
+        if !host_matches_bind(&meta.status.host, &host) {
+            return Err((
+                403,
+                format!("Host `{host}` is not accepted by this phone server"),
+            ));
+        }
     }
     if let Some(authority) = &request.authority {
         let (absolute_host, absolute_port) = split_authority(authority)
@@ -2724,7 +2838,7 @@ fn validate_request_authority(
         }
     }
     if let Some(origin) = request.header("origin") {
-        validate_origin(origin, Some(&host), bound_port)?;
+        validate_origin(origin, Some(&host), bound_port, reverse_proxied_tls)?;
     }
     Ok(())
 }

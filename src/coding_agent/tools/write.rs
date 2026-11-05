@@ -158,7 +158,7 @@ impl AgentTool for WriteTool {
                     ))
                 }
             };
-            checkpoint_before_mutation(&checkpoint_ctx, "write", &mutation_paths);
+            checkpoint_before_mutation(&checkpoint_ctx, "write", &mutation_paths).await;
             match target
                 .write_atomically(content.as_bytes(), signal.as_ref(), LOCAL_WRITE_CHUNK_BYTES)
                 .await

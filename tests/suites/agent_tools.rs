@@ -95,6 +95,22 @@ impl AgentTool for FailingTool {
     }
 }
 
+/// Panics synchronously inside `run`, before it can return a future, to verify
+/// that panic isolation covers future construction and not only polling.
+struct SyncPanicTool;
+
+impl AgentTool for SyncPanicTool {
+    fn name(&self) -> &'static str {
+        "sync_panic"
+    }
+    fn description(&self) -> &'static str {
+        "panics before returning its future"
+    }
+    fn run(&self, _args: &serde_json::Value, _ctx: &ToolContext) -> BoxFuture<'static, ToolResult> {
+        panic!("synchronous tool panic")
+    }
+}
+
 fn probe_calls(names: &[&str]) -> Vec<AgentToolCall> {
     names
         .iter()
@@ -107,6 +123,37 @@ fn probe_calls(names: &[&str]) -> Vec<AgentToolCall> {
 
 fn default_context() -> ToolContext {
     ToolContext::new(".")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn synchronous_tool_panic_is_isolated_as_error_result() {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(SyncPanicTool));
+    let scheduler = ToolScheduler::new(ToolSchedulerConfig::default());
+    let outcome = scheduler
+        .execute_batch(
+            probe_calls(&["sync_panic"]),
+            &registry,
+            &default_context(),
+            None,
+        )
+        .await;
+    assert_eq!(
+        outcome.results.len(),
+        1,
+        "the one scheduled call must return"
+    );
+    let result = &outcome.results[0];
+    assert!(
+        result.is_error(),
+        "a synchronous panic must become an error result, got {result:?}"
+    );
+    assert!(
+        result.result.content.contains("panicked"),
+        "the error must name the panic, got {:?}",
+        result.result.content
+    );
+    assert_eq!(outcome.execution_end.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

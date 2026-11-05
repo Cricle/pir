@@ -77,7 +77,28 @@ impl AgentSession {
         // surface the loadout's active set is drawn from.
         let registry = self.merged_tool_registry(plugins);
         let active = registry.active_names(self.resolve_active_override(Some(plugins)).as_deref());
-        let decision = mcp.discovery_activation(&registry, &active);
+        let mut decision = mcp.discovery_activation(&registry, &active);
+        // An explicit `--exclude-tools` / `-name` exclusion outranks discovery
+        // activation (upstream applies `_excludedTools` at registration, so
+        // the tool is absent and cannot be activated). Filter the decision
+        // here as well as in `McpPlugin::recompute`: this loadout-time
+        // application must not resurrect a name the user removed.
+        let exclusions = self.default_tool_exclusions();
+        if crate::coding_agent::tool_selection::tool_excluded_by(
+            &exclusions,
+            crate::plugins::builtin::CODEMODE_TOOL_NAME,
+        ) {
+            decision.has_codemode = false;
+        }
+        if crate::coding_agent::tool_selection::tool_excluded_by(
+            &exclusions,
+            crate::plugins::builtin::TOOL_SEARCH_TOOL_NAME,
+        ) {
+            decision.has_tool_search = false;
+        }
+        decision.activate.retain(|name| {
+            !crate::coding_agent::tool_selection::tool_excluded_by(&exclusions, name)
+        });
         let mut reachable = active;
         for name in &decision.activate {
             if !reachable.iter().any(|active| active == name) {
@@ -96,19 +117,10 @@ impl AgentSession {
             return decision.activate;
         }
         // A registered reaching tool that is now active makes the exposure
-        // reachable; nothing to warn about.
-        if decision.has_codemode
-            && reachable
-                .iter()
-                .any(|name| name == crate::plugins::builtin::CODEMODE_TOOL_NAME)
-        {
-            return decision.activate;
-        }
-        if decision.has_tool_search
-            && reachable
-                .iter()
-                .any(|name| name == crate::plugins::builtin::TOOL_SEARCH_TOOL_NAME)
-        {
+        // reachable; nothing to warn about. Each exposure is checked
+        // independently: an active `codemode` does not make a deferred
+        // server's `tool_search` reachable (or vice versa).
+        if !decision.has_unreachable_discovery(&reachable) {
             return decision.activate;
         }
         // One warning per session (upstream `warnedUnreachable`, reset at
@@ -118,14 +130,37 @@ impl AgentSession {
         if self.mcp_unreachable_warned.swap(true, Ordering::SeqCst) {
             return decision.activate;
         }
-        let reason =
-            if decision.needs_codemode && decision.has_codemode && !decision.auto_enable_codemode {
-                " (autoEnableCodemode is false)"
-            } else {
-                ""
-            };
+        let codemode_reachable = decision.has_codemode
+            && reachable
+                .iter()
+                .any(|name| name == crate::plugins::builtin::CODEMODE_TOOL_NAME);
+        let tool_search_reachable = decision.has_tool_search
+            && reachable
+                .iter()
+                .any(|name| name == crate::plugins::builtin::TOOL_SEARCH_TOOL_NAME);
+        // Name only the exposure(s) that are actually missing: when one
+        // discovery tool is active and the other needed one is not, "neither
+        // is active" would be false.
+        let exposure = match (
+            decision.needs_codemode && !codemode_reachable,
+            decision.needs_tool_search && !tool_search_reachable,
+        ) {
+            (true, true) => "the codemode or tool_search tool, but neither is active",
+            (true, false) => "the codemode tool, but it is not active",
+            (false, true) => "the tool_search tool, but it is not active",
+            (false, false) => return decision.activate,
+        };
+        let reason = if decision.needs_codemode
+            && !codemode_reachable
+            && decision.has_codemode
+            && !decision.auto_enable_codemode
+        {
+            " (autoEnableCodemode is false)"
+        } else {
+            ""
+        };
         crate::ext_diag!(
-            "[ext] warning: MCP tools are only reachable from the codemode or tool_search tool, but neither is active{reason}; they cannot be called."
+            "[ext] warning: MCP tools are only reachable from {exposure}{reason}; they cannot be called."
         );
         decision.activate
     }

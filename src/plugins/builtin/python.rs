@@ -163,7 +163,7 @@ Imports resolve against the frozen stdlib and the working directory; no network,
             Some(code) if !code.trim().is_empty() => Some(code.to_owned()),
             _ => None,
         };
-        let timeout_ms = args.get("timeout_ms").and_then(serde_json::Value::as_u64);
+        let timeout_ms = args.get("timeout_ms").and_then(serde_json::Value::as_f64);
         let cwd = ctx.cwd.to_string_lossy().into_owned();
         let signal = ctx.signal.clone();
 
@@ -175,8 +175,14 @@ Imports resolve against the frozen stdlib and the working directory; no network,
                 ),
             };
 
+            // The schema declares `timeout_ms` as a JSON number, so accept
+            // fractional spellings (e.g. `500.0`) instead of silently falling
+            // back to the 30s default. Sub-millisecond positive values clamp
+            // to 1ms; the 120s ceiling still applies.
             let timeout = match timeout_ms {
-                Some(ms) if ms > 0 => Duration::from_millis(ms.min(MAX_TIMEOUT_MS)),
+                Some(ms) if ms > 0.0 => {
+                    Duration::from_millis((ms.min(MAX_TIMEOUT_MS as f64).round() as u64).max(1))
+                }
                 _ => Duration::from_millis(DEFAULT_TIMEOUT_MS),
             };
 

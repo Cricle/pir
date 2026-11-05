@@ -206,6 +206,41 @@ pub fn load_agents_from_dir(dir: &Path, source: AgentSource) -> Vec<AgentConfig>
     agents
 }
 
+/// Built-in agent definitions shipped with the binary. A fresh install has no
+/// `~/.pi/agent/agents` directory, so without these the `subagent` tool can
+/// only answer "Available agents: none" and is unusable out of the box.
+/// `model` is intentionally omitted: every built-in inherits the parent
+/// session's active model, so no provider-specific model id can make a
+/// default agent fail to resolve. User/project agents with the same name
+/// override these through the normal upsert order.
+const BUILTIN_AGENT_MARKDOWN: &[&str] = &[
+    include_str!("../../../assets/agents/scout.md"),
+    include_str!("../../../assets/agents/planner.md"),
+    include_str!("../../../assets/agents/reviewer.md"),
+    include_str!("../../../assets/agents/worker.md"),
+];
+
+fn builtin_agents() -> Vec<AgentConfig> {
+    BUILTIN_AGENT_MARKDOWN
+        .iter()
+        .filter_map(|markdown| {
+            let frontmatter = parse_agent_markdown(markdown)?;
+            let name = frontmatter.name?;
+            let description = frontmatter.description?;
+            let file_path = PathBuf::from(format!("<builtin>/agents/{name}.md"));
+            Some(AgentConfig {
+                name,
+                description,
+                tools: frontmatter.tools,
+                model: frontmatter.model,
+                system_prompt: frontmatter.body,
+                source: AgentSource::User,
+                file_path,
+            })
+        })
+        .collect()
+}
+
 /// The nearest `.pi/agents` directory walking up from `cwd` (upstream
 /// `findNearestProjectAgentsDir`).
 pub fn find_nearest_project_agents_dir(cwd: &Path) -> Option<PathBuf> {
@@ -236,7 +271,16 @@ pub fn discover_agents(cwd: &Path, scope: AgentScope, user_agents_dir: &Path) ->
         (_, Some(dir)) => load_agents_from_dir(dir, AgentSource::Project),
     };
 
-    let mut agents: Vec<AgentConfig> = Vec::new();
+    // A fresh install has neither `~/.pi/agent/agents` nor `.pi/agents`, so
+    // use the shipped defaults only when no agent files were found anywhere.
+    // Once the user configures any agent, that directory is the source of
+    // truth (the defaults would otherwise shadow nothing but add noise).
+    let mut agents: Vec<AgentConfig> =
+        if scope != AgentScope::Project && user_agents.is_empty() && project_agents.is_empty() {
+            builtin_agents()
+        } else {
+            Vec::new()
+        };
     let mut upsert = |agent: AgentConfig| {
         if let Some(existing) = agents.iter_mut().find(|a| a.name == agent.name) {
             *existing = agent;
@@ -244,17 +288,11 @@ pub fn discover_agents(cwd: &Path, scope: AgentScope, user_agents_dir: &Path) ->
             agents.push(agent);
         }
     };
-    if scope == AgentScope::Both {
-        for agent in user_agents {
-            upsert(agent);
-        }
-        for agent in project_agents {
-            upsert(agent);
-        }
-    } else if scope == AgentScope::User {
-        agents = user_agents;
-    } else {
-        agents = project_agents;
+    for agent in user_agents {
+        upsert(agent);
+    }
+    for agent in project_agents {
+        upsert(agent);
     }
 
     Discovery {

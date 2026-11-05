@@ -364,9 +364,16 @@ const CHANNEL_DIR_PREFIX: &str = "pir-pool-";
 /// a long-running command in another process.
 const OUTPUT_FILE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// Minimum spacing between output-file cleanup scans: walking the whole temp
-/// directory is not a per-command cost.
+/// Minimum spacing between output-file cleanup scans: the common scan only
+/// visits this process's registered channel files, not the temp directory.
 const OUTPUT_FILE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Spacing between full temp-directory scans for orphaned private channel
+/// directories left by dead processes. The fallback is deliberately rare: the
+/// temp directory can hold thousands of unrelated entries, and a live process
+/// still owns its own directory.
+const ORPHAN_OUTPUT_SWEEP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
 
 /// Process-unique sequence for output-file names (the UUID suffix makes them
 /// unguessable even by a same-user process; the sequence keeps concurrent
@@ -375,6 +382,24 @@ static OUTPUT_FILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 
 /// The throttle for [`sweep_output_files`].
 static LAST_OUTPUT_SWEEP: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+
+/// Throttle for the full temp-directory orphan scan (separate from the common
+/// registry sweep).
+static LAST_ORPHAN_OUTPUT_SWEEP: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+
+/// One channel file this process created. `live` stays true while an
+/// [`OutputChannel`] owns the file, so the common sweep can never reap a file
+/// that a call may still read. Entries are removed on successful drop or when
+/// the file no longer exists.
+struct OwnedOutputFile {
+    path: PathBuf,
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Absolute paths of channel files this process created (see
+/// [`sweep_owned_output_files`]). A crashed process cannot leave entries here,
+/// which is why the rare directory fallback still exists.
+static OWNED_OUTPUT_FILES: OnceLock<Mutex<Vec<OwnedOutputFile>>> = OnceLock::new();
 
 /// The path of the process's private channel directory
 /// (`%TEMP%/pir-pool-<pid>-<random>`), once per [`ShellPool`]. The *path* is
@@ -1214,6 +1239,16 @@ fn private_dir_pid(name: &str) -> Option<&str> {
     Some(pid)
 }
 
+/// The pid embedded in a `pir-pool-out-<pid>-<seq>-<uuid>` channel name.
+fn output_file_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(OUTPUT_FILE_PREFIX)?;
+    let (pid, rest) = rest.split_once('-')?;
+    if pid.is_empty() || rest.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
 /// One invocation's private output channel.
 ///
 /// The member's stdout is a single control stream shared by every invocation,
@@ -1265,6 +1300,9 @@ struct OutputChannel {
     read_bytes: u64,
     /// Set once the channel file grew past [`OUTPUT_FILE_MAX_BYTES`].
     overflowed: bool,
+    /// Cleared when this channel is dropped; the common sweep must not delete
+    /// a registered file while this stays true.
+    sweep_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OutputChannel {
@@ -1324,6 +1362,8 @@ impl OutputChannel {
                 }
             };
             dir.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let sweep_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            register_owned_output_file(&path, &sweep_live);
             Self {
                 dir: Arc::clone(&dir),
                 path,
@@ -1331,6 +1371,7 @@ impl OutputChannel {
                 compromised: false,
                 read_bytes: 0,
                 overflowed: false,
+                sweep_live,
             }
         };
         Some(created)
@@ -1420,6 +1461,10 @@ impl OutputChannel {
 
 impl Drop for OutputChannel {
     fn drop(&mut self) {
+        // From here on this channel never reads the file again, so the common
+        // sweep may reclaim it if the unlink below fails.
+        self.sweep_live
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         // Close the read handle FIRST: on Windows a delete of an open file
         // only marks it delete-pending, so the directory would not become
         // removable until the handle closed (and a handful of tests create a
@@ -1439,6 +1484,9 @@ impl Drop for OutputChannel {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let file_gone = remove_channel_file(&self.path);
+            if file_gone {
+                unregister_owned_output_file(&self.path);
+            }
             let live = self
                 .dir
                 .live
@@ -1520,15 +1568,99 @@ fn remove_channel_file(path: &Path) -> bool {
     }
 }
 
-/// Remove channel files/directories that outlived their call (see
-/// [`OutputChannel::drop`]). Throttled to [`OUTPUT_FILE_SWEEP_INTERVAL`]; best
-/// effort by design — a temp directory that cannot be listed or an entry that
-/// cannot be removed never fails a run.
+fn owned_output_files() -> &'static Mutex<Vec<OwnedOutputFile>> {
+    OWNED_OUTPUT_FILES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_owned_output_file(path: &Path, live: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let mut files = owned_output_files()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !files.iter().any(|file| file.path == path) {
+        files.push(OwnedOutputFile {
+            path: path.to_path_buf(),
+            live: std::sync::Arc::clone(live),
+        });
+    }
+}
+
+fn unregister_owned_output_file(path: &Path) {
+    let mut files = owned_output_files()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    files.retain(|file| file.path != path);
+}
+
+fn output_file_expired(now: std::time::SystemTime, metadata: &std::fs::Metadata) -> bool {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age > OUTPUT_FILE_MAX_AGE)
+}
+
+/// Common sweep: visit only channel files registered by this process at
+/// creation. A registered file is reclaimed only after its [`OutputChannel`]
+/// dropped (`live == false`) and it is older than [`OUTPUT_FILE_MAX_AGE`], so
+/// a call that is still reading can never lose its channel. No temp-directory
+/// listing and no cross-process liveness probe happens here.
+fn sweep_owned_output_files(now: std::time::SystemTime) {
+    let entries: Vec<(PathBuf, std::sync::Arc<std::sync::atomic::AtomicBool>)> = {
+        let files = owned_output_files()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        files
+            .iter()
+            .map(|file| (file.path.clone(), std::sync::Arc::clone(&file.live)))
+            .collect()
+    };
+    let mut gone = Vec::new();
+    for (path, live) in entries {
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            gone.push(path);
+            continue;
+        };
+        if !metadata.is_file() {
+            gone.push(path);
+            continue;
+        }
+        if live.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+        if output_file_expired(now, &metadata) && remove_channel_file(&path) {
+            gone.push(path);
+        }
+    }
+    if !gone.is_empty() {
+        let mut files = owned_output_files()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        files.retain(|file| !gone.iter().any(|path| path == &file.path));
+    }
+}
+
+fn orphan_output_sweep_due() -> bool {
+    let throttle = LAST_ORPHAN_OUTPUT_SWEEP.get_or_init(|| Mutex::new(None));
+    let Ok(mut last) = throttle.lock() else {
+        return false;
+    };
+    match *last {
+        Some(at) if at.elapsed() < ORPHAN_OUTPUT_SWEEP_INTERVAL => false,
+        _ => {
+            *last = Some(std::time::Instant::now());
+            true
+        }
+    }
+}
+
+/// Rare fallback: list the temp root for orphaned artifacts left by a process
+/// that exited before its own cleanup could run.
 ///
 /// Two layouts are handled:
 /// * legacy flat `pir-pool-out-*` files from before the private-directory
 ///   change (removed once older than [`OUTPUT_FILE_MAX_AGE`], so upgrades do
-///   not leave them forever);
+///   not leave them forever). A file naming another live pid is preserved,
+///   matching the private-directory rule.
 /// * `pir-pool-<pid>-<random>` private directories. The sweep lists the
 ///   PARENT (the temp root) to find them; it never lists a private directory's
 ///   contents. A directory whose owning pid is dead is reaped right away (no
@@ -1538,48 +1670,37 @@ fn remove_channel_file(path: &Path) -> bool {
 ///   a plain owner allow) and then deletes it with `remove_dir_all`; when that
 ///   is refused the directory is left in place and the refusal is logged once
 ///   per process.
-fn sweep_output_files() {
-    let throttle = LAST_OUTPUT_SWEEP.get_or_init(|| Mutex::new(None));
-    let Ok(mut last) = throttle.lock() else {
-        return;
-    };
-    if last
-        .as_ref()
-        .is_some_and(|at| at.elapsed() < OUTPUT_FILE_SWEEP_INTERVAL)
-    {
-        return;
-    }
-    *last = Some(std::time::Instant::now());
-    drop(last);
+fn sweep_orphan_output_files(now: std::time::SystemTime) {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
     };
-    let now = std::time::SystemTime::now();
-    let own_pid = std::process::id().to_string();
+    let own_pid = std::process::id();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
-        let expired = |metadata: &std::fs::Metadata| {
-            metadata
-                .modified()
-                .ok()
-                .and_then(|modified| now.duration_since(modified).ok())
-                .is_some_and(|age| age > OUTPUT_FILE_MAX_AGE)
-        };
         // Legacy flat channel file (pre-private-directory layout).
         if name.starts_with(OUTPUT_FILE_PREFIX) {
+            let Some(pid) = output_file_pid(name) else {
+                continue; // unattributable legacy artifact: never delete it
+            };
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            if metadata.is_file() && expired(&metadata) {
+            if metadata.is_file()
+                && output_file_expired(now, &metadata)
+                && (pid == own_pid || !process_is_alive(pid))
+            {
                 let _ = std::fs::remove_file(entry.path());
             }
             continue;
         }
         // Private channel directory: `pir-pool-<pid>-<random>`.
         let Some(pid) = private_dir_pid(name) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
             continue;
         };
         if pid == own_pid {
@@ -1591,9 +1712,6 @@ fn sweep_output_files() {
         if !metadata.is_dir() {
             continue;
         }
-        let Ok(pid) = pid.parse::<u32>() else {
-            continue;
-        };
         // A LIVE owner's directory is never touched, however old (a >24 h
         // process may still be writing). A DEAD owner's directory is reaped
         // immediately — the pid is gone, no channel in it can be live, and
@@ -1618,6 +1736,72 @@ fn sweep_output_files() {
             );
             log_sweep_refusal(&path);
         }
+    }
+}
+
+/// Remove channel files/directories that outlived their call (see
+/// [`OutputChannel::drop`]). Throttled to [`OUTPUT_FILE_SWEEP_INTERVAL`]; best
+/// effort by design — a temp directory that cannot be listed or an entry that
+/// cannot be removed never fails a run.
+///
+/// The common pass is O(files this process created) thanks to
+/// [`OWNED_OUTPUT_FILES`]. The full temp-directory scan runs only on the first
+/// sweep of the process and every [`ORPHAN_OUTPUT_SWEEP_INTERVAL`] thereafter,
+/// so orphan reclamation does not sit on the per-command path.
+fn sweep_output_files() {
+    sweep_output_files_inner(false);
+}
+
+/// Force a full sweep now (registry pass plus orphan scan). Test seam.
+#[doc(hidden)]
+pub fn sweep_output_files_now() {
+    sweep_output_files_inner(true);
+}
+
+/// Registry-only sweep now. Test seam for the common production pass; it
+/// never lists the temp directory.
+#[doc(hidden)]
+pub fn sweep_owned_output_files_now() {
+    sweep_owned_output_files(std::time::SystemTime::now());
+}
+
+/// Test seam: treat an already-created `pir-pool-out-<own-pid>-*` file as a
+/// registered, non-live channel file so the registry sweep can be observed.
+#[doc(hidden)]
+pub fn register_output_file_for_tests(path: PathBuf) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if output_file_pid(name) != Some(std::process::id()) {
+        return false;
+    }
+    register_owned_output_file(
+        &path,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    true
+}
+
+fn sweep_output_files_inner(force: bool) {
+    let throttle = LAST_OUTPUT_SWEEP.get_or_init(|| Mutex::new(None));
+    let Ok(mut last) = throttle.lock() else {
+        return;
+    };
+    if !force
+        && last
+            .as_ref()
+            .is_some_and(|at| at.elapsed() < OUTPUT_FILE_SWEEP_INTERVAL)
+    {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+    let now = std::time::SystemTime::now();
+    sweep_owned_output_files(now);
+    // The first production sweep performs one orphan scan at process start;
+    // later scans are six hours apart (or explicitly forced by the test seam).
+    if force || orphan_output_sweep_due() {
+        sweep_orphan_output_files(now);
     }
 }
 

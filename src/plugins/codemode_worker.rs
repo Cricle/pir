@@ -366,13 +366,15 @@ pub(super) fn assemble_script_outcome(
     // A top-level `return <value>` adds output (upstream contract); `exit()`
     // and a bare `return` produce no value item.
     if ok {
+        // `return_value` is `None` only when the script completed without a
+        // value (`exit()` / a bare `return`); an explicit `return null`
+        // arrives as the text "null" and is output, like upstream
+        // `outputText(null)`.
         if let Some(value) = return_value {
-            if !value.is_empty() && value != "null" {
-                items.push(OutputItem {
-                    kind: "text",
-                    text: value,
-                });
-            }
+            items.push(OutputItem {
+                kind: "text",
+                text: value,
+            });
         }
     }
     let partial = super::render_output(&items);
@@ -939,13 +941,11 @@ async fn run_script(
             if parsed.get("ok").and_then(JsonValue::as_bool) == Some(true) {
                 WorkerExit::Done(ScriptDone {
                     ok: true,
-                    value: Some(
-                        parsed
-                            .get("value")
-                            .and_then(JsonValue::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    ),
+                    // `value` is absent for `exit()` / a bare `return`.
+                    value: parsed
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned),
                     name: None,
                     error: None,
                     head: None,

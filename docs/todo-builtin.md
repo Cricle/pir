@@ -119,10 +119,14 @@ deserialization for a well-formed transcript).
 Header counts omit zero values; sections appear only when non-empty; tombstones are never listed. Empty list: `No
 todos yet. Ask the agent to add some!`. No UI: `/todos requires interactive mode` (`ok = false`).
 
+**Overlay.** On a UI session the plugin registers a native widget factory (`ctx.ui.setWidget("todos", …)`,
+`WidgetPlacement::Overlay`) that renders the same grouped list in the dock. It repaints after every tool mutation,
+`/todos`, transcript replay, `/reload` and session start. The list is clipped to the frame width and capped at 12
+rows; `ctrl+shift+t` toggles a one-line counts summary. The `/todos` command keeps its text channel for print mode.
+
 **Text channel.** A Rust command's only host-visible text output is `CommandOutcome.error` (the `mcp` builtin's
 precedent), so the grouped list rides that field with `ok = true`. Print mode prints it (`[ext] command:todos:
-…`); the TUI renders extension-command text only for failed outcomes and does not list Rust builtin commands, so
-`/todos` is not surfaced there yet (same gap `/mcp` has).
+…`); the TUI overlay above is the interactive surface.
 
 ## 4. Feature control
 
@@ -166,9 +170,9 @@ Pinned by `tests/suites/todo_builtin.rs` and module unit tests.
 | 11 | Table-driven `VALID_TRANSITIONS` map | `matches!` table with the same cells, pinned cell-by-cell | Idempotent, allocation-free, same semantics |
 | 12 | Regex-based `sanitizeTerminalText` | Hand-written single-pass scanner | No regex on a hot path; pinned character cases (CSI, C1 CSI, OSC with/without ST, bare ESC, C0/C1 controls, U+2028/29, bidi) are covered |
 | 13 | i18n through `@juicesharp/rpiv-i18n` (9 locales) with English fallbacks | English literals only | No i18n layer; scoped out |
-| 14 | `~/.config/rpiv-todo/config.json` (`maxWidgetLines`, `collapseKey`, `guidance`) | Not read | These affect overlay rows, collapse key and prompt guidance only; overlay out of scope, built-in guidance shipped |
-| 15 | Overlay widget, collapse state, "completed rows fade after the turn", per-row glyphs/colors, `selectOverlayLayout`; only the foreground session's overlay repaints | Not ported; no render surface and each session host owns its instance. `ctrl+shift+t` is a registered definition (name + description) with a no-op Rust handler for a UI lane | v1 scope: `src/tui/**` is another lane's surface; the definition is the seam |
-| 16 | `/todos` through `ctx.ui.notify(..., "info")` | `CommandOutcome.error` text (`ok: true`), the mcp builtin's channel | No Rust notify route today (see §3); print shows it, TUI surfacing is a host fix |
+| 14 | `~/.config/rpiv-todo/config.json` (`maxWidgetLines`, `collapseKey`, `guidance`) | Not read | The native overlay uses fixed 12-row/width clipping and the registered `ctrl+shift+t`; the config file is not a settings surface yet |
+| 15 | Overlay widget, collapse state, "completed rows fade after the turn", per-row glyphs/colors, `selectOverlayLayout`; only the foreground session's overlay repaints | Native widget factory + collapse state ported; no per-row colors/fade or `selectOverlayLayout`. `ctrl+shift+t` reaches the native handler through `PluginHost::invoke_shortcut`; the TUI's JS-only shortcut dispatcher still does not call that host path | One overlay mechanism (`ctx.ui.setWidget`, `WidgetPlacement::Overlay`); TUI-native shortcut routing is a separate host seam |
+| 16 | `/todos` through `ctx.ui.notify(..., "info")` | Native overlay widget plus `CommandOutcome.error` text (`ok: true`) for print mode | The overlay is the interactive surface; print keeps the mcp-style text channel |
 
 Everything else — six actions, parameter names/semantics, status machine, tombstones, dependency validation and
 `blocks` edges, metadata null-deletion, the envelope shape, all contract error strings, `list`/`get` content lines

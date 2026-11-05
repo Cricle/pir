@@ -22,12 +22,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ai::types::AbortSignal;
 
-/// Snapshot a mutation tool's target paths before the mutation. Checkpoint
-/// failures are best-effort: they never block the actual write/edit (the
-/// transcript itself still records the tool result). Sessions without a
-/// session file (in-memory/read-only) have no checkpoint store and are
-/// skipped.
-pub(super) fn checkpoint_before_mutation(
+/// Snapshot a mutation tool's target paths before the mutation.
+///
+/// The snapshot reads whole files and hashes/writes them, so it runs on
+/// `tokio`'s blocking pool: a large file must not stall the async runtime while
+/// the tool awaits it. The per-file ceiling makes an oversized target fail the
+/// snapshot cleanly (no partial checkpoint is published); like every other
+/// checkpoint failure, an error is logged as a warning and the mutation
+/// proceeds. Sessions without a session file (in-memory/read-only) have no
+/// checkpoint store and are skipped.
+pub(super) async fn checkpoint_before_mutation(
     ctx: &crate::agent::tool_execution::ToolContext,
     tool: &str,
     paths: &[PathBuf],
@@ -44,8 +48,17 @@ pub(super) fn checkpoint_before_mutation(
     else {
         return;
     };
-    if let Err(error) = store.snapshot(tool, paths) {
-        tracing::warn!(%error, tool, "file checkpoint failed; the mutation proceeds");
+    let tool_name = tool.to_owned();
+    let log_tool = tool_name.clone();
+    let paths = paths.to_vec();
+    match tokio::task::spawn_blocking(move || store.snapshot(&tool_name, &paths)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, tool = %log_tool, "file checkpoint failed; the mutation proceeds");
+        }
+        Err(error) => {
+            tracing::warn!(%error, tool = %log_tool, "file checkpoint task failed; the mutation proceeds");
+        }
     }
 }
 

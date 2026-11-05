@@ -752,7 +752,7 @@ FROM chunks_fts \
 JOIN chunks c ON c.id = chunks_fts.rowid \
 WHERE chunks_fts MATCH ?1 \
   AND (?2 IS NULL OR c.source = ?2) \
-  AND (?3 IS NULL OR c.content_type = ?3) \
+  AND (?3 IS NULL OR LOWER(c.content_type) = ?3) \
 ORDER BY rank \
 LIMIT ?4";
 
@@ -1495,10 +1495,15 @@ pub(crate) fn documents_for_index(
     let content_type = content_type
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_ascii_lowercase());
+    // Source labels are user-facing keys, and both `ctx_search` and
+    // `ctx_purge` trim their source filter before the exact-match SQL. Trim
+    // the stored label here too; otherwise `source: " docs "` is indexed
+    // verbatim and can never be addressed (or scoped-purged) as `"docs"`.
+    let source = source
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
     if let Some(content) = content {
-        let source = source
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "inline".to_owned());
+        let source = source.unwrap_or_else(|| "inline".to_owned());
         let content_type = content_type.unwrap_or_else(|| "markdown".to_owned());
         return Ok(vec![IndexDoc::from_text(source, content_type, &content)]);
     }
@@ -1514,9 +1519,7 @@ pub(crate) fn documents_for_index(
         .map_err(|error| format!("ctx_index: cannot stat `{path}`: {error}"))?;
 
     if metadata.is_dir() {
-        let base = source
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| path.trim_end_matches(['/', '\\']).to_owned());
+        let base = source.unwrap_or_else(|| path.trim().trim_end_matches(['/', '\\']).to_owned());
         let files = walk_directory(&resolved)?;
         let mut docs = Vec::with_capacity(files.len());
         for file in files {
@@ -1573,9 +1576,7 @@ pub(crate) fn documents_for_index(
         .map_err(|error| format!("ctx_index: cannot read `{path}`: {error}"))?;
     let content_type =
         content_type.unwrap_or_else(|| content_type_for_extension(&extension).to_owned());
-    let source = source
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| path.clone());
+    let source = source.unwrap_or_else(|| path.trim().to_owned());
     let text = String::from_utf8_lossy(&bytes);
     Ok(vec![IndexDoc::from_text(source, content_type, &text)])
 }
@@ -1792,9 +1793,8 @@ Use 2-4 specific technical terms per query and batch related questions here inst
         let content_type = args
             .get("contentType")
             .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|content_type| !content_type.is_empty())
-            .map(str::to_owned);
+            .map(|content_type| content_type.trim().to_ascii_lowercase())
+            .filter(|content_type| !content_type.is_empty());
         let limit = args
             .get("limit")
             .and_then(serde_json::Value::as_u64)
@@ -1963,12 +1963,26 @@ impl AgentTool for CtxPurgeTool {
             .get("confirm")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let source = args
-            .get("source")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|source| !source.is_empty())
-            .map(str::to_owned);
+        // Destructive scope: only an ABSENT `source` means the whole knowledge
+        // base. A present-but-null, blank, or non-string value must never
+        // silently widen a scoped purge into a global one.
+        let source = match args.get("source") {
+            None => None,
+            Some(value) => match value
+                .as_str()
+                .map(str::trim)
+                .filter(|source| !source.is_empty())
+            {
+                Some(source) => Some(source.to_owned()),
+                None => {
+                    return Box::pin(async {
+                        ToolResult::error(
+                            "ctx_purge: the `source` parameter must be a non-empty string when provided; omit it to purge the whole knowledge base",
+                        )
+                    });
+                }
+            },
+        };
         let _ = ctx;
 
         Box::pin(async move {

@@ -389,8 +389,21 @@ impl Tailscale {
         }
 
         let after = self.serve_info(port).await;
+        let error = if after.active {
+            String::new()
+        } else if after.error.is_empty() {
+            format!(
+                "`tailscale serve` succeeded but the {} route is absent from `serve status`.",
+                serve_path(port)
+            )
+        } else {
+            after.error
+        };
         EnableResult {
-            enabled: after.active || after.error.is_empty(),
+            // Only an observed route counts as enabled: `serve` can exit 0
+            // while the path-scoped handler is still missing, and reporting
+            // "ready" then would send the user to a 502.
+            enabled: after.active,
             changed: true,
             replaced_existing: before.had_any_web_config,
             url: if after.url.is_empty() {
@@ -398,11 +411,7 @@ impl Tailscale {
             } else {
                 after.url
             },
-            error: if after.active {
-                String::new()
-            } else {
-                after.error
-            },
+            error,
         }
     }
 

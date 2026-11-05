@@ -161,6 +161,26 @@ pub async fn codex_ws_pool_guard() -> tokio::sync::MutexGuard<'static, ()> {
     codex_ws_pool_lock().lock().await
 }
 
+/// Wait until the producer side of the Codex WebSocket transport has returned
+/// the previous turn's socket to the process-global pool.
+///
+/// The terminal `Done` event is pushed to the consumer **before** the transport
+/// releases its lease and inserts the socket, so a follow-up turn started
+/// immediately after `Done` can handshake fresh and lose the pooled
+/// continuation. Tests that pin pool continuity must wait on the production
+/// pool instead of sleeping for a fixed interval: a fixed delay is a guess
+/// that loses under CI load.
+pub async fn wait_for_pooled_codex_websocket(session_id: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pir::ai::api::openai_responses::codex::codex_ws::pooled_websocket_count(session_id) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session {session_id} never returned its WebSocket to the pool"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// A local HTTP endpoint that answers every request with an immediate 401:
 /// failed prompts in sandboxed CLI/RPC tests must be FAST (auth errors are
 /// non-retryable), while an unreachable endpoint (127.0.0.1:1) stalls ~8s in

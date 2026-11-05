@@ -10,6 +10,7 @@
 //! |---|---|
 //! | `phase_sequence_answers_and_settles_inputs` | prepare → request → classify → final boundary |
 //! | `partial_throttle_commits_at_the_interval` | one partial commit per interval, none when the response beats it |
+//! | `partial_flushes_preserve_accumulated_tool_arguments` | incremental flushes keep committed tool-call arguments |
 //! | `retry_backoff_sleeps_then_prepares_next_attempt` | a retryable error sleeps `retry_delay_ms`, then retries |
 //! | `overflow_compacts_and_retries_once` | overflow → blocking compaction → prepare → request |
 //! | `blocking_compaction_failure_settles_model_error` | a failed blocking compaction settles `unanswered`/`model_error` |
@@ -487,6 +488,16 @@ enum Reply {
     },
     /// One tool call.
     Call(ToolCall),
+    /// A tool call whose argument JSON arrives in `deltas`, `gap_ms` apart,
+    /// with the parsed arguments visible in the partial after each fragment.
+    /// The stream stays open for `tail_ms` after the last fragment.
+    ToolCallDeltas {
+        id: &'static str,
+        name: &'static str,
+        deltas: Vec<(&'static str, Vec<(&'static str, &'static str)>)>,
+        gap_ms: u64,
+        tail_ms: u64,
+    },
     /// A retryable provider error.
     Error(&'static str),
 }
@@ -613,6 +624,53 @@ impl GenerationModels for Models {
                         reason: pir::ai::types::TerminalReason::ToolUse,
                         message: call_message(call),
                     });
+                }
+                Reply::ToolCallDeltas {
+                    id,
+                    name,
+                    deltas,
+                    gap_ms,
+                    tail_ms,
+                } => {
+                    let partial_message = |arguments: &BTreeMap<String, Value>| {
+                        let mut message = call_message(ToolCall {
+                            id: id.to_owned(),
+                            name: name.to_owned(),
+                            arguments: arguments.clone(),
+                            thought_signature: None,
+                            namespace: None,
+                            arguments_error: None,
+                        });
+                        message.stop_reason = StopReason::Pending;
+                        Arc::new(message)
+                    };
+                    output
+                        .push_await(AssistantMessageEvent::ToolCallStart {
+                            content_index: 0,
+                            partial: partial_message(&BTreeMap::new()),
+                        })
+                        .await;
+                    for (delta, parsed) in deltas {
+                        let arguments: BTreeMap<String, Value> = parsed
+                            .iter()
+                            .map(|(key, value)| {
+                                ((*key).to_owned(), Value::String((*value).to_owned()))
+                            })
+                            .collect();
+                        output
+                            .push_await(AssistantMessageEvent::ToolCallDelta {
+                                content_index: 0,
+                                delta: delta.to_owned(),
+                                partial: partial_message(&arguments),
+                            })
+                            .await;
+                        if gap_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+                        }
+                    }
+                    if tail_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(tail_ms)).await;
+                    }
                 }
                 Reply::Error(message) => {
                     output.push(AssistantMessageEvent::Error {
@@ -1459,6 +1517,112 @@ async fn throttled_partials_accumulate_on_the_committed_base() {
          observed {seen:?}"
     );
     world.wait_terminal(task).await;
+}
+
+/// Regression (P1): a tool call whose argument JSON arrives over several
+/// throttled flushes must keep the arguments committed by earlier flushes.
+/// `PartialChanges::take` clears the arguments in the message copy and plans
+/// `Keep` for them; that only preserves the committed values while the
+/// `generation.message` slot itself stays in place.
+#[tokio::test]
+async fn partial_flushes_preserve_accumulated_tool_arguments() {
+    let mut settings = base_settings();
+    settings.progress = pir::durable::harness::settings::ProgressPolicy {
+        partial_interval_ms: 1,
+        output_interval_ms: 1,
+    };
+    let models = Models::new(vec![Reply::ToolCallDeltas {
+        id: "call-1",
+        name: "write",
+        deltas: vec![
+            ("{\"alpha\":\"one\",", vec![("alpha", "one")]),
+            ("\"beta\":\"two\",", vec![("alpha", "one"), ("beta", "two")]),
+            (
+                "\"gamma\":\"three\"}",
+                vec![("alpha", "one"), ("beta", "two"), ("gamma", "three")],
+            ),
+        ],
+        gap_ms: 40,
+        tail_ms: 30_000,
+    }]);
+    let world = World::new(models, Arc::new(Tools::default()), settings).await;
+    let task = world
+        .create_with(json!({ "phase": "prepare", "attempt": 1 }))
+        .await;
+    world.start_run(task).await;
+    world.scheduler.resume();
+
+    // Wait for the SECOND flush: the first commit carries `alpha`, the second
+    // adds `beta`. Before the fix the second flush replaced the committed
+    // message with a cleared one, dropping `alpha`.
+    let mut observed = None;
+    for _ in 0..600 {
+        let live = world.live().await;
+        let arguments = live
+            .generation
+            .as_ref()
+            .and_then(|generation| generation.message.as_ref())
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|content| content.first())
+            .and_then(|block| block.get("arguments"))
+            .and_then(Value::as_object);
+        if arguments.is_some_and(|arguments| arguments.contains_key("beta")) {
+            observed = arguments.cloned();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let arguments = observed.expect("the second partial flush must commit");
+    assert_eq!(
+        arguments.get("alpha").and_then(Value::as_str),
+        Some("one"),
+        "the first flush's argument was erased by the second flush: {arguments:?}"
+    );
+    assert_eq!(
+        arguments.get("beta").and_then(Value::as_str),
+        Some("two"),
+        "the second flush's argument is missing: {arguments:?}"
+    );
+
+    // Abort with the partial committed: its conversion to a transcript entry
+    // must carry every argument emitted before the abort.
+    world.scheduler.abort(task).await.expect("abort the task");
+    let record = world.wait_terminal(task).await;
+    assert!(
+        matches!(outcome_of(&record), TaskOutcome::Aborted { .. }),
+        "expected aborted, got {:?}",
+        record.state
+    );
+    let entries = entry_messages(&world.storage, world.conversation).await;
+    let aborted = entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == "pi.assistant")
+        .and_then(|entry| entry.model.as_ref())
+        .and_then(|model| model.first())
+        .expect("the converted partial is appended as an assistant entry");
+    let message: AssistantMessage = serde_json::from_value(aborted.clone()).unwrap();
+    assert_eq!(message.stop_reason, StopReason::Aborted);
+    let ContentBlock::ToolCall(call) = message
+        .content
+        .first()
+        .expect("the converted message carries the tool call")
+    else {
+        panic!("expected a tool call block, got {:?}", message.content);
+    };
+    assert_eq!(
+        call.arguments.get("alpha").and_then(Value::as_str),
+        Some("one"),
+        "the converted transcript entry lost an earlier flush's argument: {:?}",
+        call.arguments
+    );
+    assert_eq!(
+        call.arguments.get("beta").and_then(Value::as_str),
+        Some("two"),
+        "the converted transcript entry lost the second flush's argument: {:?}",
+        call.arguments
+    );
 }
 
 #[tokio::test]

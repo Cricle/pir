@@ -2150,6 +2150,23 @@ impl<'a> serde_json::ser::Formatter for PyJsonFormatter<'a> {
         Ok(())
     }
 
+    fn write_f64<W>(&mut self, writer: &mut W, value: f64) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        // `json.dumps` emits `float.__repr__` text; serde_json/ryu differs in
+        // the negative-exponent range (`0.00001` vs `1e-05`) and exponent
+        // zero-padding, so reproduce CPython's repr exactly.
+        writer.write_all(python_float_repr(value).as_bytes())
+    }
+
+    fn write_f32<W>(&mut self, writer: &mut W, value: f32) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        self.write_f64(writer, f64::from(value))
+    }
+
     fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> std::io::Result<()>
     where
         W: ?Sized + std::io::Write,
@@ -2180,6 +2197,33 @@ impl<'a> serde_json::ser::Formatter for PyJsonFormatter<'a> {
         }
         writer.write_all(&fragment.as_bytes()[start..])
     }
+}
+
+/// CPython `float.__repr__` text for a finite float (what `json.dumps` emits).
+///
+/// Scientific notation is used for magnitudes below `1e-4` or at/above
+/// `1e16`, with a signed, at-least-two-digit exponent; integral floats in the
+/// decimal range keep their trailing `.0`. The mantissa comes from Rust's
+/// shortest-round-trip formatter, which matches CPython's shortest repr.
+fn python_float_repr(value: f64) -> String {
+    let magnitude = value.abs();
+    if magnitude != 0.0 && !(1e-4..1e16).contains(&magnitude) {
+        let text = format!("{value:e}");
+        // `LowerExp` always emits `<mantissa>e<integer>`; the fallbacks keep
+        // the formatting path infallible without a production `.expect`.
+        let mut parts = text.split('e');
+        let mantissa = parts.next().unwrap_or(text.as_str());
+        let exponent = parts
+            .next()
+            .and_then(|exponent| exponent.parse::<i32>().ok())
+            .unwrap_or(0);
+        return format!("{mantissa}e{exponent:+03}");
+    }
+    let mut text = value.to_string();
+    if !text.contains('.') {
+        text.push_str(".0");
+    }
+    text
 }
 
 // ---------------------------------------------------------------------------
