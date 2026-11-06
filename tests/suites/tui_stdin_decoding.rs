@@ -1059,6 +1059,58 @@ fn stdin_gate_keeps_an_unterminated_paste_open_until_the_end_marker() {
 }
 
 #[test]
+fn max_paste_bytes_covers_a_ten_mib_paste() {
+    // The user-visible target is a 10 MB paste (10 MiB = 10 * 1024 * 1024
+    // bytes). The cap is a memory upper bound for an unterminated paste, not
+    // a plausible paste size: it must sit well above a real 10 MB paste.
+    assert_eq!(MAX_PASTE_BYTES, 64 * 1024 * 1024);
+    assert!(MAX_PASTE_BYTES > 10 * 1024 * 1024);
+}
+
+#[test]
+fn stdin_gate_accepts_a_paste_past_the_old_eight_mib_cap() {
+    // Regression: the old 8 MiB cap ended a still-arriving paste mid-payload
+    // and sent the rest of a 10 MB paste down the ordinary per-key path (the
+    // split that made real 10 MB pastes slow). A payload just past the old
+    // cap must stay ONE paste until its end marker; nothing may be delivered
+    // at the old boundary.
+    const OLD_CAP: usize = 8 * 1024 * 1024;
+    let base = Instant::now();
+    let mut gate = StdinGate::default();
+    assert!(push_console_bytes(&mut gate, base, 0, 1, b"\x1b[200~").is_empty());
+    assert!(gate.paste_open());
+
+    let mut out = gate.push(Event::Paste("a".repeat(OLD_CAP / 2)), at(base, 10));
+    assert!(
+        out.is_empty(),
+        "nothing arrives before the end marker: {out:?}"
+    );
+    assert!(gate.paste_open());
+
+    out.extend(gate.push(
+        Event::Paste("a".repeat(OLD_CAP / 2 + 1)),
+        at(base, 11),
+    ));
+    assert!(
+        out.is_empty(),
+        "the old 8 MiB cap must not split the paste (got {} events)",
+        out.len()
+    );
+    assert!(
+        gate.paste_open(),
+        "a payload past the old cap must stay open until the end marker"
+    );
+
+    out.extend(gate.push(Event::Paste("\x1b[201~".to_string()), at(base, 12)));
+    assert_eq!(out.len(), 1, "one paste event expected, got {} events", out.len());
+    match &out[0] {
+        Event::Paste(text) => assert_eq!(text.len(), OLD_CAP + 1),
+        other => panic!("expected one paste, got {other:?}"),
+    }
+    assert!(!gate.paste_open());
+}
+
+#[test]
 fn stdin_gate_caps_an_unterminated_paste() {
     // A paste whose end marker never arrives is bounded (pir's deviation from
     // upstream's unbounded `pasteBuffer`): once MAX_PASTE_BYTES were collected
@@ -1071,16 +1123,23 @@ fn stdin_gate_caps_an_unterminated_paste() {
     // A Unix `Event::Paste` nested in a gate-collected paste is payload too
     // (`collect_paste`), which feeds a payload this size without a million
     // pushes.
-    let half = "a".repeat(MAX_PASTE_BYTES / 2);
-    out.extend(gate.push(Event::Paste(half.clone()), at(base, 10)));
-    assert!(out.is_empty(), "below the cap nothing is delivered yet");
+    let first = "a".repeat(MAX_PASTE_BYTES / 2);
+    out.extend(gate.push(Event::Paste(first), at(base, 10)));
+    assert!(out.is_empty(), "below the 64 MiB cap nothing is delivered yet");
     assert!(gate.paste_open());
-    out.extend(gate.push(Event::Paste(half), at(base, 11)));
-    assert_eq!(
-        out,
-        vec![Event::Paste("a".repeat(MAX_PASTE_BYTES))],
-        "the cap delivers what was collected, as one paste"
-    );
+    out.extend(gate.push(
+        Event::Paste("a".repeat(MAX_PASTE_BYTES - MAX_PASTE_BYTES / 2)),
+        at(base, 11),
+    ));
+    assert_eq!(out.len(), 1, "the cap delivers one paste, got {} events", out.len());
+    match &out[0] {
+        Event::Paste(text) => assert_eq!(
+            text.len(),
+            MAX_PASTE_BYTES,
+            "the cap delivers exactly what was collected, as one paste"
+        ),
+        other => panic!("expected one paste, got {other:?}"),
+    }
     assert!(!gate.paste_open());
     // The gate is back in normal mode: later input is typed, not collected.
     assert_eq!(

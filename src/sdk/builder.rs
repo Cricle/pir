@@ -17,6 +17,7 @@ use crate::session_manager::SessionManager;
 use super::agent::Agent;
 use super::error::SdkError;
 use super::resources::{DefaultResourceLoader, ResourceLoader};
+use super::runtime::apply_system_prompt_files;
 
 /// Wire API of an explicitly configured endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +103,21 @@ impl Endpoint {
             max_tokens: 8_192,
         }
     }
+}
+
+/// Explicit system-prompt files read at build time.
+///
+/// Pass to [`AgentBuilder::system_prompt_files`] (or
+/// [`crate::sdk::CreateAgentSessionOptions::system_prompt_files`]) to replace
+/// the ambient `SYSTEM.md` / `APPEND_SYSTEM.md` lookup with caller-chosen
+/// files. Relative paths are resolved against the process working directory.
+#[derive(Debug, Clone, Default)]
+pub struct SystemPromptFiles {
+    /// File read as the SYSTEM.md preamble replacement (`None` keeps the
+    /// derived preamble).
+    pub system: Option<PathBuf>,
+    /// File whose contents become an APPEND_SYSTEM.md addendum section.
+    pub append: Option<PathBuf>,
 }
 
 /// How the builder obtains the session storage.
@@ -270,6 +286,13 @@ pub struct AgentBuilder {
     thinking_level: Option<ThinkingLevel>,
     system_prompt: Option<String>,
     append_system_prompt: Option<String>,
+    /// Tri-state ambient SYSTEM.md/APPEND_SYSTEM.md discovery. `None` keeps
+    /// the path default: on for environment-resolved `model*` builds, off for
+    /// `endpoint` / `with_registry` and when explicit files are supplied.
+    discover_system_prompt: Option<bool>,
+    /// Explicit prompt files; ambient discovery stays off unless
+    /// [`AgentBuilder::discover_system_prompt(true)`] is also requested.
+    system_prompt_files: Option<SystemPromptFiles>,
     cwd: Option<PathBuf>,
     /// The agent directory this agent identifies with (D2/D9). `None` resolves
     /// the process environment exactly like the CLI does
@@ -340,6 +363,8 @@ impl AgentBuilder {
             thinking_level: None,
             system_prompt: None,
             append_system_prompt: None,
+            discover_system_prompt: None,
+            system_prompt_files: None,
             cwd: None,
             agent_dir: None,
             max_turns: None,
@@ -370,6 +395,11 @@ impl AgentBuilder {
     /// reasoning metadata). Mutually exclusive with [`AgentBuilder::model`],
     /// [`AgentBuilder::model_in_provider`], and
     /// [`AgentBuilder::with_registry`].
+    ///
+    /// This path is environment-free: no `PIR_SYSTEM_PROMPT_FILE` read and no
+    /// `SYSTEM.md` / `APPEND_SYSTEM.md` discovery happens unless
+    /// [`AgentBuilder::discover_system_prompt(true)`] or
+    /// [`AgentBuilder::system_prompt_files(..)`] explicitly requests it.
     pub fn endpoint(mut self, endpoint: Endpoint) -> Self {
         self.endpoint = Some(endpoint);
         self
@@ -410,6 +440,11 @@ impl AgentBuilder {
     /// so a keyless provider can return an empty
     /// [`api_key_auth`](crate::ai::provider::Provider::api_key_auth) list and
     /// no environment variable is read.
+    ///
+    /// This path is environment-free: no `PIR_SYSTEM_PROMPT_FILE` read and no
+    /// `SYSTEM.md` / `APPEND_SYSTEM.md` discovery happens unless
+    /// [`AgentBuilder::discover_system_prompt(true)`] or
+    /// [`AgentBuilder::system_prompt_files(..)`] explicitly requests it.
     ///
     /// # Examples
     ///
@@ -548,6 +583,10 @@ impl AgentBuilder {
     /// context-derived prompt (the base preamble/`<tools>`/`<rules>`/`<cwd>`
     /// plus AGENTS.md / CLAUDE.md discovery); when unset, the session always
     /// sends that derived prompt.
+    ///
+    /// An explicit prompt also pins the whole prompt: no ambient
+    /// `SYSTEM.md` / `APPEND_SYSTEM.md` discovery and no
+    /// `PIR_SYSTEM_PROMPT_FILE` read happens on this build.
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = Some(prompt.into());
         self
@@ -561,6 +600,39 @@ impl AgentBuilder {
     /// discovery stay in place.
     pub fn append_system_prompt(mut self, text: impl Into<String>) -> Self {
         self.append_system_prompt = Some(text.into());
+        self
+    }
+
+    /// Enable or disable ambient system-prompt discovery.
+    ///
+    /// When enabled and no explicit [`AgentBuilder::system_prompt`] pins the
+    /// prompt, the build reads `PIR_SYSTEM_PROMPT_FILE` and discovers
+    /// `SYSTEM.md` / `APPEND_SYSTEM.md` (project `.pi/` files trust-gated,
+    /// global agent-dir files always considered). Explicit
+    /// [`AgentBuilder::system_prompt_files`] win over the ambient preamble but
+    /// join the same discovery when this is enabled.
+    ///
+    /// Default: enabled for the environment-resolved `model(..)` /
+    /// `model_in_provider(..)` / `new()` paths (CLI parity), **disabled** for
+    /// [`AgentBuilder::endpoint`] / [`AgentBuilder::with_registry`] /
+    /// [`AgentBuilder::proxy`] builds and for builds supplying
+    /// [`AgentBuilder::system_prompt_files`]. This keeps the explicit
+    /// endpoint/registry contract environment-free unless the caller opts in.
+    pub fn discover_system_prompt(mut self, discover: bool) -> Self {
+        self.discover_system_prompt = Some(discover);
+        self
+    }
+
+    /// Read system-prompt files from explicit paths instead of (or, with
+    /// [`AgentBuilder::discover_system_prompt(true)`], in addition to) the
+    /// ambient lookup.
+    ///
+    /// An explicit [`AgentBuilder::system_prompt`] still wins: the files are
+    /// only applied to the context-derived prompt. Precedence:
+    /// `files.system` > `PIR_SYSTEM_PROMPT_FILE` > discovered `SYSTEM.md`;
+    /// discovered `APPEND_SYSTEM.md` precedes `files.append`.
+    pub fn system_prompt_files(mut self, files: SystemPromptFiles) -> Self {
+        self.system_prompt_files = Some(files);
         self
     }
 
@@ -1118,6 +1190,8 @@ impl AgentBuilder {
     /// A builtin or extension path that cannot be attached also fails here —
     /// never as a silently incomplete agent.
     pub async fn build(mut self) -> Result<Agent, SdkError> {
+        let perf_trace = std::env::var_os("PIR_PERF_TRACE").is_some();
+        let perf_t0 = std::time::Instant::now();
         let cwd = self
             .cwd
             .clone()
@@ -1201,6 +1275,10 @@ impl AgentBuilder {
             ));
         }
         let from_endpoint = self.endpoint.is_some();
+        // Explicit model setup (endpoint/registry) is environment-free: used
+        // below to keep ambient SYSTEM.md discovery off by default (D-03).
+        // Captured before the model match moves those fields.
+        let explicit_model_setup = self.endpoint.is_some() || self.registry.is_some();
         // Environment-resolved auth keys, kept for a restored session model
         // whose provider differs from the initially resolved one.
         let mut environment_api_keys: Option<std::collections::BTreeMap<String, String>> = None;
@@ -1717,6 +1795,9 @@ impl AgentBuilder {
             user_plugins.push(rewire_builtin_for_session(plugin, &agent_dir, &cwd));
         }
         user_plugins.extend(self.plugins);
+        if perf_trace {
+            eprintln!("[perf] pre-plugin-host {:?}", perf_t0.elapsed());
+        }
         let sink_slot = Arc::new(std::sync::Mutex::new(None));
         user_plugins.push(Arc::new(super::event::SdkBridgePlugin::new(Arc::clone(
             &sink_slot,
@@ -1742,6 +1823,9 @@ impl AgentBuilder {
                 Some(cwd.as_path()),
             )
         };
+        if perf_trace {
+            eprintln!("[perf] plugin-host {:?}", perf_t0.elapsed());
+        }
         // Strict attachment contract (the same one `extension_paths` and
         // `builtin(...)` use): a plugin that was explicitly handed to the
         // builder and whose `register()` failed is NOT silently absent. The
@@ -2050,6 +2134,9 @@ impl AgentBuilder {
             Some(plugin_host),
             Some(agent_dir.clone()),
         );
+        if perf_trace {
+            eprintln!("[perf] session-facade {:?}", perf_t0.elapsed());
+        }
         // Clamp the starting thinking level to what the resolved model
         // supports (upstream `createAgentSession`'s
         // `clampThinkingLevel(model, thinkingLevel)`): a non-reasoning model
@@ -2063,29 +2150,39 @@ impl AgentBuilder {
         if tool_hooks.is_some() {
             session_facade.set_tool_hooks(tool_hooks);
         }
-        // Derived-prompt form: the SYSTEM.md / APPEND_SYSTEM.md discovery
-        // joins the just-derived base prompt with print's exact precedence
-        // (print.rs:3315-3337): the `PIR_SYSTEM_PROMPT_FILE` env file or a
-        // discovered SYSTEM.md becomes the preamble override and a discovered
-        // APPEND_SYSTEM.md renders as the `addendum` section, re-applied on
-        // every active-set/`/reload` rebuild. The builder's
-        // `.append_system_prompt(..)` keeps its own trailing form (upstream
-        // appends the caller's addendum after the whole rendered prompt, not
-        // as a tagged section). The explicit-prompt form stays hermetic: the
-        // caller pinned the whole prompt, so no ambient file discovery
-        // applies.
+        // Derived-prompt form: the shared SDK prompt-file helper owns the
+        // SYSTEM.md / APPEND_SYSTEM.md discovery and override precedence
+        // (print.rs:3315-3337): an explicit `files.system` wins, then the
+        // `PIR_SYSTEM_PROMPT_FILE` env file, then a discovered SYSTEM.md as
+        // the preamble override; discovered APPEND_SYSTEM.md entries precede
+        // the explicit append file. The builder's `.append_system_prompt(..)`
+        // keeps its own trailing form (upstream appends the caller's addendum
+        // after the whole rendered prompt, not as a tagged section).
+        //
+        // D-03: ambient discovery is path-scoped, not global. The
+        // environment-resolved `model*` paths keep CLI parity (on by default),
+        // while `endpoint` / `with_registry` / `proxy` are environment-free
+        // and only opt in through `.discover_system_prompt(true)` or explicit
+        // `.system_prompt_files(..)`. An explicit `.system_prompt(..)` always
+        // pins the whole prompt and performs no prompt-file IO.
         if !explicit_system_prompt {
-            let system_prompt_file = std::env::var_os("PIR_SYSTEM_PROMPT_FILE")
-                .map(std::path::PathBuf::from)
-                .map(std::fs::read_to_string)
-                .transpose()?;
-            let discovered = crate::config::settings::discover_system_md(
-                &session_cwd,
-                &agent_dir,
-                crate::config::trust::resolve_cwd_trust(&session_cwd, &agent_dir),
-            );
-            let append: Vec<String> = discovered.1.into_iter().collect();
-            session_facade.apply_prompt_overrides(system_prompt_file.or(discovered.0), append);
+            // `.system_prompt_files(..)` is itself the opt-out: even an empty
+            // value means the caller owns prompt-file selection.
+            let explicit_files = self.system_prompt_files.is_some();
+            let discover = self
+                .discover_system_prompt
+                .unwrap_or(!explicit_model_setup && !explicit_files);
+            let files = self.system_prompt_files.take().unwrap_or_default();
+            if discover || explicit_files {
+                apply_system_prompt_files(
+                    &session_facade,
+                    &session_cwd,
+                    &agent_dir,
+                    crate::config::trust::resolve_cwd_trust(&session_cwd, &agent_dir),
+                    discover,
+                    &files,
+                )?;
+            }
             if let Some(appendix) = append_system_prompt {
                 session_facade.append_derived_system_prompt(appendix);
             }
@@ -2103,6 +2200,9 @@ impl AgentBuilder {
                     .set_prompt_resources_shared(resources.skills, resources.prompt_templates);
             }
         }
+        if perf_trace {
+            eprintln!("[perf] prompt-files {:?}", perf_t0.elapsed());
+        }
         let agent = Agent::new(super::agent::AgentInit {
             session: session_facade,
             // The bridge plugin and the Agent share ONE sink slot: live
@@ -2118,6 +2218,9 @@ impl AgentBuilder {
             initial_usage,
             api_key_provider,
         });
+        if perf_trace {
+            eprintln!("[perf] agent-new {:?}", perf_t0.elapsed());
+        }
         if self.max_retries.is_some() || self.max_retry_delay_ms.is_some() {
             agent
                 .inner

@@ -730,12 +730,18 @@ pub enum Command {
     },
     /// RPC mode (JSON lines over stdin/stdout)
     Rpc,
-    /// Remote session server
+    /// Remote session server (requires PIR_SERVER_AUTH_TOKEN by default)
     Server {
         /// Bind a Unix-domain socket at this path instead of TCP (upstream
         /// unix transport preset; Unix only)
         #[arg(long = "unix")]
         unix: Option<String>,
+        /// Start without authentication for local development. Any local
+        /// user/process can then create sessions and read/write files under
+        /// the server's working directory; loopback is not user isolation.
+        /// Requires PIR_SERVER_AUTH_TOKEN to be unset.
+        #[arg(long = "allow-unauthenticated")]
+        allow_unauthenticated: bool,
     },
     /// Connect to a remote server and print its session count
     Client,
@@ -1054,6 +1060,11 @@ pub enum CheckpointCommand {
         /// Explicit session `.jsonl` path
         #[arg(long = "session", value_name = "PATH")]
         session: Option<String>,
+        /// Workspace directory that confines every restored path. Required for
+        /// both dry runs and real restores; the session header `cwd` is never
+        /// used as a security root.
+        #[arg(long = "root", value_name = "DIR")]
+        root: Option<String>,
         /// Show what would change without writing anything
         #[arg(long = "dry-run")]
         dry_run: bool,
@@ -2854,8 +2865,10 @@ const KNOWN_LONG_FLAGS: &[&str] = &[
     // `pir --print "msg"` lost both the flag and the message.
     "print",
     // `Server --unix <path>`: silently degrading to TCP was a transport
-    // safety bug, not only a lost flag.
+    // safety bug, not only a lost flag. `--allow-unauthenticated` is the
+    // explicit local-development opt-in for a token-less server.
     "unix",
+    "allow-unauthenticated",
     // The `install`/`remove`/`uninstall`/`config` `--local` (`-l`) spelling,
     // plus `config --json/--enable/--disable/--source` and
     // `auth check --json` (the latter already covered above).
@@ -2871,6 +2884,15 @@ const KNOWN_LONG_FLAGS: &[&str] = &[
     "force",
     // `mcp login --timeout <seconds>`.
     "timeout",
+    // `checkpoint restore --root <dir>`: a real clap arg. Without this entry
+    // `preprocess_args` would collect it as an extension flag, drop it from
+    // argv, and clap would never bind the value.
+    "root",
+    // `checkpoint restore --dry-run` and `checkpoint list --limit <n>`:
+    // clap-defined flags that must not be swallowed as extension flags (a
+    // swallowed `--dry-run` also ate the following checkpoint id).
+    "dry-run",
+    "limit",
     // `mcp add`: `--url`, `--env`, `--cwd`, `--header`,
     // `--bearer-token-env-var`, `--oauth-client-id`, `--oauth-client-secret`,
     // `--oauth-callback-port`, `--oauth-client-name`, `--exposure`,

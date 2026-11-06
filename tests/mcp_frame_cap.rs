@@ -67,7 +67,6 @@ fn frame_mock_spawn() -> (String, Vec<String>) {
         exe.to_string_lossy().into_owned(),
         vec![
             "mock_mcp_frame_child".to_owned(),
-            "--exact".to_owned(),
             "--nocapture".to_owned(),
         ],
     )

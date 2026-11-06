@@ -5,6 +5,7 @@
 pub mod agent_loop;
 pub mod commit;
 pub mod nested_tool_calls;
+pub mod read_ledger;
 pub mod tool_batch;
 pub mod tool_dependencies;
 pub mod tool_execution;

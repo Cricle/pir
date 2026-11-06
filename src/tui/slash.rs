@@ -1417,22 +1417,8 @@ pub fn format_thousands(value: u64) -> String {
 }
 
 /// Compact token counts (upstream `formatTokens`, footer.ts: 1.2k / 12k /
-/// 1.2M / 12M).
-pub fn format_tokens(count: u64) -> String {
-    if count < 1000 {
-        return count.to_string();
-    }
-    if count < 10_000 {
-        return format!("{:.1}k", count as f64 / 1000.0);
-    }
-    if count < 1_000_000 {
-        return format!("{}k", (count as f64 / 1000.0).round() as u64);
-    }
-    if count < 10_000_000 {
-        return format!("{:.1}M", count as f64 / 1_000_000.0);
-    }
-    format!("{}M", (count as f64 / 1_000_000.0).round() as u64)
-}
+/// 1.2M / 12M); shared implementation in [`crate::text`].
+pub use crate::text::format_tokens;
 
 /// The compaction / branch-summary billed notice (upstream
 /// `addCompactionCostNotice`, interactive-mode.ts:4110-4126, gated by

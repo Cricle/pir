@@ -317,6 +317,7 @@ fn env_with_updates(
     on_update: Option<pir::agent::tool_execution::ToolUpdateFn>,
 ) -> Arc<ToolSessionEnv> {
     Arc::new(ToolSessionEnv {
+        read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),
         thinking: ThinkingLevel::Off,

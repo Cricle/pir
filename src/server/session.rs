@@ -36,6 +36,44 @@ use super::progress::agent_event_to_progress;
 
 const UPDATE_CHANNEL_CAPACITY: usize = 1024;
 
+/// Stack budget for the OS thread that hosts one server prompt/agent run.
+///
+/// `tokio::spawn` runs the future on a runtime worker with the platform
+/// default stack (2 MiB on Windows). A server prompt drives the full
+/// `AgentSession` (provider request assembly, MCP tool calls, persistence),
+/// exactly the stack shape that overflowed `pir-tui-worker`; a debug build
+/// needs well over 2 MiB before the first provider request. Run each prompt
+/// on a dedicated thread with its own current-thread runtime instead, matching
+/// the TUI worker's 12–16 MiB policy. Public so the stack regression test can
+/// pin it.
+pub const SERVER_AGENT_TASK_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Spawn one prompt/agent future on a dedicated large-stack thread with a
+/// current-thread runtime. Tokio has no per-task stack-size knob, so a
+/// dedicated thread is the only way to give the task a bigger stack than the
+/// runtime's workers.
+fn spawn_agent_task(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    let spawned = std::thread::Builder::new()
+        .name("pir-server-agent".to_owned())
+        .stack_size(SERVER_AGENT_TASK_STACK_BYTES)
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(crate::env_daemon::tokio_max_blocking_threads())
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(future),
+                Err(error) => tracing::error!(%error, "server agent runtime failed"),
+            }
+        });
+    if let Err(error) = spawned {
+        // Dropping the future drops the completion sender; the dispatcher
+        // treats that as a vanished run and sends no response (connection is
+        // tearing down), so log rather than panic.
+        tracing::error!(%error, "server agent thread failed");
+    }
+}
+
 /// Bound on the tail window a persisted session is first opened with when
 /// attaching (`SessionManager::open_paged`). A session that fits inside these
 /// caps is opened fully (the paged open falls back); a larger one parses only
@@ -1128,7 +1166,9 @@ impl ServerState {
         let state = self.clone();
         let id = id.to_owned();
         let connection_id = connection_id.to_owned();
-        tokio::spawn(async move {
+        // NOT `tokio::spawn`: see SERVER_AGENT_TASK_STACK_BYTES — the agent
+        // run needs a 16 MiB stack, not the runtime worker's 2 MiB default.
+        spawn_agent_task(async move {
             let outcome = state
                 .run_prompt(&id, &connection_id, text, queued, model_ref, signal)
                 .await;

@@ -33,12 +33,12 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use pir::tui::altscreen_search::{route_alt_screen_key, AltKeyRoute, AltScreenState};
-use pir::tui::app::{ChatContainer, ChatEntry};
+use pir::tui::app::{settle_attached_editor, ChatContainer, ChatEntry, SessionTab};
 use pir::tui::autocomplete::{AutocompleteItem, AutocompletePopup, AutocompleteSuggestions};
 use pir::tui::core::{Component, DockMouseLayout, MouseRegion, Terminal, Text, TuiCore};
 use pir::tui::editor::Editor;
 use pir::tui::image_preview::{
-    render_image_with_settings, ImageSettings, DEFAULT_IMAGE_WIDTH_CELLS,
+    render_image_with_settings, resolve_image_path, ImageSettings, DEFAULT_IMAGE_WIDTH_CELLS,
 };
 use pir::tui::keybindings::Keybindings;
 use pir::tui::settings_menu::{
@@ -566,6 +566,51 @@ fn type_to_search_filters_the_settings_rows() {
     assert_eq!(menu.rows().len(), all);
 }
 
+/// Regression (S2 `2026-11-06T0415-settings-nomatch-enter`): Enter/←/→ on a
+/// search with zero rows must be a no-op. Before the fix `current_index`
+/// clamped to the unfiltered row count, so Enter cycled the hidden first row
+/// (`compaction.enabled`) and the host printed `Saved setting`.
+#[test]
+fn settings_enter_with_no_matching_rows_does_not_apply_a_hidden_row() {
+    let settings = pir::config::settings::Settings::default();
+    let menu = SettingsMenu::new(&settings, menu_context());
+    let auto_compact = menu
+        .rows()
+        .into_iter()
+        .find(|(label, _)| label == "Auto-compact")
+        .expect("the compaction row exists");
+
+    for c in "/model".chars() {
+        assert!(matches!(
+            menu.handle_key(MenuKey::Char(c)),
+            MenuOutcome::None
+        ));
+    }
+    assert_eq!(menu.query(), "/model");
+    assert!(
+        menu.rows().is_empty(),
+        "the query must match no settings row"
+    );
+    assert!(
+        menu.selected_label().is_none(),
+        "an empty result list has no selected row"
+    );
+    for key in [MenuKey::Enter, MenuKey::Right, MenuKey::Left] {
+        assert!(
+            matches!(menu.handle_key(key), MenuOutcome::None),
+            "{key:?} must be a no-op when no row matches"
+        );
+    }
+
+    // Clearing the search restores the untouched value: no action was applied.
+    assert!(matches!(menu.handle_key(MenuKey::Esc), MenuOutcome::None));
+    assert_eq!(menu.query(), "");
+    assert!(
+        menu.rows().contains(&auto_compact),
+        "no-match Enter must leave the settings values untouched"
+    );
+}
+
 /// The wheel row is the upstream numeric list: `auto`, 1, 2, 3, 5, 10, plus a
 /// stored value outside the presets, and it persists the right JSON.
 #[test]
@@ -755,6 +800,32 @@ fn image_settings_resolve_from_the_terminal_settings() {
     assert!(!configured.show);
 }
 
+/// IMAGE-REL: `/image` resolves a relative path against the session cwd;
+/// absolute paths pass through unchanged, and an unavailable cwd leaves the
+/// argument as typed (the read error keeps the user's path context).
+#[test]
+fn image_path_argument_resolves_against_session_cwd() {
+    use std::path::Path;
+
+    let cwd = Path::new("session-root");
+    assert_eq!(
+        resolve_image_path(Path::new("qa.png"), cwd),
+        cwd.join("qa.png")
+    );
+    assert_eq!(
+        resolve_image_path(Path::new("sub/qa.png"), cwd),
+        cwd.join("sub/qa.png")
+    );
+
+    let absolute = std::env::temp_dir().join("qa.png");
+    assert_eq!(resolve_image_path(&absolute, cwd), absolute);
+
+    assert_eq!(
+        resolve_image_path(Path::new("qa.png"), Path::new("")),
+        Path::new("qa.png")
+    );
+}
+
 /// `terminal.showImages: false` renders the upstream `[Image: …]` text
 /// fallback instead of halfblocks — in a DEFAULT build (the module used to be
 /// compiled out entirely unless the non-default `image-protocol` feature was
@@ -888,4 +959,139 @@ fn tiny_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
     png_chunk(&mut png, b"IDAT", &zlib_stored(&raw));
     png_chunk(&mut png, b"IEND", &[]);
     png
+}
+
+// ---------------------------------------------------------------------------
+// Startup input (S2 `2026-11-06T0415-first-keystroke-loss`).
+// ---------------------------------------------------------------------------
+
+fn session_tab(path: &str, title: &str) -> SessionTab {
+    SessionTab {
+        path: path.to_string(),
+        title: title.to_string(),
+        draft: String::new(),
+    }
+}
+
+/// Keys typed between the first frame and the worker's `SessionAttached`
+/// reply must survive the attach. Before `settle_attached_editor` the attach
+/// restored the new tab's empty draft over the live composer text, dropping
+/// the leading characters.
+#[test]
+fn startup_attach_keeps_keystrokes_typed_before_the_worker_reply() {
+    let editor = Editor::new();
+    for character in "XYZ".chars() {
+        editor.insert_char(character);
+    }
+
+    let mut tabs = Vec::new();
+    let mut active = None;
+    let restored = settle_attached_editor(
+        &mut tabs,
+        &mut active,
+        "/sessions/startup.jsonl",
+        "startup",
+        &editor.get_text(),
+    );
+    editor.set_text(&restored);
+
+    assert_eq!(
+        editor.get_text(),
+        "XYZ",
+        "the startup attach must not overwrite live composer text"
+    );
+    assert_eq!(active.as_deref(), Some("/sessions/startup.jsonl"));
+    assert_eq!(tabs.len(), 1);
+}
+
+/// A switch attach belongs to the OUTGOING tab: text typed while the worker
+/// opens the target is saved there, and the target's own draft is restored.
+#[test]
+fn attach_during_a_switch_saves_live_text_and_restores_the_target_draft() {
+    let mut tabs = vec![
+        session_tab("/sessions/a.jsonl", "A"),
+        session_tab("/sessions/b.jsonl", "B"),
+    ];
+    let mut active = Some("/sessions/a.jsonl".to_string());
+    tabs[0].draft = "draft for A".to_string();
+    tabs[1].draft = "draft for B".to_string();
+
+    let restored = settle_attached_editor(
+        &mut tabs,
+        &mut active,
+        "/sessions/b.jsonl",
+        "B",
+        "draft for A + typed while attaching",
+    );
+
+    assert_eq!(restored, "draft for B");
+    assert_eq!(tabs[0].draft, "draft for A + typed while attaching");
+    assert_eq!(
+        tabs[1].draft, "",
+        "the taken target draft is not duplicated"
+    );
+}
+
+/// The trust prompt's key-level reader submits exactly on Enter; digits,
+/// Backspace, empty/out-of-range answers keep the old line-prompt semantics.
+#[test]
+fn trust_choice_input_stops_at_submit_and_validates_the_choice() {
+    use pir::tui::startup_input::{TrustChoiceInput, TrustChoiceKey, TrustChoiceStep};
+
+    let mut input = TrustChoiceInput::new(5);
+    assert_eq!(
+        input.push(TrustChoiceKey::Digit('3')),
+        TrustChoiceStep::Pending
+    );
+    assert_eq!(
+        input.push(TrustChoiceKey::Submit),
+        TrustChoiceStep::Submit(2)
+    );
+
+    let mut input = TrustChoiceInput::new(5);
+    input.push(TrustChoiceKey::Digit('1'));
+    input.push(TrustChoiceKey::Digit('2'));
+    input.push(TrustChoiceKey::Backspace);
+    assert_eq!(input.digits(), "1");
+    assert_eq!(
+        input.push(TrustChoiceKey::Submit),
+        TrustChoiceStep::Submit(0)
+    );
+
+    assert_eq!(
+        TrustChoiceInput::new(5).push(TrustChoiceKey::Submit),
+        TrustChoiceStep::Cancel
+    );
+    let mut input = TrustChoiceInput::new(5);
+    input.push(TrustChoiceKey::Digit('9'));
+    assert_eq!(input.push(TrustChoiceKey::Submit), TrustChoiceStep::Cancel);
+}
+
+/// Bytes the Unix OSC 11 reader had to hand back are replayed through the
+/// same sequence model as live input: text in order, escape sequences as
+/// their key events.
+#[test]
+fn startup_handback_bytes_decode_to_key_events_in_order() {
+    use crossterm::event::Event;
+    use pir::tui::stdin_buffer::decode_startup_input_bytes;
+
+    let events = decode_startup_input_bytes(b"XYZ");
+    let chars: Vec<char> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Key(key) => match key.code {
+                KeyCode::Char(character) => Some(character),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(chars, vec!['X', 'Y', 'Z']);
+
+    let events = decode_startup_input_bytes(b"\x1b[A");
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0],
+        Event::Key(key) if key.code == KeyCode::Up
+    ));
 }

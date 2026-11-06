@@ -13,6 +13,12 @@ use tokio::net::{TcpListener, TcpStream};
 /// `PIR_SERVER_ALLOWED_ROOTS` (the cwd policy re-reads it on every call).
 static ALLOWED_ROOTS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Servers in this suite exercise protocol behavior, not authentication;
+/// token-less binds are an explicit local-development opt-in (C2-04).
+fn open_security() -> ServerSecurityConfig {
+    ServerSecurityConfig::unauthenticated_local()
+}
+
 #[tokio::test]
 async fn authenticated_server_accepts_valid_token_and_rejects_invalid_token() {
     let server = Server::bind_with_security(
@@ -99,9 +105,13 @@ async fn hello_and_snapshot_query_use_framed_cbor() {
     // v8 response frames validate `target.serverId` against the upstream
     // uuid-v4 shape, so the fixture server id must be a v4 uuid.
     let server_id = uuid::Uuid::new_v4().to_string();
-    let server = Server::bind_with_snapshot("127.0.0.1:0", empty_snapshot(server_id.clone()))
-        .await
-        .expect("bind test server");
+    let server = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        ServerState::new(empty_snapshot(server_id.clone())),
+        open_security(),
+    )
+    .await
+    .expect("bind test server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 
@@ -121,7 +131,9 @@ async fn hello_and_snapshot_query_use_framed_cbor() {
 
 #[tokio::test]
 async fn unsupported_commands_return_protocol_error_codes() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind test server");
+    let server = Server::bind_with_security("127.0.0.1:0", open_security())
+        .await
+        .expect("bind test server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 
@@ -146,7 +158,9 @@ async fn unsupported_commands_return_protocol_error_codes() {
 
 #[tokio::test]
 async fn session_commands_enforce_ownership_and_report_missing_provider() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind test server");
+    let server = Server::bind_with_security("127.0.0.1:0", open_security())
+        .await
+        .expect("bind test server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
     let mut client = Client::connect(address).await.expect("hello handshake");
@@ -192,7 +206,7 @@ async fn remote_agent_policy_can_be_disabled_without_server_execution() {
         "127.0.0.1:0",
         ServerSecurityConfig {
             allow_remote_agent: false,
-            ..ServerSecurityConfig::default()
+            ..open_security()
         },
     )
     .await
@@ -239,7 +253,9 @@ async fn remote_agent_policy_can_be_disabled_without_server_execution() {
 
 #[tokio::test]
 async fn disconnect_removes_active_connection() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind test server");
+    let server = Server::bind_with_security("127.0.0.1:0", open_security())
+        .await
+        .expect("bind test server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 
@@ -253,7 +269,9 @@ async fn disconnect_removes_active_connection() {
 
 #[tokio::test]
 async fn create_session_and_list_shows_it() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind test server");
+    let server = Server::bind_with_security("127.0.0.1:0", open_security())
+        .await
+        .expect("bind test server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 
@@ -304,7 +322,9 @@ async fn create_session_and_list_shows_it() {
 
 #[tokio::test]
 async fn create_and_attach_session() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind test server");
+    let server = Server::bind_with_security("127.0.0.1:0", open_security())
+        .await
+        .expect("bind test server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 
@@ -373,7 +393,9 @@ async fn create_and_attach_session() {
 
 #[tokio::test]
 async fn create_with_model_and_thinking_and_list_across_connections() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind test server");
+    let server = Server::bind_with_security("127.0.0.1:0", open_security())
+        .await
+        .expect("bind test server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 
@@ -499,7 +521,9 @@ async fn request_times_out_when_peer_never_responds() {
 /// instead of blocking forever.
 #[tokio::test]
 async fn next_update_times_out_without_incoming_updates() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind test server");
+    let server = Server::bind_with_security("127.0.0.1:0", open_security())
+        .await
+        .expect("bind test server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 
@@ -549,7 +573,7 @@ const _: fn(ServerSnapshot) -> ServerSnapshot = std::convert::identity;
 /// control (`session_tool_registry`, src/server/session.rs).
 #[tokio::test]
 async fn session_tool_registry_excludes_bash_unless_remote_bash_allowed() {
-    let server = Server::bind("127.0.0.1:0")
+    let server = Server::bind_with_security("127.0.0.1:0", open_security())
         .await
         .expect("bind default test server");
     server
@@ -572,7 +596,7 @@ async fn session_tool_registry_excludes_bash_unless_remote_bash_allowed() {
         "127.0.0.1:0",
         ServerSecurityConfig {
             allow_remote_bash: true,
-            ..ServerSecurityConfig::default()
+            ..open_security()
         },
     )
     .await
@@ -637,7 +661,7 @@ async fn create_with_cwd_is_policy_gated_and_allowed_roots_widen_it() {
     let root_text = root.to_string_lossy().to_string();
 
     // Phase 1 — no allowlist configured: any explicit cwd is rejected.
-    let server = Server::bind("127.0.0.1:0")
+    let server = Server::bind_with_security("127.0.0.1:0", open_security())
         .await
         .expect("bind cwd test server");
     let address = server.local_addr().expect("local address");
@@ -669,7 +693,7 @@ async fn create_with_cwd_is_policy_gated_and_allowed_roots_widen_it() {
 
     // Phase 2 — the allowlist widens the gate to cwds inside its roots.
     std::env::set_var("PIR_SERVER_ALLOWED_ROOTS", &root_text);
-    let server = Server::bind("127.0.0.1:0")
+    let server = Server::bind_with_security("127.0.0.1:0", open_security())
         .await
         .expect("bind cwd test server with allowlist");
     let address = server.local_addr().expect("local address");
@@ -873,7 +897,7 @@ async fn attach_persisted_session_rechecks_cwd_against_allowed_roots() {
     );
     let state = ServerState::new(empty_snapshot(uuid::Uuid::new_v4().to_string()))
         .with_session_dir(sessions.clone());
-    let server = Server::bind_with_state("127.0.0.1:0", state)
+    let server = Server::bind_with_state_and_security("127.0.0.1:0", state, open_security())
         .await
         .expect("bind attach-cwd test server");
     let address = server.local_addr().expect("local address");
@@ -934,7 +958,7 @@ async fn idle_connection_is_reaped_at_the_configured_deadline() {
         "127.0.0.1:0",
         ServerSecurityConfig {
             idle_timeout: Duration::from_millis(150),
-            ..ServerSecurityConfig::default()
+            ..open_security()
         },
     )
     .await

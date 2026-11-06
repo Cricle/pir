@@ -21,6 +21,7 @@ pub mod crash_log;
 #[cfg(feature = "export-html")]
 pub mod export_html;
 pub mod json;
+pub mod output;
 pub mod overrides;
 pub mod package_manager;
 #[cfg(feature = "print")]

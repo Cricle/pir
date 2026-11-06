@@ -820,7 +820,7 @@ fn editor_hint() -> String {
 /// One selector row (upstream `extension-selector.ts:87-92`): the selected
 /// row is accent `→ ` + accent label, every other row two plain spaces +
 /// text-colored label (the `Text` row applies the 1-cell pad).
-fn selector_option(label: &str, selected: bool) -> String {
+pub(super) fn selector_option(label: &str, selected: bool) -> String {
     if selected {
         with_theme(|theme| {
             format!(

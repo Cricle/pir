@@ -9,6 +9,9 @@ Cargo.lock.bak
 /target-exp-*/
 /target-release-*/
 /target-perf-*/
+/target-gnu/
+/target-gnu-off/
+/target-merge/
 /scripts/tui_conpty/out/
 /.pi/
 /AGENT.md

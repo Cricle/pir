@@ -2911,7 +2911,7 @@ fn encode_agent(state: &AgentState) -> JsonObject {
 /// [`REPORT_TYPES`](super::telemetry::REPORT_TYPES) and
 /// [`REPORT_REASONS`](super::telemetry::REPORT_REASONS); matching here keeps the
 /// no-sink path free of serialization and allocation.
-fn report_telemetry(
+pub(super) fn report_telemetry(
     info: &ReportInfo,
 ) -> (
     &'static str,

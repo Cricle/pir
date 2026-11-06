@@ -6,7 +6,7 @@
 //! alone exceeds the limit. The pir port scanned char boundaries in reverse,
 //! which kept only the final character.
 
-use pir::coding_agent::truncate::{truncate_tail, TruncatedBy};
+use pir::coding_agent::truncate::{truncate_head, truncate_tail, TruncatedBy};
 
 #[test]
 fn partial_last_line_keeps_the_longest_suffix() {
@@ -53,6 +53,19 @@ fn trailing_char_larger_than_take_yields_empty() {
     assert_eq!(result.content, "");
     assert_eq!(result.output_bytes, 0);
     assert_eq!(result.output_lines, 1);
+}
+
+#[test]
+fn head_truncation_reports_trailing_newline_byte_overflow() {
+    // Only the trailing newline crosses the byte limit: the content is kept
+    // whole, but the limit that fired is still the byte limit (shared core
+    // with `durable::truncate`, which pins this upstream behavior).
+    let result = truncate_head("abc\n", usize::MAX, 3);
+    assert!(result.truncated);
+    assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
+    assert_eq!(result.content, "abc");
+    assert_eq!(result.total_bytes, 4);
+    assert_eq!(result.output_bytes, 3);
 }
 
 #[test]

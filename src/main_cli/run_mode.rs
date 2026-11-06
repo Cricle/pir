@@ -1,5 +1,37 @@
 use super::*;
 
+// CLI output must not panic when a pipe consumer goes away. Rust's
+// `println!`/`eprintln!` panic on `BrokenPipe`; these shadowing macros write
+// fallibly instead. stdout ends the process quietly on a closed pipe (the
+// conventional `| head` behavior); stderr diagnostics are dropped when their
+// stream is gone.
+macro_rules! println {
+    () => {{
+        if let Err(error) = pir::coding_agent::output::write_stdout_line("") {
+            pir::coding_agent::output::exit_stdout_error(error);
+        }
+    }};
+    ($($arg:tt)*) => {{
+        if let Err(error) = pir::coding_agent::output::write_stdout_line(&format!($($arg)*)) {
+            pir::coding_agent::output::exit_stdout_error(error);
+        }
+    }};
+}
+
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        if let Err(error) = pir::coding_agent::output::write_stdout_text(&format!($($arg)*)) {
+            pir::coding_agent::output::exit_stdout_error(error);
+        }
+    }};
+}
+
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        let _ = pir::coding_agent::output::write_stderr_line(&format!($($arg)*));
+    }};
+}
+
 pub(super) async fn run() -> Result<()> {
     // Upstream `cli/setup.ts:6-7` / `rpc-entry.ts:7-8`: extensions, hooks, and
     // child tools detect that they run under the coding agent. Set before any
@@ -259,14 +291,19 @@ pub(super) async fn run() -> Result<()> {
                 );
                 tracing_subscriber::fmt()
                     .with_env_filter(log_filter)
-                    .with_writer(std::io::stderr)
+                    // Swallow writer errors: the subscriber reacts to a
+                    // failed write with its own `eprintln!`, which panics
+                    // when stderr is a closed pipe.
+                    .with_writer(pir::coding_agent::output::lossy_stderr_writer)
                     .init();
             }
         }
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(log_filter)
-            .with_writer(std::io::stderr)
+            // See the TUI fallback above: never let a closed stderr turn a
+            // diagnostic into a panic inside tracing-subscriber.
+            .with_writer(pir::coding_agent::output::lossy_stderr_writer)
             .init();
     }
 
@@ -911,6 +948,7 @@ pub(super) async fn run() -> Result<()> {
             // Upstream `--mode rpc` switches the default command to RPC; RPC
             // is core, so it stays available in a build without the TUI.
             if mode == Some(Mode::Rpc) {
+                maybe_prune_before_rpc(&settings_manager, &config, &cli)?;
                 return pir::coding_agent::rpc::run_rpc_with_options(
                     &extension_paths,
                     tool_selection_request.clone(),
@@ -970,6 +1008,7 @@ pub(super) async fn run() -> Result<()> {
         Some(Command::Print { prompt }) => {
             // Upstream `--mode rpc` starts the RPC loop instead of printing.
             if mode == Some(Mode::Rpc) {
+                maybe_prune_before_rpc(&settings_manager, &config, &cli)?;
                 return pir::coding_agent::rpc::run_rpc_with_options(
                     &extension_paths,
                     tool_selection_request.clone(),
@@ -997,6 +1036,7 @@ pub(super) async fn run() -> Result<()> {
             .await
         }
         Some(Command::Rpc) => {
+            maybe_prune_before_rpc(&settings_manager, &config, &cli)?;
             pir::coding_agent::rpc::run_rpc_with_options(
                 &extension_paths,
                 tool_selection_request.clone(),
@@ -1007,9 +1047,40 @@ pub(super) async fn run() -> Result<()> {
         #[cfg(not(feature = "server"))]
         Some(Command::Server { .. }) => Err(missing_feature("pir server", "server")),
         #[cfg(feature = "server")]
-        Some(Command::Server { unix }) => {
+        Some(Command::Server {
+            unix,
+            allow_unauthenticated,
+        }) => {
+            // C2-04: the historical default (loopback, no token) trusted every
+            // local process, but loopback TCP is not a user boundary. Require
+            // a token unless the operator explicitly opts into an
+            // unauthenticated local-development server. The bind layer repeats
+            // this check so library callers cannot bypass it.
+            if allow_unauthenticated && config.server_auth_token.is_some() {
+                anyhow::bail!(
+                    "--allow-unauthenticated cannot be combined with PIR_SERVER_AUTH_TOKEN; \
+                     the token already enables authenticated access"
+                );
+            }
+            if config.server_auth_token.is_none() && !allow_unauthenticated {
+                anyhow::bail!(
+                    "refusing to start `pir server` without authentication: set \
+                     PIR_SERVER_AUTH_TOKEN, or pass --allow-unauthenticated for local \
+                     development (loopback does not isolate other local users)"
+                );
+            }
+            if config.server_auth_token.is_none() {
+                eprintln!(
+                    "warning: pir server is running WITHOUT authentication \
+                     (--allow-unauthenticated). Any local user or process can create \
+                     sessions, run prompts with the server's model credentials, and \
+                     read/write files under the server's working directory. Loopback \
+                     is not user isolation."
+                );
+            }
             let security = pir::server::ServerSecurityConfig {
                 auth_token: config.server_auth_token.clone(),
+                allow_unauthenticated,
                 max_connections: config.server_max_connections,
                 max_request_body_bytes: config.server_max_request_body_bytes,
                 max_connection_body_bytes: config.server_max_connection_body_bytes,
@@ -1194,6 +1265,7 @@ pub(super) async fn run() -> Result<()> {
             }
             match app_mode {
                 AppMode::Rpc => {
+                    maybe_prune_before_rpc(&settings_manager, &config, &cli)?;
                     pir::coding_agent::rpc::run_rpc_with_options(
                         &extension_paths,
                         tool_selection_request.clone(),
@@ -1205,6 +1277,7 @@ pub(super) async fn run() -> Result<()> {
                     // Headless resolution never yields the picker plan:
                     // `--resume` selects this project's most recent session.
                     let plan = resolve_run_session_plan(&cli, &config, false)?;
+                    maybe_prune_sessions_on_startup(&settings_manager, &config, &plan);
                     // `@file` image positionals become `initialImages`
                     // (upstream prepareInitialMessage) while still
                     // contributing their `<file name="…"></file>` marker to
@@ -1269,6 +1342,7 @@ pub(super) async fn run() -> Result<()> {
                             // to attach.
                             return Ok(());
                         }
+                        maybe_prune_sessions_on_startup(&settings_manager, &config, &plan);
                         // `startup_settings_diagnostics` moves into the TUI as
                         // chat warning notices; interactive mode intentionally
                         // does not print them to stderr.
@@ -1408,6 +1482,23 @@ fn interactive_overrides(cli: &Cli) -> Result<pir::tui::TuiOverrides> {
     })
 }
 
+/// Startup retention for the RPC hosts. RPC has no long-lived `SessionPlan`
+/// variable in the dispatch, so resolve it here (disabled policy returns
+/// before any resolution) and protect the session it will attach.
+fn maybe_prune_before_rpc(
+    settings: &SettingsManager,
+    config: &pir::config::Config,
+    cli: &Cli,
+) -> Result<()> {
+    let policy = settings.session_retention_policy();
+    if !policy.enabled || policy.is_noop() {
+        return Ok(());
+    }
+    let plan = resolve_run_session_plan(cli, config, false)?;
+    maybe_prune_sessions_on_startup(settings, config, &plan);
+    Ok(())
+}
+
 /// Automatic startup retention pass. Only runs when the user explicitly
 /// enabled `sessionRetention.enabled`; the session the run is about to open
 /// (or fork from) is always protected.
@@ -1430,7 +1521,7 @@ fn maybe_prune_sessions_on_startup(
         &policy,
         active,
     );
-    if !report.removed.is_empty() || !report.errors.is_empty() {
+    if !report.removed.is_empty() || !report.errors.is_empty() || report.skipped_active > 0 {
         eprintln!(
             "session retention: {}",
             pir::session_manager::format_prune_report(&report)
@@ -1439,6 +1530,10 @@ fn maybe_prune_sessions_on_startup(
 }
 
 /// `pir checkpoint ...`: inspect/restore a session's file checkpoints.
+///
+/// Restore requires an explicit `--root <dir>`: the session header `cwd` is
+/// untrusted and is only reported as a diagnostic, never used as a security
+/// root (F2c).
 fn run_checkpoint_command(
     command: pir::coding_agent::cli::CheckpointCommand,
     config: &pir::config::Config,
@@ -1490,11 +1585,23 @@ fn run_checkpoint_command(
         CheckpointCommand::Restore {
             id,
             session,
+            root,
             dry_run,
             json,
         } => {
             let session = resolve_session(session).map_err(|error| anyhow::anyhow!(error))?;
             let store = CheckpointStore::open(&session).map_err(|error| anyhow::anyhow!(error))?;
+            let store = match root {
+                Some(root) if !root.trim().is_empty() => {
+                    store.with_workspace_root(std::path::PathBuf::from(root))
+                }
+                Some(_) => {
+                    return Err(anyhow::anyhow!(
+                        "--root requires a non-empty directory path"
+                    ))
+                }
+                None => store,
+            };
             let report = store
                 .restore(&id, dry_run)
                 .map_err(|error| anyhow::anyhow!(error))?;
@@ -1652,7 +1759,7 @@ fn run_jobs_command(command: pir::coding_agent::cli::JobsCommand) -> Result<()> 
                 .ok_or_else(|| anyhow::anyhow!("job not found or log missing: {id}"))?;
             print!("{}", log.text);
             if !log.text.ends_with('\n') && !log.text.is_empty() {
-                println!();
+                println!("");
             }
             Ok(())
         }
@@ -1738,7 +1845,10 @@ fn run_sessions_command(
     settings: &SettingsManager,
 ) -> Result<()> {
     use pir::coding_agent::cli::SessionsCommand;
-    use pir::session_manager::{format_prune_report, prune_session_dir, prune_sessions_root};
+    use pir::session_manager::{
+        format_prune_report, prune_session_dir, prune_sessions_root, resolve_all_prune_root,
+        sessions_dir,
+    };
 
     let SessionsCommand::Prune {
         dry_run,
@@ -1760,17 +1870,22 @@ fn run_sessions_command(
     }
     let session_dir = std::path::Path::new(&config.session_dir);
     let target = if all {
-        session_dir.parent().unwrap_or(session_dir)
+        // `--all` may only recurse from the known sessions root. The
+        // configured directory can come from `--session-dir`, an env
+        // override, or settings and point anywhere, so its parent is never
+        // a safe delete root.
+        resolve_all_prune_root(session_dir, &sessions_dir())
+            .map_err(|message| anyhow::anyhow!(message))?
     } else {
-        session_dir
+        session_dir.to_path_buf()
     };
 
     let report = if dry_run {
-        dry_run_report(target, all, &policy)
+        dry_run_report(&target, all, &policy)
     } else if all {
-        prune_sessions_root(target, &policy, None)
+        prune_sessions_root(&target, &policy, None)
     } else {
-        prune_session_dir(target, &policy, None)
+        prune_session_dir(&target, &policy, None)
     };
 
     if json {
@@ -1794,7 +1909,7 @@ fn dry_run_report(
     policy: &pir::session_manager::SessionRetentionPolicy,
 ) -> pir::session_manager::PruneReport {
     use pir::session_manager::{
-        plan_session_prune, scan_session_files, PruneReport, SessionRetentionPolicy,
+        plan_session_prune, scan_session_files_with_ignored, PruneReport, SessionRetentionPolicy,
     };
 
     fn visit(
@@ -1806,14 +1921,11 @@ fn dry_run_report(
         if depth > 8 {
             return;
         }
-        let plan = plan_session_prune(
-            scan_session_files(dir),
-            policy,
-            std::time::SystemTime::now(),
-            None,
-        );
+        let (files, ignored) = scan_session_files_with_ignored(dir);
+        let plan = plan_session_prune(files, policy, std::time::SystemTime::now(), None);
         report.kept += plan.kept;
         report.removed.extend(plan.remove);
+        report.errors.extend(ignored);
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -1832,14 +1944,11 @@ fn dry_run_report(
     if recursive {
         visit(target, policy, &mut report, 0);
     } else {
-        let plan = plan_session_prune(
-            scan_session_files(target),
-            policy,
-            std::time::SystemTime::now(),
-            None,
-        );
+        let (files, ignored) = scan_session_files_with_ignored(target);
+        let plan = plan_session_prune(files, policy, std::time::SystemTime::now(), None);
         report.kept = plan.kept;
         report.removed = plan.remove;
+        report.errors.extend(ignored);
     }
     report
 }
@@ -1878,5 +1987,9 @@ fn rpc_overrides(
             SessionPlan::Pick => None,
             plan => Some(plan),
         },
+        skill_paths: cli.skill.clone(),
+        prompt_template_paths: cli.prompt_template.clone(),
+        no_skills: cli.no_skills,
+        no_prompt_templates: cli.no_prompt_templates,
     })
 }

@@ -52,6 +52,7 @@ use crate::config::settings::SettingsManager;
 use crate::extensions::resources::ExtensionResourceReload;
 use crate::session_manager::SessionManager;
 
+use super::builder::SystemPromptFiles;
 use super::error::SdkError;
 use super::registry::ModelRegistry;
 use super::resources::{DefaultResourceLoader, ResourceLoader};
@@ -100,7 +101,23 @@ pub struct CreateAgentSessionOptions {
     /// Maximum loop turns per prompt. Default: 100.
     pub max_turns: Option<usize>,
     /// Caller-supplied system prompt. Default: the derived prompt.
+    ///
+    /// When set, it wins over every prompt file: no `SYSTEM.md` /
+    /// `APPEND_SYSTEM.md` discovery and no `PIR_SYSTEM_PROMPT_FILE` read runs.
     pub system_prompt: Option<String>,
+    /// Enable or disable ambient `SYSTEM.md` / `APPEND_SYSTEM.md` discovery
+    /// (and the `PIR_SYSTEM_PROMPT_FILE` env file) for the derived prompt.
+    ///
+    /// Default: enabled (`Some(true)` semantics) when no explicit
+    /// `system_prompt` is set, so the raw factory matches the CLI and
+    /// [`crate::sdk::AgentBuilder`]'s environment-resolved path. `Some(false)`
+    /// keeps the session hermetic. Supplying `system_prompt_files` turns
+    /// ambient discovery off unless this is explicitly `Some(true)`.
+    pub discover_system_prompt: Option<bool>,
+    /// Explicit prompt files applied to the derived prompt. Off by default.
+    /// An explicit `system_prompt` still wins; see
+    /// [`crate::sdk::SystemPromptFiles`] for the precedence.
+    pub system_prompt_files: Option<SystemPromptFiles>,
     /// JS extension runtime to attach.
     pub extensions: Option<crate::extensions::ExtensionHandle>,
     /// Settings snapshot. Default: loaded for `cwd`/`agent_dir` through the
@@ -446,6 +463,61 @@ fn resolve_services(
     ))
 }
 
+/// Apply the SDK's SYSTEM.md / APPEND_SYSTEM.md override to a freshly built
+/// session.
+///
+/// This is the ONE prompt-file implementation both [`crate::sdk::AgentBuilder`]
+/// and the low-level session factories call, so the same workspace cannot
+/// produce two different system prompts depending on the entry point.
+///
+/// Precedence for the preamble: `files.system` >
+/// `PIR_SYSTEM_PROMPT_FILE` (only when `discover`) > discovered
+/// `<cwd>/.pi/SYSTEM.md` (trust-gated) / `<agent_dir>/SYSTEM.md`. Append
+/// sections: discovered `APPEND_SYSTEM.md` first, then `files.append`.
+/// A session built with an explicit system prompt ignores all of it (the
+/// caller owns the whole prompt).
+pub(crate) fn apply_system_prompt_files(
+    session: &AgentSession,
+    cwd: &Path,
+    agent_dir: &Path,
+    project_trusted: bool,
+    discover: bool,
+    files: &SystemPromptFiles,
+) -> Result<(), SdkError> {
+    let mut preamble = files.system.as_deref().map(read_prompt_file).transpose()?;
+    let mut append: Vec<String> = Vec::new();
+    if let Some(path) = files.append.as_deref() {
+        append.push(read_prompt_file(path)?);
+    }
+    if discover {
+        // The explicit file wins without touching the ambient chain (and
+        // without a failure when the env var names an unreadable path).
+        if preamble.is_none() {
+            if let Some(path) = std::env::var_os("PIR_SYSTEM_PROMPT_FILE").map(PathBuf::from) {
+                preamble = Some(read_prompt_file(&path)?);
+            }
+        }
+        let discovered =
+            crate::config::settings::discover_system_md(cwd, agent_dir, project_trusted);
+        if preamble.is_none() {
+            preamble = discovered.0;
+        }
+        if let Some(section) = discovered.1 {
+            append.insert(0, section);
+        }
+    }
+    session.apply_prompt_overrides(preamble, append);
+    Ok(())
+}
+
+/// Read a prompt file, stripping a UTF-8 BOM like the settings/context-file
+/// readers do. Unlike discovery (which skips unreadable files), an explicit
+/// env/file path is a caller request: an I/O failure surfaces.
+fn read_prompt_file(path: &Path) -> Result<String, SdkError> {
+    let text = std::fs::read_to_string(path)?;
+    Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
+}
+
 async fn build_from_services(
     services: AgentSessionServices,
     mut options: CreateAgentSessionOptions,
@@ -482,6 +554,21 @@ async fn build_from_services(
     let mut loader = options.resource_loader.take().unwrap_or(services.resources);
     let resources = loader.reload();
     let provider_registry = Arc::clone(services.model_registry.registry());
+    // D-04: the same shared prompt-file path AgentBuilder uses. An explicit
+    // `system_prompt` pins the whole prompt (and skips all file IO); without
+    // one, SYSTEM.md/APPEND_SYSTEM.md discovery is on by default so the raw
+    // factory matches the CLI hosts. `discover_system_prompt: Some(false)`
+    // keeps it hermetic; explicit `system_prompt_files` disable the ambient
+    // half unless discovery is also switched on.
+    let explicit_system_prompt = options.system_prompt.is_some();
+    let project_trusted = services.settings.project_trusted;
+    // `.system_prompt_files(..)` is itself the opt-out: even an empty value
+    // means the caller owns prompt-file selection.
+    let explicit_prompt_files = options.system_prompt_files.is_some();
+    let prompt_files = options.system_prompt_files.take().unwrap_or_default();
+    let discover_system_prompt = options
+        .discover_system_prompt
+        .unwrap_or(!explicit_prompt_files);
     let session_facade = AgentSession::new_arc_with_plugins_and_host_in(
         AgentSessionConfig {
             provider_registry,
@@ -493,15 +580,25 @@ async fn build_from_services(
             compaction: Some(options.compaction.take().unwrap_or_default()),
             max_turns: options.max_turns.unwrap_or(100),
             system_prompt: options.system_prompt.take(),
-            cwd: Some(cwd),
+            cwd: Some(cwd.clone()),
             event_stream: None,
             extensions,
             tool_selection: None,
         },
         Vec::new(),
         Some(host),
-        Some(agent_dir),
+        Some(agent_dir.clone()),
     );
+    if !explicit_system_prompt && (discover_system_prompt || explicit_prompt_files) {
+        apply_system_prompt_files(
+            &session_facade,
+            &cwd,
+            &agent_dir,
+            project_trusted,
+            discover_system_prompt,
+            &prompt_files,
+        )?;
+    }
     let effective_thinking = session_facade.set_thinking_level(thinking).await;
     if !resources.skills.is_empty() || !resources.prompt_templates.is_empty() {
         session_facade.set_prompt_resources_shared(

@@ -2,7 +2,8 @@
 //! differential main-screen renderer (upstream `pi-tui` contracts).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use pir::tui::ansi::strip_ansi;
 use pir::tui::core::{
@@ -191,6 +192,98 @@ fn request_render_coalesces_rapid_calls() {
         core.last_frame_lines(),
         ["x".to_string()].as_slice(),
         "the coalesced frame carries the content"
+    );
+    core.stop();
+}
+
+/// A mutable single-row component with no revision cache: every render must
+/// re-read the text, exactly like the unversioned dock/editor path.
+struct MutableLine(Arc<Mutex<String>>);
+
+impl Component for MutableLine {
+    fn render(&self, _width: usize) -> Vec<String> {
+        vec![self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()]
+    }
+}
+
+/// TUI-P1: a high event rate may not translate into a render per event. The
+/// frame budget (16 ms) caps the render count while the final content is
+/// still painted once the burst ends.
+#[test]
+fn frame_budget_caps_high_event_rate_and_flushes_final_content() {
+    let mut core = TuiCore::new(counting_terminal());
+    core.terminal().set_size(80, 24);
+    let text = Arc::new(Mutex::new(String::from("frame 0")));
+    core.push_content(Box::new(MutableLine(Arc::clone(&text))));
+    core.render();
+    let before = core.frame_version();
+
+    const REQUESTS: u32 = 5_000;
+    let started = Instant::now();
+    for index in 0..REQUESTS {
+        *text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = format!("frame {index}");
+        core.request_render();
+    }
+    let elapsed = started.elapsed();
+    let rendered = core.frame_version() - before;
+    // Time-based bound plus a small scheduling allowance. The point is that
+    // 5k content updates produce frames proportional to elapsed time, not to
+    // the event count.
+    let allowed = (elapsed.as_millis() / 16) as u64 + 2;
+    assert!(
+        rendered <= allowed,
+        "{REQUESTS} updates rendered {rendered} frames in {elapsed:?}; the 16ms budget allows at most {allowed}"
+    );
+    assert!(
+        rendered < u64::from(REQUESTS) / 10,
+        "the frame budget did not coalesce: {rendered} frames"
+    );
+
+    // A burst must not lose the last delta: after the frame interval the
+    // final content is painted.
+    *text
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = "final frame".to_string();
+    std::thread::sleep(core.min_frame_interval() + Duration::from_millis(2));
+    assert!(
+        core.request_render(),
+        "the frame deadline must paint the final content after the burst"
+    );
+    assert_eq!(
+        core.last_frame_lines(),
+        ["final frame".to_string()].as_slice(),
+        "the final frame carries the newest content"
+    );
+    core.stop();
+}
+
+/// TUI-P1: real terminal input bypasses the frame budget (low input latency),
+/// while a non-input dirty frame waits out the remainder of the 16 ms window
+/// and becomes due exactly at `next_frame_deadline`.
+#[test]
+fn frame_budget_bypasses_for_input_and_exposes_the_deadline() {
+    let mut core = TuiCore::new(counting_terminal());
+    core.push_content(Box::new(StaticLines(&["latency"])));
+    core.render();
+    let now = Instant::now();
+    assert!(
+        !core.frame_due_at(now, false),
+        "a non-input frame must respect the 16ms render interval"
+    );
+    assert!(
+        core.frame_due_at(now, true),
+        "a key/paste/mouse event must paint immediately (no input latency regression)"
+    );
+    let deadline = core.next_frame_deadline();
+    assert!(
+        core.frame_due_at(deadline, false),
+        "the poll deadline must coincide with the next paintable frame"
     );
     core.stop();
 }

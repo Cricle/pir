@@ -96,13 +96,15 @@ pub(super) async fn authenticate<R: tokio::io::AsyncRead + Unpin>(
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
+    // No early return on a length mismatch: fold over the longer input and
+    // seed the accumulator with a non-zero length difference, so the loop
+    // count does not depend on where the first differing byte is.
+    let mut difference = u8::from(left.len() != right.len());
+    for index in 0..left.len().max(right.len()) {
+        difference |=
+            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0);
     }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
-        == 0
+    difference == 0
 }
 
 fn protocol_error(

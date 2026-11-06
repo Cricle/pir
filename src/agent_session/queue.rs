@@ -38,13 +38,6 @@ impl AgentSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
     }
 
-    /// Apply both queue modes (upstream `syncQueueModesFromSettings`, called
-    /// at session construction and after a settings reload).
-    pub fn apply_queue_modes(&self, steering: SteeringMode, follow_up: FollowUpMode) {
-        self.set_steering_mode(steering);
-        self.set_follow_up_mode(follow_up);
-    }
-
     /// Drop every queued steering/follow-up message (upstream `clearQueue`)
     /// and report what was dropped (the message texts, the historical wire
     /// shape).

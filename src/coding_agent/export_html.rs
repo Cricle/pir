@@ -15,32 +15,25 @@ use crate::session_manager::{
     types::{FileEntry, StoredMessage, StoredSystemMessage},
     SessionManager,
 };
+use crate::text::format_tokens;
 
 // ---------------------------------------------------------------------------
 // HTML helpers
 // ---------------------------------------------------------------------------
 
 /// Escape text for HTML body/attribute contexts (upstream template.js
-/// `escapeHtml`).
+/// `escapeHtml`). Shared implementation: [`crate::text::escape_html`].
 pub fn escape_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            other => out.push(other),
-        }
-    }
-    out
+    crate::text::escape_html(text)
 }
 
-/// Strip ANSI escape sequences for tool output (upstream renders custom tool
-/// output through TUI→HTML; pir strips the codes and keeps the plain text).
+/// Sanitize tool output for the HTML export (upstream renders custom tool
+/// output through TUI→HTML; pir applies the same terminal-text policy as the
+/// TUI and keeps the plain text). Unlike `strip_ansi`, this also removes raw
+/// C0/C1 control bytes and non-SGR CSI, so a poisoned session cannot carry
+/// terminal controls into exported HTML.
 fn ansi_safe(text: &str) -> String {
-    crate::text::strip_ansi(text)
+    crate::text::sanitize_plain_text(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +466,10 @@ fn render_tool_call_html(
     let mut html = format!("<div class=\"tool-execution {status}\">");
     html.push_str(&format!(
         "<div class=\"tool-header\"><span class=\"tool-name\">{}</span></div>",
-        escape_html(&format_tool_call(&call.name, &args_json))
+        // The header embeds tool-name/args snippets (`bash` command, `read`
+        // path, ...), all model/tool controlled: run the same terminal-text
+        // policy as every other export sink before escaping for HTML.
+        escape_html(&ansi_safe(&format_tool_call(&call.name, &args_json)))
     ));
     let args_pretty = serde_json::to_string_pretty(&args_json).unwrap_or_default();
     if !args_pretty.is_empty() && args_pretty != "null" {
@@ -486,14 +482,14 @@ fn render_tool_call_html(
         for (data, mime) in &result.images {
             html.push_str(&format!(
                 "<img src=\"data:{};base64,{}\" class=\"tool-image\" alt=\"tool result image\" />",
-                escape_html(mime),
-                escape_html(data)
+                escape_html(&ansi_safe(mime)),
+                escape_html(&ansi_safe(data))
             ));
         }
         if !result.text.trim().is_empty() {
             html.push_str(&format!(
                 "<div class=\"tool-output\"><pre>{}</pre></div>",
-                escape_html(&result.text)
+                escape_html(&ansi_safe(&result.text))
             ));
         }
     }
@@ -510,8 +506,8 @@ fn render_message_html(message: &Message, results: &BTreeMap<String, ToolResultV
                 if let ContentBlock::Image(image) = block {
                     html.push_str(&format!(
                         "<img src=\"data:{};base64,{}\" class=\"message-image\" alt=\"attached image\" />",
-                        escape_html(&image.mime_type),
-                        escape_html(&image.data)
+                        escape_html(&ansi_safe(&image.mime_type)),
+                        escape_html(&ansi_safe(&image.data))
                     ));
                 }
             }
@@ -519,7 +515,7 @@ fn render_message_html(message: &Message, results: &BTreeMap<String, ToolResultV
             if !text.trim().is_empty() {
                 html.push_str(&format!(
                     "<div class=\"markdown-content\">{}</div>",
-                    markdown_to_html(&text)
+                    markdown_to_html(&ansi_safe(&text))
                 ));
             }
             html.push_str("</div>");
@@ -538,7 +534,7 @@ fn render_message_html(message: &Message, results: &BTreeMap<String, ToolResultV
                     ContentBlock::Text(text) => {
                         html.push_str(&format!(
                             "<div class=\"assistant-text markdown-content\">{}</div>",
-                            markdown_to_html(&text.text)
+                            markdown_to_html(&ansi_safe(&text.text))
                         ));
                     }
                     ContentBlock::Image(_) => {}
@@ -568,16 +564,6 @@ fn render_message_html(message: &Message, results: &BTreeMap<String, ToolResultV
     }
 }
 
-/// Format a token count (upstream `formatTokens`).
-fn format_tokens(count: u64) -> String {
-    if count < 1000 {
-        count.to_string()
-    } else if count < 1_000_000 {
-        format!("{:.1}k", count as f64 / 1000.0)
-    } else {
-        format!("{:.1}M", count as f64 / 1_000_000.0)
-    }
-}
 
 // ─── System prompt entries (upstream template.js system helpers) ───────────
 
@@ -709,6 +695,10 @@ fn is_leading_system_entry(entries: &[FileEntry], entry: &FileEntry) -> bool {
 
 /// A collapsible full prompt block (upstream `renderSystemPromptBlock`).
 fn render_system_prompt_block(title: &str, text: &str) -> String {
+    // System prompts can come from user-supplied AGENTS.md / repository
+    // files; strip ESC/C0/C1 here like every other export sink.
+    let title = ansi_safe(title);
+    let text = ansi_safe(text);
     let lines: Vec<&str> = text.split('\n').collect();
     if lines.len() > 10 {
         let preview = lines[..10].join("\n");
@@ -719,17 +709,17 @@ fn render_system_prompt_block(title: &str, text: &str) -> String {
              <div class=\"system-prompt-preview\">{}</div>\
              <div class=\"system-prompt-expand-hint\">... ({} more lines, click to expand)</div>\
              <div class=\"system-prompt-full\">{}</div></div>",
-            escape_html(title),
+            escape_html(&title),
             escape_html(&preview),
             remaining,
-            escape_html(text)
+            escape_html(&text)
         )
     } else {
         format!(
             "<div class=\"system-prompt\"><div class=\"system-prompt-header\">{}</div>\
              <div class=\"system-prompt-full\" style=\"display: block\">{}</div></div>",
-            escape_html(title),
-            escape_html(text)
+            escape_html(&title),
+            escape_html(&text)
         )
     }
 }
@@ -762,19 +752,22 @@ fn render_system_tools(title: &str, tools: &[&serde_json::Value]) -> String {
             let params = if parameters.is_empty() {
                 String::new()
             } else {
-                format!("<div class=\"tool-item-params\">({})</div>", escape_html(&parameters))
+                format!(
+                    "<div class=\"tool-item-params\">({})</div>",
+                    escape_html(&ansi_safe(&parameters))
+                )
             };
             Some(format!(
                 "<div class=\"tool-item\"><span class=\"tool-item-name\">{}</span><span class=\"tool-item-desc\">{}</span>{}</div>",
-                escape_html(name),
-                escape_html(description),
+                escape_html(&ansi_safe(name)),
+                escape_html(&ansi_safe(description)),
                 params
             ))
         })
         .collect::<String>();
     format!(
         "<div class=\"tools-list\"><div class=\"tools-header\">{}</div><div class=\"tools-content\">{}</div></div>",
-        escape_html(title),
+        escape_html(&ansi_safe(title)),
         items
     )
 }
@@ -790,7 +783,7 @@ fn render_system_entry(entry: &FileEntry, message: &StoredSystemMessage, leading
     } else {
         format!(
             "<div class=\"message-timestamp\">{}</div>",
-            escape_html(timestamp)
+            escape_html(&ansi_safe(timestamp))
         )
     };
     let mut body = String::new();
@@ -886,22 +879,24 @@ fn generate_html(
     let mut html = String::from("<div class=\"header\">");
     html.push_str(&format!(
         "<h1>Session: {}</h1>",
-        escape_html(header.map(|h| h.id.as_str()).unwrap_or("unknown"))
+        escape_html(&ansi_safe(
+            header.map(|h| h.id.as_str()).unwrap_or("unknown")
+        ))
     ));
     html.push_str("<div class=\"header-info\">");
     if let Some(header) = header {
         html.push_str(&format!(
             "<div class=\"info-item\"><span class=\"info-label\">Date:</span><span class=\"info-value\">{}</span></div>",
-            escape_html(&header.timestamp)
+            escape_html(&ansi_safe(&header.timestamp))
         ));
         html.push_str(&format!(
             "<div class=\"info-item\"><span class=\"info-label\">Project:</span><span class=\"info-value\">{}</span></div>",
-            escape_html(&header.cwd)
+            escape_html(&ansi_safe(&header.cwd))
         ));
     }
     html.push_str(&format!(
         "<div class=\"info-item\"><span class=\"info-label\">Models:</span><span class=\"info-value\">{}</span></div>",
-        escape_html(&models.join(", "))
+        escape_html(&ansi_safe(&models.join(", ")))
     ));
     html.push_str(&format!(
         "<div class=\"info-item\"><span class=\"info-label\">Messages:</span><span class=\"info-value\">{user_messages} user, {assistant_messages} assistant, {tool_results} tool results</span></div>"
@@ -940,8 +935,8 @@ fn generate_html(
             FileEntry::ModelChange(change) => {
                 html.push_str(&format!(
                     "<div class=\"model-change\">Switched to model: <span class=\"model-name\">{}/{}</span></div>",
-                    escape_html(&change.provider),
-                    escape_html(&change.model_id)
+                    escape_html(&ansi_safe(&change.provider)),
+                    escape_html(&ansi_safe(&change.model_id))
                 ));
             }
             FileEntry::Compaction(compaction) => {
@@ -967,7 +962,7 @@ fn generate_html(
                 };
                 html.push_str(&format!(
                     "<div class=\"hook-message\"><div class=\"hook-type\">[{}]</div><div class=\"markdown-content\">{}</div></div>",
-                    escape_html(&custom.custom_type),
+                    escape_html(&ansi_safe(&custom.custom_type)),
                     markdown_to_html(&ansi_safe(&content_text))
                 ));
             }

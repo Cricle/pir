@@ -73,7 +73,12 @@ pub fn finish_phase(start: Option<Instant>) -> Option<u128> {
 /// labels are static phase names.
 pub fn log_phase(label: &str, elapsed: Duration) {
     if timing_enabled_cached() {
-        eprintln!("pir-timing: {label}: {}ms", elapsed.as_millis());
+        // Fallible: `PI_TIMING=1` runs in the print/json hosts too, where
+        // stderr can be a closed pipe; `eprintln!` would panic on EPIPE.
+        let _ = crate::coding_agent::output::write_stderr_line(&format!(
+            "pir-timing: {label}: {}ms",
+            elapsed.as_millis()
+        ));
     }
 }
 
@@ -178,12 +183,14 @@ impl StartupTimings {
         if !self.enabled || self.entries.is_empty() {
             return;
         }
-        eprintln!("\n--- {title} ---");
+        // Fallible writes: CLI startup/run timing reports go to stderr, which
+        // can be a closed pipe; `eprintln!` would panic on EPIPE.
+        let _ = crate::coding_agent::output::write_stderr_line(&format!("\n--- {title} ---"));
         for (label, ms) in &self.entries {
-            eprintln!("  {label}: {ms}ms");
+            let _ = crate::coding_agent::output::write_stderr_line(&format!("  {label}: {ms}ms"));
         }
         let total: u128 = self.entries.iter().map(|(_, ms)| ms).sum();
-        eprintln!("  TOTAL: {total}ms");
-        eprintln!("{}", "-".repeat(title.len() + 8));
+        let _ = crate::coding_agent::output::write_stderr_line(&format!("  TOTAL: {total}ms"));
+        let _ = crate::coding_agent::output::write_stderr_line(&"-".repeat(title.len() + 8));
     }
 }

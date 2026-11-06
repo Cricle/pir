@@ -354,6 +354,117 @@ fn pending_user_run_parts(message: &CustomRunMessage) -> Option<(String, Vec<Con
     Some((text, images))
 }
 
+impl AgentSession {
+    /// RSS-B: build the prompt-start projection, extending the previous
+    /// prompt's snapshot when the session grew by pure append.
+    ///
+    /// The cached messages are MOVED into the returned projection; no
+    /// transcript-sized `Message` is cloned on the reuse path. A cache miss,
+    /// an edit/compaction/branch change, or any count mismatch falls back to
+    /// the unchanged full builder (`projection_build_count` moves only then).
+    pub(super) async fn project_session_with_cache(
+        &self,
+        session: &Arc<tokio::sync::Mutex<SessionManager>>,
+    ) -> crate::Result<(
+        crate::session_manager::SessionProjection,
+        Vec<crate::compaction::PathEntryMeta>,
+    )> {
+        let cached = self.take_cached_prompt_projection();
+        let session = Arc::clone(session);
+        let (projection, branch, reused) = tokio::task::spawn_blocking(
+            move || -> crate::Result<(
+                crate::session_manager::SessionProjection,
+                Vec<crate::compaction::PathEntryMeta>,
+                bool,
+            )> {
+                let mut session = session.blocking_lock();
+                if session.is_paged() {
+                    session.widen_to_full()?;
+                }
+                let (projection, reused) = session.build_session_projection_with_cache(cached);
+                let branch = session.branch_path_meta(None);
+                Ok((projection, branch, reused))
+            },
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("session startup blocking task failed: {error}"))??;
+        if reused {
+            self.record_projection_reuse();
+        }
+        Ok((projection, branch))
+    }
+
+    /// RSS-B: park the completed run's context as the next prompt's snapshot.
+    ///
+    /// The messages are taken out of `LoopResult.context` by move (no copy);
+    /// `Arc::try_unwrap` guards against a retained event clone — in that
+    /// (rare) case the cache stays empty and the next prompt pays one full
+    /// build. Only append-only runs whose materialized context still matches
+    /// the projection's message-count contract are cached.
+    async fn park_completed_projection(
+        &self,
+        result: &mut crate::agent::agent_loop::LoopResult,
+        run_start_leaf: Option<&str>,
+        run_session_id: Option<&str>,
+    ) {
+        let Some(session) = &self.session else {
+            self.clear_cached_prompt_projection();
+            return;
+        };
+        let Some(run_session_id) = run_session_id else {
+            return;
+        };
+        let context = std::mem::replace(
+            &mut result.context,
+            Arc::new(crate::ai::types::Context::default()),
+        );
+        let Ok(context) = Arc::try_unwrap(context) else {
+            // A host event still holds the run result; do not deep-clone the
+            // transcript just to cache it.
+            return;
+        };
+        let messages = context.messages;
+        let cached = {
+            let session = session.lock().await;
+            // A storage swap mid-run must never park the outgoing transcript
+            // against the replacement manager.
+            if session.id() != run_session_id {
+                return;
+            }
+            let leaf_id = session.leaf_id().map(str::to_owned);
+            let Some(leaf_entry) = leaf_id.as_deref().and_then(|id| {
+                session
+                    .resident_entries()
+                    .iter()
+                    .find(|entry| entry.id() == Some(id))
+                    .cloned()
+            }) else {
+                return;
+            };
+            if crate::session_manager::projection::projected_message_count_for_leaf(
+                session.resident_entries(),
+                leaf_id.as_deref(),
+            ) != messages.len()
+            {
+                return;
+            }
+            if !crate::session_manager::projection::path_delta_is_append_only(
+                session.resident_entries(),
+                run_start_leaf,
+                leaf_id.as_deref(),
+            ) {
+                return;
+            }
+            crate::session_manager::projection::CachedSessionProjection {
+                leaf_id,
+                leaf_entry: Some(leaf_entry),
+                messages,
+            }
+        };
+        self.store_cached_prompt_projection(cached);
+    }
+}
+
 /// Builds the prompt-start projection in ONE blocking task: widen a paged
 /// session, then build the projection and branch snapshot.
 ///
@@ -530,6 +641,27 @@ impl AgentSession {
         .await
     }
 
+    /// [`Self::prompt_with_images`] with a session claim already taken by
+    /// [`Self::try_claim_run`]: the caller acknowledged the prompt from the
+    /// admission result (RPC `started`) and now starts exactly that run.
+    pub async fn prompt_with_images_admitted(
+        &self,
+        text: &str,
+        images: Vec<ContentBlock>,
+        on_event: EventHandler,
+        admission: RunAdmission,
+    ) -> crate::Result<AssistantMessage> {
+        self.start_run_admitted(
+            RunTrigger::User {
+                text: text.to_owned(),
+                images,
+            },
+            on_event,
+            admission,
+        )
+        .await
+    }
+
     /// Run one custom message through the SAME setup as a prompt: compaction
     /// check, `before_agent_start` (with `messageType: "custom"`), tool
     /// loadout, pending `nextTurn` messages, handler messages and the system
@@ -556,30 +688,44 @@ impl AgentSession {
         self.start_run(RunTrigger::Custom(message), on_event).await
     }
 
-    /// Start a run (upstream `_startRun`): the session counts as busy from
-    /// here on — during the compaction check and the `before_agent_start`
-    /// handlers — so messages sent meanwhile queue into THIS run instead of
-    /// starting a second one, `ctx.isIdle()` is false, and an abort requested
-    /// meanwhile stops the run once it starts.
-    async fn start_run(
+    /// [`Self::run_custom_turn`] with a session claim already taken by
+    /// [`Self::try_claim_run`] (the RPC host acknowledged the custom run from
+    /// the admission result).
+    pub async fn run_custom_turn_admitted(
         &self,
-        trigger: RunTrigger,
+        message: CustomRunMessage,
         on_event: EventHandler,
+        admission: RunAdmission,
     ) -> crate::Result<AssistantMessage> {
-        // Native session-level fan-out: construction installed the
-        // `SessionEvent` forwarder before any pre-run producer could emit;
-        // keep this idempotent call as the safety net for the run path
-        // (`queue_update` steering enqueues, `compaction_start`/`_end`,
-        // `auto_retry_*`). A builtin-only session must deliver them to its
-        // Rust plugins exactly once, just like the loop events
-        // (`LoopDeps::plugin_events`).
-        self.ensure_session_event_bridge();
-        // Claim the session for this run (the single atomic transition every
-        // run start shares, mutual exclusion with a manual compaction's own
-        // claim). A run during a run keeps the existing rejection; a run
-        // during a manual compaction reports the upstream prompt-while-
-        // compacting message.
-        //
+        if let Some((text, images)) = pending_user_run_parts(&message) {
+            return self
+                .start_run_admitted(RunTrigger::User { text, images }, on_event, admission)
+                .await;
+        }
+        self.start_run_admitted(RunTrigger::Custom(message), on_event, admission)
+            .await
+    }
+
+    /// Atomically claim the session for a prompt run
+    /// ([`SESSION_IDLE`] → [`SESSION_RUNNING`]) and return the RAII admission
+    /// guard.
+    ///
+    /// This is the single claim point [`Self::start_run`] uses; hosts that
+    /// acknowledge a prompt BEFORE the run can start (the RPC host) take it
+    /// first and answer from its result. A manual compaction that wins the
+    /// session between the host's preflight and its acknowledgement then
+    /// surfaces as this synchronous busy error instead of an acknowledged
+    /// `started` prompt whose spawned run is rejected later — the
+    /// RPC-ADMISSION race.
+    ///
+    /// Direct [`Self::prompt`] keeps the upstream contract: during a manual
+    /// compaction it is rejected synchronously, never queued.
+    ///
+    /// The admission is released by [`RunAdmission`]'s drop unless it is
+    /// handed to [`Self::prompt_with_prepared_input_admitted`] /
+    /// [`Self::run_custom_turn_admitted`] (or
+    /// [`Self::prompt_with_images_admitted`]).
+    pub fn try_claim_run(&self) -> crate::Result<RunAdmission> {
         // A fresh run clears the previous abort request BEFORE the claim
         // (upstream `_startRun` resets `_agentRunAbortRequested`): from the
         // CAS on, the session is RUNNING and `abort()` records the request,
@@ -598,16 +744,10 @@ impl AgentSession {
             if previous_abort_request {
                 self.run_abort_requested.store(true, Ordering::SeqCst);
             }
-            if owner == SESSION_COMPACTING {
-                anyhow::bail!(
-                    "Cannot submit a prompt while compaction is in progress. \
-                     Wait for compaction to finish and retry."
-                );
-            }
-            anyhow::bail!("agent session is already streaming; queue with steer() instead");
+            return Err(run_claim_error(owner));
         }
         if std::env::var_os("PIR_DEBUG_RPC").is_some() {
-            eprintln!("[rpc-debug] start_run claimed");
+            let _ = crate::coding_agent::output::write_stderr_line("[rpc-debug] start_run claimed");
         }
         // Install a fresh transition signal as soon as the claim is ours. The
         // previous run's signal stays in the slot until now; dropping it here
@@ -623,6 +763,53 @@ impl AgentSession {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *slot = AbortSignal::new();
         }
+        Ok(RunAdmission {
+            session_state: Arc::clone(&self.session_state),
+            run_abort_requested: Arc::clone(&self.run_abort_requested),
+            idle_notify: Arc::clone(&self.idle_notify),
+            armed: true,
+        })
+    }
+
+    /// Start a run (upstream `_startRun`): the session counts as busy from
+    /// here on — during the compaction check and the `before_agent_start`
+    /// handlers — so messages sent meanwhile queue into THIS run instead of
+    /// starting a second one, `ctx.isIdle()` is false, and an abort requested
+    /// meanwhile stops the run once it starts.
+    async fn start_run(
+        &self,
+        trigger: RunTrigger,
+        on_event: EventHandler,
+    ) -> crate::Result<AssistantMessage> {
+        let admission = self.try_claim_run()?;
+        self.start_run_admitted(trigger, on_event, admission).await
+    }
+
+    /// [`Self::start_run`] with a session claim already taken by
+    /// [`Self::try_claim_run`] (the host acknowledged the prompt from the
+    /// admission result). The admission's placeholder signal, abort-request
+    /// reset and `SESSION_RUNNING` claim are adopted as-is; only the run
+    /// bookkeeping below is installed here.
+    async fn start_run_admitted(
+        &self,
+        trigger: RunTrigger,
+        on_event: EventHandler,
+        admission: RunAdmission,
+    ) -> crate::Result<AssistantMessage> {
+        // A guard from another session must never be able to release (or
+        // "start") this session's claim; dropping it releases its own.
+        if !Arc::ptr_eq(&admission.session_state, &self.session_state) {
+            anyhow::bail!("run admission belongs to a different agent session");
+        }
+        admission.disarm();
+        // Native session-level fan-out: construction installed the
+        // `SessionEvent` forwarder before any pre-run producer could emit;
+        // keep this idempotent call as the safety net for the run path
+        // (`queue_update` steering enqueues, `compaction_start`/`_end`,
+        // `auto_retry_*`). A builtin-only session must deliver them to its
+        // Rust plugins exactly once, just like the loop events
+        // (`LoopDeps::plugin_events`).
+        self.ensure_session_event_bridge();
         self.run_settling.store(false, Ordering::SeqCst);
         // A new run re-opens the background follow-up enqueue gate (closed by
         // the previous run's settle transition, see `BackgroundRegistry`).
@@ -768,7 +955,6 @@ impl AgentSession {
         let session = self.session.clone()?;
         let plugins = self.plugins.clone();
         let session_events = Arc::clone(&self.session_events);
-        let session_event_subscribers = self.has_session_event_subscribers();
         Some(Arc::new(move |message: Message| {
             let session = Arc::clone(&session);
             let plugins = plugins.clone();
@@ -777,6 +963,16 @@ impl AgentSession {
             let append = append.clone();
             let run_session_id = run_session_id.clone();
             Box::pin(async move {
+                // Gate the wire payload per message BEFORE cloning/serializing:
+                // a TUI-only host wants user entries but never the assistant/
+                // toolResult payloads its live stream already rendered.
+                let dispatch_to_plugins = plugins
+                    .as_ref()
+                    .is_some_and(|plugins| plugins.has_handlers("entry_appended"));
+                let dispatch_to_subscribers = super::notifications::entry_appended_subscriber_wants(
+                    &session_events,
+                    &message,
+                );
                 let appended = match &append.custom {
                     Some(custom) => {
                         super::settle::append_custom_message_if_session(
@@ -797,35 +993,39 @@ impl AgentSession {
                 };
                 match appended {
                     Ok(Some(entry_id)) => {
-                        // One wire payload per entry: the plugin dispatch and
-                        // the session-level event share the same upstream
-                        // `SessionEntry` shape (agent-session.ts:834).
-                        let message_wire = match &append.custom {
-                            Some(_) => append.wire.clone(),
-                            None => message_json(&message),
-                        };
-                        let entry_json = serde_json::json!({
-                            "id": entry_id,
-                            "message": message_wire,
-                        });
-                        if let Some(plugins) = &plugins {
-                            if plugins.has_handlers("entry_appended") {
-                                emit_plugin_event(
-                                    plugins,
-                                    "entry_appended",
-                                    serde_json::json!({
-                                        "type": "entry_appended",
-                                        "entry": entry_json.clone(),
-                                    }),
-                                )
-                                .await;
+                        if dispatch_to_plugins || dispatch_to_subscribers {
+                            // One wire payload per entry: the plugin dispatch
+                            // and the session-level event share the same
+                            // upstream `SessionEntry` shape
+                            // (agent-session.ts:834).
+                            crate::agent_session::events::note_entry_appended_wire_build();
+                            let message_wire = match &append.custom {
+                                Some(_) => append.wire.clone(),
+                                None => message_json(&message),
+                            };
+                            let entry_json = serde_json::json!({
+                                "id": entry_id,
+                                "message": message_wire,
+                            });
+                            if dispatch_to_plugins {
+                                if let Some(plugins) = &plugins {
+                                    emit_plugin_event(
+                                        plugins,
+                                        "entry_appended",
+                                        serde_json::json!({
+                                            "type": "entry_appended",
+                                            "entry": entry_json.clone(),
+                                        }),
+                                    )
+                                    .await;
+                                }
                             }
-                        }
-                        if session_event_subscribers {
-                            crate::agent_session::events::emit_session_event_to(
-                                &session_events,
-                                SessionEvent::EntryAppended { entry: entry_json },
-                            );
+                            if dispatch_to_subscribers {
+                                crate::agent_session::events::emit_session_event_to(
+                                    &session_events,
+                                    SessionEvent::EntryAppended { entry: entry_json },
+                                );
+                            }
                         }
                         Ok(())
                     }
@@ -908,8 +1108,15 @@ impl AgentSession {
         // not the cached `session_id`: the cache is refreshed during the swap
         // and may still name the outgoing session here.
         let persist_ledger = PersistLedger::new();
+        // RSS-B: the head this run starts from. The completed context may be
+        // parked as the next prompt's projection only when everything appended
+        // since this head is append-only (no edit/compaction/branch change).
+        let mut run_start_leaf = None;
         if let Some(session) = &self.session {
-            let run_session_id = session.lock().await.id().to_owned();
+            let session = session.lock().await;
+            let run_session_id = session.id().to_owned();
+            run_start_leaf = session.leaf_id().map(str::to_owned);
+            drop(session);
             persist_ledger.bind_run_session_id(Some(run_session_id));
         }
         // A new prompt invalidates any pending idle-mode cache warm task: the
@@ -954,7 +1161,7 @@ impl AgentSession {
         // input handlers did not move the leaf.
         let mut snapshot_projection = if self.event_extensions().is_some() {
             match &self.session {
-                Some(session) => project_session_off_thread(session).await.ok(),
+                Some(session) => self.project_session_with_cache(session).await.ok(),
                 None => None,
             }
         } else {
@@ -1068,6 +1275,25 @@ impl AgentSession {
         // the unchanged context, retry on the next turn"). Merely calling the
         // hook below the threshold arms nothing.
         let threshold_gate = Arc::new(super::compact::ThresholdRunGate::default());
+        // The gate's threshold is a FULL-request estimate (the loop's
+        // compaction hook uses `estimate_request_*`), so the request's tool
+        // declarations must ride the pre-context. Build the initial loadout
+        // here — after `session_start`/`input` handlers registered their tools
+        // and before `before_agent_start` — and hand only its definitions to
+        // the gate. Without this, a session whose transcript is small but whose
+        // tool declarations are large never compacts at prompt start (A2-01).
+        // The settle loop still builds its own per-iteration loadout; this one
+        // exists only for the gate's estimate.
+        let gate_tools: Option<Vec<crate::ai::types::Tool>> = if self.compaction_config().is_some()
+        {
+            Some(
+                self.build_tool_loadout(self.plugins.as_deref())
+                    .await
+                    .definitions,
+            )
+        } else {
+            None
+        };
         if self.compaction_config().is_some() {
             match &self.session {
                 Some(session) => {
@@ -1093,7 +1319,7 @@ impl AgentSession {
                     };
                     let built = match prebuilt {
                         Some(value) => Some(value),
-                        None => project_session_off_thread(session).await.ok(),
+                        None => self.project_session_with_cache(session).await.ok(),
                     };
                     if let Some((mut projection, branch)) = built {
                         // The MATERIALIZED projection decides whether the gate
@@ -1120,7 +1346,7 @@ impl AgentSession {
                             let pre_context = Arc::new(Context {
                                 system_prompt: self.system_prompt_snapshot(),
                                 messages: pre_messages,
-                                tools: None,
+                                tools: gate_tools.clone(),
                             });
                             let returned = hook(Arc::clone(&pre_context)).await;
                             if threshold_gate
@@ -1165,7 +1391,7 @@ impl AgentSession {
                         let pre_context = Arc::new(Context {
                             system_prompt: self.system_prompt_snapshot(),
                             messages: pre_messages,
-                            tools: None,
+                            tools: gate_tools.clone(),
                         });
                         let _ = hook(pre_context).await;
                         if threshold_gate
@@ -1346,6 +1572,15 @@ impl AgentSession {
         // The loop appends/persists the starting messages at their
         // `message_end`; the context here is the prior transcript only.
         //
+        // RSS-B: when compaction is disabled the prompt-start gate never ran,
+        // so the extension snapshot's projection (built before the handlers)
+        // is the only candidate run context. Promote it instead of paying a
+        // second full projection; D4 below still rejects it if a handler moved
+        // the leaf.
+        if startup_projection.is_none() {
+            startup_projection = snapshot_projection.take();
+        }
+        //
         // D4 (stale reuse): `before_agent_start` handlers can append session
         // entries AFTER the gate's projection was built — `setSessionName`,
         // `setModel`, `pi.appendEntry`, or `pi.sendMessage({triggerTurn:
@@ -1382,7 +1617,7 @@ impl AgentSession {
                     projection.messages
                 }
                 None => {
-                    let (projection, branch) = project_session_off_thread(session).await?;
+                    let (projection, branch) = self.project_session_with_cache(session).await?;
                     // Snapshot = per-entry METADATA only (shared source entries +
                     // message counts); the messages are moved into the loop's
                     // context below and the hook slices THAT list, so a
@@ -1453,7 +1688,7 @@ impl AgentSession {
         // compaction is appended to session storage as a compaction entry,
         // and the retry context is rebuilt from the session projection.
         let mut overflow_session_retry = false;
-        let result = 'settle: loop {
+        let mut result = 'settle: loop {
             settle_iterations += 1;
             let messages = if let Some(recovered) = recovery_context.take() {
                 // Overflow recovery retry: the compacted context replaces the
@@ -1544,6 +1779,7 @@ impl AgentSession {
                         Arc::clone(&self.background),
                     ))
                         as Arc<dyn crate::agent::tool_execution::BackgroundControl>),
+                    read_ledger: Arc::clone(&self.read_ledger),
                 });
 
             let deps = LoopDeps {
@@ -1746,7 +1982,9 @@ impl AgentSession {
             // from a clean prefix instead of trusting a stale count.
             persist_ledger.reset();
             if std::env::var_os("PIR_DEBUG_RPC").is_some() {
-                eprintln!("[rpc-debug] entering agent loop");
+                let _ = crate::coding_agent::output::write_stderr_line(
+                    "[rpc-debug] entering agent loop",
+                );
             }
             let mut result = agent_loop::run_with_options(
                 deps,
@@ -2086,15 +2324,15 @@ impl AgentSession {
             match &self.session {
                 Some(session) => {
                     // The dispatch is skipped when NEITHER a plugin handler nor
-                    // a session-event subscriber observes it: each message then
-                    // moves into storage (no clone) and no wire payload is
-                    // built.
+                    // a session-event subscriber wants THIS message: the
+                    // message then moves into storage (no clone) and no wire
+                    // payload is built. The subscriber question is asked per
+                    // message so a TUI-only host materializes user entries but
+                    // never the assistant/toolResult tail it already rendered.
                     let dispatch_entry_appended_to_plugins = self
                         .plugins
                         .as_ref()
                         .is_some_and(|plugins| plugins.has_handlers("entry_appended"));
-                    let dispatch_entry_appended =
-                        dispatch_entry_appended_to_plugins || self.has_session_event_subscribers();
                     // Append everything under the storage lock, then dispatch
                     // the `entry_appended` events after the guard is dropped
                     // (a slow JS handler must not hold the storage lock).
@@ -2104,22 +2342,24 @@ impl AgentSession {
                     // (`blocking_lock`) and the async task never holds it
                     // across the write. One blocking task appends the whole
                     // tail, preserving the previous single-lock batch order.
-                    let appended: Vec<(String, Message)> = {
+                    let appended: Vec<(String, Message, bool)> = {
                         let mut to_append = Vec::new();
                         // Skip exactly the messages the sink already handled
                         // (per-ordinal identity: a failed append leaves its
                         // ordinal — and the whole tail — for this loop, in
                         // produced order). The dispatch copy is taken only
-                        // when an `entry_appended` consumer exists, exactly
-                        // like the previous in-lock loop.
-                        let mut dispatch_messages = Vec::new();
+                        // when an `entry_appended` consumer wants this message.
+                        let mut dispatch_messages: Vec<Option<(Message, bool)>> = Vec::new();
                         let mut pending_ordinals = Vec::new();
                         for (ordinal, message) in produced.into_iter().enumerate() {
                             if persist_ledger.is_handled(ordinal) {
                                 continue;
                             }
-                            if dispatch_entry_appended {
-                                dispatch_messages.push(message.clone());
+                            let wants_subscriber = self.wants_entry_appended(&message);
+                            if dispatch_entry_appended_to_plugins || wants_subscriber {
+                                dispatch_messages.push(Some((message.clone(), wants_subscriber)));
+                            } else {
+                                dispatch_messages.push(None);
                             }
                             pending_ordinals.push(ordinal);
                             to_append.push(message);
@@ -2160,31 +2400,40 @@ impl AgentSession {
                             for (ordinal, entry_id) in pending_ordinals.iter().zip(&entry_ids) {
                                 persist_ledger.record_entry(*ordinal, entry_id);
                             }
-                            entry_ids.into_iter().zip(dispatch_messages).collect()
+                            entry_ids
+                                .into_iter()
+                                .zip(dispatch_messages)
+                                .filter_map(|(entry_id, dispatch)| {
+                                    dispatch.map(|(message, wants_subscriber)| {
+                                        (entry_id, message, wants_subscriber)
+                                    })
+                                })
+                                .collect()
                         }
                     };
-                    if dispatch_entry_appended {
-                        for (entry_id, message) in &appended {
-                            // One wire payload per entry: the plugin dispatch
-                            // and the session-level event share the same
-                            // upstream `SessionEntry` shape.
-                            let entry_json = serde_json::json!({
-                                "id": entry_id,
-                                "message": message_json(message),
-                            });
-                            if dispatch_entry_appended_to_plugins {
-                                if let Some(plugins) = &self.plugins {
-                                    emit_plugin_event(
-                                        plugins,
-                                        "entry_appended",
-                                        serde_json::json!({
-                                            "type": "entry_appended",
-                                            "entry": entry_json.clone(),
-                                        }),
-                                    )
-                                    .await;
-                                }
+                    for (entry_id, message, wants_subscriber) in &appended {
+                        // One wire payload per entry: the plugin dispatch
+                        // and the session-level event share the same
+                        // upstream `SessionEntry` shape.
+                        crate::agent_session::events::note_entry_appended_wire_build();
+                        let entry_json = serde_json::json!({
+                            "id": entry_id,
+                            "message": message_json(message),
+                        });
+                        if dispatch_entry_appended_to_plugins {
+                            if let Some(plugins) = &self.plugins {
+                                emit_plugin_event(
+                                    plugins,
+                                    "entry_appended",
+                                    serde_json::json!({
+                                        "type": "entry_appended",
+                                        "entry": entry_json.clone(),
+                                    }),
+                                )
+                                .await;
                             }
+                        }
+                        if *wants_subscriber {
                             self.emit_session_event(SessionEvent::EntryAppended {
                                 entry: entry_json,
                             });
@@ -2677,6 +2926,18 @@ impl AgentSession {
             aborted: result.aborted,
         });
 
+        // RSS-B: park this run's final transcript as the next prompt's
+        // projection snapshot. The move-in is conditional on append-only /
+        // message-count validation; on any mismatch the next prompt pays one
+        // full projection and starts a fresh snapshot.
+        let run_session_id = persist_ledger.run_session_id();
+        self.park_completed_projection(
+            &mut result,
+            run_start_leaf.as_deref(),
+            run_session_id.as_deref(),
+        )
+        .await;
+
         // Queued steering/follow-up messages live in the inbox consumer task
         // (`Inbox`); they survive this function and are polled by the next
         // run, on every exit path.
@@ -2740,6 +3001,70 @@ impl AgentSession {
         }
         if let Err(error) = session.append_model_change(provider, model_id) {
             crate::ext_diag!("[session] failed to record the virtual model selection: {error}");
+        }
+    }
+}
+
+/// The rejection for a failed `SESSION_IDLE` run claim (the two session
+/// owners have distinct upstream messages).
+fn run_claim_error(owner: u8) -> anyhow::Error {
+    if owner == SESSION_COMPACTING {
+        anyhow::anyhow!(
+            "Cannot submit a prompt while compaction is in progress. \
+             Wait for compaction to finish and retry."
+        )
+    } else {
+        anyhow::anyhow!("agent session is already streaming; queue with steer() instead")
+    }
+}
+
+/// One prompt run's admission ([`AgentSession::try_claim_run`]): the session
+/// claim is already taken ([`SESSION_RUNNING`]) while this guard exists.
+///
+/// Hosts that acknowledge a prompt before the run can start (the RPC host)
+/// take the claim first and answer from its result, so a manual compaction
+/// that wins the session in between becomes a synchronous busy error instead
+/// of an acknowledged `started` prompt the spawned run later rejects.
+///
+/// Pass the guard to [`AgentSession::prompt_with_prepared_input_admitted`] /
+/// [`AgentSession::run_custom_turn_admitted`] to start the admitted run. If
+/// the run never starts, dropping the guard releases the claim and wakes
+/// `compact()` / `wait_until_idle()` waiters.
+#[derive(Debug)]
+pub struct RunAdmission {
+    session_state: Arc<AtomicU8>,
+    run_abort_requested: Arc<AtomicBool>,
+    idle_notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl RunAdmission {
+    /// Hand the claim to the run's [`SessionStreamingGuard`] instead of
+    /// releasing it on drop.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunAdmission {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Mirrors the run guard's teardown order: clear the run-scoped abort
+        // flag while the claim is still held, then release, then wake.
+        self.run_abort_requested.store(false, Ordering::SeqCst);
+        if self
+            .session_state
+            .compare_exchange(
+                SESSION_RUNNING,
+                SESSION_IDLE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.idle_notify.notify_waiters();
         }
     }
 }

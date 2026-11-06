@@ -164,6 +164,7 @@ impl AgentPlugin for NativeTerminalPlugin {
                     data: Some(data.to_owned()),
                 },
                 NativeBehavior::Error => PluginEventOutcome::Error {
+                    timed_out: false,
                     error: "native terminal-input handler failed".to_owned(),
                 },
                 NativeBehavior::Hang => std::future::pending::<PluginEventOutcome>().await,

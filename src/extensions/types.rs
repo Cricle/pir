@@ -577,7 +577,68 @@ pub struct EventError {
     pub ext_id: u64,
     pub event: String,
     pub error: String,
+    /// Structured timeout marker: the handler did not settle within the
+    /// configured budget (the QuickJS interrupt deadline or the caller-side
+    /// mailbox deadline elapsed). Consumers must branch on this flag, not on
+    /// the error text — an ordinary handler error that happens to contain
+    /// "timed out after" must stay an ordinary error (A-06).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timed_out: bool,
 }
+
+/// Structured marker on an [`anyhow::Error`] produced by an event dispatch
+/// whose deadline elapsed (QuickJS interrupt or caller-side mailbox wait).
+///
+/// The JS plugin adapter downcasts it into
+/// [`PluginEventOutcome::Error`](crate::plugins::PluginEventOutcome) so the
+/// provider-stream dispatcher can close on a REAL timeout while leaving
+/// ordinary errors — even ones whose text mentions a timeout — alone (A-06).
+#[derive(Debug, Clone)]
+pub struct EventDispatchTimeout {
+    message: String,
+}
+
+impl EventDispatchTimeout {
+    /// A dispatch whose caller-side or actor-side budget elapsed.
+    pub fn new(event: &str, budget: Duration) -> Self {
+        Self {
+            message: format!(
+                "event `{event}` dispatch timed out after {budget:?} \
+                 (the extension actor is unresponsive)"
+            ),
+        }
+    }
+
+    /// A dispatch whose mailbox handoff itself could not complete in time
+    /// (the actor is wedged and the bounded mailbox stayed full).
+    pub fn mailbox_full(event: &str, budget: Duration) -> Self {
+        Self {
+            message: format!(
+                "event `{event}` dispatch timed out after {budget:?} before the extension \
+                 actor accepted it (mailbox full)"
+            ),
+        }
+    }
+
+    /// A dispatch whose actor-side deadline elapsed, preserving the engine's
+    /// pending-exception detail when one was sampled.
+    pub fn with_detail(event: &str, budget: Duration, detail: Option<&str>) -> Self {
+        let detail = detail
+            .map(|text| format!(" (pending engine exception: {text})"))
+            .unwrap_or_default();
+        Self {
+            message: format!("event `{event}` dispatch timed out after {budget:?}{detail}"),
+        }
+    }
+}
+
+impl std::fmt::Display for EventDispatchTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EventDispatchTimeout {}
 
 /// Outcome of dispatching a slash command.
 #[derive(Debug, Clone)]

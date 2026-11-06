@@ -156,7 +156,7 @@ pub(super) fn recorded_auto_theme_names() -> Option<(String, String)> {
 
 /// Parse one hex channel of an OSC color reply: any-length hex scaled to
 /// 0-255 (upstream `parseOscHexChannel`).
-fn osc_hex_channel(channel: &str) -> Option<u8> {
+pub(super) fn osc_hex_channel(channel: &str) -> Option<u8> {
     if channel.is_empty() || !channel.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }

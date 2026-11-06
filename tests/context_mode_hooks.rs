@@ -193,6 +193,13 @@ fn write_big_file(path: &Path, bytes: usize) {
     std::fs::write(path, vec![b'x'; bytes]).unwrap_or_else(|error| panic!("write: {error}"));
 }
 
+fn write_image_file(path: &Path, magic: &[u8], bytes: usize) {
+    assert!(bytes >= magic.len());
+    let mut content = vec![0u8; bytes];
+    content[..magic.len()].copy_from_slice(magic);
+    std::fs::write(path, content).unwrap_or_else(|error| panic!("write image: {error}"));
+}
+
 fn large_result_text(marker: &str) -> String {
     let mut text = String::new();
     while text.len() < 25 * 1024 {
@@ -330,6 +337,65 @@ async fn routing_blocks_large_simple_file_reads_only() {
     ] {
         let mut payload = tool_call(tool, input);
         assert_unblocked(harness.emit("tool_call", &mut payload).await);
+    }
+}
+
+#[tokio::test]
+async fn routing_exempts_supported_images_only() {
+    let _env = env_lock().await;
+    let harness = Harness::new("images");
+    let bytes = 100 * 1024;
+
+    // 100 KiB per format: PNG, JPEG, GIF87a/GIF89a, WebP, BMP. All must be
+    // left untouched for both the direct `read` tool and a `cat` command.
+    let images: [(&str, &[u8]); 6] = [
+        ("big.png", &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+        ("big.jpg", &[0xff, 0xd8, 0xff, 0xe0]),
+        ("big.gif87", &b"GIF87a"[..]),
+        ("big.gif89", &b"GIF89a"[..]),
+        ("big.webp", &b"RIFF\x00\x00\x00\x00WEBP"[..]),
+        ("big.bmp", &b"BM"[..]),
+    ];
+    for (name, magic) in images {
+        let path = harness.cwd.join(name);
+        write_image_file(&path, magic, bytes);
+
+        // Direct read, absolute and cwd-relative.
+        for input in [
+            json!({ "path": path.to_string_lossy() }),
+            json!({ "path": name }),
+        ] {
+            let mut payload = tool_call("read", input);
+            assert_unblocked(harness.emit("tool_call", &mut payload).await);
+        }
+
+        let mut payload = tool_call("bash", json!({ "command": format!("cat {name}") }));
+        assert_unblocked(harness.emit("tool_call", &mut payload).await);
+    }
+
+    // 100 KiB text still hits the text gate — including a text file that
+    // merely *looks* like an image by extension.
+    write_big_file(&harness.cwd.join("big.txt"), bytes);
+    write_big_file(&harness.cwd.join("text.png"), bytes);
+    for input in [
+        json!({ "path": "big.txt" }),
+        json!({ "path": "text.png" }),
+        json!({ "path": harness.cwd.join("big.txt").to_string_lossy() }),
+    ] {
+        let mut payload = tool_call("read", input);
+        let reason = assert_blocked(harness.emit("tool_call", &mut payload).await);
+        assert!(
+            reason.contains("ctx_execute_file"),
+            "large text stays routed: {reason}"
+        );
+    }
+    for command in ["cat big.txt", "cat text.png"] {
+        let mut payload = tool_call("bash", json!({ "command": command }));
+        let reason = assert_blocked(harness.emit("tool_call", &mut payload).await);
+        assert!(
+            reason.contains("ctx_execute_file"),
+            "`{command}` stays routed: {reason}"
+        );
     }
 }
 

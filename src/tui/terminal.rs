@@ -47,7 +47,7 @@ use super::command_dialogs::{
 };
 use super::core::{Component, Container, Rows, TuiCore};
 use super::dialogs::{DialogOutcome, DialogOverlay};
-use super::editor::{Editor, EditorState};
+use super::editor::{parse_bash_submission, Editor, EditorState};
 use super::keybindings::{Keybindings, TuiAction};
 use super::overlay_position::{OverlayBounds, OverlayOptions};
 use super::program_status::{BlockedStatus, ProgramStatusKind};
@@ -2532,6 +2532,10 @@ impl App {
 
         let terminal = super::core::Terminal::new();
         let mut core = TuiCore::new(terminal);
+        // DIRTY2: bound one frame's dirty-row assembly; deferred blocks
+        // repaint on the following 16 ms frame. 0 (the default) is the old
+        // unbounded behaviour.
+        core.set_frame_row_budget(4096);
         // FIX-B05: raw mode first, then clear the Windows console's QuickEdit
         // flag; with it still set, a mouse selection suspends console output
         // and freezes the TUI. Best-effort; non-Windows is a no-op. The
@@ -2819,6 +2823,8 @@ impl App {
         // so the ACTIVE selector renders in the dock's editor slot (upstream
         // `showSelector` swaps it into `editorContainer`,
         // interactive-mode.ts:4903-4905).
+        let thinking_level: Arc<Mutex<String>> =
+            Arc::new(Mutex::new(footer_state.thinking_level.clone()));
         let overlay: Arc<Mutex<Overlay>> = Arc::new(Mutex::new(Overlay {
             model: None,
             thinking: None,
@@ -2856,6 +2862,7 @@ impl App {
             dock_height: Arc::clone(&dock_height),
             cursor_cell: Arc::clone(&dock_cursor),
             mouse_layout: Some(Arc::clone(&dock_mouse_layout)),
+            thinking_level: Arc::clone(&thinking_level),
         }));
         core.set_dock_cursor_cell(Arc::clone(&dock_cursor));
 
@@ -2986,7 +2993,7 @@ impl App {
             tools_expanded,
             tools_expanded_seen,
             shutdown_requested: false,
-            thinking_level: Arc::new(Mutex::new(footer_state.thinking_level)),
+            thinking_level,
             overlay,
             selector_query: Arc::new(Mutex::new(String::new())),
             spinner_frame: spinner,
@@ -4384,6 +4391,29 @@ impl App {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     }
+
+    /// Working directory `/image` resolves a relative path against: the active
+    /// session header's cwd when a session file is attached (a resumed session
+    /// can have been created in a different directory than the one the TUI was
+    /// launched from), else the process cwd captured at startup. The bounded
+    /// header probe only runs for `/image`, never on the frame path.
+    fn image_cwd(&self) -> std::path::PathBuf {
+        let session_cwd = self.active_path.as_deref().and_then(|path| {
+            crate::session_manager::SessionTailPage::open(
+                std::path::Path::new(path),
+                crate::session_manager::DEFAULT_TAIL_PAGE_BYTES,
+                crate::session_manager::DEFAULT_TAIL_PAGE_ENTRIES,
+            )
+            .ok()
+            .flatten()
+            .and_then(|page| page.file_header())
+            .map(|header| header.cwd)
+            .filter(|cwd| !cwd.is_empty() && std::path::Path::new(cwd).is_dir())
+        });
+        session_cwd
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(&self.footer_cwd))
+    }
 }
 
 /// Timing state for the double-press key semantics (Ctrl+C exit, double-Esc
@@ -4668,6 +4698,52 @@ fn model_pairs(app: &App) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Keep only models whose provider has configured auth: a `models.json` API
+/// key, a provider environment variable, or a stored `auth.json` credential
+/// (upstream `ModelRuntime.getAvailableSnapshot`'s `configuredProviders`
+/// filter / `hasConfiguredAuth`). This is the catalog the model selector's
+/// "Only showing models from configured providers" header promises; without
+/// it every built-in catalog row is listed even when its provider is not
+/// configured.
+pub fn configured_model_pairs(
+    models: &[(String, String)],
+    api_keys: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    // One auth check per PROVIDER, not per model: `has_configured_auth`
+    // reads `auth.json` from disk, and the built-in catalog has >1600 models
+    // across a handful of providers.
+    let mut configured: std::collections::BTreeMap<&str, bool> = std::collections::BTreeMap::new();
+    models
+        .iter()
+        .filter(|(provider, _)| {
+            let provider = provider.as_str();
+            *configured
+                .entry(provider)
+                .or_insert_with(|| crate::ai::providers::has_configured_auth(provider, api_keys))
+        })
+        .cloned()
+        .collect()
+}
+
+/// [`configured_model_pairs`] over the app's loaded `models.json` key map.
+fn app_configured_model_pairs(app: &App, models: Vec<(String, String)>) -> Vec<(String, String)> {
+    match app.configured.as_ref() {
+        Some(configured) => {
+            let mut api_keys = configured.api_keys.clone();
+            // `--api-key` is a transient credential for the selected
+            // provider: it never enters `models.json`'s key map, but that
+            // provider IS configured for this run.
+            if configured.api_key.is_some() {
+                api_keys
+                    .entry(configured.model.provider.clone())
+                    .or_default();
+            }
+            configured_model_pairs(&models, &api_keys)
+        }
+        None => Vec::new(),
+    }
+}
+
 /// `provider/id` → display name for the selectors. The registry entries carry
 /// the names `models.json` overrides rename (upstream `model.name`).
 fn model_names(app: &App) -> std::collections::BTreeMap<String, String> {
@@ -4822,11 +4898,13 @@ fn filter_scoped_pairs(scoped: &[String], registry: &[(String, String)]) -> Vec<
 
 /// `(provider, id)` pairs the model selector's default `scoped` catalog is
 /// filtered from: the session's scoped models when a scope is active
-/// (upstream model-selector narrows to `session.scopedModels`); every
-/// registry model otherwise.
+/// (upstream model-selector narrows to `session.scopedModels`); otherwise the
+/// registry catalog narrowed to providers with configured auth (upstream
+/// `ModelRuntime.getAvailableSnapshot()`), so the selector's
+/// "configured providers" header is true.
 fn selector_model_pairs(app: &App) -> Vec<(String, String)> {
     if !has_model_scope(app) {
-        return model_pairs(app);
+        return app_configured_model_pairs(app, model_pairs(app));
     }
     scoped_model_pairs(app)
 }
@@ -5041,6 +5119,9 @@ struct DockComponent {
     /// editor block's rows and whether an overlay replaced it. `None` on a
     /// host without the main-screen mouse path.
     mouse_layout: Option<Arc<Mutex<super::core::DockMouseLayout>>>,
+    /// Live thinking level: the editor border returns to its thinking color
+    /// when bash mode exits.
+    thinking_level: Arc<Mutex<String>>,
 }
 
 impl Component for DockComponent {
@@ -5188,6 +5269,21 @@ impl Component for DockComponent {
                 // once the call returns. The old `render_with_cursor_rows`
                 // bridge built a throwaway `Vec<String>` plus one `String` per
                 // row here, every frame.
+                // BASHMODE: the composer border is the mode indicator. It
+                // uses the theme's bashMode color while active and returns to
+                // the live thinking-level color on exit; `set_border_color`
+                // ignores no-op writes, so this per-frame call is cheap.
+                let border_color = if self.editor.is_bash_mode() {
+                    with_theme(|theme| theme.bash_border())
+                } else {
+                    let level = self
+                        .thinking_level
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    with_theme(|theme| theme.thinking_border(&level))
+                };
+                self.editor.set_border_color(border_color);
                 let editor_start = out.len() - dock_start;
                 let editor_row = out.len();
                 let (cursor_row, cursor_col) =
@@ -5280,6 +5376,13 @@ impl Component for DockComponent {
                             &render_working_indicator_with(&spinner, &message),
                         );
                     }
+                } else if self.editor.is_bash_mode() {
+                    // BASHMODE: idle bash composer — the top border carries
+                    // the mode label (and the `!` prefix doubles as the
+                    // status bullet), so the shell state is visible even on a
+                    // blank command line.
+                    let top = out.line_at(editor_row);
+                    *top = embed_status_in_border(top, width, "!", BASH_STATUS_LABEL);
                 }
             }
         }
@@ -5535,6 +5638,11 @@ fn spinner_only_border(paint: &str, width: usize, spinner: &str) -> String {
     push_painted_run(&mut out, paint, '─', tail);
     out
 }
+
+/// Bash-mode hint spliced into the editor top border while the composer is
+/// in `!` shell mode (BASHMODE): the status bullet is `!`, the body says what
+/// Enter/Esc do.
+pub const BASH_STATUS_LABEL: &str = "BASH · shell · Enter runs · Esc exits";
 
 /// Splice an active status indicator into the editor's rendered top border —
 /// port of upstream `CustomEditor.renderTopBorder` (custom-editor.ts:36-79)
@@ -9256,7 +9364,10 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
     for message in initial_messages {
         entries.push(ChatEntry::User(message.clone()));
         worker.submit(message);
-        if prompt_arms_working_label(worker.is_active(), worker.is_streaming()) {
+        if prompt_arms_working_label(
+            worker.is_active(),
+            worker.is_streaming() || worker.is_compacting(),
+        ) {
             *app.working_message
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some("Working".to_string());
@@ -9360,6 +9471,25 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
     // events it releases (a reassembled sequence is several events).
     let mut input_gate = super::stdin_buffer::StdinGate::from_env();
     let mut pending_input: VecDeque<Event> = VecDeque::new();
+    let mut input_trace = InputLoopTrace::new();
+    let mut printable_burst = PrintableBurst::new();
+    #[cfg(windows)]
+    let mut win_batch = win_batch_input::BatchReader::new();
+    #[cfg(windows)]
+    let mut console_coalescer = ConsoleBatchCoalescer::new();
+    #[cfg(windows)]
+    let mut batch_events: Vec<Event> = Vec::new();
+    // Startup input bridge: the OSC 11 color query runs before the event loop
+    // and a tty has no peek, so bytes it had to take that were not a terminal
+    // reply are parked (Unix only; Windows peeks without consuming). Replay
+    // them through the same gate before the first poll — a key typed during
+    // startup reaches the composer instead of dying in the hand-back queue.
+    let handed_back = super::theme::take_pending_stdin_bytes();
+    if !handed_back.is_empty() {
+        for event in super::stdin_buffer::decode_startup_input_bytes(&handed_back) {
+            pending_input.extend(input_gate.push(event, Instant::now()));
+        }
+    }
     // Raw terminal-input hooks (`ctx.ui.onTerminalInput`). Disabled until the
     // worker hands over the session's plugin host; with no handlers the gate
     // is one atomic load per input and the built-in path is unchanged.
@@ -9375,6 +9505,27 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
     // is unchanged. Out-of-band crossterm events (resize) sit in the same
     // queue by construction: they are delayed with it, never dropped.
     let mut deferred_terminal_input: Option<(Event, TerminalInputPending)> = None;
+
+    // Windows batch handover: crossterm's global queue can still hold events
+    // parsed before `BatchReader` took over (the trust prompt leaves
+    // type-ahead there for the TUI). Deliver them through the same gate once;
+    // from the first loop iteration on, `BatchReader` is the only reader, so
+    // crossterm's parser never sees a fresh console record and can never
+    // mispair a surrogate. The console queue is drained first so the flush
+    // below has (almost) nothing to pre-read.
+    #[cfg(windows)]
+    if let Some(batch) = win_batch.as_mut() {
+        let mut preloop: Vec<Event> = Vec::new();
+        batch.drain(&mut preloop);
+        for event in preloop {
+            pending_input.extend(input_gate.push(event, Instant::now()));
+        }
+        let mut flushed = 0usize;
+        while flushed < PENDING_INPUT_MAX_EVENTS && event::poll(Duration::ZERO)? {
+            pending_input.extend(input_gate.push(event::read()?, Instant::now()));
+            flushed += 1;
+        }
+    }
 
     timings.time("tui.worker");
     let mut timing_first_frame = true;
@@ -10160,8 +10311,22 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                             insert_clipboard_path(&app, &paths, true);
                         }
                         Ok(Some(super::clipboard::ClipboardPaste::ImagePath(path))) => {
-                            // Upstream inserts the temp-file path verbatim.
-                            insert_clipboard_path(&app, &path, false);
+                            if editor_is_bash_mode(&app) {
+                                // A `!` shell command is not a model prompt:
+                                // `@` references are never expanded there, so
+                                // keep the raw path the shell can use.
+                                insert_clipboard_path(&app, &path, true);
+                            } else {
+                                // The prompt expander only recognizes `@path`
+                                // tokens: a bare temp-file path reaches the
+                                // model as literal text and never becomes an
+                                // image attachment. Insert the quoted prompt
+                                // reference instead; `expand_prompt_file_args`
+                                // turns it into an `ImageContent` block on
+                                // submit.
+                                let reference = super::clipboard_image::image_path_reference(&path);
+                                insert_clipboard_path(&app, &reference, true);
+                            }
                         }
                         Ok(Some(super::clipboard::ClipboardPaste::Text(text))) => {
                             // Existing text semantics: the paste pipeline folds
@@ -10389,14 +10554,21 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     // tab is active the editor is the single copy, and the
                     // switch helpers save it back with `save_active_draft` on
                     // the way out.
-                    super::app::add_or_activate_tab(
+                    //
+                    // The attach reply can arrive AFTER the first frame (the
+                    // worker builds the agent session off-thread), so the
+                    // composer may already hold keys the user typed at
+                    // startup. `settle_attached_editor` keeps that live text
+                    // on a startup attach and folds it into the outgoing
+                    // tab's draft on a switch — never silently discard it.
+                    let live = app.editor.get_text();
+                    let restored = super::app::settle_attached_editor(
                         &mut app.tabs,
                         &mut app.active_path,
                         &path,
                         &title,
+                        &live,
                     );
-                    let restored =
-                        super::app::take_active_draft(&mut app.tabs, app.active_path.as_deref());
                     app.editor.set_text(&restored);
                     app.note_editor_change();
                     // The outgoing session's name (footer/terminal title/OSC
@@ -10502,6 +10674,11 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     }
                 }
                 WorkerEvent::CompactionStarted => {
+                    // COMPACT-INPUT §5: the session claim is held by the
+                    // compaction; prompts submitted from here on are queued
+                    // by `submit_prompt` instead of being rejected by the
+                    // session's synchronous compaction guard.
+                    worker.set_compacting(true);
                     // OSC 7501: compaction began (upstream `compaction_start`).
                     app.core.program_status_reporter().compaction_start();
                     // The editor-border indicator carries the upstream
@@ -10522,6 +10699,10 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     error,
                     manual,
                 } => {
+                    // COMPACT-INPUT §5: the claim released; a prompt queued
+                    // behind the compaction can now start (the worker's FIFO
+                    // command channel delivers it in submission order).
+                    worker.set_compacting(false);
                     // OSC 7501: compaction ended (upstream `compaction_end`).
                     app.core.program_status_reporter().compaction_end(
                         aborted,
@@ -10809,7 +10990,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                             text: error.clone(),
                         });
                     }
-                    let models = model_pairs(&app);
+                    let models = selector_model_pairs(&app);
                     let scoped_models = scoped_model_pairs(&app);
                     let names = model_names(&app);
                     let current = app
@@ -11194,13 +11375,34 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
         let gate_remaining = input_gate
             .pending_deadline()
             .map(|deadline| deadline.saturating_duration_since(now));
+        // Frame budget: a dirty frame is painted at most once per
+        // `TuiCore::min_frame_interval` (16 ms / 60 fps). Clamp the poll to
+        // the next frame deadline so the FINAL frame of a burst (or a run
+        // that just ended) still paints when no further event arrives.
+        let frame_remaining = if dirty {
+            Some(
+                app.core
+                    .next_frame_deadline()
+                    .saturating_duration_since(Instant::now()),
+            )
+        } else {
+            None
+        };
+        let wait_deadline = match (gate_remaining, frame_remaining) {
+            (Some(gate), Some(frame)) => Some(gate.min(frame)),
+            (gate, frame) => gate.or(frame),
+        };
         let timeout = if drain_pending {
             // P0.3: a bounded drain left worker events queued — take the next
             // batch immediately instead of sleeping the frame cadence.
             Duration::ZERO
         } else {
-            event_loop_poll_timeout(work_in_flight, gate_remaining)
+            event_loop_poll_timeout(work_in_flight, wait_deadline)
         };
+        // TUI-P4: wake up in time to flush a coalesced printable run.
+        let timeout = printable_burst
+            .time_until_flush(Instant::now())
+            .map_or(timeout, |remaining| timeout.min(remaining));
         // P1-1: snapshot the transcript length before the input poll — any
         // entries pushed while handling this event (slash-command notices
         // like /help, /hotkeys, /copy, failed pastes, …) must be flushed
@@ -11214,7 +11416,34 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
         // reassembled sequence arrives in order without blocking the poll.
         pending_input.extend(input_gate.flush_due(now));
         bound_pending_input(&mut pending_input);
-        if pending_input.is_empty() && event::poll(timeout)? {
+        // Windows batch path: `event::poll(timeout)` is the blocking input
+        // wait, but its Windows source pre-reads the first console record into
+        // crossterm's internal queue before returning. That record bypasses
+        // `BatchReader`, and crossterm's surrogate pairing ignores `key_down`,
+        // so an emoji typed after idle (high-surrogate press first) was
+        // consumed by the parser and lost (QA INC-003). When the batch reader
+        // is available, wait on the console queue directly; every record then
+        // goes through `BatchReader`, whose pairing is key-down aware.
+        let mut input_ready = false;
+        if pending_input.is_empty() {
+            #[cfg(windows)]
+            {
+                match win_batch.as_mut() {
+                    Some(batch) => {
+                        input_ready = matches!(
+                            wait_for_win_batch_input(batch, timeout),
+                            WinBatchWake::Ready
+                        );
+                    }
+                    None => input_ready = event::poll(timeout)?,
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                input_ready = event::poll(timeout)?;
+            }
+        }
+        if input_ready {
             // The gate gets a FRESH instant per event, not this iteration's
             // `now`: `now` was captured before the poll wait, so a window
             // re-armed from it can already be in the past when the next record
@@ -11228,25 +11457,112 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             // a bracketless paste is torn across reads. Collecting the ready
             // batch lets `coalesce_paste_burst` turn a pasted paragraph into
             // one editor insertion instead of one frame per character.
-            let mut reads = 0usize;
-            loop {
-                pending_input.extend(input_gate.push(event::read()?, Instant::now()));
-                bound_pending_input(&mut pending_input);
-                reads += 1;
-                if reads >= 256 || !event::poll(Duration::ZERO)? {
-                    break;
+            #[cfg(windows)]
+            if win_batch.is_some() {
+                // TUI-P5: let the console producer get ahead before taking
+                // records. ConPTY and the winpty console agent release a paste
+                // faster while nobody drains than they can between two
+                // single-record crossterm reads: a 338 KB paste fills the
+                // console queue within a few ms and then leaves in ONE
+                // ReadConsoleInputW call, while a zero-wait poll loop turns
+                // the same bytes into ~600k one-record reads. The queue is
+                // polled for a short, bounded settle window; a single key
+                // (press + release already queued) settles after one 1 ms
+                // step, so typing latency grows by ~1 ms, not by the burst
+                // window.
+                let settle_until = Instant::now() + INPUT_BATCH_SETTLE;
+                let mut last = win_batch.as_mut().map(|batch| batch.pending()).unwrap_or(0);
+                while Instant::now() < settle_until {
+                    std::thread::sleep(Duration::from_millis(1));
+                    let current = win_batch.as_mut().map(|batch| batch.pending()).unwrap_or(0);
+                    if current == last {
+                        break;
+                    }
+                    last = current;
                 }
+                // The wait above returned with console records queued. Never
+                // call `event::poll` here: on Windows it pre-reads (and
+                // parses) one console record, which is exactly the first-emoji
+                // loss this path exists to prevent. `BatchReader` models every
+                // console record kind (key, mouse, resize, focus), and paste
+                // events are synthesized by the coalescer/gate, so no event is
+                // left for crossterm to own.
+                let mut reads = 0usize;
+                loop {
+                    batch_events.clear();
+                    if let Some(batch) = win_batch.as_mut() {
+                        batch.drain(&mut batch_events);
+                    }
+                    if batch_events.is_empty() {
+                        break;
+                    }
+                    let drained = batch_events.len();
+                    input_trace.record_batch(drained);
+                    for batched in &batch_events {
+                        input_trace.record_event(batched);
+                    }
+                    let raw = std::mem::take(&mut batch_events);
+                    let coalesced = console_coalescer.coalesce(raw);
+                    input_trace.note_batch(drained, coalesced.len());
+                    for batched in coalesced {
+                        pending_input.extend(input_gate.push(batched, Instant::now()));
+                    }
+                    reads += drained;
+                    // Backpressure: stop pulling console records once the
+                    // decoded queue is at its cap. The records stay in the
+                    // OS console buffer (bounded) instead of being copied
+                    // into an unbounded user-space queue.
+                    if pending_input.len() >= PENDING_INPUT_MAX_EVENTS {
+                        break;
+                    }
+                    let more = win_batch
+                        .as_mut()
+                        .map(|batch| batch.pending() > 0)
+                        .unwrap_or(false);
+                    if reads >= INPUT_BATCH_MAX_READS {
+                        break;
+                    }
+                    if !more {
+                        break;
+                    }
+                }
+                input_trace.note_queue(pending_input.len());
+            } else {
+                let mut reads = 0usize;
+                loop {
+                    let next_event = event::read()?;
+                    input_trace.record_event(&next_event);
+                    pending_input.extend(input_gate.push(next_event, Instant::now()));
+                    reads += 1;
+                    if reads >= 65536 || !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                }
+                input_trace.note_queue(pending_input.len());
             }
-        }
-        // A terminal without bracketed-paste markers delivers a paste as one
-        // Key event per character; one insert per event is what made it appear
-        // one glyph at a time and re-ran autocomplete per character.
-        //
-        // Only while the main editor (or a text-buffer dialog that accepts a
-        // paste) owns the focus: a selector/menu swallows `Event::Paste`
-        // instead of feeding it to its own filter, so coalescing there would
-        // turn a typed search term (`warnings`, 8 keys) into a paste the menu
-        // never sees. With an overlay open, leave the keys as keys.
+            #[cfg(not(windows))]
+            {
+                let mut reads = 0usize;
+                loop {
+                    let next_event = event::read()?;
+                    input_trace.record_event(&next_event);
+                    pending_input.extend(input_gate.push(next_event, Instant::now()));
+                    reads += 1;
+                    if reads >= 65536 || !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                }
+                input_trace.note_queue(pending_input.len());
+            }
+        } // A terminal without bracketed-paste markers delivers a paste as one
+          // Key event per character; one insert per event is what made it appear
+          // one glyph at a time and re-ran autocomplete per character.
+          //
+          // Only while the main editor (or a text-buffer dialog that accepts a
+          // paste) owns the focus: a selector/menu swallows `Event::Paste`
+          // instead of feeding it to its own filter, so coalescing there would
+          // turn a typed search term (`warnings`, 8 keys) into a paste the menu
+          // never sees. With an overlay open, leave the keys as keys.
         let selector_open = app
             .overlay
             .lock()
@@ -11264,12 +11580,57 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .search
             .active;
-        if coalesce_paste_allowed(selector_open, dialog_open, dialog_accepts_text, search_open) {
+        let coalesce_allowed =
+            coalesce_paste_allowed(selector_open, dialog_open, dialog_accepts_text, search_open);
+        // TUI-P4 printable-key burst: collect the run across the read-loop's
+        // partial drains. A selector/search/confirm owns the focus as keys,
+        // and character-jump mode consumes the next printable key as a jump —
+        // never coalesce those into a paste.
+        let burst_allowed = coalesce_allowed && app.editor.jump_mode().is_none();
+        if !burst_allowed && printable_burst.is_active() {
+            let outcome = printable_burst.flush_now(&mut pending_input);
+            input_trace.note_burst(&outcome);
+        }
+        let burst_now = Instant::now();
+        let burst_blocked = printable_burst.absorb(&mut pending_input, burst_now, burst_allowed);
+        let burst_queue_empty = pending_input.is_empty();
+        if printable_burst.should_flush(burst_now, burst_blocked, burst_queue_empty) {
+            let outcome =
+                printable_burst.flush(&mut pending_input, !burst_blocked && burst_queue_empty);
+            input_trace.note_burst(&outcome);
+            if outcome.finished && outcome.total_bytes >= LARGE_PASTE_NOTICE_BYTES {
+                let mut text = format!(
+                    "Large paste inserted: {:.1} MB in {} chunk{}",
+                    outcome.total_bytes as f64 / (1024.0 * 1024.0),
+                    outcome.chunks,
+                    if outcome.chunks == 1 { "" } else { "s" }
+                );
+                if outcome.truncated {
+                    text.push_str(&format!(
+                        " (truncated at {} MB; content beyond the cap was not inserted)",
+                        PrintableBurst::MAX_BYTES / (1024 * 1024)
+                    ));
+                } else {
+                    text.push_str(" (content complete)");
+                }
+                entries.push(ChatEntry::Notice {
+                    kind: super::app::NoticeKind::Status,
+                    text,
+                });
+            }
+        }
+        // The batch reader may have queued a whole paste in one drain; the
+        // burst above consumed its printable run, so only non-text events
+        // remain to be bounded.
+        bound_pending_input(&mut pending_input);
+        if coalesce_allowed {
             // Replacement events at the queue front are exempt: merging them
             // with the keys behind them would consume several bypass
             // reservations with one pop and silently skip the hook for later
             // physical inputs.
-            coalesce_pending_input(&mut pending_input, terminal_input_bypass);
+            let queued_before = pending_input.len();
+            let coalesced = coalesce_pending_input(&mut pending_input, terminal_input_bypass);
+            input_trace.note_coalesce(queued_before, pending_input.len(), coalesced);
         }
         // A late hook answer is applied before the next physical input: the
         // held event rejoins the built-in path on `Pass`, is dropped on
@@ -11325,7 +11686,16 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                 }
             }
         }
+        let mut input_priority = false;
         if let Some(input_event) = input_event {
+            input_trace.record_processed(&input_event);
+            // Real terminal input (key/paste/mouse/resize) bypasses the
+            // frame budget: the next frame is due immediately, so typing
+            // latency stays as low as before the coalescing change. A paste
+            // chunk is the exception: it can arrive as several bounded chunks
+            // and must not force a full transcript repaint per chunk, so it
+            // renders on the normal 60 fps budget (dirty stays set).
+            input_priority = !matches!(input_event, Event::Paste(_));
             match input_event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // Fullscreen key routing: the app-level editor actions
@@ -11787,7 +12157,8 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                 }
             }
         }
-        if dirty {
+        let frame_due = dirty && app.core.frame_due_at(Instant::now(), input_priority);
+        if frame_due {
             if !dialog_open {
                 // Frame advance: paced by `ctx.ui.setWorkingIndicator`'s
                 // `intervalMs` when set (0 = advance every tick, the built-in
@@ -11934,6 +12305,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                 }
             }
             ui_heartbeat.beat(UI_PHASE_RENDER);
+            input_trace.frames += 1;
             app.core.render();
             // No `stdout().flush()` here: `TuiCore::render` enqueues the frame
             // on `pir-tui-writer`, which writes AND flushes it on its own
@@ -11942,6 +12314,22 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             // console write, freezing input/render behind a stalled sink.
             ui_heartbeat.beat(UI_PHASE_IDLE);
             dirty = false;
+            // DIRTY2: a frame that hit its row budget left the remaining
+            // block ids in `core.pending_dirty`/`deferred_blocks`. Keep the
+            // loop dirty so the next pass (at the 16 ms deadline) paints
+            // them; component state is already the latest, so nothing is
+            // lost if the next pass is delayed by input.
+            if app.core.has_pending_dirty() {
+                dirty = true;
+            }
+            // A writer drop can happen while THIS frame is being enqueued
+            // (the queue fills between the epoch check at render start and
+            // the enqueue at its end). The frame on the wire may then be a
+            // diff against a chunk that never reached the screen, so keep the
+            // frame dirty: the next pass paints one self-contained keyframe.
+            if app.core.needs_keyframe() {
+                dirty = true;
+            }
             if search_walk_check {
                 // The frame that materialized a walked page is painted: the
                 // BAND search is the authority (the probe only decided to
@@ -11963,6 +12351,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                 timings.time("tui.firstFrame");
             }
         }
+        input_trace.maybe_report(&app.editor, printable_burst.blocked_by());
         // `ctx.shutdown()`: leave through the normal teardown once no prompt
         // run is in flight (upstream `checkShutdownRequested` at
         // `agent_settled`; the idle path shuts down immediately). The run
@@ -12556,7 +12945,6 @@ fn handle_key(
     // notification drain republishes the `ctx.ui.getEditorText()` snapshot.
     // The bump itself is one atomic add.
     app.note_editor_change();
-
     // 0. Extension dialogs consume every key while open (modal, upstream
     //    extension-selector/extension-input/extension-editor).
     if app
@@ -12841,6 +13229,16 @@ fn handle_key(
                 text: "Aborting bash command…".to_string(),
             });
             None
+        } else if app.editor.is_bash_mode() {
+            // BASHMODE: Esc leaves `!` shell mode and returns the draft to
+            // normal AI input (the leading mode `!` is stripped). While a
+            // command runs the `bash_running` branch above keeps existing
+            // shell semantics: the first Esc aborts it, the next exits mode.
+            app.editor.exit_bash_mode();
+            *app.autocomplete
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            None
         } else if app.editor.get_text().trim().is_empty() {
             let double_escape_action = app
                 .configured
@@ -13066,7 +13464,15 @@ fn handle_key(
             // CONTROL and ALT combos: alt+b/alt+f and the other char combos
             // fall through as no-ops.
             app.editor.insert_char(c);
-            update_autocomplete(app);
+            if app.editor.is_bash_mode() {
+                // `!` just switched the composer to bash mode: the slash
+                // command menu must not appear over the shell prompt.
+                *app.autocomplete
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            } else {
+                update_autocomplete(app);
+            }
         }
         None
     } else {
@@ -14816,6 +15222,24 @@ fn apply_menu_action(
             // session, not the settings file).
             "autocompact" => {
                 worker.set_auto_compaction(value.as_bool().unwrap_or(true));
+            }
+            "hide-thinking" => {
+                // `settings.hideThinkingBlock` has no session round-trip: the
+                // transcript renderer owns the whole effect, so apply it to
+                // the settled chat and the block cache (including the live
+                // streaming thinking child) immediately instead of waiting
+                // for the next session start. Persistence happens below.
+                let hide = value.as_bool().unwrap_or(false);
+                app.hide_thinking = hide;
+                app.chat
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .set_hide_thinking(hide);
+                app.chat_blocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .set_hide_thinking(hide);
+                app.chat_revision.fetch_add(1, Ordering::Relaxed);
             }
             "steering-mode" => {
                 if let Ok(mode) =
@@ -16828,20 +17252,52 @@ fn tool_render_digest(app: &App, input: ToolRenderDigest<'_>) -> u64 {
 }
 
 /// Feed one `serde_json::Value` into a hasher without an intermediate
-/// serialized string: the serializer writes straight into a hashing
-/// `io::Write` sink.
+/// serialized string. Walks the value with a depth cap instead of
+/// `serde_json::to_writer`: a deeply nested MCP result/argument must not
+/// recurse through the serializer (and its per-level generic frames) on the
+/// render path.
 fn hash_json_into(value: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
-    struct HashSink<'a, H: std::hash::Hasher>(&'a mut H);
-    impl<H: std::hash::Hasher> std::io::Write for HashSink<'_, H> {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.write(buf);
-            Ok(buf.len())
+    hash_json_at(value, hasher, 0);
+}
+
+fn hash_json_at(value: &serde_json::Value, hasher: &mut impl std::hash::Hasher, depth: usize) {
+    use std::hash::Hash as _;
+    if depth >= super::messages::MAX_JSON_RENDER_DEPTH {
+        // One marker byte distinguishes the elided subtree from a real
+        // scalar at the same position.
+        0xFFu8.hash(hasher);
+        return;
+    }
+    match value {
+        serde_json::Value::Null => 0u8.hash(hasher),
+        serde_json::Value::Bool(flag) => {
+            1u8.hash(hasher);
+            flag.hash(hasher);
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+        serde_json::Value::Number(number) => {
+            2u8.hash(hasher);
+            number.to_string().hash(hasher);
+        }
+        serde_json::Value::String(text) => {
+            3u8.hash(hasher);
+            text.hash(hasher);
+        }
+        serde_json::Value::Array(items) => {
+            4u8.hash(hasher);
+            items.len().hash(hasher);
+            for item in items {
+                hash_json_at(item, hasher, depth + 1);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            5u8.hash(hasher);
+            object.len().hash(hasher);
+            for (key, item) in object {
+                key.hash(hasher);
+                hash_json_at(item, hasher, depth + 1);
+            }
         }
     }
-    let _ = serde_json::to_writer(HashSink(hasher), value);
 }
 
 /// Render one tool-update transcript entry: a registered tool renderer's
@@ -17681,12 +18137,36 @@ fn run_action(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             let follow_up = action == Action::FollowUp;
+            // BASHMODE: Enter runs the shell only while the composer is in
+            // explicit bash mode. A pasted/typed `!…` in normal mode is a
+            // plain prompt (paste must never arm the shell).
+            let bash_mode = app.editor.is_bash_mode();
             if let Some(text) = app.editor.submit() {
                 // The submitted text consumed the editor; the active tab no
                 // longer has a draft (a restored draft was taken out of the
                 // tab when it was activated, so this is normally a no-op).
                 super::app::save_active_draft(&mut app.tabs, app.active_path.as_deref(), "");
-                if text.starts_with('/') {
+                if bash_mode {
+                    match parse_bash_submission(true, &text) {
+                        Some(submission) => {
+                            // `handle_bash` reads one extra leading `!` as
+                            // exclude-from-context; keep that encoding.
+                            let command = if submission.exclude_from_context {
+                                format!("!{}", submission.command)
+                            } else {
+                                submission.command
+                            };
+                            handle_bash(&command, app, worker, entries);
+                        }
+                        None => {
+                            // Bare `!` / blank command: restore the composer
+                            // and stay in bash mode (existing shell
+                            // semantics).
+                            app.editor.set_text(&text);
+                            app.editor.enter_bash_mode();
+                        }
+                    }
+                } else if text.starts_with('/') {
                     match handle_command(&text, app, entries, worker) {
                         // `/quit` (and any future exiting command) ends the
                         // loop.
@@ -17703,9 +18183,9 @@ fn run_action(
                             submit_user_prompt(app, entries, worker, &text, follow_up);
                         }
                     }
-                } else if let Some(command) = text.strip_prefix('!') {
-                    handle_bash(command, app, worker, entries);
                 } else {
+                    // `!`-prefixed text outside bash mode (a bracketed paste
+                    // or a resumed draft) is ordinary prompt text.
                     submit_user_prompt(app, entries, worker, &text, follow_up);
                 }
             }
@@ -17884,7 +18364,7 @@ fn run_action(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let scoped = has_model_scope(app);
-            let models = model_pairs(app);
+            let models = selector_model_pairs(app);
             let scoped_models = scoped_model_pairs(app);
             let current = app
                 .configured
@@ -17962,6 +18442,14 @@ fn update_autocomplete(app: &App) {
 /// explicit Tab; empty results close an open popup; an open popup keeps
 /// its forced mode across re-queries.
 fn request_autocomplete(app: &App, force: bool, explicit_tab: bool) {
+    // BASHMODE: the shell composer has no slash-command/file popup; `!` must
+    // never be confused with `/` command completion.
+    if app.editor.is_bash_mode() {
+        *app.autocomplete
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        return;
+    }
     if force {
         let state = app.editor.state_snapshot();
         if !app.autocomplete_provider.should_trigger_file_completion(
@@ -18149,10 +18637,11 @@ fn paste_from_clipboard(app: &App, entries: &mut Vec<ChatEntry>) {
     }
 }
 
-/// Insert a clipboard FILE-PATH or IMAGE-PATH result raw at the cursor
+/// Insert a clipboard FILE-PATH or IMAGE-PATH result at the cursor
 /// (upstream `insertTextAtCursor`): no paste folding, no paste-registry
-/// marker. File lists get the cursor spacing rule; image paths are inserted
-/// verbatim.
+/// marker. File lists get the cursor spacing rule; image paths arrive as
+/// `@"…"` prompt references (see the `ImagePath` arm in the event loop) and
+/// use the same spacing so the reference stays its own token.
 fn insert_clipboard_path(app: &App, text: &str, apply_spacing: bool) {
     let state = app.editor.state_snapshot();
     let line = state
@@ -18175,11 +18664,11 @@ fn insert_clipboard_path(app: &App, text: &str, apply_spacing: bool) {
     update_autocomplete(app);
 }
 
-/// Bash mode is the editor text's first non-whitespace character being `!`
-/// (upstream `isBashMode`): copied file paths are then space-joined and
-/// shell-quoted instead of newline-joined.
+/// Bash mode is the composer's explicit `!` mode bit (BASHMODE): copied file
+/// paths are then space-joined and shell-quoted instead of newline-joined.
+/// Text that merely starts with `!` from a paste is NOT bash mode.
 fn editor_is_bash_mode(app: &App) -> bool {
-    app.editor.get_text().trim_start().starts_with('!')
+    app.editor.is_bash_mode()
 }
 
 /// Ask for one full clipboard paste on a side thread; the outcome arrives as
@@ -18428,8 +18917,14 @@ fn handle_command(
                     .and_then(|configured| configured.settings.terminal.as_ref());
                 let image_settings =
                     super::image_preview::ImageSettings::from_terminal(terminal_settings);
-                match super::image_preview::render_image_with_terminal(
+                // Resolve a relative argument against the active session cwd;
+                // absolute paths pass through unchanged.
+                let image_path = super::image_preview::resolve_image_path(
                     std::path::Path::new(args),
+                    &app.image_cwd(),
+                );
+                match super::image_preview::render_image_with_terminal(
+                    &image_path,
                     IMAGE_PREVIEW_MAX_ROWS,
                     image_settings,
                     terminal_settings,
@@ -18506,7 +19001,7 @@ fn handle_command(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let scoped = has_model_scope(app);
-                let models = model_pairs(app);
+                let models = selector_model_pairs(app);
                 let scoped_models = scoped_model_pairs(app);
                 let names = model_names(app);
                 let current = app
@@ -18837,12 +19332,14 @@ fn handle_command(
         }
         super::slash::SlashAction::ScopedModels => {
             // Open the session-only enable/disable selector (upstream
-            // `showModelsSelector` → `ScopedModelsSelectorComponent`).
+            // `showModelsSelector` → `ScopedModelsSelectorComponent`):
             // Changes apply per toggle through the worker
             // (`session.setScopedModels`) and are session-only — persisting
             // to settings (`app.models.save`) needs the settings-menu seam
             // pir does not have yet.
-            let models = model_pairs(app);
+            // Upstream seeds this selector from `getAvailableSnapshot()`, so
+            // unconfigured catalog providers stay out of the enable list.
+            let models = app_configured_model_pairs(app, model_pairs(app));
             let enabled = {
                 let scoped = app
                     .scoped_refs
@@ -19449,6 +19946,9 @@ fn reset_session_view_state(app: &mut App) {
     );
     app.background_running.store(0, Ordering::Relaxed);
     app.bash_running.store(false, Ordering::SeqCst);
+    // BASHMODE belongs to the outgoing composer too: a new/cleared session
+    // starts in normal AI input.
+    app.editor.clear_bash_mode();
     // Every in-flight `!` bash belongs to the outgoing transcript: its
     // completion must not touch the new one's block or Esc state.
     app.active_bash_request = None;
@@ -20201,6 +20701,7 @@ fn handle_bash(command: &str, app: &mut App, worker: &WorkerHandle, entries: &mu
             text: "A bash command is already running. Press Esc to cancel it first.".to_string(),
         });
         app.editor.set_text(&format!("!{command}"));
+        app.editor.enter_bash_mode();
         return;
     }
     let (exclude_from_context, command_text) = match command.strip_prefix('!') {
@@ -20211,6 +20712,7 @@ fn handle_bash(command: &str, app: &mut App, worker: &WorkerHandle, entries: &mu
     // (interactive-mode.ts:3349-3355).
     if command_text.is_empty() {
         app.editor.set_text(&format!("!{command}"));
+        app.editor.enter_bash_mode();
         return;
     }
     // The worker re-parses the extra leading `!` as `excludeFromContext`.
@@ -20278,18 +20780,73 @@ fn submit_user_prompt(
     );
 }
 
+/// The Status notice shown when a prompt is submitted while a compaction
+/// owns the session (COMPACT-INPUT §5). The text is queued, never dropped.
+pub const COMPACTION_QUEUED_NOTICE: &str =
+    "Compaction in progress — message queued; it will run when compaction completes.";
+
+/// Where `submit_prompt` routes one non-command prompt. Pure so the
+/// streaming/compaction/idle matrix stays pinned without a live worker.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptRoute {
+    /// A run is streaming: Enter steers the active run.
+    Steer,
+    /// A run is streaming: Alt+Enter queues a follow-up behind it.
+    FollowUp,
+    /// A compaction (manual or automatic) owns the session with no run: hold
+    /// the text in the worker command channel and show
+    /// [`COMPACTION_QUEUED_NOTICE`]; `run_prompt` waits out any compaction the
+    /// worker command loop did not observe and then starts it.
+    QueueDuringCompaction,
+    /// Idle: start a new run.
+    Submit,
+}
+
+#[doc(hidden)]
+pub fn prompt_route(streaming: bool, compacting: bool, follow_up: bool) -> PromptRoute {
+    if streaming {
+        if follow_up {
+            PromptRoute::FollowUp
+        } else {
+            PromptRoute::Steer
+        }
+    } else if compacting {
+        PromptRoute::QueueDuringCompaction
+    } else {
+        PromptRoute::Submit
+    }
+}
+
+/// The transcript rows one prompt queued behind a compaction appends: the
+/// Status notice (the input was accepted, not dropped) and the optimistic
+/// user bubble. The notice comes FIRST so the trailing user row still wins
+/// the `entry_appended` dedupe when the run finally starts.
+#[doc(hidden)]
+pub fn compaction_queued_entries(display: String) -> [ChatEntry; 2] {
+    [
+        ChatEntry::Notice {
+            kind: super::app::NoticeKind::Status,
+            text: COMPACTION_QUEUED_NOTICE.to_string(),
+        },
+        ChatEntry::User(display),
+    ]
+}
+
 /// Route a non-command prompt: while the agent streams, Enter STEERS the
 /// current run and Alt+Enter queues a follow-up (upstream 4475-4503); both
 /// surface as pending-message display lines until the turn ends. Otherwise
 /// the prompt starts a new run.
 ///
-/// A QUEUED message gets NO transcript entry here: upstream's `prompt(...,
-/// {streamingBehavior})` only enqueues, and the user bubble enters the chat
-/// later — through `message_start` — when the loop actually delivers it. The
-/// dim pending list is likewise driven by the session's authoritative
-/// `queue_update` snapshots ([`WorkerEvent::QueueUpdate`]), so the optimistic
-/// push upstream never does would leave a "sent" bubble and a phantom queue
-/// row behind when the message is only waiting.
+/// A STEERED / FOLLOW-UP message gets NO transcript entry here: upstream's
+/// `prompt(..., {streamingBehavior})` only enqueues, and the user bubble
+/// enters the chat later — through `message_start` — when the loop actually
+/// delivers it. The dim pending list is likewise driven by the session's
+/// authoritative `queue_update` snapshots ([`WorkerEvent::QueueUpdate`]), so
+/// the optimistic push upstream never does would leave a "sent" bubble and a
+/// phantom queue row behind when the message is only waiting. A prompt queued
+/// behind a COMPACTION is the exception: there is no run to deliver it, so
+/// the submit path owns its bubble plus the queued Status notice.
 fn submit_prompt(
     app: &mut App,
     entries: &mut Vec<ChatEntry>,
@@ -20298,17 +20855,32 @@ fn submit_prompt(
     display: String,
     follow_up: bool,
 ) {
-    if worker.is_streaming() {
-        if follow_up {
-            worker.follow_up(to_model);
-        } else {
+    match prompt_route(worker.is_streaming(), worker.is_compacting(), follow_up) {
+        PromptRoute::Steer => {
             worker.steer(to_model);
+            return;
         }
-        return;
+        PromptRoute::FollowUp => {
+            worker.follow_up(to_model);
+            return;
+        }
+        PromptRoute::QueueDuringCompaction => {
+            // COMPACT-INPUT §5: the session would reject a direct prompt
+            // while its `SESSION_COMPACTING` claim is held. Queue it in the
+            // worker command channel (FIFO) and tell the user it will run
+            // once the compaction completes.
+            entries.extend(compaction_queued_entries(display));
+            worker.submit(to_model);
+            return;
+        }
+        PromptRoute::Submit => {}
     }
     entries.push(ChatEntry::User(display));
     worker.submit(to_model);
-    if prompt_arms_working_label(worker.is_active(), worker.is_streaming()) {
+    if prompt_arms_working_label(
+        worker.is_active(),
+        worker.is_streaming() || worker.is_compacting(),
+    ) {
         *app.working_message
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some("Working".to_string());
@@ -22035,6 +22607,29 @@ impl WorkerCommandSender {
     }
 }
 
+/// UI-side mirror of the session's `isCompacting` (COMPACT-INPUT §5).
+///
+/// Set from `WorkerEvent::CompactionStarted` and cleared from
+/// `WorkerEvent::CompactionEnded`; a prompt submitted while it is raised is
+/// held in the worker command channel (FIFO) instead of being handed to a
+/// session that would reject it synchronously. Cloneable so the worker side
+/// and the UI share one bit if the wiring ever needs it.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct CompactionLatch {
+    compacting: Arc<AtomicBool>,
+}
+
+impl CompactionLatch {
+    pub fn is_compacting(&self) -> bool {
+        self.compacting.load(Ordering::SeqCst)
+    }
+
+    pub fn set(&self, value: bool) {
+        self.compacting.store(value, Ordering::SeqCst);
+    }
+}
+
 struct WorkerHandle {
     /// `None` when the worker thread could not be spawned (P2-11: degrade to
     /// a headless UI with an Error notice instead of panicking inside raw
@@ -22043,6 +22638,10 @@ struct WorkerHandle {
     /// Whether an agent run is in flight (set by the worker around
     /// `session.prompt`); decides steer-vs-submit and Esc semantics.
     streaming: Arc<AtomicBool>,
+    /// Mirrors the session's `isCompacting`; set by
+    /// `CompactionStarted`/`CompactionEnded`. Decides whether a submitted
+    /// prompt is queued behind a compaction instead of starting a run.
+    compacting: CompactionLatch,
     /// Fires (sender dropped) when the worker thread finished — its command
     /// loop plus the bounded `session.shutdown()`. The UI exit path waits on
     /// it, bounded, so a normal Ctrl+D does not kill the process out from
@@ -22286,11 +22885,23 @@ struct WorkerParts {
     overrides: WorkerOverrides,
 }
 
+/// Stack budget for the worker thread that hosts the whole `AgentSession`
+/// (agent loop, provider serialization, MCP tool results). Windows gives
+/// spawned threads 2 MiB by default; the main thread gets 64 MiB through
+/// `env_daemon::stack_budget_bytes`, and the worker needs the same headroom
+/// for a debug build's deeply nested render/serialize frames.
+///
+/// Public so the MCP stack regression test can pin the budget and the spawn
+/// site (`tests/tui_mcp_stack_overflow.rs`); changing/removing the
+/// `.stack_size(..)` application must fail that test.
+pub const WORKER_THREAD_STACK_BYTES: usize = 12 * 1024 * 1024;
+
 impl WorkerHandle {
     fn spawn(events: WorkerEventSender, parts: WorkerParts) -> Self {
         let (submit_tx, submit_rx) =
             tokio::sync::mpsc::channel::<WorkerCommand>(WORKER_COMMAND_QUEUE_BOUND);
         let streaming = Arc::new(AtomicBool::new(false));
+        let compacting = CompactionLatch::default();
         // Event-driven wake for the native status publisher (shared with the
         // worker loop, its command boundaries, and the run event handler).
         let pulse = StatusPulse::new();
@@ -22301,6 +22912,13 @@ impl WorkerHandle {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let spawned = std::thread::Builder::new()
             .name("pir-tui-worker".to_owned())
+            // The TUI worker runs the whole agent loop (provider request
+            // serialization, MCP result handling, session persistence), not
+            // just command dispatch. The platform default (2 MiB on Windows)
+            // is not enough for a debug build's frame depth on tool results;
+            // 12 MiB matches the main thread's budget policy without paying
+            // 64 MiB per TUI run.
+            .stack_size(WORKER_THREAD_STACK_BYTES)
             // The outer `events` stays available for the failed-spawn path.
             .spawn({
                 let events = events.clone();
@@ -22331,6 +22949,7 @@ impl WorkerHandle {
             Ok(_join_handle) => Self {
                 submit_tx: Some(WorkerCommandSender::new(submit_tx)),
                 streaming,
+                compacting,
                 done_rx: Some(done_rx),
             },
             Err(error) => {
@@ -22342,6 +22961,7 @@ impl WorkerHandle {
                 Self {
                     submit_tx: None,
                     streaming,
+                    compacting,
                     done_rx: None,
                 }
             }
@@ -22379,6 +22999,17 @@ impl WorkerHandle {
     /// Esc interrupt target).
     fn is_streaming(&self) -> bool {
         self.streaming.load(Ordering::SeqCst)
+    }
+
+    /// Whether a compaction currently owns the session (manual `/compact` or
+    /// an automatic run reported by the session events). A prompt submitted
+    /// then must wait for the compaction claim to release.
+    fn is_compacting(&self) -> bool {
+        self.compacting.is_compacting()
+    }
+
+    fn set_compacting(&self, value: bool) {
+        self.compacting.set(value);
     }
 
     fn submit(&self, text: String) {
@@ -23837,6 +24468,1396 @@ pub const PENDING_INPUT_MAX_EVENTS: usize = 8 * 1024;
 /// pathological payload from parking megabytes in the input queue.
 pub const PENDING_INPUT_MAX_EVENT_BYTES: usize = super::stdin_buffer::MAX_PASTE_BYTES;
 
+/// Windows console batches: how long the reader lets the producer get ahead
+/// before taking the queued records. One 1 ms step suffices for a single key
+/// (the press and release records are already there); a paste keeps growing
+/// for a few ms and then leaves in one `ReadConsoleInputW` call.
+#[cfg(windows)]
+pub const INPUT_BATCH_SETTLE: Duration = Duration::from_millis(8);
+
+/// Per-event-loop-iteration cap for batch draining, so a continuously fed
+/// console cannot starve rendering. The records left in the console queue are
+/// genuine OS-level backpressure (the console buffer is bounded).
+#[cfg(windows)]
+pub const INPUT_BATCH_MAX_READS: usize = 256 * 1024;
+
+/// Minimum printable characters in one drained batch before the run is
+/// rewritten as one `Event::Paste`. A human cannot type this many keys inside
+/// one batch window (the Windows reader settles for ~8 ms), so ordinary typing
+/// keeps its key semantics while a pasted burst becomes one insertion.
+pub const CONSOLE_BURST_MIN_CHARS: usize = 8;
+
+/// Partial bracketed-paste payload handed to the editor once it reaches this
+/// many bytes. The payload of a slow paste is therefore visible (and memory
+/// bounded) before its end marker arrives; a fast paste is still delivered as
+/// one event because the whole batch is coalesced in one pass.
+pub const CONSOLE_PASTE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Coalesce one drained console batch into the fewest events the gate and the
+/// editor need.
+///
+/// The Windows console (ConPTY and the winpty console agent alike) reports a
+/// paste as one key press + release per character. Feeding those records
+/// through the gate, the printable-burst collector and the editor one by one
+/// costs a lock, an allocation and often a frame per character; a 10k-line
+/// paste is ~600k records. This runs at the batch seam *before* the gate:
+///
+/// * bracketed-paste markers (`ESC [ 2 0 0 ~` / `ESC [ 2 0 1 ~`) are
+///   recognized in every spelling the Windows parser produces — `Esc` + `[`
+///   + digits (crossterm byte path) and `Alt+[` + digits (crossterm's
+///   `INPUT_RECORD` parser folds the dropped ESC record into the `[` key);
+/// * a run of plain printable presses (and Enters/Tabs) becomes ONE
+///   `Event::Paste`, so a fast paste costs one editor splice;
+/// * a bracketed payload is emitted in bounded chunks while it is still
+///   arriving, so a slow paste makes progress instead of staying invisible
+///   until its end marker;
+/// * key releases of printable characters are dropped (the loop only acts on
+///   presses); non-text keys, mouse, resize and focus pass through untouched.
+#[derive(Debug, Default)]
+pub struct ConsoleBatchCoalescer {
+    /// A bracketed-paste start marker was consumed and the end marker has not
+    /// arrived yet. Persists across batches (a paste can span reads).
+    paste_open: bool,
+    /// Payload collected since the last emitted chunk. Kept here (not as a
+    /// local) because a paste spans console batches, and a chunk boundary
+    /// must not lose the tail of the previous batch.
+    paste_buffer: String,
+    /// Trailing events that may be the beginning of a paste marker split
+    /// across two console batches (`Alt+[`, `Alt+[2`, …). Held until the
+    /// next batch so a marker is never typed as payload.
+    marker_tail: Vec<Event>,
+}
+
+impl ConsoleBatchCoalescer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_paste_open(&self) -> bool {
+        self.paste_open
+    }
+
+    /// Rewrite one raw console batch. The returned vector preserves the input
+    /// order; only adjacent printable records are merged.
+    pub fn coalesce(&mut self, events: Vec<Event>) -> Vec<Event> {
+        let mut events = events;
+        if !self.marker_tail.is_empty() {
+            let mut joined = std::mem::take(&mut self.marker_tail);
+            joined.append(&mut events);
+            events = joined;
+        }
+        // A marker may straddle the batch boundary. Hold a matching suffix
+        // for the next batch instead of letting its digits fall into the
+        // payload (the observed `201~` tail).
+        let marker: &[u8] = if self.paste_open { b"[201~" } else { b"[200~" };
+        if let Some(start) = marker_prefix_suffix(&events, marker) {
+            // A suffix that is ONLY a bare Esc press (plus its release) is the
+            // user pressing Esc, not a split paste start. Holding it until the
+            // next console batch made a lone Esc look dead until another key
+            // arrived (`/settings` needed two Esc presses). A genuinely split
+            // `ESC [ 2 0 0 ~` is reassembled by the input gate's escape window.
+            let lone_escape = !self.paste_open
+                && matches!(
+                    events.get(start),
+                    Some(Event::Key(key))
+                        if key.kind == KeyEventKind::Press
+                            && key.code == KeyCode::Esc
+                            && key.modifiers.is_empty()
+                )
+                && advance_releases(&events, start + 1) == events.len();
+            if !lone_escape {
+                self.marker_tail = events.split_off(start);
+            }
+        }
+        let mut out = Vec::with_capacity(8);
+        let mut run_events: Vec<Event> = Vec::new();
+        let mut run_text = String::new();
+        let mut paste_text = std::mem::take(&mut self.paste_buffer);
+        let mut index = 0usize;
+        while index < events.len() {
+            if !self.paste_open {
+                if let Some(next) = bracket_marker_end(&events, index, b"[200~") {
+                    flush_plain_run(&mut run_events, &mut run_text, &mut out);
+                    self.paste_open = true;
+                    index = next;
+                    continue;
+                }
+            } else if let Some(next) = bracket_marker_end(&events, index, b"[201~") {
+                flush_paste_chunk(&mut paste_text, &mut out);
+                self.paste_open = false;
+                index = next;
+                continue;
+            }
+            let event = events[index].clone();
+            index += 1;
+            match &event {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Release {
+                        // Releases carry no text and the loop only dispatches
+                        // presses. Dropping them here also prevents a key-up
+                        // between two printable runs from splitting a paste.
+                        continue;
+                    }
+                    if self.paste_open {
+                        if let Some(c) = plain_text_char(key) {
+                            paste_text.push(c);
+                        } else if is_plain_enter(key) {
+                            paste_text.push('\n');
+                        } else if is_line_feed_chord(key) {
+                            paste_text.push('\n');
+                        } else if is_plain_tab(key) {
+                            paste_text.push('\t');
+                        }
+                        // Other keys inside a paste are not payload (the
+                        // gate's collect_paste drops them too).
+                        if paste_text.len() >= CONSOLE_PASTE_CHUNK_BYTES {
+                            flush_paste_chunk(&mut paste_text, &mut out);
+                        }
+                        continue;
+                    }
+                    if let Some(c) = plain_text_char(key) {
+                        run_events.push(event);
+                        run_text.push(c);
+                        continue;
+                    }
+                    if is_plain_enter(key) || is_line_feed_chord(key) {
+                        // An Enter with nothing but releases behind it is the
+                        // final effective event of the batch: the user pressed
+                        // Enter to submit, not to paste a newline. Folding it
+                        // into the printable run would produce
+                        // `Paste("text\n")`, and the editor would insert a
+                        // line break instead of dispatching the submission.
+                        // Flush the run before the Enter and keep the Enter as
+                        // its own Key event. An Enter with content after it is
+                        // an internal newline (a multiline paste) and stays
+                        // part of the run.
+                        let has_following_content = events[index..].iter().any(|next| {
+                            !matches!(
+                                next,
+                                Event::Key(next_key) if next_key.kind == KeyEventKind::Release
+                            )
+                        });
+                        if has_following_content {
+                            run_events.push(event);
+                            run_text.push('\n');
+                        } else {
+                            flush_plain_run(&mut run_events, &mut run_text, &mut out);
+                            out.push(event);
+                        }
+                        continue;
+                    }
+                    if is_plain_tab(key) {
+                        run_events.push(event);
+                        run_text.push('\t');
+                        continue;
+                    }
+                    flush_plain_run(&mut run_events, &mut run_text, &mut out);
+                    out.push(event);
+                }
+                Event::Paste(text) => {
+                    if self.paste_open {
+                        paste_text.push_str(text);
+                        if paste_text.len() >= CONSOLE_PASTE_CHUNK_BYTES {
+                            flush_paste_chunk(&mut paste_text, &mut out);
+                        }
+                    } else {
+                        flush_plain_run(&mut run_events, &mut run_text, &mut out);
+                        out.push(event);
+                    }
+                }
+                _ => {
+                    flush_plain_run(&mut run_events, &mut run_text, &mut out);
+                    if self.paste_open && !paste_text.is_empty() {
+                        flush_paste_chunk(&mut paste_text, &mut out);
+                    }
+                    out.push(event);
+                }
+            }
+        }
+        flush_plain_run(&mut run_events, &mut run_text, &mut out);
+        if self.paste_open && paste_text.len() >= CONSOLE_PASTE_CHUNK_BYTES {
+            flush_paste_chunk(&mut paste_text, &mut out);
+        }
+        if self.paste_open {
+            self.paste_buffer = paste_text;
+        }
+        out
+    }
+}
+
+fn flush_paste_chunk(text: &mut String, out: &mut Vec<Event>) {
+    if !text.is_empty() {
+        out.push(Event::Paste(std::mem::take(text)));
+    }
+}
+
+fn flush_plain_run(run_events: &mut Vec<Event>, run_text: &mut String, out: &mut Vec<Event>) {
+    if run_text.is_empty() {
+        run_events.clear();
+        return;
+    }
+    let chars = run_text.chars().count();
+    if chars >= CONSOLE_BURST_MIN_CHARS || run_text.contains('\n') {
+        out.push(Event::Paste(std::mem::take(run_text)));
+    } else {
+        out.append(run_events);
+    }
+    run_events.clear();
+    run_text.clear();
+}
+
+/// A plain (or SHIFT-composed) printable key. CONTROL/ALT chords are never
+/// text: they are keybindings (word motion, editor actions) or terminal
+/// sequences and must reach the gate untouched.
+fn plain_text_char(key: &KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
+fn is_plain_enter(key: &KeyEvent) -> bool {
+    (matches!(key.code, KeyCode::Enter)
+        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL))
+        || (matches!(key.code, KeyCode::Char('\r') | KeyCode::Char('\n'))
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL))
+}
+
+fn is_line_feed_chord(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('j') && key.modifiers == KeyModifiers::CONTROL
+}
+
+fn is_plain_tab(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Tab && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+}
+
+/// Match a bracketed-paste marker (`marker` is `[digits]~`, e.g. `[200~`)
+/// starting at `start`, accepting the spellings the Windows console
+/// produces:
+///
+/// * `Esc`, `[`, `2`, `0`, `0`, `~` (crossterm's byte parser path);
+/// * `Alt+[`, `2`, `0`, `0`, `~` (the `INPUT_RECORD` path folds the record
+///   that carries ESC into the following `[`);
+/// * `[`, `2`, `0`, `0`, `~` (an ESC record the console dropped entirely).
+///
+/// Releases between presses are skipped and consumed with the marker.
+fn bracket_marker_end(events: &[Event], start: usize, marker: &[u8]) -> Option<usize> {
+    let mut presses: Vec<(usize, &KeyEvent)> = Vec::with_capacity(marker.len() + 2);
+    let mut index = start;
+    while index < events.len() && presses.len() < marker.len() + 2 {
+        match &events[index] {
+            Event::Key(key) if key.kind == KeyEventKind::Release => {
+                index += 1;
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                presses.push((index, key));
+                index += 1;
+            }
+            _ => break,
+        }
+    }
+    let digits = &marker[1..];
+    // Esc + '[' + digits.
+    if presses.len() >= digits.len() + 2 {
+        let esc = presses[0].1;
+        let bracket = presses[1].1;
+        if esc.code == KeyCode::Esc
+            && esc.modifiers.is_empty()
+            && bracket.code == KeyCode::Char('[')
+            && !bracket
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && keys_match_digits(&presses[2..], digits)
+        {
+            let last = presses[1 + digits.len()].0;
+            return Some(advance_releases(events, last + 1));
+        }
+    }
+    // Bare digits + '~': the console can drop the whole `ESC [` prefix of
+    // the closing marker (not just the ESC record), leaving `2 0 1 ~` in the
+    // payload. Accept it while a paste is open (the caller only asks for the
+    // start marker when closed, where the same shape is far less likely).
+    if presses.len() >= digits.len() && keys_match_digits(&presses[..], digits) {
+        let last = presses[digits.len() - 1].0;
+        return Some(advance_releases(events, last + 1));
+    }
+    // '[' (plain or ALT-folded) + digits.
+    if presses.len() >= digits.len() + 1 {
+        let bracket = presses[0].1;
+        let bracket_ok = bracket.code == KeyCode::Char('[')
+            && !bracket.modifiers.intersects(KeyModifiers::CONTROL)
+            && (bracket.modifiers.is_empty() || bracket.modifiers == KeyModifiers::ALT);
+        if bracket_ok && keys_match_digits(&presses[1..], digits) {
+            let last = presses[digits.len()].0;
+            return Some(advance_releases(events, last + 1));
+        }
+    }
+    None
+}
+
+fn keys_match_digits(presses: &[(usize, &KeyEvent)], digits: &[u8]) -> bool {
+    presses.len() >= digits.len()
+        && presses
+            .iter()
+            .take(digits.len())
+            .zip(digits)
+            .all(|((_, key), byte)| {
+                (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                    && matches!(key.code, KeyCode::Char(c) if c == *byte as char)
+            })
+}
+
+/// Index at which a suffix of `events` starts that is a proper prefix of a
+/// bracketed-paste marker (`marker` is `[200~` / `[201~`). Returns `None`
+/// when the batch ends with unrelated presses or a complete marker (the
+/// complete case is consumed by [`bracket_marker_end`]).
+fn marker_prefix_suffix(events: &[Event], marker: &[u8]) -> Option<usize> {
+    let mut presses: Vec<(usize, &KeyEvent)> = Vec::new();
+    for (index, event) in events.iter().enumerate().rev() {
+        if let Event::Key(key) = event {
+            if key.kind == KeyEventKind::Press {
+                presses.push((index, key));
+                if presses.len() > marker.len() + 2 {
+                    break;
+                }
+            }
+        }
+    }
+    presses.reverse();
+    let digits = &marker[1..];
+    for start in 0..presses.len() {
+        let seq = &presses[start..];
+        if seq.is_empty() {
+            continue;
+        }
+        let base = if seq[0].1.code == KeyCode::Esc && seq[0].1.modifiers.is_empty() {
+            if seq.len() == 1 {
+                return Some(seq[0].0);
+            }
+            if !matches!(seq[1].1.code, KeyCode::Char('[')) {
+                continue;
+            }
+            2
+        } else if seq[0].1.code == KeyCode::Char('[')
+            && !seq[0].1.modifiers.intersects(KeyModifiers::CONTROL)
+            && (seq[0].1.modifiers.is_empty() || seq[0].1.modifiers == KeyModifiers::ALT)
+        {
+            1
+        } else {
+            continue;
+        };
+        if seq.len() < base {
+            continue;
+        }
+        let mut matched = 0usize;
+        while matched < digits.len()
+            && base + matched < seq.len()
+            && matches!(seq[base + matched].1.code, KeyCode::Char(c) if c == digits[matched] as char)
+            && (seq[base + matched].1.modifiers.is_empty()
+                || seq[base + matched].1.modifiers == KeyModifiers::SHIFT)
+        {
+            matched += 1;
+        }
+        if base + matched == seq.len() && matched < digits.len() {
+            return Some(seq[0].0);
+        }
+    }
+    None
+}
+
+fn advance_releases(events: &[Event], mut index: usize) -> usize {
+    while matches!(
+        events.get(index),
+        Some(Event::Key(key)) if key.kind == KeyEventKind::Release
+    ) {
+        index += 1;
+    }
+    index
+}
+
+/// A printable-key run that is coalesced across event-loop drains.
+///
+/// The Windows console hands the TUI one `Key` event per character (and a
+/// release per press); a bracketless paste therefore arrived as tens of
+/// thousands of events, each triggering one editor insertion and one frame —
+/// 18 s for 1k lines in the winpty harness. [`super::stdin_buffer::coalesce_paste_burst`]
+/// only merges keys that are queued in the SAME drain; a terminal that
+/// delivers a partial line per read left up to half the characters as
+/// individual events.
+///
+/// This collector keeps a run across drains: printable presses (plain or
+/// SHIFT) append to `text`, a plain Enter/LF joins as `\n` while the stream is
+/// still hot, and the accumulated text is handed to the normal
+/// `Event::Paste` path in ONE insertion (one undo snapshot, one autocomplete
+/// invalidation, one frame). A lone press is replayed as its original key so
+/// ordinary typing keeps keybinding/autocomplete semantics and a single
+/// character never becomes a paste.
+pub struct PrintableBurst {
+    text: String,
+    /// The original key for a one-press run (replayed as a key, not a paste).
+    single: Option<KeyEvent>,
+    /// The last absorbed press was a plain Enter (CRLF collapse).
+    last_was_enter: bool,
+    presses: usize,
+    last_at: Instant,
+    /// Start of the current flush interval (TUI-P5): a slow producer may keep
+    /// a run "hot" for minutes without a quiet gap. Flushing on this deadline
+    /// keeps the editor and the screen making progress instead of holding the
+    /// whole paste invisible until the stream ends.
+    last_flush_at: Instant,
+    /// Bytes across every flush of this burst (the whole raw run), for the
+    /// large-paste notice.
+    total_bytes: usize,
+    chunks: usize,
+    truncated: bool,
+    has_line_break: bool,
+    /// Diagnostic: the event that ended the last non-empty run.
+    blocked_by: Option<String>,
+}
+
+/// What [`PrintableBurst::flush`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PrintableBurstOutcome {
+    /// True when a synthetic `Event::Paste` was queued.
+    pub pasted: bool,
+    /// A one-press run was replayed as its original key instead.
+    pub replayed_key: bool,
+    /// Bytes handed to the paste path.
+    pub bytes: usize,
+    /// True when this flush ended a quiet run (not a size-triggered chunk).
+    pub finished: bool,
+    /// The run crossed [`PrintableBurst::MAX_BYTES`]; later input was dropped.
+    pub truncated: bool,
+    /// Total bytes in all flushes of this run.
+    pub total_bytes: usize,
+    /// Number of flushes that inserted paste chunks.
+    pub chunks: usize,
+}
+
+impl PrintableBurst {
+    /// Flush threshold inside one quiet run. 256 KiB keeps a 10k-line
+    /// (339 KB) paste to two bounded chunks; the editor folds each into its
+    /// own marker and the event loop can render between them.
+    pub const FLUSH_BYTES: usize = 256 * 1024;
+    /// Maximum time a multi-press run may stay unflushed. A terminal that
+    /// trickles a paste one record at a time never produces the quiet gap the
+    /// old collector waited for, so without this deadline the whole paste sat
+    /// invisible in `text` until the sender stopped.
+    pub const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+    /// Hard per-run cap: beyond 64 MiB the run is truncated with an explicit
+    /// notice instead of growing without bound.
+    pub const MAX_BYTES: usize = 64 * 1024 * 1024;
+    /// Quiet window after a single press before it is replayed as a key. Keeps
+    /// ordinary typing/keybindings exact while giving a fast terminal a chance
+    /// to deliver the second character of a paste.
+    pub const SINGLE_QUIET: Duration = Duration::from_millis(6);
+    /// Quiet window after a multi-key paste run. A human cannot produce the
+    /// second character inside [`Self::SINGLE_QUIET`], so once a run has two
+    /// presses it is machine/paste input; the longer window bridges a
+    /// terminal's line-by-line delivery (winpty pauses between console
+    /// records) without ever delaying ordinary typing, which never enters
+    /// multi-key mode.
+    pub const RUN_QUIET: Duration = Duration::from_millis(120);
+    /// A newline joins the run only while the previous key is this recent.
+    pub const NEWLINE_GAP: Duration = Duration::from_millis(25);
+
+    pub fn new() -> Self {
+        Self {
+            text: String::new(),
+            single: None,
+            last_was_enter: false,
+            presses: 0,
+            last_at: Instant::now(),
+            last_flush_at: Instant::now(),
+            total_bytes: 0,
+            chunks: 0,
+            truncated: false,
+            has_line_break: false,
+            blocked_by: None,
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.presses > 0
+    }
+
+    /// Diagnostic: the event that ended the last non-empty run.
+    pub fn blocked_by(&self) -> Option<&str> {
+        self.blocked_by.as_deref()
+    }
+
+    /// Time until the next quiet-window flush, for the loop's poll timeout.
+    pub fn time_until_flush(&self, now: Instant) -> Option<Duration> {
+        if self.presses == 0 {
+            return None;
+        }
+        let quiet = if self.presses == 1 {
+            Self::SINGLE_QUIET
+        } else {
+            Self::RUN_QUIET
+        };
+        Some(quiet.saturating_sub(now.saturating_duration_since(self.last_at)))
+    }
+
+    fn push_char(&mut self, c: char, key: &KeyEvent, now: Instant) {
+        if self.presses == 0 {
+            self.single = Some(key.clone());
+            self.last_flush_at = now;
+        }
+        self.text.push(c);
+        self.presses += 1;
+        self.last_was_enter = false;
+        self.last_at = now;
+    }
+
+    /// Absorb the printable run at the front of `queue`.
+    ///
+    /// Returns `true` when the run stopped at a non-absorbable event (the
+    /// caller must flush before that event is processed). `allowed` is false
+    /// while a selector/search/confirm owns the focus: those components read
+    /// keys (not pastes), so the run must stay as keys.
+    pub fn absorb(&mut self, queue: &mut VecDeque<Event>, now: Instant, allowed: bool) -> bool {
+        if !allowed {
+            if let Some(front) = queue.front() {
+                self.blocked_by = Some(format!("{front:?}"));
+                return true;
+            }
+            return false;
+        }
+        loop {
+            let Some(front) = queue.front() else {
+                return false;
+            };
+            match front {
+                // A batch coalescer (or crossterm's own bracketed-paste
+                // parser) may already have turned a run into `Event::Paste`
+                // chunks. Merge them into this run too: a slow producer
+                // interleaves key batches and paste chunks, and flushing each
+                // chunk separately was one editor insertion (and one
+                // autocomplete snapshot) per 20 characters.
+                Event::Paste(text) if !text.is_empty() => {
+                    let text = text.clone();
+                    queue.pop_front();
+                    if self.presses == 0 {
+                        self.last_flush_at = now;
+                        self.single = None;
+                    }
+                    self.text.push_str(&text);
+                    // A paste is machine input even if it carries one char:
+                    // never replay a merged run as an original key.
+                    self.presses = self
+                        .presses
+                        .saturating_add(text.chars().count().max(1))
+                        .max(2);
+                    self.last_was_enter = false;
+                    self.has_line_break |= text.contains('\n');
+                    self.last_at = now;
+                    if self.text.len() >= Self::FLUSH_BYTES
+                        || self.text.len() + self.total_bytes >= Self::MAX_BYTES
+                    {
+                        if self.text.len() + self.total_bytes >= Self::MAX_BYTES {
+                            self.truncated = true;
+                        }
+                        return true;
+                    }
+                    continue;
+                }
+                // Releases carry no text: skip any that pair with the run.
+                // (The gate rewrites the LF chord's press to `Char('j')` but
+                // leaves its release as `Enter`, so matching codes is not
+                // reliable; a release in an active printable run can only
+                // belong to a press already absorbed.)
+                Event::Key(key) if key.kind == KeyEventKind::Release && self.presses > 0 => {
+                    queue.pop_front();
+                }
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+                {
+                    let plain_char = matches!(key.code, KeyCode::Char(_))
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                    let line_feed =
+                        key.code == KeyCode::Char('j') && key.modifiers == KeyModifiers::CONTROL;
+                    let carriage_return = key.code == KeyCode::Char('\r')
+                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL);
+                    let enter = key.code == KeyCode::Enter
+                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL);
+                    let tab = key.code == KeyCode::Tab
+                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT);
+                    let hot = now.saturating_duration_since(self.last_at)
+                        <= if self.presses > 1 {
+                            Self::RUN_QUIET
+                        } else {
+                            Self::SINGLE_QUIET
+                        };
+                    if plain_char {
+                        let KeyCode::Char(c) = key.code else {
+                            unreachable!()
+                        };
+                        let key = key.clone();
+                        queue.pop_front();
+                        self.push_char(c, &key, now);
+                        if self.text.len() >= Self::FLUSH_BYTES {
+                            return true;
+                        }
+                        if self.text.len() + self.total_bytes >= Self::MAX_BYTES {
+                            self.truncated = true;
+                            return true;
+                        }
+                        continue;
+                    }
+                    if (enter || line_feed || carriage_return) && self.presses > 0 && hot {
+                        // A CRLF pair: the console may deliver Enter then the
+                        // LF chord. Collapse the LF half to the same newline.
+                        if !(line_feed && self.last_was_enter) {
+                            self.text.push('\n');
+                        }
+                        self.presses += 1;
+                        self.has_line_break = true;
+                        self.last_was_enter = enter || carriage_return;
+                        self.last_at = now;
+                        queue.pop_front();
+                        continue;
+                    }
+                    if tab && self.presses > 1 && hot {
+                        // Pasted tabs are payload (the cleaner expands them to
+                        // four spaces). A human Tab never has a multi-key run
+                        // in progress, so the autocomplete action is safe.
+                        self.text.push('\t');
+                        self.presses += 1;
+                        self.last_was_enter = false;
+                        self.last_at = now;
+                        queue.pop_front();
+                        continue;
+                    }
+                    self.blocked_by = Some(format!("{front:?}"));
+                    return true;
+                }
+                _ => {
+                    self.blocked_by = Some(format!("{front:?}"));
+                    return true;
+                }
+            }
+        }
+    }
+
+    /// Whether the caller should flush now. `blocked` is the value returned
+    /// by [`Self::absorb`], `queue_empty` says whether any event is still
+    /// queued after absorption.
+    pub fn should_flush(&self, now: Instant, blocked: bool, queue_empty: bool) -> bool {
+        if self.presses == 0 {
+            return false;
+        }
+        if self.truncated || self.text.len() >= Self::FLUSH_BYTES {
+            return true;
+        }
+        // A slow paste keeps `last_at` fresh on every character; the flush
+        // interval is measured from the start of the run instead.
+        if self.presses > 1
+            && now.saturating_duration_since(self.last_flush_at) >= Self::FLUSH_INTERVAL
+        {
+            return true;
+        }
+        if blocked {
+            return true;
+        }
+        queue_empty
+            && now.saturating_duration_since(self.last_at)
+                >= if self.presses == 1 {
+                    Self::SINGLE_QUIET
+                } else {
+                    Self::RUN_QUIET
+                }
+    }
+
+    /// Hand the run to the normal input path. A one-press run is replayed as
+    /// its original `Key`; everything else becomes one `Event::Paste` at the
+    /// queue front. Returns what happened (the caller emits the large-paste
+    /// notice when `finished && total_bytes` crossed the notice threshold).
+    pub fn flush(&mut self, queue: &mut VecDeque<Event>, finished: bool) -> PrintableBurstOutcome {
+        if self.presses == 0 {
+            return PrintableBurstOutcome::default();
+        }
+        let bytes = self.text.len();
+        let outcome;
+        if self.presses == 1 && !self.has_line_break {
+            let Some(key) = self.single.take() else {
+                self.text.clear();
+                return PrintableBurstOutcome::default();
+            };
+            queue.push_front(Event::Key(key));
+            // A replayed single press is dispatched as its key, so its text
+            // must not survive into the NEXT run: otherwise a later multi-key
+            // burst flushes the earlier keys a second time (`/`, pause,
+            // `quit` used to become `Paste("/quit")` on top of the inserted
+            // `/` → `//quit`).
+            self.text.clear();
+            outcome = PrintableBurstOutcome {
+                pasted: false,
+                replayed_key: true,
+                bytes,
+                finished,
+                truncated: self.truncated,
+                total_bytes: self.total_bytes,
+                chunks: self.chunks,
+            };
+        } else {
+            let text = std::mem::take(&mut self.text);
+            queue.push_front(Event::Paste(text));
+            self.total_bytes += bytes;
+            self.chunks += 1;
+            outcome = PrintableBurstOutcome {
+                pasted: true,
+                replayed_key: false,
+                bytes,
+                finished,
+                truncated: self.truncated,
+                total_bytes: self.total_bytes,
+                chunks: self.chunks,
+            };
+        }
+        self.presses = 0;
+        self.single = None;
+        self.has_line_break = false;
+        self.truncated = false;
+        self.last_flush_at = Instant::now();
+        if finished {
+            self.total_bytes = 0;
+            self.chunks = 0;
+        }
+        outcome
+    }
+
+    /// Drop an active run (focus changed to a component that must not receive
+    /// a paste). A one-press run is replayed; a multi-key run is delivered as
+    /// a paste so no typed content is lost.
+    pub fn flush_now(&mut self, queue: &mut VecDeque<Event>) -> PrintableBurstOutcome {
+        self.flush(queue, true)
+    }
+}
+
+impl Default for PrintableBurst {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A finished raw-key run at least this large surfaces a status notice: the
+/// user should know the paste crossed the folded/streamed path (and whether
+/// it was complete) rather than silently accepting a partial edit.
+const LARGE_PASTE_NOTICE_BYTES: usize = 1024 * 1024;
+
+/// Decode one Windows console `KEY_EVENT_RECORD.uChar` code unit into a key
+/// code, pairing UTF-16 surrogate halves across records.
+///
+/// The console repeats a character's UTF-16 unit on the matching key-up
+/// record. Pairing on a release would consume the pending high half and then
+/// fail to decode `[high, high]`, clearing the state before the low half
+/// arrives — which is why every non-BMP emoji used to vanish. Only a key-down
+/// record may complete a pair; surrogate releases leave `surrogate` untouched.
+/// BMP units decode directly (release records keep their key code, as before).
+#[doc(hidden)]
+pub fn decode_console_char(
+    unit: u16,
+    key_down: bool,
+    surrogate: &mut Option<u16>,
+) -> Option<KeyCode> {
+    if !(0xD800..=0xDFFF).contains(&unit) {
+        return char::from_u32(unit as u32).map(KeyCode::Char);
+    }
+    if !key_down {
+        return None;
+    }
+    match surrogate.take() {
+        Some(high) => char::decode_utf16([high, unit])
+            .next()
+            .and_then(Result::ok)
+            .map(KeyCode::Char),
+        None => {
+            *surrogate = Some(unit);
+            None
+        }
+    }
+}
+
+/// One console input record at the granularity the Windows batch reader
+/// decodes.
+///
+/// This is the pure seam of the batch path: [`win_batch_input::BatchReader`]
+/// reduces the `INPUT_RECORD`s it drains to these values, and
+/// [`ConsoleBatchDecoder`] maps them to crossterm `Event`s exactly as the live
+/// reader does. Keeping the mapping platform-independent lets regression
+/// tests feed the same records the console delivers — including a lone high
+/// surrogate press — without a real console handle.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleBatchRecord {
+    /// `KEY_EVENT_RECORD`: `u_char` is one UTF-16 unit.
+    Key {
+        key_down: bool,
+        virtual_key_code: u16,
+        u_char: u16,
+        modifiers: KeyModifiers,
+    },
+    /// `WINDOW_BUFFER_SIZE_EVENT` (zero-based, as Win32 reports it).
+    Resize { x: i16, y: i16 },
+    /// `FOCUS_EVENT`.
+    Focus { focused: bool },
+}
+
+/// Stateful record → event decoder shared by the Windows batch reader and the
+/// tests. The only state is the pending surrogate half; pairing follows
+/// [`decode_console_char`] (key-down records only).
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ConsoleBatchDecoder {
+    surrogate: Option<u16>,
+}
+
+impl ConsoleBatchDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decode one console record, appending every event it produces.
+    pub fn push(&mut self, record: ConsoleBatchRecord, out: &mut Vec<Event>) {
+        match record {
+            ConsoleBatchRecord::Key {
+                key_down,
+                virtual_key_code,
+                u_char,
+                modifiers,
+            } => {
+                if let Some(code) = self.decode_key(key_down, virtual_key_code, u_char, modifiers) {
+                    let kind = if key_down {
+                        KeyEventKind::Press
+                    } else {
+                        KeyEventKind::Release
+                    };
+                    out.push(Event::Key(KeyEvent::new_with_kind(code, modifiers, kind)));
+                }
+            }
+            ConsoleBatchRecord::Resize { x, y } => out.push(Event::Resize(
+                (x as i32 + 1).max(0) as u16,
+                (y as i32 + 1).max(0) as u16,
+            )),
+            ConsoleBatchRecord::Focus { focused } => {
+                out.push(if focused {
+                    Event::FocusGained
+                } else {
+                    Event::FocusLost
+                });
+            }
+        }
+    }
+
+    fn decode_key(
+        &mut self,
+        key_down: bool,
+        vk: u16,
+        unit: u16,
+        modifiers: KeyModifiers,
+    ) -> Option<KeyCode> {
+        // Crossterm drops bare modifier records; the state they carry is
+        // already folded into every following record.
+        match vk {
+            0x10 | 0x11 | 0x12 => return None,
+            0x08 => return Some(KeyCode::Backspace),
+            0x09 if modifiers.contains(KeyModifiers::SHIFT) => return Some(KeyCode::BackTab),
+            0x09 => return Some(KeyCode::Tab),
+            0x0D => return Some(KeyCode::Enter),
+            0x1B => return Some(KeyCode::Esc),
+            0x21 => return Some(KeyCode::PageUp),
+            0x22 => return Some(KeyCode::PageDown),
+            0x23 => return Some(KeyCode::End),
+            0x24 => return Some(KeyCode::Home),
+            0x25 => return Some(KeyCode::Left),
+            0x26 => return Some(KeyCode::Up),
+            0x27 => return Some(KeyCode::Right),
+            0x28 => return Some(KeyCode::Down),
+            0x2D => return Some(KeyCode::Insert),
+            0x2E => return Some(KeyCode::Delete),
+            0x70..=0x87 => return Some(KeyCode::F((vk - 0x70 + 1) as u8)),
+            _ => {}
+        }
+        if unit == 0 {
+            // No character: recover Ctrl+letter / Ctrl+digit.
+            return match vk {
+                0x41..=0x5A => Some(KeyCode::Char((b'a' + (vk as u8 - b'A')) as char)),
+                0x30..=0x39 => Some(KeyCode::Char(vk as u8 as char)),
+                0x20 => Some(KeyCode::Char(' ')),
+                _ => None,
+            };
+        }
+        if (0xD800..=0xDFFF).contains(&unit) {
+            return decode_console_char(unit, key_down, &mut self.surrogate);
+        }
+        if unit < 0x20 {
+            // Control code: map the key that produced it back to its
+            // letter/digit (crossterm uses ToUnicodeEx for this; VK+control
+            // code is equivalent for the ASCII chords the TUI binds).
+            return Some(match vk {
+                0x41..=0x5A => KeyCode::Char((b'a' + (vk as u8 - b'A')) as char),
+                0x30..=0x39 => KeyCode::Char(vk as u8 as char),
+                0x20 => KeyCode::Char(' '),
+                _ => match char::from_u32(unit as u32 + 0x40) {
+                    Some(ch) if ch.is_ascii_graphic() => KeyCode::Char(ch),
+                    _ => return None,
+                },
+            });
+        }
+        let code = KeyCode::Char(char::from_u32(unit as u32).unwrap_or('\0'));
+        if matches!(code, KeyCode::Char('\0')) {
+            return None;
+        }
+        Some(code)
+    }
+}
+
+/// Decode one batch of [`ConsoleBatchRecord`]s exactly as the Windows batch
+/// reader would. Test seam for the first-record path; the live loop keeps one
+/// [`ConsoleBatchDecoder`] so a surrogate pair may straddle drains.
+#[doc(hidden)]
+pub fn decode_console_batch(records: &[ConsoleBatchRecord]) -> Vec<Event> {
+    let mut decoder = ConsoleBatchDecoder::new();
+    let mut out = Vec::new();
+    for record in records {
+        decoder.push(*record, &mut out);
+    }
+    out
+}
+
+/// Windows console input batch reader (TUI-P4).
+///
+/// Crossterm's Windows source reads `INPUT_RECORD`s one at a time: each
+/// `event::read` is a `WaitForSingleObject` + `GetNumberOfConsoleInputEvents`
+/// + `ReadConsoleInputW` round trip. A 10k-line paste arrives as ~600k
+/// records (press+release per character), so that path capped at ~9k
+/// events/s — 30 s for the payload. `crossterm_winapi::Console::read_console_input`
+/// drains every queued record in one call; this module converts those
+/// records to the same `Event` shapes crossterm would have produced.
+///
+/// Used only on Windows. It is the primary reader while it is available: the
+/// main loop waits on [`BatchReader::pending`] instead of `event::poll`, so
+/// crossterm's parser never consumes the first console record (see
+/// [`wait_for_win_batch_input`]). Ordering and the per-event gate stay
+/// unchanged.
+#[cfg(windows)]
+mod win_batch_input {
+    use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm_winapi::{
+        Console, ControlKeyState, EventFlags, Handle, HandleType, InputRecord, ScreenBuffer,
+    };
+
+    use super::{ConsoleBatchDecoder, ConsoleBatchRecord};
+
+    const SHIFT_PRESSED: u32 = 0x0010;
+    const LEFT_ALT_PRESSED: u32 = 0x0002;
+    const RIGHT_ALT_PRESSED: u32 = 0x0001;
+    const LEFT_CTRL_PRESSED: u32 = 0x0008;
+    const RIGHT_CTRL_PRESSED: u32 = 0x0004;
+
+    pub(super) struct BatchReader {
+        console: Console,
+        decoder: ConsoleBatchDecoder,
+        left: bool,
+        right: bool,
+        middle: bool,
+    }
+
+    impl BatchReader {
+        pub(super) fn new() -> Option<Self> {
+            let handle = Handle::new(HandleType::InputHandle).ok()?;
+            let console = Console::from(handle);
+            // This reader is the PRIMARY input source while it exists, so it
+            // must only exist for a real console input buffer. A redirected
+            // stdin (pipe/file) has no console queue to wait on; the caller
+            // falls back to crossterm's event source, exactly as before.
+            console.number_of_console_input_events().ok()?;
+            Some(Self {
+                console,
+                decoder: ConsoleBatchDecoder::new(),
+                left: false,
+                right: false,
+                middle: false,
+            })
+        }
+
+        /// Records already queued in the console input buffer.
+        pub(super) fn pending(&self) -> usize {
+            self.console.number_of_console_input_events().unwrap_or(0) as usize
+        }
+
+        /// Drain every currently queued record (never blocks; returns empty
+        /// when another reader won the race).
+        pub(super) fn drain(&mut self, out: &mut Vec<Event>) {
+            let Ok(records) = self.console.read_console_input() else {
+                return;
+            };
+            for record in records {
+                match record {
+                    InputRecord::KeyEvent(key) => self.decoder.push(
+                        ConsoleBatchRecord::Key {
+                            key_down: key.key_down,
+                            virtual_key_code: key.virtual_key_code,
+                            u_char: key.u_char,
+                            modifiers: Self::modifiers(&key.control_key_state),
+                        },
+                        out,
+                    ),
+                    InputRecord::MouseEvent(mouse) => self.push_mouse(&mouse, out),
+                    InputRecord::WindowBufferSizeEvent(size) => self.decoder.push(
+                        ConsoleBatchRecord::Resize {
+                            x: size.size.x,
+                            y: size.size.y,
+                        },
+                        out,
+                    ),
+                    InputRecord::FocusEvent(focus) => self.decoder.push(
+                        ConsoleBatchRecord::Focus {
+                            focused: focus.set_focus,
+                        },
+                        out,
+                    ),
+                    InputRecord::MenuEvent(_) => {}
+                }
+            }
+        }
+
+        fn modifiers(state: &ControlKeyState) -> KeyModifiers {
+            let mut modifiers = KeyModifiers::empty();
+            if state.has_state(SHIFT_PRESSED) {
+                modifiers |= KeyModifiers::SHIFT;
+            }
+            if state.has_state(LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) {
+                modifiers |= KeyModifiers::CONTROL;
+            }
+            if state.has_state(LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) {
+                modifiers |= KeyModifiers::ALT;
+            }
+            modifiers
+        }
+
+        fn push_mouse(&mut self, mouse: &crossterm_winapi::MouseEvent, out: &mut Vec<Event>) {
+            let modifiers = Self::modifiers(&mouse.control_key_state);
+            let x = mouse.mouse_position.x.max(0) as u16;
+            let y = ScreenBuffer::current()
+                .ok()
+                .and_then(|buffer| buffer.info().ok())
+                .map(|info| info.terminal_window().top)
+                .map_or(mouse.mouse_position.y.max(0) as u16, |top| {
+                    (mouse.mouse_position.y - top).max(0) as u16
+                });
+            let buttons = mouse.button_state;
+            let kind = match mouse.event_flags {
+                EventFlags::PressOrRelease | EventFlags::DoubleClick => {
+                    if buttons.left_button() && !self.left {
+                        Some(MouseEventKind::Down(MouseButton::Left))
+                    } else if !buttons.left_button() && self.left {
+                        Some(MouseEventKind::Up(MouseButton::Left))
+                    } else if buttons.right_button() && !self.right {
+                        Some(MouseEventKind::Down(MouseButton::Right))
+                    } else if !buttons.right_button() && self.right {
+                        Some(MouseEventKind::Up(MouseButton::Right))
+                    } else if buttons.middle_button() && !self.middle {
+                        Some(MouseEventKind::Down(MouseButton::Middle))
+                    } else if !buttons.middle_button() && self.middle {
+                        Some(MouseEventKind::Up(MouseButton::Middle))
+                    } else {
+                        None
+                    }
+                }
+                EventFlags::MouseMoved => {
+                    let button = if buttons.right_button() {
+                        MouseButton::Right
+                    } else if buttons.middle_button() {
+                        MouseButton::Middle
+                    } else {
+                        MouseButton::Left
+                    };
+                    Some(if buttons.release_button() {
+                        MouseEventKind::Moved
+                    } else {
+                        MouseEventKind::Drag(button)
+                    })
+                }
+                EventFlags::MouseWheeled => {
+                    if buttons.scroll_down() {
+                        Some(MouseEventKind::ScrollDown)
+                    } else if buttons.scroll_up() {
+                        Some(MouseEventKind::ScrollUp)
+                    } else {
+                        None
+                    }
+                }
+                EventFlags::MouseHwheeled => {
+                    if buttons.scroll_left() {
+                        Some(MouseEventKind::ScrollLeft)
+                    } else if buttons.scroll_right() {
+                        Some(MouseEventKind::ScrollRight)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            self.left = buttons.left_button();
+            self.right = buttons.right_button();
+            self.middle = buttons.middle_button();
+            if let Some(kind) = kind {
+                out.push(Event::Mouse(MouseEvent {
+                    kind,
+                    column: x,
+                    row: y,
+                    modifiers,
+                }));
+            }
+        }
+    }
+}
+
+/// How the Windows batch input wait ended.
+#[cfg(windows)]
+enum WinBatchWake {
+    /// At least one console record is queued for [`win_batch_input::BatchReader`].
+    Ready,
+    /// The timeout elapsed with an empty console queue.
+    Timeout,
+}
+
+/// Wait up to `timeout` for a Windows console record without letting
+/// crossterm's parser read it.
+///
+/// `event::poll` is the blocking wait everywhere else, but on Windows it reads
+/// one `INPUT_RECORD` into crossterm's internal queue before returning. That
+/// record never reaches `BatchReader`, and crossterm's surrogate pairing does
+/// not distinguish key-down from key-up, so the first record after idle (a
+/// high-surrogate press when typing a non-BMP emoji) used to die there. Polling
+/// the console queue keeps the record on the batch path; `GetNumberOfConsoleInputEvents`
+/// is a cheap non-blocking query and the 1 ms step preserves typing latency.
+#[cfg(windows)]
+fn wait_for_win_batch_input(
+    batch: &mut win_batch_input::BatchReader,
+    timeout: Duration,
+) -> WinBatchWake {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if batch.pending() > 0 {
+            return WinBatchWake::Ready;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return WinBatchWake::Timeout;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
+}
+
+/// Env-gated input-loop accounting for paste/typing performance probes.
+///
+/// Set `PIR_TUI_INPUT_TRACE=1` to emit one `tui-input-trace` line per second
+/// through the extension diagnostic log (`<agent dir>/pir.log`): drained
+/// event shapes, coalescer effectiveness, processed keys/pastes, editor
+/// insertion calls and render frames. Off by default; every counter is a
+/// relaxed atomic-free local, so the disabled path costs one bool test per
+/// drained event.
+struct InputLoopTrace {
+    enabled: bool,
+    started: Instant,
+    last_report: Instant,
+    key_press: u64,
+    key_release: u64,
+    key_repeat: u64,
+    paste_events: u64,
+    paste_bytes: u64,
+    other_events: u64,
+    queued_max: usize,
+    coalesced_runs: u64,
+    coalesced_events: u64,
+    processed_keys: u64,
+    processed_chars: u64,
+    processed_pastes: u64,
+    frames: u64,
+    burst_flushes: u64,
+    burst_bytes: u64,
+    batch_events: u64,
+    batch_max: usize,
+    batch_emitted: u64,
+    batch_pastes: u64,
+    shapes: Vec<String>,
+}
+
+impl InputLoopTrace {
+    fn new() -> Self {
+        let enabled = std::env::var_os("PIR_TUI_INPUT_TRACE")
+            .is_some_and(|value| value != "0" && !value.is_empty());
+        let now = Instant::now();
+        Self {
+            enabled,
+            started: now,
+            last_report: now,
+            key_press: 0,
+            key_release: 0,
+            key_repeat: 0,
+            paste_events: 0,
+            paste_bytes: 0,
+            other_events: 0,
+            queued_max: 0,
+            coalesced_runs: 0,
+            coalesced_events: 0,
+            processed_keys: 0,
+            processed_chars: 0,
+            processed_pastes: 0,
+            frames: 0,
+            burst_flushes: 0,
+            burst_bytes: 0,
+            batch_events: 0,
+            batch_max: 0,
+            batch_emitted: 0,
+            batch_pastes: 0,
+            shapes: Vec::new(),
+        }
+    }
+
+    fn record_event(&mut self, event: &Event) {
+        if !self.enabled {
+            return;
+        }
+        match event {
+            Event::Key(key) => match key.kind {
+                crossterm::event::KeyEventKind::Press => self.key_press += 1,
+                crossterm::event::KeyEventKind::Release => self.key_release += 1,
+                crossterm::event::KeyEventKind::Repeat => self.key_repeat += 1,
+            },
+            Event::Paste(text) => {
+                self.paste_events += 1;
+                self.paste_bytes += text.len() as u64;
+            }
+            _ => self.other_events += 1,
+        }
+        if self.shapes.len() < 24 {
+            self.shapes.push(format!("{event:?}"));
+        }
+    }
+
+    fn note_queue(&mut self, len: usize) {
+        self.queued_max = self.queued_max.max(len);
+    }
+
+    fn record_batch(&mut self, len: usize) {
+        if !self.enabled || len == 0 {
+            return;
+        }
+        self.batch_events += len as u64;
+        self.batch_max = self.batch_max.max(len);
+    }
+
+    fn note_batch(&mut self, raw: usize, emitted: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.batch_emitted += emitted as u64;
+        if emitted < raw {
+            self.batch_pastes += 1;
+        }
+    }
+
+    fn note_coalesce(&mut self, before: usize, after: usize, changed: bool) {
+        if !self.enabled || !changed {
+            return;
+        }
+        self.coalesced_runs += 1;
+        self.coalesced_events += before.saturating_sub(after) as u64;
+    }
+
+    fn note_burst(&mut self, outcome: &PrintableBurstOutcome) {
+        if !self.enabled || !outcome.pasted {
+            return;
+        }
+        self.burst_flushes += 1;
+        self.burst_bytes += outcome.bytes as u64;
+    }
+
+    fn record_processed(&mut self, event: &Event) {
+        if !self.enabled {
+            return;
+        }
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                self.processed_keys += 1;
+                if let KeyCode::Char(_) = key.code {
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    {
+                        self.processed_chars += 1;
+                    }
+                }
+            }
+            Event::Paste(text) => {
+                self.processed_pastes += 1;
+                self.processed_chars += text.chars().count() as u64;
+            }
+            _ => {}
+        }
+    }
+
+    fn maybe_report(&mut self, editor: &Editor, burst_blocked_by: Option<&str>) {
+        if !self.enabled || self.last_report.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_report = Instant::now();
+        let io = editor.io_stats();
+        let layout = editor.layout_cache_stats();
+        crate::ext_diag!(
+            "[tui] tui-input-trace t={:.1}s drained[p={} r={} rep={} paste={}/{}B other={}] queued_max={} coalesce[{}runs/{}ev] burst[{}f/{}B blocked={:?}] batch[{}ev max={} out={} merges={}] processed[key={} chars={} paste={}] editor[insert={} chars={} burst={}/{}ch paste={}/{}B undo={} snap={}/{}L] layout[full={} inc={} lines={} hits={} passes={}] frames={} shapes={:?}",
+            self.started.elapsed().as_secs_f64(),
+            self.key_press,
+            self.key_release,
+            self.key_repeat,
+            self.paste_events,
+            self.paste_bytes,
+            self.other_events,
+            self.queued_max,
+            self.coalesced_runs,
+            self.coalesced_events,
+            self.burst_flushes,
+            self.burst_bytes,
+            burst_blocked_by,
+            self.batch_events,
+            self.batch_max,
+            self.batch_emitted,
+            self.batch_pastes,
+            self.processed_keys,
+            self.processed_chars,
+            self.processed_pastes,
+            io.insert_calls,
+            io.insert_chars,
+            io.insert_bursts,
+            io.insert_burst_chars,
+            io.paste_calls,
+            io.paste_bytes,
+            io.undo_pushes,
+            io.snapshot_calls,
+            io.snapshot_lines,
+            layout.full_builds,
+            layout.incremental_updates,
+            layout.lines_built,
+            layout.cache_hits,
+            layout.render_passes,
+            self.frames,
+            self.shapes
+        );
+    }
+}
+
 /// Coalesce a drained paste burst unless hook replacement events are still
 /// waiting at the front of the queue.
 ///
@@ -23856,7 +25877,45 @@ pub fn coalesce_pending_input(pending: &mut VecDeque<Event>, bypass: usize) -> b
     if bypass > 0 {
         return false;
     }
-    super::stdin_buffer::coalesce_paste_burst(pending)
+    let burst = super::stdin_buffer::coalesce_paste_burst(pending);
+    let pastes = coalesce_adjacent_pastes(pending);
+    burst || pastes
+}
+
+/// Merge a run of adjacent `Event::Paste` chunks into one insertion. A
+/// bracketless paste larger than one terminal read is coalesced into several
+/// events; applying them one by one made each chunk push a full editor undo
+/// snapshot and re-run autocomplete (O(n²) on a long draft). One merged paste
+/// keeps the user-visible semantics (same bytes, same final cursor) while the
+/// editor takes one snapshot, one invalidation and one line-model splice.
+/// The merged payload keeps the single-paste byte cap.
+fn coalesce_adjacent_pastes(pending: &mut VecDeque<Event>) -> bool {
+    if !matches!(pending.front(), Some(Event::Paste(_))) {
+        return false;
+    }
+    let mut total_bytes = 0usize;
+    let mut end = 0usize;
+    for (index, event) in pending.iter().enumerate() {
+        let Event::Paste(text) = event else {
+            break;
+        };
+        if index > 0 && total_bytes + text.len() > super::stdin_buffer::MAX_PASTE_BYTES {
+            break;
+        }
+        total_bytes += text.len();
+        end = index + 1;
+    }
+    if end < 2 {
+        return false;
+    }
+    let mut merged = String::with_capacity(total_bytes);
+    for _ in 0..end {
+        if let Some(Event::Paste(text)) = pending.pop_front() {
+            merged.push_str(&text);
+        }
+    }
+    pending.push_front(Event::Paste(merged));
+    true
 }
 
 /// Enforce [`PENDING_INPUT_MAX_EVENTS`] after a queue extension.
@@ -24599,11 +26658,18 @@ async fn worker_loop(
         let session = std::sync::Arc::clone(&session);
         Arc::new(move || session.background_calls().len())
     };
-    session.on_session_event(session_event_bridge(
-        events.clone(),
-        std::sync::Arc::clone(&pulse),
-        background_count,
-    ));
+    // RSS-A: the transcript bridge consumes only USER `entry_appended`
+    // entries (assistant/toolResult already stream live). Declare that
+    // interest so the session producer never clones/serializes the payloads
+    // this handler would discard.
+    session.on_session_event_with_interest(
+        session_event_bridge(
+            events.clone(),
+            std::sync::Arc::clone(&pulse),
+            background_count,
+        ),
+        crate::agent_session::SessionEventInterest::EntryAppendedUserOnly,
+    );
 
     // Live tool-output streaming: route every call-id-carrying partial into
     // the matching tool block (upstream tool_execution_update rendering —
@@ -24838,6 +26904,15 @@ async fn run_prompt(
         debug_mode,
         pulse,
     } = services;
+    // COMPACT-INPUT §5: a compaction started outside this command loop
+    // (extension `ctx.compact`, or a threshold run that outlived its prompt)
+    // still owns the transcript. `session.prompt` rejects a COMPACTING claim
+    // synchronously, and an entry appended mid-compaction can fall outside
+    // its cut point — hold the submitted prompt until the claim releases so
+    // the TUI's queued message starts exactly once, after it is safe.
+    if session.is_compacting() {
+        session.wait_until_idle().await;
+    }
     let _ = events.send(WorkerEvent::Working(Some("Working".to_string())));
     streaming.store(true, Ordering::SeqCst);
     // F12: `AgentEnd` (RunSettled) can be followed by an Err return from

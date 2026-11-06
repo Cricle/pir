@@ -540,7 +540,6 @@ async fn d5_connect_reports_resources_without_listing_them() {
         "command": exe.to_string_lossy(),
         "args": [
             "mock_mcp_resource_server_child",
-            "--exact",
             "--nocapture",
         ],
         "env": env,

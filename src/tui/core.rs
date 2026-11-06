@@ -97,7 +97,10 @@ pub struct FrameWork {
     /// Rows produced by components/blocks that actually re-ran `render_into`
     /// / `render_block_into` this frame. A frame whose content revisions are
     /// unchanged serves every transcript row from the row caches and reports
-    /// zero here (the dock's rows are the only remaining work).
+    /// zero here (the dock's rows are the only remaining work). For a block
+    /// whose append-stable prefix was carried in its own row pool (a live
+    /// streaming Markdown block), this counts only the rows past that carried
+    /// prefix — the prefix rows are reported through `cached_rows`.
     pub rerendered_rows: u64,
     /// Rows served without re-running their component or block
     /// (`render_into` skipped because revision/width/theme matched). A hit at
@@ -120,6 +123,18 @@ pub struct FrameWork {
     /// Rows the regular path proved unchanged from the exact dirty-row
     /// markers and skipped comparing. See the struct docs.
     pub diff_skipped_rows: u64,
+    /// Distinct frame rows covered by this frame's dirty interval set AFTER
+    /// adjacent/overlapping ranges were coalesced. This is the set the frame
+    /// builder had to assemble/compare (plus the pending marks carried into
+    /// the frame); a steady frame reports zero, and a full-repaint path
+    /// (resize, invalidate, scrolled viewport) publishes its written row
+    /// count here instead.
+    pub dirty_rows: u64,
+    /// How many existing dirty intervals were absorbed by later marks while
+    /// building this frame's set: N adjacent single-row marks merge into one
+    /// interval and report `N - 1` here (a mark bridging two intervals
+    /// reports two). Zero means every mark found an empty slot.
+    pub dirty_ranges_merged: u64,
     pub reset_rows: u64,
 }
 
@@ -139,6 +154,8 @@ impl FrameWork {
             snapshot_bytes: FRAME_WORK.snapshot_bytes.load(Ordering::Relaxed),
             diff_scanned_rows: FRAME_WORK.diff_scanned_rows.load(Ordering::Relaxed),
             diff_skipped_rows: FRAME_WORK.diff_skipped_rows.load(Ordering::Relaxed),
+            dirty_rows: FRAME_WORK.dirty_rows.load(Ordering::Relaxed),
+            dirty_ranges_merged: FRAME_WORK.dirty_ranges_merged.load(Ordering::Relaxed),
             reset_rows: FRAME_WORK.reset_rows.load(Ordering::Relaxed),
         }
     }
@@ -157,6 +174,8 @@ impl FrameWork {
         FRAME_WORK.snapshot_bytes.store(0, Ordering::Relaxed);
         FRAME_WORK.diff_scanned_rows.store(0, Ordering::Relaxed);
         FRAME_WORK.diff_skipped_rows.store(0, Ordering::Relaxed);
+        FRAME_WORK.dirty_rows.store(0, Ordering::Relaxed);
+        FRAME_WORK.dirty_ranges_merged.store(0, Ordering::Relaxed);
         FRAME_WORK.reset_rows.store(0, Ordering::Relaxed);
     }
 }
@@ -174,6 +193,8 @@ struct FrameWorkCounters {
     snapshot_bytes: AtomicU64,
     diff_scanned_rows: AtomicU64,
     diff_skipped_rows: AtomicU64,
+    dirty_rows: AtomicU64,
+    dirty_ranges_merged: AtomicU64,
     reset_rows: AtomicU64,
 }
 
@@ -189,6 +210,8 @@ static FRAME_WORK: FrameWorkCounters = FrameWorkCounters {
     snapshot_bytes: AtomicU64::new(0),
     diff_scanned_rows: AtomicU64::new(0),
     diff_skipped_rows: AtomicU64::new(0),
+    dirty_rows: AtomicU64::new(0),
+    dirty_ranges_merged: AtomicU64::new(0),
     reset_rows: AtomicU64::new(0),
 };
 
@@ -241,6 +264,11 @@ pub struct RowsWork {
     /// with a clean raw canvas skips the comparison entirely and reports
     /// zero here; a moved/decorated canvas reports only the rows it served.
     pub row_compare_bytes: u64,
+    /// Rows reclaimed from the canvas by [`Rows::skip_unchanged`] without a
+    /// byte compare or copy. A streaming block's final prefix lands here: it
+    /// was painted by an earlier frame and is append-stable, so only the
+    /// added/changed tail rows are compared on the next delta.
+    pub rows_carried: u64,
 }
 
 impl RowsWork {
@@ -254,6 +282,7 @@ impl RowsWork {
             rows_reused: ROWS_WORK.rows_reused.load(Ordering::Relaxed),
             pool_growth: ROWS_WORK.pool_growth.load(Ordering::Relaxed),
             row_compare_bytes: ROWS_WORK.row_compare_bytes.load(Ordering::Relaxed),
+            rows_carried: ROWS_WORK.rows_carried.load(Ordering::Relaxed),
         }
     }
 
@@ -266,6 +295,7 @@ impl RowsWork {
         ROWS_WORK.rows_reused.store(0, Ordering::Relaxed);
         ROWS_WORK.pool_growth.store(0, Ordering::Relaxed);
         ROWS_WORK.row_compare_bytes.store(0, Ordering::Relaxed);
+        ROWS_WORK.rows_carried.store(0, Ordering::Relaxed);
     }
 }
 
@@ -277,6 +307,7 @@ impl std::ops::AddAssign for RowsWork {
         self.rows_reused += other.rows_reused;
         self.pool_growth += other.pool_growth;
         self.row_compare_bytes += other.row_compare_bytes;
+        self.rows_carried += other.rows_carried;
     }
 }
 
@@ -288,6 +319,7 @@ struct RowsWorkCounters {
     rows_reused: AtomicU64,
     pool_growth: AtomicU64,
     row_compare_bytes: AtomicU64,
+    rows_carried: AtomicU64,
 }
 
 static ROWS_WORK: RowsWorkCounters = RowsWorkCounters {
@@ -297,7 +329,345 @@ static ROWS_WORK: RowsWorkCounters = RowsWorkCounters {
     rows_reused: AtomicU64::new(0),
     pool_growth: AtomicU64::new(0),
     row_compare_bytes: AtomicU64::new(0),
+    rows_carried: AtomicU64::new(0),
 };
+
+// ---------------------------------------------------------------------------
+// Dirty block/row intervals (DIRTY2)
+// ---------------------------------------------------------------------------
+
+/// One coalesced dirty interval in absolute FRAME row coordinates.
+///
+/// `block` records the block that first marked the interval so a frame test
+/// or probe can attribute a range without re-deriving it from the block
+/// caches. Ranges are sorted, non-overlapping and non-adjacent (a range that
+/// touches the next one is merged into it), so walking [`DirtyRanges::ranges`]
+/// visits every dirty row exactly once.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyRange {
+    /// Packed `(component_index, block_index)` of the first block that marked
+    /// the interval; [`u64::MAX`] for a whole-frame fallback.
+    pub block: u64,
+    /// First dirty frame row (inclusive).
+    pub start: usize,
+    /// One past the last dirty frame row (exclusive).
+    pub end: usize,
+}
+
+/// Pack a component/block pair into the id recorded on [`DirtyRange`]s.
+///
+/// The high 32 bits hold the top-level component index and the low 32 bits
+/// the block index inside it (0 for a whole-component slot). The packing is
+/// only an attribution/debug key; rows are the authoritative coordinates.
+#[doc(hidden)]
+pub const fn pack_block_id(component: usize, block: usize) -> u64 {
+    ((component as u64) << 32) | (block as u64 & 0xffff_ffff)
+}
+
+/// Inverse of [`pack_block_id`].
+#[doc(hidden)]
+pub const fn unpack_block_id(id: u64) -> (usize, usize) {
+    ((id >> 32) as usize, (id & 0xffff_ffff) as usize)
+}
+
+/// A sorted set of dirty row intervals with adjacent/overlapping coalescing.
+///
+/// This is the DIRTY2 core primitive: producers mark a block id plus a row
+/// range (`mark` / `mark_row`), repeated marks for the same block within one
+/// frame are idempotent (latest state wins — the interval is the union, the
+/// block id is the first contributor), and any mark that touches an existing
+/// interval merges into it. [`DirtyRanges::rows`] is the number of distinct
+/// dirty rows after merging, [`DirtyRanges::merges`] counts how many existing
+/// intervals later marks absorbed (100 adjacent single-row marks => one
+/// interval, 99 merges).
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirtyRanges {
+    ranges: Vec<DirtyRange>,
+    /// Coalescing insertions (see [`DirtyRanges::merges`]).
+    merges: u64,
+    /// Marks accepted (empty marks included) since construction/reset.
+    marks: u64,
+}
+
+impl DirtyRanges {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark `[start, end)` dirty. Empty ranges are ignored.
+    pub fn mark(&mut self, block: u64, start: usize, end: usize) {
+        self.marks += 1;
+        if start >= end {
+            return;
+        }
+        self.merges += self.insert(block, start, end);
+    }
+
+    /// Mark one row dirty.
+    pub fn mark_row(&mut self, block: u64, row: usize) {
+        self.mark(block, row, row.saturating_add(1));
+    }
+
+    /// Replace the set with one whole-frame interval.
+    pub fn mark_full(&mut self, rows: usize) {
+        self.ranges.clear();
+        self.merges = 0;
+        self.marks = 1;
+        if rows > 0 {
+            self.ranges.push(DirtyRange {
+                block: u64::MAX,
+                start: 0,
+                end: rows,
+            });
+        }
+    }
+
+    /// Absorb `other`'s intervals. Its historical merge/mark counts are
+    /// preserved so a frame that carries pending marks into its own set
+    /// reports the coalescing that already happened.
+    pub fn extend(&mut self, other: DirtyRanges) {
+        self.merges += other.merges;
+        self.marks += other.marks;
+        for range in other.ranges {
+            self.merges += self.insert(range.block, range.start, range.end);
+        }
+    }
+
+    /// Drop every interval and its per-set counters.
+    pub fn clear(&mut self) {
+        self.ranges.clear();
+        self.merges = 0;
+        self.marks = 0;
+    }
+
+    /// Number of coalesced intervals.
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Distinct dirty rows after merging.
+    pub fn rows(&self) -> usize {
+        self.ranges
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum()
+    }
+
+    /// Coalescing insertions since this set was created/last cleared.
+    pub fn merges(&self) -> u64 {
+        self.merges
+    }
+
+    /// Marks accepted since this set was created/last cleared.
+    pub fn marks(&self) -> u64 {
+        self.marks
+    }
+
+    pub fn ranges(&self) -> &[DirtyRange] {
+        &self.ranges
+    }
+
+    /// First dirty row, if any.
+    pub fn first_row(&self) -> Option<usize> {
+        self.ranges.first().map(|range| range.start)
+    }
+
+    /// One past the last dirty row, if any.
+    pub fn last_row_end(&self) -> Option<usize> {
+        self.ranges.last().map(|range| range.end)
+    }
+
+    pub fn contains_row(&self, row: usize) -> bool {
+        self.ranges
+            .binary_search_by(|range| {
+                if row < range.start {
+                    std::cmp::Ordering::Greater
+                } else if row >= range.end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    }
+
+    /// Clamp every interval to `[0, max_rows)`; intervals starting past the
+    /// end are dropped.
+    pub fn clamp_rows(&mut self, max_rows: usize) {
+        self.ranges.retain_mut(|range| {
+            range.start = range.start.min(max_rows);
+            range.end = range.end.min(max_rows);
+            range.start < range.end
+        });
+    }
+
+    /// Binary-search insertion with adjacency/overlap coalescing. Returns the
+    /// number of existing intervals absorbed.
+    fn insert(&mut self, block: u64, start: usize, end: usize) -> u64 {
+        let mut new_start = start;
+        let mut new_end = end;
+        let mut new_block = block;
+        let mut first = 0usize;
+        while first < self.ranges.len() && self.ranges[first].end < new_start {
+            first += 1;
+        }
+        let mut last = first;
+        while last < self.ranges.len() && self.ranges[last].start <= new_end {
+            let range = self.ranges[last];
+            new_start = new_start.min(range.start);
+            new_end = new_end.max(range.end);
+            // Attribution follows frame order: the earliest block whose rows
+            // are part of the merged interval.
+            new_block = new_block.min(range.block);
+            last += 1;
+        }
+        let absorbed = (last - first) as u64;
+        if absorbed > 0 {
+            self.ranges.splice(
+                first..last,
+                [DirtyRange {
+                    block: new_block,
+                    start: new_start,
+                    end: new_end,
+                }],
+            );
+        } else {
+            self.ranges.insert(first, DirtyRange { block, start, end });
+        }
+        absorbed
+    }
+}
+
+/// Bounded latest-wins input queue for producers that must never wait on a
+/// frame build (the AI token ingest path is the intended caller).
+///
+/// A producer records the block id plus its newest revision/row range; if the
+/// same block is already pending, the old entry is REPLACED (latest state
+/// wins) instead of growing the queue. When the block budget is exceeded the
+/// queue collapses to a single whole-frame marker, so memory stays bounded
+/// and the next frame simply re-renders everything. [`DirtyInbox::drain`] is
+/// O(pending blocks) and never acquires the render lock; the renderer drains
+/// it once per frame and merges the result into its [`DirtyRanges`].
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct DirtyInbox {
+    inner: Mutex<DirtyInboxState>,
+    capacity: usize,
+}
+
+#[derive(Debug, Default)]
+struct DirtyInboxState {
+    /// block id -> latest revision (only the newest value is retained).
+    blocks: Vec<(u64, u64)>,
+    /// Whole-frame fallback was requested (overflow or a full invalidate).
+    overflow: bool,
+    pushes: u64,
+    coalesced: u64,
+}
+
+/// Snapshot returned by [`DirtyInbox::drain`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirtyInboxBatch {
+    /// Latest `(block, revision)` pairs, in first-push order.
+    pub blocks: Vec<(u64, u64)>,
+    /// The producer exceeded the bound (or marked the whole frame): the
+    /// consumer treats every row as dirty.
+    pub overflow: bool,
+}
+
+impl DirtyInbox {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(DirtyInboxState::default()),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Record the newest revision of one block. O(pending blocks) worst case,
+    /// no allocation once the block is present; callable from any thread and
+    /// never blocked by a render (the renderer only holds the inner lock for
+    /// the tiny drain swap).
+    pub fn note_block(&self, block: u64, revision: u64) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pushes += 1;
+        if state.overflow {
+            return;
+        }
+        if let Some(entry) = state.blocks.iter_mut().find(|(id, _)| *id == block) {
+            entry.1 = revision;
+            state.coalesced += 1;
+            return;
+        }
+        if state.blocks.len() >= self.capacity {
+            state.blocks.clear();
+            state.overflow = true;
+            return;
+        }
+        state.blocks.push((block, revision));
+    }
+
+    /// Mark the whole next frame dirty (a structural change the per-block
+    /// queue cannot describe). Collapses any pending blocks.
+    pub fn note_full(&self) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pushes += 1;
+        state.blocks.clear();
+        state.overflow = true;
+    }
+
+    /// Swap the pending state out without ever waiting on the renderer.
+    pub fn drain(&self) -> DirtyInboxBatch {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        DirtyInboxBatch {
+            blocks: std::mem::take(&mut state.blocks),
+            overflow: std::mem::take(&mut state.overflow),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .blocks
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Total notes received (coalesced notes included).
+    pub fn pushes(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pushes
+    }
+
+    /// Notes that replaced an already-pending block (latest-wins).
+    pub fn coalesced(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .coalesced
+    }
+}
 
 /// Reusable row canvas for [`Component::render_into`].
 ///
@@ -339,6 +709,11 @@ pub struct Rows<'a> {
     /// `false` for scratch canvases used to probe a component's output (the
     /// header's revision hash), which must not appear as frame work.
     count_global: bool,
+    /// Rows advanced over by [`Rows::skip_unchanged`] on this canvas: rows
+    /// whose pooled bytes are known (by the caller's append-stable contract)
+    /// to already hold the exact output, so no compare or copy ran. The frame
+    /// builder uses this to skip the same prefix in its canvas pass.
+    carried_rows: u64,
 }
 
 /// Inline capacity of [`Rows`]' dirty-row list. A steady frame records no
@@ -359,6 +734,7 @@ impl<'a> Rows<'a> {
             changed_len: 0,
             changed_overflow: Vec::new(),
             count_global: true,
+            carried_rows: 0,
         }
     }
 
@@ -376,6 +752,7 @@ impl<'a> Rows<'a> {
             changed_len: 0,
             changed_overflow: Vec::new(),
             count_global: false,
+            carried_rows: 0,
         }
     }
 
@@ -396,6 +773,7 @@ impl<'a> Rows<'a> {
             changed_len: 0,
             changed_overflow: Vec::new(),
             count_global: true,
+            carried_rows: 0,
         }
     }
 
@@ -440,6 +818,73 @@ impl<'a> Rows<'a> {
         self.next = self.base;
         self.changed_len = 0;
         self.changed_overflow.clear();
+        self.carried_rows = 0;
+    }
+
+    /// Advance over `count` pooled rows whose bytes are already the exact
+    /// output the caller is producing — no compare, no copy, no dirty mark.
+    ///
+    /// This is the streaming-block fast path: a Markdown body only appends,
+    /// its final prefix lines are append-stable, and the block's row pool was
+    /// painted by the previous frame. Re-pushing those prefix rows through
+    /// [`Rows::push`] would compare every row (O(block bytes)) on every
+    /// delta; skipping them keeps the per-delta canvas pass at the mutable
+    /// tail. The caller MUST prove the pooled rows still hold its previous
+    /// output (row count/start + boundary content); a mismatched pool must
+    /// fall back to the ordinary push path.
+    #[doc(hidden)]
+    pub fn skip_unchanged(&mut self, count: usize) {
+        debug_assert!(
+            self.next.saturating_add(count) <= self.lines.len(),
+            "skip_unchanged past the pooled rows: {} + {} > {}",
+            self.next,
+            count,
+            self.lines.len()
+        );
+        let end = self.next.saturating_add(count).min(self.lines.len());
+        let carried = end - self.next;
+        self.next = end;
+        self.carried_rows += carried as u64;
+        self.work.rows_carried += carried as u64;
+    }
+
+    /// Advance over `count` pooled rows whose bytes are already the exact
+    /// output the caller is producing and that are NOT part of the
+    /// append-stable carried prefix the component reported. This is the
+    /// frame-assembly fast path for a changed block's unchanged rows: the
+    /// caller proved the canvas still holds the previous frame's raw bytes at
+    /// this position, so the rows need neither a compare nor a copy. Unlike
+    /// [`Rows::skip_unchanged`] this does not report the rows as carried (they
+    /// were re-rendered by the block/component; only the paged-in canvas
+    /// copy is skipped).
+    #[doc(hidden)]
+    pub fn skip_clean(&mut self, count: usize) {
+        let end = self.next.saturating_add(count).min(self.lines.len());
+        self.next = end;
+    }
+
+    /// Rows [`Rows::skip_unchanged`] advanced over on this canvas since the
+    /// last rewind.
+    #[doc(hidden)]
+    pub fn carried_rows(&self) -> u64 {
+        self.carried_rows
+    }
+
+    /// Number of rows currently held by the pool (including rows of the
+    /// previous frame this canvas has not reclaimed yet). Used by the
+    /// streaming-block fast path to prove the previous emission is present
+    /// before skipping it.
+    #[doc(hidden)]
+    pub fn pool_len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Read a pooled row by absolute index. Only for validation of a
+    /// streaming block's previous emission; components should use
+    /// [`Rows::line_at`] for their current frame rows.
+    #[doc(hidden)]
+    pub fn pooled_row(&self, index: usize) -> Option<&str> {
+        self.lines.get(index).map(String::as_str)
     }
 
     /// Absolute row index just past the rows this canvas wrote (the frame
@@ -642,6 +1087,9 @@ impl Drop for Rows<'_> {
         ROWS_WORK
             .row_compare_bytes
             .fetch_add(work.row_compare_bytes, Ordering::Relaxed);
+        ROWS_WORK
+            .rows_carried
+            .fetch_add(work.rows_carried, Ordering::Relaxed);
     }
 }
 
@@ -2255,12 +2703,42 @@ pub struct TuiCore {
     /// work buffer clears it, and the next frame falls back to the comparing
     /// append.
     frame_scratch_raw: bool,
-    /// Exact absolute row indices whose raw bytes changed while building the
+    /// Exact absolute row intervals whose raw bytes changed while building the
     /// most recent frame (`None` = markers unavailable because the pooled
     /// canvas was decorated/clamped and the row compares ran against stale
-    /// bytes). The regular main-screen path uses it to skip unchanged rows in
-    /// the changed-line scan.
-    last_frame_dirty: Option<Vec<usize>>,
+    /// bytes). Ranges are coalesced: a streaming tail, N adjacent block edits
+    /// or a whole-frame fallback each travel as one interval, so the regular
+    /// main-screen path clones/scans only the dirty rows and never expands the
+    /// set into a per-row vector.
+    last_frame_dirty: Option<DirtyRanges>,
+    /// Dirty marks accumulated between frames (block id + row interval).
+    /// `mark_dirty_rows` / `mark_dirty_block` / [`DirtyInbox`] producers only
+    /// append here; the next [`TuiCore::render`] takes the set, coalesces it
+    /// with the rows its block caches discover, and only the leftovers of a
+    /// row-budget-deferred frame stay behind for the next frame. This is the
+    /// latest-wins staging area that keeps AI ingest off the render path.
+    pending_dirty: DirtyRanges,
+    /// Rows (whole blocks) a previous frame deferred because it hit its row
+    /// budget. Kept as packed block ids, not merged intervals: a merged
+    /// interval loses the individual block ids, and the next frame must force
+    /// each deferred block through `render_block_into` even when the range
+    /// happened to coalesce with a processed neighbour.
+    deferred_blocks: Vec<u64>,
+    /// Blocks explicitly forced dirty (packed ids) even when their content
+    /// revision did not move: the next frame re-runs `render_block_into` once
+    /// for each and then drops the flag.
+    pending_forced_blocks: Vec<u64>,
+    /// Upper bound on distinct pending intervals before the set collapses to
+    /// a whole-frame dirty marker (bounded latest-wins queue).
+    dirty_range_cap: usize,
+    /// Distinct dirty rows one frame may assemble before the rest is deferred
+    /// to the next frame (0 = unlimited, the compatibility default). A live
+    /// streaming tail is always below any sensible budget; a burst that
+    /// touches a whole band degrades into bounded slices instead of one
+    /// unbounded frame, and the deferred range stays pending (no token is
+    /// lost because the component state is authoritative and revisions stay
+    /// stale until their block is actually rebuilt).
+    frame_row_budget: usize,
     /// Recycle pool for the windowed render path ([`TuiCore::render_scrolled`]):
     /// the buffer `previous_lines` retired one scrolled frame earlier, reused
     /// row by row (`clone_from`) instead of allocating a fresh painted frame
@@ -2339,6 +2817,12 @@ pub struct TuiCore {
     /// frame head on the main screen's scrollback (startup header twice for
     /// one app start).
     force_clear: bool,
+    /// Set by [`TuiCore::invalidate_diff_baseline`] (writer drop): the next
+    /// frame is a self-contained keyframe. It clears the visible screen
+    /// (`2J` + home) so stale rows cannot survive a shrink, but unlike
+    /// `force_clear` it leaves the terminal's scrollback intact — a dropped
+    /// writer chunk must not erase history the user can still scroll to.
+    force_screen_clear: bool,
     /// Editor cursor cell (dock-relative row, column), written by the dock
     /// component on every render (upstream `extractCursorPosition` over the
     /// editor's CURSOR_MARKER).
@@ -2525,6 +3009,11 @@ impl TuiCore {
             frame_slots: Vec::new(),
             frame_scratch_raw: true,
             last_frame_dirty: None,
+            pending_dirty: DirtyRanges::new(),
+            deferred_blocks: Vec::new(),
+            pending_forced_blocks: Vec::new(),
+            dirty_range_cap: 2048,
+            frame_row_budget: 0,
             scrolled_scratch: Vec::new(),
             previous_width: 0,
             previous_height: 0,
@@ -2547,6 +3036,7 @@ impl TuiCore {
             last_rows_work: RowsWork::default(),
             last_frame_work: FrameWork::default(),
             force_clear: false,
+            force_screen_clear: false,
             dock_cursor_cell: None,
             show_hardware_cursor: false,
             cursor_visible: true,
@@ -2801,6 +3291,149 @@ impl TuiCore {
         self.last_frame_work
     }
 
+    // -----------------------------------------------------------------------
+    // DIRTY2: dirty block/row intervals
+    // -----------------------------------------------------------------------
+
+    /// Dirty marks accumulated since the last render (block id + merged row
+    /// intervals). Empty once a frame has consumed them; a frame that hit its
+    /// row budget leaves the deferred subset here for the next frame.
+    #[doc(hidden)]
+    pub fn pending_dirty(&self) -> &DirtyRanges {
+        &self.pending_dirty
+    }
+
+    /// Distinct dirty rows waiting for the next frame.
+    #[doc(hidden)]
+    pub fn pending_dirty_rows(&self) -> usize {
+        self.pending_dirty.rows()
+            + self
+                .deferred_blocks
+                .iter()
+                .map(|id| {
+                    let (component, block) = unpack_block_id(*id);
+                    self.block_row_range(component, block)
+                        .map_or(0, |(start, end)| end - start)
+                })
+                .sum::<usize>()
+    }
+
+    /// Number of coalesced dirty intervals waiting for the next frame.
+    #[doc(hidden)]
+    pub fn pending_dirty_ranges(&self) -> usize {
+        self.pending_dirty.len() + self.deferred_blocks.len()
+    }
+
+    /// Coalescing insertions accumulated in the pending set.
+    #[doc(hidden)]
+    pub fn pending_dirty_merges(&self) -> u64 {
+        self.pending_dirty.merges()
+    }
+
+    /// Whether the next frame has dirty work that was not painted yet (the
+    /// event loop must keep its dirty flag set / schedule the next deadline).
+    #[doc(hidden)]
+    pub fn has_pending_dirty(&self) -> bool {
+        !self.pending_dirty.is_empty() || !self.deferred_blocks.is_empty()
+    }
+
+    /// Drain a producer [`DirtyInbox`] into this core's pending set. Call once
+    /// per loop pass before the frame decision; the O(pending blocks) drain
+    /// happens on the UI thread, while the producer's `note_block` calls never
+    /// wait for a render. Overflow (more distinct blocks than the inbox bound,
+    /// or an explicit `note_full`) becomes one whole-frame dirty marker.
+    #[doc(hidden)]
+    pub fn absorb_dirty_inbox(&mut self, inbox: &DirtyInbox) {
+        let batch = inbox.drain();
+        if batch.overflow {
+            let rows = self.last_frame.len().max(self.frame_scratch.len()).max(1);
+            self.mark_dirty_rows(u64::MAX, 0, rows);
+            return;
+        }
+        for (block, _revision) in batch.blocks {
+            let (component, block_index) = unpack_block_id(block);
+            let Some((start, end)) = self.block_row_range(component, block_index) else {
+                continue;
+            };
+            self.mark_dirty_rows(block, start, end);
+            if !self.pending_forced_blocks.contains(&block) {
+                self.pending_forced_blocks.push(block);
+            }
+        }
+    }
+
+    /// Mark an absolute frame row range dirty for the next frame. Multiple
+    /// marks for the same block in one frame are latest-wins at the block
+    /// level (the interval is the union; no per-delta queue grows).
+    #[doc(hidden)]
+    pub fn mark_dirty_rows(&mut self, block: u64, start: usize, end: usize) {
+        if self.pending_dirty.len() + self.deferred_blocks.len() >= self.dirty_range_cap {
+            // Bounded queue: collapse a pathological burst to one full-frame
+            // marker instead of letting the interval vector grow with the
+            // producer's event rate.
+            let rows = self.last_frame.len().max(self.frame_scratch.len()).max(1);
+            self.pending_dirty.mark_full(rows);
+            self.deferred_blocks.clear();
+            self.pending_forced_blocks.clear();
+            return;
+        }
+        self.pending_dirty.mark(block, start, end);
+    }
+
+    /// Mark one block of the last frame dirty by id. The row range is resolved
+    /// from the frame block cache (`None` when the block did not exist in the
+    /// last frame). The block is also forced through `render_block_into` on
+    /// the next frame even if its content revision did not move — useful for
+    /// app-layer in-place edits that repaint bytes without publishing a new
+    /// revision.
+    #[doc(hidden)]
+    pub fn mark_dirty_block(&mut self, component: usize, block: usize) -> Option<(usize, usize)> {
+        let id = pack_block_id(component, block);
+        let (start, end) = self.block_row_range(component, block)?;
+        self.mark_dirty_rows(id, start, end);
+        if !self.pending_forced_blocks.contains(&id) {
+            self.pending_forced_blocks.push(id);
+        }
+        Some((start, end))
+    }
+
+    /// Row range of one cached block in the last frame, if it exists.
+    #[doc(hidden)]
+    pub fn block_row_range(&self, component: usize, block: usize) -> Option<(usize, usize)> {
+        let slot = self.frame_slots.get(component)?;
+        if slot.blocks.is_empty() {
+            return (block == 0).then(|| (slot.start, slot.start + slot.rows.len()));
+        }
+        let block = slot.blocks.get(block)?;
+        Some((block.start, block.start + block.rows.len()))
+    }
+
+    /// Bound the rows one frame may assemble (0 = unlimited). Deferred blocks
+    /// keep their previous cached rows and stale revision; their dirty range
+    /// stays in [`TuiCore::pending_dirty`] for the next frame.
+    #[doc(hidden)]
+    pub fn set_frame_row_budget(&mut self, rows: usize) {
+        self.frame_row_budget = rows;
+    }
+
+    #[doc(hidden)]
+    pub fn frame_row_budget(&self) -> usize {
+        self.frame_row_budget
+    }
+
+    /// `requestRender` with the TUI-P1 input-priority escape hatch: a key,
+    /// paste or mouse event bypasses the 16 ms clamp, a background dirtiness
+    /// signal coalesces to the next frame deadline.
+    #[doc(hidden)]
+    pub fn request_render_with_priority(&mut self, input_priority: bool) -> bool {
+        if self.frame_due_at(Instant::now(), input_priority) {
+            self.render();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Map a screen row (0-based from the top of the terminal) to the absolute
     /// buffer row whose undecorated line is shown there; `None` for a row
     /// below the painted content (a frame shorter than the screen).
@@ -2899,12 +3532,41 @@ impl TuiCore {
         let mut cache_copy_bytes = 0u64;
         let mut cache_buffer_allocs = 0u64;
         let mut cache_buffer_reuses = 0u64;
-        let mut dirty: Vec<usize> = Vec::new();
+        // DIRTY2: take the marks producers accumulated since the last frame.
+        // The set is already coalesced (adjacent/overlapping ranges merged)
+        // and latest-wins per block, so N streaming deltas cost one tail
+        // interval, not N entries. Deferred whole-block ranges from a
+        // budget-limited frame are a separate input: their stale revisions
+        // are re-processed without counting their old rows as new work.
+        let mut dirty = std::mem::take(&mut self.pending_dirty);
+        let deferred_in = std::mem::take(&mut self.deferred_blocks);
+        let mut forced_blocks = std::mem::take(&mut self.pending_forced_blocks);
+        for range in dirty.ranges() {
+            if range.block != u64::MAX && !forced_blocks.contains(&range.block) {
+                forced_blocks.push(range.block);
+            }
+        }
+        for block in &deferred_in {
+            if !forced_blocks.contains(block) {
+                forced_blocks.push(*block);
+            }
+        }
+        let pending_marks_at_start = dirty.marks();
+        let mut deferred_out: Vec<u64> = Vec::new();
+        let mut processed_blocks: Vec<u64> = Vec::new();
+        let row_budget = self.frame_row_budget;
         // Dirty markers are exact only when every append compared against the
         // previous frame's raw bytes. A decorated/clamped canvas (or a pool
         // that does not hold that whole frame) invalidates the comparison
         // baseline, so the regular diff falls back to a scan.
         let dirty_known = scratch_matches_last;
+        if !dirty_known {
+            // Pending absolute rows describe a canvas that no longer exists;
+            // the full scan below is authoritative. Deferred block ids and
+            // their forced flags stay valid: they name frame blocks, not
+            // canvas rows, and the next frame must still retry them.
+            dirty.clear();
+        }
         let mut cursor = 0usize;
         {
             let content = self
@@ -2929,15 +3591,53 @@ impl TuiCore {
                         .unwrap_or_default();
                     let mut blocks = Vec::with_capacity(block_revisions.len());
                     for (block_index, block_revision) in block_revisions.into_iter().enumerate() {
+                        let block_id = pack_block_id(index, block_index);
+                        let forced = forced_blocks.contains(&block_id);
                         let previous_block =
                             previous_blocks.get_mut(block_index).and_then(Option::take);
-                        let hit = geometry_matches
+                        let hit = !forced
+                            && geometry_matches
                             && previous_block
                                 .as_ref()
                                 .is_some_and(|block| block.revision == block_revision);
                         let previous_start = previous_block.as_ref().map(|block| block.start);
                         let had_previous = previous_block.is_some();
+                        // Frame budget: once this frame has assembled its
+                        // dirty row allowance, defer the remaining blocks.
+                        // Deferral is only safe for an unchanged position on a
+                        // clean raw canvas: the old rows stay exactly where
+                        // they are, the old revision stays in the slot (so
+                        // the next frame sees the miss again), and the range
+                        // is carried in `pending_dirty`. No token is lost —
+                        // the component state is already the newest one.
+                        if !hit
+                            && !forced
+                            && row_budget > 0
+                            && dirty.marks().saturating_sub(pending_marks_at_start) as usize
+                                >= row_budget
+                            && scratch_matches_last
+                            && previous_block
+                                .as_ref()
+                                .is_some_and(|block| block.start == cursor)
+                        {
+                            if let Some(block) = previous_block {
+                                let len = block.rows.len();
+                                cursor += len;
+                                if !deferred_out.contains(&block_id) {
+                                    deferred_out.push(block_id);
+                                }
+                                blocks.push(block);
+                                continue;
+                            }
+                        }
                         let mut rows = previous_block.map(|block| block.rows).unwrap_or_default();
+                        let mut carried_rows = 0u64;
+                        // Exact local rows the block's own recycled pool had
+                        // to rewrite. On an unchanged block position with a
+                        // clean raw canvas the frame assembly can advance over
+                        // the clean rows without comparing or copying them;
+                        // only these local rows enter the frame's dirty set.
+                        let mut block_changed: Vec<usize> = Vec::new();
                         if !hit {
                             let reused = had_previous;
                             if reused {
@@ -2952,8 +3652,16 @@ impl TuiCore {
                                 out.trim();
                                 work += out.work();
                                 rendered_len = out.len();
+                                carried_rows = out.carried_rows();
+                                block_changed.extend_from_slice(out.changed_rows());
                             }
-                            rerendered_rows += rendered_len as u64;
+                            // A streaming block whose append-stable prefix was
+                            // carried over in the block's own row pool did not
+                            // actually rebuild those rows. `rerendered_rows`
+                            // reports the rows the block wrote past the
+                            // carried prefix; the full prefix is still served
+                            // from that block cache below.
+                            rerendered_rows += (rendered_len as u64).saturating_sub(carried_rows);
                             rebuilt_blocks += 1;
                         }
                         // A hit at the SAME frame position on a clean raw
@@ -2966,14 +3674,70 @@ impl TuiCore {
                         {
                             cached_rows += rows.len() as u64;
                         } else {
+                            let scratch_len = scratch.len();
                             let mut out = Rows::at(&mut scratch, cursor);
-                            cache_copy_bytes += out.append_cached(&rows);
+                            // A block miss at an unchanged position on the
+                            // previous raw frame: the canvas rows outside
+                            // `block_changed` already hold this block's bytes,
+                            // so the dirty interval is exactly the local
+                            // changes (a streaming delta is its tail rows).
+                            let local_tail =
+                                !hit && previous_start == Some(cursor) && scratch_matches_last;
+                            if local_tail {
+                                let before = out.work().row_write_bytes;
+                                let mut local_pos = 0usize;
+                                for &local in &block_changed {
+                                    if local < local_pos || local >= rows.len() {
+                                        continue;
+                                    }
+                                    out.skip_clean(local - local_pos);
+                                    out.push(&rows[local]);
+                                    local_pos = local + 1;
+                                }
+                                if local_pos < rows.len() {
+                                    out.skip_clean(rows.len() - local_pos);
+                                }
+                                cache_copy_bytes += out.work().row_write_bytes - before;
+                            } else {
+                                // A block miss whose Markdown prefix was carried
+                                // in the block pool is also carried in the frame
+                                // canvas only when the block did not move (the
+                                // rows at `cursor..` are still last frame's raw
+                                // block) and the canvas is the previous raw frame.
+                                // Scrolling, decorators, width changes and any
+                                // other position move fall back to the full
+                                // compare-and-copy path.
+                                let frame_carried = if !hit
+                                    && carried_rows > 0
+                                    && previous_start == Some(cursor)
+                                    && scratch_matches_last
+                                    && cursor + carried_rows.min(rows.len() as u64) as usize
+                                        <= scratch_len
+                                {
+                                    carried_rows.min(rows.len() as u64) as usize
+                                } else {
+                                    0
+                                };
+                                if frame_carried > 0 {
+                                    out.skip_unchanged(frame_carried);
+                                    let actual = out.carried_rows() as usize;
+                                    cache_copy_bytes += out.append_cached(&rows[actual..]);
+                                } else {
+                                    cache_copy_bytes += out.append_cached(&rows);
+                                }
+                            }
                             if dirty_known {
-                                dirty.extend_from_slice(out.changed_rows());
+                                for &row in out.changed_rows() {
+                                    dirty.mark(block_id, row, row.saturating_add(1));
+                                }
                             }
                             work += out.work();
                             if hit {
                                 cached_rows += rows.len() as u64;
+                            } else {
+                                // The carried prefix was served from the block
+                                // pool without re-rendering it this frame.
+                                cached_rows += carried_rows;
                             }
                         }
                         cursor += rows.len();
@@ -2982,6 +3746,7 @@ impl TuiCore {
                             start: cursor.saturating_sub(rows.len()),
                             rows,
                         });
+                        processed_blocks.push(block_id);
                     }
                     // Previous blocks beyond the new count are dropped with
                     // `previous_blocks`; their rows are not part of the frame.
@@ -2995,12 +3760,38 @@ impl TuiCore {
                     });
                     continue;
                 }
-                let cache_hit = revision.is_some_and(|revision| {
-                    geometry_matches
-                        && previous.as_ref().is_some_and(|slot| {
-                            slot.revision == Some(revision) && slot.blocks.is_empty()
-                        })
-                });
+                let component_block_id = pack_block_id(index, 0);
+                let forced_component = forced_blocks.contains(&component_block_id);
+                let cache_hit = !forced_component
+                    && revision.is_some_and(|revision| {
+                        geometry_matches
+                            && previous.as_ref().is_some_and(|slot| {
+                                slot.revision == Some(revision) && slot.blocks.is_empty()
+                            })
+                    });
+                // Whole-component frame-budget deferral (same contract as the
+                // per-block branch): keep the old slot/canvas and carry the
+                // range to the next frame.
+                if !cache_hit
+                    && row_budget > 0
+                    && dirty.marks().saturating_sub(pending_marks_at_start) as usize >= row_budget
+                    && scratch_matches_last
+                {
+                    let deferrable = previous.as_ref().is_some_and(|slot| {
+                        slot.start == cursor && slot.blocks.is_empty() && slot.revision.is_some()
+                    });
+                    if deferrable {
+                        if let Some(slot) = previous {
+                            let len = slot.rows.len();
+                            cursor += len;
+                            if !deferred_out.contains(&component_block_id) {
+                                deferred_out.push(component_block_id);
+                            }
+                            new_slots.push(slot);
+                            continue;
+                        }
+                    }
+                }
                 if cache_hit {
                     // The slot's rows were produced under this exact
                     // (revision, width, theme). A same-position hit on a clean
@@ -3018,7 +3809,9 @@ impl TuiCore {
                         let mut out = Rows::at(&mut scratch, cursor);
                         cache_copy_bytes += out.append_cached(&rows);
                         if dirty_known {
-                            dirty.extend_from_slice(out.changed_rows());
+                            for &row in out.changed_rows() {
+                                dirty.mark(component_block_id, row, row.saturating_add(1));
+                            }
                         }
                         work += out.work();
                         cached_rows += rows.len() as u64;
@@ -3032,33 +3825,67 @@ impl TuiCore {
                         rows,
                         blocks: Vec::new(),
                     });
+                    processed_blocks.push(component_block_id);
                 } else if let Some(revision) = revision {
                     // Content changed: rebuild this component's cached rows
                     // in the slot's recycled buffer (a first render allocates
                     // the Vec; every later miss rewinds the same one), then
                     // append them at the current frame position with the
                     // exact-content check.
-                    let (mut rows, reused) = match previous {
-                        Some(slot) if slot.revision.is_some() => (slot.rows, true),
-                        _ => (Vec::new(), false),
+                    let (mut rows, previous_start, had_previous) = match previous {
+                        Some(slot) if slot.revision.is_some() => {
+                            let start = slot.start;
+                            (slot.rows, Some(start), true)
+                        }
+                        _ => (Vec::new(), None, false),
                     };
-                    if reused {
+                    if had_previous {
                         cache_buffer_reuses += 1;
                     } else {
                         cache_buffer_allocs += 1;
                     }
+                    let mut component_changed: Vec<usize> = Vec::new();
                     {
                         let mut out = Rows::new(&mut rows);
                         component.render_into(width, &mut out);
                         out.trim();
                         work += out.work();
+                        component_changed.extend_from_slice(out.changed_rows());
                     }
-                    let mut out = Rows::at(&mut scratch, cursor);
-                    cache_copy_bytes += out.append_cached(&rows);
-                    if dirty_known {
-                        dirty.extend_from_slice(out.changed_rows());
+                    let local_tail =
+                        had_previous && previous_start == Some(cursor) && scratch_matches_last;
+                    if local_tail {
+                        let mut out = Rows::at(&mut scratch, cursor);
+                        let before = out.work().row_write_bytes;
+                        let mut local_pos = 0usize;
+                        for &local in &component_changed {
+                            if local < local_pos || local >= rows.len() {
+                                continue;
+                            }
+                            out.skip_clean(local - local_pos);
+                            out.push(&rows[local]);
+                            local_pos = local + 1;
+                        }
+                        if local_pos < rows.len() {
+                            out.skip_clean(rows.len() - local_pos);
+                        }
+                        cache_copy_bytes += out.work().row_write_bytes - before;
+                        if dirty_known {
+                            for &row in out.changed_rows() {
+                                dirty.mark(component_block_id, row, row.saturating_add(1));
+                            }
+                        }
+                        work += out.work();
+                    } else {
+                        let mut out = Rows::at(&mut scratch, cursor);
+                        cache_copy_bytes += out.append_cached(&rows);
+                        if dirty_known {
+                            for &row in out.changed_rows() {
+                                dirty.mark(component_block_id, row, row.saturating_add(1));
+                            }
+                        }
+                        work += out.work();
                     }
-                    work += out.work();
                     rerendered_rows += rows.len() as u64;
                     rebuilt_blocks += 1;
                     cursor += rows.len();
@@ -3070,6 +3897,7 @@ impl TuiCore {
                         rows,
                         blocks: Vec::new(),
                     });
+                    processed_blocks.push(component_block_id);
                 } else {
                     // Unversioned component: render it into the frame
                     // directly, exactly like the pre-cache path.
@@ -3077,7 +3905,9 @@ impl TuiCore {
                     component.render_into(width, &mut out);
                     let len = out.len() - cursor;
                     if dirty_known {
-                        dirty.extend_from_slice(out.changed_rows());
+                        for &row in out.changed_rows() {
+                            dirty.mark(component_block_id, row, row.saturating_add(1));
+                        }
                     }
                     work += out.work();
                     rerendered_rows += len as u64;
@@ -3091,22 +3921,44 @@ impl TuiCore {
                         rows: Vec::new(),
                         blocks: Vec::new(),
                     });
+                    processed_blocks.push(component_block_id);
                 }
             }
         }
         // Rows the new frame shrank away are removals the diff must process
         // even though no remaining row was written.
         if cursor < previous_scratch_len && dirty_known {
-            dirty.extend(cursor..previous_scratch_len);
+            dirty.mark(u64::MAX, cursor, previous_scratch_len);
         }
         scratch.truncate(cursor);
         if dirty_known {
-            dirty.sort_unstable();
-            dirty.dedup();
+            // `dirty` is already sorted, non-overlapping and non-adjacent:
+            // the interval set is what the snapshot copy and the changed-line
+            // scan consume, so a 100-row tail travels as one range instead of
+            // a 100-entry Vec.
             self.last_frame_dirty = Some(dirty);
         } else {
             self.last_frame_dirty = None;
         }
+        // Carried to the next frame only when this frame hit its row budget
+        // or a block could not be safely deferred; the stale slot revision
+        // makes the next frame see the miss again, so the newest component
+        // state is eventually painted (tokens are never dropped). A deferred
+        // block id whose block WAS processed this frame is dropped.
+        for block in deferred_in {
+            if !processed_blocks.contains(&block) && !deferred_out.contains(&block) {
+                deferred_out.push(block);
+            }
+        }
+        self.deferred_blocks = deferred_out;
+        let dirty_rows = self
+            .last_frame_dirty
+            .as_ref()
+            .map_or(0, |dirty| dirty.rows() as u64);
+        let dirty_ranges_merged = self
+            .last_frame_dirty
+            .as_ref()
+            .map_or(0, DirtyRanges::merges);
         // Every row of the rebuilt canvas was either left as the previous raw
         // row (a same-position hit) or pushed through the exact-content check;
         // the canvas therefore holds raw frame bytes again.
@@ -3121,6 +3973,8 @@ impl TuiCore {
             cache_copy_bytes,
             cache_buffer_allocs,
             cache_buffer_reuses,
+            dirty_rows,
+            dirty_ranges_merged,
             ..FrameWork::default()
         };
         FRAME_WORK
@@ -3144,6 +3998,12 @@ impl TuiCore {
         FRAME_WORK
             .cache_buffer_reuses
             .fetch_add(cache_buffer_reuses, Ordering::Relaxed);
+        FRAME_WORK
+            .dirty_rows
+            .fetch_add(dirty_rows, Ordering::Relaxed);
+        FRAME_WORK
+            .dirty_ranges_merged
+            .fetch_add(dirty_ranges_merged, Ordering::Relaxed);
         scratch
     }
 
@@ -3197,6 +4057,43 @@ impl TuiCore {
     /// (one relaxed add of the branch's locally counted rows).
     fn count_reset_rows(rows: u64) {
         FRAME_WORK.reset_rows.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// Replace this frame's dirty-row stats with the row count a full-repaint
+    /// branch actually wrote. `frame_lines` already published its assembled
+    /// dirty set; the path override must adjust the process-wide counters by
+    /// the difference (relaxed, saturated on the way down) and update the
+    /// per-core snapshot.
+    fn set_frame_dirty_stats(&mut self, rows: u64, ranges_merged: u64) {
+        let previous_rows = self.last_frame_work.dirty_rows;
+        let previous_merged = self.last_frame_work.dirty_ranges_merged;
+        if rows >= previous_rows {
+            FRAME_WORK
+                .dirty_rows
+                .fetch_add(rows - previous_rows, Ordering::Relaxed);
+        } else {
+            let delta = previous_rows - rows;
+            let _ =
+                FRAME_WORK
+                    .dirty_rows
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                        Some(value.saturating_sub(delta))
+                    });
+        }
+        if ranges_merged >= previous_merged {
+            FRAME_WORK
+                .dirty_ranges_merged
+                .fetch_add(ranges_merged - previous_merged, Ordering::Relaxed);
+        } else {
+            let delta = previous_merged - ranges_merged;
+            let _ = FRAME_WORK.dirty_ranges_merged.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |value| Some(value.saturating_sub(delta)),
+            );
+        }
+        self.last_frame_work.dirty_rows = rows;
+        self.last_frame_work.dirty_ranges_merged = ranges_merged;
     }
 
     /// Append the hardware-cursor sync for one written frame (upstream
@@ -3279,14 +4176,25 @@ impl TuiCore {
         if self.stopped {
             return;
         }
+        // Frame-budget clock: the event loop asks `frame_due_at` before
+        // calling us, so a render start is what the 16 ms (60 fps) clamp
+        // measures. Recording it here also covers direct callers/tests.
+        *self
+            .last_render
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
         // A dropped writer frame never reached the terminal. The diff
         // baseline (`previous_lines`) describes the last frame BUILT, not what
         // the screen shows, so diffing against it would skip the dropped
-        // frame's rows forever. Force one full repaint instead.
+        // frame's rows forever. The next frame is a self-contained keyframe:
+        // drop the diff baseline (full repaint, `2J` + home) but KEEP the
+        // per-component block caches, so a drop never turns into a
+        // whole-transcript re-render (the old `invalidate_frame` path did,
+        // which made a slow writer slower).
         let drop_epoch = self.terminal.drop_epoch();
         if drop_epoch != self.seen_drop_epoch {
             self.seen_drop_epoch = drop_epoch;
-            self.invalidate_frame();
+            self.invalidate_diff_baseline();
         }
         // Send the OSC 7501 support query with the first frame (upstream sends
         // it during start(); the negotiation itself runs at most once).
@@ -3340,21 +4248,24 @@ impl TuiCore {
         let mut snapshot_bytes = 0u64;
         let mut changed_rows: Option<(usize, usize)> = None;
         if let Some(dirty) = self.last_frame_dirty.clone() {
-            // The frame builder's exact dirty markers already compared the
+            // The frame builder's exact dirty intervals already compared the
             // fresh frame against this same previous-raw buffer. Copy only the
             // marked rows into the recycled work buffer instead of scanning
-            // every row of a long transcript again.
-            for &index in &dirty {
-                if index >= self.last_frame.len() {
-                    continue;
+            // every row of a long transcript again — and walk the coalesced
+            // intervals, never a per-row vector.
+            for range in dirty.ranges() {
+                for index in range.start..range.end {
+                    if index >= self.last_frame.len() {
+                        continue;
+                    }
+                    new_lines[index].clone_from(&self.last_frame[index]);
+                    snapshot_rows += 1;
+                    snapshot_bytes += self.last_frame[index].len() as u64;
+                    changed_rows = Some(match changed_rows {
+                        Some((first, _)) => (first, index),
+                        None => (index, index),
+                    });
                 }
-                new_lines[index].clone_from(&self.last_frame[index]);
-                snapshot_rows += 1;
-                snapshot_bytes += self.last_frame[index].len() as u64;
-                changed_rows = Some(match changed_rows {
-                    Some((first, _)) => (first, index),
-                    None => (index, index),
-                });
             }
         } else {
             for (index, (line, snapshot)) in
@@ -3450,64 +4361,74 @@ impl TuiCore {
         // written frame moves into `previous_lines` instead of being copied.
         // Every row is written here, so every row gets the lazy reset and the
         // baseline carries it.
-        let full_render = |core: &mut Self, mut new_lines: Vec<String>, clear: bool| {
-            let mut out = String::from("\x1b[?2026h");
-            if clear {
-                out.push_str("\x1b[2J\x1b[H\x1b[3J");
-            } else {
-                // First render onto a clean screen: the cursor is assumed to
-                // be at home already (upstream comment), but emitting `H`
-                // keeps this correct if it is not.
-                out.push_str("\x1b[H");
-            }
-            let mut clamped = false;
-            for (i, line) in new_lines.iter_mut().enumerate() {
-                if i > 0 {
-                    out.push_str("\r\n");
+        let full_render =
+            |core: &mut Self, mut new_lines: Vec<String>, clear: bool, screen_clear: bool| {
+                // A full repaint writes every row: publish that as this
+                // frame's dirty-row work instead of the builder's partial set.
+                core.set_frame_dirty_stats(new_lines.len() as u64, 0);
+                let mut out = String::from("\x1b[?2026h");
+                if clear {
+                    out.push_str("\x1b[2J\x1b[H\x1b[3J");
+                } else if screen_clear {
+                    // Writer-drop keyframe: erase the visible screen (stale rows
+                    // below a shrunk frame) without touching scrollback.
+                    out.push_str("\x1b[2J\x1b[H");
+                } else {
+                    // First render onto a clean screen: the cursor is assumed to
+                    // be at home already (upstream comment), but emitting `H`
+                    // keeps this correct if it is not.
+                    out.push_str("\x1b[H");
                 }
-                out.push_str("\x1b[2K");
-                clamped |= Self::clamp_row_width(line, width);
-                Self::append_line_reset(line);
-                out.push_str(line);
-            }
-            Self::count_reset_rows(new_lines.len() as u64);
-            let buffer_length = height.max(new_lines.len());
-            let viewport_top = buffer_length.saturating_sub(height);
-            let moved = core.append_cursor_sync(
-                &mut out,
-                new_lines.len().saturating_sub(1),
-                new_lines.len(),
-                viewport_top,
-                false,
-            );
-            out.push_str("\x1b[?2026l");
-            core.terminal.write_owned(out);
-            let last_row = new_lines.len().saturating_sub(1);
-            let frame_len = new_lines.len();
-            // The written frame becomes the baseline; the baseline it retires
-            // is dead and goes back to the raw-frame pool. The retired rows
-            // carry the lazy per-line reset this path appended — strip it so
-            // the pool holds the raw content the next frame's exact-content
-            // compare expects (otherwise every row would look changed again).
-            let mut retired = std::mem::replace(&mut core.previous_lines, new_lines);
-            for row in &mut retired {
-                if row.ends_with(SEGMENT_RESET) {
-                    let raw_len = row.len() - SEGMENT_RESET.len();
-                    row.truncate(raw_len);
+                for (i, line) in new_lines.iter_mut().enumerate() {
+                    if i > 0 {
+                        out.push_str("\r\n");
+                    }
+                    out.push_str("\x1b[2K");
+                    Self::clamp_row_width(line, width);
+                    Self::append_line_reset(line);
+                    out.push_str(line);
                 }
-            }
-            core.frame_scratch = retired;
-            // The retired baseline is raw only if nothing clamped it (the
-            // lazy reset is stripped above); a decorated/clamped canvas must
-            // make the next frame compare before serving cache hits.
-            core.frame_scratch_raw = core.frame_scratch_raw && !clamped;
-            core.previous_width = width;
-            core.previous_height = height;
-            core.hardware_cursor_row = moved.unwrap_or(last_row);
-            core.previous_viewport_top = viewport_top;
-            core.last_window_start = core.previous_viewport_top;
-            core.publish_follow_layout(frame_len);
-        };
+                Self::count_reset_rows(new_lines.len() as u64);
+                let buffer_length = height.max(new_lines.len());
+                let viewport_top = buffer_length.saturating_sub(height);
+                let moved = core.append_cursor_sync(
+                    &mut out,
+                    new_lines.len().saturating_sub(1),
+                    new_lines.len(),
+                    viewport_top,
+                    false,
+                );
+                out.push_str("\x1b[?2026l");
+                core.terminal.write_owned(out);
+                let last_row = new_lines.len().saturating_sub(1);
+                let frame_len = new_lines.len();
+                // The written frame becomes the baseline; the baseline it retires
+                // is dead and goes back to the raw-frame pool. The retired rows
+                // carry the lazy per-line reset this path appended — strip it so
+                // the pool holds the raw content the next frame's exact-content
+                // compare expects (otherwise every row would look changed again).
+                let mut retired = std::mem::replace(&mut core.previous_lines, new_lines);
+                for row in &mut retired {
+                    if row.ends_with(SEGMENT_RESET) {
+                        let raw_len = row.len() - SEGMENT_RESET.len();
+                        row.truncate(raw_len);
+                    }
+                }
+                core.frame_scratch = retired;
+                // The retired baseline is the frame BEFORE this one, not the
+                // raw frame this build just produced: the next frame's cache
+                // hits must compare before trusting the pooled rows. (The
+                // diff path hands over its own `new_lines` work buffer, which
+                // is the exact raw frame; only this full-render branch swaps
+                // in the retired baseline.)
+                core.frame_scratch_raw = false;
+                core.previous_width = width;
+                core.previous_height = height;
+                core.hardware_cursor_row = moved.unwrap_or(last_row);
+                core.previous_viewport_top = viewport_top;
+                core.last_window_start = core.previous_viewport_top;
+                core.publish_follow_layout(frame_len);
+            };
 
         if self.previous_lines.is_empty() && !width_changed && !height_changed {
             // `invalidate_frame` was called (overlay swapped the alternate
@@ -3515,11 +4436,13 @@ impl TuiCore {
             // the renderer has no cached frame, so the first repaint must
             // clear.
             let clear = std::mem::take(&mut self.force_clear);
-            full_render(self, new_lines, clear);
+            let screen_clear = std::mem::take(&mut self.force_screen_clear);
+            full_render(self, new_lines, clear, screen_clear);
             return;
         }
         if width_changed || height_changed {
-            full_render(self, new_lines, true);
+            self.force_screen_clear = false;
+            full_render(self, new_lines, true, false);
             return;
         }
 
@@ -3547,13 +4470,13 @@ impl TuiCore {
         let mut scanned_rows = 0u64;
         let mut skipped_rows = 0u64;
         if let Some(dirty) = marker_dirty {
-            // `dirty` is sorted+deduped by `frame_lines`; rows past the new
-            // length are the shrink's removals.
-            if let (Some(first), Some(last)) = (dirty.first(), dirty.last()) {
-                first_changed = *first as isize;
-                last_changed = *last as isize;
+            // `dirty` is a coalesced interval set; rows past the new length
+            // are the shrink's removals.
+            if let (Some(first), Some(last_end)) = (dirty.first_row(), dirty.last_row_end()) {
+                first_changed = first as isize;
+                last_changed = last_end.saturating_sub(1) as isize;
             }
-            skipped_rows = (max_lines as u64).saturating_sub(dirty.len() as u64);
+            skipped_rows = (max_lines as u64).saturating_sub(dirty.rows() as u64);
         } else {
             for i in 0..max_lines {
                 let old = self.previous_lines.get(i).map(String::as_str).unwrap_or("");
@@ -3630,12 +4553,12 @@ impl TuiCore {
                 if target_row < prev_viewport_top {
                     // The end of the new content scrolled away: the removed
                     // tail is not reachable on screen.
-                    full_render(self, new_lines, true);
+                    full_render(self, new_lines, true, false);
                     return;
                 }
                 let extra_lines = self.previous_lines.len() - new_lines.len();
                 if extra_lines > height {
-                    full_render(self, new_lines, true);
+                    full_render(self, new_lines, true, false);
                     return;
                 }
                 let mut out = String::from("\x1b[?2026h");
@@ -3692,7 +4615,7 @@ impl TuiCore {
         // visible; a change above the previous viewport needs a full repaint
         // (upstream guard).
         if first_changed < prev_viewport_top {
-            full_render(self, new_lines, true);
+            full_render(self, new_lines, true, false);
             return;
         }
 
@@ -3968,6 +4891,7 @@ impl TuiCore {
             if last_unchanged {
                 Self::append_line_reset(&mut painted[last]);
             }
+            self.set_frame_dirty_stats(changed.len() as u64 + u64::from(last_unchanged), 0);
             Self::count_reset_rows(changed.len() as u64 + u64::from(last_unchanged));
             let mut out = scrolled_diff_output(&painted, &changed);
             moved = self.append_cursor_sync(&mut out, from_row, total, 0, true);
@@ -3977,6 +4901,7 @@ impl TuiCore {
         } else {
             // Every row is written: every row gets the lazy reset, and the
             // painted window becomes the baseline.
+            self.set_frame_dirty_stats(painted.len() as u64, 0);
             for row in painted.iter_mut() {
                 Self::append_line_reset(row);
             }
@@ -3985,6 +4910,9 @@ impl TuiCore {
             if std::mem::take(&mut self.force_clear) {
                 out.push_str("\x1b[2J\x1b[H\x1b[3J");
             }
+            // `scrolled_full_output` starts with `2J` + home itself; the
+            // writer-drop keyframe flag needs no extra bytes here.
+            self.force_screen_clear = false;
             out.push_str(&scrolled_full_output(&painted));
             moved = self.append_cursor_sync(&mut out, from_row, total, 0, true);
             self.terminal.write_owned(out);
@@ -4004,22 +4932,70 @@ impl TuiCore {
         self.publish_scrolled_layout(new_lines.len(), start, dock_start, dock.len());
     }
 
-    /// Request a render; coalesces to at most one frame per min_frame
-    /// interval (upstream requestRender + 16ms clamp).
-    pub fn request_render(&mut self) {
-        let elapsed = self
-            .last_render
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .elapsed();
-        if elapsed >= self.min_frame {
+    /// Minimum interval between frame starts (upstream `requestRender`'s
+    /// 16 ms clamp, i.e. at most ~60 rendered frames per second).
+    pub fn min_frame_interval(&self) -> Duration {
+        self.min_frame
+    }
+
+    /// Whether a frame may start at `now`. `input_priority` bypasses the
+    /// clamp so a key/paste/mouse event is painted on the next loop pass
+    /// instead of waiting out the remainder of the frame budget.
+    pub fn frame_due_at(&self, now: Instant, input_priority: bool) -> bool {
+        if input_priority {
+            return true;
+        }
+        now.saturating_duration_since(
             *self
                 .last_render
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
-            self.render();
-        }
-        // else: skip; the next event loop tick re-renders anyway.
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ) >= self.min_frame
+    }
+
+    /// The earliest instant at which the next non-input frame is due. The
+    /// event loop clamps its poll timeout to this so a dirty final frame is
+    /// never left unpainted just because no further event arrives.
+    pub fn next_frame_deadline(&self) -> Instant {
+        *self
+            .last_render
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            + self.min_frame
+    }
+
+    /// Whether the writer dropped a queued frame after the last render
+    /// started. Such a drop is only observed at the start of the NEXT render,
+    /// so the event loop keeps the frame dirty for one more self-contained
+    /// keyframe (and [`TuiCore::stop`] paints it if the run ends first).
+    pub fn needs_keyframe(&self) -> bool {
+        self.terminal.drop_epoch() != self.seen_drop_epoch
+    }
+
+    /// Request a render; coalesces to at most one frame per min_frame
+    /// interval (upstream requestRender + 16ms clamp). Returns whether a
+    /// frame was painted.
+    pub fn request_render(&mut self) -> bool {
+        self.request_render_with_priority(false)
+    }
+
+    /// Writer-drop recovery: keep every component/block row cache and drop
+    /// only the line-diff baseline. The next [`TuiCore::render`] rebuilds the
+    /// frame from the caches (a steady frame re-renders only blocks whose
+    /// revisions moved) and WRITES every row, so the resulting chunk is a
+    /// self-contained keyframe even though the terminal missed a previous
+    /// diff chunk. Unlike [`TuiCore::invalidate_frame`] this never clears the
+    /// per-block caches and never clears terminal scrollback.
+    fn invalidate_diff_baseline(&mut self) {
+        self.previous_lines.clear();
+        self.previous_width = 0;
+        self.previous_height = 0;
+        self.hardware_cursor_row = 0;
+        self.previous_viewport_top = 0;
+        self.force_screen_clear = true;
+        // The pinning baseline is meaningless for a full repaint; the next
+        // frame re-anchors it.
+        self.last_transcript_end = None;
     }
 
     /// Drop the cached frame so the next [`TuiCore::render`] is a full
@@ -4048,6 +5024,7 @@ impl TuiCore {
         // only way to drop the cached frame, and the caller knows rows below
         // the new content are stale.
         self.force_clear = true;
+        self.force_screen_clear = false;
         // P1-2: the pinning baseline is meaningless for the next (full)
         // repaint — the next frame re-anchors it instead of compensating
         // against a stale transcript length.
@@ -4057,6 +5034,13 @@ impl TuiCore {
     pub fn stop(&mut self) {
         if self.stopped {
             return;
+        }
+        // The writer may have dropped the newest frame after the last render
+        // (a drop during that render's enqueue is detected only on the next
+        // render). Paint one last self-contained keyframe before teardown so
+        // the final screen matches the content even when no event follows.
+        if self.needs_keyframe() {
+            self.render();
         }
         self.stopped = true;
         // Teardown is a synchronous direct-write path: give the async queue a

@@ -399,16 +399,26 @@ async fn rewrite_file_success_leaves_no_temp_residue_and_reopens() {
         .expect("branched session path");
 
     assert!(new_path.exists(), "the rewritten file must exist");
+    // The live writer-presence lock (`.<name>.jsonl.lock`) is NOT rewrite
+    // residue: it is the deletion guard retention requires while this manager
+    // is alive, and `Drop` releases it (pinned by
+    // `p0_session_retention::create_branched_session_moves_the_writer_lock_to_the_branch`).
+    // This test only guards the atomic-rewrite temp files.
     let leftovers: Vec<_> = std::fs::read_dir(dir.path())
         .expect("read dir")
         .flatten()
         .filter(|entry| {
-            entry
-                .path()
-                .extension()
+            let path = entry.path();
+            let is_writer_lock = path
+                .file_name()
                 .and_then(|value| value.to_str())
-                .map(|extension| extension != "jsonl")
-                .unwrap_or(false)
+                .is_some_and(|name| name.starts_with('.') && name.ends_with(".jsonl.lock"));
+            !is_writer_lock
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(|extension| extension != "jsonl")
+                    .unwrap_or(false)
         })
         .collect();
     assert!(

@@ -169,7 +169,10 @@ fn rejects_unknown_client_value_field() {
 // ---------------------------------------------------------------------------
 
 async fn bind_server() -> (Arc<Server>, std::net::SocketAddr) {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind test server");
+    let server =
+        Server::bind_with_security("127.0.0.1:0", ServerSecurityConfig::unauthenticated_local())
+            .await
+            .expect("bind test server");
     let address = server.local_addr().expect("local address");
     (Arc::new(server), address)
 }
@@ -762,9 +765,13 @@ async fn server_legacy_state_update_switch_emits_object_ops() {
     use pir::protocol::{ServiceUpdate, StateOp, StateUpdateDecoder};
 
     let state = ServerState::default().with_legacy_state_updates();
-    let server = Server::bind_with_state("127.0.0.1:0", state)
-        .await
-        .expect("bind legacy server");
+    let server = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state,
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("bind legacy server");
     let address = server.local_addr().expect("local address");
     let server = Arc::new(server);
     let accepting = {
@@ -1637,7 +1644,7 @@ fn client_library_decodes_both_state_update_shapes() {
 async fn slow_subscriber_does_not_block_unsubscribe_on_the_control_plane() {
     let security = ServerSecurityConfig {
         max_sessions: 1024,
-        ..ServerSecurityConfig::default()
+        ..ServerSecurityConfig::unauthenticated_local()
     };
     let server =
         Server::bind_with_state_and_security("127.0.0.1:0", ServerState::default(), security)

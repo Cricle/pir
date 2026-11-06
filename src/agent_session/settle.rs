@@ -619,7 +619,6 @@ impl AgentSession {
         // Session-level `entry_appended` subscribers (see the payload gate
         // below): cloned into the 'static sink as its own emitter.
         let session_events = Arc::clone(&self.session_events);
-        let session_event_subscribers = self.has_session_event_subscribers();
         Some(Arc::new(move |mut message: Message| {
             let session = session.clone();
             let session_id = session_id.clone();
@@ -656,14 +655,20 @@ impl AgentSession {
                     return;
                 }
                 // The `entry_appended` dispatch is skipped when NEITHER a
-                // plugin handler nor a session-event subscriber observes it:
-                // the message then moves into storage (no clone) and no wire
-                // payload is built.
+                // plugin handler nor a session-event subscriber wants THIS
+                // message: the message then moves into storage (no clone) and
+                // no wire payload is built. Per-message gating keeps a
+                // TUI-only host from materializing assistant/toolResult
+                // payloads it already rendered live.
                 let dispatch_entry_appended_to_plugins = plugins
                     .as_ref()
                     .is_some_and(|plugins| plugins.has_handlers("entry_appended"));
+                let wants_subscriber = super::notifications::entry_appended_subscriber_wants(
+                    &session_events,
+                    &message,
+                );
                 let dispatch_entry_appended =
-                    dispatch_entry_appended_to_plugins || session_event_subscribers;
+                    dispatch_entry_appended_to_plugins || wants_subscriber;
                 // Append off the async runtime: the JSONL write is blocking
                 // I/O, so the manager lock is acquired on the blocking pool.
                 // The `entry_appended` dispatch (a JS handler with a long call
@@ -674,7 +679,9 @@ impl AgentSession {
                 let appended = if dispatch_entry_appended {
                     append_message_if_session(&session, session_id.as_deref(), message.clone())
                         .await
-                        .map(|entry_id| entry_id.map(|entry_id| (entry_id, Some(message))))
+                        .map(|entry_id| {
+                            entry_id.map(|entry_id| (entry_id, Some((message, wants_subscriber))))
+                        })
                 } else {
                     append_message_if_session(&session, session_id.as_deref(), message)
                         .await
@@ -687,10 +694,11 @@ impl AgentSession {
                         // the entry id (the recovery omission targets it).
                         ledger.handle(ordinal);
                         ledger.record_entry(ordinal, &entry_id);
-                        if let Some(message) = &dispatch_message {
+                        if let Some((message, wants_subscriber)) = &dispatch_message {
                             // One wire payload per entry: the plugin dispatch
                             // and the session-level event share the same
                             // upstream `SessionEntry` shape.
+                            crate::agent_session::events::note_entry_appended_wire_build();
                             let entry_json = serde_json::json!({
                                 "id": entry_id,
                                 "message": message_json(message),
@@ -708,7 +716,7 @@ impl AgentSession {
                                     .await;
                                 }
                             }
-                            if session_event_subscribers {
+                            if *wants_subscriber {
                                 crate::agent_session::events::emit_session_event_to(
                                     &session_events,
                                     SessionEvent::EntryAppended { entry: entry_json },

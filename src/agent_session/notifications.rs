@@ -272,6 +272,14 @@ fn native_event_bridge(
     // before `session_before_compact` (direct), and `compaction_end` before
     // `session_compact_failed`.
     plugins.set_session_event_flush(Some(NativeEventBridge::flush_handle(&bridge)));
+    // The bridge drops `entry_appended` before serializing (its direct emit
+    // site owns both plugin faces), so it must never make the append path
+    // materialize a payload. Record it as a never-interested subscriber.
+    register_session_event_interest(
+        events,
+        &handler,
+        super::events::SessionEventInterest::EntryAppendedNever,
+    );
     // The registry lock is held across the push so two concurrent installs
     // for the same session cannot both register a subscriber. The handler
     // list never takes this lock, so the ordering cannot deadlock.
@@ -283,43 +291,112 @@ fn native_event_bridge(
     Some(bridge)
 }
 
-/// The live bridge registered for `events`, without installing one.
-fn existing_native_event_bridge(
-    events: &Arc<SessionEventHandlers>,
-) -> Option<Arc<NativeEventBridge>> {
-    let mut bridges = NATIVE_SESSION_EVENT_BRIDGES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    bridges.retain(|bridge| bridge.strong_count() > 0);
-    for bridge in bridges.iter() {
-        if let Some(existing) = bridge.upgrade() {
-            if std::ptr::eq(existing.events.as_ptr(), Arc::as_ptr(events)) {
-                return Some(existing);
-            }
-        }
-    }
-    None
+/// One subscriber's declared `entry_appended` interest, keyed by the session's
+/// handler list allocation and the handler's allocation identity. The handler
+/// list type stays `Vec<SessionEventHandler>` (no ripple through the
+/// compaction/queue/background signatures); the interest is metadata owned by
+/// the registration call.
+struct SessionEventInterestEntry {
+    events: Weak<SessionEventHandlers>,
+    handler: usize,
+    interest: super::events::SessionEventInterest,
 }
 
-/// Whether `events` has a subscriber besides the native/session-event bridge.
+static SESSION_EVENT_INTERESTS: Mutex<Vec<SessionEventInterestEntry>> = Mutex::new(Vec::new());
+
+/// Record what `handler` consumes from `entry_appended`. `on_session_event`
+/// records [`SessionEventInterest::All`] (print/RPC/SDK unchanged); the TUI
+/// registers user-only; the native bridge registers never.
+pub(super) fn register_session_event_interest(
+    events: &Arc<SessionEventHandlers>,
+    handler: &SessionEventHandler,
+    interest: super::events::SessionEventInterest,
+) {
+    let pointer = Arc::as_ptr(handler) as *const () as usize;
+    let mut registrations = SESSION_EVENT_INTERESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Drop entries whose session has been released; while a session lives its
+    // handler list only grows, so a matching pointer stays valid.
+    registrations.retain(|entry| {
+        entry.events.strong_count() > 0
+            && !(std::ptr::eq(entry.events.as_ptr(), Arc::as_ptr(events))
+                && entry.handler == pointer)
+    });
+    registrations.push(SessionEventInterestEntry {
+        events: Arc::downgrade(events),
+        handler: pointer,
+        interest,
+    });
+}
+
+/// The interest `handler` declared, defaulting to [`All`] for handlers that
+/// were pushed directly onto the list (only the bridge does that, and it
+/// registers explicitly).
 ///
-/// The bridge is installed at construction and observes every session event,
-/// but it deliberately drops `entry_appended` (the append path dispatches that
-/// one directly to both plugin faces). Treating the bridge as a consumer made
-/// `has_session_event_subscribers` permanently true and forced the append hot
-/// path to materialize the wire entry even when no plugin handler and no host
-/// subscriber existed. This predicate answers the producer's real question:
-/// "will anybody other than the drop-only bridge use this payload?"
-pub(super) fn has_observed_session_event_subscribers(events: &Arc<SessionEventHandlers>) -> bool {
-    // Read the length in its own statement so the handler-list lock is
-    // released before the bridge registry lock is taken (the installer takes
-    // them in the opposite order).
-    let total = events
+/// [`All`]: super::events::SessionEventInterest::All
+fn session_event_interest_for(
+    registrations: &[SessionEventInterestEntry],
+    events: &Arc<SessionEventHandlers>,
+    handler: &SessionEventHandler,
+) -> super::events::SessionEventInterest {
+    let pointer = Arc::as_ptr(handler) as *const () as usize;
+    registrations
+        .iter()
+        .rev()
+        .find(|entry| {
+            std::ptr::eq(entry.events.as_ptr(), Arc::as_ptr(events)) && entry.handler == pointer
+        })
+        .map_or(super::events::SessionEventInterest::All, |entry| {
+            entry.interest
+        })
+}
+
+/// Whether any subscriber wants EVERY `entry_appended` entry. This is the
+/// historical `has_session_event_subscribers` producer gate: print/RPC/SDK
+/// subscribe with `All`, so their behavior is unchanged. A TUI-only session
+/// returns `false`, keeping assistant/toolResult messages on the move-only
+/// path (the TUI gets the user entries through the per-message gate below).
+pub(super) fn has_entry_appended_all_subscribers(events: &Arc<SessionEventHandlers>) -> bool {
+    let handlers = events
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .len();
-    let bridge_subscribers = usize::from(existing_native_event_bridge(events).is_some());
-    total > bridge_subscribers
+        .clone();
+    if handlers.is_empty() {
+        return false;
+    }
+    let mut registrations = SESSION_EVENT_INTERESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registrations.retain(|entry| entry.events.strong_count() > 0);
+    handlers.iter().any(|handler| {
+        session_event_interest_for(&registrations, events, handler)
+            == super::events::SessionEventInterest::All
+    })
+}
+
+/// Whether at least one subscriber needs the `entry_appended` wire entry for
+/// this exact message. The caller uses it BEFORE `message.clone()` and
+/// `message_json`, so a TUI-only session builds nothing for assistant/
+/// toolResult entries while user messages still reach the bridge.
+pub(super) fn entry_appended_subscriber_wants(
+    events: &Arc<SessionEventHandlers>,
+    message: &Message,
+) -> bool {
+    let handlers = events
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if handlers.is_empty() {
+        return false;
+    }
+    let mut registrations = SESSION_EVENT_INTERESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registrations.retain(|entry| entry.events.strong_count() > 0);
+    handlers.iter().any(|handler| {
+        session_event_interest_for(&registrations, events, handler).wants_entry_appended(message)
+    })
 }
 
 /// Register the session-event fan-out on a session's [`SessionEvent`] stream
@@ -848,8 +925,18 @@ impl AgentSession {
                 Notification::CompactRequest {
                     custom_instructions,
                 } => {
+                    // Serialize compactions explicitly: a request during a run
+                    // is deferred to the settle drain, and one during another
+                    // compaction is refused with a diagnostic instead of
+                    // reaching `compact()`'s claim error.
                     if self.is_streaming() {
                         crate::ext_diag!("[ext] ctx.compact ignored: the agent is streaming");
+                        continue;
+                    }
+                    if self.is_compacting() {
+                        crate::ext_diag!(
+                            "[ext] ctx.compact ignored: a compaction is already in progress"
+                        );
                         continue;
                     }
                     if let Err(error) = self.compact(custom_instructions.as_deref()).await {
@@ -1050,12 +1137,18 @@ impl AgentSession {
     /// 2. The session is busy (a run is in flight OR still starting) and
     ///    `triggerTurn` is not explicitly `false` — steer (or follow-up per
     ///    `deliverAs`) into THAT run instead of starting a second one.
-    /// 3. Idle with `triggerTurn: true` — the message STARTS a run
+    /// 3. A MANUAL compaction owns the session — queue the custom message
+    ///    (steering by default, follow-up when asked) instead of appending it
+    ///    into the transcript: an append that lands between the compaction's
+    ///    cut-point snapshot and its `firstKeptEntryId` write can fall
+    ///    outside the rebuilt context (silently lost). Queued input survives
+    ///    the compaction and is delivered exactly once by the next run.
+    /// 4. Idle with `triggerTurn: true` — the message STARTS a run
     ///    (`run_custom_turn`, drained by the host through
     ///    [`AgentSession::take_pending_custom_run`]).
-    /// 4. Otherwise — append the custom message entry (while busy the append
-    ///    is safe: the entry is never spliced between a tool call and its
-    ///    result).
+    /// 5. Otherwise — append the custom message entry (while a RUN is busy the
+    ///    append is safe: the entry is never spliced between a tool call and
+    ///    its result).
     pub(super) async fn consume_send_message(&self, plugins: &PluginHost, payload: &JsonValue) {
         let message = payload.get("message").cloned().unwrap_or(JsonValue::Null);
         let options = payload.get("options").cloned().unwrap_or(JsonValue::Null);
@@ -1082,6 +1175,30 @@ impl AgentSession {
             // The queued entry carries the custom wire shape and (for a
             // stored session) persists as a custom-message entry, so
             // `customType`/`display`/`details` and image content survive.
+            let prompt = self.custom_prompt_message(&record);
+            if deliver_as == Some("followUp") {
+                self.enqueue_follow_up(prompt);
+            } else {
+                self.enqueue_steering(prompt);
+            }
+            return;
+        }
+        if self.is_compacting() {
+            // A manual compaction owns the transcript: appending ANY entry
+            // now races the cut point (a self-retaining compaction would
+            // rebuild the context without it). An explicit `triggerTurn:
+            // true` keeps its own-run semantics via the host pump (drained
+            // after the compaction); every other shape queues with the custom
+            // wire shape instead. `triggerTurn: false` still does not start a
+            // run by itself — the entry only joins the next run the user
+            // starts.
+            if trigger_turn == Some(true) {
+                self.pending_custom_runs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push_back(record);
+                return;
+            }
             let prompt = self.custom_prompt_message(&record);
             if deliver_as == Some("followUp") {
                 self.enqueue_follow_up(prompt);

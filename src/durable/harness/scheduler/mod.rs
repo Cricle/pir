@@ -113,6 +113,7 @@ use crate::durable::errors::{
     HostCallback, ReadOnlySession, ReportInfo, ReportTask, StorageError, TaskFaultReason,
     TaskOutdatedReason,
 };
+use crate::durable::harness::harness::report_telemetry;
 use crate::durable::harness::settings::{RestartLimit, Settings, DEFAULT_RESTART_LIMIT};
 use crate::durable::harness::task::{ErasedTask, Task};
 use crate::durable::harness::telemetry::{HarnessTelemetry, SpanHandle, TraceCarrier};
@@ -2684,84 +2685,6 @@ impl SchedulerInner {
 
 // ─── Record helpers ─────────────────────────────────────────────────────────
 
-/// The telemetry description of a report: its fixed type, reason, extension
-/// and task id.
-///
-/// The strings are the wire values declared by
-/// [`REPORT_TYPES`](crate::durable::harness::telemetry::REPORT_TYPES) and
-/// [`REPORT_REASONS`](crate::durable::harness::telemetry::REPORT_REASONS);
-/// matching here keeps the no-sink path free of serialization and allocation.
-fn report_telemetry(
-    info: &ReportInfo,
-) -> (
-    &'static str,
-    Option<&'static str>,
-    Option<&str>,
-    Option<i64>,
-) {
-    match info {
-        ReportInfo::SessionFailed => ("session_failed", None, None, None),
-        ReportInfo::TaskFaulted {
-            task,
-            extension,
-            reason,
-        } => (
-            "task_faulted",
-            Some(match reason {
-                TaskFaultReason::Threw => "threw",
-                TaskFaultReason::RestartLimit => "restart_limit",
-            }),
-            extension.as_deref(),
-            Some(task.id.as_i64()),
-        ),
-        ReportInfo::TaskParked { task, extension } => (
-            "task_parked",
-            None,
-            extension.as_deref(),
-            Some(task.id.as_i64()),
-        ),
-        ReportInfo::MigrationFailed { task, extension } => (
-            "migration_failed",
-            None,
-            extension.as_deref(),
-            Some(task.id.as_i64()),
-        ),
-        ReportInfo::TaskOutdated {
-            task,
-            extension,
-            reason,
-        } => (
-            "task_outdated",
-            Some(match reason {
-                TaskOutdatedReason::MissingTask => "missing_task",
-                TaskOutdatedReason::IncompatibleTask => "incompatible_task",
-            }),
-            extension.as_deref(),
-            Some(task.id.as_i64()),
-        ),
-        ReportInfo::TaskError { task, extension } => (
-            "task_error",
-            None,
-            extension.as_deref(),
-            Some(task.id.as_i64()),
-        ),
-        ReportInfo::ExtensionError {
-            extension, task, ..
-        } => (
-            "extension_error",
-            None,
-            extension.as_deref(),
-            task.as_ref().map(|task| task.id.as_i64()),
-        ),
-        ReportInfo::HostError { task, .. } => (
-            "host_error",
-            None,
-            None,
-            task.as_ref().map(|task| task.id.as_i64()),
-        ),
-        ReportInfo::ListenerError => ("listener_error", None, None, None),
-    }
-}
 
 /// The checkpoint of a checkpoint-bearing state.
 #[must_use]

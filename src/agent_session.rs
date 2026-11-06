@@ -33,7 +33,7 @@ use crate::ai::types::{
     AbortSignal, AssistantMessage, ContentBlock, Context, Message, Model, StopReason,
     StreamOptions, TextContent, ThinkingLevel, UserMessage, UserRole,
 };
-use crate::compaction::{self, CompactionConfig, CompactionResult, CompleteFn, ProjectedEntry};
+use crate::compaction::{self, CompactionConfig, CompactionResult, CompleteFn};
 use crate::config::settings::{FollowUpMode, SettingsManager, SteeringMode};
 use crate::extensions::{ExtensionConfig, ExtensionHandle, Notification, SessionContextSnapshot};
 use crate::plugins::PluginHost;
@@ -163,8 +163,9 @@ pub use bash::BashResult;
 #[doc(hidden)]
 pub use build::plugin_services::wait_for_claim_change_for_tests;
 pub use events::{
-    agent_event_to_json, registry_event_stream, session_event_to_json, SessionEvent,
-    SessionEventHandler, SummarizationRetrySource,
+    agent_event_to_json, entry_appended_wire_builds, registry_event_stream,
+    reset_entry_appended_wire_builds, session_event_to_json, SessionEvent, SessionEventHandler,
+    SessionEventInterest, SummarizationRetrySource,
 };
 pub use models::{resolve_starting_thinking_level, ModelCycle};
 pub use native_host::{
@@ -172,6 +173,7 @@ pub use native_host::{
     NativeSessionAction, NativeSessionHost, SessionReplacement,
 };
 pub use notifications::drain_extension_notifications_pub;
+pub use prompt_loop::RunAdmission;
 #[doc(hidden)]
 pub use prompt_loop::trim_ephemeral_history;
 pub use providers::serialize_scoped_models;
@@ -611,6 +613,11 @@ pub struct AgentSession {
     /// installed over this registry at construction, so every execution path
     /// of the session — model batches and nested calls alike — shares it.
     background: Arc<background::BackgroundRegistry>,
+    /// Session-scoped read-before-edit ledger: `read` records every successful
+    /// text read here, and `edit`/`write` consult it before mutating an
+    /// existing file. Created once at build (the mode is resolved from
+    /// `PIR_READ_BEFORE_EDIT` exactly once) and shared across all turns.
+    read_ledger: Arc<crate::agent::read_ledger::ReadLedger>,
     session: Option<Arc<tokio::sync::Mutex<SessionManager>>>,
     /// Cached session identity; interior-mutable so the new-session/fork/
     /// clone seams ([`AgentSession::replace_session_storage`]) can refresh it.
@@ -876,6 +883,17 @@ pub struct AgentSession {
     /// holds the identical snapshot and the expensive session-derived payload
     /// is not rebuilt.
     session_context_cache: Mutex<Option<session_ctx::SessionContextCache>>,
+    /// RSS-B: the last completed prompt projection, parked for the next prompt
+    /// to extend in place. `None` means "no reusable snapshot" (first prompt,
+    /// failed/aborted run, or an edit/compaction invalidated it); the next
+    /// build then pays the full projection once and starts a new snapshot.
+    /// The messages are moved in/out — never cloned on the steady path.
+    prompt_projection_cache:
+        Mutex<Option<crate::session_manager::projection::CachedSessionProjection>>,
+    /// RSS-B test/profiling probe: prompt-start projections served from
+    /// [`Self::prompt_projection_cache`] (full builds stay counted by the
+    /// session manager's `projection_build_count`).
+    projection_reuse_count: AtomicU64,
     /// Whether this process was spawned as a parallel phone session
     /// (`PI_PHONE_CHILD=1`). Read ONCE at construction so the per-prompt
     /// guard is a bool test; parent sessions are byte-for-byte unchanged.

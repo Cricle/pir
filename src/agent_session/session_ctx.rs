@@ -677,6 +677,57 @@ session does not have"
             .collect();
         (system_prompt, tools)
     }
+
+    // ------------------------------------------------------------------
+    // RSS-B: prompt projection cache
+    // ------------------------------------------------------------------
+
+    /// Take the previous prompt's projection snapshot, if any. The caller
+    /// either consumes it (incremental build) or drops it (fallback).
+    pub(super) fn take_cached_prompt_projection(
+        &self,
+    ) -> Option<crate::session_manager::projection::CachedSessionProjection> {
+        self.prompt_projection_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Park a completed run's projection for the next prompt. Only called
+    /// after the append-only/count validation succeeds.
+    pub(super) fn store_cached_prompt_projection(
+        &self,
+        cached: crate::session_manager::projection::CachedSessionProjection,
+    ) {
+        *self
+            .prompt_projection_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cached);
+    }
+
+    /// Drop the snapshot without using it (failed runs, storage swaps).
+    pub(super) fn clear_cached_prompt_projection(&self) {
+        *self
+            .prompt_projection_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Count one prompt-start projection served by extending the previous
+    /// snapshot instead of materializing the whole transcript.
+    pub(super) fn record_projection_reuse(&self) {
+        self.projection_reuse_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test/profiling probe: how many prompt-start projections reused the
+    /// incremental snapshot (see [`Self::take_cached_prompt_projection`]).
+    #[doc(hidden)]
+    pub fn projection_reuse_count(&self) -> u64 {
+        self.projection_reuse_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Push the live session/model snapshot backing the `ctx` facade.
     ///
     /// Returns whether the session-derived snapshot was rebuilt; `false` means

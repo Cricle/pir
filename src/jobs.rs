@@ -31,10 +31,15 @@ use serde::{Deserialize, Serialize};
 pub const MAX_LOG_BYTES: u64 = 256 * 1024 * 1024;
 /// Default lines returned by [`JobStore::read_log`].
 pub const MAX_LOG_LINES: usize = 4096;
-/// Default bytes returned by [`JobStore::read_log`].
-pub const DEFAULT_READ_BYTES: u64 = 256 * 1024;
 /// Terminal jobs older than this are removed by `jobs clean` by default.
 pub const DEFAULT_CLEAN_AGE_DAYS: u64 = 7;
+
+/// How long `kill` waits for the job tree to exit after SIGTERM before
+/// escalating to SIGKILL.
+#[cfg(unix)]
+const KILL_TERM_GRACE: Duration = Duration::from_secs(2);
+/// How long `kill` waits after SIGKILL before reporting failure.
+const KILL_FINAL_GRACE: Duration = Duration::from_secs(5);
 
 static JOB_SEQ: AtomicU64 = AtomicU64::new(0);
 static META_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -338,6 +343,18 @@ impl JobStore {
         let dir = self.job_dir(id).ok()?;
         let mut meta = read_meta(&dir)?;
         if meta.status.is_terminal() {
+            // A terminal record is only credible when the recorded child is
+            // gone. Older builds wrote `Killed` without checking the signal;
+            // never let such a record hide a live job (and `clean` must not
+            // remove its directory). Persist the correction so every reader
+            // sees the same state.
+            if recorded_process_is_alive(meta.pid, meta.child_start_token) {
+                meta.status = JobStatus::Running;
+                meta.ended_at_ms = None;
+                meta.exit_code = None;
+                meta.error = None;
+                let _ = write_meta(&dir, &meta);
+            }
             return Some(meta);
         }
         let supervisor_alive =
@@ -411,55 +428,53 @@ impl JobStore {
 
     /// Kill the supervisor and its child tree (explicit abort path). A job
     /// that already exited is a no-op.
+    ///
+    /// Success is only reported after the recorded processes are confirmed
+    /// gone. When the signal cannot be delivered (or the tree survives), the
+    /// record stays non-terminal and an error is returned, so `status` keeps
+    /// reporting the job as running and `clean` refuses to remove it.
     pub fn kill(&self, id: &str) -> Result<bool, String> {
         let dir = self.job_dir(id)?;
         let mut meta = read_meta(&dir).ok_or_else(|| format!("job not found: {id}"))?;
-        if meta.status.is_terminal() {
+        let child_alive = recorded_process_is_alive(meta.pid, meta.child_start_token);
+        if meta.status.is_terminal() && !child_alive {
             return Ok(false);
+        }
+        // A terminal record whose child is still alive is stale (older builds
+        // ignored the signal result). Downgrade it before doing any work so a
+        // concurrent `clean` cannot delete the directory from under us.
+        if meta.status.is_terminal() {
+            meta.status = JobStatus::Running;
+            meta.ended_at_ms = None;
+            meta.exit_code = None;
+            meta.error = None;
+            write_meta(&dir, &meta)?;
         }
         // Never signal a recycled pid: only accept a recorded pid whose start
         // token still matches (legacy token-less records keep the old probe).
-        let supervisor_pid = meta
-            .supervisor_pid
-            .filter(|pid| recorded_process_is_alive(Some(*pid), meta.supervisor_start_token));
-        let child_pid = meta
-            .pid
-            .filter(|pid| recorded_process_is_alive(Some(*pid), meta.child_start_token));
-        let Some(pid) = supervisor_pid.or(child_pid) else {
+        let supervisor_alive =
+            recorded_process_is_alive(meta.supervisor_pid, meta.supervisor_start_token);
+        if !supervisor_alive && !child_alive {
+            // Nothing left to signal; reconcile the record so `status` and
+            // `clean` agree that the job is gone.
+            let _ = self.status(id);
             return Ok(false);
-        };
-        #[cfg(windows)]
-        {
-            let status = std::process::Command::new("taskkill")
-                .args(["/T", "/F", "/PID", &pid.to_string()])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            let _ = status;
         }
-        #[cfg(unix)]
-        {
-            // The supervisor is a process-group leader (see `spawn`), so a
-            // negative pid reaches it and every child in the job tree.
-            let group = format!("-{pid}");
-            let _ = std::process::Command::new("kill")
-                .args(["-TERM", "--", &group])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+        terminate_job(&meta, supervisor_alive, child_alive)
+            .map_err(|error| format!("kill job {id}: {error}"))?;
+        // Do not overwrite a terminal record written while we were signalling
+        // (a surviving supervisor records the child's real exit status).
+        if read_meta(&dir).is_some_and(|latest| latest.status.is_terminal()) {
+            return Ok(true);
         }
-        // Do not overwrite a terminal record written while we were signalling.
-        if let Some(latest) = read_meta(&dir) {
-            if latest.status.is_terminal() {
-                return Ok(true);
-            }
+        let mut latest = read_meta(&dir).ok_or_else(|| format!("job not found: {id}"))?;
+        if latest.status.is_terminal() {
+            return Ok(true);
         }
-        meta.status = JobStatus::Killed;
-        meta.ended_at_ms = Some(now_ms());
-        meta.error = Some("killed by user".to_owned());
-        write_meta(&dir, &meta)?;
+        latest.status = JobStatus::Killed;
+        latest.ended_at_ms = Some(now_ms());
+        latest.error = Some("killed by user".to_owned());
+        write_meta(&dir, &latest)?;
         Ok(true)
     }
 
@@ -472,6 +487,13 @@ impl JobStore {
             return Err(format!(
                 "job {id} is still {}; wait for it before reaping",
                 meta.status.as_str()
+            ));
+        }
+        if recorded_process_is_alive(meta.pid, meta.child_start_token) {
+            // A stale `killed`/`exited` record with a live child must not be
+            // reaped as if the command had terminated.
+            return Err(format!(
+                "job {id} still has a live child process; wait for it before reaping"
             ));
         }
         let log = self.read_log(id, max_bytes, max_lines).unwrap_or_default();
@@ -508,6 +530,15 @@ impl JobStore {
             if !meta.status.is_terminal() {
                 continue;
             }
+            // A terminal record does not prove the command is gone: older
+            // builds wrote `Killed` without checking the signal. Never remove
+            // the directory while the recorded child can still run.
+            if recorded_process_is_alive(meta.pid, meta.child_start_token) {
+                report.errors.push(format!(
+                    "skipped {id}: the recorded child process is still alive"
+                ));
+                continue;
+            }
             let ended = meta.ended_at_ms.unwrap_or(meta.created_at_ms);
             let age_ms = now.saturating_sub(ended);
             if !all && age_ms < older_than.as_millis() as u64 {
@@ -521,6 +552,395 @@ impl JobStore {
             }
         }
         report
+    }
+}
+
+/// Signal the recorded job tree and wait for it to actually exit. Returns an
+/// error when the processes survive; the caller must then leave the record
+/// non-terminal.
+fn terminate_job(meta: &JobMeta, supervisor_alive: bool, child_alive: bool) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        terminate_job_unix(meta, supervisor_alive, child_alive)
+    }
+    #[cfg(windows)]
+    {
+        terminate_job_windows(meta, supervisor_alive, child_alive)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (meta, supervisor_alive, child_alive);
+        Err("job termination is not supported on this platform".to_owned())
+    }
+}
+
+#[cfg(unix)]
+fn terminate_job_unix(
+    meta: &JobMeta,
+    supervisor_alive: bool,
+    child_alive: bool,
+) -> Result<(), String> {
+    // Fail before touching any process when a forged/corrupt record carries a
+    // pid that cannot even be represented as a `pid_t`.
+    validate_recorded_pid(meta.supervisor_pid, "supervisor")?;
+    validate_recorded_pid(meta.pid, "child")?;
+    // The supervisor is a process-group leader (`spawn` uses
+    // `process_group(0)`), and its child inherits that PGID. Group ids carry
+    // no start token, so only send `-supervisor_pid` while the recorded
+    // supervisor is still alive with a matching token and still leads that
+    // exact group; after pid reuse the numeric id can name an unrelated
+    // group.
+    let group = meta.supervisor_pid;
+    // Only walk the child's tree when the child is still the process we
+    // recorded; a dead pid may already have been recycled with a new family.
+    let mut tracked = meta
+        .pid
+        .filter(|_| child_alive)
+        .map(descendant_pids)
+        .unwrap_or_default();
+
+    let mut group_signalled = false;
+    if let Some(pgid) = group.filter(|_| recorded_group_leader_is_alive(meta)) {
+        match signal_process_group(pgid, libc::SIGTERM) {
+            Ok(()) => group_signalled = true,
+            // The group is already gone (for example the child moved itself
+            // into a new session); fall back to the recorded pids below.
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) => return Err(format!("signal process group {pgid}: {error}")),
+        }
+    }
+    if !group_signalled {
+        let mut signalled = false;
+        if let Some(child) = meta.pid.filter(|_| child_alive) {
+            tracked.extend(signal_process_tree(child, libc::SIGTERM)?);
+            signalled = true;
+        }
+        if let Some(supervisor) = meta.supervisor_pid.filter(|_| supervisor_alive) {
+            signal_process(supervisor, libc::SIGTERM)
+                .map_err(|error| format!("signal supervisor {supervisor}: {error}"))?;
+            signalled = true;
+        }
+        if !signalled {
+            return Ok(());
+        }
+    }
+    if wait_for_processes_exit(meta, &tracked, KILL_TERM_GRACE) {
+        return Ok(());
+    }
+    // Graceful termination was not enough. Re-probe every recorded process
+    // right before the irreversible signal: one that died during the grace
+    // period may already have had its pid recycled, and signalling the new
+    // owner would kill an unrelated process.
+    if let Some(pgid) = group.filter(|_| recorded_group_leader_is_alive(meta)) {
+        match signal_process_group(pgid, libc::SIGKILL) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) => {
+                return Err(format!("signal process group {pgid} with SIGKILL: {error}"));
+            }
+        }
+    }
+    let mut recycled = None;
+    if let Some(child) = meta.pid {
+        if recorded_process_is_alive(Some(child), meta.child_start_token) {
+            tracked.extend(signal_process_tree(child, libc::SIGKILL)?);
+        } else if recorded_process_was_recycled(Some(child), meta.child_start_token) {
+            recycled = Some(format!(
+                "recorded child pid {child} was recycled; skipped SIGKILL"
+            ));
+        }
+    }
+    if let Some(supervisor) = meta.supervisor_pid {
+        if recorded_process_is_alive(Some(supervisor), meta.supervisor_start_token) {
+            // Direct fallback for records whose supervisor is not a group
+            // leader (or whose group identity could not be verified).
+            let _ = signal_process(supervisor, libc::SIGKILL);
+        } else if recycled.is_none()
+            && recorded_process_was_recycled(Some(supervisor), meta.supervisor_start_token)
+        {
+            recycled = Some(format!(
+                "recorded supervisor pid {supervisor} was recycled; skipped SIGKILL"
+            ));
+        }
+    }
+    if !wait_for_processes_exit(meta, &tracked, KILL_FINAL_GRACE) {
+        return Err("job processes are still alive after SIGKILL".to_owned());
+    }
+    if let Some(recycled) = recycled {
+        // Never report success for a record whose live pid now belongs to a
+        // different process: leave the job running so `status`/`clean` can
+        // reconcile it instead of writing a false `Killed`.
+        return Err(format!("{recycled}; refusing to report the job as killed"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_recorded_pid(pid: Option<u32>, role: &str) -> Result<(), String> {
+    if let Some(pid) = pid {
+        libc::pid_t::try_from(pid)
+            .map_err(|_| format!("invalid recorded {role} pid {pid}: out of range"))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_processes_exit(meta: &JobMeta, descendants: &[u32], timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let alive = recorded_process_is_alive(meta.supervisor_pid, meta.supervisor_start_token)
+            || recorded_process_is_alive(meta.pid, meta.child_start_token)
+            || descendants.iter().any(|pid| process_is_alive(*pid));
+        if !alive {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: i32) -> std::io::Result<()> {
+    if pid == 0 {
+        // `kill(0, ...)` would signal the caller's whole process group.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pid must be positive",
+        ));
+    }
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pid out of range"))?;
+    // SAFETY: `kill` takes plain integer ids and no pointers.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::kill(pid, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pgid: u32, signal: i32) -> std::io::Result<()> {
+    if pgid <= 1 {
+        // `kill(-0, ...)` is `kill(0, ...)`: the caller's own process group.
+        // `kill(-1, ...)` is even broader: every process the caller may
+        // signal. A real job supervisor is never pid 1.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process group id must be greater than 1",
+        ));
+    }
+    let pgid = libc::pid_t::try_from(pgid)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pgid out of range"))?;
+    // SAFETY: a negative id addresses the process group; no pointers.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::kill(-pgid, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// A recorded pid whose start token no longer matches is not this job's
+/// process anymore. The pid must never be signalled, even though it is live.
+#[cfg(unix)]
+fn recorded_process_was_recycled(pid: Option<u32>, token: Option<u64>) -> bool {
+    let (Some(pid), Some(expected)) = (pid, token) else {
+        return false;
+    };
+    process_is_alive(pid) && process_start_token(pid) != Some(expected)
+}
+
+/// Whether the recorded supervisor is still the live leader of the process
+/// group named by its pid. A group id carries no start token, so without this
+/// check `kill(-supervisor_pid)` can hit an unrelated group after pid reuse.
+#[cfg(unix)]
+fn recorded_group_leader_is_alive(meta: &JobMeta) -> bool {
+    let Some(pid) = meta.supervisor_pid else {
+        return false;
+    };
+    recorded_process_is_alive(Some(pid), meta.supervisor_start_token)
+        && process_group_id(pid) == Some(pid)
+}
+
+#[cfg(unix)]
+fn process_group_id(pid: u32) -> Option<u32> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    // SAFETY: `getpgid` takes a plain pid and returns its process group id.
+    #[allow(unsafe_code)]
+    let pgid = unsafe { libc::getpgid(pid) };
+    (pgid > 0).then_some(pgid as u32)
+}
+
+/// Signal `root` and every descendant found in the process table. Returns the
+/// descendants that were signalled so the caller can verify they exit.
+#[cfg(unix)]
+fn signal_process_tree(root: u32, signal: i32) -> Result<Vec<u32>, String> {
+    let descendants = descendant_pids(root);
+    match signal_process(root, signal) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+        Err(error) => return Err(format!("signal pid {root}: {error}")),
+    }
+    for pid in &descendants {
+        // A descendant may exit between the snapshot and the signal; ESRCH is
+        // not a failure for the best-effort part of the tree.
+        let _ = signal_process(*pid, signal);
+    }
+    Ok(descendants)
+}
+
+#[cfg(unix)]
+fn descendant_pids(root: u32) -> Vec<u32> {
+    let pairs = process_parent_pairs();
+    let mut descendants: Vec<u32> = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for (pid, ppid) in &pairs {
+            if *ppid == parent && *pid != root && !descendants.contains(pid) {
+                descendants.push(*pid);
+                frontier.push(*pid);
+            }
+        }
+    }
+    descendants
+}
+
+#[cfg(unix)]
+fn process_parent_pairs() -> Vec<(u32, u32)> {
+    #[cfg(target_os = "linux")]
+    {
+        let pairs = linux_process_parent_pairs();
+        if !pairs.is_empty() {
+            return pairs;
+        }
+    }
+    ps_process_parent_pairs()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_parent_pairs() -> Vec<(u32, u32)> {
+    let mut pairs = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return pairs;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // `comm` can contain spaces and parentheses; fields resume after the
+        // last ')'. State is field 3 and ppid field 4.
+        let Some(rest) = stat.rfind(')').and_then(|index| stat.get(index + 1..)) else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let _state = fields.next();
+        let Some(ppid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        pairs.push((pid, ppid));
+    }
+    pairs
+}
+
+#[cfg(unix)]
+fn ps_process_parent_pairs() -> Vec<(u32, u32)> {
+    let mut pairs = Vec::new();
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid="])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return pairs;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        if let (Some(pid), Some(ppid)) = (fields.next(), fields.next()) {
+            if let (Ok(pid), Ok(ppid)) = (pid.parse(), ppid.parse()) {
+                pairs.push((pid, ppid));
+            }
+        }
+    }
+    pairs
+}
+
+#[cfg(windows)]
+fn terminate_job_windows(
+    meta: &JobMeta,
+    supervisor_alive: bool,
+    child_alive: bool,
+) -> Result<(), String> {
+    let mut targets = Vec::new();
+    if let Some(pid) = meta.supervisor_pid.filter(|_| supervisor_alive) {
+        targets.push(pid);
+    }
+    if let Some(pid) = meta.pid.filter(|_| child_alive) {
+        if !targets.contains(&pid) {
+            targets.push(pid);
+        }
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let mut last_error = String::new();
+    for pid in targets {
+        let status = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|error| format!("run taskkill for pid {pid}: {error}"))?;
+        if status.success() {
+            last_error.clear();
+            break;
+        }
+        last_error = format!("taskkill /T /F /PID {pid} exited with {status}");
+        // taskkill reports failure for a process that already exited; accept
+        // that when the recorded tree is in fact gone.
+        if job_processes_gone(meta) {
+            return Ok(());
+        }
+    }
+    if wait_for_job_processes_exit(meta, KILL_FINAL_GRACE) {
+        return Ok(());
+    }
+    if last_error.is_empty() {
+        last_error = "job processes are still alive after taskkill".to_owned();
+    }
+    Err(last_error)
+}
+
+#[cfg(windows)]
+fn job_processes_gone(meta: &JobMeta) -> bool {
+    !recorded_process_is_alive(meta.supervisor_pid, meta.supervisor_start_token)
+        && !recorded_process_is_alive(meta.pid, meta.child_start_token)
+}
+
+#[cfg(windows)]
+fn wait_for_job_processes_exit(meta: &JobMeta, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if job_processes_gone(meta) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -622,6 +1042,12 @@ pub fn __test_process_start_token(pid: u32) -> Option<u64> {
     process_start_token(pid)
 }
 
+/// Test-only visibility hook: whether `pid` is a live, runnable process.
+#[doc(hidden)]
+pub fn __test_process_is_alive(pid: u32) -> bool {
+    process_is_alive(pid)
+}
+
 /// Test-only visibility hook: the conditional post-spawn supervisor update.
 #[doc(hidden)]
 pub fn __test_record_supervisor_start(
@@ -634,14 +1060,38 @@ pub fn __test_record_supervisor_start(
 
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
+    // A zombie still answers `kill(pid, 0)` but can never run again. Treating
+    // one as alive would make `status` and `kill` wait forever when a
+    // supervisor dies while its parent is gone (the process is reaped by
+    // init, not by us).
+    #[cfg(target_os = "linux")]
+    if linux_process_is_zombie(pid) {
+        return false;
+    }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        // A pid outside the OS range (for example a forged record) must not
+        // wrap to a negative id, where -1 would probe every process.
+        return false;
+    };
     // SAFETY: `kill(pid, 0)` performs only an existence/permission probe; it
     // sends no signal.
     #[allow(unsafe_code)]
-    let result = unsafe { libc::kill(pid as i32, 0) };
+    let result = unsafe { libc::kill(pid, 0) };
     if result == 0 {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(rest) = stat.rfind(')').and_then(|index| stat.get(index + 1..)) else {
+        return false;
+    };
+    matches!(rest.split_whitespace().next(), Some("Z" | "X" | "x"))
 }
 
 #[cfg(windows)]

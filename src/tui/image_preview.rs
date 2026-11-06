@@ -35,7 +35,19 @@
 //! halfblocks renderer achieves the visible goal (preview local image files
 //! in the transcript) with none of that integration cost.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Resolve `/image`'s path argument against the session working directory:
+/// absolute paths are returned unchanged, relative paths are joined to
+/// `cwd`. An empty `cwd` (unavailable at startup) leaves the path as-is so
+/// the read error keeps naming the user's argument.
+pub fn resolve_image_path(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() || cwd.as_os_str().is_empty() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
 
 /// Render `path` as at most `max_width` columns × `max_height` rows of
 /// half-block ANSI lines. Falls back to the upstream-style

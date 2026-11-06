@@ -293,8 +293,8 @@ pub use crate::extensions::{CommandOutcome, Notification};
 pub use crate::session_manager::{PagedWindow, SessionManager};
 // SDK-specific session-level surface (upstream `createAgentSession*`,
 // `AgentSessionRuntime`, `ResourceLoader`, package/model managers).
-pub use agent::{Agent, ModelRef, ToolInfo, UsageSnapshot};
-pub use builder::{AgentBuilder, ApiKind, Endpoint, SessionMode};
+pub use agent::{Agent, ModelRef, ToolInfo, UsageSnapshot, SDK_AGENT_TASK_STACK_BYTES};
+pub use builder::{AgentBuilder, ApiKind, Endpoint, SessionMode, SystemPromptFiles};
 pub use error::SdkError;
 pub use event::SdkEvent;
 pub use event_bus::{create_event_bus, EventBus, EventBusSubscription};

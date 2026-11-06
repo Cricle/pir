@@ -274,7 +274,7 @@ fn write_daemon_wrapper(dir: &Path) -> PathBuf {
     let exe = std::env::current_exe().expect("current exe");
     let wrapper = dir.join("mock-daemon.bat");
     let script = format!(
-        "@echo off\r\nset \"PIR_MOCK_PTY_TOKEN=%~3\"\r\nset \"PIR_MOCK_PTY_DIR={}\"\r\nset \"PIR_MOCK_PTY_DAEMON=1\"\r\n\"{}\" mock_pty_daemon_child --exact --nocapture\r\n",
+        "@echo off\r\nset \"PIR_MOCK_PTY_TOKEN=%~3\"\r\nset \"PIR_MOCK_PTY_DIR={}\"\r\nset \"PIR_MOCK_PTY_DAEMON=1\"\r\n\"{}\" mock_pty_daemon_child --nocapture\r\n",
         dir.display(),
         exe.display()
     );
@@ -288,7 +288,7 @@ fn write_daemon_wrapper(dir: &Path) -> PathBuf {
     let exe = std::env::current_exe().expect("current exe");
     let wrapper = dir.join("mock-daemon.sh");
     let script = format!(
-        "#!/bin/sh\nPIR_MOCK_PTY_TOKEN=\"$3\"\nPIR_MOCK_PTY_DIR=\"{}\"\nPIR_MOCK_PTY_DAEMON=1\nexport PIR_MOCK_PTY_TOKEN PIR_MOCK_PTY_DIR PIR_MOCK_PTY_DAEMON\nexec \"{}\" mock_pty_daemon_child --exact --nocapture\n",
+        "#!/bin/sh\nPIR_MOCK_PTY_TOKEN=\"$3\"\nPIR_MOCK_PTY_DIR=\"{}\"\nPIR_MOCK_PTY_DAEMON=1\nexport PIR_MOCK_PTY_TOKEN PIR_MOCK_PTY_DIR PIR_MOCK_PTY_DAEMON\nexec \"{}\" mock_pty_daemon_child --nocapture\n",
         dir.display(),
         exe.display()
     );
@@ -1115,4 +1115,43 @@ async fn idle_terminal_close_kills_the_background_process_group() {
     assert_eq!(second.exited().wait().await.expect("second exit code"), 0);
     wait_for_output(&second_output, b"alive").await;
     connection.close();
+}
+
+/// C2-05: closing the connection while a terminal is running must let the
+/// daemon's stdin-EOF path cancel the pty and kill its process group. A
+/// daemon SIGKILL would leave the `sleep` behind.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_the_connection_kills_a_running_terminal_process_group() {
+    let tree = Tree::new("pty-connection-close");
+    let connection = real_connection();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let callback = Arc::clone(&output);
+    let terminal = open_terminal(
+        connection.clone(),
+        TerminalOptions::new(tree.root(), 80, 24, move |bytes| {
+            callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+        })
+        .argv(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "sleep 1000 & echo pid:$!; wait".to_owned(),
+        ])
+        .inherit_env(true),
+    )
+    .await
+    .expect("open terminal");
+    wait_for_output(&output, b"pid:").await;
+    let pid = printed_pid(&output);
+
+    connection.close();
+    wait_for_process_gone(pid).await;
+    assert!(
+        terminal.exited().wait().await.is_err(),
+        "the pty request does not survive the closed connection"
+    );
+    terminal.close();
 }

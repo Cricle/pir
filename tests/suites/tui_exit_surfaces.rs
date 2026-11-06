@@ -23,12 +23,15 @@
 use std::time::{Duration, Instant};
 
 use pir::ai::types::StopReason;
+use pir::tui::app::{ChatEntry, NoticeKind};
 use pir::tui::editor::Editor;
 use pir::tui::terminal::{
-    ctrl_d_action, event_loop_poll_timeout, initial_interactive_thinking,
-    prompt_arms_working_label, settled_run_error_notice, worker_error_ends_run_state,
-    worker_level_failure_signals, CtrlDAction, WorkerFailureSignal, ACTIVE_POLL_TIMEOUT,
-    GIT_BRANCH_POLL_INTERVAL, IDLE_POLL_TIMEOUT, UI_WATCHDOG_CHECK_INTERVAL,
+    compaction_queued_entries, ctrl_d_action, event_loop_poll_timeout,
+    initial_interactive_thinking, prompt_arms_working_label, prompt_route,
+    settled_run_error_notice, worker_error_ends_run_state, worker_level_failure_signals,
+    CompactionLatch, CtrlDAction, PromptRoute, WorkerFailureSignal, ACTIVE_POLL_TIMEOUT,
+    COMPACTION_QUEUED_NOTICE, GIT_BRANCH_POLL_INTERVAL, IDLE_POLL_TIMEOUT,
+    UI_WATCHDOG_CHECK_INTERVAL,
 };
 use pir::tui::theme::{theme_watch_timeout, ThemeWatcherPlan};
 
@@ -342,4 +345,77 @@ fn interactive_session_starts_at_the_settings_thinking_level() {
         ThinkingLevel::Medium,
         "`off` is not a starting level (upstream filters it out)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// COMPACT-INPUT §5: submit during compaction queues instead of dropping
+// ---------------------------------------------------------------------------
+
+/// The UI-side mirror is flipped by the session event pair and read by the
+/// submit path: `CompactionStarted` raises it, `CompactionEnded` clears it.
+/// The cloned handle observes the same bit (one state, not a copy).
+#[test]
+fn compaction_latch_follows_the_started_ended_pair() {
+    let latch = CompactionLatch::default();
+    assert!(!latch.is_compacting(), "a fresh session is not compacting");
+
+    latch.set(true); // WorkerEvent::CompactionStarted
+    assert!(latch.is_compacting());
+    assert!(
+        latch.clone().is_compacting(),
+        "a clone must observe the shared latch, not a stale copy"
+    );
+
+    latch.set(false); // WorkerEvent::CompactionEnded
+    assert!(!latch.is_compacting());
+}
+
+/// A prompt submitted while a compaction owns the session must be queued
+/// behind it and surfaced as a Status notice (never silently dropped, never
+/// handed to the session's synchronous compaction rejection). Once the
+/// compaction ends the same submission runs normally; the streaming routes
+/// stay untouched.
+#[test]
+fn prompt_submitted_during_compaction_is_queued_with_a_status_notice() {
+    // Compaction with no run: both Enter and Alt+Enter queue behind it.
+    assert_eq!(
+        prompt_route(false, true, false),
+        PromptRoute::QueueDuringCompaction
+    );
+    assert_eq!(
+        prompt_route(false, true, true),
+        PromptRoute::QueueDuringCompaction
+    );
+    assert!(
+        COMPACTION_QUEUED_NOTICE.contains("queued")
+            && COMPACTION_QUEUED_NOTICE.contains("Compaction in progress"),
+        "the user must see that the input was accepted and is waiting"
+    );
+    let queued = compaction_queued_entries("queued prompt".to_string());
+    assert!(
+        matches!(
+            &queued[0],
+            ChatEntry::Notice {
+                kind: NoticeKind::Status,
+                text,
+            } if text == COMPACTION_QUEUED_NOTICE
+        ),
+        "the queued submission must render a Status notice first"
+    );
+    assert!(
+        matches!(&queued[1], ChatEntry::User(text) if text == "queued prompt"),
+        "the user bubble must still show the submitted text"
+    );
+    // The queued submission must not layer a `Working` label over the
+    // compaction label.
+    assert!(!prompt_arms_working_label(true, true));
+
+    // Streaming keeps its steer / follow-up routing (BASHMODE/TUI-INPUT).
+    assert_eq!(prompt_route(true, false, false), PromptRoute::Steer);
+    assert_eq!(prompt_route(true, false, true), PromptRoute::FollowUp);
+    // A threshold compaction inside a run must still steer that run.
+    assert_eq!(prompt_route(true, true, false), PromptRoute::Steer);
+
+    // After `CompactionEnded` the same Enter starts the queued run normally.
+    assert_eq!(prompt_route(false, false, false), PromptRoute::Submit);
 }

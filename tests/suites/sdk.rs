@@ -2540,6 +2540,14 @@ async fn session_switches_are_rejected_while_a_manual_compaction_is_in_flight() 
         !agent.is_streaming(),
         "a manual compaction is not a prompt run"
     );
+    assert!(
+        agent.is_compacting(),
+        "the SDK must expose the live compaction busy state"
+    );
+    assert!(
+        !agent.is_idle(),
+        "a compaction owns the transcript: is_idle must be false"
+    );
 
     for (label, error) in [
         ("new_session", agent.new_session().await.err()),

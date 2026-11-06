@@ -97,6 +97,37 @@ pub const UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// source; the typed error says so.
 pub const MAX_PENDING_UPDATES: usize = 1024;
 
+/// Maximum cumulative serialized bytes retained by the client's
+/// pending-update queue: each entry's `update` body PLUS the server-chosen
+/// `subscriptionId` string. The count bound alone still lets a peer fill 1024
+/// slots with near-frame-cap values (up to ~16 GiB at the default frame
+/// size); this budget bounds the queue's actual server-controlled payload
+/// bytes. Drop-oldest keeps the queue within the budget and records each drop
+/// exactly like the count bound.
+pub const MAX_PENDING_UPDATE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum length in bytes of a buffered `service_update` `subscriptionId`.
+///
+/// Client-issued ids are short (`sub-N`); an id longer than this cannot name
+/// a live subscription this client registered. A peer could otherwise put a
+/// near-16 MiB id on a 4-byte `null` update and park it in a queue slot, so
+/// oversized frames are dropped before enqueueing and counted in
+/// [`Client::pending_updates_dropped`] (same observable overflow counter as
+/// the count/byte bounds). 4 KiB keeps 1024 ids at most 4 MiB — a small
+/// slice of [`MAX_PENDING_UPDATE_BYTES`].
+pub const MAX_PENDING_UPDATE_SUBSCRIPTION_ID_BYTES: usize = 4 * 1024;
+
+/// Maximum number of distinct session keys [`SnapshotSequenceTracker`]
+/// retains. The keys are server-chosen `instance.key` strings; without a cap
+/// a peer could add one entry per fabricated `member:"snapshot"` update.
+/// New keys past this cap are ignored and counted.
+pub const MAX_TRACKED_SNAPSHOT_SESSIONS: usize = 4_096;
+
+/// Maximum length in bytes of a tracked session key. Longer keys cannot be
+/// legitimate session ids for this client; they are ignored and counted
+/// instead of being retained.
+pub const MAX_SNAPSHOT_SESSION_KEY_BYTES: usize = 256;
+
 /// Maximum number of unmatched `response` frames buffered by request id while
 /// the caller is consuming updates or waiting for another request. Responses
 /// for [`Client::start_call`] requests routinely arrive while
@@ -275,10 +306,19 @@ pub struct Subscription {
 /// The tracker is deliberately separate from the delta decoder: it only reads
 /// the piracy-visible `sequence`/`instance` fields and never materializes the
 /// session state.
+///
+/// Boundedness: the session key comes straight from the server-controlled
+/// `instance.key`. The tracker keeps at most
+/// [`MAX_TRACKED_SNAPSHOT_SESSIONS`] keys of at most
+/// [`MAX_SNAPSHOT_SESSION_KEY_BYTES`] bytes each; observations past either
+/// bound are ignored and counted in [`SnapshotSequenceTracker::dropped_observations`]
+/// instead of growing the maps. The gap set is a subset of the tracked keys,
+/// so it is bounded by the same cap.
 #[derive(Debug, Default)]
 pub struct SnapshotSequenceTracker {
     last: HashMap<String, i64>,
     gaps: HashSet<String>,
+    dropped: u64,
 }
 
 impl SnapshotSequenceTracker {
@@ -302,12 +342,52 @@ impl SnapshotSequenceTracker {
         self.gaps.remove(session_id);
     }
 
+    /// Number of distinct session keys currently tracked (test/profiling
+    /// probe: proves the cap keeps the tracker bounded).
+    #[doc(hidden)]
+    pub fn tracked_sessions(&self) -> usize {
+        self.last.len()
+    }
+
+    /// Observations ignored because the session key was over the length cap
+    /// or the tracker was at its entry cap (test/profiling probe).
+    #[doc(hidden)]
+    pub fn dropped_observations(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Drop all per-connection tracking state while keeping the lifetime drop
+    /// counter. Called when a transport is torn down: marks from the dead
+    /// connection are stale, and a reconnect's attach re-establishes them.
+    fn clear_sessions(&mut self) {
+        self.last.clear();
+        self.gaps.clear();
+    }
+
+    /// Whether `session_id` may be inserted/updated. Existing keys are always
+    /// accepted (updating them cannot grow the map); a new key is counted as
+    /// dropped when it is too long or the entry cap is reached.
+    fn accepts_new_key(&mut self, session_id: &str) -> bool {
+        if session_id.len() > MAX_SNAPSHOT_SESSION_KEY_BYTES {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        if !self.last.contains_key(session_id) && self.last.len() >= MAX_TRACKED_SNAPSHOT_SESSIONS {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        true
+    }
+
     /// Restart the high-water mark of `session_id` at `sequence` after a
     /// fresh full snapshot was applied (attach/resync). The snapshot is a
     /// replacement, so any gap recorded before it is repaired; a sequence
     /// LOWER than the previous high-water mark is a restarted stream (server
     /// restart or a re-created session id), not an old snapshot.
     pub fn reset_to(&mut self, session_id: &str, sequence: i64) {
+        if !self.accepts_new_key(session_id) {
+            return;
+        }
         self.last.insert(session_id.to_owned(), sequence);
         self.gaps.remove(session_id);
     }
@@ -338,6 +418,9 @@ impl SnapshotSequenceTracker {
         else {
             return false;
         };
+        if !self.accepts_new_key(session_id) {
+            return false;
+        }
         // Sequences are monotonic per session; observing the same update
         // twice must not reset the high-water mark.
         let skipped = match self.last.get(session_id) {
@@ -388,6 +471,53 @@ fn is_superseded_session_snapshot(update: &Value, session_id: &str, revision: i6
     session_snapshot_sequence(update, session_id).is_some_and(|sequence| sequence <= revision)
 }
 
+/// One buffered `service_update` plus its accounted size, so the queue's byte
+/// budget stays accurate across removals and attach-purges without
+/// re-serializing the value. `bytes` covers both server-controlled variable
+/// fields: the `update` body's serialized JSON and the `subscription_id`
+/// bytes (see [`pending_update_bytes`]).
+struct PendingUpdate {
+    subscription_id: String,
+    update: Value,
+    bytes: usize,
+}
+
+/// Counts bytes written by `serde_json::to_writer` without materializing the
+/// encoded document, so measuring a server-controlled update costs no
+/// allocation proportional to its size.
+#[derive(Default)]
+struct JsonByteCounter(usize);
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialized JSON size of `value`; `usize::MAX` when it cannot be measured
+/// (a `Value` always serializes, but an unmeasurable body must count as over
+/// budget instead of bypassing the bound).
+fn serialized_json_len(value: &Value) -> usize {
+    let mut counter = JsonByteCounter::default();
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => usize::MAX,
+    }
+}
+
+/// Accounted bytes of one [`PendingUpdate`]: the serialized update body plus
+/// the subscription id string. Both are peer-controlled, so both must count
+/// against [`MAX_PENDING_UPDATE_BYTES`] or a peer can park near-frame-cap
+/// ids in queue slots while the byte budget sees only a `null` body.
+fn pending_update_bytes(subscription_id: &str, update: &Value) -> usize {
+    serialized_json_len(update).saturating_add(subscription_id.len())
+}
+
 /// Retires one request id when the wait ends — response, error, timeout, or
 /// the caller dropping the [`Client::await_response`] future.
 struct PendingRequestGuard {
@@ -419,15 +549,25 @@ pub struct Client {
     connection_id: String,
     /// Attachment id leased by the server for the attached session route.
     attachment_id: Option<String>,
-    /// Service updates received while waiting for responses.
-    pending_updates: VecDeque<(String, Value)>,
+    /// Service updates received while waiting for responses. Bounded by
+    /// [`MAX_PENDING_UPDATES`] entries AND [`MAX_PENDING_UPDATE_BYTES`]
+    /// cumulative serialized body bytes (drop-oldest).
+    pending_updates: VecDeque<PendingUpdate>,
+    /// Sum of `PendingUpdate::bytes` for [`Self::pending_updates`].
+    pending_updates_bytes: usize,
+    /// Per-client override of [`MAX_PENDING_UPDATE_BYTES`] (test seam; the
+    /// production default is the constant).
+    max_pending_update_bytes: usize,
     /// Updates dropped by the [`MAX_PENDING_UPDATES`] bound per subscription
     /// id. Reported once through [`ClientError::UpdateBufferOverflow`] on the
     /// next [`Client::next_update`] for that subscription — the bound may not
     /// truncate a progress stream silently.
     pending_updates_lost: HashMap<String, u64>,
-    /// Updates dropped by the [`MAX_PENDING_UPDATES`] bound (observation: the
-    /// bound may not grow silently).
+    /// Updates dropped by the [`MAX_PENDING_UPDATES`] /
+    /// [`MAX_PENDING_UPDATE_BYTES`] bounds, or rejected because their
+    /// `subscriptionId` exceeded
+    /// [`MAX_PENDING_UPDATE_SUBSCRIPTION_ID_BYTES`] (observation: the bound
+    /// may not grow silently).
     pending_updates_dropped: u64,
     /// Complete `response` frames whose request ids were not being awaited
     /// when they arrived (issued with [`Client::start_call`], consumed while
@@ -590,6 +730,8 @@ impl Client {
             connection_id: Uuid::new_v4().to_string(),
             attachment_id: None,
             pending_updates: VecDeque::new(),
+            pending_updates_bytes: 0,
+            max_pending_update_bytes: MAX_PENDING_UPDATE_BYTES,
             pending_updates_lost: HashMap::new(),
             pending_updates_dropped: 0,
             pending_responses: HashMap::new(),
@@ -705,13 +847,41 @@ impl Client {
     }
 
     /// Test/profiling probe (`#[doc(hidden)]`): how many buffered
-    /// `service_update` frames the [`MAX_PENDING_UPDATES`] bound dropped. Zero
-    /// on any client whose consumer keeps up; nonzero proves the bound engaged
-    /// (and the loss was reported through
-    /// [`ClientError::UpdateBufferOverflow`] on the next `next_update`).
+    /// `service_update` frames the [`MAX_PENDING_UPDATES`] /
+    /// [`MAX_PENDING_UPDATE_BYTES`] bounds dropped, or that were rejected for
+    /// a `subscriptionId` longer than
+    /// [`MAX_PENDING_UPDATE_SUBSCRIPTION_ID_BYTES`]. Zero on any client whose
+    /// consumer keeps up; nonzero proves a bound engaged (count/byte drops are
+    /// reported through [`ClientError::UpdateBufferOverflow`] on the next
+    /// `next_update`).
     #[doc(hidden)]
     pub fn pending_updates_dropped(&self) -> u64 {
         self.pending_updates_dropped
+    }
+
+    /// Test/profiling probe (`#[doc(hidden)]`): number of `service_update`
+    /// bodies currently buffered.
+    #[doc(hidden)]
+    pub fn pending_updates_count(&self) -> usize {
+        self.pending_updates.len()
+    }
+
+    /// Test/profiling probe (`#[doc(hidden)]`): sum of the accounted bytes
+    /// (serialized update body plus `subscriptionId` length) currently
+    /// buffered (never above [`MAX_PENDING_UPDATE_BYTES`] unless a test
+    /// overrides the limit).
+    #[doc(hidden)]
+    pub fn pending_updates_bytes(&self) -> usize {
+        self.pending_updates_bytes
+    }
+
+    /// Test seam (`#[doc(hidden)]`): override the pending-update byte budget
+    /// so the byte-bound path can be exercised without pushing 64 MiB
+    /// through the socket.
+    #[doc(hidden)]
+    pub fn set_pending_updates_byte_limit(&mut self, bytes: usize) {
+        self.max_pending_update_bytes = bytes;
+        self.trim_pending_updates();
     }
 
     /// Test/profiling probe (`#[doc(hidden)]`): how many unmatched response
@@ -750,6 +920,22 @@ impl Client {
     /// Drain the sessions currently flagged as needing a resync.
     pub fn take_snapshot_sequence_gaps(&mut self) -> Vec<String> {
         self.snapshot_sequences.take_gaps()
+    }
+
+    /// Test/profiling probe (`#[doc(hidden)]`): distinct session keys the
+    /// snapshot sequence tracker currently retains (bounded by
+    /// [`MAX_TRACKED_SNAPSHOT_SESSIONS`]).
+    #[doc(hidden)]
+    pub fn snapshot_tracked_sessions(&self) -> usize {
+        self.snapshot_sequences.tracked_sessions()
+    }
+
+    /// Test/profiling probe (`#[doc(hidden)]`): snapshot observations ignored
+    /// by the tracker's key length / entry caps (never grows without a
+    /// matching diagnostic count).
+    #[doc(hidden)]
+    pub fn snapshot_tracker_dropped(&self) -> u64 {
+        self.snapshot_sequences.dropped_observations()
     }
 
     /// Fetch a fresh session **state** snapshot after a detected sequence
@@ -809,15 +995,19 @@ impl Client {
         match session.get("revision").and_then(Value::as_i64) {
             Some(revision) => {
                 let mut newest = revision;
-                self.pending_updates.retain(|(_, update)| {
-                    if is_superseded_session_snapshot(update, session_id, revision) {
+                self.pending_updates.retain(|pending| {
+                    if is_superseded_session_snapshot(&pending.update, session_id, revision) {
                         return false;
                     }
-                    if let Some(sequence) = session_snapshot_sequence(update, session_id) {
+                    if let Some(sequence) = session_snapshot_sequence(&pending.update, session_id) {
                         newest = newest.max(sequence);
                     }
                     true
                 });
+                self.pending_updates_bytes = self
+                    .pending_updates
+                    .iter()
+                    .fold(0usize, |total, pending| total.saturating_add(pending.bytes));
                 self.snapshot_sequences.reset_to(session_id, newest);
             }
             // A response without a revision still carries a full snapshot;
@@ -924,10 +1114,15 @@ impl Client {
         self.reader = None;
         self.writer = None;
         self.pending_updates.clear();
+        self.pending_updates_bytes = 0;
         self.pending_updates_lost.clear();
         self.pending_responses.clear();
         self.pending_response_lost.clear();
         self.pending_frames.clear();
+        // Snapshot marks refer to the dead connection's stream; a reconnect's
+        // attach installs fresh marks. Clearing also keeps a peer from
+        // accumulating per-connection keys across reconnects.
+        self.snapshot_sequences.clear_sessions();
         // Requests from the dead connection can never receive a response;
         // dropping them keeps `cancel` from sending a cancel frame for an id
         // the new connection never issued.
@@ -956,6 +1151,7 @@ impl Client {
         // re-attaches and leases a fresh one.
         self.attachment_id = None;
         self.pending_updates = fresh.pending_updates;
+        self.pending_updates_bytes = fresh.pending_updates_bytes;
         self.pending_updates_lost = fresh.pending_updates_lost;
         self.pending_responses = fresh.pending_responses;
         self.pending_response_lost = fresh.pending_response_lost;
@@ -1208,15 +1404,17 @@ impl Client {
         if let Some(position) = self
             .pending_updates
             .iter()
-            .position(|(id, _)| id == &subscription.subscription_id)
+            .position(|pending| pending.subscription_id == subscription.subscription_id)
         {
-            if let Some((_, update)) = self.pending_updates.remove(position) {
-                self.invalidate_on_closed(&update);
+            if let Some(pending) = self.pending_updates.remove(position) {
+                self.pending_updates_bytes =
+                    self.pending_updates_bytes.saturating_sub(pending.bytes);
+                self.invalidate_on_closed(&pending.update);
                 // The update was already observed when it was queued
                 // (`queue_push`); observing a replayed, OLDER snapshot again
                 // would move the high-water mark backwards and read as a
                 // restarted stream (clearing a real gap).
-                return Ok(update);
+                return Ok(pending.update);
             }
         }
         let update_timeout = self.timeouts.update;
@@ -1310,37 +1508,36 @@ impl Client {
                     .get("subscriptionId")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let update = value.get("update").cloned().unwrap_or(Value::Null);
-                self.snapshot_sequences.observe(&update);
-                self.pending_updates
-                    .push_back((frame_id.to_owned(), update));
-                while self.pending_updates.len() > MAX_PENDING_UPDATES {
-                    let Some((dropped_subscription, _)) = self.pending_updates.pop_front() else {
-                        break;
-                    };
-                    // Only registered subscriptions can ever be asked for via
-                    // `next_update`; dropping frames for an unknown id must not
-                    // grow the loss map unboundedly under an adversarial peer.
-                    if self
-                        .subscriptions
-                        .iter()
-                        .any(|sub| sub.subscription_id == dropped_subscription)
-                    {
-                        *self
-                            .pending_updates_lost
-                            .entry(dropped_subscription)
-                            .or_insert(0) += 1;
-                    }
+                // Reject before cloning the id or the body: an overlong id
+                // cannot name a subscription this client registered, and
+                // queueing it would let a peer park near-frame-cap ids in
+                // queue slots that the body-only budget cannot see.
+                if frame_id.len() > MAX_PENDING_UPDATE_SUBSCRIPTION_ID_BYTES {
                     self.pending_updates_dropped = self.pending_updates_dropped.saturating_add(1);
-                    let dropped = self.pending_updates_dropped;
-                    if dropped == 1 || dropped.is_multiple_of(PENDING_UPDATES_REPORT_EVERY) {
+                    let dropped_count = self.pending_updates_dropped;
+                    if dropped_count == 1
+                        || dropped_count.is_multiple_of(PENDING_UPDATES_REPORT_EVERY)
+                    {
                         crate::ext_diag!(
-                            "[client] subscription update buffer full ({} updates): dropped the oldest updates ({} so far); the next next_update reports UpdateBufferOverflow",
-                            MAX_PENDING_UPDATES,
-                            dropped
+                            "[client] service_update subscriptionId is {} bytes (limit {}): dropped the frame ({} so far)",
+                            frame_id.len(),
+                            MAX_PENDING_UPDATE_SUBSCRIPTION_ID_BYTES,
+                            dropped_count
                         );
                     }
+                    return;
                 }
+                let frame_id = frame_id.to_owned();
+                let update = value.get("update").cloned().unwrap_or(Value::Null);
+                let bytes = pending_update_bytes(&frame_id, &update);
+                self.snapshot_sequences.observe(&update);
+                self.pending_updates_bytes = self.pending_updates_bytes.saturating_add(bytes);
+                self.pending_updates.push_back(PendingUpdate {
+                    subscription_id: frame_id,
+                    update,
+                    bytes,
+                });
+                self.trim_pending_updates();
             }
             Some("attachment") => {
                 if let Some(id) = value
@@ -1386,6 +1583,45 @@ impl Client {
                 self.pending_responses.insert(id.to_owned(), value.clone());
             }
             _ => {}
+        }
+    }
+
+    /// Drop the oldest buffered service updates until both the entry bound
+    /// ([`MAX_PENDING_UPDATES`]) and the byte bound (`max_pending_update_bytes`,
+    /// [`MAX_PENDING_UPDATE_BYTES`] in production) hold. Each drop is recorded
+    /// per registered subscription so [`Client::next_update`] reports the gap
+    /// instead of silently truncating a progress stream.
+    fn trim_pending_updates(&mut self) {
+        while self.pending_updates.len() > MAX_PENDING_UPDATES
+            || self.pending_updates_bytes > self.max_pending_update_bytes
+        {
+            let Some(dropped) = self.pending_updates.pop_front() else {
+                break;
+            };
+            self.pending_updates_bytes = self.pending_updates_bytes.saturating_sub(dropped.bytes);
+            // Only registered subscriptions can ever be asked for via
+            // `next_update`; dropping frames for an unknown id must not grow
+            // the loss map unboundedly under an adversarial peer.
+            if self
+                .subscriptions
+                .iter()
+                .any(|sub| sub.subscription_id == dropped.subscription_id)
+            {
+                *self
+                    .pending_updates_lost
+                    .entry(dropped.subscription_id)
+                    .or_insert(0) += 1;
+            }
+            self.pending_updates_dropped = self.pending_updates_dropped.saturating_add(1);
+            let dropped_count = self.pending_updates_dropped;
+            if dropped_count == 1 || dropped_count.is_multiple_of(PENDING_UPDATES_REPORT_EVERY) {
+                crate::ext_diag!(
+                    "[client] subscription update buffer full ({} updates / {} bytes): dropped the oldest updates ({} so far); the next next_update reports UpdateBufferOverflow",
+                    MAX_PENDING_UPDATES,
+                    self.max_pending_update_bytes,
+                    dropped_count
+                );
+            }
         }
     }
 

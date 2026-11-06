@@ -12,11 +12,13 @@
 
 use std::borrow::Borrow;
 use std::ops::Range;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
 use super::types::{ContextEditEntry, FileEntry, StoredMessage, StoredSystemMessage};
+use super::SessionManager;
 use crate::ai::types::{ContentBlock, Message, TextContent, UserMessage, UserRole};
 
 /// One projected session entry (upstream `ProjectedSessionEntry`).
@@ -892,4 +894,238 @@ pub fn last_assistant_text_from_entries<E: Borrow<FileEntry>>(
         };
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// RSS-B: incremental prompt projection cache
+// ---------------------------------------------------------------------------
+
+/// A snapshot of the last successfully built prompt projection, keyed by the
+/// session head it describes.
+///
+/// The messages are moved in/out of the cache — never cloned on the steady
+/// path — so the next prompt only materializes the entries appended since
+/// [`Self::leaf_entry`]. `leaf_entry` is the exact `Arc` the projection ended
+/// on; comparing it with [`Arc::ptr_eq`] also rejects a reloaded/replaced
+/// session that happens to reuse ids.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CachedSessionProjection {
+    pub(crate) leaf_id: Option<String>,
+    pub(crate) leaf_entry: Option<Arc<FileEntry>>,
+    pub(crate) messages: Vec<Message>,
+}
+
+/// Build a projection by extending `cached` with the entries appended after
+/// its leaf. Returns `None` — the caller must fall back to
+/// [`build_session_projection`] — when the session did not grow by pure
+/// append:
+///
+/// - the cached leaf is no longer on the live leaf path (branch switch,
+///   rewrite, storage swap);
+/// - the appended range contains a `compaction` or `context_edit` (both change
+///   the meaning of already-projected messages);
+/// - the cached message count no longer matches the retained-entry count
+///   contract (defensive: any stale/foreign snapshot).
+///
+/// The walk below is metadata-only over the OLD entries; only the appended
+/// entries run [`push_context_entry_messages`]. That is the per-turn
+/// transcript-sized materialization H1 removed.
+pub(crate) fn extend_cached_session_projection(
+    entries: &[Arc<FileEntry>],
+    leaf_id: Option<&str>,
+    cached: CachedSessionProjection,
+) -> Option<SessionProjection> {
+    let CachedSessionProjection {
+        leaf_id: cached_leaf_id,
+        leaf_entry: cached_leaf_entry,
+        mut messages,
+    } = cached;
+
+    // One leaf-path walk feeds both the append delta and the retained range —
+    // the same selection a full build uses, without touching a single message.
+    let (path, context_entries, edits) = retained_context(entries, leaf_id);
+
+    let cached_path_index: Option<usize> = match (&cached_leaf_entry, &cached_leaf_id) {
+        (Some(leaf_entry), Some(_)) => Some(
+            path.iter()
+                .position(|entry| Arc::ptr_eq(leaf_entry, *entry))?,
+        ),
+        (None, None) => {
+            // The empty-session snapshot can only extend an empty message
+            // aggregate; everything below must then be an append contribution.
+            if !messages.is_empty() {
+                return None;
+            }
+            None
+        }
+        _ => return None,
+    };
+
+    let appended_path = match cached_path_index {
+        Some(index) => &path[index + 1..],
+        None => &path[..],
+    };
+    for source in appended_path {
+        let entry: &FileEntry = (*source).borrow();
+        if matches!(
+            entry,
+            FileEntry::Compaction(_) | FileEntry::ContextEdit(_) | FileEntry::Session(_)
+        ) {
+            return None;
+        }
+    }
+
+    // The cached leaf itself must still be a retained context entry (state
+    // entries are retained with an empty range; only filtered system entries
+    // inside a kept range disappear, and those can never be the cached leaf of
+    // a successful build).
+    let cached_context_index: Option<usize> = match (&cached_leaf_entry, cached_path_index) {
+        (Some(leaf_entry), Some(_)) => Some(
+            context_entries
+                .iter()
+                .position(|entry| Arc::ptr_eq(leaf_entry, *entry))?,
+        ),
+        (None, None) => None,
+        _ => return None,
+    };
+
+    // Message-count contract: the cached aggregate must be exactly what a full
+    // build would have produced for the retained prefix ending at the cached
+    // leaf. This catches a stale cache whose leaf entry is shared but whose
+    // path/settings changed around it.
+    if let Some(cached_index) = cached_context_index {
+        let mut prefix_count = 0usize;
+        for (index, source) in context_entries.iter().enumerate() {
+            if index > cached_index {
+                break;
+            }
+            let entry: &FileEntry = (*source).borrow();
+            if matches!(entry, FileEntry::Compaction(_)) && index > 0 {
+                continue;
+            }
+            prefix_count += projected_message_count(entry, context_edit_for(entry, edits.as_ref()));
+        }
+        if prefix_count != messages.len() {
+            return None;
+        }
+    }
+
+    let mut projected: Vec<ProjectedSessionEntry> = Vec::with_capacity(context_entries.len());
+    let mut cursor = 0usize;
+    for (index, source) in context_entries.iter().enumerate() {
+        let entry: &FileEntry = (*source).borrow();
+        let is_stale_compaction = matches!(entry, FileEntry::Compaction(_)) && index > 0;
+        let edit = context_edit_for(entry, edits.as_ref());
+        let is_appended = cached_context_index.map_or(true, |cached_index| index > cached_index);
+        let start = cursor;
+        if !is_stale_compaction {
+            if is_appended {
+                let before = messages.len();
+                push_context_entry_messages(entry, edit, &mut messages);
+                let expected = projected_message_count(entry, edit);
+                if messages.len() - before != expected {
+                    // The count contract is broken; never publish a projection
+                    // whose entry ranges disagree with its messages.
+                    return None;
+                }
+                cursor = messages.len();
+            } else {
+                cursor += projected_message_count(entry, edit);
+            }
+        }
+        projected.push(ProjectedSessionEntry {
+            source_entry: (*source).shared_entry(),
+            messages: start..cursor,
+        });
+    }
+    if cursor != messages.len() {
+        return None;
+    }
+
+    let (thinking_level, model) = get_session_context_settings(&path);
+    Some(SessionProjection {
+        entries: projected,
+        messages,
+        thinking_level,
+        model,
+    })
+}
+
+/// The number of model-visible messages a full projection of `leaf_id` would
+/// contain, computed without materializing any message. Used to validate a
+/// run's final context before it is parked in the incremental cache.
+pub(crate) fn projected_message_count_for_leaf(
+    entries: &[Arc<FileEntry>],
+    leaf_id: Option<&str>,
+) -> usize {
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id);
+    context_entries
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let entry: &FileEntry = (*source).borrow();
+            if matches!(entry, FileEntry::Compaction(_)) && index > 0 {
+                0
+            } else {
+                projected_message_count(entry, context_edit_for(entry, edits.as_ref()))
+            }
+        })
+        .sum()
+}
+
+/// Whether the leaf-path segment `(from_leaf, to_leaf]` contains only entries
+/// whose contribution can be appended to an existing projection. Compaction
+/// and context edits invalidate; state entries and plain messages/summaries
+/// are append-safe.
+pub(crate) fn path_delta_is_append_only(
+    entries: &[Arc<FileEntry>],
+    from_leaf: Option<&str>,
+    to_leaf: Option<&str>,
+) -> bool {
+    let path = build_session_path_entries(entries, to_leaf);
+    let start = match from_leaf {
+        None => 0,
+        Some(from) => match path.iter().position(|entry| {
+            let entry: &FileEntry = (**entry).borrow();
+            entry.id() == Some(from)
+        }) {
+            Some(index) => index + 1,
+            None => return false,
+        },
+    };
+    path[start..].iter().all(|source| {
+        let entry: &FileEntry = (*source).borrow();
+        !matches!(
+            entry,
+            FileEntry::Compaction(_) | FileEntry::ContextEdit(_) | FileEntry::Session(_)
+        )
+    })
+}
+
+impl SessionManager {
+    /// RSS-B projection entry point: reuse `cached` when the session grew by
+    /// pure append, else fall back to the full builder. Returns the projection
+    /// and whether it was served incrementally.
+    ///
+    /// `projection_build_count` deliberately counts FULL builds only; the
+    /// caller tracks reuses separately (`projection_reuse_count`).
+    pub(crate) fn build_session_projection_with_cache(
+        &self,
+        cached: Option<CachedSessionProjection>,
+    ) -> (SessionProjection, bool) {
+        if let Some(cached) = cached {
+            if let Some(projection) = extend_cached_session_projection(
+                &self.file_entries,
+                self.leaf_id.as_deref(),
+                cached,
+            ) {
+                return (projection, true);
+            }
+        }
+        self.projection_builds.fetch_add(1, Ordering::Relaxed);
+        (
+            build_session_projection(&self.file_entries, self.leaf_id.as_deref()),
+            false,
+        )
+    }
 }

@@ -84,7 +84,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pir::ai::types::{
@@ -4315,6 +4315,109 @@ z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
     assert_eq!(settled, 0, "the rebuilt rows must settle again");
 
     set_resolved_capabilities(previous);
+}
+
+// ---------------------------------------------------------------------------
+// Streaming block: per-delta frame work stays flat in the block length
+// ---------------------------------------------------------------------------
+
+/// A block component over one streaming Markdown body: the block revision
+/// moves with every delta, so `TuiCore::frame_lines` takes the block miss
+/// path each frame (the live transcript shape).
+struct StreamingMarkdownBlock {
+    markdown: Arc<Markdown>,
+    revision: Arc<AtomicU64>,
+}
+
+impl Component for StreamingMarkdownBlock {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.markdown.render(width)
+    }
+
+    fn render_into(&self, width: usize, out: &mut Rows<'_>) {
+        self.markdown.render_into(width, out);
+    }
+
+    fn content_blocks(&self) -> Option<Vec<u64>> {
+        Some(vec![self.revision.load(Ordering::Relaxed)])
+    }
+
+    fn render_block_into(&self, _index: usize, width: usize, out: &mut Rows<'_>) {
+        self.markdown.render_into(width, out);
+    }
+}
+
+/// A streaming block that has grown to hundreds of rows must not re-assemble
+/// its whole block per delta: only the newly final prefix rows and the
+/// mutable tail are compared/written (`rerendered_rows`), while the
+/// append-stable prefix is carried (`rows_carried`). Before the fix both the
+/// Markdown canvas pass and `append_cached` compared every row, so
+/// `rerendered_rows` grew linearly with the reply and `row_compare_bytes`
+/// with it.
+#[test]
+fn streaming_block_rerenders_only_the_mutable_tail_per_delta() {
+    let _guard = test_lock();
+    warm_theme();
+    use pir::tui::core::TerminalSink;
+    use pir::tui::stdin_buffer::WriteLog;
+
+    let terminal = Terminal::with_sink_factory(
+        || Box::new(std::io::sink()) as Box<dyn TerminalSink>,
+        WriteLog::disabled(),
+    );
+    terminal.set_size(100, 40);
+    let mut core = TuiCore::new(terminal);
+    let markdown = Arc::new(Markdown::new("", 0, 0));
+    let revision = Arc::new(AtomicU64::new(0));
+    core.push_content(Box::new(StreamingMarkdownBlock {
+        markdown: Arc::clone(&markdown),
+        revision: Arc::clone(&revision),
+    }));
+
+    // Build a long reply: one two-row block per delta (text line + blank).
+    for index in 0..160 {
+        markdown.set_text_growing_delta(&format!("line-{index:04} body text\n\n"));
+        revision.fetch_add(1, Ordering::Relaxed);
+        core.render();
+    }
+    let block_rows = core.frame_buffer_length() as u64;
+    assert!(
+        block_rows >= 300,
+        "fixture must grow a long streaming block: {block_rows} rows"
+    );
+
+    let mut max_rerendered = 0u64;
+    let mut max_compare = 0u64;
+    let mut max_carried = 0u64;
+    for index in 160..260 {
+        markdown.set_text_growing_delta(&format!("line-{index:04} body text\n\n"));
+        revision.fetch_add(1, Ordering::Relaxed);
+        core.render();
+        let work = core.last_frame_work();
+        let rows = core.last_frame_rows_work();
+        assert_eq!(
+            work.rebuilt_blocks, 1,
+            "only the streaming block misses the cache: {work:?}"
+        );
+        max_rerendered = max_rerendered.max(work.rerendered_rows);
+        max_compare = max_compare.max(rows.row_compare_bytes);
+        max_carried = max_carried.max(rows.rows_carried);
+    }
+    assert!(
+        max_rerendered <= 3,
+        "a delta may only rebuild its few new final rows, not the {block_rows}-row block: \
+         max rerendered {max_rerendered}"
+    );
+    assert!(
+        max_compare <= 4096,
+        "the per-delta row compare must stay tail-sized, not block-sized: \
+         max {max_compare} bytes over a {block_rows}-row block"
+    );
+    assert!(
+        max_carried >= block_rows.saturating_sub(4),
+        "the append-stable prefix must be carried by reference: \
+         max carried {max_carried} of {block_rows} rows"
+    );
 }
 
 // ---------------------------------------------------------------------------

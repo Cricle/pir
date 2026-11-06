@@ -366,6 +366,7 @@ fn failing_tool_call_handler_is_fail_closed() {
         "tool_call",
         "builtin:x",
         PluginEventOutcome::Error {
+            timed_out: false,
             error: "boom".into(),
         },
     );

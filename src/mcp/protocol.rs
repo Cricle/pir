@@ -65,7 +65,7 @@ pub struct PromptsCapability {
 }
 
 /// Tool annotations (upstream `ToolAnnotations`).
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ToolAnnotations {
     pub title: Option<String>,
@@ -76,7 +76,7 @@ pub struct ToolAnnotations {
 }
 
 /// One tool from `tools/list` (upstream `Tool`).
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct McpTool {
     pub name: String,
@@ -93,7 +93,7 @@ pub struct McpTool {
 }
 
 /// `tools/list` result.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ListToolsResult {
     #[serde(default)]

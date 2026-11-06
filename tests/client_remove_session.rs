@@ -16,14 +16,15 @@
 
 use pir::client::{Client, ClientError, ConnectionState};
 use pir::protocol::{Command, SESSION_SERVICE_ID};
-use pir::server::Server;
+use pir::server::{Server, ServerSecurityConfig};
 
 /// Bind a test server and serve it in the background (the run loop accepts
 /// unlimited connections, so several clients can share one server).
 async fn spawn_server() -> std::net::SocketAddr {
-    let server = Server::bind("127.0.0.1:0")
-        .await
-        .expect("bind remove-session test server");
+    let server =
+        Server::bind_with_security("127.0.0.1:0", ServerSecurityConfig::unauthenticated_local())
+            .await
+            .expect("bind remove-session test server");
     let address = server.local_addr().expect("local address");
     tokio::spawn(async move { server.run().await });
     address

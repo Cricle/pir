@@ -130,6 +130,7 @@ fn preprocess_args_keeps_clap_defined_long_flags() {
     for flag in [
         "--print",
         "--unix",
+        "--allow-unauthenticated",
         "--local",
         "--all",
         "--extensions",

@@ -79,9 +79,10 @@ pub use runtime::{ExtensionRuntime, RejectionLog};
 #[cfg(feature = "extensions")]
 pub use transpile::transpile;
 pub use types::{
-    CommandDef, CommandOutcome, ContentItem, EmitOutcome, EventError, ExtensionConfig, FlagDef,
-    FlagValue, HookStreamItem, LoadResult, Notification, RendererCallOutcome, RendererOutcome,
-    SessionContextSnapshot, ShortcutDef, SourceInfo, StreamHookBridge, StreamResponseHook,
-    ToolAnnotationsDef, ToolDef, ToolNamespaceDef, ToolReachDef, ToolRenderShell, ToolResult,
-    UserBashOutcome, DEFAULT_CALL_TIMEOUT, HOOK_CALL_TIMEOUT,
+    CommandDef, CommandOutcome, ContentItem, EmitOutcome, EventDispatchTimeout, EventError,
+    ExtensionConfig, FlagDef, FlagValue, HookStreamItem, LoadResult, Notification,
+    RendererCallOutcome, RendererOutcome, SessionContextSnapshot, ShortcutDef, SourceInfo,
+    StreamHookBridge, StreamResponseHook, ToolAnnotationsDef, ToolDef, ToolNamespaceDef,
+    ToolReachDef, ToolRenderShell, ToolResult, UserBashOutcome, DEFAULT_CALL_TIMEOUT,
+    HOOK_CALL_TIMEOUT,
 };

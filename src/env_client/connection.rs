@@ -18,8 +18,8 @@
 //! once and are matched by id, as upstream.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
@@ -55,6 +55,97 @@ const OUTBOX_WARN_DEPTH: usize = 4096;
 const OUTBOX_REPORT_EVERY: u64 = 1024;
 /// How long starting the daemon and its `hello` may take.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a graceful shutdown may take before the client forces the daemon
+/// down.
+///
+/// Graceful here means the documented protocol's only shutdown signal: the
+/// daemon's stdin reaches EOF. `env_daemon::daemon::serve` then cancels the
+/// registered controls, runs `kill_all` over the exec/pty process groups and
+/// exits. Killing the daemon first (the old `kill` teardown) skipped that:
+/// each exec/pty child is its own session (`setsid`), so it survived the
+/// daemon's death. The bound is generous for that cleanup (signals are sent
+/// synchronously) while still making a wedged or hostile daemon recoverable.
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the forced path waits for the daemon to be reaped after SIGKILL
+/// (or `taskkill /F /T` on Windows) before giving up. The child is already
+/// dead after this phase's signal; this only bounds the reaper-thread wait.
+const FORCED_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Exit-watcher poll interval. The watcher is an OS thread (not a runtime
+/// task), so it can observe the daemon's exit even while a caller's `Drop` is
+/// blocking a runtime worker; polling keeps it independent of tokio's child
+/// reaper and of the async runtime being shut down.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// `#[doc(hidden)]` live task/session counters, shared by every task spawned
+/// for one [`Connection`] and readable after the connection itself is gone.
+///
+/// The regression C2-05 is a lifetime leak: a task that keeps `Arc<Inner>`
+/// alive also keeps the daemon and its SSH session alive. Tests capture this
+/// handle, drop the connection, and assert every count returns to zero.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct TaskCounters {
+    tasks: AtomicUsize,
+    live_sessions: AtomicUsize,
+}
+
+impl TaskCounters {
+    /// Tasks/threads currently running for the connection (reader, logger,
+    /// writer, exit watcher, shutdown reaper).
+    pub fn tasks(&self) -> usize {
+        self.tasks.load(Ordering::SeqCst)
+    }
+
+    /// Sessions that have started and whose daemon child has not been reaped.
+    pub fn live_sessions(&self) -> usize {
+        self.live_sessions.load(Ordering::SeqCst)
+    }
+
+    fn session_started(&self) {
+        self.live_sessions.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn session_exited(&self) {
+        // Saturating: a session can only be marked exited once, but keep this
+        // robust against a test/user constructing odd states.
+        let _ = self
+            .live_sessions
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            });
+    }
+}
+
+/// A snapshot of one connection's live resources (`#[doc(hidden)]` test seam).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DebugCounts {
+    pub tasks: usize,
+    pub live_sessions: usize,
+    pub pending_requests: usize,
+}
+
+/// RAII task-count guard: increments when a task starts, decrements when it
+/// returns — including on panic.
+struct TaskGuard {
+    counters: Arc<TaskCounters>,
+}
+
+impl TaskGuard {
+    fn new(counters: Arc<TaskCounters>) -> TaskGuard {
+        counters.tasks.fetch_add(1, Ordering::SeqCst);
+        TaskGuard { counters }
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.counters.tasks.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Diagnostic text (the daemon's stderr, shell noise before the sync line).
 pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
@@ -538,10 +629,21 @@ struct Session {
     pending: Mutex<HashMap<u32, Pending>>,
     /// The `hello` reply, cached per session as upstream caches it per start.
     info: tokio::sync::OnceCell<RemoteInfo>,
-    /// Wakes the task that owns the `Child` to kill it.
-    kill: Mutex<Option<oneshot::Sender<()>>>,
+    /// Set once the daemon child has been reaped. The shutdown reaper waits
+    /// on this before escalating to a forced kill.
+    exited: AtomicBool,
+    /// Guards [`Session::exited`] + [`Session::exit_cv`] wakeups (a plain
+    /// atomic check could miss the notification between check and wait).
+    exit_lock: Mutex<()>,
+    exit_cv: Condvar,
+    /// Set by [`Session::request_kill`]: the exit-watcher thread calls
+    /// `start_kill` on its next poll. A flag (not a channel) so a `Drop` from
+    /// any thread — including one with no tokio runtime — can raise it.
+    kill_requested: AtomicBool,
     /// Stops the writer/ping task.
     stop: Mutex<Option<oneshot::Sender<()>>>,
+    /// Task/live-session accounting (`#[doc(hidden)]` test seam).
+    counters: Arc<TaskCounters>,
 }
 
 impl Session {
@@ -560,6 +662,109 @@ impl Session {
     fn is_live(&self) -> bool {
         self.live.load(Ordering::SeqCst)
     }
+
+    /// Queue one frame for the session's writer task. This is synchronous (the
+    /// caller's order is the wire order); the frame is dropped when the session
+    /// is gone, exactly as upstream's `_write` drops writes on a dead session.
+    fn write(&self, frame: Frame) {
+        if !self.is_live() {
+            return;
+        }
+        let depth = {
+            let mut outbox = lock(&self.outbox);
+            outbox.push_back(frame);
+            outbox.len()
+        };
+        // Observation (see `Session::outbox`): a writer stalled behind a full
+        // pipe is reported rather than parked (parking a caller's task) or
+        // silently dropped (breaking the request the frame carries).
+        if depth >= OUTBOX_WARN_DEPTH {
+            let crossings = self.outbox_warned.fetch_add(1, Ordering::Relaxed) + 1;
+            if crossings == 1 || crossings.is_multiple_of(OUTBOX_REPORT_EVERY) {
+                crate::ext_diag!(
+                    "[env-client] outbox at {depth} frames (daemon not draining; {} crossings)",
+                    crossings
+                );
+            }
+        }
+        self.wake.notify_one();
+    }
+
+    /// Cancel one registered request (`{ mode: "kill" }` is sent by
+    /// [`Connection::kill`] instead).
+    fn cancel(&self, id: u32) {
+        if self.is_registered(id) {
+            self.write(Frame::new(CANCEL, id, Value::Object(Default::default())));
+        }
+    }
+
+    fn is_registered(&self, id: u32) -> bool {
+        lock(&self.pending).contains_key(&id)
+    }
+
+    fn dispatch(&self, frame: Frame) {
+        if frame.kind == EVENT {
+            let handler = lock(&self.pending)
+                .get(&frame.id)
+                .and_then(|pending| pending.on_event.clone());
+            if let Some(handler) = handler {
+                handler(&frame.json, &frame.payload);
+            }
+            return;
+        }
+        if frame.kind != RESULT && frame.kind != ERROR {
+            return;
+        }
+        let pending = lock(&self.pending).remove(&frame.id);
+        let Some(pending) = pending else {
+            return;
+        };
+        if frame.kind == RESULT {
+            let _ = pending.reply.send(Ok(Reply {
+                json: frame.json,
+                payload: frame.payload,
+                session: self.id,
+                request_id: frame.id,
+            }));
+        } else {
+            let _ = pending.reply.send(Err(RemoteError::from_json(&frame.json)));
+        }
+    }
+
+    /// Mark the daemon child reaped (idempotent) and wake the shutdown reaper.
+    fn mark_exited(&self) {
+        let _guard = lock(&self.exit_lock);
+        if !self.exited.swap(true, Ordering::SeqCst) {
+            self.counters.session_exited();
+        }
+        self.exit_cv.notify_all();
+    }
+
+    /// Wait at most `timeout` for the daemon child to be reaped.
+    fn wait_exited(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut guard = lock(&self.exit_lock);
+        loop {
+            if self.exited.load(Ordering::SeqCst) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, _) = self
+                .exit_cv
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner);
+            guard = next;
+        }
+    }
+
+    /// Ask the exit watcher to send the forced kill; the watcher also reaps
+    /// the child.
+    fn request_kill(&self) {
+        self.kill_requested.store(true, Ordering::SeqCst);
+    }
 }
 
 struct Inner {
@@ -570,6 +775,24 @@ struct Inner {
     next_id: AtomicU32,
     sessions: AtomicU32,
     closed: AtomicBool,
+    counters: Arc<TaskCounters>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The last external `Connection` (and every task that held one) is
+        // gone. There is no caller left to invoke `close()`, so this is the
+        // connection's Drop path: mark closed, take the published session and
+        // start the same graceful shutdown `close()` uses. A reaper thread
+        // waits out `GRACEFUL_SHUTDOWN_TIMEOUT` and only then sets the forced
+        // kill flag, so the daemon gets its chance to run `kill_all` and reap
+        // the exec/pty process groups.
+        self.closed.store(true, Ordering::SeqCst);
+        let session = lock(&self.session).take();
+        if let Some(session) = session {
+            teardown_session(None, &session, &RemoteError::closed());
+        }
+    }
 }
 
 /// Tears one starting session down when the [`Connection::start`] future is
@@ -613,6 +836,7 @@ impl Connection {
                 next_id: AtomicU32::new(1),
                 sessions: AtomicU32::new(0),
                 closed: AtomicBool::new(false),
+                counters: Arc::new(TaskCounters::default()),
             }),
         }
     }
@@ -631,6 +855,26 @@ impl Connection {
 
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// `#[doc(hidden)]` test seam: a handle that stays readable after this
+    /// connection (and its `Inner`) is dropped.
+    #[doc(hidden)]
+    pub fn debug_counters(&self) -> Arc<TaskCounters> {
+        self.inner.counters.clone()
+    }
+
+    /// `#[doc(hidden)]` test seam: live task/session/pending counts right now.
+    #[doc(hidden)]
+    pub fn debug_counts(&self) -> DebugCounts {
+        let session = lock(&self.inner.session).clone();
+        DebugCounts {
+            tasks: self.inner.counters.tasks(),
+            live_sessions: self.inner.counters.live_sessions(),
+            pending_requests: session
+                .map(|session| lock(&session.pending).len())
+                .unwrap_or(0),
+        }
     }
 
     /// Whether the daemon runs on this machine (see [`ConnectionOptions::local`]).
@@ -694,6 +938,14 @@ impl Connection {
 
     /// Stop the daemon; it kills everything it started. Requests in flight fail
     /// with `Connection closed`.
+    ///
+    /// The shutdown order is deliberate: stdin is closed first (the writer
+    /// stops and drops it), which is the protocol's graceful shutdown — the
+    /// daemon's `serve` loop ends, cancels its controls and runs `kill_all`
+    /// over the exec/pty process groups. Only if the daemon has not exited
+    /// within [`GRACEFUL_SHUTDOWN_TIMEOUT`] is a forced kill requested. This
+    /// method waits for that bounded sequence, so a returned `close()` means
+    /// the daemon was either reaped or force-killed.
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
         // Read the session out with the guard released BEFORE `teardown` runs:
@@ -703,6 +955,10 @@ impl Connection {
         let session = lock(&self.inner.session).clone();
         if let Some(session) = session {
             self.teardown(&session, &RemoteError::closed());
+            if !session.wait_exited(GRACEFUL_SHUTDOWN_TIMEOUT) {
+                session.request_kill();
+                let _ = session.wait_exited(FORCED_KILL_TIMEOUT);
+            }
         }
     }
 
@@ -713,10 +969,11 @@ impl Connection {
             .clone()
             .filter(|current| current.id == session && current.is_live());
         if let Some(current) = current {
-            self.write(
-                &current,
-                Frame::new(CANCEL, id, serde_json::json!({ "mode": "kill" })),
-            );
+            current.write(Frame::new(
+                CANCEL,
+                id,
+                serde_json::json!({ "mode": "kill" }),
+            ));
         }
     }
 
@@ -781,9 +1038,14 @@ impl Connection {
             wake: tokio::sync::Notify::new(),
             pending: Mutex::new(HashMap::new()),
             info: tokio::sync::OnceCell::new(),
-            kill: Mutex::new(None),
+            exited: AtomicBool::new(false),
+            exit_lock: Mutex::new(()),
+            exit_cv: Condvar::new(),
+            kill_requested: AtomicBool::new(false),
             stop: Mutex::new(None),
+            counters: self.inner.counters.clone(),
         });
+        self.inner.counters.session_started();
         session.touch();
         // Start the session's tasks BEFORE publishing it: each installs the
         // stop/kill sender a teardown needs, so a `close()` — or a daemon that
@@ -881,9 +1143,16 @@ impl Connection {
 
     /// The task that turns the daemon's stdout into frames.
     fn spawn_reader(&self, mut stdout: tokio::process::ChildStdout, session: &Arc<Session>) {
-        let connection = self.clone();
+        // Weak, not `Connection`: a long-lived reader must never be the reason
+        // `Inner` (and with it the daemon/SSH session) stays alive after the
+        // caller drops every handle. `Inner::drop` performs the teardown; a
+        // failed upgrade means that path is already running.
+        let inner = Arc::downgrade(&self.inner);
+        let on_log = self.inner.options.on_log.clone();
         let session = session.clone();
+        let counters = self.inner.counters.clone();
         tokio::spawn(async move {
+            let _task = TaskGuard::new(counters);
             // The documented framing and sync rules live in `StreamParser`,
             // which the protocol-vector tests drive directly.
             let mut parser = StreamParser::new(session.token.clone());
@@ -894,7 +1163,11 @@ impl Connection {
                 let read = stdout.read(&mut chunk).await.unwrap_or_default();
                 if read == 0 {
                     // The daemon's end of the pipe closed: the connection is gone.
-                    connection.teardown(&session, &RemoteError::lost("pi-env connection lost"));
+                    teardown_via(
+                        &inner,
+                        &session,
+                        &RemoteError::lost("pi-env connection lost"),
+                    );
                     return;
                 }
                 if !session.is_live() {
@@ -902,14 +1175,14 @@ impl Connection {
                 }
                 session.touch();
                 let mut log = |noise: &str| {
-                    if let Some(on_log) = &connection.inner.options.on_log {
+                    if let Some(on_log) = &on_log {
                         on_log(noise);
                     }
                 };
                 let frames = match parser.feed(&chunk[..read], &mut log) {
                     Ok(frames) => frames,
                     Err(message) => {
-                        connection.teardown(&session, &RemoteError::lost(message));
+                        teardown_via(&inner, &session, &RemoteError::lost(message));
                         return;
                     }
                 };
@@ -919,11 +1192,14 @@ impl Connection {
                     // daemon's own error reply, which is not a case the client
                     // can act on).
                     if !parsed.json.is_object() {
-                        connection
-                            .teardown(&session, &RemoteError::lost("Corrupt frame from pi-env"));
+                        teardown_via(
+                            &inner,
+                            &session,
+                            &RemoteError::lost("Corrupt frame from pi-env"),
+                        );
                         return;
                     }
-                    connection.dispatch(&session, parsed);
+                    session.dispatch(parsed);
                     if !session.is_live() {
                         return;
                     }
@@ -935,7 +1211,9 @@ impl Connection {
     fn spawn_logger(&self, mut stderr: tokio::process::ChildStderr, session: &Arc<Session>) {
         let on_log = self.inner.options.on_log.clone();
         let session = session.clone();
+        let counters = self.inner.counters.clone();
         tokio::spawn(async move {
+            let _task = TaskGuard::new(counters);
             let mut chunk = vec![0u8; 16 * 1024];
             loop {
                 match stderr.read(&mut chunk).await {
@@ -958,11 +1236,13 @@ impl Connection {
     /// in), and sends a `ping` every 5 s while enforcing the 30 s silence
     /// limit. Returns when the session is torn down, dropping stdin with it.
     fn spawn_writer(&self, stdin: Option<ChildStdin>, session: &Arc<Session>) {
-        let connection = self.clone();
+        let inner = Arc::downgrade(&self.inner);
         let session = session.clone();
+        let counters = self.inner.counters.clone();
         let (stop_sender, mut stop_receiver) = oneshot::channel();
         *lock(&session.stop) = Some(stop_sender);
         tokio::spawn(async move {
+            let _task = TaskGuard::new(counters);
             let mut stdin = stdin;
             let mut next_ping = tokio::time::Instant::now() + session.ping_interval;
             loop {
@@ -981,14 +1261,14 @@ impl Connection {
                 let now = tokio::time::Instant::now();
                 if now >= next_ping {
                     if Duration::from_millis(session.silent_ms()) > session.silence_limit {
-                        connection
-                            .teardown(&session, &RemoteError::lost("pi-env connection timed out"));
+                        teardown_via(
+                            &inner,
+                            &session,
+                            &RemoteError::lost("pi-env connection timed out"),
+                        );
                         return;
                     }
-                    connection.write(
-                        &session,
-                        Frame::new(PING, 0, Value::Object(Default::default())),
-                    );
+                    session.write(Frame::new(PING, 0, Value::Object(Default::default())));
                     next_ping = now + session.ping_interval;
                 }
                 // A `notified` future created before the queue check cannot
@@ -1007,7 +1287,11 @@ impl Connection {
                     // The child has no stdin pipe, so no frame (not even the
                     // handshake) can ever reach it: every pending request would
                     // wait forever. Fail the session like a lost connection.
-                    connection.teardown(&session, &RemoteError::lost("pi-env connection lost"));
+                    teardown_via(
+                        &inner,
+                        &session,
+                        &RemoteError::lost("pi-env connection lost"),
+                    );
                     return;
                 };
                 let mut bytes: Vec<u8> = Vec::with_capacity(64 + frame.payload.len());
@@ -1017,7 +1301,8 @@ impl Connection {
                     // would strand every later request behind a frame that
                     // never reaches the wire. Tear the session down; the
                     // request's pending slot fails with `lost`.
-                    connection.teardown(
+                    teardown_via(
+                        &inner,
                         &session,
                         &RemoteError::lost("pi-env request exceeds the frame limit"),
                     );
@@ -1032,19 +1317,28 @@ impl Connection {
                 while written < bytes.len() {
                     match tokio::time::timeout(WRITE_TIMEOUT, pipe.write(&bytes[written..])).await {
                         Ok(Ok(0)) => {
-                            connection
-                                .teardown(&session, &RemoteError::lost("pi-env connection lost"));
+                            teardown_via(
+                                &inner,
+                                &session,
+                                &RemoteError::lost("pi-env connection lost"),
+                            );
                             return;
                         }
                         Ok(Ok(count)) => written += count,
                         Ok(Err(_)) => {
-                            connection
-                                .teardown(&session, &RemoteError::lost("pi-env connection lost"));
+                            teardown_via(
+                                &inner,
+                                &session,
+                                &RemoteError::lost("pi-env connection lost"),
+                            );
                             return;
                         }
                         Err(_) => {
-                            connection
-                                .teardown(&session, &RemoteError::lost("pi-env write timed out"));
+                            teardown_via(
+                                &inner,
+                                &session,
+                                &RemoteError::lost("pi-env write timed out"),
+                            );
                             return;
                         }
                     }
@@ -1052,11 +1346,19 @@ impl Connection {
                 match tokio::time::timeout(WRITE_TIMEOUT, pipe.flush()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(_)) => {
-                        connection.teardown(&session, &RemoteError::lost("pi-env connection lost"));
+                        teardown_via(
+                            &inner,
+                            &session,
+                            &RemoteError::lost("pi-env connection lost"),
+                        );
                         return;
                     }
                     Err(_) => {
-                        connection.teardown(&session, &RemoteError::lost("pi-env write timed out"));
+                        teardown_via(
+                            &inner,
+                            &session,
+                            &RemoteError::lost("pi-env write timed out"),
+                        );
                         return;
                     }
                 }
@@ -1064,34 +1366,67 @@ impl Connection {
         });
     }
 
-    /// The task that owns the `Child`: it reports the exit, or kills the child
-    /// when the session is torn down first.
+    /// The thread that owns the `Child`: it reports the exit and reaps it, or
+    /// kills the child when the session was torn down first.
+    ///
+    /// An OS thread rather than a tokio task: `Child` must be reaped even if
+    /// the last `Connection` is dropped while a caller blocks a runtime worker
+    /// in `Drop`, and the shutdown reaper needs `exited` to be set no matter
+    /// which runtime (if any) is still alive.
     fn spawn_exit_watcher(&self, mut child: Child, session: &Arc<Session>) {
-        let connection = self.clone();
+        let inner = Arc::downgrade(&self.inner);
         let session = session.clone();
-        let (kill_sender, mut kill_receiver) = oneshot::channel();
-        *lock(&session.kill) = Some(kill_sender);
-        tokio::spawn(async move {
-            tokio::select! {
-                status = child.wait() => {
-                    let code = status.ok().and_then(|status| status.code());
-                    let message = if session.ready.load(Ordering::SeqCst) {
-                        "pi-env connection lost".to_string()
-                    } else {
-                        format!(
-                            "pi-env exited with code {} before it was ready",
-                            code.map(|code| code.to_string())
-                                .unwrap_or_else(|| "unknown".to_string())
-                        )
-                    };
-                    connection.teardown(&session, &RemoteError::lost(message));
+        let thread_session = session.clone();
+        let counters = self.inner.counters.clone();
+        let spawned = std::thread::Builder::new()
+            .name("pir-env-exit".to_string())
+            .spawn(move || {
+                let _task = TaskGuard::new(counters);
+                let mut kill_sent = false;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_status)) => {
+                            thread_session.mark_exited();
+                            let message = if thread_session.ready.load(Ordering::SeqCst) {
+                                "pi-env connection lost".to_string()
+                            } else {
+                                format!(
+                                    "pi-env exited with code {} before it was ready",
+                                    _status
+                                        .code()
+                                        .map(|code| code.to_string())
+                                        .unwrap_or_else(|| "unknown".to_string())
+                                )
+                            };
+                            teardown_via(&inner, &thread_session, &RemoteError::lost(message));
+                            return;
+                        }
+                        Ok(None) => {
+                            if thread_session.kill_requested.load(Ordering::SeqCst) && !kill_sent {
+                                kill_sent = true;
+                                let _ = child.start_kill();
+                            }
+                            std::thread::sleep(EXIT_POLL_INTERVAL);
+                        }
+                        Err(_) => {
+                            thread_session.mark_exited();
+                            teardown_via(
+                                &inner,
+                                &thread_session,
+                                &RemoteError::lost("pi-env connection lost"),
+                            );
+                            return;
+                        }
+                    }
                 }
-                _ = &mut kill_receiver => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                }
-            }
-        });
+            });
+        if spawned.is_err() {
+            // No watcher means no way to observe (or later force) the child.
+            // `kill_on_drop(true)` still terminates it when the failed spawn
+            // drops the closure's `Child`; account the session as gone.
+            session.mark_exited();
+            session.request_kill();
+        }
     }
 
     /// Register a request id and send its frame; the reply arrives on the
@@ -1134,28 +1469,27 @@ impl Connection {
             fields.insert("value".to_string(), request);
             request = Value::Object(fields);
         }
-        self.write(
-            session,
-            Frame::with_payload(REQUEST, id, request, options.payload),
-        );
+        session.write(Frame::with_payload(REQUEST, id, request, options.payload));
         // Cancel-on-abort (upstream `_send`'s `onAbort` listener): the signal
         // may already be aborted when the request is written.
         let signal = options.signal.clone();
         let already_aborted = signal.as_ref().is_some_and(AbortSignal::is_aborted);
         let abort_guard = signal.map(|signal| {
-            let connection = self.clone();
+            // Weak: an abort listener can live as long as the caller's signal,
+            // and it must not pin the connection (or its daemon) alive.
+            let inner = Arc::downgrade(&self.inner);
             let session = session.clone();
             let (done_sender, done_receiver) = oneshot::channel::<()>();
             tokio::spawn(async move {
                 tokio::select! {
-                    _ = signal.cancelled() => connection.cancel(&session, id),
+                    _ = signal.cancelled() => cancel_via(&inner, &session, id),
                     _ = done_receiver => {}
                 }
             });
             done_sender
         });
         if already_aborted {
-            self.cancel(session, id);
+            session.cancel(id);
         }
         let reply = receiver
             .await
@@ -1166,104 +1500,88 @@ impl Connection {
         reply
     }
 
-    fn is_registered(&self, session: &Arc<Session>, id: u32) -> bool {
-        lock(&session.pending).contains_key(&id)
-    }
-
-    /// Cancel one registered request (`{ mode: "kill" }` is sent by
-    /// [`Connection::kill`] instead).
-    fn cancel(&self, session: &Arc<Session>, id: u32) {
-        if self.is_registered(session, id) {
-            self.write(
-                session,
-                Frame::new(CANCEL, id, Value::Object(Default::default())),
-            );
-        }
-    }
-
-    /// Queue one frame for the session's writer task. This is synchronous (the
-    /// caller's order is the wire order); the frame is dropped when the session
-    /// is gone, exactly as upstream's `_write` drops writes on a dead session.
-    fn write(&self, session: &Arc<Session>, frame: Frame) {
-        if !session.is_live() {
-            return;
-        }
-        let depth = {
-            let mut outbox = lock(&session.outbox);
-            outbox.push_back(frame);
-            outbox.len()
-        };
-        // Observation (see `Session::outbox`): a writer stalled behind a full
-        // pipe is reported rather than parked (parking a caller's task) or
-        // silently dropped (breaking the request the frame carries).
-        if depth >= OUTBOX_WARN_DEPTH {
-            let crossings = session.outbox_warned.fetch_add(1, Ordering::Relaxed) + 1;
-            if crossings == 1 || crossings.is_multiple_of(OUTBOX_REPORT_EVERY) {
-                crate::ext_diag!(
-                    "[env-client] outbox at {depth} frames (daemon not draining; {} crossings)",
-                    crossings
-                );
-            }
-        }
-        session.wake.notify_one();
-    }
-
-    fn dispatch(&self, session: &Arc<Session>, frame: Frame) {
-        if frame.kind == EVENT {
-            let handler = lock(&session.pending)
-                .get(&frame.id)
-                .and_then(|pending| pending.on_event.clone());
-            if let Some(handler) = handler {
-                handler(&frame.json, &frame.payload);
-            }
-            return;
-        }
-        if frame.kind != RESULT && frame.kind != ERROR {
-            return;
-        }
-        let pending = lock(&session.pending).remove(&frame.id);
-        let Some(pending) = pending else {
-            return;
-        };
-        if frame.kind == RESULT {
-            let _ = pending.reply.send(Ok(Reply {
-                json: frame.json,
-                payload: frame.payload,
-                session: session.id,
-                request_id: frame.id,
-            }));
-        } else {
-            let _ = pending.reply.send(Err(RemoteError::from_json(&frame.json)));
-        }
-    }
-
-    /// Tear one session down: stop its tasks, kill its daemon, and fail every
-    /// request still in flight. Idempotent.
+    /// Tear one session down: stop its tasks, shut its daemon down gracefully,
+    /// and fail every request still in flight. Idempotent.
     fn teardown(&self, session: &Arc<Session>, error: &RemoteError) {
-        let was_live = session.live.swap(false, Ordering::SeqCst);
-        // Clear the published slot even when the session was already dead: a
-        // start publishes only after its tasks run, so the exit watcher may
-        // have torn the session down between the handshake and that publish —
-        // a dead Arc must not stay readable as the connection's session.
-        let current = lock(&self.inner.session).clone();
-        if current.is_some_and(|current| Arc::ptr_eq(&current, session)) {
-            *lock(&self.inner.session) = None;
+        teardown_session(Some(&self.inner), session, error);
+    }
+}
+
+/// Initiate one session's teardown.
+///
+/// The forced kill is deliberately *not* sent here: the writer is stopped so
+/// its `ChildStdin` drops, which is the daemon protocol's shutdown signal. The
+/// reaper thread waits [`GRACEFUL_SHUTDOWN_TIMEOUT`] for the child to be
+/// reaped by the exit watcher, and only then sets the kill flag — giving the
+/// daemon time to cancel controls and run `kill_all` over the exec/pty process
+/// groups. Idempotent: only the first caller (`live` false→true) acts.
+fn teardown_session(inner: Option<&Inner>, session: &Arc<Session>, error: &RemoteError) {
+    let was_live = session.live.swap(false, Ordering::SeqCst);
+    // Clear the published slot even when the session was already dead: a
+    // start publishes only after its tasks run, so the exit watcher may
+    // have torn the session down between the handshake and that publish —
+    // a dead Arc must not stay readable as the connection's session.
+    if let Some(inner) = inner {
+        let current = lock(&inner.session).clone();
+        if current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            *lock(&inner.session) = None;
         }
-        if !was_live {
-            return;
-        }
-        if let Some(kill) = lock(&session.kill).take() {
-            let _ = kill.send(());
-        }
-        // Stop the writer; it drops the daemon's stdin, and the daemon
-        // exits on the end of its input if it has not already.
-        if let Some(stop) = lock(&session.stop).take() {
-            let _ = stop.send(());
-        }
-        let pending = std::mem::take(&mut *lock(&session.pending));
-        for (_, pending) in pending {
-            let _ = pending.reply.send(Err(error.clone()));
-        }
+    }
+    if !was_live {
+        return;
+    }
+    // Fail every in-flight request before waiting: callers observe closure
+    // immediately, not after the daemon's graceful shutdown.
+    let pending = std::mem::take(&mut *lock(&session.pending));
+    for (_, pending) in pending {
+        let _ = pending.reply.send(Err(error.clone()));
+    }
+    // Graceful shutdown: stop the writer; it drops the daemon's stdin, and
+    // `serve` ends on EOF, cancelling controls and killing its process groups.
+    if let Some(stop) = lock(&session.stop).take() {
+        let _ = stop.send(());
+    }
+    spawn_shutdown_reaper(session.clone());
+}
+
+/// Teardown from a task that only holds a `Weak<Inner>`: if the connection is
+/// already being dropped (`Inner::drop`), that path owns the teardown.
+fn teardown_via(inner: &Weak<Inner>, session: &Arc<Session>, error: &RemoteError) {
+    match inner.upgrade() {
+        Some(inner) => teardown_session(Some(&inner), session, error),
+        None => teardown_session(None, session, error),
+    }
+}
+
+/// Cancel one request from a task holding a `Weak<Inner>` (abort listener).
+fn cancel_via(inner: &Weak<Inner>, session: &Arc<Session>, id: u32) {
+    // `cancel` only needs the session: the request table and outbox live
+    // there. Nothing to do once the session died.
+    let _ = inner;
+    session.cancel(id);
+}
+
+/// Wait for the daemon child to be reaped after its stdin closed; force-kill
+/// it if the graceful shutdown did not finish within
+/// [`GRACEFUL_SHUTDOWN_TIMEOUT`].
+fn spawn_shutdown_reaper(session: Arc<Session>) {
+    let counters = session.counters.clone();
+    let thread_session = session.clone();
+    let spawned = std::thread::Builder::new()
+        .name("pir-env-shutdown".to_string())
+        .spawn(move || {
+            let _task = TaskGuard::new(counters);
+            if !thread_session.wait_exited(GRACEFUL_SHUTDOWN_TIMEOUT) {
+                thread_session.request_kill();
+                let _ = thread_session.wait_exited(FORCED_KILL_TIMEOUT);
+            }
+        });
+    if spawned.is_err() {
+        // Without a reaper the daemon must not be left running: force it now.
+        session.request_kill();
     }
 }
 

@@ -71,8 +71,47 @@ pub const CLIENT_NAME: &str = "pir";
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Upper bound on `tools/list` pagination before giving up (upstream
-/// `MAX_LIST_PAGES`).
+/// `MAX_LIST_PAGES`). The primary bound is [`MAX_LIST_ALL_TOOLS_BYTES`]; the
+/// page cap remains as a hard stop for a server that returns tiny pages
+/// forever.
 const MAX_LIST_PAGES: usize = 1_000;
+
+/// Maximum cumulative serialized bytes of `tools/list` pages
+/// [`McpClient::list_all_tools`] may retain (tool definitions plus pagination
+/// cursors). A page that would cross the budget fails the whole listing with
+/// [`McpError::Protocol`] instead of extending the result: a paginated
+/// server must not be able to make the client retain an unbounded number of
+/// tool schemas/descriptions. The transport's per-message cap bounds a single
+/// page; this bounds their sum.
+pub const MAX_LIST_ALL_TOOLS_BYTES: usize = 64 * 1024 * 1024;
+
+/// Counts bytes written by `serde_json::to_writer` without materializing the
+/// encoded document, so measuring a page costs no allocation proportional to
+/// its size.
+#[derive(Default)]
+struct JsonByteCounter(usize);
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialized JSON size of `value`. `usize::MAX` on failure (serializing the
+/// client's own protocol types cannot fail, but an unmeasurable page must be
+/// treated as over budget rather than admitted).
+fn serialized_json_len<T: serde::Serialize>(value: &T) -> usize {
+    let mut counter = JsonByteCounter::default();
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => usize::MAX,
+    }
+}
 
 /// How long a read-only request waits before its single transient retry
 /// (upstream `CONNECT_RETRY_DELAYS_MS[0]`, applied by runtime.ts's
@@ -1549,8 +1588,8 @@ impl McpClient {
     }
 
     /// Every tool page, following `nextCursor` (upstream `listAll`): errors
-    /// past the page cap and on a repeated cursor instead of silently
-    /// truncating.
+    /// past the page cap, past [`MAX_LIST_ALL_TOOLS_BYTES`], and on a repeated
+    /// cursor instead of silently truncating.
     pub async fn list_all_tools(&self) -> Result<Vec<McpTool>, McpError> {
         self.list_all_tools_with_options(&McpRequestOptions::default())
             .await
@@ -1561,13 +1600,56 @@ impl McpClient {
         &self,
         options: &McpRequestOptions,
     ) -> Result<Vec<McpTool>, McpError> {
+        self.list_all_tools_with_options_and_byte_cap(options, MAX_LIST_ALL_TOOLS_BYTES)
+            .await
+    }
+
+    /// Test seam: [`McpClient::list_all_tools`] with an explicit aggregate
+    /// result byte budget, so the byte-cap rejection can be exercised without
+    /// materializing a 64 MiB listing.
+    #[doc(hidden)]
+    pub async fn list_all_tools_with_byte_cap_for_test(
+        &self,
+        byte_cap: usize,
+    ) -> Result<Vec<McpTool>, McpError> {
+        self.list_all_tools_with_options_and_byte_cap(&McpRequestOptions::default(), byte_cap)
+            .await
+    }
+
+    async fn list_all_tools_with_options_and_byte_cap(
+        &self,
+        options: &McpRequestOptions,
+        byte_cap: usize,
+    ) -> Result<Vec<McpTool>, McpError> {
         let mut tools = Vec::new();
+        let mut total_bytes = 0usize;
         let mut cursor: Option<String> = None;
         let mut seen_cursors: HashSet<String> = HashSet::new();
-        for _ in 0..MAX_LIST_PAGES {
+        for page_index in 0..MAX_LIST_PAGES {
             let page = self
                 .list_tools_with_options(cursor.as_deref(), options)
                 .await?;
+            // Measure the whole page (tools AND the server-chosen cursor):
+            // a server can otherwise grow the result with cursors alone.
+            // Serialization overhead makes this a conservative accounting of
+            // the strings/schemas the client retains.
+            let page_bytes = serialized_json_len(&page);
+            let cap_label = crate::mcp::transport::frame_cap_label(byte_cap);
+            if page_bytes > byte_cap {
+                return Err(McpError::Protocol(format!(
+                    "tools/list page {} is {page_bytes} bytes, exceeding the {byte_cap}-byte ({cap_label}) per-page result cap; the listing was aborted after {} tools",
+                    page_index + 1,
+                    tools.len()
+                )));
+            }
+            if total_bytes.saturating_add(page_bytes) > byte_cap {
+                return Err(McpError::Protocol(format!(
+                    "tools/list exceeded the {byte_cap}-byte ({cap_label}) cumulative result cap on page {} after {} tool(s); the listing was aborted instead of retaining more pages",
+                    page_index + 1,
+                    tools.len()
+                )));
+            }
+            total_bytes = total_bytes.saturating_add(page_bytes);
             tools.extend(page.tools);
             match page.next_cursor.filter(|next| !next.is_empty()) {
                 Some(next) => {

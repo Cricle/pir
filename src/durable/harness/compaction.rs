@@ -1644,15 +1644,7 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
 /// Upstream slices at a UTF-16 length; this counts Unicode scalar values.
 #[must_use]
 pub fn truncate(text: &str, max_chars: usize) -> String {
-    let length = text.chars().count();
-    if length <= max_chars {
-        return text.to_owned();
-    }
-    let head: String = text.chars().take(max_chars).collect();
-    format!(
-        "{head}\n\n[... {} more characters truncated]",
-        length - max_chars
-    )
+    crate::text::truncate_chars_with_marker(text, max_chars)
 }
 
 /// The summary of a clean `stop` with text and no tool call; anything else is

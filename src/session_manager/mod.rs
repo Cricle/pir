@@ -193,8 +193,9 @@ impl SessionTailPage {
 }
 pub use retention::{
     format_prune_report, plan_session_prune, prune_session_dir, prune_sessions_root,
-    scan_session_files, session_sidecar_paths, PlannedPrune, PrunePlan, PruneReason, PruneReport,
-    SessionFileInfo, SessionRetentionPolicy,
+    resolve_all_prune_root, scan_session_files, scan_session_files_with_ignored,
+    session_sidecar_paths, PlannedPrune, PrunePlan, PruneReason, PruneReport, SessionFileInfo,
+    SessionRetentionPolicy,
 };
 pub use types::{
     assert_valid_session_id, iso_from_ms, ms_from_iso, new_entry_id, new_session_id,
@@ -2070,6 +2071,127 @@ fn path_file_identity(path: &Path, path_metadata: &std::fs::Metadata) -> Option<
     }
 }
 
+/// Cross-process writer-presence lock for one session transcript.
+///
+/// The lock is the deletion guard for retention: a live `.<name>.lock` tells
+/// `prune_session_dir` that another process may still append. It is a
+/// best-effort advisory lock (no `flock`): `create_new` makes acquisition
+/// atomic, the file carries pid/token/timestamp/host/process-start, `Drop`
+/// removes it only when the token still matches, and only a lock whose pid is
+/// provably dead (and whose mtime is older than
+/// [`retention::SESSION_LOCK_STALE_AFTER`]) may be reclaimed after a crash.
+#[derive(Debug)]
+struct SessionWriterLock {
+    path: PathBuf,
+    token: String,
+}
+
+impl SessionWriterLock {
+    fn acquire(session_file: &Path) -> Option<Self> {
+        Self::acquire_at(retention::session_lock_path(session_file)?)
+    }
+
+    /// Acquire the lock at `lock_path`. `create_new` makes acquisition
+    /// atomic; a live lock yields `None`, a stale one is reclaimed and
+    /// retried.
+    fn acquire_at(lock_path: PathBuf) -> Option<Self> {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        let token = format!("{}-{}", std::process::id(), now_ms());
+        let host = retention::current_host_id();
+        let start_token = retention::process_start_token(std::process::id());
+        // A stale lock from a crashed process is reclaimed; a live one
+        // belongs to a live writer and this manager proceeds without it
+        // (opening a session must stay possible; the lock is a prune guard,
+        // not a mutual-exclusion gate for readers).
+        for _ in 0..3 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    let mut content = format!(
+                        "pid={}\ntoken={token}\nstarted={}",
+                        std::process::id(),
+                        now_ms()
+                    );
+                    if let Some(host) = &host {
+                        content.push_str(&format!("\nhost={host}"));
+                    }
+                    if let Some(start_token) = start_token {
+                        content.push_str(&format!("\nstart={start_token}"));
+                    }
+                    content.push('\n');
+                    let _ = file.write_all(content.as_bytes());
+                    return Some(Self {
+                        path: lock_path,
+                        token,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    match retention::session_lock_snapshot(&lock_path).state {
+                        retention::SessionLockState::Live => return None,
+                        retention::SessionLockState::Missing => continue,
+                        retention::SessionLockState::Stale => {
+                            if !retention::reclaim_stale_session_lock(&lock_path) {
+                                // Another reclaimer won or the lock changed:
+                                // the next loop iteration re-inspects it.
+                                continue;
+                            }
+                        }
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// Whether the lock file still exists with this owner's token.
+    fn still_owned(&self) -> bool {
+        std::fs::read_to_string(&self.path)
+            .is_ok_and(|content| content.contains(&format!("token={}", self.token)))
+    }
+
+    /// Refresh the lock mtime after a successful append/rewrite. The pid probe
+    /// is the primary liveness signal; touching the lock keeps its age young
+    /// as a second layer and keeps diagnostics honest. Best-effort: a failed
+    /// touch must not fail the transcript write.
+    fn touch(&self) {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+        else {
+            return;
+        };
+        // Read and touch through the same handle: a lock replaced between the
+        // two operations must not have its mtime refreshed by this owner.
+        let mut content = String::new();
+        if std::io::Read::read_to_string(&mut &file, &mut content).is_err()
+            || !content.contains(&format!("token={}", self.token))
+        {
+            return;
+        }
+        let _ = file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()));
+    }
+}
+
+impl Drop for SessionWriterLock {
+    fn drop(&mut self) {
+        // Never delete a lock a different process has since acquired (stale
+        // cleanup + recreate race): only the owner's token may remove it.
+        if let Ok(content) = std::fs::read_to_string(&self.path) {
+            if content.contains(&format!("token={}", self.token)) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
 /// Manages one conversation session as an append-only entry tree stored in a
 /// JSONL file (the pir facade over upstream `SessionManager` semantics).
 #[derive(Debug)]
@@ -2080,6 +2202,13 @@ pub struct SessionManager {
     session_dir: PathBuf,
     cwd: String,
     persist: bool,
+    /// Advisory `.<name>.lock` held while this manager may append; removed on
+    /// `Drop`. `None` when not persisting or when another process holds it.
+    writer_lock: Option<SessionWriterLock>,
+    /// Exclusive claim on an explicit session id (`--session-id`) held from
+    /// [`SessionManager::create_with_id`] until the first transcript write
+    /// materializes the file. Released on `Drop`/branch/new-session too.
+    create_lock: Option<SessionWriterLock>,
     /// Whether the file exists and future appends go through the fast path.
     flushed: bool,
     /// Reused append handle for `session_file` (opened lazily once the file
@@ -2287,6 +2416,8 @@ impl SessionManager {
             session_dir: session_dir.to_path_buf(),
             cwd: resolve_path_str(cwd),
             persist: false,
+            writer_lock: None,
+            create_lock: None,
             flushed: false,
             append_file: None,
             append_len: 0,
@@ -2328,6 +2459,8 @@ impl SessionManager {
             cwd,
             persist,
             flushed: false,
+            writer_lock: None,
+            create_lock: None,
             append_file: None,
             append_len: 0,
             append_identity: None,
@@ -2359,6 +2492,75 @@ impl SessionManager {
         Ok(manager)
     }
 
+    /// Re-acquire the writer-presence lock for the current `session_file`.
+    /// Releases any previous lock first; best-effort (a fresh foreign lock is
+    /// honored, not overwritten).
+    ///
+    /// A planned-but-not-yet-materialized session has no transcript for
+    /// retention to protect, so no lock is created for it here: the first
+    /// write ([`Self::persist_entry`]) or rewrite ([`Self::rewrite_file`])
+    /// calls [`Self::ensure_writer_lock`] before creating the file. A manager
+    /// that only planned a path (the extension host's `SessionManager.create`)
+    /// therefore does not leave a live `.<name>.jsonl.lock` next to a session
+    /// another process materialized from the same planned path.
+    fn refresh_writer_lock(&mut self) {
+        self.writer_lock = None;
+        if !self.persist {
+            return;
+        }
+        if let Some(path) = self.session_file.clone() {
+            if path.exists() {
+                self.writer_lock = SessionWriterLock::acquire(&path);
+            }
+        }
+    }
+
+    fn ensure_writer_lock(&mut self) {
+        if !self.persist {
+            return;
+        }
+        if let Some(lock) = &self.writer_lock {
+            if lock.still_owned() {
+                return;
+            }
+            // The lock disappeared or belongs to someone else; drop it (Drop
+            // will not delete a foreign lock) and try to acquire again.
+            self.writer_lock = None;
+        }
+        if let Some(path) = self.session_file.clone() {
+            self.writer_lock = SessionWriterLock::acquire(&path);
+        }
+    }
+
+    /// Take the cross-process claim for an explicit session id. Unlike the
+    /// per-file writer lock (a prune guard), a live holder here is a hard
+    /// error: two managers must never materialize two transcripts for one id.
+    fn acquire_create_lock(session_dir: &Path, id: &str) -> crate::Result<SessionWriterLock> {
+        let Some(lock_path) = retention::session_id_lock_path(session_dir, id) else {
+            anyhow::bail!("invalid session id '{id}'");
+        };
+        if let Some(lock) = SessionWriterLock::acquire_at(lock_path.clone()) {
+            return Ok(lock);
+        }
+        match retention::session_lock_owner_pid(&lock_path) {
+            Some(pid) => anyhow::bail!(
+                "Session '{id}' is already in use by another process (pid {pid}); \
+                 refusing to create a second writer for the same session id"
+            ),
+            None => anyhow::bail!(
+                "Session '{id}' is already in use by another process; \
+                 refusing to create a second writer for the same session id"
+            ),
+        }
+    }
+
+    /// Refresh the lock mtime after a successful append/rewrite.
+    fn touch_writer_lock(&self) {
+        if let Some(lock) = &self.writer_lock {
+            lock.touch();
+        }
+    }
+
     /// Switch to a different session file (used for resume and branching).
     pub fn set_session_file(
         &mut self,
@@ -2367,6 +2569,9 @@ impl SessionManager {
     ) -> crate::Result<()> {
         // Any cached append handle belongs to the previous file.
         self.clear_append_handle();
+        // Switching to an explicit path abandons any pending id-creation
+        // claim; the path itself is the rendezvous from here on.
+        self.create_lock = None;
         // Parsed prefix pages are keyed by path, but a manager switching files
         // has no use for the outgoing session's cache; dropping it returns the
         // memory immediately.
@@ -2375,6 +2580,7 @@ impl SessionManager {
             self.page_cache = None;
         }
         self.session_file = Some(path.to_path_buf());
+        self.refresh_writer_lock();
         if path.exists() {
             let entries = match preloaded {
                 Some(entries) => {
@@ -2407,6 +2613,7 @@ impl SessionManager {
                 self.unparsed_raw_lines.clear();
                 self.new_session(None)?;
                 self.session_file = Some(path.to_path_buf());
+                self.refresh_writer_lock();
                 self.rewrite_file()?;
                 self.flushed = true;
                 return Ok(());
@@ -2418,6 +2625,7 @@ impl SessionManager {
             self.new_session(None)?;
             // Preserve the explicit path (the `--session` flag).
             self.session_file = Some(path.to_path_buf());
+            self.refresh_writer_lock();
         }
         Ok(())
     }
@@ -2432,7 +2640,13 @@ impl SessionManager {
         if let Some(id) = &options.id {
             assert_valid_session_id(id)?;
         }
-        self.session_id = options.id.clone().unwrap_or_else(new_session_id);
+        let session_id = options.id.clone().unwrap_or_else(new_session_id);
+        if self.session_id != session_id {
+            // Switching away from an explicit id abandons its creation claim
+            // (the old transcript, if any, remains addressable by its file).
+            self.create_lock = None;
+        }
+        self.session_id = session_id;
         let timestamp = iso_from_ms(now_ms());
         let header =
             SessionHeader::new(self.session_id.clone(), self.cwd.clone(), timestamp.clone())
@@ -2455,6 +2669,7 @@ impl SessionManager {
                 .join(format!("{file_timestamp}_{}.jsonl", self.session_id));
             self.session_file = Some(path);
         }
+        self.refresh_writer_lock();
         Ok(self.session_file.clone())
     }
 
@@ -2693,6 +2908,11 @@ impl SessionManager {
         let Some(path) = self.session_file.clone() else {
             return Ok(());
         };
+        // A rewrite can materialize a planned session (branch-to-new-file) or
+        // replace an existing one. Take the writer-presence lock before the
+        // file exists so retention can never observe the new transcript
+        // unguarded.
+        self.ensure_writer_lock();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -2748,6 +2968,8 @@ impl SessionManager {
         });
         if write_result.is_err() {
             let _ = std::fs::remove_file(&tmp_path);
+        } else {
+            self.touch_writer_lock();
         }
         write_result
     }
@@ -2824,6 +3046,10 @@ impl SessionManager {
         let Some(path) = self.session_file.clone() else {
             return Ok(());
         };
+        // A manager that could not take the advisory lock at open time (a
+        // foreign writer held it then) retries before its first write, so the
+        // file it is about to create/append stays protected.
+        self.ensure_writer_lock();
         // Consumed even on the file-creation path so a seam armed before the
         // first conversation append cannot fire on a later unrelated append.
         let failure = self.append_failure.take();
@@ -2880,6 +3106,10 @@ impl SessionManager {
             self.append_identity = FileIdentity::from_file(&file);
             self.append_file = Some(file);
             self.flushed = true;
+            // The transcript header is on disk now: later `--session-id`
+            // lookups resolve this file, so the creation claim can go.
+            self.create_lock = None;
+            self.touch_writer_lock();
             return Ok(());
         }
         let line = serde_json::to_string(entry)?;
@@ -2967,6 +3197,7 @@ impl SessionManager {
             return Err(error);
         }
         self.append_len = previous_len.saturating_add(line.len() as u64 + 1);
+        self.touch_writer_lock();
         Ok(())
     }
 
@@ -3081,18 +3312,59 @@ impl SessionManager {
 
     /// Create a new session file whose id (and file name) is `id` (upstream
     /// `SessionManager.create(cwd, dir, { id })`).
+    ///
+    /// An explicit id may materialize at most ONE transcript. The file name
+    /// embeds a creation timestamp, so the file lookup alone cannot serialize
+    /// two processes that both start from an empty session directory: the id
+    /// is claimed with an exclusive `.session-<id>.lock` before the manager is
+    /// built, and the claim stays held until [`Self::persist_entry`] writes
+    /// the header (or the manager drops). A second creator fails with a clear
+    /// "already in use" error instead of writing a second same-id file.
     pub fn create_with_id(cwd: &str, session_dir: &Path, id: &str) -> crate::Result<Self> {
-        Self::new(
-            cwd,
-            session_dir,
-            None,
-            true,
-            Some(NewSessionOptions {
-                id: Some(id.to_owned()),
-                parent_session: None,
-            }),
-            None,
-        )
+        assert_valid_session_id(id)?;
+        #[cfg(feature = "session")]
+        {
+            if let Some(path) = Self::find_session_by_id(session_dir, id) {
+                anyhow::bail!("Session already exists with id '{id}': {}", path.display());
+            }
+            if !session_dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(session_dir)?;
+            }
+            let create_lock = Self::acquire_create_lock(session_dir, id)?;
+            // Re-check after claiming: a creator that flushed and released
+            // its claim in between must not be shadowed by a second file.
+            if let Some(path) = Self::find_session_by_id(session_dir, id) {
+                drop(create_lock);
+                anyhow::bail!("Session already exists with id '{id}': {}", path.display());
+            }
+            let mut manager = Self::new(
+                cwd,
+                session_dir,
+                None,
+                true,
+                Some(NewSessionOptions {
+                    id: Some(id.to_owned()),
+                    parent_session: None,
+                }),
+                None,
+            )?;
+            manager.create_lock = Some(create_lock);
+            Ok(manager)
+        }
+        #[cfg(not(feature = "session"))]
+        {
+            Self::new(
+                cwd,
+                session_dir,
+                None,
+                true,
+                Some(NewSessionOptions {
+                    id: Some(id.to_owned()),
+                    parent_session: None,
+                }),
+                None,
+            )
+        }
     }
 
     /// Open a specific session file (replays and repairs a missing trailing
@@ -3185,6 +3457,7 @@ impl SessionManager {
         // the guard and the open fails loudly; armed later it would silently
         // migrate in memory while the file kept its old version.
         manager.session_file = Some(path.clone());
+        manager.refresh_writer_lock();
         manager.paged = Some(PagedWindow {
             page_start: page.page_start(),
             // The repair above may have appended one newline byte; the cursor
@@ -3545,6 +3818,17 @@ impl SessionManager {
         }
         std::fs::create_dir_all(session_dir)?;
         let id = new_id.map(str::to_owned).unwrap_or_else(new_session_id);
+        // A fork with an explicit id must obey the same one-file-per-id rule
+        // as `create_with_id`: claim the id until the fork's file is renamed
+        // into place (the fork writes eagerly, so the claim is short-lived).
+        let create_lock = if new_id.is_some() {
+            if let Some(path) = Self::find_session_by_id(session_dir, &id) {
+                anyhow::bail!("Session already exists with id '{id}': {}", path.display());
+            }
+            Some(Self::acquire_create_lock(session_dir, &id)?)
+        } else {
+            None
+        };
         let timestamp = iso_from_ms(now_ms());
         let file_timestamp = timestamp.replace([':', '.'], "-");
         let destination = session_dir.join(format!("{file_timestamp}_{id}.jsonl"));
@@ -3594,6 +3878,9 @@ impl SessionManager {
             let _ = std::fs::remove_file(&tmp_path);
         }
         write_result?;
+        // The destination now exists (its header is what `--session-id`
+        // discovery reads), so the creation claim can be released.
+        drop(create_lock);
         Self::open(destination)
     }
 
@@ -5002,8 +5289,14 @@ impl SessionManager {
             None
         };
         // The branched file is a different file: never write through the
-        // source session's cached handle.
+        // source session's cached handle, and move the writer lock with the
+        // manager. Without this refresh the manager would keep the SOURCE
+        // lock while the new branch file stayed unprotected.
         self.clear_append_handle();
+        self.refresh_writer_lock();
+        // The branch has its own random id/file; a claim attached to the
+        // source session id no longer applies to this manager.
+        self.create_lock = None;
         self.build_index();
 
         // A branch is immediately addressable by its caller (the TUI opens the
@@ -5019,6 +5312,7 @@ impl SessionManager {
                 self.append_len = old_append_len;
                 self.append_identity = old_append_identity;
                 self.flushed = old_flushed;
+                self.refresh_writer_lock();
                 self.build_index();
                 self.leaf_id = old_leaf;
                 return Err(error);

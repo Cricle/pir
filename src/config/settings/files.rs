@@ -231,14 +231,6 @@ fn write_text_atomic_impl(
 
 /// Canonicalize a path for identity comparisons, stripping the Windows `\\?\`
 /// / `\\?\UNC\` extended-length prefixes that `fs::canonicalize` emits.
-pub(super) fn canonicalize_lossy(path: &Path) -> PathBuf {
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let text = canonical.to_string_lossy();
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{rest}"))
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
-    } else {
-        canonical
-    }
-}
+///
+/// Single implementation, owned by [`crate::config::trust::normalize_cwd`].
+pub(super) use crate::config::trust::normalize_cwd as canonicalize_lossy;

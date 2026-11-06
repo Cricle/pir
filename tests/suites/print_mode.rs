@@ -39,12 +39,13 @@ use pir::ai::types::{
 };
 use pir::coding_agent::json::to_session_event_json;
 use pir::coding_agent::print::{
-    background_abort_diagnostic, background_abort_event, partition_file_args,
-    print_apply_max_turns, print_apply_retry, print_compaction_config, print_compaction_hook,
-    print_loop_deps, print_plugin_host, print_retry_policy, print_tool_definitions,
-    print_transport_hooks, print_transport_hooks_with_model, run_print_with_environment,
-    text_with_background_reports, threshold_model_for, try_extension_command, OutputMode,
-    PrintBackground, PrintOptions, PrintSessionEventSink, SharedSession,
+    background_abort_diagnostic, background_abort_event, expand_prompt_file_args,
+    partition_file_args, print_apply_max_turns, print_apply_retry, print_compaction_config,
+    print_compaction_hook, print_loop_deps, print_plugin_host, print_retry_policy,
+    print_tool_definitions, print_transport_hooks, print_transport_hooks_with_model,
+    run_print_with_environment, text_with_background_reports, threshold_model_for,
+    try_extension_command, OutputMode, PrintBackground, PrintOptions, PrintSessionEventSink,
+    SharedSession,
 };
 use pir::coding_agent::resources::ResourcePathOptions;
 use pir::coding_agent::session_resolve::SessionPlan;
@@ -280,6 +281,134 @@ fn partition_file_args_binary_non_image_goes_to_text() {
         file_text.contains(&format!("<file name=\"{}\">", bin.display())),
         "{file_text}"
     );
+    assert!(images.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// `@file` expansion inside one `pir print` prompt string
+// ---------------------------------------------------------------------------
+
+/// Deterministic ASCII body of exactly `size` bytes.
+fn sized_prompt_body(size: usize, label: &str) -> String {
+    let line = format!("{label}-0123456789abcdef\n");
+    let mut body = String::with_capacity(size);
+    while body.len() + line.len() <= size {
+        body.push_str(&line);
+    }
+    while body.len() < size {
+        body.push('x');
+    }
+    body
+}
+
+fn assert_prompt_file_size(label: &str, size: usize) {
+    let dir = TempDir::new(label);
+    let path = dir.0.join("notes.txt");
+    let body = sized_prompt_body(size, label);
+    assert_eq!(body.len(), size);
+    std::fs::write(&path, &body).expect("write body");
+
+    let (expanded, images) = expand_prompt_file_args("@notes.txt summarize", &dir.0)
+        .expect("expand prompt file reference");
+    assert!(images.is_empty());
+    assert_eq!(
+        expanded,
+        format!(
+            "<file name=\"{}\">\n{body}\n</file>\nsummarize",
+            path.display()
+        ),
+        "{size}-byte file must be injected byte-for-byte (no truncation)"
+    );
+}
+
+#[test]
+fn expand_prompt_file_args_injects_512_byte_file() {
+    assert_prompt_file_size("at-file-512", 512);
+}
+
+#[test]
+fn expand_prompt_file_args_injects_8_kib_file() {
+    assert_prompt_file_size("at-file-8k", 8 * 1024);
+}
+
+#[test]
+fn expand_prompt_file_args_injects_140_kib_file() {
+    assert_prompt_file_size("at-file-140k", 140 * 1024);
+}
+
+#[test]
+fn expand_prompt_file_args_expands_multiple_files_in_order() {
+    let dir = TempDir::new("at-file-multi");
+    let first = dir.0.join("a.txt");
+    let second = dir.0.join("b.txt");
+    std::fs::write(&first, "AAA").expect("write a");
+    std::fs::write(&second, "BBB").expect("write b");
+
+    let (expanded, images) = expand_prompt_file_args("@a.txt @b.txt explain both", &dir.0)
+        .expect("expand multiple file references");
+    assert_eq!(
+        expanded,
+        format!(
+            "<file name=\"{}\">\nAAA\n</file>\n<file name=\"{}\">\nBBB\n</file>\nexplain both",
+            first.display(),
+            second.display()
+        )
+    );
+    assert!(images.is_empty());
+}
+
+#[test]
+fn expand_prompt_file_args_handles_quoted_and_escaped_paths() {
+    let dir = TempDir::new("at-file-escape");
+    let path = dir.0.join("my notes.txt");
+    std::fs::write(&path, "SPACED").expect("write spaced path");
+
+    // Quotes and a backslash-escaped space both group a path with whitespace.
+    for prompt in ["@\"my notes.txt\" summarize", "@my\\ notes.txt summarize"] {
+        let (expanded, images) =
+            expand_prompt_file_args(prompt, &dir.0).expect("expand quoted path");
+        assert_eq!(
+            expanded,
+            format!(
+                "<file name=\"{}\">\nSPACED\n</file>\nsummarize",
+                path.display()
+            ),
+            "prompt: {prompt}"
+        );
+        assert!(images.is_empty());
+    }
+
+    // `\@` keeps a leading at-sign literal instead of reading a file.
+    let (literal, images) =
+        expand_prompt_file_args("mail \\@notes.txt", &dir.0).expect("escaped at-sign");
+    assert_eq!(literal, "mail @notes.txt");
+    assert!(images.is_empty());
+}
+
+#[test]
+fn expand_prompt_file_args_missing_file_is_error() {
+    let dir = TempDir::new("at-file-missing");
+    let error = expand_prompt_file_args("read @missing.txt", &dir.0)
+        .expect_err("missing file is a hard error, same as the argv path");
+    let message = error.to_string();
+    assert!(message.contains("File not found:"), "got: {message}");
+    assert!(message.contains("missing.txt"), "got: {message}");
+}
+
+#[test]
+fn expand_prompt_file_args_leaves_ordinary_at_text_alone() {
+    let prompt =
+        "contact user@example.com or ops@example.org about (@home), a@b, @pi and version @2.0";
+    let (expanded, images) =
+        expand_prompt_file_args(prompt, Path::new(".")).expect("plain text stays plain");
+    assert_eq!(expanded, prompt);
+    assert!(images.is_empty());
+
+    // A lone `@` in prose is punctuation, not an empty file reference.
+    let prompt = "Use @ here to mention someone";
+    let (expanded, images) =
+        expand_prompt_file_args(prompt, Path::new(".")).expect("lone at-sign stays text");
+    assert_eq!(expanded, prompt);
     assert!(images.is_empty());
 }
 
@@ -2988,7 +3117,13 @@ fn paged_threshold_met_is_the_compaction_trigger() {
     let mut huge = test_model();
     huge.context_window = 10_000_000;
     assert!(
-        !pir::compaction::paged::threshold_met(&paged, &huge, &config).expect("projection"),
+        !pir::compaction::paged::threshold_met(
+            &paged,
+            &huge,
+            &config,
+            pir::compaction::paged::PagedRequestPrompt::default(),
+        )
+        .expect("projection"),
         "the resident-window estimate is far below a 10M-token window"
     );
     // Window 0: the gate sits at the saturating floor (0), and the resident
@@ -2996,7 +3131,13 @@ fn paged_threshold_met_is_the_compaction_trigger() {
     let mut zero = test_model();
     zero.context_window = 0;
     assert!(
-        pir::compaction::paged::threshold_met(&paged, &zero, &config).expect("projection"),
+        pir::compaction::paged::threshold_met(
+            &paged,
+            &zero,
+            &config,
+            pir::compaction::paged::PagedRequestPrompt::default(),
+        )
+        .expect("projection"),
         "a 0-token window makes any positive estimate cross the gate"
     );
 }
@@ -3465,4 +3606,443 @@ async fn print_main_loop_stream_ignores_another_sessions_shared_provider() {
         1,
         "the static provider must answer exactly the one prompt request"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Closed-pipe (BrokenPipe) behavior of the CLI print hosts
+// ---------------------------------------------------------------------------
+
+/// A loopback OpenAI-compatible SSE endpoint for a real print run. The
+/// closed-stdout tests need the model/session setup to succeed so the first
+/// emitted line is the one that hits the closed pipe; the request body is
+/// irrelevant and captured only to keep the connection drain simple.
+fn spawn_closed_pipe_mock() -> u16 {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+    let port = listener.local_addr().expect("mock addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(index + 4);
+                }
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break None,
+                    Ok(read) => request.extend_from_slice(&buf[..read]),
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&buf[..read]),
+                }
+            }
+            let delta = serde_json::json!({"role":"assistant","content":"hello mock"});
+            let chunk = serde_json::json!({"id":"x","object":"chat.completion.chunk","created":1,"model":"mock-model","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+            let done = serde_json::json!({"id":"x","object":"chat.completion.chunk","created":1,"model":"mock-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+            let events = format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                events.len(),
+                events
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    port
+}
+
+/// Write the hermetic agent dir used by the closed-pipe subprocess tests.
+fn write_closed_pipe_agent(dir: &TempDir, port: u16) {
+    let agent = dir.0.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        agent.join("models.json"),
+        format!(r#"{{"providers":{{"mock":{{"name":"Mock","baseUrl":"http://127.0.0.1:{port}/v1","api":"openai-completions","apiKey":"k","models":[{{"id":"mock-model","name":"M","api":"openai-completions","baseUrl":"http://127.0.0.1:{port}/v1","reasoning":false,"input":["text"],"contextWindow":100000,"maxTokens":1024}}]}}}}}}"#),
+    )
+    .expect("write models.json");
+    std::fs::write(agent.join("settings.json"), "{}").expect("write settings.json");
+}
+
+/// Spawn `pir` with stdout (and optionally stderr) closed from the start: the
+/// parent drops the read end of the pipe immediately, so the child's first
+/// write gets `BrokenPipe` — the deterministic form of `… | head -5`
+/// followed by the consumer exiting.
+fn spawn_with_closed_pipes(
+    dir: &TempDir,
+    args: &[&str],
+    close_stderr: bool,
+) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pir"));
+    command
+        .current_dir(&dir.0)
+        .args(args)
+        .env("PIR_AGENT_DIR", dir.0.join("agent"))
+        .env("HOME", &dir.0)
+        .env("USERPROFILE", &dir.0)
+        .env("PI_OFFLINE", "1")
+        .env("PI_SKIP_VERSION_CHECK", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().expect("pir binary should start");
+    // Closing the parent's read handles is what a downstream `head`/`true`
+    // does when it exits.
+    drop(child.stdout.take());
+    if close_stderr {
+        drop(child.stderr.take());
+    }
+    let output = child.wait_with_output().expect("wait for pir");
+    assert!(
+        !dir.0.join("agent").join("crashes.json").exists(),
+        "a closed pipe must never be recorded as a crash (stderr: {})",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+#[test]
+fn json_mode_closed_stdout_exits_zero_without_crash_record() {
+    // The empty JSON print writes the session header first (upstream
+    // print-mode.ts:122-127). Closing stdout at spawn makes that write fail
+    // with EPIPE; the process must exit 0, not panic and leave a crash log.
+    let temp = TempDir::new("closed-pipe-json-empty");
+    let output = spawn_with_closed_pipes(&temp, &["--mode", "json"], true);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn print_json_closed_stdout_does_not_panic_or_record_a_crash() {
+    let port = spawn_closed_pipe_mock();
+    let temp = TempDir::new("closed-pipe-json");
+    write_closed_pipe_agent(&temp, port);
+    // stdout closed, stderr kept open so the test can prove no panic text
+    // was emitted by the old print-failure path.
+    let output = spawn_with_closed_pipes(
+        &temp,
+        &[
+            "print",
+            "hello mock",
+            "--no-session",
+            "--mode",
+            "json",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+        ],
+        false,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("failed printing"),
+        "closed stdout must not panic: {stderr}"
+    );
+}
+
+#[test]
+fn print_text_mode_closed_stdout_exits_zero_without_crash_record() {
+    let port = spawn_closed_pipe_mock();
+    let temp = TempDir::new("closed-pipe-text");
+    write_closed_pipe_agent(&temp, port);
+    let output = spawn_with_closed_pipes(
+        &temp,
+        &[
+            "print",
+            "hello mock",
+            "--no-session",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+        ],
+        true,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `pir print @file` end-to-end (the provider request proves the injection)
+// ---------------------------------------------------------------------------
+
+/// A loopback OpenAI-compatible SSE endpoint that records every request body.
+fn spawn_capturing_mock() -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+    let port = listener.local_addr().expect("mock addr").port();
+    let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(index + 4);
+                }
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break None,
+                    Ok(read) => request.extend_from_slice(&buf[..read]),
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&buf[..read]),
+                }
+            }
+            sink.lock().expect("capture lock").push(
+                request[header_end..]
+                    .get(..content_length)
+                    .unwrap_or(&request[header_end..])
+                    .to_vec(),
+            );
+            let delta = serde_json::json!({"role":"assistant","content":"hello mock"});
+            let chunk = serde_json::json!({"id":"x","object":"chat.completion.chunk","created":1,"model":"mock-model","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+            let done = serde_json::json!({"id":"x","object":"chat.completion.chunk","created":1,"model":"mock-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+            let events = format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                events.len(),
+                events
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (port, captured)
+}
+
+fn run_print_subcommand(dir: &TempDir, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_pir"))
+        .current_dir(&dir.0)
+        .args(args)
+        .env("PIR_AGENT_DIR", dir.0.join("agent"))
+        .env("HOME", &dir.0)
+        .env("USERPROFILE", &dir.0)
+        .env("PI_OFFLINE", "1")
+        .env("PI_SKIP_VERSION_CHECK", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run pir print")
+}
+
+/// `pir print "@notes.txt"` (text and `--mode json`) must send the file body —
+/// not the literal reference — in the first provider request, exactly like
+/// the bare `pir @notes.txt` entry shape.
+#[test]
+fn print_subcommand_injects_at_file_into_request_body() {
+    let marker = "ATFILE-REQUEST-MARKER-512";
+    let second = "ATFILE-SECOND-MARKER";
+    for json in [false, true] {
+        let (port, captured) = spawn_capturing_mock();
+        let temp = TempDir::new(if json {
+            "at-file-e2e-json"
+        } else {
+            "at-file-e2e-text"
+        });
+        write_closed_pipe_agent(&temp, port);
+        std::fs::write(temp.0.join("notes.txt"), format!("{marker}\n")).expect("write notes file");
+        std::fs::write(temp.0.join("extra.txt"), format!("{second}\n")).expect("write extra file");
+        let mut args = vec![
+            "print",
+            "@notes.txt @extra.txt",
+            "--no-session",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+        ];
+        if json {
+            args.extend_from_slice(&["--mode", "json"]);
+        }
+        let output = run_print_subcommand(&temp, &args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "json={json} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bodies = captured.lock().expect("capture lock");
+        let body = bodies.first().expect("the provider must be called once");
+        let body = String::from_utf8_lossy(body);
+        assert!(
+            body.contains(marker),
+            "json={json}: the first @file body must reach the provider request"
+        );
+        assert!(
+            body.contains(second),
+            "json={json}: the second @file body must reach the provider request"
+        );
+        assert!(
+            !body.contains("@notes.txt") && !body.contains("@extra.txt"),
+            "json={json}: literal @references must not reach the provider request"
+        );
+    }
+}
+
+/// A missing `@file` is the same hard error as the argv path: exit 1, a
+/// `File not found:` diagnostic, and no provider request.
+#[test]
+fn print_subcommand_missing_at_file_exits_nonzero_without_a_request() {
+    let (port, captured) = spawn_capturing_mock();
+    let temp = TempDir::new("at-file-e2e-missing");
+    write_closed_pipe_agent(&temp, port);
+    let output = run_print_subcommand(
+        &temp,
+        &[
+            "print",
+            "@missing.txt",
+            "--no-session",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("File not found:"), "stderr: {stderr}");
+    assert!(stderr.contains("missing.txt"), "stderr: {stderr}");
+    assert!(
+        captured.lock().expect("capture lock").is_empty(),
+        "a missing file must fail before any provider request"
+    );
+}
+
+/// Ordinary text containing `@` (e.g. an email address) stays literal.
+#[test]
+fn print_subcommand_leaves_plain_at_text_in_request_body() {
+    let (port, captured) = spawn_capturing_mock();
+    let temp = TempDir::new("at-file-e2e-plain");
+    write_closed_pipe_agent(&temp, port);
+    let output = run_print_subcommand(
+        &temp,
+        &[
+            "print",
+            "contact user@example.com about the release",
+            "--no-session",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = captured.lock().expect("capture lock");
+    let body = bodies.first().expect("the provider must be called once");
+    let body = String::from_utf8_lossy(body);
+    assert!(
+        body.contains("contact user@example.com about the release"),
+        "ordinary @ text must stay literal in the request"
+    );
+}
+
+#[test]
+fn expand_prompt_file_args_accepts_quotes_around_the_whole_token() {
+    let dir = TempDir::new("at-file-whole-quote");
+    let path = dir.0.join("my notes.txt");
+    std::fs::write(&path, "WHOLE").expect("write spaced path");
+
+    // Shell-style quoting around the whole `@path` token must resolve the
+    // same as `@"path"` (both shapes occur after argv quoting is stripped).
+    for prompt in [
+        "\"@my notes.txt\" summarize",
+        "'@my notes.txt' summarize",
+    ] {
+        let (expanded, images) =
+            expand_prompt_file_args(prompt, &dir.0).expect("expand whole-token quote");
+        assert_eq!(
+            expanded,
+            format!(
+                "<file name=\"{}\">\nWHOLE\n</file>\nsummarize",
+                path.display()
+            ),
+            "prompt: {prompt}"
+        );
+        assert!(images.is_empty());
+    }
+}
+
+#[test]
+fn expand_prompt_file_args_resolves_relative_paths_and_reports_absolute_missing_names() {
+    let dir = TempDir::new("at-file-relative");
+    let nested = dir.0.join("nested dir");
+    std::fs::create_dir_all(&nested).expect("mkdir nested");
+    let path = nested.join("notes.txt");
+    std::fs::write(&path, "RELATIVE").expect("write nested");
+    std::fs::write(dir.0.join("plain.txt"), "PLAIN").expect("write plain");
+
+    for prompt in [
+        "@./plain.txt explain",
+        "@nested\\ dir/notes.txt explain",
+        "\"@nested dir/notes.txt\" explain",
+    ] {
+        let (expanded, images) =
+            expand_prompt_file_args(prompt, &dir.0).expect("expand relative path");
+        assert!(expanded.contains("</file>\nexplain"), "{prompt}: {expanded}");
+        assert!(images.is_empty());
+    }
+
+    let missing = expand_prompt_file_args("\"@nested dir/missing.txt\"", &dir.0)
+        .expect_err("missing quoted path is a hard error");
+    assert!(missing.to_string().contains("File not found:"), "{missing}");
+    assert!(missing.to_string().contains("missing.txt"), "{missing}");
+}
+
+#[test]
+fn expand_prompt_file_args_attaches_image_references_with_mime() {
+    let dir = TempDir::new("at-file-image");
+    let png = dir.0.join("shot.png");
+    let bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRfake-body".to_vec();
+    std::fs::write(&png, &bytes).expect("write png");
+
+    let (expanded, images) =
+        expand_prompt_file_args("describe @shot.png", &dir.0).expect("expand image ref");
+    assert!(expanded.contains(&format!("<file name=\"{}\"></file>", png.display())));
+    assert!(expanded.ends_with("describe"), "{expanded}");
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].mime_type, "image/png");
+    assert_eq!(images[0].data, base64_of(&bytes));
 }

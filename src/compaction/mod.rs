@@ -44,6 +44,7 @@
 pub mod algorithm;
 pub mod branch_summarization;
 pub mod chunking;
+pub mod evidence;
 pub mod paged;
 pub mod prompts;
 
@@ -64,7 +65,9 @@ pub use algorithm::{
     estimate_message_tokens_conservative, estimate_projected_context_tokens,
     estimate_projected_context_tokens_with_tail, estimate_prompt_tokens,
     estimate_prompt_tokens_conservative, estimate_request_context_tokens,
-    estimate_request_context_tokens_conservative, estimate_text_tokens,
+    estimate_request_context_tokens_conservative, estimate_request_messages_tokens,
+    estimate_request_messages_tokens_floor, estimate_request_projected_context_tokens,
+    estimate_request_projected_context_tokens_floor, estimate_text_tokens,
     estimate_text_tokens_conservative, find_projected_cut_point, is_cut_point_message,
     is_turn_start_message, materialize_projected_tail, projection_materializations,
     reset_projection_materializations, should_compact, should_compact_tokens, text_token_units,
@@ -817,8 +820,9 @@ fn truncate_for_summary_units(text: &str, max_units: u64) -> String {
     }
     let truncated_chars = text.chars().count().saturating_sub(prefix_chars);
     format!(
-        "{}\n\n[... {} more characters truncated]",
-        prefix, truncated_chars
+        "{}{}",
+        prefix,
+        crate::text::truncated_chars_marker(truncated_chars)
     )
 }
 
@@ -1550,6 +1554,30 @@ fn plan_compaction<E: ProjectedEntry, P: PathEntry>(
     path_entries: &[P],
     settings: &CompactionConfig,
 ) -> Option<PreparationPlan> {
+    plan_compaction_with_budget(
+        projected,
+        path_entries,
+        settings.keep_recent_tokens,
+        false,
+    )
+}
+
+/// `plan_compaction` with an explicit keep budget, and an optional
+/// compact-everything plan.
+///
+/// `compact_all` is the manual-`/compact` fallback when the request is already
+/// over the context threshold but the conversation itself is smaller than the
+/// keep-recent budget (a tiny transcript behind a huge system prompt/tool
+/// loadout, or a provider usage record that puts the request near the window).
+/// The normal cut would keep the whole conversation, report "nothing to
+/// compact", and leave the user with no way to checkpoint the session; this
+/// plan summarizes every projected message and keeps no tail.
+fn plan_compaction_with_budget<E: ProjectedEntry, P: PathEntry>(
+    projected: &[E],
+    path_entries: &[P],
+    keep_recent_tokens: u64,
+    compact_all: bool,
+) -> Option<PreparationPlan> {
     if let Some(last) = path_entries.last() {
         if last.is_compaction() {
             return None;
@@ -1576,12 +1604,20 @@ fn plan_compaction<E: ProjectedEntry, P: PathEntry>(
     }
 
     let tokens_before = estimate_projected_context_tokens(projected, path_entries).tokens;
-    let cut_point = find_projected_cut_point(
-        projected,
-        boundary_start,
-        projected.len(),
-        settings.keep_recent_tokens,
-    );
+    let cut_point = if compact_all {
+        CutPointResult {
+            first_kept_entry_index: projected.len(),
+            turn_start_index: -1,
+            is_split_turn: false,
+        }
+    } else {
+        find_projected_cut_point(
+            projected,
+            boundary_start,
+            projected.len(),
+            keep_recent_tokens,
+        )
+    };
 
     let first_kept_entry_id = projected
         .get(cut_point.first_kept_entry_index)
@@ -1771,6 +1807,54 @@ pub fn prepare_compaction_refs<'a, E: ProjectedEntry, P: PathEntry>(
     settings: &CompactionConfig,
 ) -> Option<BorrowedCompactionPreparation<'a>> {
     let plan = plan_compaction(projected, path_entries, settings)?;
+    Some(borrowed_preparation(projected, plan, settings))
+}
+
+/// [`prepare_compaction_refs`] with an explicit keep-recent budget.
+///
+/// Callers that know the routed model's context window pass
+/// [`CompactionConfig::effective_keep_recent_tokens`] here so a default keep
+/// window larger than the model's window cannot suppress every cut.
+pub fn prepare_compaction_refs_with_keep<'a, E: ProjectedEntry, P: PathEntry>(
+    projected: &'a [E],
+    path_entries: &[P],
+    settings: &CompactionConfig,
+    keep_recent_tokens: u64,
+) -> Option<BorrowedCompactionPreparation<'a>> {
+    let plan = plan_compaction_with_budget(
+        projected,
+        path_entries,
+        keep_recent_tokens,
+        false,
+    )?;
+    Some(borrowed_preparation(projected, plan, settings))
+}
+
+/// Summarize EVERY projected message (no kept tail).
+///
+/// The manual-`/compact` fallback for a request that is already over the
+/// context threshold while the transcript itself fits inside the keep-recent
+/// window. Returns `None` when there is no conversation content to summarize
+/// (or the newest leaf entry is already a compaction).
+pub fn prepare_compaction_refs_forced<'a, E: ProjectedEntry, P: PathEntry>(
+    projected: &'a [E],
+    path_entries: &[P],
+    settings: &CompactionConfig,
+) -> Option<BorrowedCompactionPreparation<'a>> {
+    let plan = plan_compaction_with_budget(
+        projected,
+        path_entries,
+        settings.keep_recent_tokens,
+        true,
+    )?;
+    Some(borrowed_preparation(projected, plan, settings))
+}
+
+fn borrowed_preparation<'a, E: ProjectedEntry>(
+    projected: &'a [E],
+    plan: PreparationPlan,
+    settings: &CompactionConfig,
+) -> BorrowedCompactionPreparation<'a> {
     let messages_to_summarize: Vec<&Message> = projected[plan.history_span.clone()]
         .iter()
         .flat_map(|entry| span_messages(entry))
@@ -1783,7 +1867,7 @@ pub fn prepare_compaction_refs<'a, E: ProjectedEntry, P: PathEntry>(
         .iter()
         .flat_map(|entry| entry.messages().iter())
         .collect();
-    Some(BorrowedCompactionPreparation {
+    BorrowedCompactionPreparation {
         first_kept_entry_id: plan.first_kept_entry_id,
         messages_to_summarize,
         turn_prefix_messages,
@@ -1794,7 +1878,29 @@ pub fn prepare_compaction_refs<'a, E: ProjectedEntry, P: PathEntry>(
         first_kept_message_index: plan.first_kept_message_index,
         kept_messages,
         settings: settings.clone(),
-    })
+    }
+}
+
+/// [`should_compact`] over a projected/borrowed basis, taking the maximum of
+/// the usage-grounded estimate and a content-only floor.
+///
+/// The usage record normally describes the exact request, but a stale or
+/// understated record (common with relays and mocked providers) must not hide
+/// a transcript that alone exceeds the window. The floor only counts content
+/// actually sent, so the maximum is never below the real request size.
+pub fn should_compact_request_refs<E: ProjectedEntry, P: PathEntry>(
+    projected: &[E],
+    path_entries: &[P],
+    system_prompt: Option<&str>,
+    tools: Option<&[crate::ai::types::Tool]>,
+    model: &Model,
+    config: &CompactionConfig,
+) -> bool {
+    let estimate =
+        estimate_request_projected_context_tokens(projected, path_entries, system_prompt, tools)
+            .tokens;
+    let floor = estimate_request_projected_context_tokens_floor(projected, system_prompt, tools);
+    should_compact_tokens(estimate.max(floor), model.context_window, config)
 }
 
 // ============================================================================
@@ -1869,6 +1975,16 @@ async fn compact_with_preparation_refs_in_span(
     .await?;
     let mut summary = summary;
     let (read_files, modified_files) = compute_file_lists(&file_ops);
+    // Deterministic evidence: carried from the previous summary (the earlier
+    // span is no longer in the messages) plus everything visible in this
+    // span. Appended before the file lists so the upstream-compatible
+    // `<read-files>`/`<modified-files>` tags stay at the end of the summary.
+    let evidence_block = build_evidence_block(
+        previous_summary.as_deref(),
+        messages_to_summarize.as_slice(),
+        turn_prefix_messages.as_slice(),
+    );
+    summary.push_str(&evidence::format_evidence_block(&evidence_block));
     summary.push_str(&format_file_operations(&read_files, &modified_files));
     tracing::info!(
         summary_tokens = summary_usage.total_tokens,
@@ -1885,6 +2001,23 @@ async fn compact_with_preparation_refs_in_span(
         read_files,
         modified_files,
     })
+}
+
+/// Build the deterministic evidence block of one compaction: records carried
+/// forward from the previous summary (parsed from its evidence section) plus
+/// the history span and the split-turn prefix. Deduplication keeps the carry
+/// chain from repeating facts across compactions.
+fn build_evidence_block(
+    previous_summary: Option<&str>,
+    history: &[&Message],
+    turn_prefix: &[&Message],
+) -> evidence::EvidenceBlock {
+    let mut block = previous_summary
+        .and_then(evidence::parse_evidence_block)
+        .unwrap_or_default();
+    block.merge(evidence::collect_evidence_refs(history));
+    block.merge(evidence::collect_evidence_refs(turn_prefix));
+    block
 }
 
 /// One summarize-and-merge request: the spans to summarize and the settings
@@ -1922,6 +2055,10 @@ async fn summarize_and_merge(request: SummaryRequest<'_>) -> Result<(String, Usa
         settings,
         complete,
     } = request;
+    // The model must never see (and therefore never paraphrase or duplicate)
+    // the deterministic evidence block; it is rebuilt from the messages.
+    let previous_summary_clean = previous_summary.map(evidence::strip_evidence_block);
+    let previous_summary = previous_summary_clean.as_deref();
     if is_split_turn && !turn_prefix_messages.is_empty() {
         let mut history_text = previous_summary.unwrap_or("No prior history.").to_owned();
         let mut history_usage: Option<Usage> = None;
@@ -2006,6 +2143,12 @@ async fn compact_with_preparation_in_span(
 
     // Compute file lists and append to the summary.
     let (read_files, modified_files) = compute_file_lists(&file_ops);
+    let evidence_block = build_evidence_block(
+        previous_summary.as_deref(),
+        history_refs.as_slice(),
+        turn_prefix_refs.as_slice(),
+    );
+    summary.push_str(&evidence::format_evidence_block(&evidence_block));
     summary.push_str(&format_file_operations(&read_files, &modified_files));
 
     // Compaction summary (upstream `addEvent`/`setStatus` on the compaction
@@ -2052,27 +2195,6 @@ pub fn rebuilt_context(original: &Context, result: &CompactionResult) -> Context
         system_prompt: original.system_prompt.clone(),
         messages,
         tools: original.tools.clone(),
-    }
-}
-
-/// Run the whole compaction over an explicitly supplied projection (the
-/// widening fallback of a paged session, and the overflow-recovery path): the
-/// spans stay borrowed, so nothing beyond the projection's own messages is
-/// materialized.
-pub async fn compact_projection(
-    projection: &crate::session_manager::SessionProjection,
-    branch: &[PathEntryMeta],
-    model: &Model,
-    config: &CompactionConfig,
-    complete: Arc<CompleteFn>,
-) -> Result<CompactionResult, String> {
-    let metas = ProjectionEntryMeta::from_projection(&projection.entries);
-    let refs = ProjectionEntryMeta::cut_refs(&metas, &projection.messages);
-    match prepare_compaction_refs(&refs, branch, config) {
-        Some(preparation) => {
-            compact_with_preparation_refs(preparation, model, complete, None).await
-        }
-        None => Err("compaction found no messages to summarize".to_string()),
     }
 }
 
@@ -2142,8 +2264,14 @@ pub fn compact_context(
             .iter()
             .map(CutEntryRef::from_message)
             .collect();
-        let mut preparation = prepare_compaction_refs(&refs, &[] as &[PathEntryMeta], &config)
-            .ok_or_else(|| "compaction found no messages to summarize".to_string())?;
+        let keep_recent_tokens = config.effective_keep_recent_tokens(model.context_window);
+        let mut preparation = prepare_compaction_refs_with_keep(
+            &refs,
+            &[] as &[PathEntryMeta],
+            &config,
+            keep_recent_tokens,
+        )
+        .ok_or_else(|| "compaction found no messages to summarize".to_string())?;
         if previous_summary.is_some() {
             preparation.previous_summary = previous_summary;
         }

@@ -305,7 +305,6 @@ pub(crate) fn mock_spawn() -> (String, Vec<String>) {
         exe.to_string_lossy().into_owned(),
         vec![
             "mcp_residuals_w13::w13b_mock_stdio_server".to_owned(),
-            "--exact".to_owned(),
             "--nocapture".to_owned(),
         ],
     )
@@ -323,7 +322,6 @@ fn in_binary_mock_spawn() -> (String, Vec<String>) {
         exe.to_string_lossy().into_owned(),
         vec![
             "mcp_residuals_w13::w13b_mock_stdio_server".to_owned(),
-            "--exact".to_owned(),
             "--nocapture".to_owned(),
         ],
     )

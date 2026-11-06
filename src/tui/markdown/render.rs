@@ -1,6 +1,14 @@
 use super::inline::{InlineStyleContext, StyleFn};
 use super::*;
 
+/// Absolute cap on nested block rendering. Blockquotes and lists each have
+/// their own parse-stage caps, but those counters restart inside every
+/// container: a quote inside a list inside a quote can stack many bounded
+/// recursions. This budget bounds the TOTAL render recursion depth no matter
+/// how the containers are combined; past it blocks degrade to their plain
+/// text instead of recursing further.
+const MAX_BLOCK_RENDER_DEPTH: usize = 64;
+
 /// The inline style context for a heading (upstream `headingStyleContext`,
 /// markdown.ts:477-490): level 1 is heading+bold+underline, the rest
 /// heading+bold; the context's prefix restores the style after nested spans.
@@ -135,6 +143,18 @@ pub(super) fn render_block_range(
     theme: &MarkdownTheme,
     options: &MarkdownOptions,
 ) {
+    render_block_range_at(lines, blocks, range, width, theme, options, 0);
+}
+
+fn render_block_range_at(
+    lines: &mut Vec<String>,
+    blocks: &[Block],
+    range: std::ops::Range<usize>,
+    width: usize,
+    theme: &MarkdownTheme,
+    options: &MarkdownOptions,
+    depth: usize,
+) {
     for index in range {
         let block = &blocks[index];
         let next_is_space = blocks
@@ -215,7 +235,7 @@ pub(super) fn render_block_range(
                         start: *start,
                         loose: *loose,
                     },
-                    0,
+                    depth,
                     &ListRenderCtx {
                         width,
                         theme,
@@ -224,6 +244,14 @@ pub(super) fn render_block_range(
                     },
                     lines,
                 );
+            }
+            Block::Blockquote(text) if depth >= MAX_BLOCK_RENDER_DEPTH => {
+                let ctx = InlineStyleContext::default();
+                for line in text.lines() {
+                    lines.push(render_inline_with_context(
+                        line, theme, options, false, &ctx,
+                    ));
+                }
             }
             Block::Blockquote(text) => {
                 let inner_blocks = parse_blocks(text, options).blocks;
@@ -244,6 +272,7 @@ pub(super) fn render_block_range(
                             theme,
                             options,
                             &quote_prefix,
+                            depth + 1,
                         ));
                     }
                     continue;
@@ -260,6 +289,7 @@ pub(super) fn render_block_range(
                         theme,
                         options,
                         &quote_prefix,
+                        depth + 1,
                     ));
                 }
                 // Trim trailing blanks (upstream pops them before the quote border).
@@ -322,8 +352,9 @@ fn render_markdown_block(
     theme: &MarkdownTheme,
     options: &MarkdownOptions,
     inline_prefix: &str,
+    depth: usize,
 ) -> Vec<String> {
-    render_markdown_block_one(block, width, theme, options, inline_prefix)
+    render_markdown_block_one(block, width, theme, options, inline_prefix, depth)
 }
 
 fn render_markdown_block_one(
@@ -332,6 +363,7 @@ fn render_markdown_block_one(
     theme: &MarkdownTheme,
     options: &MarkdownOptions,
     inline_prefix: &str,
+    depth: usize,
 ) -> Vec<String> {
     match block {
         Block::Space => vec![String::new()],
@@ -396,7 +428,7 @@ fn render_markdown_block_one(
                     start: *start,
                     loose: *loose,
                 },
-                0,
+                depth,
                 &ListRenderCtx {
                     width,
                     theme,
@@ -406,6 +438,14 @@ fn render_markdown_block_one(
                 &mut lines,
             );
             lines
+        }
+        Block::Blockquote(text) if depth >= MAX_BLOCK_RENDER_DEPTH => {
+            // Absolute budget exhausted: keep the quote text visible without
+            // parsing/rendering another nesting level.
+            let ctx = InlineStyleContext::new(&[], inline_prefix);
+            text.lines()
+                .map(|line| render_inline_with_context(line, theme, options, false, &ctx))
+                .collect()
         }
         Block::Blockquote(text) => {
             let inner = parse_blocks(text, options).blocks;
@@ -425,6 +465,7 @@ fn render_markdown_block_one(
                         theme,
                         options,
                         &quote_prefix,
+                        depth + 1,
                     ));
                 }
                 return lines;
@@ -433,9 +474,14 @@ fn render_markdown_block_one(
                 if matches!(block, Block::Space) {
                     continue;
                 }
-                for quote_line in
-                    render_markdown_block_one(block, width - 2, theme, options, &quote_prefix)
-                {
+                for quote_line in render_markdown_block_one(
+                    block,
+                    width - 2,
+                    theme,
+                    options,
+                    &quote_prefix,
+                    depth + 1,
+                ) {
                     for wrapped in wrap_text_with_ansi(&quote_line, width - 2) {
                         lines.push(format!(
                             "{}{}",
@@ -493,6 +539,20 @@ fn render_list(
     ctx: &ListRenderCtx<'_>,
     lines: &mut Vec<String>,
 ) {
+    // Rendering a nested list re-parses and re-renders each item, so a deeply
+    // indented list (model/MCP output) would recurse once per level. `depth`
+    // is the ABSOLUTE block-render depth (list + blockquote nesting shared);
+    // past the cap keep the item text visible but stop descending into
+    // markdown.
+    if depth >= MAX_BLOCK_RENDER_DEPTH {
+        let indent = "    ".repeat(depth);
+        for item in list.items {
+            for line in wrap_text_with_ansi(item.trim(), ctx.width.max(1)) {
+                lines.push(format!("{indent}{line}"));
+            }
+        }
+        return;
+    }
     let ListInput {
         items,
         markers,
@@ -574,9 +634,14 @@ fn render_list(
                 rendered_any = true;
                 continue;
             }
-            for line in
-                render_markdown_block_one(item_block, item_width, theme, options, inline_prefix)
-            {
+            for line in render_markdown_block_one(
+                item_block,
+                item_width,
+                theme,
+                options,
+                inline_prefix,
+                depth + 1,
+            ) {
                 for wrapped in wrap_text_with_ansi(&line, item_width) {
                     if rendered_any {
                         lines.push(format!("{continuation_prefix}{wrapped}"));

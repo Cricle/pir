@@ -841,5 +841,7 @@ fn auth_provider_rows_carry_the_login_method() {
 #[test]
 fn format_tokens_matches_upstream_rounding() {
     assert_eq!(format_tokens(999), "999");
+    assert_eq!(format_tokens(12_500), "13k");
     assert_eq!(format_tokens(4_000_000), "4.0M");
+    assert_eq!(format_tokens(12_500_000), "13M");
 }

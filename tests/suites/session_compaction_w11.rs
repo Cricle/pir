@@ -822,6 +822,7 @@ fn paged_listing_agrees_with_the_full_listing() {
 /// fell into the skipped prefix must widen too.
 #[test]
 fn paged_widening_requires_an_on_path_resident_checkpoint() {
+    use pir::compaction::paged::PagedRequestPrompt;
     use pir::compaction::paged_requires_widening;
 
     // (a) Off-path compaction: build a long abandoned branch with a
@@ -859,7 +860,7 @@ fn paged_widening_requires_an_on_path_resident_checkpoint() {
     let model = test_model(10_000_000, 8_192);
     let config = CompactionConfig::default();
     assert!(
-        paged_requires_widening(&paged, &model, &config),
+        paged_requires_widening(&paged, &model, &config, PagedRequestPrompt::default()),
         "an OFF-PATH compaction must not make the window look complete"
     );
     drop(paged);
@@ -898,7 +899,7 @@ fn paged_widening_requires_an_on_path_resident_checkpoint() {
         "the checkpoint's kept range is resident: {first_kept}"
     );
     assert!(
-        !paged_requires_widening(&paged, &model, &config),
+        !paged_requires_widening(&paged, &model, &config, PagedRequestPrompt::default()),
         "an on-path checkpoint with its kept range resident needs no widening"
     );
 

@@ -29,15 +29,12 @@ pub(crate) const IMAGE_TYPE_SNIFF_BYTES: usize = 4100;
 /// Upstream `ImageResizeOptions` defaults: 2000x2000, 4.5MB of base64 payload
 /// (below Anthropic's 5MB request limit), JPEG quality 80.
 ///
-/// Part of the decode/resize path below, so — like that path — these exist
-/// only when the `image` crate does.
-#[cfg(feature = "image-tools")]
+/// These are plain numbers used by [`image_resize_limits_for_model`] in every
+/// build that compiles this module; the decode/resize half below is separately
+/// gated on the `image` crate.
 pub(crate) const DEFAULT_MAX_WIDTH: u32 = 2000;
-#[cfg(feature = "image-tools")]
 pub(crate) const DEFAULT_MAX_HEIGHT: u32 = 2000;
-#[cfg(feature = "image-tools")]
 pub(crate) const DEFAULT_MAX_BYTES: usize = 4_500_000;
-#[cfg(any(feature = "image-tools", all(feature = "print", feature = "tui")))]
 pub(crate) const DEFAULT_JPEG_QUALITY: u8 = 80;
 
 /// Hard per-side decode limit (a decompression-bomb guard, far above any
@@ -257,6 +254,53 @@ fn decode_image(bytes: &[u8]) -> Option<image::DynamicImage> {
     Some(decoded)
 }
 
+/// The one model surface [`image_resize_limits_for_model`] reads. Implemented
+/// for `crate::ai::types::Model` by the prompt-input caller (not here: this
+/// module is also pulled in verbatim by `tests/image_pipeline_fix.rs`, which
+/// has no crate-internal paths).
+pub(crate) trait ImageResizeLimitsSource {
+    /// `Model.compat.inputLimits` when present, else `Model.inputLimits`.
+    fn image_resize_input_limits(&self) -> Option<&serde_json::Value>;
+}
+
+/// Resolve the inline-image resize profile for `model` (upstream
+/// `ctx.model.inputLimits?.images?.resize`). The value can come from
+/// `Model.compat` (where models.json carries it) or from the top-level
+/// `Model.inputLimits` used by the upstream wire shape. Fields the model does
+/// not define fall back to the upstream defaults. Used by the interactive
+/// `@file` prompt expansion.
+pub(crate) fn image_resize_limits_for_model<M: ImageResizeLimitsSource + ?Sized>(
+    model: Option<&M>,
+) -> (u32, u32, usize, u8) {
+    let input_limits = model.and_then(|model| model.image_resize_input_limits());
+    let resize = input_limits
+        .and_then(|limits| limits.get("images"))
+        .and_then(|images| images.get("resize"));
+    let dimension = |key: &str, default: u32| {
+        resize
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    };
+    let max_width = dimension("maxWidth", DEFAULT_MAX_WIDTH);
+    let max_height = dimension("maxHeight", DEFAULT_MAX_HEIGHT);
+    let max_bytes = resize
+        .and_then(|value| value.get("maxBytes"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_BYTES);
+    let jpeg_quality = resize
+        .and_then(|value| value.get("jpegQuality"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| (1..=100).contains(value))
+        .unwrap_or(DEFAULT_JPEG_QUALITY);
+    (max_width, max_height, max_bytes, jpeg_quality)
+}
+
 /// Resize an image to fit within the max dimensions and encoded size. Returns
 /// the error variant that upstream reports when the image cannot be decoded
 /// (Convert) or no candidate fits `max_bytes` (Resize).
@@ -280,6 +324,9 @@ pub(crate) fn process_image(
     let decoded = decode_image(&normalized).ok_or(ProcessImageError::Convert)?;
 
     let (original_width, original_height) = (decoded.width(), decoded.height());
+    // A source alpha channel must survive a re-encode: those inputs keep the
+    // PNG-first candidate order (JPEG has no alpha and `to_rgb8` drops it).
+    let input_has_alpha = decoded.color().has_alpha();
 
     // Already within the limits: pass the (normalized) bytes through unchanged.
     if original_width <= max_width && original_height <= max_height && input_base64_size < max_bytes
@@ -304,34 +351,54 @@ pub(crate) fn process_image(
         target_height = max_height;
     }
 
+    // Perf: a large input payload is the cheap upper bound on what a
+    // re-encode at the same pixel count can weigh, so start the ladder at
+    // sqrt(max_bytes / input_base64_size) of the target. Every skipped
+    // full-size iteration is a decode-driven resize plus a PNG/JPEG encode;
+    // for a 12MB noise PNG this avoids the 2000px and 1500px rounds. Only
+    // large images take this shortcut (small fixtures keep the exact
+    // dimension-limited ladder), and the estimate never upscales or exceeds
+    // the limits above.
+    let mut current_width = target_width;
+    let mut current_height = target_height;
+    let original_pixels = u64::from(original_width) * u64::from(original_height);
+    if input_base64_size > max_bytes && original_pixels >= 1_000_000 {
+        let scale = (max_bytes as f64 / input_base64_size as f64).sqrt();
+        if scale.is_finite() && scale < 1.0 {
+            current_width = ((f64::from(current_width) * scale).floor() as u32).max(1);
+            current_height = ((f64::from(current_height) * scale).floor() as u32).max(1);
+        }
+    }
+
     // Quality steps: the configured quality plus upstream's ladder, deduped
     // in insertion order (`Array.from(new Set([opts.jpegQuality, 85, 70, 55, 40]))`
     // keeps the first occurrence, so the configured quality leads the ladder),
-    // and candidates are tried in order (PNG first, then the JPEG ladder).
+    // and candidates are tried in order (see [`CandidateOrder`]).
     let mut qualities = vec![jpeg_quality, 85, 70, 55, 40];
     let mut seen = std::collections::HashSet::new();
     qualities.retain(|quality| seen.insert(*quality));
 
-    let mut current_width = target_width;
-    let mut current_height = target_height;
+    // Large opaque payloads are re-encoded from scratch: trying the PNG
+    // candidate first costs the most expensive encode and is the least
+    // likely to fit, so lead with JPEG (configured quality 80 first). JPEG
+    // inputs are already lossy, so a PNG re-encode can only grow them; alpha
+    // PNGs stay PNG-first so transparency is preserved.
+    let prefer_jpeg =
+        !input_has_alpha && (input_base64_size >= max_bytes || normalized_mime == "image/jpeg");
+    let order = if prefer_jpeg {
+        CandidateOrder::JpegFirst
+    } else {
+        CandidateOrder::PngFirst
+    };
+
     loop {
         let resized = decoded.resize(
             current_width,
             current_height,
             image::imageops::FilterType::Lanczos3,
         );
-        let mut candidates: Vec<(String, String)> = Vec::new();
-        if let Some(png) = encode_png_candidate(&resized) {
-            candidates.push(png);
-        }
-        for quality in &qualities {
-            if let Some(jpeg) = encode_jpeg_candidate(&resized, *quality) {
-                candidates.push(jpeg);
-            }
-        }
-        if let Some((data_base64, mime)) = candidates
-            .into_iter()
-            .find(|(data, _)| data.len() < max_bytes)
+        if let Some((data_base64, mime)) =
+            first_fitting_candidate(&resized, &qualities, order, max_bytes)
         {
             let mut hints = conversion_hint(converted_from, &mime);
             hints.extend(format_dimension_note(
@@ -357,6 +424,45 @@ pub(crate) fn process_image(
         }
         current_width = next_width;
         current_height = next_height;
+    }
+}
+
+/// Candidate order for the resize ladder. `PngFirst` is the upstream order
+/// (PNG, then the JPEG quality ladder); `JpegFirst` is the large-payload fast
+/// path (JPEG ladder, then PNG only when no JPEG fits).
+#[cfg(any(feature = "image-tools", all(feature = "print", feature = "tui")))]
+#[derive(Clone, Copy)]
+enum CandidateOrder {
+    PngFirst,
+    JpegFirst,
+}
+
+/// Encode candidates lazily in `order` and return the first one under
+/// `max_bytes`. Returning as soon as one fits is equivalent to encoding the
+/// whole candidate list and picking the first fit, but skips the PNG encode
+/// (and the unused JPEG qualities) whenever an earlier candidate already
+/// fits - the dominant cost on the large-image path.
+#[cfg(any(feature = "image-tools", all(feature = "print", feature = "tui")))]
+fn first_fitting_candidate(
+    image: &image::DynamicImage,
+    qualities: &[u8],
+    order: CandidateOrder,
+    max_bytes: usize,
+) -> Option<(String, String)> {
+    let fits = |candidate: &(String, String)| candidate.0.len() < max_bytes;
+    let jpeg_ladder = || {
+        qualities.iter().find_map(|quality| {
+            let candidate = encode_jpeg_candidate(image, *quality)?;
+            fits(&candidate).then_some(candidate)
+        })
+    };
+    match order {
+        CandidateOrder::PngFirst => encode_png_candidate(image)
+            .filter(fits)
+            .or_else(jpeg_ladder),
+        CandidateOrder::JpegFirst => {
+            jpeg_ladder().or_else(|| encode_png_candidate(image).filter(fits))
+        }
     }
 }
 

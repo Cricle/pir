@@ -48,7 +48,7 @@ use crate::extensions::runtime::{
     CommandOutcome, EmitOutcome, ExtensionConfig, LoadResult, Notification, RendererCallOutcome,
     RendererOutcome, RuntimeState, SessionContextSnapshot, ShortcutDef, ToolDef, ToolResult,
 };
-use crate::extensions::types::LoadedExtension;
+use crate::extensions::types::{EventDispatchTimeout, LoadedExtension};
 
 // ---------------------------------------------------------------------------
 // Live session streaming flag (ctx.waitForIdle support)

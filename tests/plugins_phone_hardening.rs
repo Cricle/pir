@@ -134,7 +134,6 @@ fn pool_config(log: &Path) -> PoolConfig {
     let mut config = PoolConfig::new(std::env::current_dir().expect("cwd"));
     config.executable = std::env::current_exe().expect("test executable");
     config.args = vec![
-        "--exact".to_owned(),
         "mock_phone_budget_child".to_owned(),
         "--nocapture".to_owned(),
     ];

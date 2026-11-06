@@ -6464,10 +6464,10 @@ async fn in_loop_threshold_swap_with_fresh_snapshot_does_not_write_into_replaced
     seed_compactable_history(&mut first);
     let first_path = first.path().to_path_buf();
     let mut model = fake_model();
-    // Seed history ~408 tokens: BELOW the prompt-start threshold (499) and
-    // below the first turn's check (~415 with the starting prompt); the
-    // ~1000-token gated assistant response pushes the next turn far over.
-    model.context_window = 500;
+    // Seed history plus this run's tool declarations stays below the
+    // prompt-start gate and the first turn's check; the ~1000-token gated
+    // assistant response pushes the next turn over.
+    model.context_window = 1_000;
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
             provider_registry: registry,
@@ -6595,9 +6595,10 @@ async fn in_loop_threshold_swap_with_stale_rebuilt_context_does_not_write_into_r
     seed_compactable_history(&mut first);
     let first_path = first.path().to_path_buf();
     let mut model = fake_model();
-    // Seed history ~408 tokens < 411: the prompt-start gate stays idle, the
-    // first loop turn (seed + starting prompt ~415) compacts successfully.
-    model.context_window = 412;
+    // Keep a wide margin: the prompt-start gate sees the seed history plus
+    // this run's tool declarations only, while the first loop turn also
+    // carries the (large) starting prompt and must cross the threshold.
+    model.context_window = 1_000;
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
             provider_registry: registry,
@@ -6628,7 +6629,10 @@ async fn in_loop_threshold_swap_with_stale_rebuilt_context_does_not_write_into_r
         let agent = Arc::clone(&agent);
         async move {
             agent
-                .prompt("loop threshold", event_handler(EventLog::default()))
+                .prompt(
+                    &format!("loop threshold {}", "x".repeat(3_000)),
+                    event_handler(EventLog::default()),
+                )
                 .await
         }
     });
@@ -6728,7 +6732,10 @@ async fn threshold_compaction_retry_after_failed_append_does_not_write_into_repl
     seed_compactable_history(&mut first);
     let first_path = first.path().to_path_buf();
     let mut model = fake_model();
-    model.context_window = 412;
+    // Same sizing as the stale-rebuilt test above: the prompt-start gate
+    // (seed + tool declarations) is below the usable window; the first loop
+    // turn additionally carries the large starting prompt and crosses.
+    model.context_window = 1_000;
     let (failed_recorder, plugin_failures) =
         PluginEventRecorder::new("threshold-failed-recorder", &["session_compact_failed"]);
     let agent = Arc::new(AgentSession::new_with_plugins(
@@ -6768,7 +6775,10 @@ async fn threshold_compaction_retry_after_failed_append_does_not_write_into_repl
         let agent = Arc::clone(&agent);
         async move {
             agent
-                .prompt("loop threshold retry", event_handler(EventLog::default()))
+                .prompt(
+                    &format!("loop threshold retry {}", "x".repeat(3_000)),
+                    event_handler(EventLog::default()),
+                )
                 .await
         }
     });
@@ -7623,5 +7633,963 @@ async fn js_only_threshold_compaction_orders_its_lifecycle_events() {
         js_compaction_order(&handle).await,
         expected,
         "the lifecycle events must be delivered exactly once"
+    );
+}
+
+/// `/compact` at 91.6% provider-reported usage over a tiny transcript: the
+/// request is over the threshold even though the conversation fits the
+/// keep-recent window. The manual path must still produce a checkpoint
+/// (forced whole-conversation summary) instead of "nothing to compact".
+#[tokio::test]
+async fn manual_compact_succeeds_when_usage_is_near_window_with_tiny_history() {
+    let temp = TempDir::new("manual-compact-near-usage");
+    let registry = fake_registry(Arc::new(|_index, context| {
+        let is_summarizer = context.messages.iter().any(|message| match message {
+            Message::User(user) => user.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Text(text) if text.text.contains("<conversation>")
+            )),
+            _ => false,
+        });
+        if is_summarizer {
+            return assistant(vec![text("NEAR SUMMARY")], StopReason::Stop);
+        }
+        let mut reply = assistant(vec![text("near usage reply")], StopReason::Stop);
+        // The persisted prompt message uses the real clock; the usage record
+        // must not look older than its prefix (upstream timestamp guard).
+        reply.timestamp = pir::ai::util::now_ms();
+        reply.usage = Usage {
+            input: 30_000,
+            output: 10,
+            total_tokens: 30_010,
+            ..Usage::default()
+        };
+        reply
+    }));
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let mut model = fake_model();
+    model.context_window = 32_768;
+    let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        provider_registry: registry,
+        model,
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: tool_registry_with(None),
+        session: Some(session),
+        compaction: Some(pir::compaction::CompactionConfig::default()),
+        max_turns: 4,
+        system_prompt: None,
+        cwd: Some(temp.0.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    }));
+
+    let noop: EventLog = Arc::new(Mutex::new(Vec::new()));
+    agent
+        .prompt("hello", event_handler(noop.clone()))
+        .await
+        .expect("seed prompt");
+
+    let result = agent
+        .compact(None)
+        .await
+        .expect("near-usage manual compact must succeed");
+    assert_eq!(result.summary, "NEAR SUMMARY");
+}
+
+/// A large transcript on a small-window model: the upstream 20k keep-recent
+/// default exceeds the whole 8k window, so the normal cut used to keep
+/// everything and `/compact` reported "nothing to compact". The clamped
+/// budget must find a real cut and run the summarizer.
+#[tokio::test]
+async fn manual_compact_succeeds_for_large_session_on_small_window() {
+    let temp = TempDir::new("manual-compact-small-window");
+    let registry = fake_registry(Arc::new(|_index, context| {
+        let is_summarizer = context.messages.iter().any(|message| match message {
+            Message::User(user) => user.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Text(text) if text.text.contains("<conversation>")
+            )),
+            _ => false,
+        });
+        if is_summarizer {
+            return assistant(vec![text("BIG SUMMARY")], StopReason::Stop);
+        }
+        // Understated usage (the QA mock reports tens of tokens): the content
+        // floor must still make the large transcript visible to the trigger.
+        let mut reply = assistant(vec![text(&"a".repeat(3_000))], StopReason::Stop);
+        reply.timestamp = pir::ai::util::now_ms();
+        reply.usage = Usage {
+            input: 11,
+            output: 7,
+            total_tokens: 18,
+            ..Usage::default()
+        };
+        reply
+    }));
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let mut model = fake_model();
+    model.context_window = 8_192;
+    let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        provider_registry: registry,
+        model,
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: tool_registry_with(None),
+        session: Some(session),
+        // Disabled auto-compaction keeps this test focused on the MANUAL
+        // path; the manual path still uses the configured keep budget.
+        compaction: Some(pir::compaction::CompactionConfig {
+            enabled: false,
+            reserve_tokens: 16_384,
+            keep_recent_tokens: 20_000,
+        }),
+        max_turns: 4,
+        system_prompt: None,
+        cwd: Some(temp.0.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    }));
+
+    let noop: EventLog = Arc::new(Mutex::new(Vec::new()));
+    for turn in 0..6 {
+        agent
+            .prompt(
+                &format!("turn {turn}: {}", "u".repeat(3_000)),
+                event_handler(noop.clone()),
+            )
+            .await
+            .expect("seed prompt");
+    }
+
+    let result = agent
+        .compact(None)
+        .await
+        .expect("large-session manual compact must succeed");
+    assert_eq!(result.summary, "BIG SUMMARY");
+    assert!(
+        !result.retained_tail.is_empty(),
+        "the recent tail must be retained"
+    );
+    assert!(
+        result.first_kept_index < 12,
+        "the cut must fall inside the transcript, got {}",
+        result.first_kept_index
+    );
+}
+
+/// QA's large-session shape: 20 long turns on a 32k model with the upstream
+/// default reserve/keep settings. The transcript is larger than the effective
+/// keep-recent budget, so `/compact` must cut inside it and actually run the
+/// summarizer (not report "nothing to compact (session too small)").
+#[tokio::test]
+async fn manual_compact_cuts_a_twenty_turn_session_at_32k() {
+    let temp = TempDir::new("manual-compact-20-long-turns");
+    let registry = fake_registry(Arc::new(|_index, context| {
+        let is_summarizer = context.messages.iter().any(|message| match message {
+            Message::User(user) => user.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Text(text) if text.text.contains("<conversation>")
+            )),
+            _ => false,
+        });
+        if is_summarizer {
+            return assistant(vec![text("TWENTY TURN SUMMARY")], StopReason::Stop);
+        }
+        // Understated usage: the content floor alone must keep the session
+        // visible to the manual trigger, exactly like the QA mock.
+        let mut reply = assistant(vec![text(&"a".repeat(5_000))], StopReason::Stop);
+        reply.timestamp = pir::ai::util::now_ms();
+        reply.usage = Usage {
+            input: 11,
+            output: 7,
+            total_tokens: 18,
+            ..Usage::default()
+        };
+        reply
+    }));
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let mut model = fake_model();
+    model.context_window = 32_768;
+    let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        provider_registry: registry,
+        model,
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: tool_registry_with(None),
+        session: Some(session),
+        // Manual path only; the keep budget is the upstream default.
+        compaction: Some(pir::compaction::CompactionConfig {
+            enabled: false,
+            ..pir::compaction::CompactionConfig::default()
+        }),
+        max_turns: 4,
+        system_prompt: None,
+        cwd: Some(temp.0.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    }));
+
+    let noop: EventLog = Arc::new(Mutex::new(Vec::new()));
+    for turn in 0..20 {
+        agent
+            .prompt(
+                &format!("turn {turn}: {}", "u".repeat(1_000)),
+                event_handler(noop.clone()),
+            )
+            .await
+            .expect("seed prompt");
+    }
+
+    let result = agent
+        .compact(None)
+        .await
+        .expect("20-turn manual compact must succeed");
+    assert_eq!(result.summary, "TWENTY TURN SUMMARY");
+    assert!(
+        !result.retained_tail.is_empty(),
+        "the recent tail must be retained"
+    );
+    assert!(
+        result.first_kept_index > 0 && result.first_kept_index < 40,
+        "the cut must fall inside the 40-message transcript, got {}",
+        result.first_kept_index
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Input during compaction / streaming (COMPACT-INPUT)
+// ---------------------------------------------------------------------------
+
+/// The user-visible state machine: while a MANUAL compaction is in flight
+/// `is_streaming()` is false but the session is BUSY (`is_busy()`), so a
+/// direct prompt is rejected synchronously while steer/follow-up input is
+/// queued (`queued`, not `handled`). After the compaction releases the claim,
+/// every queued message is delivered EXACTLY ONCE, in queue order, and the
+/// persisted transcript keeps one copy of each after the compaction boundary.
+#[tokio::test]
+async fn compaction_queues_steer_and_follow_up_and_delivers_each_once() {
+    let temp = TempDir::new("compact-input-order");
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let observed_for_responder = Arc::clone(&observed);
+    let registry = fake_registry(Arc::new(move |_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            return assistant(vec![text("COMPACT SUMMARY")], StopReason::Stop);
+        }
+        observed_for_responder
+            .lock()
+            .unwrap()
+            .push(user_texts(context));
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        race_agent_config(registry, session, &temp, None),
+        vec![Arc::new(GatePlugin {
+            info: PluginInfo::inline("compact-input-gate"),
+            event: "session_before_compact",
+            entered: Arc::clone(&entered),
+            gate: gate_rx,
+        })],
+    ));
+
+    let compact_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.compact(None).await }
+    });
+    wait_for_counter(&entered, 1, "session_before_compact gate").await;
+    assert!(agent.is_compacting());
+    assert!(!agent.is_streaming());
+    assert!(agent.is_busy(), "a manual compaction is a busy session");
+    assert_eq!(
+        agent.input_disposition(),
+        Disposition::Queued,
+        "queueable input during compaction must report queued"
+    );
+
+    // Steer/follow-up are accepted (native queue semantics) and report the
+    // truth: they wait, they are not "handled" at the next poll.
+    assert_eq!(agent.steer("during-steer"), Disposition::Queued);
+    assert_eq!(agent.follow_up("during-follow"), Disposition::Queued);
+    assert_eq!(
+        agent.pending_message_count(),
+        2,
+        "both queued messages are visible while compaction runs"
+    );
+    // A direct prompt is rejected synchronously and persists nothing.
+    let rejected = agent
+        .prompt("blocked", event_handler(EventLog::default()))
+        .await
+        .expect_err("a prompt during compaction must be rejected");
+    assert_eq!(
+        rejected.to_string(),
+        "Cannot submit a prompt while compaction is in progress. \
+         Wait for compaction to finish and retry."
+    );
+
+    let _ = gate_tx.send(true);
+    let compacted = compact_task
+        .await
+        .expect("compact task")
+        .expect("compaction");
+    assert_split_turn_summary(&compacted.summary);
+    assert!(!agent.is_compacting());
+    assert!(!agent.is_busy());
+
+    // The first run after compaction drains steering into its FIRST request;
+    // the follow-up is delivered by a later request of the same run.
+    let terminal = agent
+        .prompt("after", event_handler(EventLog::default()))
+        .await
+        .expect("prompt after compaction");
+    assert_eq!(terminal.stop_reason, StopReason::Stop);
+    let seen = observed.lock().unwrap().clone();
+    // Each request carries the CUMULATIVE context: a message delivered once
+    // appears in that request and every later one. A duplicate delivery would
+    // appear TWICE (or more) inside a single request, so the max per-request
+    // count is the exact-once assertion.
+    let occurrences = |needle: &str| {
+        seen.iter()
+            .map(|request| request.iter().filter(|text| text.as_str() == needle).count())
+            .max()
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        occurrences("during-steer"),
+        1,
+        "steer must run once: {seen:?}"
+    );
+    assert_eq!(
+        occurrences("during-follow"),
+        1,
+        "follow-up must run once: {seen:?}"
+    );
+    assert_eq!(
+        occurrences("after"),
+        1,
+        "the prompt must run once: {seen:?}"
+    );
+    let position = |needle: &str| {
+        seen.iter()
+            .position(|request| request.iter().any(|text| text == needle))
+            .unwrap_or_else(|| panic!("{needle} never reached a request: {seen:?}"))
+    };
+    assert!(
+        position("during-steer") < position("during-follow"),
+        "steering must be delivered before the follow-up: {seen:?}"
+    );
+
+    // History: exactly one compaction entry, and each user message appears
+    // exactly once (no duplicate from the queue drain/persistence hand-off,
+    // no orphan from the rejected prompt).
+    let entries = agent
+        .with_session_manager(|manager| manager.entries())
+        .await
+        .expect("session manager");
+    let compactions = entries
+        .iter()
+        .filter(|entry| matches!(entry, pir::session_manager::FileEntry::Compaction(_)))
+        .count();
+    assert_eq!(compactions, 1, "expected exactly one compaction entry");
+    let stored_users: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            pir::session_manager::FileEntry::Message(message) => match &message.message {
+                pir::session_manager::types::StoredMessage::User(user) => Some(
+                    user.content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(text) => Some(text.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                ),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    for expected in ["after", "during-steer", "during-follow"] {
+        assert_eq!(
+            stored_users
+                .iter()
+                .filter(|text| text.as_str() == expected)
+                .count(),
+            1,
+            "{expected} must be stored exactly once: {stored_users:?}"
+        );
+    }
+    assert!(
+        !stored_users.iter().any(|text| text == "blocked"),
+        "the rejected prompt must never enter storage: {stored_users:?}"
+    );
+}
+
+/// Concurrent manual compactions: the second is rejected synchronously (the
+/// claim is the mutual exclusion), and only ONE compaction boundary is
+/// persisted.
+#[tokio::test]
+async fn concurrent_manual_compaction_is_rejected_while_one_is_in_flight() {
+    let temp = TempDir::new("compact-concurrent");
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let registry = fake_registry(Arc::new(|_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            return assistant(vec![text("COMPACT SUMMARY")], StopReason::Stop);
+        }
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        race_agent_config(registry, session, &temp, None),
+        vec![Arc::new(GatePlugin {
+            info: PluginInfo::inline("compact-concurrent-gate"),
+            event: "session_before_compact",
+            entered: Arc::clone(&entered),
+            gate: gate_rx,
+        })],
+    ));
+
+    let first = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.compact(None).await }
+    });
+    wait_for_counter(&entered, 1, "first session_before_compact").await;
+
+    let second = agent.compact(None).await;
+    let error = second.expect_err("a concurrent compaction must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot compact while a compaction is in progress"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        agent.is_compacting(),
+        "the rejected compaction must not disturb the live claim"
+    );
+
+    let _ = gate_tx.send(true);
+    first
+        .await
+        .expect("first compact task")
+        .expect("first compaction");
+
+    let entries = agent
+        .with_session_manager(|manager| manager.entries())
+        .await
+        .expect("session manager");
+    let compactions = entries
+        .iter()
+        .filter(|entry| matches!(entry, pir::session_manager::FileEntry::Compaction(_)))
+        .count();
+    assert_eq!(
+        compactions, 1,
+        "concurrent compacts must not duplicate the boundary"
+    );
+}
+
+/// Cancelling a manual compaction leaves the queued input intact: the failure
+/// path must not drain or orphan the steering/follow-up inboxes, and the next
+/// prompt delivers each message once.
+#[tokio::test]
+async fn cancelled_compaction_keeps_queued_input_deliverable() {
+    let temp = TempDir::new("compact-cancel-queue");
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let observed_for_responder = Arc::clone(&observed);
+    // The fake provider does not observe the abort signal itself; flipping
+    // this flag makes the summarizer answer with an error, which is exactly
+    // how an aborted continuation surfaces from a real transport. The
+    // compaction must then take its failure path.
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let cancelled_for_responder = Arc::clone(&cancelled);
+    let registry = fake_registry(Arc::new(move |_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            if cancelled_for_responder.load(Ordering::SeqCst) != 0 {
+                let mut message = assistant(vec![text("aborted summary")], StopReason::Error);
+                message.error_message = Some("aborted".into());
+                return message;
+            }
+            return assistant(vec![text("COMPACT SUMMARY")], StopReason::Stop);
+        }
+        observed_for_responder
+            .lock()
+            .unwrap()
+            .push(user_texts(context));
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        race_agent_config(registry, session, &temp, None),
+        vec![Arc::new(GatePlugin {
+            info: PluginInfo::inline("compact-cancel-gate"),
+            event: "session_before_compact",
+            entered: Arc::clone(&entered),
+            gate: gate_rx,
+        })],
+    ));
+
+    let compact_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.compact(None).await }
+    });
+    wait_for_counter(&entered, 1, "session_before_compact gate").await;
+    assert_eq!(agent.steer("survivor"), Disposition::Queued);
+    assert!(
+        agent.abort_compaction(),
+        "the compaction signal must be armed"
+    );
+    cancelled.store(1, Ordering::SeqCst);
+    let _ = gate_tx.send(true);
+    let failed = compact_task.await.expect("compact task");
+    assert!(failed.is_err(), "the compaction was cancelled");
+    assert!(!agent.is_compacting(), "the claim must be released on failure");
+    assert_eq!(
+        agent.get_steering_messages().await,
+        vec!["survivor".to_owned()],
+        "cancelling the compaction must not drain the steering queue"
+    );
+
+    agent
+        .prompt("after", event_handler(EventLog::default()))
+        .await
+        .expect("prompt after cancelled compaction");
+    let seen = observed.lock().unwrap().clone();
+    let max_per_request = seen
+        .iter()
+        .map(|request| {
+            request
+                .iter()
+                .filter(|text| text.as_str() == "survivor")
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        max_per_request, 1,
+        "the queued message must be delivered exactly once: {seen:?}"
+    );
+}
+
+/// Streaming (steer/follow-up) delivery order: messages queued during a tool
+/// call are delivered exactly once and steering precedes the follow-up.
+#[tokio::test]
+async fn steer_and_follow_up_during_streaming_deliver_in_order_once() {
+    let temp = TempDir::new("stream-input-order");
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let observed_for_responder = Arc::clone(&observed);
+    let registry = fake_registry(Arc::new(move |index, context| {
+        if index == 0 {
+            return assistant(vec![tool_call("call-1", "gate")], StopReason::ToolUse);
+        }
+        observed_for_responder
+            .lock()
+            .unwrap()
+            .push(user_texts(context));
+        assistant(vec![text("done")], StopReason::Stop)
+    }));
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        provider_registry: registry,
+        model: fake_model(),
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: tool_registry_with(Some((gate_rx, Arc::clone(&entered)))),
+        session: Some(session),
+        compaction: None,
+        max_turns: 6,
+        system_prompt: None,
+        cwd: Some(temp.0.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    }));
+
+    let prompt_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            agent
+                .prompt("start", event_handler(EventLog::default()))
+                .await
+        }
+    });
+    wait_for_tool_entry(&entered).await;
+    assert_eq!(agent.steer("s1"), Disposition::Queued);
+    assert_eq!(agent.follow_up("f1"), Disposition::Queued);
+    assert_eq!(agent.steer("s2"), Disposition::Queued);
+    assert_eq!(agent.pending_message_count(), 3);
+    let _ = gate_tx.send(true);
+    prompt_task
+        .await
+        .expect("prompt task")
+        .expect("prompt result");
+    assert!(agent.get_steering_messages().await.is_empty());
+    assert!(agent.get_follow_up_messages().await.is_empty());
+
+    let seen = observed.lock().unwrap().clone();
+    // Requests carry the cumulative context; max per-request count == exact-once.
+    let occurrences = |needle: &str| {
+        seen.iter()
+            .map(|request| request.iter().filter(|text| text.as_str() == needle).count())
+            .max()
+            .unwrap_or(0)
+    };
+    for needle in ["s1", "s2", "f1"] {
+        assert_eq!(occurrences(needle), 1, "{needle} must run once: {seen:?}");
+    }
+    let position = |needle: &str| {
+        seen.iter()
+            .position(|request| request.iter().any(|text| text == needle))
+            .unwrap_or_else(|| panic!("{needle} never reached a request: {seen:?}"))
+    };
+    assert!(
+        position("s1") < position("s2") && position("s2") < position("f1"),
+        "steering must drain in order before the follow-up: {seen:?}"
+    );
+}
+
+/// The interactive prompt path (what the TUI worker calls) expands `@file`
+/// and `@image.png` references BEFORE the user message is built: text files
+/// render as `<file name="…">…</file>`, images become image content blocks,
+/// and the literal `@` tokens disappear. This is the request-body contract the
+/// print hosts already have, pinned here at the session prompt seam.
+#[tokio::test]
+async fn interactive_prompt_expands_file_and_image_references_into_the_request() {
+    use base64::Engine as _;
+
+    let temp = TempDir::new("prompt-file-refs");
+    let notes = temp.0.join("my notes.txt");
+    std::fs::write(&notes, "ALPHA\nBETA").expect("write notes");
+    let png = temp.0.join("shot.png");
+    // Minimal PNG head: signature + IHDR chunk length/type. The MIME sniff
+    // only needs the signature (`detect_supported_image_mime_type`).
+    let png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRfake-body".to_vec();
+    std::fs::write(&png, &png_bytes).expect("write png");
+
+    let requests: Arc<Mutex<Vec<Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let registry = fake_registry(Arc::new(move |_index, context| {
+        captured.lock().unwrap().push(context.clone());
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        provider_registry: registry,
+        model: fake_model(),
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: tool_registry_with(None),
+        session: None,
+        compaction: None,
+        max_turns: 4,
+        system_prompt: None,
+        cwd: Some(temp.0.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    }));
+
+    agent
+        .prompt_with_source(
+            "summarize @\"my notes.txt\" and @shot.png",
+            "interactive",
+            Arc::new(|_| {}),
+        )
+        .await
+        .expect("prompt")
+        .expect("not handled");
+
+    let context = requests
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("one provider request");
+    let user = context
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            Message::User(user) => Some(user),
+            _ => None,
+        })
+        .expect("user message");
+    let prompt_text = user
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(
+        prompt_text.contains(&format!("<file name=\"{}\">\nALPHA\nBETA\n</file>", notes.display())),
+        "text file content must be injected under its absolute name: {prompt_text}"
+    );
+    assert!(prompt_text.contains("summarize"), "{prompt_text}");
+    assert!(
+        !prompt_text.contains("@\"my notes.txt\"") && !prompt_text.contains("@shot.png"),
+        "file-reference tokens must be removed: {prompt_text}"
+    );
+
+    let image = user
+        .content
+        .iter()
+        .find_map(|block| match block {
+            ContentBlock::Image(image) => Some(image),
+            _ => None,
+        })
+        .expect("image attachment on the user message");
+    assert_eq!(image.mime_type, "image/png");
+    assert_eq!(
+        image.data,
+        base64::engine::general_purpose::STANDARD.encode(&png_bytes)
+    );
+}
+
+/// A missing `@file` reference is a hard error before any provider request,
+/// matching the print host (`File not found: <absolute>`).
+#[tokio::test]
+async fn interactive_prompt_missing_file_reference_fails_before_the_request() {
+    let temp = TempDir::new("prompt-file-missing");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&requests);
+    let registry = fake_registry(Arc::new(move |_index, _context| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        assistant(vec![text("unexpected")], StopReason::Stop)
+    }));
+    let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        provider_registry: registry,
+        model: fake_model(),
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: tool_registry_with(None),
+        session: None,
+        compaction: None,
+        max_turns: 4,
+        system_prompt: None,
+        cwd: Some(temp.0.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    }));
+
+    let error = agent
+        .prompt_with_source("read @missing.txt", "interactive", Arc::new(|_| {}))
+        .await
+        .expect_err("missing referenced file must fail the prompt");
+    assert!(error.to_string().contains("File not found:"), "{error}");
+    assert_eq!(requests.load(Ordering::SeqCst), 0, "no provider request");
+}
+
+// ---------------------------------------------------------------------------
+// RPC-ADMISSION: atomic run admission before acknowledging a prompt
+// ---------------------------------------------------------------------------
+
+/// `try_claim_run()` is the atomic admission point an acknowledging host (RPC)
+/// uses BEFORE it answers `started`: while a MANUAL compaction owns the
+/// session the claim must fail synchronously with the upstream message (never
+/// mark a run), and once the compaction releases it the very next admission
+/// succeeds. Dropping an unused admission must return the session to idle.
+#[tokio::test]
+async fn run_admission_rejects_while_a_manual_compaction_owns_the_session() {
+    let temp = TempDir::new("run-admission-compacting");
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        race_agent_config(race_registry("done"), session, &temp, None),
+        vec![Arc::new(GatePlugin {
+            info: PluginInfo::inline("run-admission-compact-gate"),
+            event: "session_before_compact",
+            entered: Arc::clone(&entered),
+            gate: gate_rx,
+        })],
+    ));
+
+    let compact_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.compact(None).await }
+    });
+    wait_for_counter(&entered, 1, "session_before_compact gate").await;
+    assert!(agent.is_compacting());
+
+    let rejected = agent
+        .try_claim_run()
+        .expect_err("a compaction owns the session");
+    assert_eq!(
+        rejected.to_string(),
+        "Cannot submit a prompt while compaction is in progress. \
+         Wait for compaction to finish and retry."
+    );
+    assert!(
+        !agent.is_streaming(),
+        "a rejected admission must not publish a running state"
+    );
+    assert!(agent.is_compacting(), "the compaction claim stays intact");
+
+    let _ = gate_tx.send(true);
+    compact_task
+        .await
+        .expect("compact task")
+        .expect("compaction must finish");
+
+    let admission = agent
+        .try_claim_run()
+        .expect("the idle session must admit the next run");
+    assert!(agent.is_streaming());
+    drop(admission);
+    assert!(
+        !agent.is_streaming(),
+        "dropping an unused admission must release the claim"
+    );
+}
+
+/// A held admission excludes a concurrent manual compaction: `compact()`
+/// waits for the claim instead of claiming COMPACTING mid-air, and dropping
+/// the admission wakes it (the same path an admitted run uses when it
+/// settles). This is the exact ordering the RPC host relies on between
+/// its `started` acknowledgement and the run's first poll.
+#[tokio::test]
+async fn a_run_admission_holds_the_session_against_a_manual_compaction() {
+    let temp = TempDir::new("run-admission-vs-compact");
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+    let registry = fake_registry(Arc::new(|_index, context| {
+        if context.system_prompt.as_deref()
+            == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+        {
+            return assistant(vec![text("COMPACT SUMMARY")], StopReason::Stop);
+        }
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let agent = Arc::new(AgentSession::new(race_agent_config(
+        registry, session, &temp, None,
+    )));
+
+    let admission = agent.try_claim_run().expect("idle session admits a run");
+    assert!(agent.is_streaming());
+    assert_eq!(agent.input_disposition(), Disposition::Queued);
+    let second = agent
+        .try_claim_run()
+        .expect_err("only one admission may hold the session");
+    assert!(
+        second.to_string().contains("already streaming"),
+        "unexpected second-admission error: {second}"
+    );
+
+    let compact_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.compact(None).await }
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert!(
+        !compact_task.is_finished(),
+        "compact() must wait for the admitted run's claim"
+    );
+    assert!(
+        !agent.is_compacting(),
+        "compact() must not publish COMPACTING while a run is admitted"
+    );
+
+    drop(admission);
+    let compacted = compact_task
+        .await
+        .expect("compact task")
+        .expect("the released claim must let compaction run");
+    assert_split_turn_summary(&compacted.summary);
+    assert!(!agent.is_compacting());
+    assert!(!agent.is_streaming());
+}
+
+/// A run started through the admission API is the run the host acknowledged:
+/// it reaches the provider exactly once, persists its starting message once,
+/// releases the claim at settle, and does not disturb the next direct prompt.
+#[tokio::test]
+async fn an_admitted_prompt_starts_the_run_and_releases_the_session() {
+    let temp = TempDir::new("run-admission-start");
+    let mut session = SessionManager::create(".", &temp.0).expect("create session");
+    seed_compactable_history(&mut session);
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("admitted-ok")], StopReason::Stop)
+    }));
+    let agent = Arc::new(AgentSession::new(race_agent_config(
+        registry, session, &temp, None,
+    )));
+
+    let admission = agent.try_claim_run().expect("idle session admits a run");
+    let terminal = agent
+        .prompt_with_prepared_input_admitted(
+            "admitted",
+            Vec::new(),
+            event_handler(EventLog::default()),
+            admission,
+        )
+        .await
+        .expect("the admitted prompt must run");
+    assert_eq!(
+        text_of_message(&Message::Assistant(terminal)).as_deref(),
+        Some("admitted-ok")
+    );
+    assert!(!agent.is_streaming(), "the run must release its claim at settle");
+    assert!(!agent.is_busy());
+
+    let entries = agent
+        .with_session_manager(|manager| manager.entries())
+        .await
+        .expect("session manager");
+    let stored: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            pir::session_manager::FileEntry::Message(message) => match &message.message {
+                pir::session_manager::types::StoredMessage::User(user) => Some(
+                    user.content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(text) => Some(text.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                ),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stored.iter().filter(|text| text.as_str() == "admitted").count(),
+        1,
+        "the admitted prompt must be stored exactly once: {stored:?}"
+    );
+
+    let after = agent
+        .prompt("after", event_handler(EventLog::default()))
+        .await
+        .expect("a direct prompt after the admitted run");
+    assert_eq!(
+        text_of_message(&Message::Assistant(after)).as_deref(),
+        Some("admitted-ok")
     );
 }

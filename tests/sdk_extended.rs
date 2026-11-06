@@ -23,7 +23,10 @@ use pir::ai::types::{
     Message, Model, ModelCost, ModelCostRates, StopReason, StreamOptions, TerminalReason,
     TextContent, ThinkingLevel, Usage,
 };
-use pir::sdk::{AgentBuilder, SdkEvent, SessionMode};
+use pir::sdk::{
+    AgentBuilder, CreateAgentSessionOptions, ModelRegistry, SdkEvent, SessionMode,
+    SystemPromptFiles,
+};
 use pir::session_manager::SessionManager;
 
 // ---------------------------------------------------------------------------
@@ -280,6 +283,44 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Serializes tests that read `PIR_SYSTEM_PROMPT_FILE`: the variable is
+/// process-wide while cargo runs tests in parallel by default.
+static PROMPT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_prompt_env() -> std::sync::MutexGuard<'static, ()> {
+    PROMPT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Sets/removes `PIR_SYSTEM_PROMPT_FILE` for one test and restores it.
+struct PromptEnvGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl PromptEnvGuard {
+    fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os("PIR_SYSTEM_PROMPT_FILE");
+        std::env::set_var("PIR_SYSTEM_PROMPT_FILE", value);
+        Self { previous }
+    }
+
+    fn remove() -> Self {
+        let previous = std::env::var_os("PIR_SYSTEM_PROMPT_FILE");
+        std::env::remove_var("PIR_SYSTEM_PROMPT_FILE");
+        Self { previous }
+    }
+}
+
+impl Drop for PromptEnvGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var("PIR_SYSTEM_PROMPT_FILE", value),
+            None => std::env::remove_var("PIR_SYSTEM_PROMPT_FILE"),
+        }
     }
 }
 
@@ -1416,6 +1457,8 @@ async fn set_session_name_is_visible_through_session_name_and_session_metadata()
 /// does not fire and the pinned text wins.
 #[tokio::test]
 async fn sdk_discovers_workspace_system_md_and_explicit_prompt_wins() {
+    let _env_lock = lock_prompt_env();
+    let _env = PromptEnvGuard::remove();
     let root = TempDir::new("sdk-system-md");
     let workspace = root.path().join("proj");
     let agent_dir = root.path().join("agent");
@@ -1443,9 +1486,11 @@ async fn sdk_discovers_workspace_system_md_and_explicit_prompt_wins() {
         assistant(vec![text_block("ok")], StopReason::Stop)
     }));
 
-    // Derived prompt: the discovered files join it.
+    // Derived prompt: the discovered files join it. `with_registry` is
+    // hermetic by default (D-03), so discovery is requested explicitly here.
     let agent = agent_builder(Arc::clone(&registry), &workspace)
         .agent_dir(&agent_dir)
+        .discover_system_prompt(true)
         .no_session()
         .build()
         .await
@@ -1497,5 +1542,266 @@ async fn sdk_discovers_workspace_system_md_and_explicit_prompt_wins() {
     assert!(
         !system.contains("SDK SYSTEM MARKER"),
         "the discovered SYSTEM.md must not survive an explicit prompt: {system}"
+    );
+}
+
+/// D-03: the explicit-model paths are environment-free. `endpoint` and
+/// `with_registry` must ignore a project `.pi/SYSTEM.md`, the global agent-dir
+/// `SYSTEM.md`, and `PIR_SYSTEM_PROMPT_FILE` unless the caller opts in.
+#[tokio::test]
+async fn endpoint_and_with_registry_ignore_ambient_system_prompts_by_default() {
+    let _env_lock = lock_prompt_env();
+    let root = TempDir::new("sdk-ambient-ignored");
+    let workspace = root.path().join("proj");
+    let agent_dir = root.path().join("agent");
+    std::fs::create_dir_all(workspace.join(".pi")).expect("create .pi");
+    std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+    std::fs::write(
+        workspace.join(".pi").join("SYSTEM.md"),
+        "PROJECT AMBIENT MARKER",
+    )
+    .expect("write project SYSTEM.md");
+    std::fs::write(
+        workspace.join(".pi").join("APPEND_SYSTEM.md"),
+        "PROJECT APPEND MARKER",
+    )
+    .expect("write project APPEND_SYSTEM.md");
+    std::fs::write(agent_dir.join("SYSTEM.md"), "GLOBAL AMBIENT MARKER")
+        .expect("write global SYSTEM.md");
+    std::fs::write(agent_dir.join("APPEND_SYSTEM.md"), "GLOBAL APPEND MARKER")
+        .expect("write global APPEND_SYSTEM.md");
+    // These files WOULD be discovered (trust granted) if the hermetic paths
+    // silently fell back to ambient discovery.
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"defaultProjectTrust":"always"}"#,
+    )
+    .expect("write settings.json");
+    // A directory is not readable as a string: any attempt to read the env
+    // prompt file would fail the build, proving it is never opened.
+    let env_prompt_dir = root.path().join("env-prompt-dir");
+    std::fs::create_dir_all(&env_prompt_dir).expect("create env prompt dir");
+    let _env = PromptEnvGuard::set(&env_prompt_dir);
+
+    let seen: Arc<Mutex<Vec<Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    let registry = registry(Arc::new(move |_index, context| {
+        recorded.lock().unwrap().push(context.clone());
+        assistant(vec![text_block("ok")], StopReason::Stop)
+    }));
+    let agent = agent_builder(Arc::clone(&registry), &workspace)
+        .agent_dir(&agent_dir)
+        .no_session()
+        .build()
+        .await
+        .expect("hermetic with_registry build must not read prompt files");
+    agent.prompt("hi").await.expect("prompt");
+    let system = seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .and_then(|context| context.system_prompt)
+        .expect("the request carries a derived system prompt");
+    for marker in [
+        "PROJECT AMBIENT MARKER",
+        "PROJECT APPEND MARKER",
+        "GLOBAL AMBIENT MARKER",
+        "GLOBAL APPEND MARKER",
+    ] {
+        assert!(
+            !system.contains(marker),
+            "with_registry must not discover ambient prompt files ({marker}): {system}"
+        );
+    }
+
+    // Endpoint: same ambient files + unreadable env path, still builds.
+    let endpoint = AgentBuilder::new()
+        .endpoint(pir::sdk::Endpoint::new(
+            "http://127.0.0.1:9/v1",
+            pir::sdk::ApiKind::OpenAiCompletions,
+            "endpoint-model",
+        ))
+        .api_key("sk-test")
+        .cwd(&workspace)
+        .agent_dir(&agent_dir)
+        .no_session()
+        .build()
+        .await
+        .expect("hermetic endpoint build must not read prompt files");
+    assert_eq!(endpoint.model().id, "endpoint-model");
+}
+
+/// D-03: explicit `system_prompt_files(..)` replaces the ambient lookup and
+/// never silently mixes in project/global files.
+#[tokio::test]
+async fn system_prompt_files_are_explicit_and_ambient_free() {
+    let _env_lock = lock_prompt_env();
+    let _env = PromptEnvGuard::remove();
+    let root = TempDir::new("sdk-prompt-files");
+    let workspace = root.path().join("proj");
+    let agent_dir = root.path().join("agent");
+    std::fs::create_dir_all(workspace.join(".pi")).expect("create .pi");
+    std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+    std::fs::write(
+        workspace.join(".pi").join("SYSTEM.md"),
+        "AMBIENT SYSTEM MARKER",
+    )
+    .expect("write ambient SYSTEM.md");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"defaultProjectTrust":"always"}"#,
+    )
+    .expect("write settings.json");
+    let custom_system = root.path().join("custom-system.md");
+    let custom_append = root.path().join("custom-append.md");
+    std::fs::write(&custom_system, "CUSTOM SYSTEM FILE MARKER").expect("write custom system");
+    std::fs::write(&custom_append, "CUSTOM APPEND FILE MARKER").expect("write custom append");
+
+    let seen: Arc<Mutex<Vec<Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    let registry = registry(Arc::new(move |_index, context| {
+        recorded.lock().unwrap().push(context.clone());
+        assistant(vec![text_block("ok")], StopReason::Stop)
+    }));
+    let agent = agent_builder(Arc::clone(&registry), &workspace)
+        .agent_dir(&agent_dir)
+        .system_prompt_files(SystemPromptFiles {
+            system: Some(custom_system),
+            append: Some(custom_append),
+        })
+        .no_session()
+        .build()
+        .await
+        .expect("build with explicit prompt files");
+    agent.prompt("hi").await.expect("prompt");
+    let system = seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .and_then(|context| context.system_prompt)
+        .expect("the request carries a system prompt");
+    assert!(
+        system.contains("CUSTOM SYSTEM FILE MARKER"),
+        "the explicit system file becomes the preamble: {system}"
+    );
+    assert!(
+        system.contains("CUSTOM APPEND FILE MARKER"),
+        "the explicit append file becomes an addendum: {system}"
+    );
+    assert!(
+        !system.contains("AMBIENT SYSTEM MARKER"),
+        "explicit files must not mix in ambient discovery: {system}"
+    );
+}
+
+/// D-04: the low-level `create_agent_session` factory uses the same shared
+/// SYSTEM.md/APPEND_SYSTEM.md path as `AgentBuilder`. A trusted project's
+/// `.pi/SYSTEM.md` applies, and an explicit `system_prompt` overrides it.
+#[tokio::test]
+async fn create_agent_session_discovers_trusted_project_system_md_and_explicit_prompt_wins() {
+    let _env_lock = lock_prompt_env();
+    let _env = PromptEnvGuard::remove();
+    let root = TempDir::new("sdk-low-level-system-md");
+    let workspace = root.path().join("proj");
+    let agent_dir = root.path().join("agent");
+    std::fs::create_dir_all(workspace.join(".pi")).expect("create .pi");
+    std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+    std::fs::write(
+        workspace.join(".pi").join("SYSTEM.md"),
+        "LOW LEVEL SYSTEM MARKER",
+    )
+    .expect("write project SYSTEM.md");
+    std::fs::write(
+        workspace.join(".pi").join("APPEND_SYSTEM.md"),
+        "LOW LEVEL APPEND MARKER",
+    )
+    .expect("write project APPEND_SYSTEM.md");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"defaultProjectTrust":"always"}"#,
+    )
+    .expect("write settings.json");
+
+    let seen: Arc<Mutex<Vec<Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    let registry = registry(Arc::new(move |_index, context| {
+        recorded.lock().unwrap().push(context.clone());
+        assistant(vec![text_block("ok")], StopReason::Stop)
+    }));
+    let loader = || {
+        pir::sdk::DefaultResourceLoader::new(workspace.clone(), agent_dir.clone())
+            .with_home(root.path().to_path_buf())
+    };
+    let created = pir::sdk::create_agent_session(CreateAgentSessionOptions {
+        cwd: Some(workspace.clone()),
+        agent_dir: Some(agent_dir.clone()),
+        model_registry: Some(ModelRegistry::from_registry(Arc::clone(&registry))),
+        model: Some(mock_model()),
+        thinking_level: Some(ThinkingLevel::Off),
+        no_session: true,
+        no_tools: true,
+        resource_loader: Some(loader()),
+        ..Default::default()
+    })
+    .await
+    .expect("create low-level session");
+    created
+        .session
+        .prompt("hi", Arc::new(|_event| {}))
+        .await
+        .expect("prompt low-level session");
+    let system = seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .and_then(|context| context.system_prompt)
+        .expect("the low-level request carries a system prompt");
+    assert!(
+        system.contains("LOW LEVEL SYSTEM MARKER"),
+        "create_agent_session must discover the trusted project SYSTEM.md: {system}"
+    );
+    assert!(
+        system.contains("LOW LEVEL APPEND MARKER"),
+        "create_agent_session must discover the trusted project APPEND_SYSTEM.md: {system}"
+    );
+
+    // Explicit prompt wins and the factory performs no prompt-file discovery.
+    seen.lock().unwrap().clear();
+    let created = pir::sdk::create_agent_session(CreateAgentSessionOptions {
+        cwd: Some(workspace.clone()),
+        agent_dir: Some(agent_dir.clone()),
+        model_registry: Some(ModelRegistry::from_registry(registry)),
+        model: Some(mock_model()),
+        thinking_level: Some(ThinkingLevel::Off),
+        no_session: true,
+        no_tools: true,
+        system_prompt: Some("LOW LEVEL PINNED WINS".to_owned()),
+        resource_loader: Some(loader()),
+        ..Default::default()
+    })
+    .await
+    .expect("create pinned low-level session");
+    created
+        .session
+        .prompt("hi", Arc::new(|_event| {}))
+        .await
+        .expect("prompt pinned low-level session");
+    let system = seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .and_then(|context| context.system_prompt)
+        .expect("the pinned low-level request carries a system prompt");
+    assert!(
+        system.contains("LOW LEVEL PINNED WINS"),
+        "the explicit prompt is sent as-is: {system}"
+    );
+    assert!(
+        !system.contains("LOW LEVEL SYSTEM MARKER") && !system.contains("LOW LEVEL APPEND MARKER"),
+        "explicit prompt must override every discovered file: {system}"
     );
 }

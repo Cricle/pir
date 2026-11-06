@@ -14,6 +14,7 @@
 use std::sync::Mutex;
 
 use super::core::{Component, Container, DynamicBorder, Spacer, Text};
+use super::dialogs::selector_option;
 use super::theme::{with_theme, ThemeColor};
 
 // ---------------------------------------------------------------------------
@@ -132,21 +133,6 @@ impl Component for ConfirmDialog {
     }
 
     fn invalidate(&self) {}
-}
-
-/// One selector row (upstream `extension-selector.ts:87-92` via dialogs.rs).
-fn selector_option(label: &str, selected: bool) -> String {
-    if selected {
-        with_theme(|theme| {
-            format!(
-                "{}{}",
-                theme.fg(ThemeColor::Accent, "→ "),
-                theme.fg(ThemeColor::Accent, label)
-            )
-        })
-    } else {
-        with_theme(|theme| format!("  {}", theme.fg(ThemeColor::Text, label)))
-    }
 }
 
 // ---------------------------------------------------------------------------

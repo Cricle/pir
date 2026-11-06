@@ -464,6 +464,12 @@ struct RenderedLines {
     prefix_lines: Vec<String>,
     /// Final, fully padded lines of the mutable tail.
     tail_lines: Vec<String>,
+    /// Absolute canvas row the last emission started at and how many rows it
+    /// wrote. The next render may reclaim the padding + final prefix rows
+    /// without comparing them when the body only grew and the canvas still
+    /// holds that emission (see [`RenderedLines::carry_prefix_rows`]).
+    start: usize,
+    emitted_rows: usize,
     /// The open fenced code block straddling `final_len`: its opener context
     /// and full code text, so the next render parses only the bytes from the
     /// mutable line on instead of the whole block (see [`FenceTail`]).
@@ -523,21 +529,82 @@ impl RenderedLines {
         self.generation == key.generation && self.answers_layout(key)
     }
 
-    /// The frame's rows into the canvas: padding, final prefix, mutable tail,
-    /// padding — the exact order the pre-migration `assemble` built its `Vec`
-    /// in. The cached prefix and tail rows are COPIED into the pooled row
-    /// buffers (the cache keeps its own copy for the next frame, and a cached
-    /// row must never be moved out of it) and the padding rows are written in
-    /// place, so a frame whose body did not change allocates no row buffer.
-    fn assemble_into(&self, width: usize, padding_y: usize, out: &mut Rows<'_>) {
-        push_padding_rows(out, width, padding_y);
-        for line in &self.prefix_lines {
+    /// Number of top padding rows [`StreamingRender::lines_into`] writes
+    /// before the body (`push_padding_rows` writes `padding_y * 2` rows per
+    /// call, once above and once below).
+    fn top_padding_rows(padding_y: usize) -> usize {
+        padding_y * 2
+    }
+
+    /// Rows of the previous emission that are still byte-identical in `out`:
+    /// the top padding and every final-prefix line. Only valid when the body
+    /// was extended (same replace epoch / layout key) and the canvas still
+    /// holds this render's previous emission at the same absolute start.
+    ///
+    /// The check is O(1) row reads (first/middle/last prefix line), never a
+    /// whole-block scan: a prefix is append-stable, and a recycled pool that
+    /// belongs to another block almost always differs at the first boundary
+    /// row. A mismatch (fresh pool, scroll start move, width/theme change)
+    /// falls back to the full push path.
+    fn carry_prefix_rows(&self, padding_y: usize, out: &Rows<'_>) -> Option<usize> {
+        let top = Self::top_padding_rows(padding_y);
+        let carry = top.checked_add(self.prefix_lines.len())?;
+        if carry == 0 {
+            return None;
+        }
+        if out.len() != self.start
+            || out.pool_len() < self.start.checked_add(self.emitted_rows.max(carry))?
+        {
+            return None;
+        }
+        if let (Some(first), Some(last)) = (self.prefix_lines.first(), self.prefix_lines.last()) {
+            let first_index = self.start + top;
+            if out.pooled_row(first_index)? != first.as_str() {
+                return None;
+            }
+            let last_index = first_index + self.prefix_lines.len() - 1;
+            if out.pooled_row(last_index)? != last.as_str() {
+                return None;
+            }
+            if self.prefix_lines.len() >= 3 {
+                let mid_index = first_index + self.prefix_lines.len() / 2;
+                let mid = &self.prefix_lines[mid_index - first_index];
+                if out.pooled_row(mid_index)? != mid.as_str() {
+                    return None;
+                }
+            }
+        }
+        Some(carry)
+    }
+
+    /// The frame's rows into the canvas: top padding, final prefix, mutable
+    /// tail, bottom padding — the exact order the pre-migration `assemble`
+    /// built its `Vec` in. `carried_prefix` rows at the front were already
+    /// painted by the previous emission and are skipped without a compare or
+    /// copy; the remaining prefix/tail rows go through the ordinary
+    /// exact-content [`Rows::push`].
+    fn emit_into(
+        &mut self,
+        width: usize,
+        padding_y: usize,
+        out: &mut Rows<'_>,
+        carried_prefix: usize,
+    ) {
+        let start = out.len();
+        let top = Self::top_padding_rows(padding_y);
+        let carried_prefix = carried_prefix.min(top.saturating_add(self.prefix_lines.len()));
+        if carried_prefix > 0 {
+            out.skip_unchanged(carried_prefix);
+        }
+        for line in &self.prefix_lines[carried_prefix.saturating_sub(top)..] {
             out.push(line);
         }
         for line in &self.tail_lines {
             out.push(line);
         }
         push_padding_rows(out, width, padding_y);
+        self.start = start;
+        self.emitted_rows = out.len() - start;
     }
 }
 
@@ -747,7 +814,16 @@ impl StreamingRender {
         if let Some(rendered) = self.rendered.as_ref() {
             if rendered.answers(&key) {
                 self.last_reparsed = 0;
-                rendered.assemble_into(width, padding_y, out);
+                // Exact hit: the canvas may already hold this exact emission
+                // (the live block's recycled row pool). Reclaim the padding +
+                // final prefix without comparing them; the tail still goes
+                // through the ordinary compare-and-reuse.
+                let carry = rendered.carry_prefix_rows(padding_y, out).unwrap_or(0);
+                let rendered = self
+                    .rendered
+                    .as_mut()
+                    .unwrap_or_else(|| unreachable!("checked above"));
+                rendered.emit_into(width, padding_y, out, carry);
                 return;
             }
         }
@@ -759,6 +835,14 @@ impl StreamingRender {
                 && rendered.answers_layout(&key)
                 && rendered.final_len <= self.text.len()
         });
+        // The previous emission's padding + final prefix is append-stable: if
+        // the canvas still holds it at the same start, reclaim those rows
+        // without comparing them. This is the per-delta O(prefix) -> O(1)
+        // step; the mutable tail is assembled below exactly as before.
+        let carried_prefix = previous
+            .as_ref()
+            .and_then(|rendered| rendered.carry_prefix_rows(padding_y, out))
+            .unwrap_or(0);
         let (mut final_len, mut prefix_lines, mut fence_tail) = match previous {
             Some(rendered) => (
                 rendered.final_len,
@@ -792,7 +876,7 @@ impl StreamingRender {
             }
         }
 
-        let rendered = RenderedLines {
+        let mut rendered = RenderedLines {
             generation: self.generation,
             replace_epoch: self.replace_epoch,
             width,
@@ -805,12 +889,15 @@ impl StreamingRender {
             final_len,
             prefix_lines,
             tail_lines,
+            start: 0,
+            emitted_rows: 0,
             fence_tail,
         };
         // The frame's rows: padding, final prefix, mutable tail, padding. The
         // cache keeps the prefix/tail buffers (they answer the next frame);
-        // the canvas rows are copies of them.
-        rendered.assemble_into(width, padding_y, out);
+        // the canvas rows are copies of them — except the already-painted
+        // padding+prefix rows, which `emit_into` reclaims by reference.
+        rendered.emit_into(width, padding_y, out, carried_prefix);
         self.last_reparsed = reparsed;
         self.rendered = Some(rendered);
     }

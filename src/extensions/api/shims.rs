@@ -1,6 +1,7 @@
 //! Virtual module shims for the upstream package imports.
 
 use super::embedded::Shim;
+use super::node_shims::shim_source;
 
 /// Canonicalize a bare specifier to a known virtual module name.
 /// Returns `None` when the specifier is not a supported virtual module.
@@ -346,24 +347,6 @@ pub fn canonical_virtual_name(name: &str) -> Option<&'static str> {
         .find(|(from, _)| *from == name)
         .map(|(_, canonical)| *canonical)
         .or_else(|| super::node_shims::canonical_node_name(name))
-}
-
-/// Source of the virtual module for a canonical name.
-/// Inflate one shim for a caller that consumes (and drops) the source.
-///
-/// The module loader does not use [`Shim::source`] on purpose: the cached
-/// process-lifetime copy is only needed by tests and by the prelude/globals
-/// boot path, while a virtual module's source is dead once QuickJS has
-/// compiled it. Returning a fresh exact-sized `String` keeps the decoded
-/// bytes out of the resident set after boot.
-fn shim_source(shim: &Shim) -> Option<String> {
-    match shim.inflate() {
-        Ok(source) => Some(source),
-        Err(error) => {
-            crate::ext_diag!("pir-ext: failed to inflate shim `{}`: {error}", shim.name());
-            None
-        }
-    }
 }
 
 pub fn source_for(canonical: &str) -> Option<String> {

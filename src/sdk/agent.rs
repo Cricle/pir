@@ -25,6 +25,40 @@ use super::outcome::AgentOutcome;
 /// [`Agent::set_event_channel_capacity`].
 pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Stack budget for the OS thread hosting one SDK streaming prompt run.
+///
+/// The run drives the full `AgentSession` (agent loop, provider request
+/// assembly, MCP tool calls). `tokio::spawn` would run it on a runtime worker
+/// with the platform default (2 MiB on Windows) — the same budget that
+/// overflowed `pir-tui-worker`. Tokio has no per-task stack-size knob, so the
+/// run gets a dedicated thread with its own current-thread runtime. Public so
+/// the MCP stack regression test can pin it.
+pub const SDK_AGENT_TASK_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Spawn one agent prompt future on a dedicated 16 MiB-stack thread.
+fn spawn_agent_task(future: impl Future<Output = ()> + Send + 'static) {
+    let spawned = std::thread::Builder::new()
+        .name("pir-sdk-agent".to_owned())
+        .stack_size(SDK_AGENT_TASK_STACK_BYTES)
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(crate::env_daemon::tokio_max_blocking_threads())
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(future),
+                Err(error) => {
+                    // The task owns the event sink; dropping it closes the
+                    // stream, so a consumer cannot hang waiting for events.
+                    tracing::error!(%error, "sdk agent runtime failed");
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, "sdk agent thread failed");
+    }
+}
+
 /// Push one SDK event onto the run's stream, if one is attached.
 ///
 /// [`None`] means this is a NON-streaming run ([`Agent::prompt`]): it has no
@@ -794,7 +828,9 @@ impl Agent {
             .into_iter()
             .map(ContentBlock::Image)
             .collect::<Vec<_>>();
-        tokio::spawn(async move {
+        // NOT `tokio::spawn`: the agent run needs a 16 MiB stack, not the
+        // runtime worker's platform default (see SDK_AGENT_TASK_STACK_BYTES).
+        spawn_agent_task(async move {
             // Owns the sink detach and the fallback admission release. The
             // admission is released explicitly as soon as the session run
             // settles (below), BEFORE the backpressured terminal sends: a
@@ -1081,10 +1117,17 @@ impl Agent {
         self.inner.session.is_streaming()
     }
 
-    /// Whether the agent is idle, i.e. no prompt run is in flight. This is
-    /// the inverse of [`Agent::is_streaming`].
+    /// Whether a compaction run (manual, threshold or overflow) is in flight.
+    pub fn is_compacting(&self) -> bool {
+        self.inner.session.is_compacting()
+    }
+
+    /// Whether the agent is idle: no prompt run AND no compaction is in
+    /// flight. A manual compaction is not a run (`is_streaming()` stays
+    /// false) but still owns the transcript, so `is_idle` must include it or
+    /// embedders would submit a prompt the session has to reject.
     pub fn is_idle(&self) -> bool {
-        !self.is_streaming()
+        !self.is_streaming() && !self.is_compacting()
     }
 
     /// Steering plus follow-up messages queued but not yet delivered

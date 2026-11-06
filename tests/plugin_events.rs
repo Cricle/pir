@@ -49,7 +49,7 @@ use pir::ai::types::{
     ToolCall,
 };
 use pir::extensions::Notification;
-use pir::extensions::{ExtensionConfig, ExtensionHandle};
+use pir::extensions::{ExtensionConfig, ExtensionHandle, ExtensionLimits};
 use pir::plugins::{
     AgentPlugin, EventInterest, PluginEvent, PluginEventOutcome, PluginFuture, PluginHost,
     PluginInfo,
@@ -1453,5 +1453,154 @@ async fn provider_stream_events_after_a_timeout_are_dropped() {
         entered.load(Ordering::SeqCst),
         1,
         "the event after the timeout must be dropped before the handler"
+    );
+}
+
+/// Build a session whose `provider_stream_event` handler is a REAL JS
+/// extension (loaded into an actor-backed handle), so the timeout path runs
+/// through the QuickJS interrupt rather than a native future.
+async fn js_provider_session(
+    label: &str,
+    source: &str,
+    events: usize,
+    call_timeout: Duration,
+) -> Option<(Arc<AgentSession>, TempDir, ExtensionHandle)> {
+    let temp = TempDir::new(label);
+    let entry = temp.0.join("provider-stream.js");
+    std::fs::write(&entry, source).expect("write extension fixture");
+    let handle = ExtensionHandle::start(ExtensionConfig {
+        cwd: temp.0.clone(),
+        mode: "headless".to_owned(),
+        has_ui: false,
+        model: None,
+        session_id: None,
+        system_prompt: String::new(),
+        is_idle: true,
+        limits: Some(ExtensionLimits {
+            call_timeout,
+            ..Default::default()
+        }),
+    })
+    .ok()?;
+    let loaded = handle
+        .load(std::slice::from_ref(&entry))
+        .await
+        .expect("load the JS extension");
+    assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(HookCallingProvider { events }));
+    let session = AgentSession::new_arc_with_plugins(
+        AgentSessionConfig {
+            provider_registry: Arc::new(registry),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: None,
+            compaction: None,
+            max_turns: 2,
+            system_prompt: Some("js provider stream test".into()),
+            cwd: Some(temp.0.clone()),
+            event_stream: None,
+            extensions: Some(handle.clone()),
+            tool_selection: None,
+        },
+        Vec::new(),
+    );
+    Some((session, temp, handle))
+}
+
+/// C1-02: a `provider_stream_event` handler stuck in a SYNCHRONOUS JS loop is
+/// aborted by the QuickJS interrupt (`Ok(Err(js_error))`, not the tokio
+/// timeout arm). That outcome must still close the dispatcher: the second
+/// provider event is dropped before entering the handler, so the prompt pays
+/// one budget total instead of one per event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_js_provider_stream_timeout_closes_the_dispatcher() {
+    let source = r#"
+export default function (pi) {
+    globalThis.__entered = 0;
+    pi.on("provider_stream_event", () => {
+        globalThis.__entered = (globalThis.__entered ?? 0) + 1;
+        const end = Date.now() + 60_000;
+        while (Date.now() < end) {}
+    });
+}
+"#;
+    let Some((session, _temp, handle)) =
+        js_provider_session("js-sync-timeout", source, 2, Duration::from_millis(300)).await
+    else {
+        return;
+    };
+
+    let task = tokio::spawn(async move { session.prompt("go", Arc::new(|_event| {})).await });
+    let started = Instant::now();
+    let result = prompt_within(
+        task,
+        Duration::from_secs(10),
+        "a synchronous JS loop must be cut off by the dispatch budget",
+    )
+    .await;
+    result.expect("the run still completes after the JS dispatch timeout");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the second event must not pay another budget: {:?}",
+        started.elapsed()
+    );
+
+    let entered = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.eval_json("JSON.stringify(globalThis.__entered ?? 0)"),
+    )
+    .await
+    .expect("probing the JS counter must not hang")
+    .expect("probe the JS handler count");
+    let entered: u64 = serde_json::from_value(entered).expect("parse the JS handler count");
+    assert_eq!(
+        entered, 1,
+        "the event after the real JS timeout must be dropped before the handler"
+    );
+}
+
+/// A-06 direction: an ordinary handler error whose TEXT happens to contain
+/// "timed out after" must not be mistaken for a dispatcher timeout. Both
+/// provider events reach the handler; the prompt does not close the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_error_text_mentioning_timeout_does_not_close_the_dispatcher() {
+    let source = r#"
+export default function (pi) {
+    globalThis.__entered = 0;
+    pi.on("provider_stream_event", () => {
+        globalThis.__entered = (globalThis.__entered ?? 0) + 1;
+        throw new Error("upstream connect timed out after 5s");
+    });
+}
+"#;
+    let Some((session, _temp, handle)) =
+        js_provider_session("js-timeout-text", source, 2, Duration::from_secs(30)).await
+    else {
+        return;
+    };
+
+    let task = tokio::spawn(async move { session.prompt("go", Arc::new(|_event| {})).await });
+    let result = prompt_within(
+        task,
+        Duration::from_secs(10),
+        "ordinary handler errors must not wedge the provider stream",
+    )
+    .await;
+    result.expect("the run completes despite the throwing handler");
+
+    let entered = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.eval_json("JSON.stringify(globalThis.__entered ?? 0)"),
+    )
+    .await
+    .expect("probing the JS counter must not hang")
+    .expect("probe the JS handler count");
+    let entered: u64 = serde_json::from_value(entered).expect("parse the JS handler count");
+    assert_eq!(
+        entered, 2,
+        "an ordinary error mentioning a timeout must not close the dispatcher"
     );
 }

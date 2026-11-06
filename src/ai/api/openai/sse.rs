@@ -91,6 +91,11 @@ pub struct OpenAiSseParser {
     supports_finish_reason: bool,
     finish: StopReason,
     has_finish_reason: bool,
+    /// The HTTP response has no `Content-Length` and no `Transfer-Encoding`:
+    /// the body is close-delimited, so a clean transport EOF IS the protocol
+    /// terminator. Providers behind such responses may omit the terminal
+    /// `finish_reason` chunk (and `[DONE]`); the stream still completed.
+    close_delimited_eof: bool,
     /// Upstream `options.onProviderStreamEvent`: each parsed provider chunk
     /// before pir normalization.
     stream_event_hook: Option<crate::ai::types::StreamHook>,
@@ -146,6 +151,7 @@ impl OpenAiSseParser {
             supports_finish_reason: compat.supports_finish_reason,
             finish: StopReason::Stop,
             has_finish_reason: false,
+            close_delimited_eof: false,
             stream_event_hook: None,
             copies: 0,
         }
@@ -156,6 +162,15 @@ impl OpenAiSseParser {
     pub fn with_stream_hook(mut self, hook: Option<crate::ai::types::StreamHook>) -> Self {
         self.stream_event_hook = hook;
         self
+    }
+
+    /// Declare that the transport body ends at a close-delimited EOF (no
+    /// `Content-Length`, no `Transfer-Encoding`). [`Self::finish`] then treats
+    /// a missing terminal `finish_reason` as an inferred completion instead of
+    /// the retryable truncation a framed (chunked/length-delimited) body
+    /// implies. Batch callers keep the strict default.
+    pub fn set_close_delimited_eof(&mut self, close_delimited: bool) {
+        self.close_delimited_eof = close_delimited;
     }
 
     /// Snapshot of the message accumulated so far (e.g. for the Start event).
@@ -758,8 +773,18 @@ impl OpenAiSseParser {
         // Upstream post-stream checks (openai-completions.ts 695-703): without
         // finish_reason support the stop reason is inferred from the content;
         // error stop reasons terminate the stream as an error; with finish
-        // reason support a missing one is a stream failure.
-        if !self.has_finish_reason && !self.supports_finish_reason {
+        // reason support a missing one is a stream failure — EXCEPT on a
+        // close-delimited body, where a clean EOF is the protocol terminator
+        // and providers may legitimately omit the terminal chunk.
+        if !self.has_finish_reason {
+            if self.supports_finish_reason && !self.close_delimited_eof {
+                // A clean EOF without the terminal signal on a framed body is a
+                // truncated stream, not a provider verdict: retryable at the
+                // agent level (the text stays the upstream-parity wording).
+                return Err(AiError::StreamTruncated(
+                    "Stream ended without finish_reason".to_string(),
+                ));
+            }
             self.finish = if self
                 .message
                 .content
@@ -777,14 +802,6 @@ impl OpenAiSseParser {
                     .error_message
                     .take()
                     .unwrap_or_else(|| "Provider returned an error stop reason".to_string()),
-            ));
-        }
-        if self.supports_finish_reason && !self.has_finish_reason {
-            // A clean EOF without the terminal signal is a truncated stream,
-            // not a provider verdict: retryable at the agent level (the text
-            // stays the upstream-parity wording).
-            return Err(AiError::StreamTruncated(
-                "Stream ended without finish_reason".to_string(),
             ));
         }
         self.message_mut().stop_reason = self.finish;

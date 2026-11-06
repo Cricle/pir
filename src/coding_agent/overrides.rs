@@ -204,7 +204,9 @@ pub fn resolve_prompt_input(input: &str) -> String {
         match std::fs::read_to_string(&path) {
             Ok(text) => return text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned(),
             Err(error) => {
-                eprintln!("Warning: Could not read system prompt file {input}: {error}");
+                let _ = crate::coding_agent::output::write_stderr_line(&format!(
+                    "Warning: Could not read system prompt file {input}: {error}"
+                ));
             }
         }
     }

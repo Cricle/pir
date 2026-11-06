@@ -3,6 +3,7 @@
 use std::process::Command;
 
 use pir::config::Config;
+use pir::protocol::Command as SessionCommand;
 use pir::server::ServerSecurityConfig;
 
 #[test]
@@ -15,6 +16,10 @@ fn default_remote_policy_is_conservative() {
     assert!(config.server_max_connection_body_bytes >= config.server_max_request_body_bytes);
 
     let security = ServerSecurityConfig::default();
+    assert!(
+        !security.allow_unauthenticated,
+        "a token-less server must require an explicit local-development opt-in"
+    );
     assert!(!security.allow_remote_bash);
     assert!(security.allow_remote_agent);
     assert!(security.max_connections > 0);
@@ -65,7 +70,8 @@ fn invalid_server_limits_are_rejected_before_bind() {
 /// Security regression (R2-5-N02): a non-loopback listener without an auth
 /// token would let any host on the network drive the server unauthenticated;
 /// binding such an address must fail with `PermissionDenied`. Supplying a
-/// token still allows the bind, and loopback keeps working without one.
+/// token still allows the bind; a token-less loopback listener also requires
+/// the explicit local opt-in.
 #[test]
 fn non_loopback_bind_requires_auth_token() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -98,11 +104,130 @@ fn non_loopback_bind_requires_auth_token() {
         );
         drop(server);
 
-        let server = pir::server::Server::bind("127.0.0.1:0")
-            .await
-            .expect("a loopback bind needs no token");
+        let error = pir::server::Server::bind("127.0.0.1:0").await;
+        let error = match error {
+            Ok(_) => panic!("a token-less loopback bind must require explicit opt-in"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let server = pir::server::Server::bind_with_security(
+            "127.0.0.1:0",
+            ServerSecurityConfig::unauthenticated_local(),
+        )
+        .await
+        .expect("the explicit local opt-in accepts a token-less loopback bind");
         drop(server);
     });
+}
+
+/// C2-04 regression: the historical `pir server` default (loopback, no
+/// token) let every local user/process create sessions and read/write files
+/// under the server cwd. A default `ServerSecurityConfig` must refuse to
+/// bind at all — including loopback — before any listener exists.
+#[test]
+fn tokenless_server_is_refused_by_default_on_loopback() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        for result in [
+            pir::server::Server::bind("127.0.0.1:0").await,
+            pir::server::Server::bind_with_security("127.0.0.1:0", ServerSecurityConfig::default())
+                .await,
+        ] {
+            let error = match result {
+                Ok(_) => panic!("default token-less bind must be refused"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            let message = error.to_string();
+            assert!(
+                message.contains("PIR_SERVER_AUTH_TOKEN")
+                    && message.contains("--allow-unauthenticated"),
+                "the refusal must name both opt-ins: {message}"
+            );
+        }
+    });
+}
+
+/// C2-04 regression: `--allow-unauthenticated` (the library spelling is
+/// [`ServerSecurityConfig::unauthenticated_local`]) is the only way to run a
+/// token-less server, and that server still serves the normal protocol so a
+/// local-development client can create/list sessions.
+#[tokio::test]
+async fn explicit_allow_unauthenticated_serves_requests_without_a_token() {
+    let server = pir::server::Server::bind_with_security(
+        "127.0.0.1:0",
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("explicit unauthenticated local bind");
+    let address = server.local_addr().expect("local address");
+    let accepting = tokio::spawn(async move { server.accept_once().await });
+
+    let mut client = pir::client::Client::connect(address)
+        .await
+        .expect("token-less handshake is allowed only after the explicit opt-in");
+    assert!(client.list().await.expect("list").is_empty());
+    let created = client
+        .request(SessionCommand::Create {
+            cwd: None,
+            name: Some("local-dev".to_owned()),
+            model: None,
+            thinking_level: None,
+        })
+        .await
+        .expect("create without a token on the explicit opt-in server");
+    assert_eq!(created["command"], "create");
+    assert_eq!(client.list().await.expect("list after create").len(), 1);
+    drop(client);
+    accepting
+        .await
+        .expect("accept task join")
+        .expect("serve client");
+}
+
+/// C2-04 regression: the real CLI refuses to start without a token before it
+/// binds, and both opt-ins are named in stderr.
+#[test]
+fn cli_server_without_token_is_refused_before_bind() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pir"))
+        .arg("server")
+        .env_remove("PIR_SERVER_AUTH_TOKEN")
+        .env_remove("PIR_SERVER_ADDRESS")
+        .output()
+        .expect("pir server should start");
+    assert!(
+        !output.status.success(),
+        "token-less `pir server` must exit non-zero: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("PIR_SERVER_AUTH_TOKEN") && stderr.contains("--allow-unauthenticated"),
+        "stderr must document both opt-ins: {stderr}"
+    );
+    assert!(
+        !stderr.contains("pir server listening"),
+        "the refused server must not have bound: {stderr}"
+    );
+}
+
+/// The CLI help must document the opt-in and its local-only scope.
+#[test]
+fn cli_server_help_documents_allow_unauthenticated() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pir"))
+        .args(["server", "--help"])
+        .output()
+        .expect("pir server --help should start");
+    assert!(output.status.success(), "got: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--allow-unauthenticated"),
+        "help omitted --allow-unauthenticated: {stdout}"
+    );
+    assert!(
+        stdout.contains("local") || stdout.contains("Loopback"),
+        "help must explain the local-only scope: {stdout}"
+    );
 }
 
 /// Security regression (R2-5-N05): `Config` and `ServerSecurityConfig` must

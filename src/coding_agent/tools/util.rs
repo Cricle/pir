@@ -22,6 +22,62 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ai::types::AbortSignal;
 
+/// The read-before-edit gate for one mutation target (`edit` / `write`).
+///
+/// The ledger lives in the session environment; a bare `ToolContext` (tool
+/// tests, embedders without a session) has none and keeps the pre-existing
+/// behavior. Only an EXISTING regular file is gated: a new-file write is
+/// always allowed, and a path that the tool's own confinement check will
+/// reject later is not pre-empted here. Remote arms never reach a local file
+/// through this helper, so their behavior is unchanged.
+pub(super) fn read_before_edit_gate(
+    ctx: &crate::agent::tool_execution::ToolContext,
+    path: &str,
+    action: &str,
+) -> crate::agent::read_ledger::EditGate {
+    let Some(session_env) = ctx.session_env.as_ref() else {
+        return crate::agent::read_ledger::EditGate::Allowed;
+    };
+    let Ok(parts) = workspace_path_parts(&ctx.cwd, path) else {
+        // The tool branch reports the confinement error with its established
+        // wording; do not replace it with a read-ledger refusal.
+        return crate::agent::read_ledger::EditGate::Allowed;
+    };
+    match std::fs::metadata(&parts.candidate) {
+        Ok(metadata) if metadata.is_file() => session_env
+            .read_ledger
+            .gate_for_edit(&parts.candidate, action),
+        // New file (or a non-file target whose own error the tool reports).
+        _ => crate::agent::read_ledger::EditGate::Allowed,
+    }
+}
+
+/// Attach a [`crate::agent::read_ledger::EditGate::Warn`] warning to a
+/// successful tool result (model-facing content and, when present, the
+/// structured string). A failed result keeps its own error untouched.
+pub(super) fn append_read_gate_warning(
+    mut result: crate::agent::tool_batch::ToolResult,
+    warning: Option<String>,
+) -> crate::agent::tool_batch::ToolResult {
+    let Some(warning) = warning else {
+        return result;
+    };
+    if result.is_error {
+        return result;
+    }
+    if !result.content.is_empty() {
+        result.content.push_str("\n\n");
+    }
+    result.content.push_str(&warning);
+    if let Some(serde_json::Value::String(text)) = result.structured_content.as_mut() {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&warning);
+    }
+    result
+}
+
 /// Snapshot a mutation tool's target paths before the mutation.
 ///
 /// The snapshot reads whole files and hashes/writes them, so it runs on
@@ -52,6 +108,51 @@ pub(super) async fn checkpoint_before_mutation(
     let log_tool = tool_name.clone();
     let paths = paths.to_vec();
     match tokio::task::spawn_blocking(move || store.snapshot(&tool_name, &paths)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, tool = %log_tool, "file checkpoint failed; the mutation proceeds");
+        }
+        Err(error) => {
+            tracing::warn!(%error, tool = %log_tool, "file checkpoint task failed; the mutation proceeds");
+        }
+    }
+}
+
+/// Snapshot one mutation target from bytes the caller already read and
+/// validated.
+///
+/// `edit` uses this after a successful content validation so the checkpoint
+/// records the exact pre-edit bytes the replacement was computed from, with no
+/// second read of a file that could have changed in between. The caller passes
+/// the original (pre-transformation) buffer. Like
+/// [`checkpoint_before_mutation`], a snapshot failure is logged and the
+/// mutation proceeds.
+pub(super) async fn checkpoint_before_mutation_from_bytes(
+    ctx: &crate::agent::tool_execution::ToolContext,
+    tool: &str,
+    path: &Path,
+    content: Vec<u8>,
+) {
+    let Some(session_file) = ctx
+        .session_env
+        .as_ref()
+        .and_then(|env| env.session_file.as_deref())
+    else {
+        return;
+    };
+    let Some(store) =
+        crate::checkpoints::CheckpointStore::for_session_file(Path::new(session_file))
+    else {
+        return;
+    };
+    let tool_name = tool.to_owned();
+    let log_tool = tool_name.clone();
+    let path = path.to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        store.snapshot_with_content(&tool_name, &path, &content)
+    })
+    .await
+    {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
             tracing::warn!(%error, tool = %log_tool, "file checkpoint failed; the mutation proceeds");

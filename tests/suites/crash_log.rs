@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use pir::coding_agent::crash_log::{
-    clear_crash_log, crash_log_path, read_crash_log, record_crash, take_unnotified_crash,
-    CrashKind, CrashRecord, MAX_CRASH_RECORDS,
+    clear_crash_log, crash_log_path, is_broken_pipe_panic, read_crash_log, record_crash,
+    take_unnotified_crash, CrashKind, CrashRecord, MAX_CRASH_RECORDS,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -233,4 +233,27 @@ fn clear_crash_log_removes_the_file() {
     // Clearing a missing file is a no-op, not an error.
     clear_crash_log(&path);
     assert!(read_crash_log(&path).is_empty());
+}
+
+#[test]
+fn broken_pipe_print_panics_are_not_crash_records() {
+    // The stdlib's print-failure panic is a consumer disconnect, not an
+    // internal crash: the panic hook must skip persisting it, otherwise a
+    // normal `pir print … | head` leaves a TUI crash banner behind.
+    assert!(is_broken_pipe_panic(
+        "failed printing to stderr: Broken pipe (os error 32)"
+    ));
+    assert!(is_broken_pipe_panic(
+        "failed printing to stdout: Broken pipe (os error 32)"
+    ));
+    assert!(is_broken_pipe_panic(
+        "failed printing to stderr: 管道正在被关闭。 (os error 232)"
+    ));
+    assert!(is_broken_pipe_panic(
+        "failed printing to stdout: Broken pipe (os error 109)"
+    ));
+    assert!(!is_broken_pipe_panic(
+        "failed printing to stdout: Permission denied (os error 13)"
+    ));
+    assert!(!is_broken_pipe_panic("unexpected panic"));
 }

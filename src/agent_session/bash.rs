@@ -228,8 +228,11 @@ impl AgentSession {
             "truncated": result.truncated,
             "fullOutputPath": result.full_output_path,
         });
-        if self.is_streaming() {
-            // Defer to the end of the run (upstream `_pendingBashMessages`).
+        if self.is_streaming() || self.is_compacting() {
+            // Defer to the end of the run (upstream `_pendingBashMessages`) or
+            // of the manual compaction (the same cut-point race: an append
+            // between the snapshot and the compaction entry can fall outside
+            // the rebuilt context).
             self.pending_bash
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)

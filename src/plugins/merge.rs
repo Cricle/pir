@@ -60,11 +60,12 @@ impl MergedEmit {
     /// [`PluginEventOutcome::Error`] (for `tool_call` that is fail-closed,
     /// matching upstream's "extension failed, blocking execution").
     pub fn merge(&mut self, event: &str, plugin_path: &str, outcome: PluginEventOutcome) {
-        if let PluginEventOutcome::Error { error } = &outcome {
+        if let PluginEventOutcome::Error { error, timed_out } = &outcome {
             self.errors.push(EventError {
                 ext_id: 0,
                 event: event.to_owned(),
                 error: format!("{plugin_path}: {error}"),
+                timed_out: *timed_out,
             });
             if event == "tool_call" {
                 // Upstream: a throwing tool_call handler blocks the call.

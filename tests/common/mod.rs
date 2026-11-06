@@ -68,6 +68,18 @@ impl AgentDirEnvGuard {
     /// `settings_json`, when given, is written to `<dir>/settings.json`
     /// before the pin is published.
     pub async fn scratch(label: &str, settings_json: Option<&str>) -> Self {
+        Self::scratch_with(label, settings_json, &[]).await
+    }
+
+    /// [`Self::scratch`] plus extra environment variables pinned for the
+    /// guard's lifetime (restored on drop, like `PIR_AGENT_DIR`). Use this
+    /// instead of a bare `set_var` when a process-global setting must be
+    /// stable across an async test that builds sessions at several points.
+    pub async fn scratch_with(
+        label: &str,
+        settings_json: Option<&str>,
+        extra: &[(&'static str, &str)],
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "pir-test-agent-dir-{label}-{}-{}",
             std::process::id(),
@@ -80,7 +92,7 @@ impl AgentDirEnvGuard {
         if let Some(settings) = settings_json {
             std::fs::write(dir.join("settings.json"), settings).expect("write pinned settings");
         }
-        let mut guard = Self::acquire(&dir, &[]).await;
+        let mut guard = Self::acquire(&dir, extra).await;
         guard.owned_dir = Some(dir);
         guard
     }

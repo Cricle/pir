@@ -319,6 +319,16 @@ impl FullscreenWheelScrollLines {
 }
 
 impl Settings {
+    /// Effective `images.autoResize` (upstream default `true`): whether
+    /// `@file` image attachments should be resized before they are sent to a
+    /// model. `false` keeps the upstream print-mode pass-through.
+    pub fn image_auto_resize(&self) -> bool {
+        self.images
+            .as_ref()
+            .and_then(|images| images.auto_resize)
+            .unwrap_or(true)
+    }
+
     /// The default settings (upstream `SETTINGS_DEFAULTS` fields that are part
     /// of the schema; unset otherwise).
     pub fn typed_defaults() -> Self {
