@@ -46,7 +46,8 @@ Use this EXACT format:
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages."#;
+Keep each section concise. Preserve exact file paths, function names, and error messages.
+Preserve exact file paths, function names, error messages, command exit codes and unfinished items; do not infer facts not present in the messages."#;
 
 /// Upstream `UPDATE_SUMMARIZATION_INSTRUCTIONS` (`compaction/compaction.ts`).
 const UPDATE_SUMMARIZATION_INSTRUCTIONS: &str = r#"Update the existing structured summary with new information. RULES:
@@ -123,13 +124,5 @@ pub fn update_summarization_prompt() -> String {
 /// characters (upstream `String.slice`/`length` are UTF-16 code units), never
 /// in bytes, so multi-byte content cannot split a codepoint.
 pub fn truncate_for_summary(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let truncated_chars = text.chars().count() - max_chars;
-    let prefix: String = text.chars().take(max_chars).collect();
-    format!(
-        "{}\n\n[... {} more characters truncated]",
-        prefix, truncated_chars
-    )
+    crate::text::truncate_chars_with_marker(text, max_chars)
 }

@@ -272,6 +272,39 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
     ]
 }
 
+/// Merge the slash-command sources in DISPATCH precedence order.
+///
+/// The TUI resolves a submitted `/name` in this order: built-in
+/// ([`super::slash::builtin_action`](crate::tui::slash::builtin_action), then
+/// the pir-only `/image`), native plugin commands (`WorkerEvent::
+/// NativeCommands`), JS extension commands (`ExtensionHandle::command_defs`),
+/// and finally skill/prompt-template expansion on the prompt fallthrough.
+///
+/// The popup must use the same order and keep only the FIRST registration of
+/// a name. Otherwise a plugin command that merely shares a built-in name
+/// (`/model`) is offered but can never run, and names registered by more than
+/// one source render as duplicate rows.
+pub fn merge_command_sources(
+    builtin: Vec<SlashCommand>,
+    native: Vec<SlashCommand>,
+    extension: Vec<SlashCommand>,
+    resource: Vec<SlashCommand>,
+) -> Vec<SlashCommand> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut merged: Vec<SlashCommand> = Vec::new();
+    for command in builtin
+        .into_iter()
+        .chain(native)
+        .chain(extension)
+        .chain(resource)
+    {
+        if seen.insert(command.name.clone()) {
+            merged.push(command);
+        }
+    }
+    merged
+}
+
 /// INJECTION POINT for extension-registered slash commands.
 ///
 /// A later stream that loads extensions can call this once its command list
@@ -706,23 +739,24 @@ impl CombinedAutocompleteProvider {
             .unwrap_or_default()
     }
 
-    /// All commands: built-in first, extension-registered and
-    /// skill/prompt-template commands last.
+    /// All commands in dispatch precedence: built-in first, then native
+    /// plugin commands, JS extension commands, and skill/prompt-template
+    /// commands last. A name registered by an earlier source shadows later
+    /// duplicates (see [`merge_command_sources`]).
     fn all_commands(&self) -> Vec<SlashCommand> {
-        let mut commands = self.commands.clone();
-        for provider in [
-            extension_command_provider(),
-            native_command_provider(),
-            resource_command_provider(),
-        ] {
-            let Some(provider) = provider else {
-                continue;
-            };
-            let extension_commands =
-                super::terminal::catch_contained(|| provider.commands()).unwrap_or_default();
-            commands.extend(extension_commands);
-        }
-        commands
+        let collect = |provider: Option<std::sync::Arc<dyn CommandProvider>>| {
+            provider
+                .map(|provider| {
+                    super::terminal::catch_contained(|| provider.commands()).unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
+        merge_command_sources(
+            self.commands.clone(),
+            collect(native_command_provider()),
+            collect(extension_command_provider()),
+            collect(resource_command_provider()),
+        )
     }
 
     /// Suggestions for the current cursor position (upstream

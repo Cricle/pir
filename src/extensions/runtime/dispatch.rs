@@ -1067,6 +1067,11 @@ impl ExtensionRuntime {
             ),
         )
         .await;
+        // Probe the armed deadline BEFORE the recovery drain/disarm: a
+        // synchronous JS turn interrupted by the QuickJS deadline usually
+        // returns its opaque exception just before (or instead of) the tokio
+        // timeout arm. That outcome is a timeout, not a handler failure.
+        let deadline_elapsed = self.deadline_elapsed(token);
         // Same heap-cap diagnosis as `call_tool`: sample before recovery
         // clears the pending exception / the peak usage. When no heap cap is
         // configured that sampler returns without reading the exception, so
@@ -1090,12 +1095,27 @@ impl ExtensionRuntime {
             Ok(Ok(result_json)) => result_json,
             Ok(Err(js_error)) => {
                 self.recover_after_interrupt().await;
+                if let Some(failure) = memory_failure {
+                    return Err(anyhow::anyhow!("{failure}"));
+                }
+                if deadline_elapsed {
+                    // The QuickJS interrupt aborted a synchronous JS turn:
+                    // report it as the timeout it is (and with a structured
+                    // marker so the provider-stream dispatcher can close on
+                    // a real timeout without text-sniffing, C1-02).
+                    self.mark_abandoned_dispatch(epoch);
+                    return Err(anyhow::Error::new(EventDispatchTimeout::with_detail(
+                        event,
+                        budget,
+                        engine_text.as_deref(),
+                    )));
+                }
                 return Err(anyhow::anyhow!(
                     "{}",
-                    memory_failure.unwrap_or_else(|| match engine_text {
+                    match engine_text {
                         Some(text) => format!("{js_error}: {text}"),
                         None => js_error.to_string(),
-                    })
+                    }
                 ));
             }
             Err(_elapsed) => {
@@ -1106,12 +1126,11 @@ impl ExtensionRuntime {
                 // handler's JS `finally` finally runs).
                 self.mark_abandoned_dispatch(epoch);
                 self.recover_after_interrupt().await;
-                return Err(anyhow::anyhow!(
-                    "event `{event}` dispatch timed out after {budget:?}{}",
-                    engine_text
-                        .map(|text| format!(" (pending engine exception: {text})"))
-                        .unwrap_or_default()
-                ));
+                return Err(anyhow::Error::new(EventDispatchTimeout::with_detail(
+                    event,
+                    budget,
+                    engine_text.as_deref(),
+                )));
             }
         };
         // Parse the JS dispatch reply and MOVE its parts out: the returned

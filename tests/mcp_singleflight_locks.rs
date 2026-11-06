@@ -67,7 +67,6 @@ fn blocked_server_spawn() -> (String, Vec<String>) {
         exe.to_string_lossy().into_owned(),
         vec![
             "blocked_mcp_server_child".to_owned(),
-            "--exact".to_owned(),
             "--nocapture".to_owned(),
         ],
     )
@@ -147,7 +146,6 @@ fn replacement_server_spawn() -> (String, Vec<String>) {
         exe.to_string_lossy().into_owned(),
         vec![
             "replacement_mcp_server_child".to_owned(),
-            "--exact".to_owned(),
             "--nocapture".to_owned(),
         ],
     )

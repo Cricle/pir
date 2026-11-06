@@ -49,6 +49,7 @@ use pir::ai::provider::{Provider, ProviderRegistry};
 use pir::ai::types::*;
 use pir::coding_agent::rpc::{RpcServer, SessionFactory};
 use pir::extensions::{ExtensionConfig, ExtensionHandle};
+use pir::plugins::{AgentPlugin, PluginEvent, PluginEventOutcome, PluginFuture, PluginInfo};
 use pir::session_manager::SessionManager;
 use serde_json::json;
 
@@ -2068,6 +2069,187 @@ async fn rpc_compact_event_carries_the_full_result_to_extensions() {
     assert!(compaction["details"]["readFiles"].is_array(), "{seen}");
     assert!(compaction["estimatedTokensAfter"].is_number(), "{seen}");
     assert!(compaction.get("firstKeptEntryId").is_some(), "{seen}");
+
+    drop(client);
+    drop(_server_temp);
+    drop(temp);
+}
+
+// ---------------------------------------------------------------------------
+// RPC-ADMISSION: a prompt racing a manual compaction is answered BEFORE any
+// `started` acknowledgement
+// ---------------------------------------------------------------------------
+
+/// Inline plugin that parks `session_before_compact` on a gate: the manual
+/// compaction holds `SESSION_COMPACTING` deterministically while the test
+/// sends a prompt through the RPC wire.
+struct CompactGatePlugin {
+    info: PluginInfo,
+    entered: Arc<AtomicUsize>,
+    gate: tokio::sync::watch::Receiver<bool>,
+}
+
+impl AgentPlugin for CompactGatePlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> pir::plugins::EventInterest {
+        pir::plugins::EventInterest::List(vec!["session_before_compact".into()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        if event.name != "session_before_compact" {
+            return Box::pin(async { PluginEventOutcome::None });
+        }
+        let entered = Arc::clone(&self.entered);
+        let mut gate = self.gate.clone();
+        Box::pin(async move {
+            entered.fetch_add(1, Ordering::SeqCst);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if *gate.borrow() {
+                        break;
+                    }
+                    if gate.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+            PluginEventOutcome::None
+        })
+    }
+}
+
+/// Factory for the RPC compaction race test: the summarizer answers with a
+/// scripted summary; the compaction is parked in `session_before_compact`.
+fn compact_gated_factory(
+    gate: tokio::sync::watch::Receiver<bool>,
+    entered: Arc<AtomicUsize>,
+) -> SessionFactory {
+    Arc::new(move |session: Option<SessionManager>| {
+        // `SessionFactory` is an `Fn`: clone the receiver per built session
+        // instead of moving it out of the captured factory state.
+        let gate = gate.clone();
+        let registry = fake_registry(Arc::new(|_index, context| {
+            if context.system_prompt.as_deref()
+                == Some(pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT)
+            {
+                return assistant(vec![text("RPC COMPACT SUMMARY")], StopReason::Stop);
+            }
+            assistant(vec![text("unused")], StopReason::Stop)
+        }));
+        Ok(Arc::new(AgentSession::new_with_plugins(
+            AgentSessionConfig {
+                provider_registry: registry,
+                model: fake_model(),
+                api_key: None,
+                thinking: ThinkingLevel::Off,
+                tools: ToolRegistry::new(),
+                session,
+                compaction: Some(pir::compaction::CompactionConfig {
+                    enabled: false,
+                    reserve_tokens: 1,
+                    keep_recent_tokens: 1,
+                }),
+                max_turns: 2,
+                system_prompt: None,
+                cwd: None,
+                event_stream: None,
+                extensions: None,
+                tool_selection: None,
+            },
+            vec![Arc::new(CompactGatePlugin {
+                info: PluginInfo::inline("rpc-compact-gate"),
+                entered: Arc::clone(&entered),
+                gate,
+            })],
+        )))
+    })
+}
+
+/// A prompt that arrives while a manual compaction owns the session is
+/// answered `success:false` with the compaction error — never acknowledged as
+/// `started` and then failed asynchronously (the pre-COMPACT-INPUT bug this
+/// admission path exists to prevent). With `streamingBehavior` the same input
+/// is queued instead, exactly like queued steering during a run.
+#[tokio::test]
+async fn rpc_prompt_during_manual_compaction_is_rejected_before_started() {
+    let (temp, path) = seeded_session("prompt-during-compact", |manager| {
+        for index in 0..4 {
+            seed_user(manager, &format!("user turn {index} with words to summarize"));
+            seed_assistant(manager, &format!("assistant reply {index}"));
+        }
+    });
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let (mut client, _server_temp) = rpc_pair_with(
+        "prompt-during-compact-rpc",
+        compact_gated_factory(gate_rx, Arc::clone(&entered)),
+    )
+    .await;
+    attach_path(&mut client, &path).await;
+
+    // The manual compaction claims SESSION_COMPACTING and parks before its
+    // summarizer request.
+    client.send(json!({ "id": "compact-1", "type": "compact" }));
+    for _ in 0..2000 {
+        if entered.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert!(
+        entered.load(Ordering::SeqCst) > 0,
+        "the compaction never reached session_before_compact"
+    );
+
+    // No streamingBehavior: synchronous rejection, no `started` ack.
+    client.send(json!({ "id": "p1", "type": "prompt", "text": "BLOCKED_PROMPT" }));
+    let rejected = client
+        .wait_for(|value| value["command"] == "prompt" && value["id"] == "p1")
+        .await;
+    assert_eq!(rejected["success"], json!(false), "{rejected}");
+    assert!(
+        rejected["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("compaction is in progress"),
+        "{rejected}"
+    );
+    assert!(
+        rejected.get("data").is_none() || rejected["data"].is_null(),
+        "a rejected prompt must not carry a disposition: {rejected}"
+    );
+
+    // With streamingBehavior the input is ordinary queued steering.
+    client.send(json!({
+        "id": "p2",
+        "type": "prompt",
+        "text": "QUEUED_PROMPT",
+        "streamingBehavior": "steer",
+    }));
+    let queued = client
+        .wait_for(|value| value["command"] == "prompt" && value["id"] == "p2")
+        .await;
+    assert_eq!(queued["success"], json!(true), "{queued}");
+    assert_eq!(queued["data"]["disposition"], json!("queued"), "{queued}");
+
+    // Release the compaction; both the compaction and the state snapshot must
+    // observe the idle session afterwards.
+    let _ = gate_tx.send(true);
+    let compacted = client
+        .wait_for(|value| value["command"] == "compact" && value["id"] == "compact-1")
+        .await;
+    assert_eq!(compacted["success"], json!(true), "{compacted}");
+    client.send(json!({ "id": "state-1", "type": "get_state" }));
+    let state = client
+        .wait_for(|value| value["command"] == "get_state" && value["id"] == "state-1")
+        .await;
+    assert_eq!(state["success"], json!(true), "{state}");
+    assert_eq!(state["data"]["isCompacting"], json!(false), "{state}");
+    assert_eq!(state["data"]["isStreaming"], json!(false), "{state}");
 
     drop(client);
     drop(_server_temp);

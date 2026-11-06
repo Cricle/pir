@@ -23,6 +23,7 @@ use pir::ai::types::{
     TextContent, ToolCall, ToolResultMessage, ToolResultRole, Usage, UserMessage, UserRole,
 };
 use pir::compaction::chunking::{split_summarization_chunks, summarization_chunk_budget};
+use pir::compaction::paged::PagedRequestPrompt;
 use pir::compaction::prompts::TURN_PREFIX_SUMMARIZATION_PROMPT;
 use pir::compaction::{
     compact_paged, prepare_compaction_refs, serialize_conversation,
@@ -1197,6 +1198,7 @@ async fn paged_compaction_streams_the_prefix_with_bounded_requests() {
         &config,
         recording_summarizer(Arc::clone(&prompts)),
         None,
+        PagedRequestPrompt::default(),
     )
     .await
     .expect("paged compaction");
@@ -1257,6 +1259,7 @@ async fn paged_compaction_forwards_custom_instructions_to_every_summarizer_call(
         &config,
         recording_summarizer(Arc::clone(&prompts)),
         Some(focus),
+        PagedRequestPrompt::default(),
     )
     .await
     .expect("paged compaction with focus");
@@ -1291,6 +1294,7 @@ async fn paged_compaction_forwards_custom_instructions_to_every_summarizer_call(
         &config,
         recording_summarizer(Arc::clone(&plain_prompts)),
         None,
+        PagedRequestPrompt::default(),
     )
     .await
     .expect("paged compaction without focus");
@@ -1410,6 +1414,7 @@ async fn paged_compaction_resumes_from_a_real_shaped_prefix_compaction_line() {
         &config,
         recording_summarizer(Arc::clone(&prompts)),
         None,
+        PagedRequestPrompt::default(),
     )
     .await
     .expect("a real-shaped prefix compaction line must be readable");
@@ -1481,6 +1486,7 @@ async fn paged_compaction_summarizes_the_retained_tail_of_a_prefix_compaction() 
         &config,
         recording_summarizer(Arc::clone(&prompts)),
         None,
+        PagedRequestPrompt::default(),
     )
     .await
     .expect("paged compaction");
@@ -1536,6 +1542,7 @@ async fn paged_compaction_carries_previous_details_and_split_turn_file_ops() {
         &config,
         recording_summarizer(Arc::clone(&prompts)),
         None,
+        PagedRequestPrompt::default(),
     )
     .await
     .expect("paged compaction");
@@ -1610,6 +1617,7 @@ async fn paged_compaction_carries_prefix_only_compaction_details() {
         &config,
         recording_summarizer(Arc::new(Mutex::new(Vec::new()))),
         None,
+        PagedRequestPrompt::default(),
     )
     .await
     .expect("paged compaction");

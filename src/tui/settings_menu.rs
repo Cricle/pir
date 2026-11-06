@@ -1185,8 +1185,17 @@ impl MenuState {
         let index = match &self.submenu {
             Some(submenu) => submenu.selected,
             None => self.selected,
-        };
-        Some(index.min(rows.len() - 1))
+        }
+        .min(rows.len() - 1);
+        // The main list is fuzzy-filtered by `query`: only a VISIBLE row can
+        // be selected. An empty result set has no current row at all, so
+        // Enter/←/→ must not act on a hidden row (the S2 bug that toggled
+        // `compaction.enabled` from an empty `/model` search).
+        let (_, visible) = self.display_rows();
+        if !visible.contains(&index) {
+            return None;
+        }
+        Some(index)
     }
 
     fn current_row<'a>(&self, rows: &'a [SettingsItem]) -> Option<&'a SettingsItem> {

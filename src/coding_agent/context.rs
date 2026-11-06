@@ -822,3 +822,503 @@ pub fn tool_infos(registry: &crate::agent::tool_execution::ToolRegistry) -> Vec<
         .map(|tool| ToolInfo::from_agent_tool(tool.as_ref()))
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// `@file` / `@image` prompt references
+// ---------------------------------------------------------------------------
+//
+// One implementation shared by the CLI hosts (`pir @file`, `pir print
+// "@file"` — `coding_agent::print`) and by the session prompt input
+// (`AgentSession::prompt_with_images_and_source`, the TUI worker path). The
+// semantics are upstream `cli/file-processor.ts` + `main.ts`
+// `prepareInitialMessage`:
+//
+// - text files render as `<file name="…">\n{content}\n</file>\n` (BOM
+//   stripped, lossy UTF-8, empty files skipped);
+// - image files become `ImageContent` attachments (PNG/JPEG/GIF/WebP pass
+//   through; BMP and other sniffed formats are normalized to PNG when the
+//   image stack is built in) and contribute their upstream marker line;
+// - missing files are hard errors with the absolute path.
+//
+// Path handling is the shared boundary: `~`/`~/`/`~\`, cwd-relative and
+// absolute paths, and quoted / backslash-escaped whitespace all resolve the
+// same way for every entry point.
+
+/// Resize profile for `@file` image attachments. `Some` runs supported inline
+/// formats (PNG/JPEG/GIF/WebP) through the shared `process_image` resize path;
+/// `None` keeps the upstream print-mode pass-through (`autoResizeImages:
+/// false`). Text files are unaffected either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageAttachmentOptions {
+    pub max_width: u32,
+    pub max_height: u32,
+    /// Maximum base64 payload size (matching `process_image`'s `max_bytes`).
+    pub max_bytes: usize,
+    pub jpeg_quality: u8,
+}
+
+/// [`partition_file_args`] with an explicit resize profile.
+///
+/// `options = None` is byte-for-byte the old print-mode behavior: PNG/JPEG/
+/// GIF/WebP pass through untouched, BMP and other sniffed formats are
+/// normalized to PNG. `Some(options)` additionally resizes the supported
+/// inline formats through [`crate::coding_agent::tools::image::process_image`]
+/// (dimension + encoded-byte limits, JPEG quality ladder); a decodable image
+/// that cannot fit the limits renders the upstream failure text and attaches
+/// nothing, exactly like the existing BMP path. An inline-format payload that
+/// cannot be decoded at all (truncated/synthetic bytes) keeps the old raw
+/// pass-through, because there is nothing to resize.
+pub fn partition_file_args_with_options(
+    file_args: &[String],
+    cwd: &Path,
+    options: Option<ImageAttachmentOptions>,
+) -> crate::Result<(String, Vec<crate::ai::types::ImageContent>)> {
+    use std::io::Read as _;
+
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for file_arg in file_args {
+        let path = resolve_file_arg_path(file_arg, cwd);
+        if !path.is_file() {
+            return Err(anyhow::anyhow!("File not found: {}", path.display()));
+        }
+        let mut file = std::fs::File::open(&path)
+            .map_err(|error| anyhow::anyhow!("Could not read file {}: {error}", path.display()))?;
+        let size = file
+            .metadata()
+            .map_err(|error| anyhow::anyhow!("Could not stat file {}: {error}", path.display()))?
+            .len();
+        // Upstream skips empty files before the MIME sniff.
+        if size == 0 {
+            continue;
+        }
+        // Sniff from a small read instead of the full file; these bytes are
+        // then reused for the text block or extended for the image payload.
+        let mut head = [0u8; crate::coding_agent::tools::image::IMAGE_TYPE_SNIFF_BYTES];
+        let mut filled = 0;
+        while filled < head.len() {
+            match file.read(&mut head[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "Could not read file {}: {error}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+        let mut bytes = Vec::with_capacity(filled);
+        bytes.extend_from_slice(&head[..filled]);
+        file.read_to_end(&mut bytes)
+            .map_err(|error| anyhow::anyhow!("Could not read file {}: {error}", path.display()))?;
+        let sniff_head = &bytes[..bytes
+            .len()
+            .min(crate::coding_agent::tools::image::IMAGE_TYPE_SNIFF_BYTES)];
+        match crate::coding_agent::tools::image::detect_supported_image_mime_type(sniff_head) {
+            Some(mime_type) => {
+                append_file_image(&path, bytes, mime_type, &mut text, &mut images, options)
+            }
+            None => append_file_text(&path, &bytes, &mut text),
+        }
+    }
+    Ok((text, images))
+}
+
+/// Process `@file` arguments with the upstream print-mode image behavior
+/// (`autoResizeImages: false`): see [`partition_file_args_with_options`].
+pub fn partition_file_args(
+    file_args: &[String],
+    cwd: &Path,
+) -> crate::Result<(String, Vec<crate::ai::types::ImageContent>)> {
+    partition_file_args_with_options(file_args, cwd, None)
+}
+
+/// One whitespace-delimited token of a prompt value.
+struct PromptToken {
+    /// Byte range of the raw token in the source prompt (quotes included).
+    start: usize,
+    end: usize,
+    /// The token with quotes removed and escapes resolved.
+    value: String,
+    /// The raw token begins with `\@`: an escaped literal at-sign, never a
+    /// file reference.
+    escaped_at: bool,
+    /// The token is a file reference.
+    file: bool,
+}
+
+/// Whether an `@`-stripped token should be treated as a file reference.
+///
+/// Top-level argv treats every `@x` positional as a file, but a prompt is
+/// free-form text: `Use @ here` or `follow @pi` must stay literal. A token is
+/// a file reference when the whole prompt is a list of `@` tokens (the
+/// explicit `pir print "@a.txt @b.txt"` shape), or when the path looks like
+/// one (separator, `~`, an alphabetic extension) or already exists on disk.
+fn is_prompt_file_reference(path: &str, cwd: &Path) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    if path.starts_with('~') || path.contains('/') || path.contains('\\') {
+        return true;
+    }
+    let extension = path.rsplit_once('.').map(|(_, extension)| extension);
+    let extension_like = extension.is_some_and(|extension| {
+        !extension.is_empty() && extension.chars().any(|ch| ch.is_alphabetic())
+    });
+    extension_like || resolve_file_arg_path(path, cwd).exists()
+}
+
+/// Scan one prompt string into whitespace-delimited tokens.
+///
+/// `pir print` takes a single prompt positional, so its value never passes
+/// through the argv-level `split_at_args` split. This is the string-level
+/// equivalent: a leading `@` makes a token a file reference; single/double
+/// quotes group whitespace inside a path; `\` escapes whitespace, quotes, a
+/// backslash or `@` (other backslashes stay literal so Windows path
+/// separators survive). A token that merely CONTAINS `@` (`user@example.com`)
+/// is ordinary text. Quotes around the WHOLE token (`"@my notes.txt"`) are
+/// accepted too, matching the shell-stripped argv shape.
+fn scan_prompt_tokens(prompt: &str, cwd: &Path) -> Vec<PromptToken> {
+    let mut tokens: Vec<PromptToken> = Vec::new();
+    let mut chars = prompt.char_indices().peekable();
+    while let Some(&(start, first)) = chars.peek() {
+        if first.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut value = String::new();
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+        let mut end = start;
+        while let Some(&(index, ch)) = chars.peek() {
+            if quote.is_none() && !escaped && ch.is_whitespace() {
+                break;
+            }
+            chars.next();
+            end = index + ch.len_utf8();
+            if escaped {
+                // Inside quotes only the active quote and a literal
+                // backslash are escapable; outside, whitespace/quotes/
+                // backslash/`@` are. Any other pair keeps its backslash
+                // (`C:\Users\...`).
+                let unescape = match quote {
+                    Some(active) => ch == active || ch == '\\',
+                    None => {
+                        ch.is_whitespace() || ch == '\\' || ch == '\'' || ch == '"' || ch == '@'
+                    }
+                };
+                if unescape {
+                    value.push(ch);
+                } else {
+                    value.push('\\');
+                    value.push(ch);
+                }
+                escaped = false;
+                continue;
+            }
+            match quote {
+                Some(active) if ch == active => quote = None,
+                Some(_) if ch == '\\' => escaped = true,
+                Some(_) => value.push(ch),
+                None if ch == '\\' => escaped = true,
+                None if ch == '\'' || ch == '"' => quote = Some(ch),
+                None => value.push(ch),
+            }
+        }
+        if escaped {
+            value.push('\\');
+        }
+        let raw = &prompt[start..end];
+        tokens.push(PromptToken {
+            start,
+            end,
+            escaped_at: raw.starts_with("\\@"),
+            file: false,
+            value,
+        });
+    }
+    // A prompt made up exclusively of `@` tokens is an explicit file list:
+    // even an extensionless/relative entry (`@missing`) is a reference, the
+    // same way the bare argv path treats every `@x` positional.
+    let whole_prompt_files = !tokens.is_empty()
+        && tokens
+            .iter()
+            .all(|token| !token.escaped_at && token.value.starts_with('@'));
+    for token in &mut tokens {
+        token.file = !token.escaped_at
+            && token.value.starts_with('@')
+            && (whole_prompt_files
+                || token
+                    .value
+                    .strip_prefix('@')
+                    .is_some_and(|path| is_prompt_file_reference(path, cwd)));
+    }
+    tokens
+}
+
+/// Remove every file-reference token (and the whitespace separating it from
+/// its neighbour) from the prompt, leaving the ordinary text. A leading `\@`
+/// escape loses its backslash and stays as literal text.
+fn prompt_text_without_file_args(prompt: &str, tokens: &[PromptToken]) -> String {
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for token in tokens {
+        if token.file {
+            let mut start = token.start;
+            let mut end = token.end;
+            let mut trailing = end;
+            for (offset, ch) in prompt[end..].char_indices() {
+                if ch.is_whitespace() {
+                    trailing = end + offset + ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if trailing > end {
+                end = trailing;
+            } else {
+                while start > 0 {
+                    let Some((index, ch)) = prompt[..start].char_indices().next_back() else {
+                        break;
+                    };
+                    if ch.is_whitespace() {
+                        start = index;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            ranges.push(start..end);
+        } else if token.escaped_at {
+            ranges.push(token.start..token.start + 1);
+        }
+    }
+    ranges.sort_by_key(|range| range.start);
+    let mut message = String::with_capacity(prompt.len());
+    let mut cursor = 0;
+    for range in ranges {
+        if range.start > cursor {
+            message.push_str(&prompt[cursor..range.start]);
+        }
+        cursor = cursor.max(range.end);
+    }
+    message.push_str(&prompt[cursor..]);
+    if tokens.iter().any(|token| token.file) {
+        // File tokens leave whitespace holes where they were removed; the
+        // remaining message is otherwise passed through verbatim.
+        message.trim().to_string()
+    } else {
+        message
+    }
+}
+
+/// Expand `@file` references inside one prompt value.
+///
+/// The bare CLI entry shapes (`pir @notes.txt`, `pir -p @notes.txt`,
+/// `pir --mode json @notes.txt`) split `@path` positionals in argv and pass
+/// them through [`partition_file_args`]. The `pir print` subcommand and the
+/// session prompt input receive their whole prompt as ONE string, so the same
+/// rules are applied to that string here:
+///
+/// - every whitespace-delimited token beginning with `@` is a file reference
+///   and is expanded IN ORDER through [`partition_file_args`] (text files
+///   render as `<file name="…">…</file>`, images become attachments and keep
+///   their marker line; missing files are hard errors; empty files skip);
+/// - the `<file …>` text is placed BEFORE the remaining prompt text, exactly
+///   like `build_print_prompts` joins argv file text and the first message;
+/// - `@"my notes.txt"`, `"@my notes.txt"`, `@'my notes.txt'` and
+///   `@my\ notes.txt` quote/escape whitespace in a path;
+/// - `\@literal` escapes a leading `@` and stays in the message as
+///   `@literal`;
+/// - a token that does not START with `@` is untouched, and a lone `@` or a
+///   word-like token (`@pi`, `@2.0`) inside ordinary prose is not forced
+///   into a file reference, so `user@example.com` and `Use @ here` stay
+///   literal. A prompt made only of `@` tokens, or a token with a path
+///   separator / `~` / file extension / existing file, is a reference.
+pub fn expand_prompt_file_args(
+    prompt: &str,
+    cwd: &Path,
+) -> crate::Result<(String, Vec<crate::ai::types::ImageContent>)> {
+    expand_prompt_file_args_with_options(prompt, cwd, None)
+}
+
+/// [`expand_prompt_file_args`] with an explicit image resize profile.
+///
+/// `None` keeps the print-mode pass-through; `Some(options)` resizes supported
+/// inline image attachments (Interactive TUI prompts pass the current model's
+/// `inputLimits.images.resize` resolved to these options).
+pub fn expand_prompt_file_args_with_options(
+    prompt: &str,
+    cwd: &Path,
+    options: Option<ImageAttachmentOptions>,
+) -> crate::Result<(String, Vec<crate::ai::types::ImageContent>)> {
+    let tokens = scan_prompt_tokens(prompt, cwd);
+    let has_file = tokens.iter().any(|token| token.file);
+    let has_escape = tokens.iter().any(|token| token.escaped_at);
+    if !has_file && !has_escape {
+        return Ok((prompt.to_owned(), Vec::new()));
+    }
+    let file_args: Vec<String> = tokens
+        .iter()
+        .filter(|token| token.file)
+        .map(|token| {
+            token
+                .value
+                .strip_prefix('@')
+                .unwrap_or(&token.value)
+                .to_owned()
+        })
+        .collect();
+    let (file_text, images) = partition_file_args_with_options(&file_args, cwd, options)?;
+    let message = prompt_text_without_file_args(prompt, &tokens);
+    Ok((format!("{file_text}{message}"), images))
+}
+
+/// Text half of `processFileArguments`: lossy UTF-8 with a BOM strip.
+fn append_file_text(path: &Path, bytes: &[u8], text: &mut String) {
+    let raw = String::from_utf8_lossy(bytes);
+    let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    text.push_str(&format!(
+        "<file name=\"{}\">\n{content}\n</file>\n",
+        path.display()
+    ));
+}
+
+/// Image half of `processFileArguments`: with `options = None` this is
+/// `processImage` with `autoResizeImages: false` (upstream print mode) —
+/// normalize to a supported inline format, never resize. With
+/// `Some(options)` PNG/JPEG/GIF/WebP also go through `process_image` with the
+/// resolved limits. Either way, render the conversion/resize hints or the
+/// processing failure text exactly like upstream.
+#[cfg(any(feature = "image-tools", all(feature = "print", feature = "tui")))]
+fn append_file_image(
+    path: &Path,
+    bytes: Vec<u8>,
+    mime_type: &'static str,
+    text: &mut String,
+    images: &mut Vec<crate::ai::types::ImageContent>,
+    options: Option<ImageAttachmentOptions>,
+) {
+    use crate::coding_agent::tools::image::{
+        process_image, ProcessImageError, DEFAULT_JPEG_QUALITY,
+    };
+
+    // The formats `processImage` normalizes to pass through untouched under
+    // `autoResizeImages: false`: upstream returns the original bytes without
+    // decoding them (only a non-inline format such as BMP is converted).
+    // A resize profile opts the supported inline formats INTO `process_image`
+    // below; `None` preserves that pass-through exactly.
+    let inline_format = matches!(
+        mime_type,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    );
+    if options.is_none() && inline_format {
+        use base64::Engine as _;
+        images.push(crate::ai::types::ImageContent {
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            mime_type: mime_type.to_owned(),
+        });
+        text.push_str(&format!("<file name=\"{}\"></file>\n", path.display()));
+        return;
+    }
+    // BMP (and any other sniffed non-inline format): `processImage` decodes
+    // and re-encodes it as PNG. Unlimited limits express `autoResizeImages:
+    // false`: the dimension/byte checks always pass, so no resize ladder runs
+    // and only the conversion hint is produced.
+    let (max_width, max_height, max_bytes, jpeg_quality) = match options {
+        Some(options) => (
+            options.max_width,
+            options.max_height,
+            options.max_bytes,
+            options.jpeg_quality,
+        ),
+        None => (u32::MAX, u32::MAX, usize::MAX, DEFAULT_JPEG_QUALITY),
+    };
+    let processed = process_image(
+        &bytes,
+        mime_type,
+        max_width,
+        max_height,
+        max_bytes,
+        jpeg_quality,
+    );
+    match processed {
+        Ok(processed) => {
+            if processed.hints.is_empty() {
+                text.push_str(&format!("<file name=\"{}\"></file>\n", path.display()));
+            } else {
+                text.push_str(&format!(
+                    "<file name=\"{}\">{}</file>\n",
+                    path.display(),
+                    processed.hints.join("\n")
+                ));
+            }
+            images.push(crate::ai::types::ImageContent {
+                data: processed.data_base64,
+                mime_type: processed.mime_type,
+            });
+        }
+        // A supported inline format that cannot be decoded (truncated or
+        // synthetic payloads) keeps the previous pass-through behavior
+        // instead of dropping the attachment: there is nothing to resize.
+        // A decodable image that cannot fit the byte limit still reports the
+        // upstream failure and attaches nothing.
+        Err(ProcessImageError::Convert) if inline_format => {
+            use base64::Engine as _;
+            images.push(crate::ai::types::ImageContent {
+                data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                mime_type: mime_type.to_owned(),
+            });
+            text.push_str(&format!("<file name=\"{}\"></file>\n", path.display()));
+        }
+        Err(error) => {
+            text.push_str(&format!(
+                "<file name=\"{}\">{}</file>\n",
+                path.display(),
+                error.message()
+            ));
+        }
+    }
+}
+
+/// Image half without the image stack: no normalize/decode is possible, so
+/// keep the previous pass-through attachment (raw bytes).
+#[cfg(not(any(feature = "image-tools", all(feature = "print", feature = "tui"))))]
+fn append_file_image(
+    path: &Path,
+    bytes: Vec<u8>,
+    mime_type: &'static str,
+    text: &mut String,
+    images: &mut Vec<crate::ai::types::ImageContent>,
+    _options: Option<ImageAttachmentOptions>,
+) {
+    use base64::Engine as _;
+
+    images.push(crate::ai::types::ImageContent {
+        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        mime_type: mime_type.to_owned(),
+    });
+    text.push_str(&format!("<file name=\"{}\"></file>\n", path.display()));
+}
+
+/// Resolve an `@file` argument against `~`/`~/` and the cwd (same shape as
+/// cli.rs's private `expand_tilde` + cwd join).
+fn resolve_file_arg_path(file_arg: &str, cwd: &Path) -> PathBuf {
+    let path = if file_arg == "~" || file_arg.starts_with("~/") || file_arg.starts_with("~\\") {
+        match std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            Some(home) => PathBuf::from(home).join(
+                file_arg
+                    .trim_start_matches('~')
+                    .trim_start_matches(['/', '\\']),
+            ),
+            None => PathBuf::from(file_arg),
+        }
+    } else {
+        PathBuf::from(file_arg)
+    };
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}

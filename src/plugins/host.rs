@@ -246,6 +246,13 @@ impl JsExtensionsPlugin {
                 }
             }
             Err(error) => PluginEventOutcome::Error {
+                // Structured marker from the extension runtime (QuickJS
+                // interrupt / caller-side mailbox deadline), never inferred
+                // from the text: ordinary handler errors keep `false` even
+                // when their message mentions a timeout (A-06).
+                timed_out: error
+                    .downcast_ref::<crate::extensions::EventDispatchTimeout>()
+                    .is_some(),
                 error: error.to_string(),
             },
         }
@@ -889,6 +896,7 @@ async fn dispatch_native_event(
         match future.catch_unwind().await {
             Ok(outcome) => outcome,
             Err(panic) => PluginEventOutcome::Error {
+                timed_out: false,
                 error: format!(
                     "plugin `{}` panicked: {}",
                     plugin.info().name,
@@ -903,6 +911,7 @@ async fn dispatch_native_event(
     match tokio::time::timeout(timeout, isolated).await {
         Ok(outcome) => outcome,
         Err(_) => PluginEventOutcome::Error {
+            timed_out: true,
             error: format!(
                 "plugin `{}` timed out after {} ms handling `{event}`",
                 plugin.info().name,
@@ -1539,7 +1548,7 @@ impl PluginHost {
             )
             .await;
             match outcome {
-                PluginEventOutcome::Error { error } => {
+                PluginEventOutcome::Error { error, .. } => {
                     crate::ext_diag!("[ext] terminal_input dispatch failed: {error}");
                 }
                 PluginEventOutcome::TerminalInput { consume, data } => {
@@ -2052,7 +2061,7 @@ impl PluginHost {
             let before = (event == "before_provider_request").then(|| payload.clone());
             let outcome =
                 dispatch_native_event(plugin, event, payload, self.native_call_timeout()).await;
-            if let PluginEventOutcome::Error { error } = &outcome {
+            if let PluginEventOutcome::Error { error, .. } = &outcome {
                 crate::ext_diag!("[ext] {event} native dispatch failed: {error}");
             }
             let carried = outcome.carries_payload_result();
@@ -2363,7 +2372,7 @@ impl PluginHost {
                 } else {
                     dispatch_native_event(plugin, event, payload, self.native_call_timeout()).await
                 };
-                if let PluginEventOutcome::Error { error } = &outcome {
+                if let PluginEventOutcome::Error { error, .. } = &outcome {
                     crate::ext_diag!("[ext] {event} dispatch failed: {error}");
                 }
                 let carried = outcome.carries_payload_result();
@@ -2408,7 +2417,7 @@ impl PluginHost {
                 } else {
                     dispatch_native_event(plugin, event, payload, self.native_call_timeout()).await
                 };
-                if let PluginEventOutcome::Error { error } = &outcome {
+                if let PluginEventOutcome::Error { error, .. } = &outcome {
                     crate::ext_diag!("[ext] {event} dispatch failed: {error}");
                 }
                 let carried = outcome.carries_payload_result();
@@ -2560,7 +2569,7 @@ impl PluginHost {
                 continue;
             };
             rust_visited = true;
-            if let PluginEventOutcome::Error { error } =
+            if let PluginEventOutcome::Error { error, .. } =
                 dispatch_native_event(plugin, event, value, self.native_call_timeout()).await
             {
                 crate::ext_diag!("[ext] {event} dispatch failed: {error}");

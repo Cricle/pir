@@ -288,6 +288,7 @@ pub(super) struct ChildRunInputs {
     pub step: Option<usize>,
     pub parent_signal: Option<AbortSignal>,
     pub on_task_update: Option<OnTaskUpdate>,
+    pub budget: SubagentBudget,
 }
 
 /// Run one task in a fresh, isolated, in-process ephemeral child session
@@ -312,8 +313,13 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
         step,
         parent_signal,
         on_task_update,
+        budget,
     } = inputs;
     Box::pin(async move {
+        // Wall-clock budget starts before any agent/runtime setup: a child
+        // whose extension load or session build eats the whole budget must
+        // not get a fresh prompt window afterwards.
+        let run_started = std::time::Instant::now();
         // Refuse BEFORE any agent/session/runtime work: the depth check is
         // pure registry metadata, so a refused depth never allocates a child
         // session, a child extension runtime slot, or an abort watcher.
@@ -501,10 +507,12 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
             // `--no-session`; see the module doc for the isolation deviation).
             session: None,
             compaction: None,
-            // No turn cap (upstream passes no `maxTurns` to the child): the
-            // value only feeds the loop's own default bound, which is
-            // `usize::MAX` — i.e. the cap is removed, not relaxed.
-            max_turns: usize::MAX,
+            // Per-child turn cap (R13-04 / C1-03): the child loop stops with
+            // a structured `StopReason::Error` at the budgeted cap instead of
+            // upstream's unbounded `usize::MAX`. `PIR_SUBAGENT_MAX_TURNS`
+            // overrides the default; `0` restores no cap for hosts that
+            // manage their own budget.
+            max_turns: budget.max_turns,
             system_prompt,
             cwd: Some(cwd.clone()),
             event_stream: None,
@@ -622,8 +630,18 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
         // tool batch can call `subagent` again. Box it so the child's (large)
         // prompt/loop state lives on the heap instead of inline in this future —
         // combined with `run_child`'s own boxed future this keeps the per-level
-        // poll stack flat (builtin audit P1-6).
-        let outcome = Box::pin(child.prompt(&task, handler)).await;
+        // poll stack flat (builtin audit P1-6). The wall-clock budget wraps the
+        // prompt; `wall_clock_hit` distinguishes a budget abort from a normal
+        // parent/user abort, so the result carries a structured error instead
+        // of the generic `aborted` stop reason.
+        let (outcome, wall_clock_hit) = Box::pin(prompt_with_budget(
+            &child,
+            &task,
+            handler,
+            budget,
+            run_started,
+        ))
+        .await;
         let messages = child.ephemeral_transcript().await;
 
         // Child teardown BEFORE `child_runtime` drops: the child session's plugin
@@ -661,8 +679,78 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
                 }
             }
         }
+        if wall_clock_hit {
+            // A budget abort must look like a truncated/error run, not like a
+            // user/parent abort: override the cooperative-abort stop reason and
+            // name the limit (structured prefix for hosts/tests).
+            let limit = budget.wall_clock.unwrap_or_default();
+            result.stop_reason = Some("error".to_owned());
+            result.error_message = Some(wall_clock_error_message(limit));
+        }
         result
     })
+}
+
+/// Structured prefix for a child stopped by its wall-clock budget.
+pub(super) const WALL_CLOCK_ERROR_PREFIX: &str = "Subagent wall-clock budget exceeded";
+
+fn wall_clock_error_message(limit: std::time::Duration) -> String {
+    format!(
+        "{WALL_CLOCK_ERROR_PREFIX} ({} ms): the child run was aborted after the budget expired",
+        limit.as_millis()
+    )
+}
+
+/// Await the child prompt under the wall-clock budget.
+///
+/// Returns `(outcome, wall_clock_hit)`. On expiry the child is aborted
+/// cooperatively first; a prompt that never reaches a cancellation checkpoint
+/// gets [`SubagentBudget::abort_grace`] and is then abandoned (its future is
+/// dropped, the in-process equivalent of upstream's SIGKILL). Without a
+/// budget this is exactly `child.prompt(..).await`.
+async fn prompt_with_budget(
+    child: &Arc<AgentSession>,
+    task: &str,
+    handler: EventHandler,
+    budget: SubagentBudget,
+    run_started: std::time::Instant,
+) -> (crate::Result<crate::ai::types::AssistantMessage>, bool) {
+    let Some(limit) = budget.wall_clock else {
+        return (child.prompt(task, handler).await, false);
+    };
+    // The budget covers the entire child run, including the session/runtime
+    // setup that already happened.
+    let remaining = (run_started + limit).saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        child.abort();
+        return (
+            Err(anyhow::anyhow!("{}", wall_clock_error_message(limit))),
+            true,
+        );
+    }
+    let prompt = child.prompt(task, handler);
+    tokio::pin!(prompt);
+    let timer = tokio::time::sleep(remaining);
+    tokio::pin!(timer);
+    let mut wall_clock_hit = false;
+    let mut abort_grace_armed = false;
+    loop {
+        tokio::select! {
+            outcome = &mut prompt => return (outcome, wall_clock_hit),
+            _ = &mut timer => {
+                if !abort_grace_armed {
+                    wall_clock_hit = true;
+                    abort_grace_armed = true;
+                    child.abort();
+                    timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + budget.abort_grace);
+                } else {
+                    return (Err(anyhow::anyhow!("{}", wall_clock_error_message(limit))), true);
+                }
+            }
+        }
+    }
 }
 
 /// The tool list the child's context-derived system prompt renders: the

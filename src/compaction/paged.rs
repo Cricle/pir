@@ -39,17 +39,20 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
-use crate::ai::types::{Message, Model};
+use crate::ai::types::{Message, Model, Tool};
 use crate::session_manager::{
     parse_entry_line_with_version, FileEntry, PagedWindow, SessionManager, SessionProjection,
     MAX_PREFIX_ENTRY_LINE_BYTES, SESSION_READ_BUFFER_SIZE,
 };
 
-use super::algorithm::{estimate_context_tokens, estimate_projected_context_tokens};
+use super::algorithm::{
+    estimate_request_messages_tokens, estimate_request_messages_tokens_floor,
+    estimate_request_projected_context_tokens, estimate_request_projected_context_tokens_floor,
+};
 use super::chunking::StreamingChunker;
 use super::{
     carry_previous_file_ops, compute_file_lists, extract_file_ops_from_message_refs,
-    format_file_operations, prepare_compaction_refs, should_compact_tokens,
+    format_file_operations, prepare_compaction_refs_with_keep, should_compact_tokens,
     BorrowedCompactionPreparation, CompactionConfig, CompactionResult, CompleteFn, FileOperations,
     PathEntryMeta, ProjectedEntry, ProjectionEntryMeta, SpanFraming,
 };
@@ -91,6 +94,17 @@ pub struct PagedCompaction {
     pub stats: PagedCompactionStats,
 }
 
+/// The request's out-of-band leading prompt: [`crate::ai::types::Context`]'s
+/// `system_prompt` and `tools`. The paged trigger estimates the FULL request
+/// (messages + this prefix), exactly like the resident threshold; passing an
+/// empty value keeps the legacy messages-only estimate, which is only correct
+/// for a request that truly carries no prompt or tool declarations.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PagedRequestPrompt<'a> {
+    pub system_prompt: Option<&'a str>,
+    pub tools: Option<&'a [Tool]>,
+}
+
 /// The session state a paged compaction needs, captured while the caller holds
 /// the session lock. [`compact_paged`] is [`capture`](Self::capture) plus
 /// [`compact_paged_inputs`]; a host whose session storage is shared (the print
@@ -99,20 +113,32 @@ pub struct PagedCompaction {
 /// lock discipline `agent_session/compact.rs` uses for the resident path.
 ///
 /// The view is bounded by the paged open caps: the resident tail window's
-/// projection (messages + per-entry metadata) and the branch metadata. The
-/// skipped prefix stays on disk and is streamed by the summarizer.
+/// projection (messages + per-entry metadata), the branch metadata, and the
+/// request's leading prompt. The skipped prefix stays on disk and is streamed
+/// by the summarizer.
 pub struct PagedCompactionInputs {
     paged: PagedWindow,
     path: std::path::PathBuf,
     projection: SessionProjection,
     branch: Vec<PathEntryMeta>,
+    /// Owned copies of [`PagedRequestPrompt`]: the captured view outlives the
+    /// caller's context, and the trigger must see the same prefix the request
+    /// will send.
+    system_prompt: Option<String>,
+    tools: Option<Vec<Tool>>,
 }
 
 impl PagedCompactionInputs {
-    /// Read the resident window view out of a paged session. Fails exactly
-    /// like [`compact_paged`]'s own entry checks: `Unsupported` for a session
-    /// that is not paged, `Failed` for a projection error.
-    pub fn capture(session: &SessionManager) -> Result<Self, PagedCompactionError> {
+    /// Read the resident window view out of a paged session. `request` is the
+    /// leading prompt of the model request this compaction decides for
+    /// (`Context::system_prompt` / `Context::tools`); it is part of the
+    /// threshold estimate. Fails exactly like [`compact_paged`]'s own entry
+    /// checks: `Unsupported` for a session that is not paged, `Failed` for a
+    /// projection error.
+    pub fn capture(
+        session: &SessionManager,
+        request: PagedRequestPrompt<'_>,
+    ) -> Result<Self, PagedCompactionError> {
         let paged = session.paged_window().ok_or_else(|| {
             PagedCompactionError::Unsupported("session is not open in paged mode".to_owned())
         })?;
@@ -130,6 +156,8 @@ impl PagedCompactionInputs {
             path,
             projection,
             branch,
+            system_prompt: request.system_prompt.map(str::to_owned),
+            tools: request.tools.map(<[Tool]>::to_vec),
         })
     }
 
@@ -139,20 +167,34 @@ impl PagedCompactionInputs {
     /// `compaction_start` frame) asks this instead of building a second
     /// projection.
     pub fn threshold_met(&self, model: &Model, config: &CompactionConfig) -> bool {
-        projected_threshold_tokens(&self.projection, &self.branch, model, config).1
+        projected_threshold_tokens(
+            &self.projection,
+            &self.branch,
+            PagedRequestPrompt {
+                system_prompt: self.system_prompt.as_deref(),
+                tools: self.tools.as_deref(),
+            },
+            model,
+            config,
+        )
+        .1
     }
 }
 
 /// Run the threshold compaction over a paged session (the caller persists the
-/// resulting entry and rebuilds its context).
+/// resulting entry and rebuilds its context). `request` must carry the leading
+/// prompt of the request the threshold decides for; pass
+/// [`PagedRequestPrompt::default()`] only when that request genuinely has
+/// neither a system prompt nor tool declarations.
 pub async fn compact_paged(
     session: &SessionManager,
     model: &Model,
     config: &CompactionConfig,
     complete: Arc<CompleteFn>,
     custom_instructions: Option<&str>,
+    request: PagedRequestPrompt<'_>,
 ) -> Result<PagedCompaction, PagedCompactionError> {
-    let inputs = PagedCompactionInputs::capture(session)?;
+    let inputs = PagedCompactionInputs::capture(session, request)?;
     compact_paged_inputs(inputs, model, config, complete, custom_instructions).await
 }
 
@@ -172,17 +214,25 @@ pub async fn compact_paged_inputs(
         path,
         projection,
         branch,
+        system_prompt,
+        tools,
     } = inputs;
+    let request = PagedRequestPrompt {
+        system_prompt: system_prompt.as_deref(),
+        tools: tools.as_deref(),
+    };
 
     // Trigger. The usage record on the newest assistant message is the
     // provider's own count of the request that carried the whole transcript, so
     // the check is exact without scanning the prefix; a session with no usable
-    // usage falls back to the window estimate (conservative: the caller may then
-    // not compact on a huge prefix — see `PagedCompactionError::ThresholdNotMet`).
-    // The estimator+gate pair is shared with [`threshold_met`], so a caller
-    // that must know the decision BEFORE the run (the print host's lifecycle
-    // events) applies exactly this rule.
-    let (tokens_before, met) = projected_threshold_tokens(&projection, &branch, model, config);
+    // usage falls back to the window estimate plus the request's out-of-band
+    // prompt (conservative: the caller may then not compact on a huge prefix —
+    // see `PagedCompactionError::ThresholdNotMet`). The estimator+gate pair is
+    // shared with [`threshold_met`], so a caller that must know the decision
+    // BEFORE the run (the print host's lifecycle events) applies exactly this
+    // rule.
+    let (tokens_before, met) =
+        projected_threshold_tokens(&projection, &branch, request, model, config);
     if !met {
         return Err(PagedCompactionError::ThresholdNotMet);
     }
@@ -191,8 +241,9 @@ pub async fn compact_paged_inputs(
     // window itself carries a compaction — the previous summary. All resident.
     let metas = ProjectionEntryMeta::from_projection(&projection.entries);
     let refs = ProjectionEntryMeta::cut_refs(&metas, &projection.messages);
+    let prepare_budget = config.effective_keep_recent_tokens(model.context_window);
     let preparation: BorrowedCompactionPreparation<'_> =
-        prepare_compaction_refs(&refs, &branch, config)
+        prepare_compaction_refs_with_keep(&refs, &branch, config, prepare_budget)
             .ok_or_else(|| PagedCompactionError::Failed("nothing to compact".to_owned()))?;
     let window_has_compaction = projection
         .entries
@@ -860,6 +911,7 @@ pub fn paged_requires_widening(
     session: &SessionManager,
     model: &Model,
     config: &CompactionConfig,
+    request: PagedRequestPrompt<'_>,
 ) -> bool {
     if session.paged_window().is_none() {
         return false;
@@ -888,35 +940,61 @@ pub fn paged_requires_widening(
         return false;
     }
     let branch = session.branch_path_meta(None);
-    !projected_threshold_tokens(&projection, &branch, model, config).1
+    !projected_threshold_tokens(&projection, &branch, request, model, config).1
 }
 
 /// The paged trigger's estimator+gate pair over one already-built window
 /// projection: the SAME rule the resident pipeline decides with
-/// ([`estimate_projected_context_tokens`] invalidates a usage record that
-/// predates the newest context-edit/compaction boundary on the leaf path),
+/// ([`estimate_request_projected_context_tokens`] invalidates a usage record
+/// that predates the newest context-edit/compaction boundary on the leaf path
+/// and adds the out-of-band prompt exactly when no usage record covers it),
 /// shared with [`PagedCompactionInputs::threshold_met`] and
 /// [`paged_requires_widening`] so the trigger never exists in two versions.
 /// Returns `(estimated tokens before, trigger met)`.
 fn projected_threshold_tokens(
     projection: &SessionProjection,
     branch: &[PathEntryMeta],
+    request: PagedRequestPrompt<'_>,
     model: &Model,
     config: &CompactionConfig,
 ) -> (u64, bool) {
     let metas = ProjectionEntryMeta::from_projection(&projection.entries);
     let refs = ProjectionEntryMeta::cut_refs(&metas, &projection.messages);
     let plain_estimate = branch.is_empty() && refs.iter().all(|entry| !entry.is_compaction());
+    // A paged trigger must estimate the FULL request, never the window
+    // messages alone: a large system prompt or tool declaration is part of
+    // what the provider bills and what can overflow the window. The request
+    // estimators add that prefix only when the transcript carries no usage
+    // record (usage already includes it), matching `should_compact`.
     let tokens = if plain_estimate {
-        estimate_context_tokens(&projection.messages).tokens
+        let usage =
+            estimate_request_messages_tokens(&projection.messages, request.system_prompt, request.tools)
+                .tokens;
+        let floor =
+            estimate_request_messages_tokens_floor(&projection.messages, request.system_prompt, request.tools);
+        usage.max(floor)
     } else {
-        estimate_projected_context_tokens(&refs, branch).tokens
+        let usage = estimate_request_projected_context_tokens(
+            &refs,
+            branch,
+            request.system_prompt,
+            request.tools,
+        )
+        .tokens;
+        let floor = estimate_request_projected_context_tokens_floor(
+            &refs,
+            request.system_prompt,
+            request.tools,
+        );
+        usage.max(floor)
     };
     if std::env::var_os("PIR_PAGED_DEBUG").is_some() {
         eprintln!(
-            "DBG paged threshold: messages={} tokens={} window={} reserve={} enabled={}",
+            "DBG paged threshold: messages={} tokens={} prompt={:?} tools={} window={} reserve={} enabled={}",
             projection.messages.len(),
             tokens,
+            request.system_prompt.map(str::len),
+            request.tools.map_or(0, <[Tool]>::len),
             model.context_window,
             config.reserve_tokens,
             config.enabled,
@@ -949,10 +1027,11 @@ pub fn threshold_met(
     session: &SessionManager,
     model: &Model,
     config: &CompactionConfig,
+    request: PagedRequestPrompt<'_>,
 ) -> crate::Result<bool> {
     let projection = session.build_session_projection()?;
     let branch = session.branch_path_meta(None);
-    Ok(projected_threshold_tokens(&projection, &branch, model, config).1)
+    Ok(projected_threshold_tokens(&projection, &branch, request, model, config).1)
 }
 
 /// The chunk budget a paged compaction will use (diagnostics/hosts).

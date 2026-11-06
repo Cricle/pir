@@ -409,14 +409,6 @@ pub fn delete_session(path: &Path) -> Result<SessionDeleteMethod, String> {
     }
 }
 
-/// Show the full-screen session picker; returns the selected session path, or
-/// `None` when the user cancels (Esc / Ctrl+C / Ctrl+D). Single-list callers
-/// (the `-r/--resume` CLI fast path) get one scope; Tab toggles between two
-/// identical lists.
-pub fn pick_session(sessions: &[SessionSummary]) -> Option<std::path::PathBuf> {
-    pick_session_with_all(sessions, sessions)
-}
-
 /// Scope-aware picker (upstream `session-selector.ts`): Tab switches the list
 /// between the current-directory sessions and all sessions (`listAll`,
 /// session-selector.ts:559-564).

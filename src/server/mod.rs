@@ -35,7 +35,8 @@
 //! delivered by the run task when the run finishes (same response id), so the
 //! owning connection's read loop stays free and abort/steer/cancel frames are
 //! processed while a run is in flight. Connections apply the
-//! [`ServerSecurityConfig`] policy: optional preface auth, connection/body
+//! [`ServerSecurityConfig`] policy: required-by-default preface auth
+//! (token-less starts need an explicit local-development opt-in), connection/body
 //! limits, an idle read timeout, a bounded outbound frame channel, session
 //! and subscription caps, bash-tool exclusion unless `allow_remote_bash`, and
 //! remote-`create` cwd confinement (default: reject any cwd but the server's
@@ -62,7 +63,7 @@ use connection::serve_connection;
 pub use policy::ServerSecurityConfig;
 pub use session::{
     resolve_server_tool_selection, server_tool_names, stall_next_attach_open_for_test, ServerState,
-    SessionCommandError, SessionRecord,
+    SessionCommandError, SessionRecord, SERVER_AGENT_TASK_STACK_BYTES,
 };
 
 /// A bound protocol server.
@@ -76,6 +77,11 @@ pub struct Server {
 
 impl Server {
     /// Bind a TCP listener with an empty default snapshot.
+    ///
+    /// Fails with [`std::io::ErrorKind::PermissionDenied`] unless an auth
+    /// token is configured (via [`ServerSecurityConfig`] /
+    /// `PIR_SERVER_AUTH_TOKEN`) or the caller explicitly opts into an
+    /// unauthenticated local server.
     pub async fn bind<A: ToSocketAddrs>(address: A) -> io::Result<Self> {
         Self::bind_with_state(address, ServerState::default()).await
     }
@@ -110,18 +116,25 @@ impl Server {
         state: ServerState,
         security: ServerSecurityConfig,
     ) -> io::Result<Self> {
-        security.validate()?;
+        security.validate_for_bind()?;
         let listener = TcpListener::bind(address).await?;
-        // A non-loopback listener without authentication would let any host
-        // on the network create a session in the server's default cwd and
-        // read/write/edit there. Refuse at bind time (the listener is closed
-        // when it drops out of scope); loopback keeps token-less embedding.
+        // A non-loopback listener is refused without a token even when the
+        // caller opted into unauthenticated access: that opt-in is for local
+        // development, not for exposing the server to the network. The
+        // listener is closed when it drops out of scope.
         let local_addr = listener.local_addr()?;
         if !local_addr.ip().is_loopback() && security.auth_token.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "refusing non-loopback bind without PIR_SERVER_AUTH_TOKEN",
             ));
+        }
+        if security.auth_token.is_none() {
+            tracing::warn!(
+                "server is running without authentication (explicit local-development \
+                 opt-in); any local user or process can create sessions and access files \
+                 under the server's working directory"
+            );
         }
         // The state carries the policy its sessions enforce (bash exclusion,
         // caps, cwd policy); the connection layer reads the same config.
@@ -237,7 +250,11 @@ impl UnixServer {
         state: ServerState,
         security: ServerSecurityConfig,
     ) -> io::Result<Self> {
-        security.validate()?;
+        // Same authentication invariant as TCP: a token-less Unix socket is
+        // refused unless the host explicitly opts in. The 0600 socket mode
+        // isolates other Unix users, but same-user processes still share the
+        // server's file and model capabilities.
+        security.validate_for_bind()?;
         let path = path.as_ref().to_path_buf();
         // Stale socket recovery (upstream removeStaleSocket): a leftover file
         // from a crashed server would fail the bind otherwise. Only remove

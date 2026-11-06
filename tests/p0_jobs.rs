@@ -38,6 +38,117 @@ fn shell_spec(command: &str) -> JobSpec {
     }
 }
 
+/// Wait until the supervisor has recorded the command's pid.
+fn wait_for_child_recorded(store: &JobStore, id: &str) -> JobMeta {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(meta) = store.status(id) {
+            if meta.pid.is_some() {
+                return meta;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "supervisor never recorded a child pid for {id}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Read a `<prefix><pid>` line from the live log.
+#[cfg(unix)]
+fn wait_for_logged_pid(store: &JobStore, id: &str, prefix: &str) -> u32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut last = String::new();
+    loop {
+        if let Some(log) = store.read_log(id, 64 * 1024, 200) {
+            last = log.text;
+            for line in last.lines() {
+                if let Some(value) = line.trim().strip_prefix(prefix) {
+                    if let Ok(pid) = value.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no {prefix:?} line in the job log; last log: {last:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_process_alive(pid: u32, label: &str) {
+    assert!(
+        pir::jobs::__test_process_is_alive(pid),
+        "{label} pid {pid} should be alive"
+    );
+}
+
+/// Assert at the OS level that the process is gone. On Linux, also wait for
+/// the /proc entry to disappear; a leftover zombie is accepted only because
+/// it can no longer run (init has not reaped it yet).
+fn wait_until_gone(pid: u32, label: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while pir::jobs::__test_process_is_alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label} pid {pid} is still alive"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let reaped_by = std::time::Instant::now() + Duration::from_secs(2);
+        while Path::new(&format!("/proc/{pid}")).exists() && std::time::Instant::now() < reaped_by {
+            if !linux_process_state_is_zombie(pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let state = stat
+                .rfind(')')
+                .and_then(|index| stat.get(index + 1..))
+                .and_then(|rest| rest.split_whitespace().next());
+            assert!(
+                matches!(state, Some("Z" | "X" | "x")),
+                "{label} pid {pid} still has a runnable /proc entry: {stat:?}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(rest) = stat.rfind(')').and_then(|index| stat.get(index + 1..)) else {
+        return false;
+    };
+    matches!(rest.split_whitespace().next(), Some("Z" | "X" | "x"))
+}
+
+#[cfg(unix)]
+fn kill_and_reap(pid: u32) {
+    #[allow(unsafe_code)]
+    unsafe {
+        assert_eq!(
+            libc::kill(pid as libc::pid_t, libc::SIGKILL),
+            0,
+            "kill supervisor {pid}"
+        );
+        let mut status = 0;
+        assert_eq!(
+            libc::waitpid(pid as libc::pid_t, &mut status, 0),
+            pid as libc::pid_t,
+            "reap supervisor {pid}"
+        );
+    }
+}
+
 /// Minimal record for tests that only exercise id/path handling.
 fn manual_meta(root: &Path, id: &str, status: JobStatus) -> JobMeta {
     JobMeta {
@@ -113,16 +224,390 @@ fn running_job_is_visible_then_kill_marks_it_terminal() {
     let root = temp_root("kill");
     let store = job_store(&root);
     let meta = store.spawn(&shell_spec("sleep 30")).expect("spawn");
-    let running = store.status(&meta.id).expect("status");
+    let running = wait_for_child_recorded(&store, &meta.id);
     assert!(
         matches!(running.status, JobStatus::Running | JobStatus::Starting),
         "meta: {running:?}"
     );
+    let child_pid = running.pid.expect("child pid");
+    assert_process_alive(child_pid, "job child");
     let killed = store.kill(&meta.id).expect("kill");
     assert!(killed);
+    // The old test only checked meta.json; assert the OS process is gone.
+    wait_until_gone(child_pid, "job child");
     let after = store.status(&meta.id).expect("status after kill");
-    assert_eq!(after.status, JobStatus::Killed);
+    assert_eq!(after.status, JobStatus::Killed, "meta: {after:?}");
     assert!(store.reap(&meta.id, 4096, 100).is_ok());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn kill_reaps_an_orphaned_child_tree_after_the_supervisor_dies() {
+    let root = temp_root("kill-orphan");
+    let store = job_store(&root);
+    // The shell stays alive as the supervisor's child and owns a `sleep`
+    // grandchild. Killing only the recorded child pid would leave the
+    // grandchild behind, so this also covers descendant cleanup.
+    let meta = store
+        .spawn(&shell_spec("sleep 30 & echo \"grandchild $!\"; wait"))
+        .expect("spawn");
+    let running = wait_for_child_recorded(&store, &meta.id);
+    let child_pid = running.pid.expect("child pid");
+    let supervisor_pid = running.supervisor_pid.expect("supervisor pid");
+    let grandchild_pid = wait_for_logged_pid(&store, &meta.id, "grandchild ");
+    assert_process_alive(child_pid, "job child");
+    assert_process_alive(grandchild_pid, "job grandchild");
+
+    // Simulate a supervisor crash (OOM/external SIGKILL). The test process is
+    // its parent, so reap it: an unreaped zombie would still answer kill(0).
+    kill_and_reap(supervisor_pid);
+    wait_until_gone(supervisor_pid, "supervisor");
+    assert_process_alive(child_pid, "orphaned job child");
+    assert_process_alive(grandchild_pid, "orphaned job grandchild");
+
+    // The child's PGID is the dead supervisor's pid. The old implementation
+    // signalled `-child_pid` (ESRCH, ignored) and still wrote `Killed`.
+    let killed = store.kill(&meta.id).expect("kill orphaned job");
+    assert!(killed, "kill must report the job as terminated");
+    wait_until_gone(child_pid, "orphaned job child");
+    wait_until_gone(grandchild_pid, "orphaned job grandchild");
+
+    let after = store.status(&meta.id).expect("status after kill");
+    assert_eq!(after.status, JobStatus::Killed, "meta: {after:?}");
+    let report = store.clean(Duration::ZERO, true);
+    assert!(
+        report.removed.contains(&meta.id),
+        "a confirmed-dead job should be cleanable: {report:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn kill_falls_back_to_the_direct_child_tree_when_the_group_is_gone() {
+    if !std::process::Command::new("sh")
+        .args(["-c", "command -v setsid >/dev/null 2>&1"])
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return;
+    }
+    let root = temp_root("kill-setsid");
+    let store = job_store(&root);
+    // `setsid` moves the shell into its own session, so the supervisor's
+    // process group disappears with the supervisor and the group signal
+    // returns ESRCH. Only the direct child-tree fallback can reap it.
+    let meta = store
+        .spawn(&shell_spec(
+            "exec setsid sh -c 'sleep 30 & echo \"grandchild $!\"; wait'",
+        ))
+        .expect("spawn");
+    let running = wait_for_child_recorded(&store, &meta.id);
+    let child_pid = running.pid.expect("child pid");
+    let supervisor_pid = running.supervisor_pid.expect("supervisor pid");
+    let grandchild_pid = wait_for_logged_pid(&store, &meta.id, "grandchild ");
+    assert_process_alive(child_pid, "job child");
+    assert_process_alive(grandchild_pid, "job grandchild");
+
+    kill_and_reap(supervisor_pid);
+    wait_until_gone(supervisor_pid, "supervisor");
+    #[allow(unsafe_code)]
+    let group_exists = unsafe { libc::kill(-(supervisor_pid as libc::pid_t), 0) } == 0;
+    assert!(
+        !group_exists,
+        "test setup: the supervisor's process group should be gone"
+    );
+    assert_process_alive(child_pid, "orphaned job child");
+
+    let killed = store.kill(&meta.id).expect("kill orphaned job");
+    assert!(killed, "kill must report the job as terminated");
+    wait_until_gone(child_pid, "orphaned job child");
+    wait_until_gone(grandchild_pid, "orphaned job grandchild");
+    let after = store.status(&meta.id).expect("status after kill");
+    assert_eq!(after.status, JobStatus::Killed, "meta: {after:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn kill_failure_returns_an_error_and_keeps_the_record_running() {
+    let root = temp_root("kill-failure");
+    let jobs_root = root.join("jobs");
+    let dir = jobs_root.join("job-fail");
+    std::fs::create_dir_all(&dir).expect("job dir");
+    let own_pid = std::process::id();
+    let mut meta = manual_meta(&root, "job-fail", JobStatus::Running);
+    // u32::MAX cannot be converted to a pid_t, so signal setup fails before
+    // any process is touched. The recorded child (this test process) stays
+    // alive and the record must remain `running`.
+    meta.supervisor_pid = Some(u32::MAX);
+    meta.supervisor_start_token = None;
+    meta.pid = Some(own_pid);
+    meta.child_start_token = pir::jobs::__test_process_start_token(own_pid);
+    meta.started_at_ms = Some(1);
+    meta.ended_at_ms = None;
+    meta.exit_code = None;
+    meta.error = None;
+    pir::jobs::__test_write_meta(&dir, &meta).expect("meta");
+    let store = JobStore::with_root(&jobs_root);
+
+    let error = store.kill("job-fail").expect_err("kill must fail");
+    assert!(
+        error.contains("out of range") || error.contains("invalid"),
+        "error: {error}"
+    );
+    let after = store.status("job-fail").expect("status");
+    assert_eq!(after.status, JobStatus::Running, "meta: {after:?}");
+    let report = store.clean(Duration::ZERO, true);
+    assert!(
+        !report.removed.contains(&"job-fail".to_owned()),
+        "clean removed a running job: {report:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+fn spawn_group_leader(script: &str) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    std::process::Command::new("sh")
+        .args(["-c", script])
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn process-group leader")
+}
+
+/// A recorded child pid that died and was recycled must never receive the
+/// SIGKILL escalation. The decoy supervisor ignores SIGTERM, forcing the
+/// escalation path; the mismatched victim must survive and the record must
+/// stay running instead of a false `Killed`.
+#[cfg(unix)]
+#[test]
+fn sigkill_escalation_skips_a_recycled_child_pid() {
+    let root = temp_root("kill-recycled-child");
+    let jobs_root = root.join("jobs");
+    let dir = jobs_root.join("job-recycled-child");
+    std::fs::create_dir_all(&dir).expect("job dir");
+
+    let mut supervisor = spawn_group_leader("trap '' TERM; sleep 30");
+    let supervisor_pid = supervisor.id();
+    let Some(supervisor_token) = pir::jobs::__test_process_start_token(supervisor_pid) else {
+        let _ = supervisor.kill();
+        let _ = supervisor.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn recycled-pid victim");
+    let victim_pid = victim.id();
+    let victim_token = pir::jobs::__test_process_start_token(victim_pid).expect("victim token");
+    assert_process_alive(victim_pid, "victim");
+
+    let mut meta = manual_meta(&root, "job-recycled-child", JobStatus::Running);
+    meta.supervisor_pid = Some(supervisor_pid);
+    meta.supervisor_start_token = Some(supervisor_token);
+    meta.pid = Some(victim_pid);
+    // Same pid, different creation time: the original child is gone and this
+    // is an unrelated process that must not be signalled.
+    meta.child_start_token = Some(victim_token.wrapping_add(1));
+    meta.started_at_ms = Some(1);
+    meta.ended_at_ms = None;
+    meta.exit_code = None;
+    meta.error = None;
+    pir::jobs::__test_write_meta(&dir, &meta).expect("meta");
+    let store = JobStore::with_root(&jobs_root);
+
+    let result = store.kill("job-recycled-child");
+    assert!(
+        result.is_err(),
+        "kill must not claim success when it skipped a recycled pid: {result:?}"
+    );
+    assert_process_alive(victim_pid, "recycled-pid victim");
+    let persisted = pir::jobs::__test_read_meta(&dir).expect("meta after kill");
+    assert_eq!(persisted.status, JobStatus::Running, "meta: {persisted:?}");
+
+    let _ = victim.kill();
+    let _ = victim.wait();
+    let _ = supervisor.kill();
+    let _ = supervisor.wait();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Control: when the supervisor responds to SIGTERM the escalation path is
+/// never entered, so the recycled child pid is never a signal target.
+#[cfg(unix)]
+#[test]
+fn sigterm_path_never_signals_a_recycled_child_pid() {
+    let root = temp_root("kill-recycled-control");
+    let jobs_root = root.join("jobs");
+    let dir = jobs_root.join("job-recycled-control");
+    std::fs::create_dir_all(&dir).expect("job dir");
+
+    let mut supervisor = spawn_group_leader("sleep 30");
+    let supervisor_pid = supervisor.id();
+    let Some(supervisor_token) = pir::jobs::__test_process_start_token(supervisor_pid) else {
+        let _ = supervisor.kill();
+        let _ = supervisor.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn recycled-pid victim");
+    let victim_pid = victim.id();
+    let victim_token = pir::jobs::__test_process_start_token(victim_pid).expect("victim token");
+
+    let mut meta = manual_meta(&root, "job-recycled-control", JobStatus::Running);
+    meta.supervisor_pid = Some(supervisor_pid);
+    meta.supervisor_start_token = Some(supervisor_token);
+    meta.pid = Some(victim_pid);
+    meta.child_start_token = Some(victim_token.wrapping_add(1));
+    meta.started_at_ms = Some(1);
+    meta.ended_at_ms = None;
+    meta.exit_code = None;
+    meta.error = None;
+    pir::jobs::__test_write_meta(&dir, &meta).expect("meta");
+    let store = JobStore::with_root(&jobs_root);
+
+    let killed = store.kill("job-recycled-control").expect("kill");
+    assert!(killed);
+    assert_process_alive(victim_pid, "recycled-pid victim");
+    let after = store.status("job-recycled-control").expect("status");
+    assert_eq!(after.status, JobStatus::Killed, "meta: {after:?}");
+
+    let _ = victim.kill();
+    let _ = victim.wait();
+    let _ = supervisor.kill();
+    let _ = supervisor.wait();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A recycled supervisor pid must not be used as a process-group id: the
+/// unrelated group leader occupying that pid has to survive `kill`.
+#[cfg(unix)]
+#[test]
+fn kill_skips_group_signal_when_the_supervisor_identity_does_not_match() {
+    let root = temp_root("kill-recycled-leader");
+    let jobs_root = root.join("jobs");
+    let dir = jobs_root.join("job-recycled-leader");
+    std::fs::create_dir_all(&dir).expect("job dir");
+
+    let mut reused_leader = spawn_group_leader("sleep 30");
+    let reused_pid = reused_leader.id();
+    let Some(reused_token) = pir::jobs::__test_process_start_token(reused_pid) else {
+        let _ = reused_leader.kill();
+        let _ = reused_leader.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn job child");
+    let child_pid = child.id();
+    let child_token = pir::jobs::__test_process_start_token(child_pid).expect("child token");
+
+    let mut meta = manual_meta(&root, "job-recycled-leader", JobStatus::Running);
+    meta.supervisor_pid = Some(reused_pid);
+    // Same pid, different creation time: this is a new, unrelated group
+    // leader that `kill(-supervisor_pid)` must not reach.
+    meta.supervisor_start_token = Some(reused_token.wrapping_add(1));
+    meta.pid = Some(child_pid);
+    meta.child_start_token = Some(child_token);
+    meta.started_at_ms = Some(1);
+    meta.ended_at_ms = None;
+    meta.exit_code = None;
+    meta.error = None;
+    pir::jobs::__test_write_meta(&dir, &meta).expect("meta");
+    let store = JobStore::with_root(&jobs_root);
+
+    let killed = store.kill("job-recycled-leader").expect("kill");
+    assert!(killed);
+    assert_process_alive(reused_pid, "recycled group leader");
+    wait_until_gone(child_pid, "job child");
+    let after = store.status("job-recycled-leader").expect("status");
+    assert_eq!(after.status, JobStatus::Killed, "meta: {after:?}");
+
+    let _ = child.wait();
+    let _ = reused_leader.kill();
+    let _ = reused_leader.wait();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(windows)]
+#[test]
+fn kill_reaps_the_child_after_the_supervisor_is_terminated_on_windows() {
+    let root = temp_root("kill-orphan-win");
+    let store = job_store(&root);
+    let meta = store.spawn(&shell_spec("sleep 30")).expect("spawn");
+    let running = wait_for_child_recorded(&store, &meta.id);
+    let child_pid = running.pid.expect("child pid");
+    let supervisor_pid = running.supervisor_pid.expect("supervisor pid");
+
+    // Kill only the supervisor; /T would take the child tree with it.
+    let status = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &supervisor_pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run taskkill");
+    assert!(status.success(), "taskkill supervisor: {status}");
+    wait_until_gone(supervisor_pid, "supervisor");
+    assert_process_alive(child_pid, "orphaned job child");
+
+    // The supervisor record is dead, so the child pid is the only target.
+    let killed = store.kill(&meta.id).expect("kill orphaned job");
+    assert!(killed, "kill must not silently report success");
+    wait_until_gone(child_pid, "orphaned job child");
+    let after = store.status(&meta.id).expect("status after kill");
+    assert_eq!(after.status, JobStatus::Killed, "meta: {after:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn terminal_record_with_a_live_child_is_not_trusted_by_status_or_clean() {
+    let root = temp_root("live-terminal");
+    let jobs_root = root.join("jobs");
+    let dir = jobs_root.join("job-live");
+    std::fs::create_dir_all(&dir).expect("job dir");
+    let own_pid = std::process::id();
+    let own_token = pir::jobs::__test_process_start_token(own_pid);
+    let mut meta = manual_meta(&root, "job-live", JobStatus::Killed);
+    meta.pid = Some(own_pid);
+    meta.child_start_token = own_token;
+    meta.ended_at_ms = Some(2);
+    pir::jobs::__test_write_meta(&dir, &meta).expect("meta");
+    let store = JobStore::with_root(&jobs_root);
+
+    // A stale terminal record whose child still runs must not hide the job.
+    let status = store.status("job-live").expect("status");
+    assert_eq!(status.status, JobStatus::Running, "meta: {status:?}");
+
+    // `clean` independently refuses to delete a terminal record with a live
+    // child (do not rely on the status correction above).
+    pir::jobs::__test_write_meta(&dir, &meta).expect("reset meta");
+    let report = store.clean(Duration::ZERO, true);
+    assert!(
+        !report.removed.contains(&"job-live".to_owned()),
+        "clean removed a job whose child is alive: {report:?}"
+    );
+    assert!(dir.exists(), "clean deleted the job directory");
     let _ = std::fs::remove_dir_all(&root);
 }
 

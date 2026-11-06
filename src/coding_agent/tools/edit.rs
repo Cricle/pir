@@ -21,8 +21,8 @@ use super::confine::ConfinedTarget;
 #[cfg(feature = "tool-edit")]
 use super::util::single_path_arg;
 use super::util::{
-    checkpoint_before_mutation, max_source_bytes, source_limit_error, workspace_path_parts,
-    workspace_path_remote_checked, write_remote_file_atomically,
+    checkpoint_before_mutation_from_bytes, max_source_bytes, source_limit_error,
+    workspace_path_parts, workspace_path_remote_checked, write_remote_file_atomically,
 };
 
 // ---------------------------------------------------------------------------
@@ -764,6 +764,17 @@ impl AgentTool for EditTool {
             Ok(edits) => edits,
             Err(error) => return Box::pin(async move { ToolResult::error(error) }),
         };
+        // Read-before-edit: an existing target must have been fully read in
+        // this session and not changed since. A missing session env (bare
+        // ToolContext/tool tests) is ungated; a new file is not reachable here
+        // because `edit` only replaces existing content.
+        let gate_warning = match super::util::read_before_edit_gate(ctx, &path, "edit") {
+            crate::agent::read_ledger::EditGate::Allowed => None,
+            crate::agent::read_ledger::EditGate::Warn(warning) => Some(warning),
+            crate::agent::read_ledger::EditGate::Blocked(error) => {
+                return Box::pin(async move { ToolResult::error(error) })
+            }
+        };
         let cwd = ctx.cwd.clone();
         let checkpoint_ctx = ctx.clone();
         let aborted = ctx.is_aborted();
@@ -777,10 +788,12 @@ impl AgentTool for EditTool {
                 return ToolResult::error("Operation aborted");
             }
             if let Some(operations) = operations {
-                return edit_with_operations(operations, &cwd, &path, &edits, signal).await;
+                let result = edit_with_operations(operations, &cwd, &path, &edits, signal).await;
+                return super::util::append_read_gate_warning(result, gate_warning);
             }
             if let Some(environment) = remote {
-                return edit_remote(environment, &path, &edits, signal).await;
+                let result = edit_remote(environment, &path, &edits, signal).await;
+                return super::util::append_read_gate_warning(result, gate_warning);
             }
             // Name-based confinement first (model-facing errors), then the
             // read and the replacement through a handle anchored at the
@@ -802,7 +815,6 @@ impl AgentTool for EditTool {
                     ))
                 }
             };
-            checkpoint_before_mutation(&checkpoint_ctx, "edit", &mutation_paths).await;
             // Read as bytes so an invalid-UTF-8 (binary) file is reported
             // cleanly instead of surfacing a lossy conversion error. The
             // source-size cap bounds the whole-file buffer this path needs.
@@ -833,10 +845,21 @@ impl AgentTool for EditTool {
                 Ok(content) => content,
                 Err(_) => return ToolResult::error(format!("Cannot edit '{}': binary file", path)),
             };
-            let transformed = match transform_edit_content(raw_content, &edits, &path) {
+            let transformed = match transform_edit_content(&raw_content, &edits, &path) {
                 Ok(transformed) => transformed,
                 Err(error) => return ToolResult::error(error),
             };
+            // Every read and content check succeeded: the edit will be
+            // applied. Snapshot the exact pre-edit bytes just validated (no
+            // second read) immediately before the atomic write, so rejected
+            // edits above never publish a checkpoint.
+            checkpoint_before_mutation_from_bytes(
+                &checkpoint_ctx,
+                "edit",
+                &mutation_paths[0],
+                raw_content.into_bytes(),
+            )
+            .await;
             match target
                 .write_atomically(
                     transformed.final_content.as_bytes(),
@@ -845,7 +868,10 @@ impl AgentTool for EditTool {
                 )
                 .await
             {
-                Ok(true) => edit_success_result(&path, &edits, &transformed),
+                Ok(true) => super::util::append_read_gate_warning(
+                    edit_success_result(&path, &edits, &transformed),
+                    gate_warning,
+                ),
                 Ok(false) => ToolResult::error("Operation aborted"),
                 Err(e) => ToolResult::error(format!("Cannot write '{}': {}", path, e)),
             }
@@ -883,14 +909,14 @@ struct TransformedEdit {
 }
 
 fn transform_edit_content(
-    raw_content: String,
+    raw_content: &str,
     edits: &[EditRequest],
     path: &str,
 ) -> Result<TransformedEdit, String> {
     // Strip BOM before matching (the model never includes it in oldText); it is
     // restored after writing. CRLF files are matched in LF space and line
     // endings are restored afterwards.
-    let (has_bom, content) = split_bom(&raw_content);
+    let (has_bom, content) = split_bom(raw_content);
     let original_ending = detect_line_ending(content);
     let normalized_content = normalize_to_lf(content);
     let (base_content, new_content) =
@@ -995,7 +1021,7 @@ async fn edit_with_operations(
         Ok(content) => content,
         Err(_) => return ToolResult::error(format!("Cannot edit '{}': binary file", path)),
     };
-    let transformed = match transform_edit_content(raw_content, edits, path) {
+    let transformed = match transform_edit_content(&raw_content, edits, path) {
         Ok(transformed) => transformed,
         Err(error) => return ToolResult::error(error),
     };
@@ -1077,7 +1103,7 @@ async fn edit_remote(
         Ok(content) => content,
         Err(_) => return ToolResult::error(format!("Cannot edit '{}': binary file", path)),
     };
-    let transformed = match transform_edit_content(raw_content, edits, path) {
+    let transformed = match transform_edit_content(&raw_content, edits, path) {
         Ok(transformed) => transformed,
         Err(error) => return ToolResult::error(error),
     };

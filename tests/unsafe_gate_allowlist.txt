@@ -37,13 +37,14 @@ extensions/runtime/host_functions/buffer_ops.rs 3 0 0  # QuickJS raw typed-array
 # polling; keep this ceiling at 1, do not raise it for that block again.
 extensions/runtime/host_functions/child_fns.rs 1 0 0  # libc::kill on a child this process spawned
 extensions/runtime/host_functions/node_fns.rs 3 0 0  # Win32 GetProcessTimes + libc getrusage out-parameters
-jobs.rs 4 0 0  # Win32 OpenProcess/WaitForSingleObject/CloseHandle liveness probe + libc kill(pid, 0) on Unix
+jobs.rs 10 0 0  # Win32 OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill/getpgid/process-liveness probes (all with SAFETY notes)
 mcp/stdio.rs 1 0 0  # libc::killpg on the spawned MCP server's process group
 plugins/builtin/phone/session.rs 1 0 0  # libc::kill on the phone session's child process group
 session_manager/mod.rs 2 0 0  # Win32 GetFileInformationByHandle identity probe (BY_HANDLE_FILE_INFORMATION)
+session_manager/retention.rs 7 0 0  # Win32 OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill(pid,0), process-liveness probes with SAFETY notes
 session_manager/tail_page.rs 1 0 0  # memmap2 read-only map of an append-only session file
 tui/stdin_buffer.rs 3 0 0  # Win32 console input + Unix termios FFI
 tui/terminal.rs 1 0 0  # libc::raise(SIGTSTP) for terminal suspend
 tui/theme/osc11.rs 5 0 0  # libc fcntl/poll/read on the process' own stdin
 
-# total: 19 file(s), 123 unsafe block(s), 1 unsafe fn, 0 unsafe impl/trait
+# total: 20 file(s), 136 unsafe block(s), 1 unsafe fn, 0 unsafe impl/trait

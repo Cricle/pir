@@ -53,6 +53,160 @@ use super::theme::{with_theme, Theme, ThemeColor};
 use crate::ai::types::{AssistantMessage, ContentBlock, ImageContent};
 use crate::coding_agent::truncate::{format_size, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use crate::config::settings::MermaidRenderingMode;
+use crate::text::sanitize_terminal_text;
+
+/// Owned form of [`sanitize_terminal_text`], `None` when the text is clean.
+/// Used at ingestion points where the sanitized value must be retained (a
+/// component field, an `Arc<str>` output, a cloned JSON value).
+fn sanitize_owned(text: &str) -> Option<String> {
+    match sanitize_terminal_text(text) {
+        Cow::Borrowed(_) => None,
+        Cow::Owned(sanitized) => Some(sanitized),
+    }
+}
+
+/// Deepest JSON level the TUI render formatters walk. Tool arguments and
+/// result details are model/MCP-controlled: a deeply nested array/object
+/// (or a `serde_json` value built by a tool) would otherwise recurse once
+/// per level in [`sanitize_json_value`], the JSON preview formatters and the
+/// render-digest hasher until the worker/UI stack is exhausted. Past this
+/// level the value is replaced with a visible marker; execution always uses
+/// the original JSON, this cap is render-only.
+pub(crate) const MAX_JSON_RENDER_DEPTH: usize = 64;
+
+/// Visible stand-in inserted when a render walks past
+/// [`MAX_JSON_RENDER_DEPTH`]. Never silently drops the subtree: the tool card
+/// shows that output was elided instead of pretending it was empty.
+const JSON_DEPTH_ELISION: &str = "[... nested JSON truncated for display ...]";
+
+/// Sanitize every string in a JSON value (tool args, result details). These
+/// are rendered directly by the tool-call/result formatters, so a model- or
+/// repo-controlled `ESC ] 0 ; … BEL` inside e.g. an edit's file content must
+/// not reach the terminal. Only allocates the tree when something changed.
+///
+/// Depth-limited by [`MAX_JSON_RENDER_DEPTH`] so a deeply nested MCP result
+/// cannot overflow the render thread's stack.
+fn sanitize_json_value(value: &serde_json::Value) -> Option<serde_json::Value> {
+    sanitize_json_value_at(value, 0)
+}
+
+/// Dismantle a JSON tree explicitly instead of letting `serde_json::Value`'s
+/// recursive `Drop` walk it. A programmatically built value can be tens of
+/// thousands of levels deep (wire deserialization caps at 128, but builtin
+/// tools/tests/extensions can build arbitrary trees); dropping the original
+/// on the render thread would otherwise overflow the stack AFTER rendering
+/// has safely elided the deep part.
+fn drop_json_value_iterative(root: serde_json::Value) {
+    let mut stack = vec![root];
+    while let Some(mut value) = stack.pop() {
+        match &mut value {
+            serde_json::Value::Array(items) => stack.extend(std::mem::take(items)),
+            serde_json::Value::Object(map) => {
+                stack.extend(std::mem::take(map).into_iter().map(|(_, value)| value));
+            }
+            _ => {}
+        }
+        // `value` no longer owns children, so this drop is shallow.
+        drop(value);
+    }
+}
+
+/// Release one owner of a possibly deep JSON value. If this `Arc` is the last
+/// owner, dismantle the tree iteratively; otherwise another owner remains and
+/// dropping this handle is already shallow.
+fn drop_json_arc(value: Arc<serde_json::Value>) {
+    match Arc::try_unwrap(value) {
+        Ok(value) => drop_json_value_iterative(value),
+        Err(_) => {}
+    }
+}
+
+/// Test/probe seam for releasing a deep `Arc<Value>` without recursively
+/// dropping it (the public model types expose `Arc<serde_json::Value>`, so a
+/// test that keeps its own reference needs the same iteration).
+#[doc(hidden)]
+pub fn release_json_value_iteratively(value: Arc<serde_json::Value>) {
+    drop_json_arc(value);
+}
+
+fn sanitize_json_value_at(value: &serde_json::Value, depth: usize) -> Option<serde_json::Value> {
+    if depth >= MAX_JSON_RENDER_DEPTH {
+        return Some(serde_json::Value::String(JSON_DEPTH_ELISION.to_owned()));
+    }
+    match value {
+        serde_json::Value::String(text) => sanitize_owned(text).map(serde_json::Value::String),
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            let mut sanitized = Vec::with_capacity(items.len());
+            for item in items {
+                match sanitize_json_value_at(item, depth + 1) {
+                    Some(item) => {
+                        changed = true;
+                        sanitized.push(item);
+                    }
+                    None => sanitized.push(item.clone()),
+                }
+            }
+            changed.then_some(serde_json::Value::Array(sanitized))
+        }
+        serde_json::Value::Object(object) => {
+            let mut changed = false;
+            let mut sanitized = serde_json::Map::new();
+            for (key, item) in object {
+                let key = match sanitize_owned(key) {
+                    Some(key) => {
+                        changed = true;
+                        key
+                    }
+                    None => key.clone(),
+                };
+                let item = match sanitize_json_value_at(item, depth + 1) {
+                    Some(item) => {
+                        changed = true;
+                        item
+                    }
+                    None => item.clone(),
+                };
+                sanitized.insert(key, item);
+            }
+            changed.then_some(serde_json::Value::Object(sanitized))
+        }
+        _ => None,
+    }
+}
+
+/// Settled-assistant variant of the sanitizer: the component owns an immutable
+/// `Arc<AssistantMessage>`, so clone it once when any rendered text block,
+/// thinking block or error message carries control bytes. Live messages and
+/// `-c`/resume replays both come through `new_from`, so one pass covers both.
+fn sanitize_assistant_message(message: &AssistantMessage) -> Option<AssistantMessage> {
+    let mut changed = false;
+    let mut sanitized = message.clone();
+    for block in &mut sanitized.content {
+        match block {
+            ContentBlock::Text(text) => {
+                if let Some(clean) = sanitize_owned(&text.text) {
+                    text.text = clean;
+                    changed = true;
+                }
+            }
+            ContentBlock::Thinking(thinking) => {
+                if let Some(clean) = sanitize_owned(&thinking.thinking) {
+                    thinking.thinking = clean;
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(error) = sanitized.error_message.as_mut() {
+        if let Some(clean) = sanitize_owned(error) {
+            *error = clean;
+            changed = true;
+        }
+    }
+    changed.then_some(sanitized)
+}
 
 /// User message component (upstream `UserMessageComponent`): markdown
 /// inside a padded background box. Deliberately renders **no "You:"**
@@ -92,7 +246,10 @@ impl UserMessageComponent {
         let mut boxed = BoxContainer::new(output_pad, 1, move |s: &str| {
             with_theme(|theme| theme.bg(ThemeColor::UserMessageBg, s))
         });
-        boxed.add_child(Markdown::with_options(text, 0, 0, theme, options));
+        // User text is replayed from the session file too (a poisoned session
+        // must not re-inject on resume): sanitize before markdown parses it.
+        let text = sanitize_terminal_text(text);
+        boxed.add_child(Markdown::with_options(text.as_ref(), 0, 0, theme, options));
         Self {
             boxed,
             cache: Mutex::new(None),
@@ -227,6 +384,9 @@ impl SkillInvocationComponent {
     ) -> Self {
         let background =
             |text: &str| with_theme(|theme| theme.bg(ThemeColor::CustomMessageBg, text));
+        // Skill blocks are parsed out of user messages (also replayed).
+        let name = sanitize_terminal_text(&block.name);
+        let content = sanitize_terminal_text(&block.content);
         // Collapsed: the single `[skill] name (ctrl+o to expand)` line.
         let mut collapsed = BoxContainer::new(output_pad, 1, background);
         collapsed.add_child(Text::with_padding(
@@ -237,7 +397,7 @@ impl SkillInvocationComponent {
                         ThemeColor::CustomMessageLabel,
                         "\u{1b}[1m[skill]\u{1b}[22m "
                     ),
-                    theme.fg(ThemeColor::CustomMessageText, &block.name),
+                    theme.fg(ThemeColor::CustomMessageText, name.as_ref()),
                     theme.fg(ThemeColor::Dim, " (ctrl+o to expand)"),
                 )
             }),
@@ -254,7 +414,7 @@ impl SkillInvocationComponent {
             0,
         ));
         expanded.add_child(Markdown::with_options(
-            format!("**{}**\n\n{}", block.name, block.content),
+            format!("**{}**\n\n{}", name.as_ref(), content.as_ref()),
             0,
             0,
             MarkdownTheme::default(),
@@ -463,6 +623,10 @@ impl AssistantMessageComponent {
         hide_thinking: bool,
         output_pad: usize,
     ) -> Self {
+        let message = match sanitize_assistant_message(&message) {
+            Some(sanitized) => Arc::new(sanitized),
+            None => message,
+        };
         Self {
             revision_id: Self::next_revision_id(),
             state: Mutex::new(AssistantState {
@@ -875,6 +1039,11 @@ pub struct StreamingThinking {
     /// The accumulated thinking body, trimmed — the settled arm renders the
     /// trimmed run — plus the incremental render state of its final lines.
     body: Mutex<StreamingRender>,
+    /// Whitespace after the last non-whitespace byte of the delta path.
+    /// `full.trim()` would drop it until a later delta completes the line;
+    /// holding it here keeps the delta path byte-identical to the snapshot
+    /// path without rescanning the accumulated body.
+    pending_whitespace: Mutex<String>,
     output_pad: usize,
     /// `settings.hideThinkingBlock`: collapse to the label line.
     hidden: bool,
@@ -882,6 +1051,41 @@ pub struct StreamingThinking {
     label: Arc<Mutex<Option<String>>>,
     /// Memo of the hidden posture's single row (see [`HiddenThinkingRow`]).
     hidden_row: Mutex<Option<HiddenThinkingRow>>,
+}
+
+/// Call counters for the thinking sanitizer (`sanitize_terminal_text`), the
+/// measurement seam for the per-delta path: `set_text_growing` records the
+/// FULL accumulated body it scans, `set_text_growing_delta` only the new
+/// delta. Tests pin that N deltas do not rescan the accumulated body.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThinkingWork {
+    pub sanitize_calls: u64,
+    pub sanitize_bytes: u64,
+}
+
+impl ThinkingWork {
+    #[doc(hidden)]
+    pub fn snapshot() -> Self {
+        Self {
+            sanitize_calls: THINKING_SANITIZE_CALLS.load(Ordering::Relaxed),
+            sanitize_bytes: THINKING_SANITIZE_BYTES.load(Ordering::Relaxed),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn reset() {
+        THINKING_SANITIZE_CALLS.store(0, Ordering::Relaxed);
+        THINKING_SANITIZE_BYTES.store(0, Ordering::Relaxed);
+    }
+}
+
+static THINKING_SANITIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+static THINKING_SANITIZE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn count_thinking_sanitize(input_len: usize) {
+    THINKING_SANITIZE_CALLS.fetch_add(1, Ordering::Relaxed);
+    THINKING_SANITIZE_BYTES.fetch_add(input_len as u64, Ordering::Relaxed);
 }
 
 /// Memo of [`StreamingThinking`]'s hidden-posture row: `{pad}{label}` painted
@@ -920,8 +1124,10 @@ impl StreamingThinking {
         hidden: bool,
         label: Arc<Mutex<Option<String>>>,
     ) -> Self {
+        let text = sanitize_terminal_text(text);
         Self {
             body: Mutex::new(StreamingRender::new(text.trim().to_string())),
+            pending_whitespace: Mutex::new(String::new()),
             output_pad,
             hidden,
             label,
@@ -943,20 +1149,71 @@ impl StreamingThinking {
     /// Replace the accumulated thinking text (a non-append update: the cached
     /// final prefix is dropped).
     pub fn set_text_shared(&self, text: Arc<str>) {
+        count_thinking_sanitize(text.len());
+        let text = sanitize_terminal_text(&text);
+        self.pending_whitespace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.body
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .replace(text.trim().to_string());
     }
 
-    /// Live-stream update (the per-delta path): when `text` extends the
-    /// accumulated body only the appended bytes are copied, and the next
-    /// render re-parses just the mutable tail.
+    /// Snapshot update (the fallback path): `text` is the FULL accumulated
+    /// thinking body. Only used when the caller cannot prove the appended
+    /// delta; it necessarily scans/copies the whole accumulator.
     pub fn set_text_growing(&self, text: &str) {
+        // A delta may be only part of an escape sequence; sanitizing each
+        // delta still guarantees no ESC ever reaches the terminal (a split
+        // sequence's tail renders as inert printable text).
+        count_thinking_sanitize(text.len());
+        let text = sanitize_terminal_text(text);
+        self.pending_whitespace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.body
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .grow(text.trim());
+    }
+
+    /// Live-stream fast path: append only the bytes the accumulator gained
+    /// (`appended_text` gives the caller the exact delta from its own copy).
+    /// Only this delta is sanitized — the accumulated body is never scanned
+    /// again — and trailing whitespace is held until a later delta completes
+    /// the line, so the rendered body matches `set_text_growing(full)`.
+    pub fn set_text_growing_delta(&self, delta: &str) {
+        count_thinking_sanitize(delta.len());
+        let delta = sanitize_terminal_text(delta);
+        if delta.is_empty() {
+            return;
+        }
+        let mut pending = self
+            .pending_whitespace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut body = self
+            .body
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut combined = String::with_capacity(pending.len() + delta.len());
+        if !body.text().is_empty() {
+            combined.push_str(&pending);
+        }
+        pending.clear();
+        if body.text().is_empty() {
+            combined.push_str(delta.trim_start());
+        } else {
+            combined.push_str(delta.as_ref());
+        }
+        let content = combined.trim_end();
+        if !content.is_empty() {
+            body.grow_delta(content);
+        }
+        pending.push_str(&combined[content.len()..]);
     }
 }
 
@@ -1246,7 +1503,12 @@ fn js_value_text(value: &serde_json::Value) -> String {
         serde_json::Value::Number(number) => number.to_string(),
         serde_json::Value::Bool(flag) => flag.to_string(),
         serde_json::Value::Null => "null".to_string(),
-        other => serde_json::to_string(other).unwrap_or_default(),
+        other => {
+            // `serde_json::to_string` recurses through the value; bounded so
+            // a deeply nested MCP argument cannot overflow the formatter.
+            let bounded = sanitize_json_value(other);
+            serde_json::to_string(bounded.as_ref().unwrap_or(other)).unwrap_or_default()
+        }
     }
 }
 
@@ -1393,6 +1655,11 @@ fn format_tool_call_with_args(
     if args.is_null() {
         return header;
     }
+    // The compact and pretty printers below recurse through every JSON
+    // level; bound the value first so a deeply nested MCP argument or tool
+    // detail renders as a marker instead of exhausting the stack.
+    let bounded = sanitize_json_value(args);
+    let args = bounded.as_ref().unwrap_or(args);
     // Borrowed keys (and a single element for the non-object shape): every
     // reader below formats the key straight into the output, so the per-key
     // `String` clone the old `Vec<(String, …)>` carried was a frame-rate copy
@@ -3187,6 +3454,10 @@ fn ensure_call_rows(state: &mut ToolState, expanded: bool, content_width: usize)
         expanded,
         &mut state.write_preview,
     );
+    // The formatters interpolate args (and, for `write`, file content) with
+    // trusted SGR only; a raw OSC/CSI from the model must not survive the
+    // formatting step.
+    let text = sanitize_terminal_text(&text).into_owned();
     bump_memo_work!(call_rows_rewraps);
     let rows = wrap_text_with_ansi(&text, content_width);
     bump_memo_work!(call_rows_rebuilds);
@@ -3278,6 +3549,7 @@ fn render_user_bash_rows(state: &ToolState, width: usize, expanded: bool, out: &
         .get("command")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("...");
+    let command = sanitize_terminal_text(command);
     let exit_code = state
         .args
         .get("exitCode")
@@ -4064,6 +4336,19 @@ impl ToolExecutionComponent {
         args: Arc<serde_json::Value>,
         tools_expanded: Arc<AtomicBool>,
     ) -> Self {
+        // Tool-call arguments are model output and are printed by the call
+        // formatters (bash command, paths, edit bodies): sanitize the strings
+        // before any of them sees the value. The real tool invocation uses the
+        // original args; this component only renders. When sanitizing replaced
+        // a deep tree (depth cap), release the original owner iteratively — a
+        // recursive `Value::drop` here would overflow the render thread.
+        let args = match sanitize_json_value(&args) {
+            Some(sanitized) => {
+                drop_json_arc(args);
+                Arc::new(sanitized)
+            }
+            None => args,
+        };
         Self {
             state: Mutex::new(ToolState {
                 tool_name: tool_name.to_string(),
@@ -4105,6 +4390,25 @@ impl ToolExecutionComponent {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Result details carry `diff`/`fullOutputPath` and other strings that
+        // result renderers print verbatim; sanitize them with the same policy.
+        let details = details.map(|details| match sanitize_json_value(&details) {
+            Some(sanitized) => {
+                drop_json_arc(details);
+                Arc::new(sanitized)
+            }
+            None => details,
+        });
+        let preview = preview.map(|preview| super::app::ToolPreview {
+            args_key: sanitize_owned(&preview.args_key).unwrap_or(preview.args_key),
+            diff: preview
+                .diff
+                .map(|diff| sanitize_owned(&diff).unwrap_or(diff)),
+            first_changed_line: preview.first_changed_line,
+            error: preview
+                .error
+                .map(|error| sanitize_owned(&error).unwrap_or(error)),
+        });
         state.details = details;
         state.started_at = started_at;
         state.preview = preview;
@@ -4113,6 +4417,13 @@ impl ToolExecutionComponent {
     /// Upstream `updateResult`: the block leaves the pending phase; the
     /// background flips to success/error and the duration is recorded.
     pub fn update_result(&self, output: Arc<str>, is_error: bool, duration_ms: Option<u64>) {
+        // Tool stdout/stderr is untrusted (commands, MCP responses, file
+        // contents) and is painted line-by-line by every result renderer.
+        // Sanitize once here; clean output keeps its original `Arc`.
+        let output = match sanitize_owned(&output) {
+            Some(sanitized) => Arc::<str>::from(sanitized),
+            None => output,
+        };
         let mut state = self
             .state
             .lock()

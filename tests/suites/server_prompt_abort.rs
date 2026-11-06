@@ -22,7 +22,7 @@ use pir::ai::types::{
 };
 use pir::client::{Client, ClientError};
 use pir::protocol::{Command, ModelRef, RpcTarget, SESSION_SERVICE_ID};
-use pir::server::{empty_snapshot, Server, ServerState};
+use pir::server::{empty_snapshot, Server, ServerSecurityConfig, ServerState};
 use tokio::sync::watch;
 
 const WAIT_BUDGET: Duration = Duration::from_secs(10);
@@ -156,9 +156,13 @@ async fn bind_gated_server(gate: watch::Receiver<bool>) -> (Server, Arc<AtomicUs
         gated_registry(gate, Arc::clone(&entered)),
     )
     .with_security(pir::server::ServerSecurityConfig::default());
-    let server = Server::bind_with_state("127.0.0.1:0", state)
-        .await
-        .expect("bind gated test server");
+    let server = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state,
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("bind gated test server");
     (server, entered)
 }
 
@@ -208,6 +212,21 @@ async fn wait_for_phase(state: &ServerState, session_id: &str, phase: &str) {
     panic!("session {session_id} never entered phase {phase}");
 }
 
+/// Wait until the gated provider's stream has been entered. The phase flips
+/// before the prompt task is polled, and the run now lives on its own
+/// large-stack thread (MCP2), so the first provider poll can land after the
+/// phase is visible; polling the counter keeps the test deterministic without
+/// weakening the abort/disconnect assertions.
+async fn wait_for_provider_entered(entered: &AtomicUsize) {
+    for _ in 0..2000 {
+        if entered.load(Ordering::SeqCst) >= 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the gated provider stream never started");
+}
+
 /// Regression: an abort while a prompt is in flight must deliver the
 /// terminal response (no hot spin), return the phase to idle, and leave the
 /// session usable for a follow-up prompt.
@@ -234,10 +253,7 @@ async fn abort_during_prompt_delivers_response_and_session_recovers() {
         .await
         .expect("prompt call sent");
     wait_for_phase(&state, &session_id, "turn").await;
-    assert!(
-        entered.load(Ordering::SeqCst) >= 1,
-        "the gated provider stream must have started"
-    );
+    wait_for_provider_entered(&entered).await;
 
     // Abort through the shared state (the same call the `abort`/`cancel`
     // frames route to). This is the point where the biased select loop used
@@ -317,7 +333,10 @@ async fn disconnect_during_prompt_aborts_run_and_reaps_session() {
         .await
         .expect("prompt call sent");
     wait_for_phase(&state, &session_id, "turn").await;
-    assert!(entered.load(Ordering::SeqCst) >= 1);
+    // The phase flips before the run thread polls the provider; wait for the
+    // stream entry so the disconnect below really lands mid-run (same rule
+    // as the abort regression above).
+    wait_for_provider_entered(&entered).await;
 
     // Drop the connection mid-run: the server must abort the in-flight run
     // (the gated stream would otherwise hold it forever) and remove the
@@ -378,9 +397,13 @@ async fn provider_error_maps_to_internal_error_response() {
         Arc::new(ProviderRegistry::default()),
     )
     .with_security(pir::server::ServerSecurityConfig::default());
-    let server = Server::bind_with_state("127.0.0.1:0", state)
-        .await
-        .expect("bind test server");
+    let server = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state,
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("bind test server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
     let mut client = Client::connect(address).await.expect("hello handshake");

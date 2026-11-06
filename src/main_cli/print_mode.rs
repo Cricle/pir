@@ -14,6 +14,50 @@ pub(super) struct PrintModeRequest<'a> {
     pub json_output: bool,
 }
 
+/// Expand `@path` references in the `pir print` prompt positional.
+///
+/// The bare entry shapes (`pir @notes.txt`, `pir -p @notes.txt`,
+/// `pir --mode json @notes.txt`) split `@` positionals in argv before they
+/// reach this host. The `print` subcommand carries its prompt as ONE string,
+/// so apply the same attachment pipeline
+/// ([`pir::coding_agent::print::expand_print_prompt_file_args`]) to that
+/// value here. `images.autoResize` (default true) selects the resizing
+/// profile for supported inline images; `false` keeps the old pass-through.
+/// The bare print/json paths already carry expanded `<file …>` text:
+/// re-expanding them could rewrite an `@` sequence inside file content, so
+/// only `Command::Print` is affected.
+fn expand_print_subcommand_prompt(
+    cli: &Cli,
+    settings_manager: &pir::config::settings::SettingsManager,
+    prompts: pir::coding_agent::cli::PrintPrompts,
+    images: Vec<pir::ai::types::ImageContent>,
+) -> Result<(
+    pir::coding_agent::cli::PrintPrompts,
+    Vec<pir::ai::types::ImageContent>,
+)> {
+    if !matches!(cli.command, Some(Command::Print { .. })) {
+        return Ok((prompts, images));
+    }
+    let Some(prompt) = prompts.initial_message.clone() else {
+        return Ok((prompts, images));
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let (expanded, file_images) = pir::coding_agent::print::expand_print_prompt_file_args(
+        &prompt,
+        &cwd,
+        settings_manager.settings.image_auto_resize(),
+    )?;
+    let mut all_images = images;
+    all_images.extend(file_images);
+    Ok((
+        pir::coding_agent::cli::PrintPrompts {
+            initial_message: Some(expanded),
+            additional_messages: prompts.additional_messages,
+        },
+        all_images,
+    ))
+}
+
 /// Run one print pass.
 pub(super) async fn run_print_mode(request: PrintModeRequest<'_>) -> Result<()> {
     let PrintModeRequest {
@@ -26,6 +70,8 @@ pub(super) async fn run_print_mode(request: PrintModeRequest<'_>) -> Result<()> 
         plan,
         json_output,
     } = request;
+    let (prompts, images) =
+        expand_print_subcommand_prompt(cli, settings_manager, prompts, images)?;
     let outcome = pir::coding_agent::run_print(
         PrintOptions {
             prompt: prompts.initial_message.unwrap_or_default(),
@@ -64,7 +110,12 @@ pub(super) async fn run_print_mode(request: PrintModeRequest<'_>) -> Result<()> 
     )
     .await?;
     if !json_output {
-        println!("{}", outcome.text);
+        // Fallible write: `println!` panics on a closed pipe (`… | head -1`),
+        // which would be recorded as a crash. A broken pipe ends the process
+        // quietly; any other write error is reported once.
+        if let Err(error) = pir::coding_agent::output::write_stdout_line(&outcome.text) {
+            pir::coding_agent::output::exit_stdout_error(error);
+        }
     }
     // Upstream print-mode.ts leaves the truncation exit code to the CLI
     // (`process.exitCode = exitCode`): the partial text above is already on

@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::agent::read_ledger::ReadLedger;
 use crate::agent::tool_batch::ToolResult;
 use crate::agent::tool_execution::{AgentTool, BoxFuture, ToolContext};
 use crate::ai::types::AbortSignal;
@@ -338,6 +339,12 @@ impl AgentTool for ReadTool {
         // An explicitly injected backend wins over the process-wide env_client
         // selection (upstream `ReadToolOptions.operations`).
         let operations = self.operations.clone();
+        // The session's read ledger (read-before-edit): successful text reads
+        // record their delivered line range here. `None` for a bare context.
+        let read_ledger = ctx
+            .session_env
+            .as_ref()
+            .map(|env| std::sync::Arc::clone(&env.read_ledger));
         Box::pin(async move {
             if aborted {
                 return ToolResult::error("Operation aborted");
@@ -352,6 +359,7 @@ impl AgentTool for ReadTool {
                     limit,
                     image_support,
                     signal,
+                    read_ledger,
                 })
                 .await;
             }
@@ -405,12 +413,14 @@ impl AgentTool for ReadTool {
             };
             read_local(
                 file,
+                &parts.candidate,
                 &path,
                 raw_offset,
                 offset,
                 limit,
                 image_support,
                 signal,
+                read_ledger,
             )
             .await
         })
@@ -427,6 +437,7 @@ struct ReadRequest {
     limit: Option<usize>,
     image_support: ImageSupport,
     signal: Option<AbortSignal>,
+    read_ledger: Option<std::sync::Arc<ReadLedger>>,
 }
 
 /// The pluggable-backend arm of the read tool: normalize + confine the path
@@ -443,12 +454,16 @@ async fn read_with_operations(request: ReadRequest) -> ToolResult {
         limit,
         image_support,
         signal,
+        read_ledger,
     } = request;
     let parts = match resolve_read_path(&cwd, &path) {
         Ok(parts) => parts,
         Err(error) => return ToolResult::error(error),
     };
     let target = parts.candidate;
+    // Stat before the backend reads so a file changed during the read is
+    // reported stale by the next edit instead of being blessed as fresh.
+    let metadata = std::fs::metadata(&target).ok();
     if let Err(error) = operations.access(&target).await {
         return custom_read_error(&path, &target, &error);
     }
@@ -463,7 +478,7 @@ async fn read_with_operations(request: ReadRequest) -> ToolResult {
         return ToolResult::error("Operation aborted");
     }
     let custom_mime = operations.detect_image_mime_type(&target).await;
-    read_bytes(
+    let (result, text_range) = read_bytes(
         bytes,
         custom_mime,
         &path,
@@ -472,7 +487,20 @@ async fn read_with_operations(request: ReadRequest) -> ToolResult {
         limit,
         image_support,
     )
-    .await
+    .await;
+    if let (Some(ledger), Some(metadata), Some(range)) = (read_ledger, metadata, text_range) {
+        ledger.record_read(
+            &target,
+            metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            metadata.len(),
+            range.total_lines,
+            range.start_line,
+            range.end_line,
+        );
+    }
+    result
 }
 
 /// The model-facing error for a backend access/read failure: the same
@@ -498,21 +526,27 @@ async fn read_bytes(
     offset: usize,
     limit: Option<usize>,
     image_support: ImageSupport,
-) -> ToolResult {
+) -> (ToolResult, Option<TextReadRange>) {
     let sniff_head = &bytes[..bytes.len().min(IMAGE_TYPE_SNIFF_BYTES)];
     let mime_type = custom_mime.or_else(|| detect_supported_image_mime_type(sniff_head));
     if let Some(mime_type) = mime_type {
         if bytes.len() as u64 > max_source_bytes() {
-            return ToolResult::error(format!(
-                "Cannot read '{}': {}",
-                path,
-                source_limit_error(bytes.len() as u64)
-            ));
+            return (
+                ToolResult::error(format!(
+                    "Cannot read '{}': {}",
+                    path,
+                    source_limit_error(bytes.len() as u64)
+                )),
+                None,
+            );
         }
-        return read_image(bytes, mime_type, image_support).await;
+        return (read_image(bytes, mime_type, image_support).await, None);
     }
     if is_binary_content(&bytes) {
-        return ToolResult::error(format!("Cannot read '{}': binary file", path));
+        return (
+            ToolResult::error(format!("Cannot read '{}': binary file", path)),
+            None,
+        );
     }
     let end_line = match limit {
         Some(limit) => offset.saturating_add(limit),
@@ -577,21 +611,24 @@ async fn read_remaining(
 /// the text line range.
 async fn read_local(
     file: std::fs::File,
+    absolute_path: &Path,
     path: &str,
     raw_offset: Option<f64>,
     offset: usize,
     limit: Option<usize>,
     image_support: ImageSupport,
     signal: Option<AbortSignal>,
+    read_ledger: Option<std::sync::Arc<ReadLedger>>,
 ) -> ToolResult {
     let mut file = tokio::fs::File::from_std(file);
-    let size = match tokio::select! {
+    let metadata = match tokio::select! {
         result = file.metadata() => result,
         _ = wait_for_abort(signal.as_ref()) => return ToolResult::error("Operation aborted"),
     } {
-        Ok(metadata) => metadata.len(),
+        Ok(metadata) => metadata,
         Err(e) => return ToolResult::error(format!("Cannot read '{}': {}", path, e)),
     };
+    let size = metadata.len();
     // Stat first: the sniff buffer never exceeds the file size.
     let head_len = usize::try_from(size.min(HEAD_SNIFF_BYTES as u64)).unwrap_or(HEAD_SNIFF_BYTES);
     let mut head = vec![0u8; head_len];
@@ -649,7 +686,20 @@ async fn read_local(
     if signal.as_ref().is_some_and(AbortSignal::is_aborted) {
         return ToolResult::error("Operation aborted");
     }
-    render_text(path, raw_offset, offset, limit, scan.finish())
+    let (result, text_range) = render_text(path, raw_offset, offset, limit, scan.finish());
+    if let (Some(ledger), Some(range)) = (read_ledger, text_range) {
+        ledger.record_read(
+            absolute_path,
+            metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            metadata.len(),
+            range.total_lines,
+            range.start_line,
+            range.end_line,
+        );
+    }
+    result
 }
 
 /// The remote arm of the read tool: the same read through `RemoteExecutionEnv`
@@ -778,7 +828,10 @@ async fn read_remote(
     if context.aborted() {
         return ToolResult::error("Operation aborted");
     }
-    render_text(path, raw_offset, offset, limit, scan.finish())
+    // Remote reads have no local path to record: the ledger identifies local
+    // files, and a remote file's local counterpart (if any) is a different
+    // object. The gate therefore stays local-only.
+    render_text(path, raw_offset, offset, limit, scan.finish()).0
 }
 
 fn remote_read_error(
@@ -1114,26 +1167,42 @@ struct TextScanResult {
     byte_limit_hit: bool,
 }
 
+/// The 0-based line range one successful text read actually delivered,
+/// together with the file's total line count (the ledger's read-before-edit
+/// bookkeeping).
+#[derive(Debug, Clone, Copy)]
+struct TextReadRange {
+    total_lines: usize,
+    start_line: usize,
+    end_line: usize,
+}
+
 /// Render the scanned result with the upstream truncation footers and details.
+/// The second return value describes the delivered line range for the session
+/// read ledger (`None` when the read failed before rendering any content).
 fn render_text(
     path: &str,
     raw_offset: Option<f64>,
     offset: usize,
     limit: Option<usize>,
     scan: TextScanResult,
-) -> ToolResult {
+) -> (ToolResult, Option<TextReadRange>) {
     // Upstream read.ts: an out-of-bounds offset is an error. `total_file_lines`
     // counts the synthetic piece after a trailing newline (and the empty
     // file's single piece), so offset 1 on an empty file is valid and the
     // reported bound is `allLines.length`, exactly like upstream.
     let beyond_end = offset >= scan.total_file_lines;
     if beyond_end {
-        return ToolResult::error(format!(
-            "Offset {} is beyond end of file ({} lines total)",
-            raw_offset.unwrap_or(1.0),
-            scan.total_file_lines
-        ));
+        return (
+            ToolResult::error(format!(
+                "Offset {} is beyond end of file ({} lines total)",
+                raw_offset.unwrap_or(1.0),
+                scan.total_file_lines
+            )),
+            None,
+        );
     }
+    let total_file_lines = scan.total_file_lines;
     let start_line_display = offset + 1;
     // `truncate_head`'s `split_lines` drops the trailing empty piece.
     let total_lines = scan
@@ -1142,6 +1211,7 @@ fn render_text(
     let truncated = total_lines > DEFAULT_MAX_LINES || scan.selected_bytes > DEFAULT_MAX_BYTES;
     let mut details: Option<serde_json::Value> = None;
     let text: String;
+    let delivered_end: usize;
     if truncated && scan.first_line_len > DEFAULT_MAX_BYTES {
         // First line alone exceeds the byte limit. Point the model at a bash
         // fallback (upstream `firstLineExceedsLimit`).
@@ -1152,6 +1222,8 @@ fn render_text(
             format_size(DEFAULT_MAX_BYTES),
             super::util::bash_quote(path),
         );
+        // No file content was delivered: only the bash fallback hint.
+        delivered_end = offset;
         let truncation = TruncationResult {
             content: String::new(),
             truncated: true,
@@ -1173,6 +1245,7 @@ fn render_text(
         // the continuation offset.
         let output_lines = scan.kept_lines;
         let output_bytes = scan.kept_bytes;
+        delivered_end = offset.saturating_add(output_lines);
         // `truncate_head` breaks at the first counted line that does not fit
         // the byte budget; when every counted line fits, the line limit is
         // what fired (even if the trailing newline pushed total_bytes over).
@@ -1221,9 +1294,13 @@ fn render_text(
             "{}\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]",
             scan.kept.join("\n")
         );
+        delivered_end = offset.saturating_add(scan.kept_lines);
     } else {
-        // No truncation and no remaining user-limited content.
+        // No truncation and no remaining user-limited content. `selected_lines`
+        // includes the synthetic final piece after a trailing newline, so a
+        // whole-file read covers `0..total_file_lines`.
         text = scan.kept.join("\n");
+        delivered_end = offset.saturating_add(scan.selected_lines);
     }
     let structured_content = serde_json::Value::String(text.clone());
     let mut result = ToolResult::ok(text);
@@ -1231,5 +1308,10 @@ fn render_text(
     // Upstream `read.ts` always sets `structuredContent: toReadOutput(content)`
     // — a string for text reads.
     result.structured_content = Some(structured_content);
-    result
+    let range = TextReadRange {
+        total_lines: total_file_lines,
+        start_line: offset.min(total_file_lines),
+        end_line: delivered_end.min(total_file_lines),
+    };
+    (result, Some(range))
 }

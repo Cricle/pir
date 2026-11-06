@@ -401,6 +401,7 @@ fn env_with(
     project_trusted: bool,
 ) -> Arc<ToolSessionEnv> {
     Arc::new(ToolSessionEnv {
+        read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),
         thinking: ThinkingLevel::Off,
@@ -920,6 +921,7 @@ async fn bare_workspace_child_still_gets_the_default_preamble() {
     // `agent_dir` points at the same (otherwise empty) temp dir so the
     // prompt's global skill/context discovery finds nothing either.
     let env = Arc::new(ToolSessionEnv {
+        read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),
         thinking: ThinkingLevel::Off,
@@ -1024,6 +1026,7 @@ async fn agent_with_own_model_uses_the_default_thinking_level() {
     registry.set_provider(Arc::clone(&provider) as Arc<dyn Provider>);
     // Dispatch (parent) thinking level: high.
     let env = Arc::new(ToolSessionEnv {
+        read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         thinking: ThinkingLevel::High,
@@ -1091,6 +1094,7 @@ async fn child_resolves_models_json_from_the_parent_agent_dir() {
         calls: AtomicUsize::new(0),
     }));
     let env = Arc::new(ToolSessionEnv {
+        read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         thinking: ThinkingLevel::Off,
@@ -1148,6 +1152,7 @@ async fn child_inherits_only_matching_provider_credentials() {
     assert!(format!("{credential:?}").contains("[redacted]"));
     assert!(!format!("{credential:?}").contains("endpoint-scoped-key"));
     let env = Arc::new(ToolSessionEnv {
+        read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         thinking: ThinkingLevel::Off,
@@ -1231,6 +1236,7 @@ async fn chain_live_updates_show_completed_plus_one_running_entry() {
     let updates: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&updates);
     let env = Arc::new(ToolSessionEnv {
+        read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),
         thinking: ThinkingLevel::Off,
@@ -1312,6 +1318,7 @@ async fn tool_allowlist_limits_child_registry() {
         assistant(vec![text(&content)], StopReason::Stop)
     }));
     let mut env = ToolSessionEnv {
+        read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),
         thinking: ThinkingLevel::Off,
@@ -1396,6 +1403,7 @@ async fn parallel_mode_aggregates_and_emits_live_updates() {
     let updates: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let updates_for_env = updates.clone();
     let mut env = ToolSessionEnv {
+        read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),
         thinking: ThinkingLevel::Off,

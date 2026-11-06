@@ -22,8 +22,9 @@ use pir::compaction::prompts::{
     SUMMARIZATION_SYSTEM_PROMPT, TOOL_RESULT_MAX_CHARS, TURN_PREFIX_SUMMARIZATION_PROMPT,
 };
 use pir::compaction::{
-    calculate_context_tokens, compact_context, compaction_fn, recover_from_overflow,
-    serialize_conversation, summarization_max_tokens, turn_prefix_max_tokens, CompleteFn,
+    calculate_context_tokens, compact_context, compaction_fn, prepare_compaction_refs_forced,
+    prepare_compaction_refs_with_keep, recover_from_overflow, serialize_conversation,
+    summarization_max_tokens, turn_prefix_max_tokens, CompleteFn,
 };
 
 // ---------------------------------------------------------------------------
@@ -686,8 +687,10 @@ async fn compaction_fn_success_produces_summary_user_message_then_retained_tail(
     assert!(prompt.contains("[User]: turn one"));
     assert!(prompt.contains("[Tool result]: xxxx"));
     assert!(prompt
-        .trim_end()
-        .ends_with("Preserve exact file paths, function names, and error messages."));
+        .contains("Preserve exact file paths, function names, and error messages."));
+    assert!(prompt.contains(
+        "Preserve exact file paths, function names, error messages, command exit codes and unfinished items; do not infer facts not present in the messages."
+    ));
     assert!(!prompt.contains("<previous-summary>"));
     assert!(prompt.contains(SUMMARIZATION_PROMPT));
 }
@@ -1240,4 +1243,96 @@ async fn rebuilt_message_level_context_rejects_the_pre_compaction_usage() {
     assert_eq!(estimate.usage_tokens, 0);
     assert_eq!(estimate.last_usage_index, None);
     assert!(!should_compact(&rebuilt, &model, &config));
+}
+
+// ---------------------------------------------------------------------------
+// Small-window sessions and the manual compact fallback
+// ---------------------------------------------------------------------------
+
+#[test]
+fn keep_recent_budget_is_capped_to_the_model_window() {
+    let config = CompactionConfig {
+        keep_recent_tokens: 20_000,
+        ..CompactionConfig::default()
+    };
+    assert_eq!(config.effective_keep_recent_tokens(32_768), 16_384);
+    assert_eq!(config.effective_keep_recent_tokens(2_000), 1_000);
+    assert_eq!(config.effective_keep_recent_tokens(0), 1);
+    // A user setting below the cap is preserved.
+    let small = CompactionConfig {
+        keep_recent_tokens: 300,
+        ..CompactionConfig::default()
+    };
+    assert_eq!(small.effective_keep_recent_tokens(32_768), 300);
+}
+
+/// A transcript that is larger than a small model window but smaller than the
+/// upstream 20k keep-recent default must still produce a cut once the budget
+/// is clamped. Before the clamp the cut scan never crossed the budget and
+/// `/compact` reported "nothing to compact (session too small)".
+#[test]
+fn small_window_transcript_larger_than_window_yields_a_cut() {
+    let model = test_model(2_000, 256);
+    let config = CompactionConfig {
+        keep_recent_tokens: 20_000,
+        ..CompactionConfig::default()
+    };
+    let mut messages = Vec::new();
+    for turn in 0..6 {
+        messages.push(user_msg(&format!("turn {turn}: {}", "u".repeat(2_000))));
+        messages.push(assistant_msg(
+            vec![text_block(&"a".repeat(2_000))],
+            StopReason::Stop,
+            Usage::default(),
+        ));
+    }
+    let entries = cut_entries_of(&messages);
+    // Upstream default behaviour on this transcript: the whole conversation
+    // fits the keep window, so no cut exists.
+    assert!(pir::compaction::prepare_compaction_refs(
+        &entries,
+        &[] as &[pir::compaction::PathEntryMeta],
+        &config,
+    )
+    .is_none());
+
+    let preparation = prepare_compaction_refs_with_keep(
+        &entries,
+        &[] as &[pir::compaction::PathEntryMeta],
+        &config,
+        config.effective_keep_recent_tokens(model.context_window),
+    )
+    .expect("clamped budget finds a cut");
+    assert!(
+        !preparation.messages_to_summarize.is_empty(),
+        "some history must be summarized"
+    );
+    assert!(
+        !preparation.kept_messages.is_empty(),
+        "the recent tail must be retained"
+    );
+}
+
+/// The manual-`/compact` fallback summarizes the whole conversation when the
+/// request is over threshold but no normal cut exists (tiny transcript, huge
+/// prompt/usage overhead). The plan must have no kept tail and no kept entry
+/// id (a self-retaining compaction entry).
+#[test]
+fn forced_preparation_summarizes_the_whole_conversation() {
+    let config = compact_config();
+    let messages = vec![
+        user_msg("hello"),
+        assistant_msg(vec![text_block("hi there")], StopReason::Stop, usage_with_total(30_000)),
+    ];
+    let entries = cut_entries_of(&messages);
+    let preparation = prepare_compaction_refs_forced(
+        &entries,
+        &[] as &[pir::compaction::PathEntryMeta],
+        &config,
+    )
+    .expect("forced preparation");
+    assert_eq!(preparation.messages_to_summarize.len(), messages.len());
+    assert!(preparation.kept_messages.is_empty());
+    assert!(preparation.first_kept_entry_id.is_none());
+    assert_eq!(preparation.first_kept_message_index, messages.len());
 }

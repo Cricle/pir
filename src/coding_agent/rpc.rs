@@ -54,6 +54,15 @@
 //! writes) and a dead writer ends the session instead of silently dropping
 //! every further response.
 
+// RPC diagnostics must never panic when the client closes stderr (or the
+// merged stdout+stderr pipe): `eprintln!` would, and the panic hook would
+// persist a bogus crash. Route every diagnostic through the fallible writer.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        let _ = crate::coding_agent::output::write_stderr_line(&format!($($arg)*));
+    }};
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -617,8 +626,22 @@ where
             let mut line =
                 crate::session_manager::json_depth::write_value_iteratively(payload).into_bytes();
             line.push(b'\n');
-            output.write_all(&line).await?;
-            output.flush().await?;
+            // A closed client pipe is an expected shutdown, not a writer
+            // failure: remember it so the serve loop can exit quietly (and
+            // skip the "writer closed" diagnostic) instead of surfacing an
+            // error through the `Result` main path.
+            if let Err(error) = output.write_all(&line).await {
+                if crate::coding_agent::output::is_broken_pipe(&error) {
+                    crate::coding_agent::output::mark_stdout_broken();
+                }
+                return Err(error.into());
+            }
+            if let Err(error) = output.flush().await {
+                if crate::coding_agent::output::is_broken_pipe(&error) {
+                    crate::coding_agent::output::mark_stdout_broken();
+                }
+                return Err(error.into());
+            }
             drop(value);
         }
         Ok(())
@@ -1295,6 +1318,36 @@ impl RpcServerState {
                 )
                 .await;
         }
+        // A MANUAL compaction is NOT a streaming run (`is_streaming()` is
+        // false) but it owns the transcript. This branch must run BEFORE the
+        // prompt claim/ack: without it the frame was answered
+        // `disposition: "started"` and the spawned run then failed
+        // asynchronously with "Cannot submit a prompt while compaction is in
+        // progress" — an acknowledged prompt that silently never ran.
+        //
+        // With an explicit `streamingBehavior` the message is ordinary queued
+        // input: steering/follow-up survives the compaction and is delivered
+        // exactly once by the next run. Without one, reject synchronously.
+        if session.is_compacting() {
+            let Some(behavior) = behavior else {
+                return Err("Cannot submit a prompt while compaction is in progress. \
+                            Wait for compaction to finish and retry."
+                    .to_owned());
+            };
+            let disposition = if behavior.as_str() == Some("followUp") {
+                session.follow_up(&text)
+            } else {
+                session.steer(&text)
+            };
+            let id = value.get("id").and_then(Value::as_str).map(str::to_owned);
+            return out
+                .response(
+                    id.as_deref(),
+                    "prompt",
+                    Ok(Some(json!({ "disposition": disposition }))),
+                )
+                .await;
+        }
         // Reserve the streaming claim synchronously, before responding
         // (upstream checks `isStreaming` in its prompt preflight): two rapid
         // prompts can never both be acknowledged — the second gets an error
@@ -1302,6 +1355,22 @@ impl RpcServerState {
         if self.prompt_claim.swap(true, Ordering::SeqCst) {
             return Err("agent is streaming; queue the message with steer instead".to_owned());
         }
+        // Admit the run into the SESSION before acknowledging it. The session
+        // CAS is the atomic point that excludes a manual compaction: a
+        // compaction that wins the session between the preflight above and
+        // this claim makes `try_claim_run` fail here, so the client gets the
+        // honest busy error synchronously instead of an acknowledged
+        // `started` prompt whose spawned run is rejected. The admission guard
+        // releases the session claim if this handler exits without starting
+        // the run (ack writer failure), and the spawned run adopts it.
+        let disposition = session.input_disposition();
+        let admission = match session.try_claim_run() {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.prompt_claim.store(false, Ordering::SeqCst);
+                return Err(error.to_string());
+            }
+        };
         // The RAII claim guard is built HERE, before anything that can fail or
         // never be polled: moving it into the spawned run alone left the claim
         // taken forever when the response could not be queued (writer gone) or
@@ -1310,9 +1379,10 @@ impl RpcServerState {
         let claim_guard = PromptClaimGuard(Arc::clone(&self.prompt_claim));
         // Acknowledge acceptance first so the response line precedes all
         // events emitted by the run; the disposition reports what happened to
-        // the input (upstream `PromptDisposition`).
+        // the input (upstream `PromptDisposition`). Captured before the
+        // admission above (which already marks the session RUNNING), so an
+        // accepted prompt keeps reporting `started`.
         let id = value.get("id").and_then(Value::as_str).map(str::to_owned);
-        let disposition = session.input_disposition();
         out.response(
             id.as_deref(),
             "prompt",
@@ -1383,21 +1453,28 @@ impl RpcServerState {
                     // consumes that transform instead of emitting again.
                     PromptRun::Text => {
                         session
-                            .prompt_with_prepared_input(&text, Vec::new(), events)
+                            .prompt_with_prepared_input_admitted(
+                                &text,
+                                Vec::new(),
+                                events,
+                                admission,
+                            )
                             .await
                     }
                     // Idle slash command with inline image tokens: the
                     // flattened text plus the ordered images.
                     PromptRun::WithImages(images) => {
                         session
-                            .prompt_with_prepared_input(&text, images, events)
+                            .prompt_with_prepared_input_admitted(&text, images, events, admission)
                             .await
                     }
                     // Idle inline image prompt: the displayed custom message
                     // starts the turn (`pi.sendMessage(..., {triggerTurn:
                     // true})`); the interleaved content is persisted as-is.
                     PromptRun::PhoneCustom(message) => {
-                        session.run_custom_turn(message, events).await
+                        session
+                            .run_custom_turn_admitted(message, events, admission)
+                            .await
                     }
                 }
             };
@@ -2090,51 +2167,42 @@ impl RpcServerState {
                 }
             }
         }
-        let resources = crate::coding_agent::resources::DiscoveredResources::discover(
-            &crate::coding_agent::resources::ResourceDiscoveryOptions {
-                cwd: &cwd,
-                agent_dir: &agent_dir,
-                project_trusted: crate::config::trust::resolve_cwd_trust(&cwd, &agent_dir),
-                cli_skill_paths: &[],
-                cli_prompt_paths: &[],
-                no_skills: false,
-                no_prompt_templates: false,
-            },
-        );
-        // Resource-load diagnostics (collisions, malformed skills/templates)
-        // go to stderr: stdout carries only protocol lines (upstream
-        // `rpc-mode.ts` keeps the JSON-line stream clean). Non-fatal.
-        for diagnostic in &resources.diagnostics {
-            eprintln!("pir: {diagnostic}");
-        }
-        for template in &resources.prompt_templates {
-            let info = crate::extensions::SourceInfo::for_resource_path(
-                &template.file_path,
-                &cwd,
-                &agent_dir,
-            );
-            commands.push(json!({
-                "name": template.name,
-                "description": template.description,
-                "source": "prompt",
-                "sourceInfo": source_info_value(&info),
-            }));
-        }
-        for skill in &resources.skills {
-            // Upstream skill source info uses the skill's own directory as
-            // `baseDir` (`createSkillSourceInfo(..., baseDir: skillDir)`) while
-            // the scope still comes from the containing root.
-            let mut info =
-                crate::extensions::SourceInfo::for_resource_path(&skill.path, &cwd, &agent_dir);
-            if let Some(parent) = skill.path.parent() {
-                info.base_dir = Some(parent.to_string_lossy().into_owned());
+        // Skill/prompt-template commands come from the SESSION's installed
+        // resource set — the exact list `/skill:` / `/template` expansion
+        // consults. A fresh ambient discovery here used to advertise commands
+        // the session could never execute, and ignored
+        // `--no-skills`/`--no-prompt-templates` (a ghost command).
+        if let Ok(session) = self.attached() {
+            let (skills, prompt_templates) = session.prompt_resources();
+            for template in &prompt_templates {
+                let info = crate::extensions::SourceInfo::for_resource_path(
+                    &template.file_path,
+                    &cwd,
+                    &agent_dir,
+                );
+                commands.push(json!({
+                    "name": template.name,
+                    "description": template.description,
+                    "source": "prompt",
+                    "sourceInfo": source_info_value(&info),
+                }));
             }
-            commands.push(json!({
-                "name": format!("skill:{}", skill.name),
-                "description": skill.description,
-                "source": "skill",
-                "sourceInfo": source_info_value(&info),
-            }));
+            for skill in &skills {
+                // Upstream skill source info uses the skill's own directory as
+                // `baseDir` (`createSkillSourceInfo(..., baseDir: skillDir)`)
+                // while the scope still comes from the containing root.
+                let mut info =
+                    crate::extensions::SourceInfo::for_resource_path(&skill.path, &cwd, &agent_dir);
+                if let Some(parent) = skill.path.parent() {
+                    info.base_dir = Some(parent.to_string_lossy().into_owned());
+                }
+                commands.push(json!({
+                    "name": format!("skill:{}", skill.name),
+                    "description": skill.description,
+                    "source": "skill",
+                    "sourceInfo": source_info_value(&info),
+                }));
+            }
         }
         Ok(Some(json!({ "commands": commands })))
     }
@@ -2397,7 +2465,13 @@ impl RpcServer {
                 // closed pipe. (`changed` also resolves on sender drop —
                 // treated the same, the writer is gone either way.)
                 _ = writer_alive_rx.changed() => {
-                    eprintln!("pir rpc: output writer closed; ending session");
+                    // A `BrokenPipe` writer death still ends serve with an
+                    // error (see the writer drain below); only its duplicate
+                    // stderr diagnostic is suppressed (`pir rpc | head`).
+                    // Any other write failure keeps the diagnostic.
+                    if !crate::coding_agent::output::stdout_is_broken() {
+                        eprintln!("pir rpc: output writer closed; ending session");
+                    }
                     break;
                 }
                 // `ctx.shutdown()`: the run in flight settled (or the idle
@@ -2590,6 +2664,12 @@ impl RpcServer {
         // the writer is explicitly stopped so its output handle is released
         // even when a leaked sender keeps the channel open.
         match tokio::time::timeout(std::time::Duration::from_secs(5), &mut writer).await {
+            // A dead output writer is an ERROR for the host, broken pipe
+            // included: upstream's `runRpcMode` rejects when its stdout
+            // stream fails, and answering `Ok` would hide a run (or a
+            // response) that can no longer reach the client. Only the
+            // diagnostic is quiet (the select arm checks `stdout_is_broken`);
+            // the failure still propagates.
             Ok(Ok(writer_result)) => writer_result,
             Ok(Err(_)) => Err(anyhow::anyhow!(
                 "rpc writer thread exited without reporting its result"
@@ -2648,6 +2728,18 @@ pub struct RpcOverrides {
     /// (upstream `main.ts:950-952`); `None` keeps the library-embedder
     /// behavior of attaching only on `attach`/`create`.
     pub startup_session: Option<crate::coding_agent::session_resolve::SessionPlan>,
+    /// `--skill` CLI paths, discovered into every session this host builds.
+    pub skill_paths: Vec<std::path::PathBuf>,
+    /// `--prompt-template` CLI paths, same contract as [`Self::skill_paths`].
+    pub prompt_template_paths: Vec<std::path::PathBuf>,
+    /// `--no-skills`: drop settings/default/package skill roots (CLI paths
+    /// still load). The session's installed set is also exactly what
+    /// `get_commands` advertises, so a disabled resource is never a ghost
+    /// command.
+    pub no_skills: bool,
+    /// `--no-prompt-templates`: the prompt-template twin of
+    /// [`Self::no_skills`].
+    pub no_prompt_templates: bool,
 }
 
 /// Default session factory: drives real providers from pi configuration.
@@ -2744,6 +2836,27 @@ fn default_session_factory(
     let mut append: Vec<String> = discovered.1.into_iter().collect();
     append.extend(overrides.append_system_prompt.iter().cloned());
     agent_session.apply_prompt_overrides(preamble_override, append);
+    // Install the SAME discovered resource set the session exposes to
+    // `/skill:` / `/template` expansion. Before this, RPC sessions held an
+    // empty set while `get_commands` re-discovered the defaults: a client was
+    // offered `/skill:*` and template commands that could never expand, and
+    // `--no-skills`/`--no-prompt-templates` did not affect the advertised
+    // list. One discovery, one source for both the command list and dispatch.
+    let resources = crate::coding_agent::resources::DiscoveredResources::discover(
+        &crate::coding_agent::resources::ResourceDiscoveryOptions {
+            cwd: &discovery_cwd,
+            agent_dir: &agent_dir,
+            project_trusted: crate::config::trust::resolve_cwd_trust(&discovery_cwd, &agent_dir),
+            cli_skill_paths: &overrides.skill_paths,
+            cli_prompt_paths: &overrides.prompt_template_paths,
+            no_skills: overrides.no_skills,
+            no_prompt_templates: overrides.no_prompt_templates,
+        },
+    );
+    for diagnostic in &resources.diagnostics {
+        eprintln!("Warning: {diagnostic}");
+    }
+    agent_session.set_prompt_resources_shared(resources.skills, resources.prompt_templates);
     Ok(agent_session)
 }
 
@@ -2825,7 +2938,15 @@ pub async fn run_rpc_with_options(
     if let Some(plan) = startup_session {
         server = server.with_startup_session(plan);
     }
-    server.serve(tokio::io::stdin(), tokio::io::stdout()).await
+    match server.serve(tokio::io::stdin(), tokio::io::stdout()).await {
+        // `RpcServer::serve` reports a dead output writer as the error it is;
+        // at the PROCESS boundary a closed stdout pipe (`pir rpc | head`) is
+        // the conventional consumer-went-away exit 0, exactly like the print
+        // hosts (`output::exit_stdout_error`). The API result stays an error
+        // for embedders that need to observe it.
+        Err(error) if crate::coding_agent::output::is_broken_pipe_error(&error) => Ok(()),
+        result => result,
+    }
 }
 
 /// Back-compat entry: no CLI selection (the pre-Q60 behavior).

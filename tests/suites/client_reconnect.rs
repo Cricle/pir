@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use pir::client::{
     Client, ClientError, ClientTimeouts, ConnectionState, ConnectionStateChange, ReconnectPolicy,
-    MAX_PENDING_UPDATES,
+    Subscription, MAX_PENDING_UPDATES, MAX_PENDING_UPDATE_SUBSCRIPTION_ID_BYTES,
+    MAX_SNAPSHOT_SESSION_KEY_BYTES, MAX_TRACKED_SNAPSHOT_SESSIONS,
 };
 use pir::protocol::{
     encode_server_envelope, ClientMessageDecoder, Command, FrameOptions, ResponseFrame, RpcTarget,
@@ -191,7 +192,10 @@ async fn reconnect_restores_attach_and_subscriptions_and_emits_events() {
 /// itself and the subscriptions are restored.
 #[tokio::test]
 async fn reconnect_drops_attach_state_when_the_server_removed_the_session() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind server");
+    let server =
+        Server::bind_with_security("127.0.0.1:0", ServerSecurityConfig::unauthenticated_local())
+            .await
+            .expect("bind server");
     let address = server.local_addr().expect("server address");
     let accept_loop = tokio::spawn(async move {
         loop {
@@ -247,7 +251,10 @@ async fn reconnect_drops_attach_state_when_the_server_removed_the_session() {
 /// attempt is bounded by the same `ClientTimeouts` as the initial connect.
 #[tokio::test]
 async fn reconnect_fails_after_bounded_backoff_attempts() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind server");
+    let server =
+        Server::bind_with_security("127.0.0.1:0", ServerSecurityConfig::unauthenticated_local())
+            .await
+            .expect("bind server");
     let address = server.local_addr().expect("server address");
     // `bind` only opens the listener; nothing accepts until `run()` /
     // `accept_once()`, so the initial handshake needs an acceptor spawned
@@ -312,7 +319,10 @@ async fn reconnect_fails_after_bounded_backoff_attempts() {
 /// fails with the typed `ReconnectUnavailable` error instead of guessing.
 #[tokio::test]
 async fn reconnect_is_unavailable_without_a_stored_address() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind server");
+    let server =
+        Server::bind_with_security("127.0.0.1:0", ServerSecurityConfig::unauthenticated_local())
+            .await
+            .expect("bind server");
     let address = server.local_addr().expect("server address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
     let stream = TcpStream::connect(address).await.expect("raw connect");
@@ -338,7 +348,7 @@ async fn server_side_close_emits_a_disconnected_event() {
         "127.0.0.1:0",
         ServerSecurityConfig {
             idle_timeout: Duration::from_millis(150),
-            ..ServerSecurityConfig::default()
+            ..ServerSecurityConfig::unauthenticated_local()
         },
     )
     .await
@@ -760,6 +770,54 @@ fn snapshot_tracker_treats_a_lower_sequence_as_a_restarted_stream() {
         tracker.observe(&snapshot(3)),
         "skips after the restart must be detected again"
     );
+}
+
+/// C2-03: tracker keys come straight from the peer. A crafted snapshot stream
+/// with unique `instance.key` values must not grow the tracker without bound:
+/// entries past the cap are ignored and counted, and over-long keys are
+/// rejected.
+#[test]
+fn snapshot_tracker_caps_tracked_sessions_and_counts_drops() {
+    use pir::client::SnapshotSequenceTracker;
+
+    let snapshot = |key: &str, sequence: i64| {
+        serde_json::json!({
+            "type": "state",
+            "member": "snapshot",
+            "sequence": sequence,
+            "instance": {"key": key, "generation": 1},
+            "ops": [],
+        })
+    };
+    let mut tracker = SnapshotSequenceTracker::new();
+    for index in 0..(MAX_TRACKED_SNAPSHOT_SESSIONS + 250) {
+        assert!(
+            !tracker.observe(&snapshot(&format!("forged-{index}"), 1)),
+            "the first snapshot of each forged stream is not a gap"
+        );
+    }
+    assert_eq!(
+        tracker.tracked_sessions(),
+        MAX_TRACKED_SNAPSHOT_SESSIONS,
+        "the tracker must stop growing at the entry cap"
+    );
+    assert_eq!(
+        tracker.dropped_observations(),
+        250,
+        "observations past the cap must be counted"
+    );
+
+    // An existing key still updates at the cap (no new entry, no drop).
+    assert!(tracker.observe(&snapshot("forged-0", 3)));
+    assert_eq!(tracker.last_sequence("forged-0"), Some(3));
+    assert_eq!(tracker.dropped_observations(), 250);
+
+    // Over-long keys are rejected and counted even when there is room.
+    let mut fresh = SnapshotSequenceTracker::new();
+    let long_key = "k".repeat(MAX_SNAPSHOT_SESSION_KEY_BYTES + 1);
+    assert!(!fresh.observe(&snapshot(&long_key, 1)));
+    assert_eq!(fresh.tracked_sessions(), 0);
+    assert_eq!(fresh.dropped_observations(), 1);
 }
 
 /// Scripted peer for the resync purge: answers `subscribe`, then on `attach`
@@ -1668,11 +1726,43 @@ async fn start_call_response_is_buffered_across_next_update() {
     fixture.abort();
 }
 
-/// Scripted peer for the overflow test: answers `subscribe`, floods
-/// `MAX_PENDING_UPDATES + 5` progress updates behind the next response, and
-/// answers an `attach` (the resync) with a snapshot that carries an empty
-/// transcript.
-async fn update_overflow_accept_loop(listener: TcpListener, server_id: String) {
+/// Body shape used by the update-flood fixture. Tests reuse it so the exact
+/// serialized length the client accounts for is computable on the test side.
+fn progress_update(sequence: i64, payload_bytes: usize) -> serde_json::Value {
+    serde_json::json!({
+        "type": "state",
+        "member": "progress",
+        "sequence": sequence,
+        "instance": {"key": "sess-overflow", "generation": 1},
+        "ops": [],
+        "payload": "x".repeat(payload_bytes),
+    })
+}
+
+/// Snapshot body shape used by the attach byte-accounting fixture.
+fn budget_snapshot_update(sequence: i64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "state",
+        "member": "snapshot",
+        "sequence": sequence,
+        "instance": {"key": "sess-budget", "generation": 1},
+        "ops": [["r", {"id": "sess-budget"}]],
+    })
+}
+
+/// Scripted peer for the update-buffer tests: answers `subscribe`, floods
+/// `update_count` progress updates (each carrying a `payload_bytes` string)
+/// behind the next response, and answers an `attach` (the resync) with a
+/// snapshot that carries an empty transcript. `flood_subscription_id`
+/// overrides the id put on flooded frames (the client-issued `sub-N` is used
+/// when `None`).
+async fn update_flood_accept_loop(
+    listener: TcpListener,
+    server_id: String,
+    update_count: usize,
+    payload_bytes: usize,
+    flood_subscription_id: Option<String>,
+) {
     let Ok((mut stream, _)) = listener.accept().await else {
         return;
     };
@@ -1769,17 +1859,15 @@ async fn update_overflow_accept_loop(listener: TcpListener, server_id: String) {
             }
             // Flood the buffer, then answer the request. The caller's `call`
             // reads the updates while waiting, so the drop-oldest bound engages.
-            for sequence in 1..=(MAX_PENDING_UPDATES as i64 + 5) {
-                let update = serde_json::json!({
-                    "type": "state",
-                    "member": "progress",
-                    "sequence": sequence,
-                    "instance": {"key": "sess-overflow", "generation": 1},
-                    "ops": [],
-                });
+            let flood_id = flood_subscription_id
+                .as_deref()
+                .unwrap_or(&subscription_id)
+                .to_owned();
+            for sequence in 1..=update_count as i64 {
+                let update = progress_update(sequence, payload_bytes);
                 let envelope = ServerEnvelope::ServiceUpdate(ServiceUpdateFrame {
                     type_: "service_update".to_owned(),
-                    subscription_id: subscription_id.clone(),
+                    subscription_id: flood_id.clone(),
                     update,
                 });
                 let Ok(frame) = encode_server_envelope(&envelope, FrameOptions::default()) else {
@@ -1816,9 +1904,12 @@ async fn update_overflow_is_reported_and_snapshot_resync_stays_transcript_empty(
         .await
         .expect("bind fixture listener");
     let address = listener.local_addr().expect("fixture address");
-    let fixture = tokio::spawn(update_overflow_accept_loop(
+    let fixture = tokio::spawn(update_flood_accept_loop(
         listener,
         uuid::Uuid::new_v4().to_string(),
+        MAX_PENDING_UPDATES + 5,
+        0,
+        None,
     ));
 
     let mut client = Client::connect_with_timeouts(address, short_timeouts())
@@ -1879,6 +1970,520 @@ async fn update_overflow_is_reported_and_snapshot_resync_stays_transcript_empty(
         .await
         .expect("surviving updates after the overflow report");
     assert_eq!(tail["sequence"], 6, "the oldest five updates were dropped");
+    fixture.abort();
+}
+
+/// C2-03: the per-entry count bound alone still lets a peer buffer 1024
+/// near-frame-cap values. The serialized-byte budget must cap the queue's
+/// payload bytes and report dropped frames through the same typed signal.
+#[tokio::test]
+async fn update_byte_overflow_keeps_the_queue_within_its_budget() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    let fixture = tokio::spawn(update_flood_accept_loop(
+        listener,
+        uuid::Uuid::new_v4().to_string(),
+        8,
+        4096,
+        None,
+    ));
+
+    let mut client = Client::connect_with_timeouts(address, short_timeouts())
+        .await
+        .expect("initial handshake");
+    let byte_limit = 10 * 1024;
+    client.set_pending_updates_byte_limit(byte_limit);
+    let subscription = client
+        .subscribe(SESSION_SERVICE_ID)
+        .await
+        .expect("subscribe");
+    // The call drains the flood while waiting for its response.
+    client
+        .call(
+            RpcTarget::server(client.server_id()),
+            SESSION_SERVICE_ID,
+            "list",
+            Vec::new(),
+        )
+        .await
+        .expect("list behind the flood");
+
+    let dropped = client.pending_updates_dropped();
+    assert_eq!(
+        dropped, 6,
+        "three 4 KiB updates cannot fit in 10 KiB; each push evicts one older frame"
+    );
+    let bytes = client.pending_updates_bytes();
+    assert!(
+        bytes <= byte_limit,
+        "buffered {bytes} bytes exceeds the {byte_limit}-byte budget"
+    );
+    assert_eq!(
+        client.pending_updates_count(),
+        2,
+        "only the two newest updates fit the byte budget"
+    );
+    assert!(
+        client.pending_updates_count() <= MAX_PENDING_UPDATES,
+        "the entry bound still holds"
+    );
+
+    let error = client
+        .next_update(&subscription)
+        .await
+        .expect_err("a byte-bound drop must be reported like a count-bound drop");
+    match error {
+        ClientError::UpdateBufferOverflow {
+            subscription_id,
+            dropped: reported,
+        } => {
+            assert_eq!(subscription_id, subscription.subscription_id);
+            assert_eq!(reported, 6);
+        }
+        other => panic!("expected UpdateBufferOverflow, got {other:?}"),
+    }
+    // The surviving tail is still consumable after the one-time report.
+    let tail = client
+        .next_update(&subscription)
+        .await
+        .expect("surviving updates after the byte overflow report");
+    assert_eq!(tail["sequence"], 7, "the oldest six updates were dropped");
+    fixture.abort();
+}
+
+/// C2-03 regression: with a 16 MiB frame cap a peer could park 1024 ids of
+/// ~16 MiB each on tiny `null` bodies (~16 GiB). Ids above the length cap are
+/// dropped before enqueueing and counted, so the count-bound flood leaves an
+/// empty, zero-byte queue.
+#[tokio::test]
+async fn oversized_subscription_ids_are_dropped_and_counted_at_the_entry_bound() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    let oversized_id = "i".repeat(MAX_PENDING_UPDATE_SUBSCRIPTION_ID_BYTES + 1);
+    let fixture = tokio::spawn(update_flood_accept_loop(
+        listener,
+        uuid::Uuid::new_v4().to_string(),
+        MAX_PENDING_UPDATES,
+        0,
+        Some(oversized_id),
+    ));
+
+    let mut client = Client::connect_with_timeouts(address, short_timeouts())
+        .await
+        .expect("initial handshake");
+    client
+        .call(
+            RpcTarget::server(client.server_id()),
+            SESSION_SERVICE_ID,
+            "list",
+            Vec::new(),
+        )
+        .await
+        .expect("list behind the oversized-id flood");
+
+    assert_eq!(
+        client.pending_updates_dropped(),
+        MAX_PENDING_UPDATES as u64,
+        "every oversized-id frame must increment the overflow counter"
+    );
+    assert_eq!(
+        client.pending_updates_count(),
+        0,
+        "no oversized-id frame may occupy a queue slot"
+    );
+    assert_eq!(
+        client.pending_updates_bytes(),
+        0,
+        "rejected frames must not contribute to the byte budget"
+    );
+    fixture.abort();
+}
+
+/// C2-03 regression: the byte budget must account the subscription id too.
+/// The body alone fits the limit exactly; counting the id pushes the entry
+/// over it and the drop counter fires.
+#[tokio::test]
+async fn pending_update_bytes_include_the_subscription_id() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    let subscription_id = "i".repeat(256);
+    let body_len = serde_json::to_vec(&progress_update(1, 16))
+        .expect("measure flood body")
+        .len();
+    let fixture = tokio::spawn(update_flood_accept_loop(
+        listener,
+        uuid::Uuid::new_v4().to_string(),
+        1,
+        16,
+        Some(subscription_id),
+    ));
+
+    let mut client = Client::connect_with_timeouts(address, short_timeouts())
+        .await
+        .expect("initial handshake");
+    // Body-only accounting would accept this entry (bytes == limit); the id
+    // bytes must push it over.
+    client.set_pending_updates_byte_limit(body_len);
+    client
+        .call(
+            RpcTarget::server(client.server_id()),
+            SESSION_SERVICE_ID,
+            "list",
+            Vec::new(),
+        )
+        .await
+        .expect("list behind the update");
+
+    assert_eq!(
+        client.pending_updates_dropped(),
+        1,
+        "the subscription id must count against the byte budget"
+    );
+    assert_eq!(client.pending_updates_count(), 0);
+    assert_eq!(client.pending_updates_bytes(), 0);
+    fixture.abort();
+}
+
+/// Normal client-issued ids still pass: the accounted bytes are exactly the
+/// body plus the id, and consuming the queued entry returns the budget to 0.
+#[tokio::test]
+async fn normal_subscription_id_passes_and_is_accounted() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    let body_len = serde_json::to_vec(&progress_update(1, 16))
+        .expect("measure flood body")
+        .len();
+    let fixture = tokio::spawn(update_flood_accept_loop(
+        listener,
+        uuid::Uuid::new_v4().to_string(),
+        1,
+        16,
+        None,
+    ));
+
+    let mut client = Client::connect_with_timeouts(address, short_timeouts())
+        .await
+        .expect("initial handshake");
+    let subscription = client
+        .subscribe(SESSION_SERVICE_ID)
+        .await
+        .expect("subscribe");
+    let id_len = subscription.subscription_id.len();
+    client.set_pending_updates_byte_limit(body_len + id_len);
+    client
+        .call(
+            RpcTarget::server(client.server_id()),
+            SESSION_SERVICE_ID,
+            "list",
+            Vec::new(),
+        )
+        .await
+        .expect("list behind the update");
+
+    assert_eq!(client.pending_updates_dropped(), 0);
+    assert_eq!(client.pending_updates_count(), 1);
+    assert_eq!(
+        client.pending_updates_bytes(),
+        body_len + id_len,
+        "accounted bytes = serialized body + subscription id"
+    );
+    let update = client
+        .next_update(&subscription)
+        .await
+        .expect("the queued update");
+    assert_eq!(update["sequence"], 1);
+    assert_eq!(client.pending_updates_count(), 0);
+    assert_eq!(client.pending_updates_bytes(), 0);
+    fixture.abort();
+}
+
+/// Scripted peer for the attach byte-accounting boundary: queues one snapshot
+/// AHEAD of the attach response's revision under an at-cap subscription id, so
+/// the attach purge keeps it and must recompute `pending_updates_bytes` from
+/// body + id.
+async fn attach_snapshot_budget_accept_loop(listener: TcpListener, server_id: String) {
+    let Ok((mut stream, _)) = listener.accept().await else {
+        return;
+    };
+    let Ok(mut decoder) = ClientMessageDecoder::new(FrameOptions::default()) else {
+        return;
+    };
+    let hello = ServerEnvelope::Hello(ServerHelloV8 {
+        type_: "hello".to_owned(),
+        version: PROTOCOL_VERSION,
+        server_id,
+    });
+    let Ok(frame) = encode_server_envelope(&hello, FrameOptions::default()) else {
+        return;
+    };
+    if stream.write_all(&frame).await.is_err() {
+        return;
+    }
+    let long_id = "i".repeat(MAX_PENDING_UPDATE_SUBSCRIPTION_ID_BYTES);
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let Ok(read) = stream.read(&mut buffer).await else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        let Ok(messages) = decoder.push(&buffer[..read]) else {
+            return;
+        };
+        for value in messages {
+            if value.get("type").and_then(|t| t.as_str()) != Some("request") {
+                continue;
+            }
+            let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let member = value
+                .get("call")
+                .and_then(|call| call.get("member"))
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            if member == "attach" {
+                let ahead = ServerEnvelope::ServiceUpdate(ServiceUpdateFrame {
+                    type_: "service_update".to_owned(),
+                    subscription_id: long_id.clone(),
+                    update: budget_snapshot_update(7),
+                });
+                let Ok(frame) = encode_server_envelope(&ahead, FrameOptions::default()) else {
+                    return;
+                };
+                if stream.write_all(&frame).await.is_err() {
+                    return;
+                }
+                let response = ServerEnvelope::Response(ResponseFrame {
+                    type_: "response".to_owned(),
+                    id: id.to_owned(),
+                    ok: true,
+                    result: Some(serde_json::json!({
+                        "command": "attach",
+                        "attachmentId": "att-budget",
+                        "session": {"id": "sess-budget", "revision": 6},
+                    })),
+                    error: None,
+                });
+                let Ok(frame) = encode_server_envelope(&response, FrameOptions::default()) else {
+                    return;
+                };
+                if stream.write_all(&frame).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            let response = ServerEnvelope::Response(ResponseFrame {
+                type_: "response".to_owned(),
+                id: id.to_owned(),
+                ok: true,
+                result: Some(serde_json::json!({})),
+                error: None,
+            });
+            let Ok(frame) = encode_server_envelope(&response, FrameOptions::default()) else {
+                return;
+            };
+            if stream.write_all(&frame).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Attach purge boundary: the retained ahead snapshot's accounted bytes must
+/// include its (at-cap) subscription id after `apply_attach_snapshot`
+/// recomputes the queue total.
+#[tokio::test]
+async fn attach_purge_recomputes_pending_bytes_with_subscription_ids() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    let fixture = tokio::spawn(attach_snapshot_budget_accept_loop(
+        listener,
+        uuid::Uuid::new_v4().to_string(),
+    ));
+
+    let mut client = Client::connect_with_timeouts(address, short_timeouts())
+        .await
+        .expect("initial handshake");
+    let snapshot = client
+        .resync_session_snapshot("sess-budget")
+        .await
+        .expect("attach snapshot");
+    assert_eq!(snapshot["revision"], 6);
+    let body_len = serde_json::to_vec(&budget_snapshot_update(7))
+        .expect("measure snapshot body")
+        .len();
+    assert_eq!(client.pending_updates_count(), 1);
+    assert_eq!(
+        client.pending_updates_bytes(),
+        body_len + MAX_PENDING_UPDATE_SUBSCRIPTION_ID_BYTES,
+        "attach purge must recompute body + subscription id for retained entries"
+    );
+
+    let subscription = Subscription {
+        subscription_id: "i".repeat(MAX_PENDING_UPDATE_SUBSCRIPTION_ID_BYTES),
+        service_id: SESSION_SERVICE_ID.to_owned(),
+    };
+    let update = client
+        .next_update(&subscription)
+        .await
+        .expect("the queued ahead snapshot");
+    assert_eq!(update["sequence"], 7);
+    assert_eq!(client.pending_updates_count(), 0);
+    assert_eq!(client.pending_updates_bytes(), 0);
+    fixture.abort();
+}
+
+/// First connection queues one update behind a `list` response; the second
+/// (post-reconnect) connection only completes the handshake. The reconnect
+/// teardown must clear the queue and its byte total.
+async fn queued_update_then_reconnect_accept_loop(listener: TcpListener, server_id: String) {
+    let Ok((mut stream, _)) = listener.accept().await else {
+        return;
+    };
+    let Ok(mut decoder) = ClientMessageDecoder::new(FrameOptions::default()) else {
+        return;
+    };
+    let hello = ServerEnvelope::Hello(ServerHelloV8 {
+        type_: "hello".to_owned(),
+        version: PROTOCOL_VERSION,
+        server_id: server_id.clone(),
+    });
+    let Ok(frame) = encode_server_envelope(&hello, FrameOptions::default()) else {
+        return;
+    };
+    if stream.write_all(&frame).await.is_err() {
+        return;
+    }
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let Ok(read) = stream.read(&mut buffer).await else {
+            return;
+        };
+        if read == 0 {
+            break;
+        }
+        let Ok(messages) = decoder.push(&buffer[..read]) else {
+            return;
+        };
+        for value in messages {
+            if value.get("type").and_then(|t| t.as_str()) != Some("request") {
+                continue;
+            }
+            let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let member = value
+                .get("call")
+                .and_then(|call| call.get("member"))
+                .and_then(|m| m.as_str())
+                .unwrap_or_default();
+            if member == "list" {
+                let update = ServerEnvelope::ServiceUpdate(ServiceUpdateFrame {
+                    type_: "service_update".to_owned(),
+                    subscription_id: "sub-1".to_owned(),
+                    update: progress_update(1, 32),
+                });
+                let Ok(frame) = encode_server_envelope(&update, FrameOptions::default()) else {
+                    return;
+                };
+                if stream.write_all(&frame).await.is_err() {
+                    return;
+                }
+            }
+            let response = ServerEnvelope::Response(ResponseFrame {
+                type_: "response".to_owned(),
+                id: id.to_owned(),
+                ok: true,
+                result: Some(serde_json::json!({"sessions": []})),
+                error: None,
+            });
+            let Ok(frame) = encode_server_envelope(&response, FrameOptions::default()) else {
+                return;
+            };
+            if stream.write_all(&frame).await.is_err() {
+                return;
+            }
+        }
+    }
+    // Second connection: handshake, then hold until the test aborts us.
+    let Ok((mut stream, _)) = listener.accept().await else {
+        return;
+    };
+    let hello = ServerEnvelope::Hello(ServerHelloV8 {
+        type_: "hello".to_owned(),
+        version: PROTOCOL_VERSION,
+        server_id,
+    });
+    let Ok(frame) = encode_server_envelope(&hello, FrameOptions::default()) else {
+        return;
+    };
+    if stream.write_all(&frame).await.is_err() {
+        return;
+    }
+    let mut buffer = [0_u8; 8192];
+    while let Ok(read) = stream.read(&mut buffer).await {
+        if read == 0 {
+            return;
+        }
+    }
+}
+
+/// Reconnect boundary: transport teardown clears the pending-update queue and
+/// the byte total accumulated on the dead connection.
+#[tokio::test]
+async fn reconnect_clears_pending_update_bytes() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    let fixture = tokio::spawn(queued_update_then_reconnect_accept_loop(
+        listener,
+        uuid::Uuid::new_v4().to_string(),
+    ));
+
+    let mut client = Client::connect_with_timeouts(address, short_timeouts())
+        .await
+        .expect("initial handshake");
+    client
+        .call(
+            RpcTarget::server(client.server_id()),
+            SESSION_SERVICE_ID,
+            "list",
+            Vec::new(),
+        )
+        .await
+        .expect("list behind the update");
+    let body_len = serde_json::to_vec(&progress_update(1, 32))
+        .expect("measure update body")
+        .len();
+    assert_eq!(client.pending_updates_count(), 1);
+    assert_eq!(client.pending_updates_bytes(), body_len + "sub-1".len());
+
+    let report = client.reconnect().await.expect("reconnect");
+    assert_eq!(report.attempts, 1);
+    assert_eq!(
+        client.pending_updates_count(),
+        0,
+        "the dead connection's queue must be cleared"
+    );
+    assert_eq!(
+        client.pending_updates_bytes(),
+        0,
+        "the dead connection's byte total must be cleared"
+    );
     fixture.abort();
 }
 

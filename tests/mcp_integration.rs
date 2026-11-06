@@ -103,7 +103,6 @@ fn mock_server_spawn() -> (String, Vec<String>) {
         exe.to_string_lossy().into_owned(),
         vec![
             "mock_mcp_server_child".to_owned(),
-            "--exact".to_owned(),
             "--nocapture".to_owned(),
         ],
     )
@@ -154,6 +153,12 @@ fn serve_mock_requests() {
     let protocol_version =
         std::env::var("PIR_MOCK_PROTOCOL_VERSION").unwrap_or_else(|_| "2025-06-18".to_owned());
     let paged = std::env::var("PIR_MOCK_PAGED").ok();
+    // Byte-cap scenario: every paginated `tools/list` page carries one tool
+    // whose description is this many bytes (still far below the frame cap).
+    let paged_tool_bytes: usize = std::env::var("PIR_MOCK_PAGED_TOOL_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
     let notify_tools_list_changed = std::env::var("PIR_MOCK_NOTIFY_TOOLS").as_deref() == Ok("1");
     // Third-party servers omit the spec-required `name` on resources and
     // templates; the client must keep listing them (upstream falls back to the
@@ -253,10 +258,11 @@ fn serve_mock_requests() {
                 }
                 if let Some(mode) = &paged {
                     // Pagination scenarios: `dup` repeats a cursor forever,
-                    // `cap` walks an unbounded cursor sequence.
+                    // `cap` walks an unbounded cursor sequence, and `bytes`
+                    // does the same with a large tool description per page.
                     let next = match mode.as_str() {
                         "dup" => Some("dup".to_owned()),
-                        "cap" => {
+                        "cap" | "bytes" => {
                             let page = params
                                 .get("cursor")
                                 .and_then(Value::as_str)
@@ -267,7 +273,11 @@ fn serve_mock_requests() {
                         }
                         _ => None,
                     };
-                    let mut page = json!({ "tools": [{ "name": "paged", "inputSchema": {} }] });
+                    let mut tool = json!({ "name": "paged", "inputSchema": {} });
+                    if mode == "bytes" && paged_tool_bytes > 0 {
+                        tool["description"] = json!("x".repeat(paged_tool_bytes));
+                    }
+                    let mut page = json!({ "tools": [tool] });
                     if let Some(next) = next {
                         page["nextCursor"] = json!(next);
                     }
@@ -1204,7 +1214,6 @@ async fn connect_failure_closes_the_transport_and_kills_the_child() {
         command: exe.to_string_lossy().into_owned(),
         args: vec![
             "mock_mcp_silent_child".to_owned(),
-            "--exact".to_owned(),
             "--nocapture".to_owned(),
         ],
         cwd: std::env::current_dir().expect("cwd"),
@@ -1301,6 +1310,80 @@ async fn list_all_tools_errors_at_the_page_cap() {
             assert!(
                 message.contains("exceeded 1000 pages"),
                 "error names the page cap: {message}"
+            );
+        }
+        other => panic!("expected a protocol error, got {other:?}"),
+    }
+    client.close().await;
+}
+
+/// C2-02: a single `tools/list` page larger than the whole result budget is
+/// rejected before it can be retained.
+#[tokio::test]
+async fn list_all_tools_rejects_a_single_page_over_the_byte_cap() {
+    let (command, args) = mock_server_spawn();
+    let mut env = mock_server_env();
+    env.insert("PIR_MOCK_PAGED".to_owned(), "bytes".to_owned());
+    env.insert(
+        "PIR_MOCK_PAGED_TOOL_BYTES".to_owned(),
+        (16 * 1024).to_string(),
+    );
+    let options = StdioSpawnOptions {
+        command,
+        args,
+        cwd: std::env::current_dir().expect("cwd"),
+        env,
+        max_message_bytes: 1024 * 1024,
+    };
+    let client = McpClient::connect_stdio(options, None, "paged-bytes", Duration::from_secs(20))
+        .await
+        .expect("handshake");
+    let error = client
+        .list_all_tools_with_byte_cap_for_test(8 * 1024)
+        .await
+        .expect_err("a page larger than the whole byte budget must be rejected");
+    match &error {
+        McpError::Protocol(message) => {
+            assert!(
+                message.contains("per-page result cap"),
+                "error names the per-page byte cap: {message}"
+            );
+        }
+        other => panic!("expected a protocol error, got {other:?}"),
+    }
+    client.close().await;
+}
+
+/// C2-02: the page cap alone was not enough; cumulative serialized tool bytes
+/// past the budget must abort the walk instead of growing the result.
+#[tokio::test]
+async fn list_all_tools_errors_at_the_cumulative_byte_cap() {
+    let (command, args) = mock_server_spawn();
+    let mut env = mock_server_env();
+    env.insert("PIR_MOCK_PAGED".to_owned(), "bytes".to_owned());
+    env.insert(
+        "PIR_MOCK_PAGED_TOOL_BYTES".to_owned(),
+        (16 * 1024).to_string(),
+    );
+    let options = StdioSpawnOptions {
+        command,
+        args,
+        cwd: std::env::current_dir().expect("cwd"),
+        env,
+        max_message_bytes: 1024 * 1024,
+    };
+    let client = McpClient::connect_stdio(options, None, "paged-bytes", Duration::from_secs(20))
+        .await
+        .expect("handshake");
+    let error = client
+        .list_all_tools_with_byte_cap_for_test(64 * 1024)
+        .await
+        .expect_err("an unending stream of large pages errors at the byte cap");
+    match &error {
+        McpError::Protocol(message) => {
+            assert!(
+                message.contains("cumulative result cap"),
+                "error names the cumulative byte cap: {message}"
             );
         }
         other => panic!("expected a protocol error, got {other:?}"),

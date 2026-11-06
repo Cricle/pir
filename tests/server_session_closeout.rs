@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use pir::client::{Client, ClientError};
 use pir::protocol::{Command, RpcTarget, SESSION_SERVICE_ID};
-use pir::server::{Server, ServerState};
+use pir::server::{Server, ServerSecurityConfig, ServerState};
 
 /// A unique temp directory per call (tests run in one process; the prefix
 /// keeps parallel runs from colliding).
@@ -120,9 +120,13 @@ async fn allow_session_dir_as_root(dir: &Path) -> AllowedRootsGuard {
 /// Bind a state with the session dir and serve it in the background.
 async fn spawn_server(dir: PathBuf) -> std::net::SocketAddr {
     let state = ServerState::default().with_session_dir(dir);
-    let server = Server::bind_with_state("127.0.0.1:0", state)
-        .await
-        .expect("bind closeout test server");
+    let server = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state,
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("bind closeout test server");
     let address = server.local_addr().expect("local address");
     tokio::spawn(async move { server.run().await });
     address

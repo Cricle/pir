@@ -26,7 +26,10 @@
 //!   `cat`/`head`/`tail`/`less` invocation, or a direct `read`/`read_file`
 //!   call, whose single target file is larger than
 //!   [`ROUTING_FILE_THRESHOLD_BYTES`] is blocked with guidance to use
-//!   `ctx_execute_file`. Only unambiguous single-file commands are inspected
+//!   `ctx_execute_file`. Supported images (PNG/JPEG/GIF/WebP/BMP detected by
+//!   magic number) are exempt: they enter context as image content, never as
+//!   text, so the text-size gate does not apply. Only unambiguous single-file
+//!   commands are inspected
 //!   (no pipelines, redirections or globs); everything else — and every
 //!   `ctx_*` tool call — is left untouched. The block outcome is the standard
 //!   native `{block: true, reason}` merge, so the model sees an error result
@@ -582,7 +585,14 @@ fn shell_block_reason(tool: &str, command: &str, cwd: Option<&Path>) -> Option<S
         ));
     }
     let (reader, path) = simple_single_file_read(command, segments)?;
-    let size = file_size_if_over(&path, cwd, ROUTING_FILE_THRESHOLD_BYTES)?;
+    // `cat big.png` / `head big.png` load image content, not text: exempt the
+    // same magic-number formats the `read` gate exempts. Large text remains
+    // routed to `ctx_execute_file`.
+    let resolved = resolve_path(&path, cwd)?;
+    if is_supported_image_file(&resolved) {
+        return None;
+    }
+    let size = file_size_if_over(&resolved, ROUTING_FILE_THRESHOLD_BYTES)?;
     Some(format!(
         "context-mode routing: `{reader}` would read {size} bytes from `{path}` into context \
          (limit {limit} bytes). Use `ctx_execute_file` to analyze the file in the sandbox: only \
@@ -638,7 +648,13 @@ fn read_tool_path(input: &JsonValue) -> Option<&str> {
 }
 
 fn read_block_reason(tool: &str, path: &str, cwd: Option<&Path>) -> Option<String> {
-    let size = file_size_if_over(path, cwd, ROUTING_FILE_THRESHOLD_BYTES)?;
+    // Images enter the transcript as image content, never as text, so the
+    // text-size gate does not apply. Sniff before the size probe.
+    let resolved = resolve_path(path, cwd)?;
+    if is_supported_image_file(&resolved) {
+        return None;
+    }
+    let size = file_size_if_over(&resolved, ROUTING_FILE_THRESHOLD_BYTES)?;
     Some(format!(
         "context-mode routing: `{tool}` would load {size} bytes from `{path}` into context \
          (limit {limit} bytes). Use `ctx_execute_file` to analyze the file in the sandbox: only \
@@ -647,19 +663,45 @@ fn read_block_reason(tool: &str, path: &str, cwd: Option<&Path>) -> Option<Strin
     ))
 }
 
+/// Resolve a possibly-relative path against `cwd` (falling back to the
+/// process working directory).
+fn resolve_path(path: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let target = Path::new(path);
+    if target.is_absolute() {
+        return Some(target.to_path_buf());
+    }
+    let base = cwd
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())?;
+    Some(base.join(target))
+}
+
+/// Magic-number sniff of the image formats the `read` tool returns as image
+/// content. Only the first 16 bytes are read; any I/O error or an
+/// unrecognized/short header is `false`. Deliberately local (no dependency
+/// on the feature-gated `coding_agent::tools::image` helpers).
+fn is_supported_image_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 16];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(read) = file.read(&mut head) else {
+        return false;
+    };
+    let head = &head[..read];
+    head.starts_with(&[0x89, 0x50, 0x4e, 0x47]) // PNG
+        || head.starts_with(&[0xff, 0xd8, 0xff]) // JPEG
+        || head.starts_with(b"GIF87a")
+        || head.starts_with(b"GIF89a")
+        || (head.starts_with(b"RIFF") && head.get(8..12) == Some(&b"WEBP"[..]))
+        || head.starts_with(b"BM") // BMP
+}
+
 /// Metadata-only size probe (nothing is read). `None` when the target does
 /// not exist, is not a regular file, or is at/below `limit`.
-fn file_size_if_over(path: &str, cwd: Option<&Path>, limit: u64) -> Option<u64> {
-    let target = Path::new(path);
-    let resolved = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        let base = cwd
-            .map(Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok())?;
-        base.join(target)
-    };
-    let metadata = std::fs::metadata(&resolved).ok()?;
+fn file_size_if_over(resolved: &Path, limit: u64) -> Option<u64> {
+    let metadata = std::fs::metadata(resolved).ok()?;
     if metadata.is_file() && metadata.len() > limit {
         Some(metadata.len())
     } else {
@@ -866,7 +908,7 @@ fn tool_result_title(tool: &str, input: Option<&JsonValue>) -> String {
     }
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
+pub(super) fn truncate_chars(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
         Some((byte_index, _)) => text[..byte_index].trim_end().to_owned(),
         None => text.to_owned(),

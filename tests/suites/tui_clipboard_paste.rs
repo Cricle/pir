@@ -385,3 +385,71 @@ fn termux_never_reads_an_image() {
     );
     assert_eq!(result, None);
 }
+
+// ---------------------------------------------------------------------------
+// Clipboard image attachment helper (Ctrl+V image path)
+// ---------------------------------------------------------------------------
+
+use pir::tui::clipboard_image::{
+    image_content_from_clipboard_image, image_path_reference, powershell_save_png_script,
+};
+
+#[test]
+fn clipboard_image_content_is_base64_with_its_mime() {
+    use base64::Engine as _;
+    let image = ClipboardImage {
+        bytes: vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        mime_type: "image/png".to_owned(),
+    };
+    let content = image_content_from_clipboard_image(&image);
+    assert_eq!(content.mime_type, "image/png");
+    assert_eq!(
+        content.data,
+        base64::engine::general_purpose::STANDARD.encode(&image.bytes)
+    );
+}
+
+#[test]
+fn image_path_reference_quotes_spaces_and_escapes_backslashes() {
+    // CLI paths are already absolute; the reference must survive the shared
+    // prompt scanner's quoted-token grammar.
+    assert_eq!(image_path_reference("C:\\tmp\\a b.png"), "@\"C:\\\\tmp\\\\a b.png\"");
+    assert_eq!(image_path_reference("/tmp/a b.png"), "@\"/tmp/a b.png\"");
+    assert_eq!(image_path_reference("a\"b.png"), "@\"a\\\"b.png\"");
+}
+
+#[test]
+fn image_path_reference_expands_back_to_the_original_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "pir-clipboard-ref-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("shot one.png");
+    let bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRfake-body".to_vec();
+    std::fs::write(&path, &bytes).expect("write png");
+
+    let reference = image_path_reference(&path.to_string_lossy());
+    let (text, images) =
+        pir::coding_agent::context::expand_prompt_file_args(&reference, &dir).expect("expand");
+    assert!(text.contains(&format!("<file name=\"{}\"></file>", path.display())));
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].mime_type, "image/png");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn windows_powershell_image_script_covers_dib_and_png_payloads() {
+    let script = powershell_save_png_script("C:\\O'Brien\\clip.png");
+    assert!(
+        script.contains("$path = 'C:\\O''Brien\\clip.png'"),
+        "single quotes must be doubled: {script}"
+    );
+    assert!(script.contains("Clipboard]::GetImage()"), "{script}");
+    assert!(script.contains("GetData('PNG')"), "{script}");
+    assert!(script.contains("MemoryStream"), "{script}");
+}

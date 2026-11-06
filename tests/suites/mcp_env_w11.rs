@@ -222,7 +222,6 @@ fn aborting_a_tool_call_sends_notifications_cancelled() {
             .into_owned(),
         vec![
             "mcp_env_w11::w11h_cancellable_stdio_server".to_owned(),
-            "--exact".to_owned(),
             "--nocapture".to_owned(),
         ],
     );
@@ -514,7 +513,6 @@ fn mock_spawn() -> (String, Vec<String>) {
         exe.to_string_lossy().into_owned(),
         vec![
             "mcp_env_w11::w11h_mock_stdio_server".to_owned(),
-            "--exact".to_owned(),
             "--nocapture".to_owned(),
         ],
     )

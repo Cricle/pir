@@ -332,6 +332,94 @@ pub fn is_image_line(line: &str) -> bool {
         || line.contains(ITERM2_PREFIX)
 }
 
+/// Whether `lines` is exactly the block shape [`image_block_lines`] emits: one
+/// complete Kitty/iTerm2 image sequence plus blank reservation rows.
+///
+/// The TUI uses this to tell a trusted `/image` preview (`ChatEntry::Raw` with
+/// no renderer provenance) apart from untrusted raw text (extension renderer
+/// output, custom-entry JSON). The check is structural and deliberately
+/// strict: exactly ONE non-empty line, starting at the line start (iTerm2 may
+/// carry the cursor-up CSI prefix), with a complete terminator and printable
+/// payload. A line that merely embeds a prefix, is truncated, or carries any
+/// other control byte does not qualify — it stays on the text sanitizer.
+pub fn is_image_protocol_lines(lines: &[String]) -> bool {
+    let mut image_lines = 0usize;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if !is_complete_image_sequence(line) {
+            return false;
+        }
+        image_lines += 1;
+    }
+    image_lines == 1
+}
+
+fn is_complete_image_sequence(line: &str) -> bool {
+    is_complete_kitty_sequence(line) || is_complete_iterm2_sequence(line)
+}
+
+/// One or more concatenated Kitty APC chunks (`ESC _ params ; base64 ESC \`),
+/// as produced by [`encode_kitty`]. Requires the transmission command
+/// (`a=T`) so control commands (`a=d`, ...) never qualify.
+fn is_complete_kitty_sequence(line: &str) -> bool {
+    if !line.starts_with(KITTY_PREFIX) || !line.ends_with("\x1b\\") {
+        return false;
+    }
+    let mut rest = line;
+    let mut first = true;
+    while !rest.is_empty() {
+        let Some(after_prefix) = rest.strip_prefix(KITTY_PREFIX) else {
+            return false;
+        };
+        let Some(end) = after_prefix.find("\x1b\\") else {
+            return false;
+        };
+        let chunk = &after_prefix[..end];
+        let Some((params, payload)) = chunk.split_once(';') else {
+            return false;
+        };
+        if payload.is_empty()
+            || !payload
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+            || !chunk.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+        {
+            return false;
+        }
+        if first && !params.split(',').any(|param| param == "a=T") {
+            return false;
+        }
+        first = false;
+        rest = &after_prefix[end + 2..];
+    }
+    true
+}
+
+/// One iTerm2 inline image (`OSC 1337 ; File = … BEL`), optionally prefixed by
+/// the cursor-up CSI [`image_block_lines`] adds so the placement stays inside
+/// the scroll area.
+fn is_complete_iterm2_sequence(line: &str) -> bool {
+    let line = match line.strip_prefix("\x1b[") {
+        Some(rest) => {
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 || rest.as_bytes().get(digits) != Some(&b'A') {
+                return false;
+            }
+            &rest[digits + 1..]
+        }
+        None => line,
+    };
+    let Some(body) = line.strip_prefix(ITERM2_PREFIX) else {
+        return false;
+    };
+    let Some(payload) = body.strip_suffix('\x07') else {
+        return false;
+    };
+    !payload.is_empty() && payload.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+}
+
 /// Allocate a Kitty image id (upstream `allocateImageId`: a random value in
 /// `[1, 0xfffffffe]`). pir mixes the clock and a counter instead of pulling
 /// an RNG dependency.
@@ -903,6 +991,9 @@ pub fn image_content_lines_with_protocol(
     let dimensions = decode_base64_prefix(base64_data)
         .as_deref()
         .and_then(crate::tui::image_preview::sniff_image_dimensions);
+    // `mime_type` can come from an MCP/tool result; sanitize it before it is
+    // spliced into a line that bypasses the Markdown renderer.
+    let mime_type = crate::text::sanitize_terminal_text(mime_type);
     let mut fallback = format!("[Image: {mime_type}");
     if let Some((width, height)) = dimensions {
         fallback.push_str(&format!(" {width}x{height}"));

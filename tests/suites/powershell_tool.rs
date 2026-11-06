@@ -199,9 +199,10 @@ fn tool_selection_type_is_public_for_hosts() {
 /// (`allow_remote_bash: true`) must keep both.
 #[tokio::test]
 async fn server_session_excludes_both_shell_tools_unless_remote_bash_allowed() {
-    let locked_down = Server::bind("127.0.0.1:0")
-        .await
-        .expect("bind default test server");
+    let locked_down =
+        Server::bind_with_security("127.0.0.1:0", ServerSecurityConfig::unauthenticated_local())
+            .await
+            .expect("bind default test server");
     locked_down
         .state()
         .create_session("shell-excluded".to_owned(), None, None, None, None, 0)
@@ -224,7 +225,7 @@ async fn server_session_excludes_both_shell_tools_unless_remote_bash_allowed() {
         "127.0.0.1:0",
         ServerSecurityConfig {
             allow_remote_bash: true,
-            ..ServerSecurityConfig::default()
+            ..ServerSecurityConfig::unauthenticated_local()
         },
     )
     .await

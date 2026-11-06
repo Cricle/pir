@@ -10,6 +10,63 @@ use super::*;
 /// Handler for [`SessionEvent`] values (upstream `session.subscribe`).
 pub type SessionEventHandler = Arc<dyn Fn(SessionEvent) + Send + Sync>;
 
+/// What an `entry_appended` subscriber actually consumes. The producer asks
+/// this before cloning the message and building the wire `SessionEntry`, so a
+/// host that only renders user messages never forces assistant/toolResult
+/// payloads into existence (RSS-A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionEventInterest {
+    /// Every `entry_appended` entry (print/RPC/SDK default).
+    All,
+    /// Only user message entries with visible text (the TUI transcript
+    /// bridge; assistant/toolResult entries are already streamed live).
+    EntryAppendedUserOnly,
+    /// The event is delivered elsewhere (the native plugin bridge owns its
+    /// own direct dispatch and must never count as an append consumer).
+    #[doc(hidden)]
+    EntryAppendedNever,
+}
+
+impl SessionEventInterest {
+    /// Whether this subscriber needs `entry_appended` materialized for
+    /// `message`. Called BEFORE `message.clone()` / `message_json`, so a
+    /// `false` answer keeps the message on its move-only path.
+    pub(crate) fn wants_entry_appended(self, message: &Message) -> bool {
+        match self {
+            Self::All => true,
+            Self::EntryAppendedNever => false,
+            Self::EntryAppendedUserOnly => {
+                let Message::User(user) = message else {
+                    return false;
+                };
+                user.content.iter().any(|block| match block {
+                    ContentBlock::Text(text) => !text.text.is_empty(),
+                    _ => false,
+                })
+            }
+        }
+    }
+}
+
+/// Number of `entry_appended` wire payloads built from a message (dispatch
+/// only, not storage). Test/observability seam for the RSS-A gate.
+static ENTRY_APPENDED_WIRE_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub fn entry_appended_wire_builds() -> usize {
+    ENTRY_APPENDED_WIRE_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[doc(hidden)]
+pub fn reset_entry_appended_wire_builds() {
+    ENTRY_APPENDED_WIRE_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn note_entry_appended_wire_build() {
+    ENTRY_APPENDED_WIRE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// One session-level event emitted outside the agent loop's [`AgentEvent`]
 /// stream (upstream `AgentSessionEvent`, agent-session.ts:196-237). Hosts
 /// subscribe with [`AgentSession::on_session_event`]; the RPC host forwards
@@ -456,6 +513,24 @@ impl AgentSession {
     /// hand off to a channel/thread for anything heavier (the RPC host does
     /// exactly that).
     pub fn on_session_event(&self, handler: SessionEventHandler) {
+        self.on_session_event_with_interest(handler, SessionEventInterest::All);
+    }
+
+    /// Subscribe with an explicit `entry_appended` interest. The handler still
+    /// receives every [`SessionEvent`]; the interest only lets the producer
+    /// skip materializing append payloads this subscriber would discard. The
+    /// default [`Self::on_session_event`] keeps the historical "wants all"
+    /// semantics for print/RPC/SDK hosts.
+    pub fn on_session_event_with_interest(
+        &self,
+        handler: SessionEventHandler,
+        interest: SessionEventInterest,
+    ) {
+        super::notifications::register_session_event_interest(
+            &self.session_events,
+            &handler,
+            interest,
+        );
         self.session_events
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -468,21 +543,40 @@ impl AgentSession {
         emit_session_event_to(&self.session_events, event);
     }
 
-    /// Whether any session-level event subscriber OTHER than the session-event
-    /// bridge is attached. Used as the payload gate for `entry_appended`: when
-    /// neither a plugin handler nor a real host subscriber observes the
-    /// append, the message moves into storage without being cloned for a wire
-    /// payload. The bridge itself drops `entry_appended` (its direct emit
-    /// site owns both plugin faces), so counting it here would materialize
-    /// every entry for nothing.
+    /// Whether any session-level event subscriber wants EVERY
+    /// `entry_appended` payload (print/RPC/SDK default). A TUI-only session
+    /// registers [`SessionEventInterest::EntryAppendedUserOnly`], so this is
+    /// `false` and the assistant/toolResult hot path never clones or
+    /// serializes a message just to drop it in the TUI bridge. The native
+    /// plugin bridge registers as `EntryAppendedNever` (its direct emit site
+    /// owns both plugin faces), so it never counts here.
     pub(crate) fn has_session_event_subscribers(&self) -> bool {
-        super::notifications::has_observed_session_event_subscribers(&self.session_events)
+        super::notifications::has_entry_appended_all_subscribers(&self.session_events)
+    }
+
+    /// Whether at least one subscriber needs the `entry_appended` wire entry
+    /// for this exact message (used by the append hot paths before cloning).
+    pub(crate) fn wants_entry_appended(&self, message: &Message) -> bool {
+        super::notifications::entry_appended_subscriber_wants(&self.session_events, message)
     }
 
     /// Whether a compaction run is in flight (upstream `isCompacting`,
     /// agent-session.ts:1623). Covers manual, threshold, and overflow runs.
     pub fn is_compacting(&self) -> bool {
         self.compacting.load(Ordering::SeqCst)
+    }
+
+    /// Whether the session owns its transcript for ANY activity: a prompt run
+    /// ([`Self::is_streaming`]) or a compaction run ([`Self::is_compacting`]).
+    ///
+    /// Hosts must gate lifecycle swaps and new-run submission on this pair,
+    /// not on `is_streaming()` alone: a MANUAL compaction claims
+    /// `SESSION_COMPACTING` without setting the run state, and a message
+    /// appended to the transcript during it can land outside the compaction's
+    /// cut point. Steering/follow-up input is still accepted (and queued) in
+    /// this state; a direct prompt is rejected until the claim releases.
+    pub fn is_busy(&self) -> bool {
+        self.is_streaming() || self.is_compacting()
     }
 }
 

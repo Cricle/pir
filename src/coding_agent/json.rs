@@ -239,21 +239,30 @@ fn usage_of(event: &AssistantMessageEvent) -> Option<serde_json::Value> {
 /// of the RPC session-event bridge. The print host uses it for the transport
 /// retry lifecycle (`auto_retry_start` / `auto_retry_end`), which upstream
 /// streams as ordinary session events (print-mode.ts:108-112
-/// `session.subscribe` → `toJsonEvent`). Write failures are reported on
-/// stderr, like [`print_event`].
+/// `session.subscribe` → `toJsonEvent`). A closed stdout pipe exits quietly;
+/// other write failures are reported on stderr, like [`print_event`].
 pub fn print_session_event(event: &SessionEvent) {
-    use std::io::Write;
     let line = match serde_json::to_string(&to_session_event_json(event)) {
         Ok(line) => line,
         Err(error) => {
-            eprintln!("pir json: cannot serialize session event: {error}");
+            let _ = crate::coding_agent::output::write_stderr_line(&format!(
+                "pir json: cannot serialize session event: {error}"
+            ));
             return;
         }
     };
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    if let Err(error) = writeln!(handle, "{line}") {
-        eprintln!("pir json: stdout write failed: {error}");
+    write_json_line(&line);
+}
+
+/// Emit one already-serialized JSON line on stdout.
+///
+/// A closed stdout pipe ends the process quietly (`exit 0`): the consumer
+/// asked for no more output, and every further event would only fail again.
+/// Other write failures are reported once and exit 1. This is the fallible
+/// replacement for `println!`, whose panic would be recorded as a crash.
+fn write_json_line(line: &str) {
+    if let Err(error) = crate::coding_agent::output::write_stdout_line(line) {
+        crate::coding_agent::output::exit_stdout_error(error);
     }
 }
 
@@ -261,76 +270,65 @@ pub fn print_session_event(event: &SessionEvent) {
 /// `print-mode.ts` subscribes every session event and writes it verbatim, so
 /// the tool partial-result stream reaches JSON/SDK consumers too — not just
 /// extension handlers). The caller supplies the projected payload
-/// (`{type, toolCallId, toolName, args, partialResult}`); write failures are
-/// reported on stderr, like [`print_event`].
+/// (`{type, toolCallId, toolName, args, partialResult}`); a closed stdout pipe
+/// exits quietly, other write failures are reported on stderr, like
+/// [`print_event`].
 pub fn print_tool_update(payload: &serde_json::Value) {
-    use std::io::Write;
     let line = match serde_json::to_string(payload) {
         Ok(line) => line,
         Err(error) => {
-            eprintln!("pir json: cannot serialize tool update: {error}");
+            let _ = crate::coding_agent::output::write_stderr_line(&format!(
+                "pir json: cannot serialize tool update: {error}"
+            ));
             return;
         }
     };
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    if let Err(error) = writeln!(handle, "{line}") {
-        eprintln!("pir json: stdout write failed: {error}");
-    }
+    write_json_line(&line);
 }
 
-/// Emit one JSON event line on stdout (upstream `writeRawStdout`). Write
-/// failures are reported on stderr; the event stream never panics.
+/// Emit one JSON event line on stdout (upstream `writeRawStdout`). A closed
+/// stdout pipe exits the process quietly; other write failures are reported
+/// on stderr. The event stream never panics.
 pub fn print_event(event: &AgentEvent) {
-    use std::io::Write;
     let line = match serde_json::to_string(&to_json_event(event)) {
         Ok(line) => line,
         Err(error) => {
-            eprintln!("pir json: cannot serialize event: {error}");
+            let _ = crate::coding_agent::output::write_stderr_line(&format!(
+                "pir json: cannot serialize event: {error}"
+            ));
             return;
         }
     };
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    if let Err(error) = writeln!(handle, "{line}") {
-        eprintln!("pir json: stdout write failed: {error}");
-    }
+    write_json_line(&line);
 }
 
 /// Emit the persisted session header as the first JSON line (upstream
 /// `print-mode.ts` writes `session.sessionManager.getHeader()` first). The
 /// header is serialized in its on-disk shape (`{"type":"session",...}`).
 pub fn print_session_header(header: &crate::session_manager::SessionHeader) {
-    use std::io::Write;
     let Ok(line) =
         serde_json::to_string(&crate::session_manager::FileEntry::Session(header.clone()))
     else {
         return;
     };
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    if let Err(error) = writeln!(handle, "{line}") {
-        eprintln!("pir json: stdout write failed: {error}");
-    }
+    write_json_line(&line);
 }
 
 /// Emit the run's diagnostics summary as the final JSON line of a
 /// `--mode json` run (enabled by `PI_TIMING=1`): one
 /// `{"type":"run_diagnostics", ...}` object (`RunDiagnostics::to_wire_json`),
-/// matching the stream's other `type`-tagged frames. Write failures are
-/// reported on stderr, like [`print_event`].
+/// matching the stream's other `type`-tagged frames. A closed stdout pipe
+/// exits quietly; other write failures are reported on stderr, like
+/// [`print_event`].
 pub fn print_run_diagnostics(summary: &crate::diagnostics::RunDiagnostics) {
-    use std::io::Write;
     let line = match serde_json::to_string(&summary.to_wire_json()) {
         Ok(line) => line,
         Err(error) => {
-            eprintln!("pir json: cannot serialize run diagnostics: {error}");
+            let _ = crate::coding_agent::output::write_stderr_line(&format!(
+                "pir json: cannot serialize run diagnostics: {error}"
+            ));
             return;
         }
     };
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    if let Err(error) = writeln!(handle, "{line}") {
-        eprintln!("pir json: stdout write failed: {error}");
-    }
+    write_json_line(&line);
 }

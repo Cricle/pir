@@ -557,7 +557,9 @@ async fn mcp_command_lists_servers_with_tool_counts_and_updates_activation() {
     );
     let host = session.plugin_host_arc().expect("plugin host");
 
-    // The report: each server, state/exposure/source, and its tool count.
+    // The report: each server, state/exposure/source, and its tool state.
+    // The server never connected (its command does not exist), so an empty
+    // discovery is "not discovered yet", not the authoritative "0 tools".
     let report = session
         .dispatch_plugin_command("mcp", "")
         .await
@@ -565,8 +567,12 @@ async fn mcp_command_lists_servers_with_tool_counts_and_updates_activation() {
     let text = report.error.expect("display text");
     assert!(text.contains("docs"), "the server is listed: {text}");
     assert!(
-        text.contains("0 tools"),
-        "the discovered tool count is shown: {text}"
+        text.contains("tools not discovered yet"),
+        "an unconnected server's undiscovered tools are named: {text}"
+    );
+    assert!(
+        !text.contains("0 tools"),
+        "an undiscovered count must not read as an empty server: {text}"
     );
     assert!(text.contains("codemode"), "the exposure is shown: {text}");
 

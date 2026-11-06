@@ -33,6 +33,8 @@ use anyhow::{anyhow, Context as _};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
+use super::truncate_chars;
+
 // ---------------------------------------------------------------------------
 // Budgets
 // ---------------------------------------------------------------------------
@@ -1081,13 +1083,6 @@ fn chunk_plain(content: &str, title_hint: &str) -> Vec<ParsedChunk> {
     }
     section.flush(&mut chunks);
     chunks
-}
-
-fn truncate_chars(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        Some((byte_index, _)) => text[..byte_index].trim_end().to_owned(),
-        None => text.to_owned(),
-    }
 }
 
 // ---------------------------------------------------------------------------

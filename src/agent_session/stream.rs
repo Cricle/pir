@@ -530,17 +530,20 @@ impl std::fmt::Debug for ProviderApiKey {
 /// more than the event the worker is about to take. The bound exists for the
 /// rare concurrent caller of the same hook and is the "block explicitly
 /// instead of dropping" contract: a full queue makes the hook wait on the
-/// send, applying backpressure to the provider read loop; it never discards an
-/// event.
+/// handoff, applying backpressure to the provider read loop. The wait is
+/// bounded by [`PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT`]; a worker that stays
+/// wedged past it reports an explicit failure and closes the dispatcher
+/// instead of blocking the provider stream forever.
 const PROVIDER_STREAM_EVENT_BACKLOG_BOUND: usize = 1;
 
-/// Upper bound on ONE `provider_stream_event` dispatch: the handler call and
-/// the hook's ack wait. Aligned with [`crate::extensions::DEFAULT_CALL_TIMEOUT`]
-/// (30s), the per-call budget the JS actor already applies, so a legitimate
-/// native handler is not cut off earlier than a JS one. A wedged native
-/// handler (one that never resolves and has no actor-level timeout) can
-/// therefore pin the provider stream for at most this budget; after it the
-/// event is counted as failed and the stream returns.
+/// Upper bound on ONE `provider_stream_event` dispatch: the bounded mailbox
+/// handoff, the handler call and the hook's ack wait (one shared deadline).
+/// Aligned with [`crate::extensions::DEFAULT_CALL_TIMEOUT`] (30s), the
+/// per-call budget the JS actor already applies, so a legitimate native
+/// handler is not cut off earlier than a JS one. A wedged native handler (one
+/// that never resolves and has no actor-level timeout) can therefore pin the
+/// provider stream for at most this budget; after it the event is counted as
+/// failed and the stream returns.
 const PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT: std::time::Duration =
     crate::extensions::DEFAULT_CALL_TIMEOUT;
 
@@ -601,12 +604,13 @@ struct ProviderStreamEventJob {
 /// - the provider stream cannot parse/read the next event before the handler
 ///   observed this one — exact upstream order, one dispatch in flight;
 /// - a slow handler throttles the provider read loop (the queue bound is one,
-///   a full queue blocks the handoff) instead of growing an unbounded
-///   fire-and-forget backlog;
+///   a full queue blocks the handoff under the same bounded dispatch
+///   deadline) instead of growing an unbounded fire-and-forget backlog;
 /// - the only drops are explicit: pre-handoff abort (upstream's stream is
-///   already stopping, so no later event may reach extensions) and a
-///   dispatcher that could not run, which logs a warning — never a silent
-///   loss.
+///   already stopping, so no later event may reach extensions), a dispatcher
+///   that could not run or stayed wedged past its handoff deadline, and a
+///   dispatcher closed after a real handler timeout — each logs a warning,
+///   never a silent loss.
 ///
 /// # Why a thread, not a task
 ///
@@ -680,15 +684,48 @@ impl ProviderStreamEventDispatcher {
             event: self.build_event(data),
             done,
         };
+        // ONE dispatch budget covers the handoff AND the ack wait. The
+        // handoff used to be an unbounded `send`, so a worker wedged in a
+        // synchronous native handler could block the SSE parser forever once
+        // the one-slot backlog filled. The handoff now waits at most the
+        // remaining budget and reports an explicit failure.
+        let started = std::time::Instant::now();
         match sender.try_send(job) {
             Ok(()) => {}
-            Err(std::sync::mpsc::TrySendError::Full(job)) => {
-                // The bounded backlog is full: block until the worker takes
-                // the event. Explicit backpressure, never a silent drop.
+            Err(std::sync::mpsc::TrySendError::Full(mut pending_job)) => {
+                // The bounded backlog is full: retry with `try_send` under the
+                // same deadline as the dispatch. Explicit backpressure, never
+                // a silent drop and never an unbounded `send`. (`std`'s
+                // `SyncSender::send_timeout` is still unstable, so this is the
+                // stable bounded handoff.)
                 self.stats.blocked_sends.fetch_add(1, Ordering::Relaxed);
-                if sender.send(job).is_err() {
-                    self.note_unavailable();
-                    return;
+                let deadline = started + PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT;
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                        crate::ext_diag!(
+                            "[ext] provider_stream_event handoff timed out after {:?} \
+                             (dispatcher queue full); releasing the provider stream",
+                            PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT
+                        );
+                        self.note_unavailable();
+                        return;
+                    }
+                    std::thread::sleep(std::cmp::min(
+                        std::time::Duration::from_millis(1),
+                        deadline - now,
+                    ));
+                    match sender.try_send(pending_job) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                            pending_job = returned;
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                            self.note_unavailable();
+                            return;
+                        }
+                    }
                 }
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
@@ -703,7 +740,10 @@ impl ProviderStreamEventDispatcher {
         // the event is counted as failed ONCE and the dispatcher stops
         // accepting later events, so the stream returns instead of paying the
         // budget again for every following event.
-        match ack.recv_timeout(PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT) {
+        let remaining = PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT
+            .checked_sub(started.elapsed())
+            .unwrap_or_default();
+        match ack.recv_timeout(remaining) {
             // Dispatch finished; the run continues (handler errors were
             // already counted by the worker and do not close the dispatcher).
             Ok(true) => {}
@@ -825,15 +865,21 @@ fn start_provider_stream_event_worker(
                         // A native handler is already bounded by the host's
                         // `native_call_timeout`, which can fire just before
                         // this outer timeout. `emit` then returns Ok with a
-                        // timeout entry in `errors`; treating that as success
-                        // would leave the dispatcher open and charge the next
-                        // event another full budget (the CI-only 60s case).
-                        // Any provider-stream handler timeout closes the
-                        // dispatcher exactly like the outer timeout below.
-                        timed_out = outcome.errors.iter().any(|error| {
-                            error.event == "provider_stream_event"
-                                && error.error.contains("timed out after")
-                        });
+                        // structured `timed_out` entry in `errors`; treating
+                        // that as success would leave the dispatcher open and
+                        // charge the next event another full budget (the
+                        // CI-only 60s case). Any provider-stream handler
+                        // timeout closes the dispatcher exactly like the
+                        // outer timeout below.
+                        //
+                        // The flag is authoritative — never the error text.
+                        // An ordinary handler error whose message happens to
+                        // contain "timed out after" must NOT close the
+                        // dispatcher (A-06).
+                        timed_out = outcome
+                            .errors
+                            .iter()
+                            .any(|error| error.event == "provider_stream_event" && error.timed_out);
                         if timed_out {
                             crate::ext_diag!(
                                 "[ext] provider_stream_event handler timed out; closing the \

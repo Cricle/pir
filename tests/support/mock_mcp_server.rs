@@ -75,6 +75,12 @@ pub fn serve_mock_requests() {
     let protocol_version =
         std::env::var("PIR_MOCK_PROTOCOL_VERSION").unwrap_or_else(|_| "2025-06-18".to_owned());
     let paged = std::env::var("PIR_MOCK_PAGED").ok();
+    // Byte-cap scenario: every paginated `tools/list` page carries one tool
+    // whose description is this many bytes (still far below the frame cap).
+    let paged_tool_bytes: usize = std::env::var("PIR_MOCK_PAGED_TOOL_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
     let notify_tools_list_changed = std::env::var("PIR_MOCK_NOTIFY_TOOLS").as_deref() == Ok("1");
     let no_resource_name = std::env::var("PIR_MOCK_NO_RESOURCE_NAME").as_deref() == Ok("1");
     let list_counter = std::env::var("PIR_MOCK_LIST_COUNTER").ok();
@@ -157,9 +163,12 @@ pub fn serve_mock_requests() {
                     );
                 }
                 if let Some(mode) = &paged {
+                    // Pagination scenarios: `dup` repeats a cursor forever,
+                    // `cap` walks an unbounded cursor sequence, and `bytes`
+                    // does the same with a large tool description per page.
                     let next = match mode.as_str() {
                         "dup" => Some("dup".to_owned()),
-                        "cap" => {
+                        "cap" | "bytes" => {
                             let page = params
                                 .get("cursor")
                                 .and_then(Value::as_str)
@@ -170,7 +179,11 @@ pub fn serve_mock_requests() {
                         }
                         _ => None,
                     };
-                    let mut page = json!({ "tools": [{ "name": "paged", "inputSchema": {} }] });
+                    let mut tool = json!({ "name": "paged", "inputSchema": {} });
+                    if mode == "bytes" && paged_tool_bytes > 0 {
+                        tool["description"] = json!("x".repeat(paged_tool_bytes));
+                    }
+                    let mut page = json!({ "tools": [tool] });
                     if let Some(next) = next {
                         page["nextCursor"] = json!(next);
                     }

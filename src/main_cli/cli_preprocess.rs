@@ -533,12 +533,25 @@ pub(super) fn resolve_project_trust_for_run(
         for (index, option) in options.iter().enumerate() {
             println!("  {}. {}", index + 1, option.label);
         }
+        // Prefer the key-level reader: it stops exactly at Enter and leaves
+        // everything the user typed afterwards in crossterm's event queue
+        // for the TUI loop (a `read_line` BufReader can swallow that input,
+        // and a bare `\r` cannot be stranded by cooked-mode line editing).
+        // Non-TTY / no-raw-mode builds fall back to the line prompt below.
+        #[cfg(feature = "tui")]
+        {
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            if let Some(choice) = pir::tui::startup_input::read_trust_choice(options.len()) {
+                return choice;
+            }
+        }
         let mut choice = String::new();
         if std::io::stdin().read_line(&mut choice).is_err() {
             return None;
         }
         match choice.trim().parse::<usize>() {
-            Ok(picked) if picked >= 1 => Some(picked - 1),
+            Ok(picked) if (1..=options.len()).contains(&picked) => Some(picked - 1),
             _ => None,
         }
     })

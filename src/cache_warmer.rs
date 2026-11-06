@@ -270,20 +270,3 @@ pub async fn warm_once_with_hooks_owned_for_session(
     }
     Some(message)
 }
-
-/// Record a successful warm request as a session usage entry (upstream
-/// `appendUsage("cache_warm", ...)`). Best-effort: persistence failures are
-/// ignored — the entry never participates in LLM context.
-pub async fn record_warm_usage(
-    session: &std::sync::Arc<tokio::sync::Mutex<crate::session_manager::SessionManager>>,
-    message: &AssistantMessage,
-) {
-    let mut session = session.lock().await;
-    let _ = session.append_usage(
-        USAGE_KIND_CACHE_WARM,
-        &message.provider,
-        &message.model,
-        message.usage,
-        None,
-    );
-}

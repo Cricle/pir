@@ -566,10 +566,15 @@ async fn create_agent_session_child_round_trip() {
     // and injects nothing (upstream `agent-loop.ts:333-375`, the delta rule
     // `tool_loadout_changes_are_declared_once` locks down; D32 made the
     // declaration survive the store so a resume can restore the loadout).
+    // The live writer guard (`.<name>.jsonl.lock`) sits beside the transcript
+    // while a writer is alive; it is not a session file. A child that exits
+    // via `process::exit` can leave its dead-pid lock for retention to
+    // reclaim, so count only real transcripts here.
     let files: Vec<_> = std::fs::read_dir(&session_dir)
         .expect("session dir")
         .flatten()
         .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
         .collect();
     assert_eq!(files.len(), 1, "one session file expected: {files:?}");
     let session = SessionManager::open(&files[0]).expect("open child session");

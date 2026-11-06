@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::ai::api::provider_env_value;
 use crate::config::settings::FileStamp;
 
 /// The upstream per-command timeout (`resolve-config-value.ts`).
@@ -194,15 +195,6 @@ fn parse_reference(config: &str) -> ConfigValueReference {
     ConfigValueReference::Template(parse_template(config))
 }
 
-fn env_lookup(name: &str, env: Option<&BTreeMap<String, String>>) -> Option<String> {
-    if let Some(env) = env {
-        if let Some(value) = env.get(name) {
-            return Some(value.clone());
-        }
-    }
-    std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
 fn resolve_template(
     parts: &[TemplatePart],
     env: Option<&BTreeMap<String, String>>,
@@ -211,7 +203,7 @@ fn resolve_template(
     for part in parts {
         match part {
             TemplatePart::Literal(value) => resolved.push_str(value),
-            TemplatePart::Env(name) => resolved.push_str(&env_lookup(name, env)?),
+            TemplatePart::Env(name) => resolved.push_str(&provider_env_value(name, env)?),
         }
     }
     Some(resolved)
@@ -258,7 +250,7 @@ fn get_missing_config_value_env_var_names(
 ) -> Vec<String> {
     get_config_value_env_var_names(config)
         .into_iter()
-        .filter(|name| env_lookup(name, env).is_none())
+        .filter(|name| provider_env_value(name, env).is_none())
         .collect()
 }
 

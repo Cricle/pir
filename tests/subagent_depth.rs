@@ -358,6 +358,7 @@ fn env_at_depth(
     base.register(Arc::new(SubagentTool::default()));
     install_subagent_depth(&mut base, depth);
     Arc::new(ToolSessionEnv {
+        read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),
         thinking: ThinkingLevel::Off,
@@ -638,8 +639,22 @@ async fn three_level_chain_body() {
 // (c) Parallel siblings at depth 1 do not affect each other's depth.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn parallel_siblings_at_depth_one_keep_independent_depths() {
+#[test]
+fn parallel_siblings_at_depth_one_keep_independent_depths() {
+    // Same harness constraint as the three-level chain below: this test
+    // builds two depth-1 children that each dispatch a depth-2 child, so the
+    // default 2 MiB libtest stack overflows before the assertions run (it did
+    // on the pre-C1-03 tree too). Run it on the explicit big-stack thread.
+    run_with_chain_stack(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(parallel_siblings_body());
+    });
+}
+
+async fn parallel_siblings_body() {
     let _env_lock = TEST_ENV_LOCK.lock().await;
     let temp = TempDir::new("parallel");
     temp.write_agent("worker.md", "name: worker\ndescription: d\n", "b");

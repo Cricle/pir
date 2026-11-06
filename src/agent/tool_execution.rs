@@ -883,6 +883,10 @@ pub struct ToolSessionEnv {
     /// `background_abort` tools). `None` for hosts that run no background
     /// registry; the tools then report that instead of an empty list.
     pub background: Option<Arc<dyn BackgroundControl>>,
+    /// Session-scoped read ledger for the read-before-edit constraint (the
+    /// `read` tool records successful text reads; `edit`/`write` gate existing
+    /// files). Shared across turns by the owning session.
+    pub read_ledger: Arc<crate::agent::read_ledger::ReadLedger>,
 }
 
 impl std::fmt::Debug for ToolSessionEnv {
@@ -903,6 +907,7 @@ impl std::fmt::Debug for ToolSessionEnv {
             .field("credential", &self.credential)
             .field("on_update", &self.on_update.is_some())
             .field("background", &self.background.is_some())
+            .field("read_before_edit", &self.read_ledger.mode().as_str())
             .finish()
     }
 }

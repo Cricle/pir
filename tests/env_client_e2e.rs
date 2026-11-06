@@ -133,9 +133,36 @@ async fn wait_for_process_gone(pid: i32) {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "process {pid} survived after its `exec` future was dropped"
+            "process {pid} survived after its connection was dropped/closed"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Windows twin of the Unix probe: `tasklist` is the OS view a surviving
+/// daemon/command must disappear from.
+#[cfg(windows)]
+async fn wait_for_process_gone(pid: i32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .expect("run tasklist");
+        let text = String::from_utf8_lossy(&output.stdout);
+        let alive = text.lines().any(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|field| field == pid.to_string())
+        });
+        if !alive {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process {pid} survived after its connection was dropped/closed: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -311,6 +338,47 @@ async fn the_client_drives_the_local_daemon_end_to_end() {
         .expect("readBinaryFile");
     assert_eq!(read, content, "chunked writes and chunked reads round-trip");
     environment.connection.close();
+}
+
+/// C2-05: dropping the last handle is a shutdown, not a leak. The daemon
+/// (whose pid comes from its own `hello`) must exit, and the connection's
+/// reader/logger/writer/exit tasks and live-session count must reach zero.
+/// The counters are cloned before the drop, so they stay readable afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_last_connection_closes_the_daemon_and_its_tasks() {
+    let tree = Tree::new("drop-close");
+    let environment = local_environment(Some(tree.root()));
+    let info = environment.info().await.expect("hello");
+    assert!(info.pid > 0, "the daemon reports its pid");
+    environment
+        .connection
+        .session()
+        .await
+        .expect("a session id");
+    let counters = environment.connection.debug_counters();
+    let counts = environment.connection.debug_counts();
+    assert_eq!(counts.live_sessions, 1, "{counts:?}");
+    assert!(
+        counts.tasks >= 4,
+        "reader/logger/writer/exit watcher are running: {counts:?}"
+    );
+
+    drop(environment);
+
+    wait_for_process_gone(info.pid as i32).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if counters.tasks() == 0 && counters.live_sessions() == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "connection tasks/sessions survived the drop: tasks={}, sessions={}",
+            counters.tasks(),
+            counters.live_sessions()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -600,6 +668,57 @@ async fn a_dropped_exec_future_kills_the_remote_process() {
     );
     environment.cleanup(&Context::default()).await;
     environment.connection.close();
+}
+
+/// C2-05: `close()` while an `exec` is running must give the daemon its
+/// graceful shutdown. The daemon's stdin EOF path runs `kill_all` over the
+/// command's process group; an immediate SIGKILL of the daemon would have left
+/// this `sleep` orphaned. The assertion is the OS view of the command's pid.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_while_exec_runs_lets_the_daemon_kill_the_process_group() {
+    let tree = Tree::new("close-exec");
+    let environment = local_environment(Some(tree.root()));
+    let pid_file = tree.slash_path("running.pid");
+    let command = ExecCommand::Shell(format!("echo $$ > '{pid_file}'; exec sleep 60"));
+    let options = ExecOptions {
+        cwd: Some(tree.root()),
+        ..Default::default()
+    };
+    let context = Context::default();
+    let mut exec = Box::pin(environment.exec(&command, &options, &context));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if tree.exists("running.pid") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon never started the command"
+        );
+        tokio::select! {
+            result = &mut exec => {
+                panic!("exec settled before the pid file was written: {result:?}")
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+    }
+    let pid: i32 = tree
+        .read("running.pid")
+        .trim()
+        .parse()
+        .expect("the shell wrote a numeric pid");
+
+    environment.connection.close();
+    wait_for_process_gone(pid).await;
+    let error = exec.await.expect_err("close settles the in-flight exec");
+    assert_eq!(error.message, "Connection closed", "{error:?}");
+    assert_eq!(
+        environment.running_len_for_tests(),
+        0,
+        "the closed request is no longer left for cleanup"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -948,7 +1067,7 @@ async fn the_tools_stay_local_by_default_and_move_when_configured() {
 
     // An explicitly installed environment moves all four tools to the daemon.
     let environment = Arc::new(local_environment(Some(remote.root())));
-    environment.info().await.expect("the daemon answers hello");
+    let first_info = environment.info().await.expect("the daemon answers hello");
     install_override(environment.clone());
     assert_eq!(
         pir::env_client::tool_env_description().as_deref(),
@@ -1036,8 +1155,26 @@ async fn the_tools_stay_local_by_default_and_move_when_configured() {
         result.content
     );
 
-    // Clearing the override restores the local path exactly.
+    // C2-05: replacing the override must close the displaced connection, not
+    // drop it silently. The daemon's own pid proves it exited; the retained
+    // Arc does not prevent the explicit close.
+    let replacement = Arc::new(local_environment(Some(remote.root())));
+    let replacement_info = replacement.info().await.expect("replacement hello");
+    install_override(replacement.clone());
+    assert!(
+        environment.connection.is_closed(),
+        "install_override closes the previous environment's connection"
+    );
+    wait_for_process_gone(first_info.pid as i32).await;
+
+    // Clearing the override restores the local path exactly and closes the
+    // environment it removes.
     clear_override();
+    assert!(
+        replacement.connection.is_closed(),
+        "clear_override closes the removed environment's connection"
+    );
+    wait_for_process_gone(replacement_info.pid as i32).await;
     assert!(configured_remote_env().is_none());
     let result = run_tool("read", json!({ "path": "same.txt" }), &local.root()).await;
     assert!(
@@ -1369,7 +1506,7 @@ fn write_mock_env_wrapper(dir: &std::path::Path, mode: &str) -> std::path::PathB
     {
         let wrapper = dir.join("mock-env-daemon.bat");
         let script = format!(
-            "@echo off\r\nset \"PIR_MOCK_ENV_TOKEN=%~3\"\r\nset \"PIR_MOCK_ENV_DIR={}\"\r\nset \"PIR_MOCK_ENV_MODE={mode}\"\r\nset \"PIR_MOCK_ENV_DAEMON=1\"\r\n\"{}\" mock_env_daemon_child --exact --nocapture\r\n",
+            "@echo off\r\nset \"PIR_MOCK_ENV_TOKEN=%~3\"\r\nset \"PIR_MOCK_ENV_DIR={}\"\r\nset \"PIR_MOCK_ENV_MODE={mode}\"\r\nset \"PIR_MOCK_ENV_DAEMON=1\"\r\n\"{}\" mock_env_daemon_child --nocapture\r\n",
             dir.display(),
             exe.display()
         );
@@ -1381,7 +1518,7 @@ fn write_mock_env_wrapper(dir: &std::path::Path, mode: &str) -> std::path::PathB
         use std::os::unix::fs::PermissionsExt as _;
         let wrapper = dir.join("mock-env-daemon.sh");
         let script = format!(
-            "#!/bin/sh\nPIR_MOCK_ENV_TOKEN=\"$3\"\nPIR_MOCK_ENV_DIR=\"{}\"\nPIR_MOCK_ENV_MODE=\"{mode}\"\nPIR_MOCK_ENV_DAEMON=1\nexport PIR_MOCK_ENV_TOKEN PIR_MOCK_ENV_DIR PIR_MOCK_ENV_MODE PIR_MOCK_ENV_DAEMON\nexec \"{}\" mock_env_daemon_child --exact --nocapture\n",
+            "#!/bin/sh\nPIR_MOCK_ENV_TOKEN=\"$3\"\nPIR_MOCK_ENV_DIR=\"{}\"\nPIR_MOCK_ENV_MODE=\"{mode}\"\nPIR_MOCK_ENV_DAEMON=1\nexport PIR_MOCK_ENV_TOKEN PIR_MOCK_ENV_DIR PIR_MOCK_ENV_MODE PIR_MOCK_ENV_DAEMON\nexec \"{}\" mock_env_daemon_child --nocapture\n",
             dir.display(),
             exe.display()
         );

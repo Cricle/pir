@@ -404,9 +404,16 @@ pub fn record_panic(agent_dir: &Path, info: &std::panic::PanicHookInfo<'_>) {
     if already {
         return;
     }
-    PANIC_RECORDED.with(|flag| flag.set(true));
-
     let message = payload_message(info.payload());
+    // Defense in depth for the old `println!`/`eprintln!` failure mode: a
+    // closed stdout/stderr pipe is a normal consumer disconnect, not a crash
+    // worth surfacing in the next TUI session. The CLI output paths write
+    // fallibly now (`coding_agent::output`), but third-party code or a future
+    // call site could still panic here; never persist that as a crash.
+    if is_broken_pipe_panic(&message) {
+        return;
+    }
+    PANIC_RECORDED.with(|flag| flag.set(true));
     let location = info
         .location()
         .map(|location| {
@@ -441,6 +448,20 @@ pub fn record_panic(agent_dir: &Path, info: &std::panic::PanicHookInfo<'_>) {
         &cwd,
         &path,
     );
+}
+
+/// Whether a panic message is the standard library's print-failure panic for
+/// a closed pipe. `print!`/`eprintln!` format it as
+/// `failed printing to stdout: Broken pipe (os error 32)` on Unix and
+/// `failed printing to stderr: 管道正在被关闭。 (os error 232)` on Windows
+/// (`ERROR_BROKEN_PIPE` is 109, `ERROR_NO_DATA` is 232).
+pub fn is_broken_pipe_panic(message: &str) -> bool {
+    (message.starts_with("failed printing to stdout")
+        || message.starts_with("failed printing to stderr"))
+        && (message.contains("Broken pipe")
+            || message.contains("os error 32")
+            || message.contains("os error 109")
+            || message.contains("os error 232"))
 }
 
 /// Extract a human-readable message from a panic payload (upstream

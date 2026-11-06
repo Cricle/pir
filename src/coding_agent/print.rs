@@ -21,6 +21,16 @@
 //! a completion still mid-delivery when the abort grace expires is reported
 //! through [`BackgroundExit::undelivered`].
 
+// A print run may outlive its reader (`pir print … | head`), and Rust's
+// `eprintln!` panics when stderr is closed too (`2>&1 | head`). Every
+// diagnostic in this module goes through the fallible writer instead: a
+// closed stderr drops the line, it never turns into a recorded crash.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        let _ = crate::coding_agent::output::write_stderr_line(&format!($($arg)*));
+    }};
+}
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -45,6 +55,43 @@ use crate::ai::types::{
     ContentBlock, Context, Message, MessageSource as _, TextContent, UserMessage, UserRole,
 };
 use crate::coding_agent::session_resolve::{open_session_manager, SessionPlan};
+// The shared `@file` implementation lives in `context.rs` so the session
+// prompt input can use the exact same path/MIME/attachment rules without
+// depending on the `print` feature. Re-exported here because every print host
+// call site and test imports these through `coding_agent::print`.
+pub use crate::coding_agent::context::{
+    expand_prompt_file_args, expand_prompt_file_args_with_options, partition_file_args,
+    ImageAttachmentOptions,
+};
+
+/// Image resize profile the `pir print` subcommand applies while
+/// `images.autoResize` is enabled (upstream default: 2000x2000, 4.5 MB encoded
+/// payload, JPEG quality 80).
+pub const PRINT_IMAGE_ATTACHMENT_OPTIONS: ImageAttachmentOptions = ImageAttachmentOptions {
+    max_width: 2000,
+    max_height: 2000,
+    max_bytes: 4_500_000,
+    jpeg_quality: 80,
+};
+
+/// Expand `@file` references for the `pir print` subcommand prompt.
+///
+/// `auto_resize` is the effective `images.autoResize` setting (default true):
+/// enabled resizes supported inline images through
+/// [`expand_prompt_file_args_with_options`]; disabled keeps the upstream
+/// print-mode pass-through [`expand_prompt_file_args`] byte-for-byte.
+pub fn expand_print_prompt_file_args(
+    prompt: &str,
+    cwd: &std::path::Path,
+    auto_resize: bool,
+) -> crate::Result<(String, Vec<crate::ai::types::ImageContent>)> {
+    if auto_resize {
+        expand_prompt_file_args_with_options(prompt, cwd, Some(PRINT_IMAGE_ATTACHMENT_OPTIONS))
+    } else {
+        expand_prompt_file_args(prompt, cwd)
+    }
+}
+
 use crate::compaction::{self, CompactionConfig, ProjectedEntry};
 use crate::extensions::{ExtensionConfig, SessionContextSnapshot};
 #[cfg(feature = "mcp")]
@@ -2038,6 +2085,11 @@ pub fn print_tool_session_env_with_session(
         live_tools: Some(registry),
         active_override: Some(resolved_active),
         background,
+        // Print has no AgentSession to own a ledger: each prompt environment
+        // resolves the mode once from the process environment. A single print
+        // invocation is one prompt run, so reads and mutations it performs
+        // share this ledger.
+        read_ledger: Arc::new(crate::agent::read_ledger::ReadLedger::from_env()),
     })
 }
 
@@ -3821,9 +3873,36 @@ pub async fn run_print_with_environment(
             match guard.as_mut() {
                 Some(session) => {
                     let widening = match compaction_config.as_ref() {
-                        Some(config) => {
-                            compaction::paged_requires_widening(session, &model, config)
+                        Some(config) if session.is_paged() => {
+                            // The paged pre-run check estimates the FULL
+                            // request (messages + system prompt + tool
+                            // declarations), exactly like the compaction hook;
+                            // a large prompt-only or tools-only overage must
+                            // keep the bounded paged path instead of paying
+                            // the widening fallback.
+                            let current = resolved_active
+                                .read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone();
+                            let widening_prompt =
+                                prompt_cache.sync(&registry, &active, current.as_deref());
+                            let widening_tools = print_request_definitions(
+                                &registry,
+                                &tools,
+                                &active,
+                                current.as_deref(),
+                            );
+                            compaction::paged_requires_widening(
+                                session,
+                                &model,
+                                config,
+                                compaction::paged::PagedRequestPrompt {
+                                    system_prompt: Some(&widening_prompt),
+                                    tools: Some(widening_tools.as_slice()),
+                                },
+                            )
                         }
+                        Some(_) => false,
                         None => session.is_paged(),
                     };
                     let stream_widen = widening
@@ -5338,19 +5417,24 @@ fn print_compaction_result_wire(
 /// The threshold gate over a borrowed cut basis — the resident pipeline's own
 /// rule (upstream `_checkCompaction`), shared with the widened fallback:
 /// projected tokens when a compaction boundary/context edit makes the plain
-/// usage unreliable, the plain message-list estimate otherwise.
+/// usage unreliable, the plain message-list estimate otherwise. Both branches
+/// estimate the FULL request: a transcript without a usage record also pays
+/// for `system_prompt` and `tools`, which live outside `messages`.
 fn print_compaction_threshold_met(
     refs: &[compaction::CutEntryRef<'_>],
     branch: &[compaction::PathEntryMeta],
     messages: &[Message],
+    system_prompt: Option<&str>,
+    tools: Option<&[crate::ai::types::Tool]>,
     model: &crate::ai::types::Model,
     config: &CompactionConfig,
 ) -> bool {
     let plain_estimate = branch.is_empty() && refs.iter().all(|entry| !entry.is_compaction());
     let context_tokens = if plain_estimate {
-        compaction::estimate_context_tokens(messages).tokens
+        compaction::estimate_request_messages_tokens(messages, system_prompt, tools).tokens
     } else {
-        compaction::estimate_projected_context_tokens(refs, branch).tokens
+        compaction::estimate_request_projected_context_tokens(refs, branch, system_prompt, tools)
+            .tokens
     };
     compaction::should_compact_tokens(context_tokens, model.context_window, config)
 }
@@ -5701,7 +5785,16 @@ fn print_compaction_hook_impl(
                         // the same estimator+gate `compact_paged_inputs`
                         // applies over the SAME captured projection, so a
                         // threshold-not-met turn stays SILENT.
-                        match compaction::paged::PagedCompactionInputs::capture(paged_session) {
+                        // The threshold must see the FULL request the loop is
+                        // about to send: the live context carries this
+                        // request's system prompt and tool declarations.
+                        match compaction::paged::PagedCompactionInputs::capture(
+                            paged_session,
+                            compaction::paged::PagedRequestPrompt {
+                                system_prompt: context.system_prompt.as_deref(),
+                                tools: context.tools.as_deref(),
+                            },
+                        ) {
                             Ok(inputs) if inputs.threshold_met(&model, &config) => {
                                 (PagedPreparation::Inputs(inputs), Some(stamp))
                             }
@@ -5940,6 +6033,8 @@ fn print_compaction_hook_impl(
                             &refs,
                             &branch,
                             &projection.messages,
+                            context.system_prompt.as_deref(),
+                            context.tools.as_deref(),
                             &model,
                             &config,
                         ) {
@@ -6094,7 +6189,15 @@ fn print_compaction_hook_impl(
             // (`should_compact` on the raw context). The gate is the shared
             // estimator+gate pair (`print_compaction_threshold_met`), so
             // threshold-unmet turns (and everything that follows) stay silent.
-            if !print_compaction_threshold_met(&refs, branch, &context.messages, &model, &config) {
+            if !print_compaction_threshold_met(
+                &refs,
+                branch,
+                &context.messages,
+                context.system_prompt.as_deref(),
+                context.tools.as_deref(),
+                &model,
+                &config,
+            ) {
                 return context;
             }
             let prepared = match compaction::prepare_compaction_refs(&refs, branch, &config) {
@@ -6192,200 +6295,4 @@ fn print_compaction_details(result: &compaction::CompactionResult) -> serde_json
         "readFiles": result.read_files,
         "modifiedFiles": result.modified_files,
     })
-}
-
-// ---------------------------------------------------------------------------
-// `@file` image attachments (upstream cli/file-processor.ts + main.ts
-// prepareInitialMessage)
-// ---------------------------------------------------------------------------
-
-/// Process `@file` arguments into the upstream-shaped file text plus the
-/// image attachments (upstream cli/file-processor.ts + main.ts
-/// prepareInitialMessage): text files render as
-/// `<file name="…">\n{content}\n</file>\n`, image files become the
-/// `initialImages` attachments AND still contribute their upstream marker
-/// line to the prompt — `<file name="…"></file>\n` when there are no
-/// processing hints, otherwise `<file name="…">{hints}</file>\n`.
-/// Arguments are processed in order, so mixed text/image positions match
-/// upstream. Images go through `processImage(..., autoResizeImages: false)`
-/// like upstream print mode: unsupported formats (BMP) are normalized to
-/// PNG, but nothing is resized; a conversion failure renders the upstream
-/// failure text and attaches nothing.
-///
-/// Each file is read once: a 4 KB head-sized `File::read` decides the MIME
-/// type, and the already-read bytes are reused for the text block or
-/// extended in place for an image (the previous code read the whole file for
-/// the sniff and `process_file_arguments` then read it again). Missing files
-/// are hard errors (upstream exits 1); empty files are skipped on the text
-/// path; unreadable files surface the read error.
-pub fn partition_file_args(
-    file_args: &[String],
-    cwd: &std::path::Path,
-) -> crate::Result<(String, Vec<crate::ai::types::ImageContent>)> {
-    use std::io::Read as _;
-
-    let mut text = String::new();
-    let mut images = Vec::new();
-    for file_arg in file_args {
-        let path = resolve_file_arg_path(file_arg, cwd);
-        if !path.is_file() {
-            return Err(anyhow::anyhow!("File not found: {}", path.display()));
-        }
-        let mut file = std::fs::File::open(&path)
-            .map_err(|error| anyhow::anyhow!("Could not read file {}: {error}", path.display()))?;
-        let size = file
-            .metadata()
-            .map_err(|error| anyhow::anyhow!("Could not stat file {}: {error}", path.display()))?
-            .len();
-        // Upstream skips empty files before the MIME sniff.
-        if size == 0 {
-            continue;
-        }
-        // Sniff from a small read instead of the full file; these bytes are
-        // then reused for the text block or extended for the image payload.
-        let mut head = [0u8; crate::coding_agent::tools::image::IMAGE_TYPE_SNIFF_BYTES];
-        let mut filled = 0;
-        while filled < head.len() {
-            match file.read(&mut head[filled..]) {
-                Ok(0) => break,
-                Ok(read) => filled += read,
-                Err(error) => {
-                    return Err(anyhow::anyhow!(
-                        "Could not read file {}: {error}",
-                        path.display()
-                    ))
-                }
-            }
-        }
-        let mut bytes = Vec::with_capacity(filled);
-        bytes.extend_from_slice(&head[..filled]);
-        file.read_to_end(&mut bytes)
-            .map_err(|error| anyhow::anyhow!("Could not read file {}: {error}", path.display()))?;
-        let sniff_head = &bytes[..bytes
-            .len()
-            .min(crate::coding_agent::tools::image::IMAGE_TYPE_SNIFF_BYTES)];
-        match crate::coding_agent::tools::image::detect_supported_image_mime_type(sniff_head) {
-            Some(mime_type) => append_file_image(&path, bytes, mime_type, &mut text, &mut images),
-            None => append_file_text(&path, &bytes, &mut text),
-        }
-    }
-    Ok((text, images))
-}
-
-/// Text half of `processFileArguments`: lossy UTF-8 with a BOM strip.
-fn append_file_text(path: &std::path::Path, bytes: &[u8], text: &mut String) {
-    let raw = String::from_utf8_lossy(bytes);
-    let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-    text.push_str(&format!(
-        "<file name=\"{}\">\n{content}\n</file>\n",
-        path.display()
-    ));
-}
-
-/// Image half of `processFileArguments`: `processImage` with
-/// `autoResizeImages: false` (upstream print mode) — normalize to a supported
-/// inline format, never resize — then render the conversion hints or the
-/// processing failure text exactly like upstream.
-#[cfg(any(feature = "image-tools", feature = "tui"))]
-fn append_file_image(
-    path: &std::path::Path,
-    bytes: Vec<u8>,
-    mime_type: &'static str,
-    text: &mut String,
-    images: &mut Vec<crate::ai::types::ImageContent>,
-) {
-    use crate::coding_agent::tools::image::{process_image, DEFAULT_JPEG_QUALITY};
-
-    // The formats `processImage` normalizes to pass through untouched under
-    // `autoResizeImages: false`: upstream returns the original bytes without
-    // decoding them (only a non-inline format such as BMP is converted).
-    if matches!(
-        mime_type,
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-    ) {
-        use base64::Engine as _;
-        images.push(crate::ai::types::ImageContent {
-            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
-            mime_type: mime_type.to_owned(),
-        });
-        text.push_str(&format!("<file name=\"{}\"></file>\n", path.display()));
-        return;
-    }
-    // BMP (and any other sniffed non-inline format): `processImage` decodes
-    // and re-encodes it as PNG. Unlimited limits express `autoResizeImages:
-    // false`: the dimension/byte checks always pass, so no resize ladder runs
-    // and only the conversion hint is produced.
-    let processed = process_image(
-        &bytes,
-        mime_type,
-        u32::MAX,
-        u32::MAX,
-        usize::MAX,
-        DEFAULT_JPEG_QUALITY,
-    );
-    match processed {
-        Ok(processed) => {
-            if processed.hints.is_empty() {
-                text.push_str(&format!("<file name=\"{}\"></file>\n", path.display()));
-            } else {
-                text.push_str(&format!(
-                    "<file name=\"{}\">{}</file>\n",
-                    path.display(),
-                    processed.hints.join("\n")
-                ));
-            }
-            images.push(crate::ai::types::ImageContent {
-                data: processed.data_base64,
-                mime_type: processed.mime_type,
-            });
-        }
-        Err(error) => {
-            text.push_str(&format!(
-                "<file name=\"{}\">{}</file>\n",
-                path.display(),
-                error.message()
-            ));
-        }
-    }
-}
-
-/// Image half without the `image` crate: no normalize/decode is possible, so
-/// keep the previous pass-through attachment (raw bytes).
-#[cfg(not(any(feature = "image-tools", feature = "tui")))]
-fn append_file_image(
-    path: &std::path::Path,
-    bytes: Vec<u8>,
-    mime_type: &'static str,
-    text: &mut String,
-    images: &mut Vec<crate::ai::types::ImageContent>,
-) {
-    use base64::Engine as _;
-
-    images.push(crate::ai::types::ImageContent {
-        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
-        mime_type: mime_type.to_owned(),
-    });
-    text.push_str(&format!("<file name=\"{}\"></file>\n", path.display()));
-}
-
-/// Resolve an `@file` argument against `~`/`~/` and the cwd (same shape as
-/// cli.rs's private `expand_tilde` + cwd join).
-fn resolve_file_arg_path(file_arg: &str, cwd: &std::path::Path) -> PathBuf {
-    let path = if file_arg == "~" || file_arg.starts_with("~/") || file_arg.starts_with("~\\") {
-        match std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            Some(home) => PathBuf::from(home).join(
-                file_arg
-                    .trim_start_matches('~')
-                    .trim_start_matches(['/', '\\']),
-            ),
-            None => PathBuf::from(file_arg),
-        }
-    } else {
-        PathBuf::from(file_arg)
-    };
-    if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
-    }
 }

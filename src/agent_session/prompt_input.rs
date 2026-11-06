@@ -28,6 +28,20 @@ pub(super) enum PromptInputAction {
 /// extension `pi.sendUserMessage()` runs `"extension"`.
 const DEFAULT_INPUT_SOURCE: &str = "interactive";
 
+/// The tiny model surface the shared `@file` resize-limit resolver reads
+/// (`Model.compat.inputLimits`, else `Model.inputLimits`). The impl lives here
+/// because `coding_agent::tools::image` must stay free of crate-internal paths
+/// (an integration test includes it verbatim).
+#[cfg(any(feature = "print", feature = "tool-read"))]
+impl crate::coding_agent::tools::image::ImageResizeLimitsSource for crate::ai::types::Model {
+    fn image_resize_input_limits(&self) -> Option<&serde_json::Value> {
+        self.compat
+            .as_ref()
+            .and_then(|compat| compat.input_limits.as_ref())
+            .or(self.input_limits.as_ref())
+    }
+}
+
 /// Per-task pre-dispatched input: the source for prompts that reach the run
 /// through the ordinary `AgentSession::prompt()` seam, plus the transform
 /// already produced by a source-aware entry point.
@@ -328,7 +342,48 @@ impl AgentSession {
         source: &str,
         on_event: EventHandler,
     ) -> crate::Result<Option<AssistantMessage>> {
-        match self.prepare_prompt_input(text, images, source, None).await {
+        // Interactive prompts (the TUI worker's submit path) expand `@file`
+        // and `@image.png` references with the SAME rules as the print hosts
+        // (`coding_agent::context::expand_prompt_file_args`): text renders as
+        // `<file name="…">…</file>`, images become image content blocks on
+        // the starting user message, and a missing referenced file is a hard
+        // error before a turn starts. Unlike print mode, interactive prompts
+        // resize image attachments with the current model's
+        // `inputLimits.images.resize` profile (upstream defaults when the
+        // model does not define it) so pasted multi-megabyte screenshots do
+        // not travel raw. RPC/extension prompts are programmatic API input:
+        // their text stays verbatim (their images arrive through the explicit
+        // `images` argument).
+        let (text, images) = if source == DEFAULT_INPUT_SOURCE {
+            #[cfg(any(feature = "print", feature = "tool-read"))]
+            let attachment_options = {
+                let model = self.current_model();
+                let (max_width, max_height, max_bytes, jpeg_quality) =
+                    crate::coding_agent::tools::image::image_resize_limits_for_model(Some(
+                        &model,
+                    ));
+                Some(crate::coding_agent::context::ImageAttachmentOptions {
+                    max_width,
+                    max_height,
+                    max_bytes,
+                    jpeg_quality,
+                })
+            };
+            #[cfg(not(any(feature = "print", feature = "tool-read")))]
+            let attachment_options = None;
+            let (expanded, file_images) =
+                crate::coding_agent::context::expand_prompt_file_args_with_options(
+                    text,
+                    &self.cwd,
+                    attachment_options,
+                )?;
+            let mut images = images;
+            images.extend(file_images.into_iter().map(ContentBlock::Image));
+            (expanded, images)
+        } else {
+            (text.to_owned(), images)
+        };
+        match self.prepare_prompt_input(&text, images, source, None).await {
             Some((text, images)) => self
                 .prompt_with_prepared_input(&text, images, on_event)
                 .await
@@ -356,6 +411,31 @@ impl AgentSession {
         }));
         PROMPT_INPUT_CONTEXT
             .scope(context, self.prompt_with_images(text, images, on_event))
+            .await
+    }
+
+    /// [`Self::prompt_with_prepared_input`] with a session claim already
+    /// taken by [`Self::try_claim_run`] (the RPC host acknowledged the
+    /// prompt from the admission result).
+    pub async fn prompt_with_prepared_input_admitted(
+        &self,
+        text: &str,
+        images: Vec<ContentBlock>,
+        on_event: EventHandler,
+        admission: RunAdmission,
+    ) -> crate::Result<AssistantMessage> {
+        let context = Arc::new(Mutex::new(PromptInputContext {
+            source: DEFAULT_INPUT_SOURCE.to_owned(),
+            prepared: Some(PromptInputTransform {
+                text: text.to_owned(),
+                images: images.clone(),
+            }),
+        }));
+        PROMPT_INPUT_CONTEXT
+            .scope(
+                context,
+                self.prompt_with_images_admitted(text, images, on_event, admission),
+            )
             .await
     }
 

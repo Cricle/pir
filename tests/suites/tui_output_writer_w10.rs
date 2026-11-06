@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use pir::tui::core::{Terminal, TerminalSink, WRITER_QUEUE_CAPACITY};
+use pir::tui::core::{Component, Rows, Terminal, TerminalSink, TuiCore, WRITER_QUEUE_CAPACITY};
 use pir::tui::stdin_buffer::WriteLog;
 
 /// Shared state of a recording sink. The `pir-tui-writer` thread can be
@@ -366,4 +366,138 @@ fn tui_write_log_stops_at_the_cap_and_keeps_the_file_handle() {
     let text = std::fs::read_to_string(&path).expect("write log exists");
     assert!(!text.contains("this must not be written"), "{text}");
     let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------------
+// TUI-P1: a dropped writer frame is recovered with a keyframe, not with a
+// whole-block cache wipe.
+// ---------------------------------------------------------------------------
+
+/// Twelve independently-versioned blocks (the transcript's shape): each row
+/// is one block, and `rendered_blocks` counts actual block re-renders.
+struct BlockCacheProbe {
+    revisions: Mutex<Vec<u64>>,
+    rendered_blocks: AtomicUsize,
+}
+
+struct BlockCacheProbeHandle(Arc<BlockCacheProbe>);
+
+impl Component for BlockCacheProbeHandle {
+    fn render(&self, _width: usize) -> Vec<String> {
+        self.0
+            .revisions
+            .lock()
+            .expect("revisions lock")
+            .iter()
+            .enumerate()
+            .map(|(index, revision)| format!("block-{index}-rev-{revision}"))
+            .collect()
+    }
+
+    fn content_revision(&self) -> Option<u64> {
+        Some(0)
+    }
+
+    fn content_blocks(&self) -> Option<Vec<u64>> {
+        Some(self.0.revisions.lock().expect("revisions lock").clone())
+    }
+
+    fn render_block_into(&self, index: usize, _width: usize, out: &mut Rows<'_>) {
+        self.0.rendered_blocks.fetch_add(1, Ordering::SeqCst);
+        let revision = self.0.revisions.lock().expect("revisions lock")[index];
+        out.push(&format!("block-{index}-rev-{revision}"));
+    }
+}
+
+/// TUI-P1 / H-C: after a writer drop the next render is a self-contained
+/// keyframe (every row written), but it must reuse the per-block row caches:
+/// only the block whose revision moved re-renders. Before the fix the drop
+/// went through `invalidate_frame`, which cleared `frame_slots`, so all
+/// twelve blocks re-ran and the terminal did a full-screen rebuild.
+#[test]
+fn writer_drop_keyframes_without_rebuilding_block_caches() {
+    const BLOCKS: usize = 12;
+    let sink = RecordingSink::new();
+    sink.block_next_writer_write();
+    let terminal = terminal_with(&sink);
+    let mut core = TuiCore::new(terminal);
+    core.terminal().set_size(80, 24);
+    let probe = Arc::new(BlockCacheProbe {
+        revisions: Mutex::new(vec![0; BLOCKS]),
+        rendered_blocks: AtomicUsize::new(0),
+    });
+    core.push_content(Box::new(BlockCacheProbeHandle(Arc::clone(&probe))));
+    core.render();
+    // Park the writer on the first frame before filling the queue.
+    sink.wait_until_blocked(Duration::from_secs(5));
+
+    // The writer is parked on the first chunk; fill the queue with changed
+    // frames until one of the enqueues drops the oldest queued diff.
+    let mut dropped_during_render = false;
+    for revision in 1..=(WRITER_QUEUE_CAPACITY as u64 * 3) {
+        probe.revisions.lock().expect("revisions lock")[BLOCKS - 1] = revision;
+        let before = core.terminal().drop_epoch();
+        core.render();
+        if core.terminal().drop_epoch() != before {
+            dropped_during_render = true;
+            break;
+        }
+    }
+    assert!(
+        dropped_during_render,
+        "a saturated writer queue must drop a queued frame"
+    );
+
+    // The next render observes the drop. It must be a keyframe that reuses
+    // every cached block except the one whose content changed.
+    let changed_revision = {
+        let mut revisions = probe.revisions.lock().expect("revisions lock");
+        revisions[BLOCKS - 1] += 1;
+        revisions[BLOCKS - 1]
+    };
+    probe.rendered_blocks.store(0, Ordering::SeqCst);
+    core.render();
+    let work = core.last_frame_work();
+    assert_eq!(
+        work.rebuilt_blocks, 1,
+        "a writer drop must NOT clear frame_slots: only the changed block may re-render ({work:?})"
+    );
+    assert_eq!(
+        probe.rendered_blocks.load(Ordering::SeqCst),
+        1,
+        "the drop keyframe re-ran block renderers: {work:?}"
+    );
+    assert_eq!(
+        work.cached_rows,
+        (BLOCKS - 1) as u64,
+        "every unchanged block must be served from its row cache ({work:?})"
+    );
+    let frame = core.last_frame_lines();
+    assert_eq!(frame.len(), BLOCKS, "the keyframe keeps every block");
+    for index in 0..BLOCKS - 1 {
+        let revision = probe.revisions.lock().expect("revisions lock")[index];
+        assert_eq!(
+            frame[index],
+            format!("block-{index}-rev-{revision}"),
+            "final screen content must match the newest revisions"
+        );
+    }
+    assert_eq!(
+        frame[BLOCKS - 1],
+        format!("block-{}-rev-{changed_revision}", BLOCKS - 1),
+        "the changed block must carry its newest revision"
+    );
+
+    // Recovery is one keyframe, not a permanent full-rebuild mode: the next
+    // steady frame goes back to zero block renders.
+    core.render();
+    assert_eq!(
+        core.last_frame_work().rebuilt_blocks,
+        0,
+        "the frame after the keyframe must be steady again"
+    );
+
+    sink.open_gate();
+    assert!(core.terminal().flush_bounded(Duration::from_secs(5)));
+    core.stop();
 }

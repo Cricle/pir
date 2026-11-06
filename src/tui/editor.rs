@@ -114,6 +114,310 @@ struct VisualLine {
     length: usize,
 }
 
+/// One cached visual chunk of a logical line. `start_byte`/`end_byte` index
+/// the owning `String` so the render path can borrow the slice instead of
+/// rebuilding a `String` per wrapped chunk (`start_char`/`end_char` keep the
+/// char-indexed cursor math of `wordWrapLine`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkSpan {
+    start_byte: usize,
+    end_byte: usize,
+    start_char: usize,
+    end_char: usize,
+}
+
+/// Cached wrap layout for one logical line. Empty `chunks` means the line is
+/// empty (one visual row); one chunk means it fits the wrap width.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LineLayoutPlan {
+    chunks: Vec<ChunkSpan>,
+}
+
+impl LineLayoutPlan {
+    fn visual_count(&self) -> usize {
+        self.chunks.len().max(1)
+    }
+}
+
+/// Incremental wrap-layout cache. `visual_before[i]` is the visual-line index
+/// where logical line `i` starts (`visual_before[lines.len()]` is the total),
+/// so rendering the visible window is a binary search plus the visible rows —
+/// a 10k-line draft costs O(visible) per frame instead of a full re-wrap.
+#[derive(Debug, Default)]
+struct LayoutCache {
+    valid: bool,
+    revision: u64,
+    width: usize,
+    lines: Vec<LineLayoutPlan>,
+    visual_before: Vec<usize>,
+}
+
+impl LayoutCache {
+    fn invalidate(&mut self) {
+        self.valid = false;
+        self.revision = 0;
+        self.width = 0;
+        self.lines.clear();
+        self.visual_before.clear();
+    }
+
+    fn total_visual(&self) -> usize {
+        self.visual_before.last().copied().unwrap_or(0)
+    }
+
+    fn rebuild(&mut self, state: &EditorState, width: usize, valid_ids: &[usize], revision: u64) {
+        self.lines = state
+            .lines
+            .iter()
+            .map(|line| build_line_layout(line, width, valid_ids))
+            .collect();
+        self.width = width;
+        self.revision = revision;
+        self.valid = true;
+        self.rebuild_visual_offsets_from(0);
+    }
+
+    fn rebuild_visual_offsets_from(&mut self, from: usize) {
+        let base = self.visual_before.get(from).copied().unwrap_or(0);
+        self.visual_before.truncate(from);
+        self.visual_before.push(base);
+        for index in from..self.lines.len() {
+            let next = self.visual_before[index] + self.lines[index].visual_count();
+            self.visual_before.push(next);
+        }
+    }
+
+    /// Splice `replacement` over `removed` old logical lines and rebuild only
+    /// the shifted tail's visual offsets (the tail plans themselves are
+    /// reused verbatim).
+    fn replace_lines(
+        &mut self,
+        start: usize,
+        removed: usize,
+        replacement: Vec<LineLayoutPlan>,
+        revision: u64,
+    ) {
+        if !self.valid || start + removed > self.lines.len() {
+            self.invalidate();
+            return;
+        }
+        self.lines.splice(start..start + removed, replacement);
+        self.revision = revision;
+        self.rebuild_visual_offsets_from(start);
+    }
+
+    fn line_at_visual(&self, visual: usize) -> usize {
+        self.visual_before
+            .partition_point(|start| *start <= visual)
+            .saturating_sub(1)
+            .min(self.lines.len().saturating_sub(1))
+    }
+
+    fn cursor_visual_index(&self, state: &EditorState) -> usize {
+        if self.lines.is_empty() {
+            return 0;
+        }
+        let line_index = state.cursor_line.min(self.lines.len() - 1);
+        let base = self.visual_before.get(line_index).copied().unwrap_or(0);
+        let plan = &self.lines[line_index];
+        if plan.chunks.is_empty() {
+            return base;
+        }
+        let mut chunk_index = plan.chunks.len() - 1;
+        for (index, chunk) in plan.chunks.iter().enumerate() {
+            let is_last = index + 1 == plan.chunks.len();
+            if state.cursor_col >= chunk.start_char
+                && (is_last || state.cursor_col < chunk.end_char)
+            {
+                chunk_index = index;
+                break;
+            }
+        }
+        base + chunk_index
+    }
+
+    /// Materialize only `[start, end)` visual lines, borrowing the logical
+    /// line text from `state`.
+    fn visible_layout_lines<'a>(
+        &self,
+        state: &'a EditorState,
+        start: usize,
+        end: usize,
+    ) -> Vec<LayoutLine<'a>> {
+        let end = end.min(self.total_visual());
+        let start = start.min(end);
+        let mut layout = Vec::with_capacity(end - start);
+        for visual in start..end {
+            let line_index = self.line_at_visual(visual);
+            let line = &state.lines[line_index];
+            let column = (line_index == state.cursor_line).then_some(state.cursor_col);
+            let plan = &self.lines[line_index];
+            if plan.chunks.is_empty() {
+                layout.push(LayoutLine {
+                    text: Cow::Borrowed(""),
+                    cursor_pos: column.map(|_| 0),
+                });
+                continue;
+            }
+            let chunk_index = visual - self.visual_before[line_index];
+            let chunk = &plan.chunks[chunk_index.min(plan.chunks.len() - 1)];
+            let is_last = chunk_index + 1 == plan.chunks.len();
+            let cursor_pos = column.and_then(|col| {
+                let inside = if is_last {
+                    col >= chunk.start_char
+                } else {
+                    col >= chunk.start_char && col < chunk.end_char
+                };
+                inside.then(|| (col - chunk.start_char).min(chunk.end_char - chunk.start_char))
+            });
+            layout.push(LayoutLine {
+                text: Cow::Borrowed(&line[chunk.start_byte..chunk.end_byte]),
+                cursor_pos,
+            });
+        }
+        layout
+    }
+}
+
+/// Build the wrap plan for one logical line. Only called when the cache is
+/// invalid, the width changed, or the line itself was edited.
+fn build_line_layout(line: &str, width: usize, valid_ids: &[usize]) -> LineLayoutPlan {
+    if line.is_empty() {
+        return LineLayoutPlan::default();
+    }
+    let content_width = width.max(1);
+    if visible_width(line) <= content_width {
+        let char_len = line.chars().count();
+        return LineLayoutPlan {
+            chunks: vec![ChunkSpan {
+                start_byte: 0,
+                end_byte: line.len(),
+                start_char: 0,
+                end_char: char_len,
+            }],
+        };
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let chunks = word_wrap_line(line, content_width, valid_ids);
+    let mut byte_offsets: Vec<usize> = line.char_indices().map(|(index, _)| index).collect();
+    byte_offsets.push(line.len());
+    LineLayoutPlan {
+        chunks: chunks
+            .into_iter()
+            .map(|chunk| {
+                let start = chunk.start.min(chars.len());
+                let end = chunk.end.min(chars.len());
+                ChunkSpan {
+                    start_byte: byte_offsets[start],
+                    end_byte: byte_offsets[end],
+                    start_char: start,
+                    end_char: end,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Public counter seam for the incremental layout cache (tests / probes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayoutCacheStats {
+    pub full_builds: u64,
+    pub incremental_updates: u64,
+    pub lines_built: u64,
+    pub render_passes: u64,
+    pub rendered_lines: u64,
+    pub cache_hits: u64,
+}
+
+/// Input-pipeline counters (TUI-P4 burst probes and regression tests).
+///
+/// `insert_calls` counts [`Editor::insert_text_inner`] invocations — one per
+/// typed character before burst coalescing, one per drained run after it.
+/// `snapshot_lines` sums the lines cloned by [`Editor::state_snapshot`], the
+/// autocomplete path that made the bracketless paste O(draft × chars).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EditorIoStats {
+    pub insert_calls: u64,
+    pub insert_chars: u64,
+    /// Batch insertions routed through [`Editor::insert_text_burst`].
+    pub insert_bursts: u64,
+    pub insert_burst_chars: u64,
+    pub paste_calls: u64,
+    pub paste_bytes: u64,
+    pub undo_pushes: u64,
+    pub snapshot_calls: u64,
+    pub snapshot_lines: u64,
+}
+
+/// Public accounting for one `paste_text` call: the input/output sizes plus
+/// the bytes actually copied on the paste path (cleaning, registry store and
+/// the returned `String`). Tests pin the upper bounds on a 10k-line paste.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PasteReport {
+    pub input_bytes: usize,
+    pub output_bytes: usize,
+    pub output_chars: usize,
+    pub line_count: usize,
+    /// 0 = the cleaner borrowed the input unchanged; 1 = one output buffer.
+    pub cleaning_allocations: u64,
+    pub copied_bytes: usize,
+    pub undo_snapshots: u64,
+    pub inserted_lines: usize,
+}
+
+/// Result of the single-pass paste cleaner. `text` borrows the caller's
+/// string when no byte needed rewriting (the common clipboard case).
+struct CleanedPaste<'a> {
+    text: Cow<'a, str>,
+    line_count: usize,
+    char_count: usize,
+    cleaning_allocations: u64,
+    copied_bytes: usize,
+}
+
+/// What one insertion copied/added, for the paste accounting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InsertOutcome {
+    pub copied_bytes: usize,
+    pub lines_added: usize,
+}
+
+/// A `!` bash-mode submission parsed from the composer text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashSubmission {
+    /// Command text with the leading mode `!` removed.
+    pub command: String,
+    /// `!!` — run without adding the command or output to the model context.
+    pub exclude_from_context: bool,
+}
+
+/// Parse a composer submission as a bash command.
+///
+/// `bash_mode` is the editor's explicit mode bit; a `!` prefix alone never
+/// selects bash execution (a pasted `!…` is plain text). Inside bash mode the
+/// mode `!` is optional — after the first command the editor stays in bash
+/// mode with an empty (prefix-free) composer, like a shell prompt. `!!`
+/// (one extra `!`) keeps the existing "exclude from context" semantics.
+pub fn parse_bash_submission(bash_mode: bool, text: &str) -> Option<BashSubmission> {
+    if !bash_mode {
+        return None;
+    }
+    let text = text.trim();
+    let command = text.strip_prefix('!').unwrap_or(text);
+    let (exclude_from_context, command) = match command.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, command),
+    };
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some(BashSubmission {
+        command: command.to_string(),
+        exclude_from_context,
+    })
+}
+
 /// A parsed `[paste #N ( +L lines | C chars)?]` marker occurrence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PasteMarker {
@@ -181,6 +485,44 @@ pub struct Editor {
     /// The next printable key jumps; any control key cancels and falls
     /// through.
     jump_mode: Mutex<Option<bool>>,
+    /// Monotone revision of the editable CONTENT (lines + paste registry).
+    /// Cursor position is folded into [`Component::content_revision`] without
+    /// a bump, so cursor moves never invalidate the wrap-layout cache.
+    content_rev: std::sync::atomic::AtomicU64,
+    /// Revision of render-affecting style inputs (border color, padding,
+    /// hardware cursor) folded into [`Component::content_revision`].
+    style_rev: std::sync::atomic::AtomicU64,
+    /// Incremental wrap layout keyed on `(content_rev, width)`.
+    layout_cache: Mutex<LayoutCache>,
+    layout_full_builds: std::sync::atomic::AtomicU64,
+    layout_incremental_updates: std::sync::atomic::AtomicU64,
+    layout_lines_built: std::sync::atomic::AtomicU64,
+    layout_render_passes: std::sync::atomic::AtomicU64,
+    layout_rendered_lines: std::sync::atomic::AtomicU64,
+    layout_cache_hits: std::sync::atomic::AtomicU64,
+    /// Input-pipeline diagnostic counters ([`EditorIoStats`]).
+    io_insert_calls: std::sync::atomic::AtomicU64,
+    io_insert_chars: std::sync::atomic::AtomicU64,
+    io_insert_bursts: std::sync::atomic::AtomicU64,
+    io_insert_burst_chars: std::sync::atomic::AtomicU64,
+    io_paste_calls: std::sync::atomic::AtomicU64,
+    io_paste_bytes: std::sync::atomic::AtomicU64,
+    io_undo_pushes: std::sync::atomic::AtomicU64,
+    io_snapshot_calls: std::sync::atomic::AtomicU64,
+    io_snapshot_lines: std::sync::atomic::AtomicU64,
+    /// Accounting for the most recent [`Editor::paste_text`] call.
+    last_paste: Mutex<Option<PasteReport>>,
+    /// True between consecutive `paste_text` calls with no other editing
+    /// action: a bracketless paste arrives as many chunks, and one undo
+    /// snapshot for the whole burst (instead of one per chunk, each cloning
+    /// the full draft) keeps the paste path linear. Any non-paste mutation
+    /// ends the burst.
+    paste_burst: std::sync::atomic::AtomicBool,
+    /// Explicit `!` bash mode (BASHMODE). Entered ONLY by a key-origin `!`
+    /// typed into an empty composer; bracketed/clipboard paste never sets
+    /// it. Stays active after a command runs (shell-prompt semantics) until
+    /// Esc, a backspace/delete of the leading `!`, or an explicit exit.
+    bash_mode: std::sync::atomic::AtomicBool,
 }
 
 impl Editor {
@@ -202,7 +544,96 @@ impl Editor {
             snapped_from_cursor_col: Mutex::new(None),
             show_hardware_cursor: std::sync::atomic::AtomicBool::new(false),
             jump_mode: Mutex::new(None),
+            content_rev: std::sync::atomic::AtomicU64::new(1),
+            style_rev: std::sync::atomic::AtomicU64::new(0),
+            layout_cache: Mutex::new(LayoutCache::default()),
+            layout_full_builds: std::sync::atomic::AtomicU64::new(0),
+            layout_incremental_updates: std::sync::atomic::AtomicU64::new(0),
+            layout_lines_built: std::sync::atomic::AtomicU64::new(0),
+            layout_render_passes: std::sync::atomic::AtomicU64::new(0),
+            layout_rendered_lines: std::sync::atomic::AtomicU64::new(0),
+            layout_cache_hits: std::sync::atomic::AtomicU64::new(0),
+            io_insert_calls: std::sync::atomic::AtomicU64::new(0),
+            io_insert_chars: std::sync::atomic::AtomicU64::new(0),
+            io_insert_bursts: std::sync::atomic::AtomicU64::new(0),
+            io_insert_burst_chars: std::sync::atomic::AtomicU64::new(0),
+            io_paste_calls: std::sync::atomic::AtomicU64::new(0),
+            io_paste_bytes: std::sync::atomic::AtomicU64::new(0),
+            io_undo_pushes: std::sync::atomic::AtomicU64::new(0),
+            io_snapshot_calls: std::sync::atomic::AtomicU64::new(0),
+            io_snapshot_lines: std::sync::atomic::AtomicU64::new(0),
+            last_paste: Mutex::new(None),
+            paste_burst: std::sync::atomic::AtomicBool::new(false),
+            bash_mode: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn end_paste_burst(&self) {
+        self.paste_burst
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn touch_style(&self) {
+        self.style_rev
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn touch_content(&self) -> u64 {
+        self.content_rev
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+
+    fn invalidate_layout_cache(&self) {
+        self.layout_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate();
+    }
+
+    /// Cached-layout counters (tests / performance probes).
+    pub fn layout_cache_stats(&self) -> LayoutCacheStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        LayoutCacheStats {
+            full_builds: self.layout_full_builds.load(Relaxed),
+            incremental_updates: self.layout_incremental_updates.load(Relaxed),
+            lines_built: self.layout_lines_built.load(Relaxed),
+            render_passes: self.layout_render_passes.load(Relaxed),
+            rendered_lines: self.layout_rendered_lines.load(Relaxed),
+            cache_hits: self.layout_cache_hits.load(Relaxed),
+        }
+    }
+
+    /// Input-pipeline counters (tests / performance probes).
+    pub fn io_stats(&self) -> EditorIoStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        EditorIoStats {
+            insert_calls: self.io_insert_calls.load(Relaxed),
+            insert_chars: self.io_insert_chars.load(Relaxed),
+            insert_bursts: self.io_insert_bursts.load(Relaxed),
+            insert_burst_chars: self.io_insert_burst_chars.load(Relaxed),
+            paste_calls: self.io_paste_calls.load(Relaxed),
+            paste_bytes: self.io_paste_bytes.load(Relaxed),
+            undo_pushes: self.io_undo_pushes.load(Relaxed),
+            snapshot_calls: self.io_snapshot_calls.load(Relaxed),
+            snapshot_lines: self.io_snapshot_lines.load(Relaxed),
+        }
+    }
+
+    /// Accounting for the most recent [`Editor::paste_text`] call.
+    pub fn last_paste_report(&self) -> Option<PasteReport> {
+        *self
+            .last_paste
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Current undo depth (tests pin "one snapshot per paste").
+    pub fn undo_depth(&self) -> usize {
+        self.undo_stack
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// `showHardwareCursor` (settings / `PI_HARDWARE_CURSOR=1`): when true
@@ -211,13 +642,22 @@ impl Editor {
     pub fn set_show_hardware_cursor(&self, show: bool) {
         self.show_hardware_cursor
             .store(show, std::sync::atomic::Ordering::Relaxed);
+        self.touch_style();
     }
 
     pub fn set_border_color(&self, color: String) {
-        *self
+        let mut current = self
             .border_color
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(color);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The dock recomputes the mode-dependent border each frame; only a
+        // real change may bump the style revision (a bump rebuilds layout).
+        if current.as_deref() == Some(color.as_str()) {
+            return;
+        }
+        *current = Some(color);
+        drop(current);
+        self.touch_style();
     }
 
     /// `editorPaddingX` (upstream `getEditorPaddingX`, clamped 0..=3 by the
@@ -227,6 +667,7 @@ impl Editor {
     pub fn set_padding_x(&self, padding_x: usize) {
         self.padding_x
             .store(padding_x, std::sync::atomic::Ordering::Relaxed);
+        self.touch_style();
     }
 
     fn border(&self) -> String {
@@ -270,6 +711,7 @@ impl Editor {
     /// first line (history restore going Up), otherwise at the end of the
     /// last line (default / Down).
     fn set_text_placement(&self, text: &str, at_start: bool) {
+        self.end_paste_burst();
         let mut state = self
             .state
             .lock()
@@ -286,19 +728,80 @@ impl Editor {
                 .map(|line| line.chars().count())
                 .unwrap_or(0);
         }
+        self.touch_content();
+        drop(state);
+        self.invalidate_layout_cache();
     }
 
     pub fn clear(&self) {
         self.set_text("");
     }
 
+    /// Whether the composer is in explicit `!` bash mode.
+    pub fn is_bash_mode(&self) -> bool {
+        self.bash_mode.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Drop bash mode without touching the draft (session rebind).
+    pub fn clear_bash_mode(&self) {
+        self.bash_mode
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Enter bash mode without touching the text (used when restoring an
+    /// empty `!` submission and by tests). The normal entry is
+    /// [`Editor::insert_char`] with `!` on an empty composer.
+    pub fn enter_bash_mode(&self) {
+        self.bash_mode
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Leave bash mode: clears the mode flag and strips the leading mode `!`
+    /// from the draft (the rest stays as a normal AI prompt). Returns whether
+    /// the editor was in bash mode.
+    pub fn exit_bash_mode(&self) -> bool {
+        let was_bash = self
+            .bash_mode
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if !was_bash {
+            return false;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .lines
+            .first()
+            .is_some_and(|line| line.starts_with('!'))
+        {
+            self.push_undo(&state);
+            let line = &mut state.lines[0];
+            line.remove(0);
+            if state.cursor_line == 0 && state.cursor_col > 0 {
+                state.cursor_col -= 1;
+            }
+            self.touch_content();
+            drop(state);
+            self.invalidate_layout_cache();
+        }
+        true
+    }
+
     /// Snapshot of the editor state (lines + cursor) for autocomplete
     /// providers.
     pub fn state_snapshot(&self) -> EditorState {
-        self.state
+        let state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.io_snapshot_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.io_snapshot_lines.fetch_add(
+            state.lines.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        state.clone()
     }
 
     /// Replace the whole state with an externally computed result (used by
@@ -307,6 +810,7 @@ impl Editor {
     /// (`editor.ts:772-783, 2244-2255, 2395-2406`), so the replacement is
     /// undoable.
     pub fn apply_state(&self, lines: Vec<String>, cursor_line: usize, cursor_col: usize) {
+        self.end_paste_burst();
         let mut state = self
             .state
             .lock()
@@ -319,6 +823,9 @@ impl Editor {
         state.cursor_line = cursor_line.min(state.lines.len() - 1);
         state.cursor_col = Self::normalize_col(&state, state.cursor_line, cursor_col);
         self.clear_sticky_columns();
+        self.touch_content();
+        drop(state);
+        self.invalidate_layout_cache();
     }
 
     /// Insert pasted text at the cursor after cleaning it — port of upstream
@@ -343,14 +850,29 @@ impl Editor {
     ///
     /// Returns the cleaned text actually inserted (for status reporting).
     pub fn paste_text(&self, text: &str) -> String {
+        self.io_paste_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.io_paste_bytes.fetch_add(
+            text.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let continuing_paste = self
+            .paste_burst
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
         self.set_last_action(None);
+        // `set_last_action` ends a paste burst; this call is the burst.
+        self.paste_burst
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.clear_sticky_columns();
-        self.push_undo_snapshot();
-        let mut filtered = Self::clean_paste_text(text);
+        let undo_before = self.undo_depth();
+        if !continuing_paste {
+            self.push_undo_snapshot();
+        }
+        let mut cleaned = Self::clean_paste_text(text);
 
         // Path-like paste after a word character gets a leading space for
         // readability (upstream `editor.ts:1290-1296`).
-        if filtered.starts_with(['/', '~', '.']) {
+        if cleaned.text.starts_with(['/', '~', '.']) {
             let word_before_cursor = {
                 let state = self
                     .state
@@ -365,15 +887,33 @@ impl Editor {
                     })
             };
             if word_before_cursor {
-                filtered.insert(0, ' ');
+                let mut with_space = String::with_capacity(cleaned.text.len() + 1);
+                with_space.push(' ');
+                with_space.push_str(cleaned.text.as_ref());
+                cleaned.copied_bytes += with_space.len();
+                cleaned.cleaning_allocations += 1;
+                cleaned.char_count += 1;
+                cleaned.text = Cow::Owned(with_space);
             }
         }
 
-        let pasted_lines = filtered.split('\n').count();
-        let total_chars = filtered.chars().count();
+        let pasted_lines = cleaned.line_count;
+        let total_chars = cleaned.char_count;
+        let mut report = PasteReport {
+            input_bytes: text.len(),
+            output_bytes: cleaned.text.len(),
+            output_chars: total_chars,
+            line_count: pasted_lines,
+            cleaning_allocations: cleaned.cleaning_allocations,
+            copied_bytes: cleaned.copied_bytes,
+            undo_snapshots: 0,
+            inserted_lines: 0,
+        };
+        let input_was_borrowed = matches!(&cleaned.text, Cow::Borrowed(_));
         if pasted_lines > PASTE_FOLD_MAX_LINES || total_chars > PASTE_FOLD_MAX_CHARS {
             // Store the paste and insert a marker (upstream
-            // `editor.ts:1304-1315`).
+            // `editor.ts:1304-1315`). One Arc copy of the cleaned payload;
+            // the returned `String` is the only other full-size copy.
             let paste_id = {
                 let mut registry = self
                     .paste_registry
@@ -382,32 +922,204 @@ impl Editor {
                 registry.paste_counter += 1;
                 registry.paste_counter
             };
+            let stored: std::sync::Arc<str> = std::sync::Arc::from(cleaned.text.as_ref());
+            report.copied_bytes += stored.len();
             self.paste_registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pastes
-                .insert(paste_id, std::sync::Arc::from(filtered.as_str()));
+                .insert(paste_id, stored);
             let marker = if pasted_lines > PASTE_FOLD_MAX_LINES {
                 format!("[paste #{paste_id} +{pasted_lines} lines]")
             } else {
                 format!("[paste #{paste_id} {total_chars} chars]")
             };
-            self.insert_text_inner(&marker);
-            return filtered;
+            let inserted = self.insert_text_inner(&marker);
+            report.inserted_lines = inserted.lines_added;
+            report.copied_bytes += inserted.copied_bytes;
+            let returned = cleaned.text.into_owned();
+            if input_was_borrowed {
+                report.copied_bytes += returned.len();
+            }
+            report.undo_snapshots = self.undo_depth().saturating_sub(undo_before) as u64;
+            *self
+                .last_paste
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
+            return returned;
         }
 
-        self.insert_text_inner(&filtered);
-        filtered
+        let inserted = self.insert_text_burst(cleaned.text.as_ref());
+        report.inserted_lines = inserted.lines_added;
+        report.copied_bytes += inserted.copied_bytes;
+        let returned = cleaned.text.into_owned();
+        if input_was_borrowed {
+            report.copied_bytes += returned.len();
+        }
+        report.undo_snapshots = self.undo_depth().saturating_sub(undo_before) as u64;
+        *self
+            .last_paste
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
+        returned
     }
 
-    /// Paste cleaning pipeline — upstream `handlePaste` (:1267-1286).
-    fn clean_paste_text(text: &str) -> String {
-        let decoded = Self::decode_csi_u_controls(text);
-        let normalized = super::clipboard::normalize_newlines(&decoded).replace('\t', "    ");
-        normalized
-            .chars()
-            .filter(|character| *character == '\n' || (*character as u32) >= 0x20)
-            .collect()
+    /// Single-pass paste cleaner — upstream `handlePaste` (:1267-1286):
+    /// CSI-u control decode, `\r\n`/`\r` → `\n`, tab → four spaces, then drop
+    /// C0 controls. Scans the input bytes once; the output `String` is
+    /// allocated only when a byte actually changes (the clean case borrows the
+    /// caller's text). Line/char counts are accumulated during the same pass,
+    /// replacing the old `split('\n').count()` + `chars().count()` rescans.
+    fn clean_paste_text(text: &str) -> CleanedPaste<'_> {
+        let bytes = text.as_bytes();
+        let mut output: Option<String> = None;
+        let mut run_start = 0usize;
+        let mut index = 0usize;
+        let mut line_count = 1usize;
+        let mut char_count = 0usize;
+        let mut copied_bytes = 0usize;
+
+        while index < bytes.len() {
+            let byte = bytes[index];
+            let special =
+                byte == b'\x1b' || byte == b'\r' || byte == b'\t' || (byte < 0x20 && byte != b'\n');
+            if !special {
+                if byte < 0x80 {
+                    if byte >= 0x20 || byte == b'\n' {
+                        char_count += 1;
+                        if byte == b'\n' {
+                            line_count += 1;
+                        }
+                    }
+                } else if byte & 0xC0 != 0x80 {
+                    // UTF-8 lead byte: one char; continuation bytes are
+                    // copied without counting.
+                    char_count += 1;
+                }
+                index += 1;
+                continue;
+            }
+
+            let out = output.get_or_insert_with(|| String::with_capacity(bytes.len()));
+            if run_start < index {
+                let unchanged = &text[run_start..index];
+                out.push_str(unchanged);
+                copied_bytes += unchanged.len();
+            }
+
+            match byte {
+                b'\r' => {
+                    if index + 1 < bytes.len() && bytes[index + 1] == b'\n' {
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                    out.push('\n');
+                    line_count += 1;
+                    char_count += 1;
+                }
+                b'\t' => {
+                    out.push_str("    ");
+                    char_count += 4;
+                    index += 1;
+                }
+                b'\x1b' => {
+                    if let Some((consumed, control)) = Self::decode_csi_u_at(bytes, index) {
+                        match control {
+                            '\n' => {
+                                out.push('\n');
+                                line_count += 1;
+                                char_count += 1;
+                            }
+                            '\r' => {
+                                out.push('\n');
+                                line_count += 1;
+                                char_count += 1;
+                            }
+                            '\t' => {
+                                out.push_str("    ");
+                                char_count += 4;
+                            }
+                            character if (character as u32) >= 0x20 => {
+                                out.push(character);
+                                char_count += 1;
+                            }
+                            // Decoded C0 controls are dropped by the same
+                            // `>= 0x20` filter as before.
+                            _ => {}
+                        }
+                        index += consumed;
+                    } else {
+                        // Not a decodable CSI-u control: the ESC itself is a
+                        // C0 control and is dropped; the printable tail (if
+                        // any) is copied on the next iterations.
+                        index += 1;
+                    }
+                }
+                // Remaining C0 controls are dropped.
+                _ => {
+                    index += 1;
+                }
+            }
+            run_start = index;
+        }
+
+        match output {
+            None => CleanedPaste {
+                text: Cow::Borrowed(text),
+                line_count,
+                char_count,
+                cleaning_allocations: 0,
+                copied_bytes: 0,
+            },
+            Some(mut output) => {
+                if run_start < bytes.len() {
+                    let tail = &text[run_start..];
+                    output.push_str(tail);
+                    copied_bytes += tail.len();
+                }
+                CleanedPaste {
+                    text: Cow::Owned(output),
+                    line_count,
+                    char_count,
+                    cleaning_allocations: 1,
+                    copied_bytes,
+                }
+            }
+        }
+    }
+
+    /// Match a decodable `ESC [ <digits> ; 5 u` CSI-u control at `index`.
+    /// Returns `(consumed_bytes, control_char)`; `None` leaves the ESC to be
+    /// filtered and the sequence tail to be copied verbatim, matching the old
+    /// two-phase decoder.
+    fn decode_csi_u_at(bytes: &[u8], index: usize) -> Option<(usize, char)> {
+        if bytes.get(index) != Some(&b'\x1b') || bytes.get(index + 1) != Some(&b'[') {
+            return None;
+        }
+        let digits_start = index + 2;
+        let mut end = digits_start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == digits_start
+            || end + 2 >= bytes.len()
+            || bytes[end] != b';'
+            || bytes[end + 1] != b'5'
+            || bytes[end + 2] != b'u'
+        {
+            return None;
+        }
+        let codepoint = bytes[digits_start..end].iter().fold(0u32, |acc, digit| {
+            acc.saturating_mul(10)
+                .saturating_add((*digit - b'0') as u32)
+        });
+        let control = match codepoint {
+            97..=122 => Some((codepoint - 96) as u8 as char),
+            65..=90 => Some((codepoint - 64) as u8 as char),
+            _ => None,
+        };
+        control.map(|control| (end + 3 - index, control))
     }
 
     /// Expand `[paste #N …]` markers back to their stored content (port of
@@ -447,52 +1159,6 @@ impl Editor {
             index += 1;
         }
         out
-    }
-
-    /// Decode CSI-u re-encoded control bytes (`ESC [ <codepoint> ; 5 u`)
-    /// back to their literal control character — port of the decode step in
-    /// upstream `handlePaste` (`editor.ts:1267-1277`). Some terminals (tmux
-    /// with `extended-keys-format=csi-u`) re-encode control bytes inside
-    /// bracketed paste; decoding first keeps newlines intact instead of
-    /// letting the `>= 0x20` filter strip the ESC and leak the printable
-    /// tail (e.g. "[106;5u") into the editor.
-    fn decode_csi_u_controls(text: &str) -> String {
-        let chars: Vec<char> = text.chars().collect();
-        let mut decoded = String::with_capacity(text.len());
-        let mut index = 0;
-        while index < chars.len() {
-            if chars[index] == '\x1b' && chars.get(index + 1) == Some(&'[') {
-                let digits_start = index + 2;
-                let mut end = digits_start;
-                while end < chars.len() && chars[end].is_ascii_digit() {
-                    end += 1;
-                }
-                let is_csi_u = end > digits_start
-                    && end + 2 < chars.len()
-                    && chars[end] == ';'
-                    && chars[end + 1] == '5'
-                    && chars[end + 2] == 'u';
-                if is_csi_u {
-                    let codepoint = chars[digits_start..end].iter().fold(0u32, |acc, digit| {
-                        acc.saturating_mul(10)
-                            .saturating_add(*digit as u32 - '0' as u32)
-                    });
-                    let control = match codepoint {
-                        97..=122 => Some((codepoint - 96) as u8 as char),
-                        65..=90 => Some((codepoint - 64) as u8 as char),
-                        _ => None,
-                    };
-                    if let Some(control) = control {
-                        decoded.push(control);
-                        index = end + 3;
-                        continue;
-                    }
-                }
-            }
-            decoded.push(chars[index]);
-            index += 1;
-        }
-        decoded
     }
 
     fn normalize_col(state: &EditorState, line_index: usize, col: usize) -> usize {
@@ -664,6 +1330,9 @@ impl Editor {
             }
             *line = out;
         }
+        self.touch_content();
+        drop(state);
+        self.invalidate_layout_cache();
     }
 
     /// Insert `text` at the cursor (newlines split lines). One undo
@@ -673,9 +1342,29 @@ impl Editor {
         if text.is_empty() {
             return;
         }
+        self.end_paste_burst();
         self.push_undo_snapshot();
         self.set_last_action(None);
         self.insert_text_inner(text);
+    }
+
+    /// Batch insertion for an input burst or a paste chunk: the caller owns
+    /// the undo snapshot (a paste burst is one undo unit), and the whole
+    /// `text` lands in ONE line-vector splice and ONE layout-cache update.
+    /// This is the seam the terminal's `Event::Paste` path uses, so a
+    /// coalesced burst never regresses to one `String::insert` (and one
+    /// layout rebuild) per character.
+    pub fn insert_text_burst(&self, text: &str) -> InsertOutcome {
+        if text.is_empty() {
+            return InsertOutcome::default();
+        }
+        self.io_insert_bursts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.io_insert_burst_chars.fetch_add(
+            text.chars().count() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.insert_text_inner(text)
     }
 
     /// Type a single character — port of upstream `insertCharacter`
@@ -684,6 +1373,14 @@ impl Editor {
     /// captures the state before itself (so undo removes the space plus the
     /// word typed after it together).
     pub fn insert_char(&self, c: char) {
+        // BASHMODE: a real key event `!` typed into an EMPTY composer is the
+        // mode switch. Paste paths never reach `insert_char` (they call
+        // `paste_text`/`insert_text_burst`), so a pasted `!…` stays plain
+        // text even though it lands at the same position.
+        if c == '!' && !self.is_bash_mode() && self.get_text().is_empty() {
+            self.bash_mode
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         if c.is_whitespace() || self.last_action() != Some(LastAction::TypeWord) {
             self.push_undo_snapshot();
         }
@@ -693,10 +1390,16 @@ impl Editor {
 
     /// Insertion without undo bookkeeping — callers push their own snapshot
     /// (upstream `insertTextAtCursorInternal`, `editor.ts:1157-1198`).
-    fn insert_text_inner(&self, text: &str) {
+    fn insert_text_inner(&self, text: &str) -> InsertOutcome {
         if text.is_empty() {
-            return;
+            return InsertOutcome::default();
         }
+        self.io_insert_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.io_insert_chars.fetch_add(
+            text.chars().count() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut state = self
             .state
             .lock()
@@ -704,56 +1407,122 @@ impl Editor {
         self.clear_sticky_columns();
         let cursor_line = state.cursor_line;
         let col = Self::normalize_col(&state, cursor_line, state.cursor_col);
+        let mut outcome = InsertOutcome::default();
 
         // Splice into the line vector IN PLACE: the previous shape rebuilt
         // `state.lines` with `.to_vec()` plus a clone of every tail line, so
         // every typed character copied the whole draft (O(n²) bytes over a
         // long prompt). Only the edited line's bytes are copied now; the
         // untouched lines are moved within the same allocation.
-        let parts: Vec<&str> = text.split('\n').collect();
-        if parts.len() == 1 {
-            // Single piece: splice into the current line, cursor after it.
-            let only = parts[0];
-            let new_line = {
-                let line = &state.lines[cursor_line];
-                let char_index = line
-                    .char_indices()
-                    .nth(col)
-                    .map(|(i, _)| i)
-                    .unwrap_or(line.len());
-                let (before, after) = line.split_at(char_index);
-                format!("{before}{only}{after}")
-            };
-            state.lines[cursor_line] = new_line;
+        if !text.contains('\n') {
+            // Single piece: insert into the line's existing allocation.
+            // `String::insert_str` grows geometrically and, at the common
+            // append position, copies only the new chunk — the old
+            // `format!("{before}{only}{after}")` copied the whole line per
+            // paste chunk (O(n²) across a chunked paste).
+            let only = text;
+            let line = &mut state.lines[cursor_line];
+            let byte_index = char_byte_offset(line, col);
+            line.insert_str(byte_index, only);
             state.cursor_col = col + only.chars().count();
+            outcome.copied_bytes = only.len();
         } else {
             // Multi-piece: first joins the current line, the last piece
             // joins the remainder, middle pieces become their own lines
-            // (upstream `insertText`).
-            let last_index = parts.len() - 1;
-            let (first, last) = {
+            // (upstream `insertText`). One `Vec<String>` is built for the
+            // replacement; the tail of `state.lines` is only shifted.
+            let mut parts = text.split('\n').peekable();
+            let first = parts.next().unwrap_or("");
+            let mut middle: Vec<String> = Vec::new();
+            let mut last = "";
+            while let Some(piece) = parts.next() {
+                if parts.peek().is_none() {
+                    last = piece;
+                    break;
+                }
+                middle.push(piece.to_string());
+            }
+            let (first_line, last_line) = {
                 let line = &state.lines[cursor_line];
-                let char_index = line
-                    .char_indices()
-                    .nth(col)
-                    .map(|(i, _)| i)
-                    .unwrap_or(line.len());
-                let (before, after) = line.split_at(char_index);
-                (
-                    format!("{before}{}", parts[0]),
-                    format!("{}{after}", parts[last_index]),
-                )
+                let byte_index = char_byte_offset(line, col);
+                let (before, after) = line.split_at(byte_index);
+                let mut first_line = String::with_capacity(before.len() + first.len());
+                first_line.push_str(before);
+                first_line.push_str(first);
+                let mut last_line = String::with_capacity(last.len() + after.len());
+                last_line.push_str(last);
+                last_line.push_str(after);
+                (first_line, last_line)
             };
-            let middle = parts[1..last_index].iter().map(|part| (*part).to_string());
-            state.lines.splice(
-                cursor_line..=cursor_line,
-                std::iter::once(first)
-                    .chain(middle)
-                    .chain(std::iter::once(last)),
-            );
-            state.cursor_line = cursor_line + last_index;
-            state.cursor_col = parts[last_index].chars().count();
+            let new_line_count = middle.len() + 2;
+            let mut replacement = Vec::with_capacity(new_line_count);
+            outcome.copied_bytes = first_line.len() + last_line.len();
+            replacement.push(first_line);
+            for piece in middle {
+                outcome.copied_bytes += piece.len();
+                replacement.push(piece);
+            }
+            replacement.push(last_line);
+            state.lines.splice(cursor_line..=cursor_line, replacement);
+            state.cursor_line = cursor_line + new_line_count - 1;
+            state.cursor_col = last.chars().count();
+            outcome.lines_added = new_line_count - 1;
         }
+
+        let revision = self.touch_content();
+        let valid_ids = self.valid_paste_ids();
+        self.update_layout_cache_after_splice(
+            &state,
+            cursor_line,
+            1,
+            if outcome.lines_added == 0 {
+                1
+            } else {
+                outcome.lines_added + 1
+            },
+            revision,
+            &valid_ids,
+        );
+        outcome
+    }
+
+    /// Update the wrap cache for an in-place splice that replaced one logical
+    /// line with `added` lines. Untouched tail plans stay valid; only the
+    /// inserted/modified lines are rebuilt and the tail's visual offsets are
+    /// shifted.
+    fn update_layout_cache_after_splice(
+        &self,
+        state: &EditorState,
+        start: usize,
+        removed: usize,
+        added: usize,
+        revision: u64,
+        valid_ids: &[usize],
+    ) {
+        let mut cache = self
+            .layout_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expected_old_len = state.lines.len() + removed - added;
+        if !cache.valid
+            || cache.revision.wrapping_add(1) != revision
+            || cache.lines.len() != expected_old_len
+            || start + added > state.lines.len()
+        {
+            cache.invalidate();
+            return;
+        }
+        let width = cache.width;
+        let replacement: Vec<LineLayoutPlan> = (start..start + added)
+            .map(|index| build_line_layout(&state.lines[index], width, valid_ids))
+            .collect();
+        self.layout_lines_built.fetch_add(
+            replacement.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.layout_incremental_updates
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cache.replace_lines(start, removed, replacement, revision);
     }
 
     pub fn newline(&self) {
@@ -768,6 +1537,14 @@ impl Editor {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.clear_sticky_columns();
         let col = Self::normalize_col(&state, state.cursor_line, state.cursor_col);
+        // BASHMODE: deleting the leading mode `!` leaves bash mode.
+        let deletes_bash_prefix = self.is_bash_mode()
+            && state.cursor_line == 0
+            && col == 1
+            && state
+                .lines
+                .first()
+                .is_some_and(|line| line.starts_with('!'));
         if col > 0 {
             self.push_undo(&state);
             let line = state.lines[state.cursor_line].clone();
@@ -783,7 +1560,13 @@ impl Editor {
                 let cursor_line = state.cursor_line;
                 state.lines[cursor_line] = format!("{keep}{rest}");
                 state.cursor_col = col - marker.len;
+                if deletes_bash_prefix {
+                    self.bash_mode
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.touch_content();
                 drop(state);
+                self.invalidate_layout_cache();
                 self.remove_paste_and_renumber(marker.id);
                 return;
             }
@@ -796,6 +1579,10 @@ impl Editor {
             let rest: String = chars[col..].iter().collect();
             state.lines[cursor_line] = format!("{keep}{rest}");
             state.cursor_col = col - step;
+            if deletes_bash_prefix {
+                self.bash_mode
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
         } else if state.cursor_line > 0 {
             self.push_undo(&state);
             // Upstream merges into `lines[cursorLine - 1]` BEFORE splicing
@@ -810,6 +1597,9 @@ impl Editor {
             state.cursor_line -= 1;
             state.cursor_col = prev_len;
         }
+        self.touch_content();
+        drop(state);
+        self.invalidate_layout_cache();
     }
 
     /// Move left one unit — port of upstream `moveCursor(0, -1)`
@@ -1307,6 +2097,11 @@ impl Editor {
         let col = Self::normalize_col(&state, state.cursor_line, state.cursor_col);
         let line = state.lines[state.cursor_line].clone();
         let len = line.chars().count();
+        // BASHMODE: forward-deleting the leading mode `!` leaves bash mode.
+        let deletes_bash_prefix = self.is_bash_mode()
+            && state.cursor_line == 0
+            && col == 0
+            && line.starts_with('!');
         if col < len {
             self.push_undo(&state);
             // Upstream `handleForwardDelete`: `segment(afterCursor,
@@ -1317,6 +2112,10 @@ impl Editor {
             let rest: String = chars[col + step..].iter().collect();
             let index = state.cursor_line;
             state.lines[index] = format!("{keep}{rest}");
+            if deletes_bash_prefix {
+                self.bash_mode
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
         } else if state.cursor_line + 1 < state.lines.len() {
             // At end of line: join the next line (upstream deleteCharForward).
             self.push_undo(&state);
@@ -1325,6 +2124,9 @@ impl Editor {
             let next = state.lines.remove(next_index);
             state.lines[current].push_str(&next);
         }
+        self.touch_content();
+        drop(state);
+        self.invalidate_layout_cache();
     }
 
     /// Delete back to the start of the previous word (upstream
@@ -1371,7 +2173,10 @@ impl Editor {
                 }
             }
         }
-        if !merged {
+        if merged {
+            self.touch_content();
+            self.invalidate_layout_cache();
+        } else {
             self.delete_range_on_current_line(target);
         }
     }
@@ -1416,7 +2221,10 @@ impl Editor {
                 }
             }
         }
-        if !merged {
+        if merged {
+            self.touch_content();
+            self.invalidate_layout_cache();
+        } else {
             self.delete_range_from_current_line(target);
         }
     }
@@ -1456,7 +2264,10 @@ impl Editor {
                 merged = true;
             }
         }
-        if !merged {
+        if merged {
+            self.touch_content();
+            self.invalidate_layout_cache();
+        } else {
             self.delete_range_on_current_line(0);
         }
     }
@@ -1494,7 +2305,10 @@ impl Editor {
                 merged = true;
             }
         }
-        if !merged {
+        if merged {
+            self.touch_content();
+            self.invalidate_layout_cache();
+        } else {
             let len = {
                 let state = self
                     .state
@@ -1524,6 +2338,9 @@ impl Editor {
         let index = state.cursor_line;
         state.lines[index] = format!("{keep}{rest}");
         state.cursor_col = target;
+        self.touch_content();
+        drop(state);
+        self.invalidate_layout_cache();
     }
 
     /// Delete `[cursor_col, target_col)` on the current line (target must be
@@ -1547,6 +2364,9 @@ impl Editor {
             let index = state.cursor_line;
             state.lines[index] = format!("{keep}{rest}");
         }
+        self.touch_content();
+        drop(state);
+        self.invalidate_layout_cache();
     }
 
     /// Submit: expand paste markers, snapshot the text, clear the editor,
@@ -1674,10 +2494,13 @@ impl Editor {
             drop(history);
             match draft {
                 Some(draft) => {
+                    self.end_paste_burst();
                     *self
                         .state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = draft;
+                    self.touch_content();
+                    self.invalidate_layout_cache();
                 }
                 None => self.set_text_placement("", false),
             }
@@ -1706,6 +2529,7 @@ impl Editor {
             .last_action
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = action;
+        self.end_paste_burst();
     }
 
     fn last_action_is_kill(&self) -> bool {
@@ -1715,6 +2539,8 @@ impl Editor {
     /// Push a snapshot of `state` plus the paste registry onto the undo
     /// stack (upstream `pushUndoSnapshot`, `editor.ts:2116-2118`).
     fn push_undo(&self, state: &EditorState) {
+        self.io_undo_pushes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let registry = self.paste_registry_snapshot();
         self.undo_stack
             .lock()
@@ -1789,6 +2615,8 @@ impl Editor {
             pastes: snapshot.pastes,
             paste_counter: snapshot.paste_counter,
         };
+        self.touch_content();
+        self.invalidate_layout_cache();
         self.set_last_action(None);
         self.clear_sticky_columns();
     }
@@ -1921,6 +2749,9 @@ impl Editor {
             state.cursor_line = start_line;
             state.cursor_col = start_col;
         }
+        self.touch_content();
+        drop(state);
+        self.invalidate_layout_cache();
     }
 
     /// Page up — port of upstream `pageScroll(-1)` (`editor.ts:1957-1971`):
@@ -2022,6 +2853,7 @@ impl Editor {
     /// line, history browsing ends, and the autocomplete popup refreshes on
     /// the next input pass. Out-of-range lines are ignored.
     pub fn set_cursor_position(&self, line: usize, col: usize) -> bool {
+        self.end_paste_burst();
         let mut state = self
             .state
             .lock()
@@ -2075,67 +2907,7 @@ impl Editor {
         find_current_visual_line(&visual_lines, &state) + 1 == visual_lines.len()
     }
 
-    /// Wrap the logical lines at `wrap_width` (the caller already subtracted
-    /// any cursor column / padding inset — upstream `layoutText(layoutWidth)`,
-    /// editor.ts:523-528, 998-1084). Wrapping is marker-aware: registered
-    /// paste markers never break across visual lines.
-    fn layout_lines<'a>(
-        state: &'a EditorState,
-        wrap_width: usize,
-        valid_ids: &[usize],
-    ) -> Vec<LayoutLine<'a>> {
-        let content_width = wrap_width.max(1);
-        // Every logical line yields at least one layout line, so the logical
-        // line count is a lower bound that saves the growth reallocations.
-        let mut layout: Vec<LayoutLine<'a>> = Vec::with_capacity(state.lines.len());
-        for (line_index, line) in state.lines.iter().enumerate() {
-            let col = if line_index == state.cursor_line {
-                Some(state.cursor_col)
-            } else {
-                None
-            };
-            if line.is_empty() {
-                layout.push(LayoutLine {
-                    text: Cow::Borrowed(""),
-                    cursor_pos: col.map(|_| 0),
-                });
-                continue;
-            }
-            if visible_width(line) <= content_width {
-                // Line fits in one layout line (upstream `editor.ts:1017-1030`).
-                layout.push(LayoutLine {
-                    text: Cow::Borrowed(line.as_str()),
-                    cursor_pos: col,
-                });
-                continue;
-            }
-            // Word-aware wrapping with (start, end) char chunks
-            // (upstream `wordWrapLine`).
-            let chunks = word_wrap_line(line, content_width, valid_ids);
-            let chars: Vec<char> = line.chars().collect();
-            for (chunk_index, chunk) in chunks.iter().enumerate() {
-                let is_last_chunk = chunk_index + 1 == chunks.len();
-                let has_cursor_in_chunk = col.is_some_and(|c| {
-                    if is_last_chunk {
-                        c >= chunk.start
-                    } else {
-                        c >= chunk.start && c < chunk.end
-                    }
-                });
-                let cursor_pos = has_cursor_in_chunk.then(|| {
-                    let pos = col.unwrap_or_default().saturating_sub(chunk.start);
-                    // Clamp into the chunk text (upstream clamps when the
-                    // cursor sits in trimmed whitespace, editor.ts:1059-1062).
-                    pos.min(chunk.end - chunk.start)
-                });
-                layout.push(LayoutLine {
-                    text: Cow::Owned(chars[chunk.start..chunk.end].iter().collect()),
-                    cursor_pos,
-                });
-            }
-        }
-        layout
-    }
+    /// `max_visible_lines` helper.
 
     fn max_visible_lines(terminal_rows: usize) -> usize {
         (terminal_rows * 30 / 100).max(5)
@@ -2261,14 +3033,27 @@ impl Editor {
         self.last_width
             .store(layout_width, std::sync::atomic::Ordering::Relaxed);
         let valid_ids = self.valid_paste_ids();
-        let layout = Self::layout_lines(&state, layout_width, &valid_ids);
+        let revision = self.content_rev.load(std::sync::atomic::Ordering::Relaxed);
+        let mut cache = self
+            .layout_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !cache.valid || cache.width != layout_width || cache.revision != revision {
+            cache.rebuild(&state, layout_width, &valid_ids, revision);
+            self.layout_full_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.layout_lines_built.fetch_add(
+                state.lines.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        } else {
+            self.layout_cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let total_visual = cache.total_visual();
+        let cursor_line_index = cache.cursor_visual_index(&state);
         let max_visible = max_visible_rows.max(1);
-
-        let cursor_line_index = layout
-            .iter()
-            .position(|line| line.cursor_pos.is_some())
-            .unwrap_or(0);
-        let max_scroll = layout.len().saturating_sub(max_visible);
+        let max_scroll = total_visual.saturating_sub(max_visible);
         let scroll_offset = if cursor_line_index >= max_visible {
             (cursor_line_index + 1)
                 .saturating_sub(max_visible)
@@ -2276,7 +3061,13 @@ impl Editor {
         } else {
             0
         };
-        let visible = &layout[scroll_offset..(scroll_offset + max_visible).min(layout.len())];
+        let visible_end = (scroll_offset + max_visible).min(total_visual);
+        let visible = cache.visible_layout_lines(&state, scroll_offset, visible_end);
+        self.layout_render_passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.layout_rendered_lines
+            .fetch_add(visible.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        drop(cache);
 
         // Upstream `renderTopBorder` (editor.ts:511-514): plain `─` run when
         // nothing is hidden above, `↑ N more` scroll label otherwise.
@@ -2373,7 +3164,7 @@ impl Editor {
         // Upstream `renderBottomBorder` (editor.ts:516-519) with
         // `linesBelow = layoutLines.length - (scrollOffset + visible.length)`
         // (:615): plain `─` run when nothing is hidden below.
-        let hidden_below = layout.len() - (scroll_offset + visible.len());
+        let hidden_below = total_visual - (scroll_offset + visible.len());
         let bottom_border = if hidden_below > 0 {
             Self::scroll_border("↓", hidden_below, width)
         } else {
@@ -2417,6 +3208,20 @@ impl Component for Editor {
             Self::max_visible_lines(COMPONENT_RENDER_TERMINAL_ROWS),
             out,
         );
+    }
+
+    fn content_revision(&self) -> Option<u64> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let content = self.content_rev.load(std::sync::atomic::Ordering::Relaxed);
+        let style = self.style_rev.load(std::sync::atomic::Ordering::Relaxed);
+        let cursor = ((state.cursor_line as u64) << 32) | (state.cursor_col as u64 & 0xffff_ffff);
+        Some(super::core::mix_content_revision(
+            super::core::mix_content_revision(content, style),
+            cursor,
+        ))
     }
 
     fn invalidate(&self) {}

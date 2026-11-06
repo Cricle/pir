@@ -312,43 +312,73 @@ impl ExtensionHandle {
         // it back, and the rewritten payload is moved home in the reply. The
         // exclusive `&mut` borrow means no other thread can observe the
         // temporarily-empty slot while we await.
-        let mailbox_payload = Arc::new(std::mem::take(payload));
-        self.command_queued();
-        if let Err(send_error) = tx
-            .send(Command::Emit {
+        let mut mailbox_payload = Some(Arc::new(std::mem::take(payload)));
+        // The mailbox SEND and the reply wait share ONE caller-side deadline.
+        // `Sender::reserve` is cancel-safe: a timeout while the mailbox is full
+        // (the actor is wedged in a synchronous host fn and stopped draining)
+        // drops the reservation future without consuming the payload, so the
+        // caller keeps its value and reports a bounded error instead of
+        // hanging in `send` forever.
+        let mut sent = false;
+        let result = tokio::time::timeout(event_timeout, async {
+            let permit = tx
+                .reserve()
+                .await
+                .map_err(|_| CommandWaitError::NotRunning)?;
+            // Count only once the command is actually queued: the actor's
+            // completion path releases the slot, and a sender that never got
+            // one must not leave `pending_commands` inflated.
+            self.command_queued();
+            let payload = mailbox_payload
+                .take()
+                .ok_or(CommandWaitError::NotRunning)?;
+            permit.send(Command::Emit {
                 event: event.to_owned(),
-                payload: mailbox_payload,
+                payload,
                 epoch,
                 timeout: event_timeout,
                 reply: reply_tx,
-            })
-            .await
-        {
-            self.command_cancelled();
-            // The actor is gone; a failed send hands the message back, so the
-            // caller keeps its payload (same observable behavior as the old
-            // clone-into-mailbox path).
-            if let Command::Emit {
-                payload: returned, ..
-            } = send_error.0
-            {
-                *payload = match Arc::try_unwrap(returned) {
-                    Ok(owned) => owned,
-                    Err(arc) => (*arc).clone(),
-                };
+            });
+            sent = true;
+            reply_rx.await.map_err(|_| CommandWaitError::ReplyDropped)
+        })
+        .await;
+        match result {
+            Ok(Ok(Ok((outcome, payload_out)))) => {
+                *payload = payload_out;
+                Ok(outcome)
             }
-            return Err(anyhow::anyhow!("extension actor is not running"));
-        }
-        let (outcome, payload_out) = match tokio::time::timeout(event_timeout, reply_rx).await {
-            Ok(reply) => reply.map_err(|_| {
+            Ok(Ok(Err(error))) => {
+                // The actor accepted the dispatch and returned its own error
+                // (including a structured `EventDispatchTimeout`); the
+                // mailbox payload moved with the command, so the caller gets
+                // a defined empty value back.
+                *payload = JsonValue::Null;
+                Err(error)
+            }
+            Ok(Err(CommandWaitError::NotRunning)) => {
+                // The actor is gone; the reservation failed before the payload
+                // moved, so hand the caller's value back untouched.
+                if let Some(returned) = mailbox_payload.take() {
+                    *payload = match Arc::try_unwrap(returned) {
+                        Ok(owned) => owned,
+                        Err(arc) => (*arc).clone(),
+                    };
+                }
+                Err(anyhow::anyhow!("extension actor is not running"))
+            }
+            Ok(Err(CommandWaitError::ReplyDropped)) => {
                 // The actor accepted the command but died before replying; the
                 // mailbox payload is gone with it, so restore the empty slot
                 // to a defined value instead of leaving the caller's payload
-                // as `Null` (the send-failure path below hands the value back;
-                // this one cannot).
+                // as `Null` (the send-failure path hands the value back; this
+                // one cannot).
                 *payload = JsonValue::Null;
-                anyhow::anyhow!("extension actor dropped the emit reply")
-            })??,
+                Err(anyhow::anyhow!("extension actor dropped the emit reply"))
+            }
+            Ok(Err(CommandWaitError::TimedOut(_))) => {
+                unreachable!("the deadline is enforced by the outer timeout")
+            }
             Err(_) => {
                 // Host-side enforcement of the documented per-call timeout.
                 // The actor-side deadline cannot fire while the actor thread
@@ -360,34 +390,48 @@ impl ExtensionHandle {
                 // dropped channel when the actor eventually finishes, and the
                 // ABANDONED marker makes the actor drop the dispatch's late
                 // side effects instead of applying them to the next run.
-                {
-                    let mut abandoned = self
-                        .abandoned_dispatch_epochs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    // Bounded: an abandoned epoch is normally cleared by the
-                    // handler's own `exitDispatch`; a handler torn down by an
-                    // interrupt may never settle, so cap the set (oldest
-                    // evicted — its notifications are already lost with it).
-                    const MAX_ABANDONED: usize = 256;
-                    if abandoned.len() >= MAX_ABANDONED {
-                        abandoned.pop_first();
+                if sent {
+                    {
+                        let mut abandoned = self
+                            .abandoned_dispatch_epochs
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        // Bounded: an abandoned epoch is normally cleared by
+                        // the handler's own `exitDispatch`; a handler torn
+                        // down by an interrupt may never settle, so cap the
+                        // set (oldest evicted — its notifications are already
+                        // lost with it).
+                        const MAX_ABANDONED: usize = 256;
+                        if abandoned.len() >= MAX_ABANDONED {
+                            abandoned.pop_first();
+                        }
+                        abandoned.insert(epoch);
                     }
-                    abandoned.insert(epoch);
+                    self.preempt_background_at_ms.store(
+                        crate::extensions::runtime::monotonic_millis(),
+                        Ordering::Relaxed,
+                    );
+                    *payload = JsonValue::Null;
+                    return Err(anyhow::Error::new(EventDispatchTimeout::new(
+                        event,
+                        event_timeout,
+                    )));
                 }
-                self.preempt_background_at_ms.store(
-                    crate::extensions::runtime::monotonic_millis(),
-                    Ordering::Relaxed,
-                );
-                *payload = JsonValue::Null;
-                return Err(anyhow::anyhow!(
-                    "event `{event}` dispatch timed out after {event_timeout:?} \
-                         (the extension actor is unresponsive)"
-                ));
+                // The deadline fired while waiting for a mailbox slot: the
+                // command was never queued, so `command_queued` never ran and
+                // the payload is still ours.
+                if let Some(returned) = mailbox_payload.take() {
+                    *payload = match Arc::try_unwrap(returned) {
+                        Ok(owned) => owned,
+                        Err(arc) => (*arc).clone(),
+                    };
+                }
+                Err(anyhow::Error::new(EventDispatchTimeout::mailbox_full(
+                    event,
+                    event_timeout,
+                )))
             }
-        };
-        *payload = payload_out;
-        Ok(outcome)
+        }
     }
 
     /// Dispatch `before_agent_start` under its dedicated budget
@@ -428,6 +472,14 @@ impl ExtensionHandle {
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
                 Some(pending.saturating_sub(1))
             });
+    }
+
+    /// Test probe: commands currently queued or executing in the actor
+    /// mailbox. Used by the mailbox-backpressure regression to prove a
+    /// timed-out handoff does not leak a `pending_commands` slot.
+    #[doc(hidden)]
+    pub fn pending_commands_for_tests(&self) -> usize {
+        self.pending_commands.load(Ordering::SeqCst)
     }
 
     /// The configured per-call event-dispatch budget
@@ -524,46 +576,68 @@ impl ExtensionHandle {
         let epoch = self.next_dispatch_epoch.fetch_add(1, Ordering::SeqCst);
         // Informational streaming event: not counted, so it never preempts
         // extension background work (see `Command::counts_pending`).
-        if let Err(error) = tx
-            .send(Command::EmitReadOnly {
+        //
+        // Send and reply share one deadline (same contract as `emit`): the
+        // mailbox is bounded, and an actor wedged in a synchronous host fn
+        // would otherwise leave this caller blocked in `send` forever.
+        let mut sent = false;
+        let result = tokio::time::timeout(event_timeout, async {
+            let permit = tx
+                .reserve()
+                .await
+                .map_err(|_| CommandWaitError::NotRunning)?;
+            permit.send(Command::EmitReadOnly {
                 event: event.to_owned(),
                 payload: payload_json,
                 epoch,
                 reply: reply_tx,
-            })
-            .await
-        {
-            let _ = error;
-            return Err(anyhow::anyhow!("extension actor is not running"));
-        }
-        match tokio::time::timeout(event_timeout, reply_rx).await {
-            Ok(reply) => {
-                reply.map_err(|_| anyhow::anyhow!("extension actor dropped the read-only reply"))?
+            });
+            sent = true;
+            reply_rx.await.map_err(|_| CommandWaitError::ReplyDropped)
+        })
+        .await;
+        match result {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Err(CommandWaitError::NotRunning)) => {
+                Err(anyhow::anyhow!("extension actor is not running"))
+            }
+            Ok(Err(CommandWaitError::ReplyDropped)) => Err(anyhow::anyhow!(
+                "extension actor dropped the read-only reply"
+            )),
+            Ok(Err(CommandWaitError::TimedOut(_))) => {
+                unreachable!("the deadline is enforced by the outer timeout")
             }
             Err(_) => {
                 // Caller-side abandonment (same rule as `emit`'s timeout
-                // arm): mark the epoch so the actor drops this dispatch's
-                // queued notifications/side effects, and nudge background
-                // preemption so the stuck turn yields sooner.
-                {
-                    let mut abandoned = self
-                        .abandoned_dispatch_epochs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    const MAX_ABANDONED: usize = 256;
-                    if abandoned.len() >= MAX_ABANDONED {
-                        abandoned.pop_first();
+                // arm): when the command was queued, mark the epoch so the
+                // actor drops this dispatch's queued notifications/side
+                // effects, and nudge background preemption so the stuck turn
+                // yields sooner. A timeout while still waiting for a mailbox
+                // slot never queued anything, so there is nothing to abandon.
+                if sent {
+                    {
+                        let mut abandoned = self
+                            .abandoned_dispatch_epochs
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        const MAX_ABANDONED: usize = 256;
+                        if abandoned.len() >= MAX_ABANDONED {
+                            abandoned.pop_first();
+                        }
+                        abandoned.insert(epoch);
                     }
-                    abandoned.insert(epoch);
+                    self.preempt_background_at_ms.store(
+                        crate::extensions::runtime::monotonic_millis(),
+                        Ordering::Relaxed,
+                    );
                 }
-                self.preempt_background_at_ms.store(
-                    crate::extensions::runtime::monotonic_millis(),
-                    Ordering::Relaxed,
-                );
-                Err(anyhow::anyhow!(
-                    "event `{event}` read-only dispatch timed out after {event_timeout:?} \
-                     (the extension actor is unresponsive)"
-                ))
+                let timeout = if sent {
+                    EventDispatchTimeout::new(event, event_timeout)
+                } else {
+                    EventDispatchTimeout::mailbox_full(event, event_timeout)
+                };
+                Err(anyhow::Error::new(timeout))
             }
         }
     }

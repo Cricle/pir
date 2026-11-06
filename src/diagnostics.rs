@@ -244,7 +244,10 @@ impl RunDiagnostics {
     /// Print [`Self::render`] to stderr, with a leading blank line (the
     /// startup-timings report's layout).
     pub fn print_to_stderr(&self) {
-        eprintln!("\n{}", self.render());
+        // Fallible: this report is emitted on the CLI print path, where
+        // stderr may be a closed pipe (`2>&1 | head`). `eprintln!` would
+        // panic and record a crash on EPIPE.
+        let _ = crate::coding_agent::output::write_stderr_line(&format!("\n{}", self.render()));
     }
 }
 

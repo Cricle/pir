@@ -116,6 +116,16 @@ impl AgentTool for WriteTool {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // Read-before-edit: overwriting an existing regular file requires a
+        // full, unchanged read in this session. Creating a new file is always
+        // allowed (the gate helper stats the target and skips missing paths).
+        let gate_warning = match super::util::read_before_edit_gate(ctx, &path, "write") {
+            crate::agent::read_ledger::EditGate::Allowed => None,
+            crate::agent::read_ledger::EditGate::Warn(warning) => Some(warning),
+            crate::agent::read_ledger::EditGate::Blocked(error) => {
+                return Box::pin(async move { ToolResult::error(error) })
+            }
+        };
         let cwd = ctx.cwd.clone();
         let checkpoint_ctx = ctx.clone();
         let aborted = ctx.is_aborted();
@@ -129,10 +139,12 @@ impl AgentTool for WriteTool {
                 return ToolResult::error("Operation aborted");
             }
             if let Some(operations) = operations {
-                return write_with_operations(operations, &cwd, &path, &content, signal).await;
+                let result = write_with_operations(operations, &cwd, &path, &content, signal).await;
+                return super::util::append_read_gate_warning(result, gate_warning);
             }
             if let Some(environment) = remote {
-                return write_remote(environment, &path, &content, signal).await;
+                let result = write_remote(environment, &path, &content, signal).await;
+                return super::util::append_read_gate_warning(result, gate_warning);
             }
             // The name-based confinement check (parent components, symlink
             // components, root containment) produces the model-facing errors;
@@ -164,7 +176,10 @@ impl AgentTool for WriteTool {
                 .await
             {
                 // Upstream e583b290a: byte counts were UTF-16 chars — misleading.
-                Ok(true) => ToolResult::ok(format!("Successfully wrote to {path}")),
+                Ok(true) => super::util::append_read_gate_warning(
+                    ToolResult::ok(format!("Successfully wrote to {path}")),
+                    gate_warning,
+                ),
                 Ok(false) => ToolResult::error("Operation aborted"),
                 Err(e) => ToolResult::error(format!("Cannot write '{}': {}", path, e)),
             }

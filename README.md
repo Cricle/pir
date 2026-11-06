@@ -49,6 +49,15 @@ pir grep|sed|python <args>
 `pir grep|sed|python` forward argv, fall back to the system tool, and keep GNU
 exit codes; `--no-fallback` / `PIR_NATIVE_FALLBACK=0` disables that.
 
+### Remote server security
+
+`pir server` requires `PIR_SERVER_AUTH_TOKEN`. `--allow-unauthenticated` is a
+local-development escape hatch only: without a token any local process can
+create sessions, use the server's model credentials, and read/write files
+under its working directory. Loopback binding does **not** isolate other local
+users; never use the flag on a shared host. Tokens are compared in constant
+time and never logged.
+
 ### Rust SDK
 
 [`pir::sdk`](docs/sdk.md) builds an agent from an endpoint, the environment, or
@@ -99,6 +108,7 @@ opt in explicitly. Details: [`docs/extensions.md`](docs/extensions.md).
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
+powershell -NoProfile -File scripts/test_fast.ps1 -UseNextest   # same targets, nextest runner
 bash scripts/run_examples.sh        # offline SDK examples
 bash scripts/run_benchmarks.sh      # manual benchmarks (dev profile)
 ```
@@ -109,11 +119,14 @@ persistence and forbidden upstream artifacts. Feature matrix:
 
 ## Security boundaries
 
-The optional remote-server token is pre-handshake authentication, **not TLS**.
-Keep `PIR_SERVER_ADDRESS` on loopback/private networks or front it with an
-authenticated TLS proxy/VPN. Remote bash is off by default; body limits are
-enforced; `PIR_ALLOW_REMOTE_AGENT=false` disables remote agent execution.
-Credentials: `~/.pi/agent/auth.json` — see [MAPPING.md](MAPPING.md).
+The remote-server token (`PIR_SERVER_AUTH_TOKEN`) is required and provides
+pre-handshake authentication, **not TLS**: keep `PIR_SERVER_ADDRESS` on
+loopback/private networks or behind an authenticated TLS proxy/VPN, and note
+that loopback alone does not isolate other local users.
+`--allow-unauthenticated` is local-development only. Remote bash is off by
+default; body limits are enforced; `PIR_ALLOW_REMOTE_AGENT=false` disables
+remote agent execution. Credentials: `~/.pi/agent/auth.json` — see
+[MAPPING.md](MAPPING.md).
 
 ## Compatibility
 

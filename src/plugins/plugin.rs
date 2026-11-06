@@ -97,7 +97,12 @@ pub enum PluginEventOutcome {
     /// The handler has no opinion.
     None,
     /// The handler failed (isolated into `EmitOutcome::errors`, never fatal).
-    Error { error: String },
+    ///
+    /// `timed_out` is the structured deadline marker: true only when the
+    /// handler was actually cut off by a dispatch budget (native per-call
+    /// timeout or the JS actor's deadline). Error text must never be used to
+    /// infer it (A-06).
+    Error { error: String, timed_out: bool },
     /// `tool_call`: block the call and/or flag batch termination (upstream
     /// `ToolCallEventResult`).
     ToolCall {

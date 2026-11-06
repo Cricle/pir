@@ -245,7 +245,7 @@ use crate::agent::nested_tool_calls::{
 use crate::agent::tool_execution::{ToolExposure, ToolRegistry, ToolSessionEnv};
 use crate::agent_session::{
     record_session_command_action, AgentSession, NativeActionKind, SessionCommandAction,
-    SessionOrigin, SESSION_COMPACTING, SESSION_RUNNING,
+    SessionOrigin, SESSION_COMPACTING, SESSION_IDLE, SESSION_RUNNING,
 };
 use crate::ai::provider::{ProviderBox, ProviderRegistry};
 use crate::ai::providers::RegisterDynamicProviderShared as _;
@@ -344,6 +344,8 @@ impl LiveSessionServices {
 /// small `Arc` clone (or a `Weak`); the session itself is not kept alive.
 pub(super) fn live_services(session: &AgentSession, host: &Arc<PluginHost>) -> LiveSessionServices {
     let config = session.extensions.as_ref().map(ExtensionHandle::config);
+    let perf_trace = std::env::var_os("PIR_PERF_TRACE").is_some();
+    let perf_t0 = std::time::Instant::now();
     // The native renderer/completion registries are HOST-owned: keyed by the
     // `PluginHost` address and held weakly process-wide, so a rebind of the
     // same host reuses them (a plugin's `on_context` re-registration is
@@ -352,6 +354,7 @@ pub(super) fn live_services(session: &AgentSession, host: &Arc<PluginHost>) -> L
     let native = shared_native_registries(host);
     let state = Arc::new(LiveSessionState {
         cwd: Arc::from(session.cwd.as_path()),
+        agent_dir: Arc::from(session.agent_dir.as_path()),
         registry: Arc::clone(&session.registry),
         tools: Arc::clone(&session.tools),
         session_state: Arc::clone(&session.session_state),
@@ -376,17 +379,11 @@ pub(super) fn live_services(session: &AgentSession, host: &Arc<PluginHost>) -> L
             .map(|config| ExtensionMode::from_mode(&config.mode))
             .unwrap_or_default(),
         has_ui: config.as_ref().is_some_and(|config| config.has_ui),
-        // The SAME resolved value the run gate used
-        // (`runtime_loader::load_settings_for_in`): operator override, then
-        // the extension `project_trust` decision recorded/pinned by the
-        // startup host, then the persisted store / `defaultProjectTrust`
-        // policy. The session's build-time agent directory is used so a
-        // mid-process `PIR_AGENT_DIR` change cannot split this read from the
-        // settings the session loaded.
-        project_trusted: crate::extensions::project_trust::resolve_project_trust(
-            &session.cwd,
-            &session.agent_dir,
-        ),
+        // Resolved lazily by `is_project_trusted` with the same order the
+        // run gate used (`runtime_loader::load_settings_for_in`): operator
+        // override, extension decision recorded/pinned by the startup host,
+        // then the persisted store / `defaultProjectTrust` policy.
+        project_trusted: std::sync::OnceLock::new(),
         js: session.extensions.clone(),
         host: Arc::downgrade(host),
         factories: Arc::clone(&native),
@@ -397,6 +394,9 @@ pub(super) fn live_services(session: &AgentSession, host: &Arc<PluginHost>) -> L
         commands_cache: Mutex::new(None),
         tools_cache: Mutex::new(None),
     });
+    if perf_trace {
+        eprintln!("[perf]     trust-resolve {:?}", perf_t0.elapsed());
+    }
     let mut services = PluginServices::new()
         .with_session(Arc::new(LiveSessionService {
             state: Arc::clone(&state),
@@ -446,6 +446,10 @@ pub(super) fn live_services(session: &AgentSession, host: &Arc<PluginHost>) -> L
 /// The small, shareable session state every adapter reads.
 struct LiveSessionState {
     cwd: Arc<Path>,
+    /// The session's agent-directory identity. Kept beside `cwd` so the lazy
+    /// project-trust read below resolves against the same directory the
+    /// session was built with, not a mid-process `PIR_AGENT_DIR`.
+    agent_dir: Arc<Path>,
     registry: Arc<ProviderRegistry>,
     tools: Arc<ToolRegistry>,
     /// Run claim (`SESSION_IDLE` / `SESSION_RUNNING` / compacting).
@@ -474,7 +478,10 @@ struct LiveSessionState {
     context_derived_prompt: bool,
     mode: ExtensionMode,
     has_ui: bool,
-    project_trusted: bool,
+    /// Resolved on first query, not at session construction: building a
+    /// session does not need the trust store, and the eager load ran a full
+    /// settings read (plus lock retries) on every AgentSession construction.
+    project_trusted: std::sync::OnceLock<bool>,
     /// The JS runtime handle, for `pi.getFlag` (CLI value > default).
     js: Option<ExtensionHandle>,
     host: Weak<PluginHost>,
@@ -711,13 +718,18 @@ impl SessionService for LiveSessionService {
     }
 
     fn is_idle(&self) -> bool {
-        // Upstream `isIdle` = "not streaming", read from the same live cell
-        // the run claims.
-        self.state.session_state.load(Ordering::SeqCst) != SESSION_RUNNING
+        // Idle means NEITHER a run NOR a manual compaction owns the session
+        // (`SESSION_COMPACTING` is busy: the transcript is being cut).
+        self.state.session_state.load(Ordering::SeqCst) == SESSION_IDLE
     }
 
     fn is_project_trusted(&self) -> bool {
-        self.state.project_trusted
+        *self.state.project_trusted.get_or_init(|| {
+            crate::extensions::project_trust::resolve_project_trust(
+                &self.state.cwd,
+                &self.state.agent_dir,
+            )
+        })
     }
 
     /// `ctx.reload()` (upstream `ExtensionCommandContext.reload`): schedule
@@ -1034,7 +1046,7 @@ impl SessionService for LiveSessionService {
                 // A dropped session ends the wait instead of spinning on its
                 // last claim state.
                 if state.session().is_none()
-                    || state.session_state.load(Ordering::SeqCst) != SESSION_RUNNING
+                    || state.session_state.load(Ordering::SeqCst) == SESSION_IDLE
                 {
                     return;
                 }
@@ -1053,13 +1065,13 @@ impl SessionService for LiveSessionService {
 /// the claim is re-read, so a release racing the registration cannot be
 /// missed.
 async fn wait_for_claim_change(state: &AtomicU8, notify: &Notify) {
-    if state.load(Ordering::SeqCst) != SESSION_RUNNING {
+    if state.load(Ordering::SeqCst) == SESSION_IDLE {
         return;
     }
     let notified = notify.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
-    if state.load(Ordering::SeqCst) != SESSION_RUNNING {
+    if state.load(Ordering::SeqCst) == SESSION_IDLE {
         return;
     }
     match tokio::runtime::Handle::try_current() {
@@ -1527,6 +1539,7 @@ impl AgentSession {
                 )),
             )
                 as Arc<dyn crate::agent::tool_execution::BackgroundControl>),
+            read_ledger: Arc::clone(&self.read_ledger),
         });
         let sink: crate::agent::nested_tool_calls::NestedEventSink =
             Arc::new(|_event| Box::pin(async {}));

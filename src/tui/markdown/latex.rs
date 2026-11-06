@@ -1157,6 +1157,15 @@ enum LowerStyle {
     Script,
 }
 
+/// Hard cap on recursively nested LaTeX groups (`{...}`) and nested
+/// environments. `MathText` is model/MCP-controlled: every `{` recurses
+/// through [`LatexParser::parse_sequence`], so without a cap a few thousand
+/// braces exhaust the render thread's stack (Windows stack overflow kills the
+/// process, it is not a catchable panic). Past the cap the parser marks the
+/// expression unsupported, which makes `render_latex` return `None` and the
+/// renderer falls back to the raw `$...$` text.
+const MAX_LATEX_NESTING: usize = 64;
+
 /// Upstream `LatexParser` (latex.ts:838-1477).
 struct LatexParser<'a> {
     source: Vec<char>,
@@ -1166,6 +1175,8 @@ struct LatexParser<'a> {
     supported: bool,
     stack_fractions: bool,
     script_depth: usize,
+    /// Current `parse_sequence` / nested-environment recursion depth.
+    nesting: usize,
 }
 
 impl<'a> LatexParser<'a> {
@@ -1178,6 +1189,7 @@ impl<'a> LatexParser<'a> {
             supported: true,
             stack_fractions: true,
             script_depth: 0,
+            nesting: 0,
         }
     }
 
@@ -1190,8 +1202,22 @@ impl<'a> LatexParser<'a> {
         Some(normalize_output(&rendered))
     }
 
-    /// Upstream `parseSequence` (latex.ts:861-947).
+    /// Upstream `parseSequence` (latex.ts:861-947), with a recursion budget.
     fn parse_sequence(&mut self, end: Option<char>) -> String {
+        if self.nesting >= MAX_LATEX_NESTING {
+            // Bail out as "unsupported" instead of recursing further. Callers
+            // advance past the opening brace before recursing, so parsing
+            // still makes progress and `render_latex` falls back to raw text.
+            self.supported = false;
+            return String::new();
+        }
+        self.nesting += 1;
+        let result = self.parse_sequence_inner(end);
+        self.nesting -= 1;
+        result
+    }
+
+    fn parse_sequence_inner(&mut self, end: Option<char>) -> String {
         let mut result = String::new();
         while self.position < self.source.len() {
             let character = self.source[self.position];
@@ -2022,6 +2048,9 @@ impl<'a> LatexParser<'a> {
     fn render_nested(&mut self, source: &str, stack_fractions: bool) -> String {
         let display = self.display && stack_fractions;
         let mut nested = LatexParser::new(source, &mut *self.layout_nodes, display);
+        // Carry the caller's group depth across the fresh parser so nested
+        // environments / optional arguments cannot reset the budget.
+        nested.nesting = self.nesting;
         match nested.render() {
             Some(rendered) => rendered,
             None => {

@@ -8,6 +8,7 @@
 #![allow(clippy::useless_format)]
 #![allow(clippy::useless_vec)]
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -64,22 +65,9 @@ impl PartialEq for UsageTotals {
     }
 }
 
-/// Compact token formatting (upstream `formatTokens`).
-pub fn format_tokens(count: u64) -> String {
-    if count < 1000 {
-        return count.to_string();
-    }
-    if count < 10_000 {
-        return format!("{:.1}k", count as f64 / 1000.0);
-    }
-    if count < 1_000_000 {
-        return format!("{}k", count / 1000);
-    }
-    if count < 10_000_000 {
-        return format!("{:.1}M", count as f64 / 1_000_000.0);
-    }
-    format!("{}M", count / 1_000_000)
-}
+/// Compact token formatting (upstream `formatTokens`); shared with the slash
+/// commands and the HTML export.
+pub use crate::text::format_tokens;
 
 /// Replace the home prefix with `~` (upstream `formatCwdForFooter`).
 pub fn format_cwd_for_footer(cwd: &str, home: Option<&str>) -> String {
@@ -143,16 +131,22 @@ pub fn session_tab_title(
     path: &str,
 ) -> String {
     if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
-        return name.to_owned();
+        // `/name` and replayed session names are user-controlled too: never
+        // let a stored OSC/CSI reach the tab bar or session picker label.
+        return crate::text::sanitize_terminal_text(name).into_owned();
     }
-    if let Some(preview) = first_user_message.and_then(session_tab_preview) {
-        return preview;
+    if let Some(raw) = first_user_message {
+        let clean = crate::text::sanitize_terminal_text(raw);
+        if let Some(preview) = session_tab_preview(&clean) {
+            return preview;
+        }
     }
-    std::path::Path::new(path)
+    let stem = std::path::Path::new(path)
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .filter(|stem| !stem.is_empty())
-        .unwrap_or_else(|| path.to_owned())
+        .unwrap_or_else(|| path.to_owned());
+    crate::text::sanitize_terminal_text(&stem).into_owned()
 }
 
 /// The first non-empty line of `text`, whitespace-collapsed and truncated.
@@ -202,6 +196,39 @@ pub fn add_or_activate_tab(
     });
     *active_path = Some(path.to_owned());
     tabs.len() - 1
+}
+
+/// Settle one `SessionAttached` reply against the live editor text.
+///
+/// `live_text` is what the composer holds when the worker's attach reply
+/// arrives. Returns the text the editor must hold afterwards:
+///
+/// * **Startup attach** (`active_path` was `None`): the composer is live from
+///   the first frame while the worker is still building the agent session.
+///   Keys typed in that window belong to this session, so a non-empty live
+///   buffer survives the new tab's empty draft (the S2 first-keystroke fix).
+/// * **Session switch**: the live text still belongs to the outgoing tab (the
+///   editor kept showing it while the target opened). It is saved into that
+///   tab's draft — including anything typed while the switch was in flight —
+///   and the target tab's stored draft becomes the editor text.
+pub fn settle_attached_editor(
+    tabs: &mut Vec<SessionTab>,
+    active_path: &mut Option<String>,
+    path: &str,
+    title: &str,
+    live_text: &str,
+) -> String {
+    let previous = active_path.clone();
+    add_or_activate_tab(tabs, active_path, path, title);
+    if let Some(previous) = previous.as_deref() {
+        save_active_draft(tabs, Some(previous), live_text);
+    }
+    let restored = take_active_draft(tabs, active_path.as_deref());
+    if previous.is_none() && !live_text.is_empty() {
+        live_text.to_owned()
+    } else {
+        restored
+    }
 }
 
 /// Activate an open tab. Returns whether the path names one.
@@ -1054,6 +1081,11 @@ pub struct ChatContainer {
     /// What the LAST [`ChatContainer::set_entries`] call did (W11-C F2/F5
     /// test seam; see [`ContainerDiff`]).
     last_diff: ContainerDiff,
+    /// DIRTY2: entry blocks whose committed children were rebuilt or patched
+    /// since the last [`ChatContainer::take_dirty_blocks`] drain. The block id
+    /// is the entry index inside the materialized window; the frame cache
+    /// resolves it to a row interval.
+    dirty_blocks: DirtyBlockLog,
 }
 
 /// Per-container report of the last [`ChatContainer::set_entries`] diff
@@ -1071,6 +1103,95 @@ pub struct ContainerDiff {
     pub entries_rebuilt: usize,
     /// Entries in the changed middle band patched in place (F5).
     pub entries_patched: usize,
+}
+
+/// Upper bound on distinct chat blocks tracked between two drains. A burst
+/// that touches more blocks collapses to `overflow = true` (the consumer
+/// repaints the whole band) instead of growing without bound.
+#[doc(hidden)]
+pub const DIRTY_BLOCK_LOG_CAP: usize = 2048;
+
+/// Snapshot of the chat blocks touched since the last drain (DIRTY2 app
+/// half).
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirtyBlockBatch {
+    /// Entry block indices touched since the last [`DirtyBlockLog::take`],
+    /// ascending, each appearing once.
+    pub blocks: Vec<usize>,
+    /// More than [`DIRTY_BLOCK_LOG_CAP`] distinct blocks were touched; the
+    /// consumer must treat the whole materialized band as dirty.
+    pub overflow: bool,
+}
+
+/// Bounded latest-wins log of chat entry blocks touched by `set_entries` /
+/// the in-place streaming patch.
+///
+/// This is the app-level half of DIRTY2: the transcript knows which ENTRY
+/// blocks changed (the block ids the frame cache indexes), but not their
+/// absolute frame rows — [`TuiCore`](super::core::TuiCore) resolves those
+/// through its frame block cache. Repeated deltas for the same entry
+/// coalesce to one pending block id (latest state wins), so a 100-delta
+/// drain between frames produces one entry, not a 100-item queue.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct DirtyBlockLog {
+    pending: BTreeMap<usize, u64>,
+    sequence: u64,
+    pushes: u64,
+    coalesced: u64,
+    overflow: bool,
+}
+
+impl DirtyBlockLog {
+    /// Record one touched block. O(log pending) and allocation-free once the
+    /// block is already pending.
+    pub fn note(&mut self, block: usize) {
+        self.pushes += 1;
+        if self.overflow {
+            return;
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        if let Some(slot) = self.pending.get_mut(&block) {
+            // Latest state for this block replaces the earlier note.
+            *slot = self.sequence;
+            self.coalesced += 1;
+            return;
+        }
+        if self.pending.len() >= DIRTY_BLOCK_LOG_CAP {
+            self.pending.clear();
+            self.overflow = true;
+            return;
+        }
+        self.pending.insert(block, self.sequence);
+    }
+
+    /// Swap the pending blocks out; counters stay for the next interval.
+    pub fn take(&mut self) -> DirtyBlockBatch {
+        DirtyBlockBatch {
+            blocks: self.pending.keys().copied().collect(),
+            overflow: std::mem::take(&mut self.overflow),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty() && !self.overflow
+    }
+
+    /// Distinct pending blocks.
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Total notes received (coalesced ones included).
+    pub fn pushes(&self) -> u64 {
+        self.pushes
+    }
+
+    /// Notes that replaced an already-pending block (latest-wins).
+    pub fn coalesced(&self) -> u64 {
+        self.coalesced
+    }
 }
 
 /// One chat entry (message or tool block) for diff-friendly rebuilds.
@@ -1869,6 +1990,7 @@ impl ChatContainer {
                 cursor += children_built;
                 old_consumed += old_children;
                 diff.entries_rebuilt += 1;
+                self.dirty_blocks.note(index);
                 ENTRY_DIFF_WORK
                     .entries_rebuilt
                     .fetch_add(1, Ordering::Relaxed);
@@ -1899,6 +2021,9 @@ impl ChatContainer {
         if entries.is_empty() {
             self.committed.shrink_to_fit();
             self.inner.shrink_children();
+            // DIRTY2: a transcript reset drops the old session's pending
+            // block ids; the next frame is a full repaint anyway.
+            self.dirty_blocks = DirtyBlockLog::default();
         }
     }
 
@@ -1950,19 +2075,36 @@ impl ChatContainer {
         // The entry owns the accumulators and only ever grows them in place,
         // so each component extends its own copy by the delta alone: no
         // full-text copy per frame. The render then reuses the lines of the
-        // text's final prefix and re-parses only the mutable tail.
+        // text's final prefix and re-parses only the mutable tail. Each delta
+        // is sanitized before the markdown sees it: a split escape sequence
+        // can only leave inert printable text, never an ESC.
         match appended_text(old_text, text) {
-            Some(delta) => markdown.set_text_growing_delta(delta),
-            None => markdown.set_text_growing(text),
+            Some(delta) => {
+                let delta = crate::text::sanitize_terminal_text(delta);
+                markdown.set_text_growing_delta(delta.as_ref());
+            }
+            None => {
+                let text = crate::text::sanitize_terminal_text(text);
+                markdown.set_text_growing(text.as_ref());
+            }
         }
         if let Some(thinking_block) = &thinking_block {
-            thinking_block.set_text_growing(thinking);
+            // Same fast path as the text body: the entry owns its thinking
+            // accumulator and only appends, so feed the delta alone. Both
+            // component trees (the main container and the block cache's
+            // per-entry container) receive the same delta and sanitize only
+            // that delta instead of rescanning the whole accumulated body.
+            match appended_text(old_thinking, thinking) {
+                Some(delta) => thinking_block.set_text_growing_delta(delta),
+                None => thinking_block.set_text_growing(thinking),
+            }
         }
         debug_assert!(
             old_thinking.len <= thinking.len(),
             "a live streaming entry only grows its thinking accumulator"
         );
         self.committed[index].tag = EntryTag::of(entry);
+        self.dirty_blocks.note(index);
         ENTRY_DIFF_WORK
             .entries_patched
             .fetch_add(1, Ordering::Relaxed);
@@ -2056,6 +2198,7 @@ impl ChatContainer {
                     tool.update_result(Arc::clone(output), *is_error, *duration_ms);
                 }
                 self.committed[index].tag = EntryTag::of(entry);
+                self.dirty_blocks.note(index);
                 ENTRY_DIFF_WORK
                     .entries_patched
                     .fetch_add(1, Ordering::Relaxed);
@@ -2083,6 +2226,29 @@ impl ChatContainer {
     #[doc(hidden)]
     pub fn last_diff(&self) -> ContainerDiff {
         self.last_diff
+    }
+
+    /// DIRTY2: entry blocks touched since the last drain, latest state per
+    /// block only. Empty when the transcript has not changed.
+    #[doc(hidden)]
+    pub fn take_dirty_blocks(&mut self) -> DirtyBlockBatch {
+        self.dirty_blocks.take()
+    }
+
+    /// Number of distinct entry blocks currently pending.
+    #[doc(hidden)]
+    pub fn dirty_block_len(&self) -> usize {
+        self.dirty_blocks.len()
+    }
+
+    #[doc(hidden)]
+    pub fn dirty_block_pushes(&self) -> u64 {
+        self.dirty_blocks.pushes()
+    }
+
+    #[doc(hidden)]
+    pub fn dirty_block_coalesced(&self) -> u64 {
+        self.dirty_blocks.coalesced()
     }
 
     /// Capacity of the underlying child-container slots (see
@@ -2166,6 +2332,9 @@ impl ChatContainer {
             }
             ChatEntry::Notice { kind, text } => {
                 children.push(Box::new(Spacer::new(1)));
+                // Notices can embed tool/provider error text; it is untrusted
+                // too, so the sanitizer runs before the theme wraps it.
+                let text = crate::text::sanitize_terminal_text(text);
                 let line = match kind {
                     NoticeKind::Error => {
                         with_theme(|theme| theme.fg(ThemeColor::Error, &format!("Error: {text}")))
@@ -2173,7 +2342,9 @@ impl ChatContainer {
                     NoticeKind::Warning => with_theme(|theme| {
                         theme.fg(ThemeColor::Warning, &format!("Warning: {text}"))
                     }),
-                    NoticeKind::Status => with_theme(|theme| theme.fg(ThemeColor::Dim, text)),
+                    NoticeKind::Status => {
+                        with_theme(|theme| theme.fg(ThemeColor::Dim, text.as_ref()))
+                    }
                 };
                 children.push(Box::new(Text::with_padding(line, 1, 0)));
             }
@@ -2207,7 +2378,14 @@ impl ChatContainer {
                         // renderer row is still a painted shell row.
                         children.push(Box::new(PaintedBlank(Arc::clone(&painter))));
                     } else {
-                        let row = Text::with_padding(line.clone(), 1, 0);
+                        // Extension/JS renderer output is built from untrusted
+                        // tool args/output: keep its SGR, drop every other
+                        // control sequence.
+                        let row = Text::with_padding(
+                            crate::text::sanitize_terminal_text(line).into_owned(),
+                            1,
+                            0,
+                        );
                         row.set_bg(Some(Arc::clone(&painter)));
                         children.push(Box::new(row));
                     }
@@ -2230,16 +2408,34 @@ impl ChatContainer {
                 // appended after its lines.
                 children.push(Box::new(Spacer::new(1)));
                 for line in lines {
-                    children.push(Box::new(Text::with_padding(line.clone(), 0, 0)));
+                    children.push(Box::new(Text::with_padding(
+                        crate::text::sanitize_terminal_text(line).into_owned(),
+                        0,
+                        0,
+                    )));
                 }
                 for line in tool.image_lines.iter() {
                     children.push(Box::new(Text::with_padding(line.clone(), 0, 0)));
                 }
             }
-            ChatEntry::Raw { lines, .. } => {
+            ChatEntry::Raw { lines, render, .. } => {
                 children.push(Box::new(Spacer::new(1)));
+                // `/image` previews are NOT untrusted text: Kitty/iTerm2
+                // emit their whole image as an APC / OSC 1337 sequence, and
+                // running the text sanitizer over those lines would delete
+                // the image. Only a verbatim block whose lines are EXACTLY
+                // the shape `image_block_lines` generates qualifies; any
+                // other raw block (custom-entry JSON, extension output) is
+                // still sanitized per line.
+                let trusted_image =
+                    render.is_none() && crate::tui::terminal_image::is_image_protocol_lines(lines);
                 for line in lines {
-                    children.push(Box::new(Text::with_padding(line.clone(), 0, 0)));
+                    let row = if trusted_image {
+                        line.clone()
+                    } else {
+                        crate::text::sanitize_terminal_text(line).into_owned()
+                    };
+                    children.push(Box::new(Text::with_padding(row, 0, 0)));
                 }
             }
             ChatEntry::Streaming {
@@ -2288,7 +2484,7 @@ impl ChatContainer {
                 // the raw fence until the engine parses it, and `final` mode
                 // keeps the fence until the settled entry replaces this one.
                 let markdown = Arc::new(Markdown::with_options(
-                    text.as_str(),
+                    crate::text::sanitize_terminal_text(text).as_ref(),
                     1,
                     0,
                     MarkdownTheme::default(),
@@ -2493,9 +2689,6 @@ impl Component for MarkdownBlock {
         self.0.invalidate();
     }
 }
-
-/// Shared app state handle for the event loop.
-pub type SharedFooter = Arc<Footer>;
 
 /// A startup header line whose Compact/ExpandedKeys text is resolved from the
 /// LIVE keybinding registry once at startup (upstream builds the hints from

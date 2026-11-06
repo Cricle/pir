@@ -278,9 +278,13 @@ async fn persisted_session_survives_disconnect_and_restart() {
     let state =
         ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry)
             .with_session_dir(temp.0.clone());
-    let server = Server::bind_with_state("127.0.0.1:0", state.clone())
-        .await
-        .expect("bind server");
+    let server = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state.clone(),
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("bind server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 
@@ -344,9 +348,13 @@ async fn persisted_session_survives_disconnect_and_restart() {
     let state2 =
         ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry2)
             .with_session_dir(temp.0.clone());
-    let server2 = Server::bind_with_state("127.0.0.1:0", state2)
-        .await
-        .expect("rebind server");
+    let server2 = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state2,
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("rebind server");
     let address2 = server2.local_addr().expect("second local address");
     let accepting2 = tokio::spawn(async move { server2.accept_once().await });
     let mut client2 = Client::connect(address2).await.expect("second handshake");
@@ -417,9 +425,13 @@ async fn default_cwd_session_reattaches_after_restart_without_allowed_roots() {
     let state =
         ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry)
             .with_session_dir(temp.0.clone());
-    let server = Server::bind_with_state("127.0.0.1:0", state)
-        .await
-        .expect("bind server");
+    let server = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state,
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("bind server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
     let mut client = Client::connect(address).await.expect("hello handshake");
@@ -455,9 +467,13 @@ async fn default_cwd_session_reattaches_after_restart_without_allowed_roots() {
     let state2 =
         ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry2)
             .with_session_dir(temp.0.clone());
-    let server2 = Server::bind_with_state("127.0.0.1:0", state2)
-        .await
-        .expect("rebind server");
+    let server2 = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state2,
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("rebind server");
     let address2 = server2.local_addr().expect("second local address");
     let accepting2 = tokio::spawn(async move { server2.accept_once().await });
     let mut client2 = Client::connect(address2).await.expect("second handshake");
@@ -495,6 +511,9 @@ async fn spawn_cli_server(
 ) -> SpawnedCliServer {
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_pir"))
         .arg("server")
+        // This host-behavior test uses an isolated loopback server; the C2-04
+        // authentication gate requires the explicit local-development opt-in.
+        .arg("--allow-unauthenticated")
         .current_dir(agent_dir)
         .env("PIR_SESSION_DIR", session_dir)
         .env("PIR_AGENT_DIR", agent_dir)
@@ -512,7 +531,7 @@ async fn spawn_cli_server(
     let stderr = child.stderr.take().expect("server stderr is piped");
     let mut lines = BufReader::new(stderr).lines();
     let deadline = tokio::time::Instant::now() + WAIT_BUDGET;
-    let mut seen = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     loop {
         let line = tokio::time::timeout_at(deadline, lines.next_line())
             .await
@@ -520,6 +539,11 @@ async fn spawn_cli_server(
             .expect("read pir server stderr")
             .unwrap_or_else(|| panic!("pir server exited before listening; stderr: {seen:?}"));
         if let Some(address) = line.strip_prefix("pir server listening on ") {
+            assert!(
+                seen.iter()
+                    .any(|line| line.contains("WITHOUT authentication")),
+                "a token-less opt-in server must warn on startup; stderr: {seen:?}"
+            );
             let address = address
                 .trim()
                 .parse()
@@ -592,9 +616,13 @@ async fn session_supports_multiple_attachments_and_broadcasts() {
     let state =
         ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry);
     let server = Arc::new(
-        Server::bind_with_state("127.0.0.1:0", state.clone())
-            .await
-            .expect("bind server"),
+        Server::bind_with_state_and_security(
+            "127.0.0.1:0",
+            state.clone(),
+            ServerSecurityConfig::unauthenticated_local(),
+        )
+        .await
+        .expect("bind server"),
     );
     let address = server.local_addr().expect("local address");
     let accepting_a = {
@@ -731,9 +759,13 @@ async fn one_attachment_disconnecting_leaves_the_other_working() {
     let state =
         ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry);
     let server = Arc::new(
-        Server::bind_with_state("127.0.0.1:0", state.clone())
-            .await
-            .expect("bind server"),
+        Server::bind_with_state_and_security(
+            "127.0.0.1:0",
+            state.clone(),
+            ServerSecurityConfig::unauthenticated_local(),
+        )
+        .await
+        .expect("bind server"),
     );
     let address = server.local_addr().expect("local address");
     let accepting_a = {
@@ -811,9 +843,13 @@ async fn draining_rejects_new_work_and_reports_on_inflight_runs() {
     let registry = gated_registry(gate_rx, entered);
     let state =
         ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry);
-    let server = Server::bind_with_state("127.0.0.1:0", state.clone())
-        .await
-        .expect("bind server");
+    let server = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state.clone(),
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("bind server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 
@@ -997,9 +1033,13 @@ async fn persisted_virtual_model_session_resumes_and_routes() {
     let state =
         ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry)
             .with_session_dir(temp.0.clone());
-    let server = Server::bind_with_state("127.0.0.1:0", state.clone())
-        .await
-        .expect("bind server");
+    let server = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state.clone(),
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("bind server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 
@@ -1360,9 +1400,13 @@ async fn server_progress_resyncs_after_a_lagged_broadcast_receiver() {
     let registry = gated_registry(gate, Arc::new(AtomicUsize::new(0)));
     let state =
         ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry);
-    let server = Server::bind_with_state("127.0.0.1:0", state.clone())
-        .await
-        .expect("bind server");
+    let server = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state.clone(),
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("bind server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 

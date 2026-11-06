@@ -1381,3 +1381,166 @@ async fn event_chunk_sink_sse_mode_feeds_one_line_at_a_time() {
         "one event per line is pushed before the next line is parsed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Close-delimited HTTP bodies
+// ---------------------------------------------------------------------------
+
+/// A close-delimited response (no `Content-Length`, no `Transfer-Encoding`)
+/// has no framing terminator other than EOF. Some OpenAI-compatible servers
+/// omit the terminal `finish_reason` chunk and `[DONE]`; a clean EOF is still
+/// a complete completion and must not be reported as a truncated stream.
+#[test]
+fn openai_close_delimited_body_without_finish_reason_completes() {
+    let model = sample_model();
+    let mut parser = OpenAiSseParser::new(&model);
+    let mut events = Vec::new();
+    parser
+        .feed(openai_text_chunk("close").as_bytes(), &mut events)
+        .expect("feed succeeds");
+    parser.set_close_delimited_eof(true);
+    parser.finish(&mut events).expect("close-delimited EOF completes");
+
+    let done = events.iter().find_map(|event| match event {
+        AssistantMessageEvent::Done { reason, message } => Some((reason, message)),
+        _ => None,
+    });
+    let (reason, message) = done.expect("Done event");
+    assert_eq!(*reason, TerminalReason::Stop);
+    assert_eq!(message.stop_reason, StopReason::Stop);
+    assert_eq!(partial_text(message), "close");
+}
+
+/// The strict truncation verdict stays in force for framed bodies: a chunked
+/// (or Content-Length) response that ends without `finish_reason` is a
+/// genuinely truncated stream, not a close-delimited completion.
+#[test]
+fn openai_framed_body_without_finish_reason_stays_truncated() {
+    let model = sample_model();
+    let mut parser = OpenAiSseParser::new(&model);
+    let mut events = Vec::new();
+    parser
+        .feed(openai_text_chunk("cut").as_bytes(), &mut events)
+        .expect("feed succeeds");
+    let error = parser.finish(&mut events).expect_err("framed truncation");
+    assert!(
+        matches!(error, AiError::StreamTruncated(_)),
+        "framed missing finish_reason must stay retryable truncation: {error:?}"
+    );
+}
+
+/// End-to-end through the provider transport: a server that closes the
+/// connection after the last event (and never sends `finish_reason`/`[DONE]`)
+/// yields a completed message, not `Stream ended without finish_reason`.
+#[test]
+fn openai_provider_close_delimited_stream_completes_at_eof() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (addr, server_handle) = rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("client connects");
+            socket.set_nodelay(true).expect("set nodelay");
+            let mut scratch = [0u8; 8192];
+            let _ = socket.read(&mut scratch).await;
+            // No Content-Length and no Transfer-Encoding: the response is
+            // delimited by the connection close itself.
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+            socket.write_all(head.as_bytes()).await.unwrap();
+            let body = "data: {\"id\":\"chatcmpl-close\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"eof\"}}]}\n\n";
+            socket.write_all(body.as_bytes()).await.unwrap();
+            // Closing the socket terminates the body.
+        });
+        (addr, handle)
+    });
+    let url = format!("http://{addr}");
+    let mut provider = OpenAiCompatibleProvider::new("test", url.clone(), vec![]).unwrap();
+    let mut model = sample_model();
+    model.base_url = url;
+    provider.models.push(model.clone());
+    let mut stream =
+        rt.block_on(async { provider.stream(&model, ctx("hi"), StreamOptions::default()) });
+    let events = rt.block_on(async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        events
+    });
+    rt.block_on(async { server_handle.await.unwrap() });
+
+    let done = events.iter().find_map(|event| match event {
+        AssistantMessageEvent::Done { reason, message } => Some((reason, message)),
+        _ => None,
+    });
+    let (reason, message) = done.expect("close-delimited stream must complete with Done");
+    assert_eq!(*reason, TerminalReason::Stop);
+    assert_eq!(partial_text(message), "eof");
+}
+
+/// The close-delimited exemption must not leak into a framed (chunked) body:
+/// a properly terminated chunked response that still omits `finish_reason` is
+/// a truncated stream and keeps the retryable error, not a silent success.
+#[test]
+fn openai_provider_chunked_stream_without_finish_reason_stays_truncated() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (addr, server_handle) = rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("client connects");
+            socket.set_nodelay(true).expect("set nodelay");
+            let mut scratch = [0u8; 8192];
+            let _ = socket.read(&mut scratch).await;
+            // A framed response: Transfer-Encoding makes a clean EOF at the
+            // chunk terminator a complete HTTP body, but the SSE payload never
+            // announced finish_reason, so it is genuinely truncated.
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+            socket.write_all(head.as_bytes()).await.unwrap();
+            let body = "data: {\"id\":\"chatcmpl-cut\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"cut\"}}]}\n\n";
+            let frame = format!("{:x}\r\n{}\r\n0\r\n\r\n", body.len(), body);
+            socket.write_all(frame.as_bytes()).await.unwrap();
+        });
+        (addr, handle)
+    });
+    let url = format!("http://{addr}");
+    let mut provider = OpenAiCompatibleProvider::new("test", url.clone(), vec![]).unwrap();
+    let mut model = sample_model();
+    model.base_url = url;
+    provider.models.push(model.clone());
+    let mut stream =
+        rt.block_on(async { provider.stream(&model, ctx("hi"), StreamOptions::default()) });
+    let events = rt.block_on(async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        events
+    });
+    rt.block_on(async { server_handle.await.unwrap() });
+
+    let error = events
+        .iter()
+        .find_map(|event| match event {
+            AssistantMessageEvent::Error { error, .. } => Some(error),
+            _ => None,
+        })
+        .expect("a chunked stream without finish_reason must fail");
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert!(
+        error
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Stream ended without finish_reason")),
+        "unexpected error message: {:?}",
+        error.error_message
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AssistantMessageEvent::Done { .. })),
+        "a truncated framed stream must not emit a Done event"
+    );
+}

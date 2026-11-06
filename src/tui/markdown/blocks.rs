@@ -64,6 +64,22 @@ impl ParsedBlocks {
     }
 }
 
+/// Deepest nested blockquote chain rendered by recursively re-parsing the
+/// stripped inner text. See [`blockquote_marker_depth`].
+const MAX_BLOCKQUOTE_DEPTH: usize = 32;
+
+/// Count leading blockquote markers (`>` optionally followed by one space),
+/// e.g. `> > > text` is 3. Used to bound recursive blockquote rendering.
+fn blockquote_marker_depth(line: &str) -> usize {
+    let mut rest = line.trim_start();
+    let mut depth = 0usize;
+    while let Some(after) = rest.strip_prefix('>') {
+        depth += 1;
+        rest = after.strip_prefix(' ').unwrap_or(after);
+    }
+    depth
+}
+
 /// Byte offset of every `source.lines()` line start, plus `source.len()` as
 /// the final entry. `str::lines` strips one trailing `\r` per line, so the
 /// separator after the content is `\r\n`, `\n`, or nothing for a source-final
@@ -254,29 +270,45 @@ pub(super) fn parse_blocks(source: &str, options: &MarkdownOptions) -> ParsedBlo
             continue;
         }
 
-        // Blockquote.
+        // Blockquote. Cap the marker chain: rendering nested quotes recurses
+        // through `parse_blocks` once per level, so a line carrying thousands
+        // of `>` (model/MCP-controlled text) must not become thousands of
+        // recursive renders. The cap is measured over the WHOLE quote run,
+        // not just its first line: a multi-line quote whose lines get
+        // progressively deeper (`>` on line 1, `> >` on line 2, …) strips one
+        // marker per parse, so each recursion level presents a harmless
+        // first line while the remaining depth hides on a later line. Past
+        // the cap the whole run stays a paragraph (literal text).
         if trimmed.starts_with('>') {
-            flush_paragraph(
-                &mut paragraph,
-                &mut blocks,
-                &mut block_starts,
-                paragraph_start,
-            );
             let block_line = i;
-            let mut quote: Vec<String> = Vec::new();
-            while i < lines.len() && lines[i].trim_start().starts_with('>') {
-                let content = lines[i]
-                    .trim_start()
-                    .strip_prefix('>')
-                    .unwrap_or("")
-                    .strip_prefix(' ')
-                    .unwrap_or_else(|| lines[i].trim_start().strip_prefix('>').unwrap_or(""));
-                quote.push(content.to_string());
-                i += 1;
+            let mut run_end = i;
+            let mut quote_depth = 0usize;
+            while run_end < lines.len() && lines[run_end].trim_start().starts_with('>') {
+                quote_depth = quote_depth.max(blockquote_marker_depth(lines[run_end].trim_start()));
+                run_end += 1;
             }
-            block_starts.push(block_line);
-            blocks.push(Block::Blockquote(quote.join("\n")));
-            continue;
+            if quote_depth <= MAX_BLOCKQUOTE_DEPTH {
+                flush_paragraph(
+                    &mut paragraph,
+                    &mut blocks,
+                    &mut block_starts,
+                    paragraph_start,
+                );
+                let mut quote: Vec<String> = Vec::new();
+                while i < run_end {
+                    let content = lines[i]
+                        .trim_start()
+                        .strip_prefix('>')
+                        .unwrap_or("")
+                        .strip_prefix(' ')
+                        .unwrap_or_else(|| lines[i].trim_start().strip_prefix('>').unwrap_or(""));
+                    quote.push(content.to_string());
+                    i += 1;
+                }
+                block_starts.push(block_line);
+                blocks.push(Block::Blockquote(quote.join("\n")));
+                continue;
+            }
         }
 
         // Table: a header row with `|` followed by a delimiter row.

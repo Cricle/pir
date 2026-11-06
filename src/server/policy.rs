@@ -1,8 +1,16 @@
 //! Security and resource limit configuration for the TCP server.
 //!
-//! Two policy decisions are documented here because they change what a remote
-//! client can make the server process do:
+//! Three policy decisions are documented here because they change what a
+//! remote client can make the server process do:
 //!
+//! * **Authentication is required by default.** A server with no
+//!   `auth_token` refuses to bind unless the host explicitly opts into
+//!   unauthenticated local development via
+//!   [`ServerSecurityConfig::unauthenticated_local`] (the CLI spells this
+//!   `--allow-unauthenticated`). Loopback is not a user boundary: any local
+//!   user/process can connect to `127.0.0.1`, so a token-less loopback server
+//!   would let other local accounts create sessions and read/write files
+//!   under the server's working directory.
 //! * `allow_remote_bash` — when `false` (the default), the bash tool is
 //!   **excluded from every session's tool registry**, so a remote prompt run
 //!   can never execute shell commands on the host even if a model asks for
@@ -64,16 +72,20 @@ pub(super) const ALLOWED_ROOTS_ENV: &str = "PIR_SERVER_ALLOWED_ROOTS";
 
 /// Security and resource limits for the TCP server.
 ///
-/// Authentication is intentionally opt-in so that loopback/library users retain
-/// the original protocol handshake. Once a token is configured, clients must
-/// send the private preface before the normal CBOR protocol and unauthenticated
-/// sockets are closed without a protocol response.
-///
-/// `Debug` is hand-written so `auth_token` is never printed; this type is not
-/// `Serialize`.
+/// Authentication is required by default: binding a token-less server fails
+/// with [`std::io::ErrorKind::PermissionDenied`] unless
+/// [`Self::unauthenticated_local`] / the CLI `--allow-unauthenticated` flag
+/// explicitly opts in. Once a token is configured, clients must send the
+/// private preface before the normal CBOR protocol and unauthenticated sockets
+/// are closed without a protocol response. The token itself is never printed
+/// by `Debug` and this type is not `Serialize`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ServerSecurityConfig {
     pub auth_token: Option<String>,
+    /// Explicit opt-in for running without `auth_token`. Only for local
+    /// development and tests: loopback TCP is reachable by every local user
+    /// and process, so it is not a user-isolation boundary.
+    pub allow_unauthenticated: bool,
     pub max_connections: usize,
     pub max_request_body_bytes: usize,
     pub max_connection_body_bytes: usize,
@@ -93,6 +105,7 @@ impl fmt::Debug for ServerSecurityConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerSecurityConfig")
             .field("auth_token", &RedactedToken(self.auth_token.as_deref()))
+            .field("allow_unauthenticated", &self.allow_unauthenticated)
             .field("max_connections", &self.max_connections)
             .field("max_request_body_bytes", &self.max_request_body_bytes)
             .field("max_connection_body_bytes", &self.max_connection_body_bytes)
@@ -124,6 +137,9 @@ impl ServerSecurityConfig {
     pub fn from_env_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let mut config = Self {
             auth_token: None,
+            // A token-less server is refused at bind time unless the host
+            // explicitly opts in (local development / tests only).
+            allow_unauthenticated: false,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             // Keep library defaults compatible with the historical 16 MiB
             // protocol frame limit; the CLI config defaults to 1 MiB.
@@ -156,6 +172,18 @@ impl ServerSecurityConfig {
         }
         config
     }
+
+    /// Explicit opt-in for a token-less local server (the CLI
+    /// `--allow-unauthenticated` flag). This disables authentication for
+    /// every client that can reach the listener — on loopback that includes
+    /// all local users/processes, not only the invoking user. Never use it
+    /// on a shared host.
+    pub fn unauthenticated_local() -> Self {
+        Self {
+            allow_unauthenticated: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl ServerSecurityConfig {
@@ -172,6 +200,24 @@ impl ServerSecurityConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid server security configuration",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the limits and enforce the authentication invariant before a
+    /// listener is created. A missing token is only accepted after an explicit
+    /// [`Self::unauthenticated_local`] opt-in; this check runs before bind so
+    /// a refused server never briefly listens (and never race-binds the
+    /// default port).
+    pub(super) fn validate_for_bind(&self) -> io::Result<()> {
+        self.validate()?;
+        if self.auth_token.is_none() && !self.allow_unauthenticated {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing to start an unauthenticated server: set PIR_SERVER_AUTH_TOKEN \
+                 or pass --allow-unauthenticated for local development (loopback does not \
+                 isolate other local users)",
             ));
         }
         Ok(())

@@ -66,6 +66,26 @@ pub(super) fn render_inline_with_context(
     inside_link: bool,
     ctx: &InlineStyleContext<'_>,
 ) -> String {
+    render_inline_at(text, theme, options, inside_link, ctx, 0)
+}
+
+/// Deepest emphasis/link nesting the inline renderer descends. A string such
+/// as `**…**` nested thousands deep (model/MCP output pasted into a message)
+/// otherwise recurses once per level; past the cap the remaining source is
+/// emitted as plain text inside the current style instead of descending.
+const MAX_INLINE_NESTING: usize = 64;
+
+fn render_inline_at(
+    text: &str,
+    theme: &MarkdownTheme,
+    options: &MarkdownOptions,
+    inside_link: bool,
+    ctx: &InlineStyleContext<'_>,
+    depth: usize,
+) -> String {
+    if depth >= MAX_INLINE_NESTING {
+        return ctx.apply(text);
+    }
     let mut out = String::with_capacity(text.len());
     // Accumulated plain-text run, flushed through the context style when a
     // styled span (or the end of input) is reached.
@@ -154,7 +174,7 @@ pub(super) fn render_inline_with_context(
                     flush_plain(&mut out, &mut plain, ctx);
                     let inner: String = chars[i + 3..end].iter().collect();
                     let rendered =
-                        render_inline_with_context(&inner, theme, options, inside_link, ctx);
+                        render_inline_at(&inner, theme, options, inside_link, ctx, depth + 1);
                     out.push_str(&(theme.italic)(&(theme.bold)(&rendered)));
                     out.push_str(ctx.prefix);
                     i = end + 3;
@@ -162,7 +182,7 @@ pub(super) fn render_inline_with_context(
                     flush_plain(&mut out, &mut plain, ctx);
                     let inner: String = chars[i + 2..end].iter().collect();
                     let rendered =
-                        render_inline_with_context(&inner, theme, options, inside_link, ctx);
+                        render_inline_at(&inner, theme, options, inside_link, ctx, depth + 1);
                     out.push_str(&(theme.bold)(&rendered));
                     out.push_str(ctx.prefix);
                     i = end + 2;
@@ -180,7 +200,7 @@ pub(super) fn render_inline_with_context(
                         flush_plain(&mut out, &mut plain, ctx);
                         let inner: String = chars[i + 1..end].iter().collect();
                         let rendered =
-                            render_inline_with_context(&inner, theme, options, inside_link, ctx);
+                            render_inline_at(&inner, theme, options, inside_link, ctx, depth + 1);
                         out.push_str(&(theme.italic)(&rendered));
                         out.push_str(ctx.prefix);
                         i = end + 1;
@@ -209,7 +229,7 @@ pub(super) fn render_inline_with_context(
                     flush_plain(&mut out, &mut plain, ctx);
                     let inner: String = chars[i + 2..end].iter().collect();
                     let rendered =
-                        render_inline_with_context(&inner, theme, options, inside_link, ctx);
+                        render_inline_at(&inner, theme, options, inside_link, ctx, depth + 1);
                     out.push_str(&(theme.strikethrough)(&rendered));
                     out.push_str(ctx.prefix);
                     i = end + 2;
@@ -250,7 +270,7 @@ pub(super) fn render_inline_with_context(
                 if let Some((link_text, href, end)) = parse_link(&chars, i) {
                     flush_plain(&mut out, &mut plain, ctx);
                     let rendered_text =
-                        render_inline_with_context(&link_text, theme, options, true, ctx);
+                        render_inline_at(&link_text, theme, options, true, ctx, depth + 1);
                     // Autolinked emails carry `text="foo@bar.com"` with
                     // `href="mailto:foo@bar.com"`: compare against the href
                     // with the `mailto:` prefix stripped.

@@ -33,7 +33,7 @@ use pir::protocol::{
     encode_client_value, FrameOptions, ModelRef, RpcTarget, ServerMessageDecoder, PROTOCOL_VERSION,
     SESSION_SERVICE_ID,
 };
-use pir::server::{empty_snapshot, Server, ServerState};
+use pir::server::{empty_snapshot, Server, ServerSecurityConfig, ServerState};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -166,9 +166,13 @@ async fn bind_gated_server(gate: watch::Receiver<bool>) -> (Server, Arc<AtomicUs
         Arc::new(registry),
     )
     .with_security(pir::server::ServerSecurityConfig::default());
-    let server = Server::bind_with_state("127.0.0.1:0", state)
-        .await
-        .expect("bind gated test server");
+    let server = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state,
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("bind gated test server");
     (server, entered)
 }
 
@@ -216,6 +220,23 @@ async fn wait_for_phase(state: &ServerState, session_id: &str, phase: &str) {
     panic!("session {session_id} never entered phase {phase}");
 }
 
+/// Poll until the gated provider's `stream()` has actually been entered.
+///
+/// The "turn" phase flips synchronously when the prompt is accepted, but the
+/// agent run itself is dispatched to a dedicated large-stack OS thread (see
+/// `SERVER_AGENT_TASK_STACK_BYTES`), so thread/runtime startup can lag the
+/// phase by more than one scheduler turn. Waiting on the provider entry is
+/// the real precondition for cancelling a started stream.
+async fn wait_for_provider_entry(entered: &AtomicUsize) {
+    for _ in 0..2000 {
+        if entered.load(Ordering::SeqCst) >= 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the gated provider stream never started");
+}
+
 /// The cancel frame produces NO response of its own: the cancelled prompt's
 /// single terminal response is `{ok:false, code:"cancelled"}` on the PROMPT
 /// request id, and no further response may follow for that id. The session
@@ -242,10 +263,7 @@ async fn cancel_frame_yields_one_cancelled_terminal_response() {
         .await
         .expect("prompt call sent");
     wait_for_phase(&state, &session_id, "turn").await;
-    assert!(
-        entered.load(Ordering::SeqCst) >= 1,
-        "the gated provider stream must have started"
-    );
+    wait_for_provider_entry(&entered).await;
 
     // `Client::cancel` sends the cancel frame and waits for the response of
     // the CANCELLED request: the terminal `cancelled` error must arrive (no
@@ -364,7 +382,10 @@ impl Conn {
 /// connection keeps serving.
 #[tokio::test]
 async fn stale_cancel_id_is_ignored_and_connection_stays_usable() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind server");
+    let server =
+        Server::bind_with_security("127.0.0.1:0", ServerSecurityConfig::unauthenticated_local())
+            .await
+            .expect("bind server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 
@@ -416,7 +437,10 @@ async fn stale_cancel_id_is_ignored_and_connection_stays_usable() {
 /// awaiting, client.ts `onAbort`).
 #[tokio::test]
 async fn client_cancel_for_a_settled_request_returns_without_waiting() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind server");
+    let server =
+        Server::bind_with_security("127.0.0.1:0", ServerSecurityConfig::unauthenticated_local())
+            .await
+            .expect("bind server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 
@@ -463,7 +487,10 @@ async fn client_cancel_for_a_settled_request_returns_without_waiting() {
 /// its connection slot for the idle timeout (slowloris).
 #[tokio::test]
 async fn pre_greeting_connection_is_closed_by_the_handshake_deadline() {
-    let server = Server::bind("127.0.0.1:0").await.expect("bind server");
+    let server =
+        Server::bind_with_security("127.0.0.1:0", ServerSecurityConfig::unauthenticated_local())
+            .await
+            .expect("bind server");
     let address = server.local_addr().expect("local address");
     let accepting = tokio::spawn(async move { server.accept_once().await });
 

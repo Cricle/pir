@@ -85,6 +85,7 @@ fn context(session_env: Option<Arc<ToolSessionEnv>>) -> ToolContext {
 
 fn env_with(background: Option<Arc<dyn BackgroundControl>>) -> Arc<ToolSessionEnv> {
     Arc::new(ToolSessionEnv {
+        read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         thinking: ThinkingLevel::Off,

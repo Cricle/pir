@@ -65,7 +65,17 @@
 //!   period. The in-process child aborts cooperatively: the parent abort
 //!   signal is watched and the child session's abort signal is set; the child
 //!   loop stops at its next cancellation checkpoint (turn boundary / provider
-//!   request). No kill escalation is needed.
+//!   request). A wall-clock budget backstops a child whose provider/tool call
+//!   never reaches a cancellation checkpoint: when the budget expires the
+//!   child is aborted, and after the same 5s grace the prompt future is
+//!   dropped (the in-process equivalent of SIGKILL).
+//! - **Budget**: every child session gets a turn cap
+//!   ([`DEFAULT_SUBAGENT_MAX_TURNS`], `PIR_SUBAGENT_MAX_TURNS`) and a
+//!   wall-clock budget ([`DEFAULT_SUBAGENT_WALL_CLOCK_MS`],
+//!   `PIR_SUBAGENT_WALL_CLOCK_MS`). A turn-cap hit surfaces the agent loop's
+//!   structured `StopReason::Error`; a wall-clock hit is reported as a
+//!   structured child error. Both keep a runaway child from spending tokens
+//!   forever, including one detached by a cancelled parallel dispatch.
 //! - **`stderr`**: children have no stderr stream; the `stderr` field of a
 //!   result carries the child run error text (`AgentSession::prompt` error),
 //!   keeping the upstream error-text precedence
@@ -117,6 +127,110 @@ const MAX_CONCURRENCY: usize = 4;
 const PER_TASK_OUTPUT_CAP: usize = 50 * 1024;
 /// Parent-abort watcher poll interval.
 const ABORT_POLL_MS: u64 = 50;
+
+// ---------------------------------------------------------------------------
+// Child-session budgets (R13-04 / C1-03)
+// ---------------------------------------------------------------------------
+
+/// Default per-child turn cap. A turn is one model request (one assistant
+/// message); every tool call in that message executes as one batch. 1000 is
+/// the same runaway guard the non-interactive hosts use
+/// ([`crate::config::defaults::DEFAULT_AGENT_MAX_TURNS`]) and gives a child
+/// that keeps calling tools a hard stop instead of upstream's unbounded loop.
+pub const DEFAULT_SUBAGENT_MAX_TURNS: usize = 1_000;
+
+/// Default per-child wall-clock budget: 30 minutes. The turn cap bounds the
+/// number of model requests; this bounds a single request/tool call that
+/// never reaches a turn boundary (a hung provider stream or an in-process
+/// tool future that ignores the abort signal).
+pub const DEFAULT_SUBAGENT_WALL_CLOCK_MS: u64 = 30 * 60 * 1_000;
+
+/// Grace period between the wall-clock abort and dropping the child's prompt
+/// future (the in-process equivalent of upstream's SIGTERM → SIGKILL 5s).
+pub const DEFAULT_SUBAGENT_ABORT_GRACE_MS: u64 = 5_000;
+
+/// `PIR_SUBAGENT_MAX_TURNS`: per-child turn cap override. A positive integer
+/// replaces [`DEFAULT_SUBAGENT_MAX_TURNS`]; `0` restores the pre-C1-03
+/// unbounded behavior for hosts that manage their own budget; junk/negative
+/// values keep the default (a typo must not disable the guard).
+pub const SUBAGENT_MAX_TURNS_ENV: &str = "PIR_SUBAGENT_MAX_TURNS";
+
+/// `PIR_SUBAGENT_WALL_CLOCK_MS`: per-child wall-clock budget in
+/// milliseconds. A positive integer replaces
+/// [`DEFAULT_SUBAGENT_WALL_CLOCK_MS`]; `0` disables the budget.
+pub const SUBAGENT_WALL_CLOCK_ENV: &str = "PIR_SUBAGENT_WALL_CLOCK_MS";
+
+/// Per-child-session resource budget. Resolved once when a [`SubagentTool`]
+/// is built (from the process environment for production, or an explicit
+/// value in tests) and applied to every single/chain/parallel child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubagentBudget {
+    /// Maximum model requests the child may issue (`usize::MAX` = unlimited).
+    pub max_turns: usize,
+    /// Wall-clock budget for one child run (`None` = unlimited).
+    pub wall_clock: Option<std::time::Duration>,
+    /// Grace between the budget-triggered abort and dropping the prompt
+    /// future when the child does not stop cooperatively.
+    pub abort_grace: std::time::Duration,
+}
+
+impl Default for SubagentBudget {
+    fn default() -> Self {
+        Self {
+            max_turns: DEFAULT_SUBAGENT_MAX_TURNS,
+            wall_clock: Some(std::time::Duration::from_millis(
+                DEFAULT_SUBAGENT_WALL_CLOCK_MS,
+            )),
+            abort_grace: std::time::Duration::from_millis(DEFAULT_SUBAGENT_ABORT_GRACE_MS),
+        }
+    }
+}
+
+impl SubagentBudget {
+    /// Resolve the budget from the process environment.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Resolve the budget through an explicit environment accessor. Tests
+    /// pass a map so they never mutate process-wide state (the same pattern
+    /// as [`crate::config::env::max_turns_from_lookup`]).
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let defaults = Self::default();
+        let max_turns = lookup(SUBAGENT_MAX_TURNS_ENV)
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map_or(defaults.max_turns, |value| {
+                if value == 0 {
+                    usize::MAX
+                } else {
+                    usize::try_from(value).unwrap_or(usize::MAX)
+                }
+            });
+        let wall_clock = lookup(SUBAGENT_WALL_CLOCK_ENV)
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map_or(defaults.wall_clock, |millis| {
+                if millis == 0 {
+                    None
+                } else {
+                    Some(std::time::Duration::from_millis(millis))
+                }
+            });
+        Self {
+            max_turns,
+            wall_clock,
+            abort_grace: defaults.abort_grace,
+        }
+    }
+}
+
+/// Number of child extension runtimes currently holding a global
+/// [`MAX_CHILD_RUNTIMES`] slot (test/embedder observability seam).
+#[doc(hidden)]
+pub fn active_child_runtime_slots() -> usize {
+    MAX_CHILD_RUNTIMES
+        .0
+        .saturating_sub(CHILD_RUNTIME_SEM.available_permits())
+}
 /// Global cap on LIVE per-child extension runtimes, typed so the bound is a
 /// named value with a constructor, not a bare magic integer at use sites.
 /// Derived from the existing per-parent bounds: one parallel dispatch runs
@@ -274,6 +388,9 @@ pub struct SubagentTool {
     /// session's config so children own the extension tool surface
     /// (upstream's child is a full `pi`).
     extensions: Option<ExtensionHandle>,
+    /// Per-child turn/wall-clock budget, resolved from the process
+    /// environment when the tool is built (see [`SubagentBudget`]).
+    budget: SubagentBudget,
     /// Tool description rendered from the RESOLVED user-agent directory (the
     /// same `agent_dir()/agents` resolution `run.rs` falls back to), not a
     /// hardcoded `~/.pi/agent/agents`: the agent dir honors
@@ -298,8 +415,16 @@ impl SubagentTool {
     ) -> Self {
         Self {
             extensions,
+            budget: SubagentBudget::from_env(),
             description: subagent_description(user_agents_dir),
         }
+    }
+
+    /// Replace the environment-resolved child budget (tests/embedders).
+    #[doc(hidden)]
+    pub fn with_budget(mut self, budget: SubagentBudget) -> Self {
+        self.budget = budget;
+        self
     }
 }
 
@@ -332,7 +457,8 @@ impl AgentTool for SubagentTool {
         let args = args.clone();
         let ctx = ctx.clone();
         let extensions = self.extensions.clone();
-        Box::pin(async move { execute(&args, &ctx, extensions).await })
+        let budget = self.budget;
+        Box::pin(async move { execute(&args, &ctx, extensions, budget).await })
     }
 }
 

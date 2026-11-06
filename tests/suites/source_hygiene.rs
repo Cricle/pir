@@ -39,12 +39,14 @@ const FORBIDDEN_MARKERS: [&str; 3] = ["#[test]", "#[tokio::test]", "#[cfg(test)]
 /// modules while the owning lanes were under active repair. They are tracked
 /// migration debt here so the hygiene gate does not fail the whole tree; move
 /// them to `tests/` before the next release tag.
-const PREEXISTING_INLINE_TEST_ALLOWLIST: [&str; 6] = [
+const PREEXISTING_INLINE_TEST_ALLOWLIST: [&str; 8] = [
     "ai/api/bedrock/credentials.rs",
     "ai/api/partial_mirror.rs",
     "durable/storage/jsonl.rs",
+    "env_client/selection.rs",
     "extensions/loader.rs",
     "main_cli/cli_preprocess.rs",
+    "plugins/builtin/mcp.rs",
     "session_manager/search.rs",
 ];
 

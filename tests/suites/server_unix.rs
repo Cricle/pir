@@ -14,9 +14,10 @@ async fn unix_server_serves_a_full_session_roundtrip() {
     let socket_path = dir.join("test.sock");
     let _ = std::fs::remove_file(&socket_path);
 
-    let server = UnixServer::bind_with_security(&socket_path, ServerSecurityConfig::default())
-        .await
-        .expect("bind unix server");
+    let server =
+        UnixServer::bind_with_security(&socket_path, ServerSecurityConfig::unauthenticated_local())
+            .await
+            .expect("bind unix server");
     let server_task = tokio::spawn(async move { server.run().await });
 
     // Wait for the socket file to appear.
@@ -41,7 +42,12 @@ async fn unix_server_serves_a_full_session_roundtrip() {
     // A live socket must not be stolen: the second bind fails with AddrInUse
     // and leaves the serving path untouched. Match explicitly: `expect_err`
     // would require `UnixServer: Debug`, which is not part of its public API.
-    let rebound = match UnixServer::bind(&socket_path).await {
+    let rebound = match UnixServer::bind_with_security(
+        &socket_path,
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    {
         Ok(_) => panic!("binding a live socket must fail"),
         Err(error) => error,
     };
@@ -103,9 +109,10 @@ async fn unix_server_recovers_a_stale_socket_file() {
     drop(stale);
     assert!(socket_path.exists());
 
-    let server = UnixServer::bind(&socket_path)
-        .await
-        .expect("stale socket must be replaced");
+    let server =
+        UnixServer::bind_with_security(&socket_path, ServerSecurityConfig::unauthenticated_local())
+            .await
+            .expect("stale socket must be replaced");
     assert_eq!(server.socket_path(), socket_path.as_path());
     server.close();
     assert!(!socket_path.exists(), "close must remove the socket");

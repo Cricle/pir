@@ -60,14 +60,30 @@ fn configured_slot() -> &'static ConfiguredSlot {
 
 /// Install a remote environment for the tool layer, overriding the
 /// configuration variables.
+///
+/// The previously installed environment (if any) is closed: replacing the
+/// configuration must not leave its daemon, SSH session and exec/pty process
+/// groups running with no owner (C2-05). `close()` is best-effort and
+/// idempotent; keeping an `Arc` clone elsewhere does not prevent it.
 pub fn install_override(environment: Arc<RemoteExecutionEnv>) {
-    *lock(override_slot()) = Some(environment);
+    let old = lock(override_slot()).replace(environment.clone());
+    if let Some(old) = old {
+        if !Arc::ptr_eq(&old, &environment) {
+            old.connection.close();
+        }
+    }
 }
 
 /// Drop a previously installed override; the configuration variables (if any)
 /// apply again.
+///
+/// The removed environment is closed for the same reason as
+/// [`install_override`].
 pub fn clear_override() {
-    *lock(override_slot()) = None;
+    let old = lock(override_slot()).take();
+    if let Some(old) = old {
+        old.connection.close();
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -87,8 +103,12 @@ pub fn configured_remote_env() -> Option<Arc<RemoteExecutionEnv>> {
     }
     let host = read_variable("PI_ENV_SSH_HOST").unwrap_or_default();
     if host.is_empty() {
-        // Nothing configured: reset the cache so a value set later starts fresh.
-        *lock(configured_slot()) = None;
+        // Nothing configured: reset the cache so a value set later starts
+        // fresh, closing the connection that configuration owned.
+        let old = lock(configured_slot()).take();
+        if let Some((_, old)) = old {
+            old.connection.close();
+        }
         return None;
     }
     let agent_dir = crate::coding_agent::context::agent_dir();
@@ -99,7 +119,12 @@ pub fn configured_remote_env() -> Option<Arc<RemoteExecutionEnv>> {
         }
     }
     let environment = Arc::new(build_ssh_environment(&host, &read_variable, &agent_dir));
-    *lock(configured_slot()) = Some((key, environment.clone()));
+    let old = lock(configured_slot()).replace((key, environment.clone()));
+    // Replacing the cached environment is a configuration change: close the
+    // previous daemon/SSH connection instead of dropping it silently.
+    if let Some((_, old)) = old {
+        old.connection.close();
+    }
     Some(environment)
 }
 
@@ -313,5 +338,58 @@ async fn canonicalize_existing(
                 return Err(RemoteError::new("unknown", error.message));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env_client::connection::Connection;
+
+    /// A connection that was never started: replacing the slot must still mark
+    /// it closed, which is the observable half of "close, don't leak" (a
+    /// started one would also drop its daemon/SSH session through the same
+    /// `close()`).
+    fn inert_environment(id: &str) -> Arc<RemoteExecutionEnv> {
+        let options = RemoteExecutionEnvOptions::new(
+            id.to_string(),
+            Connection::argv(vec!["definitely-not-a-pir-image".to_string()]),
+        );
+        Arc::new(RemoteExecutionEnv::new(options))
+    }
+
+    #[test]
+    fn replacing_or_clearing_the_override_closes_the_old_connection() {
+        clear_override();
+        let first = inert_environment("first");
+        let first_connection = first.connection.clone();
+        install_override(first.clone());
+        assert!(
+            !first_connection.is_closed(),
+            "the installed connection is open"
+        );
+
+        let second = inert_environment("second");
+        let second_connection = second.connection.clone();
+        install_override(second.clone());
+        assert!(
+            first_connection.is_closed(),
+            "replacing the override closes the displaced connection"
+        );
+        assert!(
+            !second_connection.is_closed(),
+            "the new connection stays open"
+        );
+
+        // Re-installing the same Arc must not close the environment that is
+        // still installed.
+        install_override(second.clone());
+        assert!(!second_connection.is_closed());
+
+        clear_override();
+        assert!(
+            second_connection.is_closed(),
+            "clearing the override closes the removed connection"
+        );
     }
 }

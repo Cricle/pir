@@ -67,7 +67,7 @@
 //! earlier handler (`remove` is session-scoped; upstream has no removal).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use base64::Engine as _;
@@ -1890,15 +1890,25 @@ fn servers_report(status: &McpStatusSnapshot) -> String {
     let mut lines = vec!["MCP servers:".to_owned()];
     for server in &status.servers {
         let count = server.tool_count();
+        // A connected server's count is authoritative (zero means it really
+        // exposes none), and a dropped connection keeps showing its last
+        // discovered list. A server that never published a list must not say
+        // "0 tools": that reads as "this server has no tools" when discovery
+        // merely has not finished (or failed); its state word already says
+        // which on the same row.
+        let tools = if server.state.is_connected() || count > 0 {
+            format!("{count} {}", if count == 1 { "tool" } else { "tools" })
+        } else {
+            "tools not discovered yet".to_owned()
+        };
         // Bare state word on the row; the error goes on its own indented
         // lines (so a multi-line transport message is not folded into the
         // label and then repeated by the error block).
         lines.push(format!(
-            "  {} ({} · {} · {count} {} · {})",
+            "  {} ({} · {} · {tools} · {})",
             server.name,
             server.state_word(),
             crate::mcp::manager::exposure_label(server.exposure),
-            if count == 1 { "tool" } else { "tools" },
             source_label(&server.source),
         ));
         if let Some(error) = server.error().filter(|_| !server.state.is_connected()) {
@@ -3833,36 +3843,75 @@ async fn js_call_reach(
 // The tool bridge
 // ---------------------------------------------------------------------------
 
-/// Intern dynamic tool names/descriptions to `'static` (the registry tool
-/// surface requires `&'static str`; mirrors
-/// `tool_execution::intern_tool_text`).
-fn intern_tool_text(text: String) -> &'static str {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let pool = POOL.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut pool = pool
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = pool.get(text.as_str()) {
-        return existing;
+/// Maximum bytes of a server-controlled MCP tool description kept in a
+/// bridge. `tools/list` descriptions are arbitrary server text (bounded only
+/// by the transport frame cap); a 64 KiB model-facing budget keeps one server
+/// from pinning megabytes per tool across registry rebuilds.
+pub const MAX_MCP_TOOL_DESCRIPTION_BYTES: usize = 64 * 1024;
+
+/// Truncate an oversized server description at the budget on a UTF-8
+/// boundary and report it, so the server log names the offender instead of
+/// silently losing text.
+fn bounded_tool_description(mut description: String, server: &str, tool: &str) -> String {
+    let original_bytes = description.len();
+    if original_bytes <= MAX_MCP_TOOL_DESCRIPTION_BYTES {
+        return description;
     }
-    let interned: &'static str = Box::leak(text.into_boxed_str());
-    pool.insert(interned);
-    interned
+    let mut end = MAX_MCP_TOOL_DESCRIPTION_BYTES;
+    while end > 0 && !description.is_char_boundary(end) {
+        end -= 1;
+    }
+    description.truncate(end);
+    tracing::warn!(
+        server = %server,
+        tool = %tool,
+        original_bytes,
+        kept_bytes = end,
+        cap = MAX_MCP_TOOL_DESCRIPTION_BYTES,
+        "MCP tool description truncated before registration"
+    );
+    description
 }
+
+/// Live metadata text held by [`McpToolBridge`] instances:
+/// `(bridge_count, name_and_description_bytes)`.
+///
+/// C2-01 regression instrumentation. The old global `Box::leak` intern pool
+/// never released tool text; bridges now own `Arc<str>` text and account for
+/// it here, so a registry rebuild (register a new generation, drop the old)
+/// returns to the same baseline instead of growing for the process lifetime.
+fn live_mcp_bridge_text_stats() -> (usize, usize) {
+    (
+        LIVE_MCP_TOOL_TEXT_ENTRIES.load(Ordering::Relaxed),
+        LIVE_MCP_TOOL_TEXT_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+static LIVE_MCP_TOOL_TEXT_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+static LIVE_MCP_TOOL_TEXT_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// One MCP server tool, exposed as a native [`AgentTool`].
 pub struct McpToolBridge {
     manager: Arc<McpManager>,
     server: String,
     tool: String,
-    name: &'static str,
-    description: &'static str,
+    /// Owned per live bridge (upstream `ExtensionTool`'s `Arc<str>` pattern):
+    /// a registry rebuild drops the previous bridges, releasing their text.
+    name: Arc<str>,
+    description: Arc<str>,
+    /// Bytes accounted in `LIVE_MCP_TOOL_TEXT_BYTES` (name + description).
+    text_bytes: usize,
     parameters: Option<JsonValue>,
     output_schema: Option<JsonValue>,
     exposure: ToolExposure,
     namespace: ToolNamespace,
+}
+
+impl Drop for McpToolBridge {
+    fn drop(&mut self) {
+        LIVE_MCP_TOOL_TEXT_ENTRIES.fetch_sub(1, Ordering::Relaxed);
+        LIVE_MCP_TOOL_TEXT_BYTES.fetch_sub(self.text_bytes, Ordering::Relaxed);
+    }
 }
 
 /// Agent-level exposure of an MCP exposure (upstream `toToolExposure`):
@@ -3879,6 +3928,20 @@ fn tool_exposure(exposure: crate::config::mcp::McpExposure) -> ToolExposure {
 }
 
 impl McpToolBridge {
+    /// Server-controlled descriptions are capped to this many bytes before a
+    /// bridge holds them (also exposed here for the C2-01 regression test).
+    #[doc(hidden)]
+    pub const MAX_DESCRIPTION_BYTES: usize = MAX_MCP_TOOL_DESCRIPTION_BYTES;
+
+    /// Live bridge text: `(bridge_count, name_and_description_bytes)`.
+    ///
+    /// C2-01 regression instrumentation: a registry rebuild must return this
+    /// to its previous baseline instead of retaining old descriptions.
+    #[doc(hidden)]
+    pub fn live_text_stats() -> (usize, usize) {
+        live_mcp_bridge_text_stats()
+    }
+
     /// Build the bridge for one discovered tool with its pre-assigned
     /// registry name, using the exposure the manager resolved (upstream's
     /// `codemode` default).
@@ -3913,6 +3976,7 @@ impl McpToolBridge {
                     .filter(|text| !text.trim().is_empty())
                     .unwrap_or_else(|| format!("MCP tool {tool} from server {server}"))
             });
+        let description = bounded_tool_description(description, &server, &tool);
         let namespace_description = manager
             .registry()
             .get(&server)
@@ -3921,12 +3985,18 @@ impl McpToolBridge {
         // `describeNamespace("docs")` finds `mcp__docs` (upstream
         // `registerTools`'s `aliases: [server]`).
         namespace.description = namespace_description;
+        let name: Arc<str> = Arc::from(registered);
+        let description: Arc<str> = Arc::from(description);
+        let text_bytes = name.len() + description.len();
+        LIVE_MCP_TOOL_TEXT_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        LIVE_MCP_TOOL_TEXT_BYTES.fetch_add(text_bytes, Ordering::Relaxed);
         Self {
             manager,
             server,
             tool,
-            name: intern_tool_text(registered),
-            description: intern_tool_text(description),
+            name,
+            description,
+            text_bytes,
             parameters: Some(normalize_parameters(discovered.tool.input_schema.clone())),
             output_schema: discovered.tool.output_schema.clone(),
             exposure: tool_exposure(exposure),
@@ -3952,12 +4022,12 @@ fn normalize_parameters(schema: JsonValue) -> JsonValue {
 }
 
 impl AgentTool for McpToolBridge {
-    fn name(&self) -> &'static str {
-        self.name
+    fn name(&self) -> &str {
+        &self.name
     }
 
-    fn description(&self) -> &'static str {
-        self.description
+    fn description(&self) -> &str {
+        &self.description
     }
 
     fn parameters(&self) -> Option<JsonValue> {
@@ -5168,4 +5238,83 @@ async fn read_mcp_resource(manager: &McpManager, args: &JsonValue) -> ToolResult
         "contents": result.contents,
     });
     resource_tool_result(tool, Some(&name), text, payload)
+}
+
+#[cfg(test)]
+mod servers_report_tests {
+    use super::*;
+    use crate::mcp::manager::{ConnectionState, McpServerStatus};
+    use std::path::PathBuf;
+
+    fn server(state: ConnectionState, tools: Vec<String>) -> McpServerStatus {
+        McpServerStatus {
+            name: "docs".to_owned(),
+            config: serde_json::from_value(serde_json::json!({ "command": "true" }))
+                .expect("valid server config"),
+            builtin_tools: false,
+            exposure: McpExposure::Direct,
+            enabled: true,
+            state,
+            tools,
+            transport: "stdio".to_owned(),
+            source: McpServerSource::GlobalConfig(PathBuf::from("mcp.json")),
+        }
+    }
+
+    fn report(state: ConnectionState, tools: Vec<String>) -> String {
+        servers_report(&McpStatusSnapshot {
+            servers: vec![server(state, tools)],
+            config_errors: Vec::new(),
+            overridden: Vec::new(),
+            agent_dir: PathBuf::from("."),
+        })
+    }
+
+    /// A server that never published a discovery must not claim `0 tools`:
+    /// the state word on the same row already distinguishes configured,
+    /// connecting and failed.
+    #[test]
+    fn unconnected_zero_tools_is_not_reported_as_zero() {
+        let states = [
+            ConnectionState::Idle,
+            ConnectionState::Connecting,
+            ConnectionState::Failed {
+                error: "boom".to_owned(),
+            },
+            ConnectionState::Disconnected { error: None },
+            ConnectionState::Closed,
+        ];
+        for state in states {
+            let text = report(state.clone(), Vec::new());
+            assert!(
+                !text.contains("0 tools"),
+                "{state:?} must not read as an empty server: {text}"
+            );
+            assert!(
+                text.contains("tools not discovered yet"),
+                "{state:?} names the missing discovery: {text}"
+            );
+        }
+    }
+
+    /// A connected server's count is authoritative: zero means it really
+    /// exposes no tools.
+    #[test]
+    fn connected_zero_tools_stays_zero() {
+        let text = report(ConnectionState::Connected, Vec::new());
+        assert!(text.contains("0 tools"), "{text}");
+        assert!(!text.contains("not discovered"), "{text}");
+    }
+
+    /// A dropped connection keeps the last discovered count instead of
+    /// claiming nothing was ever discovered.
+    #[test]
+    fn unconnected_last_known_count_is_kept() {
+        let text = report(
+            ConnectionState::Disconnected { error: None },
+            vec!["echo".to_owned()],
+        );
+        assert!(text.contains("1 tool"), "{text}");
+        assert!(!text.contains("not discovered"), "{text}");
+    }
 }

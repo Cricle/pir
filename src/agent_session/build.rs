@@ -333,11 +333,19 @@ impl AgentSession {
         } else {
             None
         };
+        let perf_trace = std::env::var_os("PIR_PERF_TRACE").is_some();
+        let perf_t0 = std::time::Instant::now();
         let session = Self::build(config, plugins, has_inline_plugins, agent_dir, settings);
+        if perf_trace {
+            eprintln!("[perf]   session-build {:?}", perf_t0.elapsed());
+        }
         let services = session
             .plugins
             .as_ref()
             .map(|plugins| plugin_services::live_services(&session, plugins));
+        if perf_trace {
+            eprintln!("[perf]   live-services {:?}", perf_t0.elapsed());
+        }
         (session, services)
     }
 
@@ -348,6 +356,8 @@ impl AgentSession {
         agent_dir: PathBuf,
         settings: Option<SettingsManager>,
     ) -> Self {
+        let perf_trace = std::env::var_os("PIR_PERF_TRACE").is_some();
+        let perf_t0 = std::time::Instant::now();
         let cwd = config
             .cwd
             .clone()
@@ -564,6 +574,9 @@ impl AgentSession {
         // (`pi.virtual-model-state` custom entries) re-register into the
         // provider registry's overlay so resume keeps the selection routable.
         restore_session_virtual_models(&config.provider_registry, &config.session);
+        if perf_trace {
+            eprintln!("[perf]     build-p1 {:?}", perf_t0.elapsed());
+        }
         // `pi.getSettings()`: snapshot the merged effective settings (global
         // scope + trusted project scope) into the runtime state. The facade
         // reads the same public SettingsManager the CLI uses; disk IO is two
@@ -583,6 +596,9 @@ impl AgentSession {
             steering_mode = manager.steering_mode();
             follow_up_mode = manager.follow_up_mode();
             extensions.update_settings(manager.raw);
+        }
+        if perf_trace {
+            eprintln!("[perf]     build-p2 {:?}", perf_t0.elapsed());
         }
         // Background tool calls (§2.3): ONE registry per session plus a
         // delivery bundle of owned handles (no `Arc<Self>` self-reference),
@@ -656,6 +672,13 @@ impl AgentSession {
         let api_key = config
             .api_key
             .map(|key| stream::ProviderApiKey::new(config.model.provider.clone(), key));
+        // Read-before-edit mode is process configuration, resolved ONCE here:
+        // neither the ledger nor the tools' gate may observe a mid-session
+        // environment change. Every turn shares this Arc.
+        let read_ledger = Arc::new(crate::agent::read_ledger::ReadLedger::from_env());
+        if perf_trace {
+            eprintln!("[perf]     build-p3 {:?}", perf_t0.elapsed());
+        }
         let session = Self {
             registry: config.provider_registry,
             model: RwLock::new(config.model),
@@ -668,6 +691,7 @@ impl AgentSession {
             host_tool_updates: Arc::new(Mutex::new(None)),
             scheduler,
             background,
+            read_ledger,
             session: session_handle,
             session_id: RwLock::new(session_id),
             session_path: RwLock::new(session_path),
@@ -738,6 +762,8 @@ impl AgentSession {
             queue_mirror: Arc::new(Mutex::new(QueueMirror::default())),
             last_run_diagnostics: std::sync::RwLock::new(None),
             session_context_cache: Mutex::new(None),
+            prompt_projection_cache: Mutex::new(None),
+            projection_reuse_count: AtomicU64::new(0),
             // Read the ambient child flag once here (the process was spawned
             // by the phone pool with `PI_PHONE_CHILD=1`); every prompt then
             // checks a bool. Only the RPC host reads it.
@@ -1231,17 +1257,27 @@ impl AgentSession {
     ///
     /// Returns the REAL disposition (pinned upstream contract): `Handled`
     /// when the agent is idle (the message will be delivered immediately at
-    /// the next poll), `Queued` when a run is streaming and the message waits
-    /// in the inbox.
-    pub fn steer(&self, text: &str) -> Disposition {
-        let expanded = self.expand_prompt_commands(text);
-        let streaming = self.is_streaming();
-        self.enqueue_steering(agent_loop::PromptMessage::text(expanded));
-        if streaming {
+    /// the next poll), `Queued` when a run is streaming OR a manual compaction
+    /// owns the session and the message waits in the inbox.
+    ///
+    /// A manual compaction is not a run (`is_streaming()` is false) but it
+    /// still owns the transcript; reporting `Handled` there made callers
+    /// believe the message was about to be consumed although no poll would
+    /// run until the next prompt. The message itself is queued either way and
+    /// survives the compaction (see `queue.rs`).
+    fn queued_input_disposition(&self) -> Disposition {
+        if self.is_busy() {
             Disposition::Queued
         } else {
             Disposition::Handled
         }
+    }
+
+    pub fn steer(&self, text: &str) -> Disposition {
+        let expanded = self.expand_prompt_commands(text);
+        let disposition = self.queued_input_disposition();
+        self.enqueue_steering(agent_loop::PromptMessage::text(expanded));
+        disposition
     }
 
     /// Queue a follow-up message. Delivered once the agent has otherwise
@@ -1249,13 +1285,9 @@ impl AgentSession {
     /// REAL disposition like [`Self::steer`].
     pub fn follow_up(&self, text: &str) -> Disposition {
         let expanded = self.expand_prompt_commands(text);
-        let streaming = self.is_streaming();
+        let disposition = self.queued_input_disposition();
         self.enqueue_follow_up(agent_loop::PromptMessage::text(expanded));
-        if streaming {
-            Disposition::Queued
-        } else {
-            Disposition::Handled
-        }
+        disposition
     }
 
     /// Queue a pre-built model-facing message as a steering message
@@ -1263,24 +1295,16 @@ impl AgentSession {
     /// ride one user message). No prompt-command expansion is applied — the
     /// caller already built the final message.
     pub fn steer_message(&self, message: Message) -> Disposition {
-        let streaming = self.is_streaming();
+        let disposition = self.queued_input_disposition();
         self.enqueue_steering(agent_loop::PromptMessage::message(message));
-        if streaming {
-            Disposition::Queued
-        } else {
-            Disposition::Handled
-        }
+        disposition
     }
 
     /// [`Self::steer_message`] for the follow-up queue.
     pub fn follow_up_message(&self, message: Message) -> Disposition {
-        let streaming = self.is_streaming();
+        let disposition = self.queued_input_disposition();
         self.enqueue_follow_up(agent_loop::PromptMessage::message(message));
-        if streaming {
-            Disposition::Queued
-        } else {
-            Disposition::Handled
-        }
+        disposition
     }
 
     /// Queue a custom (`role: "custom"`) message as steering input (upstream
@@ -1289,26 +1313,18 @@ impl AgentSession {
     /// lifecycle carries the custom wire shape and the custom entry is what
     /// session storage receives (instead of a regular user message entry).
     pub fn steer_custom(&self, message: CustomRunMessage) -> Disposition {
-        let streaming = self.is_streaming();
+        let disposition = self.queued_input_disposition();
         let prompt = self.custom_prompt_message(&message);
         self.enqueue_steering(prompt);
-        if streaming {
-            Disposition::Queued
-        } else {
-            Disposition::Handled
-        }
+        disposition
     }
 
     /// [`Self::steer_custom`] for the follow-up queue.
     pub fn follow_up_custom(&self, message: CustomRunMessage) -> Disposition {
-        let streaming = self.is_streaming();
+        let disposition = self.queued_input_disposition();
         let prompt = self.custom_prompt_message(&message);
         self.enqueue_follow_up(prompt);
-        if streaming {
-            Disposition::Queued
-        } else {
-            Disposition::Handled
-        }
+        disposition
     }
 
     /// Build the loop prompt for one custom message: the user-shaped
@@ -1522,10 +1538,14 @@ impl AgentSession {
     /// How an input handed to the session right now would be disposed
     /// (upstream `PromptDisposition`, the RPC `data.disposition` field):
     /// [`Disposition::Started`] when a prompt run can start immediately,
-    /// [`Disposition::Queued`] when a run is in flight and the input queues
-    /// behind it.
+    /// [`Disposition::Queued`] when a run OR a manual compaction owns the
+    /// session and the input queues behind it.
+    ///
+    /// A direct `prompt()` during compaction is still rejected (upstream
+    /// contract); this reports what queueable input (`steer`/`followUp`)
+    /// would do.
     pub fn input_disposition(&self) -> Disposition {
-        if self.is_streaming() {
+        if self.is_busy() {
             Disposition::Queued
         } else {
             Disposition::Started

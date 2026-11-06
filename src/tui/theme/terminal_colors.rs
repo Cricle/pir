@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use crate::tui::terminal_reply::reply_token_len;
 
 use super::color::relative_luminance;
+use super::osc11::osc_hex_channel;
 use super::palette::Appearance;
 
 /// An sRGB color as reported by the terminal (upstream `RgbColor`).
@@ -161,17 +162,6 @@ pub fn parse_osc_color_response(data: &str) -> Option<OscColorReply> {
         target,
         rgb: parse_osc_color_value(payload),
     })
-}
-
-/// One hex channel of an OSC color reply: any-length hex scaled to 0-255
-/// (upstream `parseOscHexChannel`, terminal-colors.ts:22-31).
-fn osc_hex_channel(channel: &str) -> Option<u8> {
-    if channel.is_empty() || !channel.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let max = 16f64.powi(channel.len() as i32) - 1.0;
-    let value = u32::from_str_radix(channel, 16).ok()? as f64;
-    Some(((value / max) * 255.0).round() as u8)
 }
 
 /// Parse an OSC color payload (upstream `parseOscColorValue`,

@@ -222,10 +222,15 @@ pub const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 /// until this many bytes have arrived; the paste is then treated as ended —
 /// what was collected is delivered as one [`Event::Paste`] and the gate
 /// returns to normal mode, so the bytes still reach the editor while the
-/// buffer stays bounded. 8 MiB is far above any real paste (a full-screen
-/// terminal's paste is a few KiB) and far below a size that would threaten the
-/// process; an unterminated paste therefore costs at most this much.
-pub const MAX_PASTE_BYTES: usize = 8 * 1024 * 1024;
+/// buffer stays bounded.
+///
+/// 64 MiB is the memory upper bound for a *real* 10 MB-class paste: the cap
+/// exists to bound an unterminated paste, not to guess a plausible paste
+/// size. At the old 8 MiB the payload of a 10 MB paste was delivered early
+/// and the remainder fell back to the per-key path; 64 MiB leaves room for
+/// the whole paste with a wide margin. An unterminated paste still costs at
+/// most this much.
+pub const MAX_PASTE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The event-loop coalescer's threshold: a run of at least this many rapid
 /// text key events in one drained input batch becomes one `Event::Paste`.
@@ -1675,6 +1680,59 @@ pub fn decode_input_sequence(data: &[u8]) -> Option<Vec<Event>> {
         b']' | b'P' | b'_' | b'\\' => None,
         byte => decode_legacy_meta(byte, &data[2..]),
     }
+}
+
+/// Decode raw stdin bytes a pre-TUI startup reader had to take out of the
+/// terminal but could not put back (the Unix OSC 11 reader's hand-back queue;
+/// see [`super::theme::take_pending_stdin_bytes`]).
+///
+/// The bytes are reassembled with [`StdinBuffer`] — the same sequence model
+/// the live input path documents — and each complete sequence is decoded with
+/// [`decode_input_sequence`]. Plain text becomes one key press per character;
+/// `\r`/`\n`, Tab and Backspace keep their usual key shapes. This is the
+/// startup bridge that keeps a keystroke typed before the event loop exists
+/// from being lost.
+pub fn decode_startup_input_bytes(bytes: &[u8]) -> Vec<Event> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let now = Instant::now();
+    let mut buffer = StdinBuffer::default();
+    let mut sequences = buffer.process(bytes, now);
+    sequences.extend(buffer.flush_due(now + Duration::from_secs(1)));
+    let mut events = Vec::new();
+    for sequence in sequences {
+        match sequence {
+            StdinEvent::Data(data) => {
+                if data.first() == Some(&ESC) {
+                    if let Some(decoded) = decode_input_sequence(&data) {
+                        events.extend(decoded);
+                        continue;
+                    }
+                }
+                for character in String::from_utf8_lossy(&data).chars() {
+                    let key = match character {
+                        '\r' => key_event(KeyCode::Enter, KeyModifiers::empty()),
+                        '\n' => key_event(KeyCode::Char('j'), KeyModifiers::CONTROL),
+                        '\t' => key_event(KeyCode::Tab, KeyModifiers::empty()),
+                        '\x7f' | '\x08' => key_event(KeyCode::Backspace, KeyModifiers::empty()),
+                        character if (character as u32) < 0x20 => key_event(
+                            KeyCode::Char(
+                                char::from_u32(character as u32 + 0x60).unwrap_or(character),
+                            ),
+                            KeyModifiers::CONTROL,
+                        ),
+                        character => key_event(KeyCode::Char(character), KeyModifiers::empty()),
+                    };
+                    events.push(key);
+                }
+            }
+            StdinEvent::Paste(payload) => {
+                events.push(Event::Paste(String::from_utf8_lossy(&payload).into_owned()));
+            }
+        }
+    }
+    events
 }
 
 /// Upstream's legacy meta rule (`keys.ts:1346-1356`): `ESC` + one byte is an

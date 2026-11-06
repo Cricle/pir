@@ -14,6 +14,7 @@
 #   powershell -NoProfile -File scripts/test_fast.ps1 -Tests g_ai,node_shims   # exact targets
 #   powershell -NoProfile -File scripts/test_fast.ps1 -RetryFailed    # last run's failures
 #   powershell -NoProfile -File scripts/test_fast.ps1 -List           # print the plan, don't run
+#   powershell -NoProfile -File scripts/test_fast.ps1 -UseNextest     # nextest backend
 #
 # Notes:
 #   - Honours CARGO_TARGET_DIR; defaults to target-alt (repo discipline:
@@ -54,6 +55,13 @@
 #   - A test binary that never terminates is not bounded by this script (it has
 #     no per-suite timeout); Ctrl+C stops the run. Use the foreman's gate
 #     scripts when an unbounded hang must fail rather than wait.
+#   - -UseNextest swaps the built-in build+parallel loop for
+#     `cargo nextest run --profile local` over the SAME target set (all
+#     tests/*.rs targets, or exactly -Tests; "pir" => --lib). It requires
+#     cargo-nextest and gives per-test timeouts from .config/nextest.toml.
+#     -NoBuild is rejected in this mode (nextest always re-checks binaries);
+#     -Concurrency does not apply, -Threads overrides NEXTEST_TEST_THREADS,
+#     and -Filter narrows the build as well as the run.
 param(
     [int]$Concurrency = 0,
     [int]$Threads = 0,
@@ -61,7 +69,8 @@ param(
     [string[]]$Tests = @(),
     [switch]$NoBuild,
     [switch]$RetryFailed,
-    [switch]$List
+    [switch]$List,
+    [switch]$UseNextest
 )
 
 $ErrorActionPreference = "Stop"
@@ -83,6 +92,45 @@ if (-not $env:RUST_MIN_STACK) {
 $stateDir = Join-Path $root "logs\test_fast"
 $statePath = Join-Path $stateDir "last-run.json"
 $deps = Join-Path $env:CARGO_TARGET_DIR "debug\deps"
+
+# Merged mode: Cargo.toml sets `autotests = false` and lists the generated
+# tests/zz_merged_N.rs harnesses explicitly (scripts/gen_merged_tests.ps1).
+# One binary then holds ~40 test files' modules, so the built-in libtest
+# runner would share one process between unrelated tests. Require nextest
+# (process-per-test) for isolation, and select harness binaries instead of
+# per-file targets.
+$mergedMode = (Select-String -Path (Join-Path $root "Cargo.toml") -Pattern '^\s*autotests\s*=\s*false\s*$' -Quiet)
+$mergedTargets = @()
+if ($mergedMode) {
+    $tomlText = Get-Content -LiteralPath (Join-Path $root "Cargo.toml") -Raw
+    $block = [regex]::Match($tomlText, '(?s)# BEGIN GENERATED MERGED TEST TARGETS(.*?)# END GENERATED MERGED TEST TARGETS')
+    if ($block.Success) {
+        $mergedTargets = @([regex]::Matches($block.Groups[1].Value, 'name\s*=\s*"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+    }
+}
+if ($mergedMode -and -not $UseNextest) {
+    Write-Host "[test_fast] Cargo.toml uses merged test harnesses (autotests = false)."
+    Write-Host "[test_fast] Re-run with -UseNextest: nextest runs each test in its own process, which is"
+    Write-Host "[test_fast] required because a zz_merged_N binary contains many unrelated test modules."
+    exit 1
+}
+
+# Map a test-file name (g_tui, node_shims, ...) to the merged harness that
+# includes it. Exact harness names pass through. Unknown names are returned
+# unchanged so cargo can produce its normal "no test target" error.
+function Resolve-MergedTarget {
+    param([string]$Name)
+    if (-not $mergedMode -or $Name -eq "pir" -or $mergedTargets -contains $Name) { return @($Name) }
+    $hits = @()
+    foreach ($h in $mergedTargets) {
+        $path = Join-Path $root "tests\$h.rs"
+        if ((Test-Path $path) -and ((Get-Content -LiteralPath $path -Raw) -match ('(?m)^\s*mod\s+' + [regex]::Escape($Name) + '\s*;'))) {
+            $hits += $h
+        }
+    }
+    if ($hits.Count -gt 0) { return $hits }
+    return @($Name)
+}
 
 # -RetryFailed: pull the failing target list from the previous run's state.
 if ($RetryFailed) {
@@ -153,6 +201,205 @@ function Select-ByFilter {
             $t = (Split-Path -Leaf $_) -replace '-[0-9a-f]{16}\.exe$', '' -replace '\.exe$', ''
             ($t.IndexOf($Pattern, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or ($t -like $Pattern)
         })
+}
+
+# --- nextest backend (opt-in) ---------------------------------------------
+# `cargo nextest run` schedules test binaries in parallel like the loop below,
+# but also enforces per-test timeouts/retries from .config/nextest.toml and
+# prints a machine-readable summary. The target set is unchanged: every
+# tests/*.rs target on a full run, or exactly -Tests. "pir" maps to --lib.
+if ($UseNextest) {
+    $nextestCmd = Get-Command cargo-nextest -ErrorAction SilentlyContinue
+    if (-not $nextestCmd) {
+        Write-Host "[test_fast] -UseNextest was passed but cargo-nextest is not on PATH."
+        Write-Host "[test_fast] install it with: cargo install cargo-nextest --locked"
+        Write-Host "[test_fast] or drop -UseNextest to use the built-in parallel runner."
+        exit 1
+    }
+    $nextestProfile = ""
+    if ((Test-Path (Join-Path $root ".config\nextest.toml")) -and
+        (Select-String -Path (Join-Path $root ".config\nextest.toml") -Pattern '^\s*\[profile\.local\]\s*$' -Quiet)) {
+        $nextestProfile = "local"
+    }
+    $nextestTargets = @()
+    if ($Tests.Count -gt 0) {
+        if ($mergedMode) {
+            $nextestTargets = @($Tests | ForEach-Object { Resolve-MergedTarget $_ } | Sort-Object -Unique)
+        } else {
+            $nextestTargets = @($Tests)
+        }
+    } else {
+        # Non-merged: every tests/*.rs file is its own target. Merged mode:
+        # the explicit [[test]] entries are the only integration targets.
+        if ($mergedMode) {
+            $nextestTargets = @($mergedTargets)
+        } else {
+            # Same universe as Get-TestExeSet: tests/*.rs targets only. The lib
+            # and bin unit harnesses are outside a full test_fast sweep; -Tests
+            # pir still selects the lib target explicitly.
+            $nextestTargets = @(Get-ChildItem -Path (Join-Path $root "tests\*.rs") -File -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.BaseName } | Sort-Object)
+        }
+    }
+    if ($Filter -ne "") {
+        if ($mergedMode) {
+            $nextestTargets = @($nextestTargets | Where-Object {
+                    $h = $_
+                    ($h.IndexOf($Filter, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                    ((Get-Content -LiteralPath (Join-Path $root "tests\$h.rs") -Raw) -match ('(?m)^\s*mod\s+[A-Za-z0-9_]*' + [regex]::Escape($Filter) + '[A-Za-z0-9_]*\s*;'))
+                })
+        } else {
+            $nextestTargets = @($nextestTargets | Where-Object {
+                    ($_.IndexOf($Filter, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or ($_ -like $Filter)
+                })
+        }
+    }
+    $runnerLabel = "cargo nextest run" + $(if ($nextestProfile) { " --profile $nextestProfile" } else { "" })
+    if ($List) {
+        Write-Host ("[test_fast] -List: {0} target(s) via {1} in {2}" -f $nextestTargets.Count, $runnerLabel, $env:CARGO_TARGET_DIR)
+        foreach ($t in $nextestTargets) { Write-Host ("  " + $t) }
+        if ($nextestTargets.Count -eq 0) {
+            Write-Host "[test_fast] -List: no tests/*.rs target matched"
+            exit 1
+        }
+        exit 0
+    }
+    if ($NoBuild) {
+        Write-Host "[test_fast] -NoBuild is not supported with -UseNextest: nextest always re-checks/builds its binaries."
+        Write-Host "[test_fast] drop -NoBuild (fresh artifacts only cost a fast freshness check), or drop -UseNextest."
+        exit 1
+    }
+    if ($nextestTargets.Count -eq 0) { Write-Error "[test_fast] no test targets selected"; exit 1 }
+
+    $selectors = @()
+    foreach ($t in $nextestTargets) {
+        if ($t -eq "pir") { $selectors += "--lib" } else { $selectors += @("--test", $t) }
+    }
+    $cargoExe = (Get-Command cargo).Source
+    $commonArgs = @("nextest", "run")
+    if ($nextestProfile -ne "") { $commonArgs += @("--profile", $nextestProfile) }
+    $commonArgs += $selectors
+    $buildArgs = $commonArgs + @("--no-run", "--color", "never")
+    $runArgs = $commonArgs + @("--no-fail-fast", "--color", "never")
+    if ($Threads -gt 0) { $env:NEXTEST_TEST_THREADS = "$Threads" }
+    if ($Concurrency -gt 0) { Write-Host "[test_fast] note: -Concurrency is ignored with -UseNextest; nextest schedules tests itself." }
+
+    # Stream nextest output live and keep it for the summary parse + log file.
+    # Native stderr trips $ErrorActionPreference=Stop on PS 5.1, so relax it.
+    function Invoke-NextestStep {
+        param([string[]]$Arguments, [System.Collections.ArrayList]$Sink)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & $cargoExe @Arguments 2>&1 | ForEach-Object {
+            $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message }
+                    elseif ($_ -is [string]) { $_ }
+                    else { $_.ToString() }
+            [void]$Sink.Add($line)
+            Write-Host $line
+        }
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prevEAP
+        $sw.Stop()
+        return [pscustomobject]@{ ExitCode = $code; Seconds = [Math]::Round($sw.Elapsed.TotalSeconds, 2) }
+    }
+
+    $logDir = Join-Path $root "logs\test_fast"
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $nextestLog = Join-Path $logDir ("nextest-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+    $writeNextestLog = {
+        param([string]$Path, $Lines)
+        [IO.File]::WriteAllLines($Path, [string[]]@($Lines), (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    Write-Host ("[test_fast] {0} target(s) via {1}{2}; building first..." -f $nextestTargets.Count, $runnerLabel, $(if ($Threads -gt 0) { ", $Threads test thread(s)" } else { "" }))
+    $buildLines = New-Object System.Collections.ArrayList
+    $build = Invoke-NextestStep -Arguments $buildArgs -Sink $buildLines
+    if ($build.ExitCode -ne 0) {
+        & $writeNextestLog $nextestLog $buildLines
+        Write-Host ""
+        Write-Host ("[test_fast] BUILD FAILED (nextest exit {0}); no test was run" -f $build.ExitCode)
+        Write-Host ("[test_fast] log: {0}" -f $nextestLog)
+        exit 1
+    }
+    Write-Host ("[test_fast] build OK in {0:N1}s" -f $build.Seconds)
+
+    $runLines = New-Object System.Collections.ArrayList
+    $run = Invoke-NextestStep -Arguments $runArgs -Sink $runLines
+    & $writeNextestLog $nextestLog (@($buildLines) + @($runLines))
+
+    # Aggregate: nextest's Summary is authoritative for totals; FAIL/TIMEOUT
+    # lines map a failing test back to its cargo target for -RetryFailed.
+    # Binary IDs are "<package>::<target>" (or just "<package>" for the lib),
+    # and newer nextest prefixes status lines with "(n/m)".
+    $summary = $null
+    foreach ($line in $runLines) { if ($line -match '^\s*Summary\s+\[') { $summary = $line } }
+    $summarySeen = $false
+    $totalTests = 0; $passed = 0; $failedTests = 0; $skipped = 0
+    # nextest omits ", N failed" when there are no failures, so every field
+    # after "passed" is optional.
+    if ($summary -and $summary -match '(\d+) tests? run:\s+(\d+) passed(?:,\s+(\d+) failed)?(?:,\s+(\d+) skipped)?') {
+        $summarySeen = $true
+        $totalTests = [int]$Matches[1]
+        $passed = [int]$Matches[2]
+        $failedTests = if ($Matches[3]) { [int]$Matches[3] } else { 0 }
+        $skipped = if ($Matches[4]) { [int]$Matches[4] } else { 0 }
+    }
+    $failedTargets = @()
+    foreach ($line in $runLines) {
+        if ($line -match '^\s*(?:FAIL|TIMEOUT|LEAK)\s+\[\s*[0-9.]+s?\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(.+)$') {
+            $binId = $Matches[1]
+            $target = ($binId -split '::')[-1]
+            # A lib failure prints only the package name as the binary ID.
+            if ($nextestTargets -notcontains $target -and $nextestTargets -contains "pir" -and $binId -notmatch '::') { $target = "pir" }
+            if ($failedTargets -notcontains $target) { $failedTargets += $target }
+        }
+    }
+    if (($failedTests -gt 0 -or $run.ExitCode -ne 0 -or -not $summarySeen) -and $failedTargets.Count -eq 0 -and $nextestTargets.Count -gt 0) {
+        # Output format changed, or the run aborted before a summary: fail
+        # closed and rerun the whole selection on -RetryFailed rather than
+        # silently leaving nothing to retry.
+        $failedTargets = @($nextestTargets)
+    }
+
+    Write-Host ""
+    Write-Host ("[test_fast] nextest: {0} test(s) run, {1} passed, {2} failed, {3} skipped ({4} target(s))" -f $totalTests, $passed, $failedTests, $skipped, $nextestTargets.Count)
+    Write-Host ("[test_fast] timing: build {0:N1}s + run {1:N1}s = {2:N1}s wall (log: {3})" -f $build.Seconds, $run.Seconds, ($build.Seconds + $run.Seconds), $nextestLog)
+
+    $ok = ($run.ExitCode -eq 0) -and $summarySeen -and ($failedTests -eq 0) -and ($failedTargets.Count -eq 0) -and ($passed -gt 0)
+    if (-not $summarySeen) {
+        Write-Host ("[test_fast] FAILED: nextest produced no summary (exit {0}); build or run aborted" -f $run.ExitCode)
+    } elseif ($passed -eq 0 -and $failedTests -eq 0) {
+        Write-Host "[test_fast] FAILED: no test executed; this is not a green run"
+    } elseif (-not $ok) {
+        Write-Host ("[test_fast] FAILED: {0} test(s) failed in {1}" -f $failedTests, ($(if ($failedTargets.Count -gt 0) { $failedTargets -join ", " } else { "unknown target(s)" })))
+    }
+
+    # Keep last-run.json in the same shape the built-in runner writes so
+    # -RetryFailed (and scripts/test_select.ps1) keep working.
+    $stateDir = Join-Path $root "logs\test_fast"
+    New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+    $state = [pscustomobject]@{
+        when           = (Get-Date).ToString("s")
+        targetDir      = $env:CARGO_TARGET_DIR
+        runner         = $runnerLabel
+        buildSecs      = $build.Seconds
+        runSecs        = $run.Seconds
+        totalSecs      = [Math]::Round($build.Seconds + $run.Seconds, 2)
+        passed         = $passed
+        failed         = $(if ($ok) { 0 } else { [Math]::Max($failedTargets.Count, 1) })
+        failedParallel = $(if ($ok) { 0 } else { [Math]::Max($failedTargets.Count, 1) })
+        emptySuites    = 0
+        exitCode       = $(if ($ok) { 0 } else { 1 })
+        flaky          = @()
+        failedTargets  = @($failedTargets)
+        suites         = @()
+        logDir         = $nextestLog
+    }
+    [IO.File]::WriteAllText((Join-Path $stateDir "last-run.json"), ($state | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+
+    if (-not $ok) { exit 1 }
+    exit 0
 }
 
 $phase = [System.Diagnostics.Stopwatch]::StartNew()

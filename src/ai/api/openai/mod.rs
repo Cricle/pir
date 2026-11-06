@@ -389,7 +389,7 @@ async fn openai_stream(
                 } else {
                     let payload = client.serialize_payload_with_capacity(body, estimated)?;
                     client
-                        .post_payload_streaming_with(
+                        .post_serialized_payload_streaming_with(
                             &url,
                             &headers,
                             payload,
@@ -439,6 +439,16 @@ async fn openai_stream(
     if let Some(on_response) = &options.hooks.on_response {
         on_response(status, &response_headers);
     }
+    // Close-delimited HTTP bodies (no Content-Length and no Transfer-Encoding)
+    // have no framing terminator other than EOF. Some OpenAI-compatible
+    // servers then omit the terminal `finish_reason` chunk and `[DONE]`; a
+    // clean EOF is still a complete body, so the parser must infer the stop
+    // reason instead of reporting `Stream ended without finish_reason`.
+    let close_delimited = !response_headers.keys().any(|name| {
+        name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+    });
+    parser.set_close_delimited_eof(close_delimited);
     let mut tail = Vec::new();
     parser.finish(&mut tail)?;
     for event in tail {

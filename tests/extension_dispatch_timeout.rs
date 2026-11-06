@@ -36,6 +36,99 @@ impl Drop for TempDir {
     }
 }
 
+/// A synchronous host fn (`spawnSync` with no timeout) wedges the actor
+/// thread, so it stops draining the 64-slot mailbox. Fill the mailbox and
+/// stack more senders behind it: every `emit_with_timeout` must still return
+/// its own timeout instead of blocking in `tx.send`, and no timed-out sender
+/// may leak a `pending_commands` slot.
+const BLOCKING_HOST_FN_EXTENSION: &str = r#"
+import { spawnSync } from "node:child_process";
+
+export default function (pi) {
+    let blocked = false;
+    pi.on("session_start", () => {
+        if (blocked) return;
+        blocked = true;
+        const command = process.platform === "win32"
+            ? "ping -n 4 127.0.0.1 > NUL"
+            : "sleep 3";
+        // No `timeout` option: the host fn blocks the actor un-interruptibly.
+        spawnSync(command, [], { shell: true });
+    });
+}
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_mailbox_with_wedged_actor_times_out_and_clears_pending() {
+    let temp = TempDir::new("mailbox-full");
+    let handle = start_and_load(&temp, BLOCKING_HOST_FN_EXTENSION).await;
+
+    // First dispatch wedges the actor inside the synchronous host fn.
+    let first = {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            let mut payload = serde_json::json!({ "type": "session_start", "reason": "block" });
+            handle
+                .emit_with_timeout("session_start", &mut payload, Duration::from_millis(150))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        handle.pending_commands_for_tests() >= 1,
+        "the wedging dispatch must already be in flight"
+    );
+
+    // 80 concurrent emits: one in the actor, 64 in the mailbox, the rest
+    // waiting for a slot. None may block past its own 150 ms deadline.
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..80 {
+        let handle = handle.clone();
+        tasks.spawn(async move {
+            let mut payload = serde_json::json!({ "type": "session_start", "reason": "fill" });
+            handle
+                .emit_with_timeout("session_start", &mut payload, Duration::from_millis(150))
+                .await
+        });
+    }
+    let joined = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut results = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            results.push(joined.expect("emit task must not panic"));
+        }
+        results
+    })
+    .await
+    .expect("a full mailbox must not block an emit past its deadline");
+    assert_eq!(joined.len(), 80);
+    assert!(
+        joined.iter().all(|result| result.is_err()),
+        "every emit behind the wedged actor must report a timeout"
+    );
+
+    let first_result = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the wedging dispatch itself must be bounded")
+        .expect("join the first dispatch");
+    assert!(
+        first_result.is_err(),
+        "the wedging dispatch must time out too"
+    );
+
+    // The actor drains the backlog after the synchronous host fn returns;
+    // every accepted command releases its pending slot. The senders that
+    // never got a slot never allocated one.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while handle.pending_commands_for_tests() > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        handle.pending_commands_for_tests(),
+        0,
+        "timed-out mailbox handoffs must not leak pending_commands slots"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn blocking_event_handler_returns_at_the_call_timeout() {
     let temp = TempDir::new("emit");

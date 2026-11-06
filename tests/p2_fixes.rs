@@ -221,6 +221,7 @@ fn tool_context(cwd: &Path, registry: Arc<ProviderRegistry>) -> ToolContext {
         signal: None,
         nested: None,
         session_env: Some(Arc::new(ToolSessionEnv {
+            read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
             provider_registry: registry,
             model: model_with("fake", "fake-model"),
             thinking: ThinkingLevel::Off,

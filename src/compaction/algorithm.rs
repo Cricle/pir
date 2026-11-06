@@ -26,7 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ai::types::{ContentBlock, Context, Message, Model, StopReason, Usage};
+use crate::ai::types::{ContentBlock, Context, Message, Model, StopReason, Tool, Usage};
 use crate::session_manager::{FileEntry, StoredMessage};
 
 /// Estimated character weight of an image content block (upstream
@@ -75,6 +75,23 @@ impl Default for CompactionConfig {
             reserve_tokens: 16_384,
             keep_recent_tokens: 20_000,
         }
+    }
+}
+
+impl CompactionConfig {
+    /// The keep-recent budget actually usable for a cut on `context_window`.
+    ///
+    /// The upstream default (20 000) can exceed the whole window of a small
+    /// model (e.g. 8 192 or 2 000 tokens). `find_projected_cut_point` only
+    /// exhausts its budget when the transcript itself exceeds
+    /// `keep_recent_tokens`, so such a session always reported "nothing to
+    /// compact" even while its request was already over the window. Capping
+    /// the retained tail at half the window guarantees a cut becomes possible
+    /// while leaving the other half for the summary, the prompt/tool
+    /// declarations, and the response reserve.
+    pub fn effective_keep_recent_tokens(&self, context_window: u64) -> u64 {
+        self.keep_recent_tokens
+            .min((context_window.max(1) / 2).max(1))
     }
 }
 
@@ -334,19 +351,47 @@ pub fn estimate_prompt_tokens_conservative(
     ceil_units_conservative(prompt_token_units(system_prompt, tools))
 }
 
+/// Add the leading prompt estimate (`system_prompt` + `tools`) to a
+/// transcript estimate unless a usage record already covers the prompt (a
+/// usage record includes the leading prompt).
+fn add_request_prompt_prefix(
+    estimate: &mut ContextUsageEstimate,
+    system_prompt: Option<&str>,
+    tools: Option<&[Tool]>,
+) {
+    if estimate.last_usage_index.is_none() {
+        let prefix = estimate_prompt_tokens(system_prompt, tools);
+        estimate.tokens = estimate.tokens.saturating_add(prefix);
+        estimate.trailing_tokens = estimate.trailing_tokens.saturating_add(prefix);
+    }
+}
+
+/// Estimate a full request from a message list plus the out-of-band leading
+/// prompt ([`Context::system_prompt`] / [`Context::tools`]): the messages-only
+/// [`estimate_context_tokens`] plus the prompt prefix exactly when the
+/// transcript carries no usage record. Callers that genuinely need only the
+/// transcript (e.g. summary chunking) keep using
+/// [`estimate_context_tokens`].
+pub fn estimate_request_messages_tokens(
+    messages: &[Message],
+    system_prompt: Option<&str>,
+    tools: Option<&[Tool]>,
+) -> ContextUsageEstimate {
+    let mut estimate = estimate_context_tokens(messages);
+    add_request_prompt_prefix(&mut estimate, system_prompt, tools);
+    estimate
+}
+
 /// Estimate a full request [`Context`]: the transcript estimate plus the
 /// leading prompt (`system_prompt` + `tools`) exactly when the transcript
 /// carries no usage record (a usage record already includes the leading
 /// prompt).
 pub fn estimate_request_context_tokens(context: &Context) -> ContextUsageEstimate {
-    let mut estimate = estimate_context_tokens(&context.messages);
-    if estimate.last_usage_index.is_none() {
-        let prefix =
-            estimate_prompt_tokens(context.system_prompt.as_deref(), context.tools.as_deref());
-        estimate.tokens = estimate.tokens.saturating_add(prefix);
-        estimate.trailing_tokens = estimate.trailing_tokens.saturating_add(prefix);
-    }
-    estimate
+    estimate_request_messages_tokens(
+        &context.messages,
+        context.system_prompt.as_deref(),
+        context.tools.as_deref(),
+    )
 }
 
 /// [`estimate_request_context_tokens`] with the conservative 3.5
@@ -362,6 +407,70 @@ pub fn estimate_request_context_tokens_conservative(context: &Context) -> Contex
         estimate.trailing_tokens = estimate.trailing_tokens.saturating_add(prefix);
     }
     estimate
+}
+
+/// Message-content token floor that deliberately IGNORES usage records.
+///
+/// A provider usage record is normally the exact size of the request that
+/// produced it, but it can be stale, bogus, or (in mocked/relay setups) far
+/// below the transcript actually sent. The compaction trigger takes the
+/// maximum of the usage-grounded estimate and this content floor so a large
+/// transcript can never hide behind an understated usage chunk and disable
+/// compaction forever.
+fn content_token_units<M: MessageSequence + ?Sized>(messages: &M) -> u64 {
+    let mut units = 0u64;
+    let mut current_system: Option<&Message> = None;
+    for index in 0..messages.message_count() {
+        let message = messages.message_at(index);
+        if matches!(message, Message::System(_)) {
+            // Like the stale-usage branch above: only the CURRENT system
+            // message (the last one) is prompt state; older checkpoints'
+            // system replays are history.
+            current_system = Some(message);
+        } else {
+            units = units.saturating_add(estimate_message_units(message));
+        }
+    }
+    if let Some(system) = current_system {
+        units = units.saturating_add(estimate_message_units(system));
+    }
+    units
+}
+
+/// [`estimate_request_messages_tokens`] ignoring any usage record: the
+/// content-derived token floor of the request (messages + leading prompt).
+pub fn estimate_request_messages_tokens_floor(
+    messages: &[Message],
+    system_prompt: Option<&str>,
+    tools: Option<&[Tool]>,
+) -> u64 {
+    ceil_units(content_token_units(messages).saturating_add(prompt_token_units(system_prompt, tools)))
+}
+
+/// [`estimate_request_projected_context_tokens`] ignoring any usage record.
+pub fn estimate_request_projected_context_tokens_floor<E: ProjectedEntry>(
+    projected: &[E],
+    system_prompt: Option<&str>,
+    tools: Option<&[Tool]>,
+) -> u64 {
+    let mut units = 0u64;
+    let mut current_system_units = 0u64;
+    for entry in projected {
+        for message in entry.messages() {
+            if matches!(message, Message::System(_)) {
+                // Only the newest system message is live prompt state; older
+                // checkpoint replays are history (see `content_token_units`).
+                current_system_units = estimate_message_units(message);
+            } else {
+                units = units.saturating_add(estimate_message_units(message));
+            }
+        }
+    }
+    ceil_units(
+        units
+            .saturating_add(current_system_units)
+            .saturating_add(prompt_token_units(system_prompt, tools)),
+    )
 }
 
 /// Quarter-token weight of a single message, before the final rounding.
@@ -525,9 +634,12 @@ fn estimate_context_tokens_over<M: MessageSequence + ?Sized>(
 
 /// Check whether compaction should trigger for this context and model
 /// (upstream `shouldCompact`): `contextTokens > contextWindow - reserveTokens`.
+///
+/// The estimate is the FULL request: transcript messages plus the context's
+/// out-of-band `system_prompt` and `tools` when no usage record covers them.
 pub fn should_compact(context: &Context, model: &Model, config: &CompactionConfig) -> bool {
     should_compact_tokens(
-        estimate_context_tokens(&context.messages).tokens,
+        estimate_request_context_tokens(context).tokens,
         model.context_window,
         config,
     )
@@ -1116,6 +1228,22 @@ pub fn estimate_projected_context_tokens<E: ProjectedEntry, P: PathEntry>(
     branch_entries: &[P],
 ) -> ContextUsageEstimate {
     estimate_projected_context_tokens_with_tail(projected, &[], branch_entries)
+}
+
+/// [`estimate_projected_context_tokens`] plus the request's out-of-band
+/// leading prompt (`system_prompt` + `tools`) when the estimate carries no
+/// usage record. This is the compaction-threshold estimator over a projection:
+/// a transcript without a usage record would otherwise omit the prompt from
+/// the trigger check.
+pub fn estimate_request_projected_context_tokens<E: ProjectedEntry, P: PathEntry>(
+    projected: &[E],
+    branch_entries: &[P],
+    system_prompt: Option<&str>,
+    tools: Option<&[Tool]>,
+) -> ContextUsageEstimate {
+    let mut estimate = estimate_projected_context_tokens(projected, branch_entries);
+    add_request_prompt_prefix(&mut estimate, system_prompt, tools);
+    estimate
 }
 
 /// [`estimate_projected_context_tokens`] over a projection PLUS the live

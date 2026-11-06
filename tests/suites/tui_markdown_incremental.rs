@@ -33,7 +33,7 @@ use pir::ai::types::{AssistantMessage, ContentBlock, TextContent, ThinkingConten
 use pir::config::settings::MermaidRenderingMode;
 use pir::tui::core::Component;
 use pir::tui::markdown::{Markdown, MarkdownOptions, MarkdownTheme};
-use pir::tui::messages::{AssistantMessageComponent, StreamingThinking};
+use pir::tui::messages::{AssistantMessageComponent, StreamingThinking, ThinkingWork};
 use pir::tui::theme::set_theme;
 
 /// Take the theme lock and pin the palette; the guard must outlive the test.
@@ -567,6 +567,54 @@ fn a_reused_prefix_row_is_painted_exactly_once() {
         third[0], first[0],
         "the reused prefix row must keep its single paint: {third:?}"
     );
+}
+
+/// The delta path must be byte-identical to the full-snapshot path at every
+/// step (including deltas that split whitespace across calls), while the
+/// sanitizer only ever scans the new delta — never the accumulated body.
+#[test]
+fn thinking_delta_path_matches_full_snapshot_and_scans_only_the_delta() {
+    let _guard = pin_theme();
+    let label = Arc::new(Mutex::new(None));
+    let deltas = [
+        "  first",
+        " thought\n",
+        "\nsecond ",
+        "line with **bold** ",
+        "text\n\n",
+        "- a",
+        "\n- b\n",
+        "\n",
+    ];
+    let full: String = deltas.concat();
+    let streamed = StreamingThinking::new("", 1, false, Arc::clone(&label));
+    let mut seen = String::new();
+    ThinkingWork::reset();
+    for (index, delta) in deltas.iter().enumerate() {
+        streamed.set_text_growing_delta(delta);
+        seen.push_str(delta);
+        let cold = StreamingThinking::new(&seen, 1, false, Arc::clone(&label));
+        assert_eq!(
+            streamed.render(60),
+            cold.render(60),
+            "delta path diverged after delta {index} of {full:?}"
+        );
+    }
+    let work = ThinkingWork::snapshot();
+    assert_eq!(work.sanitize_calls, deltas.len() as u64);
+    assert_eq!(
+        work.sanitize_bytes,
+        full.len() as u64,
+        "the delta path may sanitize each delta once, never the accumulated body"
+    );
+
+    // The snapshot fallback is the O(n) reference: one call scans the whole
+    // accumulated body (the counter makes the difference observable).
+    ThinkingWork::reset();
+    streamed.set_text_growing(&full);
+    let full_work = ThinkingWork::snapshot();
+    assert_eq!(full_work.sanitize_calls, 1);
+    assert_eq!(full_work.sanitize_bytes, full.len() as u64);
 }
 
 #[test]

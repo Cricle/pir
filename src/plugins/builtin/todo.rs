@@ -1585,14 +1585,6 @@ impl TodoStore {
         self.set_active_session("");
     }
 
-    /// Drop one session's slot (memory hygiene for a reused instance).
-    pub fn evict_session(&self, session: &str) {
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session);
-    }
-
     /// LRU-evict the least recently touched slot when the map is at capacity
     /// and the slot being written is new (never the slot being written, and
     /// never when an existing slot is merely being touched: an update must

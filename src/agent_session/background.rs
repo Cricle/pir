@@ -686,7 +686,6 @@ impl BackgroundDelivery {
     /// separate from [`Self::new`] so the print host keeps its existing
     /// construction shape; session construction chains this in
     /// `agent_session/build.rs`.
-    #[allow(dead_code)]
     pub(crate) fn with_run_settling(mut self, flag: Arc<AtomicBool>) -> Self {
         self.run_settling = Some(flag);
         self

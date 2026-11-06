@@ -9,6 +9,7 @@ pub(super) async fn execute(
     args: &JsonValue,
     ctx: &ToolContext,
     extensions: Option<ExtensionHandle>,
+    budget: SubagentBudget,
 ) -> ToolResult {
     let Some(env) = ctx.session_env.clone() else {
         return ToolResult::error(
@@ -133,6 +134,7 @@ pub(super) async fn execute(
                 builder,
                 emit,
                 ctx,
+                budget,
             )
             .await
         }
@@ -145,10 +147,11 @@ pub(super) async fn execute(
                 builder,
                 emit,
                 ctx,
+                budget,
             )
             .await
         }
-        _ => run_single(params, env, extensions, agents, builder, emit, ctx).await,
+        _ => run_single(params, env, extensions, agents, builder, emit, ctx, budget).await,
     }
 }
 
@@ -161,6 +164,7 @@ async fn run_single(
     builder: DetailsBuilder,
     emit: EmitUpdate,
     ctx: &ToolContext,
+    budget: SubagentBudget,
 ) -> ToolResult {
     let agent_name = params.agent.unwrap_or_default();
     let task = params.task.unwrap_or_default();
@@ -196,6 +200,7 @@ async fn run_single(
         step: None,
         parent_signal: ctx.signal.clone(),
         on_task_update: Some(on_task_update),
+        budget,
     })
     .await;
     let details = builder.build(std::slice::from_ref(&result));
@@ -232,6 +237,7 @@ async fn run_chain(
     builder: DetailsBuilder,
     emit: EmitUpdate,
     ctx: &ToolContext,
+    budget: SubagentBudget,
 ) -> ToolResult {
     let completed: Arc<Mutex<Vec<SingleResult>>> = Arc::new(Mutex::new(Vec::new()));
     let mut previous_output = String::new();
@@ -287,6 +293,7 @@ async fn run_chain(
             step: Some(index + 1),
             parent_signal: ctx.signal.clone(),
             on_task_update: Some(on_task_update),
+            budget,
         })
         .await;
         let failed = is_failed(&result);
@@ -334,6 +341,7 @@ async fn run_parallel(
     builder: DetailsBuilder,
     emit: EmitUpdate,
     ctx: &ToolContext,
+    budget: SubagentBudget,
 ) -> ToolResult {
     if tasks.len() > MAX_PARALLEL_TASKS {
         return ok_with_details(
@@ -380,7 +388,16 @@ async fn run_parallel(
     };
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY));
-    let mut handles = Vec::with_capacity(tasks.len());
+    // `JoinSet` is both awaitable and abort-on-drop: normal completion is
+    // observed through `join_next_with_id`, and dropping the `run_parallel`
+    // future (outer tool cancellation / session shutdown) drops the set,
+    // which aborts every still-running child. The children therefore cannot
+    // outlive their parent future and keep holding `ChildRuntimeSlot`s or
+    // spending provider tokens (C1-03; the old detached `Vec<JoinHandle>` did
+    // exactly that).
+    let mut children: tokio::task::JoinSet<(usize, SingleResult)> = tokio::task::JoinSet::new();
+    let mut task_indices: std::collections::HashMap<tokio::task::Id, usize> =
+        std::collections::HashMap::with_capacity(tasks.len());
     for (index, task) in tasks.iter().enumerate() {
         let env = Arc::clone(&env);
         let extensions = extensions.clone();
@@ -411,7 +428,7 @@ async fn run_parallel(
                 emit_aggregate();
             })
         };
-        handles.push(tokio::spawn(async move {
+        let handle = children.spawn(async move {
             let _permit = semaphore.acquire_owned().await;
             let result = run_child(ChildRunInputs {
                 env,
@@ -423,6 +440,7 @@ async fn run_parallel(
                 step: None,
                 parent_signal: signal,
                 on_task_update: Some(on_task_update),
+                budget,
             })
             .await;
             {
@@ -434,22 +452,56 @@ async fn run_parallel(
                 }
             }
             emit_aggregate();
-            result
-        }));
+            (index, result)
+        });
+        task_indices.insert(handle.id(), index);
     }
 
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        results.push(match handle.await {
-            Ok(result) => result,
-            Err(error) => SingleResult::failed(
-                "(parallel task)",
-                "",
-                format!("subagent task failed to run: {error}"),
-                None,
-            ),
-        });
+    let mut results: Vec<Option<SingleResult>> = (0..tasks.len()).map(|_| None).collect();
+    while let Some(joined) = children.join_next_with_id().await {
+        match joined {
+            Ok((_task_id, (index, result))) => {
+                if let Some(slot) = results.get_mut(index) {
+                    *slot = Some(result);
+                }
+            }
+            Err(error) => {
+                let index = task_indices.get(&error.id()).copied();
+                let (agent, task_text) = index
+                    .and_then(|index| tasks.get(index))
+                    .map(|task| (task.agent.as_str(), task.task.as_str()))
+                    .unwrap_or(("(parallel task)", ""));
+                let failed = SingleResult::failed(
+                    agent,
+                    task_text,
+                    format!("subagent task failed to run: {error}"),
+                    None,
+                );
+                if let Some(index) = index {
+                    if let Some(slot) = results.get_mut(index) {
+                        *slot = Some(failed);
+                    }
+                }
+            }
+        }
     }
+    // Defensive: a panic in a task without a resolvable id must still occupy
+    // its slot rather than silently shrinking the result list.
+    let results: Vec<SingleResult> = results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.unwrap_or_else(|| {
+                let task = &tasks[index];
+                SingleResult::failed(
+                    &task.agent,
+                    &task.task,
+                    "subagent task failed to run: task ended without a result".to_owned(),
+                    None,
+                )
+            })
+        })
+        .collect();
 
     let details = builder.build(&results);
     if ctx

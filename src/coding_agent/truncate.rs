@@ -6,15 +6,7 @@
 //! Never returns partial lines, except the tail-truncation edge case where
 //! the FIRST retained line alone exceeds the byte limit.
 
-pub const DEFAULT_MAX_LINES: usize = 2000;
-pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
-
-/// Which limit fired when content was truncated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TruncatedBy {
-    Lines,
-    Bytes,
-}
+pub use crate::text::{format_size, TruncatedBy, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
 /// The result of a truncation pass (mirrors upstream `TruncationResult`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,99 +63,27 @@ impl TruncationResult {
     }
 }
 
-fn split_lines(content: &str) -> Vec<&str> {
-    if content.is_empty() {
-        return Vec::new();
-    }
-    let mut lines: Vec<&str> = content.split('\n').collect();
-    if content.ends_with('\n') {
-        lines.pop();
-    }
-    lines
-}
-
-/// Human-readable size, mirroring upstream `formatSize`.
-pub fn format_size(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes}B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1}KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
-    }
-}
-
 /// Keep the FIRST max_lines lines within max_bytes.
 pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
-    let total_bytes = content.len();
-    let lines = split_lines(content);
-    let total_lines = lines.len();
-
-    if total_lines <= max_lines && total_bytes <= max_bytes {
-        return TruncationResult {
-            content: content.to_owned(),
-            truncated: false,
-            truncated_by: None,
-            total_lines,
-            total_bytes,
-            output_lines: total_lines,
-            output_bytes: total_bytes,
-            last_line_partial: false,
-            last_line_bytes: 0,
-            max_lines,
-            max_bytes,
-        };
-    }
-
-    // First line alone exceeds the byte limit: upstream returns empty content.
-    if lines[0].len() > max_bytes {
-        return TruncationResult {
-            content: String::new(),
-            truncated: true,
-            truncated_by: Some(TruncatedBy::Bytes),
-            total_lines,
-            total_bytes,
-            output_lines: 0,
-            output_bytes: 0,
-            last_line_partial: false,
-            last_line_bytes: 0,
-            max_lines,
-            max_bytes,
-        };
-    }
-
-    let mut kept: Vec<&str> = Vec::new();
-    let mut used = 0usize;
-    let mut truncated_by = TruncatedBy::Lines;
-    for (index, line) in lines.iter().enumerate() {
-        if kept.len() >= max_lines {
-            break;
-        }
-        let line_bytes = line.len() + if index > 0 { 1 } else { 0 };
-        if used + line_bytes > max_bytes {
-            truncated_by = TruncatedBy::Bytes;
-            break;
-        }
-        used += line_bytes;
-        kept.push(line);
-    }
-    if kept.len() >= max_lines && used <= max_bytes {
-        truncated_by = TruncatedBy::Lines;
-    }
-
-    let output = kept.join("\n");
-    TruncationResult {
-        output_bytes: output.len(),
-        content: output,
-        truncated: true,
-        truncated_by: Some(truncated_by),
-        total_lines,
-        total_bytes,
-        output_lines: kept.len(),
-        last_line_partial: false,
-        last_line_bytes: 0,
+    let core = crate::text::truncate_head_core(
+        content,
+        crate::text::split_truncate_lines(content).len(),
+        content.len(),
         max_lines,
         max_bytes,
+    );
+    TruncationResult {
+        content: core.content,
+        truncated: core.truncated,
+        truncated_by: core.truncated_by,
+        total_lines: core.total_lines,
+        total_bytes: core.total_bytes,
+        output_lines: core.output_lines,
+        output_bytes: core.output_bytes,
+        last_line_partial: false,
+        last_line_bytes: 0,
+        max_lines: core.max_lines,
+        max_bytes: core.max_bytes,
     }
 }
 
@@ -172,7 +92,7 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
 /// when that line alone exceeds the byte limit.
 pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
     let total_bytes = content.len();
-    let lines = split_lines(content);
+    let lines = crate::text::split_truncate_lines(content);
     let total_lines = lines.len();
 
     if total_lines <= max_lines && total_bytes <= max_bytes {

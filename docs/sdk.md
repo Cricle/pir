@@ -75,11 +75,13 @@ network ones.
 | Method | Effect |
 |---|---|
 | `new()` | Empty builder. Model resolves from the environment; default compaction; default session directory. |
-| `endpoint(Endpoint)` | Explicit endpoint; never consults configuration. Requires the matching `provider-*` feature (`Endpoint::new` defaults to 128k context / 8192 max tokens). The synthesized model declares `reasoning: false`, so the effective thinking level is always `off`. Mutually exclusive with `model*`/`with_registry`. |
-| `model(pattern)` / `model_in_provider(provider, pattern)` | Resolve a bare id, `provider/id`, or fuzzy pattern (optional `:thinking` suffix) against `~/.pi/agent/models.json`, the built-in catalog, and configured auth. Mutually exclusive with `endpoint`/`with_registry`. |
-| `with_registry(Arc<ProviderRegistry>, Model)` | Caller-supplied registry and model; skips environment resolution. The model must have non-zero `context_window` and `max_tokens`. The only model path usable with no `provider-*` feature. Mutually exclusive with `endpoint`/`model*`. |
+| `endpoint(Endpoint)` | Explicit endpoint; never consults configuration. Requires the matching `provider-*` feature (`Endpoint::new` defaults to 128k context / 8192 max tokens). The synthesized model declares `reasoning: false`, so the effective thinking level is always `off`. No system-prompt discovery (see note). Mutually exclusive with `model*`/`with_registry`. |
+| `model(pattern)` / `model_in_provider(provider, pattern)` | Resolve a bare id, `provider/id`, or fuzzy pattern (optional `:thinking` suffix) against `~/.pi/agent/models.json`, the built-in catalog, and configured auth. System-prompt discovery is on by default (CLI parity). Mutually exclusive with `endpoint`/`with_registry`. |
+| `with_registry(Arc<ProviderRegistry>, Model)` | Caller-supplied registry and model; skips environment resolution. The model must have non-zero `context_window` and `max_tokens`. The only model path usable with no `provider-*` feature. No system-prompt discovery (see note). Mutually exclusive with `endpoint`/`model*`. |
 | `api_key(key)` / `thinking_level(level)` | Request overrides: `api_key` is the keyless-endpoint fallback (`Endpoint::api_key` wins) or overrides configured auth / requested level defaults to the settings default, else `medium`, and is clamped to what the resolved model supports at `build()` (`off` for non-reasoning models). |
-| `system_prompt(text)` / `append_system_prompt(text)` | Replace the system prompt (unset derives the context prompt, always built; discovered context files/skills add to it), or append with a blank line. Alone, append targets the derived prompt (discovery stays on); combined with `system_prompt` it targets that explicit prompt. |
+| `system_prompt(text)` / `append_system_prompt(text)` | Replace the system prompt (unset derives the context prompt, always built; discovered context files/skills add to it), or append with a blank line. An explicit `system_prompt` pins the whole prompt: no discovery and no `PIR_SYSTEM_PROMPT_FILE`. Alone, append targets the derived prompt; combined, that explicit prompt. |
+| `discover_system_prompt(bool)` | Toggle ambient `SYSTEM.md`/`APPEND_SYSTEM.md` discovery and the `PIR_SYSTEM_PROMPT_FILE` read. Default on for `model*`; off for `endpoint`/`with_registry`/`proxy` and explicit `system_prompt_files`. |
+| `system_prompt_files(SystemPromptFiles)` | Explicit `SystemPromptFiles { system, append }` for the derived prompt. `system` beats `PIR_SYSTEM_PROMPT_FILE`/discovered `SYSTEM.md`; discovered `APPEND_SYSTEM.md` precedes `append`; explicit `system_prompt` still wins. |
 | `resource_loader(DefaultResourceLoader)` | Install skills and prompt templates discovered by the supplied loader before the first run (the builder form of `CreateAgentSessionOptions::resource_loader`). Unset = hermetic, no implicit discovery; the `skills` feature is required for actual skill discovery. |
 | `cwd(path)` / `agent_dir(path)` | Working directory for tool execution and project discovery (default: process cwd) / the agent's own config directory — the per-agent form of `PIR_AGENT_DIR` (D2) and source of every agent-dir-scoped read; unset resolves the process environment once at `build()`; resolved once and build-bound (D9). See "Agent directory identity". |
 | `max_turns(n)` | Maximum loop turns per prompt (default: 1000; one turn is one model request, not one tool call). |
@@ -100,6 +102,11 @@ network ones.
 Model setup is exclusive: more than one of `endpoint`, `model`/`model_in_provider`, and `with_registry` fails
 `build()` with "conflicting model configuration"; `endpoint` and `with_registry` also reject zero
 `context_window`/`max_tokens`.
+
+**System-prompt discovery.** The derived prompt reads `PIR_SYSTEM_PROMPT_FILE` and discovers
+`SYSTEM.md`/`APPEND_SYSTEM.md` by default only on the environment-resolved `model*` path; `endpoint`,
+`with_registry` and `proxy` stay hermetic unless `discover_system_prompt(true)`/`system_prompt_files(..)`
+asks otherwise. An explicit `system_prompt` always wins.
 
 ### Agent directory identity
 
@@ -363,6 +370,7 @@ session-level events in the builder table; `tool_call` /`tool_result` dispatch t
 |---|---|
 | `Endpoint` | `base_url`, `api_key`, `api` (`ApiKind`), `model_id`, `context_window`, `max_tokens`; `Endpoint::new` defaults to 128k / 8192. |
 | `ApiKind` | `OpenAiCompletions`, `AnthropicMessages`, `GoogleGenerativeAi`; `wire_id()` returns the models.json `api` id. |
+| `SystemPromptFiles` | `system`, `append: Option<PathBuf>`; explicit prompt files for the derived prompt (`.system_prompt_files(..)` / `CreateAgentSessionOptions::system_prompt_files`). Relative paths resolve against the process cwd. |
 | `SessionMode` | `DefaultDir`, `Dir(path)`, `Existing(path)`, `None`. |
 | `ToolInfo` / `UsageSnapshot` / `ModelRef` | `name`, `description`, `parameters`; `turns`, `total_tokens`; `provider`, `id` (`Display` prints `provider/id`). |
 | `AgentOutcome` | `message`, `tool_results`, `messages`, `usage`, `turns`, `aborted`. |
@@ -382,7 +390,7 @@ factories for applications that own lifecycle (all in `pir::sdk`, no internal mo
 | Item | Effect |
 |---|---|
 | `AgentSession` / `AgentSessionConfig` / `SessionEvent` / `SessionEventHandler` | The raw session object (the same one the CLI hosts and JS extensions use), its config, and its subscribe API. |
-| `create_agent_session(CreateAgentSessionOptions)` | Resolve services (settings, model registry, storage, resource loader) and return `CreateAgentSessionResult { session, model, thinking_level, resources, model_fallback_message }`. |
+| `create_agent_session(CreateAgentSessionOptions)` | Resolve services (settings, model registry, storage, resource loader) and return `CreateAgentSessionResult { session, model, thinking_level, resources, model_fallback_message }`. System-prompt discovery/`PIR_SYSTEM_PROMPT_FILE` is on by default (project files trust-gated); `discover_system_prompt = Some(false)` disables it, `system_prompt_files` supplies explicit files, `system_prompt` wins. |
 | `create_agent_session_services` / `create_agent_session_from_services` | Split the resolution and build halves when several sessions share one environment. |
 | `create_agent_session_runtime` / `AgentSessionRuntime` | Build a session plus the lifecycle wrapper: `new_session`, `switch_session`, `reload` (all gated on an idle session) and `dispose` (extension-runtime teardown). |
 | `ModelRegistry` / `SettingsManager` / `SessionManager` | Model lookup + configured-auth filtering, settings snapshots, and session storage; `ModelRegistry::from_environment_in` / `SessionManager` scoped to an explicit agent directory. |

@@ -156,6 +156,11 @@ impl AgentSession {
         .await
         {
             Ok((result, estimated_tokens_after)) => {
+                // Bash records deferred while the compaction owned the
+                // transcript land AFTER the compaction entry (the cut point is
+                // already durable), so they join the rebuilt context instead of
+                // racing the snapshot.
+                self.flush_pending_bash_records().await;
                 // Upstream clears the manual compaction state BEFORE the
                 // terminal event, so end listeners observe idle state.
                 run.clear_now();
@@ -176,6 +181,7 @@ impl AgentSession {
                 // 2948-2968). An abort requested during the summarization is
                 // the normal aborted outcome, not a failed compaction: the end
                 // event carries `aborted` and no errorMessage.
+                self.flush_pending_bash_records().await;
                 run.clear_now();
                 claim.release();
                 self.emit_session_event(SessionEvent::CompactionEnd {
@@ -259,11 +265,15 @@ impl AgentSession {
         }
     }
 
-    /// Wait until the session claim returns to idle. The waiter registers a
-    /// `Notify` interest BEFORE re-checking the claim (`enable`), so a
-    /// release between the check and the await can never be missed — no
-    /// busy-wait and no sleep.
-    async fn wait_until_idle(&self) {
+    /// Wait until the session claim returns to idle (neither a run nor a
+    /// manual compaction owns it). The waiter registers a `Notify` interest
+    /// BEFORE re-checking the claim (`enable`), so a release between the
+    /// check and the await can never be missed — no busy-wait and no sleep.
+    ///
+    /// Hosts use this to hold a prompt submitted while a compaction runs
+    /// (whose start they cannot observe synchronously) until the transcript
+    /// is safe to extend.
+    pub async fn wait_until_idle(&self) {
         loop {
             let notified = self.idle_notify.notified();
             tokio::pin!(notified);
@@ -338,7 +348,18 @@ impl AgentSession {
         };
         let model = self.current_model();
         let config = self.compaction_config().unwrap_or_default();
-        let preparation = match compaction::prepare_compaction_refs(&refs, &branch, &config) {
+        // The keep-recent budget must fit the routed model's window: a default
+        // 20k tail on an 8k/2k-window model can never be exceeded, so the cut
+        // always kept the whole conversation and `/compact` reported "nothing
+        // to compact" even while the request was over the window.
+        let keep_recent_tokens =
+            config.effective_keep_recent_tokens(model.context_window);
+        let preparation = match compaction::prepare_compaction_refs_with_keep(
+            &refs,
+            &branch,
+            &config,
+            keep_recent_tokens,
+        ) {
             Some(preparation) => preparation,
             None => {
                 // Upstream distinguishes the two undefined-preparation causes
@@ -356,12 +377,46 @@ impl AgentSession {
                         false,
                     ));
                 }
-                return Err(CompactFailure::new(
-                    anyhow::anyhow!("nothing to compact (session too small)"),
-                    Some("Compaction failed: nothing to compact (session too small)".to_owned()),
-                    false,
-                    false,
-                ));
+                // Manual `/compact` is an explicit user request: when the
+                // request is already over the threshold but the conversation
+                // itself fits the keep-recent budget (a tiny transcript
+                // behind a near-window usage record or a huge prompt/tool
+                // loadout), summarize the whole conversation instead of
+                // refusing. A genuinely small session with a low usage record
+                // keeps the honest upstream error.
+                if compaction::should_compact_request_refs(
+                    &refs,
+                    &branch,
+                    context.system_prompt.as_deref(),
+                    context.tools.as_deref(),
+                    &model,
+                    &config,
+                ) {
+                    if let Some(forced) =
+                        compaction::prepare_compaction_refs_forced(&refs, &branch, &config)
+                    {
+                        forced
+                    } else {
+                        return Err(CompactFailure::new(
+                            anyhow::anyhow!("nothing to compact (session too small)"),
+                            Some(
+                                "Compaction failed: nothing to compact (session too small)"
+                                    .to_owned(),
+                            ),
+                            false,
+                            false,
+                        ));
+                    }
+                } else {
+                    return Err(CompactFailure::new(
+                        anyhow::anyhow!("nothing to compact (session too small)"),
+                        Some(
+                            "Compaction failed: nothing to compact (session too small)".to_owned(),
+                        ),
+                        false,
+                        false,
+                    ));
+                }
             }
         };
         // `session_before_compact` (reason: manual): a handler may cancel or
@@ -777,22 +832,36 @@ impl AgentSession {
                 // a projection/branch is available — this skips usage that
                 // predates the latest compaction/context-edit boundary and
                 // estimates by characters when the projection contains edits
-                // — else the plain message-list estimate.
-                let plain_estimate =
-                    branch.is_empty() && refs.iter().all(|entry| !entry.is_compaction());
-                let context_tokens = if plain_estimate {
-                    compaction::estimate_context_tokens(&context.messages).tokens
-                } else {
-                    compaction::estimate_projected_context_tokens(refs.as_slice(), branch).tokens
-                };
-                if !compaction::should_compact_tokens(context_tokens, model.context_window, &config)
-                {
+                // — else the plain message-list estimate. Both branches are
+                // FULL-request estimates: without a usage record the leading
+                // `system_prompt` and `tools` are added too. The content floor
+                // keeps an understated/stale usage record from hiding a
+                // transcript that alone overflows the window.
+                let system_prompt = context.system_prompt.as_deref();
+                let tools = context.tools.as_deref();
+                if !compaction::should_compact_request_refs(
+                    &refs,
+                    branch,
+                    system_prompt,
+                    tools,
+                    &model,
+                    &config,
+                ) {
                     return context;
                 }
                 // The threshold is met: plan the cut over the BORROWED basis
                 // (no clone of the projection, the branch, the summarized span,
-                // or the kept tail).
-                let prepared = match compaction::prepare_compaction_refs(&refs, branch, &config) {
+                // or the kept tail). The keep budget is clamped to the routed
+                // model's window so a default 20k tail cannot suppress every
+                // cut on a small-window model.
+                let keep_recent_tokens =
+                    config.effective_keep_recent_tokens(model.context_window);
+                let prepared = match compaction::prepare_compaction_refs_with_keep(
+                    &refs,
+                    branch,
+                    &config,
+                    keep_recent_tokens,
+                ) {
                     Some(prepared) => prepared,
                     None => return context,
                 };

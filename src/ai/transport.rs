@@ -119,6 +119,22 @@ async fn apply_before_provider_request(body: Vec<u8>, hooks: &ProviderStreamHook
     payload
 }
 
+/// [`apply_before_provider_request`] over a pooled payload.
+///
+/// The hook path must hand the bytes to `serde_json`, so the scratch is
+/// consumed rather than returned to the pool; the replacement body is
+/// unpooled. The overwhelmingly common no-hook path returns the guard
+/// untouched and keeps the allocation reusable.
+async fn apply_before_provider_request_payload(
+    payload: SerializedPayload,
+    hooks: &ProviderStreamHooks,
+) -> SerializedPayload {
+    if hooks.before_provider_request.is_none() {
+        return payload;
+    }
+    SerializedPayload::from_vec(apply_before_provider_request(payload.into_vec(), hooks).await)
+}
+
 // ---------------------------------------------------------------------------
 // `after_provider_response` observer hook (per-request seam)
 // ---------------------------------------------------------------------------
@@ -431,18 +447,19 @@ impl ReqwestTransport {
         Ok(Self { client })
     }
 
-    /// Build one reqwest request for the retry loop. `reqwest::Body::from(Vec)`
-    /// moves the serialized payload into a single reusable `Bytes`
-    /// allocation; `reqwest::Request::try_clone` then shares that allocation
-    /// across attempts (a refcount bump, never a body copy). Header validation
-    /// matches [`ProviderRequestClient::build_request`], so both transports
-    /// fail fast on the same inputs.
+    /// Build one reqwest request for the retry loop. `reqwest::Body::from(Bytes)`
+    /// keeps the serialized payload in one refcounted allocation; the caller's
+    /// [`SerializedPayload`] guard remains alive through the request, so a
+    /// retry shares that allocation (`Request::try_clone` is a refcount bump,
+    /// never a body copy). Header validation matches
+    /// [`ProviderRequestClient::build_request`], so both transports fail fast
+    /// on the same inputs.
     fn prepare(
         &self,
         method: &Method,
         url: &str,
         headers: &BTreeMap<String, String>,
-        body: Vec<u8>,
+        body: tokio_util::bytes::Bytes,
     ) -> AiResult<reqwest::Request> {
         let headers = build_header_map(headers)?;
         self.client
@@ -584,8 +601,9 @@ enum PreparedRequest {
 
 /// Where the serialized request body lives across the retry loop.
 enum AttemptSource {
-    /// No retry budget: the body is MOVED into the single attempt.
-    Owned(Option<Vec<u8>>),
+    /// No retry budget: prepare the single attempt lazily from the payload
+    /// guard kept alive by `request_streaming_attempts`.
+    Fresh,
     /// Retry budget over the injection seam: one `HttpRequest` owns the body.
     Seam(HttpRequest),
     /// Retry budget over the default reqwest transport: one request owns a
@@ -610,14 +628,19 @@ impl AttemptTransport {
         method: &Method,
         url: &str,
         headers: &BTreeMap<String, String>,
-        body: Vec<u8>,
+        body: &SerializedPayload,
     ) -> AiResult<PreparedRequest> {
         match self {
             Self::Reqwest(transport) => transport
-                .prepare(method, url, headers, body)
+                .prepare(method, url, headers, body.shared_bytes())
                 .map(PreparedRequest::Reqwest),
-            Self::Seam(_) => ProviderRequestClient::build_request(method, url, headers, body)
-                .map(PreparedRequest::Seam),
+            // The public injection seam is Vec-shaped (test-only). It copies
+            // once into its own `HttpRequest`; the pooled scratch still stays
+            // alive and is reused by the next request.
+            Self::Seam(_) => {
+                ProviderRequestClient::build_request(method, url, headers, body.as_bytes().to_vec())
+                    .map(PreparedRequest::Seam)
+            }
         }
     }
 
@@ -706,7 +729,8 @@ static PROVIDER_BODY_FILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic:
 
 /// The request body handed to one streaming attempt loop.
 enum StreamRequestBody<'a> {
-    Bytes(Vec<u8>),
+    /// A serialized body plus the guard that owns its scratch allocation.
+    Bytes(SerializedPayload),
     File(&'a SerializedPayloadFile),
 }
 
@@ -770,21 +794,226 @@ pub struct ProviderRequestClient {
     /// Per-client payload diagnostics (see [`Self::payload_diagnostics`]).
     ///
     /// MEMORY SHAPE (pir extension): a small JSON request body is materialized
-    /// once and kept in ONE reusable allocation; a transcript-sized one
+    /// into a reusable scratch allocation; a transcript-sized one
     /// ([`Self::serialize_payload_to_file`]) is written to a temp file and
-    /// streamed instead. The default reqwest transport replays a Vec body by
-    /// cloning the `reqwest::Request`, which shares that allocation (refcount
-    /// only), so the common case — a successful first attempt under the
-    /// default two-retry budget — pays ZERO body copies; a file body reopens
-    /// the file per attempt. The injection seam (`with_transport`) keeps its
-    /// historical behavior: an attempt that must keep the body for a possible
-    /// retry pays one `Vec` copy. The counters make the property testable.
+    /// streamed instead. The default reqwest transport replays a `Bytes` body
+    /// by cloning the `reqwest::Request`, which shares that allocation
+    /// (refcount only), so the common case — a successful first attempt under
+    /// the default two-retry budget — pays ZERO body copies; a file body
+    /// reopens the file per attempt. The injection seam (`with_transport`)
+    /// keeps its historical behavior: an attempt that must keep the body for a
+    /// possible retry pays one `Vec` copy. The counters make the property
+    /// testable.
     payload: Arc<PayloadDiagnostics>,
+    /// Free serialization buffers for this provider. Clones share the pool;
+    /// a concurrent request checks one buffer out for its whole lifetime, so
+    /// two requests can never write into the same mutable buffer. Bounded:
+    /// at most [`PAYLOAD_SCRATCH_MAX_BUFFERS`] free buffers and no buffer
+    /// larger than [`PAYLOAD_SCRATCH_MAX_RETAINED_BYTES`] is retained.
+    payload_scratch: Arc<PayloadScratchPool>,
     /// Per-request total timeout (upstream `StreamOptions.timeoutMs`, set by
     /// the adapter from `options.timeout_ms`). Reset on this client clone, so
     /// the shared client keeps its own `None` default. `None` = bounded only
     /// by the idle timeout.
     request_timeout: Option<Duration>,
+}
+
+/// Maximum number of idle serialization buffers kept by one provider client.
+/// Two covers the common case (a stream request plus a cache-warmer/compaction
+/// request) without pinning memory for a wide fan-out; extra concurrent
+/// requests allocate on demand and are released normally afterwards.
+const PAYLOAD_SCRATCH_MAX_BUFFERS: usize = 2;
+
+/// Largest idle scratch buffer retained. A larger body is sent and then its
+/// allocation is released instead of being pinned for the provider's lifetime;
+/// the OpenAI streamed path already switches to a temp file at 8 MiB.
+const PAYLOAD_SCRATCH_MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+
+/// Staging capacity for the temp-file serializer. File bodies are written
+/// incrementally through this buffer instead of `BufWriter`'s per-call 256 KiB
+/// allocation, so the file path also reuses one pooled allocation across
+/// turns. A write larger than the staging window bypasses it and goes straight
+/// to the file; the buffer itself never grows to the body size.
+const PAYLOAD_FILE_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Bounded pool of reusable request-body serialization buffers.
+///
+/// The lock is only held while checking a buffer out or returning it — never
+/// across serialization and never across an await. A checked-out buffer is
+/// exclusively owned by one [`SerializedPayload`] guard, which is what makes
+/// concurrent requests safe: they either get distinct buffers from the pool or
+/// allocate a new one.
+#[derive(Default)]
+struct PayloadScratchPool {
+    free: std::sync::Mutex<Vec<tokio_util::bytes::BytesMut>>,
+}
+
+impl PayloadScratchPool {
+    fn checkout(&self) -> Option<tokio_util::bytes::BytesMut> {
+        self.free
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .pop()
+    }
+
+    fn release(&self, bytes: tokio_util::bytes::Bytes) {
+        let Ok(buffer) = bytes.try_into_mut() else {
+            // An HTTP layer still holds a byte handle (or the allocation was
+            // not promotable). Drop it instead of copying; the next request
+            // simply allocates a fresh scratch.
+            return;
+        };
+        self.release_buffer(buffer);
+    }
+
+    fn release_buffer(&self, mut buffer: tokio_util::bytes::BytesMut) {
+        buffer.clear();
+        if buffer.capacity() == 0 || buffer.capacity() > PAYLOAD_SCRATCH_MAX_RETAINED_BYTES {
+            return;
+        }
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if free.len() < PAYLOAD_SCRATCH_MAX_BUFFERS {
+            free.push(buffer);
+        }
+    }
+}
+
+/// A bounded staging writer over a pooled scratch buffer.
+///
+/// `serde_json::to_writer` emits many small fragments; buffering them avoids a
+/// syscall per fragment while keeping the allocation reusable. When a single
+/// fragment is at least the staging window and nothing is buffered, it is
+/// written directly to the file so a multi-megabyte string never gets copied
+/// through the scratch.
+struct ScratchFileWriter<'a> {
+    file: &'a mut std::fs::File,
+    buffer: &'a mut tokio_util::bytes::BytesMut,
+}
+
+impl ScratchFileWriter<'_> {
+    fn flush_buffer(&mut self) -> std::io::Result<()> {
+        if !self.buffer.is_empty() {
+            std::io::Write::write_all(self.file, &self.buffer[..])?;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Write for ScratchFileWriter<'_> {
+    fn write(&mut self, mut data: &[u8]) -> std::io::Result<usize> {
+        let total = data.len();
+        while !data.is_empty() {
+            if self.buffer.is_empty() && data.len() >= PAYLOAD_FILE_BUFFER_BYTES {
+                std::io::Write::write_all(self.file, data)?;
+                break;
+            }
+            let space = PAYLOAD_FILE_BUFFER_BYTES.saturating_sub(self.buffer.len());
+            if space == 0 {
+                self.flush_buffer()?;
+                continue;
+            }
+            let take = space.min(data.len());
+            self.buffer.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buffer.len() == PAYLOAD_FILE_BUFFER_BYTES {
+                self.flush_buffer()?;
+            }
+        }
+        Ok(total)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_buffer()?;
+        self.file.flush()
+    }
+}
+
+/// One serialized request body, backed by a pooled scratch allocation.
+///
+/// The guard keeps the buffer checked out for the whole request (including the
+/// retry and response-read loops) and returns it to the pool on drop. The
+/// public [`Self::as_bytes`] slice is stable while the guard lives; the
+/// default reqwest transport clones the inner [`Bytes`] handle (refcount only)
+/// rather than the payload bytes.
+pub struct SerializedPayload {
+    bytes: tokio_util::bytes::Bytes,
+    pool: Option<Arc<PayloadScratchPool>>,
+}
+
+impl SerializedPayload {
+    fn from_vec(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: tokio_util::bytes::Bytes::from(bytes),
+            pool: None,
+        }
+    }
+
+    fn from_pooled(bytes: tokio_util::bytes::Bytes, pool: Arc<PayloadScratchPool>) -> Self {
+        Self {
+            bytes,
+            pool: Some(pool),
+        }
+    }
+
+    /// The serialized bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The serialized body length.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether the serialized body is empty.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn shared_bytes(&self) -> tokio_util::bytes::Bytes {
+        self.bytes.clone()
+    }
+
+    /// Consume the guard and return an owned `Vec` without returning the
+    /// allocation to the pool (used by the `before_provider_request` hook,
+    /// which must hand the bytes to `serde_json` and replace them).
+    fn into_vec(mut self) -> Vec<u8> {
+        self.pool = None;
+        let bytes = std::mem::replace(&mut self.bytes, tokio_util::bytes::Bytes::new());
+        match bytes.try_into_mut() {
+            Ok(buffer) => buffer.into(),
+            Err(bytes) => bytes.to_vec(),
+        }
+    }
+}
+
+impl Drop for SerializedPayload {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            pool.release(std::mem::replace(
+                &mut self.bytes,
+                tokio_util::bytes::Bytes::new(),
+            ));
+        }
+    }
+}
+
+impl std::ops::Deref for SerializedPayload {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_bytes()
+    }
+}
+
+impl AsRef<[u8]> for SerializedPayload {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
 }
 
 /// Which limit bounded a transport wait (see
@@ -801,17 +1030,32 @@ struct PayloadDiagnostics {
     allocations: std::sync::atomic::AtomicU64,
     copies: std::sync::atomic::AtomicU64,
     bytes_copied: std::sync::atomic::AtomicU64,
+    body_bytes: std::sync::atomic::AtomicU64,
+    body_alloc_bytes: std::sync::atomic::AtomicU64,
+    body_reuses: std::sync::atomic::AtomicU64,
 }
 
 /// One client's payload-construction counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PayloadDiagnosticsSnapshot {
-    /// Request bodies serialized (`serde_json::to_vec` successes).
+    /// Request bodies serialized (`serde_json::to_writer` successes).
     pub allocations: u64,
     /// Full-body copies made to keep a body available for a retry. The default
     /// reqwest transport makes none (it replays one shared `Bytes` body); the
     /// injection seam copies only on attempts that still have a retry budget.
     pub copies: u64,
+    /// Serialized request-body bytes produced (heap body length, or temp-file
+    /// length for the file-backed path).
+    pub body_bytes: u64,
+    /// New body-buffer capacity allocated by the serialization scratch. A warm
+    /// pool makes this flat after the first request instead of growing with
+    /// every turn. It counts the final capacity of each growth, not the
+    /// intermediate buffers a `Vec`-style doubling frees; it is a stable
+    /// allocation-pressure metric, not an allocator byte-exact total.
+    pub body_alloc_bytes: u64,
+    /// Serializations served by a checked-out scratch buffer that already had
+    /// enough capacity: no new body buffer was allocated and none grew.
+    pub body_reuses: u64,
 }
 
 impl ProviderRequestClient {
@@ -823,6 +1067,7 @@ impl ProviderRequestClient {
             transport: AttemptTransport::Reqwest(transport),
             config,
             payload: Arc::new(PayloadDiagnostics::default()),
+            payload_scratch: Arc::new(PayloadScratchPool::default()),
             request_timeout: None,
         })
     }
@@ -840,6 +1085,7 @@ impl ProviderRequestClient {
             transport: AttemptTransport::Seam(transport),
             config,
             payload: Arc::new(PayloadDiagnostics::default()),
+            payload_scratch: Arc::new(PayloadScratchPool::default()),
             request_timeout: None,
         }
     }
@@ -874,7 +1120,40 @@ impl ProviderRequestClient {
                 .payload
                 .copies
                 .load(std::sync::atomic::Ordering::Relaxed),
+            body_bytes: self
+                .payload
+                .body_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            body_alloc_bytes: self
+                .payload
+                .body_alloc_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            body_reuses: self
+                .payload
+                .body_reuses
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// Total serialized request-body bytes produced.
+    pub fn payload_body_bytes(&self) -> u64 {
+        self.payload
+            .body_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total new body-buffer capacity allocated by serialization scratches.
+    pub fn payload_body_alloc_bytes(&self) -> u64 {
+        self.payload
+            .body_alloc_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of serializations served by an already-sized scratch buffer.
+    pub fn payload_body_reuses(&self) -> u64 {
+        self.payload
+            .body_reuses
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Total request-body bytes copied to keep a request replayable (a
@@ -896,30 +1175,78 @@ impl ProviderRequestClient {
         self.payload
             .bytes_copied
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.payload
+            .body_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.payload
+            .body_alloc_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.payload
+            .body_reuses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Serialize one JSON request body, counting the allocation.
-    fn serialize_payload<T: Serialize>(&self, body: &T) -> AiResult<Vec<u8>> {
+    /// Serialize one JSON request body into a pooled scratch buffer.
+    fn serialize_payload<T: Serialize>(&self, body: &T) -> AiResult<SerializedPayload> {
         self.serialize_payload_with_capacity(body, 0)
     }
 
     /// [`Self::serialize_payload`] with a caller-supplied capacity hint.
     ///
     /// A transcript-sized provider body (tens of MiB) otherwise grows its
-    /// output `Vec` through several reallocations; the last one briefly holds
+    /// output buffer through several reallocations; the last one briefly holds
     /// both the old and the new buffer. Callers that can estimate the wire
-    /// size (the OpenAI streamed body) reserve it once.
+    /// size (the OpenAI streamed body) reserve it once. The buffer comes from
+    /// a bounded per-provider pool and is returned only when the
+    /// [`SerializedPayload`] guard drops (after the request), so a warm pool
+    /// turns every later turn into a single `serde_json::to_writer` over the
+    /// same allocation instead of a fresh `Vec`.
     pub(crate) fn serialize_payload_with_capacity<T: Serialize>(
         &self,
         body: &T,
         capacity: usize,
-    ) -> AiResult<Vec<u8>> {
-        let mut payload = Vec::with_capacity(capacity);
-        serde_json::to_writer(&mut payload, body)?;
+    ) -> AiResult<SerializedPayload> {
+        // Check out a buffer, or allocate one at the caller's estimate. A
+        // fresh estimate-sized buffer avoids the log2 growth sequence on the
+        // first turn; later turns reuse the retained capacity.
+        let (mut payload, reused) = match self.payload_scratch.checkout() {
+            Some(buffer) => (buffer, true),
+            None => (tokio_util::bytes::BytesMut::with_capacity(capacity), false),
+        };
+        let before_capacity = if reused { payload.capacity() } else { 0 };
+        payload.clear();
+        if capacity > payload.capacity() {
+            payload.reserve(capacity.saturating_sub(payload.len()));
+        }
+        {
+            let mut writer = tokio_util::bytes::BufMut::writer(&mut payload);
+            serde_json::to_writer(&mut writer, body)?;
+        }
+        let body_len = payload.len();
+        let final_capacity = payload.capacity();
+        if final_capacity > before_capacity {
+            // `final_capacity` is the size of the final growth step. The
+            // intermediate log2 buffers a fresh Vec frees on the way are
+            // intentionally not counted: this metric answers "did the scratch
+            // grow this request?", and must stay flat across warm turns.
+            self.payload
+                .body_alloc_bytes
+                .fetch_add(final_capacity as u64, std::sync::atomic::Ordering::Relaxed);
+        } else if reused {
+            self.payload
+                .body_reuses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.payload
             .allocations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(payload)
+        self.payload
+            .body_bytes
+            .fetch_add(body_len as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(SerializedPayload::from_pooled(
+            payload.freeze(),
+            Arc::clone(&self.payload_scratch),
+        ))
     }
 
     /// Serialize one JSON request body directly into a temp file.
@@ -935,52 +1262,84 @@ impl ProviderRequestClient {
         &self,
         body: &T,
     ) -> AiResult<SerializedPayloadFile> {
-        let mut last_error = None;
-        for _ in 0..16 {
-            let nonce = PROVIDER_BODY_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "pir-provider-body-{}-{nonce}.json",
-                std::process::id()
-            ));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(file) => {
-                    let written = (|| -> AiResult<u64> {
-                        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
-                        serde_json::to_writer(&mut writer, body)?;
-                        writer.flush()?;
-                        let written = writer
-                            .into_inner()
-                            .map_err(std::io::IntoInnerError::into_error)?;
-                        Ok(written.metadata()?.len())
-                    })();
-                    match written {
-                        Ok(len) => {
-                            self.payload
-                                .allocations
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return Ok(SerializedPayloadFile { path, len });
-                        }
-                        Err(error) => {
-                            // The success guard does not exist yet: remove the
-                            // partial body before reporting the failure.
-                            let _ = std::fs::remove_file(&path);
-                            return Err(error);
+        // The file path streams through the same bounded scratch pool as the
+        // in-memory path. The buffer only holds one 256 KiB staging window;
+        // `ScratchFileWriter` bypasses it for larger fragments, so a
+        // transcript-sized body never becomes a heap body.
+        let mut scratch = self.payload_scratch.checkout().unwrap_or_default();
+        let reused = scratch.capacity() > 0;
+        let before_capacity = scratch.capacity();
+        scratch.clear();
+        if scratch.capacity() < PAYLOAD_FILE_BUFFER_BYTES {
+            scratch.reserve(PAYLOAD_FILE_BUFFER_BYTES);
+        }
+        let result = (|| -> AiResult<SerializedPayloadFile> {
+            let mut last_error = None;
+            for _ in 0..16 {
+                let nonce =
+                    PROVIDER_BODY_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "pir-provider-body-{}-{nonce}.json",
+                    std::process::id()
+                ));
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(mut file) => {
+                        let written = (|| -> AiResult<u64> {
+                            {
+                                let mut writer = ScratchFileWriter {
+                                    file: &mut file,
+                                    buffer: &mut scratch,
+                                };
+                                serde_json::to_writer(&mut writer, body)?;
+                                writer.flush()?;
+                            }
+                            Ok(file.metadata()?.len())
+                        })();
+                        match written {
+                            Ok(len) => {
+                                self.payload
+                                    .allocations
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                self.payload
+                                    .body_bytes
+                                    .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+                                return Ok(SerializedPayloadFile { path, len });
+                            }
+                            Err(error) => {
+                                // The success guard does not exist yet: remove
+                                // the partial body before reporting the
+                                // failure.
+                                let _ = std::fs::remove_file(&path);
+                                return Err(error);
+                            }
                         }
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        last_error = Some(error);
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    last_error = Some(error);
-                }
-                Err(error) => return Err(error.into()),
             }
+            Err(last_error
+                .unwrap_or_else(|| std::io::Error::other("cannot create provider body temp file"))
+                .into())
+        })();
+        let final_capacity = scratch.capacity();
+        if final_capacity > before_capacity {
+            self.payload
+                .body_alloc_bytes
+                .fetch_add(final_capacity as u64, std::sync::atomic::Ordering::Relaxed);
+        } else if reused {
+            self.payload
+                .body_reuses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        Err(last_error
-            .unwrap_or_else(|| std::io::Error::other("cannot create provider body temp file"))
-            .into())
+        self.payload_scratch.release_buffer(scratch);
+        result
     }
 
     pub fn with_default_config() -> AiResult<Self> {
@@ -1031,7 +1390,6 @@ impl ProviderRequestClient {
         let mut sink = SyncFnSink(on_chunk);
         self.request_streaming_with(request, body, &mut sink).await
     }
-
     /// [`request_streaming`](Self::request_streaming) with an awaitable chunk
     /// sink: the body read loop awaits [`ChunkSink::send`] for every chunk, so
     /// a sink that waits on downstream capacity (a full assistant event queue)
@@ -1051,6 +1409,18 @@ impl ProviderRequestClient {
         &self,
         request: StreamingRequest<'_>,
         body: Vec<u8>,
+        on_chunk: &mut C,
+    ) -> AiResult<(u16, BTreeMap<String, String>)> {
+        self.request_payload_streaming_with(request, SerializedPayload::from_vec(body), on_chunk)
+            .await
+    }
+
+    /// [`request_streaming_with`](Self::request_streaming_with) over an
+    /// already-serialized pooled payload (the adapters' JSON path).
+    async fn request_payload_streaming_with<C: ChunkSink>(
+        &self,
+        request: StreamingRequest<'_>,
+        body: SerializedPayload,
         on_chunk: &mut C,
     ) -> AiResult<(u16, BTreeMap<String, String>)> {
         self.request_streaming_with_no_retry_statuses(
@@ -1144,12 +1514,14 @@ impl ProviderRequestClient {
         // OpenAI streamed caller uses the file entry only when no such hook is
         // installed, keeping the no-hook path allocation-bounded.
         let body = match body {
-            StreamRequestBody::Bytes(body) => {
-                StreamRequestBody::Bytes(apply_before_provider_request(body, hooks).await)
-            }
+            StreamRequestBody::Bytes(payload) => StreamRequestBody::Bytes(
+                apply_before_provider_request_payload(payload, hooks).await,
+            ),
             StreamRequestBody::File(file) if hooks.before_provider_request.is_some() => {
                 let bytes = std::fs::read(file.path())?;
-                StreamRequestBody::Bytes(apply_before_provider_request(bytes, hooks).await)
+                StreamRequestBody::Bytes(SerializedPayload::from_vec(
+                    apply_before_provider_request(bytes, hooks).await,
+                ))
             }
             file => file,
         };
@@ -1157,28 +1529,35 @@ impl ProviderRequestClient {
         // retries when neither the client construction nor the stream options
         // set an explicit count (see [`ProviderRequestClient::effective_max_retries`]).
         let max_retries = self.effective_max_retries(url);
-        // The serialized body is materialized exactly once. With NO retry
-        // budget it is MOVED into the single attempt. With a retry budget the
-        // default reqwest transport prepares one request whose reusable
-        // `Bytes` body every attempt shares via `Request::try_clone` (refcount
-        // only): a successful first attempt under the default two-retry budget
-        // no longer pays a full-body clone. The injection seam keeps the
+        // The serialized body guard lives in `payload` for the WHOLE loop: it
+        // keeps the scratch allocation checked out of the pool while any
+        // attempt (or the response read) is alive, then returns it on drop.
+        // With NO retry budget the single attempt is prepared lazily from the
+        // guard. With a retry budget the default reqwest transport prepares
+        // one request whose reusable `Bytes` body every attempt shares via
+        // `Request::try_clone` (refcount only). The injection seam keeps the
         // public `HttpRequest` shape, so only ITS attempts that must keep the
         // body for a possible retry pay one `Vec` copy (the last attempt
         // consumes the original). A file body reopens the file per attempt.
-        let mut source = Some(match body {
-            StreamRequestBody::Bytes(body) if max_retries == 0 => AttemptSource::Owned(Some(body)),
-            StreamRequestBody::Bytes(body) => {
-                match self.transport.prepare(&method, url, headers, body)? {
-                    PreparedRequest::Reqwest(request) => AttemptSource::Replay(request),
-                    PreparedRequest::Seam(request) => AttemptSource::Seam(request),
-                }
+        let (payload, file_source) = match body {
+            StreamRequestBody::Bytes(payload) => (Some(payload), None),
+            StreamRequestBody::File(file) => (None, Some((file.path().to_path_buf(), file.len()))),
+        };
+        let mut source = match file_source {
+            Some((path, len)) => Some(AttemptSource::File { path, len }),
+            None if max_retries == 0 => Some(AttemptSource::Fresh),
+            None => {
+                let payload = payload.as_ref().ok_or_else(|| {
+                    AiError::Http("internal request body state: missing payload".to_string())
+                })?;
+                Some(
+                    match self.transport.prepare(&method, url, headers, payload)? {
+                        PreparedRequest::Reqwest(request) => AttemptSource::Replay(request),
+                        PreparedRequest::Seam(request) => AttemptSource::Seam(request),
+                    },
+                )
             }
-            StreamRequestBody::File(file) => AttemptSource::File {
-                path: file.path().to_path_buf(),
-                len: file.len(),
-            },
-        });
+        };
         let mut attempt = 0;
         'attempt: loop {
             if let Some(signal) = signal {
@@ -1187,7 +1566,10 @@ impl ProviderRequestClient {
                 }
             }
             let request = match source.take() {
-                Some(AttemptSource::Owned(Some(payload))) => {
+                Some(AttemptSource::Fresh) => {
+                    let payload = payload.as_ref().ok_or_else(|| {
+                        AiError::Http("internal request body state: missing payload".to_string())
+                    })?;
                     self.transport.prepare(&method, url, headers, payload)?
                 }
                 Some(AttemptSource::Seam(request)) if attempt < max_retries => {
@@ -1225,7 +1607,7 @@ impl ProviderRequestClient {
                     self.transport
                         .prepare_file(&method, url, headers, &path, len)?
                 }
-                Some(AttemptSource::Owned(None)) | None => {
+                None => {
                     return Err(AiError::Http(
                         "internal transport error: request body was already consumed".to_string(),
                     ))
@@ -1453,7 +1835,7 @@ impl ProviderRequestClient {
         on_chunk: &mut C,
     ) -> AiResult<(u16, BTreeMap<String, String>)> {
         let payload = self.serialize_payload(body)?;
-        self.request_streaming_with(
+        self.request_payload_streaming_with(
             StreamingRequest::new(Method::POST, url, headers, signal, hooks),
             payload,
             on_chunk,
@@ -1462,9 +1844,10 @@ impl ProviderRequestClient {
     }
 
     /// [`post_json_streaming_with`](Self::post_json_streaming_with) with an
-    /// already-serialized payload. Used by the OpenAI streamed body so it can
-    /// reserve the exact output size once instead of growing a `Vec` through
-    /// several reallocations.
+    /// already-serialized `Vec` body.
+    ///
+    /// Kept for callers that built the bytes themselves; those bytes are not
+    /// returned to the provider scratch pool (the caller owns the `Vec`).
     pub async fn post_payload_streaming_with<C: ChunkSink>(
         &self,
         url: &str,
@@ -1474,7 +1857,29 @@ impl ProviderRequestClient {
         hooks: &ProviderStreamHooks,
         on_chunk: &mut C,
     ) -> AiResult<(u16, BTreeMap<String, String>)> {
-        self.request_streaming_with(
+        self.request_payload_streaming_with(
+            StreamingRequest::new(Method::POST, url, headers, signal, hooks),
+            SerializedPayload::from_vec(payload),
+            on_chunk,
+        )
+        .await
+    }
+
+    /// [`post_payload_streaming_with`](Self::post_payload_streaming_with)
+    /// over a pooled payload. Used by the OpenAI streamed body so it can
+    /// reserve the exact output size once instead of growing a buffer through
+    /// several reallocations. The payload carries its scratch guard: it stays
+    /// checked out until this request's response is fully consumed.
+    pub(crate) async fn post_serialized_payload_streaming_with<C: ChunkSink>(
+        &self,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        payload: SerializedPayload,
+        signal: Option<&AbortSignal>,
+        hooks: &ProviderStreamHooks,
+        on_chunk: &mut C,
+    ) -> AiResult<(u16, BTreeMap<String, String>)> {
+        self.request_payload_streaming_with(
             StreamingRequest::new(Method::POST, url, headers, signal, hooks),
             payload,
             on_chunk,
@@ -1545,7 +1950,7 @@ impl ProviderRequestClient {
     ) -> AiResult<(u16, BTreeMap<String, String>)> {
         let payload = self.serialize_payload(body)?;
         let mut sink = SyncFnSink(on_chunk);
-        self.request_streaming_with(
+        self.request_payload_streaming_with(
             StreamingRequest::new(Method::POST, url, headers, signal, hooks),
             payload,
             &mut sink,

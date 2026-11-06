@@ -3752,6 +3752,19 @@ async fn wait_for_queued_detached_call(
 /// 2's untouched file is the abort's doing, not a broken setup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aborting_a_queued_detached_edit_cancels_it_before_it_writes() {
+    // The read-before-edit gate is orthogonal to this test: the fixture
+    // seeds `shared.txt` directly and never drives the `read` tool, so the
+    // production default (Enforce) would reject the detached `edit` at
+    // preparation, before it ever reaches the mutation queue under test.
+    // Pin the gate off for both phases (the mode is resolved once per
+    // `AgentSession::new`); the shared guard also keeps the process-wide
+    // env mutation serialized with the other agent-dir tests.
+    let _read_gate_off = crate::common::AgentDirEnvGuard::scratch_with(
+        "edit-queued-read-gate",
+        None,
+        &[("PIR_READ_BEFORE_EDIT", "off")],
+    )
+    .await;
     // --- Phase 1: control (no abort) — the queued detached edit applies. ---
     {
         let fixture = ProbeFixture::new("edit-queued-control");

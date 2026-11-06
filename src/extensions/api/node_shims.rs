@@ -148,7 +148,7 @@ pub fn canonical_node_name(name: &str) -> Option<&'static str> {
 /// boot path, while a virtual module's source is dead once QuickJS has
 /// compiled it. Returning a fresh exact-sized `String` keeps the decoded
 /// bytes out of the resident set after boot.
-fn shim_source(shim: &Shim) -> Option<String> {
+pub(super) fn shim_source(shim: &Shim) -> Option<String> {
     match shim.inflate() {
         Ok(source) => Some(source),
         Err(error) => {

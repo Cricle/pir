@@ -634,3 +634,59 @@ fn a_stalled_rpc_client_does_not_deadlock_a_single_worker_runtime() {
     joined.expect("serve task joins").expect("serve result");
     let _ = std::fs::remove_dir_all(&session_dir);
 }
+
+#[test]
+fn rpc_closed_stdout_exits_zero_without_crash_record() {
+    // `pir rpc | head` closes the protocol pipe. The writer sees EPIPE and
+    // must end the session quietly (exit 0, no panic, no crash record) —
+    // never surface it as a fatal host error.
+    let home = spawn_home();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pir"));
+    command
+        .arg("rpc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("PIR_AGENT_DIR", home.join("agent"))
+        .env("PI_CODING_AGENT_SESSION_DIR", home.join("sessions"));
+    for (_provider, keys) in pir::ai::auth::env_api_keys::all() {
+        for key in keys {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command.spawn().expect("pir rpc should start");
+    let mut stdin = child.stdin.take().expect("rpc stdin");
+    // Close both consumer ends, like `2>&1 | head`: the writer's first
+    // protocol line hits a closed pipe.
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    let _ = stdin.write_all(b"{\"type\":\"hello\"}\n");
+    let _ = stdin.flush();
+    drop(stdin);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("pir rpc did not exit after its stdout pipe closed");
+            }
+        }
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a closed RPC stdout pipe must exit quietly"
+    );
+    assert!(
+        !home.join("agent").join("crashes.json").exists(),
+        "a closed pipe must never be recorded as a crash"
+    );
+}

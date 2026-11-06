@@ -28,12 +28,7 @@ use crate::ai::types::{
 /// Upstream `normalizeRadiusGatewayUrl`: add a scheme when missing and drop
 /// trailing slashes.
 pub fn normalize_gateway_url(value: &str) -> String {
-    let with_scheme = if value.starts_with("http://") || value.starts_with("https://") {
-        value.to_string()
-    } else {
-        format!("https://{value}")
-    };
-    with_scheme.trim_end_matches('/').to_string()
+    crate::ai::auth::oauth::radius::normalize_radius_gateway_url(value)
 }
 
 /// A model entry from the gateway config (upstream `RadiusGatewayModel`).
