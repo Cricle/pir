@@ -99,18 +99,35 @@ jobs:
         run: |
           set -uo pipefail
           status=0
+          # `autotests = false` means tests/*.rs are modules inside the generated
+          # zz_merged_N harnesses, not cargo test targets. Enumerate the real
+          # targets from cargo metadata (jq ships on the hosted runners); fall
+          # back to the generated harness names when jq is unavailable.
+          if command -v jq >/dev/null 2>&1; then
+            mapfile -t targets < <(cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "pir-sdk") | .targets[] | select(.kind[] == "test") | .name')
+          else
+            targets=()
+            for f in tests/zz_merged_*.rs; do
+              targets+=("$(basename "$f" .rs)")
+            done
+          fi
+          if [ "${#targets[@]}" -eq 0 ]; then
+            echo "no integration test targets found"
+            exit 1
+          fi
+          echo "integration test targets: ${targets[*]}"
           for shard in 1 2 3 4 5 6 7 8; do
             args=()
             if [ "$shard" -eq 1 ]; then args+=("--lib" "--bins"); fi
             i=0
-            for f in tests/*.rs; do
-              name="$(basename "$f" .rs)"
+            for name in "${targets[@]}"; do
               if [ $((i % 8)) -eq $((shard - 1)) ]; then
                 args+=("--test" "$name")
               fi
               i=$((i + 1))
             done
-            echo "test group ${shard}/8: ${#args[@]} selectors over ${i} files"
+            echo "test group ${shard}/8: ${#args[@]} selectors over ${#targets[@]} targets"
             # Record a failure but keep going: stopping at the first red group
             # hides every later group's result, turning one flake into a
             # misleading "suite never ran" red build.
@@ -121,8 +138,7 @@ jobs:
             # linked executables; keep the pir-sdk rlib and shared dependency
             # artifacts, which are identical for every group.
             i=0
-            for f in tests/*.rs; do
-              name="$(basename "$f" .rs)"
+            for name in "${targets[@]}"; do
               if [ $((i % 8)) -eq $((shard - 1)) ]; then
                 rm -f "target/debug/deps/${name}-"* "target/debug/deps/${name}.d"
               fi
