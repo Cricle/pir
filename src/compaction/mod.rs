@@ -1554,12 +1554,7 @@ fn plan_compaction<E: ProjectedEntry, P: PathEntry>(
     path_entries: &[P],
     settings: &CompactionConfig,
 ) -> Option<PreparationPlan> {
-    plan_compaction_with_budget(
-        projected,
-        path_entries,
-        settings.keep_recent_tokens,
-        false,
-    )
+    plan_compaction_with_budget(projected, path_entries, settings.keep_recent_tokens, false)
 }
 
 /// `plan_compaction` with an explicit keep budget, and an optional
@@ -1821,12 +1816,7 @@ pub fn prepare_compaction_refs_with_keep<'a, E: ProjectedEntry, P: PathEntry>(
     settings: &CompactionConfig,
     keep_recent_tokens: u64,
 ) -> Option<BorrowedCompactionPreparation<'a>> {
-    let plan = plan_compaction_with_budget(
-        projected,
-        path_entries,
-        keep_recent_tokens,
-        false,
-    )?;
+    let plan = plan_compaction_with_budget(projected, path_entries, keep_recent_tokens, false)?;
     Some(borrowed_preparation(projected, plan, settings))
 }
 
@@ -1841,12 +1831,8 @@ pub fn prepare_compaction_refs_forced<'a, E: ProjectedEntry, P: PathEntry>(
     path_entries: &[P],
     settings: &CompactionConfig,
 ) -> Option<BorrowedCompactionPreparation<'a>> {
-    let plan = plan_compaction_with_budget(
-        projected,
-        path_entries,
-        settings.keep_recent_tokens,
-        true,
-    )?;
+    let plan =
+        plan_compaction_with_budget(projected, path_entries, settings.keep_recent_tokens, true)?;
     Some(borrowed_preparation(projected, plan, settings))
 }
 

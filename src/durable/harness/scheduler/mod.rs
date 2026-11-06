@@ -2685,7 +2685,6 @@ impl SchedulerInner {
 
 // ─── Record helpers ─────────────────────────────────────────────────────────
 
-
 /// The checkpoint of a checkpoint-bearing state.
 #[must_use]
 pub fn checkpoint_of(state: &TaskState) -> &Value {

@@ -558,11 +558,7 @@ fn a_session_manager_in_another_process_holds_the_lock() {
     let path = create_session(&dir, "held by another SessionManager");
     let marker = dir.join("holder-ready");
     let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([
-            "cross_process_lock_holder",
-            "--ignored",
-            "--test-threads=1",
-        ])
+        .args(["cross_process_lock_holder", "--ignored", "--test-threads=1"])
         .env("PIR_TEST_HOLDER_SESSION", &path)
         .env("PIR_TEST_HOLDER_MARKER", &marker)
         .stdout(std::process::Stdio::null())

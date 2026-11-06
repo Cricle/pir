@@ -65,10 +65,7 @@ fn frame_mock_spawn() -> (String, Vec<String>) {
     let exe = std::env::current_exe().expect("current exe");
     (
         exe.to_string_lossy().into_owned(),
-        vec![
-            "mock_mcp_frame_child".to_owned(),
-            "--nocapture".to_owned(),
-        ],
+        vec!["mock_mcp_frame_child".to_owned(), "--nocapture".to_owned()],
     )
 }
 

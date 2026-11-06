@@ -11,9 +11,7 @@ use std::path::{Path, PathBuf};
 use pir::coding_agent::context::{
     expand_prompt_file_args, expand_prompt_file_args_with_options, ImageAttachmentOptions,
 };
-use pir::coding_agent::print::{
-    expand_print_prompt_file_args, PRINT_IMAGE_ATTACHMENT_OPTIONS,
-};
+use pir::coding_agent::print::{expand_print_prompt_file_args, PRINT_IMAGE_ATTACHMENT_OPTIONS};
 use pir::config::settings::{Settings, SettingsManager};
 
 // ---------------------------------------------------------------------------
@@ -128,8 +126,7 @@ fn image_dimensions(bytes: &[u8]) -> (u32, u32) {
             continue;
         }
         let length = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
-        let is_sof = (0xC0..=0xCF).contains(&marker)
-            && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+        let is_sof = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
         if is_sof {
             let height = u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]) as u32;
             let width = u16::from_be_bytes([bytes[offset + 7], bytes[offset + 8]]) as u32;
@@ -232,7 +229,10 @@ fn settings_auto_resize_defaults_to_true_and_parses_false() {
     );
 
     let unset: Settings = serde_json::from_str(r#"{"images":{}}"#).expect("parse settings");
-    assert!(unset.image_auto_resize(), "images without autoResize defaults true");
+    assert!(
+        unset.image_auto_resize(),
+        "images without autoResize defaults true"
+    );
 
     let enabled: Settings =
         serde_json::from_str(r#"{"images":{"autoResize":true}}"#).expect("parse settings");
@@ -257,12 +257,9 @@ fn print_auto_resize_follows_settings_manager() {
     // resizes the attachment.
     let manager = SettingsManager::load(&global, &project, &dir, true);
     assert!(manager.settings.image_auto_resize());
-    let (_, images) = expand_print_prompt_file_args(
-        "@big.png",
-        &dir,
-        manager.settings.image_auto_resize(),
-    )
-    .expect("expand with default settings");
+    let (_, images) =
+        expand_print_prompt_file_args("@big.png", &dir, manager.settings.image_auto_resize())
+            .expect("expand with default settings");
     assert_eq!(images.len(), 1);
     let (width, height) = image_dimensions(&base64_decode(&images[0].data));
     assert!(
@@ -279,12 +276,9 @@ fn print_auto_resize_follows_settings_manager() {
     .expect("write global settings");
     let manager = SettingsManager::load(&global, &project, &dir, true);
     assert!(!manager.settings.image_auto_resize());
-    let (_, images) = expand_print_prompt_file_args(
-        "@big.png",
-        &dir,
-        manager.settings.image_auto_resize(),
-    )
-    .expect("expand with autoResize=false");
+    let (_, images) =
+        expand_print_prompt_file_args("@big.png", &dir, manager.settings.image_auto_resize())
+            .expect("expand with autoResize=false");
     assert_eq!(images.len(), 1);
     assert_eq!(
         base64_decode(&images[0].data),
@@ -310,9 +304,7 @@ fn text_and_empty_files_keep_their_behavior_with_options() {
 
     assert!(images.is_empty(), "text/empty files attach no images");
     assert!(
-        text.contains("<file name=\"")
-            && text.contains(">\nhello\n")
-            && text.contains("\n</file>"),
+        text.contains("<file name=\"") && text.contains(">\nhello\n") && text.contains("\n</file>"),
         "text file rendered unchanged, got {text:?}"
     );
     assert!(

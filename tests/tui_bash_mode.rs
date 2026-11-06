@@ -152,7 +152,10 @@ fn bash_mode_has_a_visible_shell_label_in_the_composer_border() {
     let border = format!("\x1b[38;5;1m{}\x1b[39m", "─".repeat(48));
     let painted = embed_status_in_border(&border, 48, "!", BASH_STATUS_LABEL);
     let plain = strip_ansi(&painted);
-    assert!(plain.contains("BASH"), "composer border shows the mode: {plain}");
+    assert!(
+        plain.contains("BASH"),
+        "composer border shows the mode: {plain}"
+    );
     assert!(plain.contains("Enter runs"));
     assert_eq!(visible_width(&painted), 48);
 }

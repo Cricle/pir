@@ -1399,7 +1399,9 @@ fn openai_close_delimited_body_without_finish_reason_completes() {
         .feed(openai_text_chunk("close").as_bytes(), &mut events)
         .expect("feed succeeds");
     parser.set_close_delimited_eof(true);
-    parser.finish(&mut events).expect("close-delimited EOF completes");
+    parser
+        .finish(&mut events)
+        .expect("close-delimited EOF completes");
 
     let done = events.iter().find_map(|event| match event {
         AssistantMessageEvent::Done { reason, message } => Some((reason, message)),

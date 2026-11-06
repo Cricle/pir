@@ -7645,10 +7645,12 @@ async fn manual_compact_succeeds_when_usage_is_near_window_with_tiny_history() {
     let temp = TempDir::new("manual-compact-near-usage");
     let registry = fake_registry(Arc::new(|_index, context| {
         let is_summarizer = context.messages.iter().any(|message| match message {
-            Message::User(user) => user.content.iter().any(|block| matches!(
-                block,
-                ContentBlock::Text(text) if text.text.contains("<conversation>")
-            )),
+            Message::User(user) => user.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text(text) if text.text.contains("<conversation>")
+                )
+            }),
             _ => false,
         });
         if is_summarizer {
@@ -7707,10 +7709,12 @@ async fn manual_compact_succeeds_for_large_session_on_small_window() {
     let temp = TempDir::new("manual-compact-small-window");
     let registry = fake_registry(Arc::new(|_index, context| {
         let is_summarizer = context.messages.iter().any(|message| match message {
-            Message::User(user) => user.content.iter().any(|block| matches!(
-                block,
-                ContentBlock::Text(text) if text.text.contains("<conversation>")
-            )),
+            Message::User(user) => user.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text(text) if text.text.contains("<conversation>")
+                )
+            }),
             _ => false,
         });
         if is_summarizer {
@@ -7789,10 +7793,12 @@ async fn manual_compact_cuts_a_twenty_turn_session_at_32k() {
     let temp = TempDir::new("manual-compact-20-long-turns");
     let registry = fake_registry(Arc::new(|_index, context| {
         let is_summarizer = context.messages.iter().any(|message| match message {
-            Message::User(user) => user.content.iter().any(|block| matches!(
-                block,
-                ContentBlock::Text(text) if text.text.contains("<conversation>")
-            )),
+            Message::User(user) => user.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text(text) if text.text.contains("<conversation>")
+                )
+            }),
             _ => false,
         });
         if is_summarizer {
@@ -7958,7 +7964,12 @@ async fn compaction_queues_steer_and_follow_up_and_delivers_each_once() {
     // count is the exact-once assertion.
     let occurrences = |needle: &str| {
         seen.iter()
-            .map(|request| request.iter().filter(|text| text.as_str() == needle).count())
+            .map(|request| {
+                request
+                    .iter()
+                    .filter(|text| text.as_str() == needle)
+                    .count()
+            })
             .max()
             .unwrap_or(0)
     };
@@ -8160,7 +8171,10 @@ async fn cancelled_compaction_keeps_queued_input_deliverable() {
     let _ = gate_tx.send(true);
     let failed = compact_task.await.expect("compact task");
     assert!(failed.is_err(), "the compaction was cancelled");
-    assert!(!agent.is_compacting(), "the claim must be released on failure");
+    assert!(
+        !agent.is_compacting(),
+        "the claim must be released on failure"
+    );
     assert_eq!(
         agent.get_steering_messages().await,
         vec!["survivor".to_owned()],
@@ -8249,7 +8263,12 @@ async fn steer_and_follow_up_during_streaming_deliver_in_order_once() {
     // Requests carry the cumulative context; max per-request count == exact-once.
     let occurrences = |needle: &str| {
         seen.iter()
-            .map(|request| request.iter().filter(|text| text.as_str() == needle).count())
+            .map(|request| {
+                request
+                    .iter()
+                    .filter(|text| text.as_str() == needle)
+                    .count()
+            })
             .max()
             .unwrap_or(0)
     };
@@ -8340,7 +8359,10 @@ async fn interactive_prompt_expands_file_and_image_references_into_the_request()
         })
         .collect::<String>();
     assert!(
-        prompt_text.contains(&format!("<file name=\"{}\">\nALPHA\nBETA\n</file>", notes.display())),
+        prompt_text.contains(&format!(
+            "<file name=\"{}\">\nALPHA\nBETA\n</file>",
+            notes.display()
+        )),
         "text file content must be injected under its absolute name: {prompt_text}"
     );
     assert!(prompt_text.contains("summarize"), "{prompt_text}");
@@ -8552,7 +8574,10 @@ async fn an_admitted_prompt_starts_the_run_and_releases_the_session() {
         text_of_message(&Message::Assistant(terminal)).as_deref(),
         Some("admitted-ok")
     );
-    assert!(!agent.is_streaming(), "the run must release its claim at settle");
+    assert!(
+        !agent.is_streaming(),
+        "the run must release its claim at settle"
+    );
     assert!(!agent.is_busy());
 
     let entries = agent
@@ -8579,7 +8604,10 @@ async fn an_admitted_prompt_starts_the_run_and_releases_the_session() {
         })
         .collect();
     assert_eq!(
-        stored.iter().filter(|text| text.as_str() == "admitted").count(),
+        stored
+            .iter()
+            .filter(|text| text.as_str() == "admitted")
+            .count(),
         1,
         "the admitted prompt must be stored exactly once: {stored:?}"
     );

@@ -3987,10 +3987,7 @@ fn expand_prompt_file_args_accepts_quotes_around_the_whole_token() {
 
     // Shell-style quoting around the whole `@path` token must resolve the
     // same as `@"path"` (both shapes occur after argv quoting is stripped).
-    for prompt in [
-        "\"@my notes.txt\" summarize",
-        "'@my notes.txt' summarize",
-    ] {
+    for prompt in ["\"@my notes.txt\" summarize", "'@my notes.txt' summarize"] {
         let (expanded, images) =
             expand_prompt_file_args(prompt, &dir.0).expect("expand whole-token quote");
         assert_eq!(
@@ -4021,7 +4018,10 @@ fn expand_prompt_file_args_resolves_relative_paths_and_reports_absolute_missing_
     ] {
         let (expanded, images) =
             expand_prompt_file_args(prompt, &dir.0).expect("expand relative path");
-        assert!(expanded.contains("</file>\nexplain"), "{prompt}: {expanded}");
+        assert!(
+            expanded.contains("</file>\nexplain"),
+            "{prompt}: {expanded}"
+        );
         assert!(images.is_empty());
     }
 

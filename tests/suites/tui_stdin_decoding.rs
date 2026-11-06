@@ -1087,10 +1087,7 @@ fn stdin_gate_accepts_a_paste_past_the_old_eight_mib_cap() {
     );
     assert!(gate.paste_open());
 
-    out.extend(gate.push(
-        Event::Paste("a".repeat(OLD_CAP / 2 + 1)),
-        at(base, 11),
-    ));
+    out.extend(gate.push(Event::Paste("a".repeat(OLD_CAP / 2 + 1)), at(base, 11)));
     assert!(
         out.is_empty(),
         "the old 8 MiB cap must not split the paste (got {} events)",
@@ -1102,7 +1099,12 @@ fn stdin_gate_accepts_a_paste_past_the_old_eight_mib_cap() {
     );
 
     out.extend(gate.push(Event::Paste("\x1b[201~".to_string()), at(base, 12)));
-    assert_eq!(out.len(), 1, "one paste event expected, got {} events", out.len());
+    assert_eq!(
+        out.len(),
+        1,
+        "one paste event expected, got {} events",
+        out.len()
+    );
     match &out[0] {
         Event::Paste(text) => assert_eq!(text.len(), OLD_CAP + 1),
         other => panic!("expected one paste, got {other:?}"),
@@ -1125,13 +1127,21 @@ fn stdin_gate_caps_an_unterminated_paste() {
     // pushes.
     let first = "a".repeat(MAX_PASTE_BYTES / 2);
     out.extend(gate.push(Event::Paste(first), at(base, 10)));
-    assert!(out.is_empty(), "below the 64 MiB cap nothing is delivered yet");
+    assert!(
+        out.is_empty(),
+        "below the 64 MiB cap nothing is delivered yet"
+    );
     assert!(gate.paste_open());
     out.extend(gate.push(
         Event::Paste("a".repeat(MAX_PASTE_BYTES - MAX_PASTE_BYTES / 2)),
         at(base, 11),
     ));
-    assert_eq!(out.len(), 1, "the cap delivers one paste, got {} events", out.len());
+    assert_eq!(
+        out.len(),
+        1,
+        "the cap delivers one paste, got {} events",
+        out.len()
+    );
     match &out[0] {
         Event::Paste(text) => assert_eq!(
             text.len(),

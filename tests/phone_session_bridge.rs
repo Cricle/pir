@@ -433,10 +433,7 @@ async fn bridge_closes_a_slow_consumer_beyond_its_byte_budget() {
 fn mock_pool_config() -> PoolConfig {
     let mut config = PoolConfig::new(std::env::current_dir().expect("cwd"));
     config.executable = std::env::current_exe().expect("test executable");
-    config.args = vec![
-        "mock_rpc_child_entry".to_owned(),
-        "--nocapture".to_owned(),
-    ];
+    config.args = vec!["mock_rpc_child_entry".to_owned(), "--nocapture".to_owned()];
     config
         .env
         .push(("PIR_PHONE_TEST_CHILD".to_owned(), "1".to_owned()));

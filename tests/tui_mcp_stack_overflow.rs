@@ -74,11 +74,8 @@ fn deep_mcp_result_renders_without_stack_overflow() {
         // Expanded so the bounded args formatter prints the whole 64-level
         // prefix plus the elision marker; the collapsed preview truncates at
         // 100 chars and would hide the marker behind the opening brackets.
-        let tool = ToolExecutionComponent::new(
-            "mcp__qa__qa_echo",
-            args,
-            Arc::new(AtomicBool::new(true)),
-        );
+        let tool =
+            ToolExecutionComponent::new("mcp__qa__qa_echo", args, Arc::new(AtomicBool::new(true)));
         tool.set_meta(Some(details), None, None);
         tool.update_result(Arc::from("MCP_ECHO:hello from mcp"), false, None);
         // The formatter itself (before line wrapping) carries the complete

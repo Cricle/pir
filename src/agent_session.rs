@@ -173,9 +173,9 @@ pub use native_host::{
     NativeSessionAction, NativeSessionHost, SessionReplacement,
 };
 pub use notifications::drain_extension_notifications_pub;
-pub use prompt_loop::RunAdmission;
 #[doc(hidden)]
 pub use prompt_loop::trim_ephemeral_history;
+pub use prompt_loop::RunAdmission;
 pub use providers::serialize_scoped_models;
 pub use queue::ClearedQueue;
 #[cfg(feature = "subagent")]

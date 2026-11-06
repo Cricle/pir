@@ -444,7 +444,9 @@ pub fn estimate_request_messages_tokens_floor(
     system_prompt: Option<&str>,
     tools: Option<&[Tool]>,
 ) -> u64 {
-    ceil_units(content_token_units(messages).saturating_add(prompt_token_units(system_prompt, tools)))
+    ceil_units(
+        content_token_units(messages).saturating_add(prompt_token_units(system_prompt, tools)),
+    )
 }
 
 /// [`estimate_request_projected_context_tokens`] ignoring any usage record.

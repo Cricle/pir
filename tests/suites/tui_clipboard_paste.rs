@@ -413,7 +413,10 @@ fn clipboard_image_content_is_base64_with_its_mime() {
 fn image_path_reference_quotes_spaces_and_escapes_backslashes() {
     // CLI paths are already absolute; the reference must survive the shared
     // prompt scanner's quoted-token grammar.
-    assert_eq!(image_path_reference("C:\\tmp\\a b.png"), "@\"C:\\\\tmp\\\\a b.png\"");
+    assert_eq!(
+        image_path_reference("C:\\tmp\\a b.png"),
+        "@\"C:\\\\tmp\\\\a b.png\""
+    );
     assert_eq!(image_path_reference("/tmp/a b.png"), "@\"/tmp/a b.png\"");
     assert_eq!(image_path_reference("a\"b.png"), "@\"a\\\"b.png\"");
 }

@@ -564,7 +564,6 @@ fn render_message_html(message: &Message, results: &BTreeMap<String, ToolResultV
     }
 }
 
-
 // ─── System prompt entries (upstream template.js system helpers) ───────────
 
 /// Full prompt text of a system message (upstream `getSystemMessageText`):

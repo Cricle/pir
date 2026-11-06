@@ -101,10 +101,7 @@ fn mock_server_spawn() -> (String, Vec<String>) {
     let exe = std::env::current_exe().expect("current exe");
     (
         exe.to_string_lossy().into_owned(),
-        vec![
-            "mock_mcp_server_child".to_owned(),
-            "--nocapture".to_owned(),
-        ],
+        vec!["mock_mcp_server_child".to_owned(), "--nocapture".to_owned()],
     )
 }
 
@@ -1212,10 +1209,7 @@ async fn connect_failure_closes_the_transport_and_kills_the_child() {
     );
     let options = StdioSpawnOptions {
         command: exe.to_string_lossy().into_owned(),
-        args: vec![
-            "mock_mcp_silent_child".to_owned(),
-            "--nocapture".to_owned(),
-        ],
+        args: vec!["mock_mcp_silent_child".to_owned(), "--nocapture".to_owned()],
         cwd: std::env::current_dir().expect("cwd"),
         env,
         max_message_bytes: 1024 * 1024,

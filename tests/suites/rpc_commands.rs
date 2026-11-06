@@ -2178,7 +2178,10 @@ fn compact_gated_factory(
 async fn rpc_prompt_during_manual_compaction_is_rejected_before_started() {
     let (temp, path) = seeded_session("prompt-during-compact", |manager| {
         for index in 0..4 {
-            seed_user(manager, &format!("user turn {index} with words to summarize"));
+            seed_user(
+                manager,
+                &format!("user turn {index} with words to summarize"),
+            );
             seed_assistant(manager, &format!("assistant reply {index}"));
         }
     });

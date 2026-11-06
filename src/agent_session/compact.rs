@@ -352,8 +352,7 @@ impl AgentSession {
         // 20k tail on an 8k/2k-window model can never be exceeded, so the cut
         // always kept the whole conversation and `/compact` reported "nothing
         // to compact" even while the request was over the window.
-        let keep_recent_tokens =
-            config.effective_keep_recent_tokens(model.context_window);
+        let keep_recent_tokens = config.effective_keep_recent_tokens(model.context_window);
         let preparation = match compaction::prepare_compaction_refs_with_keep(
             &refs,
             &branch,
@@ -854,8 +853,7 @@ impl AgentSession {
                 // or the kept tail). The keep budget is clamped to the routed
                 // model's window so a default 20k tail cannot suppress every
                 // cut on a small-window model.
-                let keep_recent_tokens =
-                    config.effective_keep_recent_tokens(model.context_window);
+                let keep_recent_tokens = config.effective_keep_recent_tokens(model.context_window);
                 let prepared = match compaction::prepare_compaction_refs_with_keep(
                     &refs,
                     branch,

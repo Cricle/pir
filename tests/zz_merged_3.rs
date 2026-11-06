@@ -117,10 +117,10 @@ mod tui_native_commands;
 mod tui_session_event_frames;
 #[path = "tui_toolcall_args_stream.rs"]
 mod tui_toolcall_args_stream;
-#[path = "upstream_d3_strict_tool_fallback.rs"]
-mod upstream_d3_strict_tool_fallback;
 #[path = "upstream_d34_retry.rs"]
 mod upstream_d34_retry;
+#[path = "upstream_d3_strict_tool_fallback.rs"]
+mod upstream_d3_strict_tool_fallback;
 #[path = "version_consistency.rs"]
 mod version_consistency;
 #[path = "w1_d12_openrouter.rs"]

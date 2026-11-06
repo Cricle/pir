@@ -195,5 +195,8 @@ fn paste_text_uses_the_editor_batch_api_for_a_short_multiline_paste() {
     assert_eq!(editor.undo_depth(), 1, "one undo snapshot for the paste");
     let stats = editor.io_stats();
     assert_eq!(stats.insert_bursts, 1, "{stats:?}");
-    assert_eq!(stats.insert_burst_chars, "alpha\nbeta".chars().count() as u64);
+    assert_eq!(
+        stats.insert_burst_chars,
+        "alpha\nbeta".chars().count() as u64
+    );
 }

@@ -329,9 +329,7 @@ impl ExtensionHandle {
             // completion path releases the slot, and a sender that never got
             // one must not leave `pending_commands` inflated.
             self.command_queued();
-            let payload = mailbox_payload
-                .take()
-                .ok_or(CommandWaitError::NotRunning)?;
+            let payload = mailbox_payload.take().ok_or(CommandWaitError::NotRunning)?;
             permit.send(Command::Emit {
                 event: event.to_owned(),
                 payload,

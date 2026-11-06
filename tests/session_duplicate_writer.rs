@@ -85,9 +85,7 @@ fn two_threads_creating_the_same_id_produce_exactly_one_writer() {
     drop(tx);
 
     start.wait();
-    let results: Vec<_> = (0..2)
-        .map(|_| rx.recv().expect("attempt result"))
-        .collect();
+    let results: Vec<_> = (0..2).map(|_| rx.recv().expect("attempt result")).collect();
     done.wait();
     for thread in threads {
         thread.join().expect("creator thread");

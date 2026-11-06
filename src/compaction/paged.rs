@@ -967,11 +967,17 @@ fn projected_threshold_tokens(
     // estimators add that prefix only when the transcript carries no usage
     // record (usage already includes it), matching `should_compact`.
     let tokens = if plain_estimate {
-        let usage =
-            estimate_request_messages_tokens(&projection.messages, request.system_prompt, request.tools)
-                .tokens;
-        let floor =
-            estimate_request_messages_tokens_floor(&projection.messages, request.system_prompt, request.tools);
+        let usage = estimate_request_messages_tokens(
+            &projection.messages,
+            request.system_prompt,
+            request.tools,
+        )
+        .tokens;
+        let floor = estimate_request_messages_tokens_floor(
+            &projection.messages,
+            request.system_prompt,
+            request.tools,
+        );
         usage.max(floor)
     } else {
         let usage = estimate_request_projected_context_tokens(

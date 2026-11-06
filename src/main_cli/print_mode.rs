@@ -70,8 +70,7 @@ pub(super) async fn run_print_mode(request: PrintModeRequest<'_>) -> Result<()> 
         plan,
         json_output,
     } = request;
-    let (prompts, images) =
-        expand_print_subcommand_prompt(cli, settings_manager, prompts, images)?;
+    let (prompts, images) = expand_print_subcommand_prompt(cli, settings_manager, prompts, images)?;
     let outcome = pir::coding_agent::run_print(
         PrintOptions {
             prompt: prompts.initial_message.unwrap_or_default(),

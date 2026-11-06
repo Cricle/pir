@@ -852,10 +852,8 @@ impl Editor {
     pub fn paste_text(&self, text: &str) -> String {
         self.io_paste_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.io_paste_bytes.fetch_add(
-            text.len() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.io_paste_bytes
+            .fetch_add(text.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let continuing_paste = self
             .paste_burst
             .swap(true, std::sync::atomic::Ordering::SeqCst);
@@ -2098,10 +2096,8 @@ impl Editor {
         let line = state.lines[state.cursor_line].clone();
         let len = line.chars().count();
         // BASHMODE: forward-deleting the leading mode `!` leaves bash mode.
-        let deletes_bash_prefix = self.is_bash_mode()
-            && state.cursor_line == 0
-            && col == 0
-            && line.starts_with('!');
+        let deletes_bash_prefix =
+            self.is_bash_mode() && state.cursor_line == 0 && col == 0 && line.starts_with('!');
         if col < len {
             self.push_undo(&state);
             // Upstream `handleForwardDelete`: `segment(afterCursor,

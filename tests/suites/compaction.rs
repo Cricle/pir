@@ -686,8 +686,7 @@ async fn compaction_fn_success_produces_summary_user_message_then_retained_tail(
     assert!(prompt.starts_with("<conversation>\n"));
     assert!(prompt.contains("[User]: turn one"));
     assert!(prompt.contains("[Tool result]: xxxx"));
-    assert!(prompt
-        .contains("Preserve exact file paths, function names, and error messages."));
+    assert!(prompt.contains("Preserve exact file paths, function names, and error messages."));
     assert!(prompt.contains(
         "Preserve exact file paths, function names, error messages, command exit codes and unfinished items; do not infer facts not present in the messages."
     ));
@@ -1322,15 +1321,16 @@ fn forced_preparation_summarizes_the_whole_conversation() {
     let config = compact_config();
     let messages = vec![
         user_msg("hello"),
-        assistant_msg(vec![text_block("hi there")], StopReason::Stop, usage_with_total(30_000)),
+        assistant_msg(
+            vec![text_block("hi there")],
+            StopReason::Stop,
+            usage_with_total(30_000),
+        ),
     ];
     let entries = cut_entries_of(&messages);
-    let preparation = prepare_compaction_refs_forced(
-        &entries,
-        &[] as &[pir::compaction::PathEntryMeta],
-        &config,
-    )
-    .expect("forced preparation");
+    let preparation =
+        prepare_compaction_refs_forced(&entries, &[] as &[pir::compaction::PathEntryMeta], &config)
+            .expect("forced preparation");
     assert_eq!(preparation.messages_to_summarize.len(), messages.len());
     assert!(preparation.kept_messages.is_empty());
     assert!(preparation.first_kept_entry_id.is_none());

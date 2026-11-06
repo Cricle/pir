@@ -16,9 +16,7 @@ use std::time::Instant;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use pir::tui::autocomplete::{AutocompletePopup, CombinedAutocompleteProvider};
 use pir::tui::editor::Editor;
-use pir::tui::terminal::{
-    accept_autocomplete_selection, ConsoleBatchCoalescer, PrintableBurst,
-};
+use pir::tui::terminal::{accept_autocomplete_selection, ConsoleBatchCoalescer, PrintableBurst};
 
 fn press(c: char) -> Event {
     Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
@@ -316,9 +314,8 @@ fn slash_then_quit_burst_keeps_one_slash_and_enter_submits_it() {
 
     // Menu open on `/quit`: Enter accepts the highlighted `quit` row; the
     // accepted prefix is a slash command, so the submit path runs `/quit`.
-    let provider = CombinedAutocompleteProvider::with_builtin_commands(
-        std::env::current_dir().expect("cwd"),
-    );
+    let provider =
+        CombinedAutocompleteProvider::with_builtin_commands(std::env::current_dir().expect("cwd"));
     let state = editor.state_snapshot();
     let suggestions = provider
         .suggestions(&state.lines, state.cursor_line, state.cursor_col, false)
@@ -390,7 +387,10 @@ fn split_bracketed_paste_end_marker_is_still_held() {
         press('1'),
         press('~'),
     ]);
-    assert!(!coalescer.is_paste_open(), "end marker must close the paste");
+    assert!(
+        !coalescer.is_paste_open(),
+        "end marker must close the paste"
+    );
     assert!(
         tail.iter()
             .any(|event| matches!(event, Event::Paste(text) if text == "a")),

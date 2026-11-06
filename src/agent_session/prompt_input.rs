@@ -359,9 +359,7 @@ impl AgentSession {
             let attachment_options = {
                 let model = self.current_model();
                 let (max_width, max_height, max_bytes, jpeg_quality) =
-                    crate::coding_agent::tools::image::image_resize_limits_for_model(Some(
-                        &model,
-                    ));
+                    crate::coding_agent::tools::image::image_resize_limits_for_model(Some(&model));
                 Some(crate::coding_agent::context::ImageAttachmentOptions {
                     max_width,
                     max_height,
