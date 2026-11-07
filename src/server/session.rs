@@ -277,6 +277,10 @@ pub struct ServerState {
     snapshot: Arc<RwLock<ServerSnapshot>>,
     sessions: Arc<RwLock<HashMap<String, SessionRecord>>>,
     providers: Arc<ProviderRegistry>,
+    /// Model used by `create` when the caller omits one (the host's
+    /// configured default provider/model). `None` keeps the historical
+    /// `default/default` placeholder.
+    default_model: Option<ModelRef>,
     security: ServerSecurityConfig,
     /// Host-resolved global tool selection (`--tools` / `--exclude-tools` /
     /// `--no-tools` / `--no-builtin-tools` plus `settings.defaultTools`).
@@ -317,6 +321,7 @@ impl ServerState {
             snapshot: Arc::new(RwLock::new(snapshot)),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             providers,
+            default_model: None,
             security: ServerSecurityConfig::default(),
             tool_selection: None,
             sessions_dir: None,
@@ -336,6 +341,7 @@ impl ServerState {
             snapshot: Arc::new(RwLock::new(snapshot)),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             providers,
+            default_model: None,
             security: ServerSecurityConfig::default(),
             tool_selection: None,
             sessions_dir: None,
@@ -353,6 +359,24 @@ impl ServerState {
     /// it — so sessions survive disconnects and server restarts.
     pub fn with_session_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.sessions_dir = Some(Arc::new(dir.into()));
+        self
+    }
+
+    /// Attach the host's configured provider registry. The default
+    /// [`ServerState::new`] starts with an empty registry, so a standalone
+    /// `pir server` that did not call this could create sessions but no
+    /// prompt could ever resolve a provider (`internal_error` with no model
+    /// request). The CLI host loads [`crate::ai::providers::load_pi_environment`]
+    /// once and hands the same registry to the server, matching print/RPC/TUI.
+    pub fn with_registry(mut self, providers: Arc<ProviderRegistry>) -> Self {
+        self.providers = providers;
+        self
+    }
+
+    /// Use the host's configured default provider/model when a `create`
+    /// request omits a model (the common client shape).
+    pub fn with_default_model(mut self, model: Option<ModelRef>) -> Self {
+        self.default_model = model;
         self
     }
 
@@ -656,7 +680,7 @@ impl ServerState {
         let cwd = cwd.unwrap_or_else(|| ".".to_owned());
         let mut record = SessionRecord::new(&id, cwd.clone(), timestamp);
         record.state.metadata.name = name;
-        if let Some(m) = model {
+        if let Some(m) = model.or_else(|| self.default_model.clone()) {
             record.model = m;
         }
         if let Some(tl) = thinking_level {

@@ -748,8 +748,9 @@ pub enum Command {
     Interactive,
     /// Non-interactive single execution mode
     Print {
-        /// Prompt to execute
-        prompt: String,
+        /// Prompt to execute (read from stdin when omitted or `-`)
+        #[arg(value_name = "PROMPT")]
+        prompt: Option<String>,
     },
     /// RPC mode (JSON lines over stdin/stdout)
     Rpc,
@@ -1136,18 +1137,38 @@ pub enum JobsCommand {
     Log {
         id: String,
         /// Maximum bytes from the end of the log
-        #[arg(long = "bytes", value_name = "BYTES", default_value_t = 262_144)]
+        #[arg(
+            long = "bytes",
+            id = "jobs_log_bytes",
+            value_name = "BYTES",
+            default_value_t = 262_144
+        )]
         bytes: u64,
         /// Maximum lines from the end of the log
-        #[arg(long = "lines", value_name = "N", default_value_t = 4096)]
+        #[arg(
+            long = "lines",
+            id = "jobs_log_lines",
+            value_name = "N",
+            default_value_t = 4096
+        )]
         lines: usize,
     },
     /// Collect a terminal job's status + output and mark it reaped
     Reap {
         id: String,
-        #[arg(long = "bytes", value_name = "BYTES", default_value_t = 262_144)]
+        #[arg(
+            long = "bytes",
+            id = "jobs_reap_bytes",
+            value_name = "BYTES",
+            default_value_t = 262_144
+        )]
         bytes: u64,
-        #[arg(long = "lines", value_name = "N", default_value_t = 4096)]
+        #[arg(
+            long = "lines",
+            id = "jobs_reap_lines",
+            value_name = "N",
+            default_value_t = 4096
+        )]
         lines: usize,
         #[arg(long = "json")]
         json: bool,
@@ -2892,6 +2913,16 @@ const KNOWN_LONG_FLAGS: &[&str] = &[
     // explicit local-development opt-in for a token-less server.
     "unix",
     "allow-unauthenticated",
+    // `jobs` subcommand options: without these entries `preprocess_args`
+    // treats them as extension flags and strips them (with their values)
+    // before clap, so `jobs log --lines 2` silently used the defaults.
+    "bytes",
+    "lines",
+    "shell",
+    "older-than-days",
+    "max-age-days",
+    "max-sessions",
+    "max-bytes",
     // The `install`/`remove`/`uninstall`/`config` `--local` (`-l`) spelling,
     // plus `config --json/--enable/--disable/--source` and
     // `auth check --json` (the latter already covered above).
