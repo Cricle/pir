@@ -25937,7 +25937,7 @@ impl InputLoopTrace {
         self.queued_max = self.queued_max.max(len);
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg(windows)]
     fn record_batch(&mut self, len: usize) {
         if !self.enabled || len == 0 {
             return;
@@ -25946,7 +25946,7 @@ impl InputLoopTrace {
         self.batch_max = self.batch_max.max(len);
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg(windows)]
     fn note_batch(&mut self, raw: usize, emitted: usize) {
         if !self.enabled {
             return;
