@@ -149,8 +149,15 @@ fn resolve_session_ref(arg: &str, cwd: &Path, session_dir: &Path) -> Resolved {
 /// explicit path outside the current project and has no fork prompt.
 pub fn resolve_session_path(arg: &str, cwd: &Path, session_dir: &Path) -> crate::Result<PathBuf> {
     match resolve_session_ref(arg, cwd, session_dir) {
-        Resolved::Found(path) | Resolved::CrossProject { path, .. } => Ok(path),
-        Resolved::NotFound(arg) => Err(anyhow::anyhow!(session_not_found_message(&arg))),
+        // A path-like argument is returned without an existence check by
+        // `resolve_session_ref` (the CLI reports the missing path when it
+        // opens the file). RPC `attach` must not inherit that: it would
+        // create a fresh session at a typo'd path.
+        Resolved::Found(path) if path.exists() => Ok(path),
+        Resolved::Found(_) | Resolved::NotFound(_) => {
+            Err(anyhow::anyhow!(session_not_found_message(arg)))
+        }
+        Resolved::CrossProject { path, .. } => Ok(path),
     }
 }
 

@@ -2292,9 +2292,11 @@ async fn read_json_line<R: tokio::io::AsyncBufRead + Unpin>(
     limit: usize,
 ) -> Result<Option<String>, LineReadError> {
     let decode = |bytes: Vec<u8>| {
-        String::from_utf8(bytes).map(Some).map_err(|error| {
-            LineReadError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-        })
+        // Invalid UTF-8 is a parse error for THIS line, not a reason to tear
+        // down the whole RPC session: a malformed frame must get a `parse`
+        // response and the next command still works (the JSON parser rejects
+        // the replacement characters).
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     };
     let mut bytes: Vec<u8> = Vec::new();
     loop {

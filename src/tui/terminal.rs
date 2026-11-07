@@ -13669,6 +13669,11 @@ fn handle_key(
     if kb.matches(TuiAction::Clear, key) {
         if worker.is_streaming() {
             worker.abort();
+            // Same visible state as the Esc abort path: the live status row
+            // must not survive the aborted run and linger into the next turn.
+            *app.working_message
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             return false;
         }
         let now = Instant::now();
@@ -19524,7 +19529,7 @@ fn handle_command(
         super::slash::SlashAction::Help => {
             entries.push(ChatEntry::Notice {
                 kind: super::app::NoticeKind::Status,
-                text: "Commands: /model /thinking /clear /compact /new /resume /sessions /fork /clone /name /session /copy /settings /tree /scoped-models /trust /login /logout /changelog /hotkeys /share /import /bug /reload /debug /image /mcp /todos /quit /help · ! runs bash".to_string(),
+                text: "Commands: /model /thinking /clear /compact /new /resume /sessions /fork /clone /name /session /copy /settings /tree /scoped-models /trust /login /logout /changelog /hotkeys /share /import /export /bug /reload /debug /image /mcp /todos /quit /help · ! runs bash".to_string(),
             });
         }
         super::slash::SlashAction::Tree => {
@@ -20261,7 +20266,15 @@ fn handle_resume_command(app: &mut App, entries: &mut Vec<ChatEntry>, worker: &W
         });
         return;
     }
+    // The session picker is a synchronous crossterm UI, not the VT byte
+    // reader. Switch the console back to INPUT_RECORD mode for the picker and
+    // restore VT input afterwards; otherwise every picker key is swallowed
+    // (the in-session `/resume` keyboard trap).
+    #[cfg(windows)]
+    crate::tui::stdin_buffer::restore_windows_vt_input();
     let picked = crate::coding_agent::session_pick::pick_session_with_all(&sessions, &all_sessions);
+    #[cfg(windows)]
+    let _ = crate::tui::stdin_buffer::enable_windows_vt_input();
     // Restore the TUI surface the picker swapped out. The picker always
     // leaves raw mode + the alternate screen on return, so raw mode is
     // re-enabled unconditionally; the alternate screen is re-entered only in
@@ -20296,8 +20309,14 @@ fn handle_resume_command(app: &mut App, entries: &mut Vec<ChatEntry>, worker: &W
                 // override, Cancel leaves the outgoing session untouched.
                 let (manager, resumed_in_current_cwd) = match manager.missing_session_cwd() {
                     Some(issue) => {
+                        // Same synchronous-crossterm boundary as the session
+                        // picker above.
+                        #[cfg(windows)]
+                        crate::tui::stdin_buffer::restore_windows_vt_input();
                         let choice =
                             super::session_cwd::prompt_missing_session_cwd(&issue, &cwd_text);
+                        #[cfg(windows)]
+                        let _ = crate::tui::stdin_buffer::enable_windows_vt_input();
                         match super::session_cwd::missing_cwd_override(choice, &cwd_text) {
                             Some(fallback) => {
                                 match super::session_cwd::open_session_in_current_cwd(
