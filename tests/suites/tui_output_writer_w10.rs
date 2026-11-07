@@ -398,8 +398,15 @@ impl Component for BlockCacheProbeHandle {
         Some(0)
     }
 
-    fn content_blocks(&self) -> Option<Vec<u64>> {
-        Some(self.0.revisions.lock().expect("revisions lock").clone())
+    fn content_blocks(&self) -> Option<std::sync::Arc<[u64]>> {
+        Some(
+            self.0
+                .revisions
+                .lock()
+                .expect("revisions lock")
+                .clone()
+                .into(),
+        )
     }
 
     fn render_block_into(&self, index: usize, _width: usize, out: &mut Rows<'_>) {

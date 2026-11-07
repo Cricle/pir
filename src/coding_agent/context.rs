@@ -34,6 +34,13 @@ pub const NO_CONTEXT_FILES_ENV: &str = "PIR_NO_CONTEXT_FILES";
 /// Upper bound for one context file (pir hardening; upstream is unbounded).
 pub const MAX_CONTEXT_FILE_BYTES: u64 = 1024 * 1024;
 
+/// Upper bound for one `@file` prompt-expansion argument. The expansion is
+/// explicit user input, so it is allowed to be much larger than a context
+/// file, but it must not be able to read a multi-GB path into the worker
+/// (and copy it again into the prompt string). 64 MiB matches the largest
+/// single spill/attachment unit elsewhere in the agent.
+pub const MAX_PROMPT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Whether context-file discovery is enabled for this process.
 pub fn context_files_enabled() -> bool {
     match std::env::var(NO_CONTEXT_FILES_ENV) {
@@ -892,6 +899,12 @@ pub fn partition_file_args_with_options(
         if size == 0 {
             continue;
         }
+        if size > MAX_PROMPT_FILE_BYTES {
+            return Err(anyhow::anyhow!(
+                "File too large: {} is {size} bytes (limit {MAX_PROMPT_FILE_BYTES} bytes)",
+                path.display()
+            ));
+        }
         // Sniff from a small read instead of the full file; these bytes are
         // then reused for the text block or extended for the image payload.
         // The image sniffer is compiled only when the print host or read tool
@@ -915,9 +928,7 @@ pub fn partition_file_args_with_options(
             }
             let mut bytes = Vec::with_capacity(filled);
             bytes.extend_from_slice(&head[..filled]);
-            file.read_to_end(&mut bytes).map_err(|error| {
-                anyhow::anyhow!("Could not read file {}: {error}", path.display())
-            })?;
+            let bytes = read_remaining_capped(&mut file, &path, bytes)?;
             let sniff_head = &bytes[..bytes
                 .len()
                 .min(crate::coding_agent::tools::image::IMAGE_TYPE_SNIFF_BYTES)];
@@ -931,10 +942,7 @@ pub fn partition_file_args_with_options(
         #[cfg(not(any(feature = "print", feature = "tool-read")))]
         {
             let _ = options;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map_err(|error| {
-                anyhow::anyhow!("Could not read file {}: {error}", path.display())
-            })?;
+            let bytes = read_remaining_capped(&mut file, &path, Vec::new())?;
             append_file_text(&path, &bytes, &mut text);
         }
     }
@@ -1188,6 +1196,27 @@ pub fn expand_prompt_file_args_with_options(
     let (file_text, images) = partition_file_args_with_options(&file_args, cwd, options)?;
     let message = prompt_text_without_file_args(prompt, &tokens);
     Ok((format!("{file_text}{message}"), images))
+}
+
+/// Read the remainder of `file` into `bytes`, enforcing
+/// [`MAX_PROMPT_FILE_BYTES`] even if the file grew after the metadata check.
+fn read_remaining_capped(
+    file: &mut std::fs::File,
+    path: &Path,
+    mut bytes: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let remaining = MAX_PROMPT_FILE_BYTES.saturating_sub(bytes.len() as u64);
+    file.take(remaining.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("Could not read file {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_PROMPT_FILE_BYTES {
+        return Err(anyhow::anyhow!(
+            "File too large: {} exceeds {MAX_PROMPT_FILE_BYTES} bytes",
+            path.display()
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Text half of `processFileArguments`: lossy UTF-8 with a BOM strip.

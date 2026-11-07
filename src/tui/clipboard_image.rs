@@ -58,7 +58,7 @@ pub fn image_path_reference(path: &str) -> String {
 /// normalized to PNG by [`crate::tui::clipboard::read_image`]; the Windows
 /// retry always produces PNG.
 pub fn read_image_attachment() -> Option<ImageContent> {
-    let image = crate::tui::clipboard::read_image().or_else(read_windows_png_image)?;
+    let image = crate::tui::clipboard::read_image()?;
     Some(image_content_from_clipboard_image(&image))
 }
 
@@ -84,7 +84,7 @@ pub fn powershell_save_png_script(path: &str) -> String {
 /// clipboard holds no image, PowerShell fails, or the saved file is not a
 /// non-empty PNG.
 #[cfg(windows)]
-fn read_windows_png_image() -> Option<ClipboardImage> {
+pub(super) fn read_windows_png_image() -> Option<ClipboardImage> {
     use std::time::{Duration, Instant};
 
     let temp_path =
@@ -105,8 +105,15 @@ fn read_windows_png_image() -> Option<ClipboardImage> {
             command.creation_flags(0x0800_0000);
         }
         let mut child = command.spawn().ok()?;
-        let stdout = child.stdout.take()?;
-        let reader = std::thread::Builder::new()
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        };
+        let reader = match std::thread::Builder::new()
             .name("pir-clipboard-image".to_owned())
             .spawn(move || {
                 use std::io::Read as _;
@@ -114,8 +121,14 @@ fn read_windows_png_image() -> Option<ClipboardImage> {
                 let mut handle = stdout.take(64 * 1024);
                 handle.read_to_string(&mut output).ok()?;
                 Some(output)
-            })
-            .ok()?;
+            }) {
+            Ok(reader) => reader,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        };
         let deadline = Instant::now() + Duration::from_secs(5);
         let status = loop {
             match child.try_wait() {
@@ -154,6 +167,6 @@ fn read_windows_png_image() -> Option<ClipboardImage> {
 }
 
 #[cfg(not(windows))]
-fn read_windows_png_image() -> Option<ClipboardImage> {
+pub(super) fn read_windows_png_image() -> Option<ClipboardImage> {
     None
 }

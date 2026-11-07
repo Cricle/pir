@@ -873,6 +873,15 @@ impl AgentSession {
         if let Some(summary) = diagnostics.finish() {
             self.set_last_run_diagnostics(summary);
         }
+        // Capture the run's abort state BEFORE releasing the claim: once the
+        // guard drops, a host retry can claim the session and install a new
+        // run's signal, so reading `self.signal` below could report the next
+        // run's state.
+        let aborted = self
+            .signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_aborted();
         drop(guard);
         if let Err(error) = &result {
             // Surface the run failure so hosts (and extensions) learn the run
@@ -885,13 +894,7 @@ impl AgentSession {
             // EVERY exit, including a thrown run; without this the failed-run
             // path (an error out of `run_prompt`, before its own settle
             // emission) leaves settlement observers such as git-checkpoint /
-            // pi-pretty waiting for a settle that never arrives. `aborted`
-            // mirrors the loop's own flag (the run's abort signal).
-            let aborted = self
-                .signal
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_aborted();
+            // pi-pretty waiting for a settle that never arrives.
             // Session-level event: unlike the plugin dispatch below, this
             // reaches `AgentSession::on_session_event` subscribers
             // unconditionally.
@@ -1108,6 +1111,24 @@ impl AgentSession {
         // not the cached `session_id`: the cache is refreshed during the swap
         // and may still name the outgoing session here.
         let persist_ledger = PersistLedger::new();
+        // A background tool completion persists its `backgroundToolResult`
+        // entry before enqueueing the live frame. The normal end-of-run drain
+        // removes frames that lost the race to delivery; an errored or
+        // aborted run skips that drain (the guard's Drop cannot await), so
+        // stale frames can survive into THIS prompt and inject a duplicate on
+        // top of the persisted entry. Starting a new run is the safe point to
+        // drop them: every store-backed completion is already in the
+        // projection. Store-less sessions keep the frame as their only
+        // durable surface.
+        if self.session.is_some() {
+            let stale = self.background_follow_up_inbox.drain_all().await.len();
+            if stale > 0 {
+                tracing::debug!(
+                    stale,
+                    "dropped background frames left by a previous run (already persisted)"
+                );
+            }
+        }
         // RSS-B: the head this run starts from. The completed context may be
         // parked as the next prompt's projection only when everything appended
         // since this head is append-only (no edit/compaction/branch change).

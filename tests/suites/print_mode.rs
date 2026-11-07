@@ -412,6 +412,22 @@ fn expand_prompt_file_args_leaves_ordinary_at_text_alone() {
     assert!(images.is_empty());
 }
 
+#[test]
+fn expand_prompt_file_args_rejects_files_over_the_cap() {
+    let dir = TempDir::new("at-file-cap");
+    let big = dir.0.join("big.txt");
+    let file = std::fs::File::create(&big).expect("create big");
+    file.set_len(pir::coding_agent::context::MAX_PROMPT_FILE_BYTES + 1)
+        .expect("sparse big file");
+    drop(file);
+
+    let error = expand_prompt_file_args("@big.txt", &dir.0)
+        .expect_err("oversized @file must be refused before reading");
+    let message = error.to_string();
+    assert!(message.contains("File too large:"), "{message}");
+    assert!(message.contains("big.txt"), "{message}");
+}
+
 fn base64_of(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)

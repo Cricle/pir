@@ -407,6 +407,36 @@ fn sed_native_in_place_rewrites_the_file() {
 }
 
 #[test]
+fn sed_in_place_quit_leaves_later_files_untouched() {
+    if skip_without_binary() {
+        return;
+    }
+    let dir = TempDir::new("sed-in-place-quit");
+    let first = dir.write("first.txt", "a1\na2\na3\n");
+    let second = dir.write("second.txt", "b1\nb2\nb3\n");
+
+    let output = run(&[
+        "sed",
+        "-i",
+        "1q",
+        first.to_str().expect("utf-8 temp path"),
+        second.to_str().expect("utf-8 temp path"),
+        "--no-fallback",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(
+        std::fs::read_to_string(&first).expect("read first file"),
+        "a1\n"
+    );
+    // GNU sed's `q` ends the invocation, so the second file is never opened
+    // for writing (the old per-file loop truncated it to its first line).
+    assert_eq!(
+        std::fs::read_to_string(&second).expect("read second file"),
+        "b1\nb2\nb3\n"
+    );
+}
+
+#[test]
 fn sed_missing_file_exits_two_but_processes_the_rest() {
     if skip_without_binary() {
         return;

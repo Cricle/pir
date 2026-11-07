@@ -682,7 +682,7 @@ fn resolve_path(path: &str, cwd: Option<&Path>) -> Option<PathBuf> {
 /// on the feature-gated `coding_agent::tools::image` helpers).
 fn is_supported_image_file(path: &Path) -> bool {
     use std::io::Read;
-    let mut head = [0u8; 16];
+    let mut head = [0u8; 32];
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
@@ -690,12 +690,29 @@ fn is_supported_image_file(path: &Path) -> bool {
         return false;
     };
     let head = &head[..read];
-    head.starts_with(&[0x89, 0x50, 0x4e, 0x47]) // PNG
-        || head.starts_with(&[0xff, 0xd8, 0xff]) // JPEG
-        || head.starts_with(b"GIF87a")
-        || head.starts_with(b"GIF89a")
-        || (head.starts_with(b"RIFF") && head.get(8..12) == Some(&b"WEBP"[..]))
-        || head.starts_with(b"BM") // BMP
+    // Check the full signature, not just the first few magic bytes: a text
+    // file starting with `BM`/`\x89PNG` must not be exempted from the >64 KiB
+    // routing gate (the model would receive it as text).
+    let png = head.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+        && head.get(8..12) == Some(&b"\0\0\0\r"[..])
+        && head.get(12..16) == Some(&b"IHDR"[..]);
+    let jpeg = head.starts_with(&[0xff, 0xd8, 0xff]) && head.len() >= 4;
+    let gif = head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a");
+    let webp = head.starts_with(b"RIFF")
+        && head.get(8..12) == Some(&b"WEBP"[..])
+        && head
+            .get(4..8)
+            .is_some_and(|size| u32::from_le_bytes(size.try_into().unwrap()) >= 12);
+    let bmp = head.starts_with(b"BM")
+        && head.len() >= 14
+        && head.get(2..6).is_some_and(|size| {
+            let file_size = u32::from_le_bytes(size.try_into().unwrap());
+            head.get(10..14).is_some_and(|offset| {
+                let offset = u32::from_le_bytes(offset.try_into().unwrap());
+                (file_size == 0 || file_size > offset) && offset >= 14
+            })
+        });
+    png || jpeg || gif || webp || bmp
 }
 
 /// Metadata-only size probe (nothing is read). `None` when the target does

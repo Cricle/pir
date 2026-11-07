@@ -1032,6 +1032,7 @@ pub(crate) fn background_sink(
         let call_id = call.call_id.clone();
         let tool_name = call.tool_name.clone();
         let args = call.args.clone();
+        let abort = call.abort.clone();
         handle.spawn(async move {
             // The token releases the registry's delivery count on EVERY exit
             // of this task: normal completion, an aborted call (`finish`
@@ -1039,7 +1040,24 @@ pub(crate) fn background_sink(
             // what keeps `wait_for_idle` from hanging (or returning early).
             let _slot = slot;
             let started = std::time::Instant::now();
-            let result = future.await;
+            // Race the call against its abort signal: a tool that does not
+            // poll `ToolContext::signal` itself is still dropped at its next
+            // await when the session switches/aborts. The registry has
+            // already removed the entry in that case, so `finish` delivers
+            // nothing.
+            let result = tokio::select! {
+                biased;
+                // Prefer the tool's own cooperative cancellation path when it
+                // is already ready (the probe/tools that await their signal
+                // must observe the abort); a non-cooperative tool is not
+                // ready and gets dropped by the abort branch.
+                result = future => result,
+                _ = abort.cancelled() => {
+                    crate::agent::tool_batch::ToolResult::error(
+                        "background tool call aborted",
+                    )
+                }
+            };
             let duration_ms =
                 Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
             delivery

@@ -349,12 +349,21 @@ async fn routing_exempts_supported_images_only() {
     // 100 KiB per format: PNG, JPEG, GIF87a/GIF89a, WebP, BMP. All must be
     // left untouched for both the direct `read` tool and a `cat` command.
     let images: [(&str, &[u8]); 6] = [
-        ("big.png", &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+        (
+            "big.png",
+            &[
+                0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
+                b'D', b'R',
+            ],
+        ),
         ("big.jpg", &[0xff, 0xd8, 0xff, 0xe0]),
         ("big.gif87", &b"GIF87a"[..]),
         ("big.gif89", &b"GIF89a"[..]),
-        ("big.webp", &b"RIFF\x00\x00\x00\x00WEBP"[..]),
-        ("big.bmp", &b"BM"[..]),
+        ("big.webp", &b"RIFF\x24\x00\x00\x00WEBP"[..]),
+        (
+            "big.bmp",
+            &b"BM\xff\xff\xff\xff\x00\x00\x00\x006\x00\x00\x00"[..],
+        ),
     ];
     for (name, magic) in images {
         let path = harness.cwd.join(name);

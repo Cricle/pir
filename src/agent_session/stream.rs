@@ -743,7 +743,27 @@ impl ProviderStreamEventDispatcher {
         let remaining = PROVIDER_STREAM_EVENT_DISPATCH_TIMEOUT
             .checked_sub(started.elapsed())
             .unwrap_or_default();
-        match ack.recv_timeout(remaining) {
+        // Poll the abort signal while waiting for the handler ack: a handler
+        // that runs for the full 30 s budget must not keep the provider parser
+        // (and the cancelled run's task) alive after an abort. The worker
+        // thread may still finish its handler, but the stream returns now.
+        let verdict = loop {
+            if self.signal.as_ref().is_some_and(AbortSignal::is_aborted) {
+                self.stats.dropped_aborted.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let left = remaining.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break Err(std::sync::mpsc::RecvTimeoutError::Timeout);
+            }
+            match ack.recv_timeout(left.min(std::time::Duration::from_millis(10))) {
+                Ok(value) => break Ok(value),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    if started.elapsed() < remaining => {}
+                Err(error) => break Err(error),
+            }
+        };
+        match verdict {
             // Dispatch finished; the run continues (handler errors were
             // already counted by the worker and do not close the dispatcher).
             Ok(true) => {}

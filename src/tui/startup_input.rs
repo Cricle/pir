@@ -144,13 +144,20 @@ pub fn read_trust_choice(max: usize) -> Option<Option<usize>> {
             }
             _ => TrustChoiceKey::Ignore,
         };
+        // Echo only what the buffer actually accepted: a fourth digit is
+        // ignored by `push` (the buffer holds at most three), and Backspace
+        // on an empty buffer must not erase a character of the prompt text
+        // above it.
+        let digits_before = input.digits().len();
         match input.push(action) {
             TrustChoiceStep::Pending => match action {
                 TrustChoiceKey::Digit(character) => {
-                    let _ = write!(stdout, "{character}");
-                    let _ = stdout.flush();
+                    if input.digits().len() > digits_before {
+                        let _ = write!(stdout, "{character}");
+                        let _ = stdout.flush();
+                    }
                 }
-                TrustChoiceKey::Backspace => {
+                TrustChoiceKey::Backspace if digits_before > 0 => {
                     let _ = write!(stdout, "\x08 \x08");
                     let _ = stdout.flush();
                 }

@@ -7818,6 +7818,11 @@ pub struct ChatBlockCache {
     hidden_label: Option<String>,
     tools_expanded: Arc<AtomicBool>,
     blocks: Vec<ChatBlockSlot>,
+    /// Cached revision vector: `block_revisions` is called every frame, and
+    /// a fresh `Vec<u64>` per frame was steady-state garbage in the hot path.
+    /// Keyed by `(len, rolling hash)`; a collision only costs a stale cache
+    /// hit (revisions are content hashes themselves).
+    revisions_cache: Option<(usize, u64, Arc<[u64]>)>,
 }
 
 struct ChatBlockSlot {
@@ -7837,6 +7842,7 @@ impl ChatBlockCache {
             hidden_label: None,
             tools_expanded,
             blocks: Vec::new(),
+            revisions_cache: None,
         }
     }
 
@@ -8137,9 +8143,27 @@ impl ChatBlockCache {
         Some((text.as_ptr() as usize, text.len(), text.capacity()))
     }
 
-    pub fn block_revisions(&self) -> Option<Vec<u64>> {
-        self.primed
-            .then(|| self.blocks.iter().map(|slot| slot.revision).collect())
+    pub fn block_revisions(&mut self) -> Option<Arc<[u64]>> {
+        if !self.primed {
+            return None;
+        }
+        let mut hash = self.blocks.len() as u64;
+        for slot in &self.blocks {
+            hash = super::core::mix_content_revision(hash, slot.revision);
+        }
+        if let Some((len, cached_hash, cached)) = &self.revisions_cache {
+            if *len == self.blocks.len() && *cached_hash == hash {
+                return Some(Arc::clone(cached));
+            }
+        }
+        let revisions: Arc<[u64]> = self
+            .blocks
+            .iter()
+            .map(|slot| slot.revision)
+            .collect::<Vec<_>>()
+            .into();
+        self.revisions_cache = Some((self.blocks.len(), hash, Arc::clone(&revisions)));
+        Some(revisions)
     }
 
     /// Render one block into the frame's recycled canvas. `TuiCore` calls this
@@ -8315,11 +8339,12 @@ impl Component for SharedChat {
     /// entry and re-renders only the blocks whose identity moved. Unprimed
     /// (before the first app slice install) returns `None`, keeping the
     /// whole-container cache path.
-    fn content_blocks(&self) -> Option<Vec<u64>> {
-        self.blocks
+    fn content_blocks(&self) -> Option<std::sync::Arc<[u64]>> {
+        let mut blocks = self
+            .blocks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .block_revisions()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        blocks.block_revisions()
     }
 
     fn render_block_into(&self, index: usize, width: usize, out: &mut Rows<'_>) {
@@ -10378,6 +10403,17 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                         }),
                     }
                 }
+                WorkerEvent::ImagePreview { path, result } => match result {
+                    Ok(lines) => entries.push(ChatEntry::Raw {
+                        call_id: None,
+                        lines,
+                        render: None,
+                    }),
+                    Err(error) => entries.push(ChatEntry::Notice {
+                        kind: super::app::NoticeKind::Error,
+                        text: format!("/image {}: {error}", path.display()),
+                    }),
+                },
                 WorkerEvent::Status(text) => {
                     entries.push(ChatEntry::Notice {
                         kind: super::app::NoticeKind::Status,
@@ -11426,12 +11462,14 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             .map_or(timeout, |remaining| timeout.min(remaining));
         // A partial paste-marker prefix is released as typed keys at its
         // deadline; wake the poll for it even with no other work pending.
+        // A batch-final CR has its own (shorter) CRLF window.
         #[cfg(windows)]
         let timeout = console_coalescer
             .marker_tail_deadline()
-            .map_or(timeout, |deadline| {
-                timeout.min(deadline.saturating_duration_since(Instant::now()))
-            });
+            .into_iter()
+            .chain(console_coalescer.pending_enter_deadline())
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .fold(timeout, |current, remaining| current.min(remaining));
         // P1-1: snapshot the transcript length before the input poll — any
         // entries pushed while handling this event (slash-command notices
         // like /help, /hotkeys, /copy, failed pastes, …) must be flushed
@@ -11450,6 +11488,11 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
         // other key so escape-window handling stays uniform.
         #[cfg(windows)]
         {
+            // A held CR whose CRLF window elapsed is a plain submit; dispatch
+            // it before any held marker keys so input order stays exact.
+            for event in console_coalescer.poll_pending_enter(Instant::now()) {
+                pending_input.extend(input_gate.push(event, Instant::now()));
+            }
             for event in console_coalescer.poll_marker_tail(Instant::now()) {
                 pending_input.extend(input_gate.push(event, Instant::now()));
             }
@@ -18959,31 +19002,44 @@ fn handle_command(
                 let terminal_settings = app
                     .configured
                     .as_ref()
-                    .and_then(|configured| configured.settings.terminal.as_ref());
+                    .and_then(|configured| configured.settings.terminal.as_ref())
+                    .cloned();
                 let image_settings =
-                    super::image_preview::ImageSettings::from_terminal(terminal_settings);
+                    super::image_preview::ImageSettings::from_terminal(terminal_settings.as_ref());
                 // Resolve a relative argument against the active session cwd;
                 // absolute paths pass through unchanged.
                 let image_path = super::image_preview::resolve_image_path(
                     std::path::Path::new(args),
                     &app.image_cwd(),
                 );
-                match super::image_preview::render_image_with_terminal(
-                    &image_path,
-                    IMAGE_PREVIEW_MAX_ROWS,
-                    image_settings,
-                    terminal_settings,
-                ) {
-                    Ok(lines) => entries.push(ChatEntry::Raw {
-                        call_id: None,
-                        lines,
-                        render: None,
-                    }),
-                    Err(error) => entries.push(ChatEntry::Notice {
-                        kind: super::app::NoticeKind::Error,
-                        text: error,
-                    }),
-                }
+                // Read/decode/base64 on a helper thread: a 32 MiB camera image
+                // took long enough to freeze input on the UI thread.
+                let event_tx = app
+                    .event_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let thread_path = image_path.clone();
+                let _ = std::thread::Builder::new()
+                    .name("pir-image-preview".to_owned())
+                    .spawn(move || {
+                        let result = super::image_preview::render_image_with_terminal(
+                            &thread_path,
+                            IMAGE_PREVIEW_MAX_ROWS,
+                            image_settings,
+                            terminal_settings.as_ref(),
+                        );
+                        if let Some(event_tx) = event_tx {
+                            let _ = event_tx.send(WorkerEvent::ImagePreview {
+                                path: thread_path,
+                                result,
+                            });
+                        }
+                    });
+                entries.push(ChatEntry::Notice {
+                    kind: super::app::NoticeKind::Status,
+                    text: format!("/image: rendering {}…", image_path.display()),
+                });
             }
             return SlashCommandOutcome::Handled;
         }
@@ -22182,6 +22238,12 @@ enum WorkerEvent {
     ClipboardPaste {
         result: Result<Option<super::clipboard::ClipboardPaste>, String>,
     },
+    /// One off-thread `/image` preview finished. Reading, base64 and decode
+    /// run on the helper thread so a large image cannot freeze the UI loop.
+    ImagePreview {
+        path: std::path::PathBuf,
+        result: Result<Vec<String>, String>,
+    },
     /// One stored transcript entry replayed on resume/attach (upstream
     /// `renderInitialMessages` → `renderSessionItems`, interactive-mode.ts:
     /// 4208/3991). The worker builds the `ChatEntry` directly, so replayed
@@ -24549,6 +24611,13 @@ pub const CONSOLE_PASTE_CHUNK_BYTES: usize = 64 * 1024;
 /// special case fixed, now with a deadline for every other prefix.
 pub const CONSOLE_MARKER_TAIL_TIMEOUT: Duration = Duration::from_millis(40);
 
+/// How long a batch-final CR waits for the next batch's LF half before it is
+/// dispatched as a submit. The console splits a bracketed-less paste into
+/// reads, and a line ending can land on the seam; dispatching the CR
+/// immediately submitted half the paste. 40 ms matches the marker window and
+/// stays under the perception threshold for a real Enter.
+pub const CONSOLE_CRLF_PAIR_TIMEOUT: Duration = Duration::from_millis(40);
+
 /// Coalesce one drained console batch into the fewest events the gate and the
 /// editor need.
 ///
@@ -24591,6 +24660,17 @@ pub struct ConsoleBatchCoalescer {
     /// is the second half of one CRLF pair and must not add a second
     /// newline. Kept across batches: a paste ending in CRLF can split there.
     last_was_plain_enter: bool,
+    /// When [`Self::last_was_plain_enter`] became true. The pair is only
+    /// plausible for a short window; a Ctrl+Enter typed minutes later must
+    /// not be swallowed as the LF half of an old CRLF.
+    last_plain_enter_at: Option<Instant>,
+    /// A CR that ended a batch with no visible successor. It may be the CR
+    /// half of a CRLF pair split across batches (a paste line ending) or a
+    /// real submit. Held briefly so the next batch can disambiguate; released
+    /// as an Enter key at [`CONSOLE_MARKER_TAIL_TIMEOUT`].
+    pending_enter: Option<Event>,
+    /// When [`Self::pending_enter`] was stored.
+    pending_enter_since: Option<Instant>,
 }
 
 impl ConsoleBatchCoalescer {
@@ -24603,8 +24683,15 @@ impl ConsoleBatchCoalescer {
     }
 
     /// When the held marker prefix must be released as keys, for the event
-    /// loop's poll timeout. `None` when nothing is held.
+    /// loop's poll timeout. `None` when nothing is held. While a bracketed
+    /// paste is open the held suffix is the paste END marker: releasing its
+    /// `Esc` as a normal key would dispatch `Action::Interrupt` and abort the
+    /// running agent, so it must wait for the rest of `[201~` regardless of
+    /// how long the producer takes.
     pub fn marker_tail_deadline(&self) -> Option<Instant> {
+        if self.paste_open {
+            return None;
+        }
         self.marker_tail_since
             .map(|at| at + CONSOLE_MARKER_TAIL_TIMEOUT)
     }
@@ -24612,9 +24699,10 @@ impl ConsoleBatchCoalescer {
     /// Release a held marker prefix once its sequence window has elapsed.
     /// Returns the held keys (releases stripped) in their original order.
     /// The event loop calls this every iteration; a new console batch also
-    /// ages the tail out at the top of [`Self::coalesce`].
+    /// ages the tail out at the top of [`Self::coalesce`]. While a paste is
+    /// open the tail is an end-marker fragment and is never released as keys.
     pub fn poll_marker_tail(&mut self, now: Instant) -> Vec<Event> {
-        if self.marker_tail.is_empty() {
+        if self.paste_open || self.marker_tail.is_empty() {
             return Vec::new();
         }
         if !self
@@ -24629,15 +24717,74 @@ impl ConsoleBatchCoalescer {
         held
     }
 
+    /// When a held batch-final CR must be released as a submit. `None` while
+    /// no CR is held (or while a paste is open: its CR is payload).
+    pub fn pending_enter_deadline(&self) -> Option<Instant> {
+        if self.paste_open {
+            return None;
+        }
+        self.pending_enter_since
+            .map(|at| at + CONSOLE_CRLF_PAIR_TIMEOUT)
+    }
+
+    /// Release a held batch-final CR once its CRLF window elapsed without a
+    /// following LF half.
+    pub fn poll_pending_enter(&mut self, now: Instant) -> Vec<Event> {
+        if self.paste_open {
+            return Vec::new();
+        }
+        if !self
+            .pending_enter_since
+            .is_some_and(|at| now.saturating_duration_since(at) >= CONSOLE_CRLF_PAIR_TIMEOUT)
+        {
+            return Vec::new();
+        }
+        self.pending_enter_since = None;
+        self.pending_enter.take().into_iter().collect()
+    }
+
+    /// A CR was seen recently enough that a following LF chord can be its
+    /// CRLF partner. Older state is stale and must not swallow a Ctrl+Enter.
+    fn has_recent_plain_enter(&self) -> bool {
+        self.last_was_plain_enter
+            && self.last_plain_enter_at.is_some_and(|at| {
+                Instant::now().saturating_duration_since(at) <= CONSOLE_CRLF_PAIR_TIMEOUT
+            })
+    }
+
     /// Rewrite one raw console batch. The returned vector preserves the input
     /// order; only adjacent printable records are merged.
     pub fn coalesce(&mut self, events: Vec<Event>) -> Vec<Event> {
         let mut events = events;
         let mut expired_tail: Vec<Event> = Vec::new();
+        // A CR that ended the previous batch: if this batch begins with its
+        // LF half (or we are inside a paste), join them so CRLF contributes
+        // one newline. Otherwise the CR was a real submit; dispatch it before
+        // this batch's content so a fast follow-up keystroke cannot turn it
+        // into a pasted newline.
+        if let Some(pending) = self.pending_enter.take() {
+            let since = self.pending_enter_since.take();
+            let expired = since.is_some_and(|at| {
+                Instant::now().saturating_duration_since(at) >= CONSOLE_CRLF_PAIR_TIMEOUT
+            });
+            let next_is_lf = events
+                .iter()
+                .any(|event| matches!(event, Event::Key(key) if is_lf_chord(key)));
+            if next_is_lf || self.paste_open {
+                events.insert(0, pending);
+            } else if expired || !events.is_empty() {
+                expired_tail.push(pending);
+            } else {
+                self.pending_enter = Some(pending);
+                self.pending_enter_since = since;
+            }
+        }
         if !self.marker_tail.is_empty() {
-            if self.marker_tail_since.is_some_and(|at| {
-                Instant::now().saturating_duration_since(at) >= CONSOLE_MARKER_TAIL_TIMEOUT
-            }) {
+            if !self.paste_open
+                && self.marker_tail_since.is_some_and(|at| {
+                    Instant::now().saturating_duration_since(at) >= CONSOLE_MARKER_TAIL_TIMEOUT
+                })
+            {
                 // The sequence window closed before this batch arrived: the
                 // held run was ordinary typed keys, never a marker prefix.
                 expired_tail = std::mem::take(&mut self.marker_tail);
@@ -24697,17 +24844,29 @@ impl ConsoleBatchCoalescer {
         let mut run_events: Vec<Event> = Vec::new();
         let mut run_text = String::new();
         let mut paste_text = std::mem::take(&mut self.paste_buffer);
+        // One reverse scan per batch instead of a forward scan per Enter:
+        // a 10k-line bracketless paste has 10k enters and ~600k records, so
+        // the per-enter `events[index..]` scans were quadratic.
+        let last_effective = events.iter().rposition(
+            |event| !matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release),
+        );
+        let last_lf_chord = events
+            .iter()
+            .rposition(|event| matches!(event, Event::Key(key) if is_lf_chord(key)));
         let mut index = 0usize;
         while index < events.len() {
             if !self.paste_open {
-                if let Some(next) = bracket_marker_end(&events, index, b"[200~") {
+                // Accept the prefix-less `[200~` spelling only at the start
+                // of a batch: a pasted document containing that literal in
+                // the middle must stay payload instead of opening a paste.
+                if let Some(next) = bracket_marker_end(&events, index, b"[200~", index == 0) {
                     flush_plain_run(&mut run_events, &mut run_text, &mut out);
                     self.paste_open = true;
                     self.last_was_plain_enter = false;
                     index = next;
                     continue;
                 }
-            } else if let Some(next) = bracket_marker_end(&events, index, b"[201~") {
+            } else if let Some(next) = bracket_marker_end(&events, index, b"[201~", true) {
                 flush_paste_chunk(&mut paste_text, &mut out);
                 self.paste_open = false;
                 self.last_was_plain_enter = false;
@@ -24725,7 +24884,7 @@ impl ConsoleBatchCoalescer {
                         continue;
                     }
                     if self.paste_open {
-                        if is_lf_chord(key) && self.last_was_plain_enter {
+                        if is_lf_chord(key) && self.has_recent_plain_enter() {
                             // The LF half of a CRLF pair: the CR already
                             // contributed this newline.
                             self.last_was_plain_enter = false;
@@ -24737,6 +24896,7 @@ impl ConsoleBatchCoalescer {
                         } else if is_plain_enter(key) || is_line_feed_chord(key) {
                             paste_text.push('\n');
                             self.last_was_plain_enter = is_cr_enter(key);
+                            self.last_plain_enter_at = self.last_was_plain_enter.then(Instant::now);
                         } else if is_plain_tab(key) {
                             paste_text.push('\t');
                             self.last_was_plain_enter = false;
@@ -24756,7 +24916,7 @@ impl ConsoleBatchCoalescer {
                         self.last_was_plain_enter = false;
                         continue;
                     }
-                    if is_lf_chord(key) && self.last_was_plain_enter {
+                    if is_lf_chord(key) && self.has_recent_plain_enter() {
                         // Stray LF chord after a CR that already terminated
                         // its batch (the CR was emitted as a submit key):
                         // swallow it so the prompt does not get a second,
@@ -24775,26 +24935,28 @@ impl ConsoleBatchCoalescer {
                         // its own Key event. An Enter with content after it is
                         // an internal newline (a multiline paste) and stays
                         // part of the run.
-                        let followed_by_lf = events[index..].iter().any(|next| {
-                            matches!(
-                                next,
-                                Event::Key(next_key) if is_lf_chord(next_key)
-                            )
-                        });
-                        let has_following_content = events[index..].iter().any(|next| {
-                            !matches!(
-                                next,
-                                Event::Key(next_key) if next_key.kind == KeyEventKind::Release
-                            )
-                        });
+                        let followed_by_lf = last_lf_chord.is_some_and(|at| at >= index);
+                        let has_following_content = last_effective.is_some_and(|at| at >= index);
                         if followed_by_lf || has_following_content {
                             run_events.push(event.clone());
                             run_text.push('\n');
+                        } else if is_cr_enter(key)
+                            && self.pending_enter.is_none()
+                            && !run_text.is_empty()
+                        {
+                            // A batch-final CR can still be the first half of a
+                            // CRLF split across batches. Flush the text now and
+                            // hold the CR until the next batch (or the 40 ms
+                            // deadline) decides submit vs newline.
+                            flush_plain_run(&mut run_events, &mut run_text, &mut out);
+                            self.pending_enter = Some(event.clone());
+                            self.pending_enter_since = Some(Instant::now());
                         } else {
                             flush_plain_run(&mut run_events, &mut run_text, &mut out);
                             out.push(event.clone());
                         }
                         self.last_was_plain_enter = is_cr_enter(key);
+                        self.last_plain_enter_at = self.last_was_plain_enter.then(Instant::now);
                         continue;
                     }
                     if is_plain_tab(key) {
@@ -24876,6 +25038,15 @@ fn plain_text_char(key: &KeyEvent) -> Option<char> {
     }
 }
 
+/// A key that the printable-burst collector treats as paste payload (and may
+/// therefore consume/drop after the run's byte cap).
+fn is_burst_payload_key(key: &KeyEvent) -> bool {
+    plain_text_char(key).is_some()
+        || is_plain_enter(key)
+        || is_line_feed_chord(key)
+        || is_plain_tab(key)
+}
+
 fn is_plain_enter(key: &KeyEvent) -> bool {
     (matches!(key.code, KeyCode::Enter)
         && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL))
@@ -24918,7 +25089,12 @@ fn is_plain_tab(key: &KeyEvent) -> bool {
 /// * `[`, `2`, `0`, `0`, `~` (an ESC record the console dropped entirely).
 ///
 /// Releases between presses are skipped and consumed with the marker.
-fn bracket_marker_end(events: &[Event], start: usize, marker: &[u8]) -> Option<usize> {
+fn bracket_marker_end(
+    events: &[Event],
+    start: usize,
+    marker: &[u8],
+    allow_bare: bool,
+) -> Option<usize> {
     let mut presses: Vec<(usize, &KeyEvent)> = Vec::with_capacity(marker.len() + 2);
     let mut index = start;
     while index < events.len() && presses.len() < marker.len() + 2 {
@@ -24952,14 +25128,14 @@ fn bracket_marker_end(events: &[Event], start: usize, marker: &[u8]) -> Option<u
     }
     // Bare digits + '~': the console can drop the whole `ESC [` prefix of
     // the closing marker (not just the ESC record), leaving `2 0 1 ~` in the
-    // payload. Accept it while a paste is open (the caller only asks for the
-    // start marker when closed, where the same shape is far less likely).
-    if presses.len() >= digits.len() && keys_match_digits(&presses[..], digits) {
+    // payload. Only accepted where the caller allows it (inside an open
+    // paste); a literal `[200~` in pasted text must stay text.
+    if allow_bare && presses.len() >= digits.len() && keys_match_digits(&presses[..], digits) {
         let last = presses[digits.len() - 1].0;
         return Some(advance_releases(events, last + 1));
     }
     // '[' (plain or ALT-folded) + digits.
-    if presses.len() > digits.len() {
+    if allow_bare && presses.len() > digits.len() {
         let bracket = presses[0].1;
         let bracket_ok = bracket.code == KeyCode::Char('[')
             && !bracket.modifiers.intersects(KeyModifiers::CONTROL)
@@ -25087,6 +25263,10 @@ pub struct PrintableBurst {
     total_bytes: usize,
     chunks: usize,
     truncated: bool,
+    /// The run crossed [`Self::MAX_BYTES`]: the rest of this run's printable
+    /// payload is consumed and dropped, so the cap is a real bound and the
+    /// large-paste notice is truthful.
+    drop_remaining: bool,
     has_line_break: bool,
     /// Diagnostic: the event that ended the last non-empty run.
     blocked_by: Option<String>,
@@ -25149,6 +25329,7 @@ impl PrintableBurst {
             total_bytes: 0,
             chunks: 0,
             truncated: false,
+            drop_remaining: false,
             has_line_break: false,
             blocked_by: None,
         }
@@ -25202,6 +25383,37 @@ impl PrintableBurst {
             return false;
         }
         loop {
+            if self.drop_remaining {
+                let Some(front) = queue.front() else {
+                    // The run paused/ended after the cap: reset so the next
+                    // run starts clean instead of dropping future typing.
+                    self.reset_run_state();
+                    return false;
+                };
+                match front {
+                    Event::Paste(_) => {
+                        queue.pop_front();
+                        continue;
+                    }
+                    Event::Key(key) if key.kind == KeyEventKind::Release => {
+                        queue.pop_front();
+                        continue;
+                    }
+                    Event::Key(key)
+                        if (key.kind == KeyEventKind::Press
+                            || key.kind == KeyEventKind::Repeat)
+                            && is_burst_payload_key(key) =>
+                    {
+                        queue.pop_front();
+                        continue;
+                    }
+                    // A non-payload key ends the capped run; dispatch it.
+                    _ => {
+                        self.reset_run_state();
+                        return true;
+                    }
+                }
+            }
             let Some(front) = queue.front() else {
                 return false;
             };
@@ -25234,6 +25446,7 @@ impl PrintableBurst {
                     {
                         if self.text.len() + self.total_bytes >= Self::MAX_BYTES {
                             self.truncated = true;
+                            self.drop_remaining = true;
                         }
                         return true;
                     }
@@ -25280,6 +25493,7 @@ impl PrintableBurst {
                         }
                         if self.text.len() + self.total_bytes >= Self::MAX_BYTES {
                             self.truncated = true;
+                            self.drop_remaining = true;
                             return true;
                         }
                         continue;
@@ -25339,7 +25553,9 @@ impl PrintableBurst {
     /// queued after absorption.
     pub fn should_flush(&self, now: Instant, blocked: bool, queue_empty: bool) -> bool {
         if self.presses == 0 {
-            return false;
+            // A capped run whose payload has been drained still needs one
+            // flush(finished = true) to reset the whole-run accounting.
+            return self.truncated;
         }
         if self.truncated || self.text.len() >= Self::FLUSH_BYTES {
             return true;
@@ -25363,12 +25579,40 @@ impl PrintableBurst {
                 }
     }
 
+    /// Forget the whole-run accounting. Called when a run truly ends (or when
+    /// a capped run drains), never between the chunk flushes of one run.
+    fn reset_run_state(&mut self) {
+        self.total_bytes = 0;
+        self.chunks = 0;
+        self.truncated = false;
+        self.drop_remaining = false;
+        self.has_line_break = false;
+        self.last_was_enter = false;
+    }
+
     /// Hand the run to the normal input path. A one-press run is replayed as
     /// its original `Key`; everything else becomes one `Event::Paste` at the
     /// queue front. Returns what happened (the caller emits the large-paste
     /// notice when `finished && total_bytes` crossed the notice threshold).
     pub fn flush(&mut self, queue: &mut VecDeque<Event>, finished: bool) -> PrintableBurstOutcome {
         if self.presses == 0 {
+            if finished {
+                // A capped run may have drained its final chunk in a previous
+                // flush; this empty flush is where the run truly ends. Report
+                // the accumulated totals so the large-paste/truncation notice
+                // still fires, then reset.
+                let outcome = PrintableBurstOutcome {
+                    pasted: false,
+                    replayed_key: false,
+                    bytes: 0,
+                    finished: true,
+                    truncated: self.truncated,
+                    total_bytes: self.total_bytes,
+                    chunks: self.chunks,
+                };
+                self.reset_run_state();
+                return outcome;
+            }
             return PrintableBurstOutcome::default();
         }
         let bytes = self.text.len();
@@ -25411,11 +25655,9 @@ impl PrintableBurst {
         self.presses = 0;
         self.single = None;
         self.has_line_break = false;
-        self.truncated = false;
         self.last_flush_at = Instant::now();
         if finished {
-            self.total_bytes = 0;
-            self.chunks = 0;
+            self.reset_run_state();
         }
         outcome
     }

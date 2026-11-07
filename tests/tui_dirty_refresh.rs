@@ -55,12 +55,13 @@ impl Component for BlockList {
         }
     }
 
-    fn content_blocks(&self) -> Option<Vec<u64>> {
+    fn content_blocks(&self) -> Option<std::sync::Arc<[u64]>> {
         Some(
             self.revisions
                 .iter()
                 .map(|revision| revision.load(Ordering::Relaxed))
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
         )
     }
 
@@ -88,8 +89,10 @@ impl Component for StreamingMarkdownBlock {
         self.markdown.render_into(width, out);
     }
 
-    fn content_blocks(&self) -> Option<Vec<u64>> {
-        Some(vec![self.revision.load(Ordering::Relaxed)])
+    fn content_blocks(&self) -> Option<std::sync::Arc<[u64]>> {
+        Some(std::sync::Arc::from([self
+            .revision
+            .load(Ordering::Relaxed)]))
     }
 
     fn render_block_into(&self, _index: usize, width: usize, out: &mut Rows<'_>) {
