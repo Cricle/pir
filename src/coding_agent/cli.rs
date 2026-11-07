@@ -381,9 +381,32 @@ pub fn process_file_arguments(
             // Empty files are skipped (upstream `processFileArguments`).
             continue;
         }
-        let bytes = std::fs::read(&absolute).map_err(|error| {
+        if metadata.len() > crate::coding_agent::context::MAX_PROMPT_FILE_BYTES {
+            return Err(anyhow::anyhow!(
+                "File too large: {} is {} bytes (limit {} bytes)",
+                absolute.display(),
+                metadata.len(),
+                crate::coding_agent::context::MAX_PROMPT_FILE_BYTES
+            ));
+        }
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(&absolute).map_err(|error| {
             anyhow::anyhow!("Could not read file {}: {error}", absolute.display())
         })?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.by_ref()
+            .take(crate::coding_agent::context::MAX_PROMPT_FILE_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                anyhow::anyhow!("Could not read file {}: {error}", absolute.display())
+            })?;
+        if bytes.len() as u64 > crate::coding_agent::context::MAX_PROMPT_FILE_BYTES {
+            return Err(anyhow::anyhow!(
+                "File too large: {} exceeds {} bytes",
+                absolute.display(),
+                crate::coding_agent::context::MAX_PROMPT_FILE_BYTES
+            ));
+        }
         let raw = String::from_utf8_lossy(&bytes).into_owned();
         let content = strip_bom(&raw);
         text.push_str(&format!(

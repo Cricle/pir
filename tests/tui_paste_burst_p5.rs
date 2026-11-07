@@ -245,23 +245,56 @@ fn trailing_crlf_lf_half_is_swallowed() {
     );
 }
 
-/// The CRLF pair can split across console batches: the CR ends batch one as
-/// the submit Enter, and the LF chord at the start of batch two belongs to
-/// the same newline and must vanish.
+/// The CRLF pair can split across console batches. The CR must be held at
+/// the seam: emitting it immediately submitted the half-paste as a prompt
+/// before the LF half (and the rest of the paste) arrived.
 #[test]
-fn cross_batch_crlf_lf_half_is_swallowed() {
+fn cross_batch_crlf_holds_cr_until_the_lf_half() {
     let mut coalescer = ConsoleBatchCoalescer::new();
     let mut first = text_records("abcdefgh");
     first.push(press(KeyCode::Enter));
     let out = coalescer.coalesce(first);
     assert!(
-        matches!(out.last(), Some(Event::Key(key)) if key.code == KeyCode::Enter),
-        "the final CR must stay a submit key: {out:?}"
+        !out.iter().any(|event| matches!(
+            event,
+            Event::Key(key) if key.code == KeyCode::Enter
+        )),
+        "the final CR must be held, not dispatched as a submit: {out:?}"
     );
+    assert!(matches!(out.last(), Some(Event::Paste(text)) if text == "abcdefgh"));
 
     let second = coalescer.coalesce(vec![ctrl_enter()]);
-    assert!(
-        second.is_empty(),
-        "the LF half of the CRLF must be swallowed: {second:?}"
+    assert_eq!(
+        paste_texts(&second),
+        vec!["\n".to_string()],
+        "the CRLF pair must contribute exactly one newline: {second:?}"
     );
+    assert!(
+        !second.iter().any(|event| matches!(event, Event::Key(_))),
+        "neither the held CR nor the LF half may become keys: {second:?}"
+    );
+}
+
+/// A held batch-final CR followed by ordinary text is a real submit: the CR
+/// is dispatched before the next batch's content (not turned into a pasted
+/// newline).
+#[test]
+fn cross_batch_final_cr_then_text_is_a_submit() {
+    let mut coalescer = ConsoleBatchCoalescer::new();
+    let mut first = text_records("hello world");
+    first.push(press(KeyCode::Enter));
+    let out = coalescer.coalesce(first);
+    assert!(
+        matches!(out.last(), Some(Event::Paste(text)) if text == "hello world"),
+        "first batch must flush the typed run: {out:?}"
+    );
+
+    let second = coalescer.coalesce(text_records("x"));
+    assert!(
+        matches!(second.first(), Some(Event::Key(key)) if key.code == KeyCode::Enter),
+        "the held CR must be dispatched as the submit key first: {second:?}"
+    );
+    assert!(second
+        .iter()
+        .any(|event| matches!(event, Event::Key(key) if key.code == KeyCode::Char('x'))));
 }

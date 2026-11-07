@@ -164,20 +164,26 @@ fn batch_key_run_then_final_enter_submits() {
 
     let out = coalescer.coalesce(batch);
 
-    match out.last() {
-        Some(Event::Key(key)) => {
-            assert_eq!(
-                key.code,
-                KeyCode::Enter,
-                "last event must be Enter: {out:?}"
-            );
-            assert_eq!(
-                key.kind,
-                KeyEventKind::Press,
-                "last event must be an Enter press: {out:?}"
-            );
+    // The final CR is held at the batch seam (it may be the CR half of a
+    // CRLF split across batches), but its deadline releases it as the submit
+    // key.
+    assert!(
+        !out.iter().any(|event| matches!(
+            event,
+            Event::Key(key) if key.code == KeyCode::Enter
+        )),
+        "the final CR must be held, not folded into the paste: {out:?}"
+    );
+    let deadline = coalescer
+        .pending_enter_deadline()
+        .expect("held CR must publish a wake-up deadline");
+    let released = coalescer.poll_pending_enter(deadline);
+    match released.as_slice() {
+        [Event::Key(key)] => {
+            assert_eq!(key.code, KeyCode::Enter, "released: {released:?}");
+            assert_eq!(key.kind, KeyEventKind::Press, "released: {released:?}");
         }
-        other => panic!("final Enter must stay a Key event, got {other:?} ({out:?})"),
+        other => panic!("final Enter must be released as a Key event: {other:?}"),
     }
     assert!(
         !out.iter()
@@ -185,7 +191,8 @@ fn batch_key_run_then_final_enter_submits() {
         "the final Enter must not be folded into paste payload: {out:?}"
     );
 
-    // Nothing before the Enter is lost or reordered.
+    // Nothing before the Enter is lost or reordered. The Enter itself is the
+    // separately released submit key above, so it contributes no text here.
     let mut typed = String::new();
     for event in &out {
         match event {
@@ -198,7 +205,7 @@ fn batch_key_run_then_final_enter_submits() {
             _ => {}
         }
     }
-    assert_eq!(typed, "abcdef\n", "{out:?}");
+    assert_eq!(typed, "abcdef", "{out:?}");
 }
 
 /// An Enter with more payload after it is a newline inside a multiline paste:
@@ -395,6 +402,83 @@ fn split_bracketed_paste_end_marker_is_still_held() {
         tail.iter()
             .any(|event| matches!(event, Event::Paste(text) if text == "a")),
         "payload must survive the split end marker: {tail:?}"
+    );
+}
+
+/// D-1: while a bracketed paste is open, a held end-marker prefix must NOT be
+/// released as ordinary keys when the 40 ms marker window expires. A released
+/// Esc dispatches `Action::Interrupt` and aborts the running agent.
+#[test]
+fn paste_end_marker_survives_the_marker_timeout() {
+    use pir::tui::terminal::CONSOLE_MARKER_TAIL_TIMEOUT;
+
+    let mut coalescer = ConsoleBatchCoalescer::new();
+    let start = vec![
+        esc(),
+        press('['),
+        press('2'),
+        press('0'),
+        press('0'),
+        press('~'),
+        press('a'),
+    ];
+    let out = coalescer.coalesce(start);
+    assert!(coalescer.is_paste_open(), "{out:?}");
+
+    let held = coalescer.coalesce(vec![esc()]);
+    assert!(
+        held.is_empty(),
+        "the end-marker Esc must be withheld: {held:?}"
+    );
+    assert!(
+        coalescer.marker_tail_deadline().is_none(),
+        "an open paste must not publish a key-release deadline for its end marker"
+    );
+    let after_window =
+        Instant::now() + CONSOLE_MARKER_TAIL_TIMEOUT + std::time::Duration::from_millis(10);
+    assert!(
+        coalescer.poll_marker_tail(after_window).is_empty(),
+        "expiry must not release the end-marker Esc while the paste is open"
+    );
+
+    let tail = coalescer.coalesce(vec![
+        press('['),
+        press('2'),
+        press('0'),
+        press('1'),
+        press('~'),
+    ]);
+    assert!(
+        !coalescer.is_paste_open(),
+        "the end marker closes the paste"
+    );
+    assert!(
+        tail.iter()
+            .any(|event| matches!(event, Event::Paste(text) if text == "a")),
+        "the paste payload must survive: {tail:?}"
+    );
+}
+
+/// A pasted document containing the literal `[200~` in the middle must stay
+/// payload; only a marker at the start of a batch opens a paste.
+#[test]
+fn literal_paste_marker_text_stays_payload() {
+    let mut coalescer = ConsoleBatchCoalescer::new();
+    let mut events = Vec::new();
+    for character in "abc[200~def".chars() {
+        events.push(press(character));
+        events.push(release(character));
+    }
+    let out = coalescer.coalesce(events);
+    assert!(
+        !coalescer.is_paste_open(),
+        "literal text opened a paste: {out:?}"
+    );
+    let out: VecDeque<Event> = out.into();
+    assert_eq!(
+        paste_texts(&out),
+        vec!["abc[200~def".to_string()],
+        "{out:?}"
     );
 }
 

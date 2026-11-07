@@ -20,6 +20,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use crate::config::settings::{AutoBool, TerminalImagesMode, TerminalSettings};
 
@@ -636,10 +637,12 @@ pub fn protocol_can_display_mime(protocol: ImageProtocol, mime_type: &str) -> bo
 }
 
 /// One cached transcode: the payload key, its PNG base64 result, and the
-/// result's byte length (`0` for a negative-cache `None`).
+/// result's byte length (`0` for a negative-cache `None`). The payload is
+/// shared as `Arc<str>` so a cache hit clones a pointer, not up to ~85 MiB of
+/// base64 text.
 struct PngCacheEntry {
     key: u64,
-    png: Option<String>,
+    png: Option<Arc<str>>,
     size: usize,
 }
 
@@ -663,16 +666,16 @@ struct PngCache {
 }
 
 impl PngCache {
-    fn lookup(&self, key: u64) -> Option<Option<String>> {
+    fn lookup(&self, key: u64) -> Option<Option<Arc<str>>> {
         self.entries
             .iter()
             .find(|entry| entry.key == key)
             .map(|entry| entry.png.clone())
     }
 
-    fn insert(&mut self, key: u64, png: Option<String>, max_entries: usize, max_bytes: usize) {
+    fn insert(&mut self, key: u64, png: Option<Arc<str>>, max_entries: usize, max_bytes: usize) {
         self.remove(key);
-        let size = png.as_ref().map_or(0, String::len);
+        let size = png.as_ref().map_or(0, |png| png.len());
         self.entries.insert(0, PngCacheEntry { key, png, size });
         self.bytes += size;
         while self.entries.len() > max_entries || self.bytes > max_bytes {
@@ -717,24 +720,13 @@ fn transcode_to_png_base64(base64_data: &str, _mime_type: &str) -> Option<String
     // sensibly and would only spike memory before failing.
     const MAX_BYTES: usize = 64 * 1024 * 1024;
     use base64::Engine;
-    use image::ImageDecoder as _;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(base64_data)
         .ok()?;
     if decoded.is_empty() || decoded.len() > MAX_BYTES {
         return None;
     }
-    let reader = image::ImageReader::new(std::io::Cursor::new(&decoded))
-        .with_guessed_format()
-        .ok()?;
-    let mut decoder = reader.into_decoder().ok()?;
-    // Formats without orientation metadata report `NoTransforms`; a decoder
-    // that cannot report it is treated the same way.
-    let orientation = decoder
-        .orientation()
-        .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let mut image = image::DynamicImage::from_decoder(decoder).ok()?;
-    image.apply_orientation(orientation);
+    let image = super::image_preview::decode_image_bounded(&decoded).ok()?;
     let mut png = Vec::new();
     image
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
@@ -748,7 +740,7 @@ fn transcode_to_png_base64(_base64_data: &str, _mime_type: &str) -> Option<Strin
 }
 
 /// [`transcode_to_png_base64`] behind the process-wide cache.
-fn cached_png_base64(base64_data: &str, mime_type: &str) -> Option<String> {
+fn cached_png_base64(base64_data: &str, mime_type: &str) -> Option<Arc<str>> {
     let key = png_cache_key(base64_data, mime_type);
     {
         let cache = png_cache()
@@ -758,7 +750,7 @@ fn cached_png_base64(base64_data: &str, mime_type: &str) -> Option<String> {
             return cached;
         }
     }
-    let png = transcode_to_png_base64(base64_data, mime_type);
+    let png = transcode_to_png_base64(base64_data, mime_type).map(Arc::<str>::from);
     let mut cache = png_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -788,7 +780,7 @@ pub fn png_cache_insert_for_test(
     let mut cache = png_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.insert(key, png, max_entries, max_bytes);
+    cache.insert(key, png.map(Arc::<str>::from), max_entries, max_bytes);
     (cache.entries.len(), cache.bytes)
 }
 

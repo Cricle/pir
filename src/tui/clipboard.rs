@@ -727,13 +727,17 @@ fn available_attempt(attempt: ImageAttempt) -> Option<ImageAttempt> {
 /// converting unsupported formats (e.g. Windows DIB-as-BMP) to PNG.
 pub fn read_image() -> Option<ClipboardImage> {
     let env = ImageRouteEnv::detect();
+    // The arboard/native fast path can miss clipboard owners that publish
+    // only CF_DIB or the registered PNG format; the PowerShell retry (native
+    // Windows only) is the documented fallback and makes Ctrl+V work there.
     let mut image = read_image_with(
         &env,
         wl_paste_image,
         xclip_image,
         powershell_wsl_image,
         native_image,
-    )?;
+    )
+    .or_else(super::clipboard_image::read_windows_png_image)?;
     if !is_supported_image_mime_type(&image.mime_type) {
         image.bytes = convert_image_to_png(&image.bytes)?;
         image.mime_type = "image/png".to_owned();
@@ -915,11 +919,25 @@ fn run_clipboard_capture(program: &str, args: &[&str], timeout: Duration) -> Opt
         command.creation_flags(0x0800_0000);
     }
     let mut child = command.spawn().ok()?;
-    let stdout = child.stdout.take()?;
-    let reader = std::thread::Builder::new()
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let reader = match std::thread::Builder::new()
         .name("pir-clipboard-cmd".to_owned())
         .spawn(move || read_capped(stdout, CLIPBOARD_STDOUT_CAP))
-        .ok()?;
+    {
+        Ok(reader) => reader,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
 
     let deadline = Instant::now() + timeout;
     let status = loop {

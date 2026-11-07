@@ -13,6 +13,7 @@ Cargo.lock.bak
 /target-perf2/
 /target-gnu/
 /target-gnu-off/
+/target-linux/
 /target-merge/
 /scripts/tui_conpty/out/
 /.pi/

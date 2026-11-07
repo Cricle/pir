@@ -1150,7 +1150,7 @@ pub trait Component: Send {
     /// A block component must keep its block count stable between calls that
     /// return the same `Some`; the frame renderer caches block rows aligned by
     /// index and treats a shortened list as a component shrink.
-    fn content_blocks(&self) -> Option<Vec<u64>> {
+    fn content_blocks(&self) -> Option<std::sync::Arc<[u64]>> {
         None
     }
 
@@ -1445,13 +1445,13 @@ impl Container {
 /// Block revisions of a child that only exposes a whole-component revision:
 /// a single block keyed by that revision. `None` keeps the parent on the
 /// whole-component cache path.
-fn child_block_revisions(component: &dyn Component) -> Option<Vec<u64>> {
+fn child_block_revisions(component: &dyn Component) -> Option<std::sync::Arc<[u64]>> {
     if let Some(blocks) = component.content_blocks() {
         return Some(blocks);
     }
-    component
-        .content_revision()
-        .map(|revision| vec![mix_content_revision(revision, 0x9e37_79b9_7f4a_7c15)])
+    component.content_revision().map(|revision| {
+        std::sync::Arc::from([mix_content_revision(revision, 0x9e37_79b9_7f4a_7c15)])
+    })
 }
 
 impl Component for Container {
@@ -1496,7 +1496,7 @@ impl Component for Container {
     /// per frame and then renders every block, so re-expanding each child's
     /// block list per block would be O(blocks × entries) metadata work on a
     /// cold 512-block band.
-    fn content_blocks(&self) -> Option<Vec<u64>> {
+    fn content_blocks(&self) -> Option<std::sync::Arc<[u64]>> {
         let mut blocks = Vec::new();
         let mut ends = Vec::with_capacity(self.children.len());
         for child in &self.children {
@@ -1504,7 +1504,7 @@ impl Component for Container {
                 self.invalidate_block_layout();
                 return None;
             };
-            blocks.extend(revisions);
+            blocks.extend(revisions.iter().copied());
             ends.push(blocks.len());
         }
         *self
@@ -1514,7 +1514,7 @@ impl Component for Container {
             child_count: self.children.len(),
             ends,
         });
-        Some(blocks)
+        Some(blocks.into())
     }
 
     fn render_block_into(&self, index: usize, width: usize, out: &mut Rows<'_>) {
@@ -1669,14 +1669,14 @@ impl Component for ReservedScrollbarColumn {
     /// Propagate the child's block decomposition with the reserve flag folded
     /// into every block revision; the padding is applied per block in
     /// [`Self::render_block_into`].
-    fn content_blocks(&self) -> Option<Vec<u64>> {
+    fn content_blocks(&self) -> Option<std::sync::Arc<[u64]>> {
         let reserve = u64::from(self.reserves());
-        Some(
-            child_block_revisions(self.child.as_ref())?
-                .into_iter()
-                .map(|revision| mix_content_revision(revision, reserve))
-                .collect(),
-        )
+        let blocks: Vec<u64> = child_block_revisions(self.child.as_ref())?
+            .iter()
+            .copied()
+            .map(|revision| mix_content_revision(revision, reserve))
+            .collect();
+        Some(blocks.into())
     }
 
     fn render_block_into(&self, index: usize, width: usize, out: &mut Rows<'_>) {
@@ -3624,7 +3624,8 @@ impl TuiCore {
                         .map(|slot| slot.blocks.into_iter().map(Some).collect())
                         .unwrap_or_default();
                     let mut blocks = Vec::with_capacity(block_revisions.len());
-                    for (block_index, block_revision) in block_revisions.into_iter().enumerate() {
+                    for (block_index, block_revision) in block_revisions.iter().copied().enumerate()
+                    {
                         let block_id = pack_block_id(index, block_index);
                         let forced = forced_blocks.contains(&block_id);
                         let previous_block =

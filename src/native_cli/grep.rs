@@ -246,8 +246,14 @@ fn execute(mut options: Options) -> RunOutcome {
         eprintln!("{message}");
     }
 
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    // Render one file at a time and flush it to stdout. The previous version
+    // built the complete output in a String, so a large recursive grep held
+    // every match AND a second full copy of its rendered form in memory.
     let mut output = String::new();
     for file in &files {
+        output.clear();
         let display = display_path(&file.path, walked);
         if options.files_with_matches {
             if file.matches.is_empty() {
@@ -255,6 +261,7 @@ fn execute(mut options: Options) -> RunOutcome {
             }
             output.push_str(&display);
             output.push('\n');
+            let _ = out.write_all(output.as_bytes());
             continue;
         }
         if options.count {
@@ -263,6 +270,7 @@ fn execute(mut options: Options) -> RunOutcome {
             } else {
                 output.push_str(&format!("{}\n", file.matches.len()));
             }
+            let _ = out.write_all(output.as_bytes());
             continue;
         }
         if file.matches.is_empty() {
@@ -278,9 +286,9 @@ fn execute(mut options: Options) -> RunOutcome {
             file,
             &mut first_group,
         );
+        let _ = out.write_all(output.as_bytes());
     }
 
-    let _ = std::io::stdout().write_all(output.as_bytes());
     let matched = files.iter().any(|file| !file.matches.is_empty());
     if had_error {
         RunOutcome::Exit(2)

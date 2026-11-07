@@ -842,12 +842,13 @@ fn changed_block_rebuild_does_not_rerender_the_band() {
             }
         }
 
-        fn content_blocks(&self) -> Option<Vec<u64>> {
+        fn content_blocks(&self) -> Option<std::sync::Arc<[u64]>> {
             Some(
                 self.revisions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
+                    .clone()
+                    .into(),
             )
         }
 
@@ -1459,12 +1460,12 @@ fn container_block_layout_expands_each_child_once_per_frame() {
             out.push(&self.row);
         }
 
-        fn content_blocks(&self) -> Option<Vec<u64>> {
+        fn content_blocks(&self) -> Option<std::sync::Arc<[u64]>> {
             self.content_calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(0);
-            Some(vec![1])
+            Some(std::sync::Arc::from([1u64]))
         }
 
         fn render_block_into(&self, _index: usize, _width: usize, out: &mut Rows<'_>) {

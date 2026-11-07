@@ -472,14 +472,21 @@ fn split_lines(text: &str) -> Vec<(String, bool)> {
     lines
 }
 
-fn process(lines: &[(String, bool)], commands: &[Command], quiet: bool) -> String {
-    let last = lines.len() as u64;
+fn process(
+    lines: &[(String, bool)],
+    commands: &[Command],
+    quiet: bool,
+    first_line: u64,
+    last_line: u64,
+) -> (String, bool) {
+    let last = last_line;
     // Each emitted chunk carries whether the input line it came from was
     // newline-terminated; GNU sed inserts a newline between chunks when the
     // previous one was not, and leaves the very last chunk unterminated.
     let mut chunks: Vec<(String, bool)> = Vec::new();
+    let mut quit_requested = false;
     for (index, (text, terminated)) in lines.iter().enumerate() {
-        let number = index as u64 + 1;
+        let number = first_line + index as u64;
         let mut pattern = text.clone();
         let mut deleted = false;
         let mut quit = false;
@@ -522,6 +529,7 @@ fn process(lines: &[(String, bool)], commands: &[Command], quiet: bool) -> Strin
             chunks.push((pattern, *terminated));
         }
         if quit {
+            quit_requested = true;
             break;
         }
     }
@@ -533,7 +541,7 @@ fn process(lines: &[(String, bool)], commands: &[Command], quiet: bool) -> Strin
             output.push('\n');
         }
     }
-    output
+    (output, quit_requested)
 }
 
 fn io_message(error: &std::io::Error) -> String {
@@ -544,57 +552,110 @@ fn io_message(error: &std::io::Error) -> String {
     }
 }
 
+/// Per-file / per-stream input cap. The native `sed` path materializes the
+/// input, its split lines and the output; a multi-GB file would need several
+/// GB of RSS before producing anything. GNU sed streams line by line, but
+/// this path deliberately stays a small text tool (the same hardening
+/// philosophy as the 64 MiB `@file` cap); larger inputs must use the system
+/// sed fallback.
+const MAX_SED_INPUT_BYTES: u64 = 128 * 1024 * 1024;
+
 fn read_file(path: &str) -> Result<String, ReadFailure> {
+    let metadata =
+        std::fs::metadata(path).map_err(|error| ReadFailure::Missing(io_message(&error)))?;
+    if metadata.len() > MAX_SED_INPUT_BYTES {
+        return Err(ReadFailure::TooLarge);
+    }
     let bytes = std::fs::read(path).map_err(|error| ReadFailure::Missing(io_message(&error)))?;
+    if bytes.len() as u64 > MAX_SED_INPUT_BYTES {
+        return Err(ReadFailure::TooLarge);
+    }
     String::from_utf8(bytes).map_err(|_| ReadFailure::NotText)
 }
 
 enum ReadFailure {
     Missing(String),
     NotText,
+    TooLarge,
 }
 
 fn run_stream(options: &Options, commands: &[Command]) -> RunOutcome {
-    let mut contents: Vec<String> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
     if options.files.is_empty() {
         let mut bytes = Vec::new();
-        if std::io::stdin().read_to_end(&mut bytes).is_err() {
+        let mut stdin = std::io::stdin().lock();
+        if stdin
+            .by_ref()
+            .take(MAX_SED_INPUT_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
             return RunOutcome::Unsupported;
         }
-        match String::from_utf8(bytes) {
-            Ok(text) => contents.push(text),
+        if bytes.len() as u64 > MAX_SED_INPUT_BYTES {
+            eprintln!("sed: input too large (limit {MAX_SED_INPUT_BYTES} bytes)");
+            return RunOutcome::Exit(2);
+        }
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
             // stdin is already at EOF here, so the fallback must receive the
             // original bytes through a pipe instead of inheriting it.
             Err(error) => return RunOutcome::UnsupportedWithStdin(error.into_bytes()),
-        }
-    } else {
-        for file in &options.files {
-            match read_file(file) {
-                Ok(text) => contents.push(text),
-                Err(ReadFailure::Missing(message)) => {
-                    errors.push(format!("sed: can't read {file}: {message}"));
-                }
-                Err(ReadFailure::NotText) => return RunOutcome::Unsupported,
+        };
+        let lines = split_lines(&text);
+        let (output, _quit) = process(&lines, commands, options.quiet, 1, lines.len() as u64);
+        let _ = std::io::stdout().write_all(output.as_bytes());
+        return RunOutcome::Exit(0);
+    }
+
+    // Validation/count pass: a non-UTF-8 file must fall back before any
+    // output is produced, and `$` needs the total line count of the whole
+    // file stream. Each file is held alone, then dropped.
+    let mut errors: Vec<String> = Vec::new();
+    let mut total_lines: u64 = 0;
+    for file in &options.files {
+        match read_file(file) {
+            Ok(text) => {
+                total_lines = total_lines.saturating_add(split_lines(&text).len() as u64);
             }
+            Err(ReadFailure::Missing(message)) => {
+                errors.push(format!("sed: can't read {file}: {message}"));
+            }
+            Err(ReadFailure::NotText) => return RunOutcome::Unsupported,
+            Err(ReadFailure::TooLarge) => return RunOutcome::Unsupported,
         }
     }
+    // Process one file at a time: peak RSS is bounded by the largest file,
+    // not the sum of every input plus a concatenated copy. Line numbers run
+    // continuously across files, matching GNU sed.
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut first_line: u64 = 1;
+    let mut quit = false;
+    let mut pending_cross_file_newline = false;
+    for file in &options.files {
+        if quit {
+            break;
+        }
+        let Ok(text) = read_file(file) else {
+            errors.push(format!("sed: can't read {file}"));
+            continue;
+        };
+        let lines = split_lines(&text);
+        let (output, file_quit) = process(&lines, commands, options.quiet, first_line, total_lines);
+        if !output.is_empty() {
+            if pending_cross_file_newline {
+                let _ = out.write_all(b"\n");
+            }
+            let _ = out.write_all(output.as_bytes());
+            pending_cross_file_newline = !output.ends_with('\n');
+        }
+        first_line = first_line.saturating_add(lines.len() as u64);
+        quit = file_quit;
+    }
+
     for message in &errors {
         eprintln!("{message}");
     }
-
-    // Files form one continuous stream (GNU sed semantics).
-    let mut input = String::new();
-    for content in &contents {
-        if !input.is_empty() && !input.ends_with('\n') {
-            input.push('\n');
-        }
-        input.push_str(content);
-    }
-    let lines = split_lines(&input);
-    let output = process(&lines, commands, options.quiet);
-    let _ = std::io::stdout().write_all(output.as_bytes());
-
     if errors.is_empty() {
         RunOutcome::Exit(0)
     } else {
@@ -605,23 +666,35 @@ fn run_stream(options: &Options, commands: &[Command]) -> RunOutcome {
 fn run_in_place(options: &Options, commands: &[Command]) -> RunOutcome {
     let suffix = options.in_place.as_deref().unwrap_or_default();
     let mut errors: Vec<String> = Vec::new();
-    // Read everything first: a non-UTF-8 file must degrade before any file is
-    // rewritten.
-    let mut inputs: Vec<(String, String)> = Vec::new();
+    // Validate every file before rewriting any of them (a non-UTF-8 or
+    // oversized file must degrade before the first write-back), but do not
+    // keep the contents: the processing pass re-reads one file at a time so
+    // peak RSS is the largest file, not the sum of the whole argument list.
     for file in &options.files {
         match read_file(file) {
-            Ok(text) => inputs.push((file.clone(), text)),
+            Ok(_) => {}
             Err(ReadFailure::Missing(message)) => {
                 errors.push(format!("sed: can't read {file}: {message}"));
             }
             Err(ReadFailure::NotText) => return RunOutcome::Unsupported,
+            Err(ReadFailure::TooLarge) => return RunOutcome::Unsupported,
         }
     }
-    for (file, text) in &inputs {
-        let lines = split_lines(text);
-        let output = process(&lines, commands, options.quiet);
+    for file in &options.files {
+        let Ok(text) = read_file(file) else {
+            continue;
+        };
+        let lines = split_lines(&text);
+        let (output, quit) = process(&lines, commands, options.quiet, 1, lines.len() as u64);
         if let Err(error) = write_in_place(Path::new(file), &output, suffix) {
             errors.push(format!("sed: couldn't write {file}: {error}"));
+        }
+        // GNU sed's `q` terminates the whole invocation: files after the one
+        // that quit are left exactly as they were (not truncated to the quit
+        // line). `process` scopes line addressing per file, but `q` is not a
+        // per-file reset.
+        if quit {
+            break;
         }
     }
     for message in &errors {

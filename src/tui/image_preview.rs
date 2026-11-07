@@ -49,6 +49,75 @@ pub fn resolve_image_path(path: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
+/// Largest image file the preview decoders accept. The halfblocks renderer
+/// and the inline-protocol transcoder both read the whole file into memory;
+/// refusing an oversized file before `read` keeps a stray multi-GB path from
+/// spiking RSS on the UI thread.
+pub(super) const IMAGE_PREVIEW_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Read an image file with the preview size cap, checking metadata first and
+/// re-checking the actual read so a file growing between stat and read cannot
+/// bypass the bound.
+pub(super) fn read_image_file_capped(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if metadata.len() > IMAGE_PREVIEW_MAX_FILE_BYTES {
+        return Err("image file is too large to preview".to_string());
+    }
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut data = Vec::with_capacity(metadata.len().min(IMAGE_PREVIEW_MAX_FILE_BYTES) as usize);
+    file.take(IMAGE_PREVIEW_MAX_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut data)
+        .map_err(|error| error.to_string())?;
+    if data.len() as u64 > IMAGE_PREVIEW_MAX_FILE_BYTES {
+        return Err("image file is too large to preview".to_string());
+    }
+    Ok(data)
+}
+
+/// Read only the header window used by the text fallback's dimension sniff.
+/// The fallback never decodes, so it must not read a large file into memory
+/// just to print one line.
+fn read_image_head(path: &Path, max: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut data = Vec::with_capacity(max.min(64 * 1024) as usize);
+    file.take(max)
+        .read_to_end(&mut data)
+        .map_err(|error| error.to_string())?;
+    Ok(data)
+}
+
+/// Decode image bytes with the same strict limits the read tool uses: a
+/// decompression bomb must not be able to make the TUI allocate up to the
+/// image crate's 512 MiB default. EXIF orientation is applied before the
+/// caller renders/scales.
+#[cfg(feature = "image-protocol")]
+pub(super) fn decode_image_bounded(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    use image::ImageDecoder as _;
+
+    const MAX_DIMENSION: u32 = 16_384;
+    const MAX_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?;
+    let mut decoder = reader.into_decoder().map_err(|error| error.to_string())?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DIMENSION);
+    limits.max_image_height = Some(MAX_DIMENSION);
+    limits.max_alloc = Some(MAX_ALLOC_BYTES);
+    decoder
+        .set_limits(limits)
+        .map_err(|error| error.to_string())?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut decoded =
+        image::DynamicImage::from_decoder(decoder).map_err(|error| error.to_string())?;
+    decoded.apply_orientation(orientation);
+    Ok(decoded)
+}
+
 /// Render `path` as at most `max_width` columns × `max_height` rows of
 /// half-block ANSI lines. Falls back to the upstream-style
 /// `[Image: ...]` text line when the file cannot be read or decoded
@@ -68,29 +137,16 @@ pub fn render_image_halfblocks(
     if max_width == 0 || max_height == 0 {
         return Err("preview area is empty".to_string());
     }
-    let data = match std::fs::read(path) {
+    let data = match read_image_file_capped(path) {
         Ok(data) => data,
         Err(error) => {
-            return Ok(vec![image_fallback_line(path, None, &error.to_string())]);
+            return Ok(vec![image_fallback_line(path, None, &error)]);
         }
     };
-    // Bounded decode: refuse absurd inputs before handing them to the decoder.
-    const MAX_BYTES: u64 = 32 * 1024 * 1024;
-    if data.len() as u64 > MAX_BYTES {
-        return Ok(vec![image_fallback_line(
-            path,
-            Some(&data),
-            "image file is too large to preview",
-        )]);
-    }
-    let image = match image::load_from_memory(&data) {
+    let image = match decode_image_bounded(&data) {
         Ok(image) => image,
         Err(error) => {
-            return Ok(vec![image_fallback_line(
-                path,
-                Some(&data),
-                &error.to_string(),
-            )]);
+            return Ok(vec![image_fallback_line(path, Some(&data), &error)]);
         }
     };
 
@@ -360,10 +416,11 @@ pub fn render_image_with_settings(
     let _ = (settings, max_height);
     // Hidden (or no renderer compiled in): the text fallback, with the
     // upstream failure reason when the file cannot be read (the same
-    // contract as an undecodable image).
-    match std::fs::read(path) {
+    // contract as an undecodable image). Only the header window is read:
+    // the fallback prints dimensions, never pixels.
+    match read_image_head(path, 256 * 1024) {
         Ok(data) => Ok(vec![image_fallback_line(path, Some(&data), "")]),
-        Err(error) => Ok(vec![image_fallback_line(path, None, &error.to_string())]),
+        Err(error) => Ok(vec![image_fallback_line(path, None, &error)]),
     }
 }
 
@@ -382,7 +439,7 @@ pub fn render_image_with_terminal(
 ) -> Result<Vec<String>, String> {
     if settings.show {
         if let Some(protocol) = crate::tui::terminal_image::protocol_from_settings(terminal) {
-            if let Ok(data) = std::fs::read(path) {
+            if let Ok(data) = read_image_file_capped(path) {
                 let mime = image_mime(path, Some(&data));
                 use base64::Engine;
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
