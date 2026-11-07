@@ -7,11 +7,22 @@
 //! (`{serviceId, member, args}`).  Two services are hosted:
 //!
 //! * `$chord.service` — built-in control service (`catalogue`, `subscribe`,
-//!   `unsubscribe`).
+//!   `unsubscribe`). A subscription is established with
+//!   `subscribe args:[subscriptionId, "pir.session", "singleton"]` and removed
+//!   with `unsubscribe args:[subscriptionId]`; both take the server target.
+//!   The response's `instances` is empty: live state arrives as
+//!   `service_update` frames, not as a subscribe-time replay.
 //! * `pir.session` — the session service; its members are the former v1
 //!   commands (`list`, `create`, `attach`, `detach`, `prompt`, `steer`,
 //!   `abort`, `set_model`, `set_thinking`) with arguments taken from the call
 //!   args array and, for session members, from the RPC target fencing.
+//!
+//! Protocol v8 has no dedicated `agent_end` frame. The end of a prompt run is
+//! observable as (a) the terminal `response` frame for the prompt request and
+//! (b) the final `service_update` `state`/`snapshot` update carrying
+//! `phase:"idle"` (and the cleared `queuedSteer`/`queuedSteerCount`). All
+//! transcript progress is delivered as `service_update` `state`/`progress`
+//! updates between them.
 //!
 //! Attach/detach is the attachment-fencing model (upstream
 //! `packages/server/src/session-router.ts`): an `attach` call adds the

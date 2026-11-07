@@ -234,6 +234,22 @@ struct UserMessageRowsCache {
 
 use super::core::BoxContainer;
 
+/// Plain wrapped text for a pathological single-line user paste.
+///
+/// The Markdown inline parser is superlinear on a multi-kilobyte line with
+/// no newline (a folded single-line paste expands to one such line on
+/// submit); the box only needs the same wrapped rows, so render the plain
+/// text directly.
+struct PlainUserText {
+    text: String,
+}
+
+impl Component for PlainUserText {
+    fn render(&self, width: usize) -> Vec<String> {
+        wrap_text_with_ansi(&self.text, width)
+    }
+}
+
 impl UserMessageComponent {
     pub fn new(text: &str, output_pad: usize) -> Self {
         let theme = MarkdownTheme::default();
@@ -248,7 +264,13 @@ impl UserMessageComponent {
         // User text is replayed from the session file too (a poisoned session
         // must not re-inject on resume): sanitize before markdown parses it.
         let text = sanitize_terminal_text(text);
-        boxed.add_child(Markdown::with_options(text.as_ref(), 0, 0, theme, options));
+        if !text.contains('\n') && text.chars().count() > 4096 {
+            boxed.add_child(PlainUserText {
+                text: text.into_owned(),
+            });
+        } else {
+            boxed.add_child(Markdown::with_options(text.as_ref(), 0, 0, theme, options));
+        }
         Self {
             boxed,
             cache: Mutex::new(None),

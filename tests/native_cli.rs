@@ -526,6 +526,57 @@ fn python_native_script_sets_argv_and_exit_code() {
 }
 
 #[test]
+fn python_sys_exit_without_code_exits_zero_without_traceback() {
+    if skip_without_binary() {
+        return;
+    }
+    // `sys.exit()` and `sys.exit(None)` are clean exits, not exceptions: the
+    // interpreter must return 0 and print no traceback.
+    for code in ["import sys\nsys.exit()", "import sys\nsys.exit(None)"] {
+        let output = run(&["python", "-c", code, "--no-fallback"]);
+        assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+        assert_eq!(stdout(&output), "");
+        assert_eq!(stderr(&output), "", "no traceback expected for {code:?}");
+    }
+}
+
+#[test]
+fn python_sys_exit_integer_code_becomes_process_exit_code() {
+    if skip_without_binary() {
+        return;
+    }
+    let output = run(&[
+        "python",
+        "-c",
+        "import sys\nprint('before')\nsys.exit(3)",
+        "--no-fallback",
+    ]);
+    assert_eq!(output.status.code(), Some(3), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "before\n");
+    assert_eq!(stderr(&output), "", "no traceback expected");
+}
+
+#[test]
+fn python_sys_exit_message_prints_to_stderr_and_exits_one() {
+    if skip_without_binary() {
+        return;
+    }
+    let output = run(&[
+        "python",
+        "-c",
+        "import sys\nsys.exit('something went wrong')",
+        "--no-fallback",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(stderr(&output), "something went wrong\n");
+    assert!(
+        !stderr(&output).contains("Traceback"),
+        "SystemExit must not print a traceback"
+    );
+}
+
+#[test]
 fn python_future_import_without_docstring_compiles() {
     if skip_without_binary() {
         return;

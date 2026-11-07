@@ -1348,6 +1348,32 @@ impl AgentSession {
         }
     }
 
+    /// The steering texts currently queued but not yet delivered, read from
+    /// the synchronous queue mirror instead of round-tripping through the
+    /// inbox consumer task. The mirror is updated by every enqueue and drain
+    /// site, so this reports the same texts (and order) as
+    /// [`Self::get_steering_messages`]; unlike that async peek it is safe to
+    /// call from synchronous snapshot builders (the server's
+    /// `SessionSnapshot::queuedSteer`).
+    pub fn pending_steering_messages(&self) -> Vec<String> {
+        self.queue_mirror
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .steering
+            .clone()
+    }
+
+    /// Start the steering/follow-up/background inbox consumer tasks on a
+    /// caller-chosen long-lived runtime. Hosts that drive `prompt` on a
+    /// short-lived runtime (the server's per-run agent thread) must call this
+    /// with their server runtime: a lazily spawned consumer would otherwise
+    /// die with the run and lose queued steering between runs.
+    pub fn ensure_queue_consumers_on(&self, handle: &tokio::runtime::Handle) {
+        self.steering_inbox.ensure_consumer_on(handle);
+        self.follow_up_inbox.ensure_consumer_on(handle);
+        self.background_follow_up_inbox.ensure_consumer_on(handle);
+    }
+
     /// The steering messages queued but not yet delivered (upstream
     /// `getSteeringMessages`), in queue order. Peek semantics: the loop's
     /// poll owns delivery, so this does not drain. Returns the message texts

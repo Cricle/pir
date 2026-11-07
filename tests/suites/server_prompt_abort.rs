@@ -17,8 +17,8 @@ use pir::ai::auth::ApiKeyAuth;
 use pir::ai::event_stream::AssistantMessageEventStream;
 use pir::ai::provider::{Provider, ProviderRegistry};
 use pir::ai::types::{
-    AssistantMessage, ContentBlock, Context, ErrorReason, Model, ModelCost, ModelCostRates,
-    StopReason, StreamOptions, TerminalReason, TextContent,
+    AssistantMessage, ContentBlock, Context, ErrorReason, Message, Model, ModelCost,
+    ModelCostRates, StopReason, StreamOptions, TerminalReason, TextContent,
 };
 use pir::client::{Client, ClientError};
 use pir::protocol::{Command, ModelRef, RpcTarget, SESSION_SERVICE_ID};
@@ -86,6 +86,8 @@ fn assistant(content: Vec<ContentBlock>, stop_reason: StopReason) -> AssistantMe
 struct GatedProvider {
     gate: watch::Receiver<bool>,
     entered: Arc<AtomicUsize>,
+    /// Every provider request context, in call order (steering assertions).
+    contexts: Arc<std::sync::Mutex<Vec<Context>>>,
 }
 
 impl Provider for GatedProvider {
@@ -104,10 +106,14 @@ impl Provider for GatedProvider {
     fn stream(
         &self,
         _model: &Model,
-        _context: Context,
+        context: Context,
         options: StreamOptions,
     ) -> AssistantMessageEventStream {
         self.entered.fetch_add(1, Ordering::SeqCst);
+        self.contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(context);
         let stream = AssistantMessageEventStream::new();
         let pusher = stream.clone();
         let mut gate = self.gate.clone();
@@ -142,20 +148,43 @@ impl Provider for GatedProvider {
     }
 }
 
-fn gated_registry(gate: watch::Receiver<bool>, entered: Arc<AtomicUsize>) -> Arc<ProviderRegistry> {
+fn gated_registry_with_contexts(
+    gate: watch::Receiver<bool>,
+    entered: Arc<AtomicUsize>,
+) -> (Arc<ProviderRegistry>, Arc<std::sync::Mutex<Vec<Context>>>) {
+    let contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut registry = ProviderRegistry::default();
-    registry.set_provider(Arc::new(GatedProvider { gate, entered }));
-    Arc::new(registry)
+    registry.set_provider(Arc::new(GatedProvider {
+        gate,
+        entered,
+        contexts: Arc::clone(&contexts),
+    }));
+    (Arc::new(registry), contexts)
+}
+
+fn gated_registry(gate: watch::Receiver<bool>, entered: Arc<AtomicUsize>) -> Arc<ProviderRegistry> {
+    gated_registry_with_contexts(gate, entered).0
 }
 
 /// Bind a server whose sessions run against the gated provider.
 async fn bind_gated_server(gate: watch::Receiver<bool>) -> (Server, Arc<AtomicUsize>) {
+    let (server, entered, _contexts) = bind_gated_server_recording(gate).await;
+    (server, entered)
+}
+
+/// [`bind_gated_server`] plus the recorded provider request contexts.
+async fn bind_gated_server_recording(
+    gate: watch::Receiver<bool>,
+) -> (
+    Server,
+    Arc<AtomicUsize>,
+    Arc<std::sync::Mutex<Vec<Context>>>,
+) {
     let entered = Arc::new(AtomicUsize::new(0));
-    let state = ServerState::with_providers(
-        empty_snapshot(uuid::Uuid::new_v4().to_string()),
-        gated_registry(gate, Arc::clone(&entered)),
-    )
-    .with_security(pir::server::ServerSecurityConfig::default());
+    let (registry, contexts) = gated_registry_with_contexts(gate, Arc::clone(&entered));
+    let state =
+        ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry)
+            .with_security(pir::server::ServerSecurityConfig::default());
     let server = Server::bind_with_state_and_security(
         "127.0.0.1:0",
         state,
@@ -163,7 +192,26 @@ async fn bind_gated_server(gate: watch::Receiver<bool>) -> (Server, Arc<AtomicUs
     )
     .await
     .expect("bind gated test server");
-    (server, entered)
+    (server, entered, contexts)
+}
+
+/// The text of the last user message in a provider request context.
+fn last_user_text(context: &Context) -> Option<String> {
+    context.messages.iter().rev().find_map(|message| {
+        let Message::User(user) = message else {
+            return None;
+        };
+        let text: String = user
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        (!text.is_empty()).then_some(text)
+    })
 }
 
 /// Attach one client and return (session id, attachment id). The session is
@@ -299,6 +347,102 @@ async fn abort_during_prompt_delivers_response_and_session_recovers() {
             .expect("session snapshot")
             .phase,
         "idle"
+    );
+
+    drop(client);
+    tokio::time::timeout(WAIT_BUDGET, accepting)
+        .await
+        .expect("connection task settles")
+        .expect("accept task join")
+        .expect("serve client");
+}
+
+/// A18-F02: a mid-run `steer` must reach the live agent inbox, must be
+/// reflected in the returned snapshot's `queuedSteer`/`queuedSteerCount`,
+/// and must be delivered as the next model request in the same run.
+#[tokio::test]
+async fn steer_during_prompt_reaches_agent_and_snapshot_reports_it() {
+    let (gate_tx, gate_rx) = watch::channel(false);
+    let (server, entered, contexts) = bind_gated_server_recording(gate_rx).await;
+    let state = server.state().clone();
+    let address = server.local_addr().expect("local address");
+    let accepting = tokio::spawn(async move { server.accept_once().await });
+
+    let mut client = Client::connect(address).await.expect("hello handshake");
+    let (session_id, attachment) = create_and_attach(&mut client).await;
+    let target = RpcTarget::session(client.server_id(), session_id.clone(), attachment);
+
+    let prompt_id = client
+        .start_call(
+            target,
+            SESSION_SERVICE_ID,
+            "prompt",
+            vec![serde_json::json!({"text": "hi"})],
+        )
+        .await
+        .expect("prompt call sent");
+    wait_for_phase(&state, &session_id, "turn").await;
+    wait_for_provider_entered(&entered).await;
+
+    // The steer lands while the first provider request is still gated. The
+    // response snapshot must expose the queued text instead of answering
+    // `ok` with an empty queue.
+    let steered = client
+        .request(Command::Steer {
+            session_id: session_id.clone(),
+            text: "steer note alpha".to_owned(),
+        })
+        .await
+        .expect("steer response");
+    assert_eq!(steered["command"], "steer");
+    assert_eq!(steered["session"]["phase"], "turn");
+    assert_eq!(steered["session"]["queuedSteerCount"], 1);
+    assert_eq!(
+        steered["session"]["queuedSteer"][0]["content"][0]["text"],
+        "steer note alpha"
+    );
+    // The same queue is visible through a direct registry snapshot.
+    let snapshot = state
+        .get_session(&session_id)
+        .await
+        .expect("session still registered");
+    assert_eq!(snapshot.queued_steer_count, 1);
+    match &snapshot.queued_steer[0].content[0] {
+        pir::protocol::schemas::UserContent::Text(text) => {
+            assert_eq!(text.text, "steer note alpha");
+        }
+        other => panic!("queued steer must be a text item, got {other:?}"),
+    }
+
+    // Let the first request finish; the queued steering must be delivered as
+    // the next request of the same run.
+    gate_tx.send(true).expect("gate open");
+    let response = tokio::time::timeout(WAIT_BUDGET, client.wait_call(&prompt_id))
+        .await
+        .expect("steered prompt response must arrive")
+        .expect("steered prompt response ok");
+    assert_eq!(response["command"], "prompt");
+    assert_eq!(response["session"]["phase"], "idle");
+    assert_eq!(response["session"]["queuedSteerCount"], 0);
+
+    for _ in 0..2000 {
+        if entered.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        entered.load(Ordering::SeqCst) >= 2,
+        "queued steering must start a follow-up provider request"
+    );
+    let contexts = contexts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(contexts.len() >= 2, "expected two provider requests");
+    assert_eq!(
+        last_user_text(&contexts[1]).as_deref(),
+        Some("steer note alpha"),
+        "the second provider request must carry the steer text"
     );
 
     drop(client);

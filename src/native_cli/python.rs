@@ -8,7 +8,9 @@
 //! to the system `python3`/`python`.
 //!
 //! stdout and stderr are written straight to the process streams; the exit
-//! code is 0 on success and 1 when the script raised.
+//! code is 0 on success, N for `sys.exit(N)`, 1 for an uncaught exception or
+//! a non-integer `sys.exit` argument, and 2 when the script file cannot be
+//! opened.
 
 use super::RunOutcome;
 
@@ -42,7 +44,11 @@ pub(crate) fn run(args: &[String]) -> RunOutcome {
     let _ = stderr.write_all(outcome.stderr.as_bytes());
     let _ = stderr.flush();
 
-    RunOutcome::Exit(if outcome.error { 1 } else { 0 })
+    RunOutcome::Exit(
+        outcome
+            .exit_code
+            .unwrap_or(if outcome.error { 1 } else { 0 }),
+    )
 }
 
 #[cfg(not(feature = "python"))]

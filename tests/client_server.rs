@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use pir::client::{Client, ClientError, ClientTimeouts};
 use pir::protocol::{
-    encode_server_envelope, Command, FrameOptions, ServerEnvelope, ServerHelloV8, ServerSnapshot,
-    PROTOCOL_VERSION, SESSION_SERVICE_ID,
+    encode_server_envelope, Command, FrameOptions, ServerEnvelope, ServerHelloV8,
+    ServerMessageDecoder, ServerSnapshot, PROTOCOL_VERSION, SESSION_SERVICE_ID,
 };
 use pir::server::{empty_snapshot, Server, ServerSecurityConfig, ServerState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -57,10 +57,13 @@ async fn authenticated_server_accepts_valid_token_and_rejects_invalid_token() {
         Ok(_) => panic!("invalid token must be rejected"),
         Err(error) => error,
     };
-    assert!(matches!(
-        error,
-        ClientError::Disconnected | ClientError::Io(_)
-    ));
+    assert!(
+        matches!(
+            error,
+            ClientError::Server { ref code, .. } if code == "unauthorized"
+        ),
+        "wrong token must surface the structured unauthorized hello_error, got {error:?}"
+    );
     accepting
         .await
         .expect("accept task join")
@@ -68,7 +71,7 @@ async fn authenticated_server_accepts_valid_token_and_rejects_invalid_token() {
 }
 
 #[tokio::test]
-async fn unauthenticated_connection_is_closed_before_protocol_handshake() {
+async fn unauthenticated_connection_receives_hello_error_before_close() {
     let server = Server::bind_with_security(
         "127.0.0.1:0",
         ServerSecurityConfig {
@@ -85,14 +88,39 @@ async fn unauthenticated_connection_is_closed_before_protocol_handshake() {
         .write_all(b"PIR-AUTH wrong\n")
         .await
         .expect("write token");
-    let mut response = [0_u8; 1];
-    let read = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        stream.read(&mut response),
-    )
-    .await
-    .expect("close timeout")
-    .expect("read close");
+
+    // The wrong token still gets a structured pre-greeting frame
+    // (hello_error/unauthorized) before the server closes the socket.
+    let mut decoder = ServerMessageDecoder::new(FrameOptions::default()).expect("decoder");
+    let mut buffer = [0_u8; 4096];
+    let mut messages = Vec::new();
+    for _ in 0..8 {
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut buffer))
+                .await
+                .expect("auth frame timeout")
+                .expect("read auth frame");
+        if read == 0 {
+            break;
+        }
+        messages.extend(decoder.push(&buffer[..read]).expect("decode auth frame"));
+        if !messages.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        messages.len(),
+        1,
+        "expected one auth error frame: {messages:?}"
+    );
+    assert_eq!(messages[0]["type"], "hello_error");
+    assert_eq!(messages[0]["error"]["code"], "unauthorized");
+
+    // The connection is closed after the frame.
+    let read = tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut buffer))
+        .await
+        .expect("close timeout")
+        .expect("read close");
     assert_eq!(read, 0);
     accepting
         .await

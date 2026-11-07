@@ -86,16 +86,26 @@ impl Inbox {
 
     /// Start the single consumer task (exactly once, inside a runtime).
     pub(super) fn ensure_consumer(&self) {
-        if tokio::runtime::Handle::try_current().is_err() {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
-        }
+        };
+        self.ensure_consumer_on(&handle);
+    }
+
+    /// Start the single consumer task on a caller-chosen long-lived runtime.
+    ///
+    /// A host that runs prompts on a short-lived runtime (the server's
+    /// per-run `spawn_agent_task`) must pass its own runtime handle: a
+    /// consumer spawned on the prompt runtime dies with it, and steering
+    /// queued for the next run would never be drained.
+    pub(super) fn ensure_consumer_on(&self, handle: &tokio::runtime::Handle) {
         if let Some(receiver) = self
             .consumer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
         {
-            tokio::spawn(run_inbox_consumer(receiver));
+            handle.spawn(run_inbox_consumer(receiver));
         }
     }
 

@@ -6,8 +6,13 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::time::{Duration, Instant};
 
+use pir::tui::core::Component;
 use pir::tui::editor::Editor;
+use pir::tui::markdown::Markdown;
+use pir::tui::messages::UserMessageComponent;
+use pir::tui::strip_ansi;
 
 struct CountingAllocator;
 
@@ -121,4 +126,71 @@ fn ten_thousand_line_crlf_tab_paste_stays_within_four_output_copies() {
         "normalizing 10k paste caused {} allocation events",
         stats.events
     );
+}
+
+// ---------------------------------------------------------------------------
+// Single-line paste submit render bound (A20-F01)
+// ---------------------------------------------------------------------------
+
+/// A 64 KiB bracketed paste with no newline folds to one `[paste #N …]`
+/// marker and expands to a single 64 KiB line on submit. The markdown inline
+/// pass used to rescan the rest of an alphanumeric run from every character
+/// (looking for a bare-email `@`), i.e. O(n²): QA measured 13.7 s to paint
+/// the reply at 64 KiB and >60 s at 1 MiB. The user-message render must stay
+/// bounded and byte-complete. (The companion user-message component renders
+/// this shape without Markdown, but the markdown path is exercised directly
+/// so the inline scanner cannot regress unnoticed.)
+#[test]
+fn sixty_four_kib_single_line_markdown_renders_in_bounded_time() {
+    let payload = "Q".repeat(64 * 1024);
+    let started = Instant::now();
+    let lines = Markdown::new(payload.clone(), 0, 0).render(100);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "64 KiB single-line markdown took {elapsed:?} (expected well under 10 s)"
+    );
+    let text: String = lines.iter().map(|line| line.trim_end()).collect();
+    assert_eq!(text, payload);
+}
+
+/// The same shape at 1 MiB: with the linear scanner this is a few hundred
+/// milliseconds in a debug build; the old quadratic scan is effectively
+/// unbounded (hours, not seconds).
+#[test]
+fn one_mib_single_line_markdown_renders_in_bounded_time() {
+    let payload = "Q".repeat(1024 * 1024);
+    let started = Instant::now();
+    let lines = Markdown::new(payload.clone(), 0, 0).render(100);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "1 MiB single-line markdown took {elapsed:?} (expected well under 30 s)"
+    );
+    let text: String = lines.iter().map(|line| line.trim_end()).collect();
+    assert_eq!(text, payload);
+}
+
+/// End-to-end composer path for the QA repro: paste 64 KiB as one line, submit
+/// (marker expansion), then render the optimistic user bubble. Bounded and
+/// content-complete.
+#[test]
+fn sixty_four_kib_single_line_paste_submit_renders_in_bounded_time() {
+    let payload = "Q".repeat(64 * 1024);
+    let editor = Editor::new();
+    editor.paste_text(&payload);
+    assert!(editor.get_text().contains("[paste #"));
+    let submitted = editor.submit().expect("non-empty submit");
+    assert_eq!(submitted, payload);
+
+    let started = Instant::now();
+    let component = UserMessageComponent::new(&submitted, 1);
+    let lines = component.render(100);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "64 KiB single-line user-message render took {elapsed:?} (expected well under 10 s)"
+    );
+    let painted: String = lines.iter().map(|line| strip_ansi(line)).collect();
+    assert_eq!(painted.matches('Q').count(), payload.len());
 }

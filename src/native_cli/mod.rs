@@ -13,7 +13,8 @@
 //! inside the agent reaches these commands as plain `pir grep …`.
 //!
 //! Exit codes follow the system tools: grep 0/1/2 (match / no match / error),
-//! sed 0/1/2 (success / script error / file error), python 0/1/2.
+//! sed 0/1/2 (success / script error / file error), python 0/N/1/2 (success /
+//! `sys.exit(N)` / uncaught exception / file error).
 
 mod fallback;
 mod grep;
