@@ -894,32 +894,48 @@ pub fn partition_file_args_with_options(
         }
         // Sniff from a small read instead of the full file; these bytes are
         // then reused for the text block or extended for the image payload.
-        let mut head = [0u8; crate::coding_agent::tools::image::IMAGE_TYPE_SNIFF_BYTES];
-        let mut filled = 0;
-        while filled < head.len() {
-            match file.read(&mut head[filled..]) {
-                Ok(0) => break,
-                Ok(read) => filled += read,
-                Err(error) => {
-                    return Err(anyhow::anyhow!(
-                        "Could not read file {}: {error}",
-                        path.display()
-                    ))
+        // The image sniffer is compiled only when the print host or read tool
+        // pulls in `tools::image`; a minimal SDK build treats every file as
+        // text and never references that module.
+        #[cfg(any(feature = "print", feature = "tool-read"))]
+        {
+            let mut head = [0u8; crate::coding_agent::tools::image::IMAGE_TYPE_SNIFF_BYTES];
+            let mut filled = 0;
+            while filled < head.len() {
+                match file.read(&mut head[filled..]) {
+                    Ok(0) => break,
+                    Ok(read) => filled += read,
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(
+                            "Could not read file {}: {error}",
+                            path.display()
+                        ))
+                    }
                 }
             }
-        }
-        let mut bytes = Vec::with_capacity(filled);
-        bytes.extend_from_slice(&head[..filled]);
-        file.read_to_end(&mut bytes)
-            .map_err(|error| anyhow::anyhow!("Could not read file {}: {error}", path.display()))?;
-        let sniff_head = &bytes[..bytes
-            .len()
-            .min(crate::coding_agent::tools::image::IMAGE_TYPE_SNIFF_BYTES)];
-        match crate::coding_agent::tools::image::detect_supported_image_mime_type(sniff_head) {
-            Some(mime_type) => {
-                append_file_image(&path, bytes, mime_type, &mut text, &mut images, options)
+            let mut bytes = Vec::with_capacity(filled);
+            bytes.extend_from_slice(&head[..filled]);
+            file.read_to_end(&mut bytes).map_err(|error| {
+                anyhow::anyhow!("Could not read file {}: {error}", path.display())
+            })?;
+            let sniff_head = &bytes[..bytes
+                .len()
+                .min(crate::coding_agent::tools::image::IMAGE_TYPE_SNIFF_BYTES)];
+            match crate::coding_agent::tools::image::detect_supported_image_mime_type(sniff_head) {
+                Some(mime_type) => {
+                    append_file_image(&path, bytes, mime_type, &mut text, &mut images, options)
+                }
+                None => append_file_text(&path, &bytes, &mut text),
             }
-            None => append_file_text(&path, &bytes, &mut text),
+        }
+        #[cfg(not(any(feature = "print", feature = "tool-read")))]
+        {
+            let _ = options;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|error| {
+                anyhow::anyhow!("Could not read file {}: {error}", path.display())
+            })?;
+            append_file_text(&path, &bytes, &mut text);
         }
     }
     Ok((text, images))
@@ -1190,6 +1206,7 @@ fn append_file_text(path: &Path, bytes: &[u8], text: &mut String) {
 /// `Some(options)` PNG/JPEG/GIF/WebP also go through `process_image` with the
 /// resolved limits. Either way, render the conversion/resize hints or the
 /// processing failure text exactly like upstream.
+#[cfg(any(feature = "print", feature = "tool-read"))]
 #[cfg(any(feature = "image-tools", all(feature = "print", feature = "tui")))]
 fn append_file_image(
     path: &Path,
@@ -1283,6 +1300,7 @@ fn append_file_image(
 
 /// Image half without the image stack: no normalize/decode is possible, so
 /// keep the previous pass-through attachment (raw bytes).
+#[cfg(any(feature = "print", feature = "tool-read"))]
 #[cfg(not(any(feature = "image-tools", all(feature = "print", feature = "tui"))))]
 fn append_file_image(
     path: &Path,
