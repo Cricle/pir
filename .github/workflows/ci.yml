@@ -68,6 +68,11 @@ jobs:
               tail -120 /tmp/clippy.log
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
+            # Surface the first diagnostics as annotations too: they are
+            # readable through the checks API without downloading the job log.
+            grep -E -A3 '^error(\[|:)' /tmp/clippy.log | head -80 | while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error title=Clippy::$line"
+            done
           fi
           exit "$status"
       - name: SDK feature matrix (no-default-features)
