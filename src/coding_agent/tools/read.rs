@@ -609,6 +609,7 @@ async fn read_remaining(
 /// [`ConfinedTarget::open_read`]. Stat and sniff the head first (image/binary
 /// decisions need at most 8 KiB), then either read the whole image or stream
 /// the text line range.
+#[allow(clippy::too_many_arguments)]
 async fn read_local(
     file: std::fs::File,
     absolute_path: &Path,

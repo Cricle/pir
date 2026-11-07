@@ -156,6 +156,7 @@ pub(super) async fn execute(
 }
 
 /// Single mode (upstream `params.agent && params.task` branch).
+#[allow(clippy::too_many_arguments)]
 async fn run_single(
     params: SubagentParams,
     env: Arc<ToolSessionEnv>,
@@ -229,6 +230,7 @@ async fn run_single(
 
 /// Chain mode (upstream `params.chain` branch): sequential steps with
 /// `{previous}` substitution; stops at the first failed step.
+#[allow(clippy::too_many_arguments)]
 async fn run_chain(
     chain: Vec<TaskItem>,
     env: Arc<ToolSessionEnv>,
@@ -333,6 +335,7 @@ async fn run_chain(
 /// Parallel mode (upstream `params.tasks` branch): max 8 tasks, 4
 /// concurrent, per-task 50 KB model-visible output cap, live aggregate
 /// updates.
+#[allow(clippy::too_many_arguments)]
 async fn run_parallel(
     tasks: Vec<TaskItem>,
     env: Arc<ToolSessionEnv>,

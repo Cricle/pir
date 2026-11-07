@@ -131,7 +131,7 @@ pub(crate) fn current_host_id() -> Option<String> {
     let name = env_name
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .or_else(|| {
+        .or({
             #[cfg(unix)]
             {
                 std::fs::read_to_string("/proc/sys/kernel/hostname")

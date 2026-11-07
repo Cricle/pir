@@ -1016,7 +1016,7 @@ pub(crate) fn extend_cached_session_projection(
         let entry: &FileEntry = (*source).borrow();
         let is_stale_compaction = matches!(entry, FileEntry::Compaction(_)) && index > 0;
         let edit = context_edit_for(entry, edits.as_ref());
-        let is_appended = cached_context_index.map_or(true, |cached_index| index > cached_index);
+        let is_appended = cached_context_index.is_none_or(|cached_index| index > cached_index);
         let start = cursor;
         if !is_stale_compaction {
             if is_appended {

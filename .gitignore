@@ -9,6 +9,8 @@ Cargo.lock.bak
 /target-exp-*/
 /target-release-*/
 /target-perf-*/
+/target-build2/
+/target-perf2/
 /target-gnu/
 /target-gnu-off/
 /target-merge/

@@ -6,10 +6,11 @@
 //! Bodies are serialized through a key-sorting canonicalizer before
 //! `assert_json_snapshot!`, so snapshot files show keys alphabetically and are
 //! stable regardless of map implementation details. Formatting is insta's
-//! pretty JSON (2-space indent). Snapshots live in `tests/snapshots/`
-//! (`<test-binary>__<name>.snap`, insta's default layout for integration
-//! tests). The Anthropic builder also returns headers; only the body is
-//! snapshotted (headers carry the platform-dependent user-agent).
+//! pretty JSON (2-space indent). Snapshots live in `tests/snapshots/` with
+//! bare names (the merged harness pins `prepend_module_to_snapshot = false`,
+//! so a regrouping of the generated test binaries never orphans them). The
+//! Anthropic builder also returns headers; only the body is snapshotted
+//! (headers carry the platform-dependent user-agent).
 
 use insta::assert_json_snapshot;
 use pir::ai::api::anthropic::build_anthropic_request;
@@ -30,6 +31,16 @@ fn weather_schema() -> Value {
         "properties": { "city": { "type": "string" } },
         "required": ["city"],
     })
+}
+
+/// Insta snapshots are keyed by `<test-binary>__<name>`. The merged
+/// `zz_merged_N` harness would otherwise change the binary prefix and orphan
+/// every checked-in `.snap`; pin the historical name so standalone and merged
+/// runs share the same files.
+fn assert_snapshot(name: &str, value: Value) {
+    insta::with_settings!({prepend_module_to_snapshot => false}, {
+        insta::assert_json_snapshot!(name, value);
+    });
 }
 
 /// Recursively sort object keys so snapshot files are canonical (and immune to
@@ -230,7 +241,7 @@ fn openai_plain_message_snapshot() {
         &resolve_compat(&model),
     )
     .unwrap();
-    assert_json_snapshot!("openai_plain_message", canonical(&body));
+    assert_snapshot("openai_plain_message", canonical(&body));
 }
 
 /// Reasoning request: `reasoning_effort` from the thinking level, and the
@@ -264,7 +275,7 @@ fn openai_thinking_level_snapshot() {
         &resolve_compat(&model),
     )
     .unwrap();
-    assert_json_snapshot!("openai_thinking_level", canonical(&body));
+    assert_snapshot("openai_thinking_level", canonical(&body));
 }
 
 /// Tool round-trip: declared function tool, assistant tool-call replay
@@ -294,7 +305,7 @@ fn openai_tool_replay_snapshot() {
         &resolve_compat(&model),
     )
     .unwrap();
-    assert_json_snapshot!("openai_tool_replay", canonical(&body));
+    assert_snapshot("openai_tool_replay", canonical(&body));
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +324,7 @@ fn anthropic_plain_message_snapshot() {
     };
     let (body, _headers) =
         build_anthropic_request(&model, &context, &options(Some(0.7), Some(512), None)).unwrap();
-    assert_json_snapshot!("anthropic_plain_message", canonical(&body));
+    assert_snapshot("anthropic_plain_message", canonical(&body));
 }
 
 /// Extended-thinking request: `thinking.budget_tokens` from the level, the
@@ -333,7 +344,7 @@ fn anthropic_thinking_budget_snapshot() {
         &options(Some(0.2), Some(8192), Some(ThinkingLevel::Medium)),
     )
     .unwrap();
-    assert_json_snapshot!("anthropic_thinking_budget", canonical(&body));
+    assert_snapshot("anthropic_thinking_budget", canonical(&body));
 }
 
 /// Tool round-trip: function tools with the legacy `input_schema` shape and
@@ -372,7 +383,7 @@ fn anthropic_tool_replay_snapshot() {
     };
     let (body, _headers) =
         build_anthropic_request(&model, &context, &options(None, Some(1024), None)).unwrap();
-    assert_json_snapshot!("anthropic_tool_replay", canonical(&body));
+    assert_snapshot("anthropic_tool_replay", canonical(&body));
 }
 
 // ---------------------------------------------------------------------------
@@ -390,7 +401,7 @@ fn google_plain_message_snapshot() {
         ..Context::default()
     };
     let body = build_google_body(&model, &context, &options(Some(0.7), Some(512), None)).unwrap();
-    assert_json_snapshot!("google_plain_message", canonical(&body));
+    assert_snapshot("google_plain_message", canonical(&body));
 }
 
 /// Thinking request: `thinkingConfig` budget for the level, same-model
@@ -421,7 +432,7 @@ fn google_thinking_budget_snapshot() {
         &options(None, Some(512), Some(ThinkingLevel::High)),
     )
     .unwrap();
-    assert_json_snapshot!("google_thinking_budget", canonical(&body));
+    assert_snapshot("google_thinking_budget", canonical(&body));
 }
 
 /// Tool round-trip: `functionDeclarations` with `parametersJsonSchema`,
@@ -451,7 +462,7 @@ fn google_tool_replay_snapshot() {
         ..Context::default()
     };
     let body = build_google_body(&model, &context, &options(None, None, None)).unwrap();
-    assert_json_snapshot!("google_tool_replay", canonical(&body));
+    assert_snapshot("google_tool_replay", canonical(&body));
 }
 
 /// Gemini ignores `const` in `parametersJsonSchema`, so the adapter sends
@@ -479,7 +490,7 @@ fn google_const_as_enum_tool_snapshot() {
         ..Context::default()
     };
     let body = build_google_body(&model, &context, &options(None, None, None)).unwrap();
-    assert_json_snapshot!("google_const_as_enum_tool", canonical(&body));
+    assert_snapshot("google_const_as_enum_tool", canonical(&body));
 }
 
 // ---------------------------------------------------------------------------

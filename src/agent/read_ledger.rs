@@ -242,15 +242,9 @@ impl ReadLedger {
             return EditGate::Allowed;
         }
         let reason = match check {
-            ReadCheck::NotRead => format!(
-                "the file has not been read in this session; read the whole file first (use the read tool with no offset/limit), then retry"
-            ),
-            ReadCheck::Partial => format!(
-                "only part of the file has been read in this session; read the whole file (no offset/limit) so every line is covered, then retry"
-            ),
-            ReadCheck::Stale => format!(
-                "the file changed since it was last read (mtime or size differs); read it again, then retry"
-            ),
+            ReadCheck::NotRead => "the file has not been read in this session; read the whole file first (use the read tool with no offset/limit), then retry".to_string(),
+            ReadCheck::Partial => "only part of the file has been read in this session; read the whole file (no offset/limit) so every line is covered, then retry".to_string(),
+            ReadCheck::Stale => "the file changed since it was last read (mtime or size differs); read it again, then retry".to_string(),
             ReadCheck::Allowed => unreachable!("Allowed handled above"),
         };
         match self.mode {

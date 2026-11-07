@@ -406,7 +406,7 @@ fn consume_csi(chars: &mut Peekable<CharIndices<'_>>) {
 /// 8-bit ST (`U+009C`). An unterminated string runs to the end of the input.
 fn consume_control_string(chars: &mut Peekable<CharIndices<'_>>) {
     let mut prev_esc = false;
-    while let Some((_, c)) = chars.next() {
+    for (_, c) in chars.by_ref() {
         if c == '\x07' || c == '\u{009c}' {
             break;
         }

@@ -2932,6 +2932,27 @@ impl App {
                     dyn Fn(&mut Vec<String>, altscreen_search::FrameDecorateContext) + Send,
                 >)
         });
+        // The decorator above is installed for its whole lifetime so a
+        // runtime `switchTuiMode` and floating overlays keep working, but in
+        // regular mode with no floating overlay it paints nothing. Tell the
+        // core so DIRTY2's raw-frame fast path (dirty markers, row budget)
+        // stays alive instead of a no-op closure forcing a full scan per
+        // frame.
+        core.set_decorator_paint_probe({
+            let decorator_active = Arc::clone(&fullscreen_flag);
+            let decorator_overlay = Arc::clone(&overlay);
+            Some(Box::new(move || {
+                if decorator_active.load(Ordering::SeqCst) {
+                    return true;
+                }
+                let overlay = decorator_overlay
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                overlay.external.visible().is_some_and(|external| {
+                    !external.is_hidden() && external.is_floating() && external.bounds().is_some()
+                })
+            }) as Box<dyn Fn() -> bool + Send>)
+        });
 
         let _ = extension_paths;
         let hide_thinking = configured
@@ -11403,6 +11424,14 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
         let timeout = printable_burst
             .time_until_flush(Instant::now())
             .map_or(timeout, |remaining| timeout.min(remaining));
+        // A partial paste-marker prefix is released as typed keys at its
+        // deadline; wake the poll for it even with no other work pending.
+        #[cfg(windows)]
+        let timeout = console_coalescer
+            .marker_tail_deadline()
+            .map_or(timeout, |deadline| {
+                timeout.min(deadline.saturating_duration_since(Instant::now()))
+            });
         // P1-1: snapshot the transcript length before the input poll — any
         // entries pushed while handling this event (slash-command notices
         // like /help, /hotkeys, /copy, failed pastes, …) must be flushed
@@ -11415,6 +11444,16 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
         // events and the ones the gate releases drain one per iteration, so a
         // reassembled sequence arrives in order without blocking the poll.
         pending_input.extend(input_gate.flush_due(now));
+        // Release a marker prefix whose sequence window elapsed without a
+        // follow-up console batch (a lone `[2` typed by hand must not stay
+        // invisible). The released keys go through the same gate as any
+        // other key so escape-window handling stays uniform.
+        #[cfg(windows)]
+        {
+            for event in console_coalescer.poll_marker_tail(Instant::now()) {
+                pending_input.extend(input_gate.push(event, Instant::now()));
+            }
+        }
         bound_pending_input(&mut pending_input);
         // Windows batch path: `event::poll(timeout)` is the blocking input
         // wait, but its Windows source pre-reads the first console record into
@@ -11585,8 +11624,14 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
         // TUI-P4 printable-key burst: collect the run across the read-loop's
         // partial drains. A selector/search/confirm owns the focus as keys,
         // and character-jump mode consumes the next printable key as a jump —
-        // never coalesce those into a paste.
-        let burst_allowed = coalesce_allowed && app.editor.jump_mode().is_none();
+        // never coalesce those into a paste. Replacement events inserted by a
+        // terminal-input hook are one-dispatch-per-physical-input by contract
+        // (`terminal_input_bypass`), and a deferred event must not let later
+        // physical keys merge ahead of it, so both keep the burst off.
+        let burst_allowed = coalesce_allowed
+            && app.editor.jump_mode().is_none()
+            && terminal_input_bypass == 0
+            && deferred_terminal_input.is_none();
         if !burst_allowed && printable_burst.is_active() {
             let outcome = printable_burst.flush_now(&mut pending_input);
             input_trace.note_burst(&outcome);
@@ -24493,6 +24538,17 @@ pub const CONSOLE_BURST_MIN_CHARS: usize = 8;
 /// one event because the whole batch is coalesced in one pass.
 pub const CONSOLE_PASTE_CHUNK_BYTES: usize = 64 * 1024;
 
+/// How long a possible bracketed-paste marker prefix (`[`, `[2`, `[20`,
+/// `Alt+[`, an `Esc`+`[` pair, …) may sit in
+/// [`ConsoleBatchCoalescer`] before it is released as ordinary keys.
+///
+/// The marker itself is delivered in one burst, so the window only has to
+/// bridge the console reader's batch split. A user typing `[` (or `[2` on the
+/// way to a literal `[2`) must not have the keys withheld indefinitely just
+/// because no later console batch arrives — the exact bug the lone-Esc
+/// special case fixed, now with a deadline for every other prefix.
+pub const CONSOLE_MARKER_TAIL_TIMEOUT: Duration = Duration::from_millis(40);
+
 /// Coalesce one drained console batch into the fewest events the gate and the
 /// editor need.
 ///
@@ -24505,7 +24561,7 @@ pub const CONSOLE_PASTE_CHUNK_BYTES: usize = 64 * 1024;
 /// * bracketed-paste markers (`ESC [ 2 0 0 ~` / `ESC [ 2 0 1 ~`) are
 ///   recognized in every spelling the Windows parser produces — `Esc` + `[`
 ///   + digits (crossterm byte path) and `Alt+[` + digits (crossterm's
-///   `INPUT_RECORD` parser folds the dropped ESC record into the `[` key);
+///     `INPUT_RECORD` parser folds the dropped ESC record into the `[` key);
 /// * a run of plain printable presses (and Enters/Tabs) becomes ONE
 ///   `Event::Paste`, so a fast paste costs one editor splice;
 /// * a bracketed payload is emitted in bounded chunks while it is still
@@ -24524,8 +24580,17 @@ pub struct ConsoleBatchCoalescer {
     paste_buffer: String,
     /// Trailing events that may be the beginning of a paste marker split
     /// across two console batches (`Alt+[`, `Alt+[2`, …). Held until the
-    /// next batch so a marker is never typed as payload.
+    /// next batch so a marker is never typed as payload, but never longer
+    /// than [`CONSOLE_MARKER_TAIL_TIMEOUT`].
     marker_tail: Vec<Event>,
+    /// When [`Self::marker_tail`] was stored. `None` while the tail is empty;
+    /// the event loop polls [`Self::poll_marker_tail`] at this deadline.
+    marker_tail_since: Option<Instant>,
+    /// The previous effective event was a plain CR (console Enter). A
+    /// following LF chord (`Enter`+CONTROL, the console's spelling of `\n`)
+    /// is the second half of one CRLF pair and must not add a second
+    /// newline. Kept across batches: a paste ending in CRLF can split there.
+    last_was_plain_enter: bool,
 }
 
 impl ConsoleBatchCoalescer {
@@ -24537,14 +24602,55 @@ impl ConsoleBatchCoalescer {
         self.paste_open
     }
 
+    /// When the held marker prefix must be released as keys, for the event
+    /// loop's poll timeout. `None` when nothing is held.
+    pub fn marker_tail_deadline(&self) -> Option<Instant> {
+        self.marker_tail_since
+            .map(|at| at + CONSOLE_MARKER_TAIL_TIMEOUT)
+    }
+
+    /// Release a held marker prefix once its sequence window has elapsed.
+    /// Returns the held keys (releases stripped) in their original order.
+    /// The event loop calls this every iteration; a new console batch also
+    /// ages the tail out at the top of [`Self::coalesce`].
+    pub fn poll_marker_tail(&mut self, now: Instant) -> Vec<Event> {
+        if self.marker_tail.is_empty() {
+            return Vec::new();
+        }
+        if !self
+            .marker_tail_since
+            .is_some_and(|at| now.saturating_duration_since(at) >= CONSOLE_MARKER_TAIL_TIMEOUT)
+        {
+            return Vec::new();
+        }
+        self.marker_tail_since = None;
+        let mut held = std::mem::take(&mut self.marker_tail);
+        held.retain(|event| !matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release));
+        held
+    }
+
     /// Rewrite one raw console batch. The returned vector preserves the input
     /// order; only adjacent printable records are merged.
     pub fn coalesce(&mut self, events: Vec<Event>) -> Vec<Event> {
         let mut events = events;
+        let mut expired_tail: Vec<Event> = Vec::new();
         if !self.marker_tail.is_empty() {
-            let mut joined = std::mem::take(&mut self.marker_tail);
-            joined.append(&mut events);
-            events = joined;
+            if self.marker_tail_since.is_some_and(|at| {
+                Instant::now().saturating_duration_since(at) >= CONSOLE_MARKER_TAIL_TIMEOUT
+            }) {
+                // The sequence window closed before this batch arrived: the
+                // held run was ordinary typed keys, never a marker prefix.
+                expired_tail = std::mem::take(&mut self.marker_tail);
+                self.marker_tail_since = None;
+                expired_tail.retain(
+                    |event| !matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release),
+                );
+            } else {
+                let mut joined = std::mem::take(&mut self.marker_tail);
+                self.marker_tail_since = None;
+                joined.append(&mut events);
+                events = joined;
+            }
         }
         // A marker may straddle the batch boundary. Hold a matching suffix
         // for the next batch instead of letting its digits fall into the
@@ -24565,11 +24671,29 @@ impl ConsoleBatchCoalescer {
                             && key.modifiers.is_empty()
                 )
                 && advance_releases(&events, start + 1) == events.len();
-            if !lone_escape {
+            // A lone plain `[` is typing, not a marker prefix: a genuinely
+            // split `ESC [ 2 0 0 ~` keeps its Esc for the gate window, and a
+            // marker whose ESC record the console dropped arrives with the
+            // digits in the same batch (`[200~`), where `bracket_marker_end`
+            // consumes it without any hold. Withholding only `[` until the
+            // NEXT batch made the key vanish on Windows whenever no further
+            // console record arrived.
+            let lone_bracket = !self.paste_open
+                && matches!(
+                    events.get(start),
+                    Some(Event::Key(key))
+                        if key.kind == KeyEventKind::Press
+                            && key.code == KeyCode::Char('[')
+                            && key.modifiers.is_empty()
+                )
+                && advance_releases(&events, start + 1) == events.len();
+            if !lone_escape && !lone_bracket {
                 self.marker_tail = events.split_off(start);
+                self.marker_tail_since = Some(Instant::now());
             }
         }
-        let mut out = Vec::with_capacity(8);
+        let mut out = Vec::with_capacity(8 + expired_tail.len());
+        out.extend(expired_tail);
         let mut run_events: Vec<Event> = Vec::new();
         let mut run_text = String::new();
         let mut paste_text = std::mem::take(&mut self.paste_buffer);
@@ -24579,12 +24703,14 @@ impl ConsoleBatchCoalescer {
                 if let Some(next) = bracket_marker_end(&events, index, b"[200~") {
                     flush_plain_run(&mut run_events, &mut run_text, &mut out);
                     self.paste_open = true;
+                    self.last_was_plain_enter = false;
                     index = next;
                     continue;
                 }
             } else if let Some(next) = bracket_marker_end(&events, index, b"[201~") {
                 flush_paste_chunk(&mut paste_text, &mut out);
                 self.paste_open = false;
+                self.last_was_plain_enter = false;
                 index = next;
                 continue;
             }
@@ -24599,14 +24725,23 @@ impl ConsoleBatchCoalescer {
                         continue;
                     }
                     if self.paste_open {
+                        if is_lf_chord(key) && self.last_was_plain_enter {
+                            // The LF half of a CRLF pair: the CR already
+                            // contributed this newline.
+                            self.last_was_plain_enter = false;
+                            continue;
+                        }
                         if let Some(c) = plain_text_char(key) {
                             paste_text.push(c);
-                        } else if is_plain_enter(key) {
+                            self.last_was_plain_enter = false;
+                        } else if is_plain_enter(key) || is_line_feed_chord(key) {
                             paste_text.push('\n');
-                        } else if is_line_feed_chord(key) {
-                            paste_text.push('\n');
+                            self.last_was_plain_enter = is_cr_enter(key);
                         } else if is_plain_tab(key) {
                             paste_text.push('\t');
+                            self.last_was_plain_enter = false;
+                        } else {
+                            self.last_was_plain_enter = false;
                         }
                         // Other keys inside a paste are not payload (the
                         // gate's collect_paste drops them too).
@@ -24618,6 +24753,15 @@ impl ConsoleBatchCoalescer {
                     if let Some(c) = plain_text_char(key) {
                         run_events.push(event);
                         run_text.push(c);
+                        self.last_was_plain_enter = false;
+                        continue;
+                    }
+                    if is_lf_chord(key) && self.last_was_plain_enter {
+                        // Stray LF chord after a CR that already terminated
+                        // its batch (the CR was emitted as a submit key):
+                        // swallow it so the prompt does not get a second,
+                        // spurious line break.
+                        self.last_was_plain_enter = false;
                         continue;
                     }
                     if is_plain_enter(key) || is_line_feed_chord(key) {
@@ -24631,27 +24775,36 @@ impl ConsoleBatchCoalescer {
                         // its own Key event. An Enter with content after it is
                         // an internal newline (a multiline paste) and stays
                         // part of the run.
+                        let followed_by_lf = events[index..].iter().any(|next| {
+                            matches!(
+                                next,
+                                Event::Key(next_key) if is_lf_chord(next_key)
+                            )
+                        });
                         let has_following_content = events[index..].iter().any(|next| {
                             !matches!(
                                 next,
                                 Event::Key(next_key) if next_key.kind == KeyEventKind::Release
                             )
                         });
-                        if has_following_content {
-                            run_events.push(event);
+                        if followed_by_lf || has_following_content {
+                            run_events.push(event.clone());
                             run_text.push('\n');
                         } else {
                             flush_plain_run(&mut run_events, &mut run_text, &mut out);
-                            out.push(event);
+                            out.push(event.clone());
                         }
+                        self.last_was_plain_enter = is_cr_enter(key);
                         continue;
                     }
                     if is_plain_tab(key) {
                         run_events.push(event);
                         run_text.push('\t');
+                        self.last_was_plain_enter = false;
                         continue;
                     }
                     flush_plain_run(&mut run_events, &mut run_text, &mut out);
+                    self.last_was_plain_enter = false;
                     out.push(event);
                 }
                 Event::Paste(text) => {
@@ -24664,6 +24817,7 @@ impl ConsoleBatchCoalescer {
                         flush_plain_run(&mut run_events, &mut run_text, &mut out);
                         out.push(event);
                     }
+                    self.last_was_plain_enter = false;
                 }
                 _ => {
                     flush_plain_run(&mut run_events, &mut run_text, &mut out);
@@ -24729,6 +24883,23 @@ fn is_plain_enter(key: &KeyEvent) -> bool {
             && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL))
 }
 
+/// The CR half of a console CRLF pair: a plain Enter/`\r` record.
+fn is_cr_enter(key: &KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n')
+    ) && key.modifiers.is_empty()
+}
+
+/// The LF half of a console CRLF pair. ConPTY's non-VT input mode has no `\n`
+/// key: it synthesizes a Ctrl+Enter record for the byte (crossterm mirrors
+/// the control state, see `stdin_buffer::resolve_console_line_feed`), which
+/// the gate later rewrites to the `ctrl+j` LF shape. Accept both spellings.
+fn is_lf_chord(key: &KeyEvent) -> bool {
+    (key.code == KeyCode::Enter && key.modifiers == KeyModifiers::CONTROL)
+        || (key.code == KeyCode::Char('j') && key.modifiers == KeyModifiers::CONTROL)
+}
+
 fn is_line_feed_chord(key: &KeyEvent) -> bool {
     key.code == KeyCode::Char('j') && key.modifiers == KeyModifiers::CONTROL
 }
@@ -24788,7 +24959,7 @@ fn bracket_marker_end(events: &[Event], start: usize, marker: &[u8]) -> Option<u
         return Some(advance_releases(events, last + 1));
     }
     // '[' (plain or ALT-folded) + digits.
-    if presses.len() >= digits.len() + 1 {
+    if presses.len() > digits.len() {
         let bracket = presses[0].1;
         let bracket_ok = bracket.code == KeyCode::Char('[')
             && !bracket.modifiers.intersects(KeyModifiers::CONTROL)
@@ -25007,7 +25178,7 @@ impl PrintableBurst {
 
     fn push_char(&mut self, c: char, key: &KeyEvent, now: Instant) {
         if self.presses == 0 {
-            self.single = Some(key.clone());
+            self.single = Some(*key);
             self.last_flush_at = now;
         }
         self.text.push(c);
@@ -25101,7 +25272,7 @@ impl PrintableBurst {
                         let KeyCode::Char(c) = key.code else {
                             unreachable!()
                         };
-                        let key = key.clone();
+                        let key = *key;
                         queue.pop_front();
                         self.push_char(c, &key, now);
                         if self.text.len() >= Self::FLUSH_BYTES {
@@ -25114,6 +25285,21 @@ impl PrintableBurst {
                         continue;
                     }
                     if (enter || line_feed || carriage_return) && self.presses > 0 && hot {
+                        // TUI-PERF2 P1-1: an Enter that is the last effective
+                        // event of the queue is a submit, not paste payload.
+                        // Absorbing it produced `Paste("text\n")` and the
+                        // editor inserted a line break; leave it in the queue
+                        // (blocked) so `flush` emits the run first and the
+                        // loop dispatches the Enter as its own key. A later
+                        // non-release event makes this an internal newline of
+                        // a multiline paste and keeps it inside the run.
+                        let only_releases_after = queue.iter().skip(1).all(|next| {
+                            matches!(next, Event::Key(next_key) if next_key.kind == KeyEventKind::Release)
+                        });
+                        if only_releases_after {
+                            self.blocked_by = Some(format!("{front:?} (final enter)"));
+                            return true;
+                        }
                         // A CRLF pair: the console may deliver Enter then the
                         // LF chord. Collapse the LF half to the same newline.
                         if !(line_feed && self.last_was_enter) {
@@ -25186,8 +25372,7 @@ impl PrintableBurst {
             return PrintableBurstOutcome::default();
         }
         let bytes = self.text.len();
-        let outcome;
-        if self.presses == 1 && !self.has_line_break {
+        let outcome = if self.presses == 1 && !self.has_line_break {
             let Some(key) = self.single.take() else {
                 self.text.clear();
                 return PrintableBurstOutcome::default();
@@ -25199,7 +25384,7 @@ impl PrintableBurst {
             // `quit` used to become `Paste("/quit")` on top of the inserted
             // `/` → `//quit`).
             self.text.clear();
-            outcome = PrintableBurstOutcome {
+            PrintableBurstOutcome {
                 pasted: false,
                 replayed_key: true,
                 bytes,
@@ -25207,13 +25392,13 @@ impl PrintableBurst {
                 truncated: self.truncated,
                 total_bytes: self.total_bytes,
                 chunks: self.chunks,
-            };
+            }
         } else {
             let text = std::mem::take(&mut self.text);
             queue.push_front(Event::Paste(text));
             self.total_bytes += bytes;
             self.chunks += 1;
-            outcome = PrintableBurstOutcome {
+            PrintableBurstOutcome {
                 pasted: true,
                 replayed_key: false,
                 bytes,
@@ -25221,8 +25406,8 @@ impl PrintableBurst {
                 truncated: self.truncated,
                 total_bytes: self.total_bytes,
                 chunks: self.chunks,
-            };
-        }
+            }
+        };
         self.presses = 0;
         self.single = None;
         self.has_line_break = false;
@@ -25368,7 +25553,7 @@ impl ConsoleBatchDecoder {
         // Crossterm drops bare modifier records; the state they carry is
         // already folded into every following record.
         match vk {
-            0x10 | 0x11 | 0x12 => return None,
+            0x10..=0x12 => return None,
             0x08 => return Some(KeyCode::Backspace),
             0x09 if modifiers.contains(KeyModifiers::SHIFT) => return Some(KeyCode::BackTab),
             0x09 => return Some(KeyCode::Tab),
@@ -25439,6 +25624,7 @@ pub fn decode_console_batch(records: &[ConsoleBatchRecord]) -> Vec<Event> {
 /// Crossterm's Windows source reads `INPUT_RECORD`s one at a time: each
 /// `event::read` is a `WaitForSingleObject` + `GetNumberOfConsoleInputEvents`
 /// + `ReadConsoleInputW` round trip. A 10k-line paste arrives as ~600k
+///
 /// records (press+release per character), so that path capped at ~9k
 /// events/s — 30 s for the payload. `crossterm_winapi::Console::read_console_input`
 /// drains every queued record in one call; this module converts those

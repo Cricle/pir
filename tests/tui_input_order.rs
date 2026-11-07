@@ -397,3 +397,105 @@ fn split_bracketed_paste_end_marker_is_still_held() {
         "payload must survive the split end marker: {tail:?}"
     );
 }
+
+/// P1-1 (TUI-PERF2): a printable run whose batch ends with Enter must flush
+/// the text as a Paste and leave the Enter in the queue as its own Key. The
+/// pre-fix collector absorbed it as `Paste("abcdefgh\n")`, which the editor
+/// inserts as a line break instead of submitting the prompt.
+#[test]
+fn printable_burst_keeps_final_enter_as_a_key() {
+    let mut queue: VecDeque<Event> = "abcdefgh".chars().map(press).collect();
+    queue.push_back(enter());
+    let mut release_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+    release_enter.kind = KeyEventKind::Release;
+    queue.push_back(Event::Key(release_enter));
+
+    let mut burst = PrintableBurst::new();
+    let blocked = burst.absorb(&mut queue, Instant::now(), true);
+    assert!(blocked, "the final Enter must terminate the run");
+
+    let mut out = VecDeque::new();
+    burst.flush_now(&mut out);
+    assert_eq!(
+        paste_texts(&out),
+        vec!["abcdefgh".to_string()],
+        "the final Enter must not become paste payload: {out:?}"
+    );
+    assert!(
+        matches!(
+            queue.front(),
+            Some(Event::Key(key))
+                if key.code == KeyCode::Enter && key.kind == KeyEventKind::Press
+        ),
+        "the Enter must stay queued for the submit path: {queue:?}"
+    );
+}
+
+/// The same split is required when the coalescer already emitted the text as
+/// an explicit Paste and the user then presses Enter: the burst collector
+/// runs after the batch coalescer and must not merge them back into
+/// `Paste("hello\n")`.
+#[test]
+fn printable_burst_keeps_final_enter_after_explicit_paste() {
+    let mut queue: VecDeque<Event> = VecDeque::from([paste("hello"), enter()]);
+    let mut burst = PrintableBurst::new();
+    assert!(burst.absorb(&mut queue, Instant::now(), true));
+
+    let mut out = VecDeque::new();
+    burst.flush_now(&mut out);
+    assert_eq!(paste_texts(&out), vec!["hello".to_string()], "{out:?}");
+    assert!(
+        matches!(queue.front(), Some(Event::Key(key)) if key.code == KeyCode::Enter),
+        "{queue:?}"
+    );
+}
+
+/// P1-2 (TUI-PERF2): a lone `[` is a key press, not a bracketed-paste start.
+/// Holding it in `marker_tail` until the next console batch made the key
+/// disappear on Windows whenever no further record arrived.
+#[test]
+fn lone_bracket_is_dispatched_not_withheld() {
+    let mut coalescer = ConsoleBatchCoalescer::new();
+    let out = coalescer.coalesce(vec![press('['), release('[')]);
+    assert_eq!(out.len(), 1, "a lone `[` must be emitted: {out:?}");
+    assert!(
+        matches!(&out[0], Event::Key(key) if key.code == KeyCode::Char('[')),
+        "{out:?}"
+    );
+    assert!(coalescer.marker_tail_deadline().is_none());
+}
+
+/// A multi-character marker prefix (`[2`) may still straddle batches, but
+/// only for `CONSOLE_MARKER_TAIL_TIMEOUT`: the event loop wakes at that
+/// deadline and releases the keys instead of withholding them forever.
+#[test]
+fn split_marker_prefix_is_released_when_its_window_expires() {
+    use pir::tui::terminal::CONSOLE_MARKER_TAIL_TIMEOUT;
+
+    let mut coalescer = ConsoleBatchCoalescer::new();
+    let out = coalescer.coalesce(vec![press('['), press('2')]);
+    assert!(out.is_empty(), "a split prefix is held for the next batch");
+    let deadline = coalescer
+        .marker_tail_deadline()
+        .expect("held prefix must publish a wake-up deadline");
+
+    let released = coalescer.poll_marker_tail(deadline);
+    let keys: Vec<KeyCode> = released
+        .iter()
+        .filter_map(|event| match event {
+            Event::Key(key) => Some(key.code),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![KeyCode::Char('['), KeyCode::Char('2')],
+        "{released:?}"
+    );
+    assert!(coalescer.marker_tail_deadline().is_none());
+    assert!(coalescer.poll_marker_tail(deadline).is_empty());
+    assert!(
+        deadline.saturating_duration_since(Instant::now()) <= CONSOLE_MARKER_TAIL_TIMEOUT,
+        "the deadline must stay inside the sequence window"
+    );
+}

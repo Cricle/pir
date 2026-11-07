@@ -342,3 +342,42 @@ fn app_dirty_blocks_and_inbox_keep_latest_state_only() {
     assert!(overflow.overflow);
     assert!(overflow.blocks.is_empty());
 }
+
+/// P1-5 (TUI-PERF2): the production decorator is always installed, but in
+/// regular mode with no floating overlay its paint probe says it is idle.
+/// The DIRTY2 fast path must stay active on those frames: a one-block edit
+/// scans only its dirty rows (not the whole 48-row frame).
+#[test]
+fn idle_decorator_keeps_dirty_fast_path() {
+    let revisions = Arc::new((0..12).map(|_| AtomicU64::new(0)).collect::<Vec<_>>());
+    let mut core = test_core(80, 20);
+    core.push_content(Box::new(BlockList {
+        revisions: Arc::clone(&revisions),
+        rows_per_block: 4,
+    }));
+    core.set_decorator(Some(Box::new(
+        |_lines: &mut Vec<String>, _ctx: pir::tui::core::FrameDecorateContext| {},
+    )
+        as Box<
+            dyn Fn(&mut Vec<String>, pir::tui::core::FrameDecorateContext) + Send,
+        >));
+    core.set_decorator_paint_probe(Some(Box::new(|| false)));
+    core.render();
+    core.render();
+    // The first full render parks the *previous* baseline in the recycle
+    // pool; the next one establishes a clean raw pool for the fast path.
+    core.render();
+
+    revisions[6].store(1, Ordering::Relaxed);
+    core.render();
+    let work = core.last_frame_work();
+    assert_eq!(work.rerendered_rows, 4, "{work:?}");
+    assert!(
+        work.diff_scanned_rows <= 8,
+        "a one-block edit must not scan the whole frame: {work:?}"
+    );
+    assert!(
+        work.diff_skipped_rows >= 40,
+        "the dirty markers must skip the unchanged rows: {work:?}"
+    );
+}

@@ -2785,6 +2785,9 @@ pub struct TuiCore {
     /// highlight, selection, scrollbar, search box, flash) applied to the
     /// painted lines before diffing.
     decorator: Option<FrameDecorator>,
+    /// Whether [`Self::decorator`] can actually paint this frame (see
+    /// [`FrameDecoratorPaintProbe`]). `None` = unknown/assume yes.
+    decorator_paints: Option<FrameDecoratorPaintProbe>,
     /// The last frame's UNDECORATED lines (search corpus / selection source).
     last_frame: Vec<String>,
     /// Absolute buffer row painted at the top of the visible transcript area
@@ -2855,6 +2858,19 @@ pub type FrameDecorateContext = super::altscreen_search::FrameDecorateContext;
 
 /// The decoration hook installed by the alt-screen interaction layer.
 pub type FrameDecorator = Box<dyn Fn(&mut Vec<String>, FrameDecorateContext) + Send>;
+
+/// Optional companion to [`FrameDecorator`]: reports whether the installed
+/// decorator can paint the next frame. The production decorator is always
+/// installed (a runtime `switchTuiMode` and floating overlays need it), but
+/// in regular mode with no floating overlay it is a complete no-op. The core
+/// uses this probe to keep the DIRTY2 fast path (`frame_scratch_raw`,
+/// `last_frame_dirty`, the row budget) alive on those frames: without it a
+/// no-op closure would force a full-frame scan on every regular-mode frame.
+///
+/// `None` means "unknown": the core then conservatively assumes the decorator
+/// paints, which is the right contract for standalone test decorators that
+/// mutate rows unconditionally.
+pub type FrameDecoratorPaintProbe = Box<dyn Fn() -> bool + Send>;
 
 /// How the last frame was painted, as far as the mouse family needs it: the
 /// screen-row → buffer-row mapping of [`TuiCore::screen_row_to_buffer_row`].
@@ -3028,6 +3044,7 @@ impl TuiCore {
             last_transcript_end: None,
             dock_height: 0,
             decorator: None,
+            decorator_paints: None,
             last_frame: Vec::new(),
             last_window_start: 0,
             painted_layout: PaintedLayout::default(),
@@ -3248,6 +3265,19 @@ impl TuiCore {
     /// scrollbar, flash — see [`super::altscreen_search`]).
     pub fn set_decorator(&mut self, decorator: Option<FrameDecorator>) {
         self.decorator = decorator;
+    }
+
+    /// Install (or clear) the paint probe that tells the core whether the
+    /// decorator can actually rewrite rows on a frame. See
+    /// [`FrameDecoratorPaintProbe`].
+    pub fn set_decorator_paint_probe(&mut self, probe: Option<FrameDecoratorPaintProbe>) {
+        self.decorator_paints = probe;
+    }
+
+    /// Whether the decorator can paint the next frame. No decorator, or a
+    /// probe that says it is idle, keeps the raw-frame fast path valid.
+    fn decorator_may_paint(&self) -> bool {
+        self.decorator.is_some() && self.decorator_paints.as_ref().is_none_or(|probe| probe())
     }
 
     /// The last frame's undecorated lines (search corpus / selection source).
@@ -3499,10 +3529,14 @@ impl TuiCore {
     }
 
     /// Apply the decoration hook to `lines` (no-op when none installed).
-    fn apply_decorator(&mut self, lines: &mut Vec<String>, context: FrameDecorateContext) {
+    /// Returns whether the decorator may have painted the rows; callers clear
+    /// [`Self::frame_scratch_raw`] only when that is true.
+    fn apply_decorator(&mut self, lines: &mut Vec<String>, context: FrameDecorateContext) -> bool {
+        let paints = self.decorator_may_paint();
         if let Some(decorator) = &self.decorator {
             decorator(lines, context);
         }
+        paints
     }
 
     /// Build the raw (undecorated) frame off the recycle pool: components
@@ -3551,7 +3585,7 @@ impl TuiCore {
                 forced_blocks.push(*block);
             }
         }
-        let pending_marks_at_start = dirty.marks();
+        let mut assembled_rows = 0usize;
         let mut deferred_out: Vec<u64> = Vec::new();
         let mut processed_blocks: Vec<u64> = Vec::new();
         let row_budget = self.frame_row_budget;
@@ -3613,8 +3647,7 @@ impl TuiCore {
                         if !hit
                             && !forced
                             && row_budget > 0
-                            && dirty.marks().saturating_sub(pending_marks_at_start) as usize
-                                >= row_budget
+                            && assembled_rows >= row_budget
                             && scratch_matches_last
                             && previous_block
                                 .as_ref()
@@ -3740,6 +3773,7 @@ impl TuiCore {
                                 cached_rows += carried_rows;
                             }
                         }
+                        assembled_rows += rows.len();
                         cursor += rows.len();
                         blocks.push(FrameBlockSlot {
                             revision: block_revision,
@@ -3774,7 +3808,7 @@ impl TuiCore {
                 // range to the next frame.
                 if !cache_hit
                     && row_budget > 0
-                    && dirty.marks().saturating_sub(pending_marks_at_start) as usize >= row_budget
+                    && assembled_rows >= row_budget
                     && scratch_matches_last
                 {
                     let deferrable = previous.as_ref().is_some_and(|slot| {
@@ -3816,6 +3850,7 @@ impl TuiCore {
                         work += out.work();
                         cached_rows += rows.len() as u64;
                     }
+                    assembled_rows += rows.len();
                     cursor += rows.len();
                     new_slots.push(FrameComponentSlot {
                         revision,
@@ -3888,6 +3923,7 @@ impl TuiCore {
                     }
                     rerendered_rows += rows.len() as u64;
                     rebuilt_blocks += 1;
+                    assembled_rows += rows.len();
                     cursor += rows.len();
                     new_slots.push(FrameComponentSlot {
                         revision: Some(revision),
@@ -4076,7 +4112,7 @@ impl TuiCore {
             let _ =
                 FRAME_WORK
                     .dirty_rows
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                         Some(value.saturating_sub(delta))
                     });
         }
@@ -4086,7 +4122,7 @@ impl TuiCore {
                 .fetch_add(ranges_merged - previous_merged, Ordering::Relaxed);
         } else {
             let delta = previous_merged - ranges_merged;
-            let _ = FRAME_WORK.dirty_ranges_merged.fetch_update(
+            let _ = FRAME_WORK.dirty_ranges_merged.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |value| Some(value.saturating_sub(delta)),
@@ -4330,7 +4366,7 @@ impl TuiCore {
         // without a full repaint, and a change there would force one.
         let dock = self.dock_height.min(new_lines.len());
         let transcript_end = new_lines.len().saturating_sub(dock);
-        self.apply_decorator(
+        let decorated = self.apply_decorator(
             &mut new_lines,
             FrameDecorateContext {
                 width,
@@ -4342,7 +4378,7 @@ impl TuiCore {
                 scroll_offset: 0,
             },
         );
-        if self.decorator.is_some() {
+        if decorated {
             // The decorator paints into the raw frame in the follow path;
             // the pool no longer holds raw bytes for the next cache hit.
             self.frame_scratch_raw = false;
@@ -4461,7 +4497,8 @@ impl TuiCore {
         // rows (no decorator/clamp rewrote the pool), its dirty markers are
         // exact and the regular path need not scan unchanged rows again.
         // `None` falls back to the full-frame scan.
-        let marker_dirty = if self.decorator.is_none() {
+        let decorator_paints = self.decorator_may_paint();
+        let marker_dirty = if !decorator_paints {
             self.last_frame_dirty.take()
         } else {
             self.last_frame_dirty = None;
@@ -4816,7 +4853,7 @@ impl TuiCore {
         }
         let dock_start = window.len();
 
-        self.apply_decorator(
+        let _ = self.apply_decorator(
             &mut painted,
             FrameDecorateContext {
                 width,

@@ -105,7 +105,8 @@ jobs:
           # back to the generated harness names when jq is unavailable.
           if command -v jq >/dev/null 2>&1; then
             mapfile -t targets < <(cargo metadata --no-deps --format-version 1 \
-              | jq -r '.packages[] | select(.name == "pir-sdk") | .targets[] | select(.kind[] == "test") | .name')
+              | jq -r '.packages[] | select(.name == "pir-sdk") | .targets[] | select(.kind[] == "test") | .name' \
+              | tr -d '\r')
           else
             targets=()
             for f in tests/zz_merged_*.rs; do

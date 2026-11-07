@@ -200,3 +200,68 @@ fn paste_text_uses_the_editor_batch_api_for_a_short_multiline_paste() {
         "alpha\nbeta".chars().count() as u64
     );
 }
+
+/// The console's CRLF spelling: a plain Enter record (CR) followed by the
+/// synthesized Ctrl+Enter record (LF). Both halves are ONE newline.
+fn ctrl_enter() -> Event {
+    press_mod(KeyCode::Enter, KeyModifiers::CONTROL)
+}
+
+/// P1-4 (TUI-PERF2): a pasted `a\r\nb` must become `a\nb`, not `a\n\nb`.
+#[test]
+fn crlf_paste_contributes_one_newline() {
+    let mut coalescer = ConsoleBatchCoalescer::new();
+    let mut events = text_records("a");
+    events.push(press(KeyCode::Enter));
+    events.push(ctrl_enter());
+    events.extend(text_records("b"));
+
+    let out = coalescer.coalesce(events);
+    assert_eq!(
+        paste_texts(&out),
+        vec!["a\nb".to_string()],
+        "CRLF must collapse to one newline: {out:?}"
+    );
+}
+
+/// A CRLF at the end of a paste: the CR terminates the printable run as a
+/// newline (the LF half follows), and the LF chord must be swallowed rather
+/// than emitted as a standalone `ctrl+j` key that inserts an extra line.
+#[test]
+fn trailing_crlf_lf_half_is_swallowed() {
+    let mut coalescer = ConsoleBatchCoalescer::new();
+    let mut events = text_records("abcdefgh");
+    events.push(press(KeyCode::Enter));
+    events.push(ctrl_enter());
+
+    let out = coalescer.coalesce(events);
+    assert_eq!(paste_texts(&out), vec!["abcdefgh\n".to_string()], "{out:?}");
+    assert!(
+        !out.iter().any(|event| matches!(
+            event,
+            Event::Key(key) if key.code == KeyCode::Enter
+        )),
+        "the LF half must not survive as a key: {out:?}"
+    );
+}
+
+/// The CRLF pair can split across console batches: the CR ends batch one as
+/// the submit Enter, and the LF chord at the start of batch two belongs to
+/// the same newline and must vanish.
+#[test]
+fn cross_batch_crlf_lf_half_is_swallowed() {
+    let mut coalescer = ConsoleBatchCoalescer::new();
+    let mut first = text_records("abcdefgh");
+    first.push(press(KeyCode::Enter));
+    let out = coalescer.coalesce(first);
+    assert!(
+        matches!(out.last(), Some(Event::Key(key)) if key.code == KeyCode::Enter),
+        "the final CR must stay a submit key: {out:?}"
+    );
+
+    let second = coalescer.coalesce(vec![ctrl_enter()]);
+    assert!(
+        second.is_empty(),
+        "the LF half of the CRLF must be swallowed: {second:?}"
+    );
+}

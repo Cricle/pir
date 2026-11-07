@@ -115,9 +115,8 @@ fn drop_json_value_iterative(root: serde_json::Value) {
 /// owner, dismantle the tree iteratively; otherwise another owner remains and
 /// dropping this handle is already shallow.
 fn drop_json_arc(value: Arc<serde_json::Value>) {
-    match Arc::try_unwrap(value) {
-        Ok(value) => drop_json_value_iterative(value),
-        Err(_) => {}
+    if let Ok(value) = Arc::try_unwrap(value) {
+        drop_json_value_iterative(value);
     }
 }
 

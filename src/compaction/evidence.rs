@@ -256,8 +256,7 @@ fn last_meaningful_line(text: &str) -> String {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .filter(|line| !line.eq_ignore_ascii_case("(no output)"))
-        .filter(|line| !is_status_line(line))
-        .last()
+        .rfind(|line| !is_status_line(line))
         .unwrap_or("");
     truncate_chars(line, 200)
 }

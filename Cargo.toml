@@ -869,4 +869,12 @@ path = "tests/zz_merged_7.rs"
 name = "zz_merged_8"
 path = "tests/zz_merged_8.rs"
 
+[[test]]
+name = "python_session_lifecycle"
+path = "tests/python_session_lifecycle.rs"
+
+[[test]]
+name = "worker_threads_real"
+path = "tests/worker_threads_real.rs"
+
 # END GENERATED MERGED TEST TARGETS

@@ -2904,7 +2904,6 @@ impl Editor {
     }
 
     /// `max_visible_lines` helper.
-
     fn max_visible_lines(terminal_rows: usize) -> usize {
         (terminal_rows * 30 / 100).max(5)
     }

@@ -109,10 +109,7 @@ use tokio::sync::{oneshot, Notify};
 
 use crate::ai::types::AbortSignal;
 use crate::durable::context::Context;
-use crate::durable::errors::{
-    HostCallback, ReadOnlySession, ReportInfo, ReportTask, StorageError, TaskFaultReason,
-    TaskOutdatedReason,
-};
+use crate::durable::errors::{HostCallback, ReadOnlySession, ReportInfo, ReportTask, StorageError};
 use crate::durable::harness::harness::report_telemetry;
 use crate::durable::harness::settings::{RestartLimit, Settings, DEFAULT_RESTART_LIMIT};
 use crate::durable::harness::task::{ErasedTask, Task};

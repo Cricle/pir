@@ -5750,6 +5750,7 @@ fn print_compaction_hook_impl(
             // The capture-time identity/leaf is the commit-time staleness
             // check: if the session was replaced or the leaf left the captured
             // branch, the compaction entry is not appended over a moved target.
+            #[allow(clippy::large_enum_variant)]
             enum PagedPreparation {
                 Inputs(compaction::paged::PagedCompactionInputs),
                 Failed(String),
