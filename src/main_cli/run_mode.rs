@@ -1663,7 +1663,7 @@ fn run_jobs_command(command: pir::coding_agent::cli::JobsCommand) -> Result<()> 
                 ));
             }
             let spec = JobSpec {
-                command: command.join(" "),
+                command: pir::jobs::shell_command_from_argv(&command),
                 cwd,
                 program: config.program().to_owned(),
                 args: config.args().iter().map(|arg| (*arg).to_owned()).collect(),

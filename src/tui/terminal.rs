@@ -2352,6 +2352,66 @@ pub fn vt_input_opt_in(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
 }
 
+/// Whether the TUI should install `ENABLE_VIRTUAL_TERMINAL_INPUT` on a
+/// Windows console.
+///
+/// The Windows reader now owns the console's VT byte stream
+/// ([`ConsoleVtInputDecoder`]), so the flag is enabled by DEFAULT: upstream
+/// `enableWindowsVTInput` behavior, and the only mode in which a bracketed
+/// paste's markers reach the app instead of being swallowed by ConPTY.
+/// `PIR_TUI_VT_INPUT=0` (or `false`) is the explicit escape hatch back to
+/// crossterm's `INPUT_RECORD` parser for a console that misbehaves under VT
+/// input; unset, `1`, and every other value keep the default. The install
+/// itself is best-effort — a console that refuses the mode falls back to the
+/// record path in [`win_batch_input`] automatically.
+pub fn vt_input_enabled(value: Option<&str>) -> bool {
+    !matches!(value, Some("0") | Some("false"))
+}
+
+/// Crossterm events parsed before the Windows VT input switch.
+///
+/// `App::new` drains crossterm's queue immediately before installing
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT`: after the switch crossterm's record parser
+/// can no longer round-trip console input, but whatever it already parsed
+/// (trust-prompt type-ahead) is valid and must not be dropped. [`run`]'s
+/// input-loop setup replays these through the gate once.
+#[cfg(windows)]
+static EARLY_CROSSTERM_EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+
+/// Move every currently queued crossterm event into
+/// [`EARLY_CROSSTERM_EVENTS`]. Runs while the console is still in
+/// `INPUT_RECORD` mode, so the parser's output is the same one the pre-VT
+/// default produced.
+#[cfg(windows)]
+fn drain_early_crossterm_events() {
+    let mut events = Vec::new();
+    while events.len() < PENDING_INPUT_MAX_EVENTS {
+        match event::poll(Duration::ZERO) {
+            Ok(true) => match event::read() {
+                Ok(event) => events.push(event),
+                Err(_) => break,
+            },
+            Ok(false) | Err(_) => break,
+        }
+    }
+    if !events.is_empty() {
+        let mut queued = EARLY_CROSSTERM_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queued.extend(events);
+    }
+}
+
+/// Take the events [`drain_early_crossterm_events`] parked for the loop.
+#[cfg(windows)]
+fn take_early_crossterm_events() -> Vec<Event> {
+    std::mem::take(
+        &mut *EARLY_CROSSTERM_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
 /// Take the visible dialog out of `slot` — when `predicate` accepts it — and
 /// promote the queue head under the SAME slot-lock acquisition, so the slot is
 /// never observable as empty between the two steps.
@@ -2600,30 +2660,30 @@ impl App {
         if fullscreen {
             let _ = out.execute(EnableMouseCapture);
         }
-        // Deviation from upstream `enableWindowsVTInput` (terminal.ts:414-427).
-        // Upstream owns stdin as raw VT bytes and parses the console's VT
-        // translation itself, so after raw mode (which resets the console
-        // flags) it can ask for `ENABLE_VIRTUAL_TERMINAL_INPUT` and keep
-        // modified keys exact. pir reads stdin through crossterm 0.29's
-        // Windows `INPUT_RECORD` parser, which resolves each record by its
-        // `wVirtualKeyCode` (`event/sys/windows/parse.rs`): the records the
-        // console synthesizes under VT input carry the sequence's bytes in
-        // `uChar` with no usable virtual key, so crossterm either drops them
-        // (the control-code branch with VK 0 yields no event at all — a dead
-        // Enter) or surfaces them as literal `KeyCode::Char`s (the `[13;2u` of
-        // Shift+Enter is typed into the editor as text, and Backspace's `0x7f`
-        // no longer arrives as `KeyCode::Backspace`).
-        // The flag therefore stays off by default, which keeps the ordinary
-        // records crossterm round-trips. What degrades: on Windows a modified
-        // key with no distinct record shape (notably Shift+Tab) loses its
-        // modifier for byte-level rules — the pre-port behavior the
-        // `stdin_buffer` module docs already accept. `PIR_TUI_VT_INPUT=1`
-        // opts back into upstream's mode for a future raw-byte stdin reader;
-        // `cleanup_terminal` then restores the previous console mode.
-        enable_vt_input_if(
-            &mut RealTerminalModeOps,
-            vt_input_opt_in(std::env::var("PIR_TUI_VT_INPUT").ok().as_deref()),
-        );
+        // Upstream `enableWindowsVTInput` (terminal.ts:414-427) is the
+        // DEFAULT Windows input mode: after raw mode (which resets the console
+        // flags) the TUI installs `ENABLE_VIRTUAL_TERMINAL_INPUT`, and the
+        // input loop owns the resulting VT byte stream through
+        // `ConsoleVtInputDecoder` (see `win_batch_input`). The console then
+        // reports a bracketed paste's `ESC [ 2 0 0 ~` / `ESC [ 2 0 1 ~`
+        // markers and a literal `\x03` byte instead of swallowing the markers
+        // and synthesizing a genuine Ctrl+C key record — the ConPTY paste
+        // data-loss defect. Crossterm's `INPUT_RECORD` parser cannot
+        // round-trip that translation (special keys arrive as literal
+        // characters or vanish), so it is kept only as the fallback for a
+        // console that refuses the mode: `PIR_TUI_VT_INPUT=0` forces the old
+        // record path, and a failed `SetConsoleMode` falls back on its own.
+        // `cleanup_terminal` restores the previous console mode.
+        let vt_input_requested =
+            vt_input_enabled(std::env::var("PIR_TUI_VT_INPUT").ok().as_deref());
+        #[cfg(windows)]
+        if vt_input_requested {
+            // Anything crossterm parsed before this point (trust-prompt
+            // type-ahead) is valid under the record parser; park it for the
+            // event loop before the console switches to VT bytes.
+            drain_early_crossterm_events();
+        }
+        enable_vt_input_if(&mut RealTerminalModeOps, vt_input_requested);
 
         // Ctrl+O tool expansion, shared with the transcript blocks
         // (upstream `app.tools.expand`). When an extension runtime exists this
@@ -9561,15 +9621,27 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
     // below has (almost) nothing to pre-read.
     #[cfg(windows)]
     if let Some(batch) = win_batch.as_mut() {
+        // Events crossterm parsed before `App::new` switched the console to
+        // VT input (trust-prompt type-ahead) are replayed first, in order.
+        for event in take_early_crossterm_events() {
+            pending_input.extend(input_gate.push(event, Instant::now()));
+        }
         let mut preloop: Vec<Event> = Vec::new();
         batch.drain(&mut preloop);
         for event in preloop {
             pending_input.extend(input_gate.push(event, Instant::now()));
         }
-        let mut flushed = 0usize;
-        while flushed < PENDING_INPUT_MAX_EVENTS && event::poll(Duration::ZERO)? {
-            pending_input.extend(input_gate.push(event::read()?, Instant::now()));
-            flushed += 1;
+        // In VT mode crossterm's `INPUT_RECORD` parser cannot round-trip the
+        // console's VT translation (special keys arrive as literal
+        // characters or vanish), so every record at this point belongs to
+        // the batch reader; touching the crossterm queue would consume a
+        // record with the wrong parser.
+        if !batch.uses_vt_bytes() {
+            let mut flushed = 0usize;
+            while flushed < PENDING_INPUT_MAX_EVENTS && event::poll(Duration::ZERO)? {
+                pending_input.extend(input_gate.push(event::read()?, Instant::now()));
+                flushed += 1;
+            }
         }
     }
 
@@ -11470,6 +11542,15 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             .chain(console_coalescer.pending_enter_deadline())
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
             .fold(timeout, |current, remaining| current.min(remaining));
+        // A VT-mode sequence window (`ESC` waiting for its continuation, a
+        // bracketed-paste marker being reassembled) must flush on its own
+        // schedule even when no further console record arrives.
+        #[cfg(windows)]
+        let timeout = win_batch
+            .as_ref()
+            .and_then(|batch| batch.vt_deadline())
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .map_or(timeout, |remaining| timeout.min(remaining));
         // P1-1: snapshot the transcript length before the input poll — any
         // entries pushed while handling this event (slash-command notices
         // like /help, /hotkeys, /copy, failed pastes, …) must be flushed
@@ -11494,6 +11575,15 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                 pending_input.extend(input_gate.push(event, Instant::now()));
             }
             for event in console_coalescer.poll_marker_tail(Instant::now()) {
+                pending_input.extend(input_gate.push(event, Instant::now()));
+            }
+        }
+        // VT-mode byte buffer: release a held `ESC` / sequence prefix whose
+        // window elapsed without a follow-up console record.
+        #[cfg(windows)]
+        if let Some(batch) = win_batch.as_mut() {
+            let released = batch.flush_vt_due(Instant::now());
+            for event in released {
                 pending_input.extend(input_gate.push(event, Instant::now()));
             }
         }
@@ -11687,15 +11777,21 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                 printable_burst.flush(&mut pending_input, !burst_blocked && burst_queue_empty);
             input_trace.note_burst(&outcome);
             if outcome.finished && outcome.total_bytes >= LARGE_PASTE_NOTICE_BYTES {
+                // Report binary units consistently: the thresholds and caps
+                // are powers of two, so the display must be MiB too. Calling
+                // the 1024-based quotient "MB" made one 10 MiB paste read as
+                // "10.0 MB" while a decimal-MB payload of the same digit
+                // count read as "9.4 MB" — the unit label did not match the
+                // arithmetic.
                 let mut text = format!(
-                    "Large paste inserted: {:.1} MB in {} chunk{}",
+                    "Large paste inserted: {:.1} MiB in {} chunk{}",
                     outcome.total_bytes as f64 / (1024.0 * 1024.0),
                     outcome.chunks,
                     if outcome.chunks == 1 { "" } else { "s" }
                 );
                 if outcome.truncated {
                     text.push_str(&format!(
-                        " (truncated at {} MB; content beyond the cap was not inserted)",
+                        " (truncated at {} MiB; content beyond the cap was not inserted)",
                         PrintableBurst::MAX_BYTES / (1024 * 1024)
                     ));
                 } else {
@@ -13567,9 +13663,14 @@ fn handle_key(
         None
     };
 
-    // Ctrl+C (upstream `handleCtrlC`): the first press clears the editor and
-    // arms; a second press within 500ms exits regardless of editor content.
+    // Ctrl+C (upstream `handleCtrlC`): while a run is streaming it aborts
+    // (same effect as Esc); when idle the first press clears the editor and
+    // arms, and a second press within 500ms exits regardless of content.
     if kb.matches(TuiAction::Clear, key) {
+        if worker.is_streaming() {
+            worker.abort();
+            return false;
+        }
         let now = Instant::now();
         if double_press_exit(timing.last_ctrl_c, now) {
             return true;
@@ -19423,7 +19524,7 @@ fn handle_command(
         super::slash::SlashAction::Help => {
             entries.push(ChatEntry::Notice {
                 kind: super::app::NoticeKind::Status,
-                text: "Commands: /model /thinking /clear /compact /new /resume /sessions /fork /clone /name /session /copy /settings /tree /scoped-models /trust /login /logout /changelog /hotkeys /share /import /bug /reload /debug /quit /help · ! runs bash".to_string(),
+                text: "Commands: /model /thinking /clear /compact /new /resume /sessions /fork /clone /name /session /copy /settings /tree /scoped-models /trust /login /logout /changelog /hotkeys /share /import /bug /reload /debug /image /mcp /todos /quit /help · ! runs bash".to_string(),
             });
         }
         super::slash::SlashAction::Tree => {
@@ -25861,6 +25962,121 @@ pub fn decode_console_batch(records: &[ConsoleBatchRecord]) -> Vec<Event> {
     out
 }
 
+/// Decoder for the Windows console's VT input mode.
+///
+/// With `ENABLE_VIRTUAL_TERMINAL_INPUT` installed the console stops
+/// synthesizing key records from the terminal's VT byte stream and instead
+/// queues the stream itself: one `KEY_EVENT` record per UTF-16 unit, carrying
+/// the byte in `u_char` with `VK 0` (a bracketed-paste marker arrives as six
+/// such records, and `\x03` arrives as the literal control byte — not as a
+/// Ctrl+C key record). This decoder reassembles that stream and runs it
+/// through [`super::stdin_buffer::StdinBuffer`], so bracketed paste,
+/// sequence framing and the control bytes inside a paste are handled by the
+/// same upstream byte model the Unix path uses.
+///
+/// Non-BMP characters: ConPTY reports the surrogate pair as two `u_char`
+/// records whose `bKeyDown` flags are both false (probed 2026-11-07), so
+/// surrogate units are paired regardless of `key_down`; every other unit is
+/// taken from its key-down record only (the paired key-up record repeats the
+/// character and would otherwise dispatch twice).
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ConsoleVtInputDecoder {
+    stdin: super::stdin_buffer::StdinBuffer,
+    high_surrogate: Option<u16>,
+    pending: Vec<u8>,
+}
+
+impl ConsoleVtInputDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Buffer one console record, appending every event that becomes ready.
+    pub fn push(&mut self, record: ConsoleBatchRecord, out: &mut Vec<Event>) {
+        match record {
+            ConsoleBatchRecord::Key {
+                key_down, u_char, ..
+            } => {
+                if let Some(character) = self.decode_char(key_down, u_char) {
+                    let mut buffer = [0u8; 4];
+                    self.pending
+                        .extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+                }
+            }
+            ConsoleBatchRecord::Resize { x, y } => {
+                // Resize/focus are console-level, never paste payload: flush
+                // the bytes read before them first so input order is exact.
+                self.finish(Instant::now(), out);
+                out.push(Event::Resize(
+                    (x as i32 + 1).max(0) as u16,
+                    (y as i32 + 1).max(0) as u16,
+                ));
+            }
+            ConsoleBatchRecord::Focus { focused } => {
+                self.finish(Instant::now(), out);
+                out.push(if focused {
+                    Event::FocusGained
+                } else {
+                    Event::FocusLost
+                });
+            }
+        }
+    }
+
+    fn decode_char(&mut self, key_down: bool, unit: u16) -> Option<char> {
+        if unit == 0 {
+            return None;
+        }
+        if (0xD800..=0xDFFF).contains(&unit) {
+            if (0xDC00..=0xDFFF).contains(&unit) {
+                let high = self.high_surrogate.take()?;
+                return char::decode_utf16([high, unit]).next().and_then(Result::ok);
+            }
+            self.high_surrogate = Some(unit);
+            return None;
+        }
+        if !key_down {
+            return None;
+        }
+        char::from_u32(u32::from(unit))
+    }
+
+    /// Feed the buffered VT bytes through the byte buffer, then flush a
+    /// sequence window that already expired. The event loop calls this once
+    /// per drained console batch and from the poll deadline.
+    pub fn finish(&mut self, now: Instant, out: &mut Vec<Event>) {
+        if !self.pending.is_empty() {
+            let bytes = std::mem::take(&mut self.pending);
+            let sequences = self.stdin.process(&bytes, now);
+            out.extend(super::stdin_buffer::stdin_events_to_events(sequences));
+        }
+        let due = self.stdin.flush_due(now);
+        out.extend(super::stdin_buffer::stdin_events_to_events(due));
+    }
+
+    /// The pending sequence-timeout deadline, for the loop's poll timeout.
+    pub fn pending_deadline(&self) -> Option<Instant> {
+        self.stdin.pending_deadline()
+    }
+}
+
+/// Decode one batch of [`ConsoleBatchRecord`]s through the VT byte model
+/// exactly as the Windows VT reader would. Test seam mirroring
+/// [`decode_console_batch`].
+#[doc(hidden)]
+pub fn decode_console_vt_batch(records: &[ConsoleBatchRecord]) -> Vec<Event> {
+    let mut decoder = ConsoleVtInputDecoder::new();
+    let mut out = Vec::new();
+    for record in records {
+        decoder.push(*record, &mut out);
+    }
+    let now = Instant::now();
+    decoder.finish(now, &mut out);
+    decoder.finish(now + Duration::from_secs(1), &mut out);
+    out
+}
+
 /// Windows console input batch reader (TUI-P4).
 ///
 /// Crossterm's Windows source reads `INPUT_RECORD`s one at a time: each
@@ -25884,7 +26100,7 @@ mod win_batch_input {
         Console, ControlKeyState, EventFlags, Handle, HandleType, InputRecord, ScreenBuffer,
     };
 
-    use super::{ConsoleBatchDecoder, ConsoleBatchRecord};
+    use super::{ConsoleBatchDecoder, ConsoleBatchRecord, ConsoleVtInputDecoder};
 
     const SHIFT_PRESSED: u32 = 0x0010;
     const LEFT_ALT_PRESSED: u32 = 0x0002;
@@ -25895,6 +26111,11 @@ mod win_batch_input {
     pub(super) struct BatchReader {
         console: Console,
         decoder: ConsoleBatchDecoder,
+        /// `Some` when `ENABLE_VIRTUAL_TERMINAL_INPUT` is installed: the
+        /// console then queues the terminal's VT byte stream as per-unit
+        /// `KEY_EVENT` records, which must go through the byte model rather
+        /// than the key-record decoder (see [`ConsoleVtInputDecoder`]).
+        vt: Option<ConsoleVtInputDecoder>,
         left: bool,
         right: bool,
         middle: bool,
@@ -25909,13 +26130,25 @@ mod win_batch_input {
             // stdin (pipe/file) has no console queue to wait on; the caller
             // falls back to crossterm's event source, exactly as before.
             console.number_of_console_input_events().ok()?;
+            let vt = matches!(
+                super::super::stdin_buffer::windows_vt_input_status(),
+                super::super::stdin_buffer::VtInputStatus::FlagSet
+            )
+            .then(ConsoleVtInputDecoder::new);
             Some(Self {
                 console,
                 decoder: ConsoleBatchDecoder::new(),
+                vt,
                 left: false,
                 right: false,
                 middle: false,
             })
+        }
+
+        /// Whether the console delivers the raw VT byte stream (VT input
+        /// mode). The event loop uses this to skip crossterm's record parser.
+        pub(super) fn uses_vt_bytes(&self) -> bool {
+            self.vt.is_some()
         }
 
         /// Records already queued in the console input buffer.
@@ -25930,6 +26163,42 @@ mod win_batch_input {
                 return;
             };
             for record in records {
+                if let Some(vt) = self.vt.as_mut() {
+                    match record {
+                        InputRecord::KeyEvent(key) => vt.push(
+                            ConsoleBatchRecord::Key {
+                                key_down: key.key_down,
+                                virtual_key_code: key.virtual_key_code,
+                                u_char: key.u_char,
+                                modifiers: Self::modifiers(&key.control_key_state),
+                            },
+                            out,
+                        ),
+                        // In VT mode the terminal's mouse reports arrive in
+                        // the byte stream (SGR sequences, decoded by the byte
+                        // model). A MOUSE_EVENT record is still handled for a
+                        // console that reports both.
+                        InputRecord::MouseEvent(mouse) => {
+                            vt.finish(std::time::Instant::now(), out);
+                            self.push_mouse(&mouse, out);
+                        }
+                        InputRecord::WindowBufferSizeEvent(size) => vt.push(
+                            ConsoleBatchRecord::Resize {
+                                x: size.size.x,
+                                y: size.size.y,
+                            },
+                            out,
+                        ),
+                        InputRecord::FocusEvent(focus) => vt.push(
+                            ConsoleBatchRecord::Focus {
+                                focused: focus.set_focus,
+                            },
+                            out,
+                        ),
+                        InputRecord::MenuEvent(_) => {}
+                    }
+                    continue;
+                }
                 match record {
                     InputRecord::KeyEvent(key) => self.decoder.push(
                         ConsoleBatchRecord::Key {
@@ -25957,6 +26226,27 @@ mod win_batch_input {
                     InputRecord::MenuEvent(_) => {}
                 }
             }
+            if let Some(vt) = self.vt.as_mut() {
+                vt.finish(std::time::Instant::now(), out);
+            }
+        }
+
+        /// Release a VT sequence window that expired with no new record.
+        pub(super) fn flush_vt_due(&mut self, now: std::time::Instant) -> Vec<Event> {
+            let Some(vt) = self.vt.as_mut() else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            vt.finish(now, &mut out);
+            out
+        }
+
+        /// The VT byte buffer's pending sequence deadline, for the event
+        /// loop's poll timeout (a lone ESC must flush on its own schedule).
+        pub(super) fn vt_deadline(&self) -> Option<std::time::Instant> {
+            self.vt
+                .as_ref()
+                .and_then(ConsoleVtInputDecoder::pending_deadline)
         }
 
         fn modifiers(state: &ControlKeyState) -> KeyModifiers {
@@ -26466,23 +26756,18 @@ pub fn worker_error_ends_run_state(run_in_flight: bool) -> bool {
 /// F4 (pure; regression-tested): the run-level error NOTICE a settled run
 /// reports to the transcript, if any.
 ///
-/// One abort must produce ONE visible error. An aborted run already surfaces
-/// its error in the settled assistant entry — the terminal message the
-/// provider's abort built carries `error_message` and the message component
-/// renders it — plus the `Interrupted` status, so the run-level notice is
-/// suppressed (`None`). Upstream's `agent_end` shows no error line either
-/// (interactive-mode.ts:3653-3666: it only clears the working indicator and
-/// the streaming component; the message component carries the error). A real
-/// (non-abort) `StopReason::Error` keeps its single notice, as before.
+/// The settled assistant entry already renders the terminal `error_message`
+/// (the message component prints the `Error: …` row), so a second run-level
+/// notice duplicates the same error. This was observed for both aborted and
+/// real provider-error runs (QA1-F04): the notice is therefore suppressed for
+/// every terminal message; the message component is the single visible error.
 pub fn settled_run_error_notice(
     aborted: bool,
     stop_reason: crate::ai::types::StopReason,
     error_message: Option<&str>,
 ) -> Option<String> {
-    if aborted || stop_reason != crate::ai::types::StopReason::Error {
-        return None;
-    }
-    error_message.map(str::to_owned)
+    let _ = (aborted, stop_reason, error_message);
+    None
 }
 
 /// F2: emit a worker-level failure — the error notice followed by the run-end

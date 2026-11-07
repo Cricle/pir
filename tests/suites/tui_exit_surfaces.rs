@@ -148,13 +148,14 @@ fn f4_one_abort_one_error_row() {
     );
 }
 
-/// The non-abort paths keep their single notice, and the notice is only
-/// emitted for an actual error stop with a message.
+/// Every terminal error is already rendered by the settled assistant entry;
+/// a run-level notice would duplicate the `Error: …` row (QA1-F04).
 #[test]
-fn f4_real_error_keeps_its_single_notice() {
+fn f4_real_error_does_not_duplicate_the_assistant_error_row() {
     assert_eq!(
         settled_run_error_notice(false, StopReason::Error, Some("provider exploded")),
-        Some("provider exploded".to_string())
+        None,
+        "the settled assistant entry renders the error; no second notice"
     );
     assert_eq!(
         settled_run_error_notice(false, StopReason::Error, None),

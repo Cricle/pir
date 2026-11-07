@@ -9,7 +9,7 @@
 //! `--fork` > `--session` > `--resume` > `--continue` > `--session-id` >
 //! new session.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::session_manager::SessionManager;
 
@@ -137,6 +137,21 @@ fn resolve_session_ref(arg: &str, cwd: &Path, session_dir: &Path) -> Resolved {
         };
     }
     Resolved::NotFound(arg.to_owned())
+}
+
+/// Resolve a `--session`-style reference (literal path, exact id, or unique
+/// id prefix — [`resolve_session_ref`]'s rules) to the session file path.
+///
+/// Hosts that accept a session reference of their own (the RPC `attach`
+/// command) use this so `attach {"session": "<id>"}` matches the CLI's
+/// `--session <id>` resolution instead of accepting only a full path. A
+/// cross-project id resolves to its path: RPC attach already accepts an
+/// explicit path outside the current project and has no fork prompt.
+pub fn resolve_session_path(arg: &str, cwd: &Path, session_dir: &Path) -> crate::Result<PathBuf> {
+    match resolve_session_ref(arg, cwd, session_dir) {
+        Resolved::Found(path) | Resolved::CrossProject { path, .. } => Ok(path),
+        Resolved::NotFound(arg) => Err(anyhow::anyhow!(session_not_found_message(&arg))),
+    }
 }
 
 /// The notice upstream prints before it offers to fork a session that lives

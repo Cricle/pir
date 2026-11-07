@@ -269,18 +269,48 @@ fn partition_file_args_empty_is_all_text() {
     assert!(images.is_empty());
 }
 
-/// Unreadable garbage that matches no image signature stays on the text path.
+/// Binary content that matches no image signature must be rejected with an
+/// explicit "binary file" error, never inlined as U+FFFD mojibake.
 #[test]
-fn partition_file_args_binary_non_image_goes_to_text() {
+fn partition_file_args_binary_non_image_is_rejected() {
     let dir = TempDir::new("binary");
     let bin = dir.0.join("blob.bin");
     std::fs::write(&bin, [0x00, 0x01, 0x02, 0x03]).expect("write blob");
+    let error = partition_file_args(&["blob.bin".to_string()], &dir.0)
+        .expect_err("binary @file must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("Binary file"), "{message}");
+    assert!(message.contains("blob.bin"), "{message}");
+}
+
+/// Invalid UTF-8 without a NUL is binary too (latin-1 bytes, truncated
+/// multi-byte sequence): the lossy decoder would have produced U+FFFD.
+#[test]
+fn partition_file_args_invalid_utf8_is_rejected() {
+    let dir = TempDir::new("invalid-utf8");
+    let bin = dir.0.join("legacy.txt");
+    std::fs::write(&bin, [0x41, 0xC3, 0x28, 0x42]).expect("write invalid utf8");
+    let error = partition_file_args(&["legacy.txt".to_string()], &dir.0)
+        .expect_err("invalid UTF-8 @file must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("Binary file"), "{message}");
+    assert!(message.contains("UTF-8"), "{message}");
+}
+
+/// Valid UTF-8 text (with a BOM) still renders through the `<file>` block.
+#[test]
+fn partition_file_args_utf8_text_still_inlines() {
+    let dir = TempDir::new("utf8-text");
+    let text = dir.0.join("notes.txt");
+    std::fs::write(&text, "\u{feff}hello 中文").expect("write text");
     let (file_text, images) =
-        partition_file_args(&["blob.bin".to_string()], &dir.0).expect("partition");
+        partition_file_args(&["notes.txt".to_string()], &dir.0).expect("text partition");
     assert!(
-        file_text.contains(&format!("<file name=\"{}\">", bin.display())),
+        file_text.contains(&format!("<file name=\"{}\">", text.display())),
         "{file_text}"
     );
+    assert!(file_text.contains("hello 中文"), "{file_text}");
+    assert!(!file_text.contains('\u{feff}'), "BOM must be stripped");
     assert!(images.is_empty());
 }
 

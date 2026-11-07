@@ -1028,10 +1028,17 @@ impl RpcServerState {
             as_path.to_path_buf()
         } else {
             let with_extension = self.session_dir.join(format!("{name}.jsonl"));
-            if !with_extension.exists() {
-                anyhow::bail!("session not found: {name}");
+            if with_extension.exists() {
+                with_extension
+            } else {
+                // Accept the same exact-id / unique-prefix references as the
+                // CLI `--session <ID_OR_PATH>` instead of requiring a path.
+                crate::coding_agent::session_resolve::resolve_session_path(
+                    name,
+                    Path::new(&current_cwd_string()),
+                    &self.session_dir,
+                )?
             }
-            with_extension
         };
         let manager = crate::coding_agent::session_resolve::open_session_tail_first(&path)?;
         // Upstream `assertSessionCwdExists` (session-cwd.ts:54-59): a stored

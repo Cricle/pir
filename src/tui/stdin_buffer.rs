@@ -1700,10 +1700,32 @@ pub fn decode_startup_input_bytes(bytes: &[u8]) -> Vec<Event> {
     let mut buffer = StdinBuffer::default();
     let mut sequences = buffer.process(bytes, now);
     sequences.extend(buffer.flush_due(now + Duration::from_secs(1)));
+    stdin_events_to_events(sequences)
+}
+
+/// Decode one [`StdinBuffer`] pass into the key/event shapes the TUI's input
+/// layer consumes (upstream `terminal.ts` `handleInput`).
+///
+/// A complete escape sequence goes through [`decode_input_sequence`] (the
+/// crossterm subset); anything else is plain text and becomes one key press
+/// per character, with the console-compatible shapes for `\r`/`\n`, Tab,
+/// Backspace and the C0 control chords. A [`StdinEvent::Paste`] stays one
+/// `Event::Paste` — its control bytes are the editor's `clean_paste_text`
+/// input, never key dispatch (this is what keeps a pasted Ctrl+C from
+/// clearing the editor).
+pub fn stdin_events_to_events(sequences: Vec<StdinEvent>) -> Vec<Event> {
     let mut events = Vec::new();
     for sequence in sequences {
         match sequence {
             StdinEvent::Data(data) => {
+                if data == [ESC] {
+                    // A lone ESC is the Escape key, not `ctrl+[`: the
+                    // generic C0 mapping below would spell 0x1b as the
+                    // `{` control chord, so dialogs (settings, menus) could
+                    // not close in the Windows VT byte path.
+                    events.push(key_event(KeyCode::Esc, KeyModifiers::empty()));
+                    continue;
+                }
                 if data.first() == Some(&ESC) {
                     if let Some(decoded) = decode_input_sequence(&data) {
                         events.extend(decoded);
@@ -1733,6 +1755,25 @@ pub fn decode_startup_input_bytes(bytes: &[u8]) -> Vec<Event> {
         }
     }
     events
+}
+
+/// Decode one chunk of the raw VT stdin byte stream exactly like the Windows
+/// VT input path does: run it through a fresh [`StdinBuffer`] and resolve the
+/// resulting sequences with [`stdin_events_to_events`].
+///
+/// A live reader keeps one [`StdinBuffer`] across console reads instead (so
+/// markers and escape sequences may straddle reads); this one-shot form is
+/// the test/inspection seam for the stream ConPTY delivers under
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT`.
+pub fn decode_vt_input_bytes(bytes: &[u8]) -> Vec<Event> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let now = Instant::now();
+    let mut buffer = StdinBuffer::default();
+    let mut sequences = buffer.process(bytes, now);
+    sequences.extend(buffer.flush_due(now + Duration::from_secs(1)));
+    stdin_events_to_events(sequences)
 }
 
 /// Upstream's legacy meta rule (`keys.ts:1346-1356`): `ESC` + one byte is an
