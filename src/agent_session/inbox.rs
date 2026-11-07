@@ -119,7 +119,7 @@ impl Inbox {
             // reply was dropped with the queued messages still inside it. Do
             // not let that loss stay silent.
             Err(_) => {
-                tracing::warn!(
+                tracing::debug!(
                     "inbox consumer dropped the reply; queued messages may have been lost"
                 );
                 Vec::new()
@@ -139,7 +139,7 @@ impl Inbox {
         match answer.await {
             Ok(delivered) => delivered,
             Err(_) => {
-                tracing::warn!(
+                tracing::debug!(
                     "inbox consumer dropped the reply; queued messages may have been lost"
                 );
                 Vec::new()
@@ -159,7 +159,7 @@ impl Inbox {
         match answer.await {
             Ok(delivered) => delivered,
             Err(_) => {
-                tracing::warn!(
+                tracing::debug!(
                     "inbox consumer dropped the reply; queued messages may have been lost"
                 );
                 Vec::new()
