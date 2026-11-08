@@ -20157,6 +20157,18 @@ fn handle_command(
             // `/export`), so a quoted path loses its quotes.
             match path_command_argument(command, "import") {
                 Some(path) => {
+                    // Validate before asking to replace the live session: a
+                    // typo used to show the destructive confirm modal first
+                    // and only fail after the user accepted (A71-F01/A54-F01).
+                    if !std::path::Path::new(&path).is_file() {
+                        entries.push(ChatEntry::Notice {
+                            kind: super::app::NoticeKind::Error,
+                            text: format!(
+                                "Failed to import session: file not found or not a file: {path}"
+                            ),
+                        });
+                        return SlashCommandOutcome::Handled;
+                    }
                     // Upstream confirms before replacing
                     // (`showExtensionConfirm("Import session", ...)`); No/Esc
                     // cancels.
