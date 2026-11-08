@@ -29344,6 +29344,20 @@ async fn handle_session_command(
             // Full open, deliberately (see the /resume picker note): the swap
             // emits `session_tree` to extensions, and a paged manager would
             // hand them a tail-window tree.
+            let import_path = std::path::Path::new(&path);
+            if !import_path.is_file() {
+                // `SessionManager::open` on a missing path creates a fresh
+                // session, which made `/import typo.jsonl` look successful and
+                // silently drop the outgoing context (A29-F01). Validate the
+                // source before touching the live session.
+                let _ = events.send(WorkerEvent::SessionSwitchSettled { switch_epoch });
+                return report_session_outcome(
+                    events,
+                    Err(format!(
+                        "Failed to import session: file not found or not a file: {path}"
+                    )),
+                );
+            }
             let outcome =
                 match crate::session_manager::SessionManager::open(std::path::Path::new(&path)) {
                     Ok(manager) => {
