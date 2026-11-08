@@ -1528,6 +1528,15 @@ impl RpcServerState {
         if std::env::var_os("PIR_DEBUG_RPC").is_some() {
             eprintln!("[rpc-debug] spawning prompt run");
         }
+        // The prompt future runs on a per-run runtime (`spawn_prompt_run`).
+        // Pin the inbox consumers to THIS long-lived serving runtime first:
+        // a consumer lazily spawned inside the per-run runtime dies with it,
+        // so steering/follow-up queued during a later turn would sit in the
+        // channel forever (A27 P1: warm steer/followUp accepted but never
+        // delivered, pendingMessageCount stuck at 1).
+        if let Ok(queue_runtime) = tokio::runtime::Handle::try_current() {
+            session.ensure_queue_consumers_on(&queue_runtime);
+        }
         // A dedicated thread/runtime, not `tokio::spawn`: the run's event
         // bridge blocks when the client's stdout stalls, and that must never
         // park the serving runtime's only worker (see `spawn_prompt_run`).

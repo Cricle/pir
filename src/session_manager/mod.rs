@@ -2133,7 +2133,17 @@ impl SessionWriterLock {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     match retention::session_lock_snapshot(&lock_path).state {
-                        retention::SessionLockState::Live => return None,
+                        retention::SessionLockState::Live => {
+                            // A dead owner's lock is reclaimable immediately,
+                            // even inside the conservative stale-age window:
+                            // a normal TUI `/quit` leaves the file behind and
+                            // the next `--continue`/resume must not be locked
+                            // out for an hour (A27 P0). Live, foreign-host and
+                            // unparseable locks stay untouched.
+                            if !retention::reclaim_provably_dead_session_lock(&lock_path) {
+                                return None;
+                            }
+                        }
                         retention::SessionLockState::Missing => continue,
                         retention::SessionLockState::Stale => {
                             if !retention::reclaim_stale_session_lock(&lock_path) {

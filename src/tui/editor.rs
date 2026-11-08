@@ -853,6 +853,20 @@ impl Editor {
     ///
     /// Returns the cleaned text actually inserted (for status reporting).
     pub fn paste_text(&self, text: &str) -> String {
+        self.paste_text_impl(text, true).unwrap_or_default()
+    }
+
+    /// [`Self::paste_text`] for the TUI paste paths, which only distinguish
+    /// "nothing inserted" from "inserted": the full cleaned payload is never
+    /// materialized as a second owned copy (A28-F02: a 50 MB paste paid one
+    /// useless 50 MB `String` here, dropped immediately by the caller).
+    ///
+    /// Returns whether a non-empty payload was inserted.
+    pub fn paste_text_discard(&self, text: &str) -> bool {
+        self.paste_text_impl(text, false).is_some()
+    }
+
+    fn paste_text_impl(&self, text: &str, want_return: bool) -> Option<String> {
         self.io_paste_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.io_paste_bytes
@@ -938,10 +952,18 @@ impl Editor {
             let inserted = self.insert_text_inner(&marker);
             report.inserted_lines = inserted.lines_added;
             report.copied_bytes += inserted.copied_bytes;
-            let returned = cleaned.text.into_owned();
-            if input_was_borrowed {
-                report.copied_bytes += returned.len();
-            }
+            let non_empty = !cleaned.text.is_empty();
+            let returned = if want_return {
+                let returned = cleaned.text.into_owned();
+                if input_was_borrowed {
+                    report.copied_bytes += returned.len();
+                }
+                Some(returned)
+            } else if non_empty {
+                Some(String::new())
+            } else {
+                None
+            };
             report.undo_snapshots = self.undo_depth().saturating_sub(undo_before) as u64;
             *self
                 .last_paste
@@ -953,10 +975,18 @@ impl Editor {
         let inserted = self.insert_text_burst(cleaned.text.as_ref());
         report.inserted_lines = inserted.lines_added;
         report.copied_bytes += inserted.copied_bytes;
-        let returned = cleaned.text.into_owned();
-        if input_was_borrowed {
-            report.copied_bytes += returned.len();
-        }
+        let non_empty = !cleaned.text.is_empty();
+        let returned = if want_return {
+            let returned = cleaned.text.into_owned();
+            if input_was_borrowed {
+                report.copied_bytes += returned.len();
+            }
+            Some(returned)
+        } else if non_empty {
+            Some(String::new())
+        } else {
+            None
+        };
         report.undo_snapshots = self.undo_depth().saturating_sub(undo_before) as u64;
         *self
             .last_paste
@@ -1160,6 +1190,19 @@ impl Editor {
             index += 1;
         }
         out
+    }
+
+    /// `str::trim` semantics without allocating a second full-size buffer.
+    fn trim_in_place(mut text: String) -> String {
+        let start = text.len() - text.trim_start().len();
+        let end = text.trim_end().len();
+        if start > 0 || end < text.len() {
+            text.truncate(end);
+            if start > 0 {
+                text.drain(..start);
+            }
+        }
+        text
     }
 
     fn normalize_col(state: &EditorState, line_index: usize, col: usize) -> usize {
@@ -2378,7 +2421,10 @@ impl Editor {
         let text = self.get_text();
         let registry = self.paste_registry_snapshot();
         let text = Self::expand_paste_markers(&text, &registry.pastes);
-        let text = text.trim().to_string();
+        // Trim in place: `trim().to_string()` copied the whole expanded prompt
+        // (a 50 MB paste paid a second 50 MB allocation just to drop
+        // surrounding whitespace).
+        let text = Self::trim_in_place(text);
         if text.is_empty() {
             return None;
         }

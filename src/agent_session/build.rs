@@ -1162,7 +1162,14 @@ impl AgentSession {
 
     /// Expand prompt commands (`/skill:name`, `/template`) in submitted text
     /// (upstream `_expandSkillCommand` + `expandPromptTemplate`).
-    pub(super) fn expand_prompt_commands(&self, text: &str) -> String {
+    ///
+    /// Takes the prompt by value and returns it unchanged when it cannot be a
+    /// command (no leading `/`), so an ordinary prompt pays no full-size copy
+    /// on this step (A28-F02).
+    pub(super) fn expand_prompt_commands(&self, text: String) -> String {
+        if !text.starts_with('/') {
+            return text;
+        }
         let skills = self
             .skills
             .read()
@@ -1173,7 +1180,7 @@ impl AgentSession {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        crate::coding_agent::resources::expand_prompt_commands(text, &skills, &prompt_templates)
+        crate::coding_agent::resources::expand_prompt_commands(&text, &skills, &prompt_templates)
     }
 
     /// A clone of the current model (thread-safe snapshot).
@@ -1275,7 +1282,7 @@ impl AgentSession {
     }
 
     pub fn steer(&self, text: &str) -> Disposition {
-        let expanded = self.expand_prompt_commands(text);
+        let expanded = self.expand_prompt_commands(text.to_owned());
         let disposition = self.queued_input_disposition();
         self.enqueue_steering(agent_loop::PromptMessage::text(expanded));
         disposition
@@ -1285,7 +1292,7 @@ impl AgentSession {
     /// finished. Prompt commands are expanded before queueing. Returns the
     /// REAL disposition like [`Self::steer`].
     pub fn follow_up(&self, text: &str) -> Disposition {
-        let expanded = self.expand_prompt_commands(text);
+        let expanded = self.expand_prompt_commands(text.to_owned());
         let disposition = self.queued_input_disposition();
         self.enqueue_follow_up(agent_loop::PromptMessage::text(expanded));
         disposition

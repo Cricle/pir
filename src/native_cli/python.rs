@@ -30,6 +30,31 @@ const CLI_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[cfg(feature = "python")]
 pub(crate) fn run(args: &[String]) -> RunOutcome {
+    // CPython's top-level `-h`/`-V` never fall through to a system
+    // interpreter. On a Windows host without `python3.exe` that fallback was a
+    // silent rc 9009 (A27-F08).
+    if let Some(first) = args.first().map(String::as_str) {
+        match first {
+            "-h" | "--help" => {
+                println!(
+                    "usage: pir python [option] ... [-c cmd | - | file | -] [arg] ...\n\
+                     \n\
+                     Embedded RustPython 3.12 interpreter.\n\
+                     Options:\n\
+                       -c cmd      program passed in as string\n\
+                       -           program read from stdin\n\
+                       -h, --help  show this help and exit\n\
+                       -V, --version  show the Python version and exit"
+                );
+                return RunOutcome::Exit(0);
+            }
+            "-V" | "--version" => {
+                println!("Python 3.12.0");
+                return RunOutcome::Exit(0);
+            }
+            _ => {}
+        }
+    }
     let (source, argv, script_dir) = match parse(args) {
         Ok(parsed) => parsed,
         Err(outcome) => return outcome,

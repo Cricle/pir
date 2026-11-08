@@ -241,3 +241,43 @@ fn huge_submit_is_not_retained_in_history() {
         "a >1 MiB submit must not be retained in up-arrow history"
     );
 }
+
+/// The transcript keeps only a bounded display head of a huge user message;
+/// the worker payload stays byte-exact (the model/session copy is untouched).
+#[test]
+fn huge_user_message_display_is_capped_but_model_text_is_exact() {
+    use pir::tui::terminal::{submit_user_texts, USER_ENTRY_DISPLAY_MAX_BYTES};
+
+    let raw = "M".repeat(USER_ENTRY_DISPLAY_MAX_BYTES + 4096);
+    let texts = submit_user_texts(&raw, &raw);
+    assert_eq!(texts.to_model, raw, "the model text must stay exact");
+    assert!(
+        texts.display.len() < raw.len(),
+        "the display entry must be capped"
+    );
+    assert!(texts
+        .display
+        .starts_with(&raw[..USER_ENTRY_DISPLAY_MAX_BYTES]));
+    assert!(texts.display.contains("truncated for display"));
+}
+
+/// The TUI paste path uses the discard variant: same editor state as
+/// `paste_text`, without materializing the caller-ignored full-size String.
+#[test]
+fn paste_text_discard_matches_paste_text_state() {
+    let payload = (0..2_000)
+        .map(|index| format!("line {index:04}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let returned_editor = Editor::new();
+    let returned = returned_editor.paste_text(&payload);
+    assert_eq!(returned, payload);
+
+    let discarding_editor = Editor::new();
+    assert!(discarding_editor.paste_text_discard(&payload));
+    assert_eq!(returned_editor.get_text(), discarding_editor.get_text());
+    assert_eq!(
+        returned_editor.expanded_text(),
+        discarding_editor.expanded_text()
+    );
+}

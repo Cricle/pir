@@ -232,6 +232,11 @@ pub const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 /// most this much.
 pub const MAX_PASTE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Accumulation capacity kept by the input buffers after a paste closes.
+/// Anything larger is released: a completed 10–50 MB paste must not pin its
+/// scratch buffer for the whole session (A28-F02).
+const PASTE_BUFFER_RETAIN_BYTES: usize = 64 * 1024;
+
 /// The event-loop coalescer's threshold: a run of at least this many rapid
 /// text key events in one drained input batch becomes one `Event::Paste`.
 /// Kept in the event loop (not the per-key gate) so key-sequence parsing and
@@ -595,11 +600,18 @@ impl StdinBuffer {
             self.deadline = None;
             return;
         };
-        let content = self.paste_buffer[..end].to_vec();
-        let remaining = self.paste_buffer[end + BRACKETED_PASTE_END.len()..].to_vec();
+        // Hand the collected bytes out without a second full-size copy: the
+        // prefix stays in `paste_buffer`'s allocation, the (usually tiny)
+        // remainder is copied off and the marker dropped from the front.
+        let mut content = std::mem::take(&mut self.paste_buffer);
         self.paste_mode = false;
-        self.paste_buffer.clear();
+        let remaining = content[end + BRACKETED_PASTE_END.len()..].to_vec();
+        content.truncate(end);
         self.paste_scanned = 0;
+        // A finished large paste must not pin its accumulation capacity for
+        // the rest of the session (A28-F02: a 10 MB paste retained ~18 MB
+        // here after the reply).
+        shrink_after_paste(&mut self.buffer);
         self.pending_kitty_printable = None;
         out.push(StdinEvent::Paste(content));
         if !remaining.is_empty() {
@@ -840,6 +852,24 @@ fn kitty_printable_codepoint(sequence: &[u8]) -> Option<u32> {
     }
     let codepoint: u32 = std::str::from_utf8(&body[..first_end]).ok()?.parse().ok()?;
     (codepoint >= 32).then_some(codepoint)
+}
+
+/// Convert one complete paste payload into a `String`, moving the bytes when
+/// they are valid UTF-8 (the common case) instead of always copying through
+/// `from_utf8_lossy`.
+fn paste_text_from_bytes(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    }
+}
+
+/// Release a paste-sized accumulation capacity once the payload has been
+/// handed off. Small buffers keep their allocation (the steady-state case).
+fn shrink_after_paste(buffer: &mut Vec<u8>) {
+    if buffer.capacity() > PASTE_BUFFER_RETAIN_BYTES {
+        buffer.shrink_to(PASTE_BUFFER_RETAIN_BYTES);
+    }
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1796,7 +1826,7 @@ pub fn stdin_events_to_events(sequences: Vec<StdinEvent>) -> Vec<Event> {
                 }
             }
             StdinEvent::Paste(payload) => {
-                events.push(Event::Paste(String::from_utf8_lossy(&payload).into_owned()));
+                events.push(Event::Paste(paste_text_from_bytes(payload)));
             }
         }
     }
@@ -2928,23 +2958,29 @@ impl StdinGate {
         payload.extend_from_slice(&bytes);
         // The end marker closes the paste wherever it landed in the payload —
         // including on the very append that also crossed the cap.
-        if let Some(end) = find_subslice(payload, BRACKETED_PASTE_END) {
-            let content = payload[..end].to_vec();
-            let remaining = payload[end + BRACKETED_PASTE_END.len()..].to_vec();
-            self.paste = None;
-            out.push(Event::Paste(String::from_utf8_lossy(&content).into_owned()));
+        let end = find_subslice(payload, BRACKETED_PASTE_END);
+        if let Some(end) = end {
+            // Move the collected prefix out instead of copying it: the gate
+            // buffer is the only owner of the bytes here.
+            let mut content = self.paste.take().unwrap_or_default();
+            let remaining = content[end + BRACKETED_PASTE_END.len()..].to_vec();
+            content.truncate(end);
+            out.push(Event::Paste(paste_text_from_bytes(content)));
             if !remaining.is_empty() {
                 out.extend(self.reabsorb_bytes(remaining, now));
             }
             return;
         }
-        if payload.len() >= MAX_PASTE_BYTES {
+        if self
+            .paste
+            .as_ref()
+            .is_some_and(|payload| payload.len() >= MAX_PASTE_BYTES)
+        {
             // An unterminated paste is capped (see the doc above): flush what
             // was collected — this append included — as the paste payload and
             // return the gate to normal mode. Nothing collected is dropped.
-            let content = std::mem::take(payload);
-            self.paste = None;
-            out.push(Event::Paste(String::from_utf8_lossy(&content).into_owned()));
+            let content = self.paste.take().unwrap_or_default();
+            out.push(Event::Paste(paste_text_from_bytes(content)));
         }
     }
 

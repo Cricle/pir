@@ -3585,7 +3585,7 @@ impl App {
                 }
                 crate::extensions::Notification::EditorPaste(text) => {
                     // `ctx.ui.pasteToEditor` — normalized paste at the cursor.
-                    self.editor.paste_text(&text);
+                    self.editor.paste_text_discard(&text);
                     self.note_editor_change();
                 }
                 crate::extensions::Notification::SetTheme(name) => {
@@ -10461,7 +10461,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                                     text: "Clipboard text too large to paste".to_string(),
                                 });
                             } else {
-                                app.editor.paste_text(&text);
+                                app.editor.paste_text_discard(&text);
                                 app.note_editor_change();
                                 update_autocomplete(&app);
                             }
@@ -10940,10 +10940,18 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     // adds the user message on `message_start`, which pir's
                     // agent loop does not emit for injected prompts.
                     for text in delivered_steering {
-                        entries.push(ChatEntry::User(text));
+                        if let Some(text) =
+                            collect_user_display_text(std::iter::once(text.as_str()))
+                        {
+                            entries.push(ChatEntry::User(text));
+                        }
                     }
                     for text in delivered_follow_up {
-                        entries.push(ChatEntry::User(text));
+                        if let Some(text) =
+                            collect_user_display_text(std::iter::once(text.as_str()))
+                        {
+                            entries.push(ChatEntry::User(text));
+                        }
                     }
                 }
                 WorkerEvent::EntryAppended { entry } => {
@@ -10977,6 +10985,13 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                                     text: error,
                                 });
                             }
+                            // Keep this spelling under the same display cap
+                            // the optimistic submit path applied, so the
+                            // dedupe compare below still matches for a huge
+                            // pasted message.
+                            let display =
+                                collect_user_display_text(std::iter::once(display.as_str()))
+                                    .unwrap_or_default();
                             // A transformed typed prompt stores the display
                             // spelling; compare it before deciding this is a
                             // new message.
@@ -16804,11 +16819,58 @@ pub struct SubmitTexts {
     pub to_model: String,
 }
 
+/// Upper bound on the user text a transcript [`ChatEntry::User`] retains.
+///
+/// The rendered component already caps its painted prefix at 128 K chars
+/// (`USER_MESSAGE_DISPLAY_MAX_CHARS`), but the entry itself is the string the
+/// window/search/tab-title paths hold. Keeping a 50 MB pasted prompt there
+/// costs a whole-payload allocation for the session lifetime; the model copy
+/// and the session file remain exact. Display-only truncation (A28-F02).
+pub const USER_ENTRY_DISPLAY_MAX_BYTES: usize = 1024 * 1024;
+
+const USER_ENTRY_DISPLAY_OMISSION: &str = "\n… [truncated for display; the full message was sent]";
+
+/// Join user text blocks, retaining at most
+/// [`USER_ENTRY_DISPLAY_MAX_BYTES`] of the head plus an omission marker.
+/// Returns `None` when the joined text is empty (the historical "no bubble"
+/// contract).
+#[doc(hidden)]
+pub fn collect_user_display_text<'a>(blocks: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut text = String::new();
+    let mut truncated = false;
+    for block in blocks {
+        if text.len() >= USER_ENTRY_DISPLAY_MAX_BYTES {
+            truncated = true;
+            break;
+        }
+        let remaining = USER_ENTRY_DISPLAY_MAX_BYTES - text.len();
+        if block.len() <= remaining {
+            text.push_str(block);
+        } else {
+            let mut end = remaining;
+            while end > 0 && !block.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.push_str(&block[..end]);
+            truncated = true;
+            break;
+        }
+    }
+    if truncated {
+        text.push_str(USER_ENTRY_DISPLAY_OMISSION);
+    }
+    (!text.is_empty()).then_some(text)
+}
+
 /// Split a raw prompt + its markdown-transformer output into the
 /// `(display, to_model)` pair (pure; regression-tested).
+///
+/// `display` is capped at [`USER_ENTRY_DISPLAY_MAX_BYTES`] so a huge paste
+/// does not retain a second full-size copy in the transcript; `to_model` is
+/// always the exact raw prompt.
 pub fn submit_user_texts(raw: &str, transformed: &str) -> SubmitTexts {
     SubmitTexts {
-        display: transformed.to_string(),
+        display: collect_user_display_text(std::iter::once(transformed)).unwrap_or_default(),
         to_model: raw.to_string(),
     }
 }
@@ -18808,9 +18870,11 @@ fn accept_autocomplete(app: &App) -> Option<String> {
 /// Insert clipboard text at the cursor; degradation is graceful (status
 /// notice, no crash).
 fn paste_into_editor(app: &App, text: &str, entries: &mut Vec<ChatEntry>) {
-    let pasted = app.editor.paste_text(text);
+    // The caller only needs the empty/non-empty distinction; the full
+    // expanded payload is never materialized as a second owned copy.
+    let pasted = app.editor.paste_text_discard(text);
     app.note_editor_change();
-    if pasted.is_empty() {
+    if !pasted {
         entries.push(ChatEntry::Notice {
             kind: super::app::NoticeKind::Warning,
             text: "Clipboard contained no text".to_string(),
@@ -20994,7 +21058,12 @@ fn submit_user_prompt(
     text: &str,
     follow_up: bool,
 ) {
-    let (transformed, error) = transform_markdown(app, text, "user", false, None, None);
+    // Transform only the display head: the entry is capped anyway, and a
+    // markdown pass over a 50 MB paste copied the whole payload for output the
+    // transcript would truncate (A28-F02). The model path below still takes
+    // the exact raw text.
+    let display_src = collect_user_display_text(std::iter::once(text)).unwrap_or_default();
+    let (transformed, error) = transform_markdown(app, &display_src, "user", false, None, None);
     if let Some(error) = error {
         entries.push(ChatEntry::Notice {
             kind: super::app::NoticeKind::Warning,
@@ -24491,15 +24560,12 @@ pub fn transcript_entries_from_messages(
             Message::User(user) => {
                 // Upstream `getUserMessageText`: text blocks joined with ""
                 // (interactive-mode.ts:3795-3801).
-                let text = user
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
+                if let Some(text) =
+                    collect_user_display_text(user.content.iter().filter_map(|block| match block {
                         ContentBlock::Text(text) => Some(text.text.as_str()),
                         _ => None,
-                    })
-                    .collect::<String>();
-                if !text.is_empty() {
+                    }))
+                {
                     replayed.push(ChatEntry::User(text));
                 }
             }
@@ -27258,14 +27324,17 @@ pub fn entry_appended_user_text(entry: &serde_json::Value) -> Option<String> {
     if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
         return None;
     }
-    let text = message
-        .get("content")
-        .and_then(serde_json::Value::as_array)?
-        .iter()
-        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
-        .collect::<String>();
-    (!text.is_empty()).then_some(text)
+    // Build the display head only: collecting the whole JSON text first
+    // allocated another full-size copy of a pasted prompt just to compare it
+    // against the already-capped optimistic bubble (A28-F02).
+    collect_user_display_text(
+        message
+            .get("content")
+            .and_then(serde_json::Value::as_array)?
+            .iter()
+            .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str)),
+    )
 }
 
 /// Whether `raw`/`display` are already represented by the trailing user
@@ -27793,7 +27862,7 @@ async fn run_prompt(
             // `handled` outcome swallows the prompt without starting a turn.
             WorkerRun::Prompt(text) => {
                 prompt_session
-                    .prompt_with_source(&text, "interactive", handler)
+                    .prompt_with_source_owned(text, "interactive", handler)
                     .await
             }
             // A custom-message run goes through the same setup as a prompt

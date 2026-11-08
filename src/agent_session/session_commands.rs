@@ -836,11 +836,19 @@ impl AgentSession {
     /// [`Self::disable_js_event_dispatch`]). Tool execution, commands,
     /// providers and definitions still use [`Self::extensions_handle`].
     pub(crate) fn event_extensions(&self) -> Option<&crate::extensions::ExtensionHandle> {
+        // A started runtime with an empty load list has no JS module that can
+        // register a handler or read `ctx.sessionManager`. Treat it like a
+        // plan-only handle: dispatching events and, importantly, building the
+        // full `SessionContextSnapshot` (whole-tree JSON + per-entry JSON) for
+        // every prompt would otherwise copy a large pasted user message several
+        // times into a snapshot nothing can observe (A28-F02).
         if self
             .js_event_dispatch
             .load(std::sync::atomic::Ordering::SeqCst)
         {
-            self.extensions.as_ref()
+            self.extensions
+                .as_ref()
+                .filter(|extensions| extensions.has_loaded_extensions())
         } else {
             None
         }

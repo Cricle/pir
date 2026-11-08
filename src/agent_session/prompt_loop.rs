@@ -1272,7 +1272,9 @@ impl AgentSession {
                 };
                 // Expand `/skill:name args` and `/template args` (upstream
                 // `prompt()` expands both after the extension `input` event).
-                (self.expand_prompt_commands(&input.text), input.images)
+                // The owned fast path moves a plain prompt through unchanged
+                // (A28-F02).
+                (self.expand_prompt_commands(input.text), input.images)
             }
             RunTrigger::Custom(_) => (String::new(), Vec::new()),
         };

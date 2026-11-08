@@ -117,6 +117,60 @@ pub(crate) fn session_lock_owner_pid(lock: &Path) -> Option<u32> {
         .map(|owner| owner.pid)
 }
 
+/// Whether a lock's recorded owner is provably dead on THIS host.
+///
+/// Unlike [`session_lock_snapshot`]'s `Stale` state, this deliberately omits
+/// the one-hour age window: a lock left behind by a normal TUI `/quit` or a
+/// killed print has a dead PID immediately, and a subsequent writer must be
+/// able to take the session over (A27 P0). A live/reused PID, a foreign host,
+/// or an unparseable owner is never reported dead. Callers still compare the
+/// file fingerprint before removing it.
+pub(crate) fn session_lock_owner_is_provably_dead(lock: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(lock) else {
+        return false;
+    };
+    let Some(owner) = parse_lock_owner(&content) else {
+        return false;
+    };
+    if let Some(lock_host) = &owner.host {
+        match current_host_id() {
+            Some(local) if &local == lock_host => {}
+            _ => return false,
+        }
+    }
+    if !process_is_alive(owner.pid) {
+        return true;
+    }
+    // A live pid whose start token differs is a reused pid: the lock's owner
+    // is gone even though an unrelated process now carries its number.
+    match (owner.start_token, process_start_token(owner.pid)) {
+        (Some(expected), Some(actual)) => expected != actual,
+        _ => false,
+    }
+}
+
+/// Reclaim a lock whose owner is provably dead, regardless of its age.
+/// The fingerprint re-check prevents deleting a fresh lock created by another
+/// process between the liveness probe and removal.
+pub(crate) fn reclaim_provably_dead_session_lock(lock: &Path) -> bool {
+    let first = session_lock_snapshot(lock);
+    if first.state == SessionLockState::Missing {
+        return true;
+    }
+    if !session_lock_owner_is_provably_dead(lock) {
+        return false;
+    }
+    let second = session_lock_snapshot(lock);
+    if second.len != first.len || second.modified != first.modified {
+        return false;
+    }
+    match std::fs::remove_file(lock) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
 /// This machine's name, recorded in lock files so a lock written by a process
 /// on another host is never probed via the local pid table (a foreign pid can
 /// collide with an unrelated local process, or look dead). `None` when the

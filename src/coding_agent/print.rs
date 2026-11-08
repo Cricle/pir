@@ -2946,8 +2946,10 @@ pub async fn run_print_with_environment(
         // extensions are present, defer the missing-model error until the
         // merged registry (environment + plugin definitions) is resolved
         // below; otherwise keep the historical immediate failure.
-        Err(error) if !extension_paths.is_empty() => {
-            eprintln!("pir: {error}");
+        Err(_error) if !extension_paths.is_empty() => {
+            // Defer the diagnostic: an extension provider may still resolve
+            // below. Printing here duplicated the final error for a genuinely
+            // missing `--model` (A27-F10: `pir: ...` followed by `Error: ...`).
             crate::ai::providers::resolution::InitialModelResult {
                 model: None,
                 thinking_level: crate::ai::providers::resolution::DEFAULT_THINKING_LEVEL,

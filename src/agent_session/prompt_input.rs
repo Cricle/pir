@@ -299,18 +299,32 @@ impl AgentSession {
         source: &str,
         streaming_behavior: Option<&str>,
     ) -> Option<(String, Vec<ContentBlock>)> {
+        self.prepare_prompt_input_owned(text.to_owned(), images, source, streaming_behavior)
+            .await
+    }
+
+    /// [`Self::prepare_prompt_input`] taking the prompt by value: with no
+    /// `input` handler the text is moved through instead of copied (the
+    /// common TUI case; A28-F02).
+    async fn prepare_prompt_input_owned(
+        &self,
+        text: String,
+        images: Vec<ContentBlock>,
+        source: &str,
+        streaming_behavior: Option<&str>,
+    ) -> Option<(String, Vec<ContentBlock>)> {
         let Some(plugins) = self.plugins.as_ref() else {
-            return Some((text.to_owned(), images));
+            return Some((text, images));
         };
         if !plugins.has_handlers("input") {
-            return Some((text.to_owned(), images));
+            return Some((text, images));
         }
         // Mirror the pre-input part of `start_run`: the `ctx` facade carries
         // the live session/model snapshot and `session_start` fires before any
         // event handler sees this prompt.
         self.push_session_context(&self.current_model()).await;
         self.ensure_session_start().await;
-        match dispatch_prompt_input(plugins, text, images, source, streaming_behavior).await {
+        match dispatch_prompt_input(plugins, &text, images, source, streaming_behavior).await {
             PromptInputAction::Continue(transform) => Some((transform.text, transform.images)),
             PromptInputAction::Handled => None,
         }
@@ -334,10 +348,35 @@ impl AgentSession {
             .await
     }
 
+    /// [`Self::prompt_with_source`] taking the prompt by value so the TUI
+    /// worker can hand its owned command string straight through without the
+    /// `&str` entry point's full-size copy.
+    pub async fn prompt_with_source_owned(
+        &self,
+        text: String,
+        source: &str,
+        on_event: EventHandler,
+    ) -> crate::Result<Option<AssistantMessage>> {
+        self.prompt_with_images_and_source_owned(text, Vec::new(), source, on_event)
+            .await
+    }
+
     /// [`Self::prompt_with_source`] with image attachments.
     pub async fn prompt_with_images_and_source(
         &self,
         text: &str,
+        images: Vec<ContentBlock>,
+        source: &str,
+        on_event: EventHandler,
+    ) -> crate::Result<Option<AssistantMessage>> {
+        self.prompt_with_images_and_source_owned(text.to_owned(), images, source, on_event)
+            .await
+    }
+
+    /// [`Self::prompt_with_images_and_source`] on an owned prompt string.
+    pub async fn prompt_with_images_and_source_owned(
+        &self,
+        text: String,
         images: Vec<ContentBlock>,
         source: &str,
         on_event: EventHandler,
@@ -369,21 +408,29 @@ impl AgentSession {
             };
             #[cfg(not(any(feature = "print", feature = "tool-read")))]
             let attachment_options = None;
-            let (expanded, file_images) =
-                crate::coding_agent::context::expand_prompt_file_args_with_options(
-                    text,
-                    &self.cwd,
-                    attachment_options,
-                )?;
-            let mut images = images;
-            images.extend(file_images.into_iter().map(ContentBlock::Image));
-            (expanded, images)
+            if text.contains('@') {
+                let (expanded, file_images) =
+                    crate::coding_agent::context::expand_prompt_file_args_with_options(
+                        &text,
+                        &self.cwd,
+                        attachment_options,
+                    )?;
+                let mut images = images;
+                images.extend(file_images.into_iter().map(ContentBlock::Image));
+                (expanded, images)
+            } else {
+                // No `@` token can expand: keep the owned prompt as-is.
+                (text, images)
+            }
         } else {
-            (text.to_owned(), images)
+            (text, images)
         };
-        match self.prepare_prompt_input(&text, images, source, None).await {
+        match self
+            .prepare_prompt_input_owned(text, images, source, None)
+            .await
+        {
             Some((text, images)) => self
-                .prompt_with_prepared_input(&text, images, on_event)
+                .prompt_with_prepared_input_owned(text, images, on_event)
                 .await
                 .map(Some),
             None => Ok(None),
@@ -400,15 +447,30 @@ impl AgentSession {
         images: Vec<ContentBlock>,
         on_event: EventHandler,
     ) -> crate::Result<AssistantMessage> {
+        self.prompt_with_prepared_input_owned(text.to_owned(), images, on_event)
+            .await
+    }
+
+    /// [`Self::prompt_with_prepared_input`] taking the prompt by value. The
+    /// text is installed only in the task-local prepared transform; the
+    /// `RunTrigger` fallback text stays empty because `start_run` always
+    /// consumes that prepared transform first. This saves a full-size copy of
+    /// the prompt on every TUI submission (A28-F02).
+    pub async fn prompt_with_prepared_input_owned(
+        &self,
+        text: String,
+        images: Vec<ContentBlock>,
+        on_event: EventHandler,
+    ) -> crate::Result<AssistantMessage> {
         let context = Arc::new(Mutex::new(PromptInputContext {
             source: DEFAULT_INPUT_SOURCE.to_owned(),
             prepared: Some(PromptInputTransform {
-                text: text.to_owned(),
+                text,
                 images: images.clone(),
             }),
         }));
         PROMPT_INPUT_CONTEXT
-            .scope(context, self.prompt_with_images(text, images, on_event))
+            .scope(context, self.prompt_with_images("", images, on_event))
             .await
     }
 
@@ -422,6 +484,10 @@ impl AgentSession {
         on_event: EventHandler,
         admission: RunAdmission,
     ) -> crate::Result<AssistantMessage> {
+        // The prepared transform normally supplies the run's text, but the
+        // admitted (RPC) bridge has historically relied on the trigger text as
+        // well; keep both spellings so a host whose task-local scope does not
+        // reach the run can never start an empty prompt.
         let context = Arc::new(Mutex::new(PromptInputContext {
             source: DEFAULT_INPUT_SOURCE.to_owned(),
             prepared: Some(PromptInputTransform {

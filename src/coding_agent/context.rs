@@ -886,6 +886,12 @@ pub fn partition_file_args_with_options(
     let mut images = Vec::new();
     for file_arg in file_args {
         let path = resolve_file_arg_path(file_arg, cwd);
+        if path.is_dir() {
+            return Err(anyhow::anyhow!(
+                "Is a directory (not a file): {}",
+                path.display()
+            ));
+        }
         if !path.is_file() {
             return Err(anyhow::anyhow!("File not found: {}", path.display()));
         }
