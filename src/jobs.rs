@@ -554,13 +554,15 @@ impl JobStore {
         let path = dir.join("output.log");
         let metadata = std::fs::metadata(&path).ok()?;
         let len = metadata.len();
-        let want = max_bytes.clamp(1, MAX_LOG_BYTES).min(len);
+        // Zero is a real "empty tail" request, not "use the default": keep it
+        // so `jobs log --bytes 0` and `--lines 0` return nothing (A30/A33/A93).
+        let want = max_bytes.min(MAX_LOG_BYTES).min(len);
         let mut file = std::fs::File::open(&path).ok()?;
         file.seek(SeekFrom::Start(len.saturating_sub(want))).ok()?;
         let mut bytes = Vec::with_capacity(want as usize);
         file.read_to_end(&mut bytes).ok()?;
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        let max_lines = max_lines.clamp(1, MAX_LOG_LINES);
+        let max_lines = max_lines.min(MAX_LOG_LINES);
         let mut lines: Vec<&str> = text.lines().collect();
         let line_truncated = lines.len() > max_lines;
         if line_truncated {
