@@ -36,6 +36,15 @@ use super::progress::agent_event_to_progress;
 
 const UPDATE_CHANNEL_CAPACITY: usize = 1024;
 
+/// Maximum queued-steer texts carried by one `SessionSnapshot`.
+///
+/// `queuedSteer` is a full-replacement snapshot field, and every `steer`
+/// publishes one; reflecting the whole agent inbox unbounded would serialize
+/// and broadcast an O(n²) corpus when a client queues a long burst (and one
+/// frame could exceed the protocol limit). The first N pending texts stay
+/// visible; `queuedSteerCount` always reports the true total.
+const MAX_SNAPSHOT_QUEUED_STEER: usize = 64;
+
 /// Stack budget for the OS thread that hosts one server prompt/agent run.
 ///
 /// `tokio::spawn` runs the future on a runtime worker with the platform
@@ -224,6 +233,19 @@ impl SessionRecord {
     /// transcript projection here), so snapshots must not be described as a
     /// transcript replay.
     pub fn to_snapshot(&self) -> SessionSnapshot {
+        // Steering can live in TWO places: the session-level queue (a steer
+        // that arrived before the run task attached its agent) and the live
+        // agent's inbox (the common mid-run case). The snapshot is the
+        // client-visible queuedSteer projection, so it must report both or a
+        // mid-run steer would answer `ok` while the snapshot still says zero
+        // (A18-F02). The agent mirror is synchronous, so to_snapshot stays
+        // callable from every existing snapshot site.
+        let mut queued_steer = self.queued_steer.clone();
+        if let Some(agent) = &self.agent {
+            queued_steer.extend(agent.pending_steering_messages());
+        }
+        let queued_steer_count = queued_steer.len() as i64;
+        queued_steer.truncate(MAX_SNAPSHOT_QUEUED_STEER);
         SessionSnapshot {
             id: self.state.metadata.id.clone(),
             name: self.state.metadata.name.clone(),
@@ -237,8 +259,7 @@ impl SessionRecord {
             locked: self.locked,
             revision: self.update_sequence,
             transcript: Vec::<TranscriptItem>::new(),
-            queued_steer: self
-                .queued_steer
+            queued_steer: queued_steer
                 .iter()
                 .enumerate()
                 .map(|(index, text)| UserTranscriptItem {
@@ -253,7 +274,7 @@ impl SessionRecord {
                     timestamp: crate::ai::util::now_ms() as i64,
                 })
                 .collect(),
-            queued_steer_count: self.queued_steer.len() as i64,
+            queued_steer_count,
         }
     }
 
@@ -277,6 +298,10 @@ pub struct ServerState {
     snapshot: Arc<RwLock<ServerSnapshot>>,
     sessions: Arc<RwLock<HashMap<String, SessionRecord>>>,
     providers: Arc<ProviderRegistry>,
+    /// Model used by `create` when the caller omits one (the host's
+    /// configured default provider/model). `None` keeps the historical
+    /// `default/default` placeholder.
+    default_model: Option<ModelRef>,
     security: ServerSecurityConfig,
     /// Host-resolved global tool selection (`--tools` / `--exclude-tools` /
     /// `--no-tools` / `--no-builtin-tools` plus `settings.defaultTools`).
@@ -300,6 +325,13 @@ pub struct ServerState {
     /// (the chord vocabulary) is the default; [`StateUpdateFormat::Legacy`]
     /// keeps the historical `{op, value}` objects for pinned clients.
     state_update_format: StateUpdateFormat,
+    /// Long-lived runtime the per-session steering/follow-up inbox consumers
+    /// are spawned on. Prompt runs execute on a dedicated per-run runtime
+    /// (`spawn_agent_task`); an inbox consumer lazily spawned there dies with
+    /// that runtime, losing steering queued across runs. `with_security`
+    /// captures the server's own runtime, which lives for the server's
+    /// lifetime.
+    queue_runtime: Option<tokio::runtime::Handle>,
     pub(super) updates: broadcast::Sender<Value>,
 }
 
@@ -317,11 +349,13 @@ impl ServerState {
             snapshot: Arc::new(RwLock::new(snapshot)),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             providers,
+            default_model: None,
             security: ServerSecurityConfig::default(),
             tool_selection: None,
             sessions_dir: None,
             draining: Arc::new(AtomicBool::new(false)),
             state_update_format: StateUpdateFormat::default(),
+            queue_runtime: tokio::runtime::Handle::try_current().ok(),
             updates,
         }
     }
@@ -336,11 +370,13 @@ impl ServerState {
             snapshot: Arc::new(RwLock::new(snapshot)),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             providers,
+            default_model: None,
             security: ServerSecurityConfig::default(),
             tool_selection: None,
             sessions_dir: None,
             draining: Arc::new(AtomicBool::new(false)),
             state_update_format: StateUpdateFormat::default(),
+            queue_runtime: tokio::runtime::Handle::try_current().ok(),
             updates,
         }
     }
@@ -353,6 +389,24 @@ impl ServerState {
     /// it — so sessions survive disconnects and server restarts.
     pub fn with_session_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.sessions_dir = Some(Arc::new(dir.into()));
+        self
+    }
+
+    /// Attach the host's configured provider registry. The default
+    /// [`ServerState::new`] starts with an empty registry, so a standalone
+    /// `pir server` that did not call this could create sessions but no
+    /// prompt could ever resolve a provider (`internal_error` with no model
+    /// request). The CLI host loads [`crate::ai::providers::load_pi_environment`]
+    /// once and hands the same registry to the server, matching print/RPC/TUI.
+    pub fn with_registry(mut self, providers: Arc<ProviderRegistry>) -> Self {
+        self.providers = providers;
+        self
+    }
+
+    /// Use the host's configured default provider/model when a `create`
+    /// request omits a model (the common client shape).
+    pub fn with_default_model(mut self, model: Option<ModelRef>) -> Self {
+        self.default_model = model;
         self
     }
 
@@ -397,6 +451,12 @@ impl ServerState {
     /// keep the defaults.
     pub fn with_security(mut self, security: ServerSecurityConfig) -> Self {
         self.security = security;
+        // Binding runs on the server's long-lived runtime: capture it here so
+        // prompt-run inbox consumers are not tied to the per-run agent
+        // runtime (see `queue_runtime`).
+        if self.queue_runtime.is_none() {
+            self.queue_runtime = tokio::runtime::Handle::try_current().ok();
+        }
         self
     }
 
@@ -656,7 +716,7 @@ impl ServerState {
         let cwd = cwd.unwrap_or_else(|| ".".to_owned());
         let mut record = SessionRecord::new(&id, cwd.clone(), timestamp);
         record.state.metadata.name = name;
-        if let Some(m) = model {
+        if let Some(m) = model.or_else(|| self.default_model.clone()) {
             record.model = m;
         }
         if let Some(tl) = thinking_level {
@@ -1216,6 +1276,15 @@ impl ServerState {
                             record.storage.take(),
                             self.tool_selection.clone(),
                         ));
+                        // The run executes on a dedicated short-lived runtime;
+                        // an inbox consumer spawned there would die with it
+                        // and silently lose steering queued for the next run
+                        // (A18-F10's "inbox consumer dropped the reply"
+                        // warning). Pin the queue consumers to the server's
+                        // long-lived runtime instead.
+                        if let Some(handle) = &self.queue_runtime {
+                            agent.ensure_queue_consumers_on(handle);
+                        }
                         record.agent = Some(agent.clone());
                         record.persisted = agent.session_manager();
                         Some(agent)
@@ -1449,6 +1518,14 @@ fn prepare_persisted_session(
                 }
             },
         };
+    if let Err(error) = manager.ensure_exclusive_writer() {
+        tracing::warn!(
+            %error,
+            session_id = %id,
+            "persisted server session is already owned by another writer"
+        );
+        return None;
+    }
     if manager.is_paged() {
         if let Err(error) = manager.widen_to_full() {
             tracing::warn!(

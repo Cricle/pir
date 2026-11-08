@@ -1397,7 +1397,8 @@ async fn attaching_a_large_persisted_session_does_not_block_the_runtime() {
 #[tokio::test]
 async fn server_progress_resyncs_after_a_lagged_broadcast_receiver() {
     let (gate_tx, gate) = watch::channel(false);
-    let registry = gated_registry(gate, Arc::new(AtomicUsize::new(0)));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let registry = gated_registry(gate, Arc::clone(&entered));
     let state =
         ServerState::with_providers(empty_snapshot(uuid::Uuid::new_v4().to_string()), registry);
     let server = Server::bind_with_state_and_security(
@@ -1446,18 +1447,13 @@ async fn server_progress_resyncs_after_a_lagged_broadcast_receiver() {
     // frame; steering before that is an `invalid` "no active prompt".
     wait_for_phase(&state, &session_id, "turn").await;
 
-    // Wait until the run has attached its agent: steering then goes to the
-    // agent inbox and does not grow the published snapshot.
+    // Wait until the run has attached its agent (its first provider stream
+    // started) so the flood below lands in the agent inbox.
     let mut attached = false;
     for _ in 0..400 {
-        let _ = state
-            .steer(&session_id, &attachment, "warm".to_owned())
-            .await;
-        if let Some(snapshot) = state.get_session(&session_id).await {
-            if snapshot.queued_steer_count == 0 {
-                attached = true;
-                break;
-            }
+        if entered.load(Ordering::SeqCst) >= 1 {
+            attached = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -1609,10 +1605,22 @@ async fn a_failed_run_neither_loses_nor_replays_queued_steering() {
         .await
         .expect("start the failing prompt");
     wait_for_phase(&state, &session_id, "turn").await;
+    // Wait until the first provider request has started: the run's top-of-turn
+    // steering poll is behind us, so these texts land in the agent inbox and
+    // stay there while the gated request is in flight.
+    for _ in 0..2000 {
+        if provider.calls.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        provider.calls.load(Ordering::SeqCst) >= 1,
+        "the failing run must reach the provider before steering"
+    );
 
-    // The provider is gated, so the run cannot settle while these land. A
-    // pre-attach steer takes the record-queue path; a post-attach one goes
-    // straight to the agent inbox. Both must end up delivered exactly once.
+    // The provider is gated, so the run cannot settle while these land. Both
+    // must end up delivered exactly once.
     state
         .steer(&session_id, "conn-d9", "D9-ALPHA".to_owned())
         .await
@@ -1631,15 +1639,23 @@ async fn a_failed_run_neither_loses_nor_replays_queued_steering() {
         matches!(outcome, Err(pir::server::SessionCommandError::Provider(_))),
         "the first run must fail, got {outcome:?}"
     );
+    // The two texts were handed to the agent inbox, and the snapshot now
+    // reports them (A18-F02): a failed run keeps them pending for the next
+    // prompt instead of silently hiding them.
+    let pending = state.get_session(&session_id).await.expect("live record");
     assert_eq!(
-        state
-            .get_session(&session_id)
-            .await
-            .expect("live record")
-            .queued_steer_count,
-        0,
-        "a failed run must not leave a session-level steering backlog"
+        pending.queued_steer_count, 2,
+        "a failed run must keep its undelivered agent-inbox steering visible"
     );
+    let pending_texts: Vec<String> = pending
+        .queued_steer
+        .iter()
+        .map(|item| match &item.content[0] {
+            pir::protocol::schemas::UserContent::Text(text) => text.text.clone(),
+            other => panic!("queued steer must be text, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(pending_texts, vec!["D9-ALPHA", "D9-BETA"]);
 
     let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
     state

@@ -67,6 +67,12 @@ enum LastAction {
 const PASTE_FOLD_MAX_LINES: usize = 10;
 const PASTE_FOLD_MAX_CHARS: usize = 1000;
 
+/// Do not retain a submitted prompt larger than this in up-arrow history.
+/// The history is a convenience for recalling short prompts; a 50 MB paste
+/// (A23-F02) would otherwise stay resident for the whole session in addition
+/// to the transcript's own copy.
+const MAX_HISTORY_ENTRY_BYTES: usize = 1024 * 1024;
+
 /// Upper bound for the backward scan that locates a paste marker ending at
 /// the cursor (`[paste #` + id digits + optional suffix + `]`).
 const PASTE_MARKER_MAX_LEN: usize = 64;
@@ -445,8 +451,6 @@ pub struct Editor {
     /// `editor.ts:348 / 464-483`).
     history_draft: Mutex<Option<EditorState>>,
     padding_x: std::sync::atomic::AtomicUsize,
-    /// Submit handler text snapshot (the app reads it on Enter).
-    submitted: Mutex<Option<String>>,
     /// Emacs-style kill ring — port of upstream `KillRing`
     /// (`kill-ring.ts`): killed texts in insertion order, unbounded;
     /// consecutive kills accumulate into the newest entry.
@@ -534,7 +538,6 @@ impl Editor {
             history_index: Mutex::new(None),
             history_draft: Mutex::new(None),
             padding_x: std::sync::atomic::AtomicUsize::new(1),
-            submitted: Mutex::new(None),
             kill_ring: Mutex::new(VecDeque::new()),
             last_action: Mutex::new(None),
             undo_stack: Mutex::new(Vec::new()),
@@ -850,6 +853,20 @@ impl Editor {
     ///
     /// Returns the cleaned text actually inserted (for status reporting).
     pub fn paste_text(&self, text: &str) -> String {
+        self.paste_text_impl(text, true).unwrap_or_default()
+    }
+
+    /// [`Self::paste_text`] for the TUI paste paths, which only distinguish
+    /// "nothing inserted" from "inserted": the full cleaned payload is never
+    /// materialized as a second owned copy (A28-F02: a 50 MB paste paid one
+    /// useless 50 MB `String` here, dropped immediately by the caller).
+    ///
+    /// Returns whether a non-empty payload was inserted.
+    pub fn paste_text_discard(&self, text: &str) -> bool {
+        self.paste_text_impl(text, false).is_some()
+    }
+
+    fn paste_text_impl(&self, text: &str, want_return: bool) -> Option<String> {
         self.io_paste_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.io_paste_bytes
@@ -935,10 +952,18 @@ impl Editor {
             let inserted = self.insert_text_inner(&marker);
             report.inserted_lines = inserted.lines_added;
             report.copied_bytes += inserted.copied_bytes;
-            let returned = cleaned.text.into_owned();
-            if input_was_borrowed {
-                report.copied_bytes += returned.len();
-            }
+            let non_empty = !cleaned.text.is_empty();
+            let returned = if want_return {
+                let returned = cleaned.text.into_owned();
+                if input_was_borrowed {
+                    report.copied_bytes += returned.len();
+                }
+                Some(returned)
+            } else if non_empty {
+                Some(String::new())
+            } else {
+                None
+            };
             report.undo_snapshots = self.undo_depth().saturating_sub(undo_before) as u64;
             *self
                 .last_paste
@@ -950,10 +975,18 @@ impl Editor {
         let inserted = self.insert_text_burst(cleaned.text.as_ref());
         report.inserted_lines = inserted.lines_added;
         report.copied_bytes += inserted.copied_bytes;
-        let returned = cleaned.text.into_owned();
-        if input_was_borrowed {
-            report.copied_bytes += returned.len();
-        }
+        let non_empty = !cleaned.text.is_empty();
+        let returned = if want_return {
+            let returned = cleaned.text.into_owned();
+            if input_was_borrowed {
+                report.copied_bytes += returned.len();
+            }
+            Some(returned)
+        } else if non_empty {
+            Some(String::new())
+        } else {
+            None
+        };
         report.undo_snapshots = self.undo_depth().saturating_sub(undo_before) as u64;
         *self
             .last_paste
@@ -1157,6 +1190,19 @@ impl Editor {
             index += 1;
         }
         out
+    }
+
+    /// `str::trim` semantics without allocating a second full-size buffer.
+    fn trim_in_place(mut text: String) -> String {
+        let start = text.len() - text.trim_start().len();
+        let end = text.trim_end().len();
+        if start > 0 || end < text.len() {
+            text.truncate(end);
+            if start > 0 {
+                text.drain(..start);
+            }
+        }
+        text
     }
 
     fn normalize_col(state: &EditorState, line_index: usize, col: usize) -> usize {
@@ -2375,7 +2421,10 @@ impl Editor {
         let text = self.get_text();
         let registry = self.paste_registry_snapshot();
         let text = Self::expand_paste_markers(&text, &registry.pastes);
-        let text = text.trim().to_string();
+        // Trim in place: `trim().to_string()` copied the whole expanded prompt
+        // (a 50 MB paste paid a second 50 MB allocation just to drop
+        // surrounding whitespace).
+        let text = Self::trim_in_place(text);
         if text.is_empty() {
             return None;
         }
@@ -2383,7 +2432,9 @@ impl Editor {
             .history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if history.first().map(String::as_str) != Some(text.as_str()) {
+        if text.len() <= MAX_HISTORY_ENTRY_BYTES
+            && history.first().map(String::as_str) != Some(text.as_str())
+        {
             history.insert(0, text.clone());
             // Cap the history at 100 entries, dropping the oldest (upstream
             // `addToHistory`, `editor.ts:428-438`).
@@ -2414,10 +2465,6 @@ impl Editor {
             .clear();
         self.set_last_action(None);
         self.clear_sticky_columns();
-        *self
-            .submitted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text.clone());
         Some(text)
     }
 

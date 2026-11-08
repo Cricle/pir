@@ -690,8 +690,18 @@ impl DiscoveredResources {
 /// wrapped in a `<skill>` element; trailing args are appended after a blank
 /// line. Unknown skill or unreadable file: the original text is returned.
 pub fn expand_skill_command(text: &str, skills: &[SkillInfo]) -> String {
+    expand_skill_command_cow(text, skills).into_owned()
+}
+
+/// [`expand_skill_command`] that borrows the input when nothing expands: a
+/// plain prompt is not copied just to discover it has no `/skill:` prefix.
+pub fn expand_skill_command_cow<'a>(
+    text: &'a str,
+    skills: &[SkillInfo],
+) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
     if !text.starts_with("/skill:") {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     let body = &text["/skill:".len()..];
     let (skill_name, args) = match body.find(' ') {
@@ -699,10 +709,10 @@ pub fn expand_skill_command(text: &str, skills: &[SkillInfo]) -> String {
         None => (body, ""),
     };
     let Some(skill) = skills.iter().find(|skill| skill.name == skill_name) else {
-        return text.to_string();
+        return Cow::Borrowed(text);
     };
     let Ok(content) = std::fs::read_to_string(&skill.path) else {
-        return text.to_string();
+        return Cow::Borrowed(text);
     };
     let base_dir = skill
         .path
@@ -717,11 +727,11 @@ pub fn expand_skill_command(text: &str, skills: &[SkillInfo]) -> String {
         base_dir,
         body
     );
-    if args.is_empty() {
+    Cow::Owned(if args.is_empty() {
         skill_block
     } else {
         format!("{skill_block}\n\n{args}")
-    }
+    })
 }
 
 /// The full prompt-command expansion applied to every submitted prompt
@@ -732,6 +742,23 @@ pub fn expand_prompt_commands(
     skills: &[SkillInfo],
     templates: &[PromptTemplate],
 ) -> String {
-    let expanded = expand_skill_command(text, skills);
-    crate::coding_agent::prompt_templates::expand_prompt_template(&expanded, templates)
+    expand_prompt_commands_cow(text, skills, templates).into_owned()
+}
+
+/// [`expand_prompt_commands`] with borrow-preserving fast paths. Used on the
+/// prompt hot path so an ordinary (non-command) prompt is not copied twice.
+pub fn expand_prompt_commands_cow<'a>(
+    text: &'a str,
+    skills: &[SkillInfo],
+    templates: &[PromptTemplate],
+) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
+    match expand_skill_command_cow(text, skills) {
+        Cow::Borrowed(borrowed) => {
+            crate::coding_agent::prompt_templates::expand_prompt_template_cow(borrowed, templates)
+        }
+        Cow::Owned(expanded) => Cow::Owned(
+            crate::coding_agent::prompt_templates::expand_prompt_template(&expanded, templates),
+        ),
+    }
 }

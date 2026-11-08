@@ -422,6 +422,35 @@ fn a_new_writer_reclaims_a_dead_pid_stale_lock() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A27 P0: a normal TUI `/quit` leaves a lock with a dead PID and a YOUNG
+/// mtime. Opening the session must reclaim it immediately (not wait an hour);
+/// otherwise `--continue`/`--session`/resume are locked out after every quit.
+#[test]
+fn a_new_writer_reclaims_a_dead_pid_young_lock() {
+    let dir = temp_dir("dead-lock-young");
+    let path = create_session(&dir, "quit left a lock");
+    let lock = lock_path(&path);
+    let (dead_pid, start_token) = exited_child_pid();
+    std::fs::write(&lock, dead_lock_contents(dead_pid, start_token)).expect("fake young dead lock");
+    assert!(
+        std::time::SystemTime::now()
+            .duration_since(std::fs::metadata(&lock).unwrap().modified().unwrap())
+            .unwrap()
+            < Duration::from_secs(60),
+        "fixture must be young"
+    );
+
+    let manager = SessionManager::open(&path).expect("open must reclaim a dead young lock");
+    let content = std::fs::read_to_string(&lock).expect("new lock");
+    assert!(
+        content.contains(&format!("pid={}", std::process::id())),
+        "the new lock must name this process: {content}"
+    );
+    drop(manager);
+    assert!(!lock.exists(), "Drop must release the reclaimed lock");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_dead_pid_lock_is_reclaimed_only_after_the_stale_window() {
     let dir = temp_dir("dead-lock-stale");

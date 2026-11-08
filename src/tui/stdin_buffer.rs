@@ -232,6 +232,11 @@ pub const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 /// most this much.
 pub const MAX_PASTE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Accumulation capacity kept by the input buffers after a paste closes.
+/// Anything larger is released: a completed 10–50 MB paste must not pin its
+/// scratch buffer for the whole session (A28-F02).
+const PASTE_BUFFER_RETAIN_BYTES: usize = 64 * 1024;
+
 /// The event-loop coalescer's threshold: a run of at least this many rapid
 /// text key events in one drained input batch becomes one `Event::Paste`.
 /// Kept in the event loop (not the per-key gate) so key-sequence parsing and
@@ -444,6 +449,10 @@ pub struct StdinBuffer {
     escape_timeout: Duration,
     paste_mode: bool,
     paste_buffer: Vec<u8>,
+    /// First byte of `paste_buffer` not yet searched for an end-marker start.
+    /// The search only has to cover newly arrived bytes plus the marker-length
+    /// overlap, so a paste that is fed in many chunks stays linear.
+    paste_scanned: usize,
     pending_kitty_printable: Option<u32>,
 }
 
@@ -466,6 +475,7 @@ impl StdinBuffer {
             escape_timeout,
             paste_mode: false,
             paste_buffer: Vec::new(),
+            paste_scanned: 0,
             pending_kitty_printable: None,
         }
     }
@@ -538,6 +548,7 @@ impl StdinBuffer {
             self.buffer = rest;
             self.paste_mode = true;
             self.paste_buffer = std::mem::take(&mut self.buffer);
+            self.paste_scanned = 0;
             self.finish_paste_if_closed(now, out);
             return;
         }
@@ -567,16 +578,40 @@ impl StdinBuffer {
         self.deadline = Some(now + window);
     }
 
-    /// Close an in-flight paste once its `ESC [ 2 0 1 ~` arrives.
+    /// Close an in-flight paste once the terminal's own `ESC [ 2 0 1 ~`
+    /// arrives.
+    ///
+    /// A paste payload may itself contain the end-marker bytes (a pasted log,
+    /// source file or binary). A marker followed by more paste bytes in the
+    /// same chunk is therefore literal payload; only a marker whose suffix is
+    /// empty (it ends the chunk) or starts with the Enter that followed the
+    /// paste closes it. Of several such markers the last one wins, so multiple
+    /// inner markers stay inside one paste. Text after the real terminator in
+    /// the same chunk is ordinary input (the suffix is reprocessed below).
     fn finish_paste_if_closed(&mut self, now: Instant, out: &mut Vec<StdinEvent>) {
-        let Some(end) = find_subslice(&self.paste_buffer, BRACKETED_PASTE_END) else {
+        // Only scan bytes not searched before (plus the marker-length overlap
+        // so a marker split across chunks is still found once complete).
+        let len = self.paste_buffer.len();
+        let search_from = self.paste_scanned.min(len);
+        let end = find_paste_terminator(&self.paste_buffer[search_from..])
+            .map(|offset| search_from + offset);
+        self.paste_scanned = len.saturating_sub(BRACKETED_PASTE_END.len() - 1);
+        let Some(end) = end else {
             self.deadline = None;
             return;
         };
-        let content = self.paste_buffer[..end].to_vec();
-        let remaining = self.paste_buffer[end + BRACKETED_PASTE_END.len()..].to_vec();
+        // Hand the collected bytes out without a second full-size copy: the
+        // prefix stays in `paste_buffer`'s allocation, the (usually tiny)
+        // remainder is copied off and the marker dropped from the front.
+        let mut content = std::mem::take(&mut self.paste_buffer);
         self.paste_mode = false;
-        self.paste_buffer.clear();
+        let remaining = content[end + BRACKETED_PASTE_END.len()..].to_vec();
+        content.truncate(end);
+        self.paste_scanned = 0;
+        // A finished large paste must not pin its accumulation capacity for
+        // the rest of the session (A28-F02: a 10 MB paste retained ~18 MB
+        // here after the reply).
+        shrink_after_paste(&mut self.buffer);
         self.pending_kitty_printable = None;
         out.push(StdinEvent::Paste(content));
         if !remaining.is_empty() {
@@ -654,6 +689,7 @@ impl StdinBuffer {
         self.buffer.clear();
         self.paste_mode = false;
         self.paste_buffer.clear();
+        self.paste_scanned = 0;
         self.pending_kitty_printable = None;
     }
 
@@ -818,6 +854,24 @@ fn kitty_printable_codepoint(sequence: &[u8]) -> Option<u32> {
     (codepoint >= 32).then_some(codepoint)
 }
 
+/// Convert one complete paste payload into a `String`, moving the bytes when
+/// they are valid UTF-8 (the common case) instead of always copying through
+/// `from_utf8_lossy`.
+fn paste_text_from_bytes(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    }
+}
+
+/// Release a paste-sized accumulation capacity once the payload has been
+/// handed off. Small buffers keep their allocation (the steady-state case).
+fn shrink_after_paste(buffer: &mut Vec<u8>) {
+    if buffer.capacity() > PASTE_BUFFER_RETAIN_BYTES {
+        buffer.shrink_to(PASTE_BUFFER_RETAIN_BYTES);
+    }
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -825,6 +879,28 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// Last bracketed-paste terminator in `haystack` whose suffix is empty or
+/// begins with a line ending (the Enter that followed the paste). A marker
+/// followed by other bytes is payload (see
+/// [`StdinBuffer::finish_paste_if_closed`]).
+fn find_paste_terminator(haystack: &[u8]) -> Option<usize> {
+    let marker = BRACKETED_PASTE_END;
+    let mut found = None;
+    let mut index = 0usize;
+    while index + marker.len() <= haystack.len() {
+        if &haystack[index..index + marker.len()] == marker {
+            let suffix = &haystack[index + marker.len()..];
+            if suffix.is_empty() || matches!(suffix.first(), Some(b'\r' | b'\n')) {
+                found = Some(index);
+            }
+            index += marker.len();
+        } else {
+            index += 1;
+        }
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -1700,10 +1776,32 @@ pub fn decode_startup_input_bytes(bytes: &[u8]) -> Vec<Event> {
     let mut buffer = StdinBuffer::default();
     let mut sequences = buffer.process(bytes, now);
     sequences.extend(buffer.flush_due(now + Duration::from_secs(1)));
+    stdin_events_to_events(sequences)
+}
+
+/// Decode one [`StdinBuffer`] pass into the key/event shapes the TUI's input
+/// layer consumes (upstream `terminal.ts` `handleInput`).
+///
+/// A complete escape sequence goes through [`decode_input_sequence`] (the
+/// crossterm subset); anything else is plain text and becomes one key press
+/// per character, with the console-compatible shapes for `\r`/`\n`, Tab,
+/// Backspace and the C0 control chords. A [`StdinEvent::Paste`] stays one
+/// `Event::Paste` — its control bytes are the editor's `clean_paste_text`
+/// input, never key dispatch (this is what keeps a pasted Ctrl+C from
+/// clearing the editor).
+pub fn stdin_events_to_events(sequences: Vec<StdinEvent>) -> Vec<Event> {
     let mut events = Vec::new();
     for sequence in sequences {
         match sequence {
             StdinEvent::Data(data) => {
+                if data == [ESC] {
+                    // A lone ESC is the Escape key, not `ctrl+[`: the
+                    // generic C0 mapping below would spell 0x1b as the
+                    // `{` control chord, so dialogs (settings, menus) could
+                    // not close in the Windows VT byte path.
+                    events.push(key_event(KeyCode::Esc, KeyModifiers::empty()));
+                    continue;
+                }
                 if data.first() == Some(&ESC) {
                     if let Some(decoded) = decode_input_sequence(&data) {
                         events.extend(decoded);
@@ -1728,11 +1826,30 @@ pub fn decode_startup_input_bytes(bytes: &[u8]) -> Vec<Event> {
                 }
             }
             StdinEvent::Paste(payload) => {
-                events.push(Event::Paste(String::from_utf8_lossy(&payload).into_owned()));
+                events.push(Event::Paste(paste_text_from_bytes(payload)));
             }
         }
     }
     events
+}
+
+/// Decode one chunk of the raw VT stdin byte stream exactly like the Windows
+/// VT input path does: run it through a fresh [`StdinBuffer`] and resolve the
+/// resulting sequences with [`stdin_events_to_events`].
+///
+/// A live reader keeps one [`StdinBuffer`] across console reads instead (so
+/// markers and escape sequences may straddle reads); this one-shot form is
+/// the test/inspection seam for the stream ConPTY delivers under
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT`.
+pub fn decode_vt_input_bytes(bytes: &[u8]) -> Vec<Event> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let now = Instant::now();
+    let mut buffer = StdinBuffer::default();
+    let mut sequences = buffer.process(bytes, now);
+    sequences.extend(buffer.flush_due(now + Duration::from_secs(1)));
+    stdin_events_to_events(sequences)
 }
 
 /// Upstream's legacy meta rule (`keys.ts:1346-1356`): `ESC` + one byte is an
@@ -2841,23 +2958,29 @@ impl StdinGate {
         payload.extend_from_slice(&bytes);
         // The end marker closes the paste wherever it landed in the payload —
         // including on the very append that also crossed the cap.
-        if let Some(end) = find_subslice(payload, BRACKETED_PASTE_END) {
-            let content = payload[..end].to_vec();
-            let remaining = payload[end + BRACKETED_PASTE_END.len()..].to_vec();
-            self.paste = None;
-            out.push(Event::Paste(String::from_utf8_lossy(&content).into_owned()));
+        let end = find_subslice(payload, BRACKETED_PASTE_END);
+        if let Some(end) = end {
+            // Move the collected prefix out instead of copying it: the gate
+            // buffer is the only owner of the bytes here.
+            let mut content = self.paste.take().unwrap_or_default();
+            let remaining = content[end + BRACKETED_PASTE_END.len()..].to_vec();
+            content.truncate(end);
+            out.push(Event::Paste(paste_text_from_bytes(content)));
             if !remaining.is_empty() {
                 out.extend(self.reabsorb_bytes(remaining, now));
             }
             return;
         }
-        if payload.len() >= MAX_PASTE_BYTES {
+        if self
+            .paste
+            .as_ref()
+            .is_some_and(|payload| payload.len() >= MAX_PASTE_BYTES)
+        {
             // An unterminated paste is capped (see the doc above): flush what
             // was collected — this append included — as the paste payload and
             // return the gate to normal mode. Nothing collected is dropped.
-            let content = std::mem::take(payload);
-            self.paste = None;
-            out.push(Event::Paste(String::from_utf8_lossy(&content).into_owned()));
+            let content = self.paste.take().unwrap_or_default();
+            out.push(Event::Paste(paste_text_from_bytes(content)));
         }
     }
 

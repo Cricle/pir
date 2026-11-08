@@ -2352,6 +2352,66 @@ pub fn vt_input_opt_in(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
 }
 
+/// Whether the TUI should install `ENABLE_VIRTUAL_TERMINAL_INPUT` on a
+/// Windows console.
+///
+/// The Windows reader now owns the console's VT byte stream
+/// ([`ConsoleVtInputDecoder`]), so the flag is enabled by DEFAULT: upstream
+/// `enableWindowsVTInput` behavior, and the only mode in which a bracketed
+/// paste's markers reach the app instead of being swallowed by ConPTY.
+/// `PIR_TUI_VT_INPUT=0` (or `false`) is the explicit escape hatch back to
+/// crossterm's `INPUT_RECORD` parser for a console that misbehaves under VT
+/// input; unset, `1`, and every other value keep the default. The install
+/// itself is best-effort — a console that refuses the mode falls back to the
+/// record path in [`win_batch_input`] automatically.
+pub fn vt_input_enabled(value: Option<&str>) -> bool {
+    !matches!(value, Some("0") | Some("false"))
+}
+
+/// Crossterm events parsed before the Windows VT input switch.
+///
+/// `App::new` drains crossterm's queue immediately before installing
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT`: after the switch crossterm's record parser
+/// can no longer round-trip console input, but whatever it already parsed
+/// (trust-prompt type-ahead) is valid and must not be dropped. [`run`]'s
+/// input-loop setup replays these through the gate once.
+#[cfg(windows)]
+static EARLY_CROSSTERM_EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+
+/// Move every currently queued crossterm event into
+/// [`EARLY_CROSSTERM_EVENTS`]. Runs while the console is still in
+/// `INPUT_RECORD` mode, so the parser's output is the same one the pre-VT
+/// default produced.
+#[cfg(windows)]
+fn drain_early_crossterm_events() {
+    let mut events = Vec::new();
+    while events.len() < PENDING_INPUT_MAX_EVENTS {
+        match event::poll(Duration::ZERO) {
+            Ok(true) => match event::read() {
+                Ok(event) => events.push(event),
+                Err(_) => break,
+            },
+            Ok(false) | Err(_) => break,
+        }
+    }
+    if !events.is_empty() {
+        let mut queued = EARLY_CROSSTERM_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queued.extend(events);
+    }
+}
+
+/// Take the events [`drain_early_crossterm_events`] parked for the loop.
+#[cfg(windows)]
+fn take_early_crossterm_events() -> Vec<Event> {
+    std::mem::take(
+        &mut *EARLY_CROSSTERM_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
 /// Take the visible dialog out of `slot` — when `predicate` accepts it — and
 /// promote the queue head under the SAME slot-lock acquisition, so the slot is
 /// never observable as empty between the two steps.
@@ -2600,30 +2660,30 @@ impl App {
         if fullscreen {
             let _ = out.execute(EnableMouseCapture);
         }
-        // Deviation from upstream `enableWindowsVTInput` (terminal.ts:414-427).
-        // Upstream owns stdin as raw VT bytes and parses the console's VT
-        // translation itself, so after raw mode (which resets the console
-        // flags) it can ask for `ENABLE_VIRTUAL_TERMINAL_INPUT` and keep
-        // modified keys exact. pir reads stdin through crossterm 0.29's
-        // Windows `INPUT_RECORD` parser, which resolves each record by its
-        // `wVirtualKeyCode` (`event/sys/windows/parse.rs`): the records the
-        // console synthesizes under VT input carry the sequence's bytes in
-        // `uChar` with no usable virtual key, so crossterm either drops them
-        // (the control-code branch with VK 0 yields no event at all — a dead
-        // Enter) or surfaces them as literal `KeyCode::Char`s (the `[13;2u` of
-        // Shift+Enter is typed into the editor as text, and Backspace's `0x7f`
-        // no longer arrives as `KeyCode::Backspace`).
-        // The flag therefore stays off by default, which keeps the ordinary
-        // records crossterm round-trips. What degrades: on Windows a modified
-        // key with no distinct record shape (notably Shift+Tab) loses its
-        // modifier for byte-level rules — the pre-port behavior the
-        // `stdin_buffer` module docs already accept. `PIR_TUI_VT_INPUT=1`
-        // opts back into upstream's mode for a future raw-byte stdin reader;
-        // `cleanup_terminal` then restores the previous console mode.
-        enable_vt_input_if(
-            &mut RealTerminalModeOps,
-            vt_input_opt_in(std::env::var("PIR_TUI_VT_INPUT").ok().as_deref()),
-        );
+        // Upstream `enableWindowsVTInput` (terminal.ts:414-427) is the
+        // DEFAULT Windows input mode: after raw mode (which resets the console
+        // flags) the TUI installs `ENABLE_VIRTUAL_TERMINAL_INPUT`, and the
+        // input loop owns the resulting VT byte stream through
+        // `ConsoleVtInputDecoder` (see `win_batch_input`). The console then
+        // reports a bracketed paste's `ESC [ 2 0 0 ~` / `ESC [ 2 0 1 ~`
+        // markers and a literal `\x03` byte instead of swallowing the markers
+        // and synthesizing a genuine Ctrl+C key record — the ConPTY paste
+        // data-loss defect. Crossterm's `INPUT_RECORD` parser cannot
+        // round-trip that translation (special keys arrive as literal
+        // characters or vanish), so it is kept only as the fallback for a
+        // console that refuses the mode: `PIR_TUI_VT_INPUT=0` forces the old
+        // record path, and a failed `SetConsoleMode` falls back on its own.
+        // `cleanup_terminal` restores the previous console mode.
+        let vt_input_requested =
+            vt_input_enabled(std::env::var("PIR_TUI_VT_INPUT").ok().as_deref());
+        #[cfg(windows)]
+        if vt_input_requested {
+            // Anything crossterm parsed before this point (trust-prompt
+            // type-ahead) is valid under the record parser; park it for the
+            // event loop before the console switches to VT bytes.
+            drain_early_crossterm_events();
+        }
+        enable_vt_input_if(&mut RealTerminalModeOps, vt_input_requested);
 
         // Ctrl+O tool expansion, shared with the transcript blocks
         // (upstream `app.tools.expand`). When an extension runtime exists this
@@ -3525,7 +3585,7 @@ impl App {
                 }
                 crate::extensions::Notification::EditorPaste(text) => {
                     // `ctx.ui.pasteToEditor` — normalized paste at the cursor.
-                    self.editor.paste_text(&text);
+                    self.editor.paste_text_discard(&text);
                     self.note_editor_change();
                 }
                 crate::extensions::Notification::SetTheme(name) => {
@@ -9561,15 +9621,27 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
     // below has (almost) nothing to pre-read.
     #[cfg(windows)]
     if let Some(batch) = win_batch.as_mut() {
+        // Events crossterm parsed before `App::new` switched the console to
+        // VT input (trust-prompt type-ahead) are replayed first, in order.
+        for event in take_early_crossterm_events() {
+            pending_input.extend(input_gate.push(event, Instant::now()));
+        }
         let mut preloop: Vec<Event> = Vec::new();
         batch.drain(&mut preloop);
         for event in preloop {
             pending_input.extend(input_gate.push(event, Instant::now()));
         }
-        let mut flushed = 0usize;
-        while flushed < PENDING_INPUT_MAX_EVENTS && event::poll(Duration::ZERO)? {
-            pending_input.extend(input_gate.push(event::read()?, Instant::now()));
-            flushed += 1;
+        // In VT mode crossterm's `INPUT_RECORD` parser cannot round-trip the
+        // console's VT translation (special keys arrive as literal
+        // characters or vanish), so every record at this point belongs to
+        // the batch reader; touching the crossterm queue would consume a
+        // record with the wrong parser.
+        if !batch.uses_vt_bytes() {
+            let mut flushed = 0usize;
+            while flushed < PENDING_INPUT_MAX_EVENTS && event::poll(Duration::ZERO)? {
+                pending_input.extend(input_gate.push(event::read()?, Instant::now()));
+                flushed += 1;
+            }
         }
     }
 
@@ -10389,7 +10461,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                                     text: "Clipboard text too large to paste".to_string(),
                                 });
                             } else {
-                                app.editor.paste_text(&text);
+                                app.editor.paste_text_discard(&text);
                                 app.note_editor_change();
                                 update_autocomplete(&app);
                             }
@@ -10868,10 +10940,18 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     // adds the user message on `message_start`, which pir's
                     // agent loop does not emit for injected prompts.
                     for text in delivered_steering {
-                        entries.push(ChatEntry::User(text));
+                        if let Some(text) =
+                            collect_user_display_text(std::iter::once(text.as_str()))
+                        {
+                            entries.push(ChatEntry::User(text));
+                        }
                     }
                     for text in delivered_follow_up {
-                        entries.push(ChatEntry::User(text));
+                        if let Some(text) =
+                            collect_user_display_text(std::iter::once(text.as_str()))
+                        {
+                            entries.push(ChatEntry::User(text));
+                        }
                     }
                 }
                 WorkerEvent::EntryAppended { entry } => {
@@ -10905,6 +10985,13 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                                     text: error,
                                 });
                             }
+                            // Keep this spelling under the same display cap
+                            // the optimistic submit path applied, so the
+                            // dedupe compare below still matches for a huge
+                            // pasted message.
+                            let display =
+                                collect_user_display_text(std::iter::once(display.as_str()))
+                                    .unwrap_or_default();
                             // A transformed typed prompt stores the display
                             // spelling; compare it before deciding this is a
                             // new message.
@@ -11470,6 +11557,15 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             .chain(console_coalescer.pending_enter_deadline())
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
             .fold(timeout, |current, remaining| current.min(remaining));
+        // A VT-mode sequence window (`ESC` waiting for its continuation, a
+        // bracketed-paste marker being reassembled) must flush on its own
+        // schedule even when no further console record arrives.
+        #[cfg(windows)]
+        let timeout = win_batch
+            .as_ref()
+            .and_then(|batch| batch.vt_deadline())
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .map_or(timeout, |remaining| timeout.min(remaining));
         // P1-1: snapshot the transcript length before the input poll — any
         // entries pushed while handling this event (slash-command notices
         // like /help, /hotkeys, /copy, failed pastes, …) must be flushed
@@ -11494,6 +11590,15 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                 pending_input.extend(input_gate.push(event, Instant::now()));
             }
             for event in console_coalescer.poll_marker_tail(Instant::now()) {
+                pending_input.extend(input_gate.push(event, Instant::now()));
+            }
+        }
+        // VT-mode byte buffer: release a held `ESC` / sequence prefix whose
+        // window elapsed without a follow-up console record.
+        #[cfg(windows)]
+        if let Some(batch) = win_batch.as_mut() {
+            let released = batch.flush_vt_due(Instant::now());
+            for event in released {
                 pending_input.extend(input_gate.push(event, Instant::now()));
             }
         }
@@ -11687,15 +11792,21 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                 printable_burst.flush(&mut pending_input, !burst_blocked && burst_queue_empty);
             input_trace.note_burst(&outcome);
             if outcome.finished && outcome.total_bytes >= LARGE_PASTE_NOTICE_BYTES {
+                // Report binary units consistently: the thresholds and caps
+                // are powers of two, so the display must be MiB too. Calling
+                // the 1024-based quotient "MB" made one 10 MiB paste read as
+                // "10.0 MB" while a decimal-MB payload of the same digit
+                // count read as "9.4 MB" — the unit label did not match the
+                // arithmetic.
                 let mut text = format!(
-                    "Large paste inserted: {:.1} MB in {} chunk{}",
+                    "Large paste inserted: {:.1} MiB in {} chunk{}",
                     outcome.total_bytes as f64 / (1024.0 * 1024.0),
                     outcome.chunks,
                     if outcome.chunks == 1 { "" } else { "s" }
                 );
                 if outcome.truncated {
                     text.push_str(&format!(
-                        " (truncated at {} MB; content beyond the cap was not inserted)",
+                        " (truncated at {} MiB; content beyond the cap was not inserted)",
                         PrintableBurst::MAX_BYTES / (1024 * 1024)
                     ));
                 } else {
@@ -11958,75 +12069,99 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                 }
                 Event::Paste(text) => {
                     dirty = true;
-                    // An externally supplied overlay (`ctx.ui.custom`) is the
-                    // focused component: a paste chunk is delivered to it in
-                    // the canonical bracketed-paste form, never to the editor.
-                    let external_paste = {
+                    // The generic overlay slot swallows paste unless the
+                    // focused component understands it. `/settings` owns a
+                    // text filter, so route the chunk into its query instead
+                    // of losing it and letting Enter act on the stale row
+                    // (A57-F01).
+                    let settings_paste = {
                         let overlay = app
                             .overlay
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let route = external_overlay_paste_route(&overlay.external, &text);
-                        let visible = overlay.external.visible().cloned();
-                        (route, visible)
+                        if let Some(menu) = overlay.settings.as_ref() {
+                            menu.paste_text(&text);
+                            true
+                        } else {
+                            false
+                        }
                     };
-                    if let (ExternalPasteRoute::Component(data), Some(component)) = external_paste {
-                        // Delivered as a bracketed-paste chunk (the same form
-                        // the focused component's other input takes). The rest
-                        // of the paste routing is skipped — the modal owns it.
-                        component.handle_input(&data);
+                    if settings_paste {
                         app.request_ui_refresh();
-                    } else {
-                        // P1-1: while ANY overlay is open it owns the focus and
-                        // the paste must never reach the main editor (upstream
-                        // routes paste through the focused component). Buffer
-                        // dialogs (input/editor) consume it into their buffer;
-                        // select/confirm dialogs and the model/thinking selector
-                        // swallow it.
-                        let (dialog_open, dialog_accepts_text, selector_open) = {
-                            let dialog = app
-                                .dialog
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if !settings_paste {
+                        // An externally supplied overlay (`ctx.ui.custom`) is the
+                        // focused component: a paste chunk is delivered to it in
+                        // the canonical bracketed-paste form, never to the editor.
+                        let external_paste = {
                             let overlay = app
                                 .overlay
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            (
-                                dialog.is_some(),
-                                dialog.as_ref().is_some_and(DialogOverlay::accepts_text),
-                                overlay.any_open(),
-                            )
+                            let route = external_overlay_paste_route(&overlay.external, &text);
+                            let visible = overlay.external.visible().cloned();
+                            (route, visible)
                         };
-                        // F3: an active transcript search owns the input
-                        // (upstream the search overlay is the focused
-                        // component); a paste must not leak into the hidden
-                        // main editor, so the search state swallows it.
-                        let search_active = app
-                            .alt
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .search
-                            .active;
-                        let route = if search_active {
-                            PasteRoute::Swallowed
+                        if let (ExternalPasteRoute::Component(data), Some(component)) =
+                            external_paste
+                        {
+                            // Delivered as a bracketed-paste chunk (the same form
+                            // the focused component's other input takes). The rest
+                            // of the paste routing is skipped — the modal owns it.
+                            component.handle_input(&data);
+                            app.request_ui_refresh();
                         } else {
-                            paste_route(dialog_open, dialog_accepts_text, selector_open)
-                        };
-                        match route {
-                            PasteRoute::DialogBuffer => {
-                                let mut dialog = app
+                            // P1-1: while ANY overlay is open it owns the focus and
+                            // the paste must never reach the main editor (upstream
+                            // routes paste through the focused component). Buffer
+                            // dialogs (input/editor) consume it into their buffer;
+                            // select/confirm dialogs and the model/thinking selector
+                            // swallow it.
+                            let (dialog_open, dialog_accepts_text, selector_open) = {
+                                let dialog = app
                                     .dialog
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if let Some(overlay) = dialog.as_mut() {
-                                    overlay.paste_text(&text);
+                                let overlay = app
+                                    .overlay
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                (
+                                    dialog.is_some(),
+                                    dialog.as_ref().is_some_and(DialogOverlay::accepts_text),
+                                    overlay.any_open(),
+                                )
+                            };
+                            // F3: an active transcript search owns the input
+                            // (upstream the search overlay is the focused
+                            // component); a paste must not leak into the hidden
+                            // main editor, so the search state swallows it.
+                            let search_active = app
+                                .alt
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .search
+                                .active;
+                            let route = if search_active {
+                                PasteRoute::Swallowed
+                            } else {
+                                paste_route(dialog_open, dialog_accepts_text, selector_open)
+                            };
+                            match route {
+                                PasteRoute::DialogBuffer => {
+                                    let mut dialog = app
+                                        .dialog
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    if let Some(overlay) = dialog.as_mut() {
+                                        overlay.paste_text(&text);
+                                    }
                                 }
-                            }
-                            PasteRoute::Swallowed => {}
-                            PasteRoute::Editor => {
-                                paste_into_editor(&app, &text, &mut entries);
-                                update_autocomplete(&app);
+                                PasteRoute::Swallowed => {}
+                                PasteRoute::Editor => {
+                                    paste_into_editor(&app, &text, &mut entries);
+                                    update_autocomplete(&app);
+                                }
                             }
                         }
                     }
@@ -13198,12 +13333,19 @@ fn handle_key(
         }
         if kb.matches(TuiAction::Submit, key) {
             // Upstream: Enter accepts the completion; a slash-command prefix
-            // then falls through to submit.
+            // then falls through to submit. Command ARGUMENT completions (for
+            // example `/sessions new`) have a non-slash prefix and used to
+            // swallow the first Enter even when accepting changed nothing, so
+            // the command only ran on the second press (A32-F01). If the
+            // completion was a no-op and the editor still holds a slash
+            // command, submit it now.
+            let before = app.editor.get_text();
             let accepted = accept_autocomplete(app);
+            let changed = app.editor.get_text() != before;
             let is_slash = accepted
                 .as_ref()
                 .is_some_and(|prefix| prefix.starts_with('/') && !accepted_str_is_path(prefix));
-            if !is_slash {
+            if !is_slash && !(popup_open && !changed && before.starts_with('/')) {
                 return false;
             }
         } else if kb.matches(TuiAction::Abort, key) {
@@ -13567,9 +13709,19 @@ fn handle_key(
         None
     };
 
-    // Ctrl+C (upstream `handleCtrlC`): the first press clears the editor and
-    // arms; a second press within 500ms exits regardless of editor content.
+    // Ctrl+C (upstream `handleCtrlC`): while a run is streaming it aborts
+    // (same effect as Esc); when idle the first press clears the editor and
+    // arms, and a second press within 500ms exits regardless of content.
     if kb.matches(TuiAction::Clear, key) {
+        if worker.is_streaming() {
+            worker.abort();
+            // Same visible state as the Esc abort path: the live status row
+            // must not survive the aborted run and linger into the next turn.
+            *app.working_message
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            return false;
+        }
         let now = Instant::now();
         if double_press_exit(timing.last_ctrl_c, now) {
             return true;
@@ -16698,11 +16850,58 @@ pub struct SubmitTexts {
     pub to_model: String,
 }
 
+/// Upper bound on the user text a transcript [`ChatEntry::User`] retains.
+///
+/// The rendered component already caps its painted prefix at 128 K chars
+/// (`USER_MESSAGE_DISPLAY_MAX_CHARS`), but the entry itself is the string the
+/// window/search/tab-title paths hold. Keeping a 50 MB pasted prompt there
+/// costs a whole-payload allocation for the session lifetime; the model copy
+/// and the session file remain exact. Display-only truncation (A28-F02).
+pub const USER_ENTRY_DISPLAY_MAX_BYTES: usize = 1024 * 1024;
+
+const USER_ENTRY_DISPLAY_OMISSION: &str = "\n… [truncated for display; the full message was sent]";
+
+/// Join user text blocks, retaining at most
+/// [`USER_ENTRY_DISPLAY_MAX_BYTES`] of the head plus an omission marker.
+/// Returns `None` when the joined text is empty (the historical "no bubble"
+/// contract).
+#[doc(hidden)]
+pub fn collect_user_display_text<'a>(blocks: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut text = String::new();
+    let mut truncated = false;
+    for block in blocks {
+        if text.len() >= USER_ENTRY_DISPLAY_MAX_BYTES {
+            truncated = true;
+            break;
+        }
+        let remaining = USER_ENTRY_DISPLAY_MAX_BYTES - text.len();
+        if block.len() <= remaining {
+            text.push_str(block);
+        } else {
+            let mut end = remaining;
+            while end > 0 && !block.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.push_str(&block[..end]);
+            truncated = true;
+            break;
+        }
+    }
+    if truncated {
+        text.push_str(USER_ENTRY_DISPLAY_OMISSION);
+    }
+    (!text.is_empty()).then_some(text)
+}
+
 /// Split a raw prompt + its markdown-transformer output into the
 /// `(display, to_model)` pair (pure; regression-tested).
+///
+/// `display` is capped at [`USER_ENTRY_DISPLAY_MAX_BYTES`] so a huge paste
+/// does not retain a second full-size copy in the transcript; `to_model` is
+/// always the exact raw prompt.
 pub fn submit_user_texts(raw: &str, transformed: &str) -> SubmitTexts {
     SubmitTexts {
-        display: transformed.to_string(),
+        display: collect_user_display_text(std::iter::once(transformed)).unwrap_or_default(),
         to_model: raw.to_string(),
     }
 }
@@ -18702,9 +18901,11 @@ fn accept_autocomplete(app: &App) -> Option<String> {
 /// Insert clipboard text at the cursor; degradation is graceful (status
 /// notice, no crash).
 fn paste_into_editor(app: &App, text: &str, entries: &mut Vec<ChatEntry>) {
-    let pasted = app.editor.paste_text(text);
+    // The caller only needs the empty/non-empty distinction; the full
+    // expanded payload is never materialized as a second owned copy.
+    let pasted = app.editor.paste_text_discard(text);
     app.note_editor_change();
-    if pasted.is_empty() {
+    if !pasted {
         entries.push(ChatEntry::Notice {
             kind: super::app::NoticeKind::Warning,
             text: "Clipboard contained no text".to_string(),
@@ -19293,7 +19494,17 @@ fn handle_command(
         super::slash::SlashAction::Clone => {
             // Duplicate the current session at the current position (upstream
             // `/clone`): the clone carries the same transcript, so the rebind
-            // clears the TUI side and the worker replays the copy.
+            // clears the TUI side and the worker replays the copy. A rebind
+            // aborts the in-flight run; refuse the command instead of silently
+            // truncating the reply (A44-F01).
+            if worker.is_streaming() {
+                entries.push(ChatEntry::Notice {
+                    kind: super::app::NoticeKind::Warning,
+                    text: "Cannot clone while the agent is running; stop or wait for the current response first."
+                        .to_string(),
+                });
+                return SlashCommandOutcome::Handled;
+            }
             app.program_status_session_reset();
             reset_session_transcript(app, entries);
             let switch_epoch = app.session_switch.begin();
@@ -19423,7 +19634,7 @@ fn handle_command(
         super::slash::SlashAction::Help => {
             entries.push(ChatEntry::Notice {
                 kind: super::app::NoticeKind::Status,
-                text: "Commands: /model /thinking /clear /compact /new /resume /sessions /fork /clone /name /session /copy /settings /tree /scoped-models /trust /login /logout /changelog /hotkeys /share /import /bug /reload /debug /quit /help · ! runs bash".to_string(),
+                text: "Commands: /model /thinking /clear /compact /new /resume /sessions /fork /clone /name /session /copy /settings /tree /scoped-models /trust /login /logout /changelog /hotkeys /share /import /export /bug /reload /debug /image /mcp /todos /quit /help · ! runs bash".to_string(),
             });
         }
         super::slash::SlashAction::Tree => {
@@ -19946,6 +20157,18 @@ fn handle_command(
             // `/export`), so a quoted path loses its quotes.
             match path_command_argument(command, "import") {
                 Some(path) => {
+                    // Validate before asking to replace the live session: a
+                    // typo used to show the destructive confirm modal first
+                    // and only fail after the user accepted (A71-F01/A54-F01).
+                    if !std::path::Path::new(&path).is_file() {
+                        entries.push(ChatEntry::Notice {
+                            kind: super::app::NoticeKind::Error,
+                            text: format!(
+                                "Failed to import session: file not found or not a file: {path}"
+                            ),
+                        });
+                        return SlashCommandOutcome::Handled;
+                    }
                     // Upstream confirms before replacing
                     // (`showExtensionConfirm("Import session", ...)`); No/Esc
                     // cancels.
@@ -20160,7 +20383,15 @@ fn handle_resume_command(app: &mut App, entries: &mut Vec<ChatEntry>, worker: &W
         });
         return;
     }
+    // The session picker is a synchronous crossterm UI, not the VT byte
+    // reader. Switch the console back to INPUT_RECORD mode for the picker and
+    // restore VT input afterwards; otherwise every picker key is swallowed
+    // (the in-session `/resume` keyboard trap).
+    #[cfg(windows)]
+    crate::tui::stdin_buffer::restore_windows_vt_input();
     let picked = crate::coding_agent::session_pick::pick_session_with_all(&sessions, &all_sessions);
+    #[cfg(windows)]
+    let _ = crate::tui::stdin_buffer::enable_windows_vt_input();
     // Restore the TUI surface the picker swapped out. The picker always
     // leaves raw mode + the alternate screen on return, so raw mode is
     // re-enabled unconditionally; the alternate screen is re-entered only in
@@ -20188,6 +20419,17 @@ fn handle_resume_command(app: &mut App, entries: &mut Vec<ChatEntry>, worker: &W
         // tree event first, named in the lane report.)
         Some(path) => match crate::session_manager::SessionManager::open(&path) {
             Ok(manager) => {
+                // A live foreign writer owns this transcript (A28-F01): never
+                // attach a second one and interleave turns. Same-process
+                // reopens (a tab switch, /fork's source read) remain allowed.
+                if let Err(error) = manager.ensure_exclusive_writer() {
+                    restore_tui_surface_after_prompt(app);
+                    entries.push(ChatEntry::Notice {
+                        kind: super::app::NoticeKind::Error,
+                        text: format!("cannot open session: {error}"),
+                    });
+                    return;
+                }
                 // §6 #16 (upstream `switchSession` → `assertSessionCwdExists`
                 // + `handleResumeSession`'s MissingSessionCwdError catch): the
                 // stored cwd is gone. Offer the upstream Continue/Cancel
@@ -20195,8 +20437,14 @@ fn handle_resume_command(app: &mut App, entries: &mut Vec<ChatEntry>, worker: &W
                 // override, Cancel leaves the outgoing session untouched.
                 let (manager, resumed_in_current_cwd) = match manager.missing_session_cwd() {
                     Some(issue) => {
+                        // Same synchronous-crossterm boundary as the session
+                        // picker above.
+                        #[cfg(windows)]
+                        crate::tui::stdin_buffer::restore_windows_vt_input();
                         let choice =
                             super::session_cwd::prompt_missing_session_cwd(&issue, &cwd_text);
+                        #[cfg(windows)]
+                        let _ = crate::tui::stdin_buffer::enable_windows_vt_input();
                         match super::session_cwd::missing_cwd_override(choice, &cwd_text) {
                             Some(fallback) => {
                                 match super::session_cwd::open_session_in_current_cwd(
@@ -20863,7 +21111,12 @@ fn submit_user_prompt(
     text: &str,
     follow_up: bool,
 ) {
-    let (transformed, error) = transform_markdown(app, text, "user", false, None, None);
+    // Transform only the display head: the entry is capped anyway, and a
+    // markdown pass over a 50 MB paste copied the whole payload for output the
+    // transcript would truncate (A28-F02). The model path below still takes
+    // the exact raw text.
+    let display_src = collect_user_display_text(std::iter::once(text)).unwrap_or_default();
+    let (transformed, error) = transform_markdown(app, &display_src, "user", false, None, None);
     if let Some(error) = error {
         entries.push(ChatEntry::Notice {
             kind: super::app::NoticeKind::Warning,
@@ -24360,15 +24613,12 @@ pub fn transcript_entries_from_messages(
             Message::User(user) => {
                 // Upstream `getUserMessageText`: text blocks joined with ""
                 // (interactive-mode.ts:3795-3801).
-                let text = user
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
+                if let Some(text) =
+                    collect_user_display_text(user.content.iter().filter_map(|block| match block {
                         ContentBlock::Text(text) => Some(text.text.as_str()),
                         _ => None,
-                    })
-                    .collect::<String>();
-                if !text.is_empty() {
+                    }))
+                {
                     replayed.push(ChatEntry::User(text));
                 }
             }
@@ -24841,6 +25091,16 @@ impl ConsoleBatchCoalescer {
         }
         let mut out = Vec::with_capacity(8 + expired_tail.len());
         out.extend(expired_tail);
+        // Inside an open paste the payload may itself contain end markers (a
+        // pasted log/source/binary). Only the LAST end marker in the batch can
+        // be the terminal's own terminator; every earlier one is followed by
+        // more payload in the same batch and stays literal payload text. When
+        // the start marker opened the paste in this same batch, the scan starts
+        // after it.
+        let mut paste_end_start = self
+            .paste_open
+            .then(|| last_paste_terminator_start(&events))
+            .flatten();
         let mut run_events: Vec<Event> = Vec::new();
         let mut run_text = String::new();
         let mut paste_text = std::mem::take(&mut self.paste_buffer);
@@ -24863,15 +25123,20 @@ impl ConsoleBatchCoalescer {
                     flush_plain_run(&mut run_events, &mut run_text, &mut out);
                     self.paste_open = true;
                     self.last_was_plain_enter = false;
+                    paste_end_start =
+                        last_paste_terminator_start(&events[next..]).map(|at| next + at);
                     index = next;
                     continue;
                 }
-            } else if let Some(next) = bracket_marker_end(&events, index, b"[201~", true) {
-                flush_paste_chunk(&mut paste_text, &mut out);
-                self.paste_open = false;
-                self.last_was_plain_enter = false;
-                index = next;
-                continue;
+            } else if paste_end_start == Some(index) {
+                if let Some(next) = bracket_marker_end(&events, index, b"[201~", true) {
+                    flush_paste_chunk(&mut paste_text, &mut out);
+                    self.paste_open = false;
+                    self.last_was_plain_enter = false;
+                    paste_end_start = None;
+                    index = next;
+                    continue;
+                }
             }
             let event = events[index].clone();
             index += 1;
@@ -25143,6 +25408,97 @@ fn bracket_marker_end(
         if bracket_ok && keys_match_digits(&presses[1..], digits) {
             let last = presses[digits.len()].0;
             return Some(advance_releases(events, last + 1));
+        }
+    }
+    None
+}
+
+/// Start index of the last end marker (`ESC [ 2 0 1 ~`) in `events` whose
+/// suffix is empty (the marker ends the batch) or begins with a line ending
+/// (the Enter that followed the paste), accepting every spelling
+/// [`bracket_marker_end`] accepts.
+///
+/// While a bracketed paste is open, an end marker followed by more payload is
+/// literal text; only such a terminal marker may close the paste. Scanning
+/// backwards keeps the cost linear in the batch and, unlike calling
+/// `bracket_marker_end` at every index, allocates nothing for the hundreds of
+/// thousands of records a paste can carry.
+fn last_paste_terminator_start(events: &[Event]) -> Option<usize> {
+    const END: &[u8] = b"[201~";
+    let digits = &END[1..]; // `201~`
+    let last_digit = *digits.last()?;
+    let mut index = events.len();
+    while index > 0 {
+        index -= 1;
+        let Event::Key(key) = &events[index] else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press || key.code != KeyCode::Char(last_digit as char) {
+            continue;
+        }
+        // Collect the presses ending here, newest first, skipping the release
+        // records the console interleaves.
+        let mut presses: [Option<(usize, &KeyEvent)>; 8] = [None; 8];
+        let mut count = 0usize;
+        let mut cursor = index + 1;
+        while cursor > 0 && count < presses.len() {
+            cursor -= 1;
+            match &events[cursor] {
+                Event::Key(key) if key.kind == KeyEventKind::Release => continue,
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    presses[count] = Some((cursor, key));
+                    count += 1;
+                }
+                _ => break,
+            }
+        }
+        let digits_ok = digits.iter().rev().enumerate().all(|(offset, byte)| {
+            presses
+                .get(offset)
+                .and_then(|entry| *entry)
+                .is_some_and(|(_, key)| {
+                    (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                        && matches!(key.code, KeyCode::Char(c) if c == *byte as char)
+                })
+        });
+        if !digits_ok {
+            continue;
+        }
+        // Prefer `ESC [` + digits, then `[` + digits (plain or ALT-folded),
+        // then the bare digits spelling.
+        let start = if let Some((bracket_index, bracket)) =
+            presses.get(digits.len()).and_then(|entry| *entry)
+        {
+            let bracket_ok = bracket.code == KeyCode::Char('[')
+                && !bracket.modifiers.intersects(KeyModifiers::CONTROL)
+                && (bracket.modifiers.is_empty() || bracket.modifiers == KeyModifiers::ALT);
+            if bracket_ok {
+                if let Some((escape_index, escape)) =
+                    presses.get(digits.len() + 1).and_then(|entry| *entry)
+                {
+                    if escape.code == KeyCode::Esc && escape.modifiers.is_empty() {
+                        escape_index
+                    } else {
+                        bracket_index
+                    }
+                } else {
+                    bracket_index
+                }
+            } else {
+                presses[digits.len() - 1]?.0
+            }
+        } else {
+            presses[digits.len() - 1]?.0
+        };
+        // A marker with payload after it is an inner marker, not the
+        // terminator. Only the chunk-final marker, or one immediately followed
+        // by a line ending, closes the paste.
+        let next = advance_releases(events, index + 1);
+        let suffix_is_line_ending = events.get(next).is_some_and(
+            |event| matches!(event, Event::Key(key) if is_cr_enter(key) || is_lf_chord(key)),
+        );
+        if next >= events.len() || suffix_is_line_ending {
+            return Some(start);
         }
     }
     None
@@ -25861,6 +26217,121 @@ pub fn decode_console_batch(records: &[ConsoleBatchRecord]) -> Vec<Event> {
     out
 }
 
+/// Decoder for the Windows console's VT input mode.
+///
+/// With `ENABLE_VIRTUAL_TERMINAL_INPUT` installed the console stops
+/// synthesizing key records from the terminal's VT byte stream and instead
+/// queues the stream itself: one `KEY_EVENT` record per UTF-16 unit, carrying
+/// the byte in `u_char` with `VK 0` (a bracketed-paste marker arrives as six
+/// such records, and `\x03` arrives as the literal control byte — not as a
+/// Ctrl+C key record). This decoder reassembles that stream and runs it
+/// through [`super::stdin_buffer::StdinBuffer`], so bracketed paste,
+/// sequence framing and the control bytes inside a paste are handled by the
+/// same upstream byte model the Unix path uses.
+///
+/// Non-BMP characters: ConPTY reports the surrogate pair as two `u_char`
+/// records whose `bKeyDown` flags are both false (probed 2026-11-07), so
+/// surrogate units are paired regardless of `key_down`; every other unit is
+/// taken from its key-down record only (the paired key-up record repeats the
+/// character and would otherwise dispatch twice).
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ConsoleVtInputDecoder {
+    stdin: super::stdin_buffer::StdinBuffer,
+    high_surrogate: Option<u16>,
+    pending: Vec<u8>,
+}
+
+impl ConsoleVtInputDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Buffer one console record, appending every event that becomes ready.
+    pub fn push(&mut self, record: ConsoleBatchRecord, out: &mut Vec<Event>) {
+        match record {
+            ConsoleBatchRecord::Key {
+                key_down, u_char, ..
+            } => {
+                if let Some(character) = self.decode_char(key_down, u_char) {
+                    let mut buffer = [0u8; 4];
+                    self.pending
+                        .extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+                }
+            }
+            ConsoleBatchRecord::Resize { x, y } => {
+                // Resize/focus are console-level, never paste payload: flush
+                // the bytes read before them first so input order is exact.
+                self.finish(Instant::now(), out);
+                out.push(Event::Resize(
+                    (x as i32 + 1).max(0) as u16,
+                    (y as i32 + 1).max(0) as u16,
+                ));
+            }
+            ConsoleBatchRecord::Focus { focused } => {
+                self.finish(Instant::now(), out);
+                out.push(if focused {
+                    Event::FocusGained
+                } else {
+                    Event::FocusLost
+                });
+            }
+        }
+    }
+
+    fn decode_char(&mut self, key_down: bool, unit: u16) -> Option<char> {
+        if unit == 0 {
+            return None;
+        }
+        if (0xD800..=0xDFFF).contains(&unit) {
+            if (0xDC00..=0xDFFF).contains(&unit) {
+                let high = self.high_surrogate.take()?;
+                return char::decode_utf16([high, unit]).next().and_then(Result::ok);
+            }
+            self.high_surrogate = Some(unit);
+            return None;
+        }
+        if !key_down {
+            return None;
+        }
+        char::from_u32(u32::from(unit))
+    }
+
+    /// Feed the buffered VT bytes through the byte buffer, then flush a
+    /// sequence window that already expired. The event loop calls this once
+    /// per drained console batch and from the poll deadline.
+    pub fn finish(&mut self, now: Instant, out: &mut Vec<Event>) {
+        if !self.pending.is_empty() {
+            let bytes = std::mem::take(&mut self.pending);
+            let sequences = self.stdin.process(&bytes, now);
+            out.extend(super::stdin_buffer::stdin_events_to_events(sequences));
+        }
+        let due = self.stdin.flush_due(now);
+        out.extend(super::stdin_buffer::stdin_events_to_events(due));
+    }
+
+    /// The pending sequence-timeout deadline, for the loop's poll timeout.
+    pub fn pending_deadline(&self) -> Option<Instant> {
+        self.stdin.pending_deadline()
+    }
+}
+
+/// Decode one batch of [`ConsoleBatchRecord`]s through the VT byte model
+/// exactly as the Windows VT reader would. Test seam mirroring
+/// [`decode_console_batch`].
+#[doc(hidden)]
+pub fn decode_console_vt_batch(records: &[ConsoleBatchRecord]) -> Vec<Event> {
+    let mut decoder = ConsoleVtInputDecoder::new();
+    let mut out = Vec::new();
+    for record in records {
+        decoder.push(*record, &mut out);
+    }
+    let now = Instant::now();
+    decoder.finish(now, &mut out);
+    decoder.finish(now + Duration::from_secs(1), &mut out);
+    out
+}
+
 /// Windows console input batch reader (TUI-P4).
 ///
 /// Crossterm's Windows source reads `INPUT_RECORD`s one at a time: each
@@ -25884,7 +26355,7 @@ mod win_batch_input {
         Console, ControlKeyState, EventFlags, Handle, HandleType, InputRecord, ScreenBuffer,
     };
 
-    use super::{ConsoleBatchDecoder, ConsoleBatchRecord};
+    use super::{ConsoleBatchDecoder, ConsoleBatchRecord, ConsoleVtInputDecoder};
 
     const SHIFT_PRESSED: u32 = 0x0010;
     const LEFT_ALT_PRESSED: u32 = 0x0002;
@@ -25895,6 +26366,11 @@ mod win_batch_input {
     pub(super) struct BatchReader {
         console: Console,
         decoder: ConsoleBatchDecoder,
+        /// `Some` when `ENABLE_VIRTUAL_TERMINAL_INPUT` is installed: the
+        /// console then queues the terminal's VT byte stream as per-unit
+        /// `KEY_EVENT` records, which must go through the byte model rather
+        /// than the key-record decoder (see [`ConsoleVtInputDecoder`]).
+        vt: Option<ConsoleVtInputDecoder>,
         left: bool,
         right: bool,
         middle: bool,
@@ -25909,13 +26385,25 @@ mod win_batch_input {
             // stdin (pipe/file) has no console queue to wait on; the caller
             // falls back to crossterm's event source, exactly as before.
             console.number_of_console_input_events().ok()?;
+            let vt = matches!(
+                super::super::stdin_buffer::windows_vt_input_status(),
+                super::super::stdin_buffer::VtInputStatus::FlagSet
+            )
+            .then(ConsoleVtInputDecoder::new);
             Some(Self {
                 console,
                 decoder: ConsoleBatchDecoder::new(),
+                vt,
                 left: false,
                 right: false,
                 middle: false,
             })
+        }
+
+        /// Whether the console delivers the raw VT byte stream (VT input
+        /// mode). The event loop uses this to skip crossterm's record parser.
+        pub(super) fn uses_vt_bytes(&self) -> bool {
+            self.vt.is_some()
         }
 
         /// Records already queued in the console input buffer.
@@ -25930,6 +26418,42 @@ mod win_batch_input {
                 return;
             };
             for record in records {
+                if let Some(vt) = self.vt.as_mut() {
+                    match record {
+                        InputRecord::KeyEvent(key) => vt.push(
+                            ConsoleBatchRecord::Key {
+                                key_down: key.key_down,
+                                virtual_key_code: key.virtual_key_code,
+                                u_char: key.u_char,
+                                modifiers: Self::modifiers(&key.control_key_state),
+                            },
+                            out,
+                        ),
+                        // In VT mode the terminal's mouse reports arrive in
+                        // the byte stream (SGR sequences, decoded by the byte
+                        // model). A MOUSE_EVENT record is still handled for a
+                        // console that reports both.
+                        InputRecord::MouseEvent(mouse) => {
+                            vt.finish(std::time::Instant::now(), out);
+                            self.push_mouse(&mouse, out);
+                        }
+                        InputRecord::WindowBufferSizeEvent(size) => vt.push(
+                            ConsoleBatchRecord::Resize {
+                                x: size.size.x,
+                                y: size.size.y,
+                            },
+                            out,
+                        ),
+                        InputRecord::FocusEvent(focus) => vt.push(
+                            ConsoleBatchRecord::Focus {
+                                focused: focus.set_focus,
+                            },
+                            out,
+                        ),
+                        InputRecord::MenuEvent(_) => {}
+                    }
+                    continue;
+                }
                 match record {
                     InputRecord::KeyEvent(key) => self.decoder.push(
                         ConsoleBatchRecord::Key {
@@ -25957,6 +26481,27 @@ mod win_batch_input {
                     InputRecord::MenuEvent(_) => {}
                 }
             }
+            if let Some(vt) = self.vt.as_mut() {
+                vt.finish(std::time::Instant::now(), out);
+            }
+        }
+
+        /// Release a VT sequence window that expired with no new record.
+        pub(super) fn flush_vt_due(&mut self, now: std::time::Instant) -> Vec<Event> {
+            let Some(vt) = self.vt.as_mut() else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            vt.finish(now, &mut out);
+            out
+        }
+
+        /// The VT byte buffer's pending sequence deadline, for the event
+        /// loop's poll timeout (a lone ESC must flush on its own schedule).
+        pub(super) fn vt_deadline(&self) -> Option<std::time::Instant> {
+            self.vt
+                .as_ref()
+                .and_then(ConsoleVtInputDecoder::pending_deadline)
         }
 
         fn modifiers(state: &ControlKeyState) -> KeyModifiers {
@@ -26466,23 +27011,18 @@ pub fn worker_error_ends_run_state(run_in_flight: bool) -> bool {
 /// F4 (pure; regression-tested): the run-level error NOTICE a settled run
 /// reports to the transcript, if any.
 ///
-/// One abort must produce ONE visible error. An aborted run already surfaces
-/// its error in the settled assistant entry — the terminal message the
-/// provider's abort built carries `error_message` and the message component
-/// renders it — plus the `Interrupted` status, so the run-level notice is
-/// suppressed (`None`). Upstream's `agent_end` shows no error line either
-/// (interactive-mode.ts:3653-3666: it only clears the working indicator and
-/// the streaming component; the message component carries the error). A real
-/// (non-abort) `StopReason::Error` keeps its single notice, as before.
+/// The settled assistant entry already renders the terminal `error_message`
+/// (the message component prints the `Error: …` row), so a second run-level
+/// notice duplicates the same error. This was observed for both aborted and
+/// real provider-error runs (QA1-F04): the notice is therefore suppressed for
+/// every terminal message; the message component is the single visible error.
 pub fn settled_run_error_notice(
     aborted: bool,
     stop_reason: crate::ai::types::StopReason,
     error_message: Option<&str>,
 ) -> Option<String> {
-    if aborted || stop_reason != crate::ai::types::StopReason::Error {
-        return None;
-    }
-    error_message.map(str::to_owned)
+    let _ = (aborted, stop_reason, error_message);
+    None
 }
 
 /// F2: emit a worker-level failure — the error notice followed by the run-end
@@ -26837,14 +27377,17 @@ pub fn entry_appended_user_text(entry: &serde_json::Value) -> Option<String> {
     if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
         return None;
     }
-    let text = message
-        .get("content")
-        .and_then(serde_json::Value::as_array)?
-        .iter()
-        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
-        .collect::<String>();
-    (!text.is_empty()).then_some(text)
+    // Build the display head only: collecting the whole JSON text first
+    // allocated another full-size copy of a pasted prompt just to compare it
+    // against the already-capped optimistic bubble (A28-F02).
+    collect_user_display_text(
+        message
+            .get("content")
+            .and_then(serde_json::Value::as_array)?
+            .iter()
+            .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str)),
+    )
 }
 
 /// Whether `raw`/`display` are already represented by the trailing user
@@ -27372,7 +27915,7 @@ async fn run_prompt(
             // `handled` outcome swallows the prompt without starting a turn.
             WorkerRun::Prompt(text) => {
                 prompt_session
-                    .prompt_with_source(&text, "interactive", handler)
+                    .prompt_with_source_owned(text, "interactive", handler)
                     .await
             }
             // A custom-message run goes through the same setup as a prompt
@@ -28854,9 +29397,30 @@ async fn handle_session_command(
             // Full open, deliberately (see the /resume picker note): the swap
             // emits `session_tree` to extensions, and a paged manager would
             // hand them a tail-window tree.
+            let import_path = std::path::Path::new(&path);
+            if !import_path.is_file() {
+                // `SessionManager::open` on a missing path creates a fresh
+                // session, which made `/import typo.jsonl` look successful and
+                // silently drop the outgoing context (A29-F01). Validate the
+                // source before touching the live session.
+                let _ = events.send(WorkerEvent::SessionSwitchSettled { switch_epoch });
+                return report_session_outcome(
+                    events,
+                    Err(format!(
+                        "Failed to import session: file not found or not a file: {path}"
+                    )),
+                );
+            }
             let outcome =
                 match crate::session_manager::SessionManager::open(std::path::Path::new(&path)) {
                     Ok(manager) => {
+                        if let Err(error) = manager.ensure_exclusive_writer() {
+                            let _ = events.send(WorkerEvent::SessionSwitchSettled { switch_epoch });
+                            return report_session_outcome(
+                                events,
+                                Err(format!("Failed to import session: {error}")),
+                            );
+                        }
                         let opened = manager.path().to_string_lossy().into_owned();
                         // §2.5: never carry a background call across an import.
                         session.abort_all_background();

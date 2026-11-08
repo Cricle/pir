@@ -3,15 +3,23 @@
 //! upstream ServerId pattern.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use pir::ai::auth::ApiKeyAuth;
+use pir::ai::event_stream::AssistantMessageEventStream;
+use pir::ai::provider::{Provider, ProviderRegistry};
+use pir::ai::types::{
+    AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Model, ModelCost,
+    ModelCostRates, StopReason, StreamOptions, TerminalReason, TextContent,
+};
 use pir::protocol::{
     decode_value, encode_client_value, is_server_id, parse_client_value, parse_server_message,
     parse_service_provider_update, parse_session_snapshot_value, CborOptions, FrameOptions,
     ServerMessageDecoder, PROTOCOL_VERSION, SERVICE_CONTROL_ID, SESSION_SERVICE_ID,
 };
-use pir::server::{Server, ServerSecurityConfig, ServerState};
+use pir::server::{empty_snapshot, Server, ServerSecurityConfig, ServerState};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -436,6 +444,46 @@ async fn request_response_round_trip_over_control_and_session_services() {
         .expect("serve client");
 }
 
+/// Create a session with an explicit model and attach it, returning
+/// (session_id, attachment_id).
+async fn create_and_attach_with_model(
+    conn: &mut Conn,
+    server_id: &str,
+    provider: &str,
+    model_id: &str,
+) -> (String, String) {
+    let server_target = serde_json::json!({"serverId": server_id});
+    conn.send(&request_envelope(
+        "s1",
+        server_target,
+        session_call(
+            "create",
+            serde_json::json!([{"model": {"provider": provider, "id": model_id}}]),
+        ),
+    ))
+    .await;
+    let response = conn.read().await;
+    let session_id = response["result"]["session"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session id ({response})"))
+        .to_owned();
+    conn.send(&request_envelope(
+        "a1",
+        serde_json::json!({"serverId": server_id}),
+        session_call("attach", serde_json::json!([{"sessionId": session_id}])),
+    ))
+    .await;
+    let attachment = conn.read().await;
+    assert_eq!(attachment["type"], "attachment");
+    let leased = attachment["attachment"]["attachmentId"]
+        .as_str()
+        .expect("attachmentId")
+        .to_owned();
+    let response = conn.read().await;
+    assert_eq!(response["ok"], true, "attach failed: {response}");
+    (session_id, leased)
+}
+
 /// Create a session and attach it, returning (session_id, attachment_id).
 async fn create_and_attach(conn: &mut Conn, server_id: &str) -> (String, String) {
     let server_target = serde_json::json!({"serverId": server_id});
@@ -657,6 +705,365 @@ async fn service_updates_are_emitted_to_subscribers_on_session_progress() {
         .await
         .expect("accept task join")
         .expect("serve client");
+}
+
+/// A provider that reports one streamed assistant reply, so a prompt run
+/// produces real transcript progress (item start/delta/finish) rather than
+/// only lifecycle snapshots.
+struct ProgressProvider {
+    calls: AtomicUsize,
+}
+
+fn progress_model() -> Model {
+    Model {
+        id: "progress-model".into(),
+        name: "Progress model".into(),
+        api: "progress-api".into(),
+        provider: "progress".into(),
+        base_url: "http://localhost".into(),
+        reasoning: false,
+        thinking_level_map: None,
+        input: vec!["text".into()],
+        cost: ModelCost {
+            rates: ModelCostRates {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            tiers: Vec::new(),
+        },
+        context_window: 4_096,
+        max_tokens: 256,
+        sampling_params: None,
+        headers: None,
+        thinking_token_budget_field: None,
+        input_limits: None,
+        prompt_cache: None,
+        sampling_params_by_thinking_level: None,
+        model_type: None,
+        compat: None,
+    }
+}
+
+fn progress_assistant(content: Vec<ContentBlock>) -> AssistantMessage {
+    AssistantMessage {
+        api: "progress-api".into(),
+        provider: "progress".into(),
+        model: "progress-model".into(),
+        content,
+        stop_reason: StopReason::Stop,
+        timestamp: 1,
+        ..AssistantMessage::default()
+    }
+}
+
+impl Provider for ProgressProvider {
+    fn id(&self) -> &str {
+        "progress"
+    }
+
+    fn name(&self) -> &str {
+        "Progress provider"
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        vec![progress_model()]
+    }
+
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        vec![ApiKeyAuth::new(
+            "progress key",
+            vec!["PROGRESS_TEST_KEY".into()],
+        )]
+    }
+
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: Context,
+        _options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let stream = AssistantMessageEventStream::new();
+        let mut partial = progress_assistant(Vec::new());
+        stream.push(AssistantMessageEvent::Start {
+            partial: Arc::new(partial.clone()),
+        });
+        partial.content = vec![ContentBlock::Text(TextContent {
+            text: "streamed reply".into(),
+            text_signature: None,
+        })];
+        stream.push(AssistantMessageEvent::TextStart {
+            content_index: 0,
+            partial: Arc::new(partial.clone()),
+        });
+        stream.push(AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "streamed reply".into(),
+            partial: Arc::new(partial.clone()),
+        });
+        stream.push(AssistantMessageEvent::TextEnd {
+            content_index: 0,
+            content: "streamed reply".into(),
+            partial: Arc::new(partial.clone()),
+        });
+        stream.push(AssistantMessageEventStream::done_event(
+            TerminalReason::Stop,
+            partial,
+        ));
+        stream
+    }
+}
+
+/// Bind a server whose sessions run against [`ProgressProvider`].
+async fn bind_progress_server() -> (Arc<Server>, std::net::SocketAddr) {
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(ProgressProvider {
+        calls: AtomicUsize::new(0),
+    }));
+    let state = ServerState::with_providers(
+        empty_snapshot(uuid::Uuid::new_v4().to_string()),
+        Arc::new(registry),
+    );
+    let server = Server::bind_with_state_and_security(
+        "127.0.0.1:0",
+        state,
+        ServerSecurityConfig::unauthenticated_local(),
+    )
+    .await
+    .expect("bind progress server");
+    let address = server.local_addr().expect("local address");
+    (Arc::new(server), address)
+}
+
+/// A18-F01: a canonical `$chord.service` subscription receives the whole
+/// prompt run as `service_update` frames: snapshot transitions (turn → idle)
+/// plus transcript `progress` updates. The terminal idle snapshot is the v8
+/// representation of agent end; there is no separate `agent_end` frame type.
+#[tokio::test]
+async fn subscribed_client_receives_prompt_progress_and_terminal_snapshot() {
+    let (server, address) = bind_progress_server().await;
+    let accepting = {
+        let server = server.clone();
+        tokio::spawn(async move { server.accept_once().await })
+    };
+    let mut conn = Conn::connect(address).await;
+    let server_id = conn.handshake().await;
+    let (session_id, leased) =
+        create_and_attach_with_model(&mut conn, &server_id, "progress", "progress-model").await;
+
+    // The canonical upstream subscription shape: [subscriptionId, serviceId,
+    // mode].
+    conn.send(&request_envelope(
+        "sub1",
+        serde_json::json!({"serverId": server_id}),
+        control_call(
+            "subscribe",
+            serde_json::json!(["sub-1", SESSION_SERVICE_ID, "singleton"]),
+        ),
+    ))
+    .await;
+    let response = conn.read().await;
+    assert_eq!(response["ok"], true, "subscribe failed: {response}");
+    assert_eq!(response["result"]["serviceId"], SESSION_SERVICE_ID);
+
+    conn.send(&request_envelope(
+        "p1",
+        serde_json::json!({
+            "serverId": server_id,
+            "sessionId": session_id,
+            "attachmentId": leased,
+        }),
+        session_call("prompt", serde_json::json!([{"text": "hello"}])),
+    ))
+    .await;
+
+    let mut phases = Vec::new();
+    let mut progress_kinds = Vec::new();
+    let mut saw_response = false;
+    let mut last_member = None;
+    for _ in 0..128 {
+        let frame = conn.read().await;
+        match frame["type"].as_str().expect("frame type") {
+            "service_update" => {
+                assert_eq!(frame["subscriptionId"], "sub-1");
+                let update = &frame["update"];
+                parse_service_provider_update(update)
+                    .unwrap_or_else(|error| panic!("invalid service update {update}: {error}"));
+                assert_eq!(update["type"], "state");
+                assert_eq!(update["instance"]["key"], session_id.as_str());
+                match update["member"].as_str().expect("member") {
+                    "snapshot" => {
+                        let value = snapshot_payload(update);
+                        parse_session_snapshot_value(&value).expect("valid snapshot body");
+                        phases.push(value["phase"].as_str().expect("phase").to_owned());
+                    }
+                    "progress" => {
+                        let ops = update["ops"].as_array().expect("progress ops");
+                        let payload = &ops[0][1];
+                        progress_kinds
+                            .push(payload["type"].as_str().expect("progress type").to_owned());
+                    }
+                    other => panic!("unexpected state member: {other}"),
+                }
+                last_member = update["member"].as_str().map(str::to_owned);
+            }
+            "response" => {
+                assert_eq!(frame["id"], "p1");
+                assert_eq!(frame["ok"], true, "prompt failed: {frame}");
+                assert_eq!(frame["result"]["command"], "prompt");
+                assert_eq!(frame["result"]["session"]["phase"], "idle");
+                assert_eq!(frame["result"]["session"]["queuedSteerCount"], 0);
+                saw_response = true;
+            }
+            other => panic!("unexpected frame type {other}: {frame}"),
+        }
+        if saw_response {
+            break;
+        }
+    }
+    assert!(saw_response, "prompt response never arrived");
+    assert!(
+        phases.iter().any(|phase| phase == "turn"),
+        "snapshot stream must show the turn phase: {phases:?}"
+    );
+    assert_eq!(
+        phases.last().map(String::as_str),
+        Some("idle"),
+        "the final snapshot is the agent-end signal: {phases:?}"
+    );
+    assert_eq!(
+        last_member.as_deref(),
+        Some("snapshot"),
+        "the terminal update must be the idle snapshot"
+    );
+    assert!(
+        progress_kinds
+            .iter()
+            .any(|kind| kind == "item_started" || kind == "assistant_delta"),
+        "transcript progress must reach the subscriber: {progress_kinds:?}"
+    );
+
+    // Unsubscribe stops the stream: the next state mutation produces only its
+    // response, no service_update.
+    conn.send(&request_envelope(
+        "u1",
+        serde_json::json!({"serverId": server_id}),
+        control_call("unsubscribe", serde_json::json!(["sub-1"])),
+    ))
+    .await;
+    let response = conn.read().await;
+    assert_eq!(response["id"], "u1");
+    assert_eq!(response["ok"], true, "unsubscribe failed: {response}");
+
+    conn.send(&request_envelope(
+        "t1",
+        serde_json::json!({
+            "serverId": server_id,
+            "sessionId": session_id,
+            "attachmentId": leased,
+        }),
+        session_call(
+            "set_thinking",
+            serde_json::json!([{"thinkingLevel": "low"}]),
+        ),
+    ))
+    .await;
+    let response = conn.read().await;
+    assert_eq!(response["id"], "t1");
+    assert_eq!(response["ok"], true, "set_thinking failed: {response}");
+
+    drop(conn);
+    accepting
+        .await
+        .expect("accept task join")
+        .expect("serve client");
+}
+
+/// A18-F12: wrong/missing auth must produce a structured `hello_error`
+/// (code `unauthorized`) before the TCP close, not a bare reset.
+#[tokio::test]
+async fn auth_failure_sends_structured_hello_error_before_close() {
+    async fn expect_auth_error(mut stream: TcpStream) {
+        let mut decoder = ServerMessageDecoder::new(FrameOptions::default()).expect("decoder");
+        let mut buffer = [0_u8; 4096];
+        let mut messages = Vec::new();
+        for _ in 0..8 {
+            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buffer))
+                .await
+                .expect("auth frame timeout")
+                .expect("read auth frame");
+            if read == 0 {
+                break;
+            }
+            messages.extend(decoder.push(&buffer[..read]).expect("decode auth frame"));
+            if !messages.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            messages.len(),
+            1,
+            "expected one auth error frame: {messages:?}"
+        );
+        assert_eq!(messages[0]["type"], "hello_error");
+        assert_eq!(messages[0]["error"]["code"], "unauthorized");
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buffer))
+            .await
+            .expect("close timeout")
+            .expect("read close");
+        assert_eq!(read, 0, "the server must close after the auth error");
+    }
+
+    let server = Server::bind_with_security(
+        "127.0.0.1:0",
+        ServerSecurityConfig {
+            auth_token: Some("auth-secret".to_owned()),
+            ..ServerSecurityConfig::default()
+        },
+    )
+    .await
+    .expect("bind secure server");
+    let address = server.local_addr().expect("local address");
+    let accepting = tokio::spawn(async move { server.accept_once().await });
+
+    // Wrong token.
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    stream
+        .write_all(b"PIR-AUTH wrong-token\n")
+        .await
+        .expect("write wrong token");
+    expect_auth_error(stream).await;
+    accepting
+        .await
+        .expect("accept task join")
+        .expect_err("wrong token must be rejected");
+
+    // Missing token: speak the protocol without the preface at all.
+    let server = Server::bind_with_security(
+        "127.0.0.1:0",
+        ServerSecurityConfig {
+            auth_token: Some("auth-secret".to_owned()),
+            ..ServerSecurityConfig::default()
+        },
+    )
+    .await
+    .expect("bind secure server");
+    let address = server.local_addr().expect("local address");
+    let accepting = tokio::spawn(async move { server.accept_once().await });
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let hello = encode_client_value(
+        &serde_json::json!({"type": "hello", "version": PROTOCOL_VERSION}),
+        FrameOptions::default(),
+    )
+    .expect("encode hello");
+    stream.write_all(&hello).await.expect("write hello");
+    expect_auth_error(stream).await;
+    accepting
+        .await
+        .expect("accept task join")
+        .expect_err("missing token must be rejected");
 }
 
 /// §6 #17: the server publishes pir.session state updates in the chord delta

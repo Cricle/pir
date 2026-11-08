@@ -110,6 +110,43 @@ pub(super) struct ConnectionCtx<'a> {
     pub(super) shutdown: &'a std::sync::Arc<tokio::sync::Notify>,
 }
 
+/// Consume whatever the failed client already sent before closing.
+///
+/// On Windows, closing a socket that still has unread inbound bytes makes the
+/// stack send RST instead of FIN, and an RST can discard the auth error frame
+/// the peer has not read yet. Bounded by a short deadline so a flooding
+/// client cannot hold the closing connection.
+async fn drain_before_auth_close<R: AsyncRead + Unpin>(reader: &mut R) {
+    let _ = tokio::time::timeout(Duration::from_millis(50), async {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+}
+
+/// Best-effort structured authentication failure. The frame is written
+/// directly (the writer task does not exist yet at preface time); a write
+/// failure is ignored because the connection is being closed anyway.
+async fn send_auth_error<W: AsyncWrite + Unpin>(writer: &mut W, options: FrameOptions) {
+    let envelope = ServerEnvelope::HelloError(ServerHelloError {
+        type_: "hello_error".to_owned(),
+        error: ProtocolError {
+            code: "unauthorized".to_owned(),
+            message: "authentication failed".to_owned(),
+            details: None,
+        },
+    });
+    if let Ok(frame) = encode_server_envelope(&envelope, options) {
+        let _ = writer.write_all(&frame).await;
+        let _ = writer.flush().await;
+    }
+}
+
 async fn serve_connection_inner<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     state: ServerState,
@@ -124,7 +161,17 @@ async fn serve_connection_inner<S: AsyncRead + AsyncWrite + Unpin + Send + 'stat
     // response is sent. After the greeting the per-read idle timeout governs.
     let handshake_deadline = tokio::time::Instant::now() + DEFAULT_HANDSHAKE_TIMEOUT;
     if let Some(token) = security.auth_token.as_deref() {
-        authenticate(&mut reader, token).await?;
+        if let Err(error) = authenticate(&mut reader, token).await {
+            // The preface is read before the protocol greeting, but
+            // `hello_error` is the protocol's legal pre-greeting frame. Send a
+            // structured `unauthorized` frame before closing so a client can
+            // distinguish bad/missing credentials from a network failure
+            // (A18-F12): the raw preface has no request id to answer, and a
+            // bare TCP reset is indistinguishable from a dropped connection.
+            send_auth_error(&mut writer, options).await;
+            drain_before_auth_close(&mut reader).await;
+            return Err(error);
+        }
     }
     let mut decoder = ClientMessageDecoder::new(options)?;
     let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(FRAME_CHANNEL_CAPACITY);

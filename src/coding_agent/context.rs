@@ -886,6 +886,12 @@ pub fn partition_file_args_with_options(
     let mut images = Vec::new();
     for file_arg in file_args {
         let path = resolve_file_arg_path(file_arg, cwd);
+        if path.is_dir() {
+            return Err(anyhow::anyhow!(
+                "Is a directory (not a file): {}",
+                path.display()
+            ));
+        }
         if !path.is_file() {
             return Err(anyhow::anyhow!("File not found: {}", path.display()));
         }
@@ -936,14 +942,14 @@ pub fn partition_file_args_with_options(
                 Some(mime_type) => {
                     append_file_image(&path, bytes, mime_type, &mut text, &mut images, options)
                 }
-                None => append_file_text(&path, &bytes, &mut text),
+                None => append_file_text(&path, &bytes, &mut text)?,
             }
         }
         #[cfg(not(any(feature = "print", feature = "tool-read")))]
         {
             let _ = options;
             let bytes = read_remaining_capped(&mut file, &path, Vec::new())?;
-            append_file_text(&path, &bytes, &mut text);
+            append_file_text(&path, &bytes, &mut text)?;
         }
     }
     Ok((text, images))
@@ -1219,14 +1225,35 @@ fn read_remaining_capped(
     Ok(bytes)
 }
 
-/// Text half of `processFileArguments`: lossy UTF-8 with a BOM strip.
-fn append_file_text(path: &Path, bytes: &[u8], text: &mut String) {
-    let raw = String::from_utf8_lossy(bytes);
-    let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+/// Text half of `processFileArguments`: strict UTF-8 with a BOM strip.
+///
+/// Upstream decodes text lossily. Inlining `String::from_utf8_lossy` output
+/// turned a binary `@file` (NUL bytes, arbitrary invalid UTF-8) into U+FFFD
+/// mojibake inside the prompt; the user cannot tell the content was mangled
+/// (and the request is usually nonsense). pir rejects it instead with an
+/// explicit "binary file" error. The image path is unaffected: an image is
+/// sniffed before this function and never enters the text decoder.
+fn append_file_text(path: &Path, bytes: &[u8], text: &mut String) -> anyhow::Result<()> {
+    // NUL is valid UTF-8 but never appears in a text file meant for a
+    // prompt; check it first so the message names the real reason.
+    if bytes.contains(&0) {
+        return Err(anyhow::anyhow!(
+            "Binary file not supported: {} contains NUL bytes (only UTF-8 text files can be attached with @)",
+            path.display()
+        ));
+    }
+    let content = std::str::from_utf8(bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "Binary file not supported: {} is not valid UTF-8 text ({error})",
+            path.display()
+        )
+    })?;
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     text.push_str(&format!(
         "<file name=\"{}\">\n{content}\n</file>\n",
         path.display()
     ));
+    Ok(())
 }
 
 /// Image half of `processFileArguments`: with `options = None` this is

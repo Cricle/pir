@@ -83,6 +83,114 @@ fn validate_job_id(id: &str) -> Result<(), String> {
     }
 }
 
+/// Spawn the detached supervisor on Windows.
+///
+/// `std::process::Command` always calls `CreateProcessW` with
+/// `bInheritHandles = TRUE`, which leaks every inheritable handle in the
+/// caller — including the stdout/stderr *pipes* a shell or Python created for
+/// `pir jobs start`. A detached supervisor holding a duplicate of that pipe
+/// keeps the caller's `$(...)`/`capture_output` waiting until the job exits
+/// (the V2 P1-3 hang). This helper calls `CreateProcessW` with
+/// `bInheritHandles = FALSE`: the supervisor inherits no caller handles at
+/// all, while its own std handles are simply absent (it only writes the job
+/// log and `meta.json`).
+#[cfg(windows)]
+fn spawn_supervisor_detached(
+    program: &Path,
+    args: &[std::ffi::OsString],
+    cwd: &Path,
+) -> std::io::Result<u32> {
+    #![allow(unsafe_code)]
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+        PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    fn wide(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    // Quote one argument with the MS C runtime / CommandLineToArgvW rules
+    // (the same quoting std::process::Command applies).
+    fn push_quoted_arg(out: &mut Vec<u16>, arg: &OsStr) {
+        let units: Vec<u16> = arg.encode_wide().collect();
+        let needs_quotes = units.is_empty()
+            || units
+                .iter()
+                .any(|unit| matches!(*unit, 0x20 | 0x09 | 0x0a | 0x0b | 0x22));
+        if !needs_quotes {
+            out.extend_from_slice(&units);
+            return;
+        }
+        let quote = u16::from(b'"');
+        let backslash = u16::from(b'\\');
+        out.push(quote);
+        let mut pending_backslashes = 0usize;
+        for unit in units {
+            if unit == backslash {
+                pending_backslashes += 1;
+            } else if unit == quote {
+                out.extend(std::iter::repeat_n(backslash, pending_backslashes * 2 + 1));
+                out.push(quote);
+                pending_backslashes = 0;
+            } else {
+                out.extend(std::iter::repeat_n(backslash, pending_backslashes));
+                out.push(unit);
+                pending_backslashes = 0;
+            }
+        }
+        out.extend(std::iter::repeat_n(backslash, pending_backslashes * 2));
+        out.push(quote);
+    }
+
+    let mut command_line = Vec::new();
+    push_quoted_arg(&mut command_line, program.as_os_str());
+    for arg in args {
+        command_line.push(u16::from(b' '));
+        push_quoted_arg(&mut command_line, arg);
+    }
+    command_line.push(0);
+
+    let application = wide(program.as_os_str());
+    let current_directory = wide(cwd.as_os_str());
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut process_information: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+    // SAFETY: both wide buffers are NUL-terminated and live for the call;
+    // `startup`/`process_information` are valid out-parameters; NULL
+    // security attributes/environment mean defaults, and
+    // `bInheritHandles = FALSE` is the point of this helper.
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            FALSE,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            std::ptr::null(),
+            current_directory.as_ptr(),
+            &startup,
+            &mut process_information,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the handles were filled in by a successful CreateProcessW and
+    // are owned by this function; the pid stays valid for the caller's
+    // `record_supervisor_start` probe.
+    unsafe {
+        CloseHandle(process_information.hThread);
+        CloseHandle(process_information.hProcess);
+    }
+    Ok(process_information.dwProcessId)
+}
+
 /// Lifecycle state of one job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -127,6 +235,55 @@ pub struct JobSpec {
     /// Additional environment variables for the child (the supervisor also
     /// inherits the parent environment).
     pub env: Vec<(String, String)>,
+}
+
+/// Build the `-c` command string for a caller-supplied argv vector without
+/// losing argument boundaries (`pir jobs start -- prog "two words"`).
+///
+/// The job shell is always the resolved `bash`/`sh` family (see
+/// [`crate::coding_agent::tools::resolve_shell_config`]), so arguments are
+/// POSIX single-quoted as needed. A single argument keeps the historical
+/// shell-snippet behavior (`jobs start -- 'echo one; echo two'`), which has
+/// no separate argv boundary to preserve; two or more arguments are quoted
+/// one by one.
+pub fn shell_command_from_argv(argv: &[String]) -> String {
+    match argv {
+        [] => String::new(),
+        [single] => single.clone(),
+        args => args
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn shell_quote(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_owned();
+    }
+    let safe = arg.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'_' | b'-' | b'.' | b'/' | b':' | b',' | b'+' | b'=' | b'@' | b'%'
+            )
+    });
+    if safe {
+        return arg.to_owned();
+    }
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            // Close the quote, emit an escaped quote, reopen it.
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Persisted record. `meta.json` is rewritten atomically on every transition.
@@ -279,43 +436,48 @@ impl JobStore {
             .clone()
             .or_else(|| std::env::current_exe().ok())
             .ok_or_else(|| "cannot resolve the pir executable for the job supervisor".to_owned())?;
-        let mut command = std::process::Command::new(&supervisor);
-        command
-            .arg("__jobs-supervise")
-            .arg("--job-dir")
-            .arg(&dir)
-            .arg("--program")
-            .arg(&spec.program);
+        let mut supervisor_args: Vec<std::ffi::OsString> = vec![
+            "__jobs-supervise".into(),
+            "--job-dir".into(),
+            dir.as_os_str().to_owned(),
+            "--program".into(),
+            spec.program.as_str().into(),
+        ];
         for arg in &spec.args {
-            command.arg("--arg").arg(arg);
+            supervisor_args.push("--arg".into());
+            supervisor_args.push(arg.into());
         }
-        command.arg("--command").arg(&spec.command);
-        command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .current_dir(&spec.cwd);
+        supervisor_args.push("--command".into());
+        supervisor_args.push(spec.command.as_str().into());
+
         #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW:
-            // the supervisor must outlive the TUI and must not flash a console.
-            command.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // Put the supervisor in its own process group so terminal signals
-            // (Ctrl-C/SIGHUP) do not reach it and `kill` can target the whole
-            // job tree with one negative-pid signal.
-            command.process_group(0);
-        }
-        let child = command
-            .spawn()
+        let supervisor_pid = spawn_supervisor_detached(&supervisor, &supervisor_args, &spec.cwd)
             .map_err(|error| format!("spawn job supervisor: {error}"))?;
+        #[cfg(not(windows))]
+        let supervisor_pid = {
+            let mut command = std::process::Command::new(&supervisor);
+            command
+                .args(&supervisor_args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .current_dir(&spec.cwd);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // Put the supervisor in its own process group so terminal
+                // signals (Ctrl-C/SIGHUP) do not reach it and `kill` can
+                // target the whole job tree with one negative-pid signal.
+                command.process_group(0);
+            }
+            let child = command
+                .spawn()
+                .map_err(|error| format!("spawn job supervisor: {error}"))?;
+            child.id()
+        };
         // The re-read in `record_supervisor_start` keeps a fast supervisor's
         // child-pid/terminal record instead of overwriting it with `Starting`.
-        record_supervisor_start(&dir, child.id(), process_start_token(child.id()))
+        record_supervisor_start(&dir, supervisor_pid, process_start_token(supervisor_pid))
     }
 
     /// All jobs, newest first.
@@ -392,13 +554,15 @@ impl JobStore {
         let path = dir.join("output.log");
         let metadata = std::fs::metadata(&path).ok()?;
         let len = metadata.len();
-        let want = max_bytes.clamp(1, MAX_LOG_BYTES).min(len);
+        // Zero is a real "empty tail" request, not "use the default": keep it
+        // so `jobs log --bytes 0` and `--lines 0` return nothing (A30/A33/A93).
+        let want = max_bytes.min(MAX_LOG_BYTES).min(len);
         let mut file = std::fs::File::open(&path).ok()?;
         file.seek(SeekFrom::Start(len.saturating_sub(want))).ok()?;
         let mut bytes = Vec::with_capacity(want as usize);
         file.read_to_end(&mut bytes).ok()?;
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        let max_lines = max_lines.clamp(1, MAX_LOG_LINES);
+        let max_lines = max_lines.min(MAX_LOG_LINES);
         let mut lines: Vec<&str> = text.lines().collect();
         let line_truncated = lines.len() > max_lines;
         if line_truncated {

@@ -74,12 +74,17 @@ fn two_threads_creating_the_same_id_produce_exactly_one_writer() {
         let tx = tx.clone();
         threads.push(std::thread::spawn(move || {
             start.wait();
-            let result = SessionManager::create_with_id(".", &dir, id)
+            let manager = SessionManager::create_with_id(".", &dir, id);
+            let result = manager
+                .as_ref()
                 .map(|manager| manager.id().to_owned())
                 .map_err(|error| error.to_string());
             tx.send(result).expect("send attempt result");
-            // Keep a winning manager alive until BOTH attempts have run.
+            // Keep a winning manager (and its create claim) alive until BOTH
+            // attempts have run. Extracting the id above used to drop the
+            // manager here, making the race timing-dependent.
             done.wait();
+            drop(manager);
         }));
     }
     drop(tx);

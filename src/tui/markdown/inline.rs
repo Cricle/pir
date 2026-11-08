@@ -833,14 +833,28 @@ fn parse_extended_autolink(chars: &[char], pos: usize) -> Option<(String, String
     Some((text, href))
 }
 
+/// `[A-Za-z0-9._+-]` — the GFM bare-email local-part class.
+fn is_email_local_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-')
+}
+
 /// marked's email branch: `[A-Za-z0-9._+-]+(@)[a-zA-Z0-9-_]+
 /// (?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![-_])`, href = `mailto:` + text. No
 /// `_backpedal` is applied (the domain grammar itself excludes the trailing
 /// punctuation).
 fn match_extended_email(chars: &[char], pos: usize) -> Option<(String, String)> {
-    let is_local_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-');
+    // A match starting in the middle of a maximal local-part run would also
+    // match from that run's first character (the local part is greedy and
+    // `@` is never a local char), and the caller scans left to right, so the
+    // run start has already had its chance. Bailing here keeps a long
+    // single-line alphanumeric paste linear: without it every character
+    // rescans the rest of the run looking for `@` (O(n²); 64 KiB alone costs
+    // ~13 s in the debug TUI).
+    if pos > 0 && is_email_local_char(chars[pos - 1]) {
+        return None;
+    }
     let mut local_end = pos;
-    while matches!(chars.get(local_end), Some(&c) if is_local_char(c)) {
+    while matches!(chars.get(local_end), Some(&c) if is_email_local_char(c)) {
         local_end += 1;
     }
     if local_end == pos || chars.get(local_end) != Some(&'@') {

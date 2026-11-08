@@ -1342,7 +1342,7 @@ impl AgentSession {
         images = input.images;
 
         if expand_prompt_templates {
-            text = self.expand_prompt_commands(&text);
+            text = self.expand_prompt_commands(text);
         }
         if text.is_empty() && images.is_empty() {
             crate::ext_diag!("[ext] sendUserMessage ignored: empty content");

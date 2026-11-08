@@ -735,6 +735,7 @@ impl AgentSession {
             session_state: session_state_handle,
             run_abort_requested: Arc::new(AtomicBool::new(false)),
             run_settling: run_settling_handle,
+            run_end_seen: Arc::new(AtomicBool::new(false)),
             idle_notify: Arc::new(Notify::new()),
             pending_custom_runs: Arc::new(Mutex::new(VecDeque::new())),
             pending_next_turn_messages: Arc::new(Mutex::new(Vec::new())),
@@ -1161,7 +1162,14 @@ impl AgentSession {
 
     /// Expand prompt commands (`/skill:name`, `/template`) in submitted text
     /// (upstream `_expandSkillCommand` + `expandPromptTemplate`).
-    pub(super) fn expand_prompt_commands(&self, text: &str) -> String {
+    ///
+    /// Takes the prompt by value and returns it unchanged when it cannot be a
+    /// command (no leading `/`), so an ordinary prompt pays no full-size copy
+    /// on this step (A28-F02).
+    pub(super) fn expand_prompt_commands(&self, text: String) -> String {
+        if !text.starts_with('/') {
+            return text;
+        }
         let skills = self
             .skills
             .read()
@@ -1172,7 +1180,7 @@ impl AgentSession {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        crate::coding_agent::resources::expand_prompt_commands(text, &skills, &prompt_templates)
+        crate::coding_agent::resources::expand_prompt_commands(&text, &skills, &prompt_templates)
     }
 
     /// A clone of the current model (thread-safe snapshot).
@@ -1274,7 +1282,7 @@ impl AgentSession {
     }
 
     pub fn steer(&self, text: &str) -> Disposition {
-        let expanded = self.expand_prompt_commands(text);
+        let expanded = self.expand_prompt_commands(text.to_owned());
         let disposition = self.queued_input_disposition();
         self.enqueue_steering(agent_loop::PromptMessage::text(expanded));
         disposition
@@ -1284,7 +1292,7 @@ impl AgentSession {
     /// finished. Prompt commands are expanded before queueing. Returns the
     /// REAL disposition like [`Self::steer`].
     pub fn follow_up(&self, text: &str) -> Disposition {
-        let expanded = self.expand_prompt_commands(text);
+        let expanded = self.expand_prompt_commands(text.to_owned());
         let disposition = self.queued_input_disposition();
         self.enqueue_follow_up(agent_loop::PromptMessage::text(expanded));
         disposition
@@ -1346,6 +1354,32 @@ impl AgentSession {
                 persist: None,
             },
         }
+    }
+
+    /// The steering texts currently queued but not yet delivered, read from
+    /// the synchronous queue mirror instead of round-tripping through the
+    /// inbox consumer task. The mirror is updated by every enqueue and drain
+    /// site, so this reports the same texts (and order) as
+    /// [`Self::get_steering_messages`]; unlike that async peek it is safe to
+    /// call from synchronous snapshot builders (the server's
+    /// `SessionSnapshot::queuedSteer`).
+    pub fn pending_steering_messages(&self) -> Vec<String> {
+        self.queue_mirror
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .steering
+            .clone()
+    }
+
+    /// Start the steering/follow-up/background inbox consumer tasks on a
+    /// caller-chosen long-lived runtime. Hosts that drive `prompt` on a
+    /// short-lived runtime (the server's per-run agent thread) must call this
+    /// with their server runtime: a lazily spawned consumer would otherwise
+    /// die with the run and lose queued steering between runs.
+    pub fn ensure_queue_consumers_on(&self, handle: &tokio::runtime::Handle) {
+        self.steering_inbox.ensure_consumer_on(handle);
+        self.follow_up_inbox.ensure_consumer_on(handle);
+        self.background_follow_up_inbox.ensure_consumer_on(handle);
     }
 
     /// The steering messages queued but not yet delivered (upstream
@@ -1464,6 +1498,20 @@ impl AgentSession {
     /// Whether a prompt run is currently in flight.
     pub fn is_streaming(&self) -> bool {
         self.session_state() == SESSION_RUNNING
+    }
+
+    /// Whether the in-flight run has already produced its terminal agent-loop
+    /// result and is only finishing post-run settlement work.
+    ///
+    /// `agent_end` is delivered from inside the agent loop, before the run
+    /// persists its remaining messages, drains extensions, emits
+    /// `agent_settled`, and releases the session claim. A client that reacts
+    /// to `agent_end` by sending the next plain prompt must therefore be
+    /// admitted by waiting out this window instead of being rejected with the
+    /// "already processing" streaming error. `false` while a run is still
+    /// producing model/tool work (and false when idle).
+    pub fn is_settling(&self) -> bool {
+        self.run_settling.load(Ordering::SeqCst) || self.run_end_seen.load(Ordering::SeqCst)
     }
 
     /// Whether this session was constructed as a parallel phone child

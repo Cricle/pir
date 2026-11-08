@@ -2633,6 +2633,59 @@ pub fn print_tool_loadout(
     })
 }
 
+/// Apply the MCP discovery activation a `codemode`/`deferred` server asks for
+/// to a print loadout built with the default tool selection.
+///
+/// The interactive host performs this through the plugin context bound by
+/// `AgentSession` (`McpPlugin::on_context`). Print drives the loop without a
+/// session, so no context is bound and `McpPlugin::recompute_discovery_activation`
+/// has nothing to write; the same pure decision is applied here before the
+/// loadout is frozen. An explicit `--tools` / `settings.defaultTools` choice
+/// is authoritative (upstream `setActiveTools`), so callers skip this helper
+/// for those.
+fn auto_activate_mcp_discovery(loadout: &mut PrintToolLoadout, plugins: Option<&PluginHost>) {
+    #[cfg(feature = "mcp")]
+    {
+        let Some(mcp) = plugins.and_then(mcp_plugin_of) else {
+            return;
+        };
+        let activate = mcp
+            .discovery_activation(&loadout.registry, &loadout.active)
+            .activate;
+        if activate.is_empty() {
+            return;
+        }
+        for name in activate {
+            if !loadout.active.iter().any(|active| active == &name) {
+                loadout.active.push(name);
+            }
+        }
+        loadout.declared =
+            crate::agent::tool_execution::declared_tools(&loadout.registry, &loadout.active)
+                .iter()
+                .map(|tool| tool.name().to_owned())
+                .collect();
+        loadout.callable =
+            crate::agent::tool_execution::callable_tools(&loadout.registry, &loadout.active)
+                .iter()
+                .map(|tool| tool.name().to_owned())
+                .collect();
+        let hidden = {
+            let declared_set: std::collections::BTreeSet<&str> =
+                loadout.declared.iter().map(String::as_str).collect();
+            loadout
+                .registry
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .filter(|name| !declared_set.contains(name.as_str()))
+                .collect()
+        };
+        loadout.hidden = hidden;
+    }
+    #[cfg(not(feature = "mcp"))]
+    let _ = (loadout, plugins);
+}
+
 /// Output mode for one print run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
@@ -2893,8 +2946,10 @@ pub async fn run_print_with_environment(
         // extensions are present, defer the missing-model error until the
         // merged registry (environment + plugin definitions) is resolved
         // below; otherwise keep the historical immediate failure.
-        Err(error) if !extension_paths.is_empty() => {
-            eprintln!("pir: {error}");
+        Err(_error) if !extension_paths.is_empty() => {
+            // Defer the diagnostic: an extension provider may still resolve
+            // below. Printing here duplicated the final error for a genuinely
+            // missing `--model` (A27-F10: `pir: ...` followed by `Error: ...`).
             crate::ai::providers::resolution::InitialModelResult {
                 model: None,
                 thinking_level: crate::ai::providers::resolution::DEFAULT_THINKING_LEVEL,
@@ -3304,7 +3359,7 @@ pub async fn run_print_with_environment(
     // for the same selection), while every other registered tool stays in the
     // registry for `ctx.executeTool`, `tool_search` and nested calls.
     let loadout_started = crate::config::timings::start_phase();
-    let loadout = match print_tool_loadout(
+    let mut loadout = match print_tool_loadout(
         registry,
         options.settings_default_tools.as_deref(),
         &options.cli_tools,
@@ -3315,6 +3370,18 @@ pub async fn run_print_with_environment(
         Ok(loadout) => loadout,
         Err(error) => return Err(anyhow::anyhow!(error)),
     };
+    // A default-selection print run gets the same MCP discovery activation the
+    // interactive host performs through its bound plugin context. An explicit
+    // selection remains authoritative and is never widened here.
+    if !crate::coding_agent::tool_selection::tool_selection_requested(
+        options.settings_default_tools.as_deref(),
+        &options.cli_tools,
+        &options.cli_exclude_tools,
+        options.no_tools,
+        options.no_builtin_tools,
+    ) {
+        auto_activate_mcp_discovery(&mut loadout, plugins.as_deref());
+    }
     // The provider request declares only the active direct/model-only tools;
     // `codemode`/`deferred` tools stay in the (executable) registry. The
     // declared definitions carry the `prepareLoadout` results (upstream
@@ -4444,24 +4511,14 @@ pub async fn run_print_with_environment(
         // Upstream print-mode.ts:139-156 treats an `error` OR `aborted`
         // stopReason as a process failure only in TEXT mode (exit 1 after
         // printing the error). In JSON mode the process exits 0 and the
-        // terminal message arrives as an event line (the terminal message is
-        // re-emitted through the standard event serializer), so JSON
-        // consumers see the failure in-band.
+        // terminal message arrives in-band through the run's normal event
+        // stream (`turn_end` + `agent_end`); do not re-emit a second
+        // `turn_end` here (A18/A24: duplicate turn=0 after agent_end).
         if matches!(
             result.terminal.stop_reason,
             crate::ai::types::StopReason::Error | crate::ai::types::StopReason::Aborted
         ) {
-            if options.mode == OutputMode::Json {
-                crate::coding_agent::json::print_event(
-                    &crate::agent::agent_loop::AgentEvent::TurnEnd {
-                        turn: turn_index,
-                        message: result.terminal.clone(),
-                        // The run's real TurnEnd already carried the tool
-                        // results; this is the terminal re-emission.
-                        tool_results: result.tool_results.clone(),
-                    },
-                );
-            } else if result.aborted {
+            if result.aborted {
                 // A non-termination abort can only come from an extension's
                 // `ctx.abort()` (process termination is handled above). It
                 // settles normally — Settled drain + `agent_settled` already
@@ -4471,7 +4528,7 @@ pub async fn run_print_with_environment(
                 crate::ext_diag!(
                     "[ext] prompt run aborted by an extension; continuing with the next prompt"
                 );
-            } else {
+            } else if options.mode != OutputMode::Json {
                 // Upstream: `errorMessage || "Request " + stopReason`.
                 let error_text = result
                     .terminal

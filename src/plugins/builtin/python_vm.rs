@@ -117,6 +117,11 @@ pub(crate) struct ExecOutcome {
     /// `Some` when the run raised an uncaught exception (traceback is in
     /// `stderr`; `print_exception` writes through the captured stream).
     pub error: bool,
+    /// `Some(code)` when the run ended through `SystemExit`/`sys.exit(code)`.
+    /// No traceback is printed for it, and `error` is `false`; a `None` or
+    /// missing exit code is reported as `Some(0)`, and a non-integer code
+    /// prints its text to `stderr` and reports `Some(1)` (CPython semantics).
+    pub exit_code: Option<i32>,
     /// The `eval`-mode result's repr when the job ran in eval-first mode and
     /// `code` was a single expression.
     pub eval_repr: Option<String>,
@@ -867,6 +872,7 @@ pub(crate) fn failed_outcome(message: &str) -> ExecOutcome {
         stdout: String::new(),
         stderr: message.to_owned(),
         error: true,
+        exit_code: None,
         eval_repr: None,
         duration_ms: 0,
     }
@@ -1118,6 +1124,7 @@ fn run_job(
                     stdout: String::new(),
                     stderr: message,
                     error: true,
+                    exit_code: None,
                     eval_repr: None,
                     duration_ms: started.elapsed().as_millis(),
                 };
@@ -2231,10 +2238,14 @@ fn python_float_repr(value: f64) -> String {
 // ---------------------------------------------------------------------------
 
 /// The result of `compile_and_run`: a finished value (eval mode), a clean
-/// exec, or a failed run whose traceback was printed into the capture.
+/// exec, an explicit `SystemExit`, or a failed run whose traceback was
+/// printed into the capture.
 enum RunResult {
     Eval(rpy::PyObjectRef),
     Exec,
+    /// The program ended through `SystemExit`/`sys.exit(...)`: this is a
+    /// process exit request, not an error, so no traceback was printed.
+    Exit(i32),
     Failed,
 }
 
@@ -2253,10 +2264,7 @@ fn compile_and_run(
         if let Ok(code) = vm.compile(source, rpy::compiler::Mode::Eval, SOURCE_PATH.to_owned()) {
             return match vm.run_code_obj(code, scope.clone()) {
                 Ok(value) => RunResult::Eval(value),
-                Err(exc) => {
-                    print_failure_traceback(vm, exc);
-                    RunResult::Failed
-                }
+                Err(exc) => exception_result(vm, exc),
             };
         }
     }
@@ -2264,10 +2272,7 @@ fn compile_and_run(
     match vm.compile(source, rpy::compiler::Mode::Exec, SOURCE_PATH.to_owned()) {
         Ok(code) => match vm.run_code_obj(code, scope.clone()) {
             Ok(_value) => RunResult::Exec,
-            Err(exc) => {
-                print_failure_traceback(vm, exc);
-                RunResult::Failed
-            }
+            Err(exc) => exception_result(vm, exc),
         },
         Err(err) => {
             let exc = vm.new_syntax_error(&err, Some(source));
@@ -2275,6 +2280,54 @@ fn compile_and_run(
             RunResult::Failed
         }
     }
+}
+
+/// Classify an uncaught exception: `SystemExit` is an exit request (its code
+/// becomes the process exit status, with no traceback), anything else is a
+/// failure whose traceback is printed into the capture.
+fn exception_result(vm: &rpy::VirtualMachine, exc: rpy::builtins::PyBaseExceptionRef) -> RunResult {
+    if exc.fast_isinstance(vm.ctx.exceptions.system_exit) {
+        return system_exit_result(vm, &exc);
+    }
+    print_failure_traceback(vm, exc);
+    RunResult::Failed
+}
+
+/// Translate a `SystemExit` into [`RunResult::Exit`], mirroring CPython:
+///
+/// * no argument, `None`, or no integer code -> exit 0;
+/// * an integer code -> that code;
+/// * any other code -> its text on `stderr`, exit 1.
+///
+/// Must run while the output capture is installed (the message is written
+/// through the captured `sys.stderr`).
+fn system_exit_result(
+    vm: &rpy::VirtualMachine,
+    exc: &rpy::builtins::PyBaseExceptionRef,
+) -> RunResult {
+    let code = vm
+        .get_attribute_opt(exc.clone().into(), "code")
+        .ok()
+        .flatten();
+    let Some(code) = code else {
+        return RunResult::Exit(0);
+    };
+    if vm.is_none(&code) {
+        return RunResult::Exit(0);
+    }
+    if let Some(int) = code.payload_if_subclass::<rpy::builtins::PyInt>(vm) {
+        return match int.try_to_primitive::<i32>(vm) {
+            Ok(code) => RunResult::Exit(code),
+            // CPython truncates huge codes; anything outside `i32` is far
+            // outside the process exit-code range, so keep it a failure.
+            Err(_) => RunResult::Exit(1),
+        };
+    }
+    // Non-integer code: CPython prints `str(code)` to stderr and exits 1.
+    if let Ok(text) = code.str(vm) {
+        writeln!(rpy::stdlib::sys::PyStderr(vm), "{text}");
+    }
+    RunResult::Exit(1)
 }
 
 /// Collect captured output (and the traceback on failure) and restore the
@@ -2293,14 +2346,24 @@ fn finish_job(vm: &rpy::VirtualMachine, capture: &Capture, run: RunResult) -> Ex
                 stdout: capped_text(stdout, stdout_truncated),
                 stderr: capped_text(stderr, stderr_truncated),
                 error: true,
+                exit_code: None,
                 eval_repr: None,
                 duration_ms: 0,
             }
         }
+        RunResult::Exit(code) => ExecOutcome {
+            stdout: capped_text(stdout, stdout_truncated),
+            stderr: capped_text(stderr, stderr_truncated),
+            error: false,
+            exit_code: Some(code),
+            eval_repr: None,
+            duration_ms: 0,
+        },
         RunResult::Eval(value) => ExecOutcome {
             stdout: capped_text(stdout, stdout_truncated),
             stderr: capped_text(stderr, stderr_truncated),
             error: false,
+            exit_code: None,
             eval_repr: repr_if_not_none(vm, &value).map(cap_output),
             duration_ms: 0,
         },
@@ -2308,6 +2371,7 @@ fn finish_job(vm: &rpy::VirtualMachine, capture: &Capture, run: RunResult) -> Ex
             stdout: capped_text(stdout, stdout_truncated),
             stderr: capped_text(stderr, stderr_truncated),
             error: false,
+            exit_code: None,
             eval_repr: None,
             duration_ms: 0,
         },

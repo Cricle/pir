@@ -322,8 +322,17 @@ pub fn load_templates_from_dir(dir: &Path) -> (Vec<PromptTemplate>, Vec<String>)
 /// `expandPromptTemplate`): returns the expanded content, or the original
 /// text when it is not a template command or the name is unknown.
 pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> String {
+    expand_prompt_template_cow(text, templates).into_owned()
+}
+
+/// [`expand_prompt_template`] that borrows the input when nothing expands.
+pub fn expand_prompt_template_cow<'a>(
+    text: &'a str,
+    templates: &[PromptTemplate],
+) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
     if !text.starts_with('/') {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     // `/name` or `/name args...` (upstream `^\/([^\s]+)(?:\s+([\s\S]*))?$`).
     let body = &text[1..];
@@ -332,11 +341,11 @@ pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> Strin
         None => (body, ""),
     };
     if name.is_empty() {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     let Some(template) = templates.iter().find(|template| template.name == name) else {
-        return text.to_string();
+        return Cow::Borrowed(text);
     };
     let args = parse_command_args(args_string);
-    substitute_args(&template.content, &args)
+    Cow::Owned(substitute_args(&template.content, &args))
 }

@@ -2133,7 +2133,17 @@ impl SessionWriterLock {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     match retention::session_lock_snapshot(&lock_path).state {
-                        retention::SessionLockState::Live => return None,
+                        retention::SessionLockState::Live => {
+                            // A dead owner's lock is reclaimable immediately,
+                            // even inside the conservative stale-age window:
+                            // a normal TUI `/quit` leaves the file behind and
+                            // the next `--continue`/resume must not be locked
+                            // out for an hour (A27 P0). Live, foreign-host and
+                            // unparseable locks stay untouched.
+                            if !retention::reclaim_provably_dead_session_lock(&lock_path) {
+                                return None;
+                            }
+                        }
                         retention::SessionLockState::Missing => continue,
                         retention::SessionLockState::Stale => {
                             if !retention::reclaim_stale_session_lock(&lock_path) {
@@ -2512,6 +2522,48 @@ impl SessionManager {
             if path.exists() {
                 self.writer_lock = SessionWriterLock::acquire(&path);
             }
+        }
+    }
+
+    /// Refuse to attach a second writer to an EXISTING session whose
+    /// `.<name>.jsonl.lock` names another live process.
+    ///
+    /// [`Self::refresh_writer_lock`] deliberately proceeds without the lock
+    /// when a live owner exists, so history previews and read-only opens stay
+    /// possible. Every host that will append to the session (print, TUI,
+    /// RPC, remote attach) must call this after opening: otherwise a second
+    /// process silently interleaves its turns into the live transcript
+    /// (A28-F01). A lock owned by this same process is allowed: opening the
+    /// current session a second time for `/fork`/`/export` is a same-process
+    /// read, not another writer.
+    pub fn ensure_exclusive_writer(&self) -> crate::Result<()> {
+        if !self.persist {
+            return Ok(());
+        }
+        let Some(path) = self.session_file.as_deref() else {
+            return Ok(());
+        };
+        if !path.exists() || self.writer_lock.is_some() {
+            return Ok(());
+        }
+        let lock_path = retention::session_lock_path(path);
+        let owner = lock_path
+            .as_deref()
+            .and_then(retention::session_lock_owner_pid);
+        if owner == Some(std::process::id()) {
+            return Ok(());
+        }
+        match owner {
+            Some(pid) => anyhow::bail!(
+                "Session '{}' is already in use by another process (pid {pid}); \
+                 refusing to create a second writer for the same session id",
+                self.session_id
+            ),
+            None => anyhow::bail!(
+                "Session '{}' is already in use by another process; \
+                 refusing to create a second writer for the same session id",
+                self.session_id
+            ),
         }
     }
 
@@ -3324,6 +3376,14 @@ impl SessionManager {
         assert_valid_session_id(id)?;
         #[cfg(feature = "session")]
         {
+            // Threads in one process share the pid, so the file lock alone can
+            // be raced by two local creators (the duplicate-id regression).
+            // Serialize the whole claim+construct section in-process; the
+            // on-disk claim still fences other processes.
+            static CREATE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _create_serial = CREATE_SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(path) = Self::find_session_by_id(session_dir, id) {
                 anyhow::bail!("Session already exists with id '{id}': {}", path.display());
             }

@@ -2258,3 +2258,297 @@ async fn rpc_prompt_during_manual_compaction_is_rejected_before_started() {
     drop(_server_temp);
     drop(temp);
 }
+
+// ---------------------------------------------------------------------------
+// P1: a plain prompt sent immediately after `agent_end` is admitted
+// ---------------------------------------------------------------------------
+
+/// Inline plugin that parks the run inside its post-agent-loop settlement
+/// window (`agent_settled` dispatch). `agent_end` has already been delivered
+/// to the RPC client at that point, so this reproduces the exact window a
+/// client reacts to.
+struct SettleGatePlugin {
+    info: PluginInfo,
+    entered: Arc<AtomicUsize>,
+    gate: tokio::sync::watch::Receiver<bool>,
+}
+
+impl AgentPlugin for SettleGatePlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> pir::plugins::EventInterest {
+        pir::plugins::EventInterest::List(vec!["agent_settled".into()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        if event.name != "agent_settled" {
+            return Box::pin(async { PluginEventOutcome::None });
+        }
+        let entered = Arc::clone(&self.entered);
+        let mut gate = self.gate.clone();
+        Box::pin(async move {
+            entered.fetch_add(1, Ordering::SeqCst);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if *gate.borrow() {
+                        break;
+                    }
+                    if gate.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+            PluginEventOutcome::None
+        })
+    }
+}
+
+/// Factory answering every request immediately, with the settle gate
+/// installed so the post-loop window can be held open deterministically.
+fn settle_gated_factory(
+    gate: tokio::sync::watch::Receiver<bool>,
+    entered: Arc<AtomicUsize>,
+) -> SessionFactory {
+    Arc::new(move |session: Option<SessionManager>| {
+        let gate = gate.clone();
+        let entered = Arc::clone(&entered);
+        let registry = fake_registry(Arc::new(|_index, _context| {
+            assistant(vec![text("settle reply")], StopReason::Stop)
+        }));
+        Ok(Arc::new(AgentSession::new_with_plugins(
+            AgentSessionConfig {
+                provider_registry: registry,
+                model: fake_model(),
+                api_key: None,
+                thinking: ThinkingLevel::Off,
+                tools: ToolRegistry::new(),
+                session,
+                compaction: None,
+                max_turns: 2,
+                system_prompt: None,
+                cwd: None,
+                event_stream: None,
+                extensions: None,
+                tool_selection: None,
+            },
+            vec![Arc::new(SettleGatePlugin {
+                info: PluginInfo::inline("rpc-settle-gate"),
+                entered,
+                gate,
+            })],
+        )))
+    })
+}
+
+/// `agent_end` is delivered from inside the agent loop, before the run
+/// finishes persistence/extension settlement and releases its session claim.
+/// A plain prompt sent right after that frame must be admitted (wait for the
+/// idle edge), never answered with "Agent is already processing"; an explicit
+/// `streamingBehavior` keeps its queue semantics.
+#[tokio::test]
+async fn rpc_prompt_after_agent_end_is_admitted_during_settlement() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let (mut client, _temp) = rpc_pair_with(
+        "prompt-after-agent-end",
+        settle_gated_factory(gate_rx, Arc::clone(&entered)),
+    )
+    .await;
+
+    client.send(json!({ "type": "create" }));
+    let created = client
+        .wait_for(|value| value["command"] == "create" && value["success"] == true)
+        .await;
+    assert_eq!(created["success"], json!(true), "{created}");
+
+    client.send(json!({ "id": "p1", "type": "prompt", "text": "first turn" }));
+    let first = client
+        .wait_for(|value| value["command"] == "prompt" && value["id"] == "p1")
+        .await;
+    assert_eq!(first["success"], json!(true), "{first}");
+    client.wait_for(|value| value["type"] == "agent_end").await;
+
+    // `agent_end` is out; the run is now parked in its settle window.
+    for _ in 0..2000 {
+        if entered.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert!(
+        entered.load(Ordering::SeqCst) > 0,
+        "the run never reached its agent_settled settle window"
+    );
+
+    client.send(json!({ "id": "p2", "type": "prompt", "text": "second turn" }));
+    // Give a regression the chance to answer the busy error while the settle
+    // gate still holds the run; the fixed host waits for the idle edge.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let _ = gate_tx.send(true);
+
+    let second = client
+        .wait_for(|value| value["command"] == "prompt" && value["id"] == "p2")
+        .await;
+    assert_eq!(
+        second["success"],
+        json!(true),
+        "a prompt sent after agent_end must be admitted: {second}"
+    );
+    assert_eq!(second["data"]["disposition"], json!("started"), "{second}");
+    client.wait_for(|value| value["type"] == "agent_end").await;
+}
+
+// ---------------------------------------------------------------------------
+// P2: new_session during a streaming turn aborts and settles it first
+// ---------------------------------------------------------------------------
+
+/// Provider whose turn stays in flight until the request's abort signal
+/// fires, then settles as an aborted assistant message.
+struct HangingProvider;
+
+impl Provider for HangingProvider {
+    fn id(&self) -> &str {
+        "fake"
+    }
+    fn name(&self) -> &str {
+        "Fake provider"
+    }
+    fn get_models(&self) -> Vec<Model> {
+        vec![fake_model()]
+    }
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        Vec::new()
+    }
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: Context,
+        options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        let stream = AssistantMessageEventStream::new();
+        let sender = stream.clone();
+        let signal = options.signal.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            drop(handle.spawn(async move {
+                if let Some(signal) = signal {
+                    // The session normally passes its abort signal here; the
+                    // timeout keeps this fake from wedging the test (and the
+                    // RPC command) if a build path omits it.
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), signal.cancelled())
+                            .await;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                let message = AssistantMessage {
+                    stop_reason: StopReason::Aborted,
+                    ..AssistantMessage::default()
+                };
+                sender.push(AssistantMessageEventStream::error_event(
+                    ErrorReason::Aborted,
+                    message,
+                ));
+            }));
+        }
+        stream
+    }
+}
+
+fn hanging_factory() -> SessionFactory {
+    Arc::new(|session: Option<SessionManager>| {
+        let mut registry = ProviderRegistry::default();
+        registry.set_provider(Arc::new(HangingProvider));
+        Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            provider_registry: Arc::new(registry),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session,
+            compaction: None,
+            max_turns: 2,
+            system_prompt: None,
+            cwd: None,
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        })))
+    })
+}
+
+/// `new_session` must not succeed while the old agent can still emit: it
+/// aborts and awaits the in-flight run, so the outgoing transcript ends with
+/// an explicit aborted assistant message (never an orphan user line) and the
+/// next prompt is accepted immediately.
+#[tokio::test]
+async fn rpc_new_session_mid_stream_aborts_and_preserves_the_outgoing_turn() {
+    let (mut client, _temp) = rpc_pair_with("new-session-midstream", hanging_factory()).await;
+
+    client.send(json!({ "type": "create" }));
+    let created = client
+        .wait_for(|value| value["command"] == "create" && value["success"] == true)
+        .await;
+    let old_path = created["data"]["path"]
+        .as_str()
+        .expect("created session path")
+        .to_owned();
+
+    client.send(json!({ "id": "p1", "type": "prompt", "text": "OLD_TURN" }));
+    let first = client
+        .wait_for(|value| value["command"] == "prompt" && value["id"] == "p1")
+        .await;
+    eprintln!("[p2-debug] prompt acked: {first}");
+    assert_eq!(first["success"], json!(true), "{first}");
+
+    // Wait until the spawned run owns the session claim.
+    let mut streaming = false;
+    for _ in 0..2000 {
+        client.send(json!({ "id": "state", "type": "get_state" }));
+        let state = client
+            .wait_for(|value| value["command"] == "get_state" && value["id"] == "state")
+            .await;
+        if state["data"]["isStreaming"] == json!(true) {
+            streaming = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    eprintln!("[p2-debug] streaming={streaming}");
+    assert!(streaming, "the prompt run never became streaming");
+
+    client.send(json!({ "id": "n1", "type": "new_session" }));
+    eprintln!("[p2-debug] new_session sent");
+    let switched = client
+        .wait_for(|value| value["command"] == "new_session" && value["id"] == "n1")
+        .await;
+    eprintln!("[p2-debug] new_session answered: {switched}");
+    assert_eq!(switched["success"], json!(true), "{switched}");
+    assert_eq!(switched["data"]["cancelled"], json!(false), "{switched}");
+
+    client.send(json!({ "id": "p2", "type": "prompt", "text": "NEW_TURN" }));
+    let second = client
+        .wait_for(|value| value["command"] == "prompt" && value["id"] == "p2")
+        .await;
+    assert_eq!(
+        second["success"],
+        json!(true),
+        "the next prompt after new_session must be accepted: {second}"
+    );
+    assert_eq!(second["data"]["disposition"], json!("started"), "{second}");
+    client.wait_for(|value| value["type"] == "agent_end").await;
+
+    // The outgoing transcript kept the user turn and its explicit aborted
+    // terminal assistant message.
+    let old = std::fs::read_to_string(&old_path).expect("read the outgoing session file");
+    assert!(
+        old.contains("OLD_TURN"),
+        "outgoing user turn missing: {old}"
+    );
+    assert!(
+        old.contains("\"stopReason\":\"aborted\""),
+        "outgoing transcript has no aborted assistant terminal: {old}"
+    );
+}

@@ -612,12 +612,14 @@ fn run_stream(options: &Options, commands: &[Command]) -> RunOutcome {
     // file stream. Each file is held alone, then dropped.
     let mut errors: Vec<String> = Vec::new();
     let mut total_lines: u64 = 0;
-    for file in &options.files {
+    let mut unreadable: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (index, file) in options.files.iter().enumerate() {
         match read_file(file) {
             Ok(text) => {
                 total_lines = total_lines.saturating_add(split_lines(&text).len() as u64);
             }
             Err(ReadFailure::Missing(message)) => {
+                unreadable.insert(index);
                 errors.push(format!("sed: can't read {file}: {message}"));
             }
             Err(ReadFailure::NotText) => return RunOutcome::Unsupported,
@@ -632,13 +634,23 @@ fn run_stream(options: &Options, commands: &[Command]) -> RunOutcome {
     let mut first_line: u64 = 1;
     let mut quit = false;
     let mut pending_cross_file_newline = false;
-    for file in &options.files {
+    for (index, file) in options.files.iter().enumerate() {
         if quit {
             break;
         }
-        let Ok(text) = read_file(file) else {
-            errors.push(format!("sed: can't read {file}"));
+        // The validation pass already reported this file in full; a second
+        // bare diagnostic here would duplicate the line (P2-3).
+        if unreadable.contains(&index) {
             continue;
+        }
+        let text = match read_file(file) {
+            Ok(text) => text,
+            Err(_) => {
+                // The file disappeared between the validation and processing
+                // passes; report it once (the validation pass saw it).
+                errors.push(format!("sed: can't read {file}"));
+                continue;
+            }
         };
         let lines = split_lines(&text);
         let (output, file_quit) = process(&lines, commands, options.quiet, first_line, total_lines);

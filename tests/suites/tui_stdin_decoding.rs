@@ -240,6 +240,86 @@ fn stdin_buffer_emits_a_complete_bracketed_paste() {
     assert_eq!(buf.process(b"b", at(base, 2)), vec![data(b"b")]);
 }
 
+/// A23-F01: an end marker embedded in the payload is literal paste data; the
+/// trailing bytes must not become live keys (Ctrl+C/BEL/Ctrl+D).
+#[test]
+fn stdin_buffer_keeps_an_inner_end_marker_inside_one_paste() {
+    let base = Instant::now();
+    let mut buf = buffer();
+    assert_eq!(
+        buf.process(b"\x1b[200~AAA\x1b[201~BBB\x03CCC\x1b[201~", base),
+        vec![paste(b"AAA\x1b[201~BBB\x03CCC")]
+    );
+}
+
+#[test]
+fn stdin_buffer_keeps_two_inner_end_markers_inside_one_paste() {
+    let base = Instant::now();
+    let mut buf = buffer();
+    assert_eq!(
+        buf.process(b"\x1b[200~A\x1b[201~B\x1b[201~C\x1b[201~", base),
+        vec![paste(b"A\x1b[201~B\x1b[201~C")]
+    );
+}
+
+#[test]
+fn stdin_buffer_closes_at_a_chunk_final_end_marker() {
+    // The real marker is split across reads and ends the chunk: it is
+    // reassembled and terminates the paste.
+    let base = Instant::now();
+    let mut buf = buffer();
+    assert!(buf.process(b"\x1b[200~PASTE\x1b[20", base).is_empty());
+    assert_eq!(buf.process(b"1~", at(base, 1)), vec![paste(b"PASTE")]);
+}
+
+#[test]
+fn stdin_buffer_keeps_a_split_inner_end_marker_literal() {
+    // An inner marker split across reads is completed inside the paste and is
+    // followed by more payload, so it stays data; the outer marker closes.
+    let base = Instant::now();
+    let mut buf = buffer();
+    assert!(buf.process(b"\x1b[200~AA\x1b[20", base).is_empty());
+    assert!(buf.process(b"1~BB", at(base, 1)).is_empty());
+    assert_eq!(
+        buf.process(b"\x1b[201~", at(base, 2)),
+        vec![paste(b"AA\x1b[201~BB")]
+    );
+}
+
+#[test]
+fn stdin_buffer_keeps_an_inner_end_marker_across_chunks() {
+    // The inner marker is complete but followed by payload in its chunk, so
+    // the paste stays open until the next chunk's outer marker.
+    let base = Instant::now();
+    let mut buf = buffer();
+    assert!(buf.process(b"\x1b[200~AA", base).is_empty());
+    assert!(buf.process(b"\x1b[201~BB", at(base, 1)).is_empty());
+    assert_eq!(
+        buf.process(b"\x1b[201~", at(base, 2)),
+        vec![paste(b"AA\x1b[201~BB")]
+    );
+}
+
+#[test]
+fn stdin_buffer_dispatches_enter_after_the_end_marker() {
+    let base = Instant::now();
+    let mut buf = buffer();
+    assert_eq!(
+        buf.process(b"\x1b[200~PASTE\x1b[201~\r", base),
+        vec![paste(b"PASTE"), data(b"\r")]
+    );
+}
+
+#[test]
+fn stdin_buffer_keeps_c0_controls_inside_one_paste() {
+    let base = Instant::now();
+    let mut buf = buffer();
+    assert_eq!(
+        buf.process(b"\x1b[200~A\x03B\x07C\x04D\x15E\x17F\x0fG\x1b[201~", base),
+        vec![paste(b"A\x03B\x07C\x04D\x15E\x17F\x0fG")]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Timeout rules (10 / 50 / 100 ms) and the flush split
 // ---------------------------------------------------------------------------

@@ -786,6 +786,17 @@ fn wrap_plain_ascii_line(line: &str, width: usize) -> Option<Vec<String>> {
     if width == 0 || !line.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
         return None;
     }
+    // A single over-wide word (a folded 1 MB single-line paste is the common
+    // case) has no break opportunities for `textwrap` to exploit; its word
+    // search is quadratic on such input. Chunk it directly by cells.
+    if !line.contains(' ') {
+        return Some(
+            line.as_bytes()
+                .chunks(width)
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect(),
+        );
+    }
     let options = textwrap::Options::new(width)
         .word_separator(textwrap::WordSeparator::AsciiSpace)
         .word_splitter(textwrap::WordSplitter::NoHyphenation)

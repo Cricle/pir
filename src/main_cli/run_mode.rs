@@ -265,9 +265,13 @@ pub(super) async fn run() -> Result<()> {
     // `rustpython_vm=warn`: the embedded interpreter logs every caught
     // exception at INFO (`Exception raised: PyBaseException`) — normal
     // control flow inside the frozen stdlib, and pure noise on the CLI's
-    // stderr. Warnings and errors still surface.
-    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rustpython_vm=warn"));
+    // stderr. `rmcp=warn` likewise keeps the MCP client's expected lifecycle
+    // ("Service initialized as client", "task cancelled") off every
+    // `mcp list` / prompt invocation unless the user opts into RUST_LOG.
+    // Warnings and errors still surface in both cases.
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,rustpython_vm=warn,rmcp=warn")
+    });
     if app_mode_tui {
         let log_path = pir::coding_agent::context::agent_dir().join("pir.log");
         rotate_tui_trace_log(&log_path, TUI_TRACE_LOG_MAX_BYTES);
@@ -1016,6 +1020,19 @@ pub(super) async fn run() -> Result<()> {
                 )
                 .await;
             }
+            // `pir print` accepts the prompt as stdin like the top-level form:
+            // a missing positional or explicit `-` reads piped input.
+            let prompt = match prompt {
+                Some(prompt) if prompt != "-" => prompt,
+                _ => match pir::coding_agent::cli::read_piped_input(stdin_tty, std::io::stdin()) {
+                    Some(prompt) => prompt,
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "pir print requires a prompt (pass an argument or pipe stdin)"
+                        ))
+                    }
+                },
+            };
             // Headless resolution never yields the picker plan: `--resume`
             // selects this project's most recent session instead.
             let plan = resolve_run_session_plan(&cli, &config, false)?;
@@ -1099,6 +1116,24 @@ pub(super) async fn run() -> Result<()> {
                 config.allow_remote_bash,
             )
             .map_err(anyhow::Error::msg)?;
+            // The server handshake creates sessions, but prompt runs need the
+            // host's provider registry: `ServerState::default()` starts with
+            // an empty one and every remote prompt then fails with a generic
+            // `internal_error` before any model request. Load the same
+            // environment print/RPC/TUI use.
+            let environment = pir::ai::providers::load_pi_environment(Some(
+                &std::env::current_dir().unwrap_or_default(),
+            ))?;
+            let registry = std::sync::Arc::new(environment.registry);
+            let default_model = environment
+                .settings
+                .default_provider
+                .as_ref()
+                .zip(environment.settings.default_model.as_ref())
+                .map(|(provider, id)| pir::protocol::ModelRef {
+                    provider: provider.clone(),
+                    id: id.clone(),
+                });
             if let Some(socket_path) = unix {
                 #[cfg(unix)]
                 {
@@ -1106,6 +1141,8 @@ pub(super) async fn run() -> Result<()> {
                     // so a Unix-host restart reopens them instead of starting
                     // empty (upstream SessionRouter over a persisted ServerHost).
                     let state = pir::server::ServerState::default()
+                        .with_registry(std::sync::Arc::clone(&registry))
+                        .with_default_model(default_model.clone())
                         .with_session_dir(config.session_dir.clone())
                         .with_tool_selection(tool_selection.clone());
                     let server = pir::server::UnixServer::bind_with_state_and_security(
@@ -1130,6 +1167,8 @@ pub(super) async fn run() -> Result<()> {
             // directory the CLI resolved (settings/env/flag) so `list` merges
             // on-disk sessions and attach reopens them across restarts.
             let state = pir::server::ServerState::default()
+                .with_registry(registry)
+                .with_default_model(default_model)
                 .with_session_dir(config.session_dir.clone())
                 .with_tool_selection(tool_selection);
             let server = pir::server::Server::bind_with_state_and_security(
@@ -1663,7 +1702,7 @@ fn run_jobs_command(command: pir::coding_agent::cli::JobsCommand) -> Result<()> 
                 ));
             }
             let spec = JobSpec {
-                command: command.join(" "),
+                command: pir::jobs::shell_command_from_argv(&command),
                 cwd,
                 program: config.program().to_owned(),
                 args: config.args().iter().map(|arg| (*arg).to_owned()).collect(),

@@ -6,8 +6,13 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::time::{Duration, Instant};
 
+use pir::tui::core::Component;
 use pir::tui::editor::Editor;
+use pir::tui::markdown::Markdown;
+use pir::tui::messages::UserMessageComponent;
+use pir::tui::strip_ansi;
 
 struct CountingAllocator;
 
@@ -120,5 +125,159 @@ fn ten_thousand_line_crlf_tab_paste_stays_within_four_output_copies() {
         stats.events <= 32,
         "normalizing 10k paste caused {} allocation events",
         stats.events
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Single-line paste submit render bound (A20-F01)
+// ---------------------------------------------------------------------------
+
+/// A 64 KiB bracketed paste with no newline folds to one `[paste #N …]`
+/// marker and expands to a single 64 KiB line on submit. The markdown inline
+/// pass used to rescan the rest of an alphanumeric run from every character
+/// (looking for a bare-email `@`), i.e. O(n²): QA measured 13.7 s to paint
+/// the reply at 64 KiB and >60 s at 1 MiB. The user-message render must stay
+/// bounded and byte-complete. (The companion user-message component renders
+/// this shape without Markdown, but the markdown path is exercised directly
+/// so the inline scanner cannot regress unnoticed.)
+#[test]
+fn sixty_four_kib_single_line_markdown_renders_in_bounded_time() {
+    let payload = "Q".repeat(64 * 1024);
+    let started = Instant::now();
+    let lines = Markdown::new(payload.clone(), 0, 0).render(100);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "64 KiB single-line markdown took {elapsed:?} (expected well under 10 s)"
+    );
+    let text: String = lines.iter().map(|line| line.trim_end()).collect();
+    assert_eq!(text, payload);
+}
+
+/// The same shape at 1 MiB: with the linear scanner this is a few hundred
+/// milliseconds in a debug build; the old quadratic scan is effectively
+/// unbounded (hours, not seconds).
+#[test]
+fn one_mib_single_line_markdown_renders_in_bounded_time() {
+    let payload = "Q".repeat(1024 * 1024);
+    let started = Instant::now();
+    let lines = Markdown::new(payload.clone(), 0, 0).render(100);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "1 MiB single-line markdown took {elapsed:?} (expected well under 30 s)"
+    );
+    let text: String = lines.iter().map(|line| line.trim_end()).collect();
+    assert_eq!(text, payload);
+}
+
+/// End-to-end composer path for the QA repro: paste 64 KiB as one line, submit
+/// (marker expansion), then render the optimistic user bubble. Bounded and
+/// content-complete.
+#[test]
+fn sixty_four_kib_single_line_paste_submit_renders_in_bounded_time() {
+    let payload = "Q".repeat(64 * 1024);
+    let editor = Editor::new();
+    editor.paste_text(&payload);
+    assert!(editor.get_text().contains("[paste #"));
+    let submitted = editor.submit().expect("non-empty submit");
+    assert_eq!(submitted, payload);
+
+    let started = Instant::now();
+    let component = UserMessageComponent::new(&submitted, 1);
+    let lines = component.render(100);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "64 KiB single-line user-message render took {elapsed:?} (expected well under 10 s)"
+    );
+    let painted: String = lines.iter().map(|line| strip_ansi(line)).collect();
+    assert_eq!(painted.matches('Q').count(), payload.len());
+}
+
+/// A huge multi-line user message (the 50 MB QA paste at a test-friendly
+/// size) must not build a Markdown document and one row per line. The painted
+/// rows are a bounded prefix plus an omission notice; submit still carries the
+/// full text (the component is display-only).
+#[test]
+fn huge_multiline_user_message_renders_a_bounded_prefix() {
+    let payload = (0..80_000)
+        .map(|index| format!("line {index:05} payload"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(payload.len() > 1_000_000);
+
+    let started = Instant::now();
+    let component = UserMessageComponent::new(&payload, 1);
+    let lines = component.render(100);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "1 MB multi-line user-message render took {elapsed:?}"
+    );
+    let painted: String = lines.iter().map(|line| strip_ansi(line)).collect();
+    assert!(
+        painted.contains("characters omitted from the display"),
+        "the display cap notice must be visible"
+    );
+    assert!(
+        painted.len() < 2_000_000,
+        "painted rows must stay bounded, got {} bytes",
+        painted.len()
+    );
+}
+
+/// Up-arrow history must not pin a huge submitted paste for the session's
+/// lifetime (the transcript and the model payload already own their copies).
+#[test]
+fn huge_submit_is_not_retained_in_history() {
+    let payload = "H".repeat(1024 * 1024 + 1);
+    let editor = Editor::new();
+    editor.set_text(&payload);
+    assert_eq!(editor.submit().as_deref(), Some(payload.as_str()));
+    editor.history_navigate(-1);
+    assert!(
+        editor.get_text().is_empty(),
+        "a >1 MiB submit must not be retained in up-arrow history"
+    );
+}
+
+/// The transcript keeps only a bounded display head of a huge user message;
+/// the worker payload stays byte-exact (the model/session copy is untouched).
+#[test]
+fn huge_user_message_display_is_capped_but_model_text_is_exact() {
+    use pir::tui::terminal::{submit_user_texts, USER_ENTRY_DISPLAY_MAX_BYTES};
+
+    let raw = "M".repeat(USER_ENTRY_DISPLAY_MAX_BYTES + 4096);
+    let texts = submit_user_texts(&raw, &raw);
+    assert_eq!(texts.to_model, raw, "the model text must stay exact");
+    assert!(
+        texts.display.len() < raw.len(),
+        "the display entry must be capped"
+    );
+    assert!(texts
+        .display
+        .starts_with(&raw[..USER_ENTRY_DISPLAY_MAX_BYTES]));
+    assert!(texts.display.contains("truncated for display"));
+}
+
+/// The TUI paste path uses the discard variant: same editor state as
+/// `paste_text`, without materializing the caller-ignored full-size String.
+#[test]
+fn paste_text_discard_matches_paste_text_state() {
+    let payload = (0..2_000)
+        .map(|index| format!("line {index:04}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let returned_editor = Editor::new();
+    let returned = returned_editor.paste_text(&payload);
+    assert_eq!(returned, payload);
+
+    let discarding_editor = Editor::new();
+    assert!(discarding_editor.paste_text_discard(&payload));
+    assert_eq!(returned_editor.get_text(), discarding_editor.get_text());
+    assert_eq!(
+        returned_editor.expanded_text(),
+        discarding_editor.expanded_text()
     );
 }
