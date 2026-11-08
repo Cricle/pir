@@ -12069,75 +12069,99 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                 }
                 Event::Paste(text) => {
                     dirty = true;
-                    // An externally supplied overlay (`ctx.ui.custom`) is the
-                    // focused component: a paste chunk is delivered to it in
-                    // the canonical bracketed-paste form, never to the editor.
-                    let external_paste = {
+                    // The generic overlay slot swallows paste unless the
+                    // focused component understands it. `/settings` owns a
+                    // text filter, so route the chunk into its query instead
+                    // of losing it and letting Enter act on the stale row
+                    // (A57-F01).
+                    let settings_paste = {
                         let overlay = app
                             .overlay
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let route = external_overlay_paste_route(&overlay.external, &text);
-                        let visible = overlay.external.visible().cloned();
-                        (route, visible)
+                        if let Some(menu) = overlay.settings.as_ref() {
+                            menu.paste_text(&text);
+                            true
+                        } else {
+                            false
+                        }
                     };
-                    if let (ExternalPasteRoute::Component(data), Some(component)) = external_paste {
-                        // Delivered as a bracketed-paste chunk (the same form
-                        // the focused component's other input takes). The rest
-                        // of the paste routing is skipped — the modal owns it.
-                        component.handle_input(&data);
+                    if settings_paste {
                         app.request_ui_refresh();
-                    } else {
-                        // P1-1: while ANY overlay is open it owns the focus and
-                        // the paste must never reach the main editor (upstream
-                        // routes paste through the focused component). Buffer
-                        // dialogs (input/editor) consume it into their buffer;
-                        // select/confirm dialogs and the model/thinking selector
-                        // swallow it.
-                        let (dialog_open, dialog_accepts_text, selector_open) = {
-                            let dialog = app
-                                .dialog
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if !settings_paste {
+                        // An externally supplied overlay (`ctx.ui.custom`) is the
+                        // focused component: a paste chunk is delivered to it in
+                        // the canonical bracketed-paste form, never to the editor.
+                        let external_paste = {
                             let overlay = app
                                 .overlay
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            (
-                                dialog.is_some(),
-                                dialog.as_ref().is_some_and(DialogOverlay::accepts_text),
-                                overlay.any_open(),
-                            )
+                            let route = external_overlay_paste_route(&overlay.external, &text);
+                            let visible = overlay.external.visible().cloned();
+                            (route, visible)
                         };
-                        // F3: an active transcript search owns the input
-                        // (upstream the search overlay is the focused
-                        // component); a paste must not leak into the hidden
-                        // main editor, so the search state swallows it.
-                        let search_active = app
-                            .alt
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .search
-                            .active;
-                        let route = if search_active {
-                            PasteRoute::Swallowed
+                        if let (ExternalPasteRoute::Component(data), Some(component)) =
+                            external_paste
+                        {
+                            // Delivered as a bracketed-paste chunk (the same form
+                            // the focused component's other input takes). The rest
+                            // of the paste routing is skipped — the modal owns it.
+                            component.handle_input(&data);
+                            app.request_ui_refresh();
                         } else {
-                            paste_route(dialog_open, dialog_accepts_text, selector_open)
-                        };
-                        match route {
-                            PasteRoute::DialogBuffer => {
-                                let mut dialog = app
+                            // P1-1: while ANY overlay is open it owns the focus and
+                            // the paste must never reach the main editor (upstream
+                            // routes paste through the focused component). Buffer
+                            // dialogs (input/editor) consume it into their buffer;
+                            // select/confirm dialogs and the model/thinking selector
+                            // swallow it.
+                            let (dialog_open, dialog_accepts_text, selector_open) = {
+                                let dialog = app
                                     .dialog
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if let Some(overlay) = dialog.as_mut() {
-                                    overlay.paste_text(&text);
+                                let overlay = app
+                                    .overlay
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                (
+                                    dialog.is_some(),
+                                    dialog.as_ref().is_some_and(DialogOverlay::accepts_text),
+                                    overlay.any_open(),
+                                )
+                            };
+                            // F3: an active transcript search owns the input
+                            // (upstream the search overlay is the focused
+                            // component); a paste must not leak into the hidden
+                            // main editor, so the search state swallows it.
+                            let search_active = app
+                                .alt
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .search
+                                .active;
+                            let route = if search_active {
+                                PasteRoute::Swallowed
+                            } else {
+                                paste_route(dialog_open, dialog_accepts_text, selector_open)
+                            };
+                            match route {
+                                PasteRoute::DialogBuffer => {
+                                    let mut dialog = app
+                                        .dialog
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    if let Some(overlay) = dialog.as_mut() {
+                                        overlay.paste_text(&text);
+                                    }
                                 }
-                            }
-                            PasteRoute::Swallowed => {}
-                            PasteRoute::Editor => {
-                                paste_into_editor(&app, &text, &mut entries);
-                                update_autocomplete(&app);
+                                PasteRoute::Swallowed => {}
+                                PasteRoute::Editor => {
+                                    paste_into_editor(&app, &text, &mut entries);
+                                    update_autocomplete(&app);
+                                }
                             }
                         }
                     }

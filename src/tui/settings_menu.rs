@@ -935,6 +935,23 @@ impl SettingsMenu {
             .clone()
     }
 
+    /// Append a pasted search chunk to the filter. The main editor never sees
+    /// an `Event::Paste` while this menu owns focus, so without this hook a
+    /// pasted search term was silently dropped and Enter acted on the stale
+    /// row (A57-F01).
+    pub fn paste_text(&self, text: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for character in text.chars() {
+            if !character.is_control() {
+                state.query.push(character);
+            }
+        }
+        state.reset_selection();
+    }
+
     /// The label of the highlighted row (test seam).
     pub fn selected_label(&self) -> Option<String> {
         let state = self
