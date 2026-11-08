@@ -4444,24 +4444,14 @@ pub async fn run_print_with_environment(
         // Upstream print-mode.ts:139-156 treats an `error` OR `aborted`
         // stopReason as a process failure only in TEXT mode (exit 1 after
         // printing the error). In JSON mode the process exits 0 and the
-        // terminal message arrives as an event line (the terminal message is
-        // re-emitted through the standard event serializer), so JSON
-        // consumers see the failure in-band.
+        // terminal message arrives in-band through the run's normal event
+        // stream (`turn_end` + `agent_end`); do not re-emit a second
+        // `turn_end` here (A18/A24: duplicate turn=0 after agent_end).
         if matches!(
             result.terminal.stop_reason,
             crate::ai::types::StopReason::Error | crate::ai::types::StopReason::Aborted
         ) {
-            if options.mode == OutputMode::Json {
-                crate::coding_agent::json::print_event(
-                    &crate::agent::agent_loop::AgentEvent::TurnEnd {
-                        turn: turn_index,
-                        message: result.terminal.clone(),
-                        // The run's real TurnEnd already carried the tool
-                        // results; this is the terminal re-emission.
-                        tool_results: result.tool_results.clone(),
-                    },
-                );
-            } else if result.aborted {
+            if result.aborted {
                 // A non-termination abort can only come from an extension's
                 // `ctx.abort()` (process termination is handled above). It
                 // settles normally — Settled drain + `agent_settled` already
@@ -4471,7 +4461,7 @@ pub async fn run_print_with_environment(
                 crate::ext_diag!(
                     "[ext] prompt run aborted by an extension; continuing with the next prompt"
                 );
-            } else {
+            } else if options.mode != OutputMode::Json {
                 // Upstream: `errorMessage || "Request " + stopReason`.
                 let error_text = result
                     .terminal
