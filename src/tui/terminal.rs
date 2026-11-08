@@ -19470,7 +19470,17 @@ fn handle_command(
         super::slash::SlashAction::Clone => {
             // Duplicate the current session at the current position (upstream
             // `/clone`): the clone carries the same transcript, so the rebind
-            // clears the TUI side and the worker replays the copy.
+            // clears the TUI side and the worker replays the copy. A rebind
+            // aborts the in-flight run; refuse the command instead of silently
+            // truncating the reply (A44-F01).
+            if worker.is_streaming() {
+                entries.push(ChatEntry::Notice {
+                    kind: super::app::NoticeKind::Warning,
+                    text: "Cannot clone while the agent is running; stop or wait for the current response first."
+                        .to_string(),
+                });
+                return SlashCommandOutcome::Handled;
+            }
             app.program_status_session_reset();
             reset_session_transcript(app, entries);
             let switch_epoch = app.session_switch.begin();
