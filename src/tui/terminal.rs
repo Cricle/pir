@@ -13309,12 +13309,19 @@ fn handle_key(
         }
         if kb.matches(TuiAction::Submit, key) {
             // Upstream: Enter accepts the completion; a slash-command prefix
-            // then falls through to submit.
+            // then falls through to submit. Command ARGUMENT completions (for
+            // example `/sessions new`) have a non-slash prefix and used to
+            // swallow the first Enter even when accepting changed nothing, so
+            // the command only ran on the second press (A32-F01). If the
+            // completion was a no-op and the editor still holds a slash
+            // command, submit it now.
+            let before = app.editor.get_text();
             let accepted = accept_autocomplete(app);
+            let changed = app.editor.get_text() != before;
             let is_slash = accepted
                 .as_ref()
                 .is_some_and(|prefix| prefix.starts_with('/') && !accepted_str_is_path(prefix));
-            if !is_slash {
+            if !is_slash && !(popup_open && !changed && before.starts_with('/')) {
                 return false;
             }
         } else if kb.matches(TuiAction::Abort, key) {

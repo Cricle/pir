@@ -2751,6 +2751,18 @@ impl RpcServer {
         // responses: their `Out` clones keep the channel open until they
         // finish (stdin EOF does not cut a running command short).
         //
+        // A piped batch may end stdin immediately after `create`/`prompt`
+        // lines. Those long-running commands are dispatched on their own
+        // tasks, so taking the session down here would make a queued prompt
+        // run after the teardown and report "no attached session" (A33-F18).
+        // Let every already-accepted dispatch task finish before the session
+        // is detached. Bounded so a wedged command cannot hold EOF forever.
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        while running_commands.load(Ordering::SeqCst) > 0
+            && tokio::time::Instant::now() < drain_deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         // Detach and tear down the session FIRST: the session-event bridge's
         // forwarder thread (see `build_and_attach`) holds an `Out` clone that
         // is only released when the attached session — and its event
