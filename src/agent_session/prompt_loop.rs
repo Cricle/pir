@@ -811,6 +811,7 @@ impl AgentSession {
         // (`LoopDeps::plugin_events`).
         self.ensure_session_event_bridge();
         self.run_settling.store(false, Ordering::SeqCst);
+        self.run_end_seen.store(false, Ordering::SeqCst);
         // A new run re-opens the background follow-up enqueue gate (closed by
         // the previous run's settle transition, see `BackgroundRegistry`).
         self.background.open_follow_up_queue();
@@ -842,6 +843,7 @@ impl AgentSession {
             state: Arc::clone(&self.session_state),
             run_abort_requested: Arc::clone(&self.run_abort_requested),
             run_settling: Arc::clone(&self.run_settling),
+            run_end_seen: Arc::clone(&self.run_end_seen),
             background: Arc::clone(&self.background),
             background_queue_gated,
             idle_notify: Arc::clone(&self.idle_notify),
@@ -852,12 +854,18 @@ impl AgentSession {
         // `last_run_diagnostics()` without an env gate. The wrapper observes
         // every loop event on the way to the host's handler and forwards it
         // unchanged; retried attempts (overflow recovery) accumulate into the
-        // same run's turn list.
+        // same run's turn list. It also records the terminal `AgentEnd`
+        // delivery so `is_settling()` is true from the exact moment a client
+        // can observe the end of the loop (not only after `mark_settling`).
         let diagnostics = Arc::new(crate::diagnostics::RunDiagnosticsCollector::new(true));
         let on_event = {
             let diagnostics = Arc::clone(&diagnostics);
+            let run_end_seen = Arc::clone(&self.run_end_seen);
             let handler = on_event;
             let wrapped: EventHandler = Arc::new(move |event: AgentEvent| {
+                if matches!(event, AgentEvent::AgentEnd { .. }) {
+                    run_end_seen.store(true, Ordering::SeqCst);
+                }
                 diagnostics.record(&event);
                 handler(event);
             });
@@ -2002,6 +2010,11 @@ impl AgentSession {
             // it makes a partial settle resumable — the next iteration starts
             // from a clean prefix instead of trusting a stale count.
             persist_ledger.reset();
+            // A settle retry starts a fresh agent loop; `agent_end` from the
+            // previous (failed/recovered) attempt must not keep the session in
+            // the `is_settling()` state while this attempt is still producing
+            // model/tool work.
+            self.run_end_seen.store(false, Ordering::SeqCst);
             if std::env::var_os("PIR_DEBUG_RPC").is_some() {
                 let _ = crate::coding_agent::output::write_stderr_line(
                     "[rpc-debug] entering agent loop",
@@ -3106,6 +3119,7 @@ struct SessionStreamingGuard {
     state: Arc<AtomicU8>,
     run_abort_requested: Arc<AtomicBool>,
     run_settling: Arc<AtomicBool>,
+    run_end_seen: Arc<AtomicBool>,
     /// The session's background registry: `mark_settling` closes its
     /// follow-up enqueue gate BEFORE the settle path drains the inbox.
     background: Arc<background::BackgroundRegistry>,
@@ -3151,6 +3165,7 @@ impl Drop for SessionStreamingGuard {
             js.set_session_streaming(false);
         }
         self.run_settling.store(false, Ordering::SeqCst);
+        self.run_end_seen.store(false, Ordering::SeqCst);
         self.run_abort_requested.store(false, Ordering::SeqCst);
         self.state.store(SESSION_IDLE, Ordering::SeqCst);
         self.idle_notify.notify_waiters();

@@ -166,6 +166,20 @@ impl Drop for PromptClaimGuard {
     }
 }
 
+/// RAII guard for one session-storage replacement's exclusive claim
+/// (`RpcServerState::storage_claim`): held from the abort of the in-flight run
+/// through the actual storage swap, so a concurrent prompt cannot start
+/// against the outgoing transcript and a second `new_session` /
+/// `switch_session` / fork cannot interleave with the replacement. Resets on
+/// drop, including every error path.
+struct StorageClaimGuard(Arc<AtomicBool>);
+
+impl Drop for StorageClaimGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// How one RPC `prompt` run starts. An `images` array (upstream
 /// `RpcCommand.prompt.images`) starts an image-carrying normal turn; the
 /// phone-child inline-image rewrite can also replace a plain text prompt with
@@ -764,6 +778,11 @@ struct RpcServerState {
     /// be acknowledged (`AgentSession::prompt` would only reject the second
     /// from inside its spawned task — too late for the response).
     prompt_claim: Arc<AtomicBool>,
+    /// Exclusive claim for one session-storage replacement (`new_session`,
+    /// `switch_session`, fork/clone). Held from the abort/settle of the
+    /// in-flight run through the swap so no prompt can start against the
+    /// outgoing transcript and two replacements cannot interleave.
+    storage_claim: Arc<AtomicBool>,
     /// Strong handle to the session-event forwarder's sender. The subscriber
     /// closure holds only a `Weak`, so a session whose event list outlives
     /// the RPC host (a detached background delivery keeps it alive) cannot
@@ -781,6 +800,7 @@ impl RpcServerState {
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             resource_env: Arc::new(std::sync::RwLock::new(None)),
             prompt_claim: Arc::new(AtomicBool::new(false)),
+            storage_claim: Arc::new(AtomicBool::new(false)),
             session_event_tx: std::sync::Mutex::new(None),
         }
     }
@@ -962,7 +982,57 @@ impl RpcServerState {
     /// spawned run task publishing `is_streaming`.
     fn run_in_flight(&self) -> bool {
         self.prompt_claim.load(Ordering::SeqCst)
+            || self.storage_claim.load(Ordering::SeqCst)
             || self.attached().is_ok_and(|session| session.is_streaming())
+    }
+
+    /// Take the exclusive session-storage replacement claim for one command.
+    /// Fails when another replacement is already in progress; the returned
+    /// guard releases the claim on every exit path.
+    fn begin_storage_replacement(&self) -> Result<StorageClaimGuard, String> {
+        self.storage_claim
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| StorageClaimGuard(Arc::clone(&self.storage_claim)))
+            .map_err(|_| {
+                "another session switch is already in progress; retry after it settles".to_owned()
+            })
+    }
+
+    /// Settle any in-flight run/compaction before a storage replacement: abort
+    /// it and wait for the session claim to release, so the outgoing
+    /// transcript has its terminal (possibly aborted) assistant message
+    /// persisted before the manager is swapped out
+    /// (upstream `teardownCurrent`: "Settle any active response first so the
+    /// aborted turn … is persisted to the outgoing session before it is
+    /// replaced").
+    ///
+    /// A prompt that was acknowledged but whose spawned run has not claimed
+    /// the session yet cannot be reached by `abort()`; reject the replacement
+    /// instead of swapping under it (the prompt would otherwise be appended
+    /// to the replacement transcript).
+    async fn settle_before_storage_replacement(
+        &self,
+        session: &Arc<AgentSession>,
+    ) -> Result<(), String> {
+        // A freshly acknowledged prompt can still be between the response and
+        // its spawned run's session claim. Give that hand-off a moment; if the
+        // run becomes visible, abort it like any other in-flight run.
+        let mut waited_ms = 0u32;
+        while self.prompt_claim.load(Ordering::SeqCst)
+            && !session.is_streaming()
+            && !session.is_compacting()
+        {
+            if waited_ms >= 100 {
+                return Err("agent is starting a prompt; retry after agent_settled".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            waited_ms += 2;
+        }
+        if session.is_streaming() || session.is_compacting() {
+            session.abort();
+            session.wait_until_idle().await;
+        }
+        Ok(())
     }
 
     /// Whether an extension asked `session` to exit: the session-level latch
@@ -1041,6 +1111,7 @@ impl RpcServerState {
             }
         };
         let manager = crate::coding_agent::session_resolve::open_session_tail_first(&path)?;
+        manager.ensure_exclusive_writer()?;
         // Upstream `assertSessionCwdExists` (session-cwd.ts:54-59): a stored
         // cwd that no longer exists is a hard error for the headless RPC host.
         if let Some(issue) = manager.missing_session_cwd() {
@@ -1202,6 +1273,27 @@ impl RpcServerState {
             eprintln!("[rpc-debug] prompt command");
         }
         let session = self.attached()?;
+        // A storage replacement (`new_session`/`switch_session`/fork) aborts
+        // and settles the run before swapping; a prompt landing in that
+        // transaction must not start against the outgoing transcript.
+        if self.storage_claim.load(Ordering::SeqCst) {
+            return Err("a session switch is in progress; retry after it settles".to_owned());
+        }
+        let behavior = value
+            .get("streamingBehavior")
+            .filter(|behavior| !behavior.is_null());
+        // `agent_end` is delivered from inside the agent loop, before the run
+        // finishes persisting its remaining messages and releases the session
+        // claim. A plain prompt sent immediately after that frame (the client
+        // cannot see the settle window) must be admitted: wait for the run's
+        // idle edge instead of rejecting with the streaming error. An explicit
+        // `streamingBehavior` keeps its queue semantics.
+        if behavior.is_none() && session.is_settling() {
+            session.wait_until_idle().await;
+            if self.storage_claim.load(Ordering::SeqCst) {
+                return Err("a session switch is in progress; retry after it settles".to_owned());
+            }
+        }
         let mut text = message_text(value);
         if text.is_empty() {
             return Err("prompt requires a non-empty 'text' field".to_owned());
@@ -1249,9 +1341,6 @@ impl RpcServerState {
         // `prompt_with_prepared_input`, so the event is never emitted twice.
         // A phone-child custom message is not a user prompt (`sendMessage`
         // with `triggerTurn`), so it bypasses the event like upstream.
-        let behavior = value
-            .get("streamingBehavior")
-            .filter(|behavior| !behavior.is_null());
         let (text, run) = match run {
             PromptRun::PhoneCustom(message) => (text, PromptRun::PhoneCustom(message)),
             run => {
@@ -1860,6 +1949,10 @@ impl RpcServerState {
 
     async fn handle_new_session(&self, value: &Value) -> CommandOutcome {
         let session = self.attached()?;
+        if session.session_manager().is_none() {
+            return Err("no attached session storage; the run stays ephemeral".to_owned());
+        }
+        let _swap = self.begin_storage_replacement()?;
         let cwd = session
             .with_session_manager(|sm| sm.cwd().to_owned())
             .await
@@ -1881,8 +1974,15 @@ impl RpcServerState {
                 }))
                 .map_err(|error| format!("new session failed: {error}"))?;
         }
+        // Upstream `teardownCurrent`: abort and settle an in-flight run before
+        // the outgoing transcript is replaced, so its aborted turn (assistant
+        // message included) is persisted there and the old agent can never
+        // emit into the replacement session.
+        self.settle_before_storage_replacement(&session).await?;
         if !session.replace_session_storage(new_session).await {
-            return Err("no attached session storage; the run stays ephemeral".to_owned());
+            // Only a `session_before_switch` handler can refuse here (storage
+            // was checked above): upstream answers `{cancelled: true}`.
+            return Ok(Some(json!({ "cancelled": true })));
         }
         // The session now lives in a fresh file for `cwd`: commands are
         // discovered from that cwd from here on.
@@ -1896,12 +1996,17 @@ impl RpcServerState {
             .get("sessionPath")
             .and_then(Value::as_str)
             .ok_or("switch_session requires a 'sessionPath' field")?;
+        if session.session_manager().is_none() {
+            return Err("no attached session storage; the run stays ephemeral".to_owned());
+        }
+        let _swap = self.begin_storage_replacement()?;
         let manager = self
             .resolve_session_file(name)
             .map_err(|error| error.to_string())?;
         let switched_cwd = manager.cwd().to_owned();
+        self.settle_before_storage_replacement(&session).await?;
         if !session.replace_session_storage(manager).await {
-            return Err("no attached session storage; the run stays ephemeral".to_owned());
+            return Ok(Some(json!({ "cancelled": true })));
         }
         // The swapped-in session carries its own cwd; `get_commands` follows
         // it.
@@ -1924,6 +2029,8 @@ impl RpcServerState {
         let session = self.attached()?;
         match value.get("entryId").and_then(Value::as_str) {
             Some(entry_id) => {
+                let _swap = self.begin_storage_replacement()?;
+                self.settle_before_storage_replacement(&session).await?;
                 let position = crate::agent_session::ForkPosition::parse(
                     value.get("position").and_then(Value::as_str),
                 );
@@ -1942,28 +2049,32 @@ impl RpcServerState {
                 }
             }
             None => {
-                self.fork_current("fork").await?;
-                Ok(Some(json!({ "text": "", "cancelled": false })))
+                let cancelled = self.fork_current("fork").await?;
+                Ok(Some(json!({ "text": "", "cancelled": cancelled })))
             }
         }
     }
 
     async fn handle_clone(&self) -> CommandOutcome {
-        self.fork_current("clone").await?;
+        let cancelled = self.fork_current("clone").await?;
         // Upstream `clone` answers with `{cancelled}` only.
-        Ok(Some(json!({ "cancelled": false })))
+        Ok(Some(json!({ "cancelled": cancelled })))
     }
 
     /// Shared `fork`/`clone` body (upstream forks from a selected entry; pir
-    /// duplicates the session at the current position). The response payload
-    /// is chosen by the caller ({text,cancelled} vs {cancelled}).
-    async fn fork_current(&self, label: &str) -> Result<(), String> {
+    /// duplicates the session at the current position). Returns whether a
+    /// `session_before_switch` handler cancelled the storage replacement.
+    async fn fork_current(&self, label: &str) -> Result<bool, String> {
         let session = self.attached()?;
         let Some(path) = session.state().session_path else {
             return Err(format!(
                 "cannot {label} an in-memory session (--no-session)"
             ));
         };
+        if session.session_manager().is_none() {
+            return Err("no attached session storage; the run stays ephemeral".to_owned());
+        }
+        let _swap = self.begin_storage_replacement()?;
         let cwd = session
             .with_session_manager(|sm| sm.cwd().to_owned())
             .await
@@ -1975,12 +2086,13 @@ impl RpcServerState {
             None,
         )
         .map_err(|error| format!("{label} failed: {error}"))?;
+        self.settle_before_storage_replacement(&session).await?;
         if !session.replace_session_storage(forked).await {
-            return Err("no attached session storage; the run stays ephemeral".to_owned());
+            return Ok(true);
         }
         // The forked storage keeps this cwd; command discovery follows it.
         self.rebind_resource_cwd(cwd);
-        Ok(())
+        Ok(false)
     }
 
     async fn handle_get_entries(&self, value: &Value) -> CommandOutcome {

@@ -129,6 +129,83 @@ fn byte_parser_paste_markers_are_consumed_not_typed() {
     assert_eq!(paste_texts(&out), vec![payload.to_string()], "{out:?}");
 }
 
+/// A23-F01 (record path): an end marker inside the payload is followed by
+/// more payload in the same batch, so it is literal text, not a terminator.
+#[test]
+fn inner_end_marker_stays_literal_payload() {
+    let mut coalescer = ConsoleBatchCoalescer::new();
+    let mut events = bracket_marker_byte("200~");
+    events.extend(text_records("AAA"));
+    events.extend(bracket_marker_byte("201~"));
+    events.extend(text_records("BBB"));
+    events.extend(bracket_marker_byte("201~"));
+    let out = coalescer.coalesce(events);
+    assert_eq!(
+        paste_texts(&out),
+        vec!["AAA[201~BBB".to_string()],
+        "{out:?}"
+    );
+    assert!(!coalescer.is_paste_open());
+}
+
+#[test]
+fn two_inner_end_markers_stay_literal_payload() {
+    let mut coalescer = ConsoleBatchCoalescer::new();
+    let mut events = bracket_marker_byte("200~");
+    events.extend(text_records("A"));
+    events.extend(bracket_marker_byte("201~"));
+    events.extend(text_records("B"));
+    events.extend(bracket_marker_byte("201~"));
+    events.extend(text_records("C"));
+    events.extend(bracket_marker_byte("201~"));
+    let out = coalescer.coalesce(events);
+    assert_eq!(
+        paste_texts(&out),
+        vec!["A[201~B[201~C".to_string()],
+        "{out:?}"
+    );
+    assert!(!coalescer.is_paste_open());
+}
+
+/// An inner marker in one batch is followed by more payload, so it stays
+/// literal across the batch seam; only the next batch's final marker closes.
+#[test]
+fn inner_end_marker_across_batches_stays_literal() {
+    let mut coalescer = ConsoleBatchCoalescer::new();
+    let mut first = bracket_marker_byte("200~");
+    first.extend(text_records("AA"));
+    assert!(paste_texts(&coalescer.coalesce(first)).is_empty());
+
+    let mut second = bracket_marker_byte("201~");
+    second.extend(text_records("BB"));
+    let out = coalescer.coalesce(second);
+    assert!(paste_texts(&out).is_empty(), "{out:?}");
+    assert!(coalescer.is_paste_open());
+
+    let out = coalescer.coalesce(bracket_marker_byte("201~"));
+    assert_eq!(paste_texts(&out), vec!["AA[201~BB".to_string()], "{out:?}");
+    assert!(!coalescer.is_paste_open());
+}
+
+/// A paste whose end marker is the last event still terminates, and an Enter
+/// that follows it in the same batch is dispatched as a submit key rather
+/// than swallowed by the paste.
+#[test]
+fn paste_end_followed_by_enter_dispatches_enter() {
+    let mut coalescer = ConsoleBatchCoalescer::new();
+    let mut events = bracket_marker_byte("200~");
+    events.extend(text_records("PASTE"));
+    events.extend(bracket_marker_byte("201~"));
+    events.push(press(KeyCode::Enter));
+    let out = coalescer.coalesce(events);
+    assert_eq!(paste_texts(&out), vec!["PASTE".to_string()], "{out:?}");
+    assert!(matches!(
+        out.last(),
+        Some(Event::Key(key)) if key.code == KeyCode::Enter
+    ));
+    assert!(!coalescer.is_paste_open());
+}
+
 #[test]
 fn a_paste_spanning_batches_keeps_state_and_emits_bounded_chunks() {
     let mut coalescer = ConsoleBatchCoalescer::new();
@@ -399,10 +476,16 @@ fn vt_multiline_paste_keeps_every_line() {
     );
 }
 
-/// Text typed after the closing marker is normal input, not paste payload.
+/// Text typed after the closing marker in a LATER console read is normal
+/// input, not paste payload. (Bytes after a marker in the same read are
+/// ambiguous with an embedded marker and stay payload — the A23-F01 rule.)
 #[test]
 fn vt_text_after_paste_marker_dispatches_as_keys() {
-    let events = decode_console_vt_batch(&vt_records(b"\x1b[200~PASTE\x1b[201~TAIL"));
+    let now = Instant::now();
+    let mut buffer = StdinBuffer::default();
+    let mut sequences = buffer.process(b"\x1b[200~PASTE\x1b[201~", now);
+    sequences.extend(buffer.process(b"TAIL", now));
+    let events = stdin_events_to_events(sequences);
     assert_eq!(vt_text(&events), vec!["PASTE".to_string()], "{events:?}");
     let tail: String = events
         .iter()
@@ -447,13 +530,17 @@ fn vt_lone_ctrl_c_is_a_real_control_key() {
 }
 
 /// A paste split across console reads keeps its payload: the byte buffer is
-/// stateful across chunks, exactly like the live reader's.
+/// stateful across chunks, exactly like the live reader's. The end marker is
+/// split too; only the chunk-final completion closes the paste, and text in
+/// the next read is ordinary input.
 #[test]
 fn vt_paste_markers_may_straddle_console_reads() {
     let now = Instant::now();
     let mut buffer = StdinBuffer::default();
     let mut sequences = buffer.process(b"\x1b[200~AAA", now);
-    sequences.extend(buffer.process(b"\x03BBB\x1b[201~TAILMARK", now));
+    sequences.extend(buffer.process(b"\x03BBB\x1b[20", now));
+    sequences.extend(buffer.process(b"1~", now));
+    sequences.extend(buffer.process(b"TAILMARK", now));
     let events = stdin_events_to_events(sequences);
     assert_eq!(
         vt_text(&events),

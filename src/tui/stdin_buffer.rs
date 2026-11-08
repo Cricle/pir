@@ -444,6 +444,10 @@ pub struct StdinBuffer {
     escape_timeout: Duration,
     paste_mode: bool,
     paste_buffer: Vec<u8>,
+    /// First byte of `paste_buffer` not yet searched for an end-marker start.
+    /// The search only has to cover newly arrived bytes plus the marker-length
+    /// overlap, so a paste that is fed in many chunks stays linear.
+    paste_scanned: usize,
     pending_kitty_printable: Option<u32>,
 }
 
@@ -466,6 +470,7 @@ impl StdinBuffer {
             escape_timeout,
             paste_mode: false,
             paste_buffer: Vec::new(),
+            paste_scanned: 0,
             pending_kitty_printable: None,
         }
     }
@@ -538,6 +543,7 @@ impl StdinBuffer {
             self.buffer = rest;
             self.paste_mode = true;
             self.paste_buffer = std::mem::take(&mut self.buffer);
+            self.paste_scanned = 0;
             self.finish_paste_if_closed(now, out);
             return;
         }
@@ -567,9 +573,25 @@ impl StdinBuffer {
         self.deadline = Some(now + window);
     }
 
-    /// Close an in-flight paste once its `ESC [ 2 0 1 ~` arrives.
+    /// Close an in-flight paste once the terminal's own `ESC [ 2 0 1 ~`
+    /// arrives.
+    ///
+    /// A paste payload may itself contain the end-marker bytes (a pasted log,
+    /// source file or binary). A marker followed by more paste bytes in the
+    /// same chunk is therefore literal payload; only a marker whose suffix is
+    /// empty (it ends the chunk) or starts with the Enter that followed the
+    /// paste closes it. Of several such markers the last one wins, so multiple
+    /// inner markers stay inside one paste. Text after the real terminator in
+    /// the same chunk is ordinary input (the suffix is reprocessed below).
     fn finish_paste_if_closed(&mut self, now: Instant, out: &mut Vec<StdinEvent>) {
-        let Some(end) = find_subslice(&self.paste_buffer, BRACKETED_PASTE_END) else {
+        // Only scan bytes not searched before (plus the marker-length overlap
+        // so a marker split across chunks is still found once complete).
+        let len = self.paste_buffer.len();
+        let search_from = self.paste_scanned.min(len);
+        let end = find_paste_terminator(&self.paste_buffer[search_from..])
+            .map(|offset| search_from + offset);
+        self.paste_scanned = len.saturating_sub(BRACKETED_PASTE_END.len() - 1);
+        let Some(end) = end else {
             self.deadline = None;
             return;
         };
@@ -577,6 +599,7 @@ impl StdinBuffer {
         let remaining = self.paste_buffer[end + BRACKETED_PASTE_END.len()..].to_vec();
         self.paste_mode = false;
         self.paste_buffer.clear();
+        self.paste_scanned = 0;
         self.pending_kitty_printable = None;
         out.push(StdinEvent::Paste(content));
         if !remaining.is_empty() {
@@ -654,6 +677,7 @@ impl StdinBuffer {
         self.buffer.clear();
         self.paste_mode = false;
         self.paste_buffer.clear();
+        self.paste_scanned = 0;
         self.pending_kitty_printable = None;
     }
 
@@ -825,6 +849,28 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// Last bracketed-paste terminator in `haystack` whose suffix is empty or
+/// begins with a line ending (the Enter that followed the paste). A marker
+/// followed by other bytes is payload (see
+/// [`StdinBuffer::finish_paste_if_closed`]).
+fn find_paste_terminator(haystack: &[u8]) -> Option<usize> {
+    let marker = BRACKETED_PASTE_END;
+    let mut found = None;
+    let mut index = 0usize;
+    while index + marker.len() <= haystack.len() {
+        if &haystack[index..index + marker.len()] == marker {
+            let suffix = &haystack[index + marker.len()..];
+            if suffix.is_empty() || matches!(suffix.first(), Some(b'\r' | b'\n')) {
+                found = Some(index);
+            }
+            index += marker.len();
+        } else {
+            index += 1;
+        }
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------

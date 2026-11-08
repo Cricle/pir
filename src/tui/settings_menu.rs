@@ -1074,7 +1074,7 @@ impl SettingsMenu {
     }
 
     fn enter(state: &mut MenuState) -> MenuOutcome {
-        let (index, id, is_submenu, level_text) = {
+        let (index, id, is_submenu, level_text, item) = {
             let (rows, _) = state.display_rows();
             let Some(index) = state.current_index(rows) else {
                 return MenuOutcome::None;
@@ -1087,6 +1087,7 @@ impl SettingsMenu {
                 item.id,
                 item.submenu,
                 item.current_text().to_string(),
+                item.clone(),
             )
         };
         let submenu = state.submenu.as_ref().map(|submenu| submenu.kind);
@@ -1105,7 +1106,11 @@ impl SettingsMenu {
                     state.submenu = Some(state.theme_automatic_submenu());
                     MenuOutcome::None
                 } else {
-                    Self::cycle(state, 1)
+                    // Each theme row carries one value; Enter SELECTS the
+                    // focused row. `cycle` treats a one-value row as a no-op,
+                    // which left the highlighted theme unapplied (A23-F08:
+                    // the picker moved but settings.json never changed).
+                    MenuOutcome::Apply(item_action(&item))
                 }
             }
             Some(SubmenuKind::ThemeAutomatic) => match id {

@@ -735,6 +735,7 @@ impl AgentSession {
             session_state: session_state_handle,
             run_abort_requested: Arc::new(AtomicBool::new(false)),
             run_settling: run_settling_handle,
+            run_end_seen: Arc::new(AtomicBool::new(false)),
             idle_notify: Arc::new(Notify::new()),
             pending_custom_runs: Arc::new(Mutex::new(VecDeque::new())),
             pending_next_turn_messages: Arc::new(Mutex::new(Vec::new())),
@@ -1490,6 +1491,20 @@ impl AgentSession {
     /// Whether a prompt run is currently in flight.
     pub fn is_streaming(&self) -> bool {
         self.session_state() == SESSION_RUNNING
+    }
+
+    /// Whether the in-flight run has already produced its terminal agent-loop
+    /// result and is only finishing post-run settlement work.
+    ///
+    /// `agent_end` is delivered from inside the agent loop, before the run
+    /// persists its remaining messages, drains extensions, emits
+    /// `agent_settled`, and releases the session claim. A client that reacts
+    /// to `agent_end` by sending the next plain prompt must therefore be
+    /// admitted by waiting out this window instead of being rejected with the
+    /// "already processing" streaming error. `false` while a run is still
+    /// producing model/tool work (and false when idle).
+    pub fn is_settling(&self) -> bool {
+        self.run_settling.load(Ordering::SeqCst) || self.run_end_seen.load(Ordering::SeqCst)
     }
 
     /// Whether this session was constructed as a parallel phone child

@@ -428,7 +428,11 @@ pub fn open_session_manager(
         // `run_print` (`paged_requires_widening`), so semantics are unchanged
         // for every session that fits. A legacy (v1/v2) file falls back to the
         // full load, which migrates it (see `open_session_tail_first`).
-        SessionPlan::Open(path) => Some(open_session_tail_first(path)?),
+        SessionPlan::Open(path) => {
+            let manager = open_session_tail_first(path)?;
+            manager.ensure_exclusive_writer()?;
+            Some(manager)
+        }
         // `fork_from_source` reads the whole source verbatim by design (the
         // fork is a new file with the full prefix), so it stays on the full
         // load.

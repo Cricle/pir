@@ -758,6 +758,14 @@ pub struct AgentSession {
     /// idle boundary (`_emitAgentSettled` clears `_isAgentRunActive` before
     /// the settle event).
     run_settling: Arc<AtomicBool>,
+    /// Set when the current settle iteration's host event stream delivered
+    /// `AgentEvent::AgentEnd` (the last event the loop reports before it
+    /// returns), cleared when the next settle iteration starts a new loop.
+    /// [`AgentSession::is_settling`] treats it as a settle boundary: a prompt
+    /// sent after a client observed `agent_end` must be admitted once the
+    /// run's claim releases, even if the post-loop bookkeeping (persistence,
+    /// extension drain) has not reached [`Self::run_settling`] yet.
+    run_end_seen: Arc<AtomicBool>,
     /// Woken whenever the session claim returns to idle. A waiter registers
     /// with `Notify` BEFORE re-checking the claim, so a release between the
     /// check and the await is never missed (no busy-wait, no sleep).

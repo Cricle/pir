@@ -67,6 +67,12 @@ enum LastAction {
 const PASTE_FOLD_MAX_LINES: usize = 10;
 const PASTE_FOLD_MAX_CHARS: usize = 1000;
 
+/// Do not retain a submitted prompt larger than this in up-arrow history.
+/// The history is a convenience for recalling short prompts; a 50 MB paste
+/// (A23-F02) would otherwise stay resident for the whole session in addition
+/// to the transcript's own copy.
+const MAX_HISTORY_ENTRY_BYTES: usize = 1024 * 1024;
+
 /// Upper bound for the backward scan that locates a paste marker ending at
 /// the cursor (`[paste #` + id digits + optional suffix + `]`).
 const PASTE_MARKER_MAX_LEN: usize = 64;
@@ -445,8 +451,6 @@ pub struct Editor {
     /// `editor.ts:348 / 464-483`).
     history_draft: Mutex<Option<EditorState>>,
     padding_x: std::sync::atomic::AtomicUsize,
-    /// Submit handler text snapshot (the app reads it on Enter).
-    submitted: Mutex<Option<String>>,
     /// Emacs-style kill ring — port of upstream `KillRing`
     /// (`kill-ring.ts`): killed texts in insertion order, unbounded;
     /// consecutive kills accumulate into the newest entry.
@@ -534,7 +538,6 @@ impl Editor {
             history_index: Mutex::new(None),
             history_draft: Mutex::new(None),
             padding_x: std::sync::atomic::AtomicUsize::new(1),
-            submitted: Mutex::new(None),
             kill_ring: Mutex::new(VecDeque::new()),
             last_action: Mutex::new(None),
             undo_stack: Mutex::new(Vec::new()),
@@ -2383,7 +2386,9 @@ impl Editor {
             .history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if history.first().map(String::as_str) != Some(text.as_str()) {
+        if text.len() <= MAX_HISTORY_ENTRY_BYTES
+            && history.first().map(String::as_str) != Some(text.as_str())
+        {
             history.insert(0, text.clone());
             // Cap the history at 100 entries, dropping the oldest (upstream
             // `addToHistory`, `editor.ts:428-438`).
@@ -2414,10 +2419,6 @@ impl Editor {
             .clear();
         self.set_last_action(None);
         self.clear_sticky_columns();
-        *self
-            .submitted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text.clone());
         Some(text)
     }
 

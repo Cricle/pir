@@ -234,14 +234,44 @@ struct UserMessageRowsCache {
 
 use super::core::BoxContainer;
 
-/// Plain wrapped text for a pathological single-line user paste.
+/// Above this many input bytes a user message is rendered as plain text and
+/// only its head is wrapped; the full payload still goes to the model and the
+/// session. A 50 MB pasted message otherwise turns into a Markdown document
+/// plus one row allocation per line (A23-F02: ~0.8 GB retained, ~1.7 GB peak).
+const USER_MESSAGE_PLAIN_RENDER_BYTES: usize = 32 * 1024;
+/// Characters actually painted/retained for a huge message. The terminal
+/// window shows at most a few thousand characters; keeping 128 K leaves ample
+/// context while bounding the rows/allocations for a 50 MB paste.
+const USER_MESSAGE_DISPLAY_MAX_CHARS: usize = 128 * 1024;
+
+/// Plain wrapped text for a pathological user paste.
 ///
 /// The Markdown inline parser is superlinear on a multi-kilobyte line with
-/// no newline (a folded single-line paste expands to one such line on
-/// submit); the box only needs the same wrapped rows, so render the plain
-/// text directly.
+/// no newline, and a huge multi-line paste expands into hundreds of thousands
+/// of parsed spans/rows. The box only needs visible rows, so render plain text
+/// directly and cap the painted prefix; the message itself is never truncated
+/// (submit uses the editor's full text, not this component).
 struct PlainUserText {
+    /// The painted text: the full input for normal messages, or the bounded
+    /// head + omission notice for a huge one. The component is display-only,
+    /// so retaining the untouched 50 MB payload here would be dead weight.
     text: String,
+}
+
+impl PlainUserText {
+    fn new(text: String) -> Self {
+        let char_count = text.chars().count();
+        if char_count <= USER_MESSAGE_DISPLAY_MAX_CHARS {
+            return Self { text };
+        }
+        let mut shown = String::with_capacity(USER_MESSAGE_DISPLAY_MAX_CHARS * 4 + 64);
+        shown.extend(text.chars().take(USER_MESSAGE_DISPLAY_MAX_CHARS));
+        shown.push_str(&format!(
+            "\n… [{} characters omitted from the display; the full message was sent]",
+            char_count - USER_MESSAGE_DISPLAY_MAX_CHARS
+        ));
+        Self { text: shown }
+    }
 }
 
 impl Component for PlainUserText {
@@ -264,10 +294,10 @@ impl UserMessageComponent {
         // User text is replayed from the session file too (a poisoned session
         // must not re-inject on resume): sanitize before markdown parses it.
         let text = sanitize_terminal_text(text);
-        if !text.contains('\n') && text.chars().count() > 4096 {
-            boxed.add_child(PlainUserText {
-                text: text.into_owned(),
-            });
+        if text.len() > USER_MESSAGE_PLAIN_RENDER_BYTES
+            || (!text.contains('\n') && text.chars().count() > 4096)
+        {
+            boxed.add_child(PlainUserText::new(text.into_owned()));
         } else {
             boxed.add_child(Markdown::with_options(text.as_ref(), 0, 0, theme, options));
         }

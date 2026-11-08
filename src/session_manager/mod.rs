@@ -2515,6 +2515,48 @@ impl SessionManager {
         }
     }
 
+    /// Refuse to attach a second writer to an EXISTING session whose
+    /// `.<name>.jsonl.lock` names another live process.
+    ///
+    /// [`Self::refresh_writer_lock`] deliberately proceeds without the lock
+    /// when a live owner exists, so history previews and read-only opens stay
+    /// possible. Every host that will append to the session (print, TUI,
+    /// RPC, remote attach) must call this after opening: otherwise a second
+    /// process silently interleaves its turns into the live transcript
+    /// (A28-F01). A lock owned by this same process is allowed: opening the
+    /// current session a second time for `/fork`/`/export` is a same-process
+    /// read, not another writer.
+    pub fn ensure_exclusive_writer(&self) -> crate::Result<()> {
+        if !self.persist {
+            return Ok(());
+        }
+        let Some(path) = self.session_file.as_deref() else {
+            return Ok(());
+        };
+        if !path.exists() || self.writer_lock.is_some() {
+            return Ok(());
+        }
+        let lock_path = retention::session_lock_path(path);
+        let owner = lock_path
+            .as_deref()
+            .and_then(retention::session_lock_owner_pid);
+        if owner == Some(std::process::id()) {
+            return Ok(());
+        }
+        match owner {
+            Some(pid) => anyhow::bail!(
+                "Session '{}' is already in use by another process (pid {pid}); \
+                 refusing to create a second writer for the same session id",
+                self.session_id
+            ),
+            None => anyhow::bail!(
+                "Session '{}' is already in use by another process; \
+                 refusing to create a second writer for the same session id",
+                self.session_id
+            ),
+        }
+    }
+
     fn ensure_writer_lock(&mut self) {
         if !self.persist {
             return;

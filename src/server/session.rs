@@ -1518,6 +1518,14 @@ fn prepare_persisted_session(
                 }
             },
         };
+    if let Err(error) = manager.ensure_exclusive_writer() {
+        tracing::warn!(
+            %error,
+            session_id = %id,
+            "persisted server session is already owned by another writer"
+        );
+        return None;
+    }
     if manager.is_paged() {
         if let Err(error) = manager.widen_to_full() {
             tracing::warn!(

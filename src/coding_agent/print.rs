@@ -2633,6 +2633,59 @@ pub fn print_tool_loadout(
     })
 }
 
+/// Apply the MCP discovery activation a `codemode`/`deferred` server asks for
+/// to a print loadout built with the default tool selection.
+///
+/// The interactive host performs this through the plugin context bound by
+/// `AgentSession` (`McpPlugin::on_context`). Print drives the loop without a
+/// session, so no context is bound and `McpPlugin::recompute_discovery_activation`
+/// has nothing to write; the same pure decision is applied here before the
+/// loadout is frozen. An explicit `--tools` / `settings.defaultTools` choice
+/// is authoritative (upstream `setActiveTools`), so callers skip this helper
+/// for those.
+fn auto_activate_mcp_discovery(loadout: &mut PrintToolLoadout, plugins: Option<&PluginHost>) {
+    #[cfg(feature = "mcp")]
+    {
+        let Some(mcp) = plugins.and_then(mcp_plugin_of) else {
+            return;
+        };
+        let activate = mcp
+            .discovery_activation(&loadout.registry, &loadout.active)
+            .activate;
+        if activate.is_empty() {
+            return;
+        }
+        for name in activate {
+            if !loadout.active.iter().any(|active| active == &name) {
+                loadout.active.push(name);
+            }
+        }
+        loadout.declared =
+            crate::agent::tool_execution::declared_tools(&loadout.registry, &loadout.active)
+                .iter()
+                .map(|tool| tool.name().to_owned())
+                .collect();
+        loadout.callable =
+            crate::agent::tool_execution::callable_tools(&loadout.registry, &loadout.active)
+                .iter()
+                .map(|tool| tool.name().to_owned())
+                .collect();
+        let hidden = {
+            let declared_set: std::collections::BTreeSet<&str> =
+                loadout.declared.iter().map(String::as_str).collect();
+            loadout
+                .registry
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .filter(|name| !declared_set.contains(name.as_str()))
+                .collect()
+        };
+        loadout.hidden = hidden;
+    }
+    #[cfg(not(feature = "mcp"))]
+    let _ = (loadout, plugins);
+}
+
 /// Output mode for one print run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
@@ -3304,7 +3357,7 @@ pub async fn run_print_with_environment(
     // for the same selection), while every other registered tool stays in the
     // registry for `ctx.executeTool`, `tool_search` and nested calls.
     let loadout_started = crate::config::timings::start_phase();
-    let loadout = match print_tool_loadout(
+    let mut loadout = match print_tool_loadout(
         registry,
         options.settings_default_tools.as_deref(),
         &options.cli_tools,
@@ -3315,6 +3368,18 @@ pub async fn run_print_with_environment(
         Ok(loadout) => loadout,
         Err(error) => return Err(anyhow::anyhow!(error)),
     };
+    // A default-selection print run gets the same MCP discovery activation the
+    // interactive host performs through its bound plugin context. An explicit
+    // selection remains authoritative and is never widened here.
+    if !crate::coding_agent::tool_selection::tool_selection_requested(
+        options.settings_default_tools.as_deref(),
+        &options.cli_tools,
+        &options.cli_exclude_tools,
+        options.no_tools,
+        options.no_builtin_tools,
+    ) {
+        auto_activate_mcp_discovery(&mut loadout, plugins.as_deref());
+    }
     // The provider request declares only the active direct/model-only tools;
     // `codemode`/`deferred` tools stay in the (executable) registry. The
     // declared definitions carry the `prepareLoadout` results (upstream

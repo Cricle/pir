@@ -20302,6 +20302,17 @@ fn handle_resume_command(app: &mut App, entries: &mut Vec<ChatEntry>, worker: &W
         // tree event first, named in the lane report.)
         Some(path) => match crate::session_manager::SessionManager::open(&path) {
             Ok(manager) => {
+                // A live foreign writer owns this transcript (A28-F01): never
+                // attach a second one and interleave turns. Same-process
+                // reopens (a tab switch, /fork's source read) remain allowed.
+                if let Err(error) = manager.ensure_exclusive_writer() {
+                    restore_tui_surface_after_prompt(app);
+                    entries.push(ChatEntry::Notice {
+                        kind: super::app::NoticeKind::Error,
+                        text: format!("cannot open session: {error}"),
+                    });
+                    return;
+                }
                 // §6 #16 (upstream `switchSession` → `assertSessionCwdExists`
                 // + `handleResumeSession`'s MissingSessionCwdError catch): the
                 // stored cwd is gone. Offer the upstream Continue/Cancel
@@ -24961,6 +24972,16 @@ impl ConsoleBatchCoalescer {
         }
         let mut out = Vec::with_capacity(8 + expired_tail.len());
         out.extend(expired_tail);
+        // Inside an open paste the payload may itself contain end markers (a
+        // pasted log/source/binary). Only the LAST end marker in the batch can
+        // be the terminal's own terminator; every earlier one is followed by
+        // more payload in the same batch and stays literal payload text. When
+        // the start marker opened the paste in this same batch, the scan starts
+        // after it.
+        let mut paste_end_start = self
+            .paste_open
+            .then(|| last_paste_terminator_start(&events))
+            .flatten();
         let mut run_events: Vec<Event> = Vec::new();
         let mut run_text = String::new();
         let mut paste_text = std::mem::take(&mut self.paste_buffer);
@@ -24983,15 +25004,20 @@ impl ConsoleBatchCoalescer {
                     flush_plain_run(&mut run_events, &mut run_text, &mut out);
                     self.paste_open = true;
                     self.last_was_plain_enter = false;
+                    paste_end_start =
+                        last_paste_terminator_start(&events[next..]).map(|at| next + at);
                     index = next;
                     continue;
                 }
-            } else if let Some(next) = bracket_marker_end(&events, index, b"[201~", true) {
-                flush_paste_chunk(&mut paste_text, &mut out);
-                self.paste_open = false;
-                self.last_was_plain_enter = false;
-                index = next;
-                continue;
+            } else if paste_end_start == Some(index) {
+                if let Some(next) = bracket_marker_end(&events, index, b"[201~", true) {
+                    flush_paste_chunk(&mut paste_text, &mut out);
+                    self.paste_open = false;
+                    self.last_was_plain_enter = false;
+                    paste_end_start = None;
+                    index = next;
+                    continue;
+                }
             }
             let event = events[index].clone();
             index += 1;
@@ -25263,6 +25289,97 @@ fn bracket_marker_end(
         if bracket_ok && keys_match_digits(&presses[1..], digits) {
             let last = presses[digits.len()].0;
             return Some(advance_releases(events, last + 1));
+        }
+    }
+    None
+}
+
+/// Start index of the last end marker (`ESC [ 2 0 1 ~`) in `events` whose
+/// suffix is empty (the marker ends the batch) or begins with a line ending
+/// (the Enter that followed the paste), accepting every spelling
+/// [`bracket_marker_end`] accepts.
+///
+/// While a bracketed paste is open, an end marker followed by more payload is
+/// literal text; only such a terminal marker may close the paste. Scanning
+/// backwards keeps the cost linear in the batch and, unlike calling
+/// `bracket_marker_end` at every index, allocates nothing for the hundreds of
+/// thousands of records a paste can carry.
+fn last_paste_terminator_start(events: &[Event]) -> Option<usize> {
+    const END: &[u8] = b"[201~";
+    let digits = &END[1..]; // `201~`
+    let last_digit = *digits.last()?;
+    let mut index = events.len();
+    while index > 0 {
+        index -= 1;
+        let Event::Key(key) = &events[index] else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press || key.code != KeyCode::Char(last_digit as char) {
+            continue;
+        }
+        // Collect the presses ending here, newest first, skipping the release
+        // records the console interleaves.
+        let mut presses: [Option<(usize, &KeyEvent)>; 8] = [None; 8];
+        let mut count = 0usize;
+        let mut cursor = index + 1;
+        while cursor > 0 && count < presses.len() {
+            cursor -= 1;
+            match &events[cursor] {
+                Event::Key(key) if key.kind == KeyEventKind::Release => continue,
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    presses[count] = Some((cursor, key));
+                    count += 1;
+                }
+                _ => break,
+            }
+        }
+        let digits_ok = digits.iter().rev().enumerate().all(|(offset, byte)| {
+            presses
+                .get(offset)
+                .and_then(|entry| *entry)
+                .is_some_and(|(_, key)| {
+                    (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                        && matches!(key.code, KeyCode::Char(c) if c == *byte as char)
+                })
+        });
+        if !digits_ok {
+            continue;
+        }
+        // Prefer `ESC [` + digits, then `[` + digits (plain or ALT-folded),
+        // then the bare digits spelling.
+        let start = if let Some((bracket_index, bracket)) =
+            presses.get(digits.len()).and_then(|entry| *entry)
+        {
+            let bracket_ok = bracket.code == KeyCode::Char('[')
+                && !bracket.modifiers.intersects(KeyModifiers::CONTROL)
+                && (bracket.modifiers.is_empty() || bracket.modifiers == KeyModifiers::ALT);
+            if bracket_ok {
+                if let Some((escape_index, escape)) =
+                    presses.get(digits.len() + 1).and_then(|entry| *entry)
+                {
+                    if escape.code == KeyCode::Esc && escape.modifiers.is_empty() {
+                        escape_index
+                    } else {
+                        bracket_index
+                    }
+                } else {
+                    bracket_index
+                }
+            } else {
+                presses[digits.len() - 1]?.0
+            }
+        } else {
+            presses[digits.len() - 1]?.0
+        };
+        // A marker with payload after it is an inner marker, not the
+        // terminator. Only the chunk-final marker, or one immediately followed
+        // by a line ending, closes the paste.
+        let next = advance_releases(events, index + 1);
+        let suffix_is_line_ending = events.get(next).is_some_and(
+            |event| matches!(event, Event::Key(key) if is_cr_enter(key) || is_lf_chord(key)),
+        );
+        if next >= events.len() || suffix_is_line_ending {
+            return Some(start);
         }
     }
     None
@@ -29161,6 +29278,13 @@ async fn handle_session_command(
             let outcome =
                 match crate::session_manager::SessionManager::open(std::path::Path::new(&path)) {
                     Ok(manager) => {
+                        if let Err(error) = manager.ensure_exclusive_writer() {
+                            let _ = events.send(WorkerEvent::SessionSwitchSettled { switch_epoch });
+                            return report_session_outcome(
+                                events,
+                                Err(format!("Failed to import session: {error}")),
+                            );
+                        }
                         let opened = manager.path().to_string_lossy().into_owned();
                         // §2.5: never carry a background call across an import.
                         session.abort_all_background();

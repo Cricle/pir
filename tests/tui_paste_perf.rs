@@ -194,3 +194,50 @@ fn sixty_four_kib_single_line_paste_submit_renders_in_bounded_time() {
     let painted: String = lines.iter().map(|line| strip_ansi(line)).collect();
     assert_eq!(painted.matches('Q').count(), payload.len());
 }
+
+/// A huge multi-line user message (the 50 MB QA paste at a test-friendly
+/// size) must not build a Markdown document and one row per line. The painted
+/// rows are a bounded prefix plus an omission notice; submit still carries the
+/// full text (the component is display-only).
+#[test]
+fn huge_multiline_user_message_renders_a_bounded_prefix() {
+    let payload = (0..80_000)
+        .map(|index| format!("line {index:05} payload"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(payload.len() > 1_000_000);
+
+    let started = Instant::now();
+    let component = UserMessageComponent::new(&payload, 1);
+    let lines = component.render(100);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "1 MB multi-line user-message render took {elapsed:?}"
+    );
+    let painted: String = lines.iter().map(|line| strip_ansi(line)).collect();
+    assert!(
+        painted.contains("characters omitted from the display"),
+        "the display cap notice must be visible"
+    );
+    assert!(
+        painted.len() < 2_000_000,
+        "painted rows must stay bounded, got {} bytes",
+        painted.len()
+    );
+}
+
+/// Up-arrow history must not pin a huge submitted paste for the session's
+/// lifetime (the transcript and the model payload already own their copies).
+#[test]
+fn huge_submit_is_not_retained_in_history() {
+    let payload = "H".repeat(1024 * 1024 + 1);
+    let editor = Editor::new();
+    editor.set_text(&payload);
+    assert_eq!(editor.submit().as_deref(), Some(payload.as_str()));
+    editor.history_navigate(-1);
+    assert!(
+        editor.get_text().is_empty(),
+        "a >1 MiB submit must not be retained in up-arrow history"
+    );
+}

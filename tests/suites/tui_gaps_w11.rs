@@ -755,6 +755,27 @@ fn the_automatic_theme_submenu_builds_a_light_dark_pair() {
     assert!(matches!(menu.handle_key(MenuKey::Esc), MenuOutcome::Close));
 }
 
+/// Selecting a plain theme row emits the live-apply + persistence action.
+/// Regression A23-F08: the submenu moved the highlight but Enter fell through
+/// to `cycle`, whose one-value guard made it a no-op, so `settings.json` kept
+/// the old theme.
+#[test]
+fn selecting_a_theme_row_applies_that_theme() {
+    let settings = pir::config::settings::Settings::default();
+    let menu = SettingsMenu::new(&settings, menu_context());
+    select_row(&menu, "Theme", 64);
+    assert!(matches!(menu.handle_key(MenuKey::Enter), MenuOutcome::None));
+    assert_eq!(menu.selected_label().as_deref(), Some("dark"));
+    menu.handle_key(MenuKey::Down);
+    assert_eq!(menu.selected_label().as_deref(), Some("light"));
+    match menu.handle_key(MenuKey::Enter) {
+        MenuOutcome::Apply(SettingsAction::SetTheme(name)) => {
+            assert_eq!(name, "light");
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
 /// A click selects the painted settings row under the pointer (the header is
 /// border + spacer + title + spacer, plus the search line when filtering).
 #[test]
