@@ -3376,6 +3376,14 @@ impl SessionManager {
         assert_valid_session_id(id)?;
         #[cfg(feature = "session")]
         {
+            // Threads in one process share the pid, so the file lock alone can
+            // be raced by two local creators (the duplicate-id regression).
+            // Serialize the whole claim+construct section in-process; the
+            // on-disk claim still fences other processes.
+            static CREATE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _create_serial = CREATE_SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(path) = Self::find_session_by_id(session_dir, id) {
                 anyhow::bail!("Session already exists with id '{id}': {}", path.display());
             }

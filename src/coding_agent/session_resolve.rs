@@ -101,14 +101,12 @@ fn resolve_session_ref(arg: &str, cwd: &Path, session_dir: &Path) -> Resolved {
         } else {
             cwd.join(arg)
         };
-        // `--session`/`--fork` name an EXISTING transcript. A path-like typo
-        // must not fall through to `SessionManager::open`, which creates a
-        // fresh session at the missing path (A55 P2); only `--session-id`
-        // intentionally creates an explicit id.
-        if path.is_file() {
-            return Resolved::Found(path);
-        }
-        return Resolved::NotFound(arg.to_owned());
+        // The SDK child bridge deliberately passes a planned session file
+        // before its first message materializes it, so `--session <path>` must
+        // remain able to create at that path. A literal typo therefore still
+        // creates a new session (documented residual); `--session-id` is the
+        // explicit creation spelling.
+        return Resolved::Found(path);
     }
     let sessions = SessionManager::list_sessions(session_dir, None);
     let mut prefix_same: Option<std::path::PathBuf> = None;

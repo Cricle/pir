@@ -165,21 +165,6 @@ impl ExtensionHandle {
             .clone()
     }
 
-    /// Whether at least one JS extension module loaded successfully.
-    ///
-    /// `has_js_runtime()` is true as soon as the actor exists — including a
-    /// runtime whose load list was empty or failed every path. Such a runtime
-    /// has no JS code that could register an event handler or read
-    /// `ctx.sessionManager`, so hosts may skip the JS-facing session-context
-    /// snapshot for it.
-    pub fn has_loaded_extensions(&self) -> bool {
-        !self
-            .loaded
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-    }
-
     /// Flags registered during load.
     pub fn flags(&self) -> Vec<crate::extensions::FlagDef> {
         crate::extensions::runtime::lock_state(&self.state)

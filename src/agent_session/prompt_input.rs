@@ -462,6 +462,16 @@ impl AgentSession {
         images: Vec<ContentBlock>,
         on_event: EventHandler,
     ) -> crate::Result<AssistantMessage> {
+        // The prepared transform is consumed by `transform_prompt_input_host`
+        // only when a plugin host exists. A session without plugins reads the
+        // `RunTrigger` text directly; keep a fallback copy there so the prompt
+        // is never empty. The no-plugin case is not the huge TUI paste path,
+        // so this does not re-introduce the full-size copy for TUI runs.
+        let fallback = if self.plugins.is_none() {
+            text.clone()
+        } else {
+            String::new()
+        };
         let context = Arc::new(Mutex::new(PromptInputContext {
             source: DEFAULT_INPUT_SOURCE.to_owned(),
             prepared: Some(PromptInputTransform {
@@ -470,7 +480,10 @@ impl AgentSession {
             }),
         }));
         PROMPT_INPUT_CONTEXT
-            .scope(context, self.prompt_with_images("", images, on_event))
+            .scope(
+                context,
+                self.prompt_with_images(&fallback, images, on_event),
+            )
             .await
     }
 

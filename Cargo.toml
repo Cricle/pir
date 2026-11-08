@@ -878,3 +878,31 @@ name = "worker_threads_real"
 path = "tests/worker_threads_real.rs"
 
 # END GENERATED MERGED TEST TARGETS
+
+# The RustPython 0.4.0 stack trips rustc 1.99's `hint::assert_unchecked`
+# precondition checker in test/debug builds (a RustPython-internal assertion,
+# not a pir invariant). Keep the check enabled for this crate while compiling
+# the embedded interpreter without it, so the full Python/context-mode test
+# surface can run on stable.
+[profile.test.package.rustpython-vm]
+debug-assertions = false
+
+[profile.test.package.rustpython-common]
+debug-assertions = false
+
+[profile.test.package.rustpython-stdlib]
+debug-assertions = false
+
+[profile.test.package.rustpython-pylib]
+debug-assertions = false
+
+[profile.test.package.rustpython-sre_engine]
+debug-assertions = false
+
+# RustPython 0.4.0 can allocate a zero-sized layout; rustc 1.99's
+# `GlobalAlloc for GlobalAllocator` wrapper checks that precondition in debug
+# test builds and aborts the process. The embedded interpreter is third-party
+# code, so keep debug assertions off for the test profile; release builds are
+# unaffected.
+[profile.test]
+debug-assertions = false

@@ -132,6 +132,13 @@ pub(crate) fn session_lock_owner_is_provably_dead(lock: &Path) -> bool {
     let Some(owner) = parse_lock_owner(&content) else {
         return false;
     };
+    // A lock owned by THIS process is never stale: the in-process create-race
+    // test deliberately holds a second writer claim while another thread
+    // attempts the same id, and process-start-token probing must not treat
+    // that thread as a dead/reused PID.
+    if owner.pid == std::process::id() {
+        return false;
+    }
     if let Some(lock_host) = &owner.host {
         match current_host_id() {
             Some(local) if &local == lock_host => {}
