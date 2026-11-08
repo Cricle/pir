@@ -6,8 +6,8 @@
 # `use pir::...` and `cargo install pir-sdk` (binary: `pir`) are both correct.
 name = "pir-sdk"
 # Single source of truth for the crate/binary version. pir uses its own semver;
-# .migration-info records the upstream pi mapping (0.0.1 = pi 1.4.0).
-version = "0.0.1"
+# .migration-info records the upstream pi mapping (0.0.2 = pi 1.4.0).
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.97"
 # Integration-test auto-discovery is disabled on purpose: every tests/*.rs

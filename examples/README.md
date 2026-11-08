@@ -125,7 +125,7 @@ external embedder needs the SDK plus the default-on surfaces it uses:
 ```toml
 [dependencies]
 # Package name `pir-sdk`; the library is still imported as `pir`.
-pir-sdk = { version = "0.0.1", default-features = false, features = [
+pir-sdk = { version = "0.0.2", default-features = false, features = [
     "sdk",
     # Add only what you use:
     # "session", "skills", "tools", "subagent", "extensions",

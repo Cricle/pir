@@ -3,8 +3,10 @@
 ## Unreleased
 
 <!-- Add user-visible changes for the next release here. The release workflow
-     requires the `v*` tag to equal Cargo.toml's `[package].version` (v0.0.1 ->
-     0.0.1), and the same value is recorded in .migration-info. -->
+     requires the `v*` tag to equal Cargo.toml's `[package].version` (v0.0.2 ->
+     0.0.2), and the same value is recorded in .migration-info. -->
+
+## 0.0.2 (2026-11-08)
 
 ### 2026-11-02
 

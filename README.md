@@ -26,7 +26,7 @@ providers, sessions, config, prompt/skills and the plugin framework.
 
 ```toml
 # Package name `pir-sdk`; the library is still imported as `pir`.
-pir-sdk = { version = "0.0.1", default-features = false, features = ["sdk"] }
+pir-sdk = { version = "0.0.2", default-features = false, features = ["sdk"] }
 ```
 
 Every optional surface is a cargo feature; `full` is the default, and the
