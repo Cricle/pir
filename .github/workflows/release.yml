@@ -74,7 +74,45 @@ jobs:
         shell: bash
         run: |
           version="${{ steps.derive.outputs.version }}"
-          manifest="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          # Resolve the manifest version the way cargo does, anchored to the
+          # owning section: `[package] version = "x.y.z"`, or
+          # `[package] version.workspace = true` inheriting
+          # `[workspace.package] version`. A bare `sed` over the whole file can
+          # silently pick up an unrelated `version = "..."` (dependency tables,
+          # `[profile.*]` keys, future manifest sections).
+          manifest="$(
+            awk '
+              /^[[:space:]]*\[/ {
+                section = $0
+                sub(/^[[:space:]]*\[/, "", section)
+                sub(/\][[:space:]]*$/, "", section)
+                next
+              }
+              section == "package" && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"/ {
+                value = $0
+                sub(/^[^"]*"/, "", value)
+                sub(/".*$/, "", value)
+                package_version = value
+              }
+              section == "package" && /^[[:space:]]*version\.workspace[[:space:]]*=[[:space:]]*true[[:space:]]*$/ {
+                inherits_workspace = 1
+              }
+              section == "workspace.package" && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"/ {
+                value = $0
+                sub(/^[^"]*"/, "", value)
+                sub(/".*$/, "", value)
+                workspace_version = value
+              }
+              END {
+                if (inherits_workspace) print workspace_version
+                else print package_version
+              }
+            ' Cargo.toml
+          )"
+          if [ -z "$manifest" ]; then
+            echo "::error title=Missing manifest version::Cargo.toml has neither [package] version nor a [workspace.package] version inherited by it."
+            exit 1
+          fi
           migration="$(sed -n 's/^pir_version=//p' .migration-info | head -n 1)"
           if [ "$manifest" != "$version" ]; then
             echo "::error title=Version mismatch::Cargo.toml has $manifest but tag says $version; bump Cargo.toml before tagging."
