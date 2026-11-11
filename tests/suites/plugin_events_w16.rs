@@ -432,6 +432,16 @@ fn expected_builtin_events() -> Vec<(&'static str, EventInterest)> {
             "todo",
             EventInterest::List(vec!["session_start".to_owned()]),
         ),
+        #[cfg(feature = "memory")]
+        (
+            "memory",
+            EventInterest::List(vec![
+                "session_start".to_owned(),
+                "input".to_owned(),
+                "before_agent_start".to_owned(),
+                "agent_settled".to_owned(),
+            ]),
+        ),
         // Two enforcement hooks + identity capture.
         #[cfg(feature = "context-mode")]
         (
@@ -488,6 +498,49 @@ fn every_compiled_builtin_declares_the_audited_event_set() {
             plugin.events(),
             want,
             "builtin `{name}` declaration drifted; on_event arms must be covered"
+        );
+    }
+}
+
+/// The declaration must be a pure function of the build (plus, for phone, the
+/// `PI_PHONE_CUSTOM_EVENTS` environment captured at construction): two
+/// instances of the same builtin agree, every compiled builtin has exactly one
+/// audit row, and no builtin declares [`EventInterest::All`]. `All` would make
+/// `has_handlers` true for every event and defeat the host's emission gates —
+/// the class of regression PIR-BIN-014 fixed for phone.
+#[test]
+fn builtin_event_declarations_are_stable_unique_and_never_all() {
+    let expected = expected_builtin_events();
+    let names = builtin_names();
+
+    for name in &names {
+        assert_eq!(
+            names.iter().filter(|other| *other == name).count(),
+            1,
+            "builtin `{name}` is registered more than once"
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|(audited, _)| audited == name)
+                .count(),
+            1,
+            "builtin `{name}` must have exactly one audited EventInterest row"
+        );
+        let first = instantiate_builtin(name)
+            .unwrap_or_else(|| panic!("builtin `{name}` is listed but did not instantiate"))
+            .events();
+        let second = instantiate_builtin(name)
+            .unwrap_or_else(|| panic!("builtin `{name}` is listed but did not instantiate"))
+            .events();
+        assert_eq!(
+            first, second,
+            "builtin `{name}` declaration changed between two instances; \
+             `events()` must not depend on mutable state"
+        );
+        assert!(
+            !matches!(first, EventInterest::All),
+            "builtin `{name}` must declare a concrete event list, not `All`"
         );
     }
 }

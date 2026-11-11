@@ -7,4 +7,4 @@ pending_drift=184 commits / 597 files / +44,149 -13,594 (3daa20280..38ff99177, 2
 
 # Version map: upstream pi -> pir. pir has its own semver.
 upstream_pi_version=1.4.0
-pir_version=0.0.2
+pir_version=0.3.0

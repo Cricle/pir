@@ -66,13 +66,15 @@ impl ToolSelectionRequest {
     /// Cheap gate: hosts must call this BEFORE enumerating tools or
     /// instantiating builtin plugins. `false` means no selection change.
     pub fn requested(&self) -> bool {
-        tool_selection_requested(
-            self.settings_default_tools.as_deref(),
-            &self.cli_tools,
-            &self.cli_exclude,
-            self.no_tools,
-            self.no_builtin_tools,
-        )
+        crate::config::settings::PerformanceSettings::from_env().profile()
+            == crate::config::settings::PerformanceProfile::Efficient
+            || tool_selection_requested(
+                self.settings_default_tools.as_deref(),
+                &self.cli_tools,
+                &self.cli_exclude,
+                self.no_tools,
+                self.no_builtin_tools,
+            )
     }
 
     /// Resolve against a host's `available_tools`, using the upstream
@@ -87,10 +89,7 @@ impl ToolSelectionRequest {
         &self,
         available_tools: &[AvailableTool],
     ) -> Result<Option<ToolSelection>, String> {
-        if !self.requested() {
-            return Ok(None);
-        }
-        resolve_tool_selection_with_availability(
+        resolve_tool_selection_with_availability_and_profile(
             self.settings_default_tools.as_deref(),
             &self.cli_tools,
             &self.cli_exclude,
@@ -98,6 +97,7 @@ impl ToolSelectionRequest {
             self.no_builtin_tools,
             available_tools,
             &crate::config::settings::DEFAULT_TOOL_NAMES,
+            crate::config::settings::PerformanceSettings::from_env().profile(),
         )
     }
 }
@@ -294,6 +294,35 @@ pub fn resolve_tool_selection_with_availability(
     available_tools: &[AvailableTool],
     builtin_tool_names: &[&str],
 ) -> Result<Option<ToolSelection>, String> {
+    resolve_tool_selection_with_availability_and_profile(
+        settings_default_tools,
+        cli_tools,
+        cli_exclude,
+        no_tools,
+        no_builtin_tools,
+        available_tools,
+        builtin_tool_names,
+        crate::config::settings::PerformanceProfile::Balanced,
+    )
+}
+
+/// [`resolve_tool_selection_with_availability`] with an explicit performance
+/// profile. `Balanced` is the byte-for-byte historical path. `Efficient`
+/// turns the *implicit* selection into the core `builtin_tool_names`
+/// (`DEFAULT_TOOL_NAMES` for the CLI hosts) instead of leaving every
+/// registration-active tool declared. An explicit `--tools`/`defaultTools`
+/// selection always wins.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_tool_selection_with_availability_and_profile(
+    settings_default_tools: Option<&[String]>,
+    cli_tools: &[String],
+    cli_exclude: &[String],
+    no_tools: bool,
+    no_builtin_tools: bool,
+    available_tools: &[AvailableTool],
+    builtin_tool_names: &[&str],
+    profile: crate::config::settings::PerformanceProfile,
+) -> Result<Option<ToolSelection>, String> {
     if let Some(error) = get_tool_list_error(cli_tools) {
         return Err(format!("--tools: {error}"));
     }
@@ -306,6 +335,16 @@ pub fn resolve_tool_selection_with_availability(
         no_tools,
         no_builtin_tools,
     ) {
+        if profile == crate::config::settings::PerformanceProfile::Efficient {
+            return Ok(Some(ToolSelection {
+                enabled: builtin_tool_names
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                modifiers: Vec::new(),
+                uses_default_tools: true,
+            }));
+        }
         return Ok(None);
     }
 

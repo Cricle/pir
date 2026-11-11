@@ -2294,6 +2294,28 @@ impl RpcServerState {
                     commands.push(entry);
                 }
             }
+            // Native (Rust backend) builtin commands live in the session's
+            // `PluginHost` registry, not in the JS extension runtime above.
+            // The TUI slash menu and the phone catalog enumerate this same
+            // snapshot, so an RPC client must see the commands it can really
+            // dispatch (`/todos`, `/memory`, `/mcp`, `/phone-start`, ...).
+            // Dedupe against JS command names: the runtime registration wins
+            // and keeps its sourceInfo.
+            let mut seen: std::collections::HashSet<String> = commands
+                .iter()
+                .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect();
+            for (name, description) in session.native_plugin_command_specs() {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                commands.push(json!({
+                    "name": name,
+                    "description": description,
+                    "source": "extension",
+                }));
+            }
         }
         // Skill/prompt-template commands come from the SESSION's installed
         // resource set — the exact list `/skill:` / `/template` expansion
@@ -2942,6 +2964,12 @@ fn default_session_factory(
         // tool call. The old hard-coded 100 cut off a 100-tool prompt that
         // emits one call per assistant message before its final answer.
         max_turns,
+        performance: environment
+            .settings
+            .performance
+            .clone()
+            .unwrap_or_default()
+            .with_env_profile(),
         system_prompt: None,
         cwd: session_cwd.clone(),
         event_stream: None,

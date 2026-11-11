@@ -697,6 +697,7 @@ fn agent_with_session(
     dir: &std::path::Path,
 ) -> Arc<AgentSession> {
     Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(4096, 256),
         api_key: None,

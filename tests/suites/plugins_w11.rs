@@ -956,3 +956,462 @@ fn merged_event_results_keep_images_and_messages() {
         "replacing content without structured content drops the stale value"
     );
 }
+
+// ---------------------------------------------------------------------------
+// (5) PIR-BIN-004 regression: tool_search activation reaches the next request
+// ---------------------------------------------------------------------------
+
+/// Generic invariants for `tool_search` activation, with one synthetic
+/// `deferred` tool and a scripted provider (no MCP server, no concrete search
+/// corpus): a loaded tool must be declared in the *same run's* next request
+/// and executable, while a no-match query must activate nothing.
+#[cfg(feature = "tool-search")]
+mod tool_search_next_request {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{json, Value};
+
+    use pir::agent::tool_batch::ToolResult;
+    use pir::agent::tool_execution::{
+        AgentTool, BoxFuture, ToolContext, ToolExposure, ToolRegistry,
+    };
+    use pir::agent_session::{AgentSession, AgentSessionConfig};
+    use pir::ai::auth::ApiKeyAuth;
+    use pir::ai::event_stream::AssistantMessageEventStream;
+    use pir::ai::provider::{Provider, ProviderRegistry};
+    use pir::ai::types::{
+        AssistantMessage, ContentBlock, Context, Model, ModelCost, ModelCostRates, StopReason,
+        StreamOptions, TerminalReason, TextContent, ThinkingLevel, ToolCall, Usage,
+    };
+    use pir::coding_agent::ToolSelection;
+    use pir::plugins::builtin::ToolSearchPlugin;
+    use pir::plugins::plugin::{AgentPlugin, RegistrationContext};
+    use pir::plugins::PluginInfo;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "pir-tool-search-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fake_model() -> Model {
+        Model {
+            id: "fake-model".into(),
+            name: "Fake model".into(),
+            api: "fake-api".into(),
+            provider: "fake".into(),
+            base_url: "http://localhost".into(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec!["text".into()],
+            cost: ModelCost {
+                rates: ModelCostRates {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                tiers: Vec::new(),
+            },
+            context_window: 8192,
+            max_tokens: 512,
+            sampling_params: None,
+            headers: None,
+            thinking_token_budget_field: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params_by_thinking_level: None,
+            model_type: None,
+            compat: None,
+        }
+    }
+
+    fn text(value: &str) -> ContentBlock {
+        ContentBlock::Text(TextContent {
+            text: value.into(),
+            text_signature: None,
+        })
+    }
+
+    fn tool_call(name: &str, arguments: BTreeMap<String, Value>) -> ContentBlock {
+        ContentBlock::ToolCall(ToolCall {
+            id: format!("call-{name}"),
+            name: name.into(),
+            arguments,
+            thought_signature: None,
+            namespace: None,
+            arguments_error: None,
+        })
+    }
+
+    fn assistant(content: Vec<ContentBlock>, stop_reason: StopReason) -> AssistantMessage {
+        AssistantMessage {
+            api: "fake".into(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            content,
+            stop_reason,
+            timestamp: 1,
+            usage: Usage::default(),
+            ..AssistantMessage::default()
+        }
+    }
+
+    /// A deferred tool: reachable only after `tool_search` loads it.
+    struct DeferredTool {
+        executed: Arc<AtomicBool>,
+    }
+
+    impl AgentTool for DeferredTool {
+        fn name(&self) -> &str {
+            "deploy_status"
+        }
+        fn description(&self) -> &str {
+            "Report the production deployment status for a service"
+        }
+        fn parameters(&self) -> Option<Value> {
+            Some(json!({
+                "type": "object",
+                "properties": { "service": { "type": "string" } },
+                "required": ["service"],
+            }))
+        }
+        fn exposure(&self) -> ToolExposure {
+            ToolExposure::Deferred
+        }
+        fn run(&self, args: &Value, _ctx: &ToolContext) -> BoxFuture<'static, ToolResult> {
+            self.executed.store(true, Ordering::SeqCst);
+            let service = args
+                .get("service")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            Box::pin(async move { ToolResult::ok(format!("deploy_status ok for {service}")) })
+        }
+    }
+
+    struct DeferredToolPlugin {
+        executed: Arc<AtomicBool>,
+    }
+
+    impl AgentPlugin for DeferredToolPlugin {
+        fn info(&self) -> &PluginInfo {
+            static INFO: std::sync::OnceLock<PluginInfo> = std::sync::OnceLock::new();
+            INFO.get_or_init(|| PluginInfo::inline("tool-search-invariant-deferred"))
+        }
+        fn register(&self, ctx: &mut RegistrationContext<'_>) -> anyhow::Result<()> {
+            ctx.register_tool(Arc::new(DeferredTool {
+                executed: Arc::clone(&self.executed),
+            }));
+            Ok(())
+        }
+    }
+
+    type Responder = Arc<dyn Fn(usize) -> AssistantMessage + Send + Sync>;
+
+    /// Records the declared tool names of every request and answers from the
+    /// scripted responder.
+    struct CapturingProvider {
+        calls: AtomicUsize,
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+        respond: Responder,
+    }
+
+    impl Provider for CapturingProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+        fn name(&self) -> &str {
+            "Fake provider"
+        }
+        fn get_models(&self) -> Vec<Model> {
+            vec![fake_model()]
+        }
+        fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+            vec![ApiKeyAuth::new("fake key", vec!["FAKE_TEST_KEY".into()])]
+        }
+        fn stream(
+            &self,
+            _model: &Model,
+            context: Context,
+            _options: StreamOptions,
+        ) -> AssistantMessageEventStream {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(
+                    context
+                        .tools
+                        .as_ref()
+                        .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect())
+                        .unwrap_or_default(),
+                );
+            let message = (self.respond)(index);
+            let stream = AssistantMessageEventStream::new();
+            stream.push(AssistantMessageEventStream::done_event(
+                TerminalReason::Stop,
+                message,
+            ));
+            stream
+        }
+    }
+
+    struct Harness {
+        session: Arc<AgentSession>,
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    fn harness(cwd: &std::path::Path, respond: Responder) -> (Harness, Arc<AtomicBool>) {
+        let executed = Arc::new(AtomicBool::new(false));
+        let requests: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ProviderRegistry::default();
+        registry.set_provider(Arc::new(CapturingProvider {
+            calls: AtomicUsize::new(0),
+            requests: Arc::clone(&requests),
+            respond,
+        }));
+        let session = Arc::new(AgentSession::new_with_plugins(
+            AgentSessionConfig {
+                performance: Default::default(),
+                provider_registry: Arc::new(registry),
+                model: fake_model(),
+                api_key: None,
+                thinking: ThinkingLevel::Off,
+                tools: ToolRegistry::new(),
+                session: None,
+                compaction: None,
+                max_turns: 6,
+                system_prompt: Some("base system prompt".into()),
+                cwd: Some(cwd.to_path_buf()),
+                event_stream: None,
+                extensions: None,
+                tool_selection: Some(ToolSelection {
+                    enabled: vec!["tool_search".to_owned()],
+                    modifiers: Vec::new(),
+                    uses_default_tools: false,
+                }),
+            },
+            vec![
+                Arc::new(ToolSearchPlugin::new()),
+                Arc::new(DeferredToolPlugin {
+                    executed: Arc::clone(&executed),
+                }),
+            ],
+        ));
+        (Harness { session, requests }, executed)
+    }
+
+    fn search_call(query: &str) -> AssistantMessage {
+        let mut arguments = BTreeMap::new();
+        arguments.insert("query".to_owned(), Value::String(query.into()));
+        arguments.insert("limit".to_owned(), json!(3));
+        assistant(
+            vec![tool_call("tool_search", arguments)],
+            StopReason::ToolUse,
+        )
+    }
+
+    fn deploy_call() -> AssistantMessage {
+        let mut arguments = BTreeMap::new();
+        arguments.insert("service".to_owned(), Value::String("billing".into()));
+        assistant(
+            vec![tool_call("deploy_status", arguments)],
+            StopReason::ToolUse,
+        )
+    }
+
+    fn done() -> AssistantMessage {
+        assistant(vec![text("done")], StopReason::Stop)
+    }
+
+    /// Invariant 1: a deferred tool is absent from the first request,
+    /// `tool_search` loads it, and the *same run's* next request declares it —
+    /// then the model's call actually executes.
+    #[tokio::test]
+    async fn tool_search_activation_is_visible_to_the_next_request_and_executes() {
+        let temp = TempDir::new("activate");
+        let (harness, executed) = harness(
+            &temp.0,
+            Arc::new(|index| match index {
+                0 => search_call("production deployment status service"),
+                1 => deploy_call(),
+                _ => done(),
+            }),
+        );
+
+        harness
+            .session
+            .prompt("find and use the deployment status tool", Arc::new(|_| {}))
+            .await
+            .expect("prompt");
+
+        let requests = harness
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(requests.len(), 3, "search, call, final text: {requests:?}");
+        assert!(
+            !requests[0].iter().any(|name| name == "deploy_status"),
+            "a deferred tool must not be declared before its search: {:?}",
+            requests[0]
+        );
+        assert!(
+            requests[1].iter().any(|name| name == "deploy_status"),
+            "tool_search must make the loaded tool visible to the next request: {:?}",
+            requests[1]
+        );
+        assert!(
+            executed.load(Ordering::SeqCst),
+            "the loaded tool must execute"
+        );
+    }
+
+    /// Invariant 2: a query with no matches does not activate anything.
+    #[tokio::test]
+    async fn tool_search_without_matches_does_not_activate_any_new_tool() {
+        let temp = TempDir::new("no-match");
+        let (harness, _executed) = harness(
+            &temp.0,
+            Arc::new(|index| match index {
+                0 => search_call("zzzz no such capability"),
+                _ => done(),
+            }),
+        );
+
+        harness
+            .session
+            .prompt("search for something that does not exist", Arc::new(|_| {}))
+            .await
+            .expect("prompt");
+
+        let requests = harness
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(requests.len(), 2, "search, final text: {requests:?}");
+        assert!(
+            !requests[1].iter().any(|name| name == "deploy_status"),
+            "no match must not activate the deferred tool: {:?}",
+            requests[1]
+        );
+    }
+}
+
+/// PIR-BIN-004 (`print --continue`): re-activate only the deferred/codemode
+/// names a resumed transcript recorded in `toolsAdded`; never direct/hidden
+/// tools or names the registry no longer has, and never duplicate an active
+/// name. This is the policy gate [`run_print`](pir::coding_agent::print) runs
+/// before the first request; `declared_tool_names` folds `toolsRemoved` in.
+mod print_continue_restore {
+    use super::*;
+    use pir::agent::tool_execution::{ToolExposure, ToolRegistry};
+    use pir::coding_agent::print::restore_recorded_active_tools;
+
+    struct Stub {
+        name: &'static str,
+        exposure: ToolExposure,
+    }
+
+    impl AgentTool for Stub {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn description(&self) -> &'static str {
+            "stub"
+        }
+
+        fn exposure(&self) -> ToolExposure {
+            self.exposure.clone()
+        }
+
+        fn run(&self, _args: &Value, _ctx: &ToolContext) -> BoxFuture<'static, ToolResult> {
+            Box::pin(async { ToolResult::ok("stub") })
+        }
+    }
+
+    #[test]
+    fn restores_only_recorded_deferred_and_codemode_tools_once() {
+        let mut registry = ToolRegistry::new();
+        for (name, exposure) in [
+            ("deferred_tool", ToolExposure::Deferred),
+            ("codemode_tool", ToolExposure::Codemode),
+            ("direct_tool", ToolExposure::Direct),
+            ("model_only_tool", ToolExposure::ModelOnly),
+            ("hidden_tool", ToolExposure::Hidden),
+        ] {
+            registry.register(Arc::new(Stub { name, exposure }));
+        }
+
+        let mut names = vec!["codemode_tool".to_string()];
+        restore_recorded_active_tools(
+            &registry,
+            [
+                "deferred_tool",
+                "codemode_tool",
+                "direct_tool",
+                "model_only_tool",
+                "hidden_tool",
+                "missing_tool",
+            ]
+            .into_iter()
+            .map(str::to_string),
+            &mut names,
+        );
+        assert_eq!(
+            names,
+            vec!["codemode_tool".to_string(), "deferred_tool".to_string()],
+            "only non-direct registered names are restorable, existing names stay single"
+        );
+    }
+
+    #[test]
+    fn removed_tool_is_not_restored_from_the_transcript() {
+        // `declared_tool_names` is the transcript reader the print host feeds
+        // into the policy above: toolsAdded then toolsRemoved leaves nothing.
+        use pir::ai::types::{Message, Tool as WireTool, ToolReference, UserMessage, UserRole};
+        let system = UserMessage {
+            role: UserRole::System,
+            content: Vec::new(),
+            tools_added: Some(vec![WireTool {
+                name: "deferred_tool".to_string(),
+                description: "d".to_string(),
+                parameters: json!({}),
+                constrained_sampling: None,
+            }]),
+            tools_removed: Some(vec![ToolReference {
+                name: "deferred_tool".to_string(),
+            }]),
+            sections: None,
+            timestamp: 0,
+        };
+        let messages = vec![Message::System(system)];
+        let recorded =
+            pir::coding_agent::print::recorded_active_tools(&messages).expect("declarations");
+        assert!(recorded.is_empty(), "{recorded:?}");
+    }
+}

@@ -511,6 +511,95 @@ pub(crate) const STRUCTURED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 /// find the setting that killed the command.
 pub(crate) const COMMAND_TIMEOUT_SETTING: &str = "tools.commandTimeoutMs";
 
+/// Reject obvious whole-filesystem searches before spawning a shell. This is
+/// deliberately a narrow, conservative guard for the `efficient` profile:
+/// scoped commands (`find .`, `rg src`, `grep -R test`) remain unrestricted.
+///
+/// `#[doc(hidden)] pub`: asserted directly by
+/// `tests/suites/coding_agent_units.rs`.
+#[doc(hidden)]
+pub fn broad_search_violation(command: &str) -> Option<String> {
+    fn trim(word: &str) -> &str {
+        word.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '\'' | '"' | '`' | ';' | '&' | '|' | '(' | ')' | '{' | '}'
+            )
+        })
+    }
+    let root = |word: &str| {
+        matches!(
+            word,
+            "/" | "/*"
+                | "/**"
+                | "/tmp"
+                | "/home"
+                | "/users"
+                | "/root"
+                | "~"
+                | "$home"
+                | "${home}"
+                | "c:"
+                | "c:/"
+        ) || word.starts_with("c:/")
+            || word.starts_with("c:\\")
+    };
+    for segment in command.split(['\n', ';', '&', '|']) {
+        let words: Vec<&str> = segment
+            .split_whitespace()
+            .map(trim)
+            .filter(|word| !word.is_empty())
+            .collect();
+        let Some(program) = words.first().copied() else {
+            continue;
+        };
+        if program == "find" {
+            if let Some(target) = words
+                .iter()
+                .skip(1)
+                .find(|word| !word.starts_with('-') && root(word))
+            {
+                return Some(format!(
+                    "Refusing a whole-filesystem search (`find {target}`). Run from the project directory and scope the search to `.` or a subdirectory."
+                ));
+            }
+        }
+        let recursive = program == "rg"
+            || (program == "grep"
+                && words
+                    .iter()
+                    .any(|word| matches!(*word, "-r" | "-R" | "--recursive")));
+        if recursive {
+            if let Some(target) = words
+                .iter()
+                .skip(1)
+                .find(|word| !word.starts_with('-') && root(word))
+            {
+                return Some(format!(
+                    "Refusing a recursive search outside the project (`{program} {target}`). Scope it to `.` or a project subdirectory."
+                ));
+            }
+        }
+        // Only bare `/`, `/tmp`, `~`, or the drive root are refused. A
+        // project may legitimately live under `/tmp/<workdir>`; that must not
+        // be confused with a whole-filesystem scan.
+        if program == "cd" {
+            if let Some(target) = words.get(1).copied() {
+                if matches!(
+                    target,
+                    "/" | "/*" | "/**" | "/tmp" | "~" | "$home" | "${home}" | "c:" | "c:/" | "c:\\"
+                ) {
+                    return Some(
+                        "Refusing to switch to /tmp or / and search for project files. Stay in the current working directory and use relative paths."
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the effective shell-command timeout. An explicit per-call
 /// `timeout` always wins (upstream semantics, `None` included); otherwise
 /// `tools.commandTimeoutMs` applies — 120 s by default, a deliberate
@@ -1376,6 +1465,30 @@ kill -9 $pids 2>/dev/null || exit 5
 /// `None` for every other shell (an MSYS2 install whose bash is already the
 /// real one, a Linux bash, the WSL launcher, …): those keep their behavior
 /// byte-identical.
+/// Convert Windows drive-letter `PATH` entries to the `/c/...` spelling the
+/// real MSYS bash uses for `command -v`/`which`. Entries that are already
+/// POSIX-shaped are left untouched.
+///
+/// `#[doc(hidden)] pub`: asserted directly by
+/// `tests/suites/coding_agent_units.rs` (Windows only).
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn msys_path_from_windows(path: &str) -> String {
+    let entries: Vec<String> = path
+        .split(';')
+        .map(|entry| {
+            let bytes = entry.as_bytes();
+            if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                let drive = (bytes[0] as char).to_ascii_lowercase();
+                format!("/{drive}{}", entry[2..].replace('\\', "/"))
+            } else {
+                entry.replace('\\', "/")
+            }
+        })
+        .collect();
+    entries.join(":")
+}
+
 #[cfg(windows)]
 pub(crate) fn msys_shim_spawn_target(shell_program: &str) -> Option<(String, String)> {
     let program = std::path::Path::new(shell_program);
@@ -1395,7 +1508,7 @@ pub(crate) fn msys_shim_spawn_target(shell_program: &str) -> Option<(String, Str
     if launcher_size >= real_size {
         return None;
     }
-    let path = std::env::var("PATH").unwrap_or_default();
+    let path = msys_path_from_windows(&std::env::var("PATH").unwrap_or_default());
     Some((
         real.to_string_lossy().into_owned(),
         format!("/mingw64/bin:/usr/bin:{path}"),
@@ -1736,6 +1849,11 @@ impl AgentTool for BashTool {
         };
         let (timeout_secs, timeout_from_setting) =
             resolve_command_timeout(call_timeout_secs, setting_timeout);
+        if prefs.restrict_broad_search {
+            if let Some(error) = broad_search_violation(&command) {
+                return Box::pin(async move { ToolResult::error(error) });
+            }
+        }
         // The settings `shellCommandPrefix` applies to the command text in both
         // arms (it is shell syntax, executed where the command runs).
         let command = apply_command_prefix(prefs.command_prefix.as_deref(), &command);

@@ -155,7 +155,7 @@ fn entry_change(entry: EntryRecord) -> CommitChange {
 }
 
 fn task_change(task: TaskRecord) -> CommitChange {
-    CommitChange::Table(TableCommitChange::Task(task))
+    CommitChange::Table(TableCommitChange::Task(std::sync::Arc::new(task)))
 }
 
 fn submission_change(record: SubmissionRecord) -> CommitChange {

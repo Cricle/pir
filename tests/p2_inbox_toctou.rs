@@ -106,6 +106,7 @@ fn user_message(text: &str) -> Message {
 /// An in-memory session scoped to `cwd` (no provider is ever called).
 fn session_in(cwd: &Path) -> Arc<AgentSession> {
     Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,
@@ -128,6 +129,7 @@ fn session_with_storage(cwd: &Path) -> Arc<AgentSession> {
     let storage =
         SessionManager::in_memory(&cwd.to_string_lossy(), None).expect("in-memory session manager");
     Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,

@@ -1,18 +1,168 @@
 # Durable specification (pir)
 
 Normative reference for `src/durable/`: a **pir-side digest** of upstream `@earendil-works/pi-durable`
-`docs/spec.md` (upstream HEAD `2ec55d808`). Upstream remains authoritative for anything not restated here; §12
-lists deliberate Rust differences.
+`docs/spec.md`. The reference tree is upstream commit `38ff99177` (package `1.4.0`); the digest began from
+`2ec55d808` (package `1.3.0`) and was re-checked against `38ff99177` for the ported modules. Upstream remains
+authoritative for anything not restated here; §12 lists deliberate Rust differences.
 
 ```text
 upstream package   pi/packages/durable
 upstream spec      pi/packages/durable/docs/spec.md
+upstream revision  38ff99177 (package 1.4.0; digest started at 2ec55d808, package 1.3.0)
 pir module         src/durable/
 ```
 
 **Positioning.** pir mirrors upstream's sibling split (`src/durable/` ↔ `pi-durable`): this module is a **second
 harness beside** `agent_loop`/`agent_session`, never the engine under them (see `../RESULTS.md`); do not stack the
 two turn drivers on one conversation.
+
+## Rust quickstart (developer usage)
+
+`pir::durable` is core: it needs no cargo feature and is **not** re-exported by `pir::sdk`, so an embed imports it
+directly (`use pir::durable::…`). Upstream `@earendil-works/pi-durable` is likewise a library; there is no CLI
+command on either side. A runnable external-crate example is
+`.play/lanes/lane-sdk-dev/apps/durable-probe/` (JSONL open, root + entries, fork, reopen, torn-line recovery,
+document migration/checkpoint). The in-tree `examples/dev_durable_timers.rs` is the minimal host-timer example
+below (`cargo run --example dev_durable_timers --no-default-features`); `examples/dev_durable_reports.rs`
+(`cargo run --example dev_durable_reports --no-default-features`) shows `HarnessOptions.on_report` versus the
+timer report sink and the `TaskRuntime::set_timer` phase lifecycle.
+
+```rust
+use std::sync::Arc;
+use pir::durable::session::transaction::EntryDraft;
+use pir::durable::session::{ConversationOwnership, Session, SessionOptions};
+use pir::durable::{Context, JsonlStorage, Storage};
+use serde_json::json;
+
+let ctx = Context::background();
+let storage: Arc<dyn Storage> = Arc::new(JsonlStorage::open(&root).await?);
+let session = Session::open(storage.clone(), SessionOptions::default());
+
+let root_conv = session.create_root_conversation(ctx.clone()).await?; // id 1
+let first = session
+    .append_entry(
+        root_conv.id,
+        EntryDraft {
+            kind: "user".to_owned(),
+            model: Some(vec![json!({"role": "user", "content": "hello"})]),
+            data: Some(json!({"text": "hello"})),
+            head: None,
+            edits: None,
+        },
+        ctx.clone(),
+    )
+    .await?;
+
+// The child inherits entries up to `first`; its `parent` records (conversation, entry).
+let child = session
+    .create_conversation(
+        ConversationOwnership::Ownerless,
+        Some((root_conv.id, first.id)),
+        ctx.clone(),
+    )
+    .await?;
+
+// Resume: close both, reopen the same directory, and read the same ids/entries.
+session.close().await?;
+storage.close().await?;
+```
+
+Reads use the table helpers, e.g. `session.scan_entries(EntryQuery { conversation_id, min_entry_id: None,
+max_entry_id: None, order: Some(ScanOrder::Ascending) }, limit, cursor, &ctx)`; `session.conversation(id, &ctx)`
+returns the record (including `parent`) after reopen. Every committed batch is one `main.jsonl` marker line.
+
+**JSONL recovery and limits.** Opening a JSONL root truncates an unterminated final line to the last `0x0a` and
+drops unconfirmed sidecar tails; every committed entry/record survives. `main.jsonl` is never compacted. With the
+default `JsonlStorageOptions { fsync: false }` the guarantee is process-crash consistency, not power-loss
+durability; storage errors fail the session and it must be reopened. The caller always supplies the storage root —
+the module never reads or writes `~/.pi`.
+
+**Documents.** `Session::doc(resolved, definition, ctx, |draft| …)` loads (migrating an older stored version),
+applies the edit and commits atomically. Build the definition with
+`CommonDocDefinition::session(kind, version)?.behaviour(initial, migrate, checkpoint_when)` (or a
+conversation/task-scoped constructor), and resolve the address with `ResolvedAddress::new(kind, semantics, owner,
+key)`. A version change stores a base even with no operations; a same-version change stores a delta unless the
+definition's `checkpoint_when(&value)` returns true, which upgrades it to a base. `migrate` is
+`fn(from_version: i64, value: serde_json::Value) -> Result<serde_json::Value, DocumentError>` in Rust (upstream is
+`(value, fromVersion)`). `Session::doc` carries the identity only: to have `checkpoint_when` consulted, install a
+`DocBehaviours` resolver in `SessionOptions.behaviours` (the harness does this for its built-in documents);
+without one no predicate runs, but version-change bases still apply.
+
+**Tasks and timers.** `Session::create_task`/`set_task` store task state machines; timer plumbing lives in
+`durable::timers` (`Timers`, `native_timer`) and the scheduler that runs tasks/phases is
+`durable::harness::Harness` (settings, registry, submissions, sleeping/wake). The lower-level `Session` kernel
+does not run tasks by itself.
+
+The two `define_task` functions are **not interchangeable**. `durable::tasks` is the metadata surface the
+agent-hooks registry stores: `TaskDefinition::define(kind, version, phases)` plus
+`tasks::define_task(definition)` produce a registry token (`TaskDefinition { kind, version, phases }`), not
+phase handlers. Executable definitions are built with `durable::harness::task::define_task(name, version,
+initial).phase(...).build()`; `TaskScheduler` runs those.
+
+**Host timers (`HarnessOptions.timers`).** A host supplies a `SetTimer` and a report sink; the same `Timers`
+value feeds the scheduler (sleep/wake) and `TaskRuntime::set_timer`:
+
+```rust
+use std::sync::Arc;
+use pir::durable::harness::{create_registry, Harness, HarnessOptions};
+use pir::durable::timers::{SetTimer, TimerCallback, TimerCancel, TimerOptions, Timers};
+use pir::durable::Context;
+
+struct HostTimer;
+
+impl SetTimer for HostTimer {
+    fn set(
+        &self,
+        callback: TimerCallback,
+        delay_ms: i64,
+        options: TimerOptions,
+    ) -> Option<TimerCancel> {
+        if options.background {
+            return None; // decline: background timers only free memory
+        }
+        // Arm `callback` after `delay_ms` with the host's own clock and return
+        // its disarm token; `None` here would fall back to the native timer.
+        // The host must tolerate a disarm after the callback already ran.
+        let _ = (callback, delay_ms);
+        Some(TimerCancel::new(Box::new(|| { /* disarm the host timer */ })))
+    }
+}
+
+let report: Arc<dyn Fn(String) + Send + Sync> =
+    Arc::new(|message| eprintln!("durable timer: {message}"));
+let timers = Timers::host_timers(Some(Arc::new(HostTimer)), report);
+let harness = Harness::open(
+    storage,
+    HarnessOptions {
+        registry: Some(Arc::new(create_registry())),
+        timers: Some(timers),
+        ..HarnessOptions::default()
+    },
+    Context::background(),
+)
+.await?;
+```
+
+`Timers::host_timers(None, report)` (equivalent to `Timers::native(report)`) uses the native timer directly.
+A declined **foreground** timer falls back to the native timer and the report closure receives
+`HarnessOptions.setTimer declined a timer that paces work; using the native timer` once per `Timers` value; a
+declined **background** timer stays declined and is not reported. A panic inside `set` is treated exactly like
+`None`. `TaskRuntime::set_timer(callback, delay_ms)` is the in-phase form: the invocation's end disarms every
+timer it armed, a call after the end rejects, and a late fire is a no-op. The timer `report` sink is separate
+from `HarnessOptions.on_report`, which receives `(&str, &ReportInfo)` for harness failures. When
+`HarnessOptions.timers` is omitted, the scheduler wraps the native timer with a report closure that routes a
+timer-callback failure to `on_report` as `ReportInfo::HostError { callback: HostCallback::SetTimer, .. }`
+(`src/durable/harness/scheduler/mod.rs:1939-1961`; upstream's `hostTimers` wiring); when a `Timers` value is
+supplied, its own `report` closure is the only sink for that message. When a host arms the
+callback on its own thread, that thread must re-enter the Tokio runtime before invoking it (`Handle::enter()`):
+the scheduler wake path calls `tokio::spawn`, so a bare thread panics with "there is no reactor running". The
+in-tree `examples/dev_durable_timers.rs` shows the thread + `Handle::enter()` shape end to end.
+
+`examples/dev_durable_reports.rs` asserts the two sinks stay distinct: `runtime.report(...)` arrives at
+`on_report` as `ReportInfo::TaskError`, while the fixed decline text arrives only at the timer report sink.
+The same example shows the phase-scoped `set_timer` lifecycle: the invocation end disarms the timer (both
+`TimerHandle::is_cancelled()` and the host cancel token run), and `set_timer` or `report` called after the
+phase ended returns `TaskRuntimeError::Ended`.
 
 ## 1. Terms and invariants
 
@@ -54,6 +204,9 @@ TaskRecord { id, conversation_id, kind, version, input, owner?, background,
 SubmissionRecord { id, conversation_id, request_id?, type: input|write,
                    status: queued|placed|done|unanswered, entry?, answer?, reason?, detail? }
 ```
+
+`TaskRecord` and `SubmissionRecord` additionally carry optional `trace`/`links` fields (propagation carriers;
+omitted when empty, see `src/durable/types.rs:533-552`).
 
 Conversation history parenting (`parent`) and task ownership (`owner`) are separate: `parent` controls inherited
 entries and documents; `owner` records task attribution and connects scopes for subtree abort and idle traversal.
@@ -141,7 +294,8 @@ excluding background subtrees. Two rules:
   candidate records.
 
 Waiting: a phase may commit `{ status: waiting, checkpoint, on, policy }`; a cycle in the wait-for graph is
-rejected, and `failFast` marks the siblings of the first non-`completed` member.
+rejected, and `failFast` marks every other live task in `on` (the one that already holds or ended with a
+non-`completed` outcome keeps its own outcome) via `src/durable/harness/scheduler/reconcile.rs:123-135`.
 
 ### 5.5 Sleeping, timers and wakeups
 
@@ -202,7 +356,7 @@ watch. The conversation view and task graph are structural mounts from committed
 trait Storage: Send + Sync {
     fn commit(&self, writes: Vec<StorageWrite>) -> StorageFuture<Result<Seq, StorageError>>;
     fn mint_id(&self) -> StorageFuture<Result<i64, StorageError>>;
-    // conversation / entry / entry_in / find_latest_head_marker / scan_entries
+    // conversation / scan_conversations / entry / entry_in / find_latest_head_marker / scan_entries
     // task / scan_tasks / submission / scan_submissions / submission_by_request
     // find_document / document / scan_documents / close
 }
@@ -217,15 +371,24 @@ a stored version boundary.
 
 A storage error ends the session: every later and in-flight call fails with `SessionFailed`, nothing is retried.
 Only a read returning `StorageRequestError`, or whose caller's context was aborted, fails just that call; a read
-after close fails with `SessionClosed`.
+after close fails with `StorageError::Closed` (`session/guard.rs:258`; `SessionClosed` is the awaitable end type,
+not the error).
 
 ## 11. Backends
 
 - **Memory** is the reference semantics: it copies retained write values and all read results.
 - **JSONL** writes sidecar records first, then one main marker per commit; without `fsync` it promises
   process-crash consistency only. Recovery removes torn final lines, drops unconfirmed sidecar tails, and poisons
-  the backend on any uncertain append failure; `main.jsonl` is never compacted.
-- **SQLite** is implemented (`src/durable/storage/sqlite/`) as a third backend. Out of scope: namespaced `prefix`,
+  the backend on any uncertain append failure; `main.jsonl` is never compacted. An mmap/COW evaluation of this
+  backend (measured on an 18k-line/8 MiB `main.jsonl`) concluded **mmap is NOT integrated for recovery reads**:
+  one-pass recovery over the existing streaming reader is faster (mmap wall +48%, page faults 55×), and Windows
+  cannot truncate while a read-only map is alive; `Arc<Mmap>`+`Cow` shared-prefix snapshots remain proven only as
+  prototypes (`session_manager`'s tail-page/`load_entries_from_file_mapped` readers are the
+  agent-session-side mmap users, not `durable`).
+- **SQLite** is implemented (`src/durable/storage/sqlite/`) as a third backend behind the optional `rusqlite`
+  driver (compiled with the `extensions` or `context-mode` feature, `src/durable/storage/mod.rs:11-12`); WAL with
+  `synchronous = NORMAL` unless `SqliteStorageOptions::fsync` upgrades it to `FULL`
+  (`src/durable/storage/sqlite/storage.rs:205-211`). Out of scope: namespaced `prefix`,
   Cloudflare Durable Object adapter, `database`/`node` facades; full `packages/chord` stays deferred (delta subset
   only), chord-lite unscheduled.
 
@@ -241,12 +404,28 @@ Each deviation is explained in the code where it lives.
 3. **Object-safe boxed futures.** The trait returns `StorageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send +
    'a>>` instead of `async fn`, for the same reason.
 4. **No chord tracker.** Upstream diffs a per-document draft in `O(changed)`; the port keeps the committed value,
-   forks a full draft, and diffs at assembly with `chord::diff_revisions`. Op vocabulary is identical, cost
-   `O(value)`, bounded because live documents stay small (tool-output windows bounded, summaries ≤500 chars).
+   forks a full draft, and diffs at assembly with `chord::diff_objects` (the object form; `diff_revisions` is the
+   `Value` wrapper and is used by the harness JSON helpers). Op vocabulary is identical, cost `O(value)`, bounded
+   because live documents stay small (tool-output windows bounded by `OutputLimits`, default 50 KiB / 2000 lines,
+   and nested-call error summaries capped at 500 chars, `harness/tool.rs:157`).
 5. **UTF-16 string units.** `Truncate` counts UTF-16 code units and the differ emits UTF-16 lengths, matching
    `String.prototype.length`/`.slice`; a split surrogate becomes U+FFFD (the lossy decode of the same slice).
 6. **No `~/.pi` writes.** The caller supplies the storage root.
 7. **Zero new dependencies.** serde, serde_json, thiserror, tokio and tokio-util were already in the dependency
-   graph.
+   graph (the harness additionally uses the already-present `futures-util`; the SQLite backend rides the existing
+   optional `rusqlite` behind `extensions`/`context-mode`, `src/durable/storage/mod.rs:11-12`).
 8. **`env/**`, `images/**`, `testing/**`, `tools/**`, `codemode/**` are out of this port.** pir has native
    equivalents for the latter five; the SQLite backend is ported separately under `storage/sqlite/`.
+9. **JSONL persists minted IDs (`ids.jsonl`).** Upstream JSONL keeps only an in-memory watermark, so a minted but
+   uncommitted ID is handed out again after reopen (verified against Node: `first=2, second=2`). pir appends every
+   mint to `ids.jsonl` and seeds the watermark from it, so ID ownership stays globally monotonic across reopen,
+   matching SQLite's `durable_metadata.next_id`.
+10. **JSONL `fsync` also flushes the main marker.** Upstream flushes only sidecars before appending the marker; pir
+    flushes the marker as well (one extra sync per commit), which is strictly stronger.
+11. **JSONL compacts live-task sidecars.** When another task record would grow `task-<id>.jsonl` past 32 KiB
+    (`TASK_SIDECAR_COMPACT_BYTES`), the sidecar is rewritten to its newest complete record; upstream keeps every
+    replacement record. Recovery semantics are unchanged because a task record is a complete replacement.
+12. **SQLite mints persist and submission request keys are unique.** `mint_id` advances
+    `durable_metadata.next_id` before returning (upstream advances an in-memory counter only), and schema version 3
+    replaces the non-unique `(conversation_id, request_id)` index with a partial unique one after deleting older
+    duplicates. Upstream ships schema version 2.

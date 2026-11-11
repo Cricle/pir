@@ -1,77 +1,29 @@
-//! pi-phone, ported natively: the phone-first remote UI.
+//! pi-phone: the agent-side client for the central `pir-phone-server`.
 //!
-//! A local HTTP + WebSocket server mirrors the live session to a mobile web
-//! app, can spawn parallel `pir --mode rpc` sessions, and supports optional
-//! Tailscale Serve exposure. This builtin is **default off** (it binds a local
-//! port and holds a server task): it joins the plan only when named
-//! explicitly (`builtin:phone` in settings/packages or `-e`), and the JS
-//! `@malinamnam/pi-phone` package is default-disabled in the loader.
+//! The plugin no longer binds a local HTTP port. `/phone-start <ws(s)://server>
+//! <device-token>` opens an outbound WebSocket to the central relay, registers
+//! the live session, and forwards commands/events through the existing
+//! [`SessionBridge`] mapping. Agent execution, files, tools, and model calls
+//! stay in this process; the central server only stores user/device/session
+//! metadata and relays messages.
 //!
 //! Module layout:
-//! - `server`: HTTP/WS server, static assets, start/stop/status commands, and
-//!   the [`PhoneHost`] host seam.
-//! - `session`: the [`SessionBridge`] (WS fan-out + host-event mapping) and the
+//! - `state`: remote transport state, status line, bridge bookkeeping.
+//! - `remote`: outbound WebSocket client, reconnect/backoff, frame routing.
+//! - `session`: [`SessionBridge`] (event mapping + bounded fan-out) and the
 //!   parallel RPC session pool.
-//! - `assets`: the embedded browser client (served from `assets/`).
-//! - `tailscale`: Tailscale Serve route management (`/phone-<port>`), with an
-//!   injectable runner so tests never invoke a real `tailscale`.
-//! - `runtime_state`: the persisted per-`host:port` runtime record used for
-//!   stale-session detection (digest only, never the token).
+//! - `quota`: Codex quota lookup on the local agent (proxied by the relay).
 //!
-//! ## Bridge wiring
-//!
-//! `/phone-start` creates one [`SessionBridge`] per listener. Each `/ws`
-//! connection subscribes to a bounded per-client queue and feeds every JSON
-//! text frame to [`SessionBridge::handle_client_line`]; the bridge routes the
-//! parsed command to [`HostCommands`] and fans mapped host events back out.
-//! `/phone-stop` closes the bridge, so every subscriber and connection task
-//! observes `ServerClosed` even if the listener is already gone.
-//!
-//! ## Host seam
-//!
-//! The live-session adapter ([`LivePhoneHost`]) is installed by
-//! `AgentSession::new_with_plugins` (through
-//! [`PhonePlugin::ensure_live_session_slot`]) and bound to the session `Arc`
-//! by `AgentSession::install_phone_host`; `AgentSession::new_arc_with_plugins`
-//! does both. It receives every phone command (prompt with images and
-//! `steer`/`followUp` semantics, abort, model/thinking changes, compaction,
-//! stats, tree, fork, session new/switch/list, raw pi-RPC passthrough) through
-//! [`HostCommands::dispatch`] and runs it on the session's own async methods.
-//!
-//! [`PhonePlugin::on_event`] feeds the agent/session events back into the same
-//! bridge through [`SessionBridge::dispatch_host_event`], reusing the bridge's
-//! mapping table (`agent_start`, `message_*`, `tool_execution_*`,
-//! `queue_update`, `compaction_*`, `auto_retry_*`, `extension_ui_request`,
-//! `status`, ...). At every run boundary the host publishes real status,
-//! catalog and snapshot state ([`PhonePlugin::publish_status`],
-//! [`PhonePlugin::publish_catalog`], [`PhonePlugin::publish_snapshot`]) and
-//! stores the saved-session listing ([`PhonePlugin::publish_session_list`]).
-//! [`PhonePlugin::published_health_json`] is the host half the server lane must
-//! merge into `/api/health` and the boot `server/status` frame; without it the
-//! endpoint keeps reporting the static placeholder.
-//!
-//! Without an installed adapter [`PhoneHost`] answers only standalone
-//! introspection commands; state-changing commands fail honestly.
-//!
-//! ## Registered surface (mirrors `register-phone-extension.ts`)
-//!
-//! Four commands, with the reference names, descriptions and argument shapes:
+//! ## Registered surface
 //!
 //! | command | args |
 //! |---|---|
-//! | `phone-start` | `[port] [token] [--cwd path] [--host 127.0.0.1] [--idle-mins 20]` (also `--port`, `--token`, `--idle-secs`, `=` forms, `-` disables the token) |
+//! | `phone-start` | `<ws(s)://server> [device-token] [--device-name name] [--device-id id]` |
 //! | `phone-stop` | none |
 //! | `phone-status` | none |
-//! | `phone-token` | none (reports the token; the reference never rotates it from a command) |
+//! | `phone-token` | none (reports the device token) |
 //!
-//! Status key `pi-phone`: `📱 ● phone on` / `📱 ○ phone off` ([`STATUS_KEY`],
-//! [`server::status_line`]). The plugin implements [`AgentPlugin::statuses`],
-//! so the native host channel (`PluginHost::statuses`) carries the live entry
-//! in a builtin-only plan. When a JS runtime is attached the same entry is
-//! additionally published through `__pir_host.setStatus`
-//! (`PhoneState::attach_runtime` / `sync_status`) for JS-facing surfaces; the
-//! footer merge dedupes by key (native wins), so the two paths never render
-//! a duplicate line.
+//! Status key `pi-phone`: `📱 ● phone on` / `📱 ○ phone off`.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
@@ -85,30 +37,17 @@ use crate::plugins::plugin::{
 };
 use crate::plugins::{PluginInfo, RegistrationContext};
 
-pub mod assets;
-pub mod runtime_state;
-pub mod server;
+pub mod quota;
+pub mod remote;
 pub mod session;
-pub mod tailscale;
+pub mod state;
 
-pub use runtime_state::{
-    digest_control_token, host_key, is_process_running, ownership_message, reconcile_runtime,
-    PersistedPhoneRuntime, Reconcile, RuntimeStore, RUNTIME_STATE_DIR,
-};
-pub use server::{
-    generate_token, parse_start_args, status_line, BridgeRuntime, ParsedPhoneArgs, PhoneConfig,
-    PhoneHost, PhoneState, COMMAND_NAMES, CONTROL_STOP_PATH, DEFAULT_IDLE_TIMEOUT_MS,
-    DEFAULT_PHONE_PORT, MAX_AUTO_PORT, STATUS_KEY,
-};
+pub use quota::quota_auth_path;
 pub use session::{
     BridgeConfig, BridgeStats, BridgeSubscriber, CloseReason, ForwardedCommand, HostCommands,
     HostFuture, HostReply, PhoneCommand, SessionBridge, SubscribeError,
 };
-pub use tailscale::{
-    disable_args, enable_args, serve_path, serve_status_args, CommandOutput, DisableResult,
-    EnableResult, NoopTailscaleRunner, ProcessTailscaleRunner, ServeInfo, Tailscale,
-    TailscaleRunner, TAILSCALE_TIMEOUT,
-};
+pub use state::{status_line, BridgeRuntime, PhoneState, COMMAND_NAMES, STATUS_KEY};
 
 /// Events whose payloads the plugin forwards to the bridge's host feed.
 ///
@@ -116,6 +55,9 @@ pub use tailscale::{
 /// envelopes (plus RPC responses, which the host returns through
 /// [`HostReply`]). Keep this list in sync with the mapping table in
 /// `session.rs`; the bridge itself owns the shape normalization.
+pub const PHONE_CUSTOM_EVENT_PREFIX: &str = "phone.custom.";
+pub const PHONE_CUSTOM_EVENT_MAX_BYTES: usize = 64 * 1024;
+
 pub const PHONE_HOST_EVENT_NAMES: [&str; 15] = [
     "agent_start",
     "agent_end",
@@ -134,15 +76,14 @@ pub const PHONE_HOST_EVENT_NAMES: [&str; 15] = [
     "status",
 ];
 
-/// `/phone-start` description, verbatim from the reference registration.
-pub const PHONE_START_DESCRIPTION: &str = "Start the phone web UI. Usage: /phone-start [port] [token] [--cwd path] [--host 127.0.0.1] [--idle-mins 20]";
+/// `/phone-start` description.
+pub const PHONE_START_DESCRIPTION: &str = "Connect to the central phone server. Usage: /phone-start <ws(s)://server> [device-token] [--device-name name] [--device-id id]";
 /// `/phone-stop` description.
-pub const PHONE_STOP_DESCRIPTION: &str =
-    "Stop the phone web UI server and remove the matching Tailscale Serve route";
+pub const PHONE_STOP_DESCRIPTION: &str = "Disconnect from the central phone server";
 /// `/phone-status` description.
-pub const PHONE_STATUS_DESCRIPTION: &str = "Show phone server and Tailscale Serve status";
+pub const PHONE_STATUS_DESCRIPTION: &str = "Show phone server connection status";
 /// `/phone-token` description.
-pub const PHONE_TOKEN_DESCRIPTION: &str = "Show the current phone UI token";
+pub const PHONE_TOKEN_DESCRIPTION: &str = "Show the current phone device token";
 
 /// The binding slot shared by a [`PhonePlugin`] and its live-session adapter.
 ///
@@ -195,17 +136,23 @@ impl PhoneSessionSlot {
 /// state.
 pub struct LivePhoneHost {
     slot: Arc<PhoneSessionSlot>,
+    pool: state::PhonePoolCell,
 }
 
 impl LivePhoneHost {
-    pub fn new(slot: Arc<PhoneSessionSlot>) -> Self {
-        Self { slot }
+    pub fn new(slot: Arc<PhoneSessionSlot>, pool: state::PhonePoolCell) -> Self {
+        Self { slot, pool }
     }
 }
 
 impl HostCommands for LivePhoneHost {
-    fn dispatch(&self, command: ForwardedCommand) -> HostFuture {
+    fn dispatch(&self, forwarded: ForwardedCommand) -> HostFuture {
         let session = self.slot.upgrade();
+        let pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         Box::pin(async move {
             let Some(session) = session else {
                 return Err(
@@ -215,9 +162,360 @@ impl HostCommands for LivePhoneHost {
                         .to_owned(),
                 );
             };
-            session.phone_dispatch_command(command).await
+            if let Some(pool) = pool {
+                match &forwarded.command {
+                    PhoneCommand::SessionSpawn { session_file } => {
+                        let session_id = pool
+                            .spawn(session_file.clone())
+                            .map_err(|error| error.to_string())?;
+                        session.publish_phone_catalog().await;
+                        return Ok(HostReply::data(json!({
+                            "sessionId": session_id,
+                            "kind": "parallel",
+                        }))
+                        .with_broadcast(json!({
+                            "type": "session-spawned",
+                            "data": { "message": "Opened new parallel session." }
+                        })));
+                    }
+                    PhoneCommand::SessionSelect { session_id } => {
+                        if pool.session(session_id).is_none() {
+                            return Err(format!("unknown parallel session: {session_id}"));
+                        }
+                        let event = pool.snapshot_event(session_id);
+                        return Ok(event.map(HostReply::broadcast_event).unwrap_or_default());
+                    }
+                    PhoneCommand::LoadEarlierMessages { before, count }
+                        if forwarded
+                            .active_session_id
+                            .as_deref()
+                            .is_some_and(|id| id.starts_with("active-session-")) =>
+                    {
+                        let active = forwarded.active_session_id.as_deref().unwrap_or_default();
+                        let response = pool
+                            .request(
+                                active,
+                                json!({ "type": "get_messages" }),
+                                std::time::Duration::from_secs(30),
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let messages = response
+                            .get("data")
+                            .and_then(|data| data.get("messages"))
+                            .and_then(JsonValue::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let total = messages.len();
+                        let before = before.unwrap_or(total).min(total);
+                        let page_size = count.unwrap_or(200).min(200);
+                        let start = before.saturating_sub(page_size);
+                        let page = messages[start..before].to_vec();
+                        return Ok(HostReply::broadcast_event(json!({
+                            "channel": "snapshot",
+                            "event": "earlier-messages",
+                            "sessionWorkerId": active,
+                            "messages": page,
+                            "startIndex": start,
+                            "hasMore": start > 0,
+                            "totalMessageCount": total,
+                        })));
+                    }
+                    PhoneCommand::Refresh
+                        if forwarded
+                            .active_session_id
+                            .as_deref()
+                            .is_some_and(|id| id.starts_with("active-session-")) =>
+                    {
+                        let active = forwarded.active_session_id.as_deref().unwrap_or_default();
+                        pool.refresh(active, std::time::Duration::from_secs(30))
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let event = pool.snapshot_event(active);
+                        return Ok(event.map(HostReply::broadcast_event).unwrap_or_default());
+                    }
+                    _ => {}
+                }
+                if forwarded
+                    .active_session_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("active-session-"))
+                {
+                    let active = forwarded.active_session_id.as_deref().unwrap_or_default();
+                    if pool.session(active).is_none() {
+                        return Err(format!("unknown parallel session: {active}"));
+                    }
+                    // The child speaks the raw pi RPC command shape, not the
+                    // phone envelope wrapper (`{kind:"rpc", command:...}`).
+                    // The vocabulary differs for the tree read: phone clients
+                    // ask for `phone_get_tree`, while `pir --mode rpc` only
+                    // implements `get_tree`. Translate the wire name and adapt
+                    // the nested RPC tree into the phone tree payload below.
+                    let phone_tree = matches!(forwarded.command, PhoneCommand::PhoneGetTree);
+                    let mut child_command = forwarded
+                        .raw
+                        .get("command")
+                        .cloned()
+                        .unwrap_or_else(|| forwarded.raw.clone());
+                    if phone_tree {
+                        // A distinct child correlation id: the pool's reader
+                        // also emits every child frame as an rpc event, so
+                        // reusing the phone request id would surface the raw
+                        // `get_tree` response next to the converted phone
+                        // tree. The child only echoes ids it was given, so the
+                        // pool's own `srv-N` assignment cannot be used here.
+                        let child_id = format!(
+                            "{}-get_tree",
+                            forwarded.request_id.as_deref().unwrap_or("phone-tree")
+                        );
+                        child_command = json!({ "type": "get_tree", "id": child_id });
+                    }
+                    // A child dialog answer is fire-and-forget on the child
+                    // side: `pir --mode rpc` resolves the `ctx.ui` promise and
+                    // deliberately emits no response frame. Answer the phone
+                    // synchronously instead of waiting for a reply that will
+                    // never come (the parent path does the same).
+                    if child_command.get("type").and_then(JsonValue::as_str)
+                        == Some("extension_ui_response")
+                    {
+                        let answered = child_command
+                            .get("id")
+                            .and_then(JsonValue::as_str)
+                            .is_some_and(|id| !id.is_empty());
+                        pool.send_command(active, child_command)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        return Ok(HostReply::data(json!({ "answered": answered })));
+                    }
+                    if forwarded.command.expects_response() {
+                        let response = pool
+                            .request(active, child_command, std::time::Duration::from_secs(30))
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let data = response.get("data").cloned().unwrap_or(JsonValue::Null);
+                        if phone_tree {
+                            let session_file = pool
+                                .session(active)
+                                .and_then(|summary| summary.session_file);
+                            return Ok(HostReply::data(child_tree_to_phone_tree(
+                                &data,
+                                session_file,
+                            )));
+                        }
+                        return Ok(HostReply::data(data));
+                    }
+                    pool.send_command(active, child_command)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Ok(HostReply::default());
+                }
+            }
+            session.phone_dispatch_command(forwarded).await
         })
     }
+}
+
+/// Adapt a child RPC `get_tree` payload (`{tree, leafId}`) into the phone
+/// tree shape the parent host answers (`sessionFile`, `currentLeafId`,
+/// `currentPathIds`, flattened `nodes`).
+///
+/// `pir --mode rpc` returns the nested `SessionTreeNode` forest, while phone
+/// clients consume the flat rows [`crate::session_manager::SessionManager::for_each_tree_row`]
+/// produces (the same rows `AgentSession::phone_dispatch_command` answers for
+/// the parent). This walk is iterative because the tree nests one level per
+/// session entry and a long linear session must not recurse on the stack.
+///
+/// `#[doc(hidden)] pub`: asserted directly by `tests/suites/phone_units.rs`.
+#[doc(hidden)]
+pub fn child_tree_to_phone_tree(data: &JsonValue, session_file: Option<String>) -> JsonValue {
+    let leaf_id = data.get("leafId").cloned().unwrap_or(JsonValue::Null);
+    let mut nodes: Vec<JsonValue> = Vec::new();
+    // First-visit parent resolution, matching `for_each_tree_row`: a duplicate
+    // entry id keeps the parent of its first (visited) occurrence.
+    let mut parents: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    if let Some(roots) = data.get("tree").and_then(JsonValue::as_array) {
+        let mut stack: Vec<(&JsonValue, usize, Option<String>)> = roots
+            .iter()
+            .rev()
+            .map(|node| (node, 0_usize, None))
+            .collect();
+        while let Some((node, depth, parent)) = stack.pop() {
+            let Some(id) = node
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .or_else(|| node.pointer("/entry/id").and_then(JsonValue::as_str))
+            else {
+                continue;
+            };
+            let id = id.to_owned();
+            let entry = node.get("entry").unwrap_or(&JsonValue::Null);
+            let kind = entry_kind_hint(entry);
+            let mut summary = json!({
+                "kind": kind,
+                "preview": entry_preview(entry),
+            });
+            if let Some(role) = entry_summary_role(entry) {
+                summary["role"] = JsonValue::String(role.to_owned());
+            }
+            let timestamp = entry
+                .get("timestamp")
+                .and_then(JsonValue::as_str)
+                .and_then(crate::session_manager::ms_from_iso)
+                .unwrap_or(0);
+            let mut row = json!({
+                "id": id,
+                "parentId": parent,
+                "type": kind,
+                "depth": depth,
+                "timestamp": timestamp,
+                "label": node.get("label").cloned().unwrap_or(JsonValue::Null),
+                "summary": summary,
+            });
+            if let Some(tool_name) = entry
+                .pointer("/message/toolName")
+                .and_then(JsonValue::as_str)
+            {
+                row["toolName"] = JsonValue::String(tool_name.to_owned());
+            }
+            nodes.push(row);
+            parents.entry(id.clone()).or_insert_with(|| parent.clone());
+            if let Some(children) = node.get("children").and_then(JsonValue::as_array) {
+                for child in children.iter().rev() {
+                    stack.push((child, depth + 1, Some(id.clone())));
+                }
+            }
+        }
+    }
+    let mut current_path: Vec<JsonValue> = Vec::new();
+    if let Some(leaf) = leaf_id.as_str() {
+        let mut cursor = Some(leaf.to_owned());
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = cursor {
+            if !seen.insert(id.clone()) {
+                break; // Defensive: a malformed tree must not loop forever.
+            }
+            current_path.push(JsonValue::String(id.clone()));
+            cursor = parents.get(&id).cloned().flatten();
+        }
+        current_path.reverse();
+    }
+    json!({
+        "sessionFile": session_file,
+        "currentLeafId": leaf_id,
+        "currentPathIds": current_path,
+        "nodes": nodes,
+    })
+}
+
+/// Entry kind label matching `SessionManager::for_each_tree_row`'s
+/// `TreeRowMeta::kind_hint` (messages refined by role).
+fn entry_kind_hint(entry: &JsonValue) -> &'static str {
+    match entry.get("type").and_then(JsonValue::as_str) {
+        Some("message") => match entry.pointer("/message/role").and_then(JsonValue::as_str) {
+            Some("user") => "user_message",
+            Some("assistant") => "assistant_message",
+            Some("toolResult") => "tool_result",
+            Some("system") => "system_message",
+            Some("developer") => "developer_message",
+            Some("bashExecution") => "bash_execution",
+            Some("custom") => "custom",
+            _ => "message",
+        },
+        Some("session") => "session",
+        Some("thinking_level_change") => "thinking_level_change",
+        Some("model_change") => "model_change",
+        Some("usage") => "usage",
+        Some("compaction") => "compaction",
+        Some("branch_summary") => "branch_summary",
+        Some("custom") => "custom",
+        Some("custom_message") => "custom_message",
+        Some("context_edit") => "context_edit",
+        Some("label") => "label",
+        Some("session_info") => "session_info",
+        _ => "unknown",
+    }
+}
+
+/// `summary.role` the parent phone tree attaches for message rows.
+fn entry_summary_role(entry: &JsonValue) -> Option<&'static str> {
+    if entry.get("type").and_then(JsonValue::as_str) != Some("message") {
+        return None;
+    }
+    match entry.pointer("/message/role").and_then(JsonValue::as_str) {
+        Some("user") => Some("user"),
+        Some("assistant") => Some("assistant"),
+        Some("toolResult") => Some("toolResult"),
+        Some("system") => Some("system"),
+        Some("developer") => Some("developer"),
+        _ => None,
+    }
+}
+
+/// Flattened text preview matching `tree_row_preview` (message text blocks
+/// concatenated, whitespace-normalized, capped at the `/tree` row length).
+fn entry_preview(entry: &JsonValue) -> String {
+    fn text_of_content(content: Option<&JsonValue>) -> String {
+        match content {
+            Some(JsonValue::String(text)) => text.clone(),
+            Some(JsonValue::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(JsonValue::as_str))
+                .collect::<String>(),
+            _ => String::new(),
+        }
+    }
+    let raw = match entry.get("type").and_then(JsonValue::as_str) {
+        Some("message") => match entry.pointer("/message/role").and_then(JsonValue::as_str) {
+            Some("user") | Some("assistant") | Some("toolResult") => {
+                text_of_content(entry.pointer("/message/content"))
+            }
+            Some("system") => entry
+                .pointer("/message/content")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            Some("bashExecution") => entry
+                .pointer("/message/output")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            Some("custom") => text_of_content(entry.pointer("/message/content")),
+            _ => String::new(),
+        },
+        Some("compaction") => entry
+            .pointer("/summary")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        Some("branch_summary") => entry
+            .pointer("/summary")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        Some("custom_message") => match entry.pointer("/content") {
+            Some(JsonValue::String(text)) => text.clone(),
+            Some(JsonValue::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(JsonValue::as_str))
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    };
+    let normalized: String = raw
+        .chars()
+        .map(|character| match character {
+            '\n' | '\t' => ' ',
+            other => other,
+        })
+        .collect();
+    normalized
+        .trim()
+        .chars()
+        .take(crate::session_manager::TREE_ROW_PREVIEW_CHARS)
+        .collect()
 }
 
 /// The most recent live state the host published into the plugin.
@@ -250,6 +548,40 @@ struct PhoneShared {
     /// Phone-initiated runs currently in flight (a counter so a settle can
     /// tell whether the run it just finished belongs to the phone).
     phone_runs_active: AtomicUsize,
+    /// Opt-in namespaced custom events (`PI_PHONE_CUSTOM_EVENTS`).
+    custom_events: Vec<String>,
+}
+
+/// Parse `PI_PHONE_CUSTOM_EVENTS`: comma-separated namespaced event names.
+///
+/// Filtering, deduplication and the 32-entry cap happen in that order, and the
+/// first occurrence wins, so the resulting list — and therefore the
+/// `EventInterest::List` built by [`PhonePlugin::events`] — is stable for a
+/// given environment value.
+///
+/// `#[doc(hidden)] pub`: asserted directly by `tests/suites/phone_units.rs`.
+#[doc(hidden)]
+pub fn parse_custom_events(value: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for name in value.split(',').map(str::trim) {
+        if !name.starts_with(PHONE_CUSTOM_EVENT_PREFIX) || name.len() > 128 {
+            continue;
+        }
+        if names.len() >= 32 {
+            break;
+        }
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
+fn configured_custom_events() -> Vec<String> {
+    std::env::var("PI_PHONE_CUSTOM_EVENTS")
+        .ok()
+        .map(|value| parse_custom_events(&value))
+        .unwrap_or_default()
 }
 
 /// The builtin plugin instance.
@@ -260,27 +592,8 @@ pub struct PhonePlugin {
 }
 
 impl PhonePlugin {
-    /// A plugin whose Tailscale integration is a no-op.
-    ///
-    /// This is the default (and test) constructor: it can never spawn the
-    /// `tailscale` CLI, so constructing or starting a plugin from tests or an
-    /// embedder cannot reconfigure a real Serve setup. The builtin factory
-    /// ([`new_phone_plugin`]) builds the production instance with the real
-    /// [`tailscale::ProcessTailscaleRunner`].
+    /// Build the remote-only phone plugin.
     pub fn new() -> Self {
-        Self::with_tailscale(Tailscale::disabled())
-    }
-
-    /// Build a plugin with an injected Tailscale runner (test seam).
-    ///
-    /// Mirrors [`PhonePlugin::set_tailscale_for_test`] but applies at
-    /// construction time, which is what most tests want.
-    #[doc(hidden)]
-    pub fn with_tailscale_runner(runner: Arc<dyn tailscale::TailscaleRunner>) -> Self {
-        Self::with_tailscale(Tailscale::with_runner(runner))
-    }
-
-    fn with_tailscale(tailscale: Tailscale) -> Self {
         let mut info = PluginInfo::builtin("phone");
         // Mirror the builtin table's `replaceable` flag: a user extension
         // registering a phone command must omit this builtin (upstream
@@ -289,110 +602,53 @@ impl PhonePlugin {
             .is_some_and(|def| def.replaceable);
         Self {
             info,
-            state: Arc::new(PhoneState::from_env_with_tailscale(tailscale)),
-            shared: Arc::new(PhoneShared::default()),
+            state: Arc::new(PhoneState::from_env()),
+            shared: Arc::new(PhoneShared {
+                custom_events: configured_custom_events(),
+                ..PhoneShared::default()
+            }),
         }
     }
 
-    /// The injected Tailscale runner's kind (`"process"`, `"noop"`, or
-    /// `"custom"`), for test/assembly inspection.
-    #[doc(hidden)]
-    pub fn tailscale_runner_kind(&self) -> &'static str {
-        self.state.tailscale_runner_kind()
-    }
-
-    /// The status-line entry this plugin owns, in the reference format.
-    ///
-    /// Exposed for the host lane and tests; the live channels are
-    /// [`AgentPlugin::statuses`] (native) and the JS `setStatus` bridge
-    /// described in the module docs.
+    /// The status-line entry this plugin owns.
     pub fn status_entry(&self) -> (&'static str, String) {
         (STATUS_KEY, status_line(self.state.is_running()))
     }
 
-    /// Whether a listener is currently running.
+    /// Whether the outbound central-server link is active.
     pub fn is_running(&self) -> bool {
         self.state.is_running()
     }
 
-    /// The bound listener address, when running.
-    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
-        self.state.local_addr()
+    /// Direct test seam: connect the outbound central-server link.
+    #[doc(hidden)]
+    pub async fn start_remote_for_test(&self, args: &str) -> Result<String, String> {
+        self.state.start_remote_command(args).await
     }
 
-    /// Direct test seam: run `/phone-start` and return the bound port.
-    ///
-    /// `args` is the same command-argument string the slash command receives;
-    /// `"0"` requests an ephemeral port so a hermetic test can bind without a
-    /// fixed-port collision.
+    /// Direct test seam: disconnect the outbound central-server link.
     #[doc(hidden)]
-    pub async fn start_for_test(&self, args: &str) -> Result<u16, String> {
-        self.state.start_for_test(args).await
+    pub async fn stop_remote_for_test(&self) -> Result<String, String> {
+        self.state.stop_remote_command().await
     }
 
-    /// Direct test seam: stop the server; true when one was running.
+    /// Direct test seam: whether the outbound relay handshake completed.
     #[doc(hidden)]
-    pub async fn stop_for_test(&self) -> bool {
-        self.state.stop_for_test().await
-    }
-
-    /// Direct test seam: replace the Tailscale client with a fake runner.
-    ///
-    /// Production always uses the default `tailscale` binary; tests inject a
-    /// recording runner so they assert the exact argv without a real tailnet.
-    #[doc(hidden)]
-    pub fn set_tailscale_for_test(&self, client: tailscale::Tailscale) {
-        self.state.set_tailscale(client);
-    }
-
-    /// Direct test seam: point the persisted runtime state at a temp directory.
-    #[doc(hidden)]
-    pub fn set_runtime_store_for_test(&self, store: runtime_state::RuntimeStore) {
-        self.state.set_runtime_store(store);
-    }
-
-    /// Direct test seam: insert a base64 image into the `/api/image` store.
-    #[doc(hidden)]
-    pub fn store_image_for_test(&self, data: &str, mime_type: &str) -> Option<String> {
-        self.state.store_image(data, mime_type)
-    }
-
-    /// Direct test seam: `(entry count, decoded bytes)` of the `/api/image`
-    /// store (the reference `PhoneImageStore.stats`).
-    #[doc(hidden)]
-    pub fn image_stats(&self) -> (usize, usize) {
-        self.state.image_stats()
-    }
-
-    /// Direct test seam: age every stored image past the TTL (the real wait
-    /// is two hours).
-    #[doc(hidden)]
-    pub fn age_images_for_test(&self, age: std::time::Duration) {
-        self.state.age_images_for_test(age);
-    }
-
-    /// Direct test seam: read one stored image through the TTL-throttled path.
-    #[doc(hidden)]
-    pub fn image_for_test(&self, key: &str) -> Option<(std::sync::Arc<[u8]>, String)> {
-        self.state.image_for_test(key)
+    pub fn remote_connected_for_test(&self) -> bool {
+        self.state
+            .remote_info()
+            .map(|(_, connected, _)| connected)
+            .unwrap_or(false)
     }
 
     /// Install a `HostCommands` adapter: the documented plugin/host seam.
     ///
     /// Production uses [`LivePhoneHost`], installed at session construction
     /// ([`PhonePlugin::ensure_live_session_slot`]) and bound by
-    /// `AgentSession::install_phone_host`. This setter remains for recording
-    /// hosts (tests, embedders) and takes effect immediately because
-    /// [`PhoneHost`] shares the adapter slot.
+    /// `AgentSession::install_phone_host`.
     #[doc(hidden)]
     pub fn set_host_commands(&self, host: Arc<dyn HostCommands>) {
         self.state.set_host_commands(host);
-    }
-
-    /// The bridge of the running server (test/host-lane inspection seam).
-    #[doc(hidden)]
-    pub fn bridge_for_test(&self) -> Option<SessionBridge> {
-        self.state.bridge_for_test()
     }
 
     /// Whether a `HostCommands` adapter is installed (the production
@@ -437,8 +693,10 @@ impl PhonePlugin {
         let slot = PhoneSessionSlot::new();
         *slot_guard = Some(Arc::clone(&slot));
         if !self.has_host_commands() {
-            self.state
-                .set_host_commands(Arc::new(LivePhoneHost::new(Arc::clone(&slot))));
+            self.state.set_host_commands(Arc::new(LivePhoneHost::new(
+                Arc::clone(&slot),
+                self.state.pool_cell(),
+            )));
         }
         slot
     }
@@ -457,6 +715,12 @@ impl PhonePlugin {
 
     pub fn has_bridge(&self) -> bool {
         self.state.has_bridge()
+    }
+
+    /// Whether `session_id` currently has a dialog-class UI request waiting
+    /// for an answer (the parent row's `hasPendingUiRequest` source).
+    pub fn has_pending_ui_request(&self, session_id: &str) -> bool {
+        self.state.pending_ui_request(session_id)
     }
 
     /// Record a state-changing phone write: while idle the phone owns control.
@@ -526,17 +790,18 @@ impl PhonePlugin {
                 .unwrap_or(false);
             object.insert("isRunning".to_owned(), json!(running));
             object.insert("serverRunning".to_owned(), json!(running));
-            object.insert("singleClientMode".to_owned(), json!(true));
+            object.insert(
+                "singleClientMode".to_owned(),
+                json!(!self.state.is_remote()),
+            );
             object.insert(
                 "controlOwner".to_owned(),
                 json!(self.control_owner(streaming)),
             );
-            if let Some(addr) = self.state.local_addr() {
-                object.insert("host".to_owned(), json!(addr.ip().to_string()));
-                object.insert("port".to_owned(), json!(addr.port()));
-            }
-            if let Some(bridge) = self.state.bridge_for_test() {
-                object.insert("connectedClients".to_owned(), json!(bridge.client_count()));
+            if let Some((server_url, connected, device_id)) = self.state.remote_info() {
+                object.insert("serverUrl".to_owned(), json!(server_url));
+                object.insert("isConnected".to_owned(), json!(connected));
+                object.insert("deviceId".to_owned(), json!(device_id));
             }
         }
         self.shared
@@ -579,8 +844,9 @@ impl PhonePlugin {
     /// screenshots would otherwise re-send hundreds of KB of base64 on every
     /// refresh. The snapshot is owned here, so the rewrite mutates it in place
     /// and costs one copy per image, never one per message.
-    pub fn publish_snapshot(&self, mut snapshot: JsonValue) {
-        self.state.extract_snapshot_images(&mut snapshot);
+    pub fn publish_snapshot(&self, snapshot: JsonValue) {
+        // The central server owns the `/api/image` store; raw base64 reaches it
+        // intact so it can extract and rewrite preview URLs.
         self.shared
             .published
             .lock()
@@ -657,6 +923,12 @@ impl PhonePlugin {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .snapshot
             .is_some()
+    }
+
+    /// The optional parallel-session pool bound to this phone plugin.
+    #[doc(hidden)]
+    pub fn pool(&self) -> Option<Arc<session::SessionPool>> {
+        self.state.pool()
     }
 
     /// The last snapshot the host published.
@@ -772,11 +1044,10 @@ impl AgentPlugin for PhonePlugin {
             let shared = Arc::clone(&shared);
             let args = args.to_owned();
             Box::pin(async move {
-                let result = state.start_command(&args).await;
+                let result = state.start_remote_command(&args).await;
                 if result.is_ok() {
-                    // Seed the host half of the health/status surface right
-                    // after the listener exists. The server lane merges
-                    // `published_health_json()` into its own status object.
+                    // Seed the live session's status/catalog/snapshot right
+                    // after the relay handshake starts.
                     let session = shared
                         .live_session
                         .lock()
@@ -804,7 +1075,7 @@ impl AgentPlugin for PhonePlugin {
             let state = Arc::clone(&state);
             let shared = Arc::clone(&shared);
             Box::pin(async move {
-                let stopped = state.stop_command().await;
+                let stopped = state.stop_remote_command().await;
                 shared.phone_owner.store(false, Ordering::SeqCst);
                 command_outcome(stopped)
             })
@@ -844,12 +1115,21 @@ impl AgentPlugin for PhonePlugin {
     }
 
     fn events(&self) -> EventInterest {
-        EventInterest::List(
-            PHONE_HOST_EVENT_NAMES
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect(),
-        )
+        // The bridge's fixed mapping table plus the namespaced custom events
+        // opted in at construction (`PI_PHONE_CUSTOM_EVENTS`). Keep this a
+        // concrete list: `EventInterest::All` would make `has_handlers` true
+        // for every event in the session and defeat the host's emission gates
+        // for a plugin that only forwards the bridge's own table.
+        let mut names: Vec<String> = PHONE_HOST_EVENT_NAMES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        for name in &self.shared.custom_events {
+            if !names.iter().any(|existing| existing == name) {
+                names.push(name.clone());
+            }
+        }
+        EventInterest::List(names)
     }
 
     /// Forward one agent/session event into the running phone bridge.
@@ -861,11 +1141,24 @@ impl AgentPlugin for PhonePlugin {
     /// never block the agent actor.
     fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
         let name = event.name.as_ref();
-        let interested = PHONE_HOST_EVENT_NAMES.contains(&name);
+        let is_custom = name.starts_with(PHONE_CUSTOM_EVENT_PREFIX)
+            && self
+                .shared
+                .custom_events
+                .iter()
+                .any(|allowed| allowed == name);
+        let interested = PHONE_HOST_EVENT_NAMES.contains(&name) || is_custom;
         // Skip the payload clone when no bridge is listening: `message_update`
         // payloads carry the cumulative assistant message and this runs on the
         // streaming hot path.
         if interested && self.state.has_bridge() {
+            if is_custom
+                && serde_json::to_vec(event.payload)
+                    .map(|bytes| bytes.len() > PHONE_CUSTOM_EVENT_MAX_BYTES)
+                    .unwrap_or(true)
+            {
+                return Box::pin(async { PluginEventOutcome::None });
+            }
             let mut value = event.payload.clone();
             let typed = value.get("type").and_then(JsonValue::as_str) == Some(name);
             if !typed {
@@ -897,12 +1190,6 @@ impl AgentPlugin for PhonePlugin {
 }
 
 /// The factory the builtin table names.
-///
-/// The production instance always uses the real
-/// [`tailscale::ProcessTailscaleRunner`]; [`PhonePlugin::new`] deliberately
-/// installs a no-op runner instead.
 pub fn new_phone_plugin() -> Arc<dyn AgentPlugin> {
-    Arc::new(PhonePlugin::with_tailscale_runner(Arc::new(
-        tailscale::ProcessTailscaleRunner::new("tailscale"),
-    )))
+    Arc::new(PhonePlugin::new())
 }

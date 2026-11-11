@@ -283,6 +283,7 @@ fn fake_registry(contexts: Contexts) -> Arc<ProviderRegistry> {
 fn session_factory(contexts: Contexts) -> SessionFactory {
     Arc::new(move |session: Option<SessionManager>| {
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: fake_registry(Arc::clone(&contexts)),
             model: fake_model(),
             api_key: None,

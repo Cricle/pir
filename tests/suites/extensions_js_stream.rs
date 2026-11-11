@@ -263,6 +263,7 @@ async fn js_stream_provider_streams_events_through_the_session() {
 
     let registry = Arc::new(ProviderRegistry::default());
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry.clone(),
         model: js_model("js-model"),
         api_key: None,
@@ -309,6 +310,7 @@ async fn js_stream_provider_callback_failure_fails_closed() {
     seed_and_load(&handle, &dir, STREAM_EXTENSION_TS).await;
 
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         // The throwing provider (its streamSimple callback always throws).
         model: js_model_for_provider("jsboom", "boom-model"),
@@ -400,6 +402,7 @@ async fn js_virtual_route_callback_routes_and_falls_back_to_static() {
     });
 
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry.clone(),
         model: virtual_model("router-ok"),
         api_key: None,

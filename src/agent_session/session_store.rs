@@ -361,6 +361,13 @@ impl AgentSession {
         // delivered twice.
         self.emit_session_start_reason(start_reason, old_session_file.as_deref())
             .await;
+        // A storage swap attaches a transcript before any prompt: push the
+        // same session-context snapshot the pre-prompt path builds so native
+        // plugins replay from the NEW entries (the `todo` builtin's
+        // `on_session_context`), not the outgoing session's. `session_start`
+        // above is what invalidates the todo replay cache, so this order is
+        // required (push after it).
+        self.push_session_context(&self.current_model()).await;
         true
     }
 
@@ -895,6 +902,24 @@ impl AgentSession {
             .with_session_manager(|sm| sm.session_file().map(Path::to_path_buf))
             .await
             .flatten();
+        // Upstream `teardownCurrent("fork", targetSessionFile)` runs BEFORE
+        // the branch is applied (agent-session-runtime.ts:299/316-323): the
+        // outgoing session is torn down first, so a plugin persisting from
+        // the shutdown handler still writes the OUTGOING file and the
+        // post-swap `session_start {reason: "fork"}` describes the
+        // replacement. Emitting it after the in-place leaf move (the old
+        // order) made the shutdown land on the branched storage.
+        if let Some(plugins) = &self.plugins {
+            plugins
+                .emit_session_shutdown(
+                    "fork",
+                    previous_session_file
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .as_deref(),
+                )
+                .await;
+        }
         match target {
             Some(target) => {
                 let new_leaf_id = match self

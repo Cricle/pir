@@ -240,6 +240,10 @@ fn render_rules_section(tools: &[ToolInfo]) -> String {
     let has_grep = tools.iter().any(|tool| tool.name == "grep");
     let has_find = tools.iter().any(|tool| tool.name == "find");
     let has_ls = tools.iter().any(|tool| tool.name == "ls");
+    let has_read = tools.iter().any(|tool| tool.name == "read");
+    let has_edit_or_write = tools
+        .iter()
+        .any(|tool| tool.name == "edit" || tool.name == "write");
 
     if (has_bash || has_powershell) && !has_grep && !has_find && !has_ls {
         if has_bash && has_powershell {
@@ -261,6 +265,28 @@ fn render_rules_section(tools: &[ToolInfo]) -> String {
         for guideline in &tool.guidelines {
             add_rule(guideline, &mut rules);
         }
+    }
+    if has_read && has_edit_or_write {
+        add_rule(
+            "Read an existing file completely (no offset/limit) before writing or editing it; after your own successful write/edit you do not need to re-read it unless the tool reports an external change",
+            &mut rules,
+        );
+        add_rule(
+            "Pass literal filesystem paths to read/edit/write; never use shell substitutions such as $(pwd) or backticks in path arguments",
+            &mut rules,
+        );
+    }
+    if has_bash || has_powershell {
+        add_rule(
+            "Run shell commands from the current working directory; never scan /, /tmp, the home directory, or an entire drive to find project files, and do not run recursive searches outside the project",
+            &mut rules,
+        );
+    }
+    if has_edit_or_write || has_bash {
+        add_rule(
+            "Before finishing, re-read the task specification and verify the edge cases it names (empty input, trailing newlines, ranges, and error exits); run the relevant tests, not only the visible ones",
+            &mut rules,
+        );
     }
     add_rule("Be concise in your responses", &mut rules);
     add_rule(

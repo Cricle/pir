@@ -1672,6 +1672,7 @@ fn build_session_agent(
         // knob as print/RPC. A turn is one model request; all tool calls in
         // that assistant message execute as one batch and cost no extra turn.
         max_turns: crate::config::env::max_turns(),
+        performance: crate::config::settings::PerformanceSettings::from_env(),
         system_prompt: None,
         cwd: Some(std::path::PathBuf::from(cwd)),
         event_stream: None,

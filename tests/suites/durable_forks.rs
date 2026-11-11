@@ -9,22 +9,24 @@
 //!
 //! Registered in `tests/g_durable.rs` as `mod durable_forks;`.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 
 use pir::durable::session::forks::{copy_write, prepare_fork_document_copies};
 use pir::durable::session::line::IntoJobValue;
-use pir::durable::session::transaction::EntryDraft;
+use pir::durable::session::transaction::{EntryDraft, TaskOptions, TaskOwnership};
 use pir::durable::session::{
     ConversationOwnership, LoadedDocument, Session, SessionOptions, StagedDocument,
 };
 use pir::durable::{
     AnyDocDefinition, CommonDocDefinition, Context, ConversationId, ConversationParent,
     ConversationQuery, ConversationRecord, DocCheckpointWhen, DocCheckpointWhenExt, DocDefinition,
-    DocOwner, DocumentAddress, DocumentFork, DocumentHistory, DocumentId, DocumentPoint,
-    DocumentScope, DocumentSemantics, EntryId, JsonObject, MemoryStorage, ResolvedAddress, Storage,
-    StorageError,
+    DocFamilyDefinition, DocOwner, DocumentAddress, DocumentContent, DocumentCreate, DocumentError,
+    DocumentFork, DocumentHistory, DocumentId, DocumentPoint, DocumentPointQuery, DocumentQuery,
+    DocumentScope, DocumentSemantics, EntryId, EntryQuery, EntryRecord, JsonObject, MemoryStorage,
+    ResolvedAddress, Storage, StorageError, StorageWrite, TaskDefinition,
 };
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -495,6 +497,70 @@ async fn a_fork_source_document_cannot_be_written_in_the_fork_transaction() {
     session.close().await.expect("close");
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_fork_rejects_duplicate_as_of_and_current_sources_for_one_child_address() {
+    let storage = Arc::new(MemoryStorage::new());
+    let session = open(storage);
+    let ctx = Context::background();
+    let parent = parent_conversation(&session, &ctx).await;
+    let kind = "demo.fork.duplicate-policy";
+    let as_of = address(kind, AS_OF, parent.id);
+    let current = address(kind, CURRENT, parent.id);
+
+    // The as-of source exists at the fork point and is retired afterwards.
+    set_counter(&session, &as_of, AS_OF, 1, &ctx).await;
+    let fork_at = session
+        .append_entry(parent.id, entry_draft("point"), ctx.clone())
+        .await
+        .expect("fork point")
+        .id;
+    session
+        .retire_doc(as_of.clone(), ctx.clone())
+        .await
+        .expect("retire as-of source");
+
+    // The current source is a second incarnation of the same child address.
+    set_counter(&session, &current, CURRENT, 2, &ctx).await;
+
+    let error = session
+        .create_conversation(
+            ConversationOwnership::Ownerless,
+            Some((parent.id, fork_at)),
+            ctx.clone(),
+        )
+        .await
+        .expect_err("two source policies for one child address must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("Fork selects multiple source documents"),
+        "unexpected error: {error}"
+    );
+    assert!(!session.is_failed(), "pre-admission rejection is not fatal");
+
+    let conversations = session
+        .scan_conversations(ConversationQuery::default(), 10, None, &ctx)
+        .await
+        .expect("scan conversations");
+    assert_eq!(
+        conversations.items.len(),
+        1,
+        "the rejected fork stored no conversation"
+    );
+    assert_eq!(
+        read_counter(&session, &current, &ctx).await,
+        Some(2),
+        "the rejected fork left the current source untouched"
+    );
+    let other = session
+        .create_conversation(ConversationOwnership::Ownerless, None, ctx.clone())
+        .await
+        .expect("session remains usable");
+    assert_ne!(other.id, parent.id);
+
+    session.close().await.expect("close");
+}
+
 // ─── Copy identity and ownership ────────────────────────────────────────────
 
 #[tokio::test(flavor = "current_thread")]
@@ -731,6 +797,614 @@ async fn forking_after_the_document_was_retired_copies_nothing() {
         .await
         .expect("find child document")
         .is_none());
+
+    session.close().await.expect("close");
+}
+
+// ─── Same-commit, paging and pre-admission boundaries ──────────────────────
+
+/// Upstream `session-forks.test.ts`: "uses final document state from the fork
+/// entry commit while excluding later same-commit entries".
+///
+/// One commit appends `included`, writes the document's final state and then
+/// appends `excluded`. The fork point is `included`, whose commit sequence is
+/// therefore the whole commit: the as-of copy must see the final document
+/// state, while the child transcript must stop at `included`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fork_copies_the_fork_commit_state_and_stops_at_the_fork_entry() {
+    let storage = Arc::new(MemoryStorage::new());
+    let session = open(storage);
+    let ctx = Context::background();
+    let parent = parent_conversation(&session, &ctx).await;
+    let kind = "demo.fork.same-commit";
+    let parent_doc = address(kind, AS_OF, parent.id);
+    let parent_id = parent.id;
+    let draft_address = parent_doc.address.clone();
+    let draft_address_id = parent_doc.id.clone();
+
+    let (fork_at, excluded): (EntryId, EntryId) = session
+        .commit(ctx.clone(), move |tx, state| {
+            Box::pin(async move {
+                let backend = state.storage.storage();
+                let included_id = EntryId::from_raw(state.storage.write(backend.mint_id()).await?);
+                tx.push_write(StorageWrite::Entry {
+                    value: EntryRecord {
+                        id: included_id,
+                        conversation_id: parent_id,
+                        kind: "included".to_owned(),
+                        model: None,
+                        data: None,
+                        head: None,
+                        edits: None,
+                        by_task_id: None,
+                    },
+                });
+                tx.stage_document(StagedDocument {
+                    address: draft_address,
+                    address_id: draft_address_id,
+                    definition: Some(
+                        DocDefinition::conversation_rewindable(kind, 1, DocumentFork::AsOf)
+                            .expect("identity definition"),
+                    ),
+                    family: None,
+                    value: object(json!({ "counter": 42, "origin": "commit" })),
+                    created: true,
+                    loaded: None,
+                    retire: false,
+                });
+                let excluded_id = EntryId::from_raw(state.storage.write(backend.mint_id()).await?);
+                tx.push_write(StorageWrite::Entry {
+                    value: EntryRecord {
+                        id: excluded_id,
+                        conversation_id: parent_id,
+                        kind: "excluded".to_owned(),
+                        model: None,
+                        data: None,
+                        head: None,
+                        edits: None,
+                        by_task_id: None,
+                    },
+                });
+                Ok((included_id, excluded_id).into_job_value())
+            })
+        })
+        .await
+        .expect("one commit with two entries and a document write");
+
+    let child = session
+        .create_conversation(
+            ConversationOwnership::Ownerless,
+            Some((parent.id, fork_at)),
+            ctx.clone(),
+        )
+        .await
+        .expect("fork conversation");
+    let child_doc = address(kind, AS_OF, child.id);
+    assert_eq!(
+        read_counter(&session, &child_doc, &ctx).await,
+        Some(42),
+        "the as-of copy reads the final state of the fork entry's commit"
+    );
+    let visible = session
+        .scan_entries(
+            EntryQuery {
+                conversation_id: child.id,
+                min_entry_id: None,
+                max_entry_id: None,
+                order: None,
+            },
+            10,
+            None,
+            &ctx,
+        )
+        .await
+        .expect("child entries");
+    let ids: Vec<EntryId> = visible.items.iter().map(|entry| entry.id).collect();
+    assert!(
+        ids.contains(&fork_at),
+        "the fork entry is inherited: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&excluded),
+        "a later entry of the same commit is not inherited: {ids:?}"
+    );
+
+    session.close().await.expect("close");
+}
+
+/// Upstream `session-forks.test.ts`: "copies every family member across
+/// storage scan pages".
+///
+/// The fork scan pages at 256 records; 260 members prove the loop follows the
+/// cursor instead of stopping at the first page.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fork_copies_every_family_member_across_scan_pages() {
+    let storage = Arc::new(MemoryStorage::new());
+    let session = open(storage);
+    let ctx = Context::background();
+    let parent = parent_conversation(&session, &ctx).await;
+    let kind = "demo.fork.pagination";
+    let fork_at = session
+        .append_entry(parent.id, entry_draft("point"), ctx.clone())
+        .await
+        .expect("fork point")
+        .id;
+    let parent_id = parent.id;
+    let family = DocFamilyDefinition::conversation_latest(kind, 1, DocumentFork::Current)
+        .expect("family definition");
+
+    let _: () = session
+        .commit(ctx.clone(), move |tx, _state| {
+            Box::pin(async move {
+                for index in 0..260_i64 {
+                    let key = format!("member-{index}");
+                    let resolved = ResolvedAddress::new(
+                        kind,
+                        CURRENT,
+                        Some(DocOwner::Conversation(parent_id)),
+                        Some(key.clone()),
+                    )
+                    .expect("family member address");
+                    tx.stage_document(StagedDocument {
+                        address_id: resolved.id,
+                        address: resolved.address,
+                        definition: None,
+                        family: Some(family.clone()),
+                        value: object(json!({ "counter": index })),
+                        created: true,
+                        loaded: None,
+                        retire: false,
+                    });
+                }
+                Ok(().into_job_value())
+            })
+        })
+        .await
+        .expect("260 family members");
+
+    let child = session
+        .create_conversation(
+            ConversationOwnership::Ownerless,
+            Some((parent.id, fork_at)),
+            ctx.clone(),
+        )
+        .await
+        .expect("fork conversation");
+
+    for index in [0_i64, 259] {
+        let member = ResolvedAddress::new(
+            kind,
+            CURRENT,
+            Some(DocOwner::Conversation(child.id)),
+            Some(format!("member-{index}")),
+        )
+        .expect("child member address");
+        assert_eq!(
+            read_counter(&session, &member, &ctx).await,
+            Some(index),
+            "member-{index} is copied across the page boundary"
+        );
+    }
+
+    session.close().await.expect("close");
+}
+
+/// Upstream `session-forks.test.ts`: a fork rejected before admission leaves
+/// no effect.
+///
+/// A persisted `(latest, asOf)` record is a definition bug, but storage can
+/// hold it. Fork planning rejects it before any write; the conversation set and
+/// the source document stay untouched, and the Session remains usable.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pre_admission_fork_failure_leaves_no_effect() {
+    let storage = Arc::new(MemoryStorage::new());
+    let session = open(storage);
+    let ctx = Context::background();
+    let parent = parent_conversation(&session, &ctx).await;
+    let kind = "demo.fork.invalid-source";
+    let parent_doc = address(kind, CURRENT, parent.id);
+    let parent_id = parent.id;
+
+    let _: () = session
+        .commit(ctx.clone(), move |tx, state| {
+            Box::pin(async move {
+                let backend = state.storage.storage();
+                let id = DocumentId::from_raw(state.storage.write(backend.mint_id()).await?);
+                tx.push_write(StorageWrite::DocumentCreate {
+                    record: DocumentCreate {
+                        id,
+                        kind: kind.to_owned(),
+                        key: None,
+                        scope: DocumentScope::Conversation {
+                            conversation_id: parent_id,
+                        },
+                        history: Some(DocumentHistory::Latest),
+                        fork: Some(DocumentFork::AsOf),
+                    },
+                    content: DocumentContent::Base {
+                        version: 1,
+                        value: object(json!({ "counter": 7 })),
+                    },
+                });
+                Ok(().into_job_value())
+            })
+        })
+        .await
+        .expect("persist a latest-only asOf document");
+
+    let fork_at = session
+        .append_entry(parent.id, entry_draft("point"), ctx.clone())
+        .await
+        .expect("fork point")
+        .id;
+    let error = session
+        .create_conversation(
+            ConversationOwnership::Ownerless,
+            Some((parent.id, fork_at)),
+            ctx.clone(),
+        )
+        .await
+        .expect_err("a latest-only asOf source cannot be copied");
+    assert!(
+        error
+            .to_string()
+            .contains("latest-only history and cannot fork asOf"),
+        "unexpected error: {error}"
+    );
+    assert!(!session.is_failed(), "pre-admission rejection is not fatal");
+
+    let conversations = session
+        .scan_conversations(ConversationQuery::default(), 10, None, &ctx)
+        .await
+        .expect("scan conversations");
+    assert_eq!(
+        conversations.items.len(),
+        1,
+        "the rejected fork stored no conversation"
+    );
+    assert_eq!(
+        read_counter(&session, &parent_doc, &ctx).await,
+        Some(7),
+        "the fork source is untouched"
+    );
+
+    let other = session
+        .create_conversation(ConversationOwnership::Ownerless, None, ctx.clone())
+        .await
+        .expect("session remains usable");
+    assert_ne!(other.id, parent.id);
+
+    session.close().await.expect("close");
+}
+
+// ─── Ancestry and stored-version semantics ──────────────────────────────────
+
+/// Upstream "selects the entry-owning ancestor for as-of copies and the
+/// immediate parent for current copies".
+///
+/// A fork at an *inherited* entry must read `asOf` documents from the
+/// conversation that owns that entry (the grandparent), while `current`
+/// documents always come from the immediate parent's current state.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fork_reads_as_of_from_the_entry_owner_and_current_from_the_parent() {
+    const AS_OF_KIND: &str = "demo.fork.ancestry.as-of";
+    const CURRENT_KIND: &str = "demo.fork.ancestry.current";
+
+    let storage = Arc::new(MemoryStorage::new());
+    let session = open(storage.clone());
+    let ctx = Context::background();
+
+    let root = parent_conversation(&session, &ctx).await;
+    let root_as_of = address(AS_OF_KIND, AS_OF, root.id);
+    let root_current = address(CURRENT_KIND, CURRENT, root.id);
+    set_counter(&session, &root_as_of, AS_OF, 11, &ctx).await;
+    set_counter(&session, &root_current, CURRENT, 12, &ctx).await;
+    let inherited = session
+        .append_entry(root.id, entry_draft("inherited point"), ctx.clone())
+        .await
+        .expect("inherited entry");
+
+    let parent = session
+        .create_conversation(
+            ConversationOwnership::Ownerless,
+            Some((root.id, inherited.id)),
+            ctx.clone(),
+        )
+        .await
+        .expect("parent fork");
+    let parent_as_of = address(AS_OF_KIND, AS_OF, parent.id);
+    let parent_current = address(CURRENT_KIND, CURRENT, parent.id);
+    set_counter(&session, &parent_as_of, AS_OF, 21, &ctx).await;
+    set_counter(&session, &parent_current, CURRENT, 22, &ctx).await;
+    let own_entry = session
+        .append_entry(parent.id, entry_draft("parent point"), ctx.clone())
+        .await
+        .expect("parent entry");
+
+    // The fork point belongs to the root: `asOf` reads the root at that
+    // commit, `current` reads the parent's latest state.
+    let inherited_child = session
+        .create_conversation(
+            ConversationOwnership::Ownerless,
+            Some((parent.id, inherited.id)),
+            ctx.clone(),
+        )
+        .await
+        .expect("fork at inherited entry");
+    assert_eq!(
+        read_counter(
+            &session,
+            &address(AS_OF_KIND, AS_OF, inherited_child.id),
+            &ctx
+        )
+        .await,
+        Some(11),
+        "asOf copies the entry-owning ancestor (root), not the parent"
+    );
+    assert_eq!(
+        read_counter(
+            &session,
+            &address(CURRENT_KIND, CURRENT, inherited_child.id),
+            &ctx
+        )
+        .await,
+        Some(22),
+        "current copies the immediate parent"
+    );
+
+    // A fork at an entry the parent owns reads the parent for both policies.
+    let own_child = session
+        .create_conversation(
+            ConversationOwnership::Ownerless,
+            Some((parent.id, own_entry.id)),
+            ctx.clone(),
+        )
+        .await
+        .expect("fork at parent entry");
+    assert_eq!(
+        read_counter(&session, &address(AS_OF_KIND, AS_OF, own_child.id), &ctx).await,
+        Some(21),
+        "asOf copies the parent when it owns the entry"
+    );
+    assert_eq!(
+        read_counter(
+            &session,
+            &address(CURRENT_KIND, CURRENT, own_child.id),
+            &ctx
+        )
+        .await,
+        Some(22),
+        "current still copies the parent"
+    );
+
+    session.close().await.expect("close");
+}
+
+static FORK_MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
+
+fn migrate_fork_v3(from_version: i64, value: Value) -> Result<Value, DocumentError> {
+    assert_eq!(from_version, 1, "only version 1 is stored");
+    FORK_MIGRATIONS.fetch_add(1, Ordering::SeqCst);
+    let mut object = value.as_object().cloned().unwrap_or_default();
+    object.insert("migrated".to_owned(), json!(true));
+    Ok(Value::Object(object))
+}
+
+fn migration_definition(kind: &str) -> AnyDocDefinition {
+    CommonDocDefinition::new(kind, 3, AS_OF)
+        .expect("valid version-3 definition")
+        .behaviour(initial, Some(migrate_fork_v3), DocCheckpointWhen::never())
+}
+
+/// Upstream "copies the stored value and version without consulting migration
+/// definitions or migrated caches".
+///
+/// The fork copies the source's stored revision at its stored version: the
+/// definition is applied only when the child is later materialized.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fork_copies_the_stored_version_and_leaves_migration_to_the_definition() {
+    const KIND: &str = "demo.fork.stored-version";
+
+    let storage = Arc::new(MemoryStorage::new());
+    let session = open(storage.clone());
+    let ctx = Context::background();
+    let parent = parent_conversation(&session, &ctx).await;
+    let parent_doc = address(KIND, AS_OF, parent.id);
+    set_counter(&session, &parent_doc, AS_OF, 1, &ctx).await;
+    // Warm the session cache at the stored (version 1) value.
+    assert_eq!(read_counter(&session, &parent_doc, &ctx).await, Some(1));
+    let fork_entry = session
+        .append_entry(parent.id, entry_draft("point"), ctx.clone())
+        .await
+        .expect("fork point");
+
+    FORK_MIGRATIONS.store(0, Ordering::SeqCst);
+    let child = session
+        .create_conversation(
+            ConversationOwnership::Ownerless,
+            Some((parent.id, fork_entry.id)),
+            ctx.clone(),
+        )
+        .await
+        .expect("fork conversation");
+    assert_eq!(
+        FORK_MIGRATIONS.load(Ordering::SeqCst),
+        0,
+        "the fork itself never runs the definition migration"
+    );
+
+    let child_doc = address(KIND, AS_OF, child.id);
+    let record = storage
+        .find_document(storage_address(&child_doc), DocumentPoint::Current)
+        .await
+        .expect("find child document")
+        .expect("child incarnation");
+    let stored = storage
+        .document(record.id, DocumentPoint::Current)
+        .await
+        .expect("read child document")
+        .expect("stored revision");
+    assert_eq!(stored.version, 1, "the copy keeps the source version");
+    assert_eq!(stored.value.get("counter"), Some(&json!(1)));
+    assert!(
+        stored.value.get("migrated").is_none(),
+        "the copied value is the stored value, not a migrated one"
+    );
+
+    // Materializing through the version-3 definition migrates exactly once and
+    // commits a version-3 base.
+    let seen = session
+        .doc(
+            child_doc.clone(),
+            migration_definition(KIND),
+            ctx.clone(),
+            |value| value.clone(),
+        )
+        .await
+        .expect("migrate child document");
+    assert_eq!(
+        seen.get("migrated"),
+        Some(&json!(true)),
+        "the edit sees the migrated value"
+    );
+    assert_eq!(FORK_MIGRATIONS.load(Ordering::SeqCst), 1);
+    let after = session
+        .snapshot(&child_doc, &ctx)
+        .await
+        .expect("snapshot")
+        .expect("child document");
+    assert_eq!(after.get("counter"), Some(&json!(1)));
+    assert_eq!(after.get("migrated"), Some(&json!(true)));
+
+    session.close().await.expect("close");
+}
+
+/// Upstream "copies only conversation documents, leaving Session and task
+/// documents in their original scopes".
+#[tokio::test(flavor = "current_thread")]
+async fn a_fork_copies_only_conversation_documents() {
+    const COPIED_KIND: &str = "demo.fork.scope.conversation";
+    const SESSION_KIND: &str = "demo.fork.scope.session";
+    const TASK_KIND: &str = "demo.fork.scope.task";
+
+    let storage = Arc::new(MemoryStorage::new());
+    let session = open(storage.clone());
+    let ctx = Context::background();
+    let parent = parent_conversation(&session, &ctx).await;
+
+    let task_definition = TaskDefinition::define("demo.fork.scope.work", 1, vec!["run".to_owned()])
+        .expect("task definition");
+    let task_id = session
+        .create_task(
+            &task_definition,
+            json!({ "n": 1 }),
+            TaskOptions {
+                trace: None,
+                conversation_id: Some(parent.id),
+                ownership: TaskOwnership::Conversation,
+                background: false,
+                abandon_on_restart: false,
+                submission_ids: Vec::new(),
+            },
+            ctx.clone(),
+        )
+        .await
+        .expect("task");
+
+    let copied = address(COPIED_KIND, CURRENT, parent.id);
+    set_counter(&session, &copied, CURRENT, 5, &ctx).await;
+
+    let session_address =
+        ResolvedAddress::new(SESSION_KIND, DocumentSemantics::Session, None, None)
+            .expect("session address");
+    session
+        .doc(
+            session_address.clone(),
+            CommonDocDefinition::session(SESSION_KIND, 1)
+                .expect("session definition")
+                .behaviour(initial, None, DocCheckpointWhen::never()),
+            ctx.clone(),
+            |value| {
+                value.insert("counter".to_owned(), json!(7));
+            },
+        )
+        .await
+        .expect("session document");
+
+    let task_address = ResolvedAddress::new(
+        TASK_KIND,
+        DocumentSemantics::Task,
+        Some(DocOwner::Task(task_id)),
+        None,
+    )
+    .expect("task address");
+    session
+        .doc(
+            task_address.clone(),
+            CommonDocDefinition::task(TASK_KIND, 1)
+                .expect("task document definition")
+                .behaviour(initial, None, DocCheckpointWhen::never()),
+            ctx.clone(),
+            |value| {
+                value.insert("counter".to_owned(), json!(9));
+            },
+        )
+        .await
+        .expect("task document");
+
+    let fork_entry = session
+        .append_entry(parent.id, entry_draft("point"), ctx.clone())
+        .await
+        .expect("fork point");
+    let child = session
+        .create_conversation(
+            ConversationOwnership::Ownerless,
+            Some((parent.id, fork_entry.id)),
+            ctx.clone(),
+        )
+        .await
+        .expect("fork conversation");
+
+    assert_eq!(
+        read_counter(&session, &address(COPIED_KIND, CURRENT, child.id), &ctx).await,
+        Some(5),
+        "the conversation document was copied"
+    );
+    assert_eq!(
+        read_counter(&session, &session_address, &ctx).await,
+        Some(7),
+        "the session document stays in the session scope"
+    );
+    assert_eq!(
+        read_counter(&session, &task_address, &ctx).await,
+        Some(9),
+        "the task document stays in the task scope"
+    );
+
+    let children = storage
+        .scan_documents(
+            DocumentQuery {
+                scope: DocumentScope::Conversation {
+                    conversation_id: child.id,
+                },
+                at: DocumentPointQuery::from(DocumentPoint::Current),
+                kind: None,
+            },
+            100,
+            None,
+        )
+        .await
+        .expect("scan child documents");
+    let kinds: Vec<&str> = children
+        .items
+        .iter()
+        .map(|record| record.kind.as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![COPIED_KIND],
+        "only the conversation document reaches the child scope"
+    );
 
     session.close().await.expect("close");
 }

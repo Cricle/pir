@@ -208,6 +208,7 @@ fn build_session(
     }));
     let session = AgentSession::new_arc_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: fake_model(),
             api_key: None,
@@ -849,6 +850,7 @@ mod direct_bridge {
         }));
         let session = AgentSession::new_arc_with_plugins(
             AgentSessionConfig {
+                performance: Default::default(),
                 provider_registry: Arc::new(registry),
                 model: fake_model(),
                 api_key: None,

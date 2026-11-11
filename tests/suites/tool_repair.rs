@@ -1592,6 +1592,7 @@ fn repair_harness_with_model(
     let session = SessionManager::create(".", &dir.0).expect("create session");
     let transcript = session.path().to_path_buf();
     let config = AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::clone(&registry),
         model: model.clone(),
         api_key: None,

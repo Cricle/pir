@@ -62,8 +62,11 @@ _NEW = '  "enabled": true\n}'
 # echoed call line (`$ <command>`, format_tool_call_line) cannot contain the
 # contiguous string the expansion check looks for — the assertion can then only
 # be satisfied by real program OUTPUT.
+# Absolute interpreter path: a bare `python` resolves to the Windows Store
+# placeholder on this host (exit 49, no output); see PROTOCOL.md.
+_PYTHON = "C:/wp/empty/tools/python312/python.exe"
 _VERIFY = (
-    "python -c '"
+    _PYTHON + " -c '"
     "import json\n"
     'for i in range(1, 25): print("case %02d: fixture item check" % i)\n'
     'd = json.load(open("w13_broken.json"))\n'

@@ -1133,6 +1133,7 @@ fn capturing_session(
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(CapturingProvider { seen }));
     AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,
@@ -1291,6 +1292,7 @@ async fn settings_transport_reaches_the_session_codex_adapter() {
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(provider));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model,
         api_key: Some(fake_jwt("acct_123")),
@@ -1341,6 +1343,7 @@ async fn settings_websocket_timeout_reaches_the_session_codex_adapter() {
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(provider));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model,
         api_key: Some(fake_jwt("acct_123")),

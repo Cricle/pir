@@ -266,6 +266,7 @@ fn session_config(
     selection: Option<ToolSelection>,
 ) -> AgentSessionConfig {
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,

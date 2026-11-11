@@ -277,6 +277,7 @@ fn session_declared(
     storage: Option<SessionManager>,
 ) -> Vec<String> {
     let session = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,
@@ -307,6 +308,7 @@ fn session_callable(
     selection: Option<pir::coding_agent::ToolSelection>,
 ) -> Vec<String> {
     let session = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,

@@ -1349,6 +1349,7 @@ async fn agent_settled_payload_carries_aborted_flag() {
     }));
     let session = SessionManager::create(".", &temp).expect("create session");
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model("fake-model"),
         api_key: None,
@@ -1409,6 +1410,7 @@ async fn session_hooks_passthrough_finish_turn_and_prepare_request() {
         assistant(vec![text("hello")], StopReason::Stop)
     }));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model("fake-model"),
         api_key: None,
@@ -1480,6 +1482,7 @@ async fn entry_appended_fires_for_messages_appended_to_storage() {
     }));
     let session = SessionManager::create(".", &temp).expect("create session");
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model("fake-model"),
         api_key: None,

@@ -302,6 +302,7 @@ fn session_config(cwd: &Path) -> AgentSessionConfig {
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(IdleProvider));
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,
@@ -427,6 +428,7 @@ async fn running_abort_refuses_the_native_service_tool_call() {
     }));
     let session = AgentSession::new_arc_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: fake_model(),
             api_key: None,

@@ -229,7 +229,20 @@ pub(super) fn register_context_host_fns(
             json_depth::push_field(&mut out, &mut first, "sessionPath", &session.session_path);
             json_depth::push_field(&mut out, &mut first, "cwd", &session.cwd);
             json_depth::push_field(&mut out, &mut first, "header", &session.header);
-            json_depth::push_field(&mut out, &mut first, "branch", &session.branch);
+            // `branch` and `projection` arrive as PRE-RENDERED JSON text
+            // (`SessionContextSnapshot::branch_json`/`projection_json`): splice
+            // them raw. `serde_json::to_string(&String)` would quote the text
+            // and change the wire shape.
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push_str("\"branch\":");
+            if session.branch_json.is_empty() {
+                out.push_str("null");
+            } else {
+                out.push_str(&session.branch_json);
+            }
             // Seven fields precede the tree, so a separator is always due here.
             out.push(',');
             out.push_str("\"tree\":");
@@ -242,7 +255,16 @@ pub(super) fn register_context_host_fns(
             }
             json_depth::push_field(&mut out, &mut first, "leafId", &session.leaf_id);
             json_depth::push_field(&mut out, &mut first, "labels", &session.labels);
-            json_depth::push_field(&mut out, &mut first, "projection", &session.projection);
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push_str("\"projection\":");
+            if session.projection_json.is_empty() {
+                out.push_str("null");
+            } else {
+                out.push_str(&session.projection_json);
+            }
             // The live context-usage cells the same snapshot carries. The
             // envelope existed before these fields, so they are appended to
             // keep the historical field order stable for consumers that rely

@@ -448,8 +448,11 @@ pub struct Invocation {
     pub conversation_id: ConversationId,
     /// Run or abort.
     pub mode: InvocationMode,
-    /// First invocation of a task loaded by this process's open recovery.
-    pub resumed: bool,
+    /// First phase of the first invocation of a task loaded by this process's
+    /// open recovery. Consumed when that phase span starts so later phases in
+    /// the same invocation are not reported as resumed (upstream phase spans
+    /// carry `resumed` only for the recovered invocation's first phase).
+    pub resumed: AtomicBool,
     /// Signalled when the invocation ends; handler contexts inherit it.
     pub signal: Arc<AbortSignal>,
     /// The task's stored trace carrier at reservation: its first submission's
@@ -500,7 +503,7 @@ impl Invocation {
             extension,
             conversation_id: record.conversation_id,
             mode,
-            resumed,
+            resumed: AtomicBool::new(resumed),
             signal: Arc::new(AbortSignal::new()),
             trace: record.trace.clone(),
             links: if record.started_at.is_none() {
@@ -907,7 +910,12 @@ impl std::fmt::Debug for TaskSchedulerOptions {
 #[derive(Debug, Default)]
 pub struct Indexes {
     /// Committed non-terminal tasks.
-    pub live: BTreeMap<TaskId, TaskRecord>,
+    ///
+    /// Shared so a publication keeps one copy of the record (the payloads are
+    /// large), and readers that only inspect a record share it instead of
+    /// cloning it. The map is the sole owner of live records: if it holds the
+    /// last `Arc`, the record dies when the task leaves `live` / settles.
+    pub live: BTreeMap<TaskId, Arc<TaskRecord>>,
     /// Ownership fields of terminal tasks that are ancestors of live work, so
     /// walks pass through them. [`relist`] drops an entry once the task has no
     /// live descendant left; the map is therefore bounded by live owner chains,
@@ -961,14 +969,14 @@ pub struct Indexes {
 impl Indexes {
     /// A live task, if it is still live.
     #[must_use]
-    pub fn live(&self, id: TaskId) -> Option<&TaskRecord> {
+    pub fn live(&self, id: TaskId) -> Option<&Arc<TaskRecord>> {
         self.live.get(&id)
     }
 }
 
 // ─── Await registry ─────────────────────────────────────────────────────────
 
-type TaskWaiter = oneshot::Sender<Result<TaskRecord, StorageError>>;
+type TaskWaiter = oneshot::Sender<Result<Arc<TaskRecord>, StorageError>>;
 type IdleWaiter = oneshot::Sender<Result<(), StorageError>>;
 
 // ─── Shared scheduler ───────────────────────────────────────────────────────
@@ -1060,8 +1068,8 @@ impl SchedulerInner {
         f(&mut state)
     }
 
-    /// A clone of one live task record.
-    pub(super) fn live_record(&self, id: TaskId) -> Option<TaskRecord> {
+    /// A shared snapshot of one live task record.
+    pub(super) fn live_record(&self, id: TaskId) -> Option<Arc<TaskRecord>> {
         self.with_state(|state| state.live.get(&id).cloned())
     }
 
@@ -1268,7 +1276,7 @@ impl SchedulerInner {
         &self,
         state: &mut Indexes,
         previous: Option<&PriorRecord>,
-        record: &TaskRecord,
+        record: Arc<TaskRecord>,
     ) {
         let id = record.id;
         if let Some(previous) = previous {
@@ -1280,7 +1288,7 @@ impl SchedulerInner {
             if !state.closing && previous.is_some_and(|previous| !previous.terminal) {
                 self.telemetry.tasks_active(&record.kind, -1);
             }
-            let node = node_of(record);
+            let node = node_of(&record);
             state.live.remove(&id);
             state.sleeping.remove(&id);
             state.intent.remove(&id);
@@ -1298,17 +1306,17 @@ impl SchedulerInner {
             relist(state, Node::Task(id));
             return;
         }
-        state.live.insert(id, record.clone());
+        state.live.insert(id, Arc::clone(&record));
         if previous.is_none() {
             if !state.closing {
                 self.telemetry.tasks_active(&record.kind, 1);
             }
-            if !known(state, parent_node(node_of(record))) {
+            if !known(state, parent_node(node_of(&record))) {
                 state.unloaded.insert(id);
             }
             relist(state, Node::Task(id));
         }
-        if cancellation_intent(record) {
+        if cancellation_intent(&record) {
             state.intent.insert(id);
         } else {
             state.intent.remove(&id);
@@ -1354,7 +1362,7 @@ impl SchedulerInner {
         let mut changed = false;
         let mut reconcile = false;
         let mut signal: Vec<TaskId> = Vec::new();
-        let mut updated: Vec<TaskRecord> = Vec::new();
+        let mut updated: Vec<Arc<TaskRecord>> = Vec::new();
         {
             let mut state = self
                 .state
@@ -1365,19 +1373,24 @@ impl SchedulerInner {
                     continue;
                 };
                 changed = true;
+                // The publication already owns the record behind an `Arc`
+                // (`CommitPublication::build`); the live map, waiters and the
+                // new-record scan share that one copy instead of cloning the
+                // input/checkpoint payloads again here.
+                let record = Arc::clone(record);
                 // Derive every decision from a small snapshot: the previous
                 // record is gone from `live` after the insert and cloning it
                 // would copy its payloads on every commit.
-                let previous = state.live.get(&record.id).map(PriorRecord::of);
-                if failed_outcome(record) && previous.as_ref().is_none_or(|prev| !prev.failed) {
+                let previous = state.live.get(&record.id).map(|r| PriorRecord::of(r));
+                if failed_outcome(&record) && previous.as_ref().is_none_or(|prev| !prev.failed) {
                     failed.push(record.id);
                 }
-                self.track(&mut state, previous.as_ref(), record);
+                self.track(&mut state, previous.as_ref(), Arc::clone(&record));
                 if record.state.is_terminal() {
                     state.failed_migrations.remove(&record.id);
                     state.fail_fast_checks.remove(&record.id);
                     drop(state);
-                    self.resolve_task_waiters(record.id, Ok(record.clone()));
+                    self.resolve_task_waiters(record.id, Ok(record));
                     state = self
                         .state
                         .lock()
@@ -1399,7 +1412,7 @@ impl SchedulerInner {
                 if matches!(record.state, TaskState::Completing { .. })
                     && previous.as_ref().is_none_or(|prev| !prev.completing)
                 {
-                    if cancellation_intent(record) {
+                    if cancellation_intent(&record) {
                         state.cascade_pending = true;
                     }
                     reconcile = true;
@@ -1415,7 +1428,7 @@ impl SchedulerInner {
                     }
                 }
                 if previous.is_none() {
-                    updated.push(record.clone());
+                    updated.push(Arc::clone(&record));
                 }
             }
             for id in &failed {
@@ -1532,7 +1545,7 @@ impl SchedulerInner {
     }
 
     /// Resolve one task's terminal waiters.
-    fn resolve_task_waiters(&self, id: TaskId, result: Result<TaskRecord, StorageError>) {
+    fn resolve_task_waiters(&self, id: TaskId, result: Result<Arc<TaskRecord>, StorageError>) {
         let senders = self
             .task_waiters
             .lock()
@@ -2263,7 +2276,7 @@ impl TaskScheduler {
                 pending
                     .into_iter()
                     .map(|record| {
-                        let mut next = record.clone();
+                        let mut next = (*record).clone();
                         next.state = TaskState::Pending {
                             checkpoint: checkpoint_of(&record.state).clone(),
                         };
@@ -2334,7 +2347,10 @@ impl TaskScheduler {
     /// Checks and registers on the line so no terminal publication falls
     /// between them.
     pub async fn wait_for_task(&self, id: TaskId) -> Result<TaskRecord, StorageError> {
-        self.inner.wait_for_task(id).await
+        self.inner
+            .wait_for_task(id)
+            .await
+            .map(|record| (*record).clone())
     }
 
     /// Resolve when ordinary traversal from the conversation, or from every
@@ -2372,7 +2388,7 @@ impl TaskScheduler {
         let tasks = live
             .iter()
             .map(|record| TaskInspection {
-                record: record.clone(),
+                record: (**record).clone(),
                 state: reconcile::inspect_task(self.inner.as_ref(), record, &catalogue),
             })
             .collect();
@@ -2504,7 +2520,7 @@ impl SchedulerInner {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for record in records {
-                    inner.track(&mut indexes, None, &record);
+                    inner.track(&mut indexes, None, Arc::new(record.clone()));
                     indexes.resumed.insert(record.id);
                     // A viewer loads live tasks as committed: a `running` task
                     // stays running in the process that owns it. No restart is
@@ -2618,7 +2634,7 @@ impl SchedulerInner {
                         let node = indexes
                             .live
                             .get(&id)
-                            .map(node_of)
+                            .map(|record| node_of(record))
                             .or_else(|| indexes.settled.get(&id).copied());
                         let loaded = node.is_some() && !indexes.unloaded.contains(&id);
                         (node, loaded)
@@ -2871,7 +2887,7 @@ fn relist(state: &mut Indexes, start: Node) {
                 let node = state
                     .live
                     .get(&id)
-                    .map(node_of)
+                    .map(|record| node_of(record))
                     .or_else(|| state.settled.get(&id).copied());
                 let Some(node) = node else {
                     return;
@@ -2913,19 +2929,47 @@ fn relist(state: &mut Indexes, start: Node) {
     }
 }
 
+/// One overlay record: a transaction-staged record (borrowed) or a record the
+/// scheduler produced during this commit (shared, one allocation no matter how
+/// many walks read it).
+#[derive(Clone, Debug)]
+pub(super) enum OverlayRecord<'a> {
+    Borrowed(&'a TaskRecord),
+    Shared(Arc<TaskRecord>),
+}
+
+impl OverlayRecord<'_> {
+    pub(super) fn as_ref(&self) -> &TaskRecord {
+        match self {
+            Self::Borrowed(record) => record,
+            Self::Shared(record) => record,
+        }
+    }
+}
+
+impl<'a> From<&'a TaskRecord> for OverlayRecord<'a> {
+    fn from(record: &'a TaskRecord) -> Self {
+        Self::Borrowed(record)
+    }
+}
+
 /// The commit's candidate records, which override committed records in walks.
+///
+/// Staged records are borrowed from the transaction; only records the caller
+/// adds itself (a finalization result) are shared. This keeps a commit's
+/// 8 KiB input/checkpoint payloads out of every overlay build.
 #[derive(Clone, Debug, Default)]
-pub(super) struct Overlay {
-    pub tasks: HashMap<TaskId, TaskRecord>,
+pub(super) struct Overlay<'a> {
+    pub tasks: HashMap<TaskId, OverlayRecord<'a>>,
     pub edges: HashMap<ConversationId, Option<TaskId>>,
 }
 
-impl Overlay {
+impl<'a> Overlay<'a> {
     /// Build the overlay from a transaction's staged writes.
-    pub(super) fn of(tx: &Transaction) -> Self {
+    pub(super) fn of(tx: &'a Transaction) -> Self {
         let mut tasks = HashMap::new();
         for record in tx.staged_tasks() {
-            tasks.insert(record.id, record.clone());
+            tasks.insert(record.id, OverlayRecord::Borrowed(record));
         }
         let mut edges = HashMap::new();
         for write in tx.writes() {
@@ -2955,11 +2999,39 @@ pub struct WalkDownItem {
 pub(super) fn walk_down(
     state: &Indexes,
     start: Node,
-    overlay: Option<&Overlay>,
+    overlay: Option<&Overlay<'_>>,
     cross_background: bool,
     enter: Option<&dyn Fn(TaskId) -> bool>,
 ) -> Vec<WalkDownItem> {
     let mut out = Vec::new();
+    walk_down_visit(
+        state,
+        start,
+        overlay,
+        cross_background,
+        enter,
+        |id, node, live| {
+            out.push(WalkDownItem {
+                id,
+                node,
+                live: live.cloned(),
+            });
+            true
+        },
+    );
+    out
+}
+
+/// [`walk_down`] without materializing records: the visitor sees a borrowed
+/// record and returns `false` to stop the walk.
+fn walk_down_visit(
+    state: &Indexes,
+    start: Node,
+    overlay: Option<&Overlay<'_>>,
+    cross_background: bool,
+    enter: Option<&dyn Fn(TaskId) -> bool>,
+    mut visit: impl FnMut(TaskId, TaskNode, Option<&TaskRecord>) -> bool,
+) {
     let mut pending: Vec<Node> = vec![start];
     let mut seen: BTreeSet<Node> = BTreeSet::new();
     while let Some(at) = pending.pop() {
@@ -2969,7 +3041,7 @@ pub(super) fn walk_down(
                 if state.live.contains_key(id) || state.settled.contains_key(id) {
                     continue;
                 }
-                if parent_node(node_of(record)) == at {
+                if parent_node(node_of(record.as_ref())) == at {
                     children.insert(Node::Task(*id));
                 }
             }
@@ -2989,19 +3061,20 @@ pub(super) fn walk_down(
                     }
                 }
                 Node::Task(id) => {
-                    let record = overlay
+                    let record: Option<&TaskRecord> = overlay
                         .and_then(|overlay| overlay.tasks.get(&id))
-                        .cloned()
-                        .or_else(|| state.live.get(&id).cloned());
+                        .map(|record| record.as_ref())
+                        .or_else(|| state.live.get(&id).map(|record| record.as_ref()));
                     let node = record
-                        .as_ref()
                         .map(node_of)
                         .or_else(|| state.settled.get(&id).copied());
                     let Some(node) = node else {
                         continue;
                     };
                     let live = record.filter(|record| !record.state.is_terminal());
-                    out.push(WalkDownItem { id, node, live });
+                    if !visit(id, node, live) {
+                        return;
+                    }
                     let entered = cross_background || !node.background;
                     if entered && enter.is_none_or(|enter| enter(id)) && seen.insert(Node::Task(id))
                     {
@@ -3011,14 +3084,13 @@ pub(super) fn walk_down(
             }
         }
     }
-    out
 }
 
 /// The live ordinary owned work of `owner` (spec §5.5).
 pub(super) fn owned_live(
     state: &Indexes,
     owner: TaskId,
-    overlay: Option<&Overlay>,
+    overlay: Option<&Overlay<'_>>,
     first: bool,
     done: Option<&BTreeSet<TaskId>>,
 ) -> Vec<TaskId> {
@@ -3030,15 +3102,22 @@ pub(super) fn owned_live(
         .as_ref()
         .map(|closure| closure as &dyn Fn(TaskId) -> bool);
     let mut found = Vec::new();
-    for item in walk_down(state, Node::Task(owner), overlay, false, enter_ref) {
-        if item.live.is_none() || item.node.background {
-            continue;
-        }
-        found.push(item.id);
-        if first {
-            break;
-        }
-    }
+    walk_down_visit(
+        state,
+        Node::Task(owner),
+        overlay,
+        false,
+        enter_ref,
+        |id, node, live| {
+            if live.is_some() && !node.background {
+                found.push(id);
+                if first {
+                    return false;
+                }
+            }
+            true
+        },
+    );
     found
 }
 
@@ -3046,10 +3125,21 @@ pub(super) fn owned_live(
 pub(super) fn has_owned_live(
     state: &Indexes,
     owner: TaskId,
-    overlay: Option<&Overlay>,
+    overlay: Option<&Overlay<'_>>,
     done: Option<&BTreeSet<TaskId>>,
 ) -> bool {
     !owned_live(state, owner, overlay, true, done).is_empty()
+}
+
+/// The nearest live task above ended ordinary work, with the only state bit
+/// the callers need; returning the record itself would copy its payloads.
+pub(super) struct NearestLive {
+    /// The live task's id.
+    pub id: TaskId,
+    /// Whether it is held as `completing`.
+    pub completing: bool,
+    /// Whether it carries a durable abort mark.
+    pub abort_requested: bool,
 }
 
 /// The nearest live task above ended ordinary work (upstream
@@ -3058,8 +3148,8 @@ pub(super) fn has_owned_live(
 pub(super) fn nearest_live_above(
     state: &Indexes,
     node: TaskNode,
-    overlay: Option<&Overlay>,
-) -> Option<TaskRecord> {
+    overlay: Option<&Overlay<'_>>,
+) -> Option<NearestLive> {
     let mut current = node;
     while !current.background {
         let owner = match current.owner {
@@ -3077,13 +3167,19 @@ pub(super) fn nearest_live_above(
                     .flatten()?,
             },
         };
-        let record = overlay
+        let record: Option<&TaskRecord> = overlay
             .and_then(|overlay| overlay.tasks.get(&owner))
-            .cloned()
-            .or_else(|| state.live.get(&owner).cloned());
+            .map(|record| record.as_ref())
+            .or_else(|| state.live.get(&owner).map(|record| record.as_ref()));
         match record {
-            Some(record) if !record.state.is_terminal() => return Some(record),
-            Some(record) => current = node_of(&record),
+            Some(record) if !record.state.is_terminal() => {
+                return Some(NearestLive {
+                    id: record.id,
+                    completing: matches!(record.state, TaskState::Completing { .. }),
+                    abort_requested: record.abort_requested,
+                });
+            }
+            Some(record) => current = node_of(record),
             None => {
                 let above = state.settled.get(&owner).copied()?;
                 current = above;
@@ -3113,9 +3209,13 @@ pub(super) fn cancelling_owner(state: &Indexes, start: Up) -> Option<TaskId> {
                 let node = state
                     .live
                     .get(&id)
-                    .map(node_of)
+                    .map(|record| node_of(record))
                     .or_else(|| state.settled.get(&id).copied())?;
-                if state.live.get(&id).is_some_and(cancellation_intent) {
+                if state
+                    .live
+                    .get(&id)
+                    .is_some_and(|record| cancellation_intent(record))
+                {
                     return Some(id);
                 }
                 if node.background {
@@ -3154,7 +3254,7 @@ pub(super) fn in_scope(state: &Indexes, start: Up, scope: Option<ConversationId>
                 let node = state
                     .live
                     .get(&id)
-                    .map(node_of)
+                    .map(|record| node_of(record))
                     .or_else(|| state.settled.get(&id).copied())?;
                 if node.background {
                     return Some(false);
@@ -3170,7 +3270,7 @@ pub(super) fn in_scope(state: &Indexes, start: Up, scope: Option<ConversationId>
 /// `#release`).
 fn release(state: &mut Indexes, node: TaskNode) {
     if let Some(above) = nearest_live_above(state, node, None) {
-        if matches!(above.state, TaskState::Completing { .. }) {
+        if above.completing {
             state.finalize_checks.insert(above.id);
         } else if above.abort_requested {
             state.runnable.insert(above.id);

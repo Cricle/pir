@@ -209,8 +209,8 @@ fn projected_context_reestimate(
     // not carry, so this (cold) path materializes the projection. The guarded
     // estimator then drops the stale usage itself (upstream's branch-position
     // invalidation).
-    let projection = session.build_session_projection().ok()?;
-    let refs = compaction::ProjectionEntryMeta::cut_refs(metas, &projection.messages);
+    let messages = session.build_session_messages();
+    let refs = compaction::ProjectionEntryMeta::cut_refs(metas, &messages);
     Some(compaction::estimate_projected_context_tokens_with_tail(&refs, &[], path).tokens)
 }
 

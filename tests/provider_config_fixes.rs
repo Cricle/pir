@@ -40,6 +40,68 @@ fn set_env(key: &str, value: Option<&str>) {
     }
 }
 
+/// The three variables `ai::providers::settings::agent_dir()` consults, in
+/// precedence order.
+const AGENT_DIR_VARS: [&str; 3] = [
+    "PIR_AGENT_DIR",
+    "PIR_CODING_AGENT_DIR",
+    "PI_CODING_AGENT_DIR",
+];
+
+/// Serialized, fully explicit control of the agent-dir environment for ONE
+/// test.
+///
+/// Constructed under the module env lock, it CLEARS every agent-dir override
+/// and restores the previous values (absence included) on drop, panic
+/// included. A test that asserts a resolution therefore states the complete
+/// environment it depends on instead of inheriting one: a host (or CI) that
+/// exports `PIR_AGENT_DIR` can no longer redirect the load, and a sibling
+/// suite can no longer leave a pin behind for this test to observe.
+struct AgentDirEnv {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl AgentDirEnv {
+    fn clear() -> Self {
+        Self::scoped(&[])
+    }
+
+    /// Clear every agent-dir override, then apply `pins` (name/value pairs).
+    fn scoped(pins: &[(&'static str, &str)]) -> Self {
+        let lock = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved = AGENT_DIR_VARS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        for key in AGENT_DIR_VARS {
+            std::env::remove_var(key);
+        }
+        for (key, value) in pins {
+            debug_assert!(
+                AGENT_DIR_VARS.contains(key),
+                "{key} is not an agent-dir variable"
+            );
+            std::env::set_var(key, value);
+        }
+        Self { _lock: lock, saved }
+    }
+}
+
+impl Drop for AgentDirEnv {
+    fn drop(&mut self) {
+        // Reverse order so a variable restored twice unwinds to its original.
+        for (key, previous) in self.saved.drain(..).rev() {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "pir-provider-fixes-{tag}-{}-{}",
@@ -575,8 +637,6 @@ fn models_json_entries_default_to_text_only_input() {
 
 #[test]
 fn models_json_resolves_under_pir_coding_agent_dir() {
-    let _guard = env_lock().lock().unwrap();
-    let previous = std::env::var("PIR_CODING_AGENT_DIR").ok();
     let dir = temp_dir("agent-dir");
     std::fs::create_dir_all(&dir).expect("agent dir");
     std::fs::write(
@@ -594,15 +654,55 @@ fn models_json_resolves_under_pir_coding_agent_dir() {
     )
     .expect("write models.json");
 
-    set_env("PIR_CODING_AGENT_DIR", Some(dir.to_str().unwrap()));
-    let configured = load_pi_config_with(None)
-        .expect("load")
-        .expect("models.json resolved under PIR_CODING_AGENT_DIR");
-    set_env("PIR_CODING_AGENT_DIR", previous.as_deref());
+    // Case 1: PIR_CODING_AGENT_DIR alone (every other override cleared). This
+    // is the documented "second" variable, so it must resolve when nothing
+    // outranks it — regardless of what the host exports.
+    {
+        let _env = AgentDirEnv::scoped(&[("PIR_CODING_AGENT_DIR", dir.to_str().unwrap())]);
+        let configured = load_pi_config_with(None)
+            .expect("load")
+            .expect("models.json resolved under PIR_CODING_AGENT_DIR");
+        assert_eq!(configured.model.provider, "acme");
+        assert_eq!(configured.model.id, "acme-large");
+        assert_eq!(configured.api_key.as_deref(), Some("sk-acme"));
+    }
 
-    assert_eq!(configured.model.provider, "acme");
-    assert_eq!(configured.model.id, "acme-large");
-    assert_eq!(configured.api_key.as_deref(), Some("sk-acme"));
+    // Case 2: PIR_AGENT_DIR pointing at the SAME directory resolves too (the
+    // higher-precedence variable names the same file; nothing changes).
+    {
+        let _env = AgentDirEnv::scoped(&[("PIR_AGENT_DIR", dir.to_str().unwrap())]);
+        let configured = load_pi_config_with(None)
+            .expect("load")
+            .expect("models.json resolved under PIR_AGENT_DIR");
+        assert_eq!(configured.model.provider, "acme");
+        assert_eq!(configured.model.id, "acme-large");
+    }
+
+    // Precedence half (kept explicit, and now immune to host env): a pinned
+    // PIR_AGENT_DIR with no models.json wins over a PIR_CODING_AGENT_DIR that
+    // HAS one, so the load cannot see the lower directory's configured
+    // provider. This is exactly the behaviour that used to make this test fail
+    // under a host-exported PIR_AGENT_DIR; asserting it here turns the
+    // fragility into coverage.
+    let empty = temp_dir("agent-dir-empty");
+    std::fs::create_dir_all(&empty).expect("empty agent dir");
+    {
+        let _env = AgentDirEnv::scoped(&[
+            ("PIR_AGENT_DIR", empty.to_str().unwrap()),
+            ("PIR_CODING_AGENT_DIR", dir.to_str().unwrap()),
+        ]);
+        let configured = load_pi_config_with(None).expect("load");
+        assert_ne!(
+            configured.map(|configured| configured.model.provider),
+            Some("acme".to_string()),
+            "PIR_AGENT_DIR outranks PIR_CODING_AGENT_DIR: the empty higher dir \
+             hides the lower dir's models.json"
+        );
+    }
+
+    // After every guard drops, the environment is back to the host's shape
+    // (an exported PIR_AGENT_DIR, if any, is visible again).
+    let _ = std::fs::remove_dir_all(&empty);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

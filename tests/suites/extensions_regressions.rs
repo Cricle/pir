@@ -1337,6 +1337,7 @@ fn session_with_extensions(
 ) -> Arc<AgentSession> {
     Arc::new(AgentSession::new_with_agent_dir(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: session_model(),
             api_key: None,

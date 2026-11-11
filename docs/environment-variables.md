@@ -8,6 +8,7 @@
 | `PI_CODING_AGENT_SESSION_DIR` / `PIR_SESSION_DIR` | Session storage location, first non-empty wins (`--session-dir` and settings `sessionDir` participate) |
 | `PI_SESSION_FILE` / `PI_SESSION_ID` | Exported by the host into `bash` child environments and the shared shell pool; not read as configuration |
 | `PIR_SESSION_FILE` | Best-effort session-file hint for the crash logger (hosts set it when a session is open; unset or empty = no hint) |
+| `PIR_DISABLE_SESSION_MMAP` | Test/diagnostic escape hatch: any value forces the streaming session loader instead of the read-only `memmap2` map (the reference loader for before/after measurements) |
 
 ## Models & providers
 
@@ -33,7 +34,7 @@
 | `PIR_CODEMODE_TIMEOUT_MS` / `PIR_CODEMODE_MAX_OUTPUT_CHARS` / `PIR_CODEMODE_MAX_OUTPUT_ITEMS` | Codemode sandbox limits |
 | `PIR_CODEMODE_MEMORY_MB` | Codemode sandbox heap cap override (`0` = no cap; default 128) |
 | `PIR_TOOL_MAX_SOURCE_BYTES` | Whole-file source ceiling for `edit`, image decode and grep context reads (default 67108864 = 64 MiB; `read` streams and is not capped). A positive byte count overrides; `0`/malformed falls back rather than disabling the guard |
-| `PIR_READ_BEFORE_EDIT` | Gate for `edit`/`write` on an existing file: `off` (no check), `warn` (proceed with a warning), or `enforce` (refuse, default). Case-insensitive; `0`/`false`/`disabled` = `off`, `warning` = `warn`; unset/unrecognized = `enforce`. Requires a full read that is unchanged (mtime/size); new-file writes bypass the check; resolved once at session build |
+| `PIR_READ_BEFORE_EDIT` | Gate for `edit`/`write` on an existing file: `off` (no check), `warn` (proceed with a warning), `edit-warn` (edit may proceed with a warning for partial/stale reads; write stays strict), or `enforce` (refuse, default). Case-insensitive; `0`/`false`/`disabled` = `off`, `warning` = `warn`; unset/unrecognized = `enforce` in balanced, `edit-warn` in efficient. Requires a full read that is unchanged (mtime/size); new-file writes bypass the check; successful writes/edits refresh the ledger; resolved once at session build |
 | `PIR_NATIVE_FALLBACK=0` | Disable the `pir grep\|sed\|python` fallback to the system tool (`0`/`false`; unset or any other value keeps it enabled) |
 | `PIR_CONTEXT_MODE_ROUTING` / `PIR_CONTEXT_MODE_INDEX_RESULTS` | `context-mode` `tool_call` routing / `tool_result` auto-indexing. Both default on; disabled by `0`, `false`, `off` or `no` (unset or any other value keeps it on) |
 | `PI_EXT_MEMORY_MB` / `PI_EXT_STACK_MB` / `PI_EXT_GC_THRESHOLD_MB` / `PI_EXT_CALL_TIMEOUT_MS` / `PI_EXT_HOOK_TIMEOUT_MS` / `PI_EXT_BEFORE_AGENT_START_TIMEOUT_MS` | Extension runtime QuickJS limits and lifecycle budgets (override `extensionLimits`; see [extensions.md](extensions.md)) |
@@ -77,10 +78,10 @@ and never logged.
 |---|---|
 | `PIR_TRUST_PROJECT=1` / `PIR_NO_CONTEXT_FILES` | Pre-trust the project (skips the trust dialog) / skip AGENTS.md/CLAUDE.md discovery |
 | `PIR_DISABLE_TERMINAL_QUERY` / `PIR_TERMINAL_COLOR_SCHEME_NOTIFY` | Disable OSC terminal queries (program status / bg color) / write mode-2031 light/dark notification sequences (unset records the state but writes nothing; any set value, not parsed, writes them) |
-| `PIR_TUI_VT_INPUT=1` | Windows only: opt into `ENABLE_VIRTUAL_TERMINAL_INPUT`; unset or any other value leaves console mode untouched |
+| `PIR_TUI_VT_INPUT=0` / `=false` | Windows only: opt OUT of `ENABLE_VIRTUAL_TERMINAL_INPUT`. The default is ON (upstream `enableWindowsVTInput`; the TUI owns the console's VT byte stream so bracketed-paste markers survive ConPTY). Unset, `1` and every other value keep the default; the install is best-effort and a console that refuses the mode falls back to crossterm's `INPUT_RECORD` parser |
 | `PIR_TUI_TERMINAL_INPUT_BUDGET_MS` | Deferral backstop for raw `onTerminalInput` hooks, in ms (default 5000). Positive integer, values above 60000 capped; `0`, negative and non-numeric fall back to 5000. The inline 5 ms wait is clamped to this total |
 | `PIR_TUI_INPUT_TRACE` | Emit one `tui-input-trace` line per second to `<agent dir>/pir.log` (drained events, paste coalescing, processed keys/pastes, editor/layout/render counters). Off by default; any non-empty value other than `0` enables it |
-| `PI_PROGRAM_STATUS=1` / `PI_HARDWARE_CURSOR` / `PI_CLEAR_ON_SHRINK` / `PI_TELEMETRY` / `PIR_VERBOSE` | Force-enable OSC 7501 program status / hardware cursor rendering / clear the alt-screen on shrink / telemetry mode override / verbose logging |
+| `PI_PROGRAM_STATUS=1` / `PI_HARDWARE_CURSOR` / `PI_CLEAR_ON_SHRINK` / `PI_TELEMETRY` / `PIR_VERBOSE` | Force-enable OSC 7501 program status / hardware cursor rendering / the `clearOnShrink` main-screen repaint / telemetry mode override / verbose logging (the three settings also have `/settings` rows; `showHardwareCursor`, `terminal.showTerminalProgress` and `terminal.clearOnShrink` apply live, PIR-TUI-017/018) |
 | `PI_CLIPBOARD_OSC52=1` | After a local clipboard write, also send the text via OSC 52 (as over SSH). Use when a remote client reaches the TUI without SSH variables |
 | `PI_SHARE_VIEWER_URL` / `PI_RADIUS_GATEWAY` | `/share` gist viewer URL prefix (default `https://pi.dev/session/`) / Radius gateway override (default `https://radius.pi.dev`) |
 

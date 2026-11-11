@@ -1117,12 +1117,31 @@ impl PluginHost {
     /// `extensionFactories = [...builtInExtensions, ...]` wiring combined
     /// with path-ordered loading.
     pub fn build(js: Option<ExtensionHandle>, inline: Vec<Arc<dyn AgentPlugin>>) -> Self {
+        Self::build_with_agent_dir(js, inline, None)
+    }
+
+    /// [`PluginHost::build`] with an explicit agent directory.
+    ///
+    /// Session-scoped builtins (currently `memory`) resolve per-agent state
+    /// (settings, store fallback) from this directory instead of the process
+    /// global. `None` preserves the pre-D2 behavior for direct callers/tests.
+    pub fn build_with_agent_dir(
+        js: Option<ExtensionHandle>,
+        inline: Vec<Arc<dyn AgentPlugin>>,
+        agent_dir: Option<&std::path::Path>,
+    ) -> Self {
         let build_started = crate::config::timings::start_phase();
         let mut diagnostics: Vec<PluginDiagnostic> = Vec::new();
         let cwd = js
             .as_ref()
             .map(|handle| handle.config().cwd.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        #[cfg(feature = "memory")]
+        let memory_agent_dir = agent_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(crate::coding_agent::context::agent_dir);
+        #[cfg(not(feature = "memory"))]
+        let _ = agent_dir;
         // A plan-only handle (builtin-only extension plan) carries no QuickJS
         // runtime and no JS registrations. Do not insert the JS adapter or let
         // `js_handle()` expose it as a live runtime: native builtins still get
@@ -1184,6 +1203,25 @@ impl PluginHost {
                             {
                                 Arc::new(McpPlugin::with_cwd(
                                     &crate::coding_agent::context::agent_dir(),
+                                    &cwd,
+                                ))
+                            } else {
+                                plugin
+                            };
+                            // The `memory` builtin is session-scoped: its
+                            // default `session` store follows the transcript
+                            // directory, so the path-plan instance must see the
+                            // same cwd/agent-dir the session was built with.
+                            #[cfg(feature = "memory")]
+                            let plugin: Arc<dyn AgentPlugin> = if plugin
+                                .as_any()
+                                .and_then(|any| {
+                                    any.downcast_ref::<crate::plugins::builtin::MemoryPlugin>()
+                                })
+                                .is_some()
+                            {
+                                Arc::new(crate::plugins::builtin::MemoryPlugin::with_paths(
+                                    &memory_agent_dir,
                                     &cwd,
                                 ))
                             } else {
@@ -3341,6 +3379,32 @@ impl PluginHost {
     /// later plugins and the JS face still receive the snapshot.
     pub fn update_session_context(&self, snapshot: crate::extensions::SessionContextSnapshot) {
         let snapshot = Arc::new(snapshot);
+        self.store_and_notify_native(Arc::clone(&snapshot));
+        if let Some(js) = &self.js {
+            // Share the SAME snapshot `Arc` with the JS runtime: it keeps the
+            // value for the next prompt, and the native readers above already
+            // hold a reference, so there is nothing to deep-copy (the old
+            // `snapshot.as_ref().clone()` duplicated the whole session-entry
+            // JSON on every push).
+            js.update_session_context_shared(snapshot);
+        }
+    }
+
+    /// [`Self::update_session_context`] for a session with no JS event face:
+    /// store the snapshot and fan it out to the Rust plugin list, but never
+    /// forward it to the JS handle. A host can own a handle it must not feed
+    /// (the subagent child's shared-runtime fallback wraps the PARENT's
+    /// actor), so the caller that skipped `event_extensions()` because of
+    /// that fallback would otherwise leak the child's session state into the
+    /// parent's `ctx`.
+    pub fn update_session_context_native_only(
+        &self,
+        snapshot: crate::extensions::SessionContextSnapshot,
+    ) {
+        self.store_and_notify_native(Arc::new(snapshot));
+    }
+
+    fn store_and_notify_native(&self, snapshot: Arc<crate::extensions::SessionContextSnapshot>) {
         // Store before notifying: an `on_session_context` implementation may
         // read the service's snapshot and must observe this push.
         *self
@@ -3358,14 +3422,6 @@ impl PluginHost {
             let _ = run_isolated_sync(plugin, "on_session_context", || {
                 plugin.on_session_context(&snapshot)
             });
-        }
-        if let Some(js) = &self.js {
-            // Share the SAME snapshot `Arc` with the JS runtime: it keeps the
-            // value for the next prompt, and the native readers above already
-            // hold a reference, so there is nothing to deep-copy (the old
-            // `snapshot.as_ref().clone()` duplicated the whole session-entry
-            // JSON on every push).
-            js.update_session_context_shared(Arc::clone(&snapshot));
         }
     }
 

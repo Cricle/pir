@@ -53,6 +53,20 @@ impl AgentSession {
         self.current_model()
     }
 
+    /// Push the live session-context snapshot once, for hosts that attach an
+    /// existing transcript outside the prompt path (`--continue` startup,
+    /// `/resume`, `/import`).
+    ///
+    /// [`Self::push_session_context`] runs before every prompt and after every
+    /// run; the attach itself had no push, so native plugins that replay
+    /// persisted state from `entries` (the `todo` builtin) or bind the session
+    /// identity (the `memory` builtin) stayed empty until the first prompt.
+    /// The snapshot is the same one the pre-prompt path builds: `entries`,
+    /// `session_id`, `session_path`, `cwd` and the current model.
+    pub(crate) async fn push_session_context_on_attach(&self) -> bool {
+        self.push_session_context(&self.model()).await
+    }
+
     /// The requested thinking level (upstream `session.thinkingLevel`).
     pub fn thinking_level(&self) -> ThinkingLevel {
         self.current_thinking()
@@ -241,12 +255,24 @@ impl AgentSession {
     /// sessions, the in-memory history for ephemeral ones.
     pub async fn transcript(&self) -> Vec<Message> {
         match &self.session {
-            Some(session) => session
-                .lock()
-                .await
-                .build_session_projection()
-                .map(|projection| projection.messages)
-                .unwrap_or_default(),
+            Some(session) => {
+                let mut session = session.lock().await;
+                // A live-tail session is bounded only BETWEEN prompts, and a
+                // session opened tail-first (`SessionMode::Existing` of a
+                // >page-size file) holds a 1024-entry window until the first
+                // prompt widens it. Both are PAGED windows: a public
+                // whole-history read must widen them, or it silently returns
+                // the resident page (PIR-SDK-018 / PIR-SDK-025).
+                #[cfg(feature = "session")]
+                if session.is_paged() {
+                    let _ = session.widen_to_full();
+                }
+                // Messages-only projection: the public return type is an
+                // owned `Vec<Message>` (one copy is required), but the
+                // per-entry provenance metadata (`Arc` bump + Range per
+                // retained entry) of `build_session_projection` is not.
+                session.build_session_messages()
+            }
             None => history_owned(self.history_snapshot()),
         }
     }
@@ -263,7 +289,13 @@ impl AgentSession {
     pub async fn transcript_json(&self) -> Vec<JsonValue> {
         match &self.session {
             Some(session) => {
-                let manager = session.lock().await;
+                let mut manager = session.lock().await;
+                // Whole-history JSON read: widen both live-trimmed and
+                // tail-first paged managers (PIR-SDK-025).
+                #[cfg(feature = "session")]
+                if manager.is_paged() {
+                    let _ = manager.widen_to_full();
+                }
                 crate::session_manager::projection::build_session_context_json(
                     manager.resident_entries(),
                     manager.leaf_id(),
@@ -321,7 +353,13 @@ impl AgentSession {
         // the manager's `Arc<FileEntry>` handles (a refcount bump each), so
         // the session lock is released before anything is serialized.
         let metas = {
-            let manager = session.lock().await;
+            let mut manager = session.lock().await;
+            // Whole-history view: widen live-trimmed AND tail-first paged
+            // managers (PIR-SDK-025).
+            #[cfg(feature = "session")]
+            if manager.is_paged() {
+                let _ = manager.widen_to_full();
+            }
             manager.projection_entry_meta()
         };
         // Latest context edit per target, over the same retained entries the

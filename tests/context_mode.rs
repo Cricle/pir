@@ -745,3 +745,92 @@ async fn index_requires_exactly_one_of_content_and_path() {
     assert!(both.is_error);
     assert!(both.content.contains("exactly one"));
 }
+
+// ---------------------------------------------------------------------------
+// CJK search (unicode61 folds contiguous CJK runs into one FTS token, so
+// substring queries need the LIKE fallback)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cjk_substring_queries_match_through_the_like_fallback() {
+    let harness = Harness::new("cjk-fallback");
+    let indexed = harness
+        .run(
+            CTX_INDEX_TOOL_NAME,
+            json!({
+                "content": "# Rotation\n\nRefresh tokens rotate on every use. 令牌轮换会记录审计事件。\n\
+                            ## 内存\n\nmmap 文件页属于 page cache。\n\
+                            ## Deploy\n\nThe deploy pipeline promotes builds. 部署流水线分阶段发布。",
+                "source": "corpus/rotation.md",
+                "contentType": "markdown"
+            }),
+        )
+        .await;
+    assert!(!indexed.is_error, "{}", indexed.content);
+
+    // A query that is a strict substring of a longer CJK run: FTS alone
+    // returns nothing (`unicode61` tokens are the whole run), the LIKE
+    // fallback must still surface the section. One query per call: within a
+    // single call, chunk ids are deduplicated across queries by contract, so
+    // a second query hitting the same section would legitimately be empty.
+    for query in ["令牌", "轮换"] {
+        let search = harness
+            .run(
+                CTX_SEARCH_TOOL_NAME,
+                json!({ "queries": [query], "limit": 5 }),
+            )
+            .await;
+        assert!(!search.is_error, "{}", search.content);
+        let parsed = parse_json(&search);
+        let results = parsed["queries"][0]["results"]
+            .as_array()
+            .expect("results array");
+        assert!(
+            !results.is_empty(),
+            "CJK substring query `{query}` returned no results: {parsed}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|hit| hit["source"] == "corpus/rotation.md"),
+            "query `{query}` did not hit corpus/rotation.md: {parsed}"
+        );
+        assert!(
+            results.iter().any(|hit| hit["snippet"]
+                .as_str()
+                .is_some_and(|snippet| snippet.contains("令牌轮换"))),
+            "query `{query}` snippet misses the CJK run: {parsed}"
+        );
+    }
+
+    // A whole-run query keeps working through the normal FTS path.
+    let whole = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "queries": ["令牌轮换会记录审计事件"] }),
+        )
+        .await;
+    assert!(!whole.is_error, "{}", whole.content);
+    let whole = parse_json(&whole);
+    let hits = &whole["queries"][0]["results"];
+    assert!(
+        hits.as_array().is_some_and(|hits| !hits.is_empty()),
+        "whole-run CJK query must still match: {whole}"
+    );
+
+    // ASCII-only queries are unaffected by the fallback (FTS rank order kept).
+    let ascii = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "queries": ["deploy pipeline"] }),
+        )
+        .await;
+    assert!(!ascii.is_error, "{}", ascii.content);
+    let ascii = parse_json(&ascii);
+    assert!(
+        ascii["queries"][0]["results"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "ASCII query broke: {ascii}"
+    );
+}

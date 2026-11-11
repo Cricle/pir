@@ -297,6 +297,14 @@ pub use agent::{Agent, ModelRef, ToolInfo, UsageSnapshot, SDK_AGENT_TASK_STACK_B
 pub use builder::{AgentBuilder, ApiKind, Endpoint, SessionMode, SystemPromptFiles};
 pub use error::SdkError;
 pub use event::SdkEvent;
+// `#[doc(hidden)]` dedupe/sink seams asserted by
+// `tests/suites/sdk_event_units.rs`: the exactly-once tool-update delivery
+// under backpressure and the bounded retained-memory accounting.
+#[doc(hidden)]
+pub use event::{
+    deliver_loop_tool_update, push_tool_update_from_bridge, tool_update_fingerprint, SharedSink,
+    SinkState, ToolUpdateDedupe,
+};
 pub use event_bus::{create_event_bus, EventBus, EventBusSubscription};
 pub use outcome::AgentOutcome;
 pub use packages::DefaultPackageManager;

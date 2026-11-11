@@ -7,6 +7,8 @@ mod cbor;
 mod config_migrations;
 #[path = "suites/config_schemas.rs"]
 mod config_schemas;
+#[path = "suites/config_settings_units.rs"]
+mod config_settings_units;
 #[path = "suites/config_units.rs"]
 mod config_units;
 #[path = "suites/forbidden_files.rs"]

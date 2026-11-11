@@ -43,6 +43,20 @@ node scripts/perf/ab-ar/run_ab.mjs --task quality --runs 5
 node scripts/perf/ab-ar/run_ab.mjs --task quality --p3 --runs 3
 ```
 
+## 2.1 Performance profile A/B
+
+`pir` has an opt-in `efficient` profile (core-four tool loadout, bounded tool
+results, turn/token budgets). It is not the default; enable it explicitly:
+
+```powershell
+$env:PIR_PERF_PROFILE = "efficient"
+node scripts/perf/ab-ar/run_ab.mjs --task probe --runs 2
+```
+
+Or put `{"performance":{"profile":"efficient"}}` in the isolated
+`settings.json`. Keep `balanced` for the default regression run and never mix
+the two profiles in one summary.
+
 ## 3. Interpretation rules
 
 - Rank **only stall-free legs**. The shared gateway has intermittent 20–137 s

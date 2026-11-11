@@ -31,14 +31,21 @@
 #          leaves; `grep-find` is an INDEPENDENT leaf (it does not imply
 #          `tools` or any `tool-*`; the `tool-grep`/`tool-find` split is
 #          deferred).
-#   bin     14 binary rows: the CLI binary's manifest minimum is `cli`
+#   bin     18 binary rows: the CLI binary's manifest minimum is `cli`
 #          (Cargo.toml `required-features`); `cli,tool-read` (the partial
 #          leaf build), `cli,tools`, `cli,tools,image-tools` (the inline image
 #          attach path), `cli,grep-find` (the independent search leaf),
 #          `cli,sdk` (the embedding facade alongside the binary), `cli,mcp`,
-#          `cli,mcp-sd`, `cli,brush`, `cli,client`, `cli,env-daemon`,
+#          `cli,mcp-sd`, `cli,subagent`, `cli,tool-repair`, `cli,tool-search`,
+#          `cli,extensions` (the codemode builtin's cargo feature),
+#          `cli,brush`, `cli,client`, `cli,env-daemon`,
 #          `cli,provider-openai` (headless), `cli,tui,provider-openai`
 #          (tui-slim), and the default `full` build.
+#          `cli,mcp` is also one of the per-builtin slim rows: the other
+#          `cli,<builtin>` rows (subagent/tool-repair/tool-search/extensions)
+#          pin the same slim-profile promise as `cli,todo` in docs/FEATURES.md
+#          §6 (only the named builtin compiles in; the rest report the
+#          documented "not compiled into this build" error).
 #          The `cli` row is the real toolless binary; `cli` itself implies
 #          `print`, `rpc` and `export-html`, so every bin row compiles all
 #          three. `bin(cli)` is also the `env-daemon` off-arm;
@@ -70,7 +77,7 @@
 #          pulls sibling suites that need `tui`/`extensions`.
 #          `smoke(cli,tool-read)` pins the partial build: `read` is available
 #          while every other leaf reports its own missing feature.
-#   TOTAL  81 cargo invocations.
+#   TOTAL  85 cargo invocations.
 #
 # It runs in the cargo target dir the caller selects (`CARGO_TARGET_DIR`,
 # default `target-alt`); lanes run it in their own `target-lane-*` dir so an
@@ -165,6 +172,10 @@ BIN_CONFIGS=(
   "bin(cli,client)|--features cli,client"
   "bin(cli,mcp)|--features cli,mcp"
   "bin(cli,mcp-sd)|--features cli,mcp-sd"
+  "bin(cli,subagent)|--features cli,subagent"
+  "bin(cli,tool-repair)|--features cli,tool-repair"
+  "bin(cli,tool-search)|--features cli,tool-search"
+  "bin(cli,extensions)|--features cli,extensions"
   "bin(cli,brush)|--features cli,brush"
   "bin(cli,provider-openai)|--features cli,provider-openai"
   "bin(cli,tui,provider-openai)|--features cli,tui,provider-openai"
@@ -186,7 +197,7 @@ SMOKE_CONFIGS=(
 # before it spends any time compiling. The consumer count is asserted in the
 # consumer phase below (its glob is only known there).
 EXPECTED_LIB_ROWS=57
-EXPECTED_BIN_ROWS=14
+EXPECTED_BIN_ROWS=18
 EXPECTED_CONSUMER_ROWS=2
 EXPECTED_SMOKE_ROWS=8
 if [ "${#CONFIGS[@]}" -ne "$EXPECTED_LIB_ROWS" ] ||

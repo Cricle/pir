@@ -775,6 +775,11 @@ impl AgentTool for EditTool {
                 return Box::pin(async move { ToolResult::error(error) })
             }
         };
+        let read_ledger = ctx
+            .session_env
+            .as_ref()
+            .map(|env| std::sync::Arc::clone(&env.read_ledger));
+        let ledger_path = path.clone();
         let cwd = ctx.cwd.clone();
         let checkpoint_ctx = ctx.clone();
         let aborted = ctx.is_aborted();
@@ -868,10 +873,15 @@ impl AgentTool for EditTool {
                 )
                 .await
             {
-                Ok(true) => super::util::append_read_gate_warning(
-                    edit_success_result(&path, &edits, &transformed),
-                    gate_warning,
-                ),
+                Ok(true) => {
+                    if let Some(ledger) = read_ledger.as_ref() {
+                        ledger.record_edit(&cwd.join(&ledger_path));
+                    }
+                    super::util::append_read_gate_warning(
+                        edit_success_result(&path, &edits, &transformed),
+                        gate_warning,
+                    )
+                }
                 Ok(false) => ToolResult::error("Operation aborted"),
                 Err(e) => ToolResult::error(format!("Cannot write '{}': {}", path, e)),
             }

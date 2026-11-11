@@ -407,7 +407,9 @@ pub enum SdkEvent {
         details: Option<JsonValue>,
         /// The real result's `structuredContent` payload, verbatim.
         structured_content: Option<JsonValue>,
-        /// The handler-reported usage for this completion, if any.
+        /// The completion's usage: the `afterToolCall` hook's report for the
+        /// real result, superseded by a parseable `tool_result` handler report
+        /// (same precedence as a foreground tool-result message).
         usage: Option<crate::ai::types::Usage>,
     },
 
@@ -931,14 +933,142 @@ pub(crate) fn loop_outcome(result: &crate::agent::agent_loop::LoopResult) -> Loo
     }
 }
 
+/// Fingerprints of `ToolExecutionUpdate` events the authoritative loop
+/// projection already delivered during one streaming run.
+///
+/// The bridge plugin uses this to skip the SAME update when the plugin-host
+/// fan-out (fired alongside the loop seam for every loop/nested tool update)
+/// reaches it a second time; updates with no loop counterpart (plugin-service
+/// calls, bare tool-service execution) are not recorded and still flow
+/// through.
+///
+/// Entries expire after [`ToolUpdateDedupe::RETENTION`]. The bridge copy is
+/// dispatched by a fire-and-forget task bounded by the session's
+/// `EXT_DISPATCH_TIMEOUT` (10s); once that window has passed the bridge can
+/// no longer deliver the update, so the fingerprint is dead weight. Without
+/// expiry a long streaming run (a shell command emits a snapshot every
+/// ~100ms, each fingerprint containing the rolling output window) kept every
+/// fingerprint until stream detach — unbounded in run length. Expiry keeps
+/// the set proportional to updates within the dispatch window while
+/// preserving the exact-once guarantee.
+///
+/// `#[doc(hidden)] pub`: asserted directly by `tests/suites/sdk_event_units.rs`
+/// (the live-key accounting and the retention prune).
+#[doc(hidden)]
+pub struct ToolUpdateDedupe {
+    // R51/PROTOCOL v5: retain only a 128-bit digest per live update. The
+    // previous shape kept the whole fingerprint String (call id + the tool's
+    // rolling partial, tens of KiB per streaming snapshot) for 15 s.
+    #[doc(hidden)]
+    pub seen: std::collections::HashMap<u128, std::time::Instant>,
+    inserts_since_prune: usize,
+    retention: std::time::Duration,
+}
+
+impl Default for ToolUpdateDedupe {
+    fn default() -> Self {
+        Self {
+            seen: std::collections::HashMap::new(),
+            inserts_since_prune: 0,
+            retention: Self::RETENTION,
+        }
+    }
+}
+
+impl ToolUpdateDedupe {
+    /// Must stay strictly above the session's `EXT_DISPATCH_TIMEOUT` (10s,
+    /// `src/agent_session/tools.rs`): the bridge plugin only observes an
+    /// update from inside that bounded dispatch task.
+    const RETENTION: std::time::Duration = std::time::Duration::from_secs(15);
+    /// Prune amortization: a full retain pass every N inserts. Between passes
+    /// expired entries are harmless (they can only cause a false skip if the
+    /// exact same fingerprint is re-delivered, which requires a live bridge
+    /// copy — impossible past `RETENTION`).
+    #[doc(hidden)]
+    pub const PRUNE_EVERY: usize = 64;
+
+    /// Record one delivered update fingerprint (test seam: `pub` for
+    /// `tests/suites/sdk_event_units.rs`; the production callers live inside
+    /// this module).
+    #[doc(hidden)]
+    pub fn record(&mut self, fingerprint: String) {
+        let now = std::time::Instant::now();
+        self.inserts_since_prune += 1;
+        if self.inserts_since_prune >= Self::PRUNE_EVERY {
+            self.prune(now);
+        }
+        self.seen.insert(fingerprint_key(&fingerprint), now);
+    }
+
+    /// Whether `fingerprint` was already delivered in this run.
+    #[doc(hidden)]
+    pub fn contains(&self, fingerprint: &str) -> bool {
+        self.seen.contains_key(&fingerprint_key(fingerprint))
+    }
+
+    /// Drop every recorded fingerprint (stream detach).
+    #[doc(hidden)]
+    pub fn clear(&mut self) {
+        self.seen.clear();
+        self.inserts_since_prune = 0;
+    }
+
+    fn prune(&mut self, now: std::time::Instant) {
+        self.seen
+            .retain(|_, recorded| now.duration_since(*recorded) < self.retention);
+        self.inserts_since_prune = 0;
+    }
+
+    /// Test-only 20ms stand-in for the 15s production retention.
+    #[doc(hidden)]
+    pub fn with_retention(retention: std::time::Duration) -> Self {
+        Self {
+            retention,
+            ..Self::default()
+        }
+    }
+}
+
+/// 128-bit digest of one dedupe fingerprint. Two independently seeded
+/// `DefaultHasher` passes keep the collision probability negligible while
+/// retaining only 16 bytes per live update instead of the full call-id +
+/// rolling-partial String (PROTOCOL v5). The value is ephemeral: it is only
+/// compared against other fingerprints of the same short dispatch window.
+fn fingerprint_key(fingerprint: &str) -> u128 {
+    use std::hash::{Hash, Hasher};
+    let mut lower = std::collections::hash_map::DefaultHasher::new();
+    let mut upper = std::collections::hash_map::DefaultHasher::new();
+    upper.write_u8(0xa5);
+    fingerprint.hash(&mut lower);
+    fingerprint.hash(&mut upper);
+    ((upper.finish() as u128) << 64) | lower.finish() as u128
+}
+
+/// One streaming run's live sink state.
+///
+/// `#[doc(hidden)] pub`: constructed directly by
+/// `tests/suites/sdk_event_units.rs`.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct SinkState {
+    /// The run's event sender; `None` when no streaming run is attached.
+    #[doc(hidden)]
+    pub sender: Option<tokio::sync::mpsc::Sender<SdkEvent>>,
+    /// Loop-delivered `ToolExecutionUpdate` fingerprints for this run (see
+    /// [`ToolUpdateDedupe`]); cleared when a stream attaches/detaches.
+    #[doc(hidden)]
+    pub loop_tool_updates: ToolUpdateDedupe,
+}
+
 /// The live SDK event sink shared between the per-run event handler, the
-/// bridge plugin, and the stream consumer. `None` when no streaming run is in
+/// bridge plugin, and the stream consumer. Empty when no streaming run is in
 /// flight (plain [`crate::sdk::Agent::prompt`] leaves it empty).
 ///
 /// The channel is the ONE bounded async channel of the run (no intermediate
 /// sync stage and no forwarder thread), so loop events and bridge
 /// `tool_execution_update` payloads share a single ordered queue.
-pub(crate) type SharedSink = Arc<Mutex<Option<tokio::sync::mpsc::Sender<SdkEvent>>>>;
+#[doc(hidden)]
+pub type SharedSink = Arc<Mutex<SinkState>>;
 
 /// Push an event to the live sink, if a streaming run is attached.
 ///
@@ -976,32 +1106,170 @@ where
     let guard = sink
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(sender) = guard.as_ref() {
+    if let Some(sender) = guard.sender.as_ref() {
         if let Some(event) = project() {
             let _ = sender.try_send(event);
         }
     }
 }
 
+/// Canonical identity of one `ToolExecutionUpdate`: the call id plus the
+/// tool-defined partial with the scheduler's identity stamps removed, so the
+/// loop projection and the plugin-host bridge payload of the same update
+/// compare equal. `SdkEvent::ToolExecutionUpdate.partial` is documented as
+/// the tool-defined partial (`{content, details, isError}`), never the
+/// scheduler's `toolCallId`/`toolName`/`args` stamps.
+///
+/// `#[doc(hidden)] pub`: asserted directly by
+/// `tests/suites/sdk_event_units.rs`.
+#[doc(hidden)]
+pub fn tool_update_fingerprint(event: &SdkEvent) -> Option<String> {
+    let SdkEvent::ToolExecutionUpdate {
+        tool_call_id,
+        partial,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let mut partial = partial;
+    let needs_strip = partial.as_object().is_some_and(|object| {
+        ["toolCallId", "toolName", "parentToolCallId", "args"]
+            .iter()
+            .any(|key| object.contains_key(*key))
+    });
+    let stripped;
+    if needs_strip {
+        // Only the plugin-host bridge payload carries scheduler identity
+        // stamps; clone in that rare case instead of cloning every loop
+        // update's (potentially large) partial just to remove absent keys.
+        let mut value = partial.clone();
+        if let Some(object) = value.as_object_mut() {
+            object.remove("toolCallId");
+            object.remove("toolName");
+            object.remove("parentToolCallId");
+            object.remove("args");
+        }
+        stripped = value;
+        partial = &stripped;
+    }
+    Some(format!("{tool_call_id}\u{1f}{partial}"))
+}
+
+/// Record a `ToolExecutionUpdate` the loop projection is about to deliver as
+/// this run's authoritative copy. A later bridge push of the same update is
+/// then skipped. Called only while a prompt stream is attached.
+pub(crate) fn record_loop_tool_update(sink: &SharedSink, event: &SdkEvent) {
+    let Some(fingerprint) = tool_update_fingerprint(event) else {
+        return;
+    };
+    sink.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .loop_tool_updates
+        .record(fingerprint);
+}
+
+/// Deliver one loop-projected `ToolExecutionUpdate` and record its
+/// fingerprint ONLY when the event actually entered the run channel.
+///
+/// Recording a `try_send`-dropped update was a lost-update bug: the bridge
+/// copy of the SAME update arrives later through the plugin fan-out, sees the
+/// recorded fingerprint, and is suppressed — leaving zero copies under a full
+/// channel (exactly-once stress: 4268/4500 delivered). Under backpressure the
+/// bridge is the remaining delivery path, so a dropped loop copy must NOT be
+/// recorded. Send and record happen under the sink lock (the bridge takes the
+/// same lock), keeping the pair atomic: no bridge copy can observe the
+/// fingerprint before the send decision, and a successful send is never
+/// re-delivered by the bridge.
+///
+/// `#[doc(hidden)] pub`: asserted directly by
+/// `tests/suites/sdk_event_units.rs` (backpressure exactly-once).
+#[doc(hidden)]
+pub fn deliver_loop_tool_update(sink: &SharedSink, event: SdkEvent) -> bool {
+    let fingerprint = tool_update_fingerprint(&event);
+    let mut guard = sink
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.sender.is_none() {
+        return false;
+    }
+    let sent = {
+        let sender = guard
+            .sender
+            .as_ref()
+            .expect("sender checked non-empty above");
+        sender.try_send(event).is_ok()
+    };
+    if sent {
+        if let Some(fingerprint) = fingerprint {
+            guard.loop_tool_updates.record(fingerprint);
+        }
+    }
+    sent
+}
+
+/// Push a plugin-host `tool_execution_update` to the live sink unless the
+/// loop projection already delivered that exact update during this run.
+///
+/// The loop's `AgentEvent::ToolExecutionUpdate` (top-level AND nested calls)
+/// is authoritative: it carries the clean tool-defined partial and is pushed
+/// synchronously in source order. The plugin-host fan-out observes the same
+/// update as a plugin event; only updates with no loop counterpart
+/// (plugin-service `update`, tool-service execution) are forwarded here.
+///
+/// `#[doc(hidden)] pub`: asserted directly by
+/// `tests/suites/sdk_event_units.rs` (backpressure exactly-once).
+#[doc(hidden)]
+pub fn push_tool_update_from_bridge<F>(sink: &SharedSink, project: F)
+where
+    F: FnOnce() -> Option<SdkEvent>,
+{
+    let guard = sink
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.sender.is_none() {
+        return;
+    }
+    let Some(event) = project() else {
+        return;
+    };
+    if let Some(fingerprint) = tool_update_fingerprint(&event) {
+        if guard.loop_tool_updates.contains(&fingerprint) {
+            return;
+        }
+    }
+    if let Some(sender) = guard.sender.as_ref() {
+        let _ = sender.try_send(event);
+    }
+}
+
 /// Project a plugin-host `tool_execution_update` payload into an SDK event.
+///
+/// The host payload carries the scheduler-stamped snapshot as
+/// `partialResult`; the SDK event keeps the same shape the loop projection
+/// produces: identity fields on the event, the clean tool-defined partial in
+/// `partial`.
 pub(crate) fn tool_update_event(payload: &JsonValue) -> Option<SdkEvent> {
-    let partial = payload.get("partialResult")?.clone();
+    let raw = payload.get("partialResult")?;
+    let parts = crate::agent::tool_execution::tool_update_parts(raw);
     Some(SdkEvent::ToolExecutionUpdate {
         tool_call_id: payload
             .get("toolCallId")
             .and_then(JsonValue::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+            .map(str::to_owned)
+            .unwrap_or(parts.call_id),
         tool_name: payload
             .get("toolName")
             .and_then(JsonValue::as_str)
-            .map(str::to_owned),
+            .map(str::to_owned)
+            .or_else(|| (!parts.tool_name.is_empty()).then_some(parts.tool_name)),
         parent_call_id: payload
             .get("parentToolCallId")
             .and_then(JsonValue::as_str)
-            .map(str::to_owned),
-        args: payload.get("args").cloned().unwrap_or(JsonValue::Null),
-        partial,
+            .map(str::to_owned)
+            .or(parts.parent_call_id),
+        args: payload.get("args").cloned().unwrap_or(parts.args),
+        partial: parts.partial,
     })
 }
 
@@ -1039,7 +1307,7 @@ impl AgentPlugin for SdkBridgePlugin {
         // agent a deep-clone consumer of the tree; the borrow parse below
         // costs nothing for unrelated events.
         if event.name.as_ref() == "tool_execution_update" {
-            push_to_sink_lazy(&self.sink, || tool_update_event(event.payload));
+            push_tool_update_from_bridge(&self.sink, || tool_update_event(event.payload));
         }
         Box::pin(async { PluginEventOutcome::None })
     }

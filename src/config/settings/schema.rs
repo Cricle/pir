@@ -361,6 +361,104 @@ pub struct CodemodeSettings {
     pub sandbox_memory_mb: Option<u32>,
 }
 
+/// Where the `memory` builtin keeps its cm store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum MemoryStoreMode {
+    /// Same directory as the session transcript (`<session-dir>/cm`); when a
+    /// session has no file, the default session directory for the cwd.
+    #[default]
+    Session,
+    /// `<project-root>/cm` (team-shared, CLI-compatible).
+    Workspace,
+    /// `<agent-dir>/memory/<project-hash>/cm` (personal, outside the repo).
+    AgentDir,
+    /// The explicit `path` setting.
+    Path,
+}
+
+/// Write policy of the `memory` builtin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum MemoryWriteMode {
+    /// Normal writes through `remember`/`frame`/`absorb`/`finish`.
+    #[default]
+    Explicit,
+    /// Open the store read-only; every write action reports an error.
+    ReadOnly,
+}
+
+/// How `input` auto-recall decides whether (and how much) to inject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum MemoryAutoRecallPolicy {
+    /// Never inject (equivalent to `autoRecall: false`).
+    Off,
+    /// Always use the configured full budget/max-items.
+    Always,
+    /// Adaptive: questions and long prompts get the full brief; plain short
+    /// edit prompts get no injection, while continuation prompts get only the
+    /// active task frame (no memory records).
+    #[default]
+    Auto,
+}
+
+/// The `memory` builtin's settings (`memory` object in settings.json).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySettings {
+    /// Store location policy; default `session`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<MemoryStoreMode>,
+    /// Explicit cm file path used when `store = "path"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Append a budgeted `<memory-context>` block to each user prompt.
+    /// Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_recall: Option<bool>,
+    /// Auto-recall selection policy; default `auto`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_recall_policy: Option<MemoryAutoRecallPolicy>,
+    /// Minimum top BM25 score for automatic recall; when no frame exists.
+    /// Default 1.0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_recall_min_score: Option<f64>,
+    /// Prompts shorter than this many characters skip automatic recall in
+    /// `auto` mode. Default 40.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_recall_min_prompt_chars: Option<u32>,
+    /// Inject a stable frame brief into the system prompt once per session.
+    /// Default false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_brief: Option<bool>,
+    /// Token budget for automatic recall. Default 600.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_budget_tokens: Option<u32>,
+    /// Maximum number of memories in automatic recall. Default 3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_max_items: Option<u32>,
+    /// Write policy; default `explicit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write: Option<MemoryWriteMode>,
+    /// Checkpoint after a turn that wrote memory. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_on_settle: Option<bool>,
+    /// Reject `source` anchors outside the project root. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict_sources: Option<bool>,
+    /// Maximum cm file size before writes are rejected. Default 256 MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_store_bytes: Option<u64>,
+    /// Keep the disposable `cm.cache` next to the store. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_cache: Option<bool>,
+    /// Allow `wiki generate` / `wiki review` to spawn external agent commands.
+    /// Default false (the rest of the wiki surface is always available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_external_commands: Option<bool>,
+}
+
 /// QuickJS resource limits of the extension runtime (pir-only
 /// `extensionLimits`). Every field is optional; unset fields keep the engine
 /// defaults (16 MiB stack, 30 s call timeout, 30 min hook timeout, no heap
@@ -406,6 +504,147 @@ pub struct ToolsSettings {
     /// explicit per-call `timeout` always wins.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_timeout_ms: Option<u64>,
+    /// `tools.broadSearchGuard`: reject obvious whole-filesystem searches
+    /// (`find /`, recursive grep/rg over `/tmp`, ...) before spawning a shell.
+    /// Defaults to true; set false to restore the unrestricted historical
+    /// shell.
+    #[serde(rename = "broadSearchGuard", skip_serializing_if = "Option::is_none")]
+    pub broad_search_guard: Option<bool>,
+}
+
+/// Performance profile for the agent loop. `Balanced` is the historical
+/// behavior; `Efficient` opts into a smaller default tool loadout, bounded
+/// tool results, and turn/token budgets. It is never selected implicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PerformanceProfile {
+    #[default]
+    Balanced,
+    Efficient,
+}
+
+/// Prompt-cache mode for OpenAI-compatible providers. `Auto` only sends
+/// cache hints when the provider declares support; `Off` never sends them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptCacheMode {
+    #[default]
+    Auto,
+    Off,
+}
+
+/// Opt-in performance controls (pir-only `performance` object). Every field
+/// is optional; with no object, or with `profile: "balanced"`, the session
+/// uses the historical behavior byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformanceSettings {
+    /// `performance.profile`: `balanced` (default) or `efficient`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<PerformanceProfile>,
+    /// Maximum model-visible text bytes per tool result. `0`/unset keeps the
+    /// historical unlimited behavior on `balanced`; `efficient` defaults to
+    /// 32 KiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_max_bytes: Option<usize>,
+    /// Soft turn budget: inject a convergence nudge, never terminate. `0`
+    /// disables it; `efficient` defaults to 24.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soft_turn_budget: Option<usize>,
+    /// Hard turn budget. `0` keeps the host's existing cap; `efficient`
+    /// defaults to 48 for non-interactive runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hard_turn_budget: Option<usize>,
+    /// Per-run cumulative token budget. `0` disables it; `efficient` defaults
+    /// to 250k.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_total_tokens: Option<u64>,
+    /// Total project-context budget in bytes. `0`/unset keeps the existing
+    /// per-file behavior; `efficient` defaults to 64 KiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_files_max_bytes: Option<usize>,
+    /// `performance.promptCache`: `auto` (default) or `off`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<PromptCacheMode>,
+}
+
+impl PerformanceSettings {
+    /// Process-level profile override for hosts that do not carry a
+    /// `SettingsManager` (library/SDK/subagent paths). Settings-file values
+    /// still win when a host passes them explicitly.
+    pub fn from_env() -> Self {
+        Self::default().with_env_profile()
+    }
+
+    /// Apply the process-level profile override to an already parsed settings
+    /// object. File values win for every field except the profile, which the
+    /// explicit env switch is allowed to change.
+    pub fn with_env_profile(mut self) -> Self {
+        if let Ok(value) = std::env::var("PIR_PERF_PROFILE") {
+            self.profile = match value.trim().to_ascii_lowercase().as_str() {
+                "efficient" => Some(PerformanceProfile::Efficient),
+                "balanced" => Some(PerformanceProfile::Balanced),
+                _ => self.profile,
+            };
+        }
+        self
+    }
+
+    /// The selected profile (balanced when absent).
+    pub fn profile(&self) -> PerformanceProfile {
+        self.profile.unwrap_or_default()
+    }
+
+    /// Effective per-result text cap. `balanced` keeps unlimited unless the
+    /// user explicitly sets a positive value; `efficient` defaults to 32 KiB.
+    pub fn effective_tool_result_max_bytes(&self) -> usize {
+        match self.tool_result_max_bytes {
+            Some(value) => value,
+            None if self.profile() == PerformanceProfile::Efficient => 32 * 1024,
+            None => 0,
+        }
+    }
+
+    /// Effective soft turn budget (0 = disabled).
+    pub fn effective_soft_turn_budget(&self) -> usize {
+        match self.soft_turn_budget {
+            Some(value) => value,
+            None if self.profile() == PerformanceProfile::Efficient => 24,
+            None => 0,
+        }
+    }
+
+    /// Effective hard turn budget (0 = host default).
+    pub fn effective_hard_turn_budget(&self) -> usize {
+        match self.hard_turn_budget {
+            Some(value) => value,
+            None if self.profile() == PerformanceProfile::Efficient => 48,
+            None => 0,
+        }
+    }
+
+    /// Effective cumulative token budget (0 = disabled).
+    pub fn effective_max_total_tokens(&self) -> u64 {
+        match self.max_total_tokens {
+            Some(value) => value,
+            None if self.profile() == PerformanceProfile::Efficient => 250_000,
+            None => 0,
+        }
+    }
+
+    /// Effective project-context budget (0 = existing behavior).
+    pub fn effective_context_files_max_bytes(&self) -> usize {
+        match self.context_files_max_bytes {
+            Some(value) => value,
+            None if self.profile() == PerformanceProfile::Efficient => 64 * 1024,
+            None => 0,
+        }
+    }
+
+    /// Whether prompt-cache hints may be sent.
+    pub fn prompt_cache_enabled(&self) -> bool {
+        self.prompt_cache.unwrap_or_default() == PromptCacheMode::Auto
+    }
 }
 
 /// npm or git package source (upstream `PackageSource`): either a bare source

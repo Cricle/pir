@@ -2171,6 +2171,23 @@ fn compaction_summary_message(summary: &str) -> Message {
     )
 }
 
+/// [`rebuilt_context`]'s token estimate WITHOUT materializing the rebuilt
+/// message list (PROTOCOL v5 memory-copy rule).
+///
+/// A session-backed compaction only needs `estimatedTokensAfter`: the rebuilt
+/// context is not installed anywhere (the session re-reads its projection from
+/// the persisted compaction entry). Building it just to estimate cloned the
+/// whole retained tail (once more on top of the `CompactionResult`'s own copy)
+/// plus the system prompt. This walks the same summary + retained messages by
+/// reference, with exactly the estimate `estimate_context_tokens` produces.
+pub fn estimate_compacted_context_tokens(summary: &str, retained_tail: &[Message]) -> u64 {
+    let summary_message = compaction_summary_message(summary);
+    let mut messages: Vec<&Message> = Vec::with_capacity(1 + retained_tail.len());
+    messages.push(&summary_message);
+    messages.extend(retained_tail.iter());
+    algorithm::estimate_context_tokens_over(messages.as_slice(), false).tokens
+}
+
 /// Rebuild a context after a successful compaction: the framed summary user
 /// message followed by the kept messages.
 pub fn rebuilt_context(original: &Context, result: &CompactionResult) -> Context {

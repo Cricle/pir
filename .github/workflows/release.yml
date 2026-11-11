@@ -160,32 +160,42 @@ jobs:
         run: |
           cargo build --release --locked --bin pir --target x86_64-apple-darwin
           cargo build --release --locked --bin pir --target aarch64-apple-darwin
+          cargo build --release --locked -p pir-phone-server --bin pir-phone-server --target x86_64-apple-darwin
+          cargo build --release --locked -p pir-phone-server --bin pir-phone-server --target aarch64-apple-darwin
           lipo -create \
             target/x86_64-apple-darwin/release/pir \
             target/aarch64-apple-darwin/release/pir \
             -output pir
+          lipo -create \
+            target/x86_64-apple-darwin/release/pir-phone-server \
+            target/aarch64-apple-darwin/release/pir-phone-server \
+            -output pir-phone-server
 
       - name: Build
         if: matrix.name != 'macos-universal'
-        run: cargo build --release --locked --bin pir --target ${{ matrix.target }}
+        run: |
+          cargo build --release --locked --bin pir --target ${{ matrix.target }}
+          cargo build --release --locked -p pir-phone-server --bin pir-phone-server --target ${{ matrix.target }}
 
       - name: Package (Linux)
         if: matrix.name == 'linux-x86_64'
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/pir" dist/pir
+          cp "target/${{ matrix.target }}/release/pir-phone-server" dist/pir-phone-server
           cp README.md dist/
-          chmod +x dist/pir
-          tar -czf "pir-${TAG}-linux-x86_64-musl.tar.gz" -C dist pir README.md
+          chmod +x dist/pir dist/pir-phone-server
+          tar -czf "pir-${TAG}-linux-x86_64-musl.tar.gz" -C dist pir pir-phone-server README.md
 
       - name: Package (macOS universal)
         if: matrix.name == 'macos-universal'
         run: |
           mkdir -p dist
           cp pir dist/pir
+          cp pir-phone-server dist/pir-phone-server
           cp README.md dist/
-          chmod +x dist/pir
-          tar -czf "pir-${TAG}-macos-universal.tar.gz" -C dist pir README.md
+          chmod +x dist/pir dist/pir-phone-server
+          tar -czf "pir-${TAG}-macos-universal.tar.gz" -C dist pir pir-phone-server README.md
 
       - name: Package (Windows)
         if: matrix.name == 'windows-x86_64'
@@ -193,6 +203,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/pir.exe" dist/
+          Copy-Item "target/${{ matrix.target }}/release/pir-phone-server.exe" dist/
           Copy-Item README.md dist/
           Compress-Archive -Path dist/* -DestinationPath "pir-${env:TAG}-windows-x86_64.zip"
 
@@ -201,7 +212,9 @@ jobs:
       - name: Smoke test (Unix)
         if: matrix.name != 'windows-x86_64'
         shell: bash
-        run: ./dist/pir --version | grep -F "${TAG#v}"
+        run: |
+          ./dist/pir --version | grep -F "${TAG#v}"
+          ./dist/pir-phone-server --version | grep -F "${TAG#v}"
 
       - name: Smoke test (Windows)
         if: matrix.name == 'windows-x86_64'
@@ -210,6 +223,10 @@ jobs:
           $out = & ./dist/pir.exe --version
           if (-not ($out -match [regex]::Escape($env:TAG.TrimStart('v')))) {
             throw "unexpected --version output: $out"
+          }
+          $server = & ./dist/pir-phone-server.exe --version
+          if (-not ($server -match [regex]::Escape($env:TAG.TrimStart('v')))) {
+            throw "unexpected pir-phone-server --version output: $server"
           }
 
       - name: Upload package

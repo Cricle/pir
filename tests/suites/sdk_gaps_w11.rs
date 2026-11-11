@@ -22,7 +22,11 @@
 //!   `is_paged_session` / `paged_window` / `transcript_cursor` /
 //!   `older_transcript_messages` / `older_transcript_json` / `session_stats` /
 //!   `usage_totals` cover the full skipped prefix without widening the
-//!   session, and `transcript_json` stays the resident window;
+//!   session, while the PUBLIC whole-history reads (`transcript` /
+//!   `transcript_json`) widen the paged window on demand (PIR-SDK-025). A
+//!   prefix walk followed by a whole-history read therefore reports the
+//!   overlap twice; the test pins the exact dedup-by-entry-id invariant that
+//!   makes the union lossless;
 //! - `SdkEvent` payload shapes: `args` on tool start/update, `result` on tool
 //!   end, and the terminal `AgentOutcome` event (including its upstream
 //!   `agent_end.messages` slice).
@@ -32,7 +36,7 @@
 //! binary-wide agent-dir env lock (a module-local lock cannot exclude the other
 //! suites of the merged `g_agent` binary).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -63,7 +67,9 @@ use pir::sdk::{
     AgentBuilder, ProxyEndpoint, ProxyProvider, ProxyStreamOptions, SdkEvent, SessionMode,
     PROXY_CONNECTION_CLOSED_MESSAGE,
 };
-use pir::session_manager::SessionManager;
+use pir::session_manager::{
+    FileEntry, SessionManager, StoredMessage, DEFAULT_TAIL_PAGE_BYTES, DEFAULT_TAIL_PAGE_ENTRIES,
+};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1119,6 +1125,14 @@ impl Provider for InitPluginProvider {
 const LARGE_SESSION_TURNS: usize = 1_400;
 const LARGE_SESSION_TOKENS: u64 = 5;
 
+/// The resident tail window: one default page of 1 024 entries = 512 turns.
+const RESIDENT_TURNS: usize = DEFAULT_TAIL_PAGE_ENTRIES / 2;
+/// The skipped prefix: 1 400 − 512 = 888 turns (turns `0000`..`0887`).
+const SKIPPED_TURNS: usize = LARGE_SESSION_TURNS - RESIDENT_TURNS;
+/// A prefix walk plus a WIDENED whole-history read reports the overlap twice:
+/// 1 400 unique + 888 duplicated = 2 288.
+const PAGES_PLUS_WIDENED_TURNS: usize = LARGE_SESSION_TURNS + SKIPPED_TURNS;
+
 /// Build a persisted session whose entry count exceeds the tail page's entry
 /// cap (1024), so `open_session_tail_first` really pages it.
 fn build_large_session(dir: &Path) -> PathBuf {
@@ -1159,11 +1173,32 @@ async fn paged_accessors_cover_the_skipped_prefix() {
     let window = agent.paged_window().await.expect("paged window");
     assert!(window.file_bytes > window.page_start);
     assert!(window.parsed_entries > 0);
+    // The tail page is entry-capped (2 entries per turn), so the resident window
+    // is a fixed, derivable number of turns and the skipped prefix is the rest.
+    // (`PagedWindow::parsed_entries` counts the entries the page parsed, i.e.
+    // the resident tail window.)
+    let resident_turns = window.parsed_entries / 2;
+    assert_eq!(
+        resident_turns, RESIDENT_TURNS,
+        "the resident window is the default tail page ({RESIDENT_TURNS} turns)"
+    );
+    let prefix_users = LARGE_SESSION_TURNS - resident_turns;
+    assert_eq!(
+        prefix_users, SKIPPED_TURNS,
+        "the skipped prefix is {SKIPPED_TURNS} turns"
+    );
+    let expected: Vec<String> = (0..LARGE_SESSION_TURNS)
+        .map(|index| format!("turn {index:04}"))
+        .collect();
+    let expected_prefix: Vec<String> = expected[..prefix_users].to_vec();
+    let expected_resident: Vec<String> = expected[prefix_users..].to_vec();
 
     // Walk the skipped prefix through the public cursor API, newest page
     // first, collecting every older user message in chronological order. The
     // first page uses the default-cap convenience accessor (`next_older_page`)
-    // and the rest the explicit-cap entry, so both are exercised.
+    // and the rest the explicit-cap entry, so both are exercised. The walk
+    // runs BEFORE any whole-history read: those widen the session
+    // (PIR-SDK-025), which retires the prefix cursor.
     let mut cursor = agent.transcript_cursor().await.expect("prefix cursor");
     let mut older_users: Vec<String> = Vec::new();
     let mut pages = 0usize;
@@ -1188,29 +1223,19 @@ async fn paged_accessors_cover_the_skipped_prefix() {
         assert!(pages <= LARGE_SESSION_TURNS, "paging did not converge");
     }
     assert!(pages > 1, "the fixture must span several pages");
-
-    // Resident transcript + streamed prefix == the full session, in order.
-    let resident = agent.transcript().await;
-    let mut all_users = older_users;
-    all_users.extend(user_texts(&resident));
-    let expected: Vec<String> = (0..LARGE_SESSION_TURNS)
-        .map(|index| format!("turn {index:04}"))
-        .collect();
     assert_eq!(
-        all_users, expected,
-        "paged pages plus the resident window must cover every message once"
+        older_users, expected_prefix,
+        "the prefix walk reports exactly the skipped turns, in order"
+    );
+    assert!(
+        agent.is_paged_session().await,
+        "the prefix walk must not widen the session"
     );
 
-    // The JSON companion walks the same prefix: `transcript_json` alone only
-    // reports the resident window, so a JSON consumer needs
-    // `older_transcript_json` to reach the rest.
-    let resident_json = agent.transcript_json().await;
-    let resident_json_users = json_user_texts(&resident_json);
-    assert!(
-        resident_json_users.len() < LARGE_SESSION_TURNS,
-        "transcript_json must stay the resident window ({} users)",
-        resident_json_users.len()
-    );
+    // The JSON companion walks the same prefix. `older_transcript_json`
+    // projects the page's messages exactly like `older_transcript_messages`,
+    // so the two walks must agree turn for turn (a strictly stronger
+    // assertion than the old "both cover the prefix" shape).
     let mut cursor = agent.transcript_cursor().await.expect("prefix cursor");
     let mut older_json_users: Vec<String> = Vec::new();
     let mut json_pages = 0usize;
@@ -1231,11 +1256,222 @@ async fn paged_accessors_cover_the_skipped_prefix() {
         assert!(json_pages <= LARGE_SESSION_TURNS, "paging did not converge");
     }
     assert!(json_pages > 1, "the JSON fixture must span several pages");
+    assert_eq!(
+        older_json_users, expected_prefix,
+        "the JSON prefix walk reports exactly the skipped turns, in order"
+    );
+
+    // Entry-level dedup invariant: pair the page entries with their SESSION
+    // ENTRY IDs through the manager (the page API the cursor walks is built
+    // on), then widen the same manager and take the union of user-entry ids.
+    // Dedup by id must yield exactly one entry per turn — the union is
+    // lossless even though the message lists overlap.
+    let mut manager =
+        SessionManager::open_paged(&path, DEFAULT_TAIL_PAGE_BYTES, DEFAULT_TAIL_PAGE_ENTRIES)
+            .expect("manager-level paged open");
+    assert!(manager.is_paged(), "the manager opened tail-first");
+    let mut page_user_ids: Vec<String> = Vec::new();
+    let mut manager_cursor = manager.prefix_cursor().expect("manager prefix cursor");
+    loop {
+        let Some(page) = manager
+            .read_older_page(manager_cursor, 256 * 1024, 64)
+            .expect("manager older page")
+        else {
+            break;
+        };
+        let mut ids: Vec<String> = page
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry.as_ref() {
+                FileEntry::Message(message)
+                    if matches!(
+                        &message.message,
+                        StoredMessage::User(user)
+                            if user.role == pir::ai::types::UserRole::User
+                    ) =>
+                {
+                    Some(message.id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        ids.extend(page_user_ids);
+        page_user_ids = ids;
+        manager_cursor = page.page_start();
+        assert!(
+            page_user_ids.len() <= LARGE_SESSION_TURNS,
+            "manager paging did not converge"
+        );
+    }
+    assert_eq!(
+        page_user_ids.len(),
+        prefix_users,
+        "the skipped prefix holds one user entry per skipped turn"
+    );
+    let page_ids_set: BTreeSet<&str> = page_user_ids.iter().map(String::as_str).collect();
+    assert_eq!(
+        page_ids_set.len(),
+        prefix_users,
+        "the page entries are distinct"
+    );
+
+    manager.widen_to_full().expect("widen the manager");
+    assert!(
+        !manager.is_paged(),
+        "widen_to_full makes the session resident"
+    );
+    let mut resident_user_ids: Vec<String> = manager
+        .resident_entries()
+        .iter()
+        .filter_map(|entry| match entry.as_ref() {
+            FileEntry::Message(message)
+                if matches!(
+                    &message.message,
+                    StoredMessage::User(user) if user.role == pir::ai::types::UserRole::User
+                ) =>
+            {
+                Some(message.id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        resident_user_ids.len(),
+        expected.len(),
+        "the widened manager holds one user entry per turn"
+    );
+    let mut union_ids = page_user_ids;
+    union_ids.extend(resident_user_ids.drain(..));
+    let deduped_ids: BTreeSet<&str> = union_ids.iter().map(String::as_str).collect();
+    assert_eq!(
+        union_ids.len(),
+        PAGES_PLUS_WIDENED_TURNS,
+        "pages plus the widened manager report the overlap twice"
+    );
+    assert_eq!(
+        deduped_ids.len(),
+        LARGE_SESSION_TURNS,
+        "dedup by entry id yields exactly one entry per turn"
+    );
+    assert_eq!(
+        union_ids.len() - deduped_ids.len(),
+        SKIPPED_TURNS,
+        "every duplicate is a skipped-prefix entry, seen once per source"
+    );
+
+    // Whole-history reads WIDEN a paged session (PIR-SDK-025: the public
+    // read must return the whole transcript instead of silently the resident
+    // page). So the "pages + resident" union now reports the overlap twice:
+    // every skipped turn once from the pages and once from the widened
+    // transcript.
+    let resident = agent.transcript().await;
+    let resident_users = user_texts(&resident);
+    assert_eq!(
+        resident_users, expected,
+        "transcript() widens the paged session to the whole history"
+    );
+    assert_eq!(
+        &resident_users[..prefix_users],
+        expected_prefix.as_slice(),
+        "the widened head is exactly the turns the prefix walk reported"
+    );
+    assert_eq!(
+        &resident_users[prefix_users..],
+        expected_resident.as_slice(),
+        "the widened tail is the previous resident window, unchanged"
+    );
+    assert!(
+        !agent.is_paged_session().await,
+        "the read widened the agent"
+    );
+    assert!(
+        agent.transcript_cursor().await.is_none(),
+        "a widened session has no prefix cursor left"
+    );
+
+    let mut all_users = older_users;
+    all_users.extend(resident_users);
+    assert_eq!(
+        all_users.len(),
+        PAGES_PLUS_WIDENED_TURNS,
+        "pages plus the widened transcript count the overlap twice \
+         ({LARGE_SESSION_TURNS} unique + {SKIPPED_TURNS} duplicated)"
+    );
+    let mut occurrences: BTreeMap<&str, usize> = BTreeMap::new();
+    for text in &all_users {
+        *occurrences.entry(text.as_str()).or_default() += 1;
+    }
+    assert!(
+        occurrences.values().all(|count| *count <= 2),
+        "a turn can appear at most once per source: {occurrences:?}"
+    );
+    let duplicate_set: BTreeSet<String> = occurrences
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(text, _)| (*text).to_owned())
+        .collect();
+    assert_eq!(
+        duplicate_set.len(),
+        SKIPPED_TURNS,
+        "the duplicate set is exactly the skipped prefix"
+    );
+    assert_eq!(
+        duplicate_set,
+        expected_prefix
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<String>>(),
+        "the duplicated turns are exactly turns 0000..{SKIPPED_TURNS:04}"
+    );
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let deduped: Vec<String> = all_users
+        .iter()
+        .filter(|text| seen.insert((*text).clone()))
+        .cloned()
+        .collect();
+    assert_eq!(
+        deduped, expected,
+        "order-preserving dedup of pages plus the widened transcript is the \
+         full turn list once"
+    );
+    assert_eq!(
+        all_users.len() - deduped.len(),
+        SKIPPED_TURNS,
+        "exactly {SKIPPED_TURNS} occurrences are duplicates"
+    );
+
+    // The JSON whole-history read widens too (and by then the session is
+    // already resident): the prefix walk plus `transcript_json` shows the same
+    // 2288-entry / 1400-unique / 888-duplicate shape.
+    let resident_json = agent.transcript_json().await;
+    let resident_json_users = json_user_texts(&resident_json);
+    assert_eq!(
+        resident_json_users, expected,
+        "transcript_json() reports the whole history after the widen"
+    );
     let mut all_json_users = older_json_users;
     all_json_users.extend(resident_json_users);
     assert_eq!(
-        all_json_users, expected,
-        "JSON pages plus transcript_json must cover every message once"
+        all_json_users.len(),
+        PAGES_PLUS_WIDENED_TURNS,
+        "JSON pages plus transcript_json count the overlap twice"
+    );
+    let json_unique: BTreeSet<&str> = all_json_users.iter().map(String::as_str).collect();
+    assert_eq!(
+        json_unique.len(),
+        LARGE_SESSION_TURNS,
+        "the JSON union has exactly one entry per turn"
+    );
+    let mut json_seen: BTreeSet<&str> = BTreeSet::new();
+    let json_deduped: Vec<&str> = all_json_users
+        .iter()
+        .map(String::as_str)
+        .filter(|text| json_seen.insert(*text))
+        .collect();
+    assert_eq!(
+        json_deduped,
+        expected.iter().map(String::as_str).collect::<Vec<_>>(),
+        "order-preserving JSON dedup is the full turn list once"
     );
 
     // Usage totals include the skipped prefix (turns and tokens), exactly the
@@ -1247,7 +1483,7 @@ async fn paged_accessors_cover_the_skipped_prefix() {
         LARGE_SESSION_TURNS as u64 * LARGE_SESSION_TOKENS
     );
 
-    // Session stats stream the prefix too.
+    // Session stats report the whole session, widened or not.
     let stats = agent.session_stats().await;
     assert_eq!(stats.total_messages, LARGE_SESSION_TURNS * 2);
     assert_eq!(stats.user_messages, LARGE_SESSION_TURNS);

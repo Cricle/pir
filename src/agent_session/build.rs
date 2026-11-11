@@ -153,7 +153,7 @@ impl AgentSession {
         inline_plugins: Vec<Arc<dyn crate::plugins::AgentPlugin>>,
         agent_dir: Option<PathBuf>,
     ) -> (Self, Option<plugin_services::LiveSessionServices>) {
-        Self::build_with_live_services_and_host(config, inline_plugins, None, agent_dir)
+        Self::build_with_live_services_and_host(config, inline_plugins, None, agent_dir, true)
     }
 
     /// Build the unified plugin host for a session configuration: enabled Rust
@@ -214,7 +214,11 @@ impl AgentSession {
                 }
             }
         }
-        let host = Arc::new(PluginHost::build(extensions.cloned(), inline_plugins));
+        let host = Arc::new(PluginHost::build_with_agent_dir(
+            extensions.cloned(),
+            inline_plugins,
+            agent_dir,
+        ));
         for diagnostic in &host.registry().diagnostics().to_vec() {
             report_plugin_diagnostic(diagnostic);
         }
@@ -293,6 +297,7 @@ impl AgentSession {
         inline_plugins: Vec<Arc<dyn crate::plugins::AgentPlugin>>,
         prepared_host: Option<Arc<PluginHost>>,
         agent_dir: Option<PathBuf>,
+        discover_prompt_skills: bool,
     ) -> (Self, Option<plugin_services::LiveSessionServices>) {
         let has_inline_plugins = !inline_plugins.is_empty();
         // D1: the session's agent-directory identity is resolved EXACTLY ONCE,
@@ -335,7 +340,14 @@ impl AgentSession {
         };
         let perf_trace = std::env::var_os("PIR_PERF_TRACE").is_some();
         let perf_t0 = std::time::Instant::now();
-        let session = Self::build(config, plugins, has_inline_plugins, agent_dir, settings);
+        let session = Self::build(
+            config,
+            plugins,
+            has_inline_plugins,
+            agent_dir,
+            settings,
+            discover_prompt_skills,
+        );
         if perf_trace {
             eprintln!("[perf]   session-build {:?}", perf_t0.elapsed());
         }
@@ -355,6 +367,7 @@ impl AgentSession {
         has_inline_plugins: bool,
         agent_dir: PathBuf,
         settings: Option<SettingsManager>,
+        discover_prompt_skills: bool,
     ) -> Self {
         let perf_trace = std::env::var_os("PIR_PERF_TRACE").is_some();
         let perf_t0 = std::time::Instant::now();
@@ -365,6 +378,7 @@ impl AgentSession {
         // Take the caller's prompt instead of cloning it: an explicit prompt is
         // the whole rendered system prompt and can be large, and the config is
         // owned here. The derived-prompt decision is captured before the move.
+        let performance = config.performance.clone();
         let explicit_system_prompt = config.system_prompt.take();
         let context_derived_prompt = explicit_system_prompt.is_none();
         let (session_id, session_path) = match &config.session {
@@ -533,26 +547,42 @@ impl AgentSession {
                     )
                 }
             };
-            let (prompt, inputs) = crate::coding_agent::context::
-                session_system_prompt_with_hidden_and_options_and_inputs_and_mcp(
-                    &cwd,
-                    &prompt_tools,
-                    &hidden_tools,
-                    &crate::coding_agent::context::ContextOptions {
-                        disabled: !crate::coding_agent::context::context_files_enabled(),
-                        agent_dir: &agent_dir,
-                        package_dir: package_dir.as_deref(),
-                    },
-                    // Upstream renders the `mcp_servers` section on every
-                    // `before_agent_start` (extensions/mcp/index.ts:1176-1184);
-                    // pir caches it with the other discovered inputs so a
-                    // steady turn does no MCP IO. A status transition lands on
-                    // the next build/reload (`sync_context_prompt` /
-                    // `/reload`), never mid-prompt.
-                    crate::coding_agent::context::mcp_servers_prompt_section(
-                        plugins.as_deref(),
-                    ),
-                );
+            // PIR-SDK-004: hermetic builder paths must not run ambient skill
+            // discovery (and must not even read `~/.agents`/`~/.pi`/project
+            // skill roots); CLI hosts keep the historic discovery path.
+            let context_options = crate::coding_agent::context::ContextOptions {
+                disabled: !crate::coding_agent::context::context_files_enabled(),
+                agent_dir: &agent_dir,
+                package_dir: package_dir.as_deref(),
+                max_total_bytes: config.performance.effective_context_files_max_bytes(),
+            };
+            // Upstream renders the `mcp_servers` section on every
+            // `before_agent_start` (extensions/mcp/index.ts:1176-1184);
+            // pir caches it with the other discovered inputs so a
+            // steady turn does no MCP IO. A status transition lands on
+            // the next build/reload (`sync_context_prompt` /
+            // `/reload`), never mid-prompt.
+            let mcp_servers =
+                crate::coding_agent::context::mcp_servers_prompt_section(plugins.as_deref());
+            let (prompt, inputs) = if discover_prompt_skills {
+                crate::coding_agent::context::
+                    session_system_prompt_with_hidden_and_options_and_inputs_and_mcp(
+                        &cwd,
+                        &prompt_tools,
+                        &hidden_tools,
+                        &context_options,
+                        mcp_servers,
+                    )
+            } else {
+                crate::coding_agent::context::
+                    session_system_prompt_with_hidden_and_options_and_inputs_and_mcp_hermetic(
+                        &cwd,
+                        &prompt_tools,
+                        &hidden_tools,
+                        &context_options,
+                        mcp_servers,
+                    )
+            };
             // P7/U4: the SESSION hosts always send the base prompt (preamble,
             // `<tools>`/`<rules>`, `<cwd>`) — upstream `buildSystemPrompt`
             // (system-prompt.ts:60-199) has no "nothing to inject" arm, but the
@@ -675,16 +705,18 @@ impl AgentSession {
         // Read-before-edit mode is process configuration, resolved ONCE here:
         // neither the ledger nor the tools' gate may observe a mid-session
         // environment change. Every turn shares this Arc.
-        let read_ledger = Arc::new(crate::agent::read_ledger::ReadLedger::from_env());
+        let read_ledger = Arc::new(
+            crate::agent::read_ledger::ReadLedger::from_env_with_profile(performance.profile()),
+        );
         if perf_trace {
             eprintln!("[perf]     build-p3 {:?}", perf_t0.elapsed());
         }
         let session = Self {
             registry: config.provider_registry,
-            model: RwLock::new(config.model),
+            model: Arc::new(RwLock::new(config.model)),
             extension_api_keys: Mutex::new(HashMap::new()),
             api_key,
-            thinking: RwLock::new(config.thinking),
+            thinking: Arc::new(RwLock::new(config.thinking)),
             tools: Arc::new(tools),
             tool_selection,
             active_tools_override: Arc::new(std::sync::RwLock::new(None)),
@@ -702,8 +734,15 @@ impl AgentSession {
             // construction-time copy here was a full transcript clone that no
             // reader of a store-backed session ever touched.
             history: Arc::new(RwLock::new(Arc::new(Vec::new()))),
-            compaction: Arc::new(RwLock::new(config.compaction)),
+            compaction: Arc::new(RwLock::new(config.compaction.map(|mut compaction| {
+                if performance.profile() == PerformanceProfile::Efficient {
+                    compaction.reserve_tokens = compaction.reserve_tokens.min(8_192);
+                    compaction.keep_recent_tokens = compaction.keep_recent_tokens.min(12_000);
+                }
+                compaction
+            }))),
             max_turns: config.max_turns,
+            performance,
             cwd,
             system_prompt: std::sync::RwLock::new(system_prompt),
             prompt_context: std::sync::RwLock::new(prompt_context),
@@ -937,6 +976,7 @@ impl AgentSession {
                     disabled: !crate::coding_agent::context::context_files_enabled(),
                     agent_dir: &self.agent_dir,
                     package_dir: self.package_dir.as_deref(),
+                    max_total_bytes: self.performance.effective_context_files_max_bytes(),
                 },
             );
         }
@@ -1900,8 +1940,38 @@ impl AgentSession {
         host: Option<Arc<PluginHost>>,
         agent_dir: Option<PathBuf>,
     ) -> Arc<Self> {
-        let (session, services) =
-            Self::build_with_live_services_and_host(config, inline_plugins, host, agent_dir);
+        Self::new_arc_with_plugins_and_host_in_and_prompt_discovery(
+            config,
+            inline_plugins,
+            host,
+            agent_dir,
+            true,
+        )
+    }
+
+    /// [`Self::new_arc_with_plugins_and_host_in`] with an explicit
+    /// prompt-skill discovery decision for the DERIVED system prompt.
+    ///
+    /// PIR-SDK-004: the SDK builder passes `false` for environment-free
+    /// `endpoint` / `with_registry` / `proxy` agents without an explicit
+    /// `resource_loader` or `.discover_system_prompt(true)`, so no ambient
+    /// `~/.agents` / `~/.pi` / project skill is read (docs/sdk.md). CLI hosts
+    /// keep the historic `true` default. Explicit prompt resources installed
+    /// through `set_prompt_resources*` are unaffected.
+    pub(crate) fn new_arc_with_plugins_and_host_in_and_prompt_discovery(
+        config: AgentSessionConfig,
+        inline_plugins: Vec<Arc<dyn crate::plugins::AgentPlugin>>,
+        host: Option<Arc<PluginHost>>,
+        agent_dir: Option<PathBuf>,
+        discover_prompt_skills: bool,
+    ) -> Arc<Self> {
+        let (session, services) = Self::build_with_live_services_and_host(
+            config,
+            inline_plugins,
+            host,
+            agent_dir,
+            discover_prompt_skills,
+        );
         let session = Arc::new(session);
         // A `&self` operation must be able to reach the `Arc` to re-key the
         // native host registry after a storage swap.
@@ -1934,6 +2004,14 @@ impl AgentSession {
     #[cfg(feature = "phone")]
     pub(crate) fn phone_plugin(&self) -> Option<&crate::plugins::builtin::phone::PhonePlugin> {
         phone_plugin_from_host(self.plugins.as_deref()?)
+    }
+
+    /// Live parent "needs input" flag from the phone bridge's pending-dialog
+    /// tracker. False without a phone bridge or while no dialog is waiting.
+    #[cfg(feature = "phone")]
+    fn phone_has_pending_ui_request(&self, session_id: &str) -> bool {
+        self.phone_plugin()
+            .is_some_and(|phone| phone.has_pending_ui_request(session_id))
     }
 
     /// Whether this session's plugin host contains the phone builtin (the
@@ -2099,6 +2177,7 @@ impl AgentSession {
         let session_name = self.session_name().await;
         let pending = self.phone_pending_messages().await;
         let session_file = self.session_path().map(|path| path.display().to_string());
+        let has_pending_ui_request = self.phone_has_pending_ui_request("parent-session");
         serde_json::json!({
             "cwd": self.cwd.display().to_string(),
             "sessionId": self.session_id(),
@@ -2113,6 +2192,7 @@ impl AgentSession {
             "isCompacting": self.is_compacting(),
             "pendingMessageCount": self.pending_message_count(),
             "pendingMessages": pending,
+            "hasPendingUiRequest": has_pending_ui_request,
             "sessionCount": 1,
             "childRunning": false,
             "lastError": "",
@@ -2202,23 +2282,41 @@ impl AgentSession {
         let model = self.current_model();
         let session_name = self.session_name().await;
         let label = session_name.unwrap_or_else(|| "Current CLI session".to_owned());
+        let has_pending_ui_request = self.phone_has_pending_ui_request("parent-session");
+        let mut sessions = vec![serde_json::json!({
+            "id": "parent-session",
+            "label": label,
+            "kind": "parent",
+            "sessionId": self.session_id(),
+            "cwd": self.cwd.display().to_string(),
+            "lastActivityAt": phone_now_ms(),
+            "isStreaming": self.is_streaming(),
+            "hasPendingUiRequest": has_pending_ui_request,
+            "model": {
+                "id": model.id,
+                "name": model.name,
+                "provider": model.provider,
+            },
+        })];
+        if let Some(pool) = self.phone_plugin().and_then(|phone| phone.pool()) {
+            for summary in pool.list() {
+                sessions.push(serde_json::json!({
+                    "id": summary.id,
+                    "label": summary.label,
+                    "kind": summary.kind,
+                    "sessionId": summary.session_id,
+                    "cwd": summary.cwd,
+                    "lastActivityAt": summary.last_activity_at,
+                    "isStreaming": summary.is_streaming,
+                    "hasPendingUiRequest": summary.has_pending_ui_request,
+                    "messageCount": summary.message_count,
+                    "model": summary.model,
+                }));
+            }
+        }
         serde_json::json!({
             "activeSessionId": "parent-session",
-            "sessions": [{
-                "id": "parent-session",
-                "label": label,
-                "kind": "parent",
-                "sessionId": self.session_id(),
-                "cwd": self.cwd.display().to_string(),
-                "lastActivityAt": phone_now_ms(),
-                "isStreaming": self.is_streaming(),
-                "hasPendingUiRequest": false,
-                "model": {
-                    "id": model.id,
-                    "name": model.name,
-                    "provider": model.provider,
-                },
-            }],
+            "sessions": sessions,
         })
     }
 

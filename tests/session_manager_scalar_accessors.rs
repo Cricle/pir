@@ -153,11 +153,11 @@ fn full_snapshot() -> SessionContextSnapshot {
         project_trusted: true,
         cwd: Some("C:/repo".into()),
         header: json!({ "type": "session", "id": "sess-1", "cwd": "C:/repo" }),
-        branch: json!([]),
+        branch_json: "[]".into(),
         tree_json: "[]".into(),
         leaf_id: Some("entry-2".into()),
         labels: json!({ "entry-1": "checkpoint" }),
-        projection: json!({ "entries": [], "messages": [] }),
+        projection_json: json!({ "entries": [], "messages": [] }).to_string(),
     }
 }
 

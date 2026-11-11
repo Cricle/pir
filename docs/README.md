@@ -23,5 +23,12 @@ diagnostics; upstream-relative pages with no counterpart are in [MAPPING.md](../
 | [FEATURES.md](FEATURES.md) | Feature graph, profiles, off-error contract |
 | [upstream-drift-status.md](upstream-drift-status.md) | Verified upstream drift: 184 commits since the recorded baseline, 62 after v1.4.0, with per-commit Landed/Partial/Open/N-A evidence |
 | [todo-builtin.md](todo-builtin.md) | `todo` builtin: contract, `/todos`, persistence |
-| [cm-rs-integration-plan.md](cm-rs-integration-plan.md) | cm-rs memory engine integration research: blockers, API refactor, plugin design, phased plan (not implemented) |
+| [memory-builtin.md](memory-builtin.md) | `memory` builtin: embedded cm-memory, `memory` tool actions, auto-recall, store/settings |
+| [memory-builtin-ab-2026-11-09.md](memory-builtin-ab-2026-11-09.md) | `builtin:memory` real-agent A/B: control/treatment totals, policy and multi-session results |
+| [memory-builtin-review-2026-11-09.md](memory-builtin-review-2026-11-09.md) | Three-agent cross-review of `builtin:memory`: findings and fixes |
+| [memory-builtin-ab-2026-11-10.md](memory-builtin-ab-2026-11-10.md) | Post-0.3.1 A/B validation: Q&A tokens, routing gate, and cache-accounting caveats |
+| [memory-builtin-test-report-2026-11-09.md](memory-builtin-test-report-2026-11-09.md) | Post-integration build/test/wiki/A-B metrics for the published cm-memory 0.3.1 |
+| [phone-server.md](phone-server.md) | Central multi-user pi-phone relay: accounts/devices/session metadata, `/agent` + `/ws`, CLI and deployment |
+| [phone-server-performance.md](phone-server-performance.md) | Repeatable release-profile load test: 10k catalog, fan-out, reconnect, RSS and CPU |
+| [cm-rs-integration-plan.md](cm-rs-integration-plan.md) | cm-rs memory engine integration research (historical; implemented as `builtin:memory` in 0.3) |
 | [system-prompt-audit.md](system-prompt-audit.md) | System prompt audit vs upstream: aligned sections, deviations, missing host wiring, fix priorities (not implemented) |

@@ -5,9 +5,11 @@
 # ([lib] name below) and the executable is still `pir` ([[bin]] name), so
 # `use pir::...` and `cargo install pir-sdk` (binary: `pir`) are both correct.
 name = "pir-sdk"
-# Single source of truth for the crate/binary version. pir uses its own semver;
-# .migration-info records the upstream pi mapping (0.0.2 = pi 1.4.0).
-version = "0.0.2"
+# Single source of truth for the crate/binary version is `[workspace.package]`
+# at the bottom of this file; every workspace member inherits it via
+# `version.workspace = true`. pir uses its own semver; `.migration-info`
+# records the upstream pi mapping.
+version.workspace = true
 edition = "2021"
 rust-version = "1.97"
 # Integration-test auto-discovery is disabled on purpose: every tests/*.rs
@@ -108,8 +110,9 @@ name = "pir"
 path = "src/lib.rs"
 
 # Examples. Each declares the MINIMAL feature set its own documented command
-# uses: `sdk` for every example, plus `session` for `sessions` (the only one
-# that writes/attaches transcript files), `subagent` for `builtin`,
+# uses: `sdk` for every example, plus `session` for the examples that
+# write/attach transcript files (`sessions`, `session_lifecycle`,
+# `session_compaction`), `tools` for `mini_coding`, `subagent` for `builtin`,
 # `extensions` for `extension`, and the common `sdk,session,skills` set for
 # `real_endpoint` (it needs a wire adapter only at runtime — build with the
 # `provider-*` feature for the protocol you target). Declaring the requirement
@@ -124,19 +127,64 @@ path = "examples/builtin.rs"
 required-features = ["sdk", "subagent"]
 
 [[example]]
+name = "builtins_matrix"
+path = "examples/builtins_matrix.rs"
+required-features = ["sdk", "session", "tools", "todo", "memory", "tool-search", "tool-repair", "subagent"]
+
+[[example]]
 name = "control"
 path = "examples/control.rs"
 required-features = ["sdk"]
+
+# The two durable examples use only the core `pir::durable` surface (durable is
+# not a cargo feature), so they build in every shape, including bare
+# `--no-default-features`. Declared explicitly so the aggregate `--examples`
+# sweep cannot silently drop them once `autoexamples` changes.
+[[example]]
+name = "dev_durable_reports"
+path = "examples/dev_durable_reports.rs"
+required-features = []
+
+[[example]]
+name = "dev_durable_timers"
+path = "examples/dev_durable_timers.rs"
+required-features = []
 
 [[example]]
 name = "extension"
 path = "examples/extension.rs"
 required-features = ["sdk", "extensions"]
 
+# PIR-SDK-018 live-tail soak: a real persisted session with
+# `live_session_tail`, so it needs `session` for the measurement to be
+# meaningful (without it every session mode is the documented in-memory stub).
+[[example]]
+name = "live_tail_soak"
+path = "examples/live_tail_soak.rs"
+required-features = ["sdk", "session"]
+
+[[example]]
+name = "mini_coding"
+path = "examples/mini_coding.rs"
+required-features = ["sdk", "tools"]
+
+# PROTOCOL v6 mmap/COW prototype: the only dependency is `memmap2`, which the
+# `session` feature owns (`Cargo.toml` `session = ["dep:memmap2"]`). Nothing
+# from `pir` is used, so `sdk` is not needed.
+[[example]]
+name = "mmap_cow_probe"
+path = "examples/mmap_cow_probe.rs"
+required-features = ["session"]
+
 [[example]]
 name = "plugin"
 path = "examples/plugin.rs"
 required-features = ["sdk"]
+
+[[example]]
+name = "phone_relay_demo"
+path = "examples/phone_relay_demo.rs"
+required-features = ["phone"]
 
 [[example]]
 name = "proxy"
@@ -154,14 +202,41 @@ path = "examples/real_endpoint.rs"
 required-features = ["sdk", "session", "skills"]
 
 [[example]]
+name = "session_compaction"
+path = "examples/session_compaction.rs"
+required-features = ["sdk", "session"]
+
+[[example]]
+name = "session_lifecycle"
+path = "examples/session_lifecycle.rs"
+required-features = ["sdk", "session"]
+
+[[example]]
 name = "sessions"
 path = "examples/sessions.rs"
 required-features = ["sdk", "session"]
 
 [[example]]
+name = "sdk_error_paths"
+path = "examples/sdk_error_paths.rs"
+required-features = ["sdk"]
+
+[[example]]
 name = "streaming"
 path = "examples/streaming.rs"
 required-features = ["sdk"]
+
+# R54 whole-history read probes: they open/create real session files through
+# `SessionManager`, so they need the `session` persistence feature.
+[[example]]
+name = "transcript_copy_probe"
+path = "examples/transcript_copy_probe.rs"
+required-features = ["session"]
+
+[[example]]
+name = "transcript_large_probe"
+path = "examples/transcript_large_probe.rs"
+required-features = ["sdk", "session"]
 
 [[example]]
 name = "tools"
@@ -226,6 +301,11 @@ flate2 = { version = "1.1", optional = true }
 # by the `cc` crate with the MSVC toolset the tree already links against.
 brotli = { version = "8", optional = true }
 zstd = { version = "0.13", optional = true }
+# The cm-memory engine behind the `memory` builtin. `default-features = false`
+# keeps the `cm` CLI out of pir's graph; only the library facade is linked.
+# Consume the published crate so `cargo package`/CI resolve the same code as
+# local builds (cm-memory 0.3.1, released 2026-11-10).
+cm-memory = { version = "0.3.1", default-features = false, optional = true }
 # RS256 (RSA PKCS#1 v1.5 + SHA-256) signing for the Google Vertex
 # service-account OAuth2 JWT (pure Rust; no OpenSSL/native deps).
 rsa = { version = "0.9", features = ["sha2"], optional = true }
@@ -379,6 +459,7 @@ full = [
     "tool-repair",
     "tool-search",
     "todo",
+    "memory",
     "phone",
     "provider-openai",
     "provider-anthropic",
@@ -618,13 +699,19 @@ tool-search = []
 # a build without the feature, so `builtin:todo` reports the unknown-builtin
 # error there.
 todo = []
+# The `memory` builtin: the cm-memory single-file project memory engine
+# (`tools/cm-rs`, published as `cm-memory`) embedded as native Rust. Registers
+# the `memory` tool, the `/memory` command, and the input auto-recall hook.
+# Absent in a build without the feature, so `builtin:memory` reports the
+# unknown-builtin error there.
+memory = ["dep:cm-memory"]
 # pi-phone ported natively: the phone-first remote UI (HTTP+WS server, session
 # mirror, parallel RPC sessions, Tailscale). Compiled into `full` but DEFAULT
 # OFF on the extension plan (`BuiltinExtensionDef::default_enabled: false`):
 # it binds a local port and holds a server task. sha1 is the WS handshake;
 # flate2 (already linked for node:zlib, pure-Rust miniz backend) serves the
 # embedded UI gzip-encoded.
-phone = ["dep:sha1", "dep:flate2", "dep:tokio-tungstenite"]
+phone = ["dep:tokio-tungstenite"]
 # The halfblocks image preview renderer in the TUI (`src/tui/image_preview.rs`).
 # The `image` crate comes with `tui` or `image-tools`; this feature gates the
 # renderer on top of that. It is part of `full` (default-on, so the preview
@@ -696,6 +783,7 @@ crossterm_winapi = { version = "0.9", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
+pir-phone-server = { path = "crates/pi-phone-server" }
 # Heap profiling harness (`tests/startup_heap_profile.rs`, ignored by default):
 # dhat tracks every allocation site without changing the product binary.
 dhat = "0.3"
@@ -720,6 +808,14 @@ harness = false
 [[bench]]
 name = "sdk_benchmark"
 harness = false
+
+# Standalone SQLite trigram-vs-LIKE evaluation harness (PIR-BIN-021 follow-up,
+# lane-builtin cycle77). Not a criterion bench: a plain binary driven by the
+# corpus/out dirs on the command line, so the numbers stay reproducible.
+[[example]]
+name = "trigram_bench"
+path = "bench/trigram_bench/main.rs"
+required-features = ["context-mode"]
 
 # Size posture, measured (Q55): the default release profile is fat LTO + one
 # codegen unit + `strip = true`. Same-source A/B against the control shape:
@@ -833,6 +929,18 @@ opt-level = 2
 opt-level = 0
 debug = 0
 
+[workspace]
+members = ["crates/pi-phone-server"]
+resolver = "2"
+
+# Single source of truth for the workspace version. Every member inherits it
+# with `version.workspace = true`, so a release bump is one edit here (plus
+# `.migration-info`, which the release workflow cross-checks against the tag).
+# Keep the spelling exactly `version = "x.y.z"` on one line: release.yml
+# extracts it with `sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p'`.
+[workspace.package]
+version = "0.3.0"
+
 # BEGIN GENERATED MERGED TEST TARGETS
 # Regenerated by scripts/gen_merged_tests.ps1; every root tests/*.rs file is
 # included by exactly one harness module. autotests = false above stops
@@ -906,3 +1014,15 @@ debug-assertions = false
 # unaffected.
 [profile.test]
 debug-assertions = false
+
+[[test]]
+name = "print_native_session"
+path = "tests/print_native_session.rs"
+
+[[test]]
+name = "g_durable"
+path = "tests/g_durable.rs"
+
+[[test]]
+name = "durable_memcopy_bench"
+path = "tests/durable_memcopy_bench.rs"

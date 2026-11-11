@@ -195,6 +195,15 @@ pub struct DetachedToolCall {
     pub parent_call_id: Option<String>,
     /// The detached call's own abort signal (see the type docs).
     pub abort: crate::ai::types::AbortSignal,
+    /// Usage reported by the `afterToolCall` hook for the real result.
+    ///
+    /// The detached future returns a [`ToolResult`], which has no usage slot
+    /// (upstream keeps it on `AgentToolResult.usage`); the execution body
+    /// stores the hook's report here right before the future yields. An
+    /// adopter takes it with [`Self::take_usage`] once the future has run, so
+    /// a background completion can carry the same usage a foreground
+    /// tool-result message carries.
+    pub(crate) usage: std::sync::Arc<std::sync::Mutex<Option<crate::ai::types::Usage>>>,
     /// The execution future. `Some` while the call awaits adoption; the sink
     /// TAKES it when it adopts the call (see [`Self::take_future`]), which
     /// leaves the call in the batch's `detached` report usable for
@@ -215,6 +224,16 @@ impl DetachedToolCall {
     /// Whether an adopter already took the future.
     pub fn is_adopted(&self) -> bool {
         self.future.is_none()
+    }
+
+    /// Take the `afterToolCall`-reported usage once the detached future has
+    /// completed. `None` when no hook reported usage (or the hook ran for a
+    /// blocked/aborted call that never produced a real result).
+    pub fn take_usage(&self) -> Option<crate::ai::types::Usage> {
+        self.usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 

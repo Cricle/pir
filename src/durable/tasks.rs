@@ -1,10 +1,11 @@
-//! Task definitions.
+//! Task metadata definitions (agent-hooks registry).
 //!
 //! Upstream `src/tasks.ts` is eight lines: `defineTask` wraps a definition in a
-//! token the registry accepts. The harness execution types are out of this
-//! port's scope, so the definition here carries the metadata storage needs —
-//! kind, version and the live-phase names — plus the input shape as opaque
-//! JSON.
+//! token the registry accepts. This module ports that metadata token: kind,
+//! version and the live-phase names plus the input shape as opaque JSON. It is
+//! not the executable task surface — `durable::harness::task::define_task`
+//! defines the phase handlers a `TaskScheduler` runs, and the two
+//! `define_task` functions are not interchangeable.
 
 use crate::durable::errors::StorageRequestError;
 

@@ -26,9 +26,11 @@
 //!
 //! Upstream keeps the list small; pir's builtins are `subagent`, `mcp`, and
 //! `codemode` — the same set upstream ships (minus its JS-only entries) —
-//! pir-only `python` (the embedded RustPython 3 interpreter) and `tool-search`
-//! (upstream extensions/tool-search), plus `tool-repair` (the
-//! pi-tool-repair npm package ported natively).
+//! pir-only `python` (the embedded RustPython 3 interpreter), `tool-search`
+//! (upstream extensions/tool-search), `tool-repair` (the pi-tool-repair npm
+//! package ported natively), `todo` (the rpiv-todo port), and `memory` (the
+//! embedded cm-memory engine; always compiled with the `memory` feature and
+//! default-enabled).
 
 use std::sync::Arc;
 
@@ -188,6 +190,20 @@ pub const BUILTIN_EXTENSION_FACTORIES: &[BuiltinExtensionDef] = &[
         factory: new_todo_plugin,
         default_enabled: true,
     },
+    // The embedded `cm-memory` engine: the model-facing `memory` tool with a
+    // CLI-shaped action enum, the `/memory` command, and the input auto-recall
+    // hook. The store lives next to the session transcript by default (see
+    // `docs/memory-builtin.md`). Replaceable: a user extension registering a
+    // `memory` tool / `memory` command omits this builtin. Absent in a build
+    // without the `memory` feature, so `builtin:memory` reports the
+    // unknown-builtin error there.
+    #[cfg(feature = "memory")]
+    BuiltinExtensionDef {
+        name: "memory",
+        replaceable: true,
+        factory: new_memory_plugin,
+        default_enabled: true,
+    },
     // pi-phone, ported natively: the phone-first remote UI (local HTTP+WS
     // server, parent-session mirror, parallel RPC sessions, Tailscale).
     // DEFAULT OFF: it binds a local port and holds a server task, so it joins
@@ -230,6 +246,7 @@ const BUILTIN_FEATURES: &[(&str, &str)] = &[
     ("context-mode", "context-mode"),
     ("codemode", "extensions"),
     ("todo", "todo"),
+    ("memory", "memory"),
     ("phone", "phone"),
 ];
 
@@ -335,6 +352,9 @@ fn new_tool_repair_plugin() -> Arc<dyn AgentPlugin> {
 #[cfg(feature = "todo")]
 pub mod todo;
 
+#[cfg(feature = "memory")]
+pub mod memory;
+
 #[cfg(feature = "phone")]
 pub mod phone;
 
@@ -351,6 +371,17 @@ pub use todo::{
     new_todo_plugin, TodoPlugin, TodoState, COMMAND_NAME as TODO_COMMAND_NAME,
     TOOL_NAME as TODO_TOOL_NAME,
 };
+
+#[cfg(feature = "memory")]
+pub use memory::{
+    MemoryConfig, MemoryPlugin, MemoryService, MemoryStoreMode, MemoryTool, MemoryWriteMode,
+    COMMAND_NAME as MEMORY_COMMAND_NAME, TOOL_NAME as MEMORY_TOOL_NAME,
+};
+
+#[cfg(feature = "memory")]
+fn new_memory_plugin() -> Arc<dyn AgentPlugin> {
+    memory::new_memory_plugin()
+}
 
 /// Public re-exports of the `python` builtin's integration surface (tests,
 /// embedders that resolve the `pythonTool` setting, and the tool-selection

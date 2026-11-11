@@ -377,7 +377,7 @@ impl TaskRuntime {
     }
 
     /// The live tasks this task owns directly, in id order.
-    pub async fn owned_tasks(&self) -> Result<Vec<TaskRecord>, TaskRuntimeError> {
+    pub async fn owned_tasks(&self) -> Result<Vec<Arc<TaskRecord>>, TaskRuntimeError> {
         self.check_live()?;
         Ok(self.inner.with_state(|state| {
             state

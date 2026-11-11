@@ -2,7 +2,98 @@
 
 - 基线：`master` @ `b26a60fb23bd45306401190cacb5b6f2c1f5459c`
 - 结果日期：2026-11-02
+- 最新实测：2026-11-11（0.3.0 release preparation，见下一节；下方各节为 2026-11-02 基线历史）
 - 本文件是唯一面向用户的结果文档；过程材料仅在 `.audit/` 保留为原始证据。
+
+## 0.3.0 release preparation (2026-11-11)
+
+本节为 0.3.0 发版准备轮的实测记录；下方各节是 2026-11-02 基线，原样保留为历史。
+
+**版本与产物（全部实测）**
+
+- 版本 `0.3.0` 由 `[workspace.package]` 单点定义、两个 crate 继承：`Cargo.toml`、`crates/pi-phone-server/Cargo.toml`、
+  `.migration-info`、`Cargo.lock` 以及两个二进制各自的 `--version`。
+- release（GNU）`pir.exe` **76,635,136 B**，sha256
+  `4c890e3b2e4905438ba4e1089c2161edbf0c08e8904f5c6ea7bc9d2d087936f9`；
+  `pir-phone-server.exe` **4,553,216 B**。两者只导入系统 DLL，GNU 链接在零售
+  Windows 上独立可用。证据：`.play/evidence/release-prep/build/REPORT.md` §2。
+- 可发布 crate `pir-sdk-0.3.0.crate` **6,795,853 B**（< 10,000,000 B 上限；
+  784 文件、6.5 MiB 压缩），`tests/`、`target*/`、`.play/` include 泄漏均为
+  **0**，137 个 `include_str!/include_bytes!` 目标全部存在。证据：
+  `build/REPORT.md` §5、`.play/evidence/release-prep/readiness/REPORT.md` §2。
+- release 运行冒烟 **19/19 PASS**；release 模式 `pir python -c "print(42)"`
+  **10/10 EXIT 0**（修复前基线为 EXIT 3221226505），`PIR_ALLOC_TRACE=0/1` 变体
+  各 3/3 通过。证据：`build/REPORT.md` §4、`build/smoke-results.json`、
+  `build/python-10x-final.log`。
+
+**门禁（本机 GNU，2026-11-11 实测）**
+
+- `cargo fmt --all -- --check` EXIT 0。
+- `cargo clippy --all-targets --all-features -D warnings` EXIT 0、0 条诊断
+  （8 条硬错误 + 13 条 `src/` 残留全部修复，未新增 `#[allow]`）。证据：
+  `.play/evidence/release-prep/closer/clippy-final.log`、`fixlib/REPORT.md` §1-§2。
+- SDK 4 形态无默认特性矩阵（`sdk`、`sdk,session`、`sdk,print`、
+  `sdk,session,print`）各自 EXIT 0。
+- doctest **33 passed / 0 failed / 7 ignored**；`cargo check --examples
+  --no-default-features --features sdk` EXIT 0。
+- 源码卫生：`PREEXISTING_INLINE_TEST_ALLOWLIST` 由 18 收到 **8**（原始豁免集）；
+  20 个 `src/` 文件的内联测试模块迁至 `tests/suites/*_units.rs`，通过
+  `#[doc(hidden)] pub` seam 访问，**37+ 条测试逐字保留**。证据：
+  `.play/evidence/release-prep/closer/REPORT.md`、`closer/per-file-counts.md`。
+
+**本轮修复**
+
+- **release python 崩溃（PIR-BIN-022）**：tracing 全局分配器对零尺寸 layout 在
+  `alloc`/`alloc_zeroed` 返回 dangling 指针、`dealloc`/`realloc` 不再转发，绕开
+  core 泛型 `GlobalAlloc` 的 `assert_unchecked(size != 0)`；release 下同样生效
+  （10/10 EXIT 0）。
+- **`LoopOptions::prepare_next_turn_needs_completed` 默认值**：与其文档契约一致，
+  手写 `Default` 改为 `true`；读 `message`/`tool_results` 的 `prepare_next_turn`
+  hook 不再拿到空快照。`g_agent::agent_loop_parity` **28/28**。证据：
+  `fixlib/REPORT.md` §3。
+- **TUI 搜索框突发粘贴丢字（PIR-TUI-023）**：控制台 coalescer 把 ≥8 个可打印键
+  重写成一个 paste 后被吞掉；现在活跃搜索框按字符消费该 chunk。单元
+  `tui_paste_burst_p5` 28/28、`altscreen_parity` 64/64。证据：
+  `.play/issues/PIR-TUI-023.md`。
+- **测试契约对齐**：`tool_search` 激活对该 run 的下一次调用可见（PIR-BIN-004，
+  与上游 `setActiveTools` 时点重建一致）；分页 `transcript()` 明确会 widen
+  （PIR-SDK-025），测试改为断言 2288 总数 / 1400 唯一 / 888 重复-by-id。证据：
+  `.play/evidence/release-prep/fixtests/REPORT.md`（§1、§2）。
+
+**性能（均已实测，非外推）**
+
+- PIR-SDK-027 投影 fragment cache：8k 条目下每次 push 的 snapshot wall
+  **519 → 333 ms（−36%）**，allocs −3.1%。证据：
+  `.play/evidence/lane-sdk/round56-027-cache/REPORT.md`。
+- `live_session_tail(64 KiB, 128)` 1000 轮：**34.05 MiB 基本持平，斜率
+  −0.0014 MiB/round**；默认全量驻留 **101.78 MiB，+0.0634 MiB/round**
+  （斜率降 60.5%）。证据：`docs/sdk.md` R56 段（34.05/101.78/±斜率）。
+- durable search tokenize 单趟流式化：同一基准 alloc bytes
+  **1,255,057,460 → 11,353,200（−99.1%）**。证据：
+  `.play/lanes/lane-builtin/STATE.md` cycle68。
+- scheduler `TaskRecord` Arc 化：240-commit 基准 alloc events
+  **81,051 → 50,815（−37.3%）**、bytes −41.8%。证据：同上 cycle69。
+- SDK optionality 矩阵 **15/15 组合构建 EXIT 0**；`sdk`-only release 二进制
+  **38,072,320 B**、idle working set **约 6.2 MiB**。证据：
+  `.play/evidence/lane-sdk-dev/round28-sdk-matrix/REPORT.md`、
+  `round29-engine-driven/REPORT.md`。
+
+**仍未关闭**
+
+- **PIR-BIN-023（low，deferred）**：`StorageWrite::Task` 改 `Arc<TaskRecord>`
+  的 A/B 已测（alloc bytes −13.42%），但落地要改公共 wire-shaped enum 并同步
+  外部 app，本轮不改，无稳定性影响。
+- **`Cargo.lock` 钉住已被 yank 的 `clipboard-win 5.4.1`**：目前仅是 warning，
+  `cargo package` 仍 EXIT 0；需要一次联网 `cargo update` 刷新（离线环境不可做）。
+- **`deny.toml` 不是 CI 门禁**：只有本地 `scripts/gate_resources.ps1` 调用它；
+  两个 workflow 都不跑 `cargo deny`；`rust-toolchain.toml` 已改为不再声称存在
+  `msrv` CI job（MSRV 由 `rust-version = "1.97"` 强制）。
+- **本地只有 GNU 验证**：CI 的 Windows 产物是 MSVC
+  （`x86_64-pc-windows-msvc`），本地从未运行；Linux musl / macOS universal 同理。
+- **全量测试**：权威 8 组在 2026-11-11T10:34:23Z 跑完，
+  `ALL GROUPS DONE status=0`，**8 组全部 EXIT 0、0 failed**。
+  聚合总数仍标记 pending re-measure，由全量 lane 写入
+  `.play/evidence/release-prep/final/REPORT.md`；本文件不写聚合总数。
 
 ## 1. 交付状态
 

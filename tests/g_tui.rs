@@ -3,6 +3,8 @@
 mod keybinding_actions;
 #[path = "suites/std_utils_w11.rs"]
 mod std_utils_w11;
+#[path = "suites/tui_alloc_trace_units.rs"]
+mod tui_alloc_trace_units;
 #[path = "suites/tui_cache_lane.rs"]
 mod tui_cache_lane;
 #[path = "suites/tui_clipboard_paste.rs"]
@@ -77,6 +79,8 @@ mod tui_settings_diagnostics;
 mod tui_slash_commands;
 #[path = "suites/tui_stdin_decoding.rs"]
 mod tui_stdin_decoding;
+#[path = "suites/tui_surface_units.rs"]
+mod tui_surface_units;
 #[path = "suites/tui_syntax_highlight.rs"]
 mod tui_syntax_highlight;
 #[path = "suites/tui_system_theme.rs"]

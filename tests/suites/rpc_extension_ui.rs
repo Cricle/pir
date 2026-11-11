@@ -200,6 +200,7 @@ async fn start_extension_runtime(
 fn session_factory(handle: ExtensionHandle) -> SessionFactory {
     Arc::new(move |session: Option<SessionManager>| {
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: fake_registry(Arc::new(|_index| {
                 assistant(vec![text("done")], StopReason::Stop)
             })),
@@ -297,6 +298,7 @@ fn gated_session_factory(
             entered: Arc::clone(&factory_entered),
         }));
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: fake_model(),
             api_key: None,

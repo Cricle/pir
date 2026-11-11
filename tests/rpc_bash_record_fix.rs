@@ -196,6 +196,7 @@ async fn start_extension_runtime(temp: &TempDir, label: &str, source: &str) -> E
 fn session_factory(handle: Option<ExtensionHandle>) -> SessionFactory {
     Arc::new(move |session: Option<SessionManager>| {
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: fake_registry(Arc::new(|_index| {
                 assistant(vec![text("done")], StopReason::Stop)
             })),

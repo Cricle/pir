@@ -588,7 +588,7 @@ pub fn estimate_context_tokens_conservative(messages: &[Message]) -> ContextUsag
 /// [`estimate_context_tokens`] over any borrowed [`MessageSequence`]: the same
 /// estimate with no message materialization. The projection estimator feeds it
 /// the entry messages plus the live context tail as one virtual sequence.
-fn estimate_context_tokens_over<M: MessageSequence + ?Sized>(
+pub(crate) fn estimate_context_tokens_over<M: MessageSequence + ?Sized>(
     messages: &M,
     conservative: bool,
 ) -> ContextUsageEstimate {
@@ -1280,7 +1280,13 @@ pub fn estimate_projected_context_tokens_with_tail<E: ProjectedEntry, P: PathEnt
     let estimate = estimate_context_tokens_over(refs.as_slice(), false);
     if let Some(usage_index) = estimate.last_usage_index {
         // Map the usage message back to its projected entry id. A usage inside
-        // the tail walks past every projected entry and stays `None`.
+        // the tail walks past every projected entry and stays `None`; such a
+        // record is NEWER than every projected/branch entry, so it can never
+        // be invalidated by a compaction/context edit later in the branch and
+        // must be trusted (upstream `estimateContextTokens(projection.messages)`
+        // has no tail: the in-run assistant is already a projected entry).
+        let projected_message_count: usize =
+            projected.iter().map(|entry| entry.messages().len()).sum();
         let mut message_index = 0usize;
         let mut usage_entry_id: Option<&str> = None;
         for entry in projected {
@@ -1291,6 +1297,7 @@ pub fn estimate_projected_context_tokens_with_tail<E: ProjectedEntry, P: PathEnt
             }
             message_index = next;
         }
+        let usage_in_tail = usage_index >= projected_message_count;
 
         let usage_entry_index = usage_entry_id.and_then(|id| {
             branch_entries
@@ -1302,7 +1309,11 @@ pub fn estimate_projected_context_tokens_with_tail<E: ProjectedEntry, P: PathEnt
             .rposition(|entry| entry.is_context_edit() || entry.is_compaction());
         let usage_index_i64 = usage_entry_index.map_or(-1, |index| index as i64);
         let latest_i64 = latest_invalidating_index.map_or(-1, |index| index as i64);
-        if usage_index_i64 > latest_i64 {
+        // A synthetic (id-less) basis has no branch identity to compare: when
+        // the caller supplied no path metadata (ephemeral/no-session run)
+        // there is no compaction/context edit that could invalidate it.
+        let synthetic_basis = usage_entry_id.is_none() && branch_entries.is_empty();
+        if usage_in_tail || usage_index_i64 > latest_i64 || synthetic_basis {
             return estimate;
         }
     }

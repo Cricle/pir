@@ -97,6 +97,7 @@ fn fake_model() -> Model {
 /// these assertions indirect).
 fn config(cwd: &Path) -> AgentSessionConfig {
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,
@@ -261,6 +262,7 @@ async fn default_dir_follows_the_env_and_is_resolved_once() {
 /// seam) actually rebuilds it.
 fn context_config(cwd: &Path) -> AgentSessionConfig {
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,

@@ -88,7 +88,7 @@ impl SchedulerInner {
                     inner.wake_due();
                     unpark_raised(&inner);
 
-                    let candidates: Vec<TaskRecord> = inner.with_state(|indexes| {
+                    let candidates: Vec<Arc<TaskRecord>> = inner.with_state(|indexes| {
                         indexes
                             .runnable
                             .iter()
@@ -96,7 +96,7 @@ impl SchedulerInner {
                             .collect()
                     });
                     let mut reservations: Vec<Reservation> = Vec::new();
-                    let mut faulted: Vec<(TaskRecord, String, Option<String>)> = Vec::new();
+                    let mut faulted: Vec<(Arc<TaskRecord>, String, Option<String>)> = Vec::new();
                     for record in candidates {
                         // Upstream's candidate filters, in order. Each one
                         // leaves the runnable set, so a later pass reconsiders
@@ -287,7 +287,7 @@ impl SchedulerInner {
 ///
 /// Returns the live record when it should be reserved, or `None` after taking
 /// it out of the runnable set.
-fn classify(inner: &SchedulerInner, record: TaskRecord) -> Option<TaskRecord> {
+fn classify(inner: &SchedulerInner, record: Arc<TaskRecord>) -> Option<Arc<TaskRecord>> {
     let id = record.id;
     let drop = |indexes: &mut super::Indexes| {
         indexes.runnable.remove(&id);

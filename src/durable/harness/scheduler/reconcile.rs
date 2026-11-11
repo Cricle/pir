@@ -36,7 +36,7 @@ use crate::durable::harness::scheduler::runtime::TaskRuntimeError;
 use crate::durable::harness::scheduler::{
     checkpoint_of, failed_outcome, has_owned_live, json_equal, nearest_live_above, node_of,
     owned_live, parent_of, progressed, walk_down, with_abort_mark, with_state, AbortResult,
-    BlockedReason, InvocationMode, NextTaskState, Node, Overlay, SchedulerInner,
+    BlockedReason, InvocationMode, NextTaskState, Node, Overlay, OverlayRecord, SchedulerInner,
     TaskInspectionState, Wake, REASON_RESTART,
 };
 use crate::durable::harness::task::ErasedTask;
@@ -163,12 +163,22 @@ impl SchedulerInner {
         let mut overlay = Overlay::of(tx);
         while !round.is_empty() {
             let mut next: BTreeSet<TaskId> = BTreeSet::new();
+            // The overlay borrows the transaction, so staged finals are queued
+            // and written once the borrow ends; each round rebuilds the overlay
+            // from the transaction and sees them without copying a payload. A
+            // finalization result is materialized ONCE (the `with_state` clone)
+            // and shared with later walks through `OverlayRecord::Shared`, so
+            // the overlay insert does not clone the 8 KiB payloads again.
+            let mut finals: Vec<Arc<TaskRecord>> = Vec::new();
             for id in round {
-                let record = overlay
-                    .tasks
-                    .get(&id)
-                    .cloned()
-                    .or_else(|| self.live_record(id));
+                let live_record;
+                let record: Option<&TaskRecord> = match overlay.tasks.get(&id) {
+                    Some(record) => Some(record.as_ref()),
+                    None => {
+                        live_record = self.live_record(id);
+                        live_record.as_deref()
+                    }
+                };
                 let Some(record) = record else {
                     continue;
                 };
@@ -183,19 +193,31 @@ impl SchedulerInner {
                 let TaskState::Completing { outcome } = record.state.clone() else {
                     continue;
                 };
-                let terminal = with_state(&record, TaskState::Terminal { outcome });
-                self.stage(tx, terminal.clone());
-                overlay.tasks.insert(id, terminal);
-                done.insert(id);
+                let terminal = Arc::new(with_state(record, TaskState::Terminal { outcome }));
                 let above = self.with_state(|indexes| {
-                    nearest_live_above(indexes, node_of(&record), Some(&overlay))
+                    nearest_live_above(indexes, node_of(record), Some(&overlay))
                 });
+                overlay
+                    .tasks
+                    .insert(id, OverlayRecord::Shared(Arc::clone(&terminal)));
+                finals.push(terminal);
+                done.insert(id);
                 if let Some(above) = above {
-                    if matches!(above.state, TaskState::Completing { .. }) {
+                    if above.completing {
                         next.insert(above.id);
                     }
                 }
             }
+            drop(overlay);
+            for terminal in finals {
+                // The overlay borrow has ended; unwrap the shared record for
+                // staging (the sole remaining owner at this point).
+                match Arc::try_unwrap(terminal) {
+                    Ok(terminal) => self.stage(tx, terminal),
+                    Err(shared) => self.stage(tx, (*shared).clone()),
+                }
+            }
+            overlay = Overlay::of(tx);
             round = next.into_iter().collect();
         }
         Ok(())
@@ -267,8 +289,10 @@ impl SchedulerInner {
             let parents: Vec<TaskId> = overlay
                 .tasks
                 .values()
-                .filter(|record| self.with_state(|indexes| !indexes.live.contains_key(&record.id)))
-                .map(|record| parent_of(node_of(record)))
+                .filter(|record| {
+                    self.with_state(|indexes| !indexes.live.contains_key(&record.as_ref().id))
+                })
+                .map(|record| parent_of(node_of(record.as_ref())))
                 .filter_map(|up| match up {
                     super::Up::Task(id) => Some(id),
                     super::Up::Conversation(_) => None,
@@ -334,12 +358,15 @@ impl SchedulerInner {
         let overlay = Overlay::of(tx);
         let mut targets: Vec<TaskId> = Vec::new();
         for id in on {
-            let member = match overlay.tasks.get(id).cloned() {
-                Some(member) => Some(member),
-                None => match self.live_record(*id) {
+            let owned_member;
+            let member: Option<&TaskRecord> = if let Some(member) = overlay.tasks.get(id) {
+                Some(member.as_ref())
+            } else {
+                owned_member = match self.live_record(*id) {
                     Some(member) => Some(member),
-                    None => read_task_in(state, *id).await?,
-                },
+                    None => read_task_in(state, *id).await?.map(Arc::new),
+                };
+                owned_member.as_deref()
             };
             let Some(member) = member else {
                 return Err(TaskRuntimeError::Invalid(format!(
@@ -391,7 +418,7 @@ impl SchedulerInner {
         state: &SessionState<'_>,
         task: TaskId,
         on: &[TaskId],
-        overlay: &Overlay,
+        overlay: &Overlay<'_>,
     ) -> Result<Option<Vec<TaskId>>, StorageError> {
         // Owned work is found by walks down, which need every chain loaded.
         self.load_scopes_in(state, false).await?;
@@ -424,11 +451,14 @@ impl SchedulerInner {
                 steps.reverse();
                 return Ok(Some(steps));
             }
-            let record = overlay
-                .tasks
-                .get(&id)
-                .cloned()
-                .or_else(|| self.live_record(id));
+            let live_record;
+            let record: Option<&TaskRecord> = match overlay.tasks.get(&id) {
+                Some(record) => Some(record.as_ref()),
+                None => {
+                    live_record = self.live_record(id);
+                    live_record.as_deref()
+                }
+            };
             let Some(record) = record else {
                 continue;
             };
@@ -587,7 +617,7 @@ impl SchedulerInner {
     pub(super) async fn wait_for_task(
         self: &Arc<Self>,
         id: TaskId,
-    ) -> Result<TaskRecord, StorageError> {
+    ) -> Result<Arc<TaskRecord>, StorageError> {
         let inner = self.clone();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let slot = Arc::new(std::sync::Mutex::new(Some(sender)));
@@ -625,7 +655,7 @@ impl SchedulerInner {
                 .map_err(|_| StorageError::closed("Session"))?;
         }
         match self.read_task(id).await? {
-            Some(record) => Ok(record),
+            Some(record) => Ok(Arc::new(record)),
             None => Err(StorageError::invalid(format!("Task {id} does not exist"))),
         }
     }
@@ -679,9 +709,9 @@ async fn any_failed(
     for id in ids {
         let record = match inner.live_record(*id) {
             Some(record) => Some(record),
-            None => read_task_in(state, *id).await?,
+            None => read_task_in(state, *id).await?.map(Arc::new),
         };
-        if record.as_ref().is_some_and(failed_outcome) {
+        if record.as_ref().is_some_and(|record| failed_outcome(record)) {
             return Ok(true);
         }
     }
@@ -747,7 +777,7 @@ pub(super) fn waiting_on(inner: &SchedulerInner, record: &TaskRecord) -> Vec<Tas
 pub(super) fn wake(inner: &SchedulerInner) -> Wake {
     let now = inner.now();
     let catalogue = inner.catalogue.snapshot();
-    let (invocations, reconciling, live): (usize, bool, Vec<TaskRecord>) =
+    let (invocations, reconciling, live): (usize, bool, Vec<Arc<TaskRecord>>) =
         inner.with_state(|indexes| {
             (
                 indexes.invocations.len(),

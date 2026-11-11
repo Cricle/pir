@@ -20,6 +20,8 @@ mod agent_dir_identity_w16;
 mod agent_loop;
 #[path = "suites/agent_loop_parity.rs"]
 mod agent_loop_parity;
+#[path = "suites/agent_loop_units.rs"]
+mod agent_loop_units;
 #[path = "suites/agent_session.rs"]
 mod agent_session;
 #[path = "suites/agent_session_units.rs"]
@@ -68,12 +70,16 @@ mod mcp_slash_command_w13;
 mod mcp_status_w13;
 #[path = "suites/mcp_toggle_refresh_w18.rs"]
 mod mcp_toggle_refresh_w18;
+#[path = "suites/memory_builtin.rs"]
+mod memory_builtin;
 #[path = "suites/model_switch_auth_w17.rs"]
 mod model_switch_auth_w17;
 #[path = "suites/native_host_w19.rs"]
 mod native_host_w19;
 #[path = "suites/parallel_concurrency.rs"]
 mod parallel_concurrency;
+#[path = "suites/phone_units.rs"]
+mod phone_units;
 #[path = "suites/plugin_events_w16.rs"]
 mod plugin_events_w16;
 #[path = "suites/plugin_ledger_w14.rs"]
@@ -102,6 +108,8 @@ mod sdk;
 mod sdk_agent_isolation_w16;
 #[path = "suites/sdk_defaults_w13.rs"]
 mod sdk_defaults_w13;
+#[path = "suites/sdk_event_units.rs"]
+mod sdk_event_units;
 #[path = "suites/sdk_gaps_w11.rs"]
 mod sdk_gaps_w11;
 #[path = "suites/sdk_plugins_w8.rs"]
@@ -114,6 +122,8 @@ mod sdk_units;
 mod session_commands;
 #[path = "suites/session_compaction_w11.rs"]
 mod session_compaction_w11;
+#[path = "suites/session_ctx_units.rs"]
+mod session_ctx_units;
 #[path = "suites/session_events_parity.rs"]
 mod session_events_parity;
 #[path = "suites/session_file_contract_w14.rs"]

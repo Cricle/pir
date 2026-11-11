@@ -224,6 +224,7 @@ fn settle_abort_config(temp: &TempDir) -> pir::agent_session::AgentSessionConfig
         })
     });
     pir::agent_session::AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(pir::ai::provider::ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,
@@ -825,6 +826,7 @@ fn bash_drop_session(cwd: PathBuf) -> pir::agent_session::AgentSession {
     use pir::ai::provider::ProviderRegistry;
 
     AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,

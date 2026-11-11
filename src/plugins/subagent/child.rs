@@ -358,7 +358,7 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
                     )
                 }
             },
-            None => env.model.clone(),
+            None => env.dispatch_model(),
         };
 
         // System prompt: pir's default (context discovery for the child cwd and
@@ -493,7 +493,7 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
             model,
             api_key,
             thinking: if inherits_dispatch {
-                env.thinking
+                env.dispatch_thinking()
             } else {
                 // Upstream passes no `--thinking` when the agent has its own
                 // model: the child uses its CLI default thinking level (upstream
@@ -513,6 +513,7 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
             // overrides the default; `0` restores no cap for hosts that
             // manage their own budget.
             max_turns: budget.max_turns,
+            performance: crate::config::settings::PerformanceSettings::from_env(),
             system_prompt,
             cwd: Some(cwd.clone()),
             event_stream: None,

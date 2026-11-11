@@ -496,7 +496,7 @@ impl IndexStore {
             // one section never occupies two result slots.
             let mut seen: HashSet<i64> = HashSet::new();
             for query in &queries {
-                let Some((expression, terms)) = build_match_expression(query) else {
+                let Some((expression, terms, non_ascii)) = build_match_expression(query) else {
                     response.queries.push(QueryResult {
                         query: query.clone(),
                         results: Vec::new(),
@@ -530,6 +530,39 @@ impl IndexStore {
                         // matches; flip it so higher is better for the model.
                         score: -rank,
                     });
+                }
+                // CJK and other non-ASCII queries often cannot match the FTS
+                // token stream at all (`unicode61` folds contiguous CJK runs
+                // into one token), so an empty FTS result is not evidence of
+                // absence. Fall back to a bounded LIKE scan; tokens that DO
+                // match FTS keep their bm25 ranking untouched.
+                if results.is_empty() && non_ascii {
+                    for mut hit in like_fallback_search(
+                        connection,
+                        &terms,
+                        source.as_deref(),
+                        content_type.as_deref(),
+                        limit,
+                    )? {
+                        if !seen.insert(hit.id) {
+                            continue;
+                        }
+                        // Fetch the content for snippet computation; the
+                        // fallback scan keeps it out of the row projection to
+                        // avoid dragging every candidate's body through the
+                        // ranking pass.
+                        let content: Option<String> = connection
+                            .query_row(
+                                "SELECT content FROM chunks WHERE id = ?1",
+                                params![hit.id],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        if let Some(content) = content.as_deref() {
+                            fill_snippet(&mut hit, content, &terms);
+                        }
+                        results.push(hit);
+                    }
                 }
                 response.queries.push(QueryResult {
                     query: query.clone(),
@@ -1168,11 +1201,21 @@ fn make_snippet(content: &str, terms: &[String], max_chars: usize) -> String {
 /// FTS5 MATCH expression from a natural-language query: alphanumeric terms
 /// OR-ed, each quoted (so FTS operators in user input cannot make the query
 /// fail). `None` when the query has no indexable terms.
-fn build_match_expression(query: &str) -> Option<(String, Vec<String>)> {
+///
+/// The second return value reports whether any term contains non-ASCII
+/// characters (CJK and friends). The `unicode61` tokenizer folds every run of
+/// contiguous CJK characters into a single FTS token (`令牌轮换会记录审计事件`
+/// is one token), so a shorter CJK query never matches it; the caller uses the
+/// flag to run a LIKE fallback scan when FTS returns no rows.
+fn build_match_expression(query: &str) -> Option<(String, Vec<String>, bool)> {
     let mut terms = Vec::new();
+    let mut non_ascii = false;
     let mut current = String::new();
     for ch in query.chars() {
         if ch.is_alphanumeric() || ch == '_' {
+            if !ch.is_ascii() {
+                non_ascii = true;
+            }
             current.push(ch);
         } else if !current.is_empty() {
             terms.push(std::mem::take(&mut current));
@@ -1189,7 +1232,119 @@ fn build_match_expression(query: &str) -> Option<(String, Vec<String>)> {
         .map(|term| format!("\"{}\"", term.replace('"', "")))
         .collect::<Vec<_>>()
         .join(" OR ");
-    Some((expression, terms))
+    Some((expression, terms, non_ascii))
+}
+
+/// LIKE fallback for queries the FTS tokenizer cannot match — specifically CJK
+/// runs, which `unicode61` collapses into one token per contiguous run. A
+/// substring scan over `chunks.content` (and `title`) is the only tokenizer-
+/// independent way to serve them, and it works on existing databases with no
+/// schema change or reindex. Ranked like FTS: title matches weigh five times a
+/// content match, then by hit count; deterministic tiebreak on id. Bounded by
+/// the same filters/limit as [`SEARCH_SQL`].
+fn like_fallback_search(
+    connection: &Connection,
+    terms: &[String],
+    source: Option<&str>,
+    content_type: Option<&str>,
+    limit: i64,
+) -> rusqlite::Result<Vec<SearchHit>> {
+    // Escape LIKE wildcards so a query containing % or _ keeps its literal
+    // meaning. The escaped pattern is paired with `ESCAPE '\'` per LIKE so
+    // backslash, percent and underscore all stay literal.
+    let likes = terms
+        .iter()
+        .map(|term| {
+            format!(
+                "%{}%",
+                term.replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
+        })
+        .collect::<Vec<_>>();
+    let conditions = terms
+        .iter()
+        .map(|_| "(c.title LIKE ? ESCAPE '\\' OR c.content LIKE ? ESCAPE '\\')".to_string())
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let source_index = likes.len() * 2 + 1;
+    let type_index = source_index + 1;
+    let sql = format!(
+        "SELECT c.id, c.title, c.source, c.content_type, c.line_start, c.line_end, c.content \
+         FROM chunks c \
+         WHERE ({conditions}) \
+           AND (?{source_index} IS NULL OR c.source = ?{source_index}) \
+           AND (?{type_index} IS NULL OR LOWER(c.content_type) = ?{type_index}) \
+         LIMIT 200"
+    );
+    let mut statement = connection.prepare_cached(&sql)?;
+    let mut bindings: Vec<rusqlite::types::Value> = Vec::with_capacity(likes.len() * 2 + 2);
+    for like in &likes {
+        bindings.push(like.clone().into());
+        bindings.push(like.clone().into());
+    }
+    bindings.push(source.map(str::to_owned).into());
+    bindings.push(content_type.map(str::to_owned).into());
+    let mut rows = statement.query(rusqlite::params_from_iter(bindings.iter()))?;
+    let mut scored: Vec<(f64, i64, SearchHit)> = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let title: String = row.get(1)?;
+        let content: String = row.get(6)?;
+        let mut score = 0.0;
+        for term in terms {
+            let title_hits = count_occurrences(&title, term);
+            let content_hits = count_occurrences(&content, term);
+            // Mirror `bm25(fts, 5.0, 1.0)`: a title hit is worth five
+            // content hits. Fractional weight per occurrence keeps multiple
+            // occurrences ranked above single ones without exploding scores.
+            score += 5.0 * title_hits as f64 + content_hits as f64;
+        }
+        let hit = SearchHit {
+            id,
+            title: row.get(1)?,
+            source: row.get(2)?,
+            content_type: row.get(3)?,
+            // Reuse the full content for snippet computation below.
+            snippet: String::new(),
+            line_start: row.get(4)?,
+            line_end: row.get(5)?,
+            score: 0.0,
+        };
+        scored.push((score, id, hit));
+    }
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(scored
+        .into_iter()
+        .take(limit.max(0) as usize)
+        .map(|(score, _, mut hit)| {
+            hit.score = score;
+            hit
+        })
+        .collect())
+}
+
+/// Case-sensitive occurrence count; CJK terms have no case folding, and the
+/// LIKE comparison above is case-sensitive for them by SQLite's default
+/// (non-ASCII LIKE is case-sensitive), so both sides agree.
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0usize;
+    let mut rest = haystack;
+    while let Some(position) = rest.find(needle) {
+        count += 1;
+        rest = &rest[position + needle.len()..];
+    }
+    count
+}
+
+/// Fill `snippet` for LIKE-fallback hits with the same [`make_snippet`]
+/// window the FTS path uses, centered on the first matching term.
+fn fill_snippet(hit: &mut SearchHit, content: &str, terms: &[String]) {
+    hit.snippet = make_snippet(content, terms, SNIPPET_CHARS);
 }
 
 // ---------------------------------------------------------------------------

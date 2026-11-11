@@ -599,6 +599,7 @@ fn agent_config_with_registry(
     provider_registry: Arc<ProviderRegistry>,
 ) -> AgentSessionConfig {
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry,
         model: fake_model(),
         api_key: None,
@@ -2610,4 +2611,296 @@ async fn snapshot_push_with_prebuilt_projection_reuses_it() {
         Some(3),
         "the rebuilt snapshot carries the appended entry: {snapshot}"
     );
+}
+
+/// R56 fragment-cache (PIR-SDK-027 round 2) regression block.
+///
+/// The per-entry projection views are cached as owned `JsonValue` fragments
+/// plus the aggregate `Arc<JsonValue>`, the aggregate text and the FULL
+/// `{entries, messages}` projection text. An append-only session EXTENDS the
+/// cached set (one serialization per appended entry; every retained view
+/// rides the cache), and any structural change (a label entry rewriting an
+/// existing node's view, a fork/branch) falls back to a full fragment build.
+/// The pushed wire snapshot must stay consistent with a full re-render in
+/// BOTH paths -- the tests here assert the text and the counters.
+mod fragment_cache_tests {
+    use super::*;
+    use pir::agent_session::{fragment_cache_stats_for_test, reset_fragment_cache_stats_for_test};
+
+    async fn push_and_capture(handle: &ExtensionHandle, agent: &AgentSession) -> serde_json::Value {
+        assert!(
+            agent.push_session_context_for_test().await,
+            "an appended entry must rebuild the snapshot"
+        );
+        snapshot_json(handle).await
+    }
+
+    /// Append-only session: every push after the first EXTENDS the cached
+    /// fragment set (zero full builds after the first), and the pushed
+    /// projection stays consistent with the live projection.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
+    async fn append_pushes_extend_the_cached_fragments_and_stay_byte_equal() {
+        let _serial = env_lock();
+        reset_fragment_cache_stats_for_test();
+        let temp = TempDir::new("frag-extend");
+        let cwd = temp.path().to_string_lossy().into_owned();
+        let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
+        manager
+            .append_message(user_message("first user"))
+            .expect("append user");
+        manager
+            .append_message(assistant_message("first reply"))
+            .expect("append assistant");
+
+        let handle =
+            ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
+        let mut config = agent_config(temp.path(), manager);
+        config.extensions = Some(handle.clone());
+        let agent = AgentSession::new_with_plugins(config, Vec::new());
+
+        let first = push_and_capture(&handle, &agent).await;
+        let (builds_first, _extends_first, _cloned_first) = fragment_cache_stats_for_test();
+        assert_eq!(
+            builds_first, 1,
+            "the first push builds the fragment set for the full projection"
+        );
+
+        // Two appends: each push must EXTEND (no new full build) and the
+        // wire text must carry the appended messages.
+        let session = agent.session_manager().expect("persisted session");
+        session
+            .lock()
+            .await
+            .append_message(user_message("second user"))
+            .expect("append second user");
+        let second = push_and_capture(&handle, &agent).await;
+        session
+            .lock()
+            .await
+            .append_message(assistant_message("second reply"))
+            .expect("append second reply");
+        let third = push_and_capture(&handle, &agent).await;
+
+        let (builds, extends, cloned) = fragment_cache_stats_for_test();
+        assert_eq!(builds, 1, "appends must extend, never full-build");
+        assert_eq!(extends, 2, "one extend per append push");
+        assert_eq!(
+            cloned, 0,
+            "the cache hands the set over by move; no structural clone"
+        );
+
+        for snapshot in [&first, &second, &third] {
+            let entries = snapshot["entries"].as_array().expect("entries is an array");
+            let messages = snapshot["projection"]["messages"]
+                .as_array()
+                .expect("projection.messages is an array");
+            assert_eq!(
+                entries.len(),
+                messages.len(),
+                "every projected entry's view appears in the aggregate: {snapshot}"
+            );
+        }
+        let third_texts: Vec<&str> = third["projection"]["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter_map(|message| {
+                message["content"]
+                    .as_array()
+                    .and_then(|blocks| blocks.first())
+                    .and_then(|block| block["text"].as_str())
+            })
+            .collect();
+        assert_eq!(
+            third_texts,
+            vec!["first user", "first reply", "second user", "second reply"],
+            "the spliced aggregate text carries the appended messages: {third}"
+        );
+        let third_views: Vec<&str> = third["projection"]["entries"]
+            .as_array()
+            .expect("entries array")
+            .iter()
+            .filter_map(|view| view["entry"]["id"].as_str())
+            .collect();
+        assert_eq!(
+            third_views.len(),
+            4,
+            "the spliced views carry every projected entry: {third}"
+        );
+        assert_eq!(
+            third["entries"].as_array().map(Vec::len),
+            Some(4),
+            "snapshot.entries is the flat message list: {third}"
+        );
+    }
+
+    /// A label append moves the leaf to the label entry (a STATE entry
+    /// projecting zero messages). The FRAGMENT set stays positionally valid —
+    /// the label's empty view appends — so the push extends; the label is
+    /// visible in the pushed label map and the entry tree, and a following
+    /// plain append extends again. (The entry TREE does full-render on a
+    /// label append — the label rewrites an existing node's rendered fields;
+    /// covered by the tree cache unit test.)
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
+    async fn label_append_extends_fragments_and_publishes_the_label() {
+        let _serial = env_lock();
+        reset_fragment_cache_stats_for_test();
+        let temp = TempDir::new("frag-label");
+        let cwd = temp.path().to_string_lossy().into_owned();
+        let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
+        manager
+            .append_message(user_message("labeled turn"))
+            .expect("append user");
+        manager
+            .append_message(assistant_message("labeled reply"))
+            .expect("append assistant");
+
+        let handle =
+            ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
+        let mut config = agent_config(temp.path(), manager);
+        config.extensions = Some(handle.clone());
+        let agent = AgentSession::new_with_plugins(config, Vec::new());
+
+        let _first = push_and_capture(&handle, &agent).await;
+        let (builds_first, _extends, _cloned) = fragment_cache_stats_for_test();
+        assert_eq!(builds_first, 1, "the first push builds");
+
+        let session = agent.session_manager().expect("persisted session");
+        let leaf = session
+            .lock()
+            .await
+            .leaf_id()
+            .map(str::to_owned)
+            .expect("leaf");
+        session
+            .lock()
+            .await
+            .set_label(&leaf, Some("checkpoint"))
+            .expect("set label");
+        let labeled = push_and_capture(&handle, &agent).await;
+        let (builds, extends, _cloned) = fragment_cache_stats_for_test();
+        assert_eq!(
+            builds, builds_first,
+            "a label append keeps the fragment set (zero-message view appended)"
+        );
+        assert_eq!(extends, 1, "the label push extended the cached set");
+        assert_eq!(
+            labeled["entries"].as_array().map(Vec::len),
+            Some(2),
+            "the label does not change the projected context: {labeled}"
+        );
+        assert_eq!(
+            labeled["labels"]
+                .as_object()
+                .and_then(|labels| labels.get(&leaf))
+                .and_then(|value| value.as_str()),
+            Some("checkpoint"),
+            "the pushed label map carries the new label: {labeled}"
+        );
+
+        // After the label push, a plain append extends again.
+        reset_fragment_cache_stats_for_test();
+        session
+            .lock()
+            .await
+            .append_message(user_message("after label"))
+            .expect("append after label");
+        let after = push_and_capture(&handle, &agent).await;
+        let (builds2, extends2, _cloned) = fragment_cache_stats_for_test();
+        assert_eq!(builds2, 0, "the post-label append must extend");
+        assert_eq!(extends2, 1, "exactly one extend");
+        assert_eq!(
+            after["projection"]["messages"].as_array().map(Vec::len),
+            Some(3),
+            "the appended message is in the aggregate: {after}"
+        );
+    }
+
+    /// A BRANCH (fork to an earlier entry) reshuffles the retained-entry list
+    /// the fragment vec is index-aligned with: the next push must FULL-BUILD
+    /// the fragment set — extending would splice the wrong views at the wrong
+    /// positions.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
+    async fn branch_falls_back_to_a_full_fragment_build() {
+        let _serial = env_lock();
+        reset_fragment_cache_stats_for_test();
+        let temp = TempDir::new("frag-branch");
+        let cwd = temp.path().to_string_lossy().into_owned();
+        let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
+        manager
+            .append_message(user_message("root user"))
+            .expect("append user");
+        manager
+            .append_message(assistant_message("root reply"))
+            .expect("append assistant");
+
+        let handle =
+            ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
+        let mut config = agent_config(temp.path(), manager);
+        config.extensions = Some(handle.clone());
+        let agent = AgentSession::new_with_plugins(config, Vec::new());
+
+        let _first = push_and_capture(&handle, &agent).await;
+        let (builds_first, _extends, _cloned) = fragment_cache_stats_for_test();
+        assert_eq!(builds_first, 1, "the first push builds");
+
+        // Branch to the FIRST message: the retained list becomes [root user]
+        // — shorter than the cached two-entry set and reordered.
+        let session = agent.session_manager().expect("persisted session");
+        let root_user_id = session
+            .lock()
+            .await
+            .resident_entries()
+            .iter()
+            .find(|entry| {
+                !entry.is_header() && {
+                    let id = entry.id();
+                    id.is_some()
+                }
+            })
+            .and_then(|entry| entry.id().map(str::to_owned))
+            .expect("root user id");
+        session
+            .lock()
+            .await
+            .branch(&root_user_id)
+            .expect("branch to root user");
+        let branched = push_and_capture(&handle, &agent).await;
+        let (builds, extends, _cloned) = fragment_cache_stats_for_test();
+        assert!(
+            builds > builds_first,
+            "a branch must fall back to a full fragment build (list reshuffled)"
+        );
+        assert_eq!(extends, 0, "no extend may fire across a branch");
+        assert_eq!(
+            branched["projection"]["messages"].as_array().map(Vec::len),
+            Some(1),
+            "the branched projection carries only the branch point: {branched}"
+        );
+        assert_eq!(
+            branched["leafId"].as_str(),
+            Some(root_user_id.as_str()),
+            "the pushed leaf is the branch point: {branched}"
+        );
+
+        // The full-build set is the new base: a plain append extends again.
+        reset_fragment_cache_stats_for_test();
+        session
+            .lock()
+            .await
+            .append_message(user_message("after branch"))
+            .expect("append after branch");
+        let after = push_and_capture(&handle, &agent).await;
+        let (builds2, extends2, _cloned) = fragment_cache_stats_for_test();
+        assert_eq!(builds2, 0, "the post-branch append must extend");
+        assert_eq!(extends2, 1, "exactly one extend");
+        assert_eq!(
+            after["projection"]["messages"].as_array().map(Vec::len),
+            Some(2),
+            "the appended message rides the spliced aggregate: {after}"
+        );
+    }
 }

@@ -47,9 +47,8 @@ pnpm-lock.yaml
 *.ts
 *.tsx
 *.js
-# Built-in phone web assets are intentional source (embedded with include_bytes),
-# not Node build artifacts.
-!src/plugins/builtin/phone/assets/**
+# Standalone pi-phone PWA client source (served/embedded by the central server).
+!clients/pi-phone-pwa/**
 
 # OS
 .DS_Store
@@ -58,3 +57,14 @@ Thumbs.db
 /.audit/
 **/__pycache__/
 *.pyc
+
+# Multi-lane play evidence: protocol, issues, lane journals and the measured
+# reports live here. It is working material, not shipped source, and it holds
+# large regenerable artifacts (pinned binaries, session JSONL, CSVs), so it
+# never enters the repository.
+/.play/
+
+# cm-memory tool cache (binary store + lock); regenerable, machine-local.
+/cm.cache
+/cm.lock
+/cm

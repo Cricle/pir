@@ -45,7 +45,13 @@ pub enum TableCommitChange {
     /// An entry was appended.
     Entry(EntryRecord),
     /// A task record was created or replaced.
-    Task(TaskRecord),
+    ///
+    /// Shared: a task record carries the full input/checkpoint payload, and
+    /// every observer (scheduler, task graph, event translation) only reads
+    /// it. Cloning the `Arc` keeps one copy per publication instead of one
+    /// copy per observer; upstream shares the record object for the same
+    /// reason.
+    Task(Arc<TaskRecord>),
     /// A submission was created or replaced.
     Submission(SubmissionRecord),
 }
@@ -113,7 +119,9 @@ impl CommitPublication {
                     changes.push(CommitChange::Table(TableCommitChange::Entry(value.clone())));
                 }
                 StorageWrite::Task { value } => {
-                    changes.push(CommitChange::Table(TableCommitChange::Task(value.clone())));
+                    changes.push(CommitChange::Table(TableCommitChange::Task(Arc::new(
+                        value.clone(),
+                    ))));
                 }
                 StorageWrite::Submission { value } => {
                     changes.push(CommitChange::Table(TableCommitChange::Submission(

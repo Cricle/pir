@@ -14,6 +14,7 @@
 //! - user messages render as background blocks without any "You:" label;
 //! - the editor border color tracks the thinking level / bash mode.
 
+pub mod alloc_trace;
 pub mod altscreen_search;
 pub mod ansi;
 pub mod app;
@@ -33,10 +34,12 @@ pub mod messages;
 pub mod overlay_position;
 pub mod program_status;
 pub mod renderers;
+pub mod search_trace;
 pub mod selector;
 pub mod session_cwd;
 pub mod settings_menu;
 pub mod slash;
+pub mod spill_preview;
 pub mod startup_input;
 pub mod stdin_buffer;
 pub mod syntax;

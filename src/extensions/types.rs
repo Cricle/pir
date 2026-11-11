@@ -534,8 +534,15 @@ pub struct SessionContextSnapshot {
     pub cwd: Option<String>,
     /// Serialized session header (`getHeader()`); `Null` when none.
     pub header: JsonValue,
-    /// Serialized branch (leaf-path) entries (`getBranch()`); `Null`.
-    pub branch: JsonValue,
+    /// Serialized branch (leaf-path) entries (`getBranch()`), as PRE-RENDERED
+    /// JSON TEXT — exactly the bytes `serde_json` writes for the equivalent
+    /// `Value` (an array or `null` when no session is attached).
+    ///
+    /// Text, not a `Value`: the branch is the whole leaf path, so holding it
+    /// as a `Value` re-materialized a transcript-sized tree on every
+    /// snapshot push (PIR-SDK-027). Consumers splice the text (`getSessionManagerJson`)
+    /// instead of re-encoding it.
+    pub branch_json: String,
     /// The full entry tree (`getTree()` / `getEntry()` / `getLeafEntry()`) as
     /// PRE-RENDERED JSON TEXT — the array `tree()` nests, written by
     /// [`crate::session_manager::TreeNode::forest_to_json_iterative`] — or
@@ -553,8 +560,17 @@ pub struct SessionContextSnapshot {
     /// Serialized `{entryId: label}` map (`getLabel()`).
     pub labels: JsonValue,
     /// Serialized session projection (`buildSessionProjection()`):
-    /// `{entries, messages}`; `Null`.
-    pub projection: JsonValue,
+    /// `{entries, messages}`, as PRE-RENDERED JSON TEXT — exactly the bytes
+    /// `serde_json` writes for the equivalent `Value`, or `null` when there
+    /// is no projection (no attached session).
+    ///
+    /// Text, not a `Value`: the projection's `messages` array duplicated the
+    /// whole transcript a second (and with the per-entry views a third) time
+    /// as a `Value` tree on every snapshot push (PIR-SDK-027). The text
+    /// form keeps one `Arc<JsonValue>` (`entries`, shared with native
+    /// readers) plus this string, and the per-entry views are serialized
+    /// borrowed from the projection's message slices instead of cloned.
+    pub projection_json: String,
 }
 
 /// Outcome of dispatching an event through all registered handlers.

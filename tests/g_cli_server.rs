@@ -18,8 +18,6 @@ pub mod common;
 mod g_server_persistence;
 #[path = "suites/mcp_config_shape.rs"]
 mod mcp_config_shape;
-#[path = "suites/phone_ws_w13.rs"]
-mod phone_ws_w13;
 #[path = "suites/powershell_tool.rs"]
 mod powershell_tool;
 #[path = "suites/print_retry_json.rs"]

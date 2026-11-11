@@ -484,6 +484,7 @@ fn retry_session(
 
     Arc::new(pir::agent_session::AgentSession::new(
         pir::agent_session::AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model,
             api_key: Some("test-key".into()),

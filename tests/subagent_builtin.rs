@@ -401,6 +401,8 @@ fn env_with(
     project_trusted: bool,
 ) -> Arc<ToolSessionEnv> {
     Arc::new(ToolSessionEnv {
+        live_model: None,
+        live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),
@@ -921,6 +923,8 @@ async fn bare_workspace_child_still_gets_the_default_preamble() {
     // `agent_dir` points at the same (otherwise empty) temp dir so the
     // prompt's global skill/context discovery finds nothing either.
     let env = Arc::new(ToolSessionEnv {
+        live_model: None,
+        live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),
@@ -1026,6 +1030,8 @@ async fn agent_with_own_model_uses_the_default_thinking_level() {
     registry.set_provider(Arc::clone(&provider) as Arc<dyn Provider>);
     // Dispatch (parent) thinking level: high.
     let env = Arc::new(ToolSessionEnv {
+        live_model: None,
+        live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: Arc::new(registry),
         model: fake_model(),
@@ -1094,6 +1100,8 @@ async fn child_resolves_models_json_from_the_parent_agent_dir() {
         calls: AtomicUsize::new(0),
     }));
     let env = Arc::new(ToolSessionEnv {
+        live_model: None,
+        live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: Arc::new(registry),
         model: fake_model(),
@@ -1152,6 +1160,8 @@ async fn child_inherits_only_matching_provider_credentials() {
     assert!(format!("{credential:?}").contains("[redacted]"));
     assert!(!format!("{credential:?}").contains("endpoint-scoped-key"));
     let env = Arc::new(ToolSessionEnv {
+        live_model: None,
+        live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: Arc::new(registry),
         model: fake_model(),
@@ -1236,6 +1246,8 @@ async fn chain_live_updates_show_completed_plus_one_running_entry() {
     let updates: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&updates);
     let env = Arc::new(ToolSessionEnv {
+        live_model: None,
+        live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),
@@ -1269,8 +1281,10 @@ async fn chain_live_updates_show_completed_plus_one_running_entry() {
     assert!(!result.is_error, "content: {}", result.content);
 
     let updates = updates.lock().unwrap().clone();
-    // Two live updates per step (one per child turn), each showing the
-    // completed steps plus exactly one running entry: lengths 1, 1, 2, 2.
+    // Each step emits one placeholder as soon as it starts plus one update per
+    // child turn; every snapshot shows the completed steps plus exactly one
+    // running entry: lengths 1,1,1,2,2,2 (PIR-TUI-005: the step-start entry
+    // must be present before the first child event).
     let lengths: Vec<usize> = updates
         .iter()
         .map(|update| {
@@ -1281,18 +1295,22 @@ async fn chain_live_updates_show_completed_plus_one_running_entry() {
         })
         .collect();
     assert!(
-        updates.len() >= 4,
-        "expected >= 2 updates per step (multi-turn children), got {}: {updates:?}",
+        updates.len() >= 6,
+        "expected step-start + 2 turn updates per step, got {}: {updates:?}",
         updates.len()
     );
     assert!(
         lengths.iter().all(|length| *length <= 2),
         "live details arrays must stay bounded per step: {lengths:?}"
     );
-    assert_eq!(lengths[0], 1, "lengths: {lengths:?}");
-    assert_eq!(lengths[1], 1, "lengths: {lengths:?}");
-    assert_eq!(lengths[2], 2, "lengths: {lengths:?}");
-    assert_eq!(lengths[3], 2, "lengths: {lengths:?}");
+    assert_eq!(lengths[..6], [1, 1, 1, 2, 2, 2], "lengths: {lengths:?}");
+    let first = updates[0]["details"]["results"][0].clone();
+    assert_eq!(first["step"], 1, "first update is step 1: {first}");
+    assert_eq!(
+        first["pending"], true,
+        "step-start entry is running: {first}"
+    );
+    assert_eq!(first["agent"], "a", "first update: {first}");
 }
 
 #[tokio::test]
@@ -1318,6 +1336,8 @@ async fn tool_allowlist_limits_child_registry() {
         assistant(vec![text(&content)], StopReason::Stop)
     }));
     let mut env = ToolSessionEnv {
+        live_model: None,
+        live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),
@@ -1403,6 +1423,8 @@ async fn parallel_mode_aggregates_and_emits_live_updates() {
     let updates: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let updates_for_env = updates.clone();
     let mut env = ToolSessionEnv {
+        live_model: None,
+        live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),
@@ -1794,6 +1816,7 @@ fn subagent_runs_through_the_agent_loop_with_session_env() {
                 let previous_agent_dir = std::env::var("PIR_AGENT_DIR").ok();
                 std::env::set_var("PIR_AGENT_DIR", &temp.0);
                 let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+                    performance: Default::default(),
                     provider_registry: Arc::clone(&registry),
                     model: fake_model(),
                     api_key: None,
@@ -1906,6 +1929,7 @@ fn session_env_propagates_the_explicit_credential_to_child_runs() {
                 // must resolve `<dir>/agents` and never the process dir.
                 let agent = Arc::new(AgentSession::new_with_agent_dir(
                     AgentSessionConfig {
+                        performance: Default::default(),
                         provider_registry: Arc::new(registry),
                         model: fake_model(),
                         api_key: Some("session-explicit-key".into()),
@@ -2108,4 +2132,882 @@ async fn child_executes_extension_tools_through_the_parent_handle() {
         .await;
     assert!(!result.is_error, "{}", result.content);
     assert_eq!(result.content, "ECHO:FROM_JS");
+}
+
+// ---------------------------------------------------------------------------
+// tool_search activation isolation: parent session vs subagent child session
+// ---------------------------------------------------------------------------
+
+/// A deferred tool used to verify that `tool_search` activation in a child
+/// session writes only the child's own override cell.
+#[cfg(feature = "tool-search")]
+mod tool_search_isolation {
+    use super::*;
+    use pir::agent::tool_batch::ToolResult;
+    use pir::agent::tool_execution::{BoxFuture, ToolExposure};
+    use pir::coding_agent::ToolSelection;
+    use pir::plugins::builtin::ToolSearchPlugin;
+    use pir::session_manager::SessionManager;
+
+    struct DeferredProbe {
+        name: &'static str,
+        description: &'static str,
+    }
+
+    impl AgentTool for DeferredProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            self.description
+        }
+        fn parameters(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": { "service": { "type": "string" } },
+            }))
+        }
+        fn exposure(&self) -> ToolExposure {
+            ToolExposure::Deferred
+        }
+        fn run(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> BoxFuture<'static, ToolResult> {
+            let text = format!("{} ok", self.name);
+            Box::pin(async move { ToolResult::ok(text) })
+        }
+    }
+
+    fn deferred_registry() -> ToolRegistry {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(DeferredProbe {
+            name: "deploy_status",
+            description: "Report the production deployment status for a service",
+        }));
+        tools.register(Arc::new(DeferredProbe {
+            name: "release_notes",
+            description: "Show changelog entries for a published version",
+        }));
+        tools.register(Arc::new(DeferredProbe {
+            name: "rollback_status",
+            description: "Undo a previously shipped release",
+        }));
+        tools
+    }
+
+    fn search_message(query: &str) -> AssistantMessage {
+        assistant(
+            vec![tool_call_block(
+                "call-search",
+                "tool_search",
+                serde_json::json!({ "query": query, "limit": 5 }),
+            )],
+            StopReason::ToolUse,
+        )
+    }
+
+    fn done() -> AssistantMessage {
+        assistant(vec![text("done")], StopReason::Stop)
+    }
+
+    fn declared(context: &Context) -> Vec<String> {
+        context
+            .tools
+            .as_ref()
+            .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Real `AgentSession` for the parent, real `SubagentTool` + plan-only
+    /// `builtin:tool-search` runtime for the child.
+    ///
+    /// 1. Parent tool_search loads A (`deploy_status`).
+    /// 2. Child tool_search loads B (`release_notes`); the child must not
+    ///    inherit A and must not throw B into the parent's active set.
+    /// 3. Parent tool_search loads C (`rollback_status`) afterwards: parent is
+    ///    A ∪ C (never B); the child declared only B in its own run.
+    #[tokio::test]
+    async fn child_tool_search_activation_does_not_pollute_parent_or_siblings() {
+        let temp = TempDir::new("tool-search-isolation");
+        temp.write_agent(
+            "scout.md",
+            "name: scout\ndescription: search isolation probe\ntools: tool_search\n",
+            "Use tool_search when needed.",
+        );
+        let ext_path = temp.0.join("deferred-tools.ts");
+        std::fs::write(
+            &ext_path,
+            r#"
+            export default function (pi) {
+                const tool = (name, description) => ({
+                    name,
+                    description,
+                    exposure: "deferred",
+                    parameters: { type: "object", properties: { service: { type: "string" } } },
+                    execute: async () => ({ content: [{ type: "text", text: name + " ok" }] }),
+                });
+                pi.registerTool(tool("deploy_status", "Report the production deployment status for a service"));
+                pi.registerTool(tool("release_notes", "Show changelog entries for a published version"));
+                pi.registerTool(tool("rollback_status", "Undo a previously shipped release"));
+            }
+            "#,
+        )
+        .expect("write extension");
+
+        let requests: Arc<Mutex<Vec<(String, Vec<String>, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let requests_for_responder = Arc::clone(&requests);
+        let providers = fake_registry(Arc::new(move |_index, context: &Context| {
+            let last_user = user_text(context);
+            requests_for_responder.lock().unwrap().push((
+                last_user.clone(),
+                declared(context),
+                context
+                    .messages
+                    .iter()
+                    .map(|message| match message {
+                        Message::User(_) => "U",
+                        Message::System(_) => "S",
+                        Message::Developer(_) => "D",
+                        Message::Assistant(_) => "A",
+                        Message::ToolResult(_) => "T",
+                    })
+                    .collect::<String>(),
+            ));
+            if has_tool_result(context) {
+                return done();
+            }
+            if last_user.contains("PARENT-A") {
+                search_message("production deployment")
+            } else if last_user.contains("CHILD-B") {
+                search_message("changelog entries")
+            } else if last_user.contains("PARENT-C") {
+                search_message("undo shipped")
+            } else {
+                done()
+            }
+        }));
+
+        let base_tools = deferred_registry();
+        let parent = AgentSession::new_with_plugins(
+            AgentSessionConfig {
+                performance: Default::default(),
+                provider_registry: Arc::clone(&providers),
+                model: fake_model(),
+                api_key: None,
+                thinking: ThinkingLevel::Off,
+                tools: base_tools.clone(),
+                session: None,
+                compaction: None,
+                max_turns: 8,
+                system_prompt: Some("base system prompt".into()),
+                cwd: Some(temp.0.clone()),
+                event_stream: None,
+                extensions: None,
+                tool_selection: Some(ToolSelection {
+                    enabled: vec!["tool_search".to_owned()],
+                    modifiers: Vec::new(),
+                    uses_default_tools: false,
+                }),
+            },
+            vec![Arc::new(ToolSearchPlugin::new()) as Arc<dyn pir::plugins::plugin::AgentPlugin>],
+        );
+
+        parent
+            .prompt(
+                "PARENT-A: find the deployment status tool",
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("parent prompt A");
+
+        // Child: independent AgentSession built by `run_child` from the
+        // plan-only handle; no `tools` allowlist, so deferred tools stay
+        // registered but inactive until the child's own tool_search.
+        let handle = pir::extensions::ExtensionHandle::start(pir::extensions::ExtensionConfig {
+            cwd: temp.0.clone(),
+            mode: "headless".to_string(),
+            has_ui: false,
+            model: Some("fake-model".to_string()),
+            session_id: Some("tool-search-isolation".to_string()),
+            system_prompt: String::new(),
+            is_idle: true,
+            limits: Some(Default::default()),
+        })
+        .expect("extension runtime");
+        let load = handle
+            .load(&[ext_path.clone()])
+            .await
+            .expect("load deferred tools");
+        assert!(load.errors.is_empty(), "{:?}", load.errors);
+        handle.set_path_plan(vec![PathBuf::from("builtin:tool-search"), ext_path]);
+        let env = Arc::new(ToolSessionEnv {
+            live_model: None,
+            live_thinking: None,
+            read_ledger: Arc::new(pir::agent::read_ledger::ReadLedger::default()),
+            provider_registry: Arc::clone(&providers),
+            model: fake_model(),
+            thinking: ThinkingLevel::Off,
+            session_id: None,
+            session_file: None,
+            base_tools: Arc::new(base_tools),
+            has_ui: false,
+            project_trusted: true,
+            user_agents_dir: Some(temp.0.join("agents")),
+            agent_dir: Some(temp.0.clone()),
+            credential: None,
+            on_update: None,
+            live_tools: None,
+            active_override: None,
+            background: None,
+        });
+        let tool_ctx = tool_context(&temp.0, env, None);
+        let result = SubagentTool::with_extensions(Some(handle))
+            .run(
+                &serde_json::json!({
+                    "agent": "scout",
+                    "task": "CHILD-B: find the release notes tool",
+                }),
+                &tool_ctx,
+            )
+            .await;
+        assert!(!result.is_error, "child failed: {}", result.content);
+        assert_eq!(result.content, "done");
+
+        parent
+            .prompt("PARENT-C: find the rollback status tool", Arc::new(|_| {}))
+            .await
+            .expect("parent prompt C");
+
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let parent_a: Vec<&Vec<String>> = requests
+            .iter()
+            .filter(|(user, _, _)| user.contains("PARENT-A"))
+            .map(|(_, declared, _)| declared)
+            .collect();
+        let child_b: Vec<&Vec<String>> = requests
+            .iter()
+            .filter(|(user, _, _)| user.contains("CHILD-B"))
+            .map(|(_, declared, _)| declared)
+            .collect();
+        let parent_c: Vec<&Vec<String>> = requests
+            .iter()
+            .filter(|(user, _, _)| user.contains("PARENT-C"))
+            .map(|(_, declared, _)| declared)
+            .collect();
+
+        assert!(!parent_a.is_empty(), "parent A requests: {requests:?}");
+        assert!(
+            !parent_a[0].iter().any(|name| name == "deploy_status"),
+            "deferred A must start inactive: {:?}",
+            parent_a[0]
+        );
+        assert!(
+            parent_a
+                .iter()
+                .any(|names| names.iter().any(|name| name == "deploy_status")),
+            "parent tool_search must load A: {parent_a:?}"
+        );
+
+        assert!(!child_b.is_empty(), "child B requests: {requests:?}");
+        assert!(
+            !child_b[0].iter().any(|name| name == "release_notes"),
+            "deferred B must start inactive in the child: {:?}",
+            child_b[0]
+        );
+        assert!(
+            child_b
+                .iter()
+                .any(|names| names.iter().any(|name| name == "release_notes")),
+            "child tool_search must load B: {child_b:?}"
+        );
+        assert!(
+            child_b
+                .iter()
+                .all(|names| !names.iter().any(|name| name == "deploy_status")),
+            "the child must NOT inherit the parent's active A: {child_b:?}"
+        );
+
+        assert!(!parent_c.is_empty(), "parent C requests: {requests:?}");
+        assert!(
+            parent_c[0].iter().any(|name| name == "deploy_status"),
+            "the child run must not clear the parent's A: {:?}",
+            parent_c[0]
+        );
+        assert!(
+            parent_c
+                .last()
+                .is_some_and(|names| names.iter().any(|name| name == "rollback_status")
+                    && names.iter().any(|name| name == "deploy_status")),
+            "parent after C must be A ∪ C: {parent_c:?}"
+        );
+        assert!(
+            parent_c
+                .iter()
+                .all(|names| !names.iter().any(|name| name == "release_notes")),
+            "the parent must NOT see the child's B: {parent_c:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|(user, _, _)| user.contains("PARENT"))
+                .all(|(_, names, _)| !names.iter().any(|name| name == "release_notes")),
+            "no parent request may declare the child-only B: {requests:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Parallel siblings: four children run concurrently, each tool_search
+    // loads a different deferred tool (or nothing for the no-match child).
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Clone)]
+    struct ParallelRequest {
+        last_user: String,
+        declared: Vec<String>,
+        tool_results: Vec<String>,
+    }
+
+    /// A tool result AFTER the current (last) user message marks a post-search
+    /// turn. (The loadout refresh inserts a trailing `system` `toolsAdded`
+    /// message, so "last message is a tool result" is false on precisely the
+    /// turn after a load; a plain "any tool result" wrongly matches the second
+    /// parent prompt, whose history still contains prompt A's tool result.)
+    fn has_any_tool_result(context: &Context) -> bool {
+        let last_user = context
+            .messages
+            .iter()
+            .rposition(|message| matches!(message, Message::User(_)))
+            .unwrap_or(0);
+        context.messages[last_user..]
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult(_)))
+    }
+
+    fn query_for(last_user: &str) -> Option<&'static str> {
+        if last_user.contains("PARENT-A") || last_user.contains("CHILD-A") {
+            Some("production deployment")
+        } else if last_user.contains("CHILD-B") {
+            Some("changelog entries")
+        } else if last_user.contains("PARENT-C") || last_user.contains("CHILD-C") {
+            Some("undo shipped")
+        } else if last_user.contains("CHILD-N") {
+            // Deliberately unlike any registered tool: the child's search
+            // returns "No matching tools found." and activates nothing.
+            Some("zzz quantum flux capacitor")
+        } else {
+            None
+        }
+    }
+
+    /// Scripted provider whose FIRST child request blocks until all four
+    /// sibling children have reached the provider. That is only reachable if
+    /// the parallel dispatcher really has all children in flight at once;
+    /// sequential dispatch trips `timed_out` after the deadline.
+    struct ParallelBarrierProvider {
+        entered: Arc<AtomicUsize>,
+        expected: usize,
+        timed_out: Arc<std::sync::atomic::AtomicBool>,
+        requests: Arc<Mutex<Vec<ParallelRequest>>>,
+    }
+
+    impl Provider for ParallelBarrierProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+        fn name(&self) -> &str {
+            "Fake parallel barrier provider"
+        }
+        fn get_models(&self) -> Vec<Model> {
+            vec![fake_model()]
+        }
+        fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+            vec![ApiKeyAuth::new("fake key", vec!["FAKE_TEST_KEY".into()])]
+        }
+        fn stream(
+            &self,
+            _model: &Model,
+            context: Context,
+            _options: StreamOptions,
+        ) -> AssistantMessageEventStream {
+            let last_user = user_text(&context);
+            let tool_results = context
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::ToolResult(result) => Some(
+                        result
+                            .content
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text(text) => Some(text.text.clone()),
+                                _ => None,
+                            })
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(ParallelRequest {
+                    last_user: last_user.clone(),
+                    declared: declared(&context),
+                    tool_results,
+                });
+
+            let stream = AssistantMessageEventStream::new();
+            let pusher = stream.clone();
+            let first_child_turn = !has_any_tool_result(&context) && last_user.contains("CHILD-");
+            if first_child_turn {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                let entered = Arc::clone(&self.entered);
+                let expected = self.expected;
+                let timed_out = Arc::clone(&self.timed_out);
+                let message = query_for(&last_user)
+                    .map(search_message)
+                    .unwrap_or_else(done);
+                tokio::spawn(async move {
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        if entered.load(Ordering::SeqCst) >= expected {
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            timed_out.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    pusher.push(AssistantMessageEventStream::done_event(
+                        TerminalReason::Stop,
+                        message,
+                    ));
+                });
+            } else {
+                let message = if has_any_tool_result(&context) {
+                    done()
+                } else {
+                    query_for(&last_user)
+                        .map(search_message)
+                        .unwrap_or_else(done)
+                };
+                pusher.push(AssistantMessageEventStream::done_event(
+                    TerminalReason::Stop,
+                    message,
+                ));
+            }
+            stream
+        }
+    }
+
+    fn deferred_names_in(requests: &[&ParallelRequest]) -> std::collections::BTreeSet<String> {
+        requests
+            .iter()
+            .flat_map(|request| request.declared.iter().cloned())
+            .filter(|name| {
+                name == "deploy_status" || name == "release_notes" || name == "rollback_status"
+            })
+            .collect()
+    }
+
+    fn requests_for<'a>(requests: &'a [ParallelRequest], marker: &str) -> Vec<&'a ParallelRequest> {
+        requests
+            .iter()
+            .filter(|request| request.last_user.contains(marker))
+            .collect()
+    }
+
+    /// Parent A loaded before the parallel dispatch; four children (A/B/C plus
+    /// a no-match child) each run their own tool_search inside their own child
+    /// runtime; parent C loaded afterwards. Siblings must not see each other's
+    /// active tools, the parent's active set is untouched by all children, and
+    /// the no-match child must not disturb its siblings.
+    #[tokio::test]
+    async fn parallel_child_tool_search_activations_stay_isolated_across_siblings() {
+        let temp = TempDir::new("parallel-tool-search-isolation");
+        temp.write_agent(
+            "scout.md",
+            "name: scout\ndescription: parallel search isolation probe\ntools: tool_search\n",
+            "Use tool_search when needed.",
+        );
+        let ext_path = temp.0.join("deferred-tools.ts");
+        std::fs::write(
+            &ext_path,
+            r#"
+            export default function (pi) {
+                const tool = (name, description) => ({
+                    name,
+                    description,
+                    exposure: "deferred",
+                    parameters: { type: "object", properties: { service: { type: "string" } } },
+                    execute: async () => ({ content: [{ type: "text", text: name + " ok" }] }),
+                });
+                pi.registerTool(tool("deploy_status", "Report the production deployment status for a service"));
+                pi.registerTool(tool("release_notes", "Show changelog entries for a published version"));
+                pi.registerTool(tool("rollback_status", "Undo a previously shipped release"));
+            }
+            "#,
+        )
+        .expect("write extension");
+
+        let requests: Arc<Mutex<Vec<ParallelRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut provider_registry = ProviderRegistry::default();
+        provider_registry.set_provider(Arc::new(ParallelBarrierProvider {
+            entered: Arc::clone(&entered),
+            expected: 4,
+            timed_out: Arc::clone(&timed_out),
+            requests: Arc::clone(&requests),
+        }));
+        let providers = Arc::new(provider_registry);
+
+        let base_tools = deferred_registry();
+        let parent_session =
+            SessionManager::create(&temp.0.display().to_string(), &temp.0).expect("create session");
+        let parent_session_path = parent_session.path().to_path_buf();
+        let parent = AgentSession::new_with_plugins(
+            AgentSessionConfig {
+                performance: Default::default(),
+                provider_registry: Arc::clone(&providers),
+                model: fake_model(),
+                api_key: None,
+                thinking: ThinkingLevel::Off,
+                tools: base_tools.clone(),
+                session: Some(parent_session),
+                compaction: None,
+                max_turns: 8,
+                system_prompt: Some("base system prompt".into()),
+                cwd: Some(temp.0.clone()),
+                event_stream: None,
+                extensions: None,
+                tool_selection: Some(ToolSelection {
+                    enabled: vec!["tool_search".to_owned()],
+                    modifiers: Vec::new(),
+                    uses_default_tools: false,
+                }),
+            },
+            vec![Arc::new(ToolSearchPlugin::new()) as Arc<dyn pir::plugins::plugin::AgentPlugin>],
+        );
+
+        parent
+            .prompt(
+                "PARENT-A: find the deployment status tool",
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("parent prompt A");
+
+        let handle = pir::extensions::ExtensionHandle::start(pir::extensions::ExtensionConfig {
+            cwd: temp.0.clone(),
+            mode: "headless".to_string(),
+            has_ui: false,
+            model: Some("fake-model".to_string()),
+            session_id: Some("parallel-tool-search-isolation".to_string()),
+            system_prompt: String::new(),
+            is_idle: true,
+            limits: Some(Default::default()),
+        })
+        .expect("extension runtime");
+        let load = handle
+            .load(&[ext_path.clone()])
+            .await
+            .expect("load deferred tools");
+        assert!(load.errors.is_empty(), "{:?}", load.errors);
+        handle.set_path_plan(vec![PathBuf::from("builtin:tool-search"), ext_path]);
+        let env = Arc::new(ToolSessionEnv {
+            live_model: None,
+            live_thinking: None,
+            read_ledger: Arc::new(pir::agent::read_ledger::ReadLedger::default()),
+            provider_registry: Arc::clone(&providers),
+            model: fake_model(),
+            thinking: ThinkingLevel::Off,
+            session_id: None,
+            session_file: None,
+            base_tools: Arc::new(base_tools),
+            has_ui: false,
+            project_trusted: true,
+            user_agents_dir: Some(temp.0.join("agents")),
+            agent_dir: Some(temp.0.clone()),
+            credential: None,
+            on_update: None,
+            live_tools: None,
+            active_override: None,
+            background: None,
+        });
+        let updates: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_sink = Arc::clone(&updates);
+        let mut tool_ctx = tool_context(&temp.0, env, None);
+        tool_ctx.on_update = Some(Arc::new(move |value| {
+            updates_sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(value);
+        }));
+
+        let task_texts = [
+            "CHILD-A: find the deployment status tool",
+            "CHILD-B: find the release notes tool",
+            "CHILD-C: find the rollback status tool",
+            "CHILD-N: find the nonexistent quantum tool",
+        ];
+        let result = SubagentTool::with_extensions(Some(handle))
+            .run(
+                &serde_json::json!({
+                    "tasks": task_texts
+                        .iter()
+                        .map(|task| serde_json::json!({ "agent": "scout", "task": task }))
+                        .collect::<Vec<_>>(),
+                }),
+                &tool_ctx,
+            )
+            .await;
+        assert!(!result.is_error, "parallel run failed: {}", result.content);
+        assert!(
+            !timed_out.load(Ordering::SeqCst),
+            "children did not reach the provider concurrently (sequential dispatch?)"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            4,
+            "all four children must have issued their first request"
+        );
+
+        parent
+            .prompt("PARENT-C: find the rollback status tool", Arc::new(|_| {}))
+            .await
+            .expect("parent prompt C");
+
+        let details = result.details.clone().expect("parallel details");
+        assert_eq!(details["mode"], "parallel");
+        let results = details["results"].as_array().expect("results array");
+        assert_eq!(results.len(), task_texts.len());
+        for (index, task) in task_texts.iter().enumerate() {
+            let entry = &results[index];
+            assert_eq!(
+                entry["task"], *task,
+                "result order must match input: {details}"
+            );
+            assert_eq!(entry["exitCode"], 0, "child {index} failed: {entry}");
+            assert_eq!(entry["stopReason"], "stop", "child {index}: {entry}");
+            // Two turns per child: tool_search + final text. The shared fake
+            // assistant usage is 10 input / 5 output / 0.25 per turn.
+            assert_eq!(entry["usage"]["turns"], 2, "child {index} usage: {entry}");
+            assert_eq!(entry["usage"]["input"], 20, "child {index} usage: {entry}");
+            assert_eq!(entry["usage"]["output"], 10, "child {index} usage: {entry}");
+            assert_eq!(entry["usage"]["cost"], 0.5, "child {index} usage: {entry}");
+            // Each child's transcript is its own full transcript: user task,
+            // tool_search call/result, the loadout refresh, final answer. It
+            // may only name its own loaded tool (or, for CHILD-N, none).
+            let messages = entry["messages"].as_array().expect("messages");
+            assert!(messages.len() >= 4, "child {index} transcript: {entry}");
+            let transcript = serde_json::to_string(messages).expect("transcript json");
+            if let Some(own) = ["deploy_status", "release_notes", "rollback_status"].get(index) {
+                assert!(
+                    transcript.contains(&format!("- {own}:")),
+                    "child {index} must see its own load result: {transcript}"
+                );
+                for other in ["deploy_status", "release_notes", "rollback_status"] {
+                    if other != *own {
+                        assert!(
+                            !transcript.contains(&format!("- {other}:")),
+                            "child {index} must not see sibling {other}: {transcript}"
+                        );
+                    }
+                }
+            } else {
+                assert!(
+                    transcript.contains("No matching tools found."),
+                    "no-match child transcript: {transcript}"
+                );
+            }
+        }
+
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        // Sibling isolation: each child's declared set contains its OWN
+        // deferred tool and none of the other two.
+        for (marker, own) in [
+            ("CHILD-A", "deploy_status"),
+            ("CHILD-B", "release_notes"),
+            ("CHILD-C", "rollback_status"),
+        ] {
+            let child_requests = requests_for(&requests, marker);
+            assert!(!child_requests.is_empty(), "no requests for {marker}");
+            assert!(
+                !child_requests[0].declared.iter().any(|name| name == own),
+                "{marker} must start with {own} inactive: {:?}",
+                child_requests[0]
+            );
+            assert!(
+                child_requests
+                    .iter()
+                    .any(|request| request.declared.iter().any(|name| name == own)),
+                "{marker} tool_search must load {own}: {child_requests:#?}"
+            );
+            let names = deferred_names_in(&child_requests);
+            assert_eq!(
+                names,
+                std::collections::BTreeSet::from([own.to_owned()]),
+                "{marker} must only activate its own deferred tool: {names:?}"
+            );
+            assert!(
+                child_requests.iter().any(|request| request
+                    .tool_results
+                    .iter()
+                    .any(|text| text.contains(&format!("Loaded 1 tool")) && text.contains(own))),
+                "{marker} must see its own successful tool_search result: {child_requests:#?}"
+            );
+        }
+
+        // No-match child: no deferred activation, no error, own transcript,
+        // and the sibling toolset never bleeds in.
+        let nomatch = requests_for(&requests, "CHILD-N");
+        assert!(!nomatch.is_empty(), "no requests for CHILD-N");
+        assert!(
+            deferred_names_in(&nomatch).is_empty(),
+            "no-match child must not activate any deferred tool: {nomatch:#?}"
+        );
+        assert!(
+            nomatch.iter().any(|request| request
+                .tool_results
+                .iter()
+                .any(|text| text.contains("No matching tools found."))),
+            "CHILD-N must observe the no-match result: {nomatch:#?}"
+        );
+        assert!(
+            results[3]["messages"]
+                .as_array()
+                .is_some_and(|messages| !messages.is_empty()),
+            "no-match child transcript must exist: {}",
+            results[3]
+        );
+
+        // Parent active set: A before, A ∪ C afterwards, never B; the four
+        // child runs neither clear A nor inject their own tools.
+        let parent_requests = requests_for(&requests, "PARENT");
+        let parent_a = requests_for(&requests, "PARENT-A");
+        let parent_c = requests_for(&requests, "PARENT-C");
+        assert!(!parent_a.is_empty() && !parent_c.is_empty());
+        assert!(
+            !parent_a[0]
+                .declared
+                .iter()
+                .any(|name| name == "deploy_status"),
+            "parent A starts inactive: {:?}",
+            parent_a[0]
+        );
+        assert!(
+            parent_c[0]
+                .declared
+                .iter()
+                .any(|name| name == "deploy_status"),
+            "child runs must not clear the parent's A: {:?}",
+            parent_c[0]
+        );
+        assert!(
+            parent_c.last().is_some_and(|request| request
+                .declared
+                .iter()
+                .any(|name| name == "deploy_status")
+                && request
+                    .declared
+                    .iter()
+                    .any(|name| name == "rollback_status")),
+            "parent after C must be A ∪ C: {parent_c:#?}"
+        );
+        assert_eq!(
+            deferred_names_in(&parent_requests),
+            std::collections::BTreeSet::from([
+                "deploy_status".to_owned(),
+                "rollback_status".to_owned()
+            ]),
+            "parent must never declare a child-only deferred tool"
+        );
+
+        // Live aggregate events: every snapshot keeps the input task order,
+        // starts with all placeholders pending, and ends with all four done.
+        let updates = updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            updates.len() >= 5,
+            "expected live aggregate updates: {updates:#?}"
+        );
+        let snapshot_results = |update: &serde_json::Value| {
+            update["details"]["results"]
+                .as_array()
+                .expect("update results")
+                .clone()
+        };
+        let first = snapshot_results(&updates[0]);
+        assert_eq!(first.len(), 4, "initial snapshot must show every slot");
+        assert!(
+            first.iter().all(|entry| entry["pending"] == true),
+            "initial snapshot must be all placeholders: {first:#?}"
+        );
+        for update in &updates {
+            let slots = snapshot_results(update);
+            assert_eq!(slots.len(), 4, "snapshot slot count: {update}");
+            for (index, task) in task_texts.iter().enumerate() {
+                assert_eq!(slots[index]["task"], *task, "snapshot order: {update}");
+            }
+        }
+        let last = snapshot_results(updates.last().expect("last update"));
+        assert!(
+            last.iter().all(|entry| entry.get("pending").is_none()),
+            "final snapshot must have no pending slot (the flag is omitted when false): {last:#?}"
+        );
+        assert!(
+            last.iter().all(|entry| entry["usage"]["turns"] == 2),
+            "final snapshot per-task usage: {last:#?}"
+        );
+
+        // Parent session JSONL: both parent prompts are persisted; no child
+        // prompt text is written as a parent user turn (children are
+        // in-memory `--no-session` runs; their transcript lives in details).
+        let jsonl = std::fs::read_to_string(&parent_session_path).expect("read parent session");
+        let mut parent_user_texts = Vec::new();
+        for line in jsonl.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).expect("jsonl line");
+            if value["type"] == "message" && value["message"]["role"] == "user" {
+                let text = value["message"]["content"]
+                    .as_array()
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|block| block["text"].as_str())
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                parent_user_texts.push(text);
+            }
+        }
+        assert!(
+            parent_user_texts
+                .iter()
+                .any(|text| text.contains("PARENT-A"))
+                && parent_user_texts
+                    .iter()
+                    .any(|text| text.contains("PARENT-C")),
+            "parent prompts must be persisted: {parent_user_texts:?}"
+        );
+        assert!(
+            parent_user_texts
+                .iter()
+                .all(|text| !text.contains("CHILD-")),
+            "child prompts must not leak into the parent session JSONL: {parent_user_texts:?}"
+        );
+    }
 }

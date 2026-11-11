@@ -723,6 +723,8 @@ fn bash_context(root: &Path, session: Option<(String, PathBuf)>) -> ToolContext 
     let mut context = ToolContext::new(root);
     if let Some((session_id, session_file)) = session {
         context.session_env = Some(Arc::new(ToolSessionEnv {
+            live_model: None,
+            live_thinking: None,
             read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
             provider_registry: Arc::new(ProviderRegistry::default()),
             model: lazy_model(),

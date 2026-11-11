@@ -150,6 +150,7 @@ fn fake_model() -> Model {
 
 fn agent_config(cwd: PathBuf) -> AgentSessionConfig {
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,

@@ -595,3 +595,123 @@ fn vt_paste_pairs_surrogate_characters() {
     let events = decode_console_vt_batch(&records);
     assert_eq!(vt_text(&events), vec!["A😀B".to_string()], "{events:?}");
 }
+
+// ---------------------------------------------------------------------------
+// PIR-TUI-023: the search box must consume a paste chunk the way the
+// focused component does upstream (tui.ts:1147-1153 delivers the re-wrapped
+// paste to `AltScreenSearchComponent.handleInput`).
+// ---------------------------------------------------------------------------
+
+use pir::tui::altscreen_search::AltScreenState;
+use pir::tui::core::{Terminal, Text, TuiCore};
+
+/// The end-to-end PIR-TUI-023 repro: a fast typed search term of
+/// [`pir::tui::terminal::CONSOLE_BURST_MIN_CHARS`] keys or more arrives at the
+/// loop as ONE `Event::Paste` (the burst coalescer's rewrite), and the search
+/// box must insert every character into the query instead of dropping the
+/// whole chunk. Before the fix the box stayed empty — the entire query
+/// vanished (the R64 "lost keystrokes" observation).
+#[test]
+fn search_box_consumes_a_burst_paste_chunk() {
+    use pir::tui::altscreen_search::paste_into_search;
+
+    let terminal = Terminal::new();
+    terminal.set_size(40, 10);
+    let mut core = TuiCore::new(terminal);
+    let transcript: String = (1..=50)
+        .map(|index| format!("searchable line {index} with payload"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    core.push_content(Box::new(Text::new(transcript)));
+    core.render();
+    let mut state = AltScreenState::default();
+    state.search.active = true;
+
+    // What the loop sees for a typed run of >= 8 chars (one console drain
+    // window): one paste chunk. The term occurs in every transcript line so
+    // the re-target finds matches.
+    let chunk = "searchable";
+    assert!(paste_into_search(&mut core, &mut state, 0, chunk));
+    assert_eq!(
+        state.search.query, "searchable",
+        "every pasted character lands in the query"
+    );
+    // The re-target ran: the matches were recomputed for the full query.
+    assert!(
+        !state.search.matches.is_empty(),
+        "the re-target found the band matches"
+    );
+
+    // A closed box does NOT consume the chunk (the caller routes it on).
+    let mut closed = AltScreenState::default();
+    closed.search.active = false;
+    assert!(!paste_into_search(&mut core, &mut closed, 0, chunk));
+
+    // Control characters cannot appear in a one-line query; the editor's
+    // paste cleaner drops them the same way. The rest of the chunk survives.
+    let mut state2 = AltScreenState::default();
+    state2.search.active = true;
+    assert!(paste_into_search(&mut core, &mut state2, 0, "ab\tc\nd"));
+    assert_eq!(state2.search.query, "abcd");
+}
+
+/// The loop's paste arm keeps the keys as keys when the search/selector owns
+/// the focus (`coalesce_paste_allowed`): the coalescer never rewrites a run
+/// into a paste there, so an exactly-eight-key typed term still reaches the
+/// search box as eight Char keys. This pins the threshold semantics end to
+/// end: coalescer rewrite (>= 8) -> paste into search == per-key insertion.
+#[test]
+fn burst_threshold_keys_reach_the_search_query_as_one_chunk_or_eight_keys() {
+    use pir::tui::terminal::{coalesce_paste_allowed, CONSOLE_BURST_MIN_CHARS};
+
+    // With the search open the coalescer must NOT rewrite typed runs —
+    // ordinary typing keeps its key semantics (the documented contract).
+    assert!(!coalesce_paste_allowed(false, false, false, true));
+    assert!(coalesce_paste_allowed(false, false, false, false));
+
+    // The batch seam may still rewrite a run that arrives inside ONE drained
+    // batch (the coalescer runs before the loop knows the focus); whatever
+    // shape crosses the seam, the query must end up identical:
+    //   * 8 keys as keys (the gate/burst keeps them when the box is open)
+    //   * the same 8 chars as one rewritten paste chunk (the batch race)
+    let terminal = Terminal::new();
+    terminal.set_size(40, 10);
+    let mut core = TuiCore::new(terminal);
+    core.push_content(Box::new(Text::new(
+        (1..=20)
+            .map(|index| format!("warnings line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )));
+    core.render();
+
+    let mut keys_state = AltScreenState::default();
+    keys_state.search.active = true;
+    for c in "warnings".chars() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        use pir::tui::altscreen_search::route_alt_screen_key;
+        let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty());
+        let mut press = key.clone();
+        press.kind = KeyEventKind::Press;
+        assert!(matches!(
+            route_alt_screen_key(&press, &mut core, &mut keys_state, 0),
+            pir::tui::altscreen_search::AltKeyRoute::Consumed
+        ));
+        let _ = key;
+    }
+    assert_eq!(keys_state.search.query, "warnings");
+
+    let mut paste_state = AltScreenState::default();
+    paste_state.search.active = true;
+    assert!(pir::tui::altscreen_search::paste_into_search(
+        &mut core,
+        &mut paste_state,
+        0,
+        "warnings"
+    ));
+    assert_eq!(
+        paste_state.search.query, keys_state.search.query,
+        "the rewritten paste and the per-key path produce the same query"
+    );
+    assert_eq!(CONSOLE_BURST_MIN_CHARS, 8);
+}

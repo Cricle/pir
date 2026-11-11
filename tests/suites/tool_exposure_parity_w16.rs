@@ -232,6 +232,7 @@ fn registry_available(registry: &ToolRegistry) -> Vec<AvailableTool> {
 
 fn session(registry: &ToolRegistry, selection: Option<ToolSelection>) -> AgentSession {
     AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,
@@ -826,6 +827,7 @@ fn context_prompt(
     cwd: &std::path::Path,
 ) -> String {
     let session = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,
@@ -975,6 +977,7 @@ fn session_with_extensions(
     cwd: &std::path::Path,
 ) -> AgentSession {
     AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,

@@ -38,6 +38,12 @@
 //! - `ctx.reload()` from an EXTENSION COMMAND is applied by the host session
 //!   command plane (`AgentSession::reload`); the runtime's
 //!   [`AgentSessionRuntime::reload`] is the direct in-process equivalent.
+//! - Upstream `CreateAgentSessionOptions.sessionStartEvent` is not exposed.
+//!   The raw factory deliberately does not classify session lifecycle
+//!   reasons: its first prompt dispatches `session_start {reason:"startup"}`.
+//!   Hosts that resume/fork should use [`crate::sdk::Agent::attach_session`] /
+//!   [`crate::sdk::Agent::new_session`] (or the runtime switch/fork), which
+//!   emit `resume`/`new`/`fork` with `previousSessionFile`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,6 +77,14 @@ pub struct CreateAgentSessionOptions {
     /// Global config directory (settings/auth/sessions root). Default: the
     /// process agent directory (`PIR_AGENT_DIR`, else `~/.pi/agent`).
     pub agent_dir: Option<PathBuf>,
+    /// Home directory the default environment resource loader resolves `~`
+    /// and the user-global `.agents/skills` scan against. Default: the process
+    /// home (`HOME`, else `USERPROFILE`). Hermetic hosts/tests set this
+    /// instead of mutating process environment; an explicit `resource_loader`
+    /// owns its home through [`DefaultResourceLoader::with_home`]. This is an
+    /// SDK host affordance (upstream `createAgentSession` always uses the
+    /// process home); it changes nothing else about the resolved services.
+    pub home: Option<PathBuf>,
     /// Models/credentials. Default: the `models.json` / catalog / `auth.json`
     /// environment of [`Self::agent_dir`] when set, else the process agent
     /// directory's environment.
@@ -124,8 +138,17 @@ pub struct CreateAgentSessionOptions {
     /// same trust-aware path every host uses.
     pub settings: Option<SettingsManager>,
     /// Resource loader whose skills/templates install into the session.
-    /// `None` installs no prompt resources (the CLI discovers them; a bare
-    /// SDK session stays hermetic unless the caller supplies one).
+    ///
+    /// `None` resolves an environment [`DefaultResourceLoader`] for
+    /// `cwd`/`agent_dir` and installs what it discovers — the same CLI-parity
+    /// behavior as upstream `createAgentSession` (`core/sdk.ts:194-206`), so
+    /// a bare low-level session is NOT hermetic: ambient `<agent_dir>/skills`,
+    /// project skill roots and the user-global `.agents/skills` scan apply
+    /// (subject to trust/flags). Supply a loader (for example one built with
+    /// [`DefaultResourceLoader::with_home`] and `without_skills`/
+    /// `without_prompt_templates`) when the host needs a pinned or hermetic
+    /// resource set. [`crate::sdk::AgentBuilder`] is the hermetic-by-default
+    /// path for `endpoint`/`with_registry`/`proxy`.
     pub resource_loader: Option<DefaultResourceLoader>,
 }
 
@@ -318,6 +341,95 @@ impl AgentSessionRuntime {
         }
     }
 
+    /// Fork the live session at `entry_id` (upstream `AgentSessionRuntime.fork`,
+    /// `agent-session-runtime.ts:262`): delegates to
+    /// [`AgentSession::fork_entry`], which emits `session_before_fork` (a
+    /// handler may cancel), applies the branch, and emits
+    /// `session_start {reason:"fork"}` with `previousSessionFile`.
+    ///
+    /// `position` is the upstream `before|at` choice; `Before` requires a user
+    /// message entry and returns its text as `selected_text`.
+    pub async fn fork(
+        &self,
+        entry_id: &str,
+        position: crate::agent_session::ForkPosition,
+    ) -> Result<crate::agent_session::ForkEntryOutcome, SdkError> {
+        self.ensure_idle("fork")?;
+        self.session
+            .fork_entry(entry_id, position)
+            .await
+            .map_err(SdkError::Other)
+    }
+
+    /// Import a session JSONL file into this runtime's session directory
+    /// (upstream `AgentSessionRuntime.importFromJsonl`,
+    /// `agent-session-runtime.ts:359`): copy the file (a unique `-N` suffix
+    /// when the destination exists), open it with `cwd_override`, and swap it
+    /// in through `replace_session_storage` (emits `session_before_switch`
+    /// and `session_start {reason:"resume"}`). Returns `true` when a
+    /// `session_before_switch` handler cancelled the import.
+    ///
+    /// Fails with [`SdkError::Session`] when the input file is missing, the
+    /// runtime has no session storage, or the imported session's cwd does not
+    /// exist.
+    pub async fn import_from_jsonl(
+        &self,
+        input_path: &Path,
+        cwd_override: Option<&str>,
+    ) -> Result<bool, SdkError> {
+        self.ensure_idle("import_from_jsonl")?;
+        let Some(session_dir) = self.session_dir.clone() else {
+            return Err(SdkError::Session(
+                "session storage is disabled; import_from_jsonl requires a persistent runtime"
+                    .to_owned(),
+            ));
+        };
+        if !input_path.is_file() {
+            return Err(SdkError::Session(format!(
+                "Session import file not found: {}",
+                input_path.display()
+            )));
+        }
+        std::fs::create_dir_all(&session_dir)
+            .map_err(|error| SdkError::Session(error.to_string()))?;
+        let file_name = input_path
+            .file_name()
+            .ok_or_else(|| SdkError::Session("import path has no file name".to_owned()))?;
+        let mut destination = session_dir.join(file_name);
+        let source_already_stored = std::fs::canonicalize(input_path)
+            .ok()
+            .zip(std::fs::canonicalize(&destination).ok())
+            .is_some_and(|(source, destination)| source == destination);
+        if !source_already_stored {
+            let stem = input_path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let extension = input_path
+                .extension()
+                .map(|extension| format!(".{}", extension.to_string_lossy()))
+                .unwrap_or_default();
+            let mut suffix = 1;
+            while destination.exists() {
+                destination = session_dir.join(format!("{stem}-{suffix}{extension}"));
+                suffix += 1;
+            }
+            std::fs::copy(input_path, &destination)
+                .map_err(|error| SdkError::Session(error.to_string()))?;
+        }
+        let manager = SessionManager::open_with(&destination, Some(&session_dir), cwd_override)
+            .map_err(|error| SdkError::Session(error.to_string()))?;
+        let cwd = PathBuf::from(manager.cwd());
+        if !cwd.is_dir() {
+            return Err(SdkError::Session(format!(
+                "imported session cwd does not exist: {}",
+                cwd.display()
+            )));
+        }
+        self.session.abort_all_background();
+        Ok(!self.session.replace_session_storage(manager).await)
+    }
+
     /// Re-run the extension runtime and its `resources_discover` dispatch
     /// (the working `ctx.reload()` equivalent).
     ///
@@ -434,7 +546,12 @@ fn resolve_services(
     let resources = match options.resource_loader.take() {
         Some(loader) => loader,
         None => {
-            DefaultResourceLoader::new(cwd.clone(), agent_dir.clone()).with_project_trusted(trusted)
+            let loader = DefaultResourceLoader::new(cwd.clone(), agent_dir.clone())
+                .with_project_trusted(trusted);
+            match options.home.take() {
+                Some(home) => loader.with_home(home),
+                None => loader,
+            }
         }
     };
     // `session` was already consumed into the services, so the build half
@@ -569,7 +686,7 @@ async fn build_from_services(
     let discover_system_prompt = options
         .discover_system_prompt
         .unwrap_or(!explicit_prompt_files);
-    let session_facade = AgentSession::new_arc_with_plugins_and_host_in(
+    let session_facade = AgentSession::new_arc_with_plugins_and_host_in_and_prompt_discovery(
         AgentSessionConfig {
             provider_registry,
             model: model.clone(),
@@ -579,6 +696,7 @@ async fn build_from_services(
             session,
             compaction: Some(options.compaction.take().unwrap_or_default()),
             max_turns: options.max_turns.unwrap_or(100),
+            performance: crate::config::settings::PerformanceSettings::from_env(),
             system_prompt: options.system_prompt.take(),
             cwd: Some(cwd.clone()),
             event_stream: None,
@@ -588,6 +706,15 @@ async fn build_from_services(
         Vec::new(),
         Some(host),
         Some(agent_dir.clone()),
+        // The low-level factory ALWAYS owns a resource loader (the caller's
+        // explicit one, else the environment default resolved in
+        // `resolve_services`). Upstream `createAgentSession` hands that
+        // loader to `AgentSession`, whose prompt skills are exactly the
+        // loader's. An independent ambient skill scan here would make an
+        // explicit `without_skills()` loader unable to pin the prompt.
+        // The loader's resources install below through
+        // `set_prompt_resources_shared`, which re-renders the derived prompt.
+        false,
     );
     if !explicit_system_prompt && (discover_system_prompt || explicit_prompt_files) {
         apply_system_prompt_files(
@@ -650,9 +777,9 @@ fn resolve_model(
     first_available(registry)
         .map(|model| (model, None))
         .ok_or_else(|| SdkError::NoModel {
-            message: "no model available: configure models.json, credentials, or pass an explicit \
-                      model"
-                .to_owned(),
+            // `SdkError::NoModel`'s Display supplies the "no model available:"
+            // prefix; keep the detail prefix-free so it is not doubled.
+            message: "configure models.json, credentials, or pass an explicit model".to_owned(),
         })
 }
 

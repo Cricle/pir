@@ -46,8 +46,34 @@ run streaming "sdk"
 run plugin "sdk"
 run control "sdk"
 
+# Durable core (no cargo feature): host timer + report + native fallback.
+run dev_durable_timers ""
+
+# Durable core: on_report vs timer report, set_timer phase lifecycle.
+run dev_durable_reports ""
+
 # The only example that persists/attaches transcript files.
 run sessions "sdk,session"
+
+# Real file edit + real Python test. Needs PIR_PYTHON pointing at a Python 3
+# binary. It does NOT skip when the variable is unset: the example falls back
+# to `python` on PATH, so on a host where `python` is the Windows Store
+# placeholder (or absent) this step fails with a nonzero exit instead of
+# silently passing. That is deliberate — a skipped repair step would make the
+# only end-to-end edit+test example vacuous.
+run mini_coding "sdk,tools"
+
+# Persistent-session extras: compaction evidence, and lifecycle subcommands
+# (start|fork|inspect take args, so this one is compile-checked only).
+run session_compaction "sdk,session"
+check session_lifecycle "sdk,session"
+
+# Builtin matrix: real todo replay, memory autoRecall/isolation, tool-search,
+# tool-repair, subagent.
+run builtins_matrix "sdk,session,tools,todo,memory,tool-search,tool-repair,subagent"
+
+# Typed SDK error paths (no model/context/tool/concurrency/shutdown).
+run sdk_error_paths "sdk"
 
 # Proxy is network-only at runtime; compile-check it in its minimal shape.
 check proxy "sdk"

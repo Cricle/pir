@@ -255,7 +255,7 @@ fn refresh_search_rebuilds_only_the_changed_row() {
 }
 
 #[test]
-fn search_cache_clears_on_query_change_and_close() {
+fn search_cache_reuses_rows_across_query_change_and_clears_on_close() {
     let frame = vec!["alpha".to_string(), "beta two".to_string()];
     let mut state = AltScreenState::default();
     state.search.active = true;
@@ -263,19 +263,24 @@ fn search_cache_clears_on_query_change_and_close() {
     assert!(refresh_search(&mut state, &frame, 0, 1));
     assert_eq!(state.search.cache.cached_rows(), 2);
     let row_rebuilds = state.search.cache.row_rebuilds();
+    let corpus_builds = state.search.cache.corpus_builds();
+    let match_runs = state.search.cache.match_runs();
 
-    // A query edit clears the row cache; the next refresh re-strips the frame
-    // (query-independent rows are dropped too, by design).
+    // A query edit invalidates only the match set: rows and the assembled
+    // corpus are query-independent, so re-stripping them per keystroke is the
+    // O(band) regression PIR-TUI-010 fixed.
     state.search.query = "two".to_string();
     assert!(refresh_search(&mut state, &frame, 0, 2));
     assert_eq!(state.search.matches.len(), 1);
     assert_eq!(state.search.matches[0].segments[0].row, 1);
-    assert_eq!(state.search.cache.row_rebuilds(), row_rebuilds + 2);
+    assert_eq!(state.search.cache.row_rebuilds(), row_rebuilds);
+    assert_eq!(state.search.cache.corpus_builds(), corpus_builds);
+    assert_eq!(state.search.cache.match_runs(), match_runs + 1);
 
     // Closing the overlay drops the cache.
     state.search.close();
     assert_eq!(state.search.cache.cached_rows(), 0);
-    assert_eq!(state.search.cache.row_rebuilds(), row_rebuilds + 2);
+    assert_eq!(state.search.cache.row_rebuilds(), row_rebuilds);
 }
 
 #[test]
@@ -3257,4 +3262,50 @@ fn osc8_hyperlink_click_opens_and_a_drag_does_not() {
         "only the four gated clicks opened a URL"
     );
     assert!(fx.state.selection.is_none());
+}
+
+#[test]
+fn incremental_corpus_matches_one_shot_across_band_slides() {
+    // A band that first appears as a tail window, then grows at the head
+    // (search walk page prepend), then releases its head (window slide), and
+    // finally changes one middle row. Every step must produce exactly the
+    // one-shot corpus matches; non-ASCII rows exercise fold_offsets across
+    // the reused prefix/suffix slices (PIR-TUI-011).
+    let base: Vec<String> = (0..40)
+        .map(|index| match index % 5 {
+            0 => format!("row {index} STRAẞE 日本語 needle-3 tail"),
+            1 => format!("row {index} 日本語 needle-3 中文"),
+            _ => format!("row {index} plain needle-{} tail", index % 7),
+        })
+        .collect();
+    let mut state = AltScreenState::default();
+    state.search.active = true;
+    state.search.query = "needle-3".to_string();
+
+    let tail: Vec<String> = base[10..].to_vec();
+    assert!(refresh_search(&mut state, &tail, 0, 1));
+    assert_eq!(state.search.matches, find_search_matches(&tail, "needle-3"));
+
+    let grown: Vec<String> = base[4..].to_vec();
+    assert!(refresh_search(&mut state, &grown, 0, 2));
+    assert_eq!(
+        state.search.matches,
+        find_search_matches(&grown, "needle-3")
+    );
+
+    let released: Vec<String> = base[15..].to_vec();
+    assert!(refresh_search(&mut state, &released, 0, 3));
+    assert_eq!(
+        state.search.matches,
+        find_search_matches(&released, "needle-3")
+    );
+
+    let mut changed = released.clone();
+    changed[5] = "changed STRAẞE 日本語 needle-3 row".to_string();
+    state.search.query = "straße 日本語 needle".to_string();
+    assert!(refresh_search(&mut state, &changed, 0, 4));
+    assert_eq!(
+        state.search.matches,
+        find_search_matches(&changed, "straße 日本語 needle")
+    );
 }

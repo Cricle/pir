@@ -1,7 +1,10 @@
 # cm-rs 接入方案（研究与设计）
 
-> 状态：**仅研究，未实施**。本文记录 2026-11-04 对 `C:\wp\empty\tools\cm-rs`（cm-memory 1.0.0）与
-> `pir` 实际代码的交叉核验结果，供后续排期。文中带「建议新增」的类型/函数尚不存在。
+> 状态：**已实施**（2026-11-08）。`cm-memory` 已库化为 0.3.0，`pir` 新增默认开启的
+> `builtin:memory`：`memory` 工具（CLI 全量 action）、`/memory` 命令、input 自动召回与
+> `before_agent_start` 稳定 brief。当前实现契约见 [memory-builtin.md](memory-builtin.md)。
+> 本文保留 2026-11-04 的研究过程与历史结论；文中「建议新增」的 API 名称与最终实现
+> （`Cm`/`ops`/`MemoryService`）不完全一致，以实际代码为准。
 
 ## 1. 结论摘要
 

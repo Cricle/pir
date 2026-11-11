@@ -43,8 +43,8 @@ pir --only-builtin --no-extensions # --no-extensions wins (no builtins, no JS)
 - **No JS runtime**: only `builtin:<name>` pseudo-paths, so a plan-only `ExtensionHandle` (`has_js_runtime() ==
   false`) — no QuickJS actor, prelude, SWC transpile, `node:*` shims or npm/config scan.
 - **Native surface intact**: every builtin's tools/commands/hooks register through the unified plugin host
-  (`subagent`, `mcp`, `codemode`, `python`, `context-mode`, `tool_search`, `tool-repair`, `todo`, plus `phone` when
-  named).
+  (`subagent`, `mcp`, `codemode`, `python`, `context-mode`, `tool_search`, `tool-repair`, `todo`, `memory`, plus
+  `phone` when named).
 - **Precedence and hosts**: `--no-extensions` wins (unchanged: only explicit `-e` paths, no builtins injected); the
   flag is global and resolved once for TUI, RPC, print and `--mode json`, while `server`/`client` load no extension
   runtime (same as `--no-extensions`). SDK equivalent: `AgentBuilder::only_builtin(true)` ([sdk.md](sdk.md)).
@@ -123,7 +123,7 @@ fail-closed against the known-event registry (an unknown name is a load-time `Ty
 `pi.events` is a **JS-runtime-only** bus: `emit` synchronously invokes the prelude's `busSubs` subscribers
 (`prelude.js.txt:3013`). The native `EventService` (`PluginContext::events()`) is a separate Rust bus with no
 cross-face bridge — JS emissions do not reach native subscribers and vice versa
-(`src/agent_session/plugin_services.rs:169`, `:4097-4110`; `src/plugins/services/mod.rs:2077-2081`).
+(`src/agent_session/plugin_services.rs:178-182`, `:4161-4219`; `src/plugins/services/mod.rs:2112-2126`).
 
 ## The `ctx` surface
 

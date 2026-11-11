@@ -146,6 +146,7 @@ fn fake_model() -> Model {
 
 fn agent_for(cwd: &Path, session: SessionManager) -> AgentSession {
     AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,

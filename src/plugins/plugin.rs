@@ -715,8 +715,9 @@ pub trait AgentPlugin: Send + Sync {
     /// `before_provider_request` model gate) can cache what it needs.
     ///
     /// Synchronous and default no-op. Invariant: the snapshot is advisory and
-    /// may be PARTIAL — a host with no JS extension runtime pushes the model
-    /// only (`crate::agent_session::*`) — so implementations must tolerate
+    /// may be PARTIAL — a host whose session has no JS extension runtime
+    /// still receives the complete session payload (entries, ids, path, cwd,
+    /// header), but a host/consumer that only needs the model must tolerate
     /// missing fields and must not block.
     fn on_session_context(&self, snapshot: &SessionContextSnapshot) {
         let _ = snapshot;

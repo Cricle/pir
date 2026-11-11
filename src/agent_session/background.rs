@@ -653,6 +653,11 @@ struct BackgroundFinish<'a> {
     args: &'a JsonValue,
     /// The settled tool result.
     result: ToolResult,
+    /// Usage the `afterToolCall` hook reported for the real result, taken
+    /// from the detached call once its future settled (upstream
+    /// `AgentToolResult.usage`; a foreground call carries it on the
+    /// tool-result message).
+    usage: Option<crate::ai::types::Usage>,
     /// Wall-clock duration of the detached future.
     duration_ms: Option<u64>,
 }
@@ -728,6 +733,7 @@ impl BackgroundDelivery {
             tool_name,
             args,
             result,
+            usage: hook_usage,
             duration_ms,
         } = settled;
         // Aborted or torn down: the session no longer owns this call, so its
@@ -747,10 +753,11 @@ impl BackgroundDelivery {
             call_id: call_id.to_owned(),
             tool_name: tool_name.to_owned(),
             result,
-            // A detached future returns only the ToolResult (the session
-            // delivery is a background completion, not a tool-result message),
-            // so afterToolCall usage has no carrier here.
-            usage: None,
+            // The detached execution body parked the afterToolCall hook's
+            // usage on the adopted call; a background completion has no
+            // tool-result message, so the completion event and the persisted
+            // entry details are this value's carriers.
+            usage: hook_usage,
             duration_ms,
         };
         // §2.4.4: the `tool_result` handler runs before persistence, so a
@@ -765,8 +772,10 @@ impl BackgroundDelivery {
         // a tool-result message, so the parsed usage rides the completion
         // event and the persisted entry details instead. Parsing uses the
         // same lenient rule as the in-loop path (`parse_usage_json`), so an
-        // unparseable payload is dropped exactly like a foreground one.
-        let mut usage = None;
+        // unparseable payload is dropped exactly like a foreground one. The
+        // hook-reported value is the base: a handler report replaces it
+        // exactly like upstream `afterResult.usage ?? result.usage`.
+        let mut usage = hook_usage;
         // A9: the unified dispatcher runs the JS face AND the host's native
         // `tool_result` handlers (ordered-list order), exactly like the
         // in-loop path. Gate on either face so a host-less, extension-less
@@ -791,11 +800,17 @@ impl BackgroundDelivery {
             )
             .await;
             if let Some(merge) = merges.get(call_id) {
-                usage = crate::agent::tool_execution::apply_tool_result_merge(
+                // Only a handler that actually reported a parseable usage
+                // replaces the hook's value (upstream `??` semantics); an
+                // unrelated merge must not wipe it.
+                if let Some(value) = crate::agent::tool_execution::apply_tool_result_merge(
                     &mut finalized.result,
                     merge,
-                )
-                .and_then(|value| crate::agent::tool_execution::parse_usage_json(&value));
+                ) {
+                    if let Some(parsed) = crate::agent::tool_execution::parse_usage_json(&value) {
+                        usage = Some(parsed);
+                    }
+                }
             }
         }
         let output = finalized.result.content.clone();
@@ -952,10 +967,11 @@ impl BackgroundDelivery {
 /// The custom-message type tag of a delivered background result (§2.4.1).
 ///
 /// The entry's `details` carry `{callId, toolName, status, durationMs,
-/// details}`, plus `usage` when the extension `tool_result` handler reported
-/// usage for the completion. The model-facing `content` stays the framed
-/// `<background-tool-result>` text; the usage is accounting metadata and is
-/// never injected into the follow-up frame.
+/// details}`, plus `usage` when the `afterToolCall` hook (or, overriding it,
+/// a `tool_result` handler) reported usage for the completion. The
+/// model-facing `content` stays the framed `<background-tool-result>` text;
+/// the usage is accounting metadata and is never injected into the follow-up
+/// frame.
 pub(crate) const BACKGROUND_TOOL_RESULT_TYPE: &str = "backgroundToolResult";
 
 /// Frame one background result as the model-facing text (§2.4.1/§2.4.6): the
@@ -1033,6 +1049,9 @@ pub(crate) fn background_sink(
         let tool_name = call.tool_name.clone();
         let args = call.args.clone();
         let abort = call.abort.clone();
+        // The after-hook usage is parked by the execution body right before
+        // the future yields; read it after the await/abort race below.
+        let usage_slot = std::sync::Arc::clone(&call.usage);
         handle.spawn(async move {
             // The token releases the registry's delivery count on EVERY exit
             // of this task: normal completion, an aborted call (`finish`
@@ -1060,6 +1079,10 @@ pub(crate) fn background_sink(
             };
             let duration_ms =
                 Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+            let usage = usage_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             delivery
                 .finish(
                     &registry,
@@ -1069,6 +1092,7 @@ pub(crate) fn background_sink(
                         tool_name: &tool_name,
                         args: &args,
                         result,
+                        usage,
                         duration_ms,
                     },
                 )

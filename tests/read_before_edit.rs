@@ -92,6 +92,8 @@ fn tool_context(cwd: &Path, ledger: Arc<ReadLedger>) -> ToolContext {
         signal: None,
         nested: None,
         session_env: Some(Arc::new(ToolSessionEnv {
+            live_model: None,
+            live_thinking: None,
             provider_registry: Arc::new(ProviderRegistry::default()),
             model: fake_model(),
             thinking: ThinkingLevel::Off,
@@ -256,6 +258,64 @@ async fn edit_after_file_change_is_refused() {
 }
 
 #[tokio::test]
+async fn edit_after_own_edit_does_not_require_another_read() {
+    let dir = TempDir::new("own-edit");
+    dir.write("note.txt", "alpha\nbeta\ngamma\n");
+    let ctx = tool_context(
+        dir.path(),
+        Arc::new(ReadLedger::new(ReadBeforeEditMode::Enforce)),
+    );
+
+    let read_result = read(&ctx, "note.txt", None, None).await;
+    assert!(
+        !read_result.is_error,
+        "read failed: {}",
+        read_result.content
+    );
+    let first = edit(&ctx, "note.txt", "beta", "BETA").await;
+    assert!(!first.is_error, "first edit failed: {}", first.content);
+    let second = edit(&ctx, "note.txt", "gamma", "GAMMA").await;
+    assert!(
+        !second.is_error,
+        "a follow-up edit after our own mutation must not require re-reading: {}",
+        second.content
+    );
+    assert_eq!(dir.read("note.txt"), "alpha\nBETA\nGAMMA\n");
+}
+
+#[tokio::test]
+async fn edit_warn_mode_allows_partial_read_but_still_blocks_write() {
+    let dir = TempDir::new("edit-warn");
+    dir.write("note.txt", "alpha\nbeta\ngamma\n");
+    let ctx = tool_context(
+        dir.path(),
+        Arc::new(ReadLedger::new(ReadBeforeEditMode::EditWarn)),
+    );
+
+    let read_result = read(&ctx, "note.txt", Some(2), Some(1)).await;
+    assert!(
+        !read_result.is_error,
+        "read failed: {}",
+        read_result.content
+    );
+    let edit_result = edit(&ctx, "note.txt", "gamma", "GAMMA").await;
+    assert!(
+        !edit_result.is_error,
+        "edit should proceed with a warning: {}",
+        edit_result.content
+    );
+    assert!(edit_result.content.contains("Warning:"));
+    assert_eq!(dir.read("note.txt"), "alpha\nbeta\nGAMMA\n");
+
+    let write_result = write(&ctx, "note.txt", "replacement\n").await;
+    assert!(
+        write_result.is_error,
+        "write must remain strict in edit-warn mode: {}",
+        write_result.content
+    );
+}
+
+#[tokio::test]
 async fn write_of_a_new_file_is_allowed_without_a_read() {
     let dir = TempDir::new("new-file");
     let ctx = tool_context(
@@ -266,6 +326,32 @@ async fn write_of_a_new_file_is_allowed_without_a_read() {
     let result = write(&ctx, "created.txt", "fresh\n").await;
     assert!(!result.is_error, "write failed: {}", result.content);
     assert_eq!(dir.read("created.txt"), "fresh\n");
+}
+
+#[tokio::test]
+async fn edit_after_own_write_does_not_require_another_read() {
+    let dir = TempDir::new("own-write");
+    dir.write("note.txt", "alpha\nbeta\n");
+    let ctx = tool_context(
+        dir.path(),
+        Arc::new(ReadLedger::new(ReadBeforeEditMode::Enforce)),
+    );
+
+    let read_result = read(&ctx, "note.txt", None, None).await;
+    assert!(
+        !read_result.is_error,
+        "read failed: {}",
+        read_result.content
+    );
+    let overwrite = write(&ctx, "note.txt", "one\ntwo\n").await;
+    assert!(!overwrite.is_error, "write failed: {}", overwrite.content);
+    let edit_result = edit(&ctx, "note.txt", "two", "TWO").await;
+    assert!(
+        !edit_result.is_error,
+        "edit after our own write must not require re-reading: {}",
+        edit_result.content
+    );
+    assert_eq!(dir.read("note.txt"), "one\nTWO\n");
 }
 
 #[tokio::test]

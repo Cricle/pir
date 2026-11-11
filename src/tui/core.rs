@@ -2830,6 +2830,19 @@ pub struct TuiCore {
     /// component on every render (upstream `extractCursorPosition` over the
     /// editor's CURSOR_MARKER).
     dock_cursor_cell: Option<std::sync::Arc<std::sync::Mutex<Option<(usize, usize)>>>>,
+    /// Upstream `clearOnShrink` (`terminal.clearOnShrink` / env
+    /// `PI_CLEAR_ON_SHRINK=1`, default false): when on, a frame shorter than
+    /// the tallest one painted since the last clearing full render triggers a
+    /// full repaint (`2J` + `3J`) so the terminal's working area and viewport
+    /// re-anchor; when off, the regular diff clears only the rows the previous
+    /// frame owned (upstream `setClearOnShrink`).
+    clear_on_shrink: bool,
+    /// Upstream `maxLinesRendered`: the tallest frame since the last full
+    /// render that cleared, i.e. the terminal's working-area high-water mark.
+    /// [`TuiCore::clear_on_shrink`] compares against this, never against the
+    /// previous frame length, so a frame that merely appends after a shrink
+    /// does not trigger a spurious full repaint.
+    max_lines_rendered: usize,
     /// Upstream `showHardwareCursor` (settings / PI_HARDWARE_CURSOR): with
     /// the cursor visible, the renderer moves it to the editor cell after
     /// every frame; hidden (default), it is hidden once and stays put.
@@ -3055,6 +3068,8 @@ impl TuiCore {
             force_clear: false,
             force_screen_clear: false,
             dock_cursor_cell: None,
+            clear_on_shrink: false,
+            max_lines_rendered: 0,
             show_hardware_cursor: false,
             cursor_visible: true,
             windowed_viewport: false,
@@ -3254,6 +3269,26 @@ impl TuiCore {
     /// the visible cursor.
     pub fn set_show_hardware_cursor(&mut self, show: bool) {
         self.show_hardware_cursor = show;
+    }
+
+    /// `terminal.clearOnShrink` (settings / `PI_CLEAR_ON_SHRINK=1`, default
+    /// false): upstream `setClearOnShrink`. With it on, a frame shorter than
+    /// the tallest painted since the last clearing full render takes the full
+    /// repaint path (`2J` + `3J`) instead of the diff; with it off (default)
+    /// the diff's own tail cleanup keeps the existing behavior and the working
+    /// area stays at its high-water mark.
+    pub fn set_clear_on_shrink(&mut self, enabled: bool) {
+        self.clear_on_shrink = enabled;
+    }
+
+    /// The current `clearOnShrink` cell (test/diagnostic seam).
+    pub fn clear_on_shrink(&self) -> bool {
+        self.clear_on_shrink
+    }
+
+    /// Upstream `maxLinesRendered` high-water mark (test/diagnostic seam).
+    pub fn max_lines_rendered(&self) -> usize {
+        self.max_lines_rendered
     }
 
     /// Whether the terminal cursor is currently shown.
@@ -3546,6 +3581,7 @@ impl TuiCore {
     /// refilled wherever a frame buffer is retired (see the `frame_scratch`
     /// assignments in [`TuiCore::render`]).
     fn frame_lines(&mut self, width: usize) -> Vec<String> {
+        let trace = super::search_trace::Timer::new();
         let mut scratch = std::mem::take(&mut self.frame_scratch);
         // Only a canvas that still holds the previous frame's RAW rows may
         // serve a same-position cache hit without comparing: a decorator or
@@ -3623,18 +3659,65 @@ impl TuiCore {
                     let mut previous_blocks: Vec<Option<FrameBlockSlot>> = previous
                         .map(|slot| slot.blocks.into_iter().map(Some).collect())
                         .unwrap_or_default();
+                    // Cross-position block reuse: a window slide (search
+                    // reveal, transcript paging) changes block POSITIONS but
+                    // not the entries' content revisions. Index the previous
+                    // frame's blocks by revision so a block that MOVED is
+                    // served from its cached rows instead of re-rendered.
+                    // Revisions are content hashes: an equal revision implies
+                    // byte-identical rows at this width/theme (geometry is
+                    // checked at the component slot).
+                    let mut previous_by_revision: std::collections::HashMap<u64, Vec<usize>> =
+                        std::collections::HashMap::new();
+                    if geometry_matches {
+                        for (previous_index, slot) in previous_blocks.iter().enumerate() {
+                            if let Some(block) = slot {
+                                previous_by_revision
+                                    .entry(block.revision)
+                                    .or_default()
+                                    .push(previous_index);
+                            }
+                        }
+                    }
                     let mut blocks = Vec::with_capacity(block_revisions.len());
                     for (block_index, block_revision) in block_revisions.iter().copied().enumerate()
                     {
                         let block_id = pack_block_id(index, block_index);
                         let forced = forced_blocks.contains(&block_id);
-                        let previous_block =
-                            previous_blocks.get_mut(block_index).and_then(Option::take);
-                        let hit = !forced
+                        let same_position = !forced
                             && geometry_matches
-                            && previous_block
-                                .as_ref()
+                            && previous_blocks
+                                .get(block_index)
+                                .and_then(Option::as_ref)
                                 .is_some_and(|block| block.revision == block_revision);
+                        let mut reused_moved = false;
+                        let previous_block = if same_position {
+                            previous_blocks.get_mut(block_index).and_then(Option::take)
+                        } else if !forced && geometry_matches {
+                            let mut found = None;
+                            if let Some(indices) = previous_by_revision.get_mut(&block_revision) {
+                                while let Some(previous_index) = indices.pop() {
+                                    if previous_index == block_index {
+                                        continue;
+                                    }
+                                    if let Some(block) = previous_blocks
+                                        .get_mut(previous_index)
+                                        .and_then(Option::take)
+                                    {
+                                        found = Some(block);
+                                        reused_moved = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            match found {
+                                Some(block) => Some(block),
+                                None => previous_blocks.get_mut(block_index).and_then(Option::take),
+                            }
+                        } else {
+                            previous_blocks.get_mut(block_index).and_then(Option::take)
+                        };
+                        let hit = same_position || reused_moved;
                         let previous_start = previous_block.as_ref().map(|block| block.start);
                         let had_previous = previous_block.is_some();
                         // Frame budget: once this frame has assembled its
@@ -4041,6 +4124,15 @@ impl TuiCore {
         FRAME_WORK
             .dirty_ranges_merged
             .fetch_add(dirty_ranges_merged, Ordering::Relaxed);
+        trace.log(
+            "frame_lines",
+            &[
+                ("rows", scratch.len() as u128),
+                ("rebuilt", rebuilt_blocks as u128),
+                ("rerendered", rerendered_rows as u128),
+                ("cached", cached_rows as u128),
+            ],
+        );
         scratch
     }
 
@@ -4356,6 +4448,7 @@ impl TuiCore {
         // instead of O(transcript).
         if self.scroll_offset > 0 || self.windowed_viewport {
             self.render_scrolled(&new_lines, height);
+            self.max_lines_rendered = self.max_lines_rendered.max(new_lines.len());
             // The windowed path paints its own (scratch-recycled) buffer; the
             // full-frame copy it sliced from is dead and returns to the pool.
             self.frame_scratch = new_lines;
@@ -4384,6 +4477,7 @@ impl TuiCore {
             // the pool no longer holds raw bytes for the next cache hit.
             self.frame_scratch_raw = false;
         }
+
         // No whole-frame reset pass any more: every write path appends the
         // per-line reset lazily to the rows it writes (see
         // [`TuiCore::append_line_reset`]), and the baseline keeps exactly the
@@ -4459,6 +4553,14 @@ impl TuiCore {
                 // is the exact raw frame; only this full-render branch swaps
                 // in the retired baseline.)
                 core.frame_scratch_raw = false;
+                // Upstream `maxLinesRendered`: a clearing full render resets
+                // the working-area high-water mark to the written frame; the
+                // non-clearing first paint grows it.
+                core.max_lines_rendered = if clear {
+                    frame_len
+                } else {
+                    core.max_lines_rendered.max(frame_len)
+                };
                 core.previous_width = width;
                 core.previous_height = height;
                 core.hardware_cursor_row = moved.unwrap_or(last_row);
@@ -4479,6 +4581,22 @@ impl TuiCore {
         }
         if width_changed || height_changed {
             self.force_screen_clear = false;
+            full_render(self, new_lines, true, false);
+            return;
+        }
+
+        // Upstream `tui-main-screen.ts` clearOnShrink gate: content shrank
+        // below the tallest frame painted since the last clearing full render
+        // and the setting asks for it → full repaint (clears screen AND the
+        // scrollback rows below, resets `max_lines_rendered`). Default false
+        // keeps the diff path, which clears only the rows the previous frame
+        // owned, avoiding the flicker of a full redraw on every shrink.
+        // (Upstream also skips while overlay entries are open; this renderer
+        // has no overlay entries — dialogs live in the frame's dock.)
+        if self.clear_on_shrink
+            && !self.previous_lines.is_empty()
+            && new_lines.len() < self.max_lines_rendered
+        {
             full_render(self, new_lines, true, false);
             return;
         }
@@ -4552,6 +4670,7 @@ impl TuiCore {
             // copy is dead — park it in the raw-frame pool.
             let frame_len = new_lines.len();
             self.frame_scratch = new_lines;
+            self.max_lines_rendered = self.max_lines_rendered.max(frame_len);
             self.previous_viewport_top = prev_viewport_top;
             self.previous_height = height;
             // Upstream's no-changes branch still calls
@@ -4640,6 +4759,7 @@ impl TuiCore {
                 // were written with. The raw frame returns to the pool.
                 self.previous_lines.truncate(new_lines.len());
                 let frame_len = new_lines.len();
+                self.max_lines_rendered = self.max_lines_rendered.max(frame_len);
                 self.frame_scratch = new_lines;
                 self.previous_width = width;
                 self.previous_height = height;
@@ -4765,6 +4885,7 @@ impl TuiCore {
         // and the raw frame returns to the pool.
         self.previous_lines.truncate(new_lines.len());
         let frame_len = new_lines.len();
+        self.max_lines_rendered = self.max_lines_rendered.max(frame_len);
         self.frame_scratch = new_lines;
         self.frame_scratch_raw = self.frame_scratch_raw && !clamped;
         self.previous_width = width;

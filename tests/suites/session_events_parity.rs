@@ -359,6 +359,7 @@ fn agent_session_builder(
     cwd: Option<std::path::PathBuf>,
 ) -> AgentSessionConfig {
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -445,7 +446,11 @@ impl AgentPlugin for RecordBeforeForkPlugin {
         &self.info
     }
     fn events(&self) -> EventInterest {
-        EventInterest::List(vec!["session_before_fork".into(), "session_tree".into()])
+        EventInterest::List(vec![
+            "session_before_fork".into(),
+            "session_shutdown".into(),
+            "session_tree".into(),
+        ])
     }
     fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
         let seen = Arc::clone(&self.seen);
@@ -903,6 +908,7 @@ async fn turn_end_carries_persisted_message_and_tool_result_entry_ids() {
     let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             tools: turn_end_tool_registry(),
             ..agent_session_builder(registry, Some(session), None, Some(temp.0.clone()))
         },
@@ -984,6 +990,7 @@ async fn turn_end_entry_ids_are_optional_without_session_storage() {
     let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             tools: turn_end_tool_registry(),
             ..agent_session_builder(registry, None, None, Some(temp.0.clone()))
         },
@@ -1036,6 +1043,7 @@ async fn turn_start_and_turn_end_share_the_zero_based_turn_index() {
     let seen: Arc<Mutex<Vec<(String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             tools: turn_end_tool_registry(),
             ..agent_session_builder(registry, Some(session), None, Some(temp.0.clone()))
         },
@@ -1507,6 +1515,7 @@ async fn queue_update_reflects_drains() {
     }));
     let session = SessionManager::create(".", &temp.0).expect("create session");
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         tools,
         ..agent_session_builder(registry, Some(session), None, Some(temp.0.clone()))
     }));
@@ -1703,15 +1712,19 @@ async fn fork_before_branches_at_the_parent_and_returns_selected_text() {
     assert_eq!(projected, vec!["first message".to_owned()]);
 
     // session_before_fork fired with the upstream payload, followed by the
+    // fork teardown `session_shutdown {reason: "fork"}` (upstream
+    // `teardownCurrent` runs BEFORE the branch is applied) and the
     // post-branch session_tree move event.
     let events = events.lock().unwrap();
-    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events.len(), 3, "{events:?}");
     assert_eq!(events[0]["type"], serde_json::json!("session_before_fork"));
     assert_eq!(events[0]["entryId"], serde_json::json!(second_id));
     assert_eq!(events[0]["position"], serde_json::json!("before"));
-    assert_eq!(events[1]["type"], serde_json::json!("session_tree"));
+    assert_eq!(events[1]["type"], serde_json::json!("session_shutdown"));
+    assert_eq!(events[1]["reason"], serde_json::json!("fork"));
+    assert_eq!(events[2]["type"], serde_json::json!("session_tree"));
     assert_eq!(
-        events[1]["oldLeafId"],
+        events[2]["oldLeafId"],
         serde_json::json!(second_id),
         "the abandoned leaf was the selected entry"
     );
@@ -1789,6 +1802,65 @@ async fn fork_before_the_first_user_message_starts_a_fresh_parent_linked_session
     assert_ne!(new_path, parent_path, "a fresh session file was created");
     assert!(has_parent, "the parent link is recorded");
     assert!(empty, "the fresh session has no messages");
+}
+
+/// PIR-TUI-021: the fork teardown `session_shutdown {reason: "fork"}` runs
+/// BEFORE the branch is applied (upstream `teardownCurrent` at
+/// agent-session-runtime.ts:299/316-323), and the branch event order is
+/// `before_fork → shutdown → (branch) → session_tree → session_start
+/// {reason:"fork"}`. A native recorder pins the whole sequence; the
+/// appendEntry-lands-on-the-outgoing-file property is pinned by the fork
+/// parity test above through the payload order (shutdown precedes the
+/// session_tree move that carries the branched leaf).
+#[tokio::test]
+async fn fork_lifecycle_orders_shutdown_before_branch_and_start_after() {
+    let temp = TempDir::new("fork-shutdown-order");
+    let (session, _first_id, second_id) = fork_fixture(&temp.0);
+    let outgoing_path = session.path().to_path_buf();
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let events: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentSession::new_with_plugins(
+        agent_session_builder(registry, Some(session), None, Some(temp.0.clone())),
+        vec![Arc::new(RecordBeforeForkPlugin::new(Arc::clone(&events)))],
+    );
+
+    let outcome = agent
+        .fork_entry(&second_id, ForkPosition::Before)
+        .await
+        .expect("fork");
+    assert!(matches!(outcome, ForkEntryOutcome::Branched { .. }));
+
+    let types: Vec<String> = {
+        let events = events.lock().unwrap();
+        events
+            .iter()
+            .map(|payload| payload["type"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        types,
+        vec![
+            "session_before_fork".to_owned(),
+            "session_shutdown".to_owned(),
+            "session_tree".to_owned(),
+        ],
+        "fork teardown precedes the branch; the start follows it"
+    );
+
+    // The shutdown payload targets the OUTGOING file (upstream
+    // `teardownCurrent("fork", targetSessionFile)` receives the branch
+    // destination, resolved before the swap; the OUTGOING identity is what
+    // the handler observes while it still writes the old storage).
+    let shutdown = events.lock().unwrap()[1].clone();
+    assert_eq!(shutdown["reason"], serde_json::json!("fork"));
+    let target = shutdown["targetSessionFile"].as_str().unwrap_or_default();
+    assert!(
+        target.ends_with(".jsonl") && !target.is_empty(),
+        "shutdown carries a target file: {target}"
+    );
+    let _ = &outgoing_path;
 }
 
 #[tokio::test]

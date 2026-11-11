@@ -31,8 +31,11 @@ TIMEOUT = 150
 # Marker s50b looks for in this run's settings.json (theme persisted to light).
 PERSISTED_THEME = "light"
 
+# Absolute interpreter path (bare `python` is the Windows Store placeholder).
+_PYTHON = "C:/wp/empty/tools/python312/python.exe"
+
 _SETTINGS_PRINT = (
-    "python -c '"
+    _PYTHON + " -c '"
     "import json\n"
     'd = json.load(open("settings.json"))\n'
     'print("THEME" + "=" + str(d.get("theme")))\n'

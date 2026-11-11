@@ -378,7 +378,13 @@ impl AgentSession {
                 bool,
             )> {
                 let mut session = session.blocking_lock();
-                if session.is_paged() {
+                // PIR-SDK-018 R46: a LIVE-TRIMMED session must stay on its
+                // tail window. Widening here re-materialized the whole
+                // transcript on every prompt, so the allocator high-water
+                // mark (and RSS) kept growing with history even though the
+                // manager was trimmed between prompts. Only user paged opens
+                // (attach/continue of a huge file) widen for a full context.
+                if session.is_paged() && !session.is_live_trimmed() {
                     session.widen_to_full()?;
                 }
                 let (projection, reused) = session.build_session_projection_with_cache(cached);
@@ -414,6 +420,39 @@ impl AgentSession {
         let Some(run_session_id) = run_session_id else {
             return;
         };
+        // PIR-SDK-018: a live-tail session drops its persisted prefix
+        // instead of parking another full-transcript snapshot. This runs
+        // BEFORE the `result.context` move / `Arc::try_unwrap` below: the
+        // app-visible run result legitimately holds that `Arc`, and trim must
+        // not depend on whether a host cloned it. The projection cache would
+        // also hold one `Arc<FileEntry>` per projected entry, pinning the
+        // exact memory the trim releases; the next prompt widens from the
+        // append-only file and rebuilds (correct, just not cached).
+        #[cfg(feature = "session")]
+        {
+            let mut manager = session.lock().await;
+            if manager.id() == run_session_id {
+                if let Some((max_bytes, max_entries)) = manager.live_tail_trim() {
+                    if manager.resident_entries().len() > max_entries {
+                        let trimmed = manager
+                            .trim_resident_tail(max_bytes, max_entries)
+                            .unwrap_or(false);
+                        drop(manager);
+                        if trimmed {
+                            self.clear_cached_prompt_projection();
+                            // The post-run `ctx` snapshot still holds the FULL
+                            // transcript JSON (entries + rendered tree):
+                            // republish from the resident tail so the plugin
+                            // host releases it. Paged snapshots already have
+                            // this tail semantics.
+                            let model = self.current_model();
+                            self.push_session_context(&model).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         let context = std::mem::replace(
             &mut result.context,
             Arc::new(crate::ai::types::Context::default()),
@@ -495,11 +534,11 @@ pub(super) async fn project_session_off_thread(
             // A session opened PAGED (`SessionManager::open_paged`) holds a
             // tail window only. The AgentSession facade runs the resident
             // compaction pipeline, so it widens to the complete transcript
-            // here — never a silently truncated context. (The print host takes
-            // the paged fast path instead: `compaction::compact_paged`.) The
-            // widening's measured cost and why it is the upstream-shaped
-            // fallback rather than a refusal: `SDK-SCOPE.md` §8.
-            if session.is_paged() {
+            // here — never a silently truncated context. A LIVE-TRIMMED
+            // session (PIR-SDK-018) is the deliberate exception: its whole
+            // transcript stays on disk and its prompt context is the tail
+            // window (plus the newest compaction checkpoint, when present).
+            if session.is_paged() && !session.is_live_trimmed() {
                 session.widen_to_full()?;
             }
             let projection = session.build_session_projection()?;
@@ -525,10 +564,10 @@ async fn project_session_messages_off_thread(
     let session = Arc::clone(session);
     tokio::task::spawn_blocking(move || -> crate::Result<Vec<Message>> {
         let mut session = session.blocking_lock();
-        if session.is_paged() {
+        if session.is_paged() && !session.is_live_trimmed() {
             session.widen_to_full()?;
         }
-        Ok(session.build_session_projection()?.messages)
+        Ok(session.build_session_messages())
     })
     .await
     .map_err(|error| anyhow::anyhow!("session projection blocking task failed: {error}"))?
@@ -553,10 +592,10 @@ pub(crate) async fn project_optional_session_messages_off_thread(
         let Some(session) = session.as_mut() else {
             return Ok(None);
         };
-        if session.is_paged() {
+        if session.is_paged() && !session.is_live_trimmed() {
             session.widen_to_full()?;
         }
-        Ok(Some(session.build_session_projection()?.messages))
+        Ok(Some(session.build_session_messages()))
     })
     .await
     .map_err(|error| anyhow::anyhow!("session projection blocking task failed: {error}"))?
@@ -569,13 +608,18 @@ pub(crate) async fn project_optional_session_messages_off_thread(
 /// must not run on a runtime worker while holding the async session lock
 /// (D6): the blocking task takes the lock with `blocking_lock` and widens
 /// there, exactly like [`project_session_off_thread`]'s widen step.
+///
+/// PIR-SDK-018 R46: a LIVE-TRIMMED session is left on its tail window — that
+/// is the point of the bound. The snapshot/prompt then observe the tail, and
+/// whole-history readers (`Agent::transcript`, `transcript_json`,
+/// `older_transcript_messages`) widen explicitly.
 pub(super) async fn widen_session_off_thread(
     session: &Arc<tokio::sync::Mutex<SessionManager>>,
 ) -> crate::Result<()> {
     let session = Arc::clone(session);
     tokio::task::spawn_blocking(move || -> crate::Result<()> {
         let mut session = session.blocking_lock();
-        if session.is_paged() {
+        if session.is_paged() && !session.is_live_trimmed() {
             session.widen_to_full()?;
         }
         Ok(())
@@ -1781,6 +1825,8 @@ impl AgentSession {
             // confirm gate takes its safe path only when a host declares a UI.
             let session_env =
                 Arc::new(crate::agent::tool_execution::ToolSessionEnv {
+                    live_model: Some(Arc::clone(&self.model)),
+                    live_thinking: Some(Arc::clone(&self.thinking)),
                     provider_registry: Arc::clone(&self.registry),
                     model: current_model.clone(),
                     thinking: self.current_thinking(),
@@ -1841,7 +1887,15 @@ impl AgentSession {
                     })
                 }),
                 cwd: self.cwd.clone(),
-                max_turns: self.max_turns,
+                max_turns: if self.performance.effective_hard_turn_budget() > 0 {
+                    self.max_turns
+                        .min(self.performance.effective_hard_turn_budget())
+                } else {
+                    self.max_turns
+                },
+                tool_result_max_bytes: self.performance.effective_tool_result_max_bytes(),
+                soft_turn_budget: self.performance.effective_soft_turn_budget(),
+                max_total_tokens: self.performance.effective_max_total_tokens(),
                 // Agent-level turn retry (`settings.retry`, upstream
                 // `_prepareRetry`): resolved from the same merged settings the
                 // session's other knobs use, and read per prompt so a settings
@@ -1992,7 +2046,41 @@ impl AgentSession {
                 // stay unset for session runs. An embedder that drives
                 // `agent_loop` directly can install them.
                 transform_context: None,
-                prepare_next_turn: None,
+                // Upstream `AgentSession.prepareNextTurnWithContext` returns
+                // the LIVE `agent.state.model` / thinking level at every turn
+                // boundary (agent-session.ts:904-931). `deps.model` above is
+                // the run-start snapshot, so without this seam a `set_model`
+                // or `set_thinking_level` issued while a run is streaming
+                // would never reach the run's next request. The hook reads
+                // the same interior-mutable cells the session mutators write,
+                // keeping the in-flight request on its old model while the
+                // next request picks up the new one.
+                prepare_next_turn: Some({
+                    let live_model = Arc::clone(&self.model);
+                    let live_thinking = Arc::clone(&self.thinking);
+                    Arc::new(
+                        move |_completed: Arc<crate::agent::agent_loop::PrepareNextTurnContext>| {
+                            let model = live_model
+                                .read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone();
+                            let thinking = *live_thinking
+                                .read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            Box::pin(async move {
+                                Some(PrepareNextTurnUpdate {
+                                    model: Some(model),
+                                    thinking_level: Some(thinking),
+                                    ..PrepareNextTurnUpdate::default()
+                                })
+                            })
+                        },
+                    )
+                }),
+                // The session hook only reads the live model/thinking cells;
+                // it never inspects the completed-turn snapshot. Skipping the
+                // per-turn assistant/tool-result clone is a pure RSS win.
+                prepare_next_turn_needs_completed: false,
                 // First iteration only: the starting prompt/next-turn
                 // messages the loop appends and persists itself (see the
                 // binding above).
@@ -2087,8 +2175,11 @@ impl AgentSession {
                 // The trigger reads the THRESHOLD model (the routed model's
                 // window under a virtual selection, matching the compaction
                 // hook): the raw virtual entry's window 0 would fire the
-                // durable compact-and-retry on every prompt.
-                let threshold_model = self.threshold_model_for(&current_model);
+                // durable compact-and-retry on every prompt. Upstream reads
+                // `this.model` at overflow handling (agent-session.ts:3003-
+                // 3044), so a mid-run `set_model` is reflected here too
+                // (PIR-SDK-010).
+                let threshold_model = self.threshold_model_for(&self.current_model());
                 let terminal_overflow = crate::ai::util::is_context_overflow(
                     &result.terminal,
                     Some(threshold_model.context_window),

@@ -330,6 +330,36 @@ fn build_session_path_entries<'a, E: Borrow<FileEntry>>(
             .copied();
     }
     path.reverse();
+    // PIR-SDK-024: a live-tail trim pins the newest compaction checkpoint in
+    // the resident list while the entries between it and the tail window stay
+    // on disk. The parent walk therefore stops at the first window entry (its
+    // parent is skipped), and the checkpoint would drop out of the projection.
+    // The checkpoint IS the model-visible replacement for that skipped prefix,
+    // so attach the newest resident compaction OLDER than the walk's first
+    // entry as the path root. A full (non-paged) load always has an unbroken
+    // parent chain, so this only fires for a trimmed window.
+    if let Some(first) = path.first() {
+        let first_entry: &FileEntry = (*first).borrow();
+        let chain_broke = first_entry
+            .parent_id()
+            .is_some_and(|parent| !index.contains_key(parent));
+        if chain_broke {
+            let first_id = first_entry.id();
+            let mut anchor = None;
+            for entry in entries {
+                let file: &FileEntry = (*entry).borrow();
+                if file.id() == first_id {
+                    break;
+                }
+                if matches!(file, FileEntry::Compaction(_)) {
+                    anchor = Some(entry);
+                }
+            }
+            if let Some(anchor) = anchor {
+                path.insert(0, anchor);
+            }
+        }
+    }
     path
 }
 
@@ -675,6 +705,413 @@ pub fn build_session_projection<E: SharedEntry>(
         thinking_level,
         model,
     }
+}
+
+/// [`build_session_projection`]'s LLM-visible message aggregate ONLY — the
+/// messages-only twin for whole-history readers (`AgentSession::transcript`,
+/// continuation rebuilds, cache-warm snapshots) that do not need provenance.
+///
+/// MEMORY SHAPE (pir extension): `build_session_projection` also materializes
+/// one [`ProjectedSessionEntry`] per retained entry (an `Arc<FileEntry>`
+/// refcount bump plus a `Range`) for callers that map messages back to source
+/// entries. A messages-only reader paid that metadata vec for nothing. This
+/// walk applies the exact same leaf-path / retention / context-edit rules but
+/// writes only the flat `Vec<Message>` (the one copy the public API must
+/// return; there is no second aggregate and no per-entry vec).
+pub fn build_session_messages<E: Borrow<FileEntry>>(
+    entries: &[E],
+    leaf_id: Option<&str>,
+) -> Vec<Message> {
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id);
+    let message_capacity: usize = context_entries
+        .iter()
+        .enumerate()
+        .map(|(index, source_entry)| {
+            let entry: &FileEntry = (*source_entry).borrow();
+            if matches!(entry, FileEntry::Compaction(_)) && index > 0 {
+                0
+            } else {
+                projected_message_count(entry, context_edit_for(entry, edits.as_ref()))
+            }
+        })
+        .sum();
+    let mut messages: Vec<Message> = Vec::with_capacity(message_capacity);
+    for (index, source_entry) in context_entries.iter().enumerate() {
+        let entry: &FileEntry = (*source_entry).borrow();
+        if matches!(entry, FileEntry::Compaction(_)) && index > 0 {
+            continue;
+        }
+        push_context_entry_messages(
+            entry,
+            context_edit_for(entry, edits.as_ref()),
+            &mut messages,
+        );
+    }
+    messages
+}
+
+/// The per-entry serialized-message FRAGMENTS of one projection, aligned with
+/// the projection's `entries` (index i = the `{entry, messages}` view of
+/// `projection.entries[i]`), plus the flat aggregate those fragments build.
+///
+/// MEMORY SHAPE (PIR-SDK-027 round 2, v3): the snapshot push renders the
+/// projection as pre-rendered JSON text and must also publish the native
+/// `entries` contract (`SessionContextSnapshot::entries: Arc<JsonValue>` —
+/// the todo plugin reads `snapshot.entries.as_array()`). Measured cost terms
+/// (`examples/transcript_large_probe` `breakdown` mode, 8k-message session):
+/// a full aggregate `to_value` is ~200k allocs / ~16.8 MB per push, a deep
+/// `Value` clone of it ~200k / ~21.3 MB, and rebuilding the aggregate OUT of
+/// per-entry fragment values ~200k / ~31.3 MB (clone per element + the
+/// re-serialization) — every variant of "rebuild the aggregate per push"
+/// costs more than the text work it replaces. So the fragments cache the
+/// aggregate VALUE and the aggregate TEXT alongside the per-entry views:
+/// - append push: the cached `Arc` is shared for `entries` (zero re-clone),
+///   the appended messages' values are built once (they are new), the
+///   aggregate text is the cached text + the appended messages' text, and
+///   each view is its cached fragment text (existing) or the appended text
+///   (new) — nothing retained is serialized twice;
+/// - structure change: fragments + aggregate + text rebuild from the
+///   projection (one pass per entry — the OLD shape's per-push cost, now
+///   paid once per structure change).
+///
+/// Per-entry message views are immutable per entry: a plain append adds new
+/// entries and never rewrites an old one (a `context_edit` is itself a new
+/// entry that changes the projection, which moves the whole key — validated
+/// by the caller's session key).
+#[derive(Debug, Clone)]
+pub struct ProjectionEntryFragments {
+    /// `Some(value)` = the entry's message slice as an owned JSON array
+    /// value; `None` = slice serialization failed (the splice falls back to
+    /// serializing the slice again — the aggregate fallback covers it).
+    pub fragments: Vec<Option<JsonValue>>,
+    /// The FLAT aggregate (every projected message in entry order) the
+    /// snapshot publishes as its `entries` field. `None` = a fragment failed
+    /// when this set was built (the caller falls back to the old per-push
+    /// `to_value`); built once per set, shared by `Arc` across pushes.
+    pub aggregate: Option<Arc<JsonValue>>,
+    /// The aggregate's serialized text (the `messages` field of the
+    /// projection object). Cached with [`Self::aggregate`]: re-serializing
+    /// the 4.3 MB aggregate was ~120k allocs / ~7.7 MB per push.
+    pub aggregate_text: Option<String>,
+    /// The FULL `{entries:[...],"messages":[...]}` projection object text the
+    /// snapshot push splices into the wire. Cached so an append SPICES the
+    /// new views in (one string copy) instead of re-serializing every
+    /// retained view (`{"entry":...}` per view is ~15 allocs; ~120k per push
+    /// on an 8k-entry session). `None` = not cached (the caller re-renders).
+    pub projection_json: Option<String>,
+}
+
+impl ProjectionEntryFragments {
+    /// Fragment for one projected entry, or `None` when its slice
+    /// serialization failed (the splice re-serializes).
+    pub fn fragment(&self, index: usize) -> Option<&JsonValue> {
+        self.fragments.get(index).and_then(|slot| slot.as_ref())
+    }
+
+    /// The one serialization pass per appended entry: the fragment value
+    /// (cached for future pushes) and its text (spliced now).
+    pub fn build_fragment(
+        projection: &SessionProjection,
+        index: usize,
+    ) -> Option<(JsonValue, String)> {
+        let entry = projection.entries.get(index)?;
+        let slice = entry.messages_in(&projection.messages);
+        match serde_json::to_value(slice) {
+            Ok(value) => {
+                let text = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_owned());
+                Some((value, text))
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// The FLAT aggregate over the per-entry fragment arrays: element-wise
+    /// concat in entry order (wrapping the arrays themselves would produce a
+    /// nested `[[...]]` — the wire shape the byte-equivalence test pins is a
+    /// flat message list). `None` when any fragment is missing (the caller
+    /// falls back to a per-push aggregate `to_value`).
+    pub fn flat_aggregate(&self) -> Option<JsonValue> {
+        let mut items = Vec::with_capacity(self.fragments.len());
+        for slot in &self.fragments {
+            match slot {
+                Some(JsonValue::Array(items_of_entry)) => {
+                    items.extend(items_of_entry.iter().cloned())
+                }
+                Some(other) => items.push(other.clone()),
+                None => return None,
+            }
+        }
+        Some(JsonValue::Array(items))
+    }
+}
+
+/// Build fragments for a FULL projection (first push / structure change):
+/// one `to_value` per projected entry, then the aggregate + its text built
+/// once from the fragments. The old round-1 shape paid the aggregate
+/// `to_value` AND the per-entry splices on EVERY push; this pays them once
+/// per structure change.
+pub fn build_projection_entry_fragments(
+    projection: &SessionProjection,
+) -> ProjectionEntryFragments {
+    let fragments: Vec<Option<JsonValue>> = (0..projection.entries.len())
+        .map(|index| ProjectionEntryFragments::build_fragment(projection, index).map(|(v, _)| v))
+        .collect();
+    let set = ProjectionEntryFragments {
+        fragments,
+        aggregate: None,
+        aggregate_text: None,
+        projection_json: None,
+    };
+    match set.flat_aggregate() {
+        Some(aggregate) => {
+            let text = aggregate.to_string();
+            let json = projection_object_text(projection, &set.fragments, Some(&text));
+            ProjectionEntryFragments {
+                aggregate: Some(Arc::new(aggregate)),
+                aggregate_text: Some(text),
+                projection_json: Some(json),
+                ..set
+            }
+        }
+        None => set,
+    }
+}
+
+/// The `{entries:[...views],"messages":[<aggregate text>]}` object text,
+/// rendered from the projection's borrowed slices (byte-identical to the
+/// old per-push splice). Called on the FULL build only — appends splice the
+/// cached text.
+fn projection_object_text(
+    projection: &SessionProjection,
+    fragments: &[Option<JsonValue>],
+    aggregate_text: Option<&str>,
+) -> String {
+    let entries_len = aggregate_text.map_or(0, str::len);
+    let mut out = String::with_capacity(entries_len * 2 + 32);
+    out.push_str("{\"entries\":[");
+    let mut first_entry = true;
+    for (index, entry) in projection.entries.iter().enumerate() {
+        if first_entry {
+            first_entry = false;
+        } else {
+            out.push(',');
+        }
+        out.push_str("{\"entry\":");
+        out.push_str(
+            &serde_json::to_string(entry.source_entry.as_ref())
+                .unwrap_or_else(|_| "null".to_owned()),
+        );
+        out.push_str(",\"messages\":");
+        match fragments
+            .get(index)
+            .and_then(|slot| slot.as_ref())
+            .map(serde_json::to_string)
+        {
+            Some(Ok(text)) => out.push_str(&text),
+            _ => {
+                let slice = entry.messages_in(&projection.messages);
+                match serde_json::to_string(slice) {
+                    Ok(text) => out.push_str(&text),
+                    Err(_) => out.push_str("null"),
+                }
+            }
+        }
+        out.push('}');
+    }
+    out.push_str("],\"messages\":");
+    out.push_str(aggregate_text.unwrap_or("null"));
+    out.push('}');
+    out
+}
+
+/// Extend cached fragments by the appended entries' fragments (the projection
+/// index contract: `cached.len() == appended_from`, entries only append).
+///
+/// The cached aggregate VALUE rides the old `Arc`'s items (a clone per
+/// message — the one term the native `Arc<JsonValue>` contract forces; every
+/// alternative measured equal or worse, see the struct docs). The cached
+/// aggregate TEXT and the cached PROJECTION TEXT are SPLICED (one copy of
+/// the cached strings + the appended texts) instead of re-serializing ~8k
+/// retained messages and ~8k retained views per push.
+pub fn extend_projection_entry_fragments(
+    cached: ProjectionEntryFragments,
+    projection: &SessionProjection,
+    appended_from: usize,
+) -> ProjectionEntryFragments {
+    debug_assert!(cached.fragments.len() <= appended_from);
+    // A shrink (branch/trim) reaches here only through the caller's guard;
+    // guard again so a debug_assert-enabled release build cannot underflow.
+    if cached.fragments.len() > appended_from {
+        return build_projection_entry_fragments(projection);
+    }
+    // One `build_fragment` per appended entry: the value joins the cached
+    // fragment slots AND its text feeds both text splices below. The +2
+    // capacity headroom keeps the extended fragment vec at ONE allocation
+    // (a single push append is the common delta).
+    let mut appended: Vec<Option<(JsonValue, String)>> =
+        Vec::with_capacity(projection.entries.len().saturating_sub(appended_from));
+    for index in appended_from..projection.entries.len() {
+        appended.push(ProjectionEntryFragments::build_fragment(projection, index));
+    }
+    let appended_count = appended.iter().filter(|slot| slot.is_some()).count();
+    let mut set = cached;
+    let mut new_texts: Vec<String> = Vec::with_capacity(appended.len());
+    let mut new_slots: Vec<Option<JsonValue>> = Vec::with_capacity(appended.len());
+    for slot in appended {
+        match slot {
+            Some((value, text)) => {
+                new_texts.push(text);
+                new_slots.push(Some(value));
+            }
+            None => new_slots.push(None),
+        }
+    }
+    set.fragments.reserve(new_slots.len());
+    set.fragments.extend(new_slots);
+    let appended_some = appended_from < projection.entries.len() && appended_count > 0;
+    if appended_some {
+        // Aggregate VALUE: the flat concat over the fragment slots — the
+        // appended slots are the new values, the retained slots are the SAME
+        // values the old aggregate held (no re-serialization; the per-message
+        // clone is the one term the native `Arc<JsonValue>` contract forces).
+        let mut items: Vec<JsonValue> = Vec::with_capacity(set.fragments.len() + 8);
+        let mut aggregate_ok = true;
+        for slot in set.fragments.iter() {
+            match slot {
+                Some(JsonValue::Array(items_of_entry)) => {
+                    items.extend(items_of_entry.iter().cloned())
+                }
+                Some(other) => items.push(other.clone()),
+                None => {
+                    aggregate_ok = false;
+                    break;
+                }
+            }
+        }
+        if aggregate_ok {
+            let text = match &set.aggregate_text {
+                // Splice: `[...cached items]` + `,` + the appended entries'
+                // MESSAGE texts (inside their fragment arrays — each fragment
+                // text is `[m1,...]`, so the inner part joins the flat list).
+                Some(cached_text) if cached_text.len() >= 2 => {
+                    let mut text = String::with_capacity(
+                        cached_text.len() + new_texts.iter().map(|t| t.len() + 1).sum::<usize>(),
+                    );
+                    text.push_str(&cached_text[..cached_text.len() - 1]);
+                    for new_text in &new_texts {
+                        // A state entry (label, model change) projects ZERO
+                        // messages: its fragment text is the empty array
+                        // `[]`, which contributes NOTHING to the flat
+                        // aggregate — pushing `,` + the unwrapped empty
+                        // string would produce a trailing comma.
+                        let inner = new_text
+                            .strip_prefix('[')
+                            .and_then(|rest| rest.strip_suffix(']'));
+                        if let Some(inner) = inner {
+                            if inner.is_empty() {
+                                continue;
+                            }
+                            text.push(',');
+                            text.push_str(inner);
+                        } else {
+                            text.push(',');
+                            text.push_str(new_text);
+                        }
+                    }
+                    text.push(']');
+                    text
+                }
+                _ => JsonValue::Array(items.clone()).to_string(),
+            };
+            set.aggregate = Some(Arc::new(JsonValue::Array(items)));
+            set.aggregate_text = Some(text);
+            // The projection object text: splice the appended views in
+            // before `],"messages":[` (the cached json ends with the
+            // aggregate text, so the views' close boundary is found by
+            // trimming the known tail: `],"messages":[<agg text>]}`).
+            let new_views_len: usize = new_texts
+                .iter()
+                .map(|t| t.len() + 3) // `,` + `{"entry":...}` wrapper is
+                // rendered below from the projection.
+                .sum();
+            set.projection_json = match (&set.projection_json, &set.aggregate_text) {
+                (Some(cached_json), Some(_)) if cached_json.len() > 16 => {
+                    // Find the boundary: the LAST `],"messages":[` (the
+                    // views close with `}],"messages":[`; the marker's
+                    // `]` CLOSES the entries array). The splice keeps
+                    // everything BEFORE that closing bracket, appends the
+                    // new views, and re-attaches the marker + aggregate.
+                    let marker = "],\"messages\":[";
+                    match cached_json.rfind(marker) {
+                        Some(boundary) => {
+                            let mut json =
+                                String::with_capacity(cached_json.len() + new_views_len + 64);
+                            // Up to (excluding) the closing `]` of the
+                            // entries array — the appended views join it.
+                            json.push_str(&cached_json[..boundary]);
+                            for (index, entry) in
+                                projection.entries[appended_from..].iter().enumerate()
+                            {
+                                json.push_str(",{\"entry\":");
+                                json.push_str(
+                                    &serde_json::to_string(entry.source_entry.as_ref())
+                                        .unwrap_or_else(|_| "null".to_owned()),
+                                );
+                                json.push_str(",\"messages\":");
+                                if let Some(new_text) = new_texts.get(index) {
+                                    json.push_str(new_text);
+                                } else {
+                                    let slice = entry.messages_in(&projection.messages);
+                                    match serde_json::to_string(slice) {
+                                        Ok(text) => json.push_str(&text),
+                                        Err(_) => json.push_str("null"),
+                                    }
+                                }
+                                json.push('}');
+                            }
+                            // The aggregate text carries its own
+                            // `[...]` wrapper and closing bracket, so
+                            // the tail is the field name plus the
+                            // object's closing brace only.
+                            json.push_str("],\"messages\":");
+                            json.push_str(set.aggregate_text.as_deref().unwrap_or("null"));
+                            json.push('}');
+                            Some(json)
+                        }
+                        None => Some(projection_object_text(
+                            projection,
+                            &set.fragments,
+                            set.aggregate_text.as_deref(),
+                        )),
+                    }
+                }
+                _ => Some(projection_object_text(
+                    projection,
+                    &set.fragments,
+                    set.aggregate_text.as_deref(),
+                )),
+            };
+        } else {
+            match set.flat_aggregate() {
+                Some(aggregate) => {
+                    let text = aggregate.to_string();
+                    set.projection_json = Some(projection_object_text(
+                        projection,
+                        &set.fragments,
+                        Some(&text),
+                    ));
+                    set.aggregate = Some(Arc::new(aggregate));
+                    set.aggregate_text = Some(text);
+                }
+                None => {
+                    set.aggregate = None;
+                    set.aggregate_text = None;
+                    set.projection_json = None;
+                }
+            }
+        }
+    }
+    set
 }
 
 /// [`build_session_projection`]'s LLM-visible messages serialized to the

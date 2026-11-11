@@ -803,6 +803,7 @@ async fn run_codemode_script(code: &str) -> pir::ai::types::ToolResultMessage {
     let tools = ToolRegistry::new();
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,

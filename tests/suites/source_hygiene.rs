@@ -30,15 +30,32 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 const FORBIDDEN_MARKERS: [&str; 3] = ["#[test]", "#[tokio::test]", "#[cfg(test)]"];
 
-/// Inline tests are **never** allowed: every test lives under `tests/`, so this
-/// allowlist is permanently empty. (It used to grandfather two TUI files while
-/// their suites were being migrated; those suites now live in
+/// Inline tests are **never** allowed: every test lives under `tests/`, so the
+/// allowlist is a migration-debt ledger, not a permanent exemption. (The TUI
+/// files that used to be grandfathered here now live in
 /// `tests/suites/tui_units.rs`.)
 ///
-/// 2026-11-01 audit remediation: four files gained focused inline regression
-/// modules while the owning lanes were under active repair. They are tracked
-/// migration debt here so the hygiene gate does not fail the whole tree; move
-/// them to `tests/` before the next release tag.
+/// 2026-11-11 release-prep sweep: the 20 files reported by this gate were
+/// re-audited one by one. Ten were moved out unchanged (their helpers are
+/// `pub`): `tui/autocomplete.rs`, `tui/app.rs`, `tui/core.rs`,
+/// `tui/settings_menu.rs`, `tui/spill_preview.rs`, `tui/alloc_trace.rs` →
+/// `tests/suites/tui_surface_units.rs` + `tests/suites/tui_alloc_trace_units.rs`;
+/// `config/settings/env.rs` + `config/settings/schema.rs` →
+/// `tests/suites/config_settings_units.rs`; `coding_agent/tool_selection.rs` →
+/// `tests/suites/coding_agent_units.rs`; `plugins/builtin/phone/session.rs` →
+/// `tests/suites/phone_units.rs`; plus `tui/terminal.rs`'s
+/// `no_model_message_tests` → `tui_surface_units.rs`.
+///
+/// 2026-11-11 closer sweep: the other ten test a private item, so each got
+/// the repo's sanctioned `#[doc(hidden)] pub` seam and moved too —
+/// `agent/agent_loop.rs` → `agent_loop_units.rs`, `agent_session/session_ctx.rs`
+/// → `session_ctx_units.rs`, `coding_agent/context.rs` + `tools/bash.rs` +
+/// `tools/util.rs` → `coding_agent_units.rs`, `plugins/builtin/phone/{mod,remote}.rs`
+/// → `phone_units.rs`, `sdk/event.rs` → `sdk_event_units.rs`,
+/// `tui/messages.rs` → `tui_messages_units.rs`, `tui/terminal.rs`'s
+/// `fork_seed_tests` → `tui_surface_units.rs`. What remains is the original
+/// 2026-11-01 grandfathered set only; every entry still has inline tests and
+/// is tracked as migration debt, not a permanent exemption.
 const PREEXISTING_INLINE_TEST_ALLOWLIST: [&str; 8] = [
     "ai/api/bedrock/credentials.rs",
     "ai/api/partial_mirror.rs",
@@ -162,7 +179,7 @@ fn src_tree_contains_only_expected_file_kinds() {
 // programming error surfaced immediately rather than a runtime condition.
 // The serde sites serialize the crate's own derive-only message/checkpoint
 // types into memory.
-const EXPECT_SITE_ALLOWLIST: [(&str, u32); 27] = [
+const EXPECT_SITE_ALLOWLIST: [(&str, u32); 30] = [
     ("plugins/tool_repair/grammar.rs", 196),
     ("ai/api/constrained_sampling.rs", 178),
     // These three shifted down when the queue-bounds work added the
@@ -213,6 +230,24 @@ const EXPECT_SITE_ALLOWLIST: [(&str, u32); 27] = [
     ("durable/harness/tool.rs", 529),
     ("durable/harness/usage.rs", 155),
     ("durable/harness/view.rs", 223),
+    // The session-tree flat arena is addressed by `u32` node indices; a real
+    // session cannot exceed `u32::MAX` nodes (each node is one JSONL entry),
+    // so the conversion failing means the fixture itself is invalid.
+    // Shifted 723 -> 746 by the R57 CachedTree head/tail edits above it in the
+    // same function (same site, same invariant).
+    ("agent_session/session_ctx.rs", 746),
+    // `reuse` is computed two lines above as
+    // `old.as_ref().is_some_and(|slot| ..)`, so `Some` is proven when this
+    // branch runs; the `take` cannot observe `None`.
+    ("tui/terminal.rs", 8191),
+    // `guard.sender.is_none()` returns above, so the `as_ref()` in the same
+    // locked scope is `Some`: the sender is read and used under one sink lock
+    // with no intervening mutation. (This site surfaced when the file's
+    // inline test module moved to `tests/`: the gate's inline-module
+    // exemption ran from the first `#[cfg(test)]` line, which used to sit
+    // above it.) Shifted 1198 -> 1200 by `cargo fmt` reflowing the same
+    // `as_ref()` call (same site, same invariant).
+    ("sdk/event.rs", 1200),
 ];
 
 /// Hygiene gate: production code may contain `.expect(` only at the explicit

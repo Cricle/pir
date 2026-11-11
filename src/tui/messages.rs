@@ -1824,6 +1824,87 @@ pub fn format_tool_call_line(tool_name: &str, args: &serde_json::Value, expanded
                 title("write"),
                 render_tool_path_with(theme, first_str_arg(args, &["file_path", "path"]), None)
             ),
+            // Native subagent (`renderCall`, examples/extensions/subagent/
+            // index.ts:721-760): chain/parallel get a headline with the task
+            // count, scope and the first three previews; a single task names
+            // the child agent and task inline.
+            "subagent" => {
+                let scope = args
+                    .get("agentScope")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("user");
+                if let Some(chain) = args
+                    .get("chain")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|chain| !chain.is_empty())
+                {
+                    let mut text = format!(
+                        "{} {} {}",
+                        title("subagent"),
+                        accent(&format!("chain ({} steps)", chain.len())),
+                        theme.fg(ThemeColor::Muted, &format!("[{scope}]"))
+                    );
+                    for (index, step) in chain.iter().take(3).enumerate() {
+                        // Upstream strips the `{previous}` placeholder before
+                        // previewing a chain step.
+                        let task = subagent_field(step, "task").replace("{previous}", "");
+                        let preview = subagent_task_preview(task.trim(), 40);
+                        text.push_str(&format!(
+                            "\n  {} {} {}",
+                            theme.fg(ThemeColor::Muted, &format!("{}.", index + 1)),
+                            accent(subagent_field(step, "agent")),
+                            theme.fg(ThemeColor::Dim, &preview)
+                        ));
+                    }
+                    if chain.len() > 3 {
+                        text.push_str(&format!(
+                            "\n  {}",
+                            theme.fg(ThemeColor::Muted, &format!("... +{} more", chain.len() - 3))
+                        ));
+                    }
+                    text
+                } else if let Some(tasks) = args
+                    .get("tasks")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|tasks| !tasks.is_empty())
+                {
+                    let mut text = format!(
+                        "{} {} {}",
+                        title("subagent"),
+                        accent(&format!("parallel ({} tasks)", tasks.len())),
+                        theme.fg(ThemeColor::Muted, &format!("[{scope}]"))
+                    );
+                    for task in tasks.iter().take(3) {
+                        let preview = subagent_task_preview(subagent_field(task, "task"), 40);
+                        text.push_str(&format!(
+                            "\n  {} {}",
+                            accent(subagent_field(task, "agent")),
+                            theme.fg(ThemeColor::Dim, &preview)
+                        ));
+                    }
+                    if tasks.len() > 3 {
+                        text.push_str(&format!(
+                            "\n  {}",
+                            theme.fg(ThemeColor::Muted, &format!("... +{} more", tasks.len() - 3))
+                        ));
+                    }
+                    text
+                } else {
+                    let agent = args
+                        .get("agent")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("subagent");
+                    let task = args
+                        .get("task")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let mut text = format!("{} {}", title("subagent"), output(agent));
+                    if !task.is_empty() {
+                        text.push_str(&format!(" — {}", output(task)));
+                    }
+                    text
+                }
+            }
             // `formatGrepCall` (renderers/grep.ts:17-35).
             "grep" => {
                 let pattern = match str_arg(args, "pattern") {
@@ -3750,6 +3831,19 @@ const FALLBACK_PREVIEW_LINES: usize = 10;
 /// `BASH_PREVIEW_LINES`).
 const BASH_PREVIEW_LINES: usize = 5;
 
+/// Ctrl+O on a truncated shell block reads at most this many physical lines
+/// from the spill file (`details.fullOutputPath`) and at most this many bytes.
+/// The file itself is memory-mapped, never loaded as one `String`; a missing,
+/// empty, non-UTF-8 or over-budget file falls back to the in-memory tail.
+const SPILL_EXPAND_PREVIEW_LINES: usize = 2048;
+const SPILL_EXPAND_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
+
+fn spill_expand_preview(details: Option<&serde_json::Value>) -> Option<String> {
+    let path = details?.get("fullOutputPath")?.as_str()?;
+    let lines = crate::tui::spill_preview::MappedLines::open(std::path::Path::new(path))?;
+    lines.tail_preview(SPILL_EXPAND_PREVIEW_LINES, SPILL_EXPAND_PREVIEW_BYTES)
+}
+
 /// The `Theme::bg` opener/closer escapes for `color` — `Theme::bg` renders
 /// exactly `{open}{text}\x1b[49m`, so painting an empty string splits the pair
 /// out for the row builders below. Both are empty when the palette carries no
@@ -4731,6 +4825,357 @@ struct ResultSectionCtx<'a> {
     bg_close: &'a str,
 }
 
+/// String field of a `tasks[]`/`chain[]` entry, `""` when absent.
+fn subagent_field<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+/// `renderCall`'s task/step preview truncation (upstream `slice(0, N)` +
+/// `...`), counted in characters so a multi-byte task cannot split a glyph.
+fn subagent_task_preview(task: &str, limit: usize) -> String {
+    if task.chars().count() > limit {
+        let mut preview: String = task.chars().take(limit).collect();
+        preview.push_str("...");
+        preview
+    } else {
+        task.to_owned()
+    }
+}
+
+fn subagent_usage_count(usage: &serde_json::Value, key: &str) -> u64 {
+    usage
+        .get(key)
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_f64().map(|count| count.max(0.0) as u64))
+        })
+        .unwrap_or(0)
+}
+
+/// Per-result usage line (upstream `formatUsageStats(usage, model)`,
+/// examples/extensions/subagent/index.ts:46-70) used by the expanded
+/// chain/parallel view.
+fn subagent_format_usage(usage: &serde_json::Value, model: Option<&str>) -> Option<String> {
+    let turns = subagent_usage_count(usage, "turns");
+    let input = subagent_usage_count(usage, "input");
+    let output = subagent_usage_count(usage, "output");
+    let cache_read = subagent_usage_count(usage, "cacheRead");
+    let cache_write = subagent_usage_count(usage, "cacheWrite");
+    let cost = usage
+        .get("cost")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let context_tokens = subagent_usage_count(usage, "contextTokens");
+    let mut parts = Vec::new();
+    if turns > 0 {
+        parts.push(format!("{turns} turn{}", if turns > 1 { "s" } else { "" }));
+    }
+    if input > 0 {
+        parts.push(format!("↑{}", crate::text::format_tokens(input)));
+    }
+    if output > 0 {
+        parts.push(format!("↓{}", crate::text::format_tokens(output)));
+    }
+    if cache_read > 0 {
+        parts.push(format!("R{}", crate::text::format_tokens(cache_read)));
+    }
+    if cache_write > 0 {
+        parts.push(format!("W{}", crate::text::format_tokens(cache_write)));
+    }
+    if cost != 0.0 {
+        parts.push(format!("${cost:.4}"));
+    }
+    if context_tokens > 0 {
+        parts.push(format!(
+            "ctx:{}",
+            crate::text::format_tokens(context_tokens)
+        ));
+    }
+    if let Some(model) = model.filter(|model| !model.is_empty()) {
+        parts.push(model.to_owned());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+/// Aggregate usage footer for a settled multi-task batch (upstream
+/// `aggregateUsage` + `formatUsageStats`, examples/extensions/subagent/
+/// index.ts:46-70,848-860). Single-mode results keep the per-result body only.
+fn subagent_total_usage(details: &serde_json::Value) -> Option<String> {
+    let results = details.get("results")?.as_array()?;
+    if results.is_empty() {
+        return None;
+    }
+    let (mut input, mut output, mut cache_read, mut cache_write) = (0u64, 0u64, 0u64, 0u64);
+    let (mut cost, mut turns) = (0.0f64, 0u64);
+    for result in results {
+        let usage = result.get("usage")?;
+        input += subagent_usage_count(usage, "input");
+        output += subagent_usage_count(usage, "output");
+        cache_read += subagent_usage_count(usage, "cacheRead");
+        cache_write += subagent_usage_count(usage, "cacheWrite");
+        turns += subagent_usage_count(usage, "turns");
+        cost += usage
+            .get("cost")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+    }
+    let mut parts = Vec::new();
+    if turns > 0 {
+        parts.push(format!("{turns} turn{}", if turns > 1 { "s" } else { "" }));
+    }
+    if input > 0 {
+        parts.push(format!("↑{}", crate::text::format_tokens(input)));
+    }
+    if output > 0 {
+        parts.push(format!("↓{}", crate::text::format_tokens(output)));
+    }
+    if cache_read > 0 {
+        parts.push(format!("R{}", crate::text::format_tokens(cache_read)));
+    }
+    if cache_write > 0 {
+        parts.push(format!("W{}", crate::text::format_tokens(cache_write)));
+    }
+    if cost != 0.0 {
+        parts.push(format!("${cost:.4}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn subagent_content_text(content: &serde_json::Value) -> String {
+    let Some(parts) = content.as_array() else {
+        return content.as_str().unwrap_or("").to_owned();
+    };
+    let mut text = String::new();
+    for part in parts {
+        let kind = part
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if kind == "text" {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(
+                part.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+            );
+        } else if kind == "toolCall" {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("→ ");
+            text.push_str(
+                part.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool"),
+            );
+        }
+    }
+    text
+}
+
+/// Render the child transcript body of a `subagent` tool result (single,
+/// parallel and chain shapes). `#[doc(hidden)] pub` (with
+/// [`format_tool_call_line`] already public): `tests/suites/tui_messages_units.rs`
+/// asserts the rendered wording, usage footer and collapsed row cap, and no
+/// other surface keeps those assertions unweakened.
+#[doc(hidden)]
+pub fn subagent_result_body(
+    details: Option<&serde_json::Value>,
+    expanded: bool,
+    width: usize,
+) -> Option<String> {
+    let details = details?;
+    let results = details.get("results")?.as_array()?;
+    let mode = details
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let running = results.iter().any(|result| {
+        result.get("pending").and_then(serde_json::Value::as_bool) == Some(true)
+            || result.get("exitCode").and_then(serde_json::Value::as_i64) == Some(-1)
+    });
+    let mut lines = Vec::new();
+    for (index, result) in results.iter().enumerate() {
+        let agent = result
+            .get("agent")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("subagent");
+        let task = result
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let pending = result.get("pending").and_then(serde_json::Value::as_bool) == Some(true)
+            || result.get("exitCode").and_then(serde_json::Value::as_i64) == Some(-1);
+        // `isFailedResult` (index.ts:180-182): non-zero exit or an error /
+        // aborted stop reason counts as failure.
+        let failed = !pending
+            && (result
+                .get("exitCode")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|code| code != 0)
+                || matches!(
+                    result.get("stopReason").and_then(serde_json::Value::as_str),
+                    Some("error" | "aborted")
+                ));
+        // Upstream `renderResult` row headers are `─── Step N: agent <icon>`
+        // (chain) and `─── agent <icon>` (parallel), with ⏳ while running
+        // and ✓ / ✗ once settled (index.ts:880-885, 898-922, 946-953,
+        // 986-1012, 1020-1040). Single mode keeps this surface's compact
+        // `● agent · status` line.
+        match mode {
+            "chain" => {
+                let step = result
+                    .get("step")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(index as u64 + 1);
+                let icon = if pending {
+                    "⏳"
+                } else if failed {
+                    "✗"
+                } else {
+                    "✓"
+                };
+                lines.push(format!("─── Step {step}: {agent} {icon}"));
+            }
+            "parallel" => {
+                let icon = if pending {
+                    "⏳"
+                } else if failed {
+                    "✗"
+                } else {
+                    "✓"
+                };
+                lines.push(format!("─── {agent} {icon}"));
+            }
+            _ => {
+                let status = if pending {
+                    "running"
+                } else if failed {
+                    "failed"
+                } else {
+                    "done"
+                };
+                lines.push(format!("● {agent} · {status}"));
+            }
+        }
+        if !task.is_empty() {
+            lines.push(format!("  {task}"));
+        }
+        if let Some(error) = result
+            .get("errorMessage")
+            .and_then(serde_json::Value::as_str)
+        {
+            lines.push(format!("  error: {error}"));
+        }
+        let mut rendered_messages = 0usize;
+        if let Some(messages) = result.get("messages").and_then(serde_json::Value::as_array) {
+            for message in messages {
+                let role = message
+                    .get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("message");
+                // Upstream `getDisplayItems` (examples/extensions/subagent/
+                // index.ts:204-215) only shows assistant text/toolCall; a
+                // child toolResult (which may be a 50 KB spilled body) and
+                // system prompts are never rendered in the panel.
+                if matches!(role, "toolResult" | "system") {
+                    continue;
+                }
+                let text = subagent_content_text(
+                    message.get("content").unwrap_or(&serde_json::Value::Null),
+                );
+                if text.trim().is_empty() {
+                    continue;
+                }
+                rendered_messages += 1;
+                // Split embedded newlines into separate display lines so the
+                // visual-row cap below cannot be bypassed by one JSON string
+                // containing thousands of lines.
+                for (index, part) in text.split('\n').enumerate() {
+                    let part = part.trim_end_matches('\r');
+                    if index == 0 {
+                        lines.push(format!("  {role}: {part}"));
+                    } else {
+                        lines.push(format!("  {part}"));
+                    }
+                }
+            }
+        }
+        if rendered_messages == 0 {
+            lines.push(format!(
+                "  {}",
+                if pending {
+                    "(running...)"
+                } else {
+                    "(no output)"
+                }
+            ));
+        }
+        // Per-result usage line (upstream `formatUsageStats(r.usage, r.model)`):
+        // expanded chain steps / parallel tasks (index.ts:920-922, 1006-1008),
+        // and every settled single-mode result in both views (index.ts:826-849
+        // — collapsed appends it to the text, expanded adds a spacer + Text).
+        // Running entries never print usage; single mode has no `Total:`
+        // aggregate (that footer is chain/parallel only).
+        let show_usage = (expanded && matches!(mode, "chain" | "parallel"))
+            || (!matches!(mode, "chain" | "parallel") && !pending);
+        if show_usage {
+            if let Some(usage) = result.get("usage").and_then(|usage| {
+                subagent_format_usage(
+                    usage,
+                    result.get("model").and_then(serde_json::Value::as_str),
+                )
+            }) {
+                lines.push(format!(
+                    "  {}",
+                    with_theme(|theme| theme.fg(ThemeColor::Dim, &usage))
+                ));
+            }
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut body = lines.join("\n");
+    // Collapse by display rows, not source newlines: a single message line
+    // that wraps across the terminal or a text node with embedded newlines
+    // must still respect the 32-row preview cap.
+    if !expanded {
+        let visual = wrap_text_with_ansi(&body, width);
+        if visual.len() > 32 {
+            let remaining = visual.len() - 32;
+            body = visual[..32].join("\n");
+            body.push_str(&format!("\n… ({remaining} more lines, ctrl+o to expand)"));
+        }
+    }
+    // A settled parallel/chain batch appends the aggregated usage footer
+    // (upstream `Total: …`, examples/extensions/subagent/index.ts:916-918,
+    // 1001-1012, 1025-1028); a running batch has no total yet.
+    if matches!(mode, "parallel" | "chain") && !running {
+        if let Some(usage) = subagent_total_usage(details) {
+            body.push_str("\n\n");
+            body.push_str(&with_theme(|theme| {
+                theme.fg(ThemeColor::Dim, &format!("Total: {usage}"))
+            }));
+        }
+    }
+    Some(body)
+}
+
 fn render_result_section(state: &ToolState, ctx: &ResultSectionCtx<'_>, out: &mut Rows<'_>) {
     let ResultSectionCtx {
         is_shell,
@@ -4746,7 +5191,7 @@ fn render_result_section(state: &ToolState, ctx: &ResultSectionCtx<'_>, out: &mu
     let content_width = width.saturating_sub(2).max(1);
     // Upstream bash.ts:104-110 appends the Elapsed/Took footer unconditionally
     // on the shell path, so a pending shell block still renders its section.
-    if !state.pending || is_timed {
+    if !state.pending || is_timed || state.tool_name == "subagent" {
         if is_shell {
             // `rebuildBashResultRenderComponent` (renderers/bash.ts:38-110)
             // — output trimmed; a finalized truncated result's duplicated
@@ -4754,7 +5199,20 @@ fn render_result_section(state: &ToolState, ctx: &ResultSectionCtx<'_>, out: &mu
             // collapsed keeps the last BASH_PREVIEW_LINES visual lines
             // (`keep: "end"`).
             let output = strip_shell_footer(state.output.trim(), state.details.as_deref());
-            if !output.is_empty() {
+            // Ctrl+O on a truncated result previews the spill file through a
+            // read-only mmap: only the bounded line range is copied, the
+            // 64 MiB-capped file is never materialized as one `String`.
+            let spill_body = if expanded {
+                spill_expand_preview(state.details.as_deref())
+            } else {
+                None
+            };
+            if let Some(body) = spill_body {
+                push_painted_blank_row(out, bg_open, bg_close, width);
+                for line in wrap_text_with_ansi(&body, content_width) {
+                    push_painted_row(out, bg_open, bg_close, " ", &line, width);
+                }
+            } else if !output.is_empty() {
                 // Styled in one pass into a single buffer: the old
                 // `map(...).collect::<Vec<_>>().join("\n")` built a
                 // `Vec<String>` of styled lines plus a second full copy of
@@ -4818,7 +5276,7 @@ fn render_result_section(state: &ToolState, ctx: &ResultSectionCtx<'_>, out: &mu
             // `createResultFallback` (tool-execution.ts:146-160).
             let specialized = matches!(
                 state.tool_name.as_str(),
-                "read" | "write" | "grep" | "find" | "ls"
+                "read" | "write" | "grep" | "find" | "ls" | "subagent"
             );
             let body = if specialized {
                 match state.tool_name.as_str() {
@@ -4855,6 +5313,9 @@ fn render_result_section(state: &ToolState, ctx: &ResultSectionCtx<'_>, out: &mu
                         LimitedResultKind::Ls,
                         state.details.as_deref(),
                     ),
+                    "subagent" => {
+                        subagent_result_body(state.details.as_deref(), expanded, content_width)
+                    }
                     _ => None,
                 }
             } else {

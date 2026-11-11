@@ -558,11 +558,11 @@ async fn session_manager_methods_backed_by_snapshot() {
         project_trusted: true,
         cwd: Some("/tmp".to_string()),
         header: json!({ "id": "s-1", "cwd": "/tmp" }),
-        branch: tree,
+        branch_json: serde_json::to_string(&tree).expect("branch text"),
         tree_json,
         leaf_id: Some("entry-2".to_string()),
         labels: json!({ "entry-2": "pinned" }),
-        projection: json!({ "entries": [ { "entry": {}, "messages": [] }, { "entry": {}, "messages": [] } ], "messages": [] }),
+        projection_json: serde_json::to_string(&json!({ "entries": [ { "entry": {}, "messages": [] }, { "entry": {}, "messages": [] } ], "messages": [] })).expect("projection text"),
     });
     seed_and_load(&handle, &dir, "sm.ts", SESSION_MANAGER_TS).await;
 
@@ -1201,6 +1201,7 @@ async fn boundary_events_commit_entries_and_honor_continue() {
     let registry = Arc::new(registry);
 
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -1309,6 +1310,7 @@ async fn session_compact_carries_the_persisted_compaction_entry() {
     let registry = Arc::new(registry);
 
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,

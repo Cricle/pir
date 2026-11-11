@@ -554,9 +554,110 @@ fn native_notification_event(notification: &Notification) -> Option<(&'static st
             };
             Some(("extension_ui_request", request))
         }
-        // Presentation notifications with TUI-only semantics (widgets, title,
-        // working message, editor text, ...) have no documented event shape;
-        // they are left to the UI hosts.
+        // Presentation notifications: expose every projection the web UI can
+        // represent. A host that does not implement a method still receives a
+        // well-formed request and may ignore it.
+        Notification::SetTitle(title) => Some((
+            "extension_ui_request",
+            serde_json::json!({
+                "type": "extension_ui_request",
+                "id": fire_and_forget_event_id(),
+                "method": "setTitle",
+                "title": title,
+            }),
+        )),
+        Notification::Widget { id, content } => Some((
+            "extension_ui_request",
+            serde_json::json!({
+                "type": "extension_ui_request",
+                "id": fire_and_forget_event_id(),
+                "method": "setWidget",
+                "widgetKey": id,
+                "content": content,
+            }),
+        )),
+        Notification::WorkingMessage(message) => Some((
+            "extension_ui_request",
+            serde_json::json!({
+                "type": "extension_ui_request",
+                "id": fire_and_forget_event_id(),
+                "method": "setWorkingMessage",
+                "message": message,
+            }),
+        )),
+        Notification::WorkingVisible(visible) => Some((
+            "extension_ui_request",
+            serde_json::json!({
+                "type": "extension_ui_request",
+                "id": fire_and_forget_event_id(),
+                "method": "setWorkingVisible",
+                "visible": visible,
+            }),
+        )),
+        Notification::EditorSetText(text) => Some((
+            "extension_ui_request",
+            serde_json::json!({
+                "type": "extension_ui_request",
+                "id": fire_and_forget_event_id(),
+                "method": "setEditorText",
+                "text": text,
+            }),
+        )),
+        Notification::EditorPaste(text) => Some((
+            "extension_ui_request",
+            serde_json::json!({
+                "type": "extension_ui_request",
+                "id": fire_and_forget_event_id(),
+                "method": "setEditorText",
+                "text": text,
+                "paste": true,
+            }),
+        )),
+        Notification::SetTheme(theme) => Some((
+            "extension_ui_request",
+            serde_json::json!({
+                "type": "extension_ui_request",
+                "id": fire_and_forget_event_id(),
+                "method": "setTheme",
+                "theme": theme,
+            }),
+        )),
+        Notification::Footer(enabled) => Some((
+            "extension_ui_request",
+            serde_json::json!({
+                "type": "extension_ui_request",
+                "id": fire_and_forget_event_id(),
+                "method": "setFooter",
+                "enabled": enabled,
+            }),
+        )),
+        Notification::Header(enabled) => Some((
+            "extension_ui_request",
+            serde_json::json!({
+                "type": "extension_ui_request",
+                "id": fire_and_forget_event_id(),
+                "method": "setHeader",
+                "enabled": enabled,
+            }),
+        )),
+        Notification::WorkingIndicator(options) => Some((
+            "extension_ui_request",
+            serde_json::json!({
+                "type": "extension_ui_request",
+                "id": fire_and_forget_event_id(),
+                "method": "setWorkingIndicator",
+                "options": options,
+            }),
+        )),
+        Notification::HiddenThinkingLabel(label) => Some((
+            "extension_ui_request",
+            serde_json::json!({
+                "type": "extension_ui_request",
+                "id": fire_and_forget_event_id(),
+                "method": "setHiddenThinkingLabel",
+                "label": label,
+            }),
+        )),
         _ => None,
     }
 }

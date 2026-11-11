@@ -376,6 +376,7 @@ async fn context_usage_reports_cjk_tokens_not_quarter_chars() {
         .expect("append");
 
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(128_000),
         api_key: None,
@@ -558,6 +559,7 @@ async fn run_gate(label: &str, tools: ToolRegistry) -> (usize, Vec<Context>) {
         seen: Arc::clone(&seen),
     }));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(16_384),
         api_key: None,

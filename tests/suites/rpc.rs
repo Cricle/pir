@@ -571,6 +571,7 @@ fn a_stalled_rpc_client_does_not_deadlock_a_single_worker_runtime() {
                 started: Arc::clone(&started),
             }));
             Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+                performance: Default::default(),
                 provider_registry: Arc::new(registry),
                 model: fake_model(),
                 api_key: None,

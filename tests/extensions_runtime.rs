@@ -1238,10 +1238,83 @@ async fn exec_output_is_bounded() {
 /// Serializes every test that mutates the agent-dir env vars (process-global).
 static AGENT_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The three variables `ai::providers::settings::agent_dir()` consults, in
+/// precedence order.
+const AGENT_DIR_ENV_VARS: [&str; 3] = [
+    "PIR_AGENT_DIR",
+    "PIR_CODING_AGENT_DIR",
+    "PI_CODING_AGENT_DIR",
+];
+
+/// Fully explicit agent-dir environment for ONE test: holds the binary's
+/// agent-dir lock, CLEARS every override, applies `pins`, and restores every
+/// touched variable (absence included) on drop, panic included.
+///
+/// `getAgentDir()` resolves the process environment on every call, so a host
+/// that exports `PIR_AGENT_DIR` (the release-harness isolation variable) or a
+/// sibling suite that pins one would otherwise decide what these tests
+/// observe. Stating the environment here makes each test deterministic on CI
+/// and on any developer machine; no mutation outlives the test.
+struct AgentDirEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl AgentDirEnvGuard {
+    /// Clear the agent-dir overrides plus every name in `pins`, and set
+    /// `pins`.
+    fn scoped(pins: &[(&'static str, &str)]) -> Self {
+        let lock = AGENT_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut saved = Vec::with_capacity(AGENT_DIR_ENV_VARS.len() + pins.len());
+        for key in AGENT_DIR_ENV_VARS {
+            saved.push((key, std::env::var_os(key)));
+            std::env::remove_var(key);
+        }
+        for (key, value) in pins {
+            if !saved.iter().any(|(saved_key, _)| saved_key == key) {
+                saved.push((*key, std::env::var_os(key)));
+            }
+            std::env::set_var(key, value);
+        }
+        Self { _lock: lock, saved }
+    }
+}
+
+impl Drop for AgentDirEnvGuard {
+    fn drop(&mut self) {
+        for (key, previous) in self.saved.drain(..).rev() {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// The default agent dir is `<home>/.pi/agent`. The test pins `HOME` (the
+/// primary fallback input) and `USERPROFILE` (the Windows fallback) at a
+/// scratch directory and clears every override, so the assertion is EXACT
+/// instead of a substring guess a host env could satisfy by accident. No
+/// mutation outlives the test.
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn get_agent_dir_resolves_to_host_path() {
-    let _guard = AGENT_DIR_ENV_LOCK.lock().unwrap();
+    let home = std::env::temp_dir().join(format!(
+        "pir-ext-agent-dir-home-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create scratch home");
+    let home_str = home.to_str().expect("temp path is UTF-8");
+
+    let _env = AgentDirEnvGuard::scoped(&[("HOME", home_str), ("USERPROFILE", home_str)]);
+
     let rt = new_runtime().await;
     rt.seed_module(
         "pir-ext:agentdir.ts",
@@ -1260,14 +1333,14 @@ async fn get_agent_dir_resolves_to_host_path() {
         .await
         .expect("eval");
     let dir = dir.as_str().unwrap_or("");
-    assert!(
-        dir.contains(".pi"),
-        "expected ~/.pi/agent style path, got {dir}"
+    let expected = home.join(".pi").join("agent");
+    assert_eq!(
+        PathBuf::from(dir.replace('\\', "/")),
+        PathBuf::from(expected.to_string_lossy().replace('\\', "/")),
+        "with no override set, getAgentDir must resolve <HOME>/.pi/agent"
     );
-    assert!(
-        dir.replace('\\', "/").ends_with(".pi/agent"),
-        "expected path to end with .pi/agent, got {dir}"
-    );
+
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// `getAgentDir()` from extension context must honor `PIR_AGENT_DIR` alone —

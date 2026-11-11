@@ -1056,13 +1056,17 @@ impl EntryDiffWork {
 
 /// Chat transcript: header + messages + tool executions
 /// (upstream `chatContainer`).
-#[derive(Default)]
 pub struct ChatContainer {
     inner: Container,
     /// `settings.hideThinkingBlock`: assistant transcript entries collapse
     /// their thinking blocks (upstream `hideThinkingBlock` forwarded to every
     /// `AssistantMessageComponent`).
     hide_thinking: bool,
+    /// `settings.outputPad` (upstream `this.outputPad`, default 1): horizontal
+    /// padding of every transcript message/tool/notice block. Baked into the
+    /// children at construction and moved live by
+    /// [`ChatContainer::set_output_pad`].
+    output_pad: usize,
     /// Shared live hidden-thinking label (`ctx.ui.setHiddenThinkingLabel`,
     /// upstream `hiddenThinkingLabel`): handed to every
     /// `AssistantMessageComponent` so a relabel reaches already-rendered
@@ -1086,6 +1090,24 @@ pub struct ChatContainer {
     /// is the entry index inside the materialized window; the frame cache
     /// resolves it to a row interval.
     dirty_blocks: DirtyBlockLog,
+}
+
+impl Default for ChatContainer {
+    fn default() -> Self {
+        Self {
+            inner: Container::default(),
+            hide_thinking: false,
+            // Upstream `SETTINGS_DEFAULTS.outputPad` is 1: a fresh container is
+            // the pre-settings posture every existing caller expects.
+            output_pad: 1,
+            hidden_thinking_label: Arc::default(),
+            tools_expanded: Arc::default(),
+            committed: Vec::new(),
+            committed_epoch: None,
+            last_diff: ContainerDiff::default(),
+            dirty_blocks: DirtyBlockLog::default(),
+        }
+    }
 }
 
 /// Per-container report of the last [`ChatContainer::set_entries`] diff
@@ -1711,6 +1733,7 @@ impl Clone for CommittedStreaming {
 struct CommitEpoch {
     theme_generation: u64,
     hide_thinking: bool,
+    output_pad: usize,
     tools_expanded: usize,
     hidden_label: usize,
 }
@@ -1814,6 +1837,17 @@ impl ChatContainer {
         self.inner.invalidate();
     }
 
+    /// Set `outputPad` (upstream `onOutputPadChange` → each child's
+    /// `setOutputPad`): the transcript rebuilds its children so already
+    /// rendered entries drop/add the horizontal inset on the next frame.
+    pub fn set_output_pad(&mut self, output_pad: usize) {
+        if self.output_pad == output_pad {
+            return;
+        }
+        self.output_pad = output_pad;
+        self.inner.invalidate();
+    }
+
     /// Apply `ctx.ui.setHiddenThinkingLabel(label?)` (upstream
     /// interactive-mode `setHiddenThinkingLabel`, types.ts:185): the shared
     /// slot every assistant component reads, so the relabel is live for
@@ -1863,6 +1897,7 @@ impl ChatContainer {
         let epoch = CommitEpoch {
             theme_generation: Theme::generation(),
             hide_thinking: self.hide_thinking,
+            output_pad: self.output_pad,
             tools_expanded: Arc::as_ptr(&self.tools_expanded) as usize,
             hidden_label: Arc::as_ptr(&self.hidden_thinking_label) as usize,
         };
@@ -2287,21 +2322,30 @@ impl ChatContainer {
                     Some(block) => {
                         children.push(Box::new(SkillInvocationComponent::new(
                             &block,
-                            1,
+                            self.output_pad,
                             Arc::clone(&self.tools_expanded),
                         )));
                         if let Some(user_message) = &block.user_message {
                             children.push(Box::new(Spacer::new(1)));
-                            children.push(Box::new(UserMessageComponent::new(user_message, 1)));
+                            children.push(Box::new(UserMessageComponent::new(
+                                user_message,
+                                self.output_pad,
+                            )));
                         }
                     }
-                    None => children.push(Box::new(UserMessageComponent::new(text, 1))),
+                    None => {
+                        children.push(Box::new(UserMessageComponent::new(text, self.output_pad)))
+                    }
                 }
             }
             ChatEntry::Assistant(message) => {
                 children.push(Box::new(
-                    AssistantMessageComponent::new_from(Arc::clone(message), self.hide_thinking, 1)
-                        .with_hidden_label(Arc::clone(&self.hidden_thinking_label)),
+                    AssistantMessageComponent::new_from(
+                        Arc::clone(message),
+                        self.hide_thinking,
+                        self.output_pad,
+                    )
+                    .with_hidden_label(Arc::clone(&self.hidden_thinking_label)),
                 ));
             }
             ChatEntry::ToolExecution {
@@ -2346,7 +2390,7 @@ impl ChatContainer {
                         with_theme(|theme| theme.fg(ThemeColor::Dim, text.as_ref()))
                     }
                 };
-                children.push(Box::new(Text::with_padding(line, 1, 0)));
+                children.push(Box::new(Text::with_padding(line, self.output_pad, 0)));
             }
             ChatEntry::Raw {
                 lines,
@@ -2383,7 +2427,7 @@ impl ChatContainer {
                         // control sequence.
                         let row = Text::with_padding(
                             crate::text::sanitize_terminal_text(line).into_owned(),
-                            1,
+                            self.output_pad,
                             0,
                         );
                         row.set_bg(Some(Arc::clone(&painter)));
@@ -2455,7 +2499,7 @@ impl ChatContainer {
                 } else {
                     let component = Arc::new(StreamingThinking::new(
                         thinking,
-                        1,
+                        self.output_pad,
                         self.hide_thinking,
                         Arc::clone(&self.hidden_thinking_label),
                     ));
@@ -2485,7 +2529,7 @@ impl ChatContainer {
                 // keeps the fence until the settled entry replaces this one.
                 let markdown = Arc::new(Markdown::with_options(
                     crate::text::sanitize_terminal_text(text).as_ref(),
-                    1,
+                    self.output_pad,
                     0,
                     MarkdownTheme::default(),
                     MarkdownOptions {

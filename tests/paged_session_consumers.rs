@@ -949,6 +949,7 @@ fn recording_factory(observed: Arc<AtomicUsize>) -> SessionFactory {
         let mut registry = ProviderRegistry::default();
         registry.set_provider(Arc::new(NullProvider));
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: fake_model(),
             api_key: None,

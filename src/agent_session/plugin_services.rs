@@ -1514,6 +1514,8 @@ impl AgentSession {
         };
         let on_update = self.tool_update_channel();
         let session_env = Arc::new(ToolSessionEnv {
+            live_model: None,
+            live_thinking: None,
             provider_registry: Arc::clone(&self.registry),
             model: self.current_model(),
             thinking: self.current_thinking(),

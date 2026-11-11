@@ -834,10 +834,17 @@ impl std::fmt::Debug for ToolCredential {
 pub struct ToolSessionEnv {
     /// Provider registry child runs stream from.
     pub provider_registry: Arc<crate::ai::provider::ProviderRegistry>,
-    /// The parent session's current model (upstream `ctx.model`).
+    /// The per-settle model snapshot. Kept for hosts that have no live cell;
+    /// session runs should also set [`Self::live_model`], which wins (upstream
+    /// `ctx.model` is a live getter on the session's current model).
     pub model: crate::ai::types::Model,
-    /// The parent session's thinking level (upstream `ctx.thinkingLevel`).
+    /// The parent session's live model cell (upstream `ctx.model` getter).
+    pub live_model: Option<Arc<RwLock<crate::ai::types::Model>>>,
+    /// The parent session's thinking level snapshot (upstream
+    /// `ctx.thinkingLevel` fallback).
     pub thinking: crate::ai::types::ThinkingLevel,
+    /// The parent session's live thinking cell.
+    pub live_thinking: Option<Arc<RwLock<crate::ai::types::ThinkingLevel>>>,
     /// The persisted session id (upstream `ctx.sessionManager.getSessionId()`),
     /// exposed to shell children as `PI_SESSION_ID`. `None` for a host without
     /// session storage (an ephemeral print run or a bare tool execution).
@@ -887,6 +894,30 @@ pub struct ToolSessionEnv {
     /// `read` tool records successful text reads; `edit`/`write` gate existing
     /// files). Shared across turns by the owning session.
     pub read_ledger: Arc<crate::agent::read_ledger::ReadLedger>,
+}
+
+impl ToolSessionEnv {
+    /// The model a tool should route child work to: the live session model
+    /// when this host has one (upstream `ctx.model`), else the snapshot.
+    pub fn dispatch_model(&self) -> crate::ai::types::Model {
+        match &self.live_model {
+            Some(cell) => cell
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            None => self.model.clone(),
+        }
+    }
+
+    /// The live thinking level (upstream `ctx.thinkingLevel`).
+    pub fn dispatch_thinking(&self) -> crate::ai::types::ThinkingLevel {
+        match &self.live_thinking {
+            Some(cell) => *cell
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            None => self.thinking,
+        }
+    }
 }
 
 impl std::fmt::Debug for ToolSessionEnv {
@@ -1252,6 +1283,23 @@ pub fn declared_tool_definitions(
     descriptions: &std::collections::BTreeMap<String, String>,
     hidden_declarations: &std::collections::BTreeSet<String>,
 ) -> Vec<crate::ai::types::Tool> {
+    declared_tool_definitions_for_profile(
+        declared,
+        descriptions,
+        hidden_declarations,
+        crate::config::settings::PerformanceProfile::Balanced,
+    )
+}
+
+/// Profile-aware variant: `Balanced` keeps the historical "background on
+/// every schema" bytes; `Efficient` only advertises it on tools that actually
+/// support background execution.
+pub fn declared_tool_definitions_for_profile(
+    declared: &[Arc<dyn AgentTool>],
+    descriptions: &std::collections::BTreeMap<String, String>,
+    hidden_declarations: &std::collections::BTreeSet<String>,
+    profile: crate::config::settings::PerformanceProfile,
+) -> Vec<crate::ai::types::Tool> {
     declared
         .iter()
         .filter(|tool| !hidden_declarations.contains(tool.name()))
@@ -1264,6 +1312,8 @@ pub fn declared_tool_definitions(
             parameters: with_background_argument(
                 tool.parameters()
                     .unwrap_or_else(|| serde_json::json!({"type": "object"})),
+                profile == crate::config::settings::PerformanceProfile::Balanced
+                    || tool.supports_background(),
             ),
             constrained_sampling: tool.constrained_sampling(),
         })
@@ -1275,8 +1325,12 @@ pub fn declared_tool_definitions(
 /// The argument is scheduler-level, not tool-level: the model passes it on
 /// every tool, and `prepare_calls` strips it before validation, so the tool
 /// itself never sees it. A non-object schema (a malformed declaration) is
-/// returned unchanged.
-fn with_background_argument(mut parameters: serde_json::Value) -> serde_json::Value {
+/// returned unchanged. `inject` is false on the efficient profile for tools
+/// that cannot run in the background.
+fn with_background_argument(mut parameters: serde_json::Value, inject: bool) -> serde_json::Value {
+    if !inject {
+        return parameters;
+    }
     let Some(object) = parameters.as_object_mut() else {
         return parameters;
     };

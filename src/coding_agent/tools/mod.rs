@@ -85,6 +85,21 @@ pub mod spill;
     feature = "tui"
 ))]
 mod util;
+// Path-substitution guard asserted directly by
+// `tests/suites/coding_agent_units.rs`; the module stays private and only
+// this seam plus its return type are re-exported. Gated exactly like
+// `mod util` above: without those features the module is not compiled, and an
+// ungated re-export would be an unresolved import in the `sdk`-only shapes.
+#[cfg(any(
+    feature = "tool-read",
+    feature = "tool-write",
+    feature = "tool-edit",
+    feature = "tool-ls",
+    feature = "grep-find",
+    feature = "tui"
+))]
+#[doc(hidden)]
+pub use util::{workspace_path_parts, WorkspacePathParts};
 #[cfg(feature = "tool-write")]
 mod write;
 
@@ -100,6 +115,14 @@ use background::{BackgroundAbortTool, BackgroundStatusTool};
 // `agent_session` bash path and the provider config-value executor resolve the
 // same shell without the tools feature.
 pub use bash::{apply_command_prefix, resolve_shell_config, ShellConfig};
+// Pure command-spelling guards asserted directly by
+// `tests/suites/coding_agent_units.rs`: the whole-filesystem search refusal
+// and the Windows PATH → MSYS spelling conversion.
+#[doc(hidden)]
+pub use bash::broad_search_violation;
+#[cfg(windows)]
+#[doc(hidden)]
+pub use bash::msys_path_from_windows;
 // The edit preview seam (`computeEditsDiff`): the TUI computes the live edit
 // diff off-thread with the same engine that later applies the edit.
 // The diff preview is read by the TUI's edit renderer only.

@@ -316,6 +316,9 @@ pub struct AgentBuilder {
     /// `builtin:<name>` entries and never start the QuickJS actor.
     only_builtin: bool,
     session: SessionMode,
+    /// PIR-SDK-018: bounded resident transcript for a persisted live session
+    /// (bytes, entries). `None` keeps upstream whole-transcript residency.
+    live_session_tail: Option<(usize, usize)>,
     compaction: Option<crate::compaction::CompactionConfig>,
     max_retries: Option<u32>,
     max_retry_delay_ms: Option<u64>,
@@ -376,6 +379,10 @@ impl AgentBuilder {
             extension_paths: Vec::new(),
             only_builtin: false,
             session: SessionMode::default(),
+            // PIR-SDK-018: opt-in. Ordinary SDK sessions keep the upstream
+            // whole-transcript residency; a long-lived service that wants the
+            // bounded tail opts in with `.live_session_tail(bytes, entries)`.
+            live_session_tail: None,
             compaction: Some(crate::compaction::CompactionConfig::default()),
             max_retries: None,
             max_retry_delay_ms: None,
@@ -903,13 +910,17 @@ impl AgentBuilder {
     ///
     /// The closure runs once for every dispatch of `event_name` through the
     /// plugin host (other events are ignored by this handler):
-    /// `session_start`, `input`, `before_agent_start`,
-    /// `tool_execution_update`, `model_select`, `thinking_level_select`,
-    /// `turn_end`, `agent_before_settle`, `session_before_compact`,
-    /// `session_before_fork`, `session_before_switch`, ... (the loop-level
-    /// `tool_call`/`tool_result` gate currently dispatches through the
-    /// JS-extension runtime only — Rust closures observe tool calls via
-    /// `tool_execution_update` and the session-level events above).
+    /// `session_start`, `input`, `before_agent_start`, `tool_call`,
+    /// `tool_result`, `tool_execution_update`, `model_select`,
+    /// `thinking_level_select`, `turn_end`, `agent_before_settle`,
+    /// `session_before_compact`, `session_before_fork`,
+    /// `session_before_switch`, ... The loop-level `tool_call`/`tool_result`
+    /// faces dispatch through the same unified host as JS extensions, for
+    /// foreground and background (`background: true`) calls alike: a closure
+    /// can block or rewrite a `tool_call` input and can rewrite a
+    /// `tool_result`'s content/details/error flag/usage, exactly like a full
+    /// Rust plugin. `tool_execution_update` remains the streaming-progress
+    /// observer for long-running tools.
     ///
     /// Stacking calls yields one plugin instance per handler, dispatched in
     /// registration order (the same ordered merge the plugin host applies to
@@ -1086,6 +1097,34 @@ impl AgentBuilder {
     /// Shorthand for [`SessionMode::None`] (in-memory transcript).
     pub fn no_session(self) -> Self {
         self.session(SessionMode::None)
+    }
+
+    /// Bound the resident transcript of a persisted live session
+    /// (PIR-SDK-018). Between prompts the session keeps only the newest
+    /// `max_bytes`/`max_entries` of JSONL resident; the append-only file is
+    /// untouched. The MODEL CONTEXT of a live-tail session is that resident
+    /// tail (plus the new turn), so a long-lived service pays a bounded
+    /// working set instead of retaining every parsed entry for the process
+    /// lifetime; whole-history reads
+    /// ([`Agent::transcript`](crate::sdk::Agent::transcript),
+    /// `transcript_json`, `full_messages_json`, `session_stats`) widen or
+    /// stream the prefix and stay complete.
+    ///
+    /// The default is `None` (upstream whole-transcript residency): this is
+    /// an explicit opt-in because the tail window also bounds what the model
+    /// sees (older history is not sent until a whole-history operation widens
+    /// the session). [`SessionMode::None`] is unaffected (nothing persisted).
+    pub fn live_session_tail(mut self, max_bytes: usize, max_entries: usize) -> Self {
+        self.live_session_tail = Some((max_bytes.max(1), max_entries.max(1)));
+        self
+    }
+
+    /// Restore the default: retain the whole parsed transcript like upstream
+    /// `SessionManager.fileEntries` for the lifetime of the agent (the
+    /// pre-PIR-SDK-018 behavior).
+    pub fn without_live_session_tail(mut self) -> Self {
+        self.live_session_tail = None;
+        self
     }
 
     /// Tune threshold compaction; `None` (via
@@ -1473,7 +1512,8 @@ impl AgentBuilder {
                             )
                             .map_err(|message| SdkError::NoModel { message })?;
                             let model = initial.model.ok_or_else(|| SdkError::NoModel {
-                                message: "no model available; configure a provider with `pir auth login` or ~/.pi/agent/models.json".to_owned(),
+                                // Display adds the "no model available:" prefix.
+                                message: "configure a provider with `pir auth login` or ~/.pi/agent/models.json".to_owned(),
                             })?;
                             (model, Some(initial.thinking_level))
                         }
@@ -1508,7 +1548,7 @@ impl AgentBuilder {
         };
 
         // --- session storage --------------------------------------------
-        let session = match &self.session {
+        let mut session = match &self.session {
             SessionMode::None => None,
             // Tail-first like `Agent::attach_session`: a huge session keeps
             // only its newest page resident (a run widens it before building
@@ -1526,6 +1566,14 @@ impl AgentBuilder {
                     .map_err(|error| SdkError::Session(error.to_string()))?,
             ),
         };
+        // PIR-SDK-018: persisted SDK sessions get a bounded resident tail by
+        // default. `SessionMode::None` has no file to re-read, so it is never
+        // configured.
+        if let Some(manager) = session.as_mut() {
+            if let Some((max_bytes, max_entries)) = self.live_session_tail {
+                manager.enable_live_tail_trim(max_bytes, max_entries);
+            }
+        }
 
         // --- recorded session settings + totals --------------------------
         // An existing session records the model/thinking level on its branch
@@ -1798,7 +1846,7 @@ impl AgentBuilder {
         if perf_trace {
             eprintln!("[perf] pre-plugin-host {:?}", perf_t0.elapsed());
         }
-        let sink_slot = Arc::new(std::sync::Mutex::new(None));
+        let sink_slot = Arc::new(std::sync::Mutex::new(super::event::SinkState::default()));
         user_plugins.push(Arc::new(super::event::SdkBridgePlugin::new(Arc::clone(
             &sink_slot,
         ))));
@@ -2062,6 +2110,19 @@ impl AgentBuilder {
         // prompt) so the derived prompt keeps its cache and the addendum is
         // re-applied on every rebuild.
         let explicit_system_prompt = self.system_prompt.is_some();
+        // PIR-SDK-004: the DERIVED prompt's skill discovery follows the same
+        // path scoping as SYSTEM.md discovery (`discover_system_prompt`):
+        // `model*` keeps CLI parity (on by default), while `endpoint` /
+        // `with_registry` / `proxy` are environment-free and only opt in via
+        // `.discover_system_prompt(true)`. `.system_prompt_files(..)` is the
+        // ambient opt-out, and an explicit `system_prompt` pins the whole
+        // prompt (no derivation at all). Skills installed by an explicit
+        // `resource_loader` still land through `set_prompt_resources_shared`.
+        let explicit_prompt_files = self.system_prompt_files.is_some();
+        let discover_prompt_skills = !explicit_system_prompt
+            && self
+                .discover_system_prompt
+                .unwrap_or(!explicit_model_setup && !explicit_prompt_files);
         let append_system_prompt = self.append_system_prompt;
         let system_prompt = match (self.system_prompt, append_system_prompt.as_deref()) {
             (Some(prompt), Some(appendix)) => Some(format!("{prompt}\n\n{appendix}")),
@@ -2108,7 +2169,8 @@ impl AgentBuilder {
         // from `agent_dir`.
         let tool_hooks = self.tool_hooks;
         let plugin_host_for_init = Arc::clone(&plugin_host);
-        let session_facade = crate::agent_session::AgentSession::new_arc_with_plugins_and_host_in(
+        let session_facade = crate::agent_session::AgentSession::
+            new_arc_with_plugins_and_host_in_and_prompt_discovery(
             crate::agent_session::AgentSessionConfig {
                 provider_registry: Arc::clone(&registry),
                 model,
@@ -2124,6 +2186,7 @@ impl AgentBuilder {
                 max_turns: self
                     .max_turns
                     .unwrap_or(crate::config::defaults::DEFAULT_AGENT_MAX_TURNS),
+                performance: crate::config::settings::PerformanceSettings::from_env(),
                 system_prompt,
                 cwd: Some(cwd),
                 event_stream: None,
@@ -2133,6 +2196,7 @@ impl AgentBuilder {
             user_plugins,
             Some(plugin_host),
             Some(agent_dir.clone()),
+            discover_prompt_skills,
         );
         if perf_trace {
             eprintln!("[perf] session-facade {:?}", perf_t0.elapsed());
@@ -2168,12 +2232,9 @@ impl AgentBuilder {
         if !explicit_system_prompt {
             // `.system_prompt_files(..)` is itself the opt-out: even an empty
             // value means the caller owns prompt-file selection.
-            let explicit_files = self.system_prompt_files.is_some();
-            let discover = self
-                .discover_system_prompt
-                .unwrap_or(!explicit_model_setup && !explicit_files);
+            let discover = discover_prompt_skills;
             let files = self.system_prompt_files.take().unwrap_or_default();
-            if discover || explicit_files {
+            if discover || explicit_prompt_files {
                 apply_system_prompt_files(
                     &session_facade,
                     &session_cwd,
@@ -2339,9 +2400,19 @@ fn rewire_builtin_for_session(
             agent_dir.join("agents"),
         ));
     }
-    #[cfg(not(feature = "mcp"))]
+    #[cfg(feature = "memory")]
+    if plugin
+        .as_any()
+        .and_then(|any| any.downcast_ref::<crate::plugins::builtin::MemoryPlugin>())
+        .is_some()
+    {
+        return Arc::new(crate::plugins::builtin::MemoryPlugin::with_paths(
+            agent_dir, cwd,
+        ));
+    }
+    #[cfg(not(any(feature = "mcp", feature = "memory")))]
     let _ = cwd;
-    #[cfg(not(any(feature = "mcp", feature = "subagent")))]
+    #[cfg(not(any(feature = "mcp", feature = "subagent", feature = "memory")))]
     let _ = agent_dir;
     plugin
 }

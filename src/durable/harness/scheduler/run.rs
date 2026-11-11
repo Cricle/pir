@@ -45,6 +45,7 @@
 //! because no code can decide the outcome.
 
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -107,7 +108,7 @@ struct ActivePhase {
 
 /// One step's value: the next record to run, and the fault it wrote, if any.
 struct StepResult {
-    next: Option<TaskRecord>,
+    next: Option<Arc<TaskRecord>>,
     fault: Option<String>,
 }
 
@@ -161,7 +162,7 @@ impl SchedulerInner {
                         self.finish_phase(
                             &invocation,
                             active,
-                            record.as_ref(),
+                            record.as_deref(),
                             step.fault.as_deref(),
                         );
                     }
@@ -186,7 +187,7 @@ impl SchedulerInner {
                         self.finish_phase(
                             &invocation,
                             active,
-                            record.as_ref(),
+                            record.as_deref(),
                             step.fault.as_deref(),
                         );
                     }
@@ -202,14 +203,18 @@ impl SchedulerInner {
     ///
     /// Only called while a phase span is open, so the extra read costs nothing
     /// on the no-sink path.
-    async fn phase_record(&self, next: &Option<TaskRecord>, id: TaskId) -> Option<TaskRecord> {
+    async fn phase_record(
+        &self,
+        next: &Option<Arc<TaskRecord>>,
+        id: TaskId,
+    ) -> Option<Arc<TaskRecord>> {
         if let Some(record) = next {
             return Some(record.clone());
         }
         if let Some(record) = self.live_record(id) {
             return Some(record);
         }
-        self.read_task(id).await.ok().flatten()
+        self.read_task(id).await.ok().flatten().map(Arc::new)
     }
 
     /// Start `pi.durable.phase` for one handler invocation.
@@ -257,7 +262,9 @@ impl SchedulerInner {
                 phase,
                 kind,
                 attempt,
-                resumed: invocation.resumed,
+                // Only the recovered invocation's first phase is resumed;
+                // the one invocation object drives every later phase too.
+                resumed: invocation.resumed.swap(false, Ordering::AcqRel),
             },
             parent,
             &links,
@@ -407,7 +414,7 @@ impl SchedulerInner {
     /// the invocation, and the task stays `running` for the next reservation.
     async fn step<F>(self: &Arc<Self>, invocation: &Arc<Invocation>, decide: F) -> StepResult
     where
-        F: FnOnce(&mut Transaction, TaskRecord) -> Decision + Send + 'static,
+        F: FnOnce(&mut Transaction, Arc<TaskRecord>) -> Decision + Send + 'static,
     {
         let inner = self.clone();
         let handle = invocation.clone();
@@ -546,7 +553,7 @@ impl SchedulerInner {
             self.finish_phase(
                 &invocation,
                 active,
-                record.as_ref(),
+                record.as_deref(),
                 step.fault.as_deref().or(fault.as_deref()),
             );
         }

@@ -142,6 +142,7 @@ fn session_with(cwd: &str, dir: &std::path::Path, name: Option<&str>) -> Session
 
 fn agent(session: SessionManager, temp: &TempDir) -> Arc<AgentSession> {
     Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: fake_registry(),
         model: fake_model(),
         api_key: None,
@@ -161,6 +162,7 @@ fn agent(session: SessionManager, temp: &TempDir) -> Arc<AgentSession> {
 /// An agent with no durable storage (`--no-session`).
 fn ephemeral_agent(temp: &TempDir) -> Arc<AgentSession> {
     Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: fake_registry(),
         model: fake_model(),
         api_key: None,
@@ -412,6 +414,7 @@ fn agent_with_extensions(
 ) -> Arc<AgentSession> {
     let session = session_with(".", &temp.0, None);
     Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: fake_registry(),
         model: fake_model(),
         api_key: None,

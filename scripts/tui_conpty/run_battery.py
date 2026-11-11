@@ -1244,6 +1244,17 @@ def execute(scen, args, run_dir, pir, use_mock=True):
            "mock": mock_rec,
            "status": "RUNNING", "duration_s": None, "checks": [],
            "hard_timeout": False, "result": None}
+    # Optional scenario SETUP(agent_dir): create the user-fixture tree before
+    # the app starts (the scenario module is exec'd before this dir exists, so
+    # a fixed path cannot be used). A raised error becomes a visible failed
+    # check, never a silent pass.
+    setup_error = None
+    setup = scen.ns.get("SETUP")
+    if callable(setup):
+        try:
+            setup(agent_dir)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the battery
+            setup_error = f"SETUP raised {type(exc).__name__}: {exc}"
     t0 = time.time()
     try:
         proc = subprocess.Popen(argv, cwd=HERE, env=env,
@@ -1264,9 +1275,10 @@ def execute(scen, args, run_dir, pir, use_mock=True):
                 out, err = "", ""
         rec["driver_returncode"] = proc.returncode
     finally:
-        if mock is not None:
+        if mock is not None and not scen.ns.get("OPS2"):
             # Stop the mock only after the driver (and the pir child it owns)
-            # has exited, so no request can arrive on a closed socket.
+            # has exited, so no request can arrive on a closed socket. A
+            # scenario with an OPS2 leg keeps it alive for that leg below.
             mock_rec["requests"] = mock.request_count
             mock.stop()
     rec["duration_s"] = round(time.time() - t0, 2)
@@ -1298,6 +1310,38 @@ def execute(scen, args, run_dir, pir, use_mock=True):
     if os.path.isfile(driver_log):
         with open(driver_log, encoding="utf-8", errors="replace") as f:
             driver_log_text = f.read()
+
+    # Optional second TUI leg in the SAME agent dir/cwd (e.g. `/quit` then
+    # `--continue`). Generic: a scenario declares OPS2 (+ARGS2/TIMEOUT2) and
+    # the leg's snaps are rendered into the same screen map below. It runs
+    # in-process so it shares this process's loopback mock server.
+    leg2 = None
+    ops2 = scen.ns.get("OPS2")
+    if ops2:
+        leg2_name = scen.name + "_continue"
+        leg2_json = os.path.join(scen_dir, leg2_name + ".result.json")
+        try:
+            import tui_drive
+            tui_drive.PIR = pir
+            tui_drive.run_scenario(
+                leg2_name, ops2,
+                extra_env=dict(scen.ns.get("ENV") or {}) or None,
+                args=scen.ns.get("ARGS2"),
+                cwd=os.path.abspath(agent_dir),
+                shots_dir=scen_dir,
+                driver_log=os.path.join(scen_dir, leg2_name + ".driver.log"),
+                result_json=leg2_json,
+                agent_dir=agent_dir,
+                timeout=float(scen.ns.get("TIMEOUT2") or 120))
+            with open(leg2_json, encoding="utf-8") as f:
+                leg2 = json.load(f)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the battery
+            leg2 = {"error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            if mock is not None:
+                mock_rec["requests"] = mock.request_count
+                mock.stop()
+        rec["leg2"] = leg2
 
     # Render EVERY app log in the scenario dir (snaps + final) to .screen.txt.
     screens = {}
@@ -1332,6 +1376,26 @@ def execute(scen, args, run_dir, pir, use_mock=True):
             ok, detail = False, f"check raised {type(exc).__name__}: {exc}"
         checks.append({"check": chk[0], "args": [str(a) for a in chk[1:]],
                        "ok": ok, "detail": detail})
+    if setup_error:
+        checks.append({"check": "scenario_setup", "args": [], "ok": False,
+                       "detail": setup_error})
+    # Optional VERIFY(scen_dir) -> {name: (ok, detail)}: on-disk assertions
+    # (real file bytes, test exit codes, session JSONL) that the screen-only
+    # check vocabulary cannot express. Runs after both legs and before the
+    # acceptance decision; an exception is a failed check, not a crash.
+    verify = scen.ns.get("VERIFY")
+    if callable(verify):
+        try:
+            outcomes = verify(scen_dir) or {}
+        except Exception as exc:  # noqa: BLE001 - report, never crash the battery
+            outcomes = {"VERIFY": (False, f"raised {type(exc).__name__}: {exc}")}
+        for vname, vres in outcomes.items():
+            try:
+                vok, vdetail = vres
+            except Exception:  # noqa: BLE001
+                vok, vdetail = False, f"malformed result: {vres!r}"
+            checks.append({"check": "verify:" + str(vname), "args": [],
+                           "ok": bool(vok), "detail": str(vdetail)})
     rec["checks"] = checks
 
     # Acceptance rule (foreman, 2026-10-15): the driver's quit path has an

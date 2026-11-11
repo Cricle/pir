@@ -94,6 +94,7 @@ fn build_session(
 ) -> Arc<AgentSession> {
     AgentSession::new_arc_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(ProviderRegistry::default()),
             model: prompt_test_model(),
             api_key: None,

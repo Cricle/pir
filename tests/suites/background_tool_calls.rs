@@ -1034,6 +1034,7 @@ async fn session_registry_reflects_and_aborts_background_calls() {
     tools.register(probe.clone());
 
     let session = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: session_model(),
         api_key: None,
@@ -1206,6 +1207,7 @@ async fn subagent_background_call_runs_detached_and_reaches_the_next_parent_turn
     let cwd = dir.to_string_lossy().into_owned();
     let session = AgentSession::new_with_agent_dir(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: session_model(),
             api_key: None,
@@ -1454,6 +1456,7 @@ async fn background_completion_after_session_swap_is_not_persisted_into_new_stor
 
     let cwd = dir.to_string_lossy().into_owned();
     let session = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: session_model(),
         api_key: None,
@@ -2446,6 +2449,7 @@ async fn nested_background_via_the_real_session_sink_persists_and_reports() {
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let turn_two_gate = Arc::new(tokio::sync::Notify::new());
     let session = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: session_model(),
         api_key: None,
@@ -2926,6 +2930,7 @@ fn probe_session_config(
     event_stream: Option<SharedEventStreamFn>,
 ) -> AgentSessionConfig {
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: session_model(),
         api_key: None,

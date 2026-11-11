@@ -185,6 +185,7 @@ async fn definition_changes_invalidate_a_kept_name_and_cache_hits_do_not_rebuild
     let plugin = Arc::new(RevisionedPlugin::new());
     let session = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(ProviderRegistry::default()),
             model: fake_model(),
             api_key: None,

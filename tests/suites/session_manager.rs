@@ -5,7 +5,7 @@
 //! compaction only), self-retaining compactions + branch copy semantics,
 //! directory layout, and listing (old-format files are skipped).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -948,6 +948,69 @@ fn fork_from_source_carries_raw_text_for_unparseable_lines() {
 
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_dir_all(&target_dir).unwrap();
+}
+
+/// Upstream `SessionManager.forkFrom` resolves `sourcePath` before loading it
+/// and writes the resolved path into `parentSession`. A relative argument must
+/// therefore produce an absolute `parentSession` that a consumer can open
+/// after changing cwd.
+#[test]
+#[cfg_attr(target_os = "linux", ignore = "asserts Windows path encoding")]
+fn fork_from_relative_source_records_absolute_parent_session() {
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    let cwd = std::env::current_dir().unwrap();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = cwd
+        .join("target")
+        .join(format!("fork-relative-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut source = SessionManager::create("C:/repo", &root.join("sessions")).unwrap();
+    source.append_message(user_message("inherited")).unwrap();
+    let source_path = source.path().to_path_buf();
+    // The source was created under the process cwd, so a relative spelling is
+    // valid for this call and exercises the resolution branch.
+    let relative: PathBuf = source_path.strip_prefix(&cwd).unwrap().to_path_buf();
+    assert!(!relative.is_absolute(), "fixture must use a relative path");
+
+    let fork_dir = root.join("forks");
+    let forked =
+        SessionManager::fork_from_source(&relative, "C:\\target-repo", &fork_dir, None).unwrap();
+    let parent = forked
+        .parent_session()
+        .expect("fork records its parent")
+        .to_owned();
+    assert!(
+        Path::new(&parent).is_absolute(),
+        "parentSession must be resolved, got {parent:?}"
+    );
+    assert_eq!(
+        Path::new(&parent),
+        source_path,
+        "parentSession is the resolved source path"
+    );
+
+    // Open the recorded parent from an unrelated working directory.
+    let guard = CwdGuard(cwd);
+    std::env::set_current_dir(&fork_dir).unwrap();
+    let reopened = SessionManager::open(Path::new(&parent)).expect("open parent from other cwd");
+    assert_eq!(reopened.id(), source.id());
+    assert_eq!(reopened.build_context_entries().unwrap().len(), 1);
+
+    drop(reopened);
+    drop(forked);
+    drop(source);
+    // The process cwd lives inside `root` until the guard restores it.
+    drop(guard);
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 // ---------------------------------------------------------------------------

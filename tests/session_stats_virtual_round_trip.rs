@@ -234,6 +234,7 @@ async fn stats_ignore_custom_entries_and_virtual_state_restores() {
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(FakeProvider));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,

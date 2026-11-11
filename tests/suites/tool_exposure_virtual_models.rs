@@ -719,6 +719,7 @@ async fn virtual_model_routes_to_the_physical_model_and_persists_state() {
     });
 
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry.clone(),
         model: virtual_model,
         api_key: None,
@@ -798,6 +799,7 @@ async fn virtual_model_routes_to_the_physical_model_and_persists_state() {
     // into its registry overlay, keeping the selection routable.
     let resumed_storage = SessionManager::open(&path).unwrap();
     let resumed = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: fake_registry(Arc::new(|_index, _context| {
             assistant_message("fake", "fake-model", "again")
         })),
@@ -884,6 +886,7 @@ async fn virtual_selection_replays_signed_thinking() {
     let session = SessionManager::create(".", &temp).unwrap();
     let path = session.path().to_path_buf();
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry.clone(),
         model: registry.get_model("fake", "virtual-x").unwrap(),
         api_key: None,
@@ -986,6 +989,7 @@ async fn compaction_threshold_uses_the_routed_virtual_model() {
         )))
         .unwrap();
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry.clone(),
         model: registry.get_model("fake", "virtual-x").unwrap(),
         api_key: None,
@@ -1075,6 +1079,7 @@ async fn session_declares_only_the_active_direct_and_model_only_tools() {
 
     let agent = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry.clone(),
             model: physical_model(),
             api_key: None,
@@ -1302,6 +1307,7 @@ async fn js_virtual_model_syncs_into_the_session_and_persists() {
     let session = SessionManager::create(".", &dir).unwrap();
     let path = session.path().to_path_buf();
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry.clone(),
         model: physical_model(),
         api_key: None,

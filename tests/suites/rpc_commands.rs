@@ -72,6 +72,16 @@ fn spawn_rpc() -> (
     BufReader<std::process::ChildStdout>,
     std::process::ChildStdin,
 ) {
+    spawn_rpc_with_args(&[])
+}
+
+fn spawn_rpc_with_args(
+    extra: &[&str],
+) -> (
+    std::process::Child,
+    BufReader<std::process::ChildStdout>,
+    std::process::ChildStdin,
+) {
     // One home per spawned process: tests in this binary run in parallel, and
     // a shared `models.json` path could be observed truncated mid-write by a
     // sibling spawn (seen as "EOF while parsing a value" from create).
@@ -85,6 +95,7 @@ fn spawn_rpc() -> (
     let mut command = Command::new(env!("CARGO_BIN_EXE_pir"));
     command
         .arg("rpc")
+        .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -369,6 +380,64 @@ fn rpc_session_control_commands_answer_without_a_model() {
         "{response}"
     );
 
+    drop(stdin);
+    wait_or_kill(&mut child);
+}
+
+/// PIR-BIN-016: RPC `get_commands` must enumerate the NATIVE (Rust builtin)
+/// slash commands too — the same snapshot the TUI slash menu and the phone
+/// catalog expose. The builtins are loaded explicitly so the test also covers
+/// the `--only-builtin` plan path (JS runtime commands stay empty here).
+#[test]
+fn rpc_get_commands_lists_native_builtin_commands() {
+    let (mut child, mut reader, mut stdin) = spawn_rpc_with_args(&[
+        "--only-builtin",
+        "-e",
+        "builtin:todo",
+        "-e",
+        "builtin:memory",
+        "-e",
+        "builtin:mcp",
+        "-e",
+        "builtin:phone",
+        "--no-session",
+        "--no-context-files",
+    ]);
+    send(&mut stdin, r#"{"type":"create","id":"c-native"}"#);
+    let created = read_response(&mut reader, "create");
+    assert_eq!(created["success"], true, "{created}");
+    send(&mut stdin, r#"{"type":"get_commands","id":"gc-native"}"#);
+    let response = read_response(&mut reader, "get_commands");
+    assert_eq!(response["success"], true, "{response}");
+    let entries = response["data"]["commands"]
+        .as_array()
+        .unwrap_or_else(|| panic!("commands must be an array: {response}"));
+    let names: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    for expected in [
+        "todos",
+        "memory",
+        "mcp",
+        "phone-start",
+        "phone-stop",
+        "phone-status",
+        "phone-token",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "native command /{expected} missing from get_commands: {response}"
+        );
+    }
+    let mut unique = names.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        names.len(),
+        "get_commands returned duplicate names: {response}"
+    );
     drop(stdin);
     wait_or_kill(&mut child);
 }
@@ -893,6 +962,7 @@ fn gated_factory(
             }
         }));
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -944,6 +1014,7 @@ fn background_gated_factory(
             }
         }));
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -1354,6 +1425,7 @@ fn recording_factory(captured: Arc<std::sync::Mutex<Option<Context>>>) -> Sessio
             assistant(vec![text("saw images")], StopReason::Stop)
         }));
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -1668,6 +1740,7 @@ fn compact_factory() -> SessionFactory {
             message
         }));
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -1878,6 +1951,7 @@ async fn operations_factory(temp: &TempDir) -> SessionFactory {
     );
     Arc::new(move |session: Option<SessionManager>| {
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: fake_registry(Arc::new(|_index, _context| {
                 assistant(vec![text("unused")], StopReason::Stop)
             })),
@@ -1988,6 +2062,7 @@ async fn compact_payload_factory(temp: &TempDir) -> (SessionFactory, ExtensionHa
             assistant(vec![text("COMPACTED SUMMARY")], StopReason::Stop)
         }));
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -2142,6 +2217,7 @@ fn compact_gated_factory(
         }));
         Ok(Arc::new(AgentSession::new_with_plugins(
             AgentSessionConfig {
+                performance: Default::default(),
                 provider_registry: registry,
                 model: fake_model(),
                 api_key: None,
@@ -2320,6 +2396,7 @@ fn settle_gated_factory(
         }));
         Ok(Arc::new(AgentSession::new_with_plugins(
             AgentSessionConfig {
+                performance: Default::default(),
                 provider_registry: registry,
                 model: fake_model(),
                 api_key: None,
@@ -2462,6 +2539,7 @@ fn hanging_factory() -> SessionFactory {
         let mut registry = ProviderRegistry::default();
         registry.set_provider(Arc::new(HangingProvider));
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: fake_model(),
             api_key: None,

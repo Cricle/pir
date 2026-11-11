@@ -85,6 +85,8 @@ fn context(session_env: Option<Arc<ToolSessionEnv>>) -> ToolContext {
 
 fn env_with(background: Option<Arc<dyn BackgroundControl>>) -> Arc<ToolSessionEnv> {
     Arc::new(ToolSessionEnv {
+        live_model: None,
+        live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
@@ -491,6 +493,7 @@ async fn session_host_exposes_and_aborts_a_background_call_through_the_tools() {
 
     let requests: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
     let session = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,
@@ -599,6 +602,7 @@ async fn each_session_reports_only_its_own_background_calls() {
         let mut tools = registry();
         tools.register(probe.clone());
         AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(ProviderRegistry::default()),
             model: fake_model(),
             api_key: None,

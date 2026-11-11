@@ -262,6 +262,7 @@ fn session_config(
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(FakeProvider { mode }));
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model("model-a"),
         api_key: None,

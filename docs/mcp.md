@@ -1,7 +1,14 @@
 # MCP servers
 
 pir runs MCP servers as a builtin plugin (rmcp 3.5 client). Configure them in settings.json (`mcpServers`,
-upstream-shaped; `deny_unknown_fields` on the server config):
+upstream-shaped; `deny_unknown_fields` on the server config).
+
+Config is read from the global `<agentDir>/mcp.json` and, **only when the project is trusted**,
+`<cwd>/.pi/mcp.json` (project overrides global). An untrusted project's file is ignored — `pir mcp list`
+reports it in `note` and its MCP tools do not appear — until trust is granted (interactive trust prompt,
+`--approve`, `PIR_TRUST_PROJECT=1`, or a recorded decision in `<agentDir>/trust.json`). `--only-builtin`
+skips settings/package/discovered extensions; it does **not** bypass project trust, so an untrusted
+project's `mcp.json` stays inactive under `--only-builtin` too.
 
 ```json
 {
@@ -28,7 +35,10 @@ upstream-shaped; `deny_unknown_fields` on the server config):
 pir is also an MCP *server*: `pir mcp-sd` (hidden subcommand, stdio) exposes one tool, `sd`, with
 [sd](https://github.com/chmln/sd) semantics — a regex `pattern` plus `replacement` (`$1`, `${name}`, `$$` for a
 literal `$`), `literal` / `case_insensitive` / `whole_word` / `multiline` flags, gitignore-aware walks, and
-`dry_run` **defaulting to true** (pass `dry_run: false` to write in place). `max_matches` / `max_files` bound a
+capture-group syntax follows sd exactly: `$1` and `${1}` both expand capture group 1, but append text
+directly after the bare form — `$1Earth` is parsed as the *named* group `1Earth` (usually empty), so use
+`${1}Earth` to concatenate. `pattern: "item-(\\d+)"` with `replacement: "entry-${1}"` turns `item-123`
+into `entry-123`. `dry_run` **defaults to true** (pass `dry_run: false` to write in place). `max_matches` / `max_files` bound a
 call and are reported as `truncated`. Paths resolve inside `--root` (default: the server's cwd); anything outside
 is refused, and symlinks are never followed. Register it like any other server (`<agentDir>/mcp.json`, project
 `.pi/mcp.json`, or settings `mcpServers`); `command` is this executable:

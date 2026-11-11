@@ -128,6 +128,7 @@ fn resolve_context_files_respects_agent_dir_and_flag() {
         disabled: false,
         agent_dir: &global,
         package_dir: None,
+        max_total_bytes: 0,
     };
     let files = resolve_context_files_with(&cwd, &options);
     assert_eq!(files.len(), 2);
@@ -194,6 +195,7 @@ fn context_system_prompt_injects_project_context_section() {
         disabled: false,
         agent_dir: &global,
         package_dir: None,
+        max_total_bytes: 0,
     };
     let tools: Vec<ToolInfo> = Vec::new();
     let prompt =

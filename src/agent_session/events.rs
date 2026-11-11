@@ -175,13 +175,16 @@ pub enum SessionEvent {
         details: Option<JsonValue>,
         /// The real result's `structuredContent` payload, verbatim.
         structured_content: Option<JsonValue>,
-        /// The `tool_result` handler-reported usage for this completion,
-        /// parsed with the same lenient rules a foreground call applies to
-        /// its tool-result message (`parse_usage_json`). A background result
-        /// has no `ToolResultMessage` to carry usage, so the completion event
-        /// and the persisted `backgroundToolResult` entry details are its
-        /// carriers. Serialized as `usage` when present; `None` when the
-        /// handler reported none (or an unparseable value).
+        /// The completion's usage: the `afterToolCall` hook's report for the
+        /// real result (the detached execution carries it past the turn),
+        /// replaced by a `tool_result` handler's report when that handler
+        /// returns a parseable one — the same precedence a foreground
+        /// tool-result message applies (upstream `afterResult.usage ??
+        /// result.usage`). A background result has no `ToolResultMessage` to
+        /// carry usage, so the completion event and the persisted
+        /// `backgroundToolResult` entry details are its carriers. Serialized
+        /// as `usage` when present; `None` when neither reported one (or the
+        /// handler's value was unparseable).
         usage: Option<crate::ai::types::Usage>,
     },
     /// A transport retry was scheduled (upstream `auto_retry_start`,

@@ -274,6 +274,7 @@ fn session_config(temp: &TempDir) -> AgentSessionConfig {
     let cwd = temp.path().to_str().expect("utf-8 temp path").to_owned();
     let session_dir = temp.path().join("sessions");
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: fake_registry(),
         model: fake_model(),
         api_key: None,

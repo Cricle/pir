@@ -826,8 +826,8 @@ pub fn translate(
                 if task.conversation_id == conversation_id =>
             {
                 match task_changes.iter_mut().find(|known| known.id == task.id) {
-                    Some(known) => *known = task.clone(),
-                    None => task_changes.push(task.clone()),
+                    Some(known) => *known = (**task).clone(),
+                    None => task_changes.push((**task).clone()),
                 }
             }
             CommitChange::Table(TableCommitChange::Submission(submission))

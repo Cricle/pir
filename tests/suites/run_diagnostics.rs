@@ -535,6 +535,7 @@ async fn session_stores_last_run_diagnostics() {
     let mut registry = ProviderRegistry::default();
     registry.set_provider(provider.clone());
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,

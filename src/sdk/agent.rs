@@ -259,10 +259,12 @@ impl Drop for StreamRunGuard {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if sink
+                .sender
                 .as_ref()
                 .is_some_and(|sender| sender.same_channel(&self.sender))
             {
-                *sink = None;
+                sink.sender = None;
+                sink.loop_tool_updates.clear();
             }
         }
         // An admission this guard already released belongs to whoever claimed
@@ -778,11 +780,15 @@ impl Agent {
         // never released.)
         let generation = self.inner.stream_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let sender = event_tx.clone();
-        *self
-            .inner
-            .sink
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender.clone());
+        {
+            let mut sink = self
+                .inner
+                .sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sink.loop_tool_updates.clear();
+            sink.sender = Some(sender.clone());
+        }
         // The stream exists now, so session-level events have somewhere to
         // go: install the bridge (once per session) before the run starts.
         // `Agent::prompt` never reaches this point and therefore never holds
@@ -992,6 +998,12 @@ impl Agent {
         // be projected into an `SdkEvent` and dropped immediately, so take a
         // fast path that skips the projection entirely.
         let has_stream = event_tx.is_some();
+        // The loop projection is the authoritative producer for tool updates
+        // it observes (top-level and nested calls). Record each delivered
+        // update on the shared sink so the plugin-host bridge, which receives
+        // the same update through the plugin fan-out, does not enqueue a
+        // second copy of the same `ToolExecutionUpdate` (PIR-SDK-006).
+        let tool_update_sink = Arc::clone(&self.inner.sink);
         Arc::new(move |event: AgentEvent| {
             // Record the run's terminal aborted flag from the ONE event that
             // carries it. The SDK's terminal event is emitted after the whole
@@ -1033,9 +1045,23 @@ impl Agent {
             };
             // Caller-supplied filter: drop the event entirely when the
             // predicate rejects it (the outcome capture above already ran).
-            let sdk_event = sdk_event.filter(|event| filter(event));
-            if let Some(event) = sdk_event {
-                forward_stream_event(&event_tx, event);
+            // A filtered-out update must not sneak back into the stream
+            // through the bridge, so it is recorded as delivered (there is
+            // deliberately no copy to make up for it).
+            let keep = sdk_event.as_ref().is_none_or(|event| filter(event));
+            if !keep {
+                if let Some(update @ SdkEvent::ToolExecutionUpdate { .. }) = sdk_event.as_ref() {
+                    super::event::record_loop_tool_update(&tool_update_sink, update);
+                }
+            } else if let Some(event) = sdk_event {
+                if matches!(event, SdkEvent::ToolExecutionUpdate { .. }) {
+                    // Send + record atomically: a full channel must leave the
+                    // fingerprint unrecorded so the bridge copy can deliver
+                    // this update (PIR-SDK-018 R48 exactly-once).
+                    super::event::deliver_loop_tool_update(&tool_update_sink, event);
+                } else {
+                    forward_stream_event(&event_tx, event);
+                }
             }
         })
     }
@@ -1807,13 +1833,16 @@ impl Agent {
     /// the current branch projection for persisted sessions, the in-memory
     /// history for ephemeral ones.
     ///
-    /// A session opened PAGED (a huge file: [`Agent::attach_session`] opens
-    /// tail-first) returns only its resident window here. That is deliberate —
-    /// materializing a 100 MB session to read the newest messages would defeat
-    /// paged mode. Walk the skipped prefix with
+    /// This is a whole-history read, so it widens a PAGED session (a huge
+    /// file: [`Agent::attach_session`] opens tail-first) to full residency and
+    /// returns the complete branch projection. Note that this does not merge
+    /// sibling branches: rows another writer appended to a different leaf stay
+    /// on disk and out of the result.
+    ///
+    /// Widening is the opposite trade-off from paged mode, so a host that only
+    /// needs the newest messages should walk the prefix with
     /// [`Agent::transcript_cursor`] / [`Agent::older_transcript_messages`],
-    /// which stream one bounded page at a time without requiring the whole
-    /// session resident.
+    /// which stream one bounded page at a time and leave the session paged.
     pub async fn transcript(&self) -> Vec<crate::ai::types::Message> {
         self.inner.session.transcript().await
     }

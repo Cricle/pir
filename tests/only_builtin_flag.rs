@@ -240,6 +240,7 @@ async fn plan_only_handle_registers_native_builtins() {
     for (builtin, tool) in [
         ("subagent", "subagent"),
         ("todo", "todo"),
+        ("memory", "memory"),
         ("tool-search", "tool_search"),
     ] {
         if names.contains(&builtin) {

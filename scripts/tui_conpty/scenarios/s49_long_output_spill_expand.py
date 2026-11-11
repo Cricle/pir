@@ -41,8 +41,10 @@ OFFLINE = False  # the app must reach the injected mock over HTTP
 TIMEOUT = 180
 
 _LINES = 5000
-_CMD = ("python -c 'for i in range(1, %d): print(\"s49 row %%04d: payload line\" %% i)'"
-        % (_LINES + 1))
+# Absolute interpreter path (bare `python` is the Windows Store placeholder).
+_PYTHON = "C:/wp/empty/tools/python312/python.exe"
+_CMD = ("%s -c 'for i in range(1, %d): print(\"s49 row %%04d: payload line\" %% i)'"
+        % (_PYTHON, _LINES + 1))
 
 MOCK_SCRIPT = [
     {"tool_call": {"name": "bash", "arguments": {"command": _CMD}}},
@@ -87,7 +89,7 @@ CHECKS = [
     # (shell_truncation_warning, src/tui/messages.rs:2210-2216). It wraps
     # across two rows, hence a multi-line regex.
     ("screen_regex", "s49_collapsed",
-     r"Truncated:\s+\d+ lines shown \(50\.0KB limit\)"),
+     r"Truncated:\s+\d+\s+lines shown \(50\.0KB limit\)"),
     ("screen_contains", "s49_collapsed", "Full output:"),
     # the collapsed preview really is the last 5 rows: row 4998 yes, row 4980
     # no (it is 20 rows above the block end)

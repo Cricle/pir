@@ -574,20 +574,25 @@ impl AgentSession {
             }
             None => None,
         };
-        let rebuilt = compaction::rebuilt_context(&context, &result);
-        // Measure before moving the messages out: the rebuilt context is not
-        // returned on this path, so its message vec becomes the new history
-        // allocation instead of a full-transcript clone. Only an ephemeral
-        // session has an in-memory history to replace; a store-backed session
-        // re-reads its projection from the compaction entry and must not keep
-        // a second transcript-sized copy alive here.
-        let estimated_tokens_after = compaction::estimate_context_tokens(&rebuilt.messages).tokens;
-        if self.session.is_none() {
+        // MEMORY SHAPE (PROTOCOL v5): a store-backed session only needs the
+        // post-compaction token estimate — it re-reads its projection from the
+        // persisted compaction entry. Building the rebuilt context just to
+        // measure it cloned the whole retained tail a second time (the
+        // `CompactionResult` already owns one copy) plus the system prompt and
+        // tools. Estimate over the summary + retained references instead; only
+        // the ephemeral path, whose history IS the rebuilt list, materializes
+        // it (and moves the messages into the history, never clones them).
+        let estimated_tokens_after = if self.session.is_none() {
+            let rebuilt = compaction::rebuilt_context(&context, &result);
+            let tokens = compaction::estimate_context_tokens(&rebuilt.messages).tokens;
             *self
                 .history
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(rebuilt.messages);
-        }
+            tokens
+        } else {
+            compaction::estimate_compacted_context_tokens(&result.summary, &result.retained_tail)
+        };
         if let Some(plugins) = &self.plugins {
             // Upstream `SessionCompactEvent.compactionEntry` is the persisted
             // `CompactionEntry` (session-manager shape: type/id/parentId/
@@ -666,7 +671,7 @@ impl AgentSession {
         // replacement manager.
         run_session_id: Option<String>,
     ) -> CompactionFn {
-        let model = threshold_model.unwrap_or_else(|| self.current_model());
+        let fallback_model = threshold_model.unwrap_or_else(|| self.current_model());
         // The summarizer completes against the same (routed) model the
         // threshold was checked against, and carries the RUN's abort signal:
         // a threshold compaction happens inside the prompt run, so Esc must
@@ -677,7 +682,20 @@ impl AgentSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let complete = self.complete_fn_for_signal_session_scoped(&model, signal.clone());
+        let fallback_complete =
+            self.complete_fn_for_signal_session_scoped(&fallback_model, signal.clone());
+        // Upstream re-reads `this.model` on every next turn
+        // (agent-session.ts:778-780) and checks `model.contextWindow` at
+        // `_checkCompaction` (agent-session.ts:3141); the summarizer runs
+        // under that same live model. Resolve both per hook invocation from
+        // the live session so a mid-run `set_model` reaches later turns of
+        // the SAME run. The snapshot above stays the fallback for a `&self`
+        // host that was never wrapped in an `Arc` (`self_weak` is empty).
+        let live_session = self
+            .self_weak
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let session = self.session.clone();
         let history = self.history.clone();
         let plugins = self.plugins.clone();
@@ -720,8 +738,11 @@ impl AgentSession {
                     return Box::pin(std::future::ready(context));
                 }
             };
-            let model = model.clone();
-            let complete = Arc::clone(&complete);
+            let model = live_session
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .map(|live| live.threshold_model_for(&live.current_model()))
+                .unwrap_or_else(|| fallback_model.clone());
             let signal = signal.clone();
             let session = session.clone();
             let history = history.clone();
@@ -733,6 +754,8 @@ impl AgentSession {
             let auto_cancel = Arc::clone(&auto_cancel);
             let gate = gate.clone();
             let run_session_id = run_session_id.clone();
+            let live_session = live_session.clone();
+            let fallback_complete = Arc::clone(&fallback_complete);
             Box::pin(async move {
                 // Threshold basis: the prompt-start projection snapshot
                 // plus the run's newer (not yet projected) messages while the
@@ -838,14 +861,15 @@ impl AgentSession {
                 // transcript that alone overflows the window.
                 let system_prompt = context.system_prompt.as_deref();
                 let tools = context.tools.as_deref();
-                if !compaction::should_compact_request_refs(
+                let should = compaction::should_compact_request_refs(
                     &refs,
                     branch,
                     system_prompt,
                     tools,
                     &model,
                     &config,
-                ) {
+                );
+                if !should {
                     return context;
                 }
                 // The threshold is met: plan the cut over the BORROWED basis
@@ -1192,6 +1216,15 @@ impl AgentSession {
                         // reaches the summarizer). The extra select layer
                         // below makes the automatic compaction's own signal
                         // cancel the request too, without touching the run.
+                        // Built against the model resolved for THIS turn (a
+                        // mid-run `set_model` must also switch the summarizer,
+                        // upstream `this.model`).
+                        let complete =
+                            match live_session.as_ref().and_then(std::sync::Weak::upgrade) {
+                                Some(live) => live
+                                    .complete_fn_for_signal_session_scoped(&model, signal.clone()),
+                                None => Arc::clone(&fallback_complete),
+                            };
                         let complete = auto_cancellable_complete(complete, auto_signal.clone());
                         let retry_observer = super::events::summarization_retry_observer(
                             &session_events,

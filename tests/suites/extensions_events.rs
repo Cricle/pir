@@ -519,6 +519,7 @@ async fn loop_events_reach_extensions() {
     tools.register(Arc::new(EchoTool));
 
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,
@@ -1069,6 +1070,7 @@ async fn register_provider_records_defs_and_session_applies_them() {
     let registry = Arc::new(registry);
 
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry.clone(),
         model: {
             // Reuse the fake provider's model for the session.
@@ -1287,6 +1289,7 @@ async fn ctx_facade_reports_session_model_and_thinking() {
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(Fake));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,
@@ -1438,6 +1441,7 @@ async fn set_model_and_thinking_level_apply_and_emit_events() {
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(Fake));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,
@@ -1691,6 +1695,7 @@ async fn late_timer_registered_handler_is_not_gated_off() {
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(Fake));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: model(),
         api_key: None,
@@ -2075,6 +2080,7 @@ async fn provider_stream_events_are_dispatched_in_order_and_awaited() {
         call_durations: Arc::clone(&call_durations),
     }));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: hook_model(),
         api_key: None,
@@ -2252,6 +2258,7 @@ async fn provider_stream_events_after_abort_are_dropped() {
         post_abort_durations: Arc::clone(&post_abort_durations),
     }));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: abort_model(),
         api_key: None,
@@ -2408,6 +2415,7 @@ async fn before_agent_start_system_prompt_options_are_mutable() {
         system_prompt: Arc::clone(&captured),
     }));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,
@@ -2932,6 +2940,7 @@ async fn model_thinking_and_name_mutations_share_one_entry_and_source() {
     registry.set_provider(Arc::new(Fake));
     let manager = SessionManager::create(".", &temp.0).expect("create session");
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: mutation_model("fake-model", false),
         api_key: None,
@@ -3202,6 +3211,7 @@ async fn input_event_reports_source_and_handled_swallows_the_prompt() {
         calls: Arc::clone(&calls),
     }));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: input_model(),
         api_key: None,

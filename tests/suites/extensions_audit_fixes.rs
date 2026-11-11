@@ -1840,6 +1840,7 @@ async fn send_user_message_preserves_images_and_expands_prompt_templates() {
         calls: AtomicUsize::new(0),
     }));
     let mut session = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: capture_model(),
         api_key: None,

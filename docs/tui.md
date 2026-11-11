@@ -1,8 +1,8 @@
 # TUI
 
-pir's interactive TUI is a ratatui/crossterm port of upstream's pi-tui components: multiline editor with
-kill-ring/undo, streaming transcript (markdown + diff + tool renderers), dialogs, selectors, autocomplete, and
-alt-screen mode.
+pir's interactive TUI is a crossterm port of upstream's pi-tui components (there is no `ratatui` dependency; the
+frame is a hand-rolled diff painter over crossterm): multiline editor with kill-ring/undo, streaming transcript
+(markdown + diff + tool renderers), dialogs, selectors, autocomplete, and alt-screen mode.
 
 ## Layout
 
@@ -10,8 +10,12 @@ alt-screen mode.
   `@file` autocomplete for paths, `/` autocomplete for commands, history (`up`/`down`), page scrolling.
 - **Transcript**: assistant messages stream with markdown rendering; tool calls render as cards (title line + live
   output for shell tools + status tail `(exit N)` / `Took Xs`); compaction and notices render as bordered entries.
-- **Alt-screen** (`/altscreen` or settings): scrollable viewport with search (`/`), selection copy, and a
-  scrollbar; upstream scroll geometry (maxScrollTop clamps).
+- **Alt-screen** (default fullscreen `tuiMode`; cycle the `tui-mode` row in `/settings`): scrollable viewport
+  with search (`ctrl+f`, not `/`), selection copy, and a scrollbar; upstream scroll geometry (maxScrollTop clamps).
+- **Image preview**: `/image <path>` renders a local PNG/JPEG/GIF/WebP as a half-block truecolor preview (up to 20
+  rows, `terminal.imageWidthCells`, default 60 cols). `terminal.showImages: false` (or a slim build without the
+  `image-protocol` feature) renders the upstream text fallback `[Image: <path> [<mime>] <WxH>]`, with the read or
+  decode error appended. A relative path resolves against the active session cwd.
 
 ## Mouse & selection
 
@@ -36,16 +40,29 @@ What works:
   transcript and dock rows (editor, footer, open dialog/selector) — via `TuiCore::screen_row_to_buffer_row`.
   Copied text matches on-screen cells: ANSI styling stripped, columns counted over grapheme clusters, wide CJK
   cells kept/dropped whole.
-- **Scrollbar** (`fullscreenScrollbar`): `"always"` reserves the transcript's last column and paints track + thumb;
-  `"hidden"` never paints; `"auto"` (default) shows the transient bar when the transcript overflows *and* a scroll
-  gesture happened in the last second (1000 ms fade). The thumb moves with the viewport (wheel, page keys, search
-  jumps).
-- **Search** (ctrl+f) highlights matches; the box renders at the top of the transcript. Windowed search caches the
+- **Scrollbar** (`fullscreenScrollbar`, fullscreen alt-screen only — regular mode keeps its terminal scrollback and
+  never reserves a column or paints a bar, `"always"` included): `"always"` reserves the transcript's last column
+  and paints track + thumb; `"hidden"` never paints; `"auto"` (default) shows the transient bar when the transcript
+  overflows *and* a scroll gesture happened in the last second (1000 ms fade). The thumb moves with the viewport
+  (wheel, page keys, search jumps).
+- **Search** (fullscreen only; `ctrl+f` on native Windows/WSL, `ctrl+shift+f` elsewhere — `tui.altScreen.search`)
+  highlights matches; the box renders at the top of the transcript. Windowed search caches the
   ANSI-stripped corpus per row keyed by content, so only changed rows are re-parsed and an unchanged frame does no
-  corpus work (`SearchFrameCache` in `altscreen_search.rs`).
+  corpus work (`SearchFrameCache` in `altscreen_search.rs`). Expanded shell-tool output previews read the spilled
+  file as a read-only `memmap2::Mmap` (`tui/spill_preview.rs`, `session`-gated; empty/failed-map/non-UTF-8 or
+  >8 MiB fallback bodies make the preview unavailable and the in-memory tail renders as before — a 58 MB spill
+  previews in ~1.0 ms vs ~59 ms for a whole-file read).
 
 Typing a complete `[<Cb;Cx;CyM` shape is claimed as mouse (the price of ESC-less support); the ESC-prefixed
-spelling (`PIR_TUI_VT_INPUT=1`, Unix terminals) keeps the byte-decoder path.
+spelling (`PIR_TUI_VT_INPUT` on, the Windows default; Unix terminals always) keeps the byte-decoder path.
+
+**Fast typed bursts become one paste.** The Windows console delivers a fast run of keys as per-character records in
+one drain window; a run of `CONSOLE_BURST_MIN_CHARS` (8) or more printable keys (or any run containing a line feed)
+is rewritten as one `Event::Paste` so the editor inserts it once instead of re-running autocomplete per character.
+The coalescing is skipped while a selector or an open transcript search owns the focus, and while a dialog that does
+not accept text is open, so those surfaces keep per-key semantics. An open search box consumes a paste chunk by
+expanding it into its query (`paste_into_search`, the upstream focused-component `handleInput` behavior) instead of
+swallowing it — PIR-TUI-023 fixed the dropped-burst bug.
 
 Mouse behaviors beyond wheel/selection:
 
@@ -61,10 +78,12 @@ Mouse behaviors beyond wheel/selection:
 - **Windows right-click paste**: a bare secondary press outside VS Code returns `AltMouseRoute::PasteClipboard`;
   the clipboard is fed through the gate as one bracketed paste into the focused component.
 
-The `tui.altScreen.*` chords (`bottom: ctrl+end`, `top: ctrl+home`, `searchNext: enter|ctrl+g`, `searchPrevious:
-shift+enter|ctrl+shift+g`, `searchClose: escape`) live in `ALT_SCREEN_KEYBINDINGS` in
-`src/tui/altscreen_search.rs`, upstream-verbatim; label rendering (`key_display_text`) resolves config layer →
-that table → the `tui` registry, so settings-registered ids win.
+The `tui.altScreen.*` chords (`bottom: ctrl+end`, `top: ctrl+home`, `search: ctrl+f` on native Windows/WSL else
+`ctrl+shift+f`, `searchNext: enter|ctrl+g`, `searchPrevious: shift+enter|ctrl+shift+g`, `searchClose: escape`) live
+in `ALT_SCREEN_KEYBINDINGS` in `src/tui/altscreen_search.rs`, upstream-verbatim (the platform-branched search chords
+resolve through `config/keybindings.rs` first). Routing honors a settings override for every id; the painted labels
+(`key_display_text`) resolve config layer → that table → the `tui` registry and show the default spelling, not a
+settings override (the label seam has no live map).
 
 **Legacy X10 reports** (`ESC[M` + 3 bytes) are decoded like upstream's `parse_csi_normal_mouse` and fed through
 `decode_input_sequence`. The **ESC-less** X10 tail is deliberately not claimed: `[M` + 3 bytes is indistinguishable
@@ -103,7 +122,9 @@ queueing a dialog whose only drainer is the blocked renderer thread. Synchronous
 - Steering: send messages while a run executes (queued, applied between tool batches).
 - Esc aborts the current run; `/quit` exits; ctrl+c aborts (double-press exits when idle). Esc does not cancel
   background tool calls — they end with the session (switch or exit).
-- `/resume`, `/tree`, `/fork` (defaults to newest user message), `/export` (HTML), `/session` (usage/cost).
+- `/resume`, `/tree`, `/fork` (defaults to newest user message), `/clone`, `/export` (HTML), `/session`
+  (usage/cost). `/fork` and `/clone` report upstream-verbatim status text (`Forked to new session` /
+  `Cloned to new session`, PIR-TUI-019) and seed the composer with the forked-away user message.
   `/resume` lists the session directory once and filters the current cwd in memory (Tab switches to full list); it
   does not rescan files per scope.
 - Session tabs: `/sessions` opens a picker of open tabs and the cwd's persisted sessions; `/sessions
@@ -119,7 +140,14 @@ queueing a dialog whose only drainer is the blocked renderer thread. Synchronous
 ## Terminal integration
 
 OSC 11 background auto-detect for theme defaults; OSC 7501 program status (opt-in, `PI_PROGRAM_STATUS=1`);
-bracketed paste; optional hardware cursor (`PI_HARDWARE_CURSOR`).
+bracketed paste; optional hardware cursor (`PI_HARDWARE_CURSOR` / the `Show hardware cursor` settings row).
+
+`showHardwareCursor`, `terminal.showTerminalProgress` and `terminal.clearOnShrink` are read at startup and also
+apply live from `/settings` (PIR-TUI-017/018): the cursor cell and the OSC 9;4 progress gate move on the next
+frame/run, and `clearOnShrink` gates the main-screen diff painter's full repaint on a frame shorter than the
+tallest one painted since the last clearing render (default false, upstream `SETTINGS_DEFAULTS`). The
+alt-screen/windowed renderer clamps every frame to the visible rows, so `clearOnShrink` has no visible effect
+there — the setting is main-screen only, matching the separate upstream alt-screen renderer.
 
 The footer's git branch comes from `.git/HEAD` read directly — polled once per second, walking parent directories
 and following `gitdir:` indirection used by worktrees/submodules. `git rev-parse --abbrev-ref HEAD` is a one-shot

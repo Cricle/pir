@@ -280,6 +280,171 @@ fn at_prefix_triggers_fuzzy_file_search() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+fn space_tree(name: &str) -> PathBuf {
+    let base = std::env::temp_dir().join(format!("pir-autocomplete-{name}"));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("dir one")).expect("mkdir dir one");
+    std::fs::create_dir_all(base.join("src dir/nested dir")).expect("mkdir nested dir");
+    std::fs::create_dir_all(base.join("中文目录")).expect("mkdir cjk");
+    std::fs::write(base.join("dir one/hello world.txt"), "hello").expect("write hello");
+    std::fs::write(base.join("src dir/nested dir/note file.txt"), "note").expect("write note");
+    std::fs::write(base.join("中文目录/你好.txt"), "你好").expect("write cjk");
+    std::fs::write(base.join("alpha.py"), "print(1)").expect("write alpha");
+    base
+}
+
+#[test]
+fn at_completion_quotes_space_path_once() {
+    let base = space_tree("space-at");
+    let provider = CombinedAutocompleteProvider::with_builtin_commands(base.clone());
+    // `@hel` fuzzy-matches the file under the space directory.
+    let lines = vec!["@hel".to_string()];
+    let suggestions = provider
+        .suggestions(&lines, 0, 4, false)
+        .expect("space suggestions");
+    let item = suggestions
+        .items
+        .iter()
+        .find(|item| item.value.contains("hello world.txt"))
+        .cloned()
+        .expect("hello world suggestion");
+    assert_eq!(item.value, "@\"dir one/hello world.txt\"");
+    // Applying the completion keeps exactly one opening quote and appends the
+    // `@file` trailing space.
+    let (new_lines, _line, col) =
+        provider.apply_completion(&lines, 0, 4, &item, &suggestions.prefix);
+    assert_eq!(new_lines, vec!["@\"dir one/hello world.txt\" ".to_string()]);
+    assert_eq!(col, "@\"dir one/hello world.txt\" ".chars().count());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn at_completion_quoted_prefix_does_not_double_quote() {
+    let base = space_tree("space-quoted");
+    let provider = CombinedAutocompleteProvider::with_builtin_commands(base.clone());
+    // Already quoted prefix: the suggestion must not add a second opening quote.
+    let lines = vec!["@\"dir one/hel".to_string()];
+    let suggestions = provider
+        .suggestions(&lines, 0, lines[0].chars().count(), false)
+        .expect("quoted suggestions");
+    let item = suggestions
+        .items
+        .iter()
+        .find(|item| item.value.contains("hello world.txt"))
+        .cloned()
+        .expect("hello world suggestion");
+    assert_eq!(item.value, "@\"dir one/hello world.txt\"");
+    let (new_lines, _line, col) = provider.apply_completion(
+        &lines,
+        0,
+        lines[0].chars().count(),
+        &item,
+        &suggestions.prefix,
+    );
+    assert_eq!(new_lines, vec!["@\"dir one/hello world.txt\" ".to_string()]);
+    assert_eq!(col, "@\"dir one/hello world.txt\" ".chars().count());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn plain_path_completion_quotes_space_file_without_at_suffix() {
+    let base = space_tree("space-plain");
+    let provider = CombinedAutocompleteProvider::with_builtin_commands(base.clone());
+    // Unquoted space paths split at the space (upstream delimiter behavior),
+    // so a space directory is completed via the quoted prefix.
+    let lines = vec!["\"dir one/hel".to_string()];
+    let suggestions = provider
+        .suggestions(&lines, 0, lines[0].chars().count(), false)
+        .expect("plain path suggestions");
+    let item = suggestions
+        .items
+        .iter()
+        .find(|item| item.value.contains("hello world.txt"))
+        .cloned()
+        .expect("hello world suggestion");
+    assert_eq!(item.value, "\"dir one/hello world.txt\"");
+    let (new_lines, _line, col) = provider.apply_completion(
+        &lines,
+        0,
+        lines[0].chars().count(),
+        &item,
+        &suggestions.prefix,
+    );
+    // Plain path completions do not gain the `@file` trailing space.
+    assert_eq!(new_lines, vec!["\"dir one/hello world.txt\"".to_string()]);
+    assert_eq!(col, "\"dir one/hello world.txt\"".chars().count());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn space_directory_completion_stays_quoted_and_slash_suffixed() {
+    let base = space_tree("space-dir");
+    let provider = CombinedAutocompleteProvider::with_builtin_commands(base.clone());
+    let lines = vec!["@\"src dir/".to_string()];
+    let suggestions = provider
+        .suggestions(&lines, 0, lines[0].chars().count(), false)
+        .expect("space dir suggestions");
+    let item = suggestions
+        .items
+        .iter()
+        .find(|item| item.label == "nested dir/")
+        .cloned()
+        .expect("nested dir suggestion");
+    assert_eq!(item.value, "@\"src dir/nested dir/\"");
+    let (new_lines, _line, col) = provider.apply_completion(
+        &lines,
+        0,
+        lines[0].chars().count(),
+        &item,
+        &suggestions.prefix,
+    );
+    // Directories keep the closing quote and gain no trailing space.
+    assert_eq!(new_lines, vec!["@\"src dir/nested dir/\"".to_string()]);
+    assert_eq!(col, "@\"src dir/nested dir/".chars().count());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn cjk_and_multi_file_completion_keep_single_layer() {
+    let base = space_tree("space-multi");
+    let provider = CombinedAutocompleteProvider::with_builtin_commands(base.clone());
+    // CJK path: no spaces, so no quotes are added.
+    let lines = vec!["@你好".to_string()];
+    let suggestions = provider
+        .suggestions(&lines, 0, lines[0].chars().count(), false)
+        .expect("cjk suggestions");
+    let item = suggestions
+        .items
+        .iter()
+        .find(|item| item.value.contains("你好.txt"))
+        .cloned()
+        .expect("cjk suggestion");
+    assert_eq!(item.value, "@中文目录/你好.txt");
+    // Second `@` token after an existing file mention completes in place.
+    let lines = vec!["@alpha.py @hel".to_string()];
+    let suggestions = provider
+        .suggestions(&lines, 0, lines[0].chars().count(), false)
+        .expect("multi-file suggestions");
+    let item = suggestions
+        .items
+        .iter()
+        .find(|item| item.value.contains("hello world.txt"))
+        .cloned()
+        .expect("hello world suggestion");
+    let (new_lines, _line, _col) = provider.apply_completion(
+        &lines,
+        0,
+        lines[0].chars().count(),
+        &item,
+        &suggestions.prefix,
+    );
+    assert_eq!(
+        new_lines,
+        vec!["@alpha.py @\"dir one/hello world.txt\" ".to_string()]
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn popup_render_and_navigation() {
     let suggestions = AutocompleteSuggestions {
@@ -318,6 +483,62 @@ fn popup_render_and_navigation() {
             == 1
     );
     assert!(lines[2].contains('\u{2192}'));
+}
+
+/// PIR-TUI-014: the popup window must follow `autocompleteMaxVisible`
+/// (upstream editor.ts:380-381): unset = 5, configured 15/3 applied live,
+/// out-of-range values clamp to 3..=20.
+#[test]
+fn popup_max_visible_follows_setting_and_clamps() {
+    let suggestions = AutocompleteSuggestions {
+        items: (0..30)
+            .map(|index| AutocompleteItem::new(format!("item{index}"), format!("item{index}")))
+            .collect(),
+        prefix: "/".to_string(),
+    };
+    // Unset: runtime default 5, matching the settings menu's unset row.
+    assert_eq!(
+        AutocompletePopup::new(suggestions.clone()).visible_item_rows(),
+        5
+    );
+    assert_eq!(
+        AutocompletePopup::new(suggestions.clone())
+            .with_max_visible(None)
+            .visible_item_rows(),
+        5
+    );
+    assert_eq!(
+        AutocompletePopup::new(suggestions.clone())
+            .with_max_visible(Some(15))
+            .visible_item_rows(),
+        15
+    );
+    assert_eq!(
+        AutocompletePopup::new(suggestions.clone())
+            .with_max_visible(Some(3))
+            .visible_item_rows(),
+        3
+    );
+    // Upstream clamp: below 3 -> 3, above 20 -> 20.
+    assert_eq!(
+        AutocompletePopup::new(suggestions.clone())
+            .with_max_visible(Some(1))
+            .visible_item_rows(),
+        3
+    );
+    assert_eq!(
+        AutocompletePopup::new(suggestions.clone())
+            .with_max_visible(Some(99))
+            .visible_item_rows(),
+        20
+    );
+    // Live `/settings` change: `set_max_visible` resizes the open popup.
+    let mut popup = AutocompletePopup::new(suggestions);
+    assert_eq!(popup.visible_item_rows(), 5);
+    popup.set_max_visible(Some(15));
+    assert_eq!(popup.visible_item_rows(), 15);
+    popup.set_max_visible(Some(3));
+    assert_eq!(popup.visible_item_rows(), 3);
 }
 
 // ---------------------------------------------------------------------------

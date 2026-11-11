@@ -107,6 +107,7 @@ fn fake_model() -> Model {
 fn session_with_storage(cwd: &Path, model: Model) -> Arc<AgentSession> {
     let storage = SessionManager::in_memory(&cwd.to_string_lossy(), None).unwrap();
     Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model,
         api_key: None,
@@ -362,6 +363,7 @@ fn threshold_model_resolves_routed_physical_window() {
     let temp = TempDir::new("threshold");
     let storage = SessionManager::in_memory(&temp.0.to_string_lossy(), None).unwrap();
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         // The raw virtual entry as the session's current model: the catalog
         // fallback without a resolved physical carries window 0.

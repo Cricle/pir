@@ -145,6 +145,7 @@ fn session_config(
     key: Option<&str>,
 ) -> AgentSessionConfig {
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model,
         api_key: key.map(str::to_string),

@@ -10,6 +10,8 @@ pub mod common;
 
 #[path = "suites/builtin_disable_w13.rs"]
 mod builtin_disable_w13;
+#[path = "suites/coding_agent_units.rs"]
+mod coding_agent_units;
 #[path = "suites/context_mode_exposure_w13.rs"]
 mod context_mode_exposure_w13;
 #[path = "suites/crash_log.rs"]

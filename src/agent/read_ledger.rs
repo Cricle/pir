@@ -33,6 +33,11 @@ pub enum ReadBeforeEditMode {
     Warn,
     /// A mutation of a file not fully read in this session is refused.
     Enforce,
+    /// `efficient` profile: `write` stays strict, but `edit` may proceed with
+    /// a warning for a partial/stale read. Exact `oldText` matching remains
+    /// the edit operation's own safety check; a never-read file is still
+    /// refused.
+    EditWarn,
 }
 
 impl ReadBeforeEditMode {
@@ -41,7 +46,23 @@ impl ReadBeforeEditMode {
     /// off). Unset or unrecognized values fall back to [`Self::Enforce`], the
     /// production default.
     pub fn from_env() -> Self {
-        Self::parse(std::env::var("PIR_READ_BEFORE_EDIT").ok().as_deref())
+        Self::from_env_with_profile(
+            crate::config::settings::PerformanceSettings::from_env().profile(),
+        )
+    }
+
+    /// Resolve the mode from an explicit performance profile. An explicit
+    /// `PIR_READ_BEFORE_EDIT` value always wins; otherwise `efficient` uses
+    /// [`Self::EditWarn`] and `balanced` keeps [`Self::Enforce`].
+    pub fn from_env_with_profile(profile: crate::config::settings::PerformanceProfile) -> Self {
+        if let Ok(value) = std::env::var("PIR_READ_BEFORE_EDIT") {
+            return Self::parse(Some(&value));
+        }
+        if profile == crate::config::settings::PerformanceProfile::Efficient {
+            Self::EditWarn
+        } else {
+            Self::Enforce
+        }
     }
 
     /// Parse one `PIR_READ_BEFORE_EDIT` value ([`Self::from_env`]'s rule).
@@ -49,6 +70,7 @@ impl ReadBeforeEditMode {
         match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
             Some("off" | "0" | "false" | "disabled") => Self::Off,
             Some("warn" | "warning") => Self::Warn,
+            Some("edit-warn" | "edit_warn") => Self::EditWarn,
             _ => Self::Enforce,
         }
     }
@@ -59,6 +81,7 @@ impl ReadBeforeEditMode {
             Self::Off => "off",
             Self::Warn => "warn",
             Self::Enforce => "enforce",
+            Self::EditWarn => "edit-warn",
         }
     }
 }
@@ -130,6 +153,13 @@ impl ReadLedger {
         Self::new(ReadBeforeEditMode::from_env())
     }
 
+    /// A ledger resolved from an explicit performance profile (used by the
+    /// session/print hosts, whose profile may come from settings rather than
+    /// `PIR_PERF_PROFILE`).
+    pub fn from_env_with_profile(profile: crate::config::settings::PerformanceProfile) -> Self {
+        Self::new(ReadBeforeEditMode::from_env_with_profile(profile))
+    }
+
     /// The ledger's mode.
     pub fn mode(&self) -> ReadBeforeEditMode {
         self.mode
@@ -199,6 +229,55 @@ impl ReadLedger {
         entry.last_read = now;
     }
 
+    /// Record a successful whole-file write. The model authored the complete
+    /// content, so the new file is considered fully read for subsequent
+    /// edits; otherwise the next `edit` would demand a redundant full read
+    /// just because our own write changed the mtime.
+    pub fn record_write(&self, path: &Path, content: &str) {
+        let key = canonical_key(path);
+        let Ok(metadata) = std::fs::metadata(&key) else {
+            return;
+        };
+        let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let total_lines = content.lines().count();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.insert(
+            key.clone(),
+            Entry {
+                canonical_path: key,
+                mtime,
+                size: metadata.len(),
+                total_lines,
+                ranges: vec![(0, total_lines)],
+                full_read: true,
+                last_read: SystemTime::now(),
+            },
+        );
+    }
+
+    /// Refresh an entry after a successful `edit`. The previous read coverage
+    /// (and therefore `full_read`) is preserved; only the file identity that
+    /// the mutation itself changed is refreshed.
+    pub fn record_edit(&self, path: &Path) {
+        let key = canonical_key(path);
+        let Ok(metadata) = std::fs::metadata(&key) else {
+            return;
+        };
+        let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.mtime = mtime;
+            entry.size = metadata.len();
+            entry.last_read = SystemTime::now();
+        }
+    }
+
     /// Check whether `path` may be mutated by `edit`/`write`.
     ///
     /// The caller only invokes this for an existing target. The path is
@@ -257,6 +336,19 @@ impl ReadLedger {
                 "Cannot {action} '{}': {reason}.",
                 path.display()
             )),
+            ReadBeforeEditMode::EditWarn => {
+                if action == "edit" && check != ReadCheck::NotRead {
+                    EditGate::Warn(format!(
+                        "Warning: editing '{}' without a full, unchanged read ({reason}). The edit proceeds because the exact oldText match is the safety check; re-read if you need more context.",
+                        path.display()
+                    ))
+                } else {
+                    EditGate::Blocked(format!(
+                        "Cannot {action} '{}': {reason}.",
+                        path.display()
+                    ))
+                }
+            }
         }
     }
 }

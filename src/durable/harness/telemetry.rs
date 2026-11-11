@@ -995,6 +995,12 @@ pub trait TelemetrySink: Send + Sync {
     /// `span` is `None`.
     fn add_event(&self, _span: Option<SpanHandle>, _event: EventRecord<'_>) {}
 
+    /// Add a link to an already-started span (upstream `Span.addLink`).
+    ///
+    /// Admission discovers a steer link inside its commit, after the submit
+    /// span has started; sinks that cannot append links ignore it.
+    fn add_link(&self, _span: SpanHandle, _link: SpanLink<'_>) {}
+
     /// Add a measurement for `metric`. Counters add a delta, up/down counters
     /// add a signed delta and histograms record a value.
     fn add_metric(
@@ -1227,6 +1233,18 @@ impl HarnessTelemetry {
     pub fn add_event(&self, span: Option<SpanHandle>, event: EventRecord<'_>) {
         if let Some(sink) = &self.sink {
             sink.add_event(span, event);
+        }
+    }
+
+    /// Add a link to an already-started span. A no-op for
+    /// [`SpanHandle::NONE`] and when no sink is installed.
+    #[inline]
+    pub fn add_span_link(&self, span: SpanHandle, link: SpanLink<'_>) {
+        if span.is_none() {
+            return;
+        }
+        if let Some(sink) = &self.sink {
+            sink.add_link(span, link);
         }
     }
 
@@ -1789,6 +1807,24 @@ impl TelemetrySink for NativeTelemetrySink {
         tracked.add_event(event.descriptor.name, &native_attributes(event.attributes));
     }
 
+    fn add_link(&self, span: SpanHandle, link: SpanLink<'_>) {
+        if span.is_none() {
+            return;
+        }
+        let local = match self.lock().spans.get(&span.id()) {
+            Some(TrackedSpan::Local(span)) => span.clone(),
+            _ => return,
+        };
+        let context = {
+            let state = self.lock();
+            tracked_context(&state, link.context)
+        };
+        let Some(context) = context else {
+            return;
+        };
+        local.add_link(&crate::telemetry::SpanLink::new(context));
+    }
+
     fn add_metric(
         &self,
         metric: &'static MetricDescriptor,
@@ -2215,6 +2251,16 @@ impl TelemetrySink for RecordingTelemetry {
                         message: message.map(str::to_owned),
                     },
                 },
+            });
+        }
+    }
+
+    fn add_link(&self, span: SpanHandle, link: SpanLink<'_>) {
+        let mut state = self.lock();
+        if let Some(record) = state.spans.iter_mut().find(|record| record.handle == span) {
+            record.links.push(RecordedLink {
+                context: link.context,
+                attributes: record_attributes(link.attributes),
             });
         }
     }

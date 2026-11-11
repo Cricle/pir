@@ -389,23 +389,63 @@ pub fn print_transport_hooks_with_model(
     hooks
 }
 
-/// The model snapshot the print host pushes to its plugin host — the print
-/// twin of `agent_session::session_ctx`'s `model_snapshot` (the serialized
-/// `Model` object, which `ToolRepairPlugin::on_session_context` resolves to
-/// its `before_provider_request` gate; a malformed/absent value clears the
-/// gate).
+/// The session/model snapshot the print host pushes to its plugin host — the
+/// print twin of `agent_session::session_ctx`'s `push_session_context`.
+///
+/// Besides the serialized `Model` object (which
+/// `ToolRepairPlugin::on_session_context` resolves to its
+/// `before_provider_request` gate), this carries the session transcript as
+/// the snapshot's `entries` aggregate (the serialized `Vec<Message>` the
+/// projection exposes). `AgentPlugin::on_session_context` implementations
+/// replay persisted session state from it — the `todo` builtin rebuilds its
+/// task slot from the last `todo` toolResult — so print must push it before
+/// every prompt and after every run, exactly like the interactive host.
+/// Without `entries` the documented "model-only host" branch keeps live
+/// state empty, which made `pir print --continue` forget todos.
 ///
 /// `project_trusted: true` mirrors the extension runtime's INITIAL snapshot
 /// (`RuntimeState::new`) and the partial-push shape
 /// `take_validated_extension_runtime` uses (runtime_loader.rs:75-85): the push
 /// goes through `PluginHost::update_session_context`, which also forwards it
-/// to the JS handle the host owns, and print never pushed a JS-facing
-/// snapshot before. `..Default::default()` would flip `ctx.isProjectTrusted()`
-/// to `false` for every print-mode extension, so the push stays additive — it
-/// adds the model and nothing else observably changes.
-fn print_model_snapshot(model: &crate::ai::types::Model) -> SessionContextSnapshot {
+/// to the JS handle the host owns. `..Default::default()` would flip
+/// `ctx.isProjectTrusted()` to `false` for every print-mode extension, so the
+/// push stays additive.
+async fn print_session_snapshot(
+    model: &crate::ai::types::Model,
+    session: &SharedSession,
+) -> SessionContextSnapshot {
+    let (entries, session_id, session_path, cwd) = {
+        let guard = session.lock().await;
+        match guard.as_ref() {
+            Some(session) => {
+                // Same aggregate the interactive host serializes: the
+                // projection's model-visible messages (the `entries` field
+                // plugin replay filters). A paged print session contributes
+                // its resident tail window, the same documented projection
+                // boundary `build_session_projection` has.
+                let entries = match session.build_session_projection() {
+                    Ok(projection) => serde_json::to_value(&projection.messages)
+                        .unwrap_or(serde_json::Value::Null),
+                    Err(_) => serde_json::Value::Null,
+                };
+                (
+                    entries,
+                    Some(session.id().to_owned()),
+                    session
+                        .session_file()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    Some(session.cwd().to_owned()),
+                )
+            }
+            None => (serde_json::Value::Null, None, None, None),
+        }
+    };
     SessionContextSnapshot {
         model: serde_json::to_value(model).unwrap_or(serde_json::Value::Null),
+        entries: std::sync::Arc::new(entries),
+        session_id,
+        session_path,
+        cwd,
         project_trusted: true,
         ..SessionContextSnapshot::default()
     }
@@ -1431,6 +1471,29 @@ pub fn print_apply_max_turns(deps: &mut LoopDeps, config: &crate::config::Config
     deps.max_turns = config.max_turns;
 }
 
+/// Apply the opt-in `performance` settings to a print run. A missing object
+/// or `profile: "balanced"` leaves every field at its default, which is the
+/// historical behavior.
+pub fn print_apply_performance(deps: &mut LoopDeps, settings: &crate::config::settings::Settings) {
+    let mut performance = settings.performance.clone().unwrap_or_default();
+    if let Ok(value) = std::env::var("PIR_PERF_PROFILE") {
+        performance.profile = match value.trim().to_ascii_lowercase().as_str() {
+            "efficient" => Some(crate::config::settings::PerformanceProfile::Efficient),
+            "balanced" => Some(crate::config::settings::PerformanceProfile::Balanced),
+            _ => performance.profile,
+        };
+    }
+    if performance.profile() == crate::config::settings::PerformanceProfile::Efficient {
+        let hard = performance.effective_hard_turn_budget();
+        if hard > 0 {
+            deps.max_turns = deps.max_turns.min(hard);
+        }
+    }
+    deps.tool_result_max_bytes = performance.effective_tool_result_max_bytes();
+    deps.soft_turn_budget = performance.effective_soft_turn_budget();
+    deps.max_total_tokens = performance.effective_max_total_tokens();
+}
+
 /// Map one agent-level retry transition onto the session-event shape the
 /// interactive host publishes (the exact mapping `agent_session/prompt_loop.rs`
 /// installs on `LoopDeps::retry_events`).
@@ -1959,6 +2022,43 @@ impl PrintToolLoadout {
     }
 }
 
+/// Re-activate the deferred/codemode tools a resumed transcript recorded in
+/// its accumulated `toolsAdded` declarations (upstream
+/// `_restoreToolsFromTranscript`).
+///
+/// Only names still registered with a non-direct exposure are restorable:
+/// a deferred/codemode tool is callable only through `tool_search`/codemode,
+/// so it can never have been declared on the wire without that activation;
+/// `toolsRemoved` is already folded into `recorded`. Names already active are
+/// kept once. Public for tests.
+/// The transcript's accumulated tool declarations (`toolsAdded` minus
+/// `toolsRemoved`), the input of [`restore_recorded_active_tools`]. Public
+/// for tests; `None` when the transcript declares nothing (a fresh run).
+pub fn recorded_active_tools(
+    messages: &[crate::ai::types::Message],
+) -> Option<std::collections::BTreeSet<String>> {
+    crate::agent::agent_loop::declared_tool_names(messages)
+}
+
+pub fn restore_recorded_active_tools(
+    registry: &ToolRegistry,
+    recorded: impl IntoIterator<Item = String>,
+    names: &mut Vec<String>,
+) {
+    for name in recorded {
+        let restorable = registry.get(&name).is_some_and(|tool| {
+            matches!(
+                tool.exposure(),
+                crate::agent::tool_execution::ToolExposure::Codemode
+                    | crate::agent::tool_execution::ToolExposure::Deferred
+            )
+        });
+        if restorable && !names.iter().any(|existing| existing == &name) {
+            names.push(name);
+        }
+    }
+}
+
 /// Re-derive the declared provider definitions for an active set captured
 /// AFTER [`print_tool_loadout`]'s first build — the `tool_search` activation
 /// path (`ToolSessionEnv::active_override`).
@@ -2062,6 +2162,8 @@ pub fn print_tool_session_env_with_session(
         session_file,
     } = inputs;
     Arc::new(crate::agent::tool_execution::ToolSessionEnv {
+        live_model: None,
+        live_thinking: None,
         provider_registry,
         model: model.clone(),
         thinking,
@@ -2089,7 +2191,11 @@ pub fn print_tool_session_env_with_session(
         // resolves the mode once from the process environment. A single print
         // invocation is one prompt run, so reads and mutations it performs
         // share this ledger.
-        read_ledger: Arc::new(crate::agent::read_ledger::ReadLedger::from_env()),
+        read_ledger: Arc::new(
+            crate::agent::read_ledger::ReadLedger::from_env_with_profile(
+                crate::config::settings::PerformanceSettings::from_env().profile(),
+            ),
+        ),
     })
 }
 
@@ -2533,12 +2639,35 @@ pub struct PrintToolLoadout {
 /// Errors are the shared resolver's validation failures (`--tools` mixing
 /// plain names and `+`/`-` modifiers, patterns in a modifier list).
 pub fn print_tool_loadout(
+    registry: ToolRegistry,
+    settings_default_tools: Option<&[String]>,
+    cli_tools: &[String],
+    cli_exclude_tools: &[String],
+    no_tools: bool,
+    no_builtin_tools: bool,
+) -> Result<PrintToolLoadout, String> {
+    print_tool_loadout_with_profile(
+        registry,
+        settings_default_tools,
+        cli_tools,
+        cli_exclude_tools,
+        no_tools,
+        no_builtin_tools,
+        crate::config::settings::PerformanceSettings::from_env().profile(),
+    )
+}
+
+/// [`print_tool_loadout`] with an explicit performance profile. The wrapper
+/// above keeps the historical env-only call sites/tests on the same path.
+#[allow(clippy::too_many_arguments)]
+pub fn print_tool_loadout_with_profile(
     mut registry: ToolRegistry,
     settings_default_tools: Option<&[String]>,
     cli_tools: &[String],
     cli_exclude_tools: &[String],
     no_tools: bool,
     no_builtin_tools: bool,
+    profile: crate::config::settings::PerformanceProfile,
 ) -> Result<PrintToolLoadout, String> {
     // Plain names and `*` glob patterns both match here (upstream
     // settings-manager validation; `?` is a literal character, matching is
@@ -2556,18 +2685,20 @@ pub fn print_tool_loadout(
     // registration-active ones (D2).
     let available_tools =
         crate::coding_agent::tool_selection::AvailableTool::from_registry(&registry);
-    let selection = crate::coding_agent::tool_selection::resolve_tool_selection_with_availability(
-        settings_default_tools,
-        cli_tools,
-        cli_exclude_tools,
-        no_tools,
-        no_builtin_tools,
-        &available_tools,
-        // Base for the settings/modifier paths stays the upstream
-        // `DEFAULT_TOOL_NAMES`; the exclude-only and `--no-builtin-tools`
-        // paths derive their base from the registry's registration facts.
-        &crate::config::settings::DEFAULT_TOOL_NAMES,
-    )?;
+    let selection =
+        crate::coding_agent::tool_selection::resolve_tool_selection_with_availability_and_profile(
+            settings_default_tools,
+            cli_tools,
+            cli_exclude_tools,
+            no_tools,
+            no_builtin_tools,
+            &available_tools,
+            // Base for the settings/modifier paths stays the upstream
+            // `DEFAULT_TOOL_NAMES`; the exclude-only and `--no-builtin-tools`
+            // paths derive their base from the registry's registration facts.
+            &crate::config::settings::DEFAULT_TOOL_NAMES,
+            profile,
+        )?;
 
     // Exposure model (upstream tool-exposure semantics): `hidden` tools are
     // registered but unreachable — dropped entirely; `codemode`/`deferred`
@@ -3359,13 +3490,20 @@ pub async fn run_print_with_environment(
     // for the same selection), while every other registered tool stays in the
     // registry for `ctx.executeTool`, `tool_search` and nested calls.
     let loadout_started = crate::config::timings::start_phase();
-    let mut loadout = match print_tool_loadout(
+    let performance = environment
+        .settings
+        .performance
+        .clone()
+        .unwrap_or_default()
+        .with_env_profile();
+    let mut loadout = match print_tool_loadout_with_profile(
         registry,
         options.settings_default_tools.as_deref(),
         &options.cli_tools,
         &options.cli_exclude_tools,
         options.no_tools,
         options.no_builtin_tools,
+        performance.profile(),
     ) {
         Ok(loadout) => loadout,
         Err(error) => return Err(anyhow::anyhow!(error)),
@@ -3373,13 +3511,14 @@ pub async fn run_print_with_environment(
     // A default-selection print run gets the same MCP discovery activation the
     // interactive host performs through its bound plugin context. An explicit
     // selection remains authoritative and is never widened here.
-    if !crate::coding_agent::tool_selection::tool_selection_requested(
+    let explicit_tool_selection = crate::coding_agent::tool_selection::tool_selection_requested(
         options.settings_default_tools.as_deref(),
         &options.cli_tools,
         &options.cli_exclude_tools,
         options.no_tools,
         options.no_builtin_tools,
-    ) {
+    );
+    if !explicit_tool_selection {
         auto_activate_mcp_discovery(&mut loadout, plugins.as_deref());
     }
     // The provider request declares only the active direct/model-only tools;
@@ -3583,14 +3722,17 @@ pub async fn run_print_with_environment(
     // above (`merge_plugin_tools`, the session host's merge), so the run's
     // declared set carries them.
     // The live session-context push (the `tool-repair` builtin's
-    // `before_provider_request` model gate reads the cached id — the print
-    // twin of session `push_session_context`, agent_session/session_ctx.rs:52-62).
-    // Print resolves ONE model for the whole run, so a single push before the
-    // first request covers every prompt turn and every request kind
-    // (conversational, compaction, navigate). Synchronous, so no request can
-    // interleave before the gate has its id.
+    // `before_provider_request` model gate reads the cached id, and native
+    // plugins replay persisted state — the `todo` builtin's
+    // `on_session_context` rebuilds its slot from the transcript's last
+    // `todo` result). This is the print twin of
+    // `AgentSession::push_session_context` (agent_session/session_ctx.rs:737):
+    // one push after the session is opened/resumed, before the first prompt,
+    // carrying both the resolved model and the resumed transcript entries.
+    // Print resolves ONE model for the whole run, so the model part needs no
+    // later refresh; the entries are refreshed after every prompt run below.
     if let Some(plugins) = &plugins {
-        plugins.update_session_context(print_model_snapshot(&model));
+        plugins.update_session_context(print_session_snapshot(&model, &session).await);
     }
 
     // The print host's out-of-loop session-event channel: JSON mode writes
@@ -3843,6 +3985,28 @@ pub async fn run_print_with_environment(
             &resources.prompt_templates,
         );
         let input_images = input.images;
+        // Native (Rust backend) plugin commands (`/todos`, `/mcp`, ...) are
+        // registered on the plugin host's unified registry, not in the JS
+        // runtime's command catalog. Print must consult that registry first,
+        // or a builtin command falls through to the model as a prompt.
+        // `PluginHost::dispatch_command` resolves first-registration-wins
+        // across Rust and JS; only a Rust backend is claimed here so the JS
+        // path below keeps its existing runtime dispatch (and its
+        // command-def fallback).
+        if let Some(host) = plugins.as_deref() {
+            if try_native_plugin_command(
+                host,
+                &prompt,
+                &session,
+                &session_dir_path,
+                Some(&navigate_summary),
+                print_session_events.clone(),
+            )
+            .await
+            {
+                continue;
+            }
+        }
         // Upstream `prompt()` runs a leading `/name args` that matches a
         // registered extension command through the extension runtime instead
         // of prompting the model (`_tryExecuteExtensionCommand`): the
@@ -4101,6 +4265,7 @@ pub async fn run_print_with_environment(
             // prompt run (the loop's `turns` counter is per run), like the
             // retry policy.
             print_apply_max_turns(&mut deps, config);
+            print_apply_performance(&mut deps, &environment.settings);
             // Agent-level retry lifecycle → the same out-of-loop session-event
             // channel the interactive host uses. The loop's sink only sees
             // turns it re-issues itself, so it never duplicates the transport
@@ -4153,6 +4318,25 @@ pub async fn run_print_with_environment(
             }));
             deps
         };
+
+        // Resume restoration (upstream `_restoreToolsFromTranscript`): a
+        // previous run records its `tool_search` loads in the transcript's
+        // `toolsAdded` declarations, but this invocation's loadout is built
+        // from the selection alone. For a default-selection run, re-activate
+        // the recorded `codemode`/`deferred` names in the active-set cell
+        // before the request, so a loaded tool stays declared and executable
+        // across `--continue`, exactly like a resumed `AgentSession`
+        // (`recorded_active_names`). An explicit selection stays
+        // authoritative (upstream's `usesDefaultTools` gate).
+        if !explicit_tool_selection {
+            if let Some(recorded) = recorded_active_tools(&messages) {
+                let mut cell = resolved_active
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let names = cell.get_or_insert_with(Vec::new);
+                restore_recorded_active_tools(&registry, recorded, names);
+            }
+        }
 
         // This prompt's request declarations AND system prompt: the loadout's
         // first build, or — once a `tool_search` has loaded matches into the
@@ -4350,6 +4534,7 @@ pub async fn run_print_with_environment(
                 Some(run_signal.clone()),
                 LoopOptions {
                     events: Some(Arc::clone(&events)),
+                    prepare_next_turn_needs_completed: true,
                     // The starting/injected messages are announced once, at
                     // the top of the first iteration only (later iterations
                     // rebuild from the session projection).
@@ -4497,6 +4682,15 @@ pub async fn run_print_with_environment(
                 Some(&prompt_abort),
             )
             .await;
+        }
+        // Post-run session-context refresh, the second half of
+        // `AgentSession::push_session_context`'s "before every prompt and
+        // after every run" contract: plugin replay caches (`todo`) must see
+        // the messages this run appended (and any `appendEntry` side effect
+        // the settle drain just persisted) before the NEXT positional prompt
+        // in this same print invocation.
+        if let Some(plugins) = &plugins {
+            plugins.update_session_context(print_session_snapshot(&model, &session).await);
         }
         // Upstream `_runAgentPrompt` emits `agent_settled` from its `finally`
         // (agent-session.ts:1849 → `_emitAgentSettled`), i.e. once per prompt
@@ -4897,6 +5091,60 @@ fn install_signal_handlers(
 // Extension commands (upstream print-mode.ts:78-100 commandContextActions)
 // ---------------------------------------------------------------------------
 
+/// Execute a leading `/name args` prompt as a NATIVE (Rust backend) plugin
+/// command (`/todos`, `/mcp`, ...), the print twin of the TUI worker's
+/// native-command route. The command lives in the plugin host's unified
+/// registry; it is NOT in the JS runtime's `command_defs()`, so without this
+/// branch a builtin command is sent to the model as a prompt.
+///
+/// Only a `CommandBackend::Rust` registration is claimed here; JS commands
+/// keep the existing runtime dispatch
+/// ([`try_extension_command_with_events`]) so their legacy registration and
+/// reload behavior is unchanged. The outcome's `error` field carries the
+/// command's display text even on success (the `/todos` list), so it is
+/// reported on stderr as `[ext] command:<name>: <text>` for both faces —
+/// the same mapping the TUI worker uses. The turn is consumed either way.
+async fn try_native_plugin_command(
+    plugins: &crate::plugins::PluginHost,
+    prompt: &str,
+    session: &SharedSession,
+    session_dir: &std::path::Path,
+    navigate_summary: Option<&crate::agent_session::NavigateSummaryBinding>,
+    session_events: Option<PrintSessionEventSink>,
+) -> bool {
+    if !prompt.starts_with('/') {
+        return false;
+    }
+    let (name, args) = match prompt.find(' ') {
+        Some(index) => (&prompt[1..index], &prompt[index + 1..]),
+        None => (&prompt[1..], ""),
+    };
+    if name.is_empty() {
+        return false;
+    }
+    let Some(command) = plugins.registry().find_command(name) else {
+        return false;
+    };
+    if !matches!(
+        command.backend.as_ref(),
+        Some(crate::plugins::CommandBackend::Rust(_))
+    ) {
+        return false;
+    }
+    match plugins.dispatch_command(name, args).await {
+        Ok(outcome) => {
+            if let Some(text) = outcome.error {
+                if !text.is_empty() {
+                    eprintln!("[ext] command:{name}: {text}");
+                }
+            }
+        }
+        Err(error) => eprintln!("[ext] command:{name}: {error}"),
+    }
+    apply_print_command_actions(name, session, session_dir, navigate_summary, session_events).await;
+    true
+}
+
 /// Execute a leading `/name args` prompt as an extension command (upstream
 /// `AgentSession.prompt` → `_tryExecuteExtensionCommand`, whose command
 /// context carries the `commandContextActions` surface): the first registered
@@ -4989,6 +5237,26 @@ async fn try_extension_command_impl(
         }
         Err(error) => eprintln!("[ext] command:{name}: {error}"),
     }
+    apply_print_command_actions(name, session, session_dir, navigate_summary, session_events).await;
+    true
+}
+
+/// Apply the session-control actions a print-dispatched command recorded
+/// (`ctx.newSession` / `ctx.fork` / `ctx.switchSession` / `ctx.navigateTree`
+/// / `ctx.reload`), shared by the JS and native dispatch branches.
+///
+/// Only the actions stamped with THIS host's identity are claimed — actions
+/// recorded by other hosts stay queued for their owner. Each claimed action
+/// is consumed even when its application fails; an ephemeral run
+/// (`--no-session`, `None` storage) rejects every action like the upstream
+/// runtimeHost does without session storage.
+async fn apply_print_command_actions(
+    name: &str,
+    session: &SharedSession,
+    session_dir: &std::path::Path,
+    navigate_summary: Option<&crate::agent_session::NavigateSummaryBinding>,
+    session_events: Option<PrintSessionEventSink>,
+) {
     // Apply the command-context session actions (see the doc above). Only the
     // actions stamped with THIS host's identity are claimed — actions recorded
     // by other hosts stay queued for their owner. Each claimed action is
@@ -5062,7 +5330,6 @@ async fn try_extension_command_impl(
             eprintln!("[ext] command:{name}: {:?}: {error}", entry.action);
         }
     }
-    true
 }
 
 /// The print host's summarizer-retry observer: maps the compaction module's

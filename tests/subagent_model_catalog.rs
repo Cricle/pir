@@ -404,6 +404,8 @@ fn session_env(
     user_agents_dir: Option<PathBuf>,
 ) -> Arc<ToolSessionEnv> {
     Arc::new(ToolSessionEnv {
+        live_model: None,
+        live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
         provider_registry: registry,
         model: fake_model(),

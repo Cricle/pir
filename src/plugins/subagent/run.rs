@@ -121,7 +121,14 @@ pub(super) async fn execute(
         }
     }
 
-    let emit = env.on_update.clone();
+    // Per-call partial updates: `ToolContext::on_update` is the channel the
+    // scheduler stamped with `toolCallId`/`toolName`/`args` (upstream
+    // `execute(_toolCallId, params, signal, onUpdate, ctx)`), so hosts can
+    // route every partial in place. `env.on_update` is the raw session-level
+    // channel and has no call identity: using it made the TUI open a fresh
+    // anonymous `tool` block per update (PIR-TUI-002). Fall back to the env
+    // only when no context channel was wired (embedders without a scheduler).
+    let emit = ctx.update_channel();
     match mode {
         // `mode` is only "chain"/"parallel" when the corresponding list was
         // validated non-empty above, so the default here is unreachable.
@@ -258,6 +265,21 @@ async fn run_chain(
             .clone()
             .map(PathBuf::from)
             .unwrap_or_else(|| ctx.cwd.clone());
+        // Emit the running-step placeholder as soon as the step starts: the
+        // completed steps plus exactly this step (upstream renders
+        // `─── Step N: agent ⏳` immediately, PIR-TUI-005).
+        {
+            let mut snapshot = completed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            snapshot.push(SingleResult::placeholder_for_step(
+                &step.agent,
+                &task_with_context,
+                index + 1,
+            ));
+            emit_partial(&emit, &builder, &snapshot, Some("(running...)"));
+        }
         let on_task_update: OnTaskUpdate = {
             let emit = emit.clone();
             let builder = builder.clone();
@@ -389,6 +411,10 @@ async fn run_parallel(
             }));
         })
     };
+
+    // The initial partial must show every task slot (upstream spawns all
+    // placeholders before any child event arrives, PIR-TUI-005).
+    emit_aggregate();
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY));
     // `JoinSet` is both awaitable and abort-on-drop: normal completion is

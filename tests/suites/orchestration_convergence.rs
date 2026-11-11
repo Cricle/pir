@@ -162,6 +162,7 @@ fn worker_like_session(
     let mut tools = pir::agent::tool_execution::ToolRegistry::new();
     pir::coding_agent::tools::register_core_tools(&mut tools);
     AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,

@@ -321,6 +321,7 @@ fn codemode_session(registry: Arc<ProviderRegistry>, temp: &TempDir) -> Arc<Agen
     let activator = ActivateCodemode::new(&tools);
     Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,

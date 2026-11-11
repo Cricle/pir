@@ -700,6 +700,11 @@ impl ToolScheduler {
             tool = %call.tool_name,
             call_id = %call.call_id
         );
+        // The after-hook usage has no place on `ToolResult`; park it here so
+        // the adopter can pick it up once the future settles (same contract a
+        // foreground tool-result message carries).
+        let usage = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let usage_slot = std::sync::Arc::clone(&usage);
         let future: crate::agent::tool_execution::BoxFuture<'static, ToolResult> = Box::pin(
             async move {
                 // The context clone is owned by the future; the borrowed view
@@ -707,9 +712,11 @@ impl ToolScheduler {
                 // bookkeeping (index/ids/duration) stays behind: the adopter
                 // owns the call's identity and reports the delivery.
                 let hooks = hooks.as_deref();
-                run_call_body(&queues, &call, &tool, &call_context, hooks)
-                    .await
-                    .result
+                let finalized = run_call_body(&queues, &call, &tool, &call_context, hooks).await;
+                *usage_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = finalized.usage;
+                finalized.result
             }
             .instrument(span),
         );
@@ -729,6 +736,7 @@ impl ToolScheduler {
                 .as_ref()
                 .and_then(|nested| nested.parent_call_id().map(str::to_owned)),
             abort: signal,
+            usage,
             future: Some(future),
         }
     }

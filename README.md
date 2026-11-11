@@ -6,11 +6,25 @@ dependency.
 
 ## Status
 
-End-to-end functional: agent loop, providers, sessions, extensions, TUI, RPC,
-server/client, SDK, builtins. Final result: [`RESULTS.md`](RESULTS.md);
-per-module truth: [MAPPING.md](MAPPING.md); feature contract:
-[`docs/FEATURES.md`](docs/FEATURES.md). Settled scope: chord delta subset only;
-llama.cpp N/A; library-first.
+0.3.0 (2026-11-11). End-to-end functional: agent loop, providers, sessions,
+extensions, TUI, RPC, server/client, SDK, builtins. Final result:
+[`RESULTS.md`](RESULTS.md); per-module truth: [MAPPING.md](MAPPING.md); feature
+contract: [`docs/FEATURES.md`](docs/FEATURES.md). Settled scope: chord delta
+subset only; llama.cpp N/A; library-first.
+
+Install from crates.io with `cargo install pir-sdk` (the package is `pir-sdk`;
+the installed binary is `pir`). CI tags also attach `pir-<tag>-windows-x86_64.zip`
+(MSVC), `pir-<tag>-linux-x86_64-musl.tar.gz` and
+`pir-<tag>-macos-universal.tar.gz`, each containing `pir` and
+`pir-phone-server`; local Windows verification in `RESULTS.md` is GNU-only.
+
+The local release gate is green on 2026-11-11: `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`, the SDK 4-shape
+feature matrix, doctests (33 passed / 0 failed / 7 ignored) and
+`cargo check --examples --no-default-features --features sdk` all exit 0. The
+authoritative 8-group full-suite run finished with every group EXIT 0 and 0
+failures; aggregate totals are pending re-measure in
+`.play/evidence/release-prep/final/REPORT.md`.
 
 ## Building
 
@@ -26,7 +40,7 @@ providers, sessions, config, prompt/skills and the plugin framework.
 
 ```toml
 # Package name `pir-sdk`; the library is still imported as `pir`.
-pir-sdk = { version = "0.0.2", default-features = false, features = ["sdk"] }
+pir-sdk = { version = "0.3.0", default-features = false, features = ["sdk"] }
 ```
 
 Every optional surface is a cargo feature; `full` is the default, and the
@@ -99,8 +113,13 @@ Builtins compile behind their features (`subagent`, `tool-repair`,
 `tool-search`, `todo`, `mcp-sd`); `--only-builtin` loads Rust-only,
 `--no-extensions` wins if both are given. JS limits live in
 `extensionLimits` + `PI_EXT_*` (project settings cannot loosen them). The
-default-off JS `phone` package starts a local server (~14 MB QuickJS heap);
-opt in explicitly. Details: [`docs/extensions.md`](docs/extensions.md).
+default-off JS `phone` package is not required by the native path. The native
+phone plugin is an agent client for the standalone central relay:
+`cargo build -p pir-phone-server`, then
+`/phone-start wss://<server> <device-token>`. The relay never executes the
+agent; it stores only user/device/session metadata and the latest status line,
+and routes messages without retaining transcripts or images. Details:
+[`docs/phone-server.md`](docs/phone-server.md).
 
 ## Development
 

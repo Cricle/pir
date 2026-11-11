@@ -898,6 +898,7 @@ async fn session_host_consumes_notifications_and_set_active_tools() {
     pir::coding_agent::tools::register_core_tools(&mut tools);
     let agent = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: fake_model(),
             api_key: None,
@@ -1056,6 +1057,7 @@ async fn js_tool_receives_the_real_tool_call_id() {
 
     let tools = ToolRegistry::new();
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,
@@ -1142,6 +1144,7 @@ async fn core_and_rust_plugin_tool_defs_reach_the_js_view() {
     pir::coding_agent::tools::register_core_tools(&mut tools);
     let agent = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: fake_model(),
             api_key: None,
@@ -1357,6 +1360,7 @@ fn builtin_paths_partition_filter_and_order() {
             PathBuf::from("builtin:tool-search"),
             PathBuf::from("builtin:tool-repair"),
             PathBuf::from("builtin:todo"),
+            PathBuf::from("builtin:memory"),
         ]
     );
     let cli_only = order_extension_paths(

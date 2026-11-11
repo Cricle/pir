@@ -3,7 +3,7 @@
 #
 # REAL TASK, HERMETIC PROVIDER. The mock LLM (mock_llm.py) decides the tool
 # calls; the tools (write/grep/read/edit), the files on disk and the whole TUI
-# render are the real product paths. FIVE model steps:
+# render are the real product paths. SIX model steps:
 #
 #   1. tool_calls x6 -> `write` a small fixture tree (6 files) under the
 #                       per-scenario work dir (the child cwd == agent dir).
@@ -23,10 +23,12 @@
 #                       `<agent>/pir.log` carrying `[tui] UI thread stalled`
 #                       (src/tui/terminal.rs:5338). The run must render the
 #                       call header `read pine/src/legacy.rs:5-7` AND finish.
-#   4. edit          -> exact-text replacement of the feature flag `"off"` ->
+#   4. read          -> the whole file (a partial read is not enough for the
+#                       default PIR_READ_BEFORE_EDIT=Enforce policy).
+#   5. edit          -> exact-text replacement of the feature flag `"off"` ->
 #                       `"on"` (real edit tool, real file on disk; the block
 #                       renders the diff from `details.diff`).
-#   5. text          -> W16K-S48-DONE.
+#   6. text          -> W16K-S48-DONE.
 #
 # The fixture is created by the agent's own `write` tool, not by this module:
 # the per-scenario agent dir path is only known at run time
@@ -111,7 +113,11 @@ MOCK_SCRIPT = [
     {"tool_call": {"name": "read",
                    "arguments": {"path": "pine/src/legacy.rs",
                                  "offset": 5, "limit": 3}}},
-    # step 4 — fix the flag the read just showed
+    # step 4 — a real user reads the whole file before editing it
+    # (PIR_READ_BEFORE_EDIT defaults to Enforce; a partial read is not enough)
+    {"tool_call": {"name": "read",
+                   "arguments": {"path": "pine/src/legacy.rs"}}},
+    # step 5 — fix the flag the read just showed
     {"tool_call": {"name": "edit",
                    "arguments": {"path": "pine/src/legacy.rs",
                                  "edits": [{"oldText": _EDIT_OLD,
@@ -123,9 +129,9 @@ MOCK_SCRIPT = [
 OPS = [
     ("wait_quiet", 5.0),
     ("snap", "s48_boot"),
-    ("log", "prompt -> mock: 6 writes, grep the marker, read offset=5 limit=3, edit the flag, text"),
+    ("log", "prompt -> mock: 6 writes, grep the marker, read offset=5 limit=3, full read, edit the flag, text"),
     ("send", b"Search the pine tree for the marker, read the match, and fix the feature flag.\r"),
-    # 5 local tool rounds; grep/edit are in-process, so this settles quickly.
+    # 6 local tool rounds; grep/edit are in-process, so this settles quickly.
     ("wait", 10.0),
     ("wait_quiet", 4.0),
     ("snap", "s48_tail"),

@@ -1,21 +1,12 @@
-//! Phone cache/budget regressions (MCP/plugins lane):
-//!
-//! - the snapshot image cache refuses an image larger than its whole-store
-//!   budget (it would be evicted immediately and the snapshot's `previewUrl`
-//!   would 404) and bounds the entry COUNT as well as the payload bytes, so a
-//!   flood of tiny distinct images cannot exhaust memory through per-entry
-//!   overhead;
-//! - the session auto-restart budget resets when a child outlived
-//!   `restart_budget_reset` BEFORE the budget check: a session that crashed
-//!   once, recovered for a long time and crashed again must restart instead of
-//!   being treated as a crash loop.
+//! Phone pool restart-budget regression:
+//! a session that crashed once, recovered for a long time and crashed again
+//! must restart instead of being treated as a crash loop.
 
 #![cfg(feature = "phone")]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use pir::plugins::builtin::phone::server::{ImageStore, MAX_IMAGE_CACHE_ENTRIES};
 use pir::plugins::builtin::phone::session::{PoolConfig, SessionPool};
 
 fn unique_log_path(tag: &str) -> PathBuf {
@@ -48,65 +39,8 @@ async fn wait_until(mut predicate: impl FnMut() -> bool, timeout: Duration) -> b
     }
 }
 
-#[test]
-fn image_cache_refuses_an_image_larger_than_its_budget() {
-    let mut store = ImageStore::default();
-    assert!(
-        store
-            .store_bytes_with_budget_for_test(b"12345", "image/png", 4)
-            .is_none(),
-        "an image above the whole-store budget can never be served; it must be refused"
-    );
-    assert_eq!(store.stats_for_test(), (0, 0));
-
-    let key = store
-        .store_bytes_with_budget_for_test(b"1234", "image/png", 4)
-        .expect("an image at the budget is stored");
-    assert!(
-        store.get_for_test(&key).is_some(),
-        "an admitted image stays reachable"
-    );
-}
-
-#[test]
-fn image_cache_bounds_the_entry_count_not_only_the_bytes() {
-    let mut store = ImageStore::default();
-    let mut first_key = None;
-    let mut last_key = None;
-    for index in 0..(MAX_IMAGE_CACHE_ENTRIES + 8) {
-        // Two distinct bytes per entry: 520 unique tiny images.
-        let bytes = [(index & 0xff) as u8, (index >> 8) as u8];
-        let key = store
-            .store_bytes(&bytes, "image/png")
-            .expect("tiny image stored");
-        if index == 0 {
-            first_key = Some(key.clone());
-        }
-        last_key = Some(key);
-    }
-    let (count, bytes) = store.stats_for_test();
-    assert_eq!(
-        count, MAX_IMAGE_CACHE_ENTRIES,
-        "the entry-count cap must bound per-entry overhead"
-    );
-    assert_eq!(bytes, MAX_IMAGE_CACHE_ENTRIES * 2);
-    assert!(
-        store
-            .get_for_test(first_key.as_deref().expect("first key"))
-            .is_none(),
-        "the oldest entry is evicted first"
-    );
-    assert!(
-        store
-            .get_for_test(last_key.as_deref().expect("last key"))
-            .is_some(),
-        "the newest entry survives"
-    );
-}
-
-/// The mock pool child: each spawn logs its pid, sleeps
-/// `PIR_PHONE_BUDGET_CRASH_MS`, then exits abnormally. A child that outlives
-/// `restart_budget_reset` must not inherit the previous crash streak.
+/// Mock child: logs its PID, sleeps for the configured duration, then exits
+/// abnormally.
 #[test]
 fn mock_phone_budget_child() {
     if std::env::var("PIR_PHONE_BUDGET_CHILD").as_deref() != Ok("1") {

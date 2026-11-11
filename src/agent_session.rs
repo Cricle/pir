@@ -21,8 +21,8 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::agent::agent_loop::{
     self, AgentEvent, AgentEventInterest, CompactionFn, EventStreamFn, FinishTurnAction,
-    FinishTurnContext, FinishTurnHook, FollowUpFn, LoopDeps, LoopOptions, PrepareRequestHook,
-    ProviderRequest,
+    FinishTurnContext, FinishTurnHook, FollowUpFn, LoopDeps, LoopOptions, PrepareNextTurnUpdate,
+    PrepareRequestHook, ProviderRequest,
 };
 use crate::agent::tool_execution::ToolRegistry;
 use crate::agent::tool_scheduler::{ToolScheduler, ToolSchedulerConfig};
@@ -34,7 +34,9 @@ use crate::ai::types::{
     StreamOptions, TextContent, ThinkingLevel, UserMessage, UserRole,
 };
 use crate::compaction::{self, CompactionConfig, CompactionResult, CompleteFn};
-use crate::config::settings::{FollowUpMode, SettingsManager, SteeringMode};
+use crate::config::settings::{
+    FollowUpMode, PerformanceProfile, PerformanceSettings, SettingsManager, SteeringMode,
+};
 use crate::extensions::{ExtensionConfig, ExtensionHandle, Notification, SessionContextSnapshot};
 use crate::plugins::PluginHost;
 use crate::session_manager::projection::custom_message_text;
@@ -73,7 +75,12 @@ mod providers;
 mod queue;
 mod runtime_loader;
 mod session_commands;
-mod session_ctx;
+/// Incremental tree/projection snapshot caches. `#[doc(hidden)] pub`: the
+/// unit suite in `tests/suites/agent_session_units.rs` asserts the cached
+/// render/splice byte-identity against the stock serializers, and the items
+/// it needs carry their own `#[doc(hidden)]` seams.
+#[doc(hidden)]
+pub mod session_ctx;
 mod session_store;
 mod settle;
 #[doc(hidden)]
@@ -195,6 +202,8 @@ pub use session_commands::{
     NavigateSummaryOutcome, PreparedNavigateTree, SessionCommandAction, SessionCommandActionEntry,
     SessionCommandStep, SessionOrigin, SessionReloadOutcome,
 };
+#[doc(hidden)]
+pub use session_ctx::{fragment_cache_stats_for_test, reset_fragment_cache_stats_for_test};
 pub use session_store::{ForkEntryOutcome, ForkPosition};
 pub use stats::{compute_cache_waste, usage_cost_breakdown, CacheWasteTotals, UsageCostEntry};
 
@@ -245,6 +254,9 @@ pub struct AgentSessionConfig {
     pub compaction: Option<CompactionConfig>,
     /// Maximum number of loop turns per prompt.
     pub max_turns: usize,
+    /// Opt-in performance profile and limits. `Default` is balanced and keeps
+    /// every historical behavior; CLI/TUI hosts pass the resolved settings.
+    pub performance: PerformanceSettings,
     /// Optional system prompt prepended to every request.
     pub system_prompt: Option<String>,
     /// Working directory supplied to tool executions (default: process cwd).
@@ -572,7 +584,9 @@ pub struct AgentSession {
     registry: Arc<ProviderRegistry>,
     /// Current model. Interior-mutable so `pi.setModel` (a notification
     /// applied at the end of a run) can switch it for subsequent runs.
-    model: RwLock<Model>,
+    /// `Arc`-shared with the loop's per-turn `prepare_next_turn` hook so a
+    /// mid-run switch reaches the run's next model request.
+    model: Arc<RwLock<Model>>,
     /// API keys contributed by extension-registered providers
     /// (`pi.registerProvider`), applied to stream options when the current
     /// model belongs to that provider.
@@ -588,8 +602,8 @@ pub struct AgentSession {
     api_key: Option<stream::ProviderApiKey>,
     /// Current thinking level. Interior-mutable so `pi.setThinkingLevel` (a
     /// notification applied at the end of a run) can change it for subsequent
-    /// runs.
-    thinking: RwLock<ThinkingLevel>,
+    /// runs. `Arc`-shared with the loop's per-turn `prepare_next_turn` hook.
+    thinking: Arc<RwLock<ThinkingLevel>>,
     tools: Arc<ToolRegistry>,
     /// The host-resolved tool selection (upstream `--tools` / settings
     /// `defaultTools`). When set it is also the ACTIVE override, so
@@ -640,6 +654,7 @@ pub struct AgentSession {
     /// `setAutoCompactionEnabled`).
     compaction: Arc<RwLock<Option<CompactionConfig>>>,
     max_turns: usize,
+    performance: PerformanceSettings,
     cwd: PathBuf,
     /// The structured system prompt. `RwLock` so the `/reload` hot-refresh
     /// seam ([`AgentSession::set_prompt_resources_shared`]) can rebuild the

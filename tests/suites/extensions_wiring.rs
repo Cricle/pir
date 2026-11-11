@@ -308,6 +308,7 @@ async fn extension_tool_registered_in_session_start_is_callable() {
     }));
 
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -377,6 +378,7 @@ async fn ctx_shutdown_requests_a_host_exit_without_aborting_the_run() {
         assistant(vec![text("completed")], StopReason::Stop)
     }));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -486,6 +488,7 @@ async fn tool_call_handler_blocks_bash_before_execution() {
     }));
 
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -554,6 +557,7 @@ async fn input_handler_transform_replaces_prompt_text() {
     }));
 
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -651,6 +655,7 @@ async fn tool_call_handler_rewrites_tool_input() {
     }));
 
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,

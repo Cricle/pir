@@ -616,6 +616,17 @@ pub struct Cli {
     #[arg(long = "exclude-tools", value_name = "TOOLS", global = true)]
     pub exclude_tools: Option<String>,
 
+    /// Opt-in performance profile: balanced (default) preserves historical
+    /// behavior; efficient selects the core tool loadout, bounded tool results
+    /// and turn/token budgets.
+    #[arg(
+        long = "perf-profile",
+        value_name = "PROFILE",
+        global = true,
+        value_parser = ["balanced", "efficient"]
+    )]
+    pub perf_profile: Option<String>,
+
     /// Disable settings/default extension discovery and built-in extensions;
     /// explicit `-e` paths (including `builtin:<name>`) still load (upstream
     /// `--no-extensions, -ne`)
@@ -2886,6 +2897,7 @@ const KNOWN_LONG_FLAGS: &[&str] = &[
     "no-builtin-tools",
     "tools",
     "exclude-tools",
+    "perf-profile",
     "no-extensions",
     "only-builtin",
     "no-mcp",

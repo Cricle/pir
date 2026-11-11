@@ -225,6 +225,10 @@ pub(super) async fn run() -> Result<()> {
         }
     };
     cli.unknown_flags = unknown_flags;
+    if let Some(profile) = cli.perf_profile.as_deref() {
+        // Process-local only; the settings file is never rewritten.
+        std::env::set_var("PIR_PERF_PROFILE", profile);
+    }
 
     // Upstream main.ts post-parse validation: every failure prints
     // `Error: …` and exits 1 before any mode work starts. (The provider rule

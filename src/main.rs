@@ -13,8 +13,12 @@ use pir::Result;
 
 #[path = "main_cli/cli_commands.rs"]
 mod cli_commands;
+// PIR-TUI-020: the instrumented global allocator is registered in this *bin*
+// crate, never in the library — see `main_alloc.rs`.
 #[path = "main_cli/cli_preprocess.rs"]
 mod cli_preprocess;
+#[path = "main_alloc.rs"]
+mod main_alloc;
 // `pir js` runs scripts on the embedded QuickJS runtime, so the whole module
 // (and its `include_str!` of the script boot overlay) is an `extensions`-only
 // surface. `run_mode` reports the missing feature at runtime instead.
@@ -39,6 +43,14 @@ use print_mode::resolve_interactive_tool_selection;
 use print_mode::{run_print_mode, PrintModeRequest};
 use run_mode::run;
 use tui_trace::{rotate_tui_trace_log, validate_tui_mode, TUI_TRACE_LOG_MAX_BYTES};
+
+/// Feature-off runtime diagnostic shared by `main_cli/run_mode.rs`'s
+/// `#[cfg(not(feature = "..."))]` arms. The default `full` feature set
+/// compiles every call site out, so this is only reachable in trimmed builds.
+#[allow(dead_code)]
+pub(crate) fn missing_feature(name: &str, feature: &str) -> anyhow::Error {
+    anyhow::anyhow!("`{name}` is unavailable: this build was built without the `{feature}` feature")
+}
 
 /// Windows gives the main thread a 1 MiB stack, and the clap command tree
 /// (`Cli`'s 60+ flags plus the subcommand trees) overflows it in debug

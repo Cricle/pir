@@ -188,7 +188,7 @@
 //!   child (the test binary re-entered in child mode) covers framing,
 //!   request/response correlation, exit handling, limits and kill-on-stop.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -345,6 +345,9 @@ impl PhoneCommand {
 #[derive(Debug, Clone)]
 pub struct ForwardedCommand {
     pub command: PhoneCommand,
+    /// Original parsed client envelope. Pool children need the raw RPC shape
+    /// because their `--mode rpc` protocol is broader than the typed enum.
+    pub raw: Value,
     /// Correlation id echoed in the response envelope (`cli-N` if the client
     /// did not send one).
     pub request_id: Option<String>,
@@ -576,6 +579,10 @@ fn client_request_id(value: &Value) -> Option<String> {
     value
         .get("id")
         .and_then(Value::as_str)
+        // The relay correlates `extension_ui_response` through the envelope's
+        // `requestId` because the command `id` must keep addressing the
+        // dialog inside the session.
+        .or_else(|| value.get("requestId").and_then(Value::as_str))
         .or_else(|| {
             value
                 .get("command")
@@ -998,11 +1005,72 @@ struct BridgeInner {
     stats: BridgeStatsAtomic,
     /// Sum of every subscriber's queued bytes.
     queued_bytes: AtomicUsize,
+    /// Dialog-class `extension_ui_request` ids awaiting an answer, keyed by
+    /// the session worker id (`parent-session` or `active-session-N`). This is
+    /// the live "needs input" source the status/catalog surface reads;
+    /// entries are dropped when the matching `extension_ui_response` arrives.
+    pending_ui: Mutex<HashMap<String, BTreeSet<String>>>,
     closed: AtomicBool,
     wake_tx: mpsc::Sender<()>,
 }
 
+/// Methods that block the extension until the user answers; notification-only
+/// requests (`notify`, `setTitle`, widget updates, ...) are not "needs input".
+fn is_blocking_ui_method(method: Option<&str>) -> bool {
+    matches!(method, Some("select" | "confirm" | "input" | "editor"))
+}
+
 impl BridgeInner {
+    /// Remember/answer a dialog-class UI request. Pool child events arrive as
+    /// `{channel:"rpc", ...}`, parent events as raw `{type:...}` payloads.
+    fn track_pending_ui_event(&self, event: &Value) {
+        let inner = if event.get("channel").and_then(Value::as_str) == Some("rpc") {
+            event.get("payload").unwrap_or(event)
+        } else {
+            event
+        };
+        if inner.get("type").and_then(Value::as_str) != Some("extension_ui_request")
+            || !is_blocking_ui_method(inner.get("method").and_then(Value::as_str))
+        {
+            return;
+        }
+        let Some(id) = inner.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let session_id = event
+            .get("sessionWorkerId")
+            .and_then(Value::as_str)
+            .or_else(|| inner.get("sessionWorkerId").and_then(Value::as_str))
+            .unwrap_or("parent-session");
+        self.pending_ui
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.to_owned())
+            .or_default()
+            .insert(id.to_owned());
+    }
+
+    fn clear_pending_ui(&self, session_id: &str, request_id: &str) {
+        let mut pending = self
+            .pending_ui
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ids) = pending.get_mut(session_id) {
+            ids.remove(request_id);
+            if ids.is_empty() {
+                pending.remove(session_id);
+            }
+        }
+    }
+
+    fn has_pending_ui(&self, session_id: &str) -> bool {
+        self.pending_ui
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .is_some_and(|ids| !ids.is_empty())
+    }
+
     fn drop_client(&self, client_id: u64, reason: CloseReason) {
         let entry = self
             .clients
@@ -1151,6 +1219,7 @@ impl SessionBridge {
                 next_client_id: AtomicU64::new(0),
                 stats: BridgeStatsAtomic::default(),
                 queued_bytes: AtomicUsize::new(0),
+                pending_ui: Mutex::new(HashMap::new()),
                 closed: AtomicBool::new(false),
                 wake_tx,
             }),
@@ -1308,6 +1377,13 @@ impl SessionBridge {
         stats
     }
 
+    /// Whether `session_id` has a dialog-class UI request still awaiting an
+    /// answer. `parent-session` is the live CLI session; pool children use
+    /// their `active-session-N` worker id.
+    pub fn pending_ui_request(&self, session_id: &str) -> bool {
+        self.inner.has_pending_ui(session_id)
+    }
+
     /// Map one host event and fan it out. Public so a host can publish without
     /// the channel; `start`'s sender is the normal path.
     pub fn dispatch_host_event(&self, event: Value) {
@@ -1315,6 +1391,7 @@ impl SessionBridge {
             return;
         }
         self.inner.stats.host_events.fetch_add(1, Ordering::Relaxed);
+        self.inner.track_pending_ui_event(&event);
 
         match map_host_event(&event, &self.inner.config) {
             Some(MappedEvent::Line(envelope)) => {
@@ -1516,12 +1593,28 @@ impl SessionBridge {
         let request_id =
             client_request_id(&parsed).unwrap_or_else(|| format!("cli-{next_request_id}"));
 
+        // Answering a dialog resolves its "needs input" mark before the host
+        // dispatch runs (an unknown id is a harmless no-op).
+        if let PhoneCommand::Raw { command } = &command {
+            if command.get("type").and_then(Value::as_str) == Some("extension_ui_response") {
+                let answered = command
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                self.inner.clear_pending_ui(
+                    active_session_id.as_deref().unwrap_or("parent-session"),
+                    answered,
+                );
+            }
+        }
+
         self.inner.stats.commands.fetch_add(1, Ordering::Relaxed);
         let forwarded = ForwardedCommand {
             command: command.clone(),
+            raw: parsed.clone(),
             request_id: Some(request_id.clone()),
             client_id,
-            active_session_id,
+            active_session_id: active_session_id.clone(),
         };
 
         match (self.inner.host.dispatch(forwarded)).await {
@@ -1542,10 +1635,18 @@ impl SessionBridge {
                     if let Some(data) = reply.data {
                         payload.insert("data".to_owned(), data);
                     }
-                    let envelope = json!({
+                    let mut envelope = json!({
                         "channel": "rpc",
                         "payload": Value::Object(payload),
                     });
+                    // Tag the reply with the session it answers so a relay
+                    // routes it to the subscriber's pending command; without
+                    // this the frame would be attributed to `parent-session`
+                    // and a pool child's reply would never settle the phone's
+                    // request.
+                    if let Some(worker_id) = active_session_id.clone() {
+                        envelope["sessionWorkerId"] = Value::String(worker_id);
+                    }
                     self.inner
                         .send_to_client(client_id, envelope.to_string(), LineClass::Terminal);
                 }
@@ -1556,7 +1657,7 @@ impl SessionBridge {
                     .command_errors
                     .fetch_add(1, Ordering::Relaxed);
                 if command.expects_response() {
-                    let envelope = json!({
+                    let mut envelope = json!({
                         "channel": "rpc",
                         "payload": {
                             "type": "response",
@@ -1566,6 +1667,9 @@ impl SessionBridge {
                             "error": error,
                         },
                     });
+                    if let Some(worker_id) = active_session_id.clone() {
+                        envelope["sessionWorkerId"] = Value::String(worker_id);
+                    }
                     self.inner
                         .send_to_client(client_id, envelope.to_string(), LineClass::Terminal);
                 } else {
@@ -1858,6 +1962,7 @@ pub fn map_host_event(event: &Value, config: &BridgeConfig) -> Option<MappedEven
         | "compaction_end"
         | "auto_retry_start"
         | "auto_retry_end" => Some(rpc_envelope(event, event.clone())),
+        name if name.starts_with("phone.custom.") => Some(rpc_envelope(event, event.clone())),
         _ => None,
     }?;
     Some(MappedEvent::Line(mapped))
@@ -2558,6 +2663,15 @@ impl SessionHandle {
                         Ok(payload.clone())
                     };
                     let _ = sender.send(result);
+                    // Correlated responses belong to the awaiting requester
+                    // only. The bridge answers the phone request with its own
+                    // response envelope; forwarding this raw line as an rpc
+                    // event too would duplicate the same command/data. The
+                    // relay consumes its pending mapping on the first frame,
+                    // so the second copy is broadcast under the relay's
+                    // `forwardId` to every subscriber. Notifications and
+                    // uncorrelated responses still pass through below.
+                    return;
                 }
             }
 
@@ -2902,6 +3016,15 @@ impl SessionHandle {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
+        // The phone routes dialog answers through `request` (they expect a
+        // response), unlike other fire-and-forget Raw commands that use
+        // `send_command`; clear the cached "needs input" state here too.
+        if command_name == "extension_ui_response" {
+            self.cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_ui = None;
+        }
         let line = serde_json::to_string(&command)
             .map_err(|error| PoolError::Io(format!("failed to encode rpc command: {error}")))?;
 

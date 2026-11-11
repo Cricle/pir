@@ -1,7 +1,9 @@
-# Track the stable channel. The MSRV itself is enforced two ways: the
-# `rust-version = "1.97"` field in Cargo.toml (rustc refuses to build on
-# older toolchains) and the dedicated `msrv` CI job, which pins the exact
-# toolchain via `dtolnay/rust-toolchain@1.97` (the action exports
-# RUSTUP_TOOLCHAIN, which takes precedence over this file).
+# Track the stable channel. The MSRV is enforced by the `rust-version = "1.97"`
+# field in Cargo.toml: rustc refuses to build on an older toolchain, and
+# `cargo` reports it as an unsupported-toolchain error rather than a wall of
+# syntax errors. A dedicated `msrv` CI job that pins 1.97 via
+# `dtolnay/rust-toolchain@1.97` is NOT defined in .github/workflows today; if
+# one is added it must export RUSTUP_TOOLCHAIN, which takes precedence over
+# this file.
 [toolchain]
 channel = "stable"

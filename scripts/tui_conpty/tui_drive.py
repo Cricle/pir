@@ -252,6 +252,18 @@ AGENT_DIR = os.path.join(OUT, "tui_agent")
 
 BASE_ENV = {
     "PIR_AGENT_DIR": AGENT_DIR,
+    # Project-trust gate (upstream `resolveProjectTrusted`): every battery cwd
+    # lives under the checkout, and an ancestor `.agents/skills` (or a
+    # project-local `.pi` resource) makes the project trust-requiring. Without
+    # a stored decision the `ask` default puts the interactive trust selector
+    # on the terminal BEFORE the TUI starts, so the scenario's first send (the
+    # user prompt) would be typed into the selector and the TUI would start
+    # with an empty session. The operator override is the supported way to
+    # pre-trust a CI checkout; it is env-only and writes no trust.json.
+    # A scenario that wants to exercise the selector itself sets
+    # ENV = {"PIR_TRUST_PROJECT": "0"} (the override only applies to the exact
+    # value "1", so "0" restores the store/default policy).
+    "PIR_TRUST_PROJECT": "1",
     "PIR_NO_UPDATE_CHECK": "1",
     "RUST_LOG": "error",
     "SystemRoot": os.environ.get("SystemRoot", r"C:\Windows"),
@@ -289,6 +301,11 @@ RESTORE_SEQUENCES = {
     "1000h": b"\x1b[?1000h",   # mouse on (context)
     "1006l": b"\x1b[?1006l",   # SGR mouse off (context)
     "1006h": b"\x1b[?1006h",   # SGR mouse on (context)
+    # crossterm's EnableMouseCapture/DisableMouseCapture on Windows emit the
+    # combined button+motion+SGR form; keyed separately so restore checks do
+    # not depend on the terminal splitting it into 1006x-only writes.
+    "1003_1006l": b"\x1b[?1003;1006l",
+    "1003_1006h": b"\x1b[?1003;1006h",
 }
 
 
@@ -324,7 +341,11 @@ def run_scenario(name, ops, extra_env=None, args=None, cwd=None,
     if agent_dir:
         env["PIR_AGENT_DIR"] = agent_dir
     if extra_env:
-        env.update(extra_env)
+        # `{agent_dir}` lets a scenario isolate HOME/USERPROFILE under its own
+        # per-run tree, whose absolute path only exists at run time.
+        base = agent_dir or AGENT_DIR
+        env.update({k: v.replace("{agent_dir}", base) if isinstance(v, str) else v
+                    for k, v in extra_env.items()})
     target_cwd = cwd or agent_dir or AGENT_DIR
     os.makedirs(target_cwd, exist_ok=True)
     cmdline = f'"{PIR}" interactive'

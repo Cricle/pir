@@ -144,6 +144,7 @@ fn fake_model() -> Model {
 /// tests only exercise `execute_bash` / `abort_bash`).
 fn session_in(cwd: &Path) -> Arc<AgentSession> {
     Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,

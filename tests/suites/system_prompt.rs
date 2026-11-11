@@ -214,6 +214,9 @@ fn sections_are_ordered_and_xml_wrapped() {
     assert!(rules.contains(
         "- You can inspect PI_* environment variables for current model and session details."
     ));
+    assert!(rules.contains(
+        "- Run shell commands from the current working directory; never scan /, /tmp, the home directory, or an entire drive"
+    ));
     assert!(rules.contains("- Be concise in your responses"));
     assert!(rules.contains("- Show file paths clearly when working with files"));
 
@@ -1360,6 +1363,7 @@ fn codemode_prompt_session(mode: CodemodeMode, active: Vec<String>, cwd: &Path) 
     }));
     AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: std::sync::Arc::new(ProviderRegistry::default()),
             model: prompt_fake_model(),
             api_key: None,
@@ -1683,6 +1687,7 @@ async fn cli_prompt_overrides_keep_structure_and_rebuild() {
     let mut tools = ToolRegistry::new();
     register_core_tools(&mut tools);
     let session = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: std::sync::Arc::new(ProviderRegistry::default()),
         model: prompt_fake_model(),
         api_key: None,

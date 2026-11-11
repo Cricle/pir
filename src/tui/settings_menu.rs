@@ -597,7 +597,18 @@ pub fn settings_items(
             [3u32, 5, 7, 10, 15, 20]
                 .iter()
                 .position(|value| Some(*value) == settings.autocomplete_max_visible)
-                .unwrap_or(3),
+                // Unset must display the runtime default (5), not an
+                // arbitrary neighbour: `AutocompletePopup` falls back to
+                // `AUTOCOMPLETE_MAX_VISIBLE_DEFAULT` (editor.ts:380-381).
+                .unwrap_or_else(|| {
+                    [3u32, 5, 7, 10, 15, 20]
+                        .iter()
+                        .position(|value| {
+                            *value as usize
+                                == super::autocomplete::AUTOCOMPLETE_MAX_VISIBLE_DEFAULT
+                        })
+                        .unwrap_or(0)
+                }),
         ),
         // upstream "clear-on-shrink"
         bool_item(

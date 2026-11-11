@@ -94,6 +94,10 @@ pub struct ShellPrefs {
     /// no-default-timeout behavior), `Some(ms)` = that cap. An explicit
     /// per-call `timeout` always wins over this default.
     pub command_timeout_ms: Option<u64>,
+    /// `tools.broadSearchGuard` (default true): reject obvious
+    /// whole-filesystem searches before spawning a shell (`find /`, recursive
+    /// grep over `/tmp`, ...). Set false to restore the unrestricted shell.
+    pub restrict_broad_search: bool,
 }
 
 impl Default for ShellPrefs {
@@ -104,6 +108,8 @@ impl Default for ShellPrefs {
             pool: true,
             // Unset, not disabled: the applied default is 120 s.
             command_timeout_ms: None,
+            // Defense is on by default; the settings switch can disable it.
+            restrict_broad_search: true,
         }
     }
 }
@@ -220,6 +226,12 @@ pub fn shell_prefs_in(agent_dir: &Path) -> ShellPrefs {
 /// `shellPath` gets the `~` expansion of upstream `normalizePath` against the
 /// EXPLICIT `home` (`None` leaves a leading `~` verbatim).
 pub fn shell_prefs_from(settings: &Settings, home: Option<&Path>) -> ShellPrefs {
+    let profile = settings
+        .performance
+        .clone()
+        .unwrap_or_default()
+        .with_env_profile()
+        .profile();
     ShellPrefs {
         command_prefix: settings
             .shell_command_prefix
@@ -234,7 +246,16 @@ pub fn shell_prefs_from(settings: &Settings, home: Option<&Path>) -> ShellPrefs 
         command_timeout_ms: settings
             .tools
             .as_ref()
-            .and_then(|tools| tools.command_timeout_ms),
+            .and_then(|tools| tools.command_timeout_ms)
+            .or_else(|| {
+                (profile == crate::config::settings::PerformanceProfile::Efficient)
+                    .then_some(30_000)
+            }),
+        restrict_broad_search: settings
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.broad_search_guard)
+            .unwrap_or(true),
     }
 }
 

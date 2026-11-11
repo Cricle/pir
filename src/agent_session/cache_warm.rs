@@ -211,12 +211,7 @@ impl AgentSession {
         run_system_prompt: Option<String>,
     ) -> crate::ai::types::Context {
         let messages = match &self.session {
-            Some(session) => session
-                .lock()
-                .await
-                .build_session_projection()
-                .map(|projection| projection.messages)
-                .unwrap_or_default(),
+            Some(session) => session.lock().await.build_session_messages(),
             None => history_owned(self.history_snapshot()),
         };
         crate::ai::types::Context {

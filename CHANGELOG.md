@@ -1,10 +1,134 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-11)
+
+### performance
+
+- Added the opt-in `performance.profile = "efficient"` (or
+  `PIR_PERF_PROFILE=efficient`) with a core-four default tool loadout, bounded
+  tool-result text, soft/hard turn budgets, a cumulative token budget, and
+  prompt-cache support. The default `balanced` path keeps the historical
+  behavior unchanged.
+- Removed a per-turn completed-turn clone on the session hook path, made
+  multi-tool batches participate in the degenerate-loop guard, and added a
+  high-water resident-session cap to `pir-phone-server` (offline sessions
+  hydrate from redb; online/subscribed sessions are never evicted).
+
+### builtin:memory
+
+- New native `memory` builtin embedding `cm-memory` 0.3.0: one `memory` tool
+  over the full `cm` CLI action surface (recall/brief, remember/append/absorb,
+  frames, governance, audit, explore/wiki, checkpoint/reindex/verify/import/
+  export), the `/memory` command, adaptive `input` auto-recall
+  (`auto|always|off`, score floor), optional stable `before_agent_start` brief,
+  and checkpoint/shutdown flush. No external `cm` process is spawned.
+- Per-session store defaults to `<session-file-dir>/cm`, with
+  `workspace`/`agentDir`/`path` modes; settings live under the `memory` key.
+- Hardened writes: model `remember`/`append` cannot self-assign `verified`
+  trust or create `frame`/`feedback`/reserved-scope records; embedded imports
+  enforce the source policy, cap trust at `imported`, regenerate ids and strip
+  supersede/merge metadata. Source anchors/snippets/audit reads are confined to
+  the canonical project root.
+- Added memory_builtin integration tests plus a 3-agent cross-review pass and
+  a post-fix A/B report (`docs/memory-builtin-ab-2026-11-09.md`).
+
+### pi-phone central relay
+
+- New standalone `pir-phone-server` workspace member: a multi-user
+  information proxy that stores users/devices/session metadata and relays
+  phone commands/events to agent processes. It does **not** execute agents or
+  tools; `pir` stays the local agent runtime.
+- User personal access tokens and per-device tokens (`SHA-256(token+pepper)`,
+  revocable), with user/device/session catalog API, paginated sessions, and
+  per-user isolation.
+- Agent protocol: outbound WSS `/agent` hello / `frame` / `command` / `resync`
+  with request-id rewriting and targeted response routing; phone protocol:
+  `/ws` with subprotocol auth, multi-client fan-out, and session selection.
+- The native phone plugin now supports `/phone-start <ws(s)://server>
+  [device-token] [--device-name]` as the remote-only agent client.
+- New PWA login/setup flow stores the central server URL and token per server;
+  chat/session frames are relayed through the central server.
+- PWA device management page: list devices, create a device token (shown
+  once), copy/revoke it; catalog pagination supports "Load more sessions".
+- PWA v1 layout: restrained American-minimal surfaces, persistent session
+  sidebar on desktop, drawer on mobile, sticky composer, no bottom navigation
+  or header chip clutter. Session rows are single-line; settings, devices and
+  session controls are center-column pages rather than modal sheets; login is
+  a page. Light, dark and follow-system appearance plus a persisted
+  Show/Hide Thinking preference are available in Settings.
+- The phone `SessionPool` is wired end to end: parallel children register as
+  `active-session-N` catalog rows, appear in the single-line session list, and
+  prompt/model/thinking/abort/tree commands route to the selected child.
+- Device revocation now closes the live agent WebSocket immediately; the new
+  `device_revoke_closes_the_agent_socket` regression test covers it.
+- Agent hello/status negotiate capabilities (`session-pool`,
+  `extension-ui.v2`, `custom-events.v1`). Plugins can opt into namespaced
+  `phone.custom.*` events via `PI_PHONE_CUSTOM_EVENTS`; frames are size-capped
+  and re-emitted to the PWA as `pi-phone-custom` DOM events.
+- `extension_ui_request` now covers status/title/widget/working-message/
+  working-visibility/editor/theme/footer/header/working-indicator/
+  hidden-thinking-label projections in addition to notify and dialogs.
+- The `subagent` tool now renders a dedicated child-agent panel in both the
+  TUI and PWA: agent/task/status plus the child transcript, tool calls, usage
+  and errors stay inside the subagent block instead of being mistaken for the
+  main assistant transcript.
+- Server hot paths use shared `Arc<str>` broadcast lines, status-diff
+  throttling, reverse B-tree catalog reads, `O(1)` health counts, compact
+  bincode metadata rows and zero-copy static responses. `/api/metrics` exposes
+  registry counters and RSS/VmHWM.
+- Added `examples/load_test.rs` / `scripts/phone_server_load.sh`: 10k catalog,
+  100-client fan-out, agent-resync reconnect, 1M-session RSS/peak RSS, cache
+  and CPU measurements.
+- HTTP proxy endpoints for session history and model lists through the agent's
+  WebSocket (`/api/sessions/:id/messages`, `/api/models`); quota remains
+  agent-side.
+- Updated-at session index plus batch session upsert; 10k-session catalog
+  page load is covered by `tests/load_catalog.rs`.
+- Added repeatable server benchmarks (`examples/bench.rs`,
+  `scripts/phone_server_bench.sh`) and stress/scenario tests: 50-client
+  fan-out, 400 KiB and multi-MiB snapshots, slow-consumer isolation, client
+  reconnect with agent resync, agent disconnect/reconnect.
+- The relay stores only account/device/session metadata and the latest small
+  status line; transcripts, snapshots, tool output and images are forwarded
+  and dropped. Compact bincode rows keep a 1M-session catalog at ~617 MiB
+  peak RSS. Agent connection ids prevent a stale socket from unregistering its
+  replacement.
+- Removed the legacy embedded HTTP/WS phone server, embedded browser assets,
+  Tailscale Serve management, and runtime-state files. The native phone plugin
+  is now remote-only; `phone` feature dependencies shrink accordingly.
+- `--allowed-origin` now configures both WebSocket Origin checks and CORS for
+  external PWA deployments; `/api/quota` proxies the agent-side quota RPC.
+- Documentation: `docs/phone-server.md` and
+  `scripts/phone_server_check.sh`.
+
+### fixes
+
+- Fixed the release-mode `python` crash: the tracing global allocator now
+  returns a dangling pointer for zero-size layouts in `alloc`/`alloc_zeroed`
+  and stops forwarding the matching `dealloc`/`realloc`, instead of tripping
+  the non-zero-size `assert_unchecked` in core's blanket `GlobalAlloc` impl.
+  `pir python -c "print(42)"` is now 10/10 EXIT 0 in release (previously
+  EXIT 3221226505), with `PIR_ALLOC_TRACE` on or off.
+- `LoopOptions::prepare_next_turn_needs_completed` now defaults to `true`,
+  matching its own doc contract: `AgentTurnContext` always carries the
+  completed `message`/`tool_results`, so a `prepare_next_turn` hook that reads
+  them no longer gets an empty snapshot unless a caller opts out.
+- The TUI search box now consumes burst input: a console burst of 8 or more
+  characters, which the terminal coalescer rewrites into one paste event while
+  a search is active, is inserted into the query character by character
+  instead of being swallowed. Fast typing or pasting into the find bar no
+  longer drops the input.
+- Test contracts reconciled with the shipped behavior: inline `#[cfg(test)]`
+  modules under `src/` are down to the original 8 grandfathered files (20
+  files' modules moved to `tests/suites/*_units.rs`, 37 tests preserved
+  verbatim); `tool_search` activation is asserted to be visible to the very
+  next call of the same run, and paged `transcript()` is asserted to widen
+  (2,288 total / 1,400 unique / 888 duplicate-by-id).
 
 <!-- Add user-visible changes for the next release here. The release workflow
-     requires the `v*` tag to equal Cargo.toml's `[package].version` (v0.0.2 ->
-     0.0.2), and the same value is recorded in .migration-info. -->
+     requires the `v*` tag to equal the `[workspace.package].version` in
+     Cargo.toml (v0.3.0 -> 0.3.0), and the same value is recorded in
+     .migration-info. -->
 
 ## 0.0.2 (2026-11-08)
 

@@ -56,6 +56,16 @@ impl SingleResult {
         }
     }
 
+    /// A still-running chain-step placeholder. The step number is known when
+    /// the step starts (upstream renders `─── Step N: agent ⏳` immediately;
+    /// without it the panel lags one step behind, PIR-TUI-005).
+    pub fn placeholder_for_step(agent: &str, task: &str, step: usize) -> Self {
+        Self {
+            step: Some(step),
+            ..Self::placeholder(agent, task)
+        }
+    }
+
     /// A still-running parallel placeholder (upstream `exitCode: -1`).
     pub fn placeholder(agent: &str, task: &str) -> Self {
         Self {

@@ -149,6 +149,7 @@ fn session_config(
     extensions: &pir::extensions::ExtensionHandle,
 ) -> pir::agent_session::AgentSessionConfig {
     pir::agent_session::AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(pir::ai::provider::ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,

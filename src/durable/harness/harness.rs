@@ -110,6 +110,7 @@ use crate::durable::harness::scheduler::{
 use crate::durable::harness::settings::{resolve_settings, HarnessSettings, Settings};
 use crate::durable::harness::submissions::{
     admit_submission_in, Admission, AdmissionStatus, Admitted, QueueModes, SubmissionDraft,
+    SubmitSpan,
 };
 use crate::durable::harness::task::Task;
 use crate::durable::harness::task_graph::{TaskGraphBlocking, TaskGraphView};
@@ -1921,6 +1922,8 @@ impl Harness {
         let now = self.now();
         let queue_modes = QueueModes::from_settings(&self.settings());
         let mut slot = Some(draft);
+        let admission_telemetry = telemetry.clone();
+        let admission_span = span;
         let scope = TransactionScope {
             conversation_id: Some(conversation),
             ..TransactionScope::default()
@@ -1933,9 +1936,19 @@ impl Harness {
                     let draft = slot.take().ok_or_else(|| {
                         StorageError::invalid("the submission draft was consumed")
                     })?;
-                    let admitted =
-                        admit_submission_in(state, tx, conversation, draft, now, queue_modes)
-                            .await?;
+                    let admitted = admit_submission_in(
+                        state,
+                        tx,
+                        conversation,
+                        draft,
+                        now,
+                        queue_modes,
+                        SubmitSpan {
+                            telemetry: &admission_telemetry,
+                            handle: admission_span,
+                        },
+                    )
+                    .await?;
                     Ok(Box::new(admitted) as JobValue)
                 })
             })

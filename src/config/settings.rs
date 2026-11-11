@@ -173,6 +173,10 @@ pub struct Settings {
     pub enabled_models: Option<Vec<String>>,
     #[serde(rename = "defaultTools", skip_serializing_if = "Option::is_none")]
     pub default_tools: Option<Vec<String>>,
+    /// Opt-in performance profile and limits (pir-only `performance` object).
+    /// Absent = balanced, byte-for-byte historical behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performance: Option<PerformanceSettings>,
     #[serde(rename = "doubleEscapeAction", skip_serializing_if = "Option::is_none")]
     pub double_escape_action: Option<DoubleEscapeAction>,
     #[serde(rename = "treeFilterMode", skip_serializing_if = "Option::is_none")]
@@ -227,6 +231,11 @@ pub struct Settings {
     /// loader layer regardless.
     #[serde(rename = "pythonTool", skip_serializing_if = "Option::is_none")]
     pub python_tool: Option<bool>,
+    /// The `memory` builtin's settings (pir-only; `memory` object). Absent =
+    /// `MemorySettings::default()`: session-directory store, input auto-recall
+    /// on, explicit writes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemorySettings>,
     #[serde(rename = "sessionDir", skip_serializing_if = "Option::is_none")]
     pub session_dir: Option<String>,
     #[serde(rename = "httpProxy", skip_serializing_if = "Option::is_none")]

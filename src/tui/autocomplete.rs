@@ -518,10 +518,11 @@ fn parse_path_prefix(prefix: &str) -> PathPrefix {
 /// `buildCompletionValue`).
 fn build_completion_value(path: &str, is_at: bool, is_quoted: bool) -> String {
     let needs_quotes = is_quoted || path.contains(' ');
+    let prefix = if is_at { "@" } else { "" };
     if !needs_quotes {
-        return format!("{}{path}", if is_at { "@" } else { "" });
+        return format!("{prefix}{path}");
     }
-    format!("{}\"{path}\"", if is_at { "@\"" } else { "\"" })
+    format!("{prefix}\"{path}\"")
 }
 
 // ---------------------------------------------------------------------------

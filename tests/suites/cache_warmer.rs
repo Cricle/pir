@@ -397,6 +397,7 @@ fn session_with_warming_model(
     let session = SessionManager::create(".", &temp.0).expect("create session");
     let path = session.path().to_path_buf();
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model,
         api_key: None,
@@ -946,6 +947,7 @@ async fn decision_payload_carries_economics_and_warm_usage_is_appended() {
     });
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model,
             api_key: None,

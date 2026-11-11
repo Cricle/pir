@@ -251,6 +251,17 @@ impl AgentSession {
                     .as_ref()
                     .map(|selection| selection.enabled.clone())
             })
+            .or_else(|| {
+                // Efficient profile: an implicit selection declares only the
+                // core tools. Balanced keeps `None` (every registration-active
+                // tool is declared), preserving the historical behavior.
+                (self.performance.profile() == PerformanceProfile::Efficient).then(|| {
+                    crate::config::settings::DEFAULT_TOOL_NAMES
+                        .iter()
+                        .map(|name| (*name).to_string())
+                        .collect()
+                })
+            })
             .map(|mut names| {
                 // Direct MCP bridges stay active on a default-tools session:
                 // whichever store won, an extension's snapshot must not drop
@@ -281,9 +292,7 @@ impl AgentSession {
         plugins: Option<&PluginHost>,
     ) -> SessionToolLoadout {
         let loadout_started = crate::config::timings::start_phase();
-        use crate::agent::tool_execution::{
-            callable_tools, declared_tool_definitions, declared_tools, ToolLoadout,
-        };
+        use crate::agent::tool_execution::{callable_tools, declared_tools, ToolLoadout};
         let registry = match plugins {
             Some(plugins) => self.merged_tool_registry(plugins),
             None => {
@@ -370,7 +379,12 @@ impl AgentSession {
         // a steady turn a no-op (no IO: the context files/skills are cached).
         self.sync_context_prompt(&active, &hidden_declarations, &declared);
 
-        let definitions = declared_tool_definitions(&declared, &descriptions, &hidden_declarations);
+        let definitions = crate::agent::tool_execution::declared_tool_definitions_for_profile(
+            &declared,
+            &descriptions,
+            &hidden_declarations,
+            self.performance.profile(),
+        );
         let nested_callable = Arc::new(
             callable
                 .iter()

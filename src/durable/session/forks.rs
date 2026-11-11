@@ -186,9 +186,12 @@ async fn collect_fork_copies(
                 };
                 address_id(&existing_address) == address_id(&child_address)
             }) {
+                let member = match &copy.record.key {
+                    Some(key) => format!("{}/{}", copy.record.kind, key),
+                    None => copy.record.kind.clone(),
+                };
                 return Err(StorageError::invalid(format!(
-                    "Two fork sources for child document kind {} key {:?}",
-                    copy.record.kind, copy.record.key
+                    "Fork selects multiple source documents for {member}"
                 )));
             }
             copies.push(copy);

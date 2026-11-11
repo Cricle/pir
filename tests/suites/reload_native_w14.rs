@@ -120,6 +120,7 @@ fn session_config(
     extensions: Option<pir::extensions::ExtensionHandle>,
 ) -> AgentSessionConfig {
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,
@@ -310,7 +311,7 @@ async fn phone_quota_auth_path_honours_pir_agent_dir() {
     )
     .await;
 
-    let resolved = pir::plugins::builtin::phone::server::quota_auth_path();
+    let resolved = pir::plugins::builtin::phone::quota_auth_path();
 
     assert_eq!(
         resolved,

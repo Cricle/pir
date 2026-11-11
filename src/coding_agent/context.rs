@@ -78,6 +78,10 @@ pub struct ContextOptions<'a> {
     /// `PI_PACKAGE_DIR` (upstream `getPackageDir`): the package docs anchors of
     /// the default prompt; `None` = not installed as a package.
     pub package_dir: Option<&'a Path>,
+    /// Opt-in total project-context budget. `0` keeps the historical per-file
+    /// limit; a positive value truncates the concatenated context across files
+    /// and appends an explicit truncation marker.
+    pub max_total_bytes: usize,
 }
 
 /// Resolve the ambient inputs of context discovery exactly once and run `f`
@@ -91,6 +95,7 @@ fn with_process_context_options<R>(f: impl FnOnce(&ContextOptions<'_>) -> R) -> 
         disabled: !context_files_enabled(),
         agent_dir: &agent_dir,
         package_dir: package_dir.as_deref(),
+        max_total_bytes: 0,
     })
 }
 
@@ -112,7 +117,50 @@ pub fn resolve_context_files_with(
     if options.disabled {
         return Vec::new();
     }
-    crate::config::settings::discover_context_files(cwd, options.agent_dir)
+    let files = crate::config::settings::discover_context_files(cwd, options.agent_dir);
+    if options.max_total_bytes == 0 {
+        return files;
+    }
+    truncate_context_files(files, options.max_total_bytes)
+}
+
+/// Apply the opt-in total context budget across all discovered files, in
+/// discovery order. Files/chars that do not fit are dropped (rather than
+/// truncated mid-UTF-8), and the final file carries a visible marker.
+///
+/// `#[doc(hidden)] pub`: driven directly by
+/// `tests/suites/coding_agent_units.rs` (the public `*_with` wrapper needs a
+/// real on-disk context fixture, which would rewrite the assertion).
+#[doc(hidden)]
+pub fn truncate_context_files(
+    files: Vec<(PathBuf, String)>,
+    max_total_bytes: usize,
+) -> Vec<(PathBuf, String)> {
+    let mut used = 0usize;
+    let mut out = Vec::new();
+    for (path, content) in files {
+        if used >= max_total_bytes {
+            break;
+        }
+        let remaining = max_total_bytes - used;
+        if content.len() <= remaining {
+            used += content.len();
+            out.push((path, content));
+            continue;
+        }
+        let mut end = remaining.min(content.len());
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            break;
+        }
+        let mut truncated = content[..end].to_owned();
+        truncated.push_str("\n\n[context truncated by performance profile]");
+        out.push((path, truncated));
+        break;
+    }
+    out
 }
 
 /// Build a system prompt from the ordered section builder with the discovered
@@ -307,8 +355,54 @@ pub fn session_system_prompt_with_hidden_and_options_and_inputs_and_mcp(
     options: &ContextOptions<'_>,
     mcp_servers: Option<String>,
 ) -> (String, PromptContextInputs) {
-    let files = resolve_context_files_with(cwd, options);
     let skills = discover_prompt_skills_with(cwd, options);
+    session_system_prompt_with_explicit_skills_and_options_and_inputs_and_mcp(
+        cwd,
+        tools,
+        hidden_tools,
+        options,
+        mcp_servers,
+        skills,
+    )
+}
+
+/// [`session_system_prompt_with_hidden_and_options_and_inputs_and_mcp`] with
+/// NO ambient prompt-skill discovery: the skill list is empty and no
+/// `~/.agents`/`~/.pi`/project skill root is read.
+///
+/// PIR-SDK-004: the SDK builder's hermetic paths (`endpoint` /
+/// `with_registry` / `proxy` without an explicit `resource_loader` or
+/// `.discover_system_prompt(true)`) build the derived prompt through this
+/// variant. Skills installed later by an explicit `resource_loader` reach the
+/// prompt through `AgentSession::set_prompt_resources_shared`, which re-renders
+/// from the installed list.
+pub fn session_system_prompt_with_hidden_and_options_and_inputs_and_mcp_hermetic(
+    cwd: &Path,
+    tools: &[ToolInfo],
+    hidden_tools: &[String],
+    options: &ContextOptions<'_>,
+    mcp_servers: Option<String>,
+) -> (String, PromptContextInputs) {
+    session_system_prompt_with_explicit_skills_and_options_and_inputs_and_mcp(
+        cwd,
+        tools,
+        hidden_tools,
+        options,
+        mcp_servers,
+        Vec::new(),
+    )
+}
+
+/// Shared renderer for the two session-prompt entry points above.
+fn session_system_prompt_with_explicit_skills_and_options_and_inputs_and_mcp(
+    cwd: &Path,
+    tools: &[ToolInfo],
+    hidden_tools: &[String],
+    options: &ContextOptions<'_>,
+    mcp_servers: Option<String>,
+    skills: Vec<crate::skills::SkillInfo>,
+) -> (String, PromptContextInputs) {
+    let files = resolve_context_files_with(cwd, options);
     let prompt = context_system_prompt_unconditional(
         cwd,
         tools,
@@ -406,6 +500,7 @@ pub(crate) fn context_system_prompt_with_hidden_in(
         disabled: !context_files_enabled(),
         agent_dir,
         package_dir: package_dir.as_deref(),
+        max_total_bytes: 0,
     };
     let skills = discover_prompt_skills_with(cwd, &options);
     build_context_prompt(cwd, tools, hidden_tools, &skills, &options)
@@ -431,6 +526,7 @@ pub(crate) fn context_system_prompt_with_hidden_in_unconditional(
         disabled: !context_files_enabled(),
         agent_dir,
         package_dir: package_dir.as_deref(),
+        max_total_bytes: 0,
     };
     let files = resolve_context_files_with(cwd, &options);
     let skills = discover_prompt_skills_with(cwd, &options);

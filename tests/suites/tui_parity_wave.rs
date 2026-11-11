@@ -576,6 +576,7 @@ async fn thinking_cycle_clamps_to_model_supported_levels() {
     model.provider = "fake".into();
     model.id = "fake-model".into();
     let agent = pir::agent_session::AgentSession::new(pir::agent_session::AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: model.clone(),
         api_key: None,
@@ -610,6 +611,7 @@ async fn thinking_cycle_clamps_to_model_supported_levels() {
         assistant(vec![text("ok")], StopReason::Stop)
     }));
     let plain = pir::agent_session::AgentSession::new(pir::agent_session::AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -645,6 +647,7 @@ async fn prompt_resources_hot_refresh_swaps_in_place() {
     pir::coding_agent::register_core_tools(&mut tools);
     let agent = Arc::new(pir::agent_session::AgentSession::new(
         pir::agent_session::AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -700,6 +703,7 @@ async fn dequeue_drains_both_queues() {
     }));
     let agent = Arc::new(pir::agent_session::AgentSession::new(
         pir::agent_session::AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,

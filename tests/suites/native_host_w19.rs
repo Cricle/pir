@@ -329,6 +329,7 @@ fn session_config(
     compaction: Option<pir::compaction::CompactionConfig>,
 ) -> AgentSessionConfig {
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,

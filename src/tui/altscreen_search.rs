@@ -291,53 +291,41 @@ pub fn match_key(matched: &SearchMatch) -> String {
 
 /// One non-space run of an ANSI-stripped frame line: the unit a
 /// [`CorpusSpan`] indexes. Columns are visible cells (a tab counts three).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CachedSearchRun {
     text: String,
+    /// Folded byte length of `text` (PIR-TUI-011 incremental corpus: lets a
+    /// splice compute the lowercased block length of reused rows without
+    /// re-folding them).
+    folded_len: usize,
     start_col: usize,
     width: usize,
     linear_columns: bool,
 }
 
-/// The parse of one frame line, tagged with a cheap fingerprint of the raw
-/// (still ANSI-decorated) line so a refresh can reuse it while only the rows
-/// whose content changed are stripped again.
-#[derive(Debug)]
+/// The parse of one frame line, tagged with the exact raw (still
+/// ANSI-decorated) line so a refresh can reuse it while only the rows whose
+/// content changed are stripped again. Keeping the raw line (instead of only
+/// a fingerprint) makes the incremental corpus' common-prefix/suffix scan a
+/// plain line compare, with no re-hash of the whole band on every band slide
+/// (PIR-TUI-011).
+#[derive(Debug, Clone)]
 struct CachedSearchRow {
-    /// `line.len()`; checked first, so a changed length misses without
-    /// hashing.
-    byte_len: usize,
-    /// FNV-1a over the raw line bytes.
-    fingerprint: u64,
+    raw: Box<str>,
     runs: Vec<CachedSearchRun>,
 }
 
 impl CachedSearchRow {
     fn parse(line: &str) -> Self {
         Self {
-            byte_len: line.len(),
-            fingerprint: line_fingerprint(line),
+            raw: line.into(),
             runs: parse_search_runs(line),
         }
     }
 
     fn unchanged(&self, line: &str) -> bool {
-        self.byte_len == line.len() && self.fingerprint == line_fingerprint(line)
+        self.raw.as_ref() == line
     }
-}
-
-/// Content fingerprint of one raw frame line (FNV-1a 64): one
-/// allocation-free pass over the line's bytes, far cheaper than
-/// `strip_ansi`, a `Vec<char>` and the run strings. Unlike a
-/// first/last-N-bytes sample it is sensitive to a change anywhere in the
-/// line (a mid-row spinner update).
-fn line_fingerprint(line: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in line.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 /// Strip ANSI and split one line into its maximal non-space runs.
@@ -366,8 +354,14 @@ fn parse_search_runs(line: &str) -> Vec<CachedSearchRun> {
             run_width += UnicodeWidthChar::width(next).unwrap_or(0).max(1);
         }
         let linear_columns = run.is_ascii();
+        let folded_len = if linear_columns {
+            run.len()
+        } else {
+            run.chars().map(|c| fold_case_char(c).len_utf8()).sum()
+        };
         runs.push(CachedSearchRun {
             text: run,
+            folded_len,
             start_col: column,
             width: run_width,
             linear_columns,
@@ -406,6 +400,265 @@ fn assemble_search_corpus(rows: &[CachedSearchRow]) -> SearchCorpus {
     corpus
 }
 
+/// Byte lengths of the joined (single-space-separated) run text of `rows`,
+/// in both the original and the case-folded form.
+fn joined_block_lens(rows: &[CachedSearchRow]) -> (usize, usize) {
+    let mut text_len = 0usize;
+    let mut lower_len = 0usize;
+    for row in rows {
+        for run in &row.runs {
+            if text_len != 0 {
+                text_len += 1;
+                lower_len += 1;
+            }
+            text_len += run.text.len();
+            lower_len += run.folded_len;
+        }
+    }
+    (text_len, lower_len)
+}
+
+/// Join the runs of `rows` with the corpus' single-space rule (no leading or
+/// trailing separator).
+fn joined_block_text(rows: &[CachedSearchRow]) -> String {
+    let (text_len, _) = joined_block_lens(rows);
+    let mut text = String::with_capacity(text_len);
+    for row in rows {
+        for run in &row.runs {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(&run.text);
+        }
+    }
+    text
+}
+
+/// Append the [`CorpusSpan`]s of `rows` at `row_offset` to `spans`, advancing
+/// `cursor` exactly like [`assemble_search_corpus`] does.
+fn append_row_spans(
+    spans: &mut Vec<CorpusSpan>,
+    cursor: &mut usize,
+    rows: &[CachedSearchRow],
+    row_offset: usize,
+) {
+    for (index, row) in rows.iter().enumerate() {
+        for run in &row.runs {
+            if *cursor != 0 {
+                *cursor += 1;
+            }
+            let text_start = *cursor;
+            *cursor += run.text.len();
+            spans.push(CorpusSpan {
+                text_start,
+                text_end: *cursor,
+                row: row_offset + index,
+                start_col: run.start_col,
+                end_col: run.start_col + run.width,
+                linear_columns: run.linear_columns,
+            });
+        }
+    }
+}
+
+impl SearchCorpus {
+    /// Splice a changed middle row range into the corpus, reusing the text,
+    /// folded haystack and fold offsets of the unchanged prefix and suffix
+    /// rows (PIR-TUI-011: a windowed band slide usually drops or prepends
+    /// whole rows, so re-folding the multi-MB band per keystroke was the
+    /// search latency). `old_rows` still includes the old middle;
+    /// `new_middle` replaces rows `[prefix .. old_len - suffix)`.
+    /// Splice a changed row range into the corpus, reusing the text, folded
+    /// haystack and fold offsets of the unchanged prefix and of an unchanged
+    /// old block that reappears near the tail of the new frame. `new_middle`
+    /// replaces the old rows between the prefix and that block, and `new_tail`
+    /// (rows after the reused block) is folded fresh: a windowed band slide is
+    /// usually `[prefix][new page][old tail block][new status rows]`, and the
+    /// bottom status rows change on every wall-clock tick (PIR-TUI-011).
+    fn splice(
+        &mut self,
+        old_rows: &[CachedSearchRow],
+        prefix: usize,
+        suffix_start: usize,
+        suffix_len: usize,
+        new_middle: &[CachedSearchRow],
+        new_tail: &[CachedSearchRow],
+    ) {
+        let trace = super::search_trace::Timer::new();
+        let old_len = old_rows.len();
+        let prefix_rows = &old_rows[..prefix];
+        let suffix_rows = &old_rows[suffix_start..suffix_start + suffix_len];
+        let (prefix_text_len, prefix_lower_len) = joined_block_lens(prefix_rows);
+        let (suffix_text_len, suffix_lower_len) = joined_block_lens(suffix_rows);
+        // The reused block may be followed by old rows that are being dropped
+        // (e.g. the previous tick row); the block still starts this far into
+        // the old corpus.
+        let (old_after_text_len, old_after_lower_len) =
+            joined_block_lens(&old_rows[suffix_start..]);
+        let middle_text = joined_block_text(new_middle);
+        let tail_text = joined_block_text(new_tail);
+        let (middle_lower, middle_offsets) = fold_case_with_offsets(&middle_text);
+        let (tail_lower, tail_offsets) = fold_case_with_offsets(&tail_text);
+        let old_text = std::mem::take(&mut self.text);
+        let old_lower = std::mem::take(&mut self.lower);
+        let old_offsets = self.fold_offsets.take();
+        let old_suffix_text_start = old_text.len() - old_after_text_len;
+        let old_suffix_lower_start = old_lower.len() - old_after_lower_len;
+
+        // Segment kinds, in new-row order.
+        const KIND_PREFIX: u8 = 0;
+        const KIND_MIDDLE: u8 = 1;
+        const KIND_SUFFIX: u8 = 2;
+        const KIND_TAIL: u8 = 3;
+        struct Segment {
+            text_start: usize,
+            lower_start: usize,
+            lower_len: usize,
+            kind: u8,
+        }
+        let mut text = String::with_capacity(
+            prefix_text_len + suffix_text_len + middle_text.len() + tail_text.len() + 4,
+        );
+        let mut lower = String::with_capacity(
+            prefix_lower_len + suffix_lower_len + middle_lower.len() + tail_lower.len() + 4,
+        );
+        let mut segments: Vec<Segment> = Vec::with_capacity(4);
+        {
+            let mut append = |body: &str, folded: &str, kind: u8| {
+                if !text.is_empty() && !body.is_empty() {
+                    text.push(' ');
+                    lower.push(' ');
+                }
+                let text_start = text.len();
+                text.push_str(body);
+                let lower_start = lower.len();
+                lower.push_str(folded);
+                segments.push(Segment {
+                    text_start,
+                    lower_start,
+                    lower_len: folded.len(),
+                    kind,
+                });
+            };
+            append(
+                &old_text[..prefix_text_len],
+                &old_lower[..prefix_lower_len],
+                KIND_PREFIX,
+            );
+            append(&middle_text, &middle_lower, KIND_MIDDLE);
+            append(
+                &old_text[old_suffix_text_start..old_suffix_text_start + suffix_text_len],
+                &old_lower[old_suffix_lower_start..old_suffix_lower_start + suffix_lower_len],
+                KIND_SUFFIX,
+            );
+            append(&tail_text, &tail_lower, KIND_TAIL);
+        }
+
+        // Fold offsets: reuse the prefix/suffix slices and build only the new
+        // middle/tail mappings. `None` keeps the all-ASCII identity mapping.
+        let new_offsets =
+            if old_offsets.is_some() || middle_offsets.is_some() || tail_offsets.is_some() {
+                let mut offsets: Vec<u32> = Vec::with_capacity(lower.len());
+                for segment in &segments {
+                    if segment.lower_start > offsets.len() {
+                        // Single-space separator immediately before this block.
+                        offsets.push((segment.text_start - 1) as u32);
+                    }
+                    match segment.kind {
+                        KIND_PREFIX => match &old_offsets {
+                            Some(source) => {
+                                offsets.extend_from_slice(&source[..segment.lower_len]);
+                            }
+                            None => offsets.extend(
+                                (0..segment.lower_len as u32)
+                                    .map(|index| segment.text_start as u32 + index),
+                            ),
+                        },
+                        KIND_SUFFIX => match &old_offsets {
+                            Some(source) => {
+                                let delta =
+                                    segment.text_start as i64 - old_suffix_text_start as i64;
+                                offsets.extend(
+                                    source[old_suffix_lower_start
+                                        ..old_suffix_lower_start + segment.lower_len]
+                                        .iter()
+                                        .map(|offset| (i64::from(*offset) + delta) as u32),
+                                );
+                            }
+                            None => offsets.extend(
+                                (0..segment.lower_len as u32)
+                                    .map(|index| segment.text_start as u32 + index),
+                            ),
+                        },
+                        _ => {
+                            let fresh = if segment.kind == KIND_MIDDLE {
+                                &middle_offsets
+                            } else {
+                                &tail_offsets
+                            };
+                            match fresh {
+                                Some(source) => offsets.extend(
+                                    source
+                                        .iter()
+                                        .map(|offset| segment.text_start as u32 + *offset),
+                                ),
+                                None => offsets.extend(
+                                    (0..segment.lower_len as u32)
+                                        .map(|index| segment.text_start as u32 + index),
+                                ),
+                            }
+                        }
+                    }
+                }
+                debug_assert_eq!(offsets.len(), lower.len());
+                Some(offsets)
+            } else {
+                None
+            };
+
+        // Spans are cheap plain structs; regenerating them from the reused
+        // row parses is far cheaper than re-folding text and keeps the
+        // `row`/column bookkeeping exactly in sync with the new row list.
+        let mut spans = Vec::with_capacity(
+            prefix_rows.len() + new_middle.len() + suffix_rows.len() + new_tail.len(),
+        );
+        let mut cursor = 0usize;
+        append_row_spans(&mut spans, &mut cursor, prefix_rows, 0);
+        append_row_spans(&mut spans, &mut cursor, new_middle, prefix);
+        append_row_spans(
+            &mut spans,
+            &mut cursor,
+            suffix_rows,
+            prefix + new_middle.len(),
+        );
+        append_row_spans(
+            &mut spans,
+            &mut cursor,
+            new_tail,
+            prefix + new_middle.len() + suffix_rows.len(),
+        );
+        debug_assert_eq!(cursor, text.len());
+
+        self.text = text;
+        self.lower = lower;
+        self.fold_offsets = new_offsets;
+        self.spans = spans;
+        trace.log(
+            "splice",
+            &[
+                ("prefix", prefix as u128),
+                ("suffix", suffix_len as u128),
+                ("suffix_start", suffix_start as u128),
+                ("newmid", new_middle.len() as u128),
+                ("tail", new_tail.len() as u128),
+                ("oldlen", old_len as u128),
+                ("text", self.text.len() as u128),
+                ("lower", self.lower.len() as u128),
+            ],
+        );
+    }
+}
+
 fn build_search_corpus(lines: &[String]) -> SearchCorpus {
     let rows: Vec<CachedSearchRow> = lines
         .iter()
@@ -422,8 +675,9 @@ fn build_search_corpus(lines: &[String]) -> SearchCorpus {
 /// each row is fingerprinted, and only rows whose raw line changed are
 /// ANSI-stripped and re-split. A refresh of unchanged content does no corpus
 /// work at all — the assembled corpus, its lowercased haystack and the match
-/// set are all reused. The cache is cleared when the query changes and when
-/// the search overlay closes (see [`SearchState::close`]).
+/// set are all reused. The cache is cleared when the search overlay closes;
+/// a query edit keeps the row/corpus parse (query-independent) and only
+/// re-runs the match set.
 #[derive(Debug, Default)]
 pub struct SearchFrameCache {
     /// Normalized query the cached corpus/matches belong to (empty = none).
@@ -440,8 +694,8 @@ pub struct SearchFrameCache {
 }
 
 impl SearchFrameCache {
-    /// Drop every cached row, corpus and match set (a query edit or the
-    /// overlay closing). The cumulative diagnostics counters survive.
+    /// Drop every cached row, corpus and match set (the overlay closing). The
+    /// cumulative diagnostics counters survive.
     pub fn clear(&mut self) {
         self.query.clear();
         self.rows.clear();
@@ -510,13 +764,13 @@ impl SearchFrameCache {
     ) -> Option<Vec<SearchMatch>> {
         let normalized = normalize_query(query);
         if normalized != self.query {
-            // A query edit drops the corpus cache (upstream recomputes from
-            // scratch). Rows are query-independent, but one clear rule 鈥?as
-            // the overlay closing 鈥?keeps the cache's lifetime honest, and a
-            // query edit only costs the same one-pass parse the old code paid
-            // on every frame anyway.
-            self.clear();
+            // A query edit only invalidates the MATCH set: the row parses and
+            // the assembled corpus (spans + folded haystack) are
+            // query-independent. Clearing them here re-stripped and re-folded
+            // the whole materialized band on every keystroke, so typing into
+            // a huge history fell behind the input queue (PIR-TUI-010).
             self.query = normalized.clone();
+            self.matches_valid = false;
         }
         if normalized.is_empty() {
             if self.matches_valid {
@@ -526,56 +780,342 @@ impl SearchFrameCache {
             return Some(Vec::new());
         }
         let rows_changed = match change {
-            RowChange::Unknown => self.sync_rows_full(lines),
+            RowChange::Unknown => self.sync_rows_incremental(lines),
             RowChange::None if self.rows.len() == lines.len() => false,
-            RowChange::None => self.sync_rows_full(lines),
+            RowChange::None => self.sync_rows_incremental(lines),
             RowChange::Range(first, last)
                 if self.rows.len() == lines.len() && !lines.is_empty() =>
             {
-                self.sync_rows_range(lines, first, last)
+                let changed = self.sync_rows_range(lines, first, last);
+                if changed {
+                    // The range path patches rows in place; its caller-owned
+                    // corpus must be rebuilt below.
+                    self.corpus_valid = false;
+                }
+                changed
             }
-            RowChange::Range(..) => self.sync_rows_full(lines),
+            RowChange::Range(..) => self.sync_rows_incremental(lines),
         };
         if rows_changed {
-            self.corpus_valid = false;
             self.matches_valid = false;
         }
         if !self.corpus_valid {
+            let trace = super::search_trace::Timer::new();
             self.corpus = assemble_search_corpus(&self.rows);
             self.corpus_valid = true;
             self.corpus_builds += 1;
+            trace.log(
+                "corpus_build",
+                &[
+                    ("rows", self.rows.len() as u128),
+                    ("text", self.corpus.text.len() as u128),
+                ],
+            );
         }
         if self.matches_valid {
             return None;
         }
         self.matches_valid = true;
         self.match_runs += 1;
-        Some(find_corpus_matches(&self.corpus, &normalized))
+        let trace = super::search_trace::Timer::new();
+        let matches = find_corpus_matches(&self.corpus, &normalized);
+        trace.log(
+            "match_scan",
+            &[
+                ("rows", self.rows.len() as u128),
+                ("lower", self.corpus.lower.len() as u128),
+                ("matches", matches.len() as u128),
+            ],
+        );
+        Some(matches)
     }
 
-    /// Reuse the cached parse of every row whose raw content is unchanged;
-    /// returns whether any row was added, removed or re-parsed.
-    fn sync_rows_full(&mut self, lines: &[String]) -> bool {
-        let mut changed = false;
-        let common = self.rows.len().min(lines.len());
-        for (index, line) in lines.iter().take(common).enumerate() {
-            if self.rows[index].unchanged(line) {
+    /// Parse the rows of a new middle block, reusing the parse of any old row
+    /// whose RAW line content is identical. A windowed band slide re-renders
+    /// the same entries at a shifted row position; the prefix/suffix scan only
+    /// catches the aligned ends, while the bulk middle is identical content at
+    /// a different index (one wall-time tick line is enough to make suffix=0).
+    /// Content equality guarantees an identical parse (parse depends on the
+    /// line bytes only), so this is safe even across different rows. Returns
+    /// the rows and how many had to be parsed from scratch (PIR-TUI-011: the
+    /// re-parse was the dominant 150-280 ms of `sync_rows_incremental`).
+    fn parse_rows_reusing_old(&self, lines: &[String]) -> (Vec<CachedSearchRow>, u64) {
+        if self.rows.is_empty() {
+            return (
+                lines
+                    .iter()
+                    .map(|line| CachedSearchRow::parse(line))
+                    .collect(),
+                lines.len() as u64,
+            );
+        }
+        // Building the content index over a huge old band costs more than
+        // parsing a handful of rows outright (the anchored splice usually
+        // leaves only the new page/status rows in the middle block).
+        if lines.len() < 64 {
+            return (
+                lines
+                    .iter()
+                    .map(|line| CachedSearchRow::parse(line))
+                    .collect(),
+                lines.len() as u64,
+            );
+        }
+        let mut seen: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(self.rows.len());
+        for (index, row) in self.rows.iter().enumerate() {
+            seen.entry(row.raw.as_ref()).or_insert(index);
+        }
+        let mut parsed_count = 0u64;
+        let rows = lines
+            .iter()
+            .map(|line| match seen.get(line.as_str()) {
+                Some(&index) => self.rows[index].clone(),
+                None => {
+                    parsed_count += 1;
+                    CachedSearchRow::parse(line)
+                }
+            })
+            .collect();
+        (rows, parsed_count)
+    }
+
+    /// Bring the row cache and corpus up to date with `lines`, reusing the
+    /// parse of the longest common prefix AND suffix and splicing only the
+    /// changed middle rows into the corpus (PIR-TUI-011). A windowed band
+    /// slide usually drops old head rows or prepends a page, so the reused
+    /// suffix/prefix keeps both the ANSI parse and the multi-MB case-fold
+    /// off the per-keystroke path. Returns whether any row changed.
+    fn sync_rows_incremental(&mut self, lines: &[String]) -> bool {
+        let trace = super::search_trace::Timer::new();
+        let old_len = self.rows.len();
+        let new_len = lines.len();
+        if old_len == 0 {
+            if new_len == 0 {
+                trace.log("sync", &[("old", 0), ("new", 0), ("mode", 0)]);
+                return false;
+            }
+            self.rows = lines
+                .iter()
+                .map(|line| CachedSearchRow::parse(line))
+                .collect();
+            self.row_rebuilds += new_len as u64;
+            self.corpus = assemble_search_corpus(&self.rows);
+            self.corpus_valid = true;
+            self.corpus_builds += 1;
+            trace.log(
+                "sync",
+                &[
+                    ("old", old_len as u128),
+                    ("new", new_len as u128),
+                    ("mode", 1),
+                    ("rebuilt", new_len as u128),
+                ],
+            );
+            return true;
+        }
+        let common_max = old_len.min(new_len);
+        let mut prefix = 0usize;
+        while prefix < common_max && self.rows[prefix].unchanged(&lines[prefix]) {
+            prefix += 1;
+        }
+        let mut suffix = 0usize;
+        while suffix < common_max - prefix
+            && self.rows[old_len - 1 - suffix].unchanged(&lines[new_len - 1 - suffix])
+        {
+            suffix += 1;
+        }
+        if prefix == old_len && prefix == new_len {
+            trace.log(
+                "sync",
+                &[
+                    ("old", old_len as u128),
+                    ("new", new_len as u128),
+                    ("mode", 0),
+                    ("prefix", prefix as u128),
+                    ("suffix", suffix as u128),
+                ],
+            );
+            return false;
+        }
+        let mut suffix_start = old_len - suffix;
+        let mut new_suffix_start = new_len - suffix;
+        if suffix < 4096 {
+            // The aligned suffix scan stops at the first changed bottom
+            // status row (wall-clock tick), even when the whole old band is
+            // still present one row above it. Anchor on the last stable rows
+            // and reuse that block instead (PIR-TUI-011).
+            if let Some((anchor_old, anchor_new, anchor_len)) = self.find_tail_anchor(lines, prefix)
+            {
+                // Only take the anchor when it replaces a large share of the
+                // rows that would otherwise be re-parsed/re-folded; a small
+                // block in a mostly-new frame just splits the splice and adds
+                // the anchor scan on top (measured on the MID- walk page).
+                let rows_to_process = new_len - prefix - anchor_len;
+                let baseline_rows = new_len - prefix - suffix;
+                if anchor_len > suffix && rows_to_process * 4 <= baseline_rows * 3 {
+                    suffix_start = anchor_old;
+                    new_suffix_start = anchor_new;
+                    suffix = anchor_len;
+                }
+            }
+        }
+        let old_middle = suffix_start - prefix;
+        let new_middle = new_suffix_start - prefix;
+        let new_tail = new_len - new_suffix_start - suffix;
+        if prefix == 0 && suffix == 0 {
+            // No reusable content: the band was genuinely rebuilt. Row parses
+            // are still reused for lines whose raw content exists in the old
+            // band (a shifted window).
+            let (parsed, actual_parses) = self.parse_rows_reusing_old(lines);
+            self.rows = parsed;
+            self.row_rebuilds += new_len as u64;
+            self.corpus = assemble_search_corpus(&self.rows);
+            self.corpus_valid = true;
+            self.corpus_builds += 1;
+            trace.log(
+                "sync",
+                &[
+                    ("old", old_len as u128),
+                    ("new", new_len as u128),
+                    ("mode", 1),
+                    ("rebuilt", new_len as u128),
+                    ("parsed", actual_parses as u128),
+                ],
+            );
+            return true;
+        }
+        let (parsed, middle_parses) = self.parse_rows_reusing_old(&lines[prefix..new_suffix_start]);
+        let (tail_rows, tail_parses) = if new_tail == 0 {
+            (Vec::new(), 0)
+        } else {
+            self.parse_rows_reusing_old(&lines[new_suffix_start + suffix..])
+        };
+        self.row_rebuilds += (new_middle + new_tail) as u64;
+        self.corpus.splice(
+            &self.rows,
+            prefix,
+            suffix_start,
+            suffix,
+            &parsed,
+            &tail_rows,
+        );
+        self.corpus_valid = true;
+        self.corpus_builds += 1;
+        // Move the reused blocks into the new row list (no deep clone of the
+        // multi-MB run text).
+        let mut old_rows = std::mem::take(&mut self.rows);
+        let _old_tail = old_rows.split_off(suffix_start + suffix);
+        let suffix_rows = old_rows.split_off(suffix_start);
+        old_rows.truncate(prefix);
+        let mut rows = Vec::with_capacity(new_len);
+        rows.extend(old_rows);
+        rows.extend(parsed);
+        rows.extend(suffix_rows);
+        rows.extend(tail_rows);
+        self.rows = rows;
+        debug_assert_eq!(self.rows.len(), new_len);
+        trace.log(
+            "sync",
+            &[
+                ("old", old_len as u128),
+                ("new", new_len as u128),
+                ("mode", 2),
+                ("prefix", prefix as u128),
+                ("suffix", suffix as u128),
+                ("suffix_start", suffix_start as u128),
+                ("oldmid", old_middle as u128),
+                ("newmid", new_middle as u128),
+                ("tail", new_tail as u128),
+                ("rebuilt", (new_middle + new_tail) as u128),
+                ("parsed", (middle_parses + tail_parses) as u128),
+            ],
+        );
+        true
+    }
+
+    /// Find the longest contiguous block of old rows that reappears anywhere
+    /// in the new frame. A windowed band slide keeps the band rows verbatim,
+    /// but the bottom status/search rows change on every keystroke or
+    /// wall-clock tick, so the aligned prefix/suffix scans can both collapse
+    /// even though almost the whole old band is still present at a shifted
+    /// position. Sampling a few unique anchors (tail first, then spread
+    /// through the frame) and extending them both ways recovers that block
+    /// for reuse (PIR-TUI-011).
+    fn find_tail_anchor(&self, lines: &[String], prefix: usize) -> Option<(usize, usize, usize)> {
+        const MAX_TAIL_ROWS: usize = 32;
+        const MIN_BLOCK_ROWS: usize = 256;
+        let old_len = self.rows.len();
+        let new_len = lines.len();
+        if old_len < MIN_BLOCK_ROWS || new_len < MIN_BLOCK_ROWS {
+            return None;
+        }
+        // Raw content -> unique old index; duplicated lines (rules, blanks)
+        // are ambiguous anchors and are marked as such.
+        let mut index: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(old_len);
+        for (position, row) in self.rows.iter().enumerate() {
+            match index.entry(row.raw.as_ref()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(position);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    slot.insert(usize::MAX);
+                }
+            }
+        }
+        let mut candidates: Vec<usize> = Vec::with_capacity(MAX_TAIL_ROWS + 8);
+        for offset in 0..=MAX_TAIL_ROWS {
+            if let Some(position) = new_len.checked_sub(1 + offset) {
+                if position > prefix {
+                    candidates.push(position);
+                }
+            }
+        }
+        for numerator in 1..8 {
+            let position = new_len * numerator / 8;
+            if position > prefix && position < new_len {
+                candidates.push(position);
+            }
+        }
+        let mut best: Option<(usize, usize, usize)> = None;
+        for new_end in candidates {
+            let Some(&old_hit) = index.get(lines[new_end].as_str()) else {
+                continue;
+            };
+            if old_hit == usize::MAX || old_hit < prefix {
                 continue;
             }
-            self.rows[index] = CachedSearchRow::parse(line);
-            self.row_rebuilds += 1;
-            changed = true;
+            let mut start_old = old_hit;
+            let mut start_new = new_end;
+            while start_old > prefix
+                && start_new > prefix
+                && self.rows[start_old - 1].unchanged(&lines[start_new - 1])
+            {
+                start_old -= 1;
+                start_new -= 1;
+            }
+            let mut end_old = old_hit + 1;
+            let mut end_new = new_end + 1;
+            while end_old < old_len
+                && end_new < new_len
+                && self.rows[end_old].unchanged(&lines[end_new])
+            {
+                end_old += 1;
+                end_new += 1;
+            }
+            let len = end_old - start_old;
+            if len < MIN_BLOCK_ROWS {
+                continue;
+            }
+            if best.is_none_or(|(_, _, best_len)| len > best_len) {
+                best = Some((start_old, start_new, len));
+                if len * 4 >= new_len * 3 {
+                    break;
+                }
+            }
         }
-        if self.rows.len() > lines.len() {
-            self.rows.truncate(lines.len());
-            changed = true;
-        }
-        for line in &lines[common..] {
-            self.rows.push(CachedSearchRow::parse(line));
-            self.row_rebuilds += 1;
-            changed = true;
-        }
-        changed
+        best
     }
 
     /// Re-fingerprint only the inclusive `[first, last]` row range (clamped to
@@ -1005,8 +1545,8 @@ pub struct SearchState {
     /// version on every render, unchanged or not.
     pub frame_version: u64,
     /// Content-keyed corpus/match cache. Survives frames (only changed rows
-    /// are re-stripped) and is cleared on a query edit or when the overlay
-    /// closes.
+    /// are re-stripped) and query edits (rows/corpus are query-independent;
+    /// only the match set is recomputed); cleared when the overlay closes.
     pub cache: SearchFrameCache,
     /// The navigation button the pointer is over (upstream
     /// `AltScreenSearchComponent.hoveredNavigationDirection`): drives the
@@ -1157,7 +1697,10 @@ pub const SEARCH_WALK_MAX_PAGES: usize = 16;
 /// measure the transcript window budgets in (`entry_payload_bytes`). The walk
 /// materializes the page it finds, so its bound is kept at the order of the
 /// window's own byte budget: a query never grows the materialized band past
-/// what scrolling the same distance would.
+/// what scrolling the same distance would. Only DISK pages count here:
+/// resident-prefix probes are bounded by [`SEARCH_WALK_MAX_PAGES`] alone and
+/// must not let an earlier query's loaded prefix starve this query's read
+/// budget.
 pub const SEARCH_WALK_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Why a backward search walk stopped (`None` = it has not).
@@ -1233,7 +1776,8 @@ pub struct SearchWalk {
     probed_entries: usize,
     /// Pages probed/read by this walk (resident slices count as pages).
     pages: usize,
-    /// Payload bytes probed/read by this walk.
+    /// Payload bytes read from disk by this walk. Resident probes do not
+    /// count (they materialize nothing; see [`SearchWalk::note_probe`]).
     bytes: usize,
     /// A found page is materialized and waits for the band check
     /// (`finish_search_walk_check`).
@@ -1241,7 +1785,7 @@ pub struct SearchWalk {
     /// How the walk stopped (`None` = still walking or never armed).
     outcome: Option<SearchWalkOutcome>,
     /// The walk materialized a page into the band: its top must be held while
-    /// the reveal is on screen ([`search_holds_band`]).
+    /// the reveal is on screen ([`SearchWalk::holds_band`]).
     revealed: bool,
 }
 
@@ -1354,11 +1898,18 @@ impl SearchWalk {
         self.probed_entries = self.probed_entries.saturating_add(inserted);
     }
 
-    /// Count one probed resident slice (`entries` above the band top).
+    /// Count one probed resident slice (`entries` above the band top). A
+    /// resident slice costs a PAGE of the bound (it is a full scratch render)
+    /// but no BYTES: the byte bound exists to cap the payload the walk pulls
+    /// into the resident list / materializes, and probing materializes
+    /// nothing. Charging resident bytes here let a previous query's loaded
+    /// prefix consume a later query's whole byte budget before it could read
+    /// a single on-disk page (PIR-TUI-009: found→Esc→capped→Esc→next stopped
+    /// at `Capped` without ever reaching the marker on disk).
     pub fn note_probe(&mut self, entries: usize, bytes: usize) {
         self.probed_entries = self.probed_entries.saturating_add(entries);
         self.pages = self.pages.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(bytes);
+        let _ = bytes;
     }
 
     /// The transcript window grew new entries immediately above the band top
@@ -2689,6 +3240,7 @@ fn route_wheel_event(
 }
 
 fn scroll_to_match(core: &mut TuiCore, state: &mut AltScreenState, dock_height: usize) {
+    let trace = super::search_trace::Timer::new();
     let Some(segment) = state
         .search
         .selected_match()
@@ -2696,6 +3248,7 @@ fn scroll_to_match(core: &mut TuiCore, state: &mut AltScreenState, dock_height: 
     else {
         return;
     };
+    let match_row = segment.row;
     let rows = core.rows().max(1);
     let dock = dock_height.min(rows.saturating_sub(1));
     let viewport_h = rows.saturating_sub(dock).max(1);
@@ -2726,6 +3279,15 @@ fn scroll_to_match(core: &mut TuiCore, state: &mut AltScreenState, dock_height: 
     state.follow_pinned_at_end = core.follow_suppressed();
     // Note: `scrollbar_linger` is intentionally not set — a search jump is not
     // a scroll gesture (upstream sets `disableFollow` only).
+    trace.log(
+        "scroll_to_match",
+        &[
+            ("row", match_row as u128),
+            ("top", top as u128),
+            ("offset", offset as u128),
+            ("frame", frame_len as u128),
+        ],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3527,9 +4089,7 @@ pub fn route_alt_screen_key(
             return AltKeyRoute::Consumed;
         }
         if let Some(c) = is_plain_char(key) {
-            let anchor = search_anchor(core, state);
-            state.search.query.push(c);
-            retarget_search(core, state, dock_height, anchor);
+            insert_search_char(core, state, dock_height, c);
             return AltKeyRoute::Consumed;
         }
         // Swallow everything else while the search box is focused.
@@ -3650,6 +4210,50 @@ fn search_anchor(core: &TuiCore, state: &AltScreenState) -> usize {
         .unwrap_or_else(|| core.visible_top())
 }
 
+/// One typed/pasted character into the live search query (the shared
+/// `updateSearchQuery` step: capture the anchor, append, re-target the
+/// closest match).
+fn insert_search_char(core: &mut TuiCore, state: &mut AltScreenState, dock_height: usize, c: char) {
+    let anchor = search_anchor(core, state);
+    state.search.query.push(c);
+    retarget_search(core, state, dock_height, anchor);
+}
+
+/// Deliver a paste chunk to the OPEN search box (upstream routes a paste to
+/// the focused component's `handleInput` — the re-wrapped bracketed payload
+/// reaches `AltScreenSearchComponent.handleInput` and its text input inserts
+/// the chunk into the query: tui.ts:1147-1153 + terminal.ts:266-272). pir's
+/// Windows batch reader rewrites a fast printable run (`>=
+/// CONSOLE_BURST_MIN_CHARS` keys inside one drain window) into exactly one
+/// `Event::Paste`, so search text of that length arrived as a paste the
+/// search family never saw: the whole run silently vanished from the box
+/// (PIR-TUI-023). Expanding the chunk per character reproduces the text
+/// input's insertion through the same per-character path live typing takes —
+/// the per-key search work is microseconds on a materialized band.
+///
+/// The paste is CONSUMED here: the caller must not route it anywhere else
+/// while the box owns the focus (P1-1). `true` when the box was open (the
+/// chunk was consumed and the caller must repaint).
+pub fn paste_into_search(
+    core: &mut TuiCore,
+    state: &mut AltScreenState,
+    dock_height: usize,
+    text: &str,
+) -> bool {
+    if !state.search.active {
+        return false;
+    }
+    for c in text.chars() {
+        // A single-line search box cannot represent control characters; the
+        // editor's paste cleaner drops them the same way for the main input.
+        if c.is_control() {
+            continue;
+        }
+        insert_search_char(core, state, dock_height, c);
+    }
+    true
+}
+
 /// Apply a query edit: recompute the matches against the current frame,
 /// select the match closest to the anchor (the first one at/after it, else
 /// the last before it — upstream `refreshSearch` binary-searches for the
@@ -3669,23 +4273,36 @@ fn retarget_search(
     dock_height: usize,
     anchor: usize,
 ) {
+    let trace = super::search_trace::Timer::new();
+    let prepare_trace = super::search_trace::Timer::new();
     let matches = {
         let frame = core.last_frame_lines();
         let dock = dock_height.min(frame.len());
+        let hint = core.last_frame_changed_rows();
         // Route the query edit through the cache: it is now keyed on the new
         // query, so the `refresh_search` after the reveal's repaint reuses
-        // this parse instead of stripping the whole frame again.
-        match state
-            .search
-            .cache
-            .prepare(&frame[..frame.len() - dock], &state.search.query)
-        {
+        // this parse instead of stripping the whole frame again. The renderer
+        // hint keeps a stable band from re-fingerprinting (PIR-TUI-011: the
+        // windowed band can shift when the reveal scrolls, and a full pass is
+        // O(band) per keystroke).
+        match state.search.cache.prepare_with_hint(
+            &frame[..frame.len() - dock],
+            &state.search.query,
+            hint,
+        ) {
             Some(matches) => matches,
             // The normalized query did not change (e.g. a trailing space was
             // typed or deleted): the cached set is this query's set.
             None => state.search.matches.clone(),
         }
     };
+    prepare_trace.log(
+        "retarget_prepare",
+        &[
+            ("frame", core.last_frame_lines().len() as u128),
+            ("matches", matches.len() as u128),
+        ],
+    );
     let has_matches = !matches.is_empty();
     state.search.selected = matches
         .iter()
@@ -3726,6 +4343,21 @@ fn retarget_search(
         state.search.restore_origin(core);
         state.follow_pinned_at_end = core.follow_suppressed();
     }
+    trace.log(
+        "retarget",
+        &[
+            ("query", state.search.query.len() as u128),
+            ("matches", state.search.matches.len() as u128),
+            (
+                "selected",
+                state
+                    .search
+                    .selected
+                    .map(|s| s as u128)
+                    .unwrap_or(u128::MAX),
+            ),
+        ],
+    );
 }
 pub fn refresh_search(
     state: &mut AltScreenState,
@@ -3762,6 +4394,7 @@ fn refresh_search_impl(
     if !state.search.active {
         return false;
     }
+    let trace = super::search_trace::Timer::new();
     // `u64::MAX` is the tests' "force a refresh" sentinel.
     let forced = state.search.frame_version == u64::MAX;
     if !forced && state.search.frame_version == frame_version {
@@ -3789,6 +4422,10 @@ fn refresh_search_impl(
         // Nothing under the search changed: keep the match set and selection
         // without hashing a single row.
         state.search.frame_version = frame_version;
+        trace.log(
+            "refresh",
+            &[("mode", 1), ("rows", transcript.len() as u128), ("hint", 0)],
+        );
         return true;
     }
     let previous_key = state
@@ -3812,6 +4449,14 @@ fn refresh_search_impl(
         // Same query + same rendered text: the cached match set — and with
         // it the selection — is already current. The version still moved, so
         // report the accepted refresh.
+        trace.log(
+            "refresh",
+            &[
+                ("mode", 2),
+                ("rows", transcript.len() as u128),
+                ("hint", hint.is_some() as u128),
+            ],
+        );
         return true;
     };
     state.search.matches = matches;
@@ -3820,6 +4465,15 @@ fn refresh_search_impl(
         // `n/m` without a current match until the user navigates (upstream
         // `selectedIndex = -1` on a fresh query).
         state.search.selected = None;
+        trace.log(
+            "refresh",
+            &[
+                ("mode", 3),
+                ("rows", transcript.len() as u128),
+                ("matches", state.search.matches.len() as u128),
+                ("hint", hint.is_some() as u128),
+            ],
+        );
         return true;
     }
     state.search.selected = state
@@ -3827,6 +4481,15 @@ fn refresh_search_impl(
         .matches
         .iter()
         .position(|matched| match_key(matched) == previous_key);
+    trace.log(
+        "refresh",
+        &[
+            ("mode", 4),
+            ("rows", transcript.len() as u128),
+            ("matches", state.search.matches.len() as u128),
+            ("hint", hint.is_some() as u128),
+        ],
+    );
     true
 }
 

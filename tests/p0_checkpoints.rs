@@ -164,6 +164,8 @@ fn tool_context_with_mode(
     };
     let mut ctx = ToolContext::new(dir);
     ctx.session_env = Some(Arc::new(ToolSessionEnv {
+        live_model: None,
+        live_thinking: None,
         read_ledger: Arc::new(pir::agent::read_ledger::ReadLedger::new(mode)),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model,

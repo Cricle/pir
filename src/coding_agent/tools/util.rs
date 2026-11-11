@@ -262,6 +262,33 @@ pub(super) fn normalize_tool_path(requested: &str) -> String {
             return home.join(rest).to_string_lossy().into_owned();
         }
     }
+    // The bash tool runs under MSYS/Git Bash, whose `pwd` and absolute paths
+    // use POSIX spellings. The file tools resolve native Windows paths, so a
+    // model that copies a `/tmp/...` or `/c/...` path from bash would
+    // otherwise be told it escaped the workspace. Map those two stable
+    // spellings back to their Windows equivalents; a `..` is still rejected
+    // by the confinement walk afterwards.
+    #[cfg(windows)]
+    {
+        if normalized == "/tmp" {
+            return std::env::temp_dir().to_string_lossy().into_owned();
+        }
+        if let Some(rest) = normalized.strip_prefix("/tmp/") {
+            return std::env::temp_dir()
+                .join(rest)
+                .to_string_lossy()
+                .into_owned();
+        }
+        if let Some(rest) = normalized.strip_prefix("/c/") {
+            return format!("C:/{rest}");
+        }
+        if let Some(rest) = normalized
+            .strip_prefix("/mnt/c/")
+            .or_else(|| normalized.strip_prefix("/cygdrive/c/"))
+        {
+            return format!("C:/{rest}");
+        }
+    }
     normalized.to_owned()
 }
 
@@ -314,18 +341,35 @@ pub(super) fn workspace_path(cwd: &Path, requested: &str) -> Result<PathBuf, Str
 ///   read-only tools use),
 /// * `relative` — the components below the root, which is what the
 ///   handle-relative walk consumes (it never re-resolves `candidate`).
-pub(super) struct WorkspacePathParts {
+///
+/// `#[doc(hidden)] pub`: the return type of the [`workspace_path_parts`] test
+/// seam below.
+#[doc(hidden)]
+pub struct WorkspacePathParts {
+    #[doc(hidden)]
     pub root: PathBuf,
+    #[doc(hidden)]
     pub candidate: PathBuf,
+    #[doc(hidden)]
     pub relative: PathBuf,
 }
 
 /// [`workspace_path`], also returning the canonical root and the relative
 /// component path the candidate was checked against.
-pub(super) fn workspace_path_parts(
-    cwd: &Path,
-    requested: &str,
-) -> Result<WorkspacePathParts, String> {
+///
+/// `#[doc(hidden)] pub`: asserted directly by
+/// `tests/suites/coding_agent_units.rs` (the shell-substitution refusal).
+#[doc(hidden)]
+pub fn workspace_path_parts(cwd: &Path, requested: &str) -> Result<WorkspacePathParts, String> {
+    // Tool paths are literal filesystem paths, not shell input. A model that
+    // copies `$(pwd)/file` from a bash command must be corrected instead of
+    // creating a literal `$(pwd)` directory or reporting an ENOENT edit.
+    if requested.contains("$(") || requested.contains("${") || requested.contains('`') {
+        return Err(format!(
+            "Path '{}' must be a literal filesystem path; do not use shell substitutions such as $(pwd) or backticks",
+            requested
+        ));
+    }
     let normalized = normalize_tool_path(requested);
     workspace_path_parts_normalized(cwd, Path::new(&normalized), requested)
 }

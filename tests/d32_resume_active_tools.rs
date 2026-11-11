@@ -260,6 +260,7 @@ fn session_with(
         tools.register(Arc::new(NamedTool { name }));
     }
     let session = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,
@@ -297,6 +298,7 @@ fn session_with_plugin(
     }
     let session = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: fake_model(),
             api_key: None,

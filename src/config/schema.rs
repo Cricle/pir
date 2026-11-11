@@ -826,6 +826,10 @@ pub fn settings_schema() -> Value {
                     ),
                     Some(crate::config::settings::DEFAULT_COMMAND_TIMEOUT_MS),
                 ),
+                "broadSearchGuard": bool_prop_with_default(
+                    "Reject obvious whole-filesystem searches (`find /`, recursive grep/rg over /tmp or the home directory) before spawning a shell. Default true; set false to disable the guard.",
+                    true,
+                ),
             },
             "additionalProperties": false,
         }),
@@ -1000,6 +1004,23 @@ pub fn settings_schema() -> Value {
         string_array("Initial tool selection. Plain names replace the inherited selection; +name and -name entries add or remove tools."),
     );
     properties.insert(
+        "performance".into(),
+        json!({
+            "type": "object",
+            "description": "Opt-in performance controls. Absent or profile=balanced preserves the default behavior.",
+            "properties": {
+                "profile": { "enum": ["balanced", "efficient"], "default": "balanced" },
+                "toolResultMaxBytes": { "type": "integer", "minimum": 0 },
+                "softTurnBudget": { "type": "integer", "minimum": 0 },
+                "hardTurnBudget": { "type": "integer", "minimum": 0 },
+                "maxTotalTokens": { "type": "integer", "minimum": 0 },
+                "contextFilesMaxBytes": { "type": "integer", "minimum": 0 },
+                "promptCache": { "enum": ["auto", "off"], "default": "auto" }
+            },
+            "additionalProperties": false
+        }),
+    );
+    properties.insert(
         "doubleEscapeAction".into(),
         json!({
             "enum": ["fork", "tree", "none"],
@@ -1159,6 +1180,98 @@ pub fn settings_schema() -> Value {
             "type": "boolean",
             "description": "Register the embedded RustPython 3 `python` tool (pir-only). Set false to skip it — for example when a custom `python` extension or the native-python path is preferred. `disabledBuiltinExtensions: [\"python\"]` removes the builtin at the loader layer regardless.",
             "default": true,
+        }),
+    );
+    properties.insert(
+        "memory".into(),
+        json!({
+            "type": "object",
+            "description": "Settings for the embedded `memory` builtin (cm-memory engine).",
+            "properties": {
+                "store": {
+                    "enum": ["session", "workspace", "agentDir", "path"],
+                    "description": "Where the cm file lives. `session` (default) puts it next to the session transcript; `workspace` uses <project-root>/cm; `agentDir` uses <agent-dir>/memory/<project-hash>/cm; `path` uses the explicit path setting.",
+                    "default": "session",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Explicit cm file path used when store = \"path\" (relative paths resolve against the session cwd).",
+                },
+                "autoRecall": {
+                    "type": "boolean",
+                    "description": "Append a budgeted <memory-context> block to each user prompt. Default true.",
+                    "default": true,
+                },
+                "autoRecallPolicy": {
+                    "enum": ["off", "always", "auto"],
+                    "description": "Auto-recall selection policy. `auto` (default) gives questions/long prompts the full brief; plain short edit prompts get no injection and continuation short edits get only the active task frame (no memory records); `always` keeps the full budget on every prompt; `off` disables injection.",
+                    "default": "auto",
+                },
+                "autoRecallMinScore": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Minimum top BM25 score for automatic recall when no frame exists. Default 1.0.",
+                    "default": 0.3,
+                },
+                "autoRecallMinPromptChars": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "description": "Prompts shorter than this many characters skip auto mode. Default 40.",
+                    "default": 40,
+                },
+                "autoBrief": {
+                    "type": "boolean",
+                    "description": "Inject a stable frame brief into the system prompt once per session. Default false.",
+                    "default": false,
+                },
+                "recallBudgetTokens": {
+                    "type": "number",
+                    "minimum": 50,
+                    "maximum": 8000,
+                    "description": "Token budget for automatic recall. Default 600.",
+                    "default": 600,
+                },
+                "recallMaxItems": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "Maximum memories in automatic recall. Default 3.",
+                    "default": 3,
+                },
+                "write": {
+                    "enum": ["explicit", "readOnly"],
+                    "description": "Write policy. `readOnly` opens the store read-only and rejects every write action.",
+                    "default": "explicit",
+                },
+                "checkpointOnSettle": {
+                    "type": "boolean",
+                    "description": "Checkpoint the store after a turn that wrote memory. Default true.",
+                    "default": true,
+                },
+                "strictSources": {
+                    "type": "boolean",
+                    "description": "Reject source anchors outside the project root. Default true.",
+                    "default": true,
+                },
+                "maxStoreBytes": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Maximum cm file size before writes are rejected. Default 256 MiB.",
+                    "default": 268435456,
+                },
+                "diskCache": {
+                    "type": "boolean",
+                    "description": "Keep the disposable cm.cache next to the store. Default true.",
+                    "default": true,
+                },
+                "allowExternalCommands": {
+                    "type": "boolean",
+                    "description": "Allow `wiki generate` / `wiki review` to spawn external agent commands. Default false.",
+                    "default": false,
+                },
+            },
+            "additionalProperties": false,
         }),
     );
     properties.insert(

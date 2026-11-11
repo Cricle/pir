@@ -12,13 +12,26 @@
 //! The tests drive a real session with an inline plugin surface (the
 //! `tool_search` builtin + fake deferred tools), emit a `tool_search` call
 //! from the fake provider, and read the tool names of each request. The
-//! remaining "next prompt, not next call" window is asserted explicitly: the
-//! run's request list is fixed when the run starts, so the second request of
-//! the same run still lacks the match; the next prompt declares it.
+//! SHIPPED window is "next call, not next prompt": the agent loop re-resolves
+//! the request's tool list from the session's live active set before every
+//! provider request (`src/agent/agent_loop.rs`
+//! `refresh_context_tools_from_active_cell`), so an activation landing during
+//! a tool batch is visible to the very next request of the SAME run
+//! (`src/plugins/builtin/tool_search.rs:21`, matching upstream's
+//! `setActiveTools`-time rebuild). `tests/suites/plugins_w11.rs`
+//! (`tool_search_next_request`) asserts the same window; the earlier
+//! "next prompt, not next call" assertions in this file were stale.
+//!
+//! Consequence for the fixture: the next request of a run can now carry an
+//! injected `toolsAdded` declaration as its last message, so "the last message
+//! is a tool result" no longer identifies a continuation. Each `prompt()`
+//! helper therefore marks its run's first request explicitly
+//! (`ScriptedProvider::begin_prompt` / `PrintProvider::begin_prompt`) instead
+//! of inferring the prompt boundary from the message list.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -181,8 +194,7 @@ impl AgentPlugin for DeferredToolsPlugin {
 
 /// One scripted prompt: what the provider answers on the first request of a
 /// prompt. The continuation requests of that prompt always answer "done", so
-/// one scripted turn produces the same two-request shape the run's fixed tool
-/// list gives.
+/// one scripted turn produces the same two-request shape every run has.
 enum Turn {
     /// Emit one `tool_search` call for `deferred widget`.
     Search,
@@ -198,11 +210,21 @@ enum Turn {
 
 /// A provider that answers each prompt with the next scripted turn and records
 /// the declared tool names of every request it sees.
+///
+/// The prompt boundary is marked by the test (`begin_prompt`), not inferred
+/// from the message list: since an activation makes the loop inject a
+/// `toolsAdded` declaration message before the next request, "the last message
+/// is a tool result" no longer distinguishes a continuation from a fresh
+/// prompt.
 struct ScriptedProvider {
     /// One entry per prompt, consumed on that prompt's first request.
     turns: Mutex<VecDeque<Turn>>,
     /// The tool names of every request, in request order.
     captured: Mutex<Vec<Vec<String>>>,
+    /// Set by [`ScriptedProvider::begin_prompt`] and consumed by the prompt's
+    /// first request: a request without it is a continuation of the current
+    /// run.
+    pending_prompt: AtomicBool,
     call_seq: AtomicUsize,
 }
 
@@ -216,8 +238,15 @@ impl ScriptedProvider {
         Self {
             turns: Mutex::new(turns.into()),
             captured: Mutex::new(Vec::new()),
+            pending_prompt: std::sync::atomic::AtomicBool::new(false),
             call_seq: AtomicUsize::new(0),
         }
+    }
+
+    /// Mark that the next request starts a fresh prompt (consumes one
+    /// scripted turn); every other request is a continuation.
+    fn begin_prompt(&self) {
+        self.pending_prompt.store(true, Ordering::SeqCst);
     }
 
     fn declared(&self) -> Vec<Vec<String>> {
@@ -316,9 +345,9 @@ impl Provider for ScriptedProvider {
                     .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect())
                     .unwrap_or_default(),
             );
-        // A continuation request (after a tool result) ends the prompt; only a
-        // fresh prompt consumes a scripted turn.
-        let new_prompt = !matches!(context.messages.last(), Some(Message::ToolResult(_)));
+        // The test marks each prompt's first request (`begin_prompt`): every
+        // other request of that prompt is a continuation and ends the run.
+        let new_prompt = self.pending_prompt.swap(false, Ordering::SeqCst);
         let turn = if new_prompt {
             self.turns
                 .lock()
@@ -403,6 +432,7 @@ fn fixture_with(
     registry.set_provider(provider.clone());
     let session = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: fake_model(),
             api_key: None,
@@ -434,6 +464,7 @@ fn count(list: &[String], name: &str) -> usize {
 }
 
 async fn prompt(fixture: &Fixture) {
+    fixture.provider.begin_prompt();
     fixture
         .session
         .prompt("go", Arc::new(|_| {}))
@@ -471,29 +502,46 @@ fn result_text(result: &ToolResultMessage) -> String {
 // Declaration behavior
 // ---------------------------------------------------------------------------
 
-/// (a) A deferred tool matched by `tool_search` is declared on the next
-/// loadout (and (c) a default-active tool is unaffected).
+/// (a) A deferred tool matched by `tool_search` is declared on the very next
+/// request of the SAME run (next call, not next prompt — the shipped
+/// PIR-BIN-004 / `refresh_context_tools_from_active_cell` contract), and (c) a
+/// default-active tool is unaffected.
 #[tokio::test(flavor = "current_thread")]
-async fn activated_deferred_tool_is_declared_on_the_next_prompt() {
+async fn activated_deferred_tool_is_declared_on_the_next_call() {
     let fixture = fixture("activated", 1);
 
     prompt(&fixture).await;
     let captured = fixture.provider.declared();
     // Prompt 1 has two requests: the tool-search call and the final answer.
-    // The match is not declared before the search, and the run's request list
-    // is fixed when the run starts (the documented one-request window).
     assert_eq!(captured.len(), 2, "two requests in the search prompt");
     assert!(
         !captured[0].iter().any(|name| name == "deferred_widget"),
         "the deferred tool is not declared before tool_search runs"
     );
     assert!(
-        !captured[1].iter().any(|name| name == "deferred_widget"),
-        "the in-flight run keeps its request tool list (next prompt, not next call)"
+        captured[1].iter().any(|name| name == "deferred_widget"),
+        "the activation is visible to the very next request of the same run: {:?}",
+        captured[1]
+    );
+    assert_eq!(
+        count(&captured[1], "deferred_widget"),
+        1,
+        "the activated tool is declared exactly once in that request: {:?}",
+        captured[1]
     );
     assert!(
         captured[0].iter().any(|name| name == "core_helper"),
         "the default-active tool is declared before the search"
+    );
+    assert!(
+        captured[1].iter().any(|name| name == "core_helper"),
+        "the default-active tool stays declared after the activation: {:?}",
+        captured[1]
+    );
+    assert!(
+        captured[1].iter().any(|name| name == "tool_search"),
+        "the search tool itself stays declared after loading a match: {:?}",
+        captured[1]
     );
 
     prompt(&fixture).await;
@@ -501,7 +549,7 @@ async fn activated_deferred_tool_is_declared_on_the_next_prompt() {
     let next_loadout = &captured[2];
     assert!(
         next_loadout.iter().any(|name| name == "deferred_widget"),
-        "the activated deferred tool is declared on the next loadout: {next_loadout:?}"
+        "the activated deferred tool stays declared on the next loadout: {next_loadout:?}"
     );
     assert!(
         next_loadout.iter().any(|name| name == "core_helper"),
@@ -609,11 +657,13 @@ async fn repeated_searches_do_not_duplicate_declarations() {
     );
 
     let captured = fixture.provider.declared();
+    // Request 0 is the batch's request; request 1 is the same run's next call,
+    // which must already declare the match once; request 2 is the next prompt.
     for (index, declared) in captured.iter().enumerate() {
         assert_eq!(
             count(declared, "deferred_widget"),
-            usize::from(index >= 2),
-            "request {index} declares the match at most once, from the next loadout on: {captured:?}"
+            usize::from(index >= 1),
+            "request {index} declares the match at most once, from the next call on: {captured:?}"
         );
     }
 }
@@ -681,12 +731,12 @@ async fn tool_search_result_text_matches_upstream_shape() {
 /// W19-CL15 regression: a successful search must never un-declare
 /// `tool_search` itself across prompts.
 ///
-/// Prompt 1: a search loads `deferred_widget`. Prompt 2: the declarations
-/// carry BOTH `tool_search` (the tool that performed the search stays active,
-/// upstream `[...getActiveTools(), ...matches]`) and `deferred_widget`; the
-/// second search EXECUTES and returns `No matching tools found.`; and the
-/// top-level call of the match still works in that same prompt (the D11 gate
-/// admits it because it is declared).
+/// Prompt 1: a search loads `deferred_widget`; the SAME run's next request
+/// already declares it (next-call window) and still declares `tool_search`
+/// itself (upstream `[...getActiveTools(), ...matches]`). Prompt 2: the
+/// declarations carry both names, the second search EXECUTES and returns
+/// `No matching tools found.`, and the top-level call of the match still works
+/// in that same prompt (the D11 gate admits it because it is declared).
 #[tokio::test(flavor = "current_thread")]
 async fn tool_search_stays_declared_across_prompts_after_a_successful_search() {
     let fixture = fixture_with(
@@ -702,7 +752,8 @@ async fn tool_search_stays_declared_across_prompts_after_a_successful_search() {
         Some(activated_selection()),
     );
 
-    // Prompt 1: the search loads the match.
+    // Prompt 1: the search loads the match, and the very next request of the
+    // same run already declares it while keeping `tool_search` itself.
     prompt(&fixture).await;
     let first = tool_results(&fixture, "tool_search").await;
     assert_eq!(first.len(), 1);
@@ -710,18 +761,35 @@ async fn tool_search_stays_declared_across_prompts_after_a_successful_search() {
         result_text(&first[0]),
         "Loaded 1 tool. They are available from your next call:\n- deferred_widget: Manages deferred widgets"
     );
+    let captured = fixture.provider.declared();
+    assert_eq!(captured.len(), 2, "two requests in the search prompt");
+    assert!(
+        !captured[0].iter().any(|name| name == "deferred_widget"),
+        "the match is absent from the request that runs the search: {:?}",
+        captured[0]
+    );
+    assert!(
+        captured[1].iter().any(|name| name == "deferred_widget"),
+        "the match is declared to the very next call of the same run: {:?}",
+        captured[1]
+    );
+    assert!(
+        captured[1].iter().any(|name| name == "tool_search"),
+        "the search tool stays declared after loading a match: {:?}",
+        captured[1]
+    );
 
-    // Prompt 2: the loadout carries the search tool AND its match.
+    // Prompt 2: the loadout still carries the search tool AND its match.
     prompt(&fixture).await;
     let captured = fixture.provider.declared();
     let second_loadout = &captured[2];
     assert!(
         second_loadout.iter().any(|name| name == "tool_search"),
-        "the search tool stays declared after loading a match: {second_loadout:?}"
+        "the search tool stays declared across prompts: {second_loadout:?}"
     );
     assert!(
         second_loadout.iter().any(|name| name == "deferred_widget"),
-        "the loaded match is declared on the next prompt: {second_loadout:?}"
+        "the loaded match stays declared on the next prompt: {second_loadout:?}"
     );
 
     // The second search EXECUTES (not refused) and finds nothing new.
@@ -947,6 +1015,10 @@ struct PrintProvider {
     turns: Mutex<VecDeque<Turn>>,
     declared: Mutex<Vec<Vec<String>>>,
     system_prompts: Mutex<Vec<String>>,
+    /// Set by [`PrintProvider::begin_prompt`] and consumed by the prompt's
+    /// first request (see [`ScriptedProvider`] for why the boundary cannot be
+    /// inferred from the message list).
+    pending_prompt: AtomicBool,
     call_seq: AtomicUsize,
 }
 
@@ -956,8 +1028,14 @@ impl PrintProvider {
             turns: Mutex::new(turns.into()),
             declared: Mutex::new(Vec::new()),
             system_prompts: Mutex::new(Vec::new()),
+            pending_prompt: AtomicBool::new(false),
             call_seq: AtomicUsize::new(0),
         }
+    }
+
+    /// Mark that the next request starts a fresh prompt.
+    fn begin_prompt(&self) {
+        self.pending_prompt.store(true, Ordering::SeqCst);
     }
 
     fn declared(&self) -> Vec<Vec<String>> {
@@ -994,7 +1072,7 @@ impl PrintProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(context.system_prompt.clone().unwrap_or_default());
-        let new_prompt = !matches!(context.messages.last(), Some(Message::ToolResult(_)));
+        let new_prompt = self.pending_prompt.swap(false, Ordering::SeqCst);
         let turn = if new_prompt {
             self.turns
                 .lock()
@@ -1068,6 +1146,11 @@ async fn run_print_prompt(
     provider: Arc<PrintProvider>,
     prompt_cache: &mut pir::coding_agent::print::PrintPromptCache,
 ) -> Vec<ToolResultMessage> {
+    // The test marks this run's first request; the loop re-resolves the
+    // declarations from the seeded cell before EVERY request (the same
+    // next-call contract as the session loop), so a load becomes visible to
+    // the request that follows the search batch.
+    provider.begin_prompt();
     let mut registry = ToolRegistry::new();
     for tool in fixture.registry.iter() {
         registry.register(Arc::clone(tool));
@@ -1148,10 +1231,13 @@ async fn run_print_prompt(
 }
 
 /// W19-CL19 + W19-Q14b: a print-mode search keeps `tool_search` declared and
-/// loads the match into the NEXT prompt's declarations AND `<tools>` section.
+/// loads the match into the SAME run's next request AND into the NEXT prompt's
+/// declarations and `<tools>` section.
 ///
-/// Three prompts: (1) a search loads `deferred_widget`; (2) the declarations
-/// carry BOTH `tool_search` and `deferred_widget`, the system prompt's
+/// Three prompts: (1) a search loads `deferred_widget`; the run's second
+/// request already declares it while `tool_search` stays declared, and the
+/// run's system prompt stays the first build (a prompt run's prompt is fixed);
+/// (2) the next prompt's declarations carry BOTH names, its system prompt's
 /// `<tools>` section mentions the match, and the second search EXECUTES (`No
 /// matching tools found.`); (3) a top-level call of the loaded match executes.
 #[tokio::test(flavor = "current_thread")]
@@ -1218,6 +1304,26 @@ async fn print_search_keeps_tool_search_declared_and_loads_the_match() {
         "prompt 1's <tools> does not list the unloaded match: {}",
         tools_section(&prompts[0])
     );
+    // The run's SECOND request already declares the loaded match (the print
+    // host re-resolves the request definitions from the active-set cell before
+    // every call, the same next-call window as the session loop).
+    let declared = provider.declared();
+    assert_eq!(declared.len(), 2, "two requests in the search prompt");
+    assert!(
+        !declared[0].iter().any(|name| name == "deferred_widget"),
+        "the match is absent from the request that runs the search: {:?}",
+        declared[0]
+    );
+    assert!(
+        declared[1].iter().any(|name| name == "deferred_widget"),
+        "the loaded match is declared to the very next call of the same run: {:?}",
+        declared[1]
+    );
+    assert!(
+        declared[1].iter().any(|name| name == "tool_search"),
+        "the search tool stays declared on the next call: {:?}",
+        declared[1]
+    );
 
     // Prompt 2: the next loadout declares the search tool AND its match; the
     // second search executes and finds nothing new.
@@ -1235,13 +1341,8 @@ async fn print_search_keeps_tool_search_declared_and_loads_the_match() {
     assert_eq!(searches[0].details, Some(json!({ "loaded": [] })));
 
     let declared = provider.declared();
-    let second_prompt = declared
-        .iter()
-        .rev()
-        .find(|names| names.iter().any(|name| name == "deferred_widget"))
-        .unwrap_or_else(|| {
-            panic!("no request declared the loaded match; every request: {declared:?}")
-        });
+    assert_eq!(declared.len(), 4, "two requests in each prompt");
+    let second_prompt = &declared[2];
     for expected in ["tool_search", "deferred_widget", "core_helper"] {
         assert!(
             second_prompt.iter().any(|name| name == expected),

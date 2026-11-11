@@ -409,6 +409,7 @@ async fn prompt_round_trips_session_storage() {
         assistant(vec![text("Hello!")], StopReason::Stop)
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -481,6 +482,7 @@ async fn startup_append_runs_off_thread_and_keeps_message_order() {
         assistant(vec![text("Hello!")], StopReason::Stop)
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -587,6 +589,7 @@ async fn steer_during_run_redirects_next_model_request() {
     }));
     let session = SessionManager::create(".", &temp.0).expect("create session");
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -640,6 +643,7 @@ async fn abort_mid_run_stops_the_loop() {
     }));
     let session = SessionManager::create(".", &temp.0).expect("create session");
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -708,6 +712,7 @@ async fn compaction_hook_invoked_and_persisted_over_threshold() {
     let mut model = fake_model();
     model.context_window = 64;
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model,
         api_key: None,
@@ -786,6 +791,7 @@ async fn manual_compact_returns_summary_and_persists() {
     let mut model = fake_model();
     model.context_window = 1_000_000;
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model,
         api_key: None,
@@ -849,6 +855,7 @@ async fn prompt_while_streaming_is_rejected() {
         }
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -903,6 +910,7 @@ async fn ephemeral_session_keeps_history_across_prompts() {
         assistant(vec![text("ok")], StopReason::Stop)
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry.clone(),
         model: fake_model(),
         api_key: None,
@@ -944,6 +952,7 @@ fn rpc_factory() -> SessionFactory {
             assistant(vec![text("rpc reply")], StopReason::Stop)
         }));
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -977,6 +986,7 @@ fn rpc_factory_gated(
             }
         }));
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -1297,6 +1307,7 @@ async fn multi_turn_run_persists_intermediate_assistant_messages() {
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(EchoTool));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -1420,6 +1431,7 @@ async fn overflow_error_triggers_one_compact_and_retry() {
     let mut model = fake_model();
     model.context_window = 1_000_000;
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model,
         api_key: None,
@@ -1542,6 +1554,7 @@ async fn session_overflow_recovery_persists_compaction_entry() {
     let mut model = fake_model();
     model.context_window = 1_000_000;
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model,
         api_key: None,
@@ -1715,6 +1728,7 @@ async fn length_with_tool_calls_omits_attempt_and_results_together() {
         ..pir::compaction::CompactionConfig::default()
     };
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: model.clone(),
         api_key: None,
@@ -1806,6 +1820,7 @@ async fn length_with_tool_calls_omits_attempt_and_results_together() {
         assistant(vec![text("resumed")], StopReason::Stop)
     }));
     let resumed = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: resumed_registry,
         model,
         api_key: None,
@@ -1845,6 +1860,7 @@ async fn non_overflow_error_is_not_omitted() {
         message
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -1916,6 +1932,7 @@ async fn failed_prompt_keeps_steering_deliverable() {
         assistant(vec![text("ok")], StopReason::Stop)
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -2226,6 +2243,7 @@ async fn steer_and_follow_up_report_real_dispositions_and_queue_texts() {
     }));
     let session = SessionManager::create(".", &temp.0).expect("create session");
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -2267,6 +2285,7 @@ async fn steer_while_streaming_reports_queued() {
     }));
     let session = SessionManager::create(".", &temp.0).expect("create session");
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -2323,6 +2342,7 @@ async fn assistant_message_is_persisted_before_the_run_settles() {
     let session = SessionManager::create(".", &temp.0).expect("create session");
     *session_path_for_check.lock().unwrap() = Some(session.path().to_path_buf());
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -2395,6 +2415,7 @@ async fn record_bash_result_appends_context_and_excluded_records() {
         }))
         .expect("user append");
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -2487,6 +2508,7 @@ async fn bash_records_are_guarded_by_the_session_storage_generation() {
     first.append_message(seed(1)).expect("user append");
     let first_path = first.path().to_path_buf();
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -2586,6 +2608,7 @@ async fn branch_with_summary_appends_a_branch_summary_entry() {
         }))
         .expect("user append");
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -2636,6 +2659,7 @@ async fn queued_commands_keep_fifo_order_and_clear_drains_all() {
         assistant(vec![text("ok")], StopReason::Stop)
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -2701,6 +2725,7 @@ async fn session_swap_drops_queued_steering_and_follow_up() {
         assistant(vec![text("ok")], StopReason::Stop)
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -2760,6 +2785,7 @@ async fn steering_delivers_one_message_per_turn() {
     }));
     let session = SessionManager::create(".", &temp.0).expect("create session");
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -2835,6 +2861,7 @@ async fn ephemeral_history_reads_observe_the_same_transcript() {
         assistant(vec![text("reply")], StopReason::Stop)
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -2941,6 +2968,7 @@ async fn user_message_events_carry_the_message_json() {
     let seen: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -3060,6 +3088,7 @@ async fn turn_end_payload_keeps_its_field_contract() {
     let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -3176,6 +3205,7 @@ async fn sub_threshold_provider_requests_do_not_materialize_the_projection() {
     // window minus the reserve.
     model.context_window = 1_000_000;
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model,
         api_key: None,
@@ -3244,6 +3274,7 @@ async fn threshold_triggering_provider_request_materializes_the_projection_once(
     let mut model = fake_model();
     model.context_window = 64;
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model,
         api_key: None,
@@ -3395,6 +3426,7 @@ fn race_agent_config(
     let mut model = fake_model();
     model.context_window = 1_000_000;
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model,
         api_key: None,
@@ -4156,6 +4188,7 @@ async fn system_prompt_follows_a_runtime_active_set_change() {
     }));
     let session = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::clone(&registry),
             model: fake_model(),
             api_key: None,
@@ -4279,6 +4312,7 @@ async fn bare_workspace_session_still_builds_the_base_prompt() {
     let mut tools = ToolRegistry::new();
     pir::coding_agent::register_core_tools(&mut tools);
     let session = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::clone(&registry),
         model: fake_model(),
         api_key: None,
@@ -4347,6 +4381,7 @@ async fn explicit_system_prompt_override_is_not_replaced_by_the_base_prompt() {
     let mut tools = ToolRegistry::new();
     pir::coding_agent::register_core_tools(&mut tools);
     let mut session = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::clone(&registry),
         model: fake_model(),
         api_key: None,
@@ -4492,6 +4527,7 @@ async fn model_complete_json_payload_never_carries_the_retry_class() {
 
     // The session pushes the completion capability on `session_start`.
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,
@@ -4653,6 +4689,7 @@ async fn model_complete_host_op_does_not_emit_provider_stream_events() {
         hook_calls: Arc::clone(&hook_calls),
     }));
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,
@@ -4792,6 +4829,7 @@ async fn starting_user_message_end_replacement_enters_the_request_and_storage() 
     let session = SessionManager::create(".", &temp.0).expect("create session");
     let path = session.path().to_path_buf();
     let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -4899,6 +4937,7 @@ async fn prompt_builds_one_projection_when_no_compaction_runs() {
         assistant(vec![text("ok")], StopReason::Stop)
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -4952,6 +4991,7 @@ async fn prompt_with_extension_builds_one_projection_for_snapshot_and_gate() {
     .expect("extension runtime");
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -5020,6 +5060,7 @@ async fn paged_run_widens_off_the_runtime_thread() {
         assistant(vec![text("ok")], StopReason::Stop)
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -5293,6 +5334,7 @@ async fn before_agent_start_append_invalidates_the_reused_projection() {
     model.context_window = 1_000_000;
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model,
             api_key: None,
@@ -5492,6 +5534,7 @@ async fn in_flight_prompt_does_not_persist_into_replaced_session_storage() {
     let first_path = first.path().to_path_buf();
 
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,
@@ -5689,6 +5732,7 @@ async fn run_start_swap_does_not_persist_into_replaced_session_storage() {
     let first_path = first.path().to_path_buf();
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -5805,6 +5849,7 @@ async fn post_run_batch_does_not_replay_into_replaced_session_storage() {
     let first_path = first.path().to_path_buf();
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: fake_model(),
             api_key: None,
@@ -6221,6 +6266,7 @@ async fn threshold_compaction_swap_does_not_write_into_replaced_session_storage(
     model.context_window = 64;
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model,
             api_key: None,
@@ -6325,6 +6371,7 @@ async fn extension_compaction_swap_does_not_write_into_replaced_session_storage(
     model.context_window = 64;
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model,
             api_key: None,
@@ -6470,6 +6517,7 @@ async fn in_loop_threshold_swap_with_fresh_snapshot_does_not_write_into_replaced
     model.context_window = 1_000;
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model,
             api_key: None,
@@ -6601,6 +6649,7 @@ async fn in_loop_threshold_swap_with_stale_rebuilt_context_does_not_write_into_r
     model.context_window = 1_000;
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model,
             api_key: None,
@@ -6740,6 +6789,7 @@ async fn threshold_compaction_retry_after_failed_append_does_not_write_into_repl
         PluginEventRecorder::new("threshold-failed-recorder", &["session_compact_failed"]);
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model,
             api_key: None,
@@ -6902,6 +6952,7 @@ async fn in_loop_threshold_compaction_still_succeeds_without_swap() {
     model.context_window = 470;
     let agent = Arc::new(AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model,
             api_key: None,
@@ -7030,6 +7081,7 @@ async fn agent_settled_and_entry_appended_reach_each_face_once_per_run() {
     let session = SessionManager::create(".", &temp.0).expect("create session");
     let agent = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model: fake_model(),
             api_key: None,
@@ -7181,6 +7233,7 @@ async fn js_only_plan_receives_compaction_and_background_session_events() {
     model.context_window = 64;
     let agent = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model,
             api_key: None,
@@ -7335,6 +7388,7 @@ async fn js_only_manual_compact_and_bash_before_first_run_reach_pi_on_exactly_on
     model.context_window = 1_000_000;
     let agent = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model,
             api_key: None,
@@ -7512,6 +7566,7 @@ async fn js_only_manual_compaction_orders_its_lifecycle_events() {
     model.context_window = 1_000_000;
     let agent = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model,
             api_key: None,
@@ -7591,6 +7646,7 @@ async fn js_only_threshold_compaction_orders_its_lifecycle_events() {
     model.context_window = 64;
     let agent = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: registry,
             model,
             api_key: None,
@@ -7672,6 +7728,7 @@ async fn manual_compact_succeeds_when_usage_is_near_window_with_tiny_history() {
     let mut model = fake_model();
     model.context_window = 32_768;
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model,
         api_key: None,
@@ -7736,6 +7793,7 @@ async fn manual_compact_succeeds_for_large_session_on_small_window() {
     let mut model = fake_model();
     model.context_window = 8_192;
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model,
         api_key: None,
@@ -7820,6 +7878,7 @@ async fn manual_compact_cuts_a_twenty_turn_session_at_32k() {
     let mut model = fake_model();
     model.context_window = 32_768;
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model,
         api_key: None,
@@ -8223,6 +8282,7 @@ async fn steer_and_follow_up_during_streaming_deliver_in_order_once() {
     }));
     let session = SessionManager::create(".", &temp.0).expect("create session");
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -8311,6 +8371,7 @@ async fn interactive_prompt_expands_file_and_image_references_into_the_request()
         assistant(vec![text("ok")], StopReason::Stop)
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,
@@ -8398,6 +8459,7 @@ async fn interactive_prompt_missing_file_reference_fails_before_the_request() {
         assistant(vec![text("unexpected")], StopReason::Stop)
     }));
     let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,

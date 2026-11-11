@@ -1178,7 +1178,12 @@ pub struct PreambleMessage {
 }
 
 /// Optional behavior for [`run_with_options`].
-#[derive(Default)]
+///
+/// `Default` is implemented by hand: the documented contract for
+/// [`Self::prepare_next_turn_needs_completed`] is `true` (upstream
+/// `AgentTurnContext` ALWAYS carries the completed `message`/`toolResults`,
+/// `packages/agent/src/types.ts:135-144`), and a derived `Default` would
+/// silently hand every external hook an empty snapshot.
 pub struct LoopOptions {
     pub events: Option<EventHandler>,
     /// Host event payload subset; defaults to [`AgentEventInterest::ALL`].
@@ -1195,6 +1200,14 @@ pub struct LoopOptions {
     /// context/model/thinking state and messages to append after a completed
     /// turn, before the next turn starts. `None` keeps the current state.
     pub prepare_next_turn: Option<PrepareNextTurnHook>,
+    /// Whether the `prepare_next_turn` hook reads its completed-turn snapshot.
+    /// `false` skips the per-turn assistant/tool-result clone for hosts whose
+    /// hook only reads live model/thinking cells (the session path). The hook
+    /// is still invoked, but its `FinishTurnContext` carries an EMPTY snapshot
+    /// (`AssistantMessage::default()` and no tool results). `true` is the
+    /// conservative default for external hooks and is REQUIRED by any hook
+    /// that reads `message`/`tool_results`/`turn_index`.
+    pub prepare_next_turn_needs_completed: bool,
     /// When present, this is used instead of `LoopDeps::stream` and gives the
     /// caller full stream lifecycle events.
     pub event_stream: Option<EventStreamFn>,
@@ -1225,6 +1238,31 @@ pub struct LoopOptions {
     /// names here so the first request does not re-declare the loadout the
     /// session already sent. `None` keeps the resident-transcript behavior.
     pub initial_declared_tools: Option<std::collections::BTreeSet<String>>,
+}
+
+impl Default for LoopOptions {
+    fn default() -> Self {
+        Self {
+            events: None,
+            event_interest: AgentEventInterest::default(),
+            steering: None,
+            compaction: None,
+            transform_context: None,
+            prepare_next_turn: None,
+            // The documented contract: `true` is the conservative default for
+            // external hooks (the derived default handed them the EMPTY
+            // snapshot, contradicting the field docs and upstream, where
+            // `AgentTurnContext` always carries the completed turn). Hosts
+            // whose hook only reads live model/thinking cells opt into the
+            // clone-free path explicitly — the session path sets `false`.
+            prepare_next_turn_needs_completed: true,
+            event_stream: None,
+            persist_message: None,
+            preamble_messages: Vec::new(),
+            preamble: Vec::new(),
+            initial_declared_tools: None,
+        }
+    }
 }
 
 /// Dependencies for a single agent run.
@@ -1308,6 +1346,17 @@ pub struct LoopDeps {
     /// `StopReason::Error` terminal (see [`TURN_CAP_ERROR_PREFIX`]), never a
     /// silent break: a truncated run must not look like a finished one.
     pub max_turns: usize,
+    /// Efficient profile: cap the model-visible text of one tool result. `0`
+    /// keeps the historical unlimited behavior. The full text remains in the
+    /// tool result details/UI payload; only the provider-visible text is
+    /// shortened.
+    pub tool_result_max_bytes: usize,
+    /// Efficient profile: inject a convergence nudge after this many turns
+    /// (0 = disabled). The run is not terminated by the soft budget.
+    pub soft_turn_budget: usize,
+    /// Efficient profile: stop the run once cumulative provider input tokens
+    /// cross this budget (0 = disabled).
+    pub max_total_tokens: u64,
     /// Agent-level turn retry policy (upstream `AgentSession._prepareRetry`):
     /// a turn that ends with a retryable provider error is re-issued with
     /// exponential backoff instead of ending the run.
@@ -1377,6 +1426,9 @@ impl Default for LoopDeps {
             background_follow_up: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             max_turns: usize::MAX,
+            tool_result_max_bytes: 0,
+            soft_turn_budget: 0,
+            max_total_tokens: 0,
             retry: Some(crate::ai::util::AgentRetryPolicy {
                 max_retries: crate::config::defaults::settings_defaults::RETRY_MAX_RETRIES,
                 base_delay_ms: crate::config::defaults::settings_defaults::RETRY_BASE_DELAY_MS,
@@ -1756,6 +1808,12 @@ async fn run_with_options_in_span_inner(
     let mut repeat_streak: usize = 0;
     let mut repeat_warned_digest: Option<u64> = None;
     let mut repeat_nudges: usize = 0;
+    // Efficient profile: one convergence nudge when the soft turn budget is
+    // reached. The run continues; only the prompt gets an extra instruction.
+    let mut soft_budget_nudged = false;
+    // Efficient profile: set when the cumulative provider-token budget is
+    // exhausted. The cap branch below turns it into an identifiable terminal.
+    let mut token_budget_hit = false;
     // declareToolChanges state (upstream agent-loop.ts:333-375): the set of
     // tool names declared to the model so far. Seeded from the transcript's
     // system declaration messages so a resumed/replayed session does not
@@ -1764,6 +1822,17 @@ async fn run_with_options_in_span_inner(
         .initial_declared_tools
         .take()
         .unwrap_or_else(|| declared_tool_names(&context.messages).unwrap_or_default());
+    // The active-set cell value the run's request declarations currently
+    // reflect (see [`refresh_context_tools_from_active_cell`]).
+    let mut last_active_cell: Option<Vec<String>> = deps
+        .session_env
+        .as_ref()
+        .and_then(|env| env.active_override.as_ref())
+        .and_then(|cell| {
+            cell.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        });
 
     'agent: loop {
         if preamble_failed || signal.as_ref().is_some_and(AbortSignal::is_aborted) {
@@ -1775,13 +1844,19 @@ async fn run_with_options_in_span_inner(
         // shape) and emit it as a real transcript message, so every host —
         // print's exit mapping included — can report a truncated run instead
         // of an empty success. The cap value itself is unchanged.
-        if turns >= deps.max_turns {
-            let mut stop = turn_cap_error(deps.max_turns, &terminal);
+        if turns >= deps.max_turns || token_budget_hit {
+            let mut stop = if token_budget_hit {
+                token_budget_error(deps.max_total_tokens, &terminal)
+            } else {
+                turn_cap_error(deps.max_turns, &terminal)
+            };
             tracing::warn!(
                 target: "pir::agent",
                 turns,
                 max_turns = deps.max_turns,
-                "agent loop: stopping at the turn cap (incomplete run)"
+                max_total_tokens = deps.max_total_tokens,
+                token_budget_hit,
+                "agent loop: stopping at a run budget (incomplete run)"
             );
             emit_lazy_if_message_lifecycle(&options.events, options.event_interest, || {
                 AgentEvent::StreamStart {
@@ -1825,6 +1900,36 @@ async fn run_with_options_in_span_inner(
             });
             terminal = stop;
             break;
+        }
+        if deps.soft_turn_budget > 0
+            && !soft_budget_nudged
+            && turns >= deps.soft_turn_budget
+            && !signal.as_ref().is_some_and(AbortSignal::is_aborted)
+        {
+            soft_budget_nudged = true;
+            tracing::warn!(
+                target: "pir::agent",
+                turn = turns,
+                soft_turn_budget = deps.soft_turn_budget,
+                "agent loop: injecting convergence nudge at the soft turn budget"
+            );
+            let nudge = Message::User(UserMessage {
+                role: UserRole::User,
+                content: vec![ContentBlock::Text(TextContent {
+                    text: "You are approaching the turn budget. Stop repeated exploration or verification now: make the smallest remaining change, run the relevant check once, and finish with a concise summary. Do not rerun a command whose output has not changed.".to_owned(),
+                    text_signature: None,
+                })],
+                tools_added: None,
+                tools_removed: None,
+                sections: None,
+                timestamp: crate::ai::util::now_ms(),
+            });
+            // Transient by design: this is a runtime hint for the remaining
+            // requests of THIS run, not a user message. Never append it to
+            // `new_messages`, never persist it, and never emit a message
+            // lifecycle event: otherwise it would appear in the transcript/UI
+            // and alter a resumed session's history.
+            Arc::make_mut(&mut context).messages.push(nudge);
         }
         // Upstream extension events index turns from 0 (`_turnIndex` starts at
         // 0 and increments after `turn_end`); the loop's `turns` is the 1-based
@@ -1960,6 +2065,13 @@ async fn run_with_options_in_span_inner(
         // transcript allocation in place.
         apply_extension_context(&deps, &mut context).await;
         apply_extension_context_with_system(&deps, &mut context).await;
+
+        // Re-resolve the request's tool declarations from the session's live
+        // active set: a `tool_search` load (or MCP discovery activation) that
+        // landed during the previous tool batch must join THIS request's tool
+        // list — which is also the top-level executable gate — before
+        // declareToolChanges diffs it.
+        refresh_context_tools_from_active_cell(&mut context, &deps, &mut last_active_cell);
 
         // declareToolChanges (upstream agent-loop.ts:333-375): when the
         // executable/declared tool set for this request differs from the last
@@ -2201,6 +2313,9 @@ async fn run_with_options_in_span_inner(
             // Every attempt's usage was spent, retried or not (upstream counts
             // the failed response's usage in the run totals).
             usage_total += message.usage.total_tokens;
+            if deps.max_total_tokens > 0 && usage_total >= deps.max_total_tokens {
+                token_budget_hit = true;
+            }
             // Retry decision (upstream `_isRetryableError` + `_prepareRetry`):
             // an abort is terminal and never retried; context overflow is left
             // to the session's compact-and-retry; only an explicit
@@ -2403,7 +2518,13 @@ async fn run_with_options_in_span_inner(
                     let duration_ms = finalized.duration_ms;
                     let tool_name = finalized.tool_name.clone();
                     let call_id = finalized.call_id.clone();
-                    let mut result = to_tool_result_message(&finalized, &message, None, None);
+                    let mut result = to_tool_result_message(
+                        &finalized,
+                        &message,
+                        None,
+                        None,
+                        deps.tool_result_max_bytes,
+                    );
                     emit_lazy(&options.events, || AgentEvent::ToolExecutionEnd {
                         turn: turns,
                         event: crate::agent::tool_batch::ToolExecutionEvent::End {
@@ -2496,6 +2617,7 @@ async fn run_with_options_in_span_inner(
             // (settle.rs `turn_end_boundary_hook`) is the single dispatch site.
             record_completed_turn(
                 options.prepare_next_turn.as_ref(),
+                options.prepare_next_turn_needs_completed,
                 &mut last_completed_turn,
                 turn_index,
                 &message,
@@ -2826,9 +2948,6 @@ async fn run_with_options_in_span_inner(
                         .map(|record| (finalized.call_id.clone(), record))
                 })
                 .collect();
-            // The final model-visible result of a single-call batch (after a
-            // `message_end` replacement), for the degenerate-loop guard.
-            let mut repeat_result: Option<(bool, String)> = None;
             for finalized in &outcome.results {
                 let nested_summary = nested_records.get(&finalized.call_id).cloned();
                 let nested_calls = nested_summary
@@ -2850,7 +2969,13 @@ async fn run_with_options_in_span_inner(
                     }),
                     None => base_usage,
                 };
-                let mut result = to_tool_result_message(finalized, &message, nested_calls, usage);
+                let mut result = to_tool_result_message(
+                    finalized,
+                    &message,
+                    nested_calls,
+                    usage,
+                    deps.tool_result_max_bytes,
+                );
                 // Tool-result messages participate in the message lifecycle in
                 // UPSTREAM order (agent-loop.ts:946-951 `emitToolResultMessage`:
                 // `message_start`, then `message_end`, and only then does the
@@ -2887,10 +3012,6 @@ async fn run_with_options_in_span_inner(
                         message: Message::ToolResult(result.clone()),
                     }
                 });
-                if outcome.results.len() == 1 {
-                    repeat_result =
-                        Some((result.is_error, tool_result_model_text(&result.content)));
-                }
                 Arc::make_mut(&mut context)
                     .messages
                     .push(Message::ToolResult(result.clone()));
@@ -2923,7 +3044,7 @@ async fn run_with_options_in_span_inner(
             // telling the model to change approach and restarts the streak for
             // the SAME digest; a SECOND trip of a streak the model was already
             // warned about (and ignored) stops the run.
-            match single_call_digest(&message, repeat_result.as_ref()) {
+            match batch_digest(&message, &tool_results[turn_results_start..]) {
                 Some(digest) if repeat_digest == Some(digest) => repeat_streak += 1,
                 Some(digest) => {
                     repeat_digest = Some(digest);
@@ -3060,6 +3181,7 @@ async fn run_with_options_in_span_inner(
             // event above is unaffected.
             record_completed_turn(
                 options.prepare_next_turn.as_ref(),
+                options.prepare_next_turn_needs_completed,
                 &mut last_completed_turn,
                 turn_index,
                 &message,
@@ -3185,6 +3307,7 @@ async fn run_with_options_in_span_inner(
             // (settle.rs `turn_end_boundary_hook`) is the single dispatch site.
             record_completed_turn(
                 options.prepare_next_turn.as_ref(),
+                options.prepare_next_turn_needs_completed,
                 &mut last_completed_turn,
                 turn_index,
                 &message,
@@ -3329,12 +3452,16 @@ async fn persist_message(options: &LoopOptions, build: impl FnOnce() -> Message)
 /// alive between turns, so the next turn's first [`Arc::make_mut`] would
 /// deep-copy the whole transcript — every tool output included — once per
 /// turn (O(turns²) bytes copied over a run).
-struct CompletedTurn {
-    message: AssistantMessage,
-    tool_results: Vec<ToolResultMessage>,
+#[doc(hidden)]
+pub struct CompletedTurn {
+    #[doc(hidden)]
+    pub message: AssistantMessage,
+    #[doc(hidden)]
+    pub tool_results: Vec<ToolResultMessage>,
     /// Zero-based index of the completed turn (the same value its
     /// `turn_start`/`turn_end` carried).
-    turn_index: usize,
+    #[doc(hidden)]
+    pub turn_index: usize,
 }
 
 /// Record the turn that just completed for `prepare_next_turn`.
@@ -3342,8 +3469,10 @@ struct CompletedTurn {
 /// A no-op without the hook: nothing reads the snapshot, so the clones of the
 /// turn's message and tool results — and the `CompletedTurn` itself — are
 /// pure cost on the hook-free (production default) path.
-fn record_completed_turn(
+#[doc(hidden)]
+pub fn record_completed_turn(
     hook: Option<&PrepareNextTurnHook>,
+    needs_completed: bool,
     completed: &mut Option<CompletedTurn>,
     turn_index: usize,
     message: &AssistantMessage,
@@ -3352,9 +3481,22 @@ fn record_completed_turn(
     if hook.is_none() {
         return;
     }
+    // `needs_completed == false` skips the per-turn assistant/tool-result
+    // CLONES for hooks that only read live model/thinking cells; it must NOT
+    // skip recording the completion marker: the call site gates the hook on
+    // `last_completed_turn`, so an early return would disable the hook (and
+    // with it the live mid-run model/thinking seam, PIR-SDK-012).
     *completed = Some(CompletedTurn {
-        message: message.clone(),
-        tool_results: tool_results.to_vec(),
+        message: if needs_completed {
+            message.clone()
+        } else {
+            AssistantMessage::default()
+        },
+        tool_results: if needs_completed {
+            tool_results.to_vec()
+        } else {
+            Vec::new()
+        },
         turn_index,
     });
 }
@@ -3812,6 +3954,25 @@ fn turn_cap_error(max_turns: usize, last: &AssistantMessage) -> AssistantMessage
     }
 }
 
+/// Terminal for the efficient profile's cumulative-token budget. It is
+/// deliberately a `StopReason::Error` so no host can mistake a truncated run
+/// for a successful finish.
+fn token_budget_error(max_total_tokens: u64, last: &AssistantMessage) -> AssistantMessage {
+    AssistantMessage {
+        api: last.api.clone(),
+        provider: last.provider.clone(),
+        model: last.model.clone(),
+        stop_reason: StopReason::Error,
+        error_message: Some(format!(
+            "{TURN_CAP_ERROR_PREFIX} cumulative token budget reached ({max_total_tokens} tokens): \
+             the run is incomplete. Raise performance.maxTotalTokens or give the model a \
+             narrower task."
+        )),
+        timestamp: crate::ai::util::now_ms(),
+        ..AssistantMessage::default()
+    }
+}
+
 /// Whether an error turn is worth re-issuing at the AGENT level (upstream
 /// `AgentSession._isRetryableError`, agent-session.ts:3739-3743).
 ///
@@ -3868,24 +4029,31 @@ fn tool_result_model_text(content: &[ContentBlock]) -> String {
 /// model-visible result (text + error flag). `structuredContent`/`details`
 /// are excluded on purpose — they can vary without any model-visible change
 /// (e.g. a shell result's `wall_time_seconds`).
-fn single_call_digest(message: &AssistantMessage, result: Option<&(bool, String)>) -> Option<u64> {
-    let mut calls = message.content.iter().filter_map(|block| match block {
-        ContentBlock::ToolCall(call) => Some(call),
-        _ => None,
-    });
-    let call = calls.next()?;
-    if calls.next().is_some() {
+fn batch_digest(message: &AssistantMessage, results: &[ToolResultMessage]) -> Option<u64> {
+    let calls: Vec<_> = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall(call) => Some(call),
+            _ => None,
+        })
+        .collect();
+    if calls.is_empty() || calls.len() != results.len() {
         return None;
     }
-    let (is_error, text) = result?;
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    call.name.hash(&mut hasher);
-    serde_json::to_string(&call.arguments)
-        .unwrap_or_default()
-        .hash(&mut hasher);
-    text.hash(&mut hasher);
-    is_error.hash(&mut hasher);
+    calls.len().hash(&mut hasher);
+    for call in calls {
+        call.name.hash(&mut hasher);
+        serde_json::to_string(&call.arguments)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+    }
+    for result in results {
+        result.is_error.hash(&mut hasher);
+        tool_result_model_text(&result.content).hash(&mut hasher);
+    }
     Some(hasher.finish())
 }
 
@@ -4910,6 +5078,65 @@ pub(crate) fn declared_tool_names(
     declared
 }
 
+/// Re-resolve the request's tool declarations from the session's live
+/// active-set cell before every provider request.
+///
+/// The session host builds its loadout once per settle iteration and print
+/// once per prompt run, so `context.tools` is seeded for the whole run.
+/// `tool_search` (and MCP discovery activation) write the loaded names into
+/// [`crate::agent::tool_execution::ToolSessionEnv::active_override`] while
+/// the run is in flight; upstream `setActiveTools` rebuilds the prompt at
+/// that moment, so the next model call already sees the matches. This is
+/// that rebuild hook: when the cell changed since the previous request,
+/// declarations that left the active set are dropped and newly active tools
+/// are appended with the shared builder's schema shape (`background`
+/// argument included). Existing declarations are kept verbatim, so
+/// `prepareLoadout` description rewrites and hidden declarations from the
+/// run's seed stay intact.
+fn refresh_context_tools_from_active_cell(
+    context: &mut Arc<Context>,
+    deps: &LoopDeps,
+    last_active_cell: &mut Option<Vec<String>>,
+) {
+    let Some(env) = deps.session_env.as_ref() else {
+        return;
+    };
+    let Some(cell) = env.active_override.as_ref() else {
+        return;
+    };
+    let current = cell
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if current == *last_active_cell {
+        return;
+    }
+    *last_active_cell = current.clone();
+    let Some(active) = current else {
+        return;
+    };
+    let declared = crate::agent::tool_execution::declared_tools(&deps.tools, &active);
+    let Some(definitions) = Arc::make_mut(context).tools.as_mut() else {
+        return;
+    };
+    let declared_names: std::collections::BTreeSet<&str> =
+        declared.iter().map(|tool| tool.name()).collect();
+    definitions.retain(|tool| declared_names.contains(tool.name.as_str()));
+    let existing: std::collections::BTreeSet<String> =
+        definitions.iter().map(|tool| tool.name.clone()).collect();
+    let added: Vec<Arc<dyn crate::agent::tool_execution::AgentTool>> = declared
+        .into_iter()
+        .filter(|tool| !existing.contains(tool.name()))
+        .collect();
+    if !added.is_empty() {
+        definitions.extend(crate::agent::tool_execution::declared_tool_definitions(
+            &added,
+            &Default::default(),
+            &Default::default(),
+        ));
+    }
+}
+
 /// declareToolChanges (upstream agent-loop.ts:333-375): compute the delta
 /// between the last declared tool set and the request's executable
 /// definitions; when it differs, return the system message that declares
@@ -5030,10 +5257,11 @@ fn to_tool_result_message(
     assistant: &AssistantMessage,
     nested_calls: Option<crate::ai::types::NestedToolCalls>,
     usage: Option<crate::ai::types::Usage>,
+    max_text_bytes: usize,
 ) -> ToolResultMessage {
     let tool_result: &ToolResult = &finalized.result;
     let mut content = vec![ContentBlock::Text(TextContent {
-        text: tool_result.content.clone(),
+        text: truncate_tool_result_text(&tool_result.content, max_text_bytes),
         text_signature: None,
     })];
     // Image blocks (upstream tool results carry `{type: "image"}` blocks; the
@@ -5058,4 +5286,30 @@ fn to_tool_result_message(
         duration_ms: finalized.duration_ms,
         timestamp: assistant.timestamp,
     }
+}
+
+/// Efficient-profile tool-result truncation. `0` is the historical unlimited
+/// path. The marker is included in the final budget; head and tail each get
+/// half of the remaining bytes and are cut on UTF-8 boundaries.
+fn truncate_tool_result_text(text: &str, max_bytes: usize) -> String {
+    if max_bytes == 0 || text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let marker = format!(
+        "\n\n[... tool result truncated: {} bytes omitted ...]\n\n",
+        text.len().saturating_sub(max_bytes)
+    );
+    if marker.len() >= max_bytes {
+        return marker.chars().take(max_bytes / 4).collect();
+    }
+    let keep = max_bytes - marker.len();
+    let mut head_end = keep / 2;
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len().saturating_sub(keep - head_end);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{}{}{}", &text[..head_end], marker, &text[tail_start..])
 }

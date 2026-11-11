@@ -63,6 +63,7 @@ fn write_mcp_json(dir: &Path) {
 fn build_session(cwd: &Path, plugin: Arc<McpPlugin>) -> Arc<AgentSession> {
     AgentSession::new_arc_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(ProviderRegistry::default()),
             model: prompt_test_model(),
             api_key: None,

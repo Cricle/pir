@@ -1324,6 +1324,7 @@ fn session_prompt_with(plugin: Arc<McpPlugin>, cwd: &std::path::Path) -> (String
     let manager = Arc::clone(plugin.manager());
     let session = pir::agent_session::AgentSession::new_with_plugins(
         pir::agent_session::AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(pir::ai::provider::ProviderRegistry::default()),
             model: prompt_test_model(),
             api_key: None,
@@ -1429,6 +1430,7 @@ fn no_mcp_means_no_section_and_identical_bytes() {
     let tree = Tree::new("prompt-off");
     let session = pir::agent_session::AgentSession::new_with_plugins(
         pir::agent_session::AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(pir::ai::provider::ProviderRegistry::default()),
             model: prompt_test_model(),
             api_key: None,
@@ -1462,6 +1464,7 @@ fn no_mcp_means_no_section_and_identical_bytes() {
                 disabled: true,
                 agent_dir: &tree.0,
                 package_dir: None,
+                max_total_bytes: 0,
             },
         )
         .0;

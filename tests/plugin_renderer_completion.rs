@@ -113,6 +113,7 @@ fn fake_model() -> Model {
 fn build_session(plugin: Arc<ProbePlugin>) -> Arc<AgentSession> {
     AgentSession::new_arc_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(ProviderRegistry::default()),
             model: fake_model(),
             api_key: None,

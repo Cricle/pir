@@ -172,6 +172,7 @@ struct SessionView {
 
 fn session_view(registry: &ToolRegistry, selection: Option<ToolSelection>) -> SessionView {
     let session = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: fake_model(),
         api_key: None,

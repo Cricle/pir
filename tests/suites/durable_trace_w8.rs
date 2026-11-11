@@ -15,6 +15,7 @@
 //! This file is intentionally not registered in `tests/g_durable.rs`; the
 //! foreman owns the aggregator.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,10 +27,11 @@ use pir::durable::harness::scheduler::runtime::TaskRuntime;
 use pir::durable::harness::scheduler::{
     AbortResult, NextTaskState, TaskScheduler, TaskSchedulerOptions,
 };
-use pir::durable::harness::submissions::SubmissionDraft;
+use pir::durable::harness::submissions::{SubmissionDraft, WhenBusy};
 use pir::durable::harness::task::{define_task, phase_handler, RunningTask, Task};
 use pir::durable::harness::telemetry::{
-    RecordedAttributeValue, RecordedSpan, RecordingTelemetry, SpanHandle, TraceCarrier,
+    RecordedAttributeValue, RecordedLink, RecordedSpan, RecordingTelemetry, SpanHandle,
+    TraceCarrier,
 };
 use pir::durable::session::facade::{ConversationOwnership, SubmissionCreate};
 use pir::durable::session::transaction::{TaskOptions, TaskOwnership};
@@ -753,4 +755,338 @@ async fn telemetry_disabled_leaves_task_carriers_empty() {
     );
     let _ = scheduler.abort(parent).await.expect("abort parent");
     scheduler.join().await;
+}
+
+/// Start-attribute boolean.
+fn start_bool(span: &RecordedSpan, key: &str) -> Option<bool> {
+    span.start_attributes.iter().find_map(|attribute| {
+        if attribute.key != key {
+            return None;
+        }
+        match &attribute.value {
+            RecordedAttributeValue::Boolean(value) => Some(*value),
+            _ => None,
+        }
+    })
+}
+
+/// End-attribute string.
+fn end_attr<'a>(span: &'a RecordedSpan, key: &str) -> Option<&'a str> {
+    span.end.as_ref()?.attributes.iter().find_map(|attribute| {
+        if attribute.key != key {
+            return None;
+        }
+        match &attribute.value {
+            RecordedAttributeValue::String(value) => Some(value.as_str()),
+            _ => None,
+        }
+    })
+}
+
+/// Open a paused scheduler over an existing storage whose session emits into
+/// `recording`.
+async fn open_scheduler_on(
+    storage: Arc<MemoryStorage>,
+    recording: &RecordingTelemetry,
+    tasks: Vec<Task>,
+) -> TaskScheduler {
+    let clock: Arc<dyn Fn() -> i64 + Send + Sync> = Arc::new(|| 1_000);
+    let options = TaskSchedulerOptions {
+        now: Some(clock.clone()),
+        session: Some(SessionOptions {
+            now: Some(clock),
+            telemetry: Some(recording.handle()),
+            ..SessionOptions::default()
+        }),
+        ..TaskSchedulerOptions::default()
+    };
+    TaskScheduler::open_with(options, storage, tasks)
+        .await
+        .expect("open scheduler")
+}
+
+/// A task that waits for cancellation until `recover` flips, then advances to
+/// `finish` and completes. Mirrors upstream's `test.resume` task.
+fn resume_task(recover: Arc<AtomicBool>) -> Task {
+    define_task("test.resume", 1, |_input| json!({ "phase": "hold" }))
+        .phase(
+            "hold",
+            phase_handler(
+                move |_task: &RunningTask, runtime: &TaskRuntime, context: Context| {
+                    let runtime = runtime.clone();
+                    let recover = recover.clone();
+                    Box::pin(async move {
+                        if !recover.load(Ordering::SeqCst) {
+                            runtime.cancelled().await;
+                            return;
+                        }
+                        runtime
+                            .commit(
+                                |_tx, _current| {
+                                    Box::pin(async move {
+                                        Ok(Some(NextTaskState::Running {
+                                            checkpoint: json!({ "phase": "finish" }),
+                                        }))
+                                    })
+                                },
+                                context,
+                            )
+                            .await
+                            .expect("advance to finish");
+                    })
+                },
+            ),
+        )
+        .phase(
+            "finish",
+            phase_handler(
+                |_task: &RunningTask, runtime: &TaskRuntime, context: Context| {
+                    let runtime = runtime.clone();
+                    Box::pin(async move {
+                        runtime
+                            .commit(
+                                |_tx, _current| {
+                                    Box::pin(async move {
+                                        Ok(Some(NextTaskState::Terminal {
+                                            outcome: TaskOutcome::Completed {
+                                                result: json!(null),
+                                            },
+                                        }))
+                                    })
+                                },
+                                context,
+                            )
+                            .await
+                            .expect("complete");
+                    })
+                },
+            ),
+        )
+        .abort(phase_handler(
+            |_task: &RunningTask, runtime: &TaskRuntime, context: Context| {
+                let runtime = runtime.clone();
+                Box::pin(async move {
+                    runtime
+                        .commit(
+                            |_tx, _current| {
+                                Box::pin(async move {
+                                    Ok(Some(NextTaskState::Terminal {
+                                        outcome: TaskOutcome::Aborted {
+                                            reason: Some("test".to_owned()),
+                                            result: None,
+                                        },
+                                    }))
+                                })
+                            },
+                            context,
+                        )
+                        .await
+                        .expect("abort commit");
+                })
+            },
+        ))
+        .build()
+        .expect("valid resume task")
+}
+
+/// Upstream "marks only the first invocation after reopen resumed, retaining
+/// its stored parent".
+///
+/// The task's first process is closed mid-phase (its phase ends `aborted`);
+/// the reopened scheduler's first invocation of the same task carries
+/// `resumed: true` and the stored trace as its parent, and later phases in the
+/// new process are not resumed.
+#[tokio::test]
+async fn reopen_marks_only_the_first_phase_resumed_and_keeps_its_parent() {
+    let recording = RecordingTelemetry::new();
+    let storage = Arc::new(MemoryStorage::new());
+    let recover = Arc::new(AtomicBool::new(false));
+    let scheduler = open_scheduler_on(
+        storage.clone(),
+        &recording,
+        vec![resume_task(recover.clone())],
+    )
+    .await;
+    let conversation = open_conversation(&scheduler).await;
+    let id = create_task(
+        &scheduler,
+        conversation,
+        "test.resume",
+        Some(carrier(4_242)),
+        Vec::new(),
+    )
+    .await;
+    scheduler.resume();
+
+    let mut running = false;
+    for _ in 0..500 {
+        let record = read_task(&scheduler, id).await;
+        if matches!(record.state, TaskState::Running { .. }) {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(running, "the task reached its first run");
+    let before = read_task(&scheduler, id).await;
+    let trace = before.trace.expect("the task persisted its trace");
+    assert_eq!(trace, carrier(4_242));
+
+    // Close mid-phase: the invocation ends `aborted`, the task is written back
+    // `pending`, and the backend stays open for the reopen.
+    scheduler.join().await;
+    let first = recording
+        .spans()
+        .into_iter()
+        .find(|span| {
+            span.descriptor.name == "pi.durable.phase" && span_task_id(span) == Some(id.as_i64())
+        })
+        .expect("the first phase span was started");
+    assert_eq!(start_bool(&first, "resumed"), Some(false));
+    assert_eq!(end_attr(&first, "outcome"), Some("aborted"));
+    assert_eq!(
+        first.parent,
+        Some(SpanHandle::new(4_242)),
+        "the first phase keeps the stored trace as its parent"
+    );
+
+    recover.store(true, Ordering::SeqCst);
+    let reopened_recording = RecordingTelemetry::new();
+    let reopened = open_scheduler_on(
+        storage,
+        &reopened_recording,
+        vec![resume_task(recover.clone())],
+    )
+    .await;
+    reopened.resume();
+    let settled = tokio::time::timeout(Duration::from_secs(5), reopened.wait_for_task(id))
+        .await
+        .expect("task settled in time")
+        .expect("wait for task");
+    assert!(
+        matches!(settled.state, TaskState::Terminal { .. }),
+        "the recovered task completed, got {:?}",
+        settled.state
+    );
+    reopened.join().await;
+
+    let phases: Vec<RecordedSpan> = reopened_recording
+        .spans()
+        .into_iter()
+        .filter(|span| {
+            span.descriptor.name == "pi.durable.phase" && span_task_id(span) == Some(id.as_i64())
+        })
+        .collect();
+    assert_eq!(phases.len(), 2, "hold and finish ran after reopen");
+    assert_eq!(start_bool(&phases[0], "resumed"), Some(true));
+    assert_eq!(end_attr(&phases[0], "outcome"), Some("next=finish"));
+    assert_eq!(start_bool(&phases[1], "resumed"), Some(false));
+    assert_eq!(end_attr(&phases[1], "outcome"), Some("done"));
+    for phase in &phases {
+        assert_eq!(
+            phase.parent,
+            Some(SpanHandle::new(4_242)),
+            "every recovered phase retains the stored parent"
+        );
+    }
+
+    let active = |recording: &RecordingTelemetry| -> Vec<f64> {
+        recording
+            .metrics()
+            .into_iter()
+            .filter(|metric| metric.descriptor.name == "pi.durable.tasks.active")
+            .map(|metric| metric.value)
+            .collect()
+    };
+    assert_eq!(active(&recording), vec![1.0, -1.0]);
+    assert_eq!(active(&reopened_recording), vec![1.0, -1.0]);
+}
+
+/// Upstream "links a steer admission to the current run without moving its
+/// work into the steer's trace".
+///
+/// The steer is admitted while the first run is still live: its submit span is
+/// a root linked to the live run's stored trace, while the first input's span
+/// only links to its caller (there is none here).
+#[tokio::test]
+async fn steer_submission_links_the_current_run_trace() {
+    let recording = RecordingTelemetry::new();
+    let options = HarnessOptions {
+        registry: Some(Arc::new(create_registry())),
+        telemetry: Some(recording.handle()),
+        ..HarnessOptions::default()
+    };
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let harness = Harness::open(storage, options, Context::background())
+        .await
+        .expect("open harness");
+    let ctx = Context::background();
+    let conversation = harness
+        .create_conversation(ConversationOwnership::Ownerless, ctx.clone())
+        .await
+        .expect("create conversation")
+        .id();
+
+    let first = harness
+        .submit(
+            conversation,
+            SubmissionDraft::input(
+                json!([{ "type": "text", "text": "first" }]),
+                WhenBusy::FollowUp,
+                None,
+            ),
+            ctx.clone(),
+        )
+        .await
+        .expect("first submit");
+    assert_eq!(first.status, SubmissionStatus::Placed);
+    let inspection = harness.scheduler().inspect().await.expect("inspect");
+    let run = inspection
+        .tasks
+        .iter()
+        .find(|task| task.record.kind == "pi.generation")
+        .expect("the placed input started a generation task");
+    let run_trace = run.record.trace.clone().expect("the run stored its trace");
+
+    let steer = harness
+        .submit(
+            conversation,
+            SubmissionDraft::input(
+                json!([{ "type": "text", "text": "steer" }]),
+                WhenBusy::Steer,
+                None,
+            ),
+            ctx.clone(),
+        )
+        .await
+        .expect("steer submit");
+    assert_eq!(steer.status, SubmissionStatus::Queued);
+
+    let spans = recording.spans();
+    let submits: Vec<&RecordedSpan> = spans
+        .iter()
+        .filter(|span| span.descriptor.name == "pi.durable.submit")
+        .collect();
+    assert_eq!(submits.len(), 2, "one submit span per admission");
+    for span in &submits {
+        assert_eq!(span.parent, None, "input admissions are root traces");
+    }
+    let run_context = recording
+        .handle()
+        .extract(Some(&run_trace))
+        .expect("the live run trace extracts");
+    assert_eq!(
+        submits[1].links,
+        vec![RecordedLink {
+            context: run_context,
+            attributes: Vec::new(),
+        }],
+        "the steer admission links the live run; upstream does this in the admission commit"
+    );
+    assert_eq!(
+        submits[0].links,
+        Vec::new(),
+        "the first input had no caller context"
+    );
+    harness.close().await.expect("close");
 }

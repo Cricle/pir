@@ -126,6 +126,11 @@ impl AgentTool for WriteTool {
                 return Box::pin(async move { ToolResult::error(error) })
             }
         };
+        let read_ledger = ctx
+            .session_env
+            .as_ref()
+            .map(|env| std::sync::Arc::clone(&env.read_ledger));
+        let ledger_path = path.clone();
         let cwd = ctx.cwd.clone();
         let checkpoint_ctx = ctx.clone();
         let aborted = ctx.is_aborted();
@@ -176,10 +181,15 @@ impl AgentTool for WriteTool {
                 .await
             {
                 // Upstream e583b290a: byte counts were UTF-16 chars — misleading.
-                Ok(true) => super::util::append_read_gate_warning(
-                    ToolResult::ok(format!("Successfully wrote to {path}")),
-                    gate_warning,
-                ),
+                Ok(true) => {
+                    if let Some(ledger) = read_ledger.as_ref() {
+                        ledger.record_write(&cwd.join(&ledger_path), &content);
+                    }
+                    super::util::append_read_gate_warning(
+                        ToolResult::ok(format!("Successfully wrote to {path}")),
+                        gate_warning,
+                    )
+                }
                 Ok(false) => ToolResult::error("Operation aborted"),
                 Err(e) => ToolResult::error(format!("Cannot write '{}': {}", path, e)),
             }

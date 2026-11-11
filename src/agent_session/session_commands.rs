@@ -1903,6 +1903,14 @@ impl AgentSession {
                     .map(phone_model_json)
                     .collect::<Vec<_>>(),
             }))),
+            "get_quota" => {
+                let provider = command.get("provider").and_then(JsonValue::as_str);
+                let model_id = command.get("modelId").and_then(JsonValue::as_str);
+                Ok(HostReply::data(
+                    crate::plugins::builtin::phone::quota::quota_for_model(provider, model_id)
+                        .await,
+                ))
+            }
             "get_session_stats" | "stats" => {
                 let stats = self.session_stats().await;
                 Ok(HostReply::data(phone_stats_json(&stats)))
@@ -1969,6 +1977,29 @@ impl AgentSession {
             "get_available_thinking_levels" => Ok(HostReply::data(serde_json::json!({
                 "levels": self.available_thinking_levels(),
             }))),
+            // A phone client answering a dialog must resolve the same JS
+            // `ctx.ui.*` wait the RPC mode resolves (extension_ui_response).
+            "extension_ui_response" => {
+                let request_id = command
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default();
+                let reply = match command.get("value") {
+                    Some(value) if !value.is_null() => value.clone(),
+                    _ => match command.get("confirmed") {
+                        Some(JsonValue::Bool(confirmed)) => JsonValue::Bool(*confirmed),
+                        _ => JsonValue::Null,
+                    },
+                };
+                if !request_id.is_empty() {
+                    if let Some(runtime) = self.extensions_handle() {
+                        runtime.respond_dialog(request_id, reply);
+                    }
+                }
+                Ok(HostReply::data(serde_json::json!({
+                    "answered": !request_id.is_empty(),
+                })))
+            }
             "clear_queue" => {
                 let cleared = self.clear_queue().await;
                 Ok(HostReply::data(

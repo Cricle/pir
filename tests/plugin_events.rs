@@ -400,6 +400,7 @@ async fn builtin_only_session_delivers_the_documented_event_set_once() {
 
     let session = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(ProviderRegistry::default()),
             model: fake_model(),
             api_key: None,
@@ -555,6 +556,7 @@ async fn native_message_update_full_content_is_opt_in() {
 
     let session = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(ProviderRegistry::default()),
             model: fake_model(),
             api_key: None,
@@ -754,6 +756,7 @@ async fn builtin_only_session_delivers_session_level_events_once() {
 
     let session = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(ProviderRegistry::default()),
             model: fake_model(),
             api_key: None,
@@ -950,6 +953,7 @@ async fn js_runtime_and_native_plugins_each_observe_session_events_once() {
 
     let session = AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(ProviderRegistry::default()),
             model: fake_model(),
             api_key: None,
@@ -1195,6 +1199,7 @@ fn hanging_provider_session(
     registry.set_provider(Arc::new(HookCallingProvider { events }));
     let session = AgentSession::new_arc_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: fake_model(),
             api_key: None,
@@ -1491,6 +1496,7 @@ async fn js_provider_session(
     registry.set_provider(Arc::new(HookCallingProvider { events }));
     let session = AgentSession::new_arc_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: Arc::new(registry),
             model: fake_model(),
             api_key: None,

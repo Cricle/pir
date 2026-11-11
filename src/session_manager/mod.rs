@@ -72,6 +72,7 @@ pub use page_cache::{
     DEFAULT_PAGE_CACHE_PAGES,
 };
 pub use paged_context::PagedPromptContext;
+pub use projection::ProjectionEntryFragments;
 pub use projection::{
     build_context_entries, build_projection_entry_meta, build_session_projection,
     projected_message_count, session_entry_to_context_messages, ProjectedSessionEntry,
@@ -2284,6 +2285,23 @@ pub struct SessionManager {
     /// PAGED mode (pir extension): the entries before the tail window stayed on
     /// disk and are NOT resident. See [`SessionManager::open_paged`].
     paged: Option<PagedWindow>,
+    /// LIVE-TAIL mode (pir extension, PIR-SDK-018): a durable session this
+    /// process writes may keep only a bounded resident tail between prompts.
+    /// Configured by the SDK builder; `trim_resident_tail` arms the same
+    /// `PagedWindow` machinery `open_paged` uses, and the next prompt widens
+    /// from the append-only file before building its context.
+    live_tail_trim: Option<(usize, usize)>,
+    /// Whether `paged` was armed by `trim_resident_tail` (not `open_paged`).
+    /// Whole-transcript read paths widen such a manager on demand; a
+    /// user-opened paged session keeps its tail window.
+    live_trimmed: bool,
+    /// PIR-SDK-024: the newest compaction entry pinned into the resident list
+    /// by [`Self::trim_resident_tail`] even though its bytes lie before the
+    /// tail window's `page_start` (the checkpoint must stay in the model
+    /// context while its summarized prefix is trimmed). Prefix streamers skip
+    /// this id so `for_each_prefix_entry` + the resident list still cover the
+    /// file exactly once.
+    resident_anchor_id: Option<String>,
     /// Bounded LRU of parsed prefix pages plus its background-prefetch
     /// bookkeeping. Created by [`SessionManager::open_paged`]; `None` for a
     /// full/in-memory manager (nothing is ever read back from disk).
@@ -2444,6 +2462,9 @@ impl SessionManager {
             widen_stall: None,
             projection_builds: AtomicU64::new(0),
             paged: None,
+            live_tail_trim: None,
+            live_trimmed: false,
+            resident_anchor_id: None,
         };
         manager.new_session(new_session_options)?;
         Ok(manager)
@@ -2486,6 +2507,9 @@ impl SessionManager {
             widen_stall: None,
             projection_builds: AtomicU64::new(0),
             paged: None,
+            live_tail_trim: None,
+            live_trimmed: false,
+            resident_anchor_id: None,
             page_cache: None,
         };
         match session_file {
@@ -2631,6 +2655,8 @@ impl SessionManager {
         {
             self.page_cache = None;
         }
+        self.live_trimmed = false;
+        self.resident_anchor_id = None;
         self.session_file = Some(path.to_path_buf());
         self.refresh_writer_lock();
         if path.exists() {
@@ -2713,6 +2739,15 @@ impl SessionManager {
         self.flushed = false;
         // The new session has no file yet (and may reuse the old path).
         self.clear_append_handle();
+        // A fresh transcript is complete in memory; drop any tail-window
+        // state inherited from the outgoing session.
+        self.paged = None;
+        self.live_trimmed = false;
+        self.resident_anchor_id = None;
+        #[cfg(feature = "session")]
+        {
+            self.page_cache = None;
+        }
 
         if self.persist {
             let file_timestamp = timestamp.replace([':', '.'], "-");
@@ -2749,6 +2784,9 @@ impl SessionManager {
         // header (`entries.find((e) => e.type === "session")`), not just the
         // first entry.
         let header = entries.iter().find_map(|entry| entry.as_header()).cloned();
+        // A full entry list is authoritative: any pinned compaction anchor
+        // belongs to a previous (trimmed) window.
+        self.resident_anchor_id = None;
         match header {
             Some(header) => {
                 self.session_id = header.id.clone();
@@ -3561,6 +3599,125 @@ impl SessionManager {
         self.paged
     }
 
+    /// Enable bounded live-session retention (PIR-SDK-018): between prompts a
+    /// durable session keeps at most this many bytes/entries resident; the
+    /// next prompt widens from the append-only file. `None` (default) keeps
+    /// the upstream whole-transcript residency.
+    pub fn enable_live_tail_trim(&mut self, max_bytes: usize, max_entries: usize) {
+        self.live_tail_trim = Some((max_bytes.max(1), max_entries.max(1)));
+    }
+
+    /// Disable bounded live-session retention.
+    pub fn disable_live_tail_trim(&mut self) {
+        self.live_tail_trim = None;
+    }
+
+    /// The configured live-tail budget, when enabled.
+    pub fn live_tail_trim(&self) -> Option<(usize, usize)> {
+        self.live_tail_trim
+    }
+
+    /// Whether the resident tail window was armed by [`Self::trim_resident_tail`]
+    /// rather than a user [`Self::open_paged`] (whole-transcript read paths
+    /// widen this manager transparently).
+    pub fn is_live_trimmed(&self) -> bool {
+        self.live_trimmed
+    }
+
+    /// Drop the persisted prefix from memory, keeping only the newest tail
+    /// window (PIR-SDK-018). The session file is untouched (append-only), so
+    /// `widen_to_full` restores the whole transcript on demand and a reopen
+    /// sees the complete history. Returns whether anything was trimmed.
+    ///
+    /// Only a flushed manager is eligible: trimming before the first write
+    /// has no file to re-read. A user-opened paged window is already bounded
+    /// and is left alone; a LIVE-trimmed manager may be re-trimmed so the
+    /// tail stays bounded as new turns are appended (PIR-SDK-018 R46).
+    #[cfg(feature = "session")]
+    pub fn trim_resident_tail(
+        &mut self,
+        max_bytes: usize,
+        max_entries: usize,
+    ) -> crate::Result<bool> {
+        if (self.paged.is_some() && !self.live_trimmed)
+            || !self.flushed
+            || self.live_tail_trim.is_none()
+        {
+            return Ok(false);
+        }
+        let Some(path) = self.session_file.clone() else {
+            return Ok(false);
+        };
+        // Header + resident entries; the page's own cap applies to entries
+        // excluding the prepended header exactly like `open_paged`.
+        if self.file_entries.len() <= max_entries.max(1) {
+            return Ok(false);
+        }
+        self.sync_now()?;
+        let Some(page) = SessionTailPage::open(&path, max_bytes.max(1), max_entries.max(1))? else {
+            return Ok(false);
+        };
+        let stats = page.stats();
+        if stats.whole_file {
+            return Ok(false);
+        }
+        // PIR-SDK-024: a compaction entry is the model's checkpoint summary
+        // for the prefix. The tail window may start AFTER it (a 100-round
+        // manual cadence and a 128-entry tail), so carry the newest compaction
+        // entry as an extra ANCHOR next to the newest tail entries instead of
+        // refusing the trim: the checkpoint stays in the prompt context while
+        // the summarized prefix is dropped, and the resident list stays
+        // bounded between compactions. The anchor is one entry beyond the
+        // entry budget by design (a checkpoint, not transcript content).
+        let anchor_entry = self
+            .file_entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry.as_ref() {
+                FileEntry::Compaction(compaction) => {
+                    Some((compaction.id.clone(), Arc::clone(entry)))
+                }
+                _ => None,
+            });
+        let anchor = anchor_entry.filter(|(id, _)| {
+            !page
+                .entries()
+                .iter()
+                .any(|entry| entry.id() == Some(id.as_str()))
+        });
+        let header = self
+            .file_entries
+            .iter()
+            .find(|entry| entry.is_header())
+            .cloned();
+        let mut entries: Vec<Arc<FileEntry>> =
+            Vec::with_capacity(page.entries().len() + usize::from(anchor.is_some()) + 1);
+        if let Some(header) = header {
+            entries.push(header);
+        }
+        if let Some((_, anchor)) = &anchor {
+            entries.push(Arc::clone(anchor));
+        }
+        entries.extend(page.entries().iter().cloned());
+        self.file_entries = entries;
+        self.unparsed_raw_lines = page.unparsed_lines().to_vec();
+        self.paged = Some(PagedWindow {
+            page_start: page.page_start(),
+            file_bytes: std::fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(stats.file_bytes),
+            parsed_entries: stats.parsed_entries,
+        });
+        self.resident_anchor_id = anchor.map(|(id, _)| id);
+        self.page_cache = Some(Arc::new(page_cache::PageCache::new(
+            page_cache::DEFAULT_PAGE_CACHE_PAGES,
+            page_cache::DEFAULT_PAGE_CACHE_BYTES,
+        )));
+        self.build_index();
+        self.live_trimmed = true;
+        Ok(true)
+    }
+
     /// The entries of the resident tail window, oldest first (only the window
     /// of a paged manager; the full list otherwise).
     pub fn resident_entries(&self) -> &[Arc<FileEntry>] {
@@ -3603,6 +3760,10 @@ impl SessionManager {
         let mut header_version: Option<u32> = None;
         let mut visited = 0usize;
         let mut consumed = 0u64;
+        // PIR-SDK-024: the pinned compaction checkpoint is resident although
+        // its line lies before `page_start`; skip it here so a prefix walk plus
+        // the resident list enumerate every entry exactly once.
+        let resident_anchor_id = self.resident_anchor_id.as_deref();
         while consumed < paged.page_start {
             let read = file.read(&mut buffer)?;
             if read == 0 {
@@ -3631,8 +3792,11 @@ impl SessionManager {
                             header_version = Some(header.version.unwrap_or(1));
                         }
                     }
-                    visited += 1;
-                    callback(entry);
+                    // The anchor stays resident; skip its prefix copy.
+                    if resident_anchor_id.is_none() || entry.id() != resident_anchor_id {
+                        visited += 1;
+                        callback(entry);
+                    }
                 }
                 line_start = end + 1;
                 scanned = 0;
@@ -3780,6 +3944,8 @@ impl SessionManager {
         self.load_shared_entries(entries, None)?;
         self.flushed = true;
         self.paged = None;
+        self.live_trimmed = false;
+        self.resident_anchor_id = None;
         // The whole transcript is resident now; cached prefix pages are dead
         // weight (and may hold `Arc`s into the old window).
         self.page_cache = None;
@@ -3861,6 +4027,12 @@ impl SessionManager {
         if let Some(id) = new_id {
             assert_valid_session_id(id)?;
         }
+        // Upstream `forkFrom` resolves the source path before loading it and
+        // stores that resolved path in `parentSession`; a relative argument
+        // must not leak into the fork header (a consumer opening it from
+        // another cwd could not find the parent).
+        let resolved_source = resolve_path_str(&source_path.to_string_lossy());
+        let source_path = Path::new(&resolved_source);
         let loaded = load_entries_from_file(source_path)?;
         // Emptiness probe over the parsed lines: no entry is cloned (the fork
         // still needs `loaded.lines`/`parsed` aligned below).
@@ -5153,6 +5325,14 @@ impl SessionManager {
         self.labels_by_id.get(entry_id).cloned()
     }
 
+    /// The timestamp of an entry's latest label change, if any.
+    ///
+    /// PAGED managers: the same resident-window boundary as [`Self::get_label`]
+    /// (`build_index` rebuilds the map from the resident entries only).
+    pub fn label_timestamp_for(&self, entry_id: &str) -> Option<String> {
+        self.label_timestamps_by_id.get(entry_id).cloned()
+    }
+
     /// Append a session name change (upstream `appendSessionInfo`) and return
     /// the entry id.
     pub fn set_session_name(&mut self, name: Option<&str>) -> crate::Result<String> {
@@ -5401,10 +5581,21 @@ impl SessionManager {
     /// (every stored tool result) into a temporary that the projection then
     /// copied again.
     pub fn build_context_entries(&self) -> crate::Result<Vec<Message>> {
-        Ok(
-            projection::build_session_projection(&self.file_entries, self.leaf_id.as_deref())
-                .messages,
-        )
+        Ok(projection::build_session_messages(
+            &self.file_entries,
+            self.leaf_id.as_deref(),
+        ))
+    }
+
+    /// [`Self::build_session_projection`]'s message aggregate without the
+    /// per-entry provenance metadata (`Vec<ProjectedSessionEntry>`): the
+    /// whole-history readers (`AgentSession::transcript`, continuation
+    /// rebuilds, cache-warm snapshots) only need the messages, so they skip
+    /// the one `Arc` bump + `Range` per retained entry. Same walk, same
+    /// retention/context-edit rules; the returned `Vec<Message>` is the same
+    /// single materialization the projection would carry.
+    pub fn build_session_messages(&self) -> Vec<Message> {
+        projection::build_session_messages(&self.file_entries, self.leaf_id.as_deref())
     }
 
     /// [`Self::build_context_entries`] aligned with the session entry ids
@@ -5485,6 +5676,21 @@ impl SessionManager {
         Ok(projection::build_session_projection(
             &self.file_entries,
             self.leaf_id.as_deref(),
+        ))
+    }
+
+    /// The per-entry serialized-message FRAGMENTS of this session's current
+    /// projection (PIR-SDK-027 round 2): index-aligned with
+    /// [`Self::build_session_projection`]'s `entries`, so the snapshot push
+    /// can extend a cached fragment vec by the appended entries instead of
+    /// re-serializing every retained message on each push. Same paged-contract
+    /// as [`Self::build_session_projection`].
+    pub fn build_projection_entry_fragments(
+        &self,
+    ) -> crate::Result<projection::ProjectionEntryFragments> {
+        self.projection_builds.fetch_add(1, Ordering::Relaxed);
+        Ok(projection::build_projection_entry_fragments(
+            &projection::build_session_projection(&self.file_entries, self.leaf_id.as_deref()),
         ))
     }
 

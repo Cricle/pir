@@ -54,6 +54,7 @@ fn every_builtin_loads_explicitly_and_exposes_its_surface() {
         ("tool-search", &["tool_search"], &[]),
         ("tool-repair", &[], &[]),
         ("todo", &["todo"], &["todos"]),
+        ("memory", &["memory"], &["memory"]),
         (
             "phone",
             &[],
@@ -104,6 +105,7 @@ fn default_plan_is_all_default_enabled_builtins_but_phone() {
             "builtin:tool-search",
             "builtin:tool-repair",
             "builtin:todo",
+            "builtin:memory",
         ]
         .into_iter()
         .map(String::from)

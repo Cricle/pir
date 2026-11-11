@@ -130,6 +130,7 @@ fn fake_registry() -> Arc<ProviderRegistry> {
 fn agent(session: SessionManager) -> AgentSession {
     AgentSession::new_with_plugins(
         AgentSessionConfig {
+            performance: Default::default(),
             provider_registry: fake_registry(),
             model: fake_model(),
             api_key: None,

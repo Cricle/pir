@@ -1196,6 +1196,21 @@ impl SettingsManager {
         Some(resolve_default_tools(&tools))
     }
 
+    /// Opt-in performance settings. `PIR_PERF_PROFILE=efficient` is a
+    /// process-level override for CI and the A/B harness; it never mutates the
+    /// persisted settings file.
+    pub fn performance(&self) -> PerformanceSettings {
+        let mut performance = self.settings.performance.clone().unwrap_or_default();
+        if let Ok(value) = std::env::var("PIR_PERF_PROFILE") {
+            performance.profile = match value.trim().to_ascii_lowercase().as_str() {
+                "efficient" => Some(PerformanceProfile::Efficient),
+                "balanced" => Some(PerformanceProfile::Balanced),
+                _ => performance.profile,
+            };
+        }
+        performance
+    }
+
     /// Install telemetry: the `PI_TELEMETRY` environment override wins over
     /// the setting (upstream args.ts environment table).
     pub fn install_telemetry_enabled(&self) -> bool {

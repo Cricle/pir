@@ -12,7 +12,7 @@ Contract, not a measurement log. Current baselines: [`RESULTS.md`](../RESULTS.md
    deliberate silent swap (`--no-fallback`/`PIR_NATIVE_FALLBACK=0` disables it).
 3. A `#[cfg]` must never change the feature-ON path.
 4. `Cargo.toml` is single-writer: declare the feature/optional deps before gating code.
-5. `scripts/feature_matrix.sh` asserts **81 rows** (57 lib + 14 bin + 2 SDK consumer + 8 smoke). Every selectable
+5. `scripts/feature_matrix.sh` asserts **85 cargo invocations** (57 lib + 18 bin + 2 SDK consumer + 8 smoke). Every selectable
    feature except `default`/`full` has its own `cargo check --lib --no-default-features --features <f>` row.
 
 ## 2. Feature graph
@@ -22,6 +22,10 @@ Responses/Codex/`pi-messages` are `provider-*`-gated), `minimal` (zero-feature p
 `durable`, `diagnostics`, `env_client`, `logging`, `plugins` framework, `protocol`, `session_manager`,
 `system_prompt`, `telemetry`, `text`, `coding_agent::json` and tool plumbing. Every core-tool leaf is off (the
 seven `tool-*` leaves and `grep-find`), so `register_core_tools` is a no-op and `CORE_TOOL_NAMES` is empty.
+The core's HTTP stack (`reqwest` + native-tls behind `ai::transport`/`ai::auth::http`) is deliberately
+unconditional: the plain OpenAI-compatible adapter is core (the `minimal` profile needs one runnable wire
+provider) and every OAuth flow drives the shared auth HTTP client, so every feature set — including
+`default-features = false` SDK embeds — inherits it (PIR-SDK-029; docs/sdk.md §Feature flags documents it).
 
 | Feature | Gates |
 |---|---|
@@ -62,9 +66,16 @@ seven `tool-*` leaves and `grep-find`), so `register_core_tools` is a no-op and 
 | `tool-repair` | tool-repair pipeline |
 | `tool-search` | BM25 `tool_search` |
 | `todo` | `todo` builtin + `/todos` |
+| `memory` | embedded cm-memory engine: `memory` tool, `/memory`, input auto-recall |
 | `phone` | phone UI; compiled, default **off** |
 | `brush` | embedded bash behind `pir __brush` |
 | `full` | all of the above (the default build) |
+
+The central pi-phone relay is a separate workspace package, **not** a feature
+of `pir-sdk`: build it with `cargo build -p pir-phone-server`. The `phone`
+feature compiles only the remote agent client (`/phone-start wss://...`); the
+legacy embedded HTTP server is gone. See
+[`docs/phone-server.md`](phone-server.md).
 
 **Not features:** `compaction`/`telemetry` are core (public types span 21 files; no-op stubs rejected); `durable`
 is core; `bug_report` is gated by `tui`; `print`/`rpc`/`export-html` and the `env-daemon` split are features.
@@ -75,28 +86,68 @@ bundled `libsqlite3-sys`, so SQLite cannot be removed while Python is kept. SDK 
 
 ## 3. Default-on policy
 
-Default-on: `subagent`, `mcp`, `codemode`, `python`, `context-mode`, `tool-search`, `tool-repair`, `todo` (mcp
-drags extensions; codemode needs extensions; context-mode lazy). `phone` is **off** even in `full` — it binds a
-port. `--only-builtin` loads exactly the Rust builtins (no settings/package scan, QuickJS, SWC or `node:*`);
+Default-on: `subagent`, `mcp`, `codemode`, `python`, `context-mode`, `tool-search`, `tool-repair`, `todo`,
+`memory` (mcp drags extensions; codemode needs extensions; context-mode lazy; memory's store lives next to the
+session transcript). `phone` is **off** even in `full` — it opens an outbound
+connection to the central relay and needs a server URL/device token. `--only-builtin` loads exactly the Rust builtins (no settings/package scan, QuickJS, SWC or `node:*`);
 `--no-extensions` wins if both are given.
 
 ## 4. Slim profiles
 
 The binary profiles (`no-js`, `tui-slim`) require `cli`; `sdk-headless` is library-only; `minimal` is the
 **zero-feature** executable profile. Sizes and opt-level trade-offs: [`RESULTS.md`](../RESULTS.md) and
-`logs/w18-help/q55/SIZE-TUNE-REPORT.md`.
+[`docs/sdk.md`](sdk.md) §Packaging and size (the older `logs/w18-help/q55/SIZE-TUNE-REPORT.md` is no longer in
+the tree).
 
 | Profile | Feature set |
 |---|---|
 | `full` | `default = ["full"]` |
 | `minimal` | `--no-default-features` (the `minimal` marker adds nothing). Builds `pir-minimal`, not the full `pir` CLI: one OpenAI-compatible provider, one `read_file` tool, in-memory session |
-| `no-js` | `cli,tui,env,env-daemon,server,client,subagent,tool-repair,tool-search,todo,python,context-mode,phone,provider-*,tools,grep-find,image-tools,session,skills` |
+| `no-js` | `cli,tui,env,env-daemon,server,client,subagent,tool-repair,tool-search,todo,memory,python,context-mode,phone,provider-*,tools,grep-find,image-tools,session,skills` |
 | `tui-slim` | `cli,tui,tools,provider-openai,provider-anthropic,session,skills` (no `env-daemon`) |
 | `sdk-headless` | bare + needed `provider-*`/`sdk` |
 
 `tui-slim` omits `env-daemon` (its `pir env-daemon` returns the off-error; `no-js` keeps it). Minimal is
 `/chat/completions` + `read_file` only (confined to cwd), no persistence/compaction/skills/MCP/extensions;
 `memmap2` only for `session`.
+
+### 4.1 SDK optionality / minimality matrix (measured, v7)
+
+Authority for embedding size/runtime cost per SDK feature. Method and full
+data: external consumer `.play/lanes/lane-sdk-dev/apps/quickstart-copy/README.md`
+(evidence `.play/evidence/lane-sdk-dev/round28-sdk-matrix/` +
+`round29-engine-driven/`, 2026-11-11). One consumer binary
+(`default-features = false, features = ["sdk"]`, one feature per row), release
+GNU, fat tables pinned per combo.
+
+| Feature over `sdk` | binary Δ | packages added (cargo tree) | run cost (heap live / WorkingSet) |
+|---|---:|---|---|
+| (sdk-only baseline) | 38,072,320 B / 339 pkgs | reqwest+hyper+native-tls (documented core stack, PIR-SDK-029) | R28 100 scripted prompts: 6.25 / 16.8 MiB; R29 engine-probe baseline: 2.18 / 15.5 MiB |
+| `session` | +0.22 MiB | memmap2 (+1) | resident tail + projection |
+| `tools` | +1.82 MiB | +0 | +178 KiB heap at first prompt (182,423 B over baseline) |
+| `todo` / `subagent` / `tool-repair` / `tool-search` / `skills` | +0.07–0.70 MiB | +0 each | sub-MiB first-prompt heap each |
+| `memory` | +4.57 MiB | cm-memory (+12) | R28 100 prompts: 16.35 / 30.0 MiB (+10.10 live over baseline; store resident) |
+| `extensions` | +21.32 MiB | rquickjs/swc/crypto/rusqlite (+333) | — |
+| `mcp` | +39.85 MiB | rmcp + extensions tree (+426) | R29 100 engine drives: 5.54 / 25.0 MiB (+3.36 live / +9.49 WS) |
+| `python` | +33.09 MiB | RustPython (+391) | R29 100 engine drives: 9.82 / 46.2 MiB (+7.64 live / +30.7 WS) |
+| `context-mode` | +34.92 MiB | python + rusqlite (+399) | R29 100 engine drives: 11.77 / 32.4 MiB (+9.60 live / +16.9 WS) |
+| `image-tools` | +0.00 MiB | image (+31, already linked) | — |
+| `session+tools` | +2.32 MiB | memmap2 | R28 100 prompts: 11.08 / 26.4 MiB (+4.82 live over baseline) |
+
+MiB = 1024² bytes (the R28/R29 REPORT tables quote the same samples in
+decimal MB, ~5% larger: memory +10.59 MB, mcp +3.52 MB, python +8.01 MB,
+context-mode +10.06 MB live deltas).
+
+Zero tui/ratatui/crossterm/phone packages in every combo (the optionality
+leak check; `rquickjs` appears only under the documented
+`extensions`/`mcp`/`context-mode` carriers). Optionality contract, probed for
+real: a `.builtin(<name>)` this build did not compile fails `build()` with the
+feature-naming diagnostic; sdk-only registers 0 builtins/tools/commands;
+enabled features really register (todo → tool+command; memory → tool+command +
+`<memory-context>` auto-recall transform). Undriven interpreter/VM combos sit
+near heap baseline — engine crates charge at link time and first use, not
+import. Idle WS 6,208–8,356 KiB (6.1–8.2 MiB), warm start 30–43 ms across all
+15 combos.
 
 ## 5. Off-error policy
 
@@ -112,7 +163,7 @@ The binary profiles (`no-js`, `tui-slim`) require `cli`; `sdk-headless` is libra
 | `session` | open/persist/discovery return `SESSION_PERSISTENCE_DISABLED`; `--session/--fork` report it; `--session-id` warns in-memory |
 | `skills` | discovery empty + one diagnostic; prompt renders |
 | `sdk` | `pir::sdk` absent (no stub); enable `sdk` |
-| `subagent`/`tool-repair`/`tool-search`/`todo` | `builtin:<name>` reports “not compiled … feature off” |
+| `subagent`/`tool-repair`/`tool-search`/`todo`/`memory` | `builtin:<name>` reports “not compiled … feature off” |
 | `phone` | builtin absent; default-off even in `full` |
 | `provider-*` | model listed; streaming returns the adapter-missing error. `openai-completions` is the exception: the plain chat adapter is core and always usable |
 | `cli` | no `pir` CLI binary (the `[[bin]]` target requires it); the library keeps the shared helpers, and the separate `pir-minimal` binary still builds with zero features |
@@ -136,7 +187,7 @@ off; `mcp add/remove` writes config in a no-`mcp` build — documented, not clai
 ## 6. Verification
 
 ```bash
-bash scripts/feature_matrix.sh            # 81 rows
+bash scripts/feature_matrix.sh            # 85 cargo invocations (57 lib + 18 bin + 2 consumer + 8 smoke)
 cargo check --lib --no-default-features --features tool-read   # each feature alone
 cargo check --lib --no-default-features --features grep-find   # independent search leaf
 cargo check --bin pir-minimal --no-default-features            # zero-feature agent

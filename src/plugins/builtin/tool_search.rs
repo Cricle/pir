@@ -15,17 +15,17 @@
 //! at the start of every prompt): `declared_tools` (`agent::tool_execution`)
 //! declares every active non-hidden tool, so activated `codemode`/`deferred`
 //! matches join the model's tool list exactly like a `setActiveTools`
-//! activation. The run's request tool list (`context.tools`) is seeded ONCE
-//! per run (`agent::agent_loop`), so an activation landing while a run is in
-//! flight is not visible to the next request of that same run — the next
-//! prompt, not the next call (upstream rebuilds the prompt at
-//! `setActiveTools` time; this remaining one-request window is the documented
-//! deviation). A resume re-derives the session's active set from the
-//! transcript (`agent_session::tools::restore_recorded_active_tools`,
-//! upstream `_restoreToolsFromTranscript`): matches loaded before the resume
-//! are re-activated as far as the transcript declared them, so a match that
-//! only ever lived in this cell without being declared is the one that cannot
-//! come back.
+//! activation. The run's request tool list (`context.tools`) is refreshed
+//! from this same cell before every provider request
+//! (`agent::agent_loop::refresh_context_tools_from_active_cell`), so an
+//! activation landing during a tool batch is visible to the very next call
+//! of the same run (matching upstream's `setActiveTools`-time rebuild). A
+//! resume re-derives the session's active set from the transcript
+//! (`agent_session::tools::restore_recorded_active_tools`, upstream
+//! `_restoreToolsFromTranscript`) and print re-activates recorded
+//! `codemode`/`deferred` declarations for `--continue`: matches loaded before
+//! the resume come back because the declaration that loaded them is in the
+//! transcript.
 //!
 //! The read-modify-write of the override cell runs under ONE write guard
 //! (same-batch `tool_search` calls serialize instead of losing each other's
@@ -654,10 +654,9 @@ fn loaded_result(loaded: &[(String, String)]) -> ToolResult {
         "No matching tools found.".to_owned()
     } else {
         // Upstream `createToolSearchToolDefinition`'s result text, including
-        // the description's first line per match. The activated names are
-        // declared on the session's next loadout rebuild; within the current
-        // run the request tool list is already fixed (the module doc's
-        // documented one-request window).
+        // the description's first line per match. The activated names join
+        // the next request's `context.tools` through the active-cell refresh
+        // in `agent::agent_loop` (and the next prompt's loadout rebuild).
         format!(
             "Loaded {} tool{}. They are available from your next call:\n{}",
             loaded.len(),

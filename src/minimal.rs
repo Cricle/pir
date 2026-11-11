@@ -129,6 +129,7 @@ impl MinimalAgent {
             session: None,
             compaction: None,
             max_turns: config.max_turns,
+            performance: crate::config::settings::PerformanceSettings::from_env(),
             system_prompt: Some(config.system_prompt),
             cwd: Some(config.cwd),
             event_stream: None,

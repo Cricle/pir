@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 
 use pir::durable::harness::scheduler::runtime::{TaskRuntime, TaskRuntimeError};
 use pir::durable::harness::scheduler::{
-    AbortResult, BlockedReason, NextTaskState, TaskInspectionState, TaskScheduler,
+    AbortResult, BlockedReason, NextTaskState, TaskCatalogue, TaskInspectionState, TaskScheduler,
     TaskSchedulerOptions,
 };
 use pir::durable::harness::settings::{RestartLimit, Settings};
@@ -47,6 +47,9 @@ use pir::durable::types::{
     TaskRecord, TaskState,
 };
 use pir::durable::Context;
+
+/// Definition-handover migration callback: `(from_version, checkpoint)`.
+type MigrateFn = fn(i64, &Value) -> Result<Value, String>;
 
 // ── harness ────────────────────────────────────────────────────────────────
 
@@ -1462,5 +1465,145 @@ async fn open_counts_restarts_close_does_not() {
     assert!(
         record.restarts.is_none(),
         "a close is not a crash and must not count a restart"
+    );
+}
+
+// ── definition handover ────────────────────────────────────────────────────
+
+/// A definition whose phases advance `a -> b -> c`; phase `a` holds on `gate`
+/// when one is supplied. `label` tags every log line so a handover is visible.
+fn handover_task(
+    label: &'static str,
+    version: i64,
+    log: Arc<Mutex<Vec<String>>>,
+    gate: Option<Arc<tokio::sync::Notify>>,
+    migrate: Option<MigrateFn>,
+) -> Task {
+    let advance = |from: &'static str, to: &'static str| {
+        let log = log.clone();
+        let gate = gate.clone();
+        let label = label.to_owned();
+        phase_handler(
+            move |_t: &RunningTask, runtime: &TaskRuntime, context: Context| {
+                let log = log.clone();
+                let gate = gate.clone();
+                let label = label.clone();
+                let runtime = runtime.clone();
+                Box::pin(async move {
+                    log.lock().unwrap().push(format!("{label}:{from} start"));
+                    if let Some(gate) = gate {
+                        gate.notified().await;
+                    }
+                    runtime
+                        .commit(
+                            move |_tx, _current| {
+                                let to = to.to_owned();
+                                Box::pin(async move {
+                                    Ok(Some(NextTaskState::Running {
+                                        checkpoint: json!({ "phase": to }),
+                                    }))
+                                })
+                            },
+                            context,
+                        )
+                        .await
+                        .expect("advance commit");
+                    // Leave room for a wrongly dispatched successor before the
+                    // invocation ends.
+                    tokio::task::yield_now().await;
+                    log.lock().unwrap().push(format!("{label}:{from} end"));
+                })
+            },
+        )
+    };
+    let finish = {
+        let log = log.clone();
+        let label = label.to_owned();
+        phase_handler(
+            move |_t: &RunningTask, runtime: &TaskRuntime, context: Context| {
+                let log = log.clone();
+                let label = label.clone();
+                let runtime = runtime.clone();
+                Box::pin(async move {
+                    log.lock().unwrap().push(format!("{label}:c"));
+                    runtime
+                        .commit(
+                            |_tx, _current| {
+                                Box::pin(async move {
+                                    Ok(Some(NextTaskState::Terminal {
+                                        outcome: TaskOutcome::Completed {
+                                            result: json!({ "label": label }),
+                                        },
+                                    }))
+                                })
+                            },
+                            context,
+                        )
+                        .await
+                        .expect("terminal commit");
+                })
+            },
+        )
+    };
+    let mut builder = define_task("test.handover", version, |_input| json!({ "phase": "a" }))
+        .phase("a", advance("a", "b"))
+        .phase("b", advance("b", "c"))
+        .phase("c", finish);
+    if let Some(migrate) = migrate {
+        builder = builder.migrate(migrate);
+    }
+    builder.build().expect("valid handover task")
+}
+
+/// Upstream "hands over to a newer version with a migration": while phase `a`
+/// holds, the same task name is replaced by version 2 with a migration that
+/// moves the stored checkpoint to `c`; the old invocation ends without overlap
+/// and the new definition finishes the task at version 2.
+#[tokio::test]
+async fn definition_handover_to_a_newer_version_with_migration() {
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let world = World::new(vec![handover_task(
+        "old",
+        1,
+        log.clone(),
+        Some(gate.clone()),
+        None,
+    )])
+    .await;
+    world.scheduler.resume();
+    let id = world.create("test.handover", json!({})).await;
+    for _ in 0..500 {
+        if log.lock().unwrap().iter().any(|line| line == "old:a start") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        log.lock().unwrap().iter().any(|line| line == "old:a start"),
+        "the old definition reached phase a"
+    );
+
+    world
+        .scheduler
+        .catalogue()
+        .replace(TaskCatalogue::new(vec![handover_task(
+            "v2",
+            2,
+            log.clone(),
+            None,
+            Some(|_from: i64, _checkpoint: &Value| Ok(json!({ "phase": "c" }))),
+        )]));
+    gate.notify_one();
+    let record = world.wait_terminal(id).await;
+    assert_eq!(record.version, 2, "the migration handover wrote version 2");
+    assert_eq!(
+        &*log.lock().unwrap(),
+        &[
+            "old:a start".to_owned(),
+            "old:a end".to_owned(),
+            "v2:c".to_owned(),
+        ],
+        "no overlap: the old invocation ended before the new definition took over"
     );
 }

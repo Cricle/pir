@@ -248,6 +248,7 @@ fn session_config(
     storage: Option<SessionManager>,
 ) -> AgentSessionConfig {
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: registry,
         model: fake_model(),
         api_key: None,

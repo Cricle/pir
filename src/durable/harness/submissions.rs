@@ -69,6 +69,7 @@ use crate::durable::harness::inbox::{
 };
 use crate::durable::harness::live::{live_from_object, LIVE_DEFINITION};
 use crate::durable::harness::settings::{AfterFailedRun, QueueMode, Settings};
+use crate::durable::harness::telemetry::{HarnessTelemetry, SpanHandle, SpanLink};
 use crate::durable::ids::{ConversationId, EntryId, SubmissionId};
 use crate::durable::session::line::SessionState;
 use crate::durable::session::transaction::{EntryDraft, HeadTarget, Transaction};
@@ -383,6 +384,20 @@ impl Admitted {
     }
 }
 
+/// The telemetry an admission reports through: the harness sink plus the
+/// commit's submission span.
+///
+/// Upstream `admitSubmission` receives one `span`; a `TelemetrySpan` there
+/// already carries its sink. In Rust the sink ([`HarnessTelemetry`]) and the
+/// opaque [`SpanHandle`] are separate values, so they travel together instead
+/// of as two positional arguments.
+pub(crate) struct SubmitSpan<'a> {
+    /// The harness telemetry sink the span belongs to.
+    pub telemetry: &'a HarnessTelemetry,
+    /// The span the commit opened for this submission.
+    pub handle: SpanHandle,
+}
+
 /// Admit a submission inside a commit (spec §6, upstream `admitSubmission`).
 ///
 /// A known `requestId` returns its existing submission without writing. A
@@ -401,6 +416,9 @@ impl Admitted {
 /// uses ([`StagedDocument`](crate::durable::session::transaction::StagedDocument)
 /// with its loaded incarnation); the run itself is staged by
 /// [`start_run_in_state`](crate::durable::harness::generation::start_run_in_state).
+///
+/// `span` carries the telemetry sink and the commit's submission span as one
+/// value, the way upstream passes a single `span` argument.
 pub(crate) async fn admit_submission_in(
     state: &SessionState<'_>,
     tx: &mut Transaction,
@@ -408,6 +426,7 @@ pub(crate) async fn admit_submission_in(
     draft: SubmissionDraft,
     now: i64,
     queue_modes: QueueModes,
+    span: SubmitSpan<'_>,
 ) -> Result<Admitted, StorageError> {
     let submission_type = draft.submission_type();
     if let SubmissionDraft::Input {
@@ -515,6 +534,35 @@ pub(crate) async fn admit_submission_in(
                 conversation_id: conversation,
             }),
         });
+    }
+
+    // Upstream links a steer admission to the trace of the run it steers. The
+    // span started before this commit, so the link is appended from inside the
+    // admission, where `pi.live` and the run task are read consistently with
+    // the queue decision.
+    if busy
+        && matches!(
+            draft,
+            SubmissionDraft::Input {
+                when_busy: WhenBusy::Steer,
+                ..
+            }
+        )
+    {
+        if let Some(run) = &live.run {
+            if let Some(record) = state
+                .storage
+                .read(&context, storage.task(run.task_id))
+                .await?
+            {
+                if let Some(trace) = record.trace.as_ref() {
+                    if let Some(handle) = span.telemetry.extract(Some(trace)) {
+                        span.telemetry
+                            .add_span_link(span.handle, SpanLink::new(handle));
+                    }
+                }
+            }
+        }
     }
 
     // The boundary reads the head marker; it is prepared before the first

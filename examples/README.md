@@ -1,10 +1,12 @@
 # pir SDK examples
 
 All examples are small, runnable programs built against the public
-`pir::sdk` facade. Except for the two network examples, they are **offline and
-deterministic**: no API key, no local model, no `~/.pi` state. They use a
-scripted `Provider` from [`common/mod.rs`](common/mod.rs), which is also the
-smallest useful template for a custom provider.
+`pir::sdk` facade, except [`dev_durable_timers.rs`](dev_durable_timers.rs)
+and [`dev_durable_reports.rs`](dev_durable_reports.rs), which use the core
+`pir::durable` surface directly (they need no cargo feature). Every example is **offline and deterministic** except the two
+network ones: no API key, no local model, no `~/.pi` state. The SDK examples
+use a scripted `Provider` from [`common/mod.rs`](common/mod.rs), which is also
+the smallest useful template for a custom provider.
 
 ## Run them
 
@@ -22,8 +24,19 @@ cargo run --example quickstart --no-default-features --features "sdk"
 cargo run --example streaming --no-default-features --features "sdk"
 cargo run --example plugin --no-default-features --features "sdk"
 cargo run --example control --no-default-features --features "sdk"
-# The only example that writes/attaches transcript files.
+
+# Durable is core (no cargo feature): host timer + report sink + native
+# fallback, with real JSONL roots and a task that parks on a durable sleep.
+cargo run --example dev_durable_timers --no-default-features
+
+# Durable report sinks and the phase-scoped timer lifecycle: on_report vs
+# timer_report, set_timer disarm at phase end, post-end calls rejected.
+cargo run --example dev_durable_reports --no-default-features
+
+# The examples that write/attach transcript files.
 cargo run --example sessions --no-default-features --features "sdk,session"
+cargo run --example session_lifecycle --no-default-features --features "sdk,session" -- start /tmp/pir-lifecycle
+cargo run --example session_compaction --no-default-features --features "sdk,session"
 
 # `tools` compiles in the built-in coding tools. The example follows the
 # build (`cfg!(feature = "tools")`): with the feature off it registers only
@@ -31,6 +44,10 @@ cargo run --example sessions --no-default-features --features "sdk,session"
 # `build()` with an explicit missing-feature diagnostic (never a silent
 # no-op).
 cargo run --example tools --no-default-features --features "sdk,tools"
+
+# A real end-to-end repair: the scripted model reads/edits a broken Python
+# module with the built-in tools and runs the real test suite.
+PIR_PYTHON=/path/to/python cargo run --example mini_coding --no-default-features --features "sdk,tools"
 
 # Compiled-in builtin (`subagent`).
 cargo run --example builtin --no-default-features --features "sdk,subagent"
@@ -60,8 +77,9 @@ scripts/run_examples.sh
 It exits nonzero on the first failure. The two network examples are
 compile-checked only (no request is sent).
 
-Every example's `main` runs its async body through
-`common::run_big_stack` (a 64 MiB thread). The GNU/Windows linker starts the
+Every SDK example's `main` runs its async body through
+`common::run_big_stack` (a 64 MiB thread); the two durable examples build the
+same runtime on their own 64 MiB thread. The GNU/Windows linker starts the
 main thread at 2 MiB and unoptimized agent futures run deeper than that on a
 tool round-trip (`plugin.rs` overflowed before the wrapper); the wrapper keeps
 `cargo run --example …` working out of the box. A real embedder on this
@@ -73,9 +91,14 @@ boxes the remaining deep futures.
 | Example | Demonstrates | Features | Network |
 |---|---|---|---|
 | [`quickstart.rs`](quickstart.rs) | `with_registry`, a custom `Provider`, one prompt, `AgentOutcome`, `shutdown` | `sdk` | no |
+| [`dev_durable_timers.rs`](dev_durable_timers.rs) | `SetTimer` host thread timer, `Timers::host_timers`, `HarnessOptions.timers`, report sink, foreground decline → native fallback reported once, `TaskRuntime::sleep_until` wake | none (durable is core) | no |
+| [`dev_durable_reports.rs`](dev_durable_reports.rs) | `HarnessOptions.on_report` (`ReportInfo::TaskError`) vs the separate `Timers` report sink; `TaskRuntime::set_timer` arms in a phase, disarms at phase end (host token + `TimerHandle::is_cancelled`), post-end `set_timer`/`report` reject with `TaskRuntimeError::Ended` | none (durable is core) | no |
 | [`streaming.rs`](streaming.rs) | `prompt_stream_with_outcome`, every `SdkEvent` variant (an explicit `event_name` checklist), text deltas, tool start/update/end, terminal outcome | `sdk` | no |
 | [`tools.rs`](tools.rs) | `core_tools(cfg!(feature = "tools"))`, typed `with_tool`, closure `tool`, `ToolContext` (`cwd` + `is_aborted()`), one tool batch, `tool_result_texts`, `Agent::tools` | `sdk`; add `tools` for the built-in coding tools | no |
 | [`sessions.rs`](sessions.rs) | `SessionMode::Dir`, `session_path`/`session_id`, `set_session_name`, `Agent::on_session_event` subscription, `new_session`, `attach_session` | `sdk,session` | no |
+| [`session_lifecycle.rs`](session_lifecycle.rs) | start → continue → fork → inspect across separate processes; `continue_session`, `SessionManager::fork_from_source`, JSONL header/entry shape | `sdk,session` | no |
+| [`session_compaction.rs`](session_compaction.rs) | manual `compact()`, compaction start/end events, the JSONL `compaction` entry, summary in the next request | `sdk,session` | no |
+| [`mini_coding.rs`](mini_coding.rs) | real read → edit → bash repair loop with `core_tools(true)`; the test suite really runs and passes | `sdk,tools` | no |
 | [`plugin.rs`](plugin.rs) | inline `AgentPlugin`, `register_tool`, `on_event("input")` transform, merged tool registry | `sdk` | no |
 | [`control.rs`](control.rs) | `steer`, `follow_up`, `pending_message_count`, `abort`, one in-memory transcript across runs | `sdk` | no |
 | [`builtin.rs`](builtin.rs) | `.builtin("subagent")`, compiled-in builtin registration, `Agent::tools()` | `sdk,subagent` | no |
@@ -125,7 +148,7 @@ external embedder needs the SDK plus the default-on surfaces it uses:
 ```toml
 [dependencies]
 # Package name `pir-sdk`; the library is still imported as `pir`.
-pir-sdk = { version = "0.0.2", default-features = false, features = [
+pir-sdk = { version = "1.0.0", default-features = false, features = [
     "sdk",
     # Add only what you use:
     # "session", "skills", "tools", "subagent", "extensions",

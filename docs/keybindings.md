@@ -8,15 +8,16 @@ namespace, 32 ids plus the `app.*` groups).
 ```json
 {
   "keybindings": {
-    "app.submit": "enter",
+    "tui.input.submit": "enter",
     "app.editor.external": "ctrl+g",
-    "tui.selector.moveUp": "up,k"
+    "tui.select.up": "up,k"
   }
 }
 ```
 
-Values are chord strings (`ctrl+`, `alt+`, `shift+` prefixes; comma separates alternatives). Unknown ids are a
-settings error; reserved ids (like `tui.input.submit`) cannot be rebound by extensions.
+Values are chord strings (`ctrl+`, `alt+`, `shift+` prefixes; comma separates alternatives). Unknown ids are
+silently ignored (upstream behavior); an explicit empty list (`[]`) unbinds an id's default. Reserved ids (like
+`tui.input.submit`) cannot be rebound by extensions.
 
 Id groups: `app.*` covers submit/newline, editor movement and kill-ring, message queue (enqueue/dequeue), model
 selector, clipboard and page scrolling; `tui.*` covers selector navigation, autocomplete accept, theme handling,

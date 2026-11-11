@@ -295,6 +295,7 @@ fn session_with_extension_options(
         None
     };
     let session = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: fake_model(),
         api_key: None,

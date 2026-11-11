@@ -77,6 +77,8 @@ use super::theme::{
     set_theme_from_settings, theme_snapshot, with_theme,
 };
 use crate::agent_session::BranchSummaryAbort;
+use crate::agent_session::ForkEntryOutcome;
+use crate::agent_session::ForkPosition;
 use crate::ai::providers::PiConfiguredModel;
 use crate::config::settings::{FullscreenExitOutput, TuiMode};
 use crate::extensions::{ExtensionHandle, NativeOverlayBounds, NativeOverlayHandle, ShortcutDef};
@@ -1996,8 +1998,11 @@ struct FooterSubscriptionCache {
     valid: bool,
 }
 
-/// The chat application state.
-struct App {
+/// The chat application state. `pub(crate)` so the display-layer seam
+/// [`apply_fork_selected_text`] can take it without a `private_interfaces`
+/// lint (the crate-private type is the honest visibility for a struct the
+/// whole terminal module owns).
+pub(crate) struct App {
     core: TuiCore,
     chat: Arc<Mutex<ChatContainer>>,
     /// Per-entry block cache behind `SharedChat` (see [`ChatBlockCache`]):
@@ -2050,6 +2055,11 @@ struct App {
     editor_snapshot_rev: u64,
     autocomplete_provider: Arc<CombinedAutocompleteProvider>,
     autocomplete: Arc<Mutex<Option<AutocompletePopup>>>,
+    /// `autocompleteMaxVisible` (upstream `editor.ts:380-381`): the visible
+    /// item window for every autocomplete popup, injected at construction and
+    /// refreshed live by the `/settings` row. `None` = unset → upstream
+    /// default 5 through [`super::autocomplete::clamp_max_visible`].
+    autocomplete_max_visible: Option<u32>,
     keybindings: Keybindings,
     extension_widgets_above: Arc<Mutex<Vec<(String, String)>>>,
     extension_widgets_below: Arc<Mutex<Vec<(String, String)>>>,
@@ -2296,6 +2306,14 @@ struct App {
     dock_height: Arc<std::sync::atomic::AtomicUsize>,
     /// Runtime thinking-block visibility (`app.thinking.toggle`).
     hide_thinking: bool,
+    /// `outputPad` (upstream `this.outputPad`, `SETTINGS_DEFAULTS` 1): the
+    /// transcript's horizontal inset. Startup reads it once; the `/settings`
+    /// row updates it live through [`App::set_output_pad`].
+    output_pad: usize,
+    /// `terminal.showTerminalProgress` (upstream reads
+    /// `getShowTerminalProgress()` per event): gates the OSC 9;4 progress
+    /// bar. The `/settings` row updates it live.
+    osc_progress: bool,
     /// `fullscreenExitOutput`: what the primary screen shows on exit
     /// (transcript dump vs the shell's own content).
     exit_output: FullscreenExitOutput,
@@ -2695,20 +2713,33 @@ impl App {
             .map(|extensions| extensions.tools_expanded_cell())
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let tools_expanded_seen = tools_expanded.load(Ordering::SeqCst);
+        // `outputPad` (upstream `SETTINGS_DEFAULTS.outputPad` 1; the schema
+        // admits 0|1): the transcript's horizontal inset, read once here and
+        // moved live by the `/settings` row.
+        let startup_output_pad = configured
+            .as_ref()
+            .and_then(|c| c.settings.output_pad)
+            .map(|pad| usize::from(pad.min(1)))
+            .unwrap_or(1);
         let chat: Arc<Mutex<ChatContainer>> = {
             // Ctrl+O expansion is shared with the transcript up front so every
             // builtin tool block reads it live (upstream `toolOutputExpanded`
             // → `ToolExecutionComponent.setExpanded`).
             let mut chat = ChatContainer::new();
             chat.set_tools_expanded(Arc::clone(&tools_expanded));
+            chat.set_output_pad(startup_output_pad);
             Arc::new(Mutex::new(chat))
         };
-        let chat_blocks = Arc::new(Mutex::new(ChatBlockCache::new(
-            Arc::clone(&tools_expanded),
-            configured
-                .as_ref()
-                .is_some_and(|c| c.settings.hide_thinking_block.unwrap_or(false)),
-        )));
+        let chat_blocks = Arc::new(Mutex::new({
+            let mut blocks = ChatBlockCache::new(
+                Arc::clone(&tools_expanded),
+                configured
+                    .as_ref()
+                    .is_some_and(|c| c.settings.hide_thinking_block.unwrap_or(false)),
+            );
+            blocks.set_output_pad(startup_output_pad);
+            blocks
+        }));
         let chat_revision = Arc::new(AtomicU64::new(0));
         let transcript_epoch = Arc::new(AtomicU64::new(0));
         let editor = Arc::new(Editor::new());
@@ -3018,6 +3049,11 @@ impl App {
         let hide_thinking = configured
             .as_ref()
             .is_some_and(|c| c.settings.hide_thinking_block.unwrap_or(false));
+        // `autocompleteMaxVisible` (upstream editor.ts:380-381): the startup
+        // snapshot; the `/settings` row updates the App field live below.
+        let autocomplete_max_visible = configured
+            .as_ref()
+            .and_then(|c| c.settings.autocomplete_max_visible);
         Ok(Self {
             core,
             chat,
@@ -3033,6 +3069,7 @@ impl App {
             editor_snapshot_rev: 0,
             autocomplete_provider,
             autocomplete,
+            autocomplete_max_visible,
             keybindings,
             extension_widgets_above: widgets_above,
             extension_widgets_below: widgets_below,
@@ -3108,6 +3145,8 @@ impl App {
             wheel,
             dock_height,
             hide_thinking,
+            output_pad: startup_output_pad,
+            osc_progress: false,
             exit_output,
             resource_paths: crate::coding_agent::resources::ResourcePathOptions::default(),
             transcript_reset: false,
@@ -3126,6 +3165,23 @@ impl App {
     /// The dirty flag background threads raise to force a repaint.
     fn request_ui_refresh(&self) {
         self.ui_dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// Apply `outputPad` live (upstream `onOutputPadChange`): move the app
+    /// copy, re-commit the whole-container transcript and every materialized
+    /// per-entry block under the new inset, and publish a content revision so
+    /// the next frame repaints it.
+    fn set_output_pad(&mut self, output_pad: usize) {
+        self.output_pad = output_pad;
+        self.chat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_output_pad(output_pad);
+        self.chat_blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_output_pad(output_pad);
+        self.chat_revision.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record an editor text change (any edit path). The per-tick drain uses
@@ -4182,6 +4238,9 @@ impl App {
             .alt
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let band_trace = super::search_trace::Timer::new();
+        let band_before = window.start();
+        let band_len_before = window.slice(entries).len();
         let moved = sync_windowed_band_tracked_with_epochs(
             entries,
             window,
@@ -4194,6 +4253,17 @@ impl App {
                 blocks: Some(&self.chat_blocks),
                 delta,
             },
+        );
+        band_trace.log(
+            "band_sync",
+            &[
+                ("entries", entries.len() as u128),
+                ("start_before", band_before as u128),
+                ("len_before", band_len_before as u128),
+                ("start_after", window.start() as u128),
+                ("len_after", window.slice(entries).len() as u128),
+                ("moved", moved as u128),
+            ],
         );
         drop(alt);
         // Use the band the sync just planned (not last frame's start) so a
@@ -5873,6 +5943,12 @@ pub const TRANSCRIPT_TAIL_BYTES: usize = 1024 * 1024;
 pub const TRANSCRIPT_TAIL_MIN_ENTRIES: usize = 64;
 
 /// Hard entry cap on the materialized window, whatever the byte budget says.
+///
+/// PIR-TUI-019: lowering this to 128 was measured on the 100x5 soak and did
+/// NOT move RSS (157.8 MB vs 158.2/154.2 at 512), so the cap is not the
+/// resident driver and the ordinary-transcript shape stays at 512. The
+/// duplicate whole-container rebuild behind the per-entry cache (below) was
+/// the waste worth removing instead.
 pub const TRANSCRIPT_WINDOW_MAX_ENTRIES: usize = 512;
 
 /// Hard byte cap on the materialized window while the view is scrolled into
@@ -7019,9 +7095,19 @@ pub fn probe_older_page(
     if chunk.is_empty() || altscreen_search::normalize_query(query).is_empty() {
         return false;
     }
+    let trace = super::search_trace::Timer::new();
     probe.set_entries(chunk);
     let lines = probe.render(width);
-    !altscreen_search::find_search_matches(&lines, query).is_empty()
+    let hit = !altscreen_search::find_search_matches(&lines, query).is_empty();
+    trace.log(
+        "walk_probe",
+        &[
+            ("entries", chunk.len() as u128),
+            ("lines", lines.len() as u128),
+            ("hit", hit as u128),
+        ],
+    );
+    hit
 }
 
 /// The transcript's paged load-more bookkeeping (one per attached session;
@@ -7254,6 +7340,12 @@ pub enum SearchWalkStep {
     /// The probed slice held the query and was materialized into the band:
     /// the band check must run right after the next render.
     Materialized,
+    /// The plan ended the walk (a stopped state: `Capped`/`Exhausted`/`Found`
+    /// while the step started from a live walk). The caller must repaint so
+    /// the box leaves its stale `…` for the terminal label — the walk block
+    /// runs outside the dirty-frame gate, so nothing else dirties that frame
+    /// (PIR-TUI-009: the box stayed on `…` forever after a capped walk).
+    Stopped,
 }
 
 impl SearchWalkStep {
@@ -7299,6 +7391,7 @@ pub fn search_walk_step(
     view: &mut SearchWalkView<'_>,
     probe: &mut SearchWalkProbe<'_>,
 ) -> SearchWalkStep {
+    let was_walking = search.walk.is_walking();
     let action = altscreen_search::plan_search_walk(
         search,
         windowed,
@@ -7306,6 +7399,13 @@ pub fn search_walk_step(
         pages.cursor,
         pages.loading,
     );
+    // The plan can end the walk while returning `Idle` (no page, no probe).
+    // Surface that as its own step: the caller runs this block outside the
+    // dirty-frame gate, so a stopped walk must explicitly dirty the frame to
+    // replace the painted `…` with its terminal label.
+    if was_walking && !search.walk.is_walking() {
+        return SearchWalkStep::Stopped;
+    }
     match action {
         altscreen_search::SearchWalkPlan::Idle => SearchWalkStep::Idle,
         altscreen_search::SearchWalkPlan::ReadPage { cursor } => {
@@ -7455,7 +7555,7 @@ pub fn sync_windowed_band_tracked_with_epochs(
             blocks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .set_entries(window.slice(entries));
+                .set_entries_windowed(window.slice(entries), window.start());
         }
         if let Some(cell) = chat_revision {
             cell.fetch_add(1, Ordering::Relaxed);
@@ -7875,15 +7975,40 @@ pub struct ChatBlockCache {
     /// `chat_revision` bump cannot reach a per-entry cache).
     live_tick: u64,
     hide_thinking: bool,
+    /// `settings.outputPad`: the horizontal inset every block container bakes
+    /// into its children. Moved live by [`Self::set_output_pad`].
+    output_pad: usize,
     hidden_label: Option<String>,
     tools_expanded: Arc<AtomicBool>,
     blocks: Vec<ChatBlockSlot>,
+    /// Slots retired from earlier materialized windows, keyed by ABSOLUTE
+    /// transcript index. `TuiCore` keys frame blocks by slice POSITION, so a
+    /// window slide (search reveal, paging through history) used to rebuild
+    /// every entry's container even when the entry itself was unchanged.
+    /// Keeping the retired slots here lets [`Self::set_entries_windowed`]
+    /// hand the same entry back its container (and every memoized row) when
+    /// a later window materializes it again. Bounded by
+    /// [`CHAT_BLOCK_RETENTION_MAX`]; `reset` clears it.
+    retired: std::collections::HashMap<usize, ChatBlockSlot>,
+    /// Absolute transcript index of `blocks[0]` (the installed window).
+    window_start: usize,
     /// Cached revision vector: `block_revisions` is called every frame, and
     /// a fresh `Vec<u64>` per frame was steady-state garbage in the hot path.
     /// Keyed by `(len, rolling hash)`; a collision only costs a stale cache
     /// hit (revisions are content hashes themselves).
     revisions_cache: Option<(usize, u64, Arc<[u64]>)>,
 }
+
+/// Hard cap on the cross-window retired slots (one per entry). A window is at
+/// most [`TRANSCRIPT_WINDOW_MAX_ENTRIES`] entries and the search walk may
+/// materialize a few pages at once. Each retired slot owns a full
+/// `ChatContainer` (its component tree and memoized rows), so the old 8192
+/// ceiling let a linear session retain tens of thousands of rendered rows and
+/// showed up as ~0.8 MB/turn RSS growth (PIR-TUI-019); 64 keeps the recent-page
+/// reuse the cache exists for while bounding it to one small search page.
+/// Overflow drops the retired set wholesale (slots are recached on the next
+/// window; correctness unaffected).
+const CHAT_BLOCK_RETENTION_MAX: usize = 64;
 
 struct ChatBlockSlot {
     entry: ChatEntry,
@@ -7899,9 +8024,13 @@ impl ChatBlockCache {
             settings_epoch: 0,
             live_tick: 0,
             hide_thinking,
+            // Upstream `SETTINGS_DEFAULTS.outputPad` is 1.
+            output_pad: 1,
             hidden_label: None,
             tools_expanded,
             blocks: Vec::new(),
+            retired: std::collections::HashMap::new(),
+            window_start: 0,
             revisions_cache: None,
         }
     }
@@ -7909,6 +8038,7 @@ impl ChatBlockCache {
     fn fresh_container(&self) -> ChatContainer {
         let mut container = ChatContainer::new();
         container.set_tools_expanded(Arc::clone(&self.tools_expanded));
+        container.set_output_pad(self.output_pad);
         if self.hide_thinking {
             container.set_hide_thinking(true);
         }
@@ -7957,12 +8087,14 @@ impl ChatBlockCache {
         }
         let tools = Arc::clone(&self.tools_expanded);
         let hide_thinking = self.hide_thinking;
+        let output_pad = self.output_pad;
         let hidden_label = self.hidden_label.clone();
         let settings_epoch = self.settings_epoch;
         let live_tick = self.live_tick;
         for slot in &mut self.blocks {
             let mut container = ChatContainer::new();
             container.set_tools_expanded(Arc::clone(&tools));
+            container.set_output_pad(output_pad);
             if hide_thinking {
                 container.set_hide_thinking(true);
             }
@@ -8015,28 +8147,59 @@ impl ChatBlockCache {
         }
     }
 
-    /// Publish the materialized entry slice (window start first). Called when
-    /// the app installs a slice / moves the window — not on steady frames.
+    /// Publish the materialized entry slice anchored at absolute transcript
+    /// index 0. Test/direct-call convenience wrapper for
+    /// [`Self::set_entries_windowed`].
     pub fn set_entries(&mut self, entries: &[ChatEntry]) {
+        self.set_entries_windowed(entries, 0);
+    }
+
+    /// Publish the materialized entry slice and its ABSOLUTE transcript
+    /// origin (window start). Called when the app installs a slice / moves
+    /// the window — not on steady frames.
+    ///
+    /// Slots are matched by absolute entry index + render revision, so an
+    /// entry that is dropped from one window and materialized again by a
+    /// later one (search reveal, history paging) keeps its container and
+    /// every memoized row instead of rebuilding. Slots that leave the window
+    /// are retained in `retired` up to [`CHAT_BLOCK_RETENTION_MAX`].
+    pub fn set_entries_windowed(&mut self, entries: &[ChatEntry], window_start: usize) {
+        // Retire the current window's slots under their absolute indices.
+        let old_start = self.window_start;
+        for (index, slot) in std::mem::take(&mut self.blocks).into_iter().enumerate() {
+            self.retired.insert(old_start + index, slot);
+        }
+        self.window_start = window_start;
+        if self.retired.len() > CHAT_BLOCK_RETENTION_MAX {
+            self.retired.clear();
+        }
         let mut user_before = false;
-        let mut rebuilt = 0u64;
         for (index, entry) in entries.iter().enumerate() {
             let revision = self.revision(entry, user_before);
-            let reuse = self
-                .blocks
-                .get(index)
+            let absolute = window_start + index;
+            let mut old = self.retired.remove(&absolute);
+            let reuse = old
+                .as_ref()
                 .is_some_and(|slot| slot.revision == revision && slot.user_before == user_before);
-            if !reuse {
-                let mut container = match self.blocks.get(index) {
-                    // Raw blocks are recreated from scratch: the private
-                    // EntryTag does not compare `RawToolRender::is_error`, so
-                    // a reused container would retain the old error/success
+            let slot = if reuse {
+                // Same revision == same render inputs: the retained container
+                // (and its committed children + row caches) already renders
+                // exactly this entry. Do NOT re-feed the live entry: its
+                // buffers can be a different allocation than the slot-owned
+                // clone the container's tags point at, and a feed would only
+                // force a rebuild.
+                old.take().expect("checked above")
+            } else {
+                let mut container = match old {
+                    // A changed entry at the same absolute index reuses its
+                    // container so the retained-child diff keeps unchanged
+                    // children. Raw blocks are recreated from scratch: the
+                    // private EntryTag does not compare `RawToolRender::is_error`,
+                    // so a reused container would retain the old error/success
                     // paint.
-                    Some(_) if !matches!(entry, ChatEntry::Raw { .. }) => {
-                        let mut container = std::mem::replace(
-                            &mut self.blocks[index].container,
-                            ChatContainer::new(),
-                        );
+                    Some(mut slot) if !matches!(entry, ChatEntry::Raw { .. }) => {
+                        let mut container =
+                            std::mem::replace(&mut slot.container, ChatContainer::new());
                         container.set_tools_expanded(Arc::clone(&self.tools_expanded));
                         container
                     }
@@ -8050,24 +8213,17 @@ impl ChatBlockCache {
                     // pointer the allocator could recycle.
                     container.set_entries(std::slice::from_ref(&new_entry));
                 }
-                let slot = ChatBlockSlot {
+                ChatBlockSlot {
                     entry: new_entry,
                     revision,
                     user_before,
                     container,
-                };
-                if index < self.blocks.len() {
-                    self.blocks[index] = slot;
-                } else {
-                    self.blocks.push(slot);
                 }
-                rebuilt += 1;
-            }
+            };
+            self.blocks.push(slot);
             user_before |= matches!(entry, ChatEntry::User(_));
         }
-        self.blocks.truncate(entries.len());
         self.primed = true;
-        let _ = rebuilt;
     }
 
     /// Patch one materialized slot in place (the per-token streaming fast path
@@ -8087,6 +8243,7 @@ impl ChatBlockCache {
         if matches!(entry, ChatEntry::Raw { .. }) {
             let mut container = ChatContainer::new();
             container.set_tools_expanded(Arc::clone(&self.tools_expanded));
+            container.set_output_pad(self.output_pad);
             if self.hide_thinking {
                 container.set_hide_thinking(true);
             }
@@ -8167,6 +8324,8 @@ impl ChatBlockCache {
 
     pub fn reset(&mut self) {
         self.blocks.clear();
+        self.retired.clear();
+        self.window_start = 0;
         self.primed = false;
     }
 
@@ -8175,6 +8334,18 @@ impl ChatBlockCache {
             return;
         }
         self.hide_thinking = hide_thinking;
+        self.settings_epoch = self.settings_epoch.wrapping_add(1);
+        self.rebuild_for_settings();
+    }
+
+    /// Move `outputPad` (upstream `onOutputPadChange`): every materialized
+    /// block is re-committed under the new inset and every block revision
+    /// moves, so the very next frame repaints the transcript.
+    pub fn set_output_pad(&mut self, output_pad: usize) {
+        if self.output_pad == output_pad {
+            return;
+        }
+        self.output_pad = output_pad;
         self.settings_epoch = self.settings_epoch.wrapping_add(1);
         self.rebuild_for_settings();
     }
@@ -9372,6 +9543,16 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
     if let Some(padding) = settings.settings.editor_padding_x {
         app.editor.set_padding_x(1 + padding.clamp(0, 3) as usize);
     }
+    // `outputPad` (upstream `this.outputPad = settingsManager.getOutputPad()`,
+    // interactive-mode.ts:666/2075): the transcript's horizontal inset for
+    // messages, tool output and command output.
+    app.set_output_pad(
+        settings
+            .settings
+            .output_pad
+            .map(|pad| usize::from(pad.min(1)))
+            .unwrap_or(1),
+    );
     // `showHardwareCursor` (upstream `getShowHardwareCursor`: the settings
     // value, else env `PI_HARDWARE_CURSOR=1`): with it on, the terminal cursor
     // follows the editor cell after every frame (IME candidate positioning)
@@ -9381,9 +9562,17 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
     let show_hardware_cursor = settings.show_hardware_cursor();
     app.core.set_show_hardware_cursor(show_hardware_cursor);
     app.editor.set_show_hardware_cursor(show_hardware_cursor);
+    // `terminal.clearOnShrink` (upstream `interactive-mode.ts:634`
+    // `this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink())`):
+    // startup read; the `/settings` row moves the same cell live below.
+    // Default false matches upstream SETTINGS_DEFAULTS.terminal.clearOnShrink
+    // and the env fallback `PI_CLEAR_ON_SHRINK=1` lives in the manager.
+    app.core.set_clear_on_shrink(settings.clear_on_shrink());
     // `terminal.showTerminalProgress`: OSC 9;4 progress bar on run/compaction
-    // start and settle (upstream `terminal.setProgress` gates).
-    let osc_progress = settings
+    // start and settle (upstream `terminal.setProgress` gates). Upstream
+    // re-reads `getShowTerminalProgress()` per event; the app field is that
+    // live cell (the `/settings` row moves it, no restart needed).
+    app.osc_progress = settings
         .settings
         .terminal
         .as_ref()
@@ -10740,6 +10929,17 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     // them. Older epochs never re-arm a newer switch.
                     app.session_switch.settle(switch_epoch);
                 }
+                WorkerEvent::ForkSelectedText { text } => {
+                    // `/fork` composer re-seed (upstream
+                    // `editor.setText(result.selectedText ?? "")`,
+                    // interactive-mode.ts:5518): the fork branches at the
+                    // picked message's parent, so its text left the
+                    // transcript — the composer starts with it so the user
+                    // can rephrase and resend. A draft seeded by the replay's
+                    // tab restore was already taken into the editor; the seed
+                    // replaces it (upstream also overwrites the composer).
+                    apply_fork_selected_text(&app, text.as_deref());
+                }
                 WorkerEvent::RunStarted => {
                     // A fresh tab's stem title becomes the first prompt's
                     // preview as soon as the run starts (agent_start): the
@@ -10766,7 +10966,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     // OSC 9;4 indeterminate progress while the run is in
                     // flight (`terminal.showTerminalProgress` gate; upstream
                     // `terminal.setProgress(true)`, interactive-mode.ts:3426).
-                    if osc_progress {
+                    if app.osc_progress {
                         write_osc_progress(true);
                     }
                 }
@@ -10774,7 +10974,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     // OSC 7501: the run settled; the pending outcome becomes
                     // the resting status (upstream `agent_settled`).
                     app.core.program_status_reporter().agent_settled(aborted);
-                    if osc_progress {
+                    if app.osc_progress {
                         write_osc_progress(false);
                     }
                 }
@@ -10786,7 +10986,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     reporter.assistant_message_end(true, Some(&error));
                     reporter.agent_settled(false);
                     drop(reporter);
-                    if osc_progress {
+                    if app.osc_progress {
                         write_osc_progress(false);
                     }
                     // No `message_done` follows a dead run: settle the live
@@ -10819,7 +11019,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
                         Some("Compacting context... (working)".to_string());
-                    if osc_progress {
+                    if app.osc_progress {
                         write_osc_progress(true);
                     }
                 }
@@ -10866,7 +11066,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     // A compaction inside a run is not the end of the run's
                     // OSC 9;4 progress; only an idle manual compaction clears
                     // it here (`RunSettled` clears the run's own progress).
-                    if osc_progress && !worker.is_streaming() {
+                    if app.osc_progress && !worker.is_streaming() {
                         write_osc_progress(false);
                     }
                 }
@@ -12134,15 +12334,39 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                             };
                             // F3: an active transcript search owns the input
                             // (upstream the search overlay is the focused
-                            // component); a paste must not leak into the hidden
-                            // main editor, so the search state swallows it.
+                            // component). Upstream delivers a paste to the
+                            // focused component's `handleInput` — the
+                            // re-wrapped chunk is inserted into the search
+                            // query (tui.ts:1147-1153 +
+                            // terminal.ts:266-272). pir's Windows burst
+                            // coalescer rewrites a fast typed run
+                            // (`CONSOLE_BURST_MIN_CHARS` keys or more in one
+                            // drain window) into ONE paste, so swallowing it
+                            // here silently dropped every typed search term
+                            // of that length from the box (PIR-TUI-023).
                             let search_active = app
                                 .alt
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .search
                                 .active;
+                            if search_active {
+                                let dock_h =
+                                    app.dock_height.load(std::sync::atomic::Ordering::Relaxed);
+                                let mut alt = app
+                                    .alt
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                altscreen_search::paste_into_search(
+                                    &mut app.core,
+                                    &mut alt,
+                                    dock_h,
+                                    &text,
+                                );
+                            }
                             let route = if search_active {
+                                // The box consumed the chunk: never route a
+                                // paste the search owns to the hidden editor.
                                 PasteRoute::Swallowed
                             } else {
                                 paste_route(dialog_open, dialog_accepts_text, selector_open)
@@ -12328,6 +12552,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                 dialog.is_some() || overlay.any_open()
             };
             let windowed = app.fullscreen && app.core.windowed_viewport();
+            let walk_trace = super::search_trace::Timer::new();
             let step = {
                 let mut alt = app
                     .alt
@@ -12359,6 +12584,23 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     SearchWalkStep::Idle
                 }
             };
+            walk_trace.log(
+                "walk_step",
+                &[
+                    (
+                        "step",
+                        match step {
+                            SearchWalkStep::Idle => 0,
+                            SearchWalkStep::Read { .. } => 1,
+                            SearchWalkStep::Probed => 2,
+                            SearchWalkStep::Materialized => 3,
+                            SearchWalkStep::Stopped => 4,
+                        } as u128,
+                    ),
+                    ("band_start", transcript_window.start() as u128),
+                    ("entries", entries.len() as u128),
+                ],
+            );
             match step {
                 SearchWalkStep::Idle => {}
                 SearchWalkStep::Read { cursor } => {
@@ -12376,6 +12618,13 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     // the check is the step's own rule (`arms_band_check`),
                     // shared with the test harness.
                     search_walk_check |= step.arms_band_check();
+                    dirty = true;
+                }
+                SearchWalkStep::Stopped => {
+                    // The walk ended while planning (a bound reached, the
+                    // session start, or settles on live matches): the box's
+                    // label changed from `…` to its terminal text, and this
+                    // block sits outside the dirty-frame gate — repaint now.
                     dirty = true;
                 }
             }
@@ -12529,7 +12778,16 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             }
             ui_heartbeat.beat(UI_PHASE_RENDER);
             input_trace.frames += 1;
+            let render_trace = super::search_trace::Timer::new();
             app.core.render();
+            render_trace.log(
+                "render",
+                &[
+                    ("frame", app.core.frame_buffer_length() as u128),
+                    ("windowed", app.core.windowed_viewport() as u128),
+                    ("offset", app.core.scroll_offset() as u128),
+                ],
+            );
             // No `stdout().flush()` here: `TuiCore::render` enqueues the frame
             // on `pir-tui-writer`, which writes AND flushes it on its own
             // thread. Flushing process stdout from the UI thread would take
@@ -14540,6 +14798,51 @@ fn start_tui_logout(app: &mut App, entries: &mut Vec<ChatEntry>, provider: AuthP
         }
     }
 }
+/// `/fork` composer re-seed (upstream `editor.setText(result.selectedText
+/// ?? "")`, interactive-mode.ts:5518): the fork branches at the picked
+/// message's parent, so its text left the transcript — the composer starts
+/// with it so the user can rephrase and resend. The worker sends this after
+/// the branch replay, so the text survives the tab draft restore. `None`
+/// (`At` position / no text) leaves the composer untouched — upstream writes
+/// `""` only when the fork itself succeeded, and a missing `selectedText`
+/// with an untouched composer is the same user-visible state for the picker's
+/// default `before` arm. The testable seam is [`seed_fork_composer`] (an
+/// `App` needs a live terminal to construct).
+pub(crate) fn apply_fork_selected_text(app: &App, text: Option<&str>) {
+    seed_fork_composer(&app.editor, &app.editor_rev, text);
+}
+
+/// The status row text for the whole-session `/fork`+`/clone` pair and the
+/// picker fork — upstream verbatim (`interactive-mode.ts:1996/:5519`
+/// "Forked to new session", `:5549` "Cloned to new session"; PIR-TUI-019
+/// final parity fix: pir used to print "Forked/Cloned session: <path>",
+/// which no upstream fork/clone path does).
+///
+/// `#[doc(hidden)] pub`: pinned verbatim by
+/// `tests/suites/tui_surface_units.rs`.
+#[doc(hidden)]
+pub fn fork_status_text(label: &str) -> String {
+    format!("{label} to new session")
+}
+
+/// The [`apply_fork_selected_text`] seed split out of `App` so the contract
+/// is testable without a live terminal (`App::new` owns one): `Some(text)`
+/// replaces the composer (`Editor::set_text`) and bumps the extension-visible
+/// revision (the same bump [`App::note_editor_change`] does); `None` returns
+/// `false` and leaves both untouched.
+///
+/// `#[doc(hidden)] pub`: asserted directly by
+/// `tests/suites/tui_surface_units.rs`.
+#[doc(hidden)]
+pub fn seed_fork_composer(editor: &Editor, editor_rev: &AtomicU64, text: Option<&str>) -> bool {
+    let Some(text) = text else {
+        return false;
+    };
+    editor.set_text(text);
+    editor_rev.fetch_add(1, Ordering::SeqCst);
+    true
+}
+
 /// The `/fork` selector keys (decoupled from crossterm for tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForkKey {
@@ -15540,6 +15843,51 @@ fn apply_menu_action(
                 };
                 app.wheel.set_lines(lines);
             }
+            // Upstream `onEditorPaddingXChange`
+            // (interactive-mode.ts:5067-5073): persist (below) and apply the
+            // clamped inset to the live editor immediately. pir's baseline
+            // inset is 1, so the effective value is `1 + setting` (same
+            // mapping as the startup path above).
+            "editor-padding" => {
+                if let Some(padding) = value.as_u64() {
+                    app.editor.set_padding_x(1 + padding.min(3) as usize);
+                    app.request_ui_refresh();
+                }
+            }
+            // Upstream `onOutputPadChange` (interactive-mode.ts:5074-5085):
+            // persist (below) and forward the new inset to every transcript
+            // child; the block cache rebuilds the already-rendered entries so
+            // the current session shows the change instead of "Saved" lying.
+            "output-padding" => {
+                if let Some(padding) = value.as_u64() {
+                    app.set_output_pad(usize::try_from(padding.min(1)).unwrap_or(0));
+                }
+            }
+            // Upstream `onShowHardwareCursorChange`
+            // (interactive-mode.ts:5059-5066): the UI cell flips immediately;
+            // the settings write below persists it for the next start.
+            "show-hardware-cursor" => {
+                if let Some(show) = value.as_bool() {
+                    app.core.set_show_hardware_cursor(show);
+                    app.editor.set_show_hardware_cursor(show);
+                    app.request_ui_refresh();
+                }
+            }
+            // Upstream `onShowTerminalProgressChange` persists only, but each
+            // event reads `settingsManager.getShowTerminalProgress()` live
+            // (interactive-mode.ts:5100-5102): mirror that by moving the app
+            // cell the next RunStarted/RunSettled gate reads.
+            "terminal-progress" => {
+                app.osc_progress = value.as_bool().unwrap_or(false);
+            }
+            // Upstream `onClearOnShrinkChange` (interactive-mode.ts:5094-5095):
+            // persist (below) and hand the enabled flag to the UI immediately.
+            "clear-on-shrink" => {
+                if let Some(enabled) = value.as_bool() {
+                    app.core.set_clear_on_shrink(enabled);
+                    app.request_ui_refresh();
+                }
+            }
             // Upstream `onShowImagesChange` / `onImageWidthCellsChange`
             // (interactive-mode.ts:4979-4993): persist, then re-point every
             // image consumer. pir resolves the pair at render time from the
@@ -15563,6 +15911,23 @@ fn apply_menu_action(
                     terminal.image_width_cells =
                         value.as_u64().and_then(|width| u32::try_from(width).ok());
                 }
+            }
+            // Upstream `onAutocompleteMaxVisibleChange` (editor.ts:411-416
+            // `setAutocompleteMaxVisible`): apply the clamped value to the
+            // open popup immediately and keep it for every popup constructed
+            // afterwards (new popups read `app.autocomplete_max_visible`).
+            "autocomplete-max-visible" => {
+                app.autocomplete_max_visible = value.as_u64().and_then(|v| u32::try_from(v).ok());
+                let requested = app.autocomplete_max_visible;
+                if let Some(popup) = app
+                    .autocomplete
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                {
+                    popup.set_max_visible(requested);
+                }
+                app.request_ui_refresh();
             }
             // `fullscreenScrollbar` / `fullscreenCopyOnSelect` are read LIVE
             // by the frame decorator and the mouse/key paths. Update the
@@ -16833,11 +17198,13 @@ fn apply_extension_completions(app: &App, prefix: &str, items: Vec<serde_json::V
     }
     *app.autocomplete
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some(AutocompletePopup::new(AutocompleteSuggestions {
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+        AutocompletePopup::new(AutocompleteSuggestions {
             items: converted,
             prefix: prefix.to_string(),
-        }));
+        })
+        .with_max_visible(app.autocomplete_max_visible),
+    );
 }
 
 /// P1-2 contract: what a user submit displays vs what the model receives.
@@ -18774,7 +19141,8 @@ fn request_autocomplete(app: &App, force: bool, explicit_tab: bool) {
         app.note_editor_change();
         return;
     }
-    let mut popup = AutocompletePopup::new(suggestions);
+    let mut popup =
+        AutocompletePopup::new(suggestions).with_max_visible(app.autocomplete_max_visible);
     popup.forced = force;
     // Upstream default highlight (`getBestAutocompleteMatchIndex`): an
     // exact value match is preselected so Enter submits what the user
@@ -22694,6 +23062,15 @@ enum WorkerEvent {
     SessionSwitchSettled {
         switch_epoch: u64,
     },
+    /// The fork's selected user-message text (upstream `fork`'s
+    /// `selectedText`, agent-session-runtime.ts:272-286): the `/fork` picker
+    /// (`Before` position) branches at the message's parent, so the picked
+    /// text is NOT in the branched transcript — the composer is re-seeded
+    /// with it (interactive-mode.ts:5518 `editor.setText(result.selectedText ?? "")`).
+    /// Sent after the branch replay so the text survives the tab draft restore.
+    ForkSelectedText {
+        text: Option<String>,
+    },
     /// OSC 7501: an agent run started (upstream `agent_start` →
     /// `programStatus.agentStart`).
     RunStarted,
@@ -23823,6 +24200,12 @@ fn build_agent_session(
             session,
             compaction: Some(crate::compaction::CompactionConfig::default()),
             max_turns: 100,
+            performance: configured
+                .settings
+                .performance
+                .clone()
+                .unwrap_or_default()
+                .with_env_profile(),
             // `None` lets the facade build the structured system prompt with
             // the discovered context files (env-gated by --no-context-files).
             system_prompt: None,
@@ -26997,6 +27380,18 @@ pub fn worker_level_failure_signals() -> [WorkerFailureSignal; 2] {
     [WorkerFailureSignal::Error, WorkerFailureSignal::RunEnd]
 }
 
+/// F2 (pure; regression-tested): the worker-level "no model configured"
+/// notice. The file paths name the agent dir actually in effect
+/// ([`crate::ai::providers::agent_dir`], env-alias aware), so a custom
+/// `PIR_AGENT_DIR` run is not told to edit `~/.pi/agent`, which would have no
+/// effect there.
+pub fn no_model_configured_message(agent_dir: &std::path::Path) -> String {
+    let dir = agent_dir.display();
+    format!(
+        "No pi model configured. Add {dir}/models.json and set defaultProvider/defaultModel in {dir}/settings.json."
+    )
+}
+
 /// F2 (pure; regression-tested): whether a worker `Error` notice must ALSO end
 /// the UI's run state. A worker-level error arrives with no run in flight
 /// (nothing else would ever clear the optimistic `Working` label — the spinner
@@ -27482,7 +27877,7 @@ async fn worker_loop(
         overrides,
     } = parts;
     let Some(configured) = configured else {
-        let message = "No pi model configured. Add ~/.pi/agent/models.json and set defaultProvider/defaultModel in ~/.pi/agent/settings.json.".to_string();
+        let message = no_model_configured_message(&global_agent_dir());
         // F2: the error notice AND the run-end signal — the UI's optimistic
         // `Working` label has no run to end it otherwise (see
         // [`worker_level_failure_signals`]).
@@ -27527,6 +27922,13 @@ async fn worker_loop(
             return;
         }
     };
+    // PIR-TUI-013: a `--continue`/opened-at-startup transcript must reach the
+    // native plugins before the first prompt. `AgentSession` pushes the
+    // session-context snapshot before every prompt and after every run, but
+    // the startup attach had no push: `todo` replay and the `memory` session
+    // binding observed an empty session until the first prompt. Push once
+    // here, after the session exists and before the UI can issue `/todos`.
+    session.push_session_context_on_attach().await;
     // Session-scoped auth/refresh handle for the UI (SNAP10 P2-S8-2): `/login`,
     // provider model refresh and Radius token auth upgrade this weak handle
     // and call `AgentSession`'s session-scoped entry points instead of the
@@ -27680,6 +28082,17 @@ async fn worker_loop(
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
             let images = tool_images_from_json(partial.get("content"));
+            // A live partial can carry structured `details` of its own — the
+            // subagent builtin emits one `SingleResult` snapshot per child
+            // turn (mode/step/pending/usage/transcript), and upstream renders
+            // `partialResult.details` exactly like a finalized result while
+            // the block stays pending (`isPartial`). Dropping them here left
+            // the running block with no per-step entries at all
+            // (PIR-TUI-004).
+            let details = partial
+                .get("details")
+                .cloned()
+                .filter(|value| !value.is_null());
             let _ = events.send(WorkerEvent::ToolUpdate {
                 call_id,
                 request_id: None,
@@ -27687,9 +28100,7 @@ async fn worker_loop(
                 args,
                 output,
                 is_error,
-                // A live rolling snapshot: no final details, and the block
-                // stays pending (upstream `isPartial`).
-                details: None,
+                details,
                 images,
                 partial: true,
             });
@@ -27909,6 +28320,15 @@ async fn run_prompt(
         Arc::clone(pulse),
     );
     let prompt_session = Arc::clone(session);
+    // PIR-TUI-019 allocator high-water: env-gated (`PIR_ALLOC_TRACE`), one
+    // sample per prompt run. Disabled builds pay two relaxed loads per
+    // allocation in the delegating global allocator.
+    let alloc_before = if crate::tui::alloc_trace::enabled() {
+        crate::tui::alloc_trace::reset_peak();
+        Some(crate::tui::alloc_trace::snapshot())
+    } else {
+        None
+    };
     let mut prompt_task = tokio::spawn(async move {
         match run {
             // TUI input is upstream `InputSource::Interactive`; a handler's
@@ -27996,6 +28416,10 @@ async fn run_prompt(
         // Wait for the cancellation to land (the task is dropped at its
         // next poll) so nothing touches the session past this point.
         let _ = prompt_task.await;
+    }
+    if let Some(before) = alloc_before {
+        let after = crate::tui::alloc_trace::snapshot();
+        crate::tui::alloc_trace::write_sample("prompt", before, after);
     }
     streaming.store(false, Ordering::SeqCst);
     let outcome = match result {
@@ -28092,6 +28516,11 @@ async fn attach_opened_session(
             if let Some(model) = recorded_model {
                 let _ = session.restore_model(model).await;
             }
+            // The swap pushed a snapshot with the model active BEFORE the
+            // restored one; refresh it (same entries, restored model) so a
+            // pre-prompt `/todos`/plugin read sees the resumed session's
+            // model, matching what the first prompt's push will use.
+            session.push_session_context_on_attach().await;
             // The swap is done: everything emitted from here on describes the
             // ATTACHED session (the replay follows), so open the UI's gate
             // before the first replay event.
@@ -28656,7 +29085,14 @@ async fn handle_session_command(
                                         first_user.as_deref(),
                                     )
                                     .await;
-                                    Ok(format!("{label} session: {forked_path}"))
+                                    // Status text = upstream verbatim
+                                    // (`interactive-mode.ts:1996/:5519` fork,
+                                    // `:5549` clone): no path suffix — the
+                                    // attached-session face (tab title,
+                                    // footer, terminal title) already carries
+                                    // the path. `{label}` stays the command
+                                    // identity ("Forked"/"Cloned").
+                                    Ok(fork_status_text(label))
                                 }
                                 false => {
                                     let _ = events
@@ -28803,63 +29239,53 @@ async fn handle_session_command(
             entry_id,
             switch_epoch,
         } => {
-            // `/fork` selection: create the branched NEW session from the
-            // picked entry (upstream `runtimeHost.fork(entryId)` →
-            // `createBranchedSession`), then attach it.
-            let outcome = match session.state().session_path {
-                Some(path) => {
-                    let branched =
-                        crate::session_manager::SessionManager::open(std::path::Path::new(&path))
-                            .and_then(|mut source| source.create_branched_session(&entry_id))
-                            .and_then(|new_path| {
-                                new_path
-                                    .map(crate::session_manager::SessionManager::open)
-                                    .transpose()
-                            });
-                    match branched {
-                        Ok(Some(forked)) => {
-                            let forked_path = forked.path().to_string_lossy().into_owned();
-                            // §2.5: never carry a background call across a branch.
-                            session.abort_all_background();
-                            match session.replace_session_storage(forked).await {
-                                true => {
-                                    let _ = events
-                                        .send(WorkerEvent::SessionSwitchSettled { switch_epoch });
-                                    // New branched session: rebind replay of
-                                    // the branch history (upstream
-                                    // `renderInitialMessages` after the fork).
-                                    let first_user =
-                                        replay_transcript_entries(session, events).await;
-                                    announce_paged_session(session, events).await;
-                                    announce_session_attached(
-                                        session,
-                                        events,
-                                        Some(forked_path.clone()),
-                                        first_user.as_deref(),
-                                    )
-                                    .await;
-                                    Ok(format!("Forked session: {forked_path}"))
-                                }
-                                false => {
-                                    let _ = events
-                                        .send(WorkerEvent::SessionSwitchSettled { switch_epoch });
-                                    Err(NO_SESSION_STORAGE.to_string())
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            let _ = events.send(WorkerEvent::SessionSwitchSettled { switch_epoch });
-                            Err(format!("Fork failed: entry {entry_id} not found"))
-                        }
-                        Err(error) => {
-                            let _ = events.send(WorkerEvent::SessionSwitchSettled { switch_epoch });
-                            Err(format!("Fork failed: {error}"))
-                        }
-                    }
-                }
-                None => {
+            // `/fork` selection: branch at the picked entry (upstream
+            // `runtimeHost.fork(entryId)` → `createBranchedSession`, with the
+            // picker's default `before` position semantics) THROUGH the
+            // AgentSession lifecycle seam, not a raw storage rewrite: the
+            // `session_before_fork` dispatch (a cancel aborts), the
+            // `session_shutdown {reason: "fork"}` teardown, and the
+            // post-swap `session_start {reason: "fork"}` all fire here, and
+            // the leaf/target semantics live in one place shared with RPC
+            // and `ctx.fork` (PIR-TUI-021: the old direct
+            // `create_branched_session` path skipped every lifecycle hook
+            // and forked at the entry itself instead of its parent).
+            let outcome = match session.fork_entry(&entry_id, ForkPosition::Before).await {
+                Ok(ForkEntryOutcome::Branched { selected_text }) => {
+                    // §2.5: never carry a background call across a branch.
+                    session.abort_all_background();
                     let _ = events.send(WorkerEvent::SessionSwitchSettled { switch_epoch });
-                    Err(NO_SESSION_STORAGE.to_string())
+                    // Upstream seeds the composer with the forked-away user
+                    // text (interactive-mode.ts:5518) BEFORE the replay
+                    // events so the branched transcript, the tab draft
+                    // restore and this text land in the same order.
+                    let _ = events.send(WorkerEvent::ForkSelectedText {
+                        text: selected_text,
+                    });
+                    // Branched session: rebind replay of the branch history
+                    // (upstream `renderInitialMessages` after the fork).
+                    let first_user = replay_transcript_entries(session, events).await;
+                    announce_paged_session(session, events).await;
+                    let forked_path = session.state().session_path.clone().unwrap_or_default();
+                    announce_session_attached(
+                        session,
+                        events,
+                        (!forked_path.is_empty()).then_some(forked_path.clone()),
+                        first_user.as_deref(),
+                    )
+                    .await;
+                    // (path display: announce_session_attached already feeds
+                    // it to the tab title / footer face, as upstream shows
+                    // it nowhere on the status row).
+                    Ok(fork_status_text("Forked"))
+                }
+                Ok(ForkEntryOutcome::Cancelled) => {
+                    let _ = events.send(WorkerEvent::SessionSwitchSettled { switch_epoch });
+                    Err("Fork cancelled by a session_before_fork handler".to_string())
+                }
+                Err(error) => {
+                    let _ = events.send(WorkerEvent::SessionSwitchSettled { switch_epoch });
+                    Err(format!("Fork failed: {error}"))
                 }
             };
             report_session_outcome(events, outcome);

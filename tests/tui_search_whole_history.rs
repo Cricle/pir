@@ -81,7 +81,7 @@ use pir::ai::types::{ContentBlock, Message, TextContent, UserMessage, UserRole};
 use pir::session_manager::SessionManager;
 use pir::tui::altscreen_search::{
     self, AltScreenState, SearchState, SearchWalk, SearchWalkOutcome, SearchWalkPlan,
-    SEARCH_WALK_MAX_PAGES,
+    SEARCH_WALK_MAX_BYTES, SEARCH_WALK_MAX_PAGES,
 };
 use pir::tui::ansi::strip_ansi;
 use pir::tui::app::{ChatContainer, ChatEntry};
@@ -158,6 +158,10 @@ const MARKER_PAGE: &str = "ZZMARK-PAGE-57";
 const MARKER_NEWEST: &str = "TAIL-NEWEST-MARK";
 /// In no turn at all.
 const MARKER_MISSING: &str = "QQMARK-NOT-ANYWHERE";
+/// Only in turn 16 — a marker the disk walk reaches from the capped walk's
+/// cursor (PIR-TUI-009's next query), with no `q`/`z` so it can be typed
+/// against either marker discipline.
+const MARKER_MIDDLE: &str = "MMMARK-MIDDLE-16";
 
 /// The one rendered line carrying [`MARKER_OLDEST`] (turn 0's head), used for
 /// the SCREEN assertions: the search box paints the typed query, so
@@ -209,6 +213,10 @@ fn turn_text(index: usize) -> String {
     if index + 1 == FIXTURE_TURNS {
         head.push(' ');
         head.push_str(MARKER_NEWEST);
+    }
+    if index == 16 {
+        head.push(' ');
+        head.push_str(MARKER_MIDDLE);
     }
     head.push('\n');
     let mut text = head;
@@ -571,6 +579,10 @@ impl Harness {
                     // harness cannot disagree with it about which step needs
                     // the post-render band check.
                     self.walk_check |= step.arms_band_check();
+                }
+                SearchWalkStep::Stopped => {
+                    // The production loop repaints for this step; the harness
+                    // renders every iteration anyway.
                 }
             }
         }
@@ -1566,4 +1578,250 @@ fn regular_sessions_keep_the_pre_existing_search_path() {
     assert_eq!(alt.search.result_text(), "No matches");
     drop(alt);
     assert_eq!(h.load_older_calls, 0);
+}
+
+// ---------------------------------------------------------------------------
+// (vi) PIR-TUI-009: found -> Esc -> capped -> Esc -> next query must settle
+// ---------------------------------------------------------------------------
+
+/// The exact sequence from PIR-TUI-009, on a fixture whose capped query
+/// leaves a resident prefix behind: a found-in-band query, Esc, a missing
+/// query that hits the page bound, Esc, then an older marker that lives past
+/// the capped cursor. The third query must walk to it and settle — a new
+/// query gets a fresh walk (the old one is cancelled, not resumed) and its
+/// disk budget is not starved by the resident prefix the capped walk loaded.
+#[test]
+fn found_then_capped_then_next_query_settles_without_wedging() {
+    let _guard = test_lock();
+    warm_theme();
+    // Two turns per page: the missing query caps at the 16-page bound while
+    // the middle marker (turn 16) is still reachable from the capped cursor.
+    let fixture = paged_fixture("found-capped-next", FIXTURE_TURNS, 2);
+    let mut h = Harness::new(fixture, true);
+    h.step();
+
+    // 1. A match in the band: the walk settles as Found without paging.
+    h.open_search();
+    h.type_text(MARKER_NEWEST);
+    h.step();
+    {
+        let alt = h.search();
+        assert_eq!(
+            alt.search.walk.outcome(),
+            Some(SearchWalkOutcome::Found),
+            "sanity: the tail marker settles the walk in the band"
+        );
+        assert!(!alt.search.walk.is_walking());
+    }
+    h.press_esc();
+
+    // 2. A missing query: 16 pages cannot reach the file start (35 pages
+    // down), so the walk stops at its bound and says so honestly.
+    h.open_search();
+    h.type_text(MARKER_MISSING);
+    h.settle(64);
+    {
+        let alt = h.search();
+        assert_eq!(
+            alt.search.walk.outcome(),
+            Some(SearchWalkOutcome::Capped),
+            "the missing query stops at the page bound"
+        );
+        assert_eq!(alt.search.result_text(), "No match so far");
+        assert!(
+            alt.search.walk.bytes() > 0,
+            "disk pages must count toward the byte bound: pages={} bytes={}",
+            alt.search.walk.pages(),
+            alt.search.walk.bytes()
+        );
+    }
+    h.press_esc();
+
+    // 3. The next query: a real match behind the capped cursor. A new walk
+    // must start (fresh budget, old walk cancelled) and settle as Found.
+    h.open_search();
+    h.type_text(MARKER_MIDDLE);
+    h.settle(128);
+    let alt = h.search();
+    assert!(
+        !alt.search.walk.is_walking(),
+        "the next query's walk must not stay pending"
+    );
+    assert_eq!(
+        alt.search.walk.outcome(),
+        Some(SearchWalkOutcome::Found),
+        "the next query must reach its marker on disk"
+    );
+    assert!(
+        !alt.search.matches.is_empty(),
+        "the walked-in page holds the middle marker"
+    );
+    assert_eq!(alt.search.result_text(), "1/1");
+    drop(alt);
+    assert!(
+        h.screen_contains(&format!("turn 00016 {MARKER_MIDDLE}")),
+        "the next query's match is revealed:\n{}",
+        h.screen().join("\n")
+    );
+}
+
+/// Rapid edits and repeated Esc between queries must not wedge the walk: a
+/// superseded read lands as a plain chunk, the next query arms a fresh walk,
+/// and it still reaches the oldest page.
+#[test]
+fn rapid_edits_and_esc_do_not_leave_the_walk_pending() {
+    let _guard = test_lock();
+    warm_theme();
+    let fixture = paged_fixture("rapid-esc", FIXTURE_TURNS, PAGE_TURNS);
+    let mut h = Harness::new(fixture, true);
+    h.step();
+
+    h.open_search();
+    // Type a query that will read a page, then Esc before the reply lands.
+    h.type_text(MARKER_PAGE);
+    h.step();
+    assert!(h.search().search.walk.is_walking(), "the walk is live");
+    h.press_esc();
+    h.press_esc(); // a second Esc must be harmless
+                   // The superseded read drains as a plain chunk.
+    assert!(h.deliver_one(), "the cancelled read still lands");
+
+    // A fresh query over the same session must still walk to the oldest page.
+    h.open_search();
+    h.type_text(MARKER_OLDEST);
+    h.settle(128);
+    let alt = h.search();
+    assert!(
+        !alt.search.walk.is_walking(),
+        "no pending walk after settling"
+    );
+    assert_eq!(
+        alt.search.walk.outcome(),
+        Some(SearchWalkOutcome::Found),
+        "the fresh query reaches the oldest page after a cancelled read"
+    );
+    assert_eq!(alt.search.result_text(), "1/1");
+}
+
+/// A walk stopped by the PLANNER (bound reached while probing, no reply on
+/// the wire) must be reported as [`SearchWalkStep::Stopped`]: the production
+/// loop runs the walk block outside the dirty-frame gate, so that step is the
+/// only thing that repaints the box from `…` to its terminal label
+/// (PIR-TUI-009's permanent ellipsis).
+#[test]
+fn a_planner_stopped_walk_returns_the_stopped_step() {
+    let mut search = SearchState {
+        active: true,
+        query: "needle".to_owned(),
+        ..SearchState::default()
+    };
+    search.walk.start("needle");
+    while search.walk.budget_left() {
+        search.walk.note_probe(0, 0);
+    }
+    assert!(search.walk.is_walking(), "spent, but not yet planned");
+    let mut pages = OlderPages {
+        cursor: Some(42),
+        ..OlderPages::default()
+    };
+    let entries: Vec<ChatEntry> = Vec::new();
+    let mut window = TranscriptWindow::new();
+    let mut probe = ChatContainer::new();
+    let step = search_walk_step(
+        &mut search,
+        true,
+        &mut pages,
+        &mut SearchWalkView {
+            entries: &entries,
+            window: &mut window,
+        },
+        &mut SearchWalkProbe {
+            probe: &mut probe,
+            width: 80,
+            hide_thinking: false,
+        },
+    );
+    assert_eq!(step, SearchWalkStep::Stopped);
+    assert!(!search.walk.is_walking());
+    assert_eq!(search.walk.outcome(), Some(SearchWalkOutcome::Capped));
+    assert_eq!(search.result_text(), "No match so far");
+}
+
+/// Resident-prefix probes are bounded by the PAGE budget; they must not spend
+/// the DISK byte budget. Otherwise a previous query's loaded prefix alone can
+/// exhaust 4 MiB and the next query caps before reading a single older page
+/// (PIR-TUI-009): the walk could never reach its match on disk.
+#[test]
+fn resident_probe_bytes_do_not_starve_the_disk_budget() {
+    let mut walk = SearchWalk::default();
+    walk.start("needle");
+    // One probe slice larger than the whole byte bound (a resident prefix a
+    // previous query loaded): a page of the bound, but zero disk bytes.
+    walk.note_probe(512, SEARCH_WALK_MAX_BYTES * 2);
+    assert_eq!(walk.bytes(), 0, "probes materialize nothing");
+    assert!(
+        walk.budget_left(),
+        "a resident probe must not spend the disk byte budget"
+    );
+    assert_eq!(walk.pages(), 1);
+}
+
+/// PIR-TUI-010: a query edit must reuse the materialized band's row parses and
+/// assembled corpus. The regression was invisible to correctness tests: every
+/// keystroke re-stripped/re-folded the whole frame, so typing into a huge
+/// materialized history fell behind the input queue. The cache counters pin
+/// the contract: a query edit runs the matcher once, nothing else.
+#[test]
+fn query_edits_reuse_the_materialized_band_cache() {
+    // Sized like a session whose whole history was materialized: 20k rendered
+    // rows, each with ANSI decoration and several runs.
+    let lines: Vec<String> = (0..20_000)
+        .map(|index| {
+            format!(
+                "\x1b[32mBULK-{index:05}-LINE-{} xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x1b[0m",
+                index % 40
+            )
+        })
+        .collect();
+    let mut state = AltScreenState::default();
+    state.search.active = true;
+    state.search.query = "B".to_string();
+    assert!(altscreen_search::refresh_search(&mut state, &lines, 0, 1));
+    assert_eq!(state.search.cache.row_rebuilds(), 20_000);
+    assert_eq!(state.search.cache.corpus_builds(), 1);
+    let rebuilds = state.search.cache.row_rebuilds();
+    let corpus_builds = state.search.cache.corpus_builds();
+    let match_runs = state.search.cache.match_runs();
+
+    for (index, query) in ["BU", "BUL", "BULK-1", "BULK-199", "BULK-1999"]
+        .iter()
+        .enumerate()
+    {
+        state.search.query = (*query).to_string();
+        assert!(altscreen_search::refresh_search(
+            &mut state,
+            &lines,
+            0,
+            2 + index as u64
+        ));
+        assert_eq!(
+            state.search.cache.row_rebuilds(),
+            rebuilds,
+            "query {query:?} must not re-parse any row"
+        );
+        assert_eq!(
+            state.search.cache.corpus_builds(),
+            corpus_builds,
+            "query {query:?} must not re-assemble the corpus"
+        );
+    }
+    assert_eq!(
+        state.search.cache.match_runs(),
+        match_runs + 5,
+        "one matcher pass per query edit"
+    );
+    assert!(
+        !state.search.matches.is_empty(),
+        "the final marker query must match"
+    );
 }

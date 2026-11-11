@@ -3661,6 +3661,7 @@ fn flush_timing_session_config(
     extensions: Option<ExtensionHandle>,
 ) -> AgentSessionConfig {
     AgentSessionConfig {
+        performance: Default::default(),
         provider_registry: Arc::new(ProviderRegistry::default()),
         model: flush_timing_model(),
         api_key: None,

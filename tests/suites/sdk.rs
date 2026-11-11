@@ -999,6 +999,92 @@ async fn todo_builtin_declares_its_tool_and_replays_the_session_transcript() {
     assert_eq!(state.next_id, 3, "the id counter is part of the snapshot");
 }
 
+/// PIR-SDK-002: a session built WITHOUT a JS extension runtime (SDK inline
+/// plugins / builtins only) must still push the complete session snapshot to
+/// its Rust plugin list — not the model-only placeholder. The plugin contract
+/// is shared: todo replays its last snapshot from `entries`, memory binds its
+/// store from `session_path`/`cwd`, and tool-repair reads `model`. A custom
+/// observer pins the generic invariant (no builtin special-casing): after a
+/// run the last push carries the transcript, session identity, cwd and header
+/// of a real session file.
+#[tokio::test]
+async fn plugin_only_session_pushes_the_full_session_context_snapshot() {
+    use pir::plugins::{AgentPlugin, PluginInfo};
+
+    struct ContextProbe {
+        info: PluginInfo,
+        snapshots: Arc<Mutex<Vec<pir::extensions::SessionContextSnapshot>>>,
+    }
+
+    impl AgentPlugin for ContextProbe {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+        fn on_session_context(&self, snapshot: &pir::extensions::SessionContextSnapshot) {
+            self.snapshots.lock().unwrap().push(snapshot.clone());
+        }
+    }
+
+    let temp = TempDir::new("plugin-only-context");
+    let snapshots = Arc::new(Mutex::new(Vec::new()));
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("recorded")], StopReason::Stop)
+    }));
+    let agent = AgentBuilder::new()
+        .with_registry(registry, fake_model())
+        .agent_dir(temp.0.clone())
+        .cwd(temp.0.clone())
+        .session(SessionMode::Dir(temp.0.clone()))
+        .no_compaction()
+        .thinking_level(ThinkingLevel::Off)
+        .with_plugin(Arc::new(ContextProbe {
+            info: PluginInfo::inline("context-probe"),
+            snapshots: Arc::clone(&snapshots),
+        }))
+        .build()
+        .await
+        .expect("build a plugin-only session");
+
+    agent.prompt("remember this turn").await.expect("prompt");
+    let session_path = agent.session_path().expect("persistent session file");
+    agent.shutdown().await.expect("shutdown");
+
+    let captured = snapshots.lock().unwrap();
+    let snapshot = captured
+        .last()
+        .expect("the plugin must receive at least one session-context push");
+    assert!(
+        snapshot
+            .entries
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty()),
+        "the no-runtime push must carry the transcript entries, got {:?}",
+        snapshot.entries
+    );
+    assert_eq!(
+        snapshot.session_path.as_deref(),
+        Some(session_path.to_string_lossy().as_ref()),
+        "the push must identify the live session file"
+    );
+    assert!(
+        snapshot
+            .session_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty()),
+        "the push must carry the session id"
+    );
+    assert_eq!(
+        snapshot.cwd.as_deref(),
+        Some(temp.0.to_string_lossy().as_ref()),
+        "the push must carry the session cwd"
+    );
+    assert!(
+        snapshot.header.is_object(),
+        "the push must carry the session header, got {:?}",
+        snapshot.header
+    );
+}
+
 /// Unknown names (bare and `builtin:`-prefixed) fail `build()` with the
 /// upstream wording, and every missing name is reported — never a silent
 /// no-op.
@@ -1130,6 +1216,7 @@ fn builtin_feature_diagnostics_are_pinned() {
         ("python", "python"),
         ("codemode", "extensions"),
         ("todo", "todo"),
+        ("memory", "memory"),
     ] {
         let message = missing_builtin_message(name);
         assert!(
