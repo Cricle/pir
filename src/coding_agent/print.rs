@@ -4589,8 +4589,18 @@ pub async fn run_print_with_environment(
             // more provider request over the settled context. The shared
             // AgentSession adapter owns the payload, `continue` gate and
             // draft commits; print only re-runs the loop.
+            //
+            // An aborted run skips the boundary entirely, exactly like
+            // upstream's `if (this._agentRunAbortRequested || !(await
+            // this._runBeforeSettleBoundary())) break;` (agent-session.ts:
+            // 1900-1907): the cancelled turn dispatches no
+            // `agent_before_settle` and never honors its `continue`.
             let continue_requested = match &plugins {
-                Some(host) if host.has_handlers("agent_before_settle") => {
+                Some(host)
+                    if !result.aborted
+                        && !run_signal.is_aborted()
+                        && host.has_handlers("agent_before_settle") =>
+                {
                     let boundary = crate::agent_session::BoundarySession::Shared(&session);
                     let pending_messages = background.has_pending_follow_up().await;
                     crate::agent_session::dispatch_agent_before_settle_boundary(

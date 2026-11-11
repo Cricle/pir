@@ -136,6 +136,38 @@ pub(super) async fn prepare_calls(
             .await;
             continue;
         }
+        // Yield once so the observer's consumer can DELIVER this start frame
+        // before the `tool_call` gate below is dispatched (PIR-BIN-048).
+        //
+        // Upstream's `executeToolCalls*` awaits `emit({type:
+        // "tool_execution_start"})` before calling `prepareToolCall(...,
+        // config.beforeToolCall)` (agent-loop.ts:553-566 sequential,
+        // 608-620 parallel), so a `tool_execution_start` handler runs FIRST and
+        // carries the model's raw arguments. pir's preflight queues the start
+        // frame into the progress channel and then dispatches the gate
+        // synchronously from the same poll: the host loop cannot drain the
+        // frame until this future yields, so the gate was observed first (and,
+        // for the JS face, both requests landed in the actor mailbox in
+        // gate-first order). The host loop polls its progress arm first
+        // (`biased` select in `agent_loop`), so one yield moves the frame out
+        // before the gate dispatch; the batch resumes on its next poll.
+        //
+        // The yield sits AFTER the batch's abort check on purpose: an abort
+        // that lands while the frame is being delivered must not skip the
+        // `tool_call` gate. Upstream looks the tool up, prepares, validates and
+        // awaits `beforeToolCall` before it reads the abort signal
+        // (agent-loop.ts:718-750: the aborted outcome replaces the call only
+        // AFTER the hook returned), and the measured pi abort run dispatches
+        // `tool_call` for the cancelled call. The tool itself still observes
+        // the abort through its context signal.
+        //
+        // Gated on both halves being present: without a progress consumer
+        // there is nothing to deliver, and without a `tool_call` observer no
+        // gate dispatch follows the frame, so the no-hook fast path keeps its
+        // current scheduling.
+        if progress.is_some() && faces.is_some_and(|faces| faces.dispatches_tool_call()) {
+            tokio::task::yield_now().await;
+        }
         let Some(tool) = registry.get(&call.tool_name) else {
             push_failure(
                 &mut results,

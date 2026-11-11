@@ -20786,7 +20786,7 @@ fn handle_resume_command(app: &mut App, entries: &mut Vec<ChatEntry>, worker: &W
         // tail-first; a resumed huge session's memory win needs a streamed
         // tree event first, named in the lane report.)
         Some(path) => match crate::session_manager::SessionManager::open(&path) {
-            Ok(manager) => {
+            Ok(mut manager) => {
                 // A live foreign writer owns this transcript (A28-F01): never
                 // attach a second one and interleave turns. Same-process
                 // reopens (a tab switch, /fork's source read) remain allowed.
@@ -29846,7 +29846,7 @@ async fn handle_session_command(
             }
             let outcome =
                 match crate::session_manager::SessionManager::open(std::path::Path::new(&path)) {
-                    Ok(manager) => {
+                    Ok(mut manager) => {
                         if let Err(error) = manager.ensure_exclusive_writer() {
                             let _ = events.send(WorkerEvent::SessionSwitchSettled { switch_epoch });
                             return report_session_outcome(

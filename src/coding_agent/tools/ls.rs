@@ -5,7 +5,7 @@ use crate::agent::tool_batch::ToolResult;
 use crate::agent::tool_execution::{AgentTool, BoxFuture, ToolContext};
 use crate::coding_agent::truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES};
 
-use super::util::{path_error_message, workspace_path};
+use super::util::{display_path, path_error_message, workspace_path};
 
 // ---------------------------------------------------------------------------
 // Ls tool
@@ -77,14 +77,16 @@ async fn list_with_operations(
         Err(error) => return ToolResult::error(error),
     };
     if !operations.exists(&list_path).await {
-        return ToolResult::error(format!("Path not found: {}", list_path.display()));
+        return ToolResult::error(format!("Path not found: {}", display_path(&list_path)));
     }
     if abort_signal.as_ref().is_some_and(AbortSignal::is_aborted) {
         return ToolResult::error("Operation aborted");
     }
     match operations.is_directory(&list_path).await {
         Ok(true) => {}
-        Ok(false) => return ToolResult::error(format!("Not a directory: {}", list_path.display())),
+        Ok(false) => {
+            return ToolResult::error(format!("Not a directory: {}", display_path(&list_path)))
+        }
         Err(error) => return ToolResult::error(path_error_message(&list_path, &error)),
     }
     let mut names = match operations.readdir(&list_path).await {
@@ -248,7 +250,7 @@ impl AgentTool for LsTool {
                 }
             };
             if !metadata.is_dir() {
-                return ToolResult::error(format!("Not a directory: {}", list_path.display()));
+                return ToolResult::error(format!("Not a directory: {}", display_path(&list_path)));
             }
             let mut entries = match tokio::fs::read_dir(&list_path).await {
                 Ok(entries) => entries,

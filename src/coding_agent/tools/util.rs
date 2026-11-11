@@ -484,14 +484,37 @@ pub(super) fn bash_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Render a path for a MODEL-FACING message: the same spelling the caller and
+/// the OS use natively, without the Windows verbatim marker.
+///
+/// The file tools resolve their target against `canonicalize(cwd)`, which on
+/// Windows returns a `\\?\C:\…` path. Printing that prefix in `Path not found:
+/// …` / `Not a directory: …` made pir's error text differ from upstream pi's
+/// (`C:\…`) for every Windows path and pointed the model at a spelling Git
+/// Bash tools (`sed`, `cat`) do not accept. `config::trust::normalize_cwd`
+/// applies the same rule for workspace identity, so this mirrors it.
+pub(super) fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    #[cfg(windows)]
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return rest.to_owned();
+    }
+    text.into_owned()
+}
+
 /// A path-stat error that preserves the useful OS distinction: a missing path
 /// is not the same failure as an unreadable one (EACCES/ENOTDIR).
 pub(super) fn path_error_message(path: &Path, error: &std::io::Error) -> String {
     match error.kind() {
-        std::io::ErrorKind::NotFound => format!("Path not found: {}", path.display()),
-        std::io::ErrorKind::PermissionDenied => format!("Permission denied: {}", path.display()),
-        std::io::ErrorKind::NotADirectory => format!("Not a directory: {}", path.display()),
-        _ => format!("Cannot access '{}': {}", path.display(), error),
+        std::io::ErrorKind::NotFound => format!("Path not found: {}", display_path(path)),
+        std::io::ErrorKind::PermissionDenied => {
+            format!("Permission denied: {}", display_path(path))
+        }
+        std::io::ErrorKind::NotADirectory => format!("Not a directory: {}", display_path(path)),
+        _ => format!("Cannot access '{}': {}", display_path(path), error),
     }
 }
 

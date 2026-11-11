@@ -2560,21 +2560,79 @@ impl SessionManager {
     /// (A28-F01). A lock owned by this same process is allowed: opening the
     /// current session a second time for `/fork`/`/export` is a same-process
     /// read, not another writer.
-    pub fn ensure_exclusive_writer(&self) -> crate::Result<()> {
+    ///
+    /// A lock whose owner is PROVABLY DEAD never blocks (A27 P0): the caller
+    /// reclaims it and takes the guard itself. The open-time attempt in
+    /// [`Self::refresh_writer_lock`] can lose a race the open cannot control —
+    /// a third-party handle opened without `FILE_SHARE_DELETE` (a scanner,
+    /// indexer or reader) makes the unlink fail with a sharing violation, and
+    /// the outgoing owner's last `touch()` can land between two inspection
+    /// snapshots (PIR-TUI-025). Retrying here is what turns that transient
+    /// filesystem condition into a successful resume instead of a refusal
+    /// that accuses the dead pid of "still using" the session.
+    pub fn ensure_exclusive_writer(&mut self) -> crate::Result<()> {
         if !self.persist {
             return Ok(());
         }
-        let Some(path) = self.session_file.as_deref() else {
+        let Some(path) = self.session_file.clone() else {
             return Ok(());
         };
         if !path.exists() || self.writer_lock.is_some() {
             return Ok(());
         }
-        let lock_path = retention::session_lock_path(path);
-        let owner = lock_path
-            .as_deref()
-            .and_then(retention::session_lock_owner_pid);
+        let Some(lock_path) = retention::session_lock_path(&path) else {
+            // No sidecar path can be derived (non-UTF-8 session file name):
+            // there is nothing another writer could be holding.
+            return Ok(());
+        };
+        // Bounded retry on the DEAD-owner path only; a live/foreign/unparseable
+        // owner breaks out immediately and falls through to the refusal.
+        const RECLAIM_ATTEMPTS: u64 = 4;
+        for attempt in 0..RECLAIM_ATTEMPTS {
+            if !retention::session_lock_owner_is_provably_dead(&lock_path) {
+                break;
+            }
+            if retention::reclaim_provably_dead_session_lock(&lock_path) {
+                if let Some(lock) = SessionWriterLock::acquire(&path) {
+                    self.writer_lock = Some(lock);
+                    return Ok(());
+                }
+            }
+            if attempt + 1 < RECLAIM_ATTEMPTS {
+                // A sharing violation is transient (the holder closes its
+                // handle); back off a few ms and re-inspect instead of
+                // reporting the dead owner as a competing writer.
+                std::thread::sleep(std::time::Duration::from_millis(2 * (attempt + 1)));
+            }
+        }
+        // One last acquisition attempt: a reclaimer may have released the file
+        // after the loop's final probe.
+        if let Some(lock) = SessionWriterLock::acquire(&path) {
+            self.writer_lock = Some(lock);
+            return Ok(());
+        }
+        if !lock_path.exists() {
+            // The lock vanished after all (its holder was the dead owner or a
+            // reclaimer): nothing blocks this writer.
+            return Ok(());
+        }
+        let owner = retention::session_lock_owner_pid(&lock_path);
         if owner == Some(std::process::id()) {
+            return Ok(());
+        }
+        if retention::session_lock_owner_is_provably_dead(&lock_path) {
+            // The owner is gone; the only reason the file is still here is an
+            // unrelated process holding it open without delete sharing. Such a
+            // file cannot protect a live writer, so it must not refuse this
+            // resume. Proceed without the advisory guard: the transcript gets
+            // a fresh mtime immediately, which keeps retention's
+            // `ACTIVE_WRITE_SAFETY_WINDOW` protection in force.
+            tracing::warn!(
+                session_id = %self.session_id,
+                lock = %lock_path.display(),
+                "session lock belongs to a dead process but cannot be reclaimed; \
+                 proceeding without the advisory lock"
+            );
             return Ok(());
         }
         match owner {

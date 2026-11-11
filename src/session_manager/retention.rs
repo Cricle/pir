@@ -123,15 +123,18 @@ pub(crate) fn session_lock_owner_pid(lock: &Path) -> Option<u32> {
 /// the one-hour age window: a lock left behind by a normal TUI `/quit` or a
 /// killed print has a dead PID immediately, and a subsequent writer must be
 /// able to take the session over (A27 P0). A live/reused PID, a foreign host,
-/// or an unparseable owner is never reported dead. Callers still compare the
-/// file fingerprint before removing it.
+/// or an unparseable owner is never reported dead. Callers still re-read the
+/// lock body before removing it.
 pub(crate) fn session_lock_owner_is_provably_dead(lock: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(lock) else {
-        return false;
-    };
-    let Some(owner) = parse_lock_owner(&content) else {
-        return false;
-    };
+    std::fs::read_to_string(lock)
+        .ok()
+        .and_then(|content| parse_lock_owner(&content))
+        .is_some_and(|owner| owner_is_provably_dead(&owner))
+}
+
+/// The liveness rule itself, shared by [`session_lock_owner_is_provably_dead`]
+/// and [`reclaim_provably_dead_session_lock`] so both can never disagree.
+fn owner_is_provably_dead(owner: &SessionLockOwner) -> bool {
     // A lock owned by THIS process is never stale: the in-process create-race
     // test deliberately holds a second writer claim while another thread
     // attempts the same id, and process-start-token probing must not treat
@@ -157,25 +160,59 @@ pub(crate) fn session_lock_owner_is_provably_dead(lock: &Path) -> bool {
 }
 
 /// Reclaim a lock whose owner is provably dead, regardless of its age.
-/// The fingerprint re-check prevents deleting a fresh lock created by another
-/// process between the liveness probe and removal.
+///
+/// The lock BODY is re-read right before removal: if another writer replaced
+/// it in the meantime, the bytes differ and the lock is left alone. The old
+/// fingerprint was `(len, mtime)`, which conflated two very different changes —
+/// a benign `touch()` (every append/lock refresh bumps mtime, and NTFS mtime
+/// granularity can put the bump inside this window) and a real ownership
+/// transfer. A benign bump made the reclaim decline, so
+/// `SessionWriterLock::acquire_at` returned `None` and the following
+/// `ensure_exclusive_writer` reported the DEAD pid as "in use by another
+/// process" (PIR-TUI-025). Comparing the body keeps the anti-steal guarantee —
+/// a lock a different writer created is never removed — because a `touch()`
+/// updates mtime only, never the content.
+///
+/// The unlink itself can still fail transiently: on Windows another process
+/// holding the file without `FILE_SHARE_DELETE` (a scanner, indexer or
+/// diagnostic reader) makes it a sharing violation. `false` is then the honest
+/// answer; callers retry, and a dead owner is never turned into a refusal.
 pub(crate) fn reclaim_provably_dead_session_lock(lock: &Path) -> bool {
-    let first = session_lock_snapshot(lock);
-    if first.state == SessionLockState::Missing {
+    if session_lock_snapshot(lock).state == SessionLockState::Missing {
         return true;
     }
-    if !session_lock_owner_is_provably_dead(lock) {
+    let Some(first_body) = std::fs::read_to_string(lock).ok() else {
+        // Present but unreadable: nothing can be attributed, never remove.
+        return false;
+    };
+    let Some(first_owner) = parse_lock_owner(&first_body) else {
+        // Present but unparseable: we cannot attribute it, so we never remove
+        // it (the conservative `Live` rule for unparseable locks).
+        return false;
+    };
+    if !owner_is_provably_dead(&first_owner) {
         return false;
     }
-    let second = session_lock_snapshot(lock);
-    if second.len != first.len || second.modified != first.modified {
-        return false;
+    match std::fs::read_to_string(lock) {
+        Ok(current) if current == first_body => {}
+        Ok(_) => return false,
+        Err(_) => {
+            // The file vanished (a peer reclaimer won): nothing left to
+            // remove. Still present but unreadable is never removed.
+            return std::fs::symlink_metadata(lock).is_err();
+        }
     }
     match std::fs::remove_file(lock) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => false,
     }
+}
+
+/// Test-only visibility hook: run the dead-owner reclaim on `lock`.
+#[doc(hidden)]
+pub fn __test_reclaim_provably_dead_session_lock(lock: &Path) -> bool {
+    reclaim_provably_dead_session_lock(lock)
 }
 
 /// This machine's name, recorded in lock files so a lock written by a process

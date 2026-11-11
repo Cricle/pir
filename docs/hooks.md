@@ -249,3 +249,51 @@ cells.
    A native plugin overrides `AgentPlugin::wants_message_update_content()` to `true`; the host
    snapshots that at build and the loop builds the full payload per delta (O(reply)); `message_end`
    carries the final message, and the JS face keeps full payloads.
+9. **`message_update` also carries the stream's terminal frames.** Upstream `pi.on("message_update")`
+   runs only for content-block deltas (`agent-loop.ts:426-473` never emits the event for `start` /
+   `done` / `error`); pir also delivers `assistantMessageEvent.type == "start"` (the initial partial)
+   and `"done"`/`"error"` (the terminal message). Counts therefore differ (`tool-ok`: pir 11 vs pi 7
+   for the same conversation). A handler that only wants deltas should switch on the event type.
+10. **Session-event bridge names are `pi.on` events on pir only.** Upstream registers
+    `compaction_start`/`compaction_end`/`queue_update`/`entry_appended` with `session.subscribe`, not
+    `pi.on`; a pi extension that calls `pi.on("compaction_start")` never fires (verified on pi
+    1.4.0). pir routes the same names to both hook faces (the table above), so a handler written
+    against pir sees them and the same handler on pi does not — the bridge is a pir extension, not
+    an upstream surface.
+11. **`entry_appended` fan-out.** pir delivers `entry_appended` for every persisted transcript
+    message (user/system/assistant/toolResult); upstream `pi.on`/`session.subscribe` emits it for
+    `pi.appendEntry()` custom entries and boundary/context-edit drafts only. Counting appends in a
+    handler therefore differs by design; use `message_start`/`message_end` for per-message work.
+12. **Payload extensions and omissions (handler-visible).**
+    - `session_compact` additionally carries `compaction` (summary/firstKeptEntryId/tokensBefore/
+      estimatedTokensAfter/usage/details) next to upstream's `compactionEntry`; it backs
+      `ctx.compact({ onComplete })`.
+    - `entry_appended`, `bash_execution_update`, `queue_update`, `session_tree` payload shapes are
+      pir's session-event shapes (`entry`/`delta`/`steering`+`followUp`/`newLeafId`+`oldLeafId`).
+    - `tool_result` omits `details` and `usage` when the tool reported none (upstream's event keys
+      exist with `undefined` values).
+    - `input` always carries `images: []` and `streamingBehavior: null`; upstream omits both keys
+      when absent.
+    - Compaction summarization requests run the provider hooks (`before_provider_request`,
+      `after_provider_response`, `provider_stream_event`) on pir; upstream's `completeSummarization`
+      passes no `onPayload`/`onResponse`, so only `before_provider_headers` fires there (measured:
+      5 vs 4 `before_provider_request` in one manual-compaction conversation).
+    - `agent_end.messages` is the run's produced messages MINUS the caller-supplied starting prompt
+      (upstream includes it); see PIR-BIN-047.
+13. **The abort path dispatches no `agent_before_settle`.** Upstream's settle loop tests the run's
+    abort request BEFORE the pre-settle boundary (`agent-session.ts:1900-1907`), so a cancelled turn
+    emits `turn_end -> agent_end -> agent_settled{aborted:true}` with zero boundary calls. pir's
+    AgentSession settle loop and the print settle loop take the same early exit (`abort_requested`
+    from the run's terminal/abort flag/session flag in `agent_session/prompt_loop.rs`; the run
+    signal in `coding_agent/print.rs`): no boundary dispatch, no honored `continue`, no extra
+    `agent_start`/`agent_end` pair after the abort. A cancelled tool call still goes through
+    `tool_execution_start -> tool_call -> tool_result -> tool_execution_end` (upstream prepares and
+    awaits `beforeToolCall` before it reads the abort signal), with the aborted result as its
+    `tool_result`/`tool_execution_end`, so a handler observes the cancellation exactly once.
+14. **Tool hook order is `tool_execution_start` THEN `tool_call`.** Upstream awaits the start emit
+    before `prepareToolCall(..., beforeToolCall)` (agent-loop.ts:553-566 sequential, 608-620
+    parallel); pir's scheduler queues the start frame into its progress channel and yields once
+    before dispatching the gate (only when both a progress consumer and a `tool_call` observer
+    exist), so a handler sees the start first. `tool_execution_start.args` is the assistant
+    message's raw call arguments, never the gate's rewrite; the mutated input reaches the tool
+    through `tool_call` and `tool_result` sees the executed payload.

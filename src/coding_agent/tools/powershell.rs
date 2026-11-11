@@ -544,23 +544,16 @@ fn finalize_powershell_result(
     } else {
         "(no output)"
     };
-    // Raw captured output only (trailing whitespace trimmed for display); the
-    // status line is appended AFTER truncation in the result branches below
-    // (upstream `appendStatus` runs post-`truncateTail`). Folding it into
-    // `text` here as well appended it twice.
-    //
-    // The TRIMMED view is display-only. The advertised full-output file must
-    // hold the complete captured stream (the bash arm passes its untrimmed
-    // tail for the same reason): `spill_if_needed` writes its argument
-    // verbatim when nothing was evicted, so handing it the trimmed view would
-    // drop the trailing whitespace from the file the model is pointed at.
+    // Raw captured output only; the status line is appended AFTER truncation
+    // in the result branches below (upstream `appendStatus` runs
+    // post-`truncateTail`). Folding it into `text` here as well appended it
+    // twice. Unlike the old trimmed view, upstream does NOT trim trailing
+    // whitespace: `createShellToolDefinition` is shared by bash and powershell
+    // and feeds the raw capture to `truncateTail`, so `PS> Write-Output o`
+    // renders `o\r\n` on both sides. Trimming only here made pir's powershell
+    // tail differ from its own bash tail for the same bytes.
     let raw_text = capture.tail_string();
-    // Borrow the trimmed display view: the old `trim_end().to_owned()`
-    // allocated a full second copy of the captured output before
-    // `truncate_tail` immediately allocated its own retained window. The
-    // untrimmed `raw_text` stays available for the spill file below.
-    let trimmed_len = raw_text.trim_end().len();
-    let display_text = &raw_text[..trimmed_len];
+    let display_text = raw_text.as_str();
 
     // Structured content for programmatic callers (upstream bashOutputSchema
     // plus `readFullOutput`, shared with the bash tool): full output up to
@@ -641,9 +634,8 @@ fn finalize_powershell_result(
         };
     }
     // Non-truncated result: `truncation.content` is already a byte-for-byte
-    // owned copy of the trimmed display text (built by `truncate_tail`).
-    // Reuse it and release the untrimmed capture instead of allocating a
-    // second trimmed copy as the old `trim_end().to_owned()` did.
+    // owned copy of the display text (built by `truncate_tail`). Reuse it and
+    // release the capture instead of allocating a second copy.
     drop(raw_text);
     let text = truncation.content;
     match status_line {
@@ -657,13 +649,9 @@ fn finalize_powershell_result(
             result
         }
         Some(line) => {
-            let trimmed = text.trim_end();
+            // Upstream `appendStatus` does not trim (see the bash arm).
             let mut result = ToolResult::error(append_status(
-                if trimmed.is_empty() {
-                    empty_text
-                } else {
-                    trimmed
-                },
+                if text.is_empty() { empty_text } else { &text },
                 &line,
             ));
             apply_structured(&mut result);

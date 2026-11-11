@@ -434,7 +434,7 @@ pub fn open_session_manager(
         // for every session that fits. A legacy (v1/v2) file falls back to the
         // full load, which migrates it (see `open_session_tail_first`).
         SessionPlan::Open(path) => {
-            let manager = open_session_tail_first(path)?;
+            let mut manager = open_session_tail_first(path)?;
             manager.ensure_exclusive_writer()?;
             Some(manager)
         }

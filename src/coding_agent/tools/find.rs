@@ -12,7 +12,7 @@ use crate::agent::tool_batch::ToolResult;
 use crate::agent::tool_execution::{AgentTool, BoxFuture, ToolContext};
 use crate::coding_agent::truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES};
 
-use super::util::{path_error_message, workspace_path};
+use super::util::{display_path, path_error_message, workspace_path};
 
 // ---------------------------------------------------------------------------
 // Abort watcher
@@ -323,7 +323,7 @@ async fn find_with_operations(
     use crate::ai::types::AbortSignal;
 
     if !operations.exists(search_path).await {
-        return ToolResult::error(format!("Path not found: {}", search_path.display()));
+        return ToolResult::error(format!("Path not found: {}", display_path(search_path)));
     }
     if abort_signal.as_ref().is_some_and(AbortSignal::is_aborted) {
         return ToolResult::error("Operation aborted");
@@ -459,7 +459,10 @@ impl AgentTool for FindTool {
                 }
             };
             if !metadata.is_dir() {
-                return ToolResult::error(format!("Not a directory: {}", search_path.display()));
+                return ToolResult::error(format!(
+                    "Not a directory: {}",
+                    display_path(&search_path)
+                ));
             }
 
             // The walk is blocking I/O; run it on a blocking thread with the

@@ -176,6 +176,10 @@ pub fn format_shell_output(
     }
     let start_line = truncation.total_lines - truncation.output_lines + 1;
     let end_line = truncation.total_lines;
+    // Upstream `formatOutput` renders `[Showing lines a-b of N. Full output:
+    // <path>]` — exactly ONE space after the sentence period. `full` keeps its
+    // own leading space so the `None` case (a degraded capture with no spill
+    // file) still ends at `.` with no stray space.
     let full = full_output_path
         .map(|path| format!(" Full output: {path}"))
         .unwrap_or_default();
@@ -187,7 +191,7 @@ pub fn format_shell_output(
         ));
     } else if truncation.truncated_by == Some(TruncatedBy::Lines) {
         text.push_str(&format!(
-            "\n\n[Showing lines {start_line}-{end_line} of {}. {full}]",
+            "\n\n[Showing lines {start_line}-{end_line} of {}.{full}]",
             truncation.total_lines,
         ));
     } else {

@@ -2718,13 +2718,18 @@ fn finalize_shell_result(
             result
         }
         Some(line) => {
-            let trimmed = text.trim_end();
+            // Upstream `appendStatus(outputText, status)` does NOT trim the
+            // captured output: a command that wrote `out\nerr\n` renders
+            // `out\nerr\n\n\nCommand exited with code 7` (the blank line the
+            // trailing newline already produced, then appendStatus's own
+            // `\n\n`). The old `trim_end()` here collapsed that into
+            // `out\nerr\n\nCommand exited with code 7`, so the model saw a
+            // different tail than upstream for every non-zero exit. The
+            // `(no output)` placeholder still replaces an EMPTY capture
+            // (upstream `formatOutput(snapshot, "(no output)")` runs before
+            // appendStatus).
             let mut result = ToolResult::error(append_status(
-                if trimmed.is_empty() {
-                    empty_text
-                } else {
-                    trimmed
-                },
+                if text.is_empty() { empty_text } else { &text },
                 &line,
             ));
             apply_structured(&mut result);

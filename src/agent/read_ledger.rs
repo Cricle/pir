@@ -326,26 +326,32 @@ impl ReadLedger {
             ReadCheck::Stale => "the file changed since it was last read (mtime or size differs); read it again, then retry".to_string(),
             ReadCheck::Allowed => unreachable!("Allowed handled above"),
         };
+        // The caller passes an already-canonicalized workspace path; on
+        // Windows that carries the `\?\` verbatim marker. Strip it for the
+        // model-facing message (the same rule as the workspace identity key),
+        // so the refusal names the path in the spelling the user/OS uses and
+        // the spelling the file tools accept as input.
+        let display = crate::config::trust::normalize_cwd(path);
         match self.mode {
             ReadBeforeEditMode::Off => EditGate::Allowed,
             ReadBeforeEditMode::Warn => EditGate::Warn(format!(
                 "Warning: cannot {action} '{}' without a full, unchanged read ({reason}). The {action} proceeds because PIR_READ_BEFORE_EDIT=warn.",
-                path.display()
+                display.display()
             )),
             ReadBeforeEditMode::Enforce => EditGate::Blocked(format!(
                 "Cannot {action} '{}': {reason}.",
-                path.display()
+                display.display()
             )),
             ReadBeforeEditMode::EditWarn => {
                 if action == "edit" && check != ReadCheck::NotRead {
                     EditGate::Warn(format!(
                         "Warning: editing '{}' without a full, unchanged read ({reason}). The edit proceeds because the exact oldText match is the safety check; re-read if you need more context.",
-                        path.display()
+                        display.display()
                     ))
                 } else {
                     EditGate::Blocked(format!(
                         "Cannot {action} '{}': {reason}.",
-                        path.display()
+                        display.display()
                     ))
                 }
             }

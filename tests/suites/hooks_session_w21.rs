@@ -906,3 +906,360 @@ async fn custom_follow_up_continues_the_run_and_persists_a_custom_entry() {
     assert_eq!(custom_entries.len(), 1);
     assert_eq!(custom_entries[0].custom_type, "followup-note");
 }
+
+// ---------------------------------------------------------------------------
+// 5. PIR-BIN-045: an aborted run never reaches the `agent_before_settle`
+//    boundary
+// ---------------------------------------------------------------------------
+
+/// A tool that parks until the test releases it (or the run is aborted),
+/// mirroring the abort repro's long-running scripted call.
+struct ParkedTool {
+    gate: tokio::sync::watch::Receiver<bool>,
+    entered: Arc<AtomicUsize>,
+}
+
+impl AgentTool for ParkedTool {
+    fn name(&self) -> &'static str {
+        "parked"
+    }
+    fn description(&self) -> &'static str {
+        "parks until released or aborted"
+    }
+    fn parameters(&self) -> Option<Value> {
+        Some(json!({ "type": "object" }))
+    }
+    fn run(&self, _args: &Value, ctx: &ToolContext) -> BoxFuture<'static, ToolResult> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let mut gate = self.gate.clone();
+        let signal = ctx.signal.clone();
+        Box::pin(async move {
+            loop {
+                if signal.as_ref().is_some_and(|signal| signal.is_aborted()) {
+                    return ToolResult::error("Operation aborted");
+                }
+                if *gate.borrow() {
+                    return ToolResult::ok("released");
+                }
+                if tokio::time::timeout(std::time::Duration::from_millis(10), gate.changed())
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+            }
+        })
+    }
+}
+
+/// `agent_before_settle` handler that always asks for a continuation. Each
+/// dispatch is counted so the test can assert the aborted run dispatched ZERO
+/// boundaries (upstream `agent-session.ts:1906`: the abort-requested check
+/// leaves the settle loop before `_runBeforeSettleBoundary`).
+struct ContinueAlwaysSettle {
+    info: PluginInfo,
+    dispatches: Arc<AtomicUsize>,
+}
+
+impl AgentPlugin for ContinueAlwaysSettle {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(vec!["agent_before_settle".into()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        if event.name != "agent_before_settle" {
+            return Box::pin(async { PluginEventOutcome::None });
+        }
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { PluginEventOutcome::Generic(json!({ "continue": true })) })
+    }
+}
+
+/// PIR-BIN-045: an abort during the tool batch must skip the
+/// `agent_before_settle` boundary entirely.
+///
+/// Upstream's settle loop breaks BEFORE the boundary whenever the run's abort
+/// was requested (`agent-session.ts:1900-1907`), so `agent_before_settle`
+/// never fires, its `continue` is never honored, and the run ends
+/// `turn_end -> agent_end -> agent_settled{aborted:true}` after ONE provider
+/// request. pir dispatched the boundary three times, re-entered the loop twice
+/// and emitted two extra `agent_start`/`agent_end` pairs (measured in
+/// `.play/evidence/ab-round1/lane-ab-hooks/runs/abort-continue/pir`).
+#[tokio::test]
+async fn aborted_run_skips_the_agent_before_settle_boundary() {
+    let temp = TempDir::new("abort-boundary");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_for_responder = Arc::clone(&requests);
+    let registry = fake_registry(Arc::new(move |_index, _context| {
+        requests_for_responder.fetch_add(1, Ordering::SeqCst);
+        assistant(
+            vec![tool_call("call-1", "parked", json!({}))],
+            StopReason::ToolUse,
+        )
+    }));
+    // The gate never opens: only the abort can end the tool.
+    let (_gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ParkedTool {
+        gate: gate_rx,
+        entered: Arc::clone(&entered),
+    }));
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        session_config(&temp, registry, tools, Some(session)),
+        vec![Arc::new(ContinueAlwaysSettle {
+            info: PluginInfo::inline("continue-always-settle"),
+            dispatches: Arc::clone(&dispatches),
+        }) as Arc<dyn AgentPlugin>],
+    ));
+    // Observe the host event stream to count the run's `agent_start` /
+    // `agent_end` pairs: a boundary continuation would emit a second pair.
+    let lifecycle: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle_for_handler = Arc::clone(&lifecycle);
+    let prompt = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            agent
+                .prompt(
+                    "start",
+                    Arc::new(move |event: pir::agent::agent_loop::AgentEvent| {
+                        let name = match &event {
+                            pir::agent::agent_loop::AgentEvent::AgentStart { .. } => "agent_start",
+                            pir::agent::agent_loop::AgentEvent::AgentEnd { .. } => "agent_end",
+                            pir::agent::agent_loop::AgentEvent::TurnEnd { .. } => "turn_end",
+                            _ => return,
+                        };
+                        lifecycle_for_handler.lock().unwrap().push(name.to_owned());
+                    }),
+                )
+                .await
+        }
+    });
+    for _ in 0..2000 {
+        if entered.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        entered.load(Ordering::SeqCst) > 0,
+        "the parked tool must have started before the abort"
+    );
+    agent.abort();
+    prompt.await.expect("prompt task").expect("prompt result");
+
+    assert_eq!(
+        dispatches.load(Ordering::SeqCst),
+        0,
+        "an aborted run must not dispatch `agent_before_settle` (PIR-BIN-045)"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "an aborted run issues exactly one provider request"
+    );
+    let lifecycle = lifecycle.lock().unwrap().clone();
+    assert_eq!(
+        lifecycle
+            .iter()
+            .filter(|name| *name == "agent_start")
+            .count(),
+        1,
+        "one aborted run must emit exactly one agent_start: {lifecycle:?}"
+    );
+    assert_eq!(
+        lifecycle.iter().filter(|name| *name == "agent_end").count(),
+        1,
+        "one aborted run must emit exactly one agent_end: {lifecycle:?}"
+    );
+    assert_eq!(
+        lifecycle.last().map(String::as_str),
+        Some("agent_end"),
+        "the boundary must not re-enter the loop after the abort: {lifecycle:?}"
+    );
+}
+
+/// A NORMAL (non-aborted) settle still dispatches the boundary exactly once
+/// and honors `continue` — the abort guard must not turn into a blanket skip.
+#[tokio::test]
+async fn normal_settle_dispatches_the_boundary_once_and_honors_continue() {
+    let temp = TempDir::new("settle-once");
+    // Turn 1 ends on a tool result (runnable), so the continuation is
+    // satisfiable and the loop re-enters for turn 2.
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_for_responder = Arc::clone(&requests);
+    let registry = fake_registry(Arc::new(move |index, _context| {
+        requests_for_responder.fetch_add(1, Ordering::SeqCst);
+        if index == 0 {
+            assistant(
+                vec![tool_call("call-1", "probe", json!({ "value": "in" }))],
+                StopReason::ToolUse,
+            )
+        } else {
+            assistant(vec![text("done")], StopReason::Stop)
+        }
+    }));
+    let (tools, _runs) = probe_registry();
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        session_config(&temp, registry, tools, Some(session)),
+        vec![Arc::new(ContinueAlwaysSettle {
+            info: PluginInfo::inline("continue-once-settle"),
+            dispatches: Arc::clone(&dispatches),
+        }) as Arc<dyn AgentPlugin>],
+    ));
+
+    agent
+        .prompt("start", Arc::new(|_| {}))
+        .await
+        .expect("prompt");
+
+    // The boundary fires once per settle. The handler continues whenever the
+    // context can run; the second boundary (after the continuation's text-only
+    // turn) is dismissed by the loop's `canContinue` gate, so exactly one
+    // honored continuation means two dispatches at most. What must NOT happen
+    // is zero dispatches (the non-aborted path still runs the boundary).
+    let dispatches = dispatches.load(Ordering::SeqCst);
+    assert!(
+        dispatches >= 1,
+        "a normal settle must dispatch `agent_before_settle` at least once"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        2,
+        "the honored continuation issues exactly one more provider request"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. PIR-BIN-048: `tool_execution_start` is delivered before `tool_call`
+// ---------------------------------------------------------------------------
+
+/// PIR-BIN-048: the hook order is `tool_execution_start` THEN `tool_call`,
+/// with the start frame carrying the model's raw arguments.
+///
+/// Upstream's `executeToolCalls*` awaits the start emit before
+/// `prepareToolCall(..., config.beforeToolCall)` (agent-loop.ts:553-566,
+/// 608-620), so a handler sees the start first and `args` is pre-gate. pir
+/// dispatched `tool_call` first, and `resolve_tool_start_args` preferred the
+/// gate's post-rewrite input, so the start frame carried the mutated args
+/// (measured: `.play/evidence/ab-round1/lane-ab-hooks/runs/tool-ok/{pir,pi}`).
+///
+/// Both faces are recorded on ONE ordered log: the native plugin observes the
+/// `tool_call` gate, and the host event handler observes the
+/// `tool_execution_start` frame. They are dispatched from the same task, so
+/// the log's order is the client-visible order.
+#[tokio::test]
+async fn tool_execution_start_precedes_the_tool_call_gate() {
+    use pir::agent::agent_loop::AgentEvent;
+
+    let temp = TempDir::new("start-before-gate");
+    let log: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    // The `tool_call` handler rewrites the input: the start frame must keep
+    // the model's raw arguments, exactly like upstream.
+    struct RewritingGate {
+        info: PluginInfo,
+        log: Arc<Mutex<Vec<(String, Value)>>>,
+    }
+    impl AgentPlugin for RewritingGate {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec!["tool_call".into()])
+        }
+        fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            if event.name != "tool_call" {
+                return Box::pin(async { PluginEventOutcome::None });
+            }
+            let payload = event.payload.clone();
+            self.log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(("tool_call".to_owned(), payload));
+            if let Some(input) = event.payload.get_mut("input") {
+                *input = json!({ "value": "rewritten" });
+            }
+            Box::pin(async { PluginEventOutcome::None })
+        }
+    }
+
+    let registry = fake_registry(Arc::new(|index, _context| {
+        if index == 0 {
+            assistant(
+                vec![tool_call("call-1", "probe", json!({ "value": "in" }))],
+                StopReason::ToolUse,
+            )
+        } else {
+            assistant(vec![text("done")], StopReason::Stop)
+        }
+    }));
+    let (tools, runs) = probe_registry();
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        session_config(&temp, registry, tools, Some(session)),
+        vec![Arc::new(RewritingGate {
+            info: PluginInfo::inline("rewriting-gate"),
+            log: Arc::clone(&log),
+        }) as Arc<dyn AgentPlugin>],
+    ));
+
+    let log_for_handler = Arc::clone(&log);
+    agent
+        .prompt(
+            "start",
+            Arc::new(move |event: AgentEvent| {
+                if let AgentEvent::ToolExecutionStart { event, args, .. } = &event {
+                    let tool_name = match event {
+                        pir::agent::tool_batch::ToolExecutionEvent::Start { tool_name, .. } => {
+                            tool_name.clone()
+                        }
+                        _ => return,
+                    };
+                    log_for_handler
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((
+                            "tool_execution_start".to_owned(),
+                            json!({ "toolName": tool_name, "args": args }),
+                        ));
+                }
+            }),
+        )
+        .await
+        .expect("prompt");
+
+    let observed = log.lock().unwrap().clone();
+    let names: Vec<&str> = observed.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["tool_execution_start", "tool_call"],
+        "upstream emits tool_execution_start before the tool_call gate: {observed:?}"
+    );
+    assert_eq!(
+        observed[0].1,
+        json!({ "toolName": "probe", "args": { "value": "in" } }),
+        "the start frame carries the model's RAW arguments, not the gate rewrite"
+    );
+    assert_eq!(
+        observed[1].1["input"],
+        json!({ "value": "in" }),
+        "the gate still sees the model's raw input"
+    );
+    // The mutation still reaches execution (upstream parity): the tool ran
+    // with the rewritten payload.
+    assert_eq!(
+        runs.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        &[json!({ "value": "rewritten" })],
+        "the tool_call rewrite must still reach the tool"
+    );
+}

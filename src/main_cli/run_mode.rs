@@ -1143,17 +1143,21 @@ pub(super) async fn run() -> Result<()> {
             // sessions honor `settings.compaction` like print/RPC/TUI. The
             // override key follows the model the sessions will route to by
             // default (the state's `default_model`); a registry miss falls
-            // back to the first catalog model, and with none at all the
-            // identity-shaped resolver still yields the ordinary settings.
+            // back to the first catalog model. With no resolvable model at all
+            // there is no per-model override to apply, so the resolver runs
+            // against the caller's model and yields the ordinary settings —
+            // the server itself reports the missing model when a prompt runs,
+            // which is where upstream surfaces it too.
             let routed_model = default_model
                 .as_ref()
                 .and_then(|model_ref| registry.get_model(&model_ref.provider, &model_ref.id))
-                .or_else(|| registry.get_models().into_iter().next())
-                .expect("server branch requires at least one resolvable model");
-            let compaction_config = pir::coding_agent::print::settings_compaction_config(
-                &environment.settings,
-                &pir::coding_agent::print::threshold_model_for(&registry, &routed_model),
-            );
+                .or_else(|| registry.get_models().into_iter().next());
+            let compaction_config = routed_model.as_ref().and_then(|routed_model| {
+                pir::coding_agent::print::settings_compaction_config(
+                    &environment.settings,
+                    &pir::coding_agent::print::threshold_model_for(&registry, routed_model),
+                )
+            });
             if let Some(socket_path) = unix {
                 #[cfg(unix)]
                 {

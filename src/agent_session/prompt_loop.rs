@@ -2965,21 +2965,44 @@ impl AgentSession {
             // `agent_before_settle` boundary: handlers may append entries and
             // force one more provider request (upstream runner/agent-session
             // BoundaryState semantics).
-            let continue_requested = match &self.plugins {
-                Some(plugins) if plugins.has_handlers("agent_before_settle") => {
-                    // Only the context and the terminal message are read by the
-                    // boundary hook; the run result's produced messages moved
-                    // into `produced` above already.
-                    let run_session_id = persist_ledger.run_session_id();
-                    self.dispatch_agent_before_settle(
-                        plugins,
-                        &result.context,
-                        &result.terminal,
-                        run_session_id.as_deref(),
-                    )
-                    .await
+            //
+            // An aborted run never reaches the boundary. Upstream's settle
+            // loop leaves BEFORE `_runBeforeSettleBoundary` whenever the run's
+            // abort was requested (`agent-session.ts:1900-1907`:
+            // `if (this._agentRunAbortRequested || !(await
+            // this._runBeforeSettleBoundary())) break;`), so a cancelled turn
+            // dispatches no `agent_before_settle`, never honors its
+            // `continue`, and never re-enters the loop (measured on pi 1.4.0:
+            // the hook sequence ends `turn_end, agent_end,
+            // agent_settled{aborted:true}` with zero boundary calls). All
+            // three abort witnesses are OR'd because each covers a different
+            // point the request can land: `result.aborted` is the loop's
+            // terminal read of the run signal, `signal.is_aborted()` catches a
+            // request that landed after that terminal was computed, and the
+            // session flag is what `abort()` records while the run is claimed
+            // (upstream `_agentRunAbortRequested`).
+            let abort_requested = result.aborted
+                || signal.is_aborted()
+                || self.run_abort_requested.load(Ordering::SeqCst);
+            let continue_requested = if abort_requested {
+                false
+            } else {
+                match &self.plugins {
+                    Some(plugins) if plugins.has_handlers("agent_before_settle") => {
+                        // Only the context and the terminal message are read by
+                        // the boundary hook; the run result's produced messages
+                        // moved into `produced` above already.
+                        let run_session_id = persist_ledger.run_session_id();
+                        self.dispatch_agent_before_settle(
+                            plugins,
+                            &result.context,
+                            &result.terminal,
+                            run_session_id.as_deref(),
+                        )
+                        .await
+                    }
+                    _ => false,
                 }
-                _ => false,
             };
             if continue_requested && settle_iterations < 8 {
                 continue;

@@ -204,8 +204,13 @@ fn search_sync_impl(
     // line of defense (and the walker alone reports a missing root as a walk
     // error, which used to be discarded).
     std::fs::metadata(root).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => format!("Path not found: {}", root.display()),
-        _ => format!("Cannot access '{}': {error}", root.display()),
+        std::io::ErrorKind::NotFound => {
+            format!("Path not found: {}", super::util::display_path(root))
+        }
+        _ => format!(
+            "Cannot access '{}': {error}",
+            super::util::display_path(root)
+        ),
     })?;
     let matcher = grep_regex::RegexMatcherBuilder::new()
         .case_insensitive(ignore_case)
@@ -253,8 +258,10 @@ fn search_sync_impl(
             Ok(()) => searched_ok += 1,
             Err(error) => {
                 if first_search_error.is_none() {
-                    first_search_error =
-                        Some(format!("Failed to search '{}': {error}", path.display()));
+                    first_search_error = Some(format!(
+                        "Failed to search '{}': {error}",
+                        super::util::display_path(path)
+                    ));
                 }
             }
         }
@@ -347,7 +354,10 @@ fn search_sync_impl(
             return Err(error);
         }
         if let Some(error) = first_walk_error {
-            return Err(format!("Failed to walk '{}': {error}", root.display()));
+            return Err(format!(
+                "Failed to walk '{}': {error}",
+                super::util::display_path(root)
+            ));
         }
     }
     Ok((matches, limit_reached, searched_files, byte_limit_reached))

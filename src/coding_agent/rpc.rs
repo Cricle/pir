@@ -1110,7 +1110,7 @@ impl RpcServerState {
                 )?
             }
         };
-        let manager = crate::coding_agent::session_resolve::open_session_tail_first(&path)?;
+        let mut manager = crate::coding_agent::session_resolve::open_session_tail_first(&path)?;
         manager.ensure_exclusive_writer()?;
         // Upstream `assertSessionCwdExists` (session-cwd.ts:54-59): a stored
         // cwd that no longer exists is a hard error for the headless RPC host.

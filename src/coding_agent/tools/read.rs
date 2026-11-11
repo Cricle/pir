@@ -380,10 +380,73 @@ impl AgentTool for ReadTool {
             // directory: a component swapped after the check cannot redirect
             // the open (the read arm had the same resolve-then-open window the
             // write/edit arms closed).
-            let parts = match resolve_read_path(&cwd, &path) {
-                Ok(parts) => parts,
-                Err(error) => return ToolResult::error(error),
+            //
+            // EXCEPTION — this process's own spill files: the shell tools
+            // advertise `Full output: <path>` in the OS temp directory, which
+            // is normally outside the workspace root. Refusing that path would
+            // make the footer a dead end (upstream pi reads the file), so a
+            // follow-up read could never recover the truncated output.
+            // `is_registered_spill` admits ONLY a file this process created
+            // through `create_spill_file` and still holds registered (compare
+            // canonical paths); no other outside-workspace path is let
+            // through, and a hand-planted temp file with a spill-shaped name is
+            // not registered, so it stays refused. The read then runs through
+            // the ordinary (non-confined) whole-file path because the
+            // containment walk anchors at the workspace root.
+            let spill_path = super::spill::is_registered_spill(Path::new(&path));
+            let parts = if spill_path {
+                None
+            } else {
+                match resolve_read_path(&cwd, &path) {
+                    Ok(parts) => Some(parts),
+                    Err(error) => return ToolResult::error(error),
+                }
             };
+            if spill_path {
+                // Stream the spill file with the same text/image/binary
+                // shaping the confined arm uses; no ledger entry (the file is
+                // not part of the workspace and must not gate a later edit).
+                let file = match std::fs::File::open(&path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return ToolResult::error(format!("Path not found: {}", path))
+                    }
+                    Err(error) => {
+                        return ToolResult::error(format!("Cannot read '{}': {}", path, error))
+                    }
+                };
+                return read_local(
+                    file,
+                    Path::new(&path),
+                    &path,
+                    raw_offset,
+                    offset,
+                    limit,
+                    image_support,
+                    signal,
+                    None,
+                )
+                .await;
+            }
+            // The spill arm returned above, so `parts` is always `Some` here; the
+            // `else` keeps the gate's no-`expect` rule without a panic path.
+            let Some(parts) = parts else {
+                return ToolResult::error(format!("Cannot read '{path}'"));
+            };
+            // A directory is not a file to read, and the two platforms report
+            // the refusal of `open_read` differently (Windows "拒绝访问。 (os
+            // error 5)" from the read, Unix `Is a directory`, upstream pi
+            // `EISDIR: …`). Check the resolved candidate up front so every
+            // platform emits one deterministic message before the handle walk.
+            if std::fs::metadata(&parts.candidate)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+            {
+                return ToolResult::error(format!(
+                    "Cannot read '{}': is a directory (use ls to list its entries)",
+                    path
+                ));
+            }
             let target = match ConfinedTarget::open(&parts.root, &parts.relative, false) {
                 Ok(target) => target,
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -392,7 +455,7 @@ impl AgentTool for ReadTool {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return ToolResult::error(format!(
                         "Path not found: {}",
-                        parts.candidate.display()
+                        super::util::display_path(&parts.candidate)
                     ))
                 }
                 Err(error) => {
@@ -404,7 +467,7 @@ impl AgentTool for ReadTool {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return ToolResult::error(format!(
                         "Path not found: {}",
-                        parts.candidate.display()
+                        super::util::display_path(&parts.candidate)
                     ))
                 }
                 Err(error) => {
@@ -508,9 +571,10 @@ async fn read_with_operations(request: ReadRequest) -> ToolResult {
 /// backend's own OS error.
 fn custom_read_error(path: &str, target: &Path, error: &std::io::Error) -> ToolResult {
     match error.kind() {
-        std::io::ErrorKind::NotFound => {
-            ToolResult::error(format!("Path not found: {}", target.display()))
-        }
+        std::io::ErrorKind::NotFound => ToolResult::error(format!(
+            "Path not found: {}",
+            super::util::display_path(target)
+        )),
         _ => ToolResult::error(format!("Cannot read '{}': {}", path, error)),
     }
 }
@@ -629,6 +693,19 @@ async fn read_local(
         Ok(metadata) => metadata,
         Err(e) => return ToolResult::error(format!("Cannot read '{}': {}", path, e)),
     };
+    // A directory is not a file to read. Both arms here already opened it
+    // (Windows allows opening a directory read-only), so the refusal has to be
+    // explicit: otherwise the first read on Windows surfaces a localized
+    // `拒绝访问。 (os error 5)` while the same call on Unix surfaces `Is a
+    // directory`, and neither is the upstream pi wording (`EISDIR: illegal
+    // operation on a directory, read`). Report the directory fact directly so
+    // the model gets one deterministic message on every platform.
+    if metadata.is_dir() {
+        return ToolResult::error(format!(
+            "Cannot read '{}': is a directory (use ls to list its entries)",
+            path
+        ));
+    }
     let size = metadata.len();
     // Stat first: the sniff buffer never exceeds the file size.
     let head_len = usize::try_from(size.min(HEAD_SNIFF_BYTES as u64)).unwrap_or(HEAD_SNIFF_BYTES);

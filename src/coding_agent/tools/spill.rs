@@ -180,6 +180,35 @@ fn register_created_spill(path: &Path) {
     paths.push(path.to_path_buf());
 }
 
+/// Whether `path` is one of the spill files THIS process created and still
+/// has registered (i.e. not yet swept).
+///
+/// The spill file is deliberately written to the OS temp directory, which is
+/// normally outside the workspace root. Without this predicate the `read`
+/// tool's workspace confinement would refuse the very path the shell tools
+/// advertise as `Full output: <path>` / `details.fullOutputPath`, so the
+/// footer would be a dead end for the model (upstream pi reads it). The
+/// predicate is exactly as narrow as the advertisement: the canonical path
+/// must equal a registered, still-existing file created by this process
+/// through [`create_spill_file`] — no other outside-workspace path is allowed
+/// by it, and a forged/re-created name (the uuid is random) is not accepted.
+pub fn is_registered_spill(path: &Path) -> bool {
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let paths = created_spills()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    paths
+        .iter()
+        // Registry entries are temp-dir files, so canonicalization is cheap
+        // and stable; compare canonical forms so a `\\?\` or 8.3 spelling of
+        // the same file still matches.
+        .any(|candidate| {
+            std::fs::canonicalize(candidate).ok().as_deref() == Some(canonical.as_path())
+        })
+}
+
 /// Force one explicit sweep now, bypassing [`SWEEP_INTERVAL`] and including
 /// the full orphan scan. Production calls [`create_spill_file`] (which sweeps
 /// on its own throttle); this seam exists so the security regression tests can

@@ -53,6 +53,8 @@ mod tool_schema_w11;
 mod tool_selection_parity_w13;
 #[path = "suites/tool_selection_units.rs"]
 mod tool_selection_units;
+#[path = "suites/tools_ab_round.rs"]
+mod tools_ab_round;
 #[path = "suites/tools_hardening.rs"]
 mod tools_hardening;
 #[path = "suites/tools_security_hardening.rs"]

@@ -825,3 +825,233 @@ fn all_prune_accepts_the_sessions_root_itself() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// PIR-TUI-025: a DEAD lock owner must never produce a "second writer" refusal.
+//
+// The recorded production failure (2/85 fresh-directory TUI cycles) was a
+// clean `/quit` followed by an immediate `-c`: the dead owner's lock was still
+// on disk, `SessionWriterLock::acquire_at` declined the reclaim, and
+// `ensure_exclusive_writer` then reported the DEAD pid as "already in use by
+// another process". The two mechanisms below are the ones that made the
+// reclaim decline; both are forced deterministically here.
+// ---------------------------------------------------------------------------
+
+/// Hold a lock file open with a handle that DENIES deletion (Windows sharing
+/// rules), exactly like a scanner/indexer/reader outside the product. The
+/// reclaim's `remove_file` then fails with a sharing violation while the dead
+/// owner's lock is still on disk.
+#[cfg(windows)]
+struct DenyDeleteHolder {
+    file: Option<std::fs::File>,
+}
+
+#[cfg(windows)]
+impl DenyDeleteHolder {
+    fn open(path: &Path) -> Self {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ only: no write share, no delete share.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001)
+            .open(path)
+            .expect("open lock with read-only sharing");
+        Self { file: Some(file) }
+    }
+
+    fn release(&mut self) {
+        self.file = None;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DenyDeleteHolder {
+    fn drop(&mut self) {
+        self.file = None;
+    }
+}
+
+/// PIR-TUI-025 (a): a dead owner's lock that a third party holds open must not
+/// refuse a resume while the holder is still there. The pre-fix path returned
+/// `None` from `acquire_at` and then reported the DEAD pid.
+#[cfg(windows)]
+#[test]
+fn ensure_exclusive_writer_reclaims_a_dead_lock_held_open_by_a_third_party() {
+    let dir = temp_dir("dead-lock-held-open");
+    let path = create_session(&dir, "crashed writer");
+    let lock = lock_path(&path);
+    let (dead_pid, start_token) = exited_child_pid();
+    std::fs::write(&lock, dead_lock_contents(dead_pid, start_token)).expect("dead lock");
+
+    let mut holder = DenyDeleteHolder::open(&lock);
+    // The open-time acquisition cannot unlink the file (a sharing violation),
+    // so the manager starts exactly like the production refusal scene: a
+    // transcript and a lock that names a dead pid.
+    let mut manager = SessionManager::open(&path).expect("open the transcript");
+    // Pre-fix this errored with the dead pid; the guarantee is that a DEAD
+    // owner never locks a resume out.
+    manager
+        .ensure_exclusive_writer()
+        .expect("a dead owner's lock must not refuse a resume");
+
+    // While the third-party handle is still open the reclaim keeps failing,
+    // yet the manager proceeds without the advisory guard (the transcript is
+    // protected by its fresh mtime instead).
+    assert!(
+        lock.exists(),
+        "the held-open file cannot be unlinked while the holder lives"
+    );
+
+    holder.release();
+    // Once the holder is gone the guard is acquirable again through the
+    // normal first-write path (a second manager must take it, not steal it).
+    drop(manager);
+    let mut second = SessionManager::open(&path).expect("reopen");
+    second
+        .ensure_exclusive_writer()
+        .expect("the dead lock is reclaimable once the holder released it");
+    let content = std::fs::read_to_string(&lock).expect("lock after reclaim");
+    assert!(
+        content.contains(&format!("pid={}", std::process::id())),
+        "the surviving writer must own the lock: {content}"
+    );
+    drop(second);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PIR-TUI-025 (b): a benign `touch()` landing BETWEEN the reclaim's two
+/// inspections (the mtime bump `SessionWriterLock::touch` performs after every
+/// append, and the one the outgoing process can still be mid-way through when
+/// `/quit` returns) must not make the reclaim decline. The old `(len, mtime)`
+/// fingerprint did exactly that even though the OWNER never changed and was
+/// provably dead: `acquire_at` then returned `None` and the next host reported
+/// the dead pid as "in use by another process".
+///
+/// Deterministic race harness: a toucher thread rewrites the lock mtime in a
+/// tight loop while the reclaim runs. Every iteration keeps the SAME bytes and
+/// the SAME dead owner, so a correct reclaim always succeeds; counting the
+/// declines is exactly the bug frequency. Post-fix the count is 0 by
+/// construction (the body never changes); pre-fix it is > 0 (measured 400/400
+/// on this host — see the lane REPORT).
+#[test]
+fn a_concurrent_lock_touch_never_makes_the_reclaim_decline() {
+    let dir = temp_dir("dead-lock-touch-race");
+    let path = create_session(&dir, "crashed writer");
+    let lock = lock_path(&path);
+    let (dead_pid, start_token) = exited_child_pid();
+    let body = dead_lock_contents(dead_pid, start_token);
+
+    const ITERATIONS: usize = 400;
+    let mut declined = 0usize;
+    for _ in 0..ITERATIONS {
+        std::fs::write(&lock, &body).expect("reset dead lock");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let toucher = {
+            let lock = lock.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // Same effect as `SessionWriterLock::touch`: mtime only, never
+                // the content. A write-capable handle is required because
+                // `set_times` maps to SetFileTime (FILE_WRITE_ATTRIBUTES).
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(file) = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&lock)
+                    {
+                        if file
+                            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()))
+                            .is_err()
+                        {
+                            continue;
+                        }
+                    }
+                }
+            })
+        };
+        let reclaimed =
+            pir::session_manager::retention::__test_reclaim_provably_dead_session_lock(&lock);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        toucher.join().expect("toucher");
+        if !reclaimed {
+            declined += 1;
+            // Leave a clean state for the next iteration regardless.
+            let _ = std::fs::remove_file(&lock);
+        }
+    }
+    assert_eq!(
+        declined, 0,
+        "a touch must never block reclaiming a dead owner's lock \
+         ({declined}/{ITERATIONS} declined)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PIR-TUI-025 (c): a lock that a LIVE writer created between the two
+/// inspections is never deleted by a dead-owner reclaimer, and the A28-F01
+/// "live foreign writer blocks" guarantee is unchanged.
+#[test]
+fn a_live_replacement_lock_is_never_deleted_by_the_reclaimer_and_still_blocks() {
+    let dir = temp_dir("reclaim-transfer");
+    let path = create_session(&dir, "crashed writer");
+    let lock = lock_path(&path);
+    let (dead_pid, start_token) = exited_child_pid();
+    std::fs::write(&lock, dead_lock_contents(dead_pid, start_token)).expect("dead lock");
+
+    // A replacement lock written by a LIVE foreign process (spawn `ping`:
+    // its pid is alive on this host for the duration). Its content differs —
+    // exactly what the body fingerprint must catch before any unlink.
+    let mut child = if cfg!(windows) {
+        std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    } else {
+        std::process::Command::new("sleep").arg("30").spawn()
+    }
+    .expect("spawn long-lived child");
+    std::fs::write(
+        &lock,
+        format!("pid={}\ntoken=live-child-token\nstarted=1\n", child.id()),
+    )
+    .expect("replacement lock");
+    assert!(
+        !pir::session_manager::retention::__test_reclaim_provably_dead_session_lock(&lock),
+        "a LIVE writer's lock must never be reclaimed"
+    );
+    assert!(lock.exists(), "the live writer's lock must survive");
+
+    // A28-F01: attaching from this manager must be refused, naming the LIVE
+    // writer's pid — the guard has not been weakened.
+    let mut manager = SessionManager::open(&path).expect("open the transcript");
+    let error = manager
+        .ensure_exclusive_writer()
+        .expect_err("a live foreign writer must block a second writer")
+        .to_string();
+    assert!(
+        error.contains("already in use by another process"),
+        "the refusal must keep its documented shape: {error}"
+    );
+    assert!(
+        error.contains(&format!("pid {}", child.id())),
+        "the refusal must name the live holder: {error}"
+    );
+    assert!(lock.exists(), "a refusal must not remove the live lock");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(manager);
+
+    // Same-process owners are explicitly allowed (a /fork or /export read).
+    std::fs::write(
+        &lock,
+        format!("pid={}\ntoken=self-token\nstarted=1\n", std::process::id()),
+    )
+    .expect("self-owned lock");
+    let mut own = SessionManager::open(&path).expect("reopen");
+    own.ensure_exclusive_writer()
+        .expect("a same-process lock must not refuse");
+    let _ = own;
+    let _ = std::fs::remove_dir_all(&dir);
+}
