@@ -3909,6 +3909,72 @@ fn run_print_subcommand(dir: &TempDir, args: &[&str]) -> std::process::Output {
         .expect("run pir print")
 }
 
+/// `--mode json` stdout must carry the terminal `agent_settled` frame
+/// (PIR-BIN-027): upstream's print sink (`session.subscribe`, print-mode.ts
+/// 108-112) streams every session event including `_emitAgentSettled`'s
+/// (agent-session.ts:1085), so the JSON stream ends
+/// `... agent_end, agent_settled` — the same settle boundary the RPC host
+/// forwards (`SessionEvent::AgentSettled` → stdout, rpc.rs) and the boundary
+/// stdout consumers wait on. Before the fix the print host routed the settle
+/// event to plugin faces only (`dispatch_print_agent_settled`), so the JSON
+/// stdout stream ended at `agent_end` and a consumer waiting for settlement
+/// could only fall back to process exit.
+#[test]
+fn print_json_stream_carries_the_agent_settled_frame() {
+    let (port, _captured) = spawn_capturing_mock();
+    let temp = TempDir::new("json-agent-settled-e2e");
+    write_closed_pipe_agent(&temp, port);
+    let output = run_print_subcommand(
+        &temp,
+        &[
+            "print",
+            "hello mock",
+            "--no-session",
+            "--mode",
+            "json",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .collect();
+    let types: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect();
+    let agent_end = types
+        .iter()
+        .rposition(|kind| *kind == "agent_end")
+        .expect("the run must emit agent_end before settling");
+    assert_eq!(
+        types.last().copied(),
+        Some("agent_settled"),
+        "the JSON stdout stream must end at agent_settled (upstream order): {stdout}"
+    );
+    assert_eq!(
+        types[agent_end + 1..],
+        ["agent_settled"],
+        "exactly one settle frame directly after agent_end: {types:?}"
+    );
+    let settle_event = events.last().expect("at least one frame was parsed");
+    assert_eq!(settle_event["type"], "agent_settled");
+    assert_eq!(
+        settle_event["aborted"], false,
+        "an un-aborted run settles with aborted:false (agent-session.ts:203)"
+    );
+}
+
 /// `pir print "@notes.txt"` (text and `--mode json`) must send the file body —
 /// not the literal reference — in the first provider request, exactly like
 /// the bare `pir @notes.txt` entry shape.

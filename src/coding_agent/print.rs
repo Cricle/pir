@@ -3739,6 +3739,12 @@ pub async fn run_print_with_environment(
     // the stdout frames, and a plugin host receives the same events through an
     // ordered bridge (text mode with no plugin host stays silent).
     let print_session_events = print_session_event_sink(options.mode, plugins.as_ref());
+    // The JSON stdout writer alone, without the plugin bridge: the settle
+    // frame below must reach stdout but NOT the plugin faces a second time
+    // (`dispatch_print_agent_settled` is print's direct settle dispatch; the
+    // bridge forwards `agent_settled` too when it is handed the event, which
+    // would run an extension's handler twice per run).
+    let print_json_events = (options.mode == OutputMode::Json).then(json_session_event_sink);
 
     // Per-request transport hooks shared by EVERY provider request this host
     // sends (loop stream, event stream, compaction/navigate summaries) —
@@ -4702,6 +4708,25 @@ pub async fn run_print_with_environment(
         // this point and emits none, matching upstream's early return from
         // `prompt()` BEFORE `_runAgentPrompt`.
         dispatch_print_agent_settled(plugins.as_ref(), extensions.as_ref(), result.aborted).await;
+        // The same settle frame on the session-event stdout sink: upstream's
+        // print-mode sink (`session.subscribe`, print-mode.ts:108-112) sees
+        // `_emitAgentSettled`'s `_emit({type:"agent_settled"})` like any
+        // other session event, so `--mode json` stdout ends
+        // `... agent_end, agent_settled` — the settle boundary RPC mode also
+        // forwards (rpc.rs releases its prompt claim on it; `agent_end` is
+        // explicitly NOT the boundary there). Without this the JSON stream
+        // carries no terminal settlement frame at all, and stdout consumers
+        // that wait for `agent_settled` (PIR-BIN-027) can only fall back to
+        // process exit. Text mode's sink is `None` and stays silent, like
+        // upstream's text print mode. Written through the JSON writer ONLY:
+        // the plugin faces already received the settle event from the direct
+        // dispatch above, and `print_session_events` would forward it to the
+        // bridge a second time.
+        if let Some(sink) = &print_json_events {
+            sink(&SessionEvent::AgentSettled {
+                aborted: result.aborted,
+            });
+        }
         // Upstream print-mode.ts:139-156 treats an `error` OR `aborted`
         // stopReason as a process failure only in TEXT mode (exit 1 after
         // printing the error). In JSON mode the process exits 0 and the
