@@ -40,10 +40,10 @@ use pir::ai::types::{
 use pir::coding_agent::json::to_session_event_json;
 use pir::coding_agent::print::{
     background_abort_diagnostic, background_abort_event, expand_prompt_file_args,
-    partition_file_args, print_apply_max_turns, print_apply_retry, print_compaction_config,
-    print_compaction_hook, print_loop_deps, print_plugin_host, print_retry_policy,
-    print_tool_definitions, print_transport_hooks, print_transport_hooks_with_model,
-    run_print_with_environment, text_with_background_reports, threshold_model_for,
+    partition_file_args, print_apply_max_turns, print_apply_retry, print_compaction_hook,
+    print_loop_deps, print_plugin_host, print_retry_policy, print_tool_definitions,
+    print_transport_hooks, print_transport_hooks_with_model, run_print_with_environment,
+    settings_compaction_config, text_with_background_reports, threshold_model_for,
     try_extension_command, OutputMode, PrintBackground, PrintOptions, PrintSessionEventSink,
     SharedSession,
 };
@@ -158,8 +158,8 @@ async fn load_runtime_with_command(dir: &TempDir, command_source: &str) -> Exten
 #[test]
 fn compaction_config_defaults_when_settings_empty() {
     let settings = settings_from_json(serde_json::json!({}));
-    let config =
-        print_compaction_config(&settings, &test_model()).expect("compaction enabled by default");
+    let config = settings_compaction_config(&settings, &test_model())
+        .expect("compaction enabled by default");
     // Upstream SETTINGS_DEFAULTS.compaction.
     assert!(config.enabled);
     assert_eq!(config.reserve_tokens, 16_384);
@@ -169,7 +169,7 @@ fn compaction_config_defaults_when_settings_empty() {
 #[test]
 fn compaction_config_disabled_returns_none() {
     let settings = settings_from_json(serde_json::json!({ "compaction": { "enabled": false } }));
-    assert!(print_compaction_config(&settings, &test_model()).is_none());
+    assert!(settings_compaction_config(&settings, &test_model()).is_none());
 }
 
 #[test]
@@ -184,7 +184,7 @@ fn compaction_config_applies_model_override() {
             }
         }
     }));
-    let config = print_compaction_config(&settings, &test_model()).expect("compaction enabled");
+    let config = settings_compaction_config(&settings, &test_model()).expect("compaction enabled");
     // Per-model override wins for reserveTokens; the ordinary setting holds
     // for keepRecentTokens (SettingsManager `compactionToken` semantics).
     assert_eq!(config.reserve_tokens, 1_024);
@@ -202,7 +202,7 @@ fn compaction_config_other_model_uses_ordinary_settings() {
             }
         }
     }));
-    let config = print_compaction_config(&settings, &test_model()).expect("compaction enabled");
+    let config = settings_compaction_config(&settings, &test_model()).expect("compaction enabled");
     assert_eq!(config.reserve_tokens, 8_192);
 }
 
@@ -4157,4 +4157,49 @@ fn expand_prompt_file_args_attaches_image_references_with_mime() {
     assert_eq!(images.len(), 1);
     assert_eq!(images[0].mime_type, "image/png");
     assert_eq!(images[0].data, base64_of(&bytes));
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-028 regression: the shared settings-compaction resolver is what
+// EVERY AgentSession host (print / rpc / TUI / server) must apply. The old
+// bug: only print resolved `settings.compaction`; the RPC/TUI/server
+// factories hard-coded `CompactionConfig::default()`, so an
+// agent-dir settings.json with a small `keepRecentTokens` was ignored and a
+// manual `/compact` answered "nothing to compact (session too small)".
+// ---------------------------------------------------------------------------
+
+#[test]
+fn settings_compaction_config_honors_small_keep_recent_window() {
+    // The A/B S5b-r2 shape: three padded prompts (~485 tokens each), settings
+    // keepRecentTokens 450 → the resolver must carry the setting through so
+    // the cut covers the older messages instead of refusing.
+    let settings = settings_from_json(serde_json::json!({
+        "compaction": { "enabled": true, "reserveTokens": 1500, "keepRecentTokens": 450 }
+    }));
+    let config = settings_compaction_config(&settings, &test_model())
+        .expect("compaction enabled with the S5b-r2 settings");
+    assert_eq!(config.reserve_tokens, 1_500);
+    assert_eq!(config.keep_recent_tokens, 450);
+    // The old hard-coded defaults must NOT leak through.
+    assert_ne!(config.keep_recent_tokens, 20_000);
+    assert_ne!(config.reserve_tokens, 16_384);
+}
+
+#[test]
+fn settings_compaction_config_model_override_beats_ordinary_setting() {
+    // Upstream getCompactionTokenSetting: modelOverrides["provider/id"] wins
+    // per field; the ordinary setting covers the rest.
+    let settings = settings_from_json(serde_json::json!({
+        "compaction": {
+            "enabled": true,
+            "reserveTokens": 2_000,
+            "keepRecentTokens": 450,
+            "modelOverrides": {
+                "test/test-model": { "keepRecentTokens": 900 }
+            }
+        }
+    }));
+    let config = settings_compaction_config(&settings, &test_model()).expect("compaction enabled");
+    assert_eq!(config.keep_recent_tokens, 900);
+    assert_eq!(config.reserve_tokens, 2_000);
 }

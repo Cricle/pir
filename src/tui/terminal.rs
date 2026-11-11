@@ -24188,6 +24188,10 @@ fn build_agent_session(
             })
             .collect::<Vec<_>>()
     });
+    let compaction_config = crate::coding_agent::print::settings_compaction_config(
+        &configured.settings,
+        &crate::coding_agent::print::threshold_model_for(&provider_registry, &configured.model),
+    );
     let mut agent_session =
         crate::agent_session::AgentSession::new(crate::agent_session::AgentSessionConfig {
             provider_registry,
@@ -24198,7 +24202,10 @@ fn build_agent_session(
             thinking,
             tools,
             session,
-            compaction: Some(crate::compaction::CompactionConfig::default()),
+            // PIR-BIN-028: resolve the settings `compaction` block like every
+            // other host (upstream `getCompactionSettings`); the hard-coded
+            // default made the TUI ignore `settings.compaction`.
+            compaction: compaction_config,
             max_turns: 100,
             performance: configured
                 .settings

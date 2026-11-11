@@ -3886,7 +3886,7 @@ pub async fn run_print_with_environment(
     // threshold is checked against the ROUTED model under a virtual selection
     // (agent_session `threshold_model_for`).
     let threshold_model = threshold_model_for(&provider_registry, &model);
-    let compaction_config = print_compaction_config(&environment.settings, &threshold_model);
+    let compaction_config = settings_compaction_config(&environment.settings, &threshold_model);
 
     // Agent-level turn retry (`settings.retry`, upstream `_prepareRetry`):
     // print drives `agent_loop` itself, so it installs on `LoopDeps::retry`
@@ -5484,10 +5484,13 @@ pub fn threshold_model_for(
     model.clone()
 }
 
-/// The print host's compaction config from the settings `compaction` block
+/// The session hosts' compaction config from the settings `compaction` block
 /// (upstream `SETTINGS_DEFAULTS.compaction` + the per-model override, the same
-/// resolution SettingsManager's `compactionToken` applies).
-pub fn print_compaction_config(
+/// resolution SettingsManager's `compactionToken` applies). Shared by every
+/// `AgentSession` host (print / rpc / TUI / server): PIR-BIN-028 — the RPC,
+/// TUI and server factories used to hard-code `CompactionConfig::default()`
+/// here and silently ignore `settings.compaction`.
+pub fn settings_compaction_config(
     settings: &crate::config::settings::Settings,
     model: &crate::ai::types::Model,
 ) -> Option<CompactionConfig> {

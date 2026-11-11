@@ -429,3 +429,20 @@ Each deviation is explained in the code where it lives.
     `durable_metadata.next_id` before returning (upstream advances an in-memory counter only), and schema version 3
     replaces the non-unique `(conversation_id, request_id)` index with a partial unique one after deleting older
     duplicates. Upstream ships schema version 2.
+13. **Built-in documents are staged agent-first.** `conversation_definitions()`
+    (`src/durable/harness/documents.rs`) lists `pi.agent, pi.live, pi.inbox, pi.provider, pi.usage`, so a new
+    conversation's one creation commit writes them in that order; upstream's `conversationCreated`
+    (`harness/harness.ts`) stages `pi.live, pi.inbox, pi.usage, pi.provider` and then `pi.agent` via
+    `createAgent`. The set, the ids the set mints, and every definition's semantics are identical — only the
+    `ordinal`s inside the creation commit (and therefore the doc sidecar file-name ↔ kind mapping, e.g. which of
+    `doc-2..doc-6.jsonl` is `pi.agent`) differ. Nothing reads creation order back.
+14. **`pi.provider`'s session id is minted lazily as a UUIDv4.** Upstream's `ProviderDoc.initial()` calls
+    `uuidv7()` per incarnation, so a fresh conversation stores its session id in the creation commit. pir's
+    `DocInitial` is a plain function pointer that cannot capture the conversation id, so the definition's initial
+    value is `{}` (`tests/suites/durable_harness_documents.rs:130-132`) and the id is written later:
+    `generation.rs:991` stages a `uuid::Uuid::new_v4()` in the generation task's own commit
+    (`ensure_provider_session_id`), and `Harness::provider_session_id` /
+    `provider::mint_session_id` mint the UUIDv7-shaped fallback for direct harness callers. Same wire field
+    (`sessionId`), same first-writer-wins semantics; the value's shape and the commit it first appear in differ.
+    Verified A/B against upstream `1.4.0` (`pi/s2` vs `pir/round4` scenario roots, 2026-11-11): pir's creation
+    commit stores `pi.provider` as `{}`, upstream stores `{ sessionId: <uuidv7> }`.

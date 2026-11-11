@@ -1138,6 +1138,22 @@ pub(super) async fn run() -> Result<()> {
                     provider: provider.clone(),
                     id: id.clone(),
                 });
+            // PIR-BIN-028: resolve the settings `compaction` block (upstream
+            // `SettingsManager.getCompactionSettings`) so the server's
+            // sessions honor `settings.compaction` like print/RPC/TUI. The
+            // override key follows the model the sessions will route to by
+            // default (the state's `default_model`); a registry miss falls
+            // back to the first catalog model, and with none at all the
+            // identity-shaped resolver still yields the ordinary settings.
+            let routed_model = default_model
+                .as_ref()
+                .and_then(|model_ref| registry.get_model(&model_ref.provider, &model_ref.id))
+                .or_else(|| registry.get_models().into_iter().next())
+                .expect("server branch requires at least one resolvable model");
+            let compaction_config = pir::coding_agent::print::settings_compaction_config(
+                &environment.settings,
+                &pir::coding_agent::print::threshold_model_for(&registry, &routed_model),
+            );
             if let Some(socket_path) = unix {
                 #[cfg(unix)]
                 {
@@ -1148,7 +1164,8 @@ pub(super) async fn run() -> Result<()> {
                         .with_registry(std::sync::Arc::clone(&registry))
                         .with_default_model(default_model.clone())
                         .with_session_dir(config.session_dir.clone())
-                        .with_tool_selection(tool_selection.clone());
+                        .with_tool_selection(tool_selection.clone())
+                        .with_compaction(compaction_config.clone());
                     let server = pir::server::UnixServer::bind_with_state_and_security(
                         std::path::PathBuf::from(&socket_path),
                         state,
@@ -1174,7 +1191,8 @@ pub(super) async fn run() -> Result<()> {
                 .with_registry(registry)
                 .with_default_model(default_model)
                 .with_session_dir(config.session_dir.clone())
-                .with_tool_selection(tool_selection);
+                .with_tool_selection(tool_selection)
+                .with_compaction(compaction_config);
             let server = pir::server::Server::bind_with_state_and_security(
                 &config.server_address,
                 state,

@@ -2951,6 +2951,17 @@ fn default_session_factory(
     let session_cwd = session
         .as_ref()
         .map(|manager| std::path::PathBuf::from(manager.cwd()));
+    // PIR-BIN-028: resolve the settings `compaction` block (upstream
+    // `SettingsManager.getCompactionSettings`, per-model override included)
+    // instead of the built-in defaults — the hard-coded
+    // `CompactionConfig::default()` here made every non-print host ignore
+    // `settings.compaction`, so a keep-recent window that covered the whole
+    // transcript rejected a manual `/compact` with "nothing to compact
+    // (session too small)" where upstream compacts.
+    let compaction_config = crate::coding_agent::print::settings_compaction_config(
+        &environment.settings,
+        &crate::coding_agent::print::threshold_model_for(&provider_registry, &selection.model),
+    );
     let agent_session = AgentSession::new_arc(crate::agent_session::AgentSessionConfig {
         provider_registry,
         model: selection.model,
@@ -2958,7 +2969,7 @@ fn default_session_factory(
         thinking: selection.thinking,
         tools,
         session,
-        compaction: Some(crate::compaction::CompactionConfig::default()),
+        compaction: compaction_config,
         // The non-interactive turn cap (`Config::max_turns`, default 1000,
         // `PIR_MAX_TURNS` override): one turn is one model request, not one
         // tool call. The old hard-coded 100 cut off a 100-tool prompt that

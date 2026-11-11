@@ -332,6 +332,9 @@ pub struct ServerState {
     /// captures the server's own runtime, which lives for the server's
     /// lifetime.
     queue_runtime: Option<tokio::runtime::Handle>,
+    /// Host CLI's resolved `settings.compaction` (PIR-BIN-028): `None` keeps
+    /// the built-in defaults for sessions built without a settings layer.
+    compaction: Option<crate::compaction::CompactionConfig>,
     pub(super) updates: broadcast::Sender<Value>,
 }
 
@@ -356,6 +359,7 @@ impl ServerState {
             draining: Arc::new(AtomicBool::new(false)),
             state_update_format: StateUpdateFormat::default(),
             queue_runtime: tokio::runtime::Handle::try_current().ok(),
+            compaction: None,
             updates,
         }
     }
@@ -377,6 +381,7 @@ impl ServerState {
             draining: Arc::new(AtomicBool::new(false)),
             state_update_format: StateUpdateFormat::default(),
             queue_runtime: tokio::runtime::Handle::try_current().ok(),
+            compaction: None,
             updates,
         }
     }
@@ -407,6 +412,18 @@ impl ServerState {
     /// request omits a model (the common client shape).
     pub fn with_default_model(mut self, model: Option<ModelRef>) -> Self {
         self.default_model = model;
+        self
+    }
+
+    /// Hand the host CLI's resolved `settings.compaction` config to every
+    /// session this state builds (PIR-BIN-028, upstream
+    /// `SettingsManager.getCompactionSettings`). `None` (the default state)
+    /// keeps the built-in defaults.
+    pub fn with_compaction(
+        mut self,
+        compaction: Option<crate::compaction::CompactionConfig>,
+    ) -> Self {
+        self.compaction = compaction;
         self
     }
 
@@ -1275,6 +1292,7 @@ impl ServerState {
                             self.security.allow_remote_bash,
                             record.storage.take(),
                             self.tool_selection.clone(),
+                            self.compaction.clone(),
                         ));
                         // The run executes on a dedicated short-lived runtime;
                         // an inbox consumer spawned there would die with it
@@ -1649,6 +1667,11 @@ pub fn resolve_server_tool_selection(
 /// appends every user/assistant/compaction entry to the file (per-append
 /// fsync, so a disconnect needs no extra flush) and rebuilds its context from
 /// the persisted transcript on reopen.
+// The eight parameters are one flat "session construction" record copied
+// straight from the server's per-connection state; grouping them into a
+// struct would only move the same fields behind one more name. Same shape as
+// the other host factories (rpc.rs / tui) and `AgentSessionConfig` itself.
+#[allow(clippy::too_many_arguments)]
 fn build_session_agent(
     registry: Arc<ProviderRegistry>,
     model: crate::ai::types::Model,
@@ -1657,6 +1680,7 @@ fn build_session_agent(
     allow_remote_bash: bool,
     session: Option<SessionManager>,
     tool_selection: Option<crate::coding_agent::ToolSelection>,
+    compaction: Option<crate::compaction::CompactionConfig>,
 ) -> crate::agent_session::AgentSession {
     let tools = session_tool_registry(allow_remote_bash);
     let agent = crate::agent_session::AgentSession::new(crate::agent_session::AgentSessionConfig {
@@ -1666,7 +1690,10 @@ fn build_session_agent(
         thinking: parse_thinking_level(thinking_level),
         tools,
         session,
-        compaction: Some(crate::compaction::CompactionConfig::default()),
+        // PIR-BIN-028: the host CLI resolves `settings.compaction` once and
+        // hands it down (upstream `getCompactionSettings`); `None` (server
+        // started without a settings layer) keeps the built-in defaults.
+        compaction: Some(compaction.unwrap_or_default()),
         // The non-interactive turn cap (`PIR_MAX_TURNS`, default 1000): the
         // server has no settings.json layer, so it resolves the same process
         // knob as print/RPC. A turn is one model request; all tool calls in
