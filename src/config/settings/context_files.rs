@@ -18,18 +18,52 @@ pub const CONTEXT_FILE_CANDIDATES: [&str; 5] = [
 pub const MAX_CONTEXT_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Load the first existing context file in `dir` (candidates in upstream order).
-fn load_context_file_from_dir(dir: &Path) -> Option<(PathBuf, String)> {
+///
+/// Upstream `loadContextFileFromDir`
+/// (`packages/coding-agent/src/core/resource-loader.ts:211-230`) returns the
+/// first candidate that reads, inlines whatever its size, and decodes the bytes
+/// lossily (Node's UTF-8 decoder substitutes U+FFFD instead of failing). pir
+/// keeps its 1 MiB hardening cap (see [`MAX_CONTEXT_FILE_BYTES`]) but ALWAYS
+/// reports the skip: a skipped candidate is announced on the routed diagnostic
+/// channel (stderr as `… warning …` for the CLI hosts, `<agentDir>/pir.log` in
+/// the TUI), naming the file and the limit, exactly like the `SYSTEM.md`
+/// oversized path does. The file whose whole job is to carry project rules can
+/// therefore never vanish without a trace (PIR-BIN-066).
+///
+/// A read error or invalid encoding is equally never silent: the bytes are
+/// decoded with [`read_text_file_lossy`], which degrades invalid sequences to
+/// U+FFFD like upstream instead of dropping the file (PIR-BIN-067); a genuine
+/// I/O failure is reported and the next candidate is tried (upstream's
+/// `catch` arm warns and continues).
+fn load_context_file_from_dir(
+    dir: &Path,
+    diagnostics: &mut Vec<String>,
+) -> Option<(PathBuf, String)> {
     for filename in CONTEXT_FILE_CANDIDATES {
         let path = dir.join(filename);
         if !path.is_file() {
             continue;
         }
         // Skip oversized files before reading (pir hardening).
-        if fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0) > MAX_CONTEXT_FILE_BYTES {
+        let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if size > MAX_CONTEXT_FILE_BYTES {
+            diagnostics.push(format!(
+                "context file is {size} bytes, exceeding the {MAX_CONTEXT_FILE_BYTES} byte limit; skipped ({})",
+                path.display()
+            ));
             continue;
         }
-        if let Some(content) = read_text_file(&path) {
-            return Some((path, content));
+        match read_text_file_lossy(&path) {
+            Ok(content) => return Some((path, content)),
+            Err(error) => {
+                // Upstream warns "Could not read <path>: <error>" and goes on
+                // to the next candidate.
+                diagnostics.push(format!(
+                    "could not read context file: {error} ({})",
+                    path.display()
+                ));
+                continue;
+            }
         }
     }
     None
@@ -110,7 +144,10 @@ fn find_shadowed_context_file(cwd: &Path) -> Option<PathBuf> {
     if canonicalize_lossy(&main_repo_root.join(".git")) != common_git_dir {
         return None;
     }
-    let (worktree_context_path, _) = load_context_file_from_dir(&worktree_root)?;
+    // This is only a probe for the file NAME; its load diagnostics belong to
+    // the actual discovery pass, so they are discarded here.
+    let mut probe = Vec::new();
+    let (worktree_context_path, _) = load_context_file_from_dir(&worktree_root, &mut probe)?;
     Some(main_repo_root.join(worktree_context_path.file_name()?))
 }
 
@@ -119,11 +156,32 @@ fn find_shadowed_context_file(cwd: &Path) -> Option<PathBuf> {
 /// existing candidate (`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`,
 /// `CLAUDE.MD`) wins. A linked worktree's copy shadows the main repo's file at the
 /// same logical scope.
+///
+/// Load diagnostics (an oversized skip, an unreadable candidate) are reported
+/// through the routed diagnostic channel — the same one the skill/template
+/// loaders use — so a context file is never dropped without a trace
+/// (PIR-BIN-066). Structured consumers use
+/// [`discover_context_files_with_diagnostics`].
 pub fn discover_context_files(cwd: &Path, global_dir: &Path) -> Vec<(PathBuf, String)> {
+    let (files, diagnostics) = discover_context_files_with_diagnostics(cwd, global_dir);
+    for diagnostic in &diagnostics {
+        crate::ext_diag!("{diagnostic}");
+    }
+    files
+}
+
+/// [`discover_context_files`] plus its load diagnostics, for callers that
+/// render them themselves (print host, startup diagnostics, tests). Each
+/// diagnostic already names the file; the oversized one also names the limit.
+pub fn discover_context_files_with_diagnostics(
+    cwd: &Path,
+    global_dir: &Path,
+) -> (Vec<(PathBuf, String)>, Vec<String>) {
     let mut files: Vec<(PathBuf, String)> = Vec::new();
+    let mut diagnostics: Vec<String> = Vec::new();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
 
-    if let Some(global_context) = load_context_file_from_dir(global_dir) {
+    if let Some(global_context) = load_context_file_from_dir(global_dir, &mut diagnostics) {
         seen.insert(canonicalize_lossy(&global_context.0));
         files.push(global_context);
     }
@@ -132,7 +190,7 @@ pub fn discover_context_files(cwd: &Path, global_dir: &Path) -> Vec<(PathBuf, St
     let mut ancestors: Vec<(PathBuf, String)> = Vec::new();
     let mut dir = cwd.to_path_buf();
     loop {
-        if let Some(context_file) = load_context_file_from_dir(&dir) {
+        if let Some(context_file) = load_context_file_from_dir(&dir, &mut diagnostics) {
             // Compare the directory's real path + file name, not the file's:
             // a worktree AGENTS.md that symlinks to the main repo's file
             // canonicalizes to the shadowed path itself (upstream
@@ -153,7 +211,7 @@ pub fn discover_context_files(cwd: &Path, global_dir: &Path) -> Vec<(PathBuf, St
         }
     }
     files.extend(ancestors);
-    files
+    (files, diagnostics)
 }
 
 // ---------------------------------------------------------------------------
@@ -195,8 +253,21 @@ pub fn discover_system_md(
                     );
                     continue;
                 }
-                if let Some(content) = read_text_file(&path) {
-                    return Some(content);
+                // Upstream `resolvePromptInput` reads with
+                // `readFileSync(input, "utf-8")` (resource-loader.ts:199-205):
+                // a non-UTF-8 file decodes lossily instead of disappearing.
+                match read_text_file_lossy(&path) {
+                    Ok(content) => return Some(content),
+                    Err(error) => {
+                        // Upstream warns "Could not read … file …" and moves
+                        // on; the project copy must not mask the global one.
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "could not read system prompt file"
+                        );
+                        continue;
+                    }
                 }
             }
         }

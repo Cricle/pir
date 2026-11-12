@@ -453,16 +453,20 @@ fn render_project_context(project_files: &[(PathBuf, String)]) -> String {
 /// `getPackageDir`): the directory arrives via
 /// [`SystemPromptInput::package_dir`] — callers read `PI_PACKAGE_DIR` once
 /// through [`crate::config::env::package_dir`] — so the builder itself never
-/// touches the process environment. pir bundles no package assets, so the docs
-/// section is emitted only when the package root (with its `README.md`) exists.
+/// touches the process environment.
+///
+/// The section is emitted whenever a package directory is resolved, WITHOUT
+/// probing the filesystem (upstream `getReadmePath`/`getDocsPath`/
+/// `getExamplesPath` are pure path joins; `system-prompt.ts` never checks that
+/// they exist). A missing/mis-installed asset tree is exactly the case the
+/// paths are meant to surface, and a probe here made the section depend on
+/// disk state that the caller had already resolved (PIR-BIN-061: pir emitted
+/// no `docs` section on a real install because `PI_PACKAGE_DIR` is unset and
+/// the old `README.md exists` gate suppressed the rest).
 fn package_docs_paths(package_dir: Option<&Path>) -> Option<(PathBuf, PathBuf, PathBuf)> {
     let package_dir = package_dir?;
-    let readme = package_dir.join("README.md");
-    if !readme.exists() {
-        return None;
-    }
     Some((
-        readme,
+        package_dir.join("README.md"),
         package_dir.join("docs"),
         package_dir.join("examples"),
     ))

@@ -42,12 +42,31 @@ pub(super) fn read_text_file(path: &Path) -> Option<String> {
     read_text_file_checked(path).ok().flatten()
 }
 
+/// Read a USER-AUTHORED text file (context files) with the upstream decoder:
+/// UTF-8 bytes are decoded lossily (invalid sequences become U+FFFD) and a
+/// leading BOM is stripped.
+///
+/// Upstream `loadContextFileFromDir` reads with
+/// `stripBom(readFileSync(filePath, "utf-8"))`
+/// (`packages/coding-agent/src/core/resource-loader.ts:211-230`); Node's
+/// UTF-8 decoder substitutes U+FFFD for invalid bytes and never throws, so a
+/// file saved by a locale editor (GBK/Windows-1252) keeps its valid text
+/// instead of being dropped whole. Only an I/O failure is an error; settings
+/// and other machine-written files stay on the strict
+/// [`read_text_file_checked`] path (invalid UTF-8 there is corruption).
+pub(super) fn read_text_file_lossy(path: &Path) -> std::io::Result<String> {
+    let bytes = fs::read(path)?;
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
+}
+
 /// Read a text file, stripping a UTF-8 BOM, distinguishing a missing file
 /// (`Ok(None)`) from a real read failure (`Err`): a settings file that exists
 /// but cannot be read (permissions, invalid UTF-8, a directory, …) must be
 /// reported as a startup diagnostic instead of silently treated as absent.
 /// `read_text_file` keeps the lossy `Option` shape for callers that only want
-/// the content (context-file discovery, persistence).
+/// the content (persistence); user-authored context files use
+/// [`read_text_file_lossy`] instead.
 pub(super) fn read_text_file_checked(path: &Path) -> std::io::Result<Option<String>> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(Some(

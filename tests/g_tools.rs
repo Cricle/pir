@@ -22,6 +22,8 @@ mod export_html;
 mod g11_context_shadow;
 #[path = "suites/g11_skills_diagnostics.rs"]
 mod g11_skills_diagnostics;
+#[path = "suites/prompt_loadout_w22.rs"]
+mod prompt_loadout_w22;
 #[cfg(feature = "python")]
 #[path = "suites/python_vm_lock.rs"]
 mod python_vm_lock;

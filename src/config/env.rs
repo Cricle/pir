@@ -32,13 +32,41 @@ pub fn telemetry_override() -> Option<bool> {
     }
 }
 
-/// The `PI_PACKAGE_DIR` override (package asset directory, for Nix/Guix style
-/// store paths). pir has no bundled package assets yet; the value is surfaced
-/// for the resource plumbing hook.
+/// The package asset directory (upstream `getPackageDir`): the `docs` section
+/// of the default system prompt anchors its README/docs/examples paths here.
+///
+/// Resolution order:
+/// 1. `PI_PACKAGE_DIR` when set and non-empty (the upstream override, for
+///    Nix/Guix style store paths);
+/// 2. the directory of the running executable when it looks like a pir
+///    package root — a `README.md` file or a `docs` directory sits next to the
+///    binary, which is exactly what the release archives ship (`pir`,
+///    `pir-phone-server`, `README.md`). This is the analogue of upstream's
+///    compiled-binary branch (`dirname(process.execPath)`,
+///    `packages/coding-agent/src/config.ts:400-404`), where a bunded executable
+///    cannot walk up to a `node_modules` package root;
+/// 3. `None` (a bare `cargo build`/`cargo install` tree with no assets next to
+///    the binary), and the prompt then omits the `docs` section — the same
+///    outcome as upstream raising no package root.
+///
+/// The probe lives HERE, at resolution time, exactly like upstream's
+/// `getPackageDir` walk: the prompt builder itself never touches the
+/// filesystem for this (`system_prompt::package_docs_paths`).
 pub fn package_dir() -> Option<PathBuf> {
-    std::env::var_os("PI_PACKAGE_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    if let Some(dir) = std::env::var_os("PI_PACKAGE_DIR").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    // The executable is fixed for the process life, so the probe runs once.
+    // `PI_PACKAGE_DIR` is still consulted on every call (above): tests and the
+    // D6 session pin change it mid-process.
+    static EXECUTABLE_ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    EXECUTABLE_ROOT
+        .get_or_init(|| {
+            let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+            let is_package_root = dir.join("README.md").is_file() || dir.join("docs").is_dir();
+            is_package_root.then_some(dir)
+        })
+        .clone()
 }
 
 /// The session-dir environment override: `PI_CODING_AGENT_SESSION_DIR` (the

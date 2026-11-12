@@ -37,7 +37,10 @@ pub use merge::*;
 pub use schema::*;
 pub use tools::*;
 // Internal helpers shared by submodules (private to this module tree).
-use files::{canonicalize_lossy, read_text_file, read_text_file_checked, with_file_lock};
+use files::{
+    canonicalize_lossy, read_text_file, read_text_file_checked, read_text_file_lossy,
+    with_file_lock,
+};
 use tools::merge_default_tools;
 
 /// The full upstream settings surface. All fields optional; unknown keys are

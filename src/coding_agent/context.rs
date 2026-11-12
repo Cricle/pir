@@ -103,25 +103,63 @@ fn with_process_context_options<R>(f: impl FnOnce(&ContextOptions<'_>) -> R) -> 
 /// disabled (`--no-context-files` / `PIR_NO_CONTEXT_FILES=1`).
 ///
 /// Boundary wrapper: resolves the ambient flag and agent dir exactly once and
-/// delegates to [`resolve_context_files_with`] (hermetic: no ambient read).
+/// delegates to the shared core (hermetic: no ambient read).
+///
+/// This is the CLI print host's entry point, so load diagnostics are written
+/// to stderr as the product's `pir: warning: …` line (the same surface the
+/// skill/template resource diagnostics use), one line per skipped or
+/// unreadable candidate: an oversized context file is still skipped by the
+/// documented 1 MiB hardening cap, but it can no longer disappear without a
+/// trace (PIR-BIN-066). The write goes through the fallible stderr writer so a
+/// closed pipe (`pir print … 2>&1 | head`) cannot panic the run.
 pub fn resolve_context_files(cwd: &Path) -> Vec<(PathBuf, String)> {
-    with_process_context_options(|options| resolve_context_files_with(cwd, options))
+    with_process_context_options(|options| {
+        let (files, diagnostics) = resolve_context_files_with_diagnostics(cwd, options);
+        for diagnostic in &diagnostics {
+            let _ = crate::coding_agent::output::write_stderr_line(&format!(
+                "pir: warning: {diagnostic}"
+            ));
+        }
+        files
+    })
 }
 
 /// [`resolve_context_files`] with the resolved [`ContextOptions`] passed in
 /// explicitly.
+///
+/// Session/TUI callers reach this hermetic variant: their diagnostics go to
+/// the routed host log (`<agentDir>/pir.log` for the TUI, stderr for the
+/// headless hosts) instead of a raw stderr write, so a skipped context file is
+/// still reported without corrupting a fullscreen frame (PIR-BIN-066).
 pub fn resolve_context_files_with(
     cwd: &Path,
     options: &ContextOptions<'_>,
 ) -> Vec<(PathBuf, String)> {
+    let (files, diagnostics) = resolve_context_files_with_diagnostics(cwd, options);
+    for diagnostic in &diagnostics {
+        crate::ext_diag!("{diagnostic}");
+    }
+    files
+}
+
+/// The discovery core shared by both boundary wrappers: the files plus the
+/// load diagnostics the caller reports. It never emits by itself, so each
+/// boundary wrapper picks exactly one destination (no duplicate line).
+fn resolve_context_files_with_diagnostics(
+    cwd: &Path,
+    options: &ContextOptions<'_>,
+) -> (Vec<(PathBuf, String)>, Vec<String>) {
     if options.disabled {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let files = crate::config::settings::discover_context_files(cwd, options.agent_dir);
-    if options.max_total_bytes == 0 {
-        return files;
-    }
-    truncate_context_files(files, options.max_total_bytes)
+    let (files, diagnostics) =
+        crate::config::settings::discover_context_files_with_diagnostics(cwd, options.agent_dir);
+    let files = if options.max_total_bytes == 0 {
+        files
+    } else {
+        truncate_context_files(files, options.max_total_bytes)
+    };
+    (files, diagnostics)
 }
 
 /// Apply the opt-in total context budget across all discovered files, in

@@ -2010,10 +2010,18 @@ impl PrintToolLoadout {
     /// left out of the request while their tools stay active and callable
     /// (upstream `_applyToolLoadout` + `_installHiddenDeclarationsProjection`,
     /// agent-session.ts:1580-1625).
+    ///
+    /// The array ORDER is the ACTIVE-SET order (`self.declared`, itself
+    /// `active` order), the same order the system prompt's `<tools>` section
+    /// lists (upstream `_applyToolLoadout` walks `getActiveToolNames()` and
+    /// `system-prompt.ts` lists `selectedTools`; both preserve the caller's
+    /// selection order). Rebuilding a filtered registry and reading its
+    /// name-sorted `iter()` here re-sorted the declarations by name, so the
+    /// prompt and the wire disagreed (PIR-BIN-064). The registry stays
+    /// deterministic for the UNORDERED paths ([`ToolRegistry::names`] /
+    /// [`ToolRegistry::iter`]).
     pub fn definitions(&self) -> Vec<crate::ai::types::Tool> {
-        let declared_registry = filter_registry(&self.registry, &self.declared);
-        let declared: Vec<Arc<dyn crate::agent::tool_execution::AgentTool>> =
-            declared_registry.iter().cloned().collect();
+        let declared = crate::agent::tool_execution::declared_tools(&self.registry, &self.declared);
         crate::agent::tool_execution::declared_tool_definitions(
             &declared,
             &self.descriptions,
@@ -2075,13 +2083,10 @@ pub fn print_active_definitions(
     registry: &ToolRegistry,
     active: &[String],
 ) -> Vec<crate::ai::types::Tool> {
-    let declared: Vec<String> = crate::agent::tool_execution::declared_tools(registry, active)
-        .iter()
-        .map(|tool| tool.name().to_owned())
-        .collect();
-    let declared_registry = filter_registry(registry, &declared);
-    let declared: Vec<Arc<dyn crate::agent::tool_execution::AgentTool>> =
-        declared_registry.iter().cloned().collect();
+    // `declared_tools` returns the tools in `active` order, so the request
+    // array here follows the same order the prompt's `<tools>` section does
+    // (PIR-BIN-064; see `PrintToolLoadout::definitions`).
+    let declared = crate::agent::tool_execution::declared_tools(registry, active);
     let (descriptions, hidden_declarations) = loadout_hook_changes(registry, active);
     crate::agent::tool_execution::declared_tool_definitions(
         &declared,
@@ -4935,19 +4940,6 @@ fn print_ephemeral_header(cwd: &str) {
         crate::session_manager::iso_from_ms(crate::ai::util::now_ms()),
     );
     crate::coding_agent::json::print_session_header(&header);
-}
-
-/// Rebuild a registry keeping only the enabled tools (the registry has no
-/// remove API; tools are `Arc` clones, so re-registering the survivors is
-/// equivalent).
-fn filter_registry(registry: &ToolRegistry, enabled: &[String]) -> ToolRegistry {
-    let mut filtered = ToolRegistry::new();
-    for tool in registry.iter() {
-        if enabled.iter().any(|name| name == tool.name()) {
-            filtered.register(tool.clone());
-        }
-    }
-    filtered
 }
 
 /// Resolve one `--append-system-prompt` entry: an existing file path's

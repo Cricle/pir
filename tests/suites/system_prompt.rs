@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pir::coding_agent::resources::{DiscoveredResources, ResourceDiscoveryOptions};
 use pir::config::settings::{
-    discover_context_files, discover_system_md, Settings, SettingsManager,
+    discover_context_files, discover_context_files_with_diagnostics, discover_system_md, Settings,
+    SettingsManager, MAX_CONTEXT_FILE_BYTES,
 };
 use pir::skills::{
     available_skills_xml, discover_skills, load_skill_from_file, validate_description,
@@ -1157,6 +1158,178 @@ fn oversized_prompt_template_is_skipped_with_a_warning() {
         "the skip warning names the path and the limit: {:?}",
         resources.diagnostics
     );
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-066 / PIR-BIN-067: context files are never dropped silently
+// ---------------------------------------------------------------------------
+
+/// PIR-BIN-066: an oversized `AGENTS.md` is still skipped by the 1 MiB
+/// hardening cap, but the skip is REPORTED through the structured diagnostics
+/// (which the public `discover_context_files` wrapper routes to the host's
+/// diagnostic channel — stderr for print, `<agentDir>/pir.log` for the TUI).
+///
+/// Before the fix `load_context_file_from_dir` did a bare `continue`: no
+/// `<project_context>` section and 0-byte stderr, i.e. the user's project
+/// instructions vanished with no signal at all.
+#[test]
+fn oversized_context_file_is_skipped_with_a_diagnostic() {
+    let root = TempDir::new("ctx-oversized");
+    let global = root.child("agent");
+    let cwd = root.child("work");
+
+    let oversized = "x".repeat((MAX_CONTEXT_FILE_BYTES + 1) as usize);
+    fs::write(cwd.join("AGENTS.md"), &oversized).unwrap();
+
+    let (files, diagnostics) = discover_context_files_with_diagnostics(&cwd, &global);
+    assert!(
+        files.is_empty(),
+        "the oversized file is still skipped by the cap: {files:?}"
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "exactly one diagnostic: {diagnostics:?}"
+    );
+    let message = &diagnostics[0];
+    assert!(
+        message.contains("AGENTS.md") && message.contains("exceeding"),
+        "the diagnostic names the file: {message}"
+    );
+    assert!(
+        message.contains(&MAX_CONTEXT_FILE_BYTES.to_string()),
+        "the diagnostic names the cap: {message}"
+    );
+
+    // The public wrapper reports the same diagnostic on the routed channel
+    // and still returns no file.
+    assert!(discover_context_files(&cwd, &global).is_empty());
+}
+
+/// PIR-BIN-066 (the silent-fallback half): with an oversized `AGENTS.md` and a
+/// small `CLAUDE.md` in the same directory, the next candidate wins — and the
+/// user is told why the first file was not used.
+#[test]
+fn oversized_agents_md_promotes_claude_md_with_a_diagnostic() {
+    let root = TempDir::new("ctx-oversized-fallback");
+    let global = root.child("agent");
+    let cwd = root.child("work");
+
+    let oversized = "x".repeat((MAX_CONTEXT_FILE_BYTES + 1) as usize);
+    fs::write(cwd.join("AGENTS.md"), &oversized).unwrap();
+    fs::write(cwd.join("CLAUDE.md"), "claude fallback").unwrap();
+
+    let (files, diagnostics) = discover_context_files_with_diagnostics(&cwd, &global);
+    assert_eq!(files.len(), 1, "only the fallback loads: {files:?}");
+    assert_eq!(files[0].1, "claude fallback");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|message| message.contains("AGENTS.md")),
+        "the skipped AGENTS.md is reported even though the next candidate wins: {diagnostics:?}"
+    );
+}
+
+/// PIR-BIN-067: a context file with a few invalid bytes (a Chinese-locale
+/// editor's GBK tail) keeps its valid prefix and becomes U+FFFD at the bad
+/// bytes, like upstream `readFileSync(path, "utf-8")`
+/// (`resource-loader.ts:211-230`). Before the fix `fs::read_to_string` failed
+/// on the first invalid byte and the WHOLE file was dropped with no warning.
+#[test]
+fn non_utf8_context_file_is_read_lossily_not_dropped() {
+    let root = TempDir::new("ctx-non-utf8");
+    let global = root.child("agent");
+    let cwd = root.child("work");
+
+    // Valid UTF-8 prefix, then the GBK bytes of "啊不好" (A/B case 19).
+    let mut bytes = b"UTF8-MARKER-OK\n".to_vec();
+    bytes.extend_from_slice(&[0xb0, 0xa1, 0xb2, 0xbb, 0xba, 0xc3]);
+    bytes.extend_from_slice(b" GBK-BYTES\n");
+    fs::write(cwd.join("AGENTS.md"), &bytes).unwrap();
+
+    let (files, diagnostics) = discover_context_files_with_diagnostics(&cwd, &global);
+    assert_eq!(
+        files.len(),
+        1,
+        "the file must not be dropped: {diagnostics:?}"
+    );
+    let content = &files[0].1;
+    assert!(
+        content.starts_with("UTF8-MARKER-OK\n"),
+        "the valid prefix survives: {content:?}"
+    );
+    assert!(
+        content.contains('\u{fffd}'),
+        "invalid bytes decode to U+FFFD like Node: {content:?}"
+    );
+    assert!(
+        content.contains("GBK-BYTES"),
+        "the valid tail after the bad bytes survives: {content:?}"
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "a lossy decode is the upstream behavior, not a skip: {diagnostics:?}"
+    );
+}
+
+/// PIR-BIN-067 / BOM parity: the lossy reader must still strip a leading
+/// UTF-8 BOM (A/B case 34 is parity today; do not regress it).
+#[test]
+fn lossy_context_read_still_strips_the_bom() {
+    let root = TempDir::new("ctx-bom-lossy");
+    let global = root.child("agent");
+    let cwd = root.child("work");
+
+    let mut bytes = "\u{feff}BOM-MARKER".as_bytes().to_vec();
+    bytes.extend_from_slice(&[0xff, 0xfe]);
+    fs::write(cwd.join("AGENTS.md"), &bytes).unwrap();
+
+    let files = discover_context_files(&cwd, &global);
+    assert_eq!(files.len(), 1);
+    assert!(
+        files[0].1.starts_with("BOM-MARKER"),
+        "BOM stripped: {:?}",
+        files[0].1
+    );
+}
+
+/// CRLF parity (A/B case 66): the lossy byte path must not normalize line
+/// endings; both sides preserve `\r\n` inside the context section.
+#[test]
+fn lossy_context_read_preserves_crlf() {
+    let root = TempDir::new("ctx-crlf-lossy");
+    let global = root.child("agent");
+    let cwd = root.child("work");
+
+    fs::write(cwd.join("AGENTS.md"), b"#line one\r\nline two\r\n").unwrap();
+
+    let files = discover_context_files(&cwd, &global);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1, "#line one\r\nline two\r\n");
+}
+
+/// Discovery order and precedence are unchanged by the reporting split: the
+/// global file still comes first, then ancestors root-most → cwd, and the
+/// first candidate in a directory still wins.
+#[test]
+fn diagnostics_split_preserves_discovery_order() {
+    let root = TempDir::new("ctx-order-diagnostics");
+    let global = root.child("global");
+    let a = child_dir(root.path(), "repo");
+    let b = child_dir(&a, "sub");
+
+    root.write("global/AGENTS.md", "global rules");
+    fs::write(a.join("AGENTS.md"), "repo rules").unwrap();
+    fs::write(b.join("AGENTS.override.md"), "deep override").unwrap();
+    fs::write(b.join("AGENTS.md"), "shadowed by the override").unwrap();
+
+    let (files, diagnostics) = discover_context_files_with_diagnostics(&b, &global);
+    let contents: Vec<&str> = files.iter().map(|(_, content)| content.as_str()).collect();
+    assert_eq!(
+        contents,
+        vec!["global rules", "repo rules", "deep override"]
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
 }
 
 // ---------------------------------------------------------------------------
