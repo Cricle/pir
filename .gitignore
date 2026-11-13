@@ -15,6 +15,7 @@ Cargo.lock.bak
 /target-gnu-off/
 /target-linux/
 /target-merge/
+/target-shared/
 /target-ab-*/
 /target-ci-fix/
 /scripts/tui_conpty/out/

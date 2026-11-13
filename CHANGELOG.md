@@ -1,5 +1,99 @@
 # Changelog
 
+## 0.3.1 (2026-11-13)
+
+A/B parity pass against upstream `pi` 1.4.0 (TUI, CLI, sessions, providers,
+streaming, SDK) plus a Windows portability pass. No breaking changes;
+`docs/FEATURES.md` §5b records the resource bounds this release makes visible.
+
+### performance
+
+- Compaction decides on the same request-projected context floor pi uses: the
+  declared tool schema and prompt units are counted once instead of twice. A
+  26-turn script now compacts 8 times instead of 24 (pi: 8); at 1000 turns
+  both sides compact 332 times at the same trigger point.
+- The TUI no longer self-drives a repaint loop while scrolled up: a dirty
+  frame whose windowed band did not move schedules no next timer (measured
+  97–99% CPU sustained → idle).
+
+### tui
+
+- Terminal scrollback is no longer cleared while the TUI is in use. Repaints
+  for a shrunk or windowed viewport emit `ESC[2J` + home but never the
+  destructive `ESC[3J`; a frame that starts above the window renders the full
+  transcript; the bounded transcript window (512 entries / 4 MiB) announces
+  truncation instead of silently dropping rows (see `docs/tui.md`,
+  "Intentional deviations from upstream").
+- The startup header's key hints collapse to the single compact row again and
+  still expand on demand; an extension `setHeader` widget still replaces the
+  built-in header.
+- `/hotkeys` reports the live bindings (for example `ctrl+p / alt+p` for the
+  model cycle and `ctrl+q` for follow-up) instead of stale literals, and the
+  footer renders the thinking level actually resolved for the session model.
+- Provider failures no longer show the internal `non-retryable provider
+  error:` marker in front of `HTTP 500:`/`HTTP 401:` text; retry behavior is
+  unchanged.
+
+### cli and sessions
+
+- `pir print` with an explicitly selected print surface treats a bare
+  positional argument as the prompt: `pir print --mode json "version"` issues
+  a model request instead of running the `version` subcommand.
+- A resumed session sends exactly one system prompt; a stored system row is no
+  longer concatenated with the live rendering (request 2219 → 1731 chars).
+- `abort` answers only after the run settles, so a prompt sent immediately
+  afterwards is queued in order instead of being rejected during the
+  14–230 ms settling window.
+- `fork {entryId}` swaps in a new session file whose header carries
+  `parentSession` = the source file and whose rows are the root→target path,
+  instead of moving the leaf inside the source JSONL. The fork now survives a
+  restart, `get_state.sessionFile`/`sessionId` change, and the source file is
+  never appended to again; `/fork`, the RPC `fork` command and
+  `AgentSessionRuntime::fork` all go through the same seam.
+- A malformed `settings.json` degrades to defaults with exit 0 and one
+  warning (previously every non-interactive command exited 1); per-subsystem
+  detail for the same problem is now log-only (`--verbose` /
+  `RUST_LOG=debug`) instead of repeating the line.
+- Provider `maxRetries`, the retry delay cap and `timeoutMs` are wired:
+  `maxRetries: 0` sends 1 request instead of 3, `maxRetries: 3` sends 4, and a
+  1 s `timeoutMs` times out at ~1.1 s.
+- A close-delimited SSE stream that ends without a finish reason is reported
+  as `Stream ended without finish_reason` instead of a silent success.
+- `--mode json` exits 1 when no provider can serve the request (pi parity).
+- `--thinking` is applied without `--model` too, and clamped to the model's
+  supported rungs before the first request (`max` → `high` on models without
+  a `max` rung).
+- `--no-session` history trimming (1024 messages / 100k tokens) is announced:
+  one `history_trimmed` event carrying `droppedMessages`, `retainedMessages`
+  and `totalDroppedMessages`, one matching stderr line, and no event for
+  persisted sessions.
+- `@file` mentions keep pi's rules: a missing file is an error, and skipped
+  context files are reported instead of silently ignored.
+- A context file that is skipped (over the 1 MiB cap, or not valid UTF-8) is
+  now reported as a warning instead of vanishing silently.
+- File tools accept workspace-internal `..` segments (`src/../src/main.rs`);
+  paths that actually escape the workspace root remain refused.
+- The request's `tools[]` array follows the active-set order instead of being
+  re-sorted by name, so it matches the order the `<tools>` prompt section
+  lists.
+- `bash` composes `PATH` in the dialect of the consumer (POSIX for MSYS
+  shells, native form for Windows executables), so `node` and other native
+  programs are found from MSYS bash again.
+- `--continue`, `--session <id>` and `--resume` match the session cwd
+  case-insensitively on Windows, so a differently-cased drive letter or
+  directory spelling no longer starts an empty history.
+
+### windows
+
+- `write`/`edit` preserve the spelling stored in the directory entry, so
+  editing `MixedCase.txt` through `mixedcase.txt` no longer renames the file
+  on disk.
+- Tool errors use stable English text plus the OS code instead of localized
+  system strings (`Cannot write 'x': permission denied (Access is denied; os
+  error 5)`).
+- A project file whose name collides only by case (`AGENTS.md` /
+  `AGENTS.MD`) is diagnosed once, not twice.
+
 ## 0.3.0 (2026-11-11)
 
 ### performance

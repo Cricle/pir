@@ -2,8 +2,98 @@
 
 - 基线：`master` @ `b26a60fb23bd45306401190cacb5b6f2c1f5459c`
 - 结果日期：2026-11-02
-- 最新实测：2026-11-11（0.3.0 release preparation，见下一节；下方各节为 2026-11-02 基线历史）
+- 最新实测：2026-11-12（与上游 pi 1.4.0 的 A/B 轮，见第一节；其下依次为 0.3.0 发版准备与 2026-11-02 基线历史）
 - 本文件是唯一面向用户的结果文档；过程材料仅在 `.audit/` 保留为原始证据。
+
+## A/B campaign vs pi 1.4.0 (2026-11-12)
+
+pir 与上游 `pi` 1.4.0 的本轮 A/B（封闭环境、loopback mock、隔离 agent dir）。
+每条结论都有可复现脚本与原始日志在 `.play/evidence/`。缺陷均已修复并附前后对比。
+
+**已修复的缺陷（本轮发现→修复→验证）**
+
+| issue | 问题 | 修复效果（实测） |
+|---|---|---|
+| PIR-TUI-027 | TUI 主屏跨 512 条目窗口滑动时 `3J` 清空终端 scrollback，用户"历史被重置" | 第 4/5 轮 scrollback 从 2116/3162 行且不可达 → **16736/33587 行且第 1 轮内容可达**；跨窗口后 `3J` 停止增加 |
+| PIR-TUI-028 | （修复 027 时自引入）窗口无法扩展时自驱重绘死循环 | 97–99% CPU 持续 + 19 MB 写日志 → **14%→0%→收敛**，剩余输出经证实是用户请求的历史物化（387 个不同条目） |
+| PIR-BIN-030 | 打印模式下位置参数若等于子命令名，会执行子命令而非当作 prompt | `--print --mode json "version"` 由输出纯文本改为发出模型请求并产出 JSONL |
+| PIR-BIN-031 | `@file` 规则被放宽后，缺失文件不再报错 | 见 `.play/issues/PIR-BIN-031.md` |
+| PIR-BIN-037 | 无 provider 时 `--mode json` 退出码 0（pi 为 1） | 见 `.play/issues/PIR-BIN-037.md` |
+| PIR-BIN-057 | provider 重试设置从未接线（`maxRetries`/延迟上限/`timeoutMs` 无效） | `maxRetries:0` 3 请求→**1**；`maxRetries:3` 3→**4**；延迟上限 60s→**5s**；`timeoutMs` 6.1s 成功→**1.13s 超时** |
+| PIR-BIN-058 | close-delimited 流被截断/零字节时静默返回"成功" | 1 请求 `stop` 半截文本 → **4 请求 `error`: Stream ended without finish_reason**；合法 `[DONE]` EOF 前后都 1 请求成功 |
+| PIR-BIN-070 | 压缩阈值 floor 把工具声明算两次，导致压缩触发过早、次数翻倍 | 26 轮脚本压缩 **24 → 8 次（与 pi 相同）**；触发时真实请求 **2242 → 3017 tokens**（阈值 3000）；摘要 prompt **21882 → 13466 tokens**（pi 13429） |
+| PIR-BIN-071 | 一个写坏的 `settings.json` 让所有非交互命令 `exit 1`（pi 只警告一次） | 畸形 settings：`exit 1` 无输出 → **`exit 0` + 正常回答**，仅一行警告 |
+| PIR-BIN-053 | 恢复会话时系统提示发两遍 | preamble/`<cwd>` 各 2 → **各 1**，请求体积 2219 → 1731 字符 |
+| PIR-TUI-025 | 陈旧 session 锁导致恢复被拒 | touch 竞态 400/400 → **0/400**；真实 ConPTY 循环 100/100 → **0/100** |
+| Windows 上下文文件 | 大小写不敏感卷上 `AGENTS.md`/`AGENTS.MD` 是同一文件，产生重复诊断 | 同一文件被两条诊断 → **一条**；大小写敏感目录仍按上游优先级（用 `fsutil` 真机验证） |
+| PIR-TUI-032 | footer 显示 `thinking off`，实际请求发出 `high`（用户看到的计费档位是假的） | 见 `.play/issues/PIR-TUI-032.md` |
+| PIR-BIN-074 | 启动 thinking 等级未按模型 `thinkingLevelMap` 钳制，`--thinking max` 原样上线 | 见 `.play/issues/PIR-BIN-074.md` |
+| PIR-BIN-075 | `--no-session` 会静默丢弃最老历史（1024 条/100k tokens），无事件、无警告、无文档 | 见 `.play/issues/PIR-BIN-075.md` |
+| PIR-BIN-073 | abort 后 14-230 ms 内 prompt 被拒，steer 被延后到下一个 prompt 之后（顺序错乱，无后续 prompt 则丢失） | `abort` 改为等待 idle 再响应：请求序列从 `[first]→[first,second]→[first,second,Q]` 变为 **`[first]→[first,Q]→[first,Q,second]`**，与 pi 完全一致 |
+| PIR-BIN-076 | （high）`bash` 把 Windows 形式路径用 `;` 拼到 POSIX PATH 上，MSYS 解析成乱码，原生命令全部 ENOENT | `PathDialect` 按消费方拼写组合：`execFileSync('node')` 从 **`spawnSync node ENOENT` → `NESTED-OK`** |
+| PIR-BIN-077 | write/edit 错误泄露中文本地化串 | `Cannot write 'x': 拒绝访问。 (os error 5)` → **`Cannot write 'x': permission denied (Access is denied; os error 5)`** |
+| PIR-BIN-079 | 文件工具拒绝工作区内任何含 `..` 的路径 | `read src/../src/main.rs` 从被拒 → **成功读到文件**；`../outside` 仍被拒 |
+| PIR-BIN-078 | `--thinking` 无 `--model` 时整条丢弃 | 无 `--model` 时 `high`/`max` 从 **`medium`（丢弃）→ `high`（生效并钳制）** |
+| PIR-BIN-074 | 启动 thinking 等级未按模型钳制 | `--thinking max` 从上线 `max` → **`high`**（模型不支持 max） |
+| PIR-TUI-032 | footer 显示 `thinking off` 而实际发 `high` | footer 改为读解析后的等级（已有 10 个自动化测试） |
+
+**长会话耐久（lane-ab-endurance，100–5000 轮实测）**
+
+- 会话文件增长双方线性一致：pir 1152.75 B/轮 vs pi 1154.09 B/轮；`lines = 2N+2` 精确，不重写不裁剪。
+- 重开会话（spawn→首个模型请求，3 次中位数）：pir 152/152/199/**345** ms vs pi 910/910/899/**925** ms（26 KB/118 KB/578 KB/2.31 MB），**pir 快 2.7–6.0 倍**；打开窗口峰值 RSS pir 57-63 MB vs pi 121-140 MB。
+- **PIR-BIN-070 的修复在 1000 轮规模上验证**：修复前 998 次压缩 vs pi 332；修复后 **332 vs 332**，触发点 3138 ≥ 阈值 3000，最后压缩在第 998 轮，0 个悬挂 `firstKeptEntryId`、0 个空摘要。摘要是**替换**而非累积。1000 轮后转录完整（0 解析错误，1000/1000 用户轮各出现一次）。
+- 每轮延迟漂移：pir +0.0395 ms/轮至 2000 轮（×5.0）、5000 轮 ×11.2；pi ×5.3 / ×14.1 —— 形状一致，pir 绝对延迟约 3 倍但 CPU 更低（1.88 s vs 2.28 s/1000 轮），代价在序列化不在计算。有界上下文（4K 窗口）则完全无漂移（33 ms 恒定）。
+- 句柄数无泄漏：pir 24→173 后稳定（5000 轮最大 176），pi 24→234 后稳定。
+
+**流式体验与侧通道（lane-ab-streamux 实测）**
+
+- 首字可见时间（含 0/200/1500 ms 人为延迟）：JSON 模式 pir 133.5/310.6/1626.3 ms vs pi 925.1/1128.5/2383.0 ms；
+  TUI 首字 pir 184-191/374-406/1669-1710 ms vs pi 1148-1323/1315-1522/2625-2811 ms。**扣除人为延迟后的自身开销 pir 110-210 ms，pi 880-1320 ms（约 6-8× 轻）**。
+- 增量粒度（4000 字/200 个 delta）：双方都不缓冲整段；pir 最大间隔 11-12 ms，pi 出现过一次 104-115 ms 调度停顿。
+- 思考过程：双方默认都实时显示，`hideThinkingBlock:true` 都折叠为 `Thinking...`，`ctrl+t` 都能切换。
+- 工具调用交织：双方可见顺序与线上顺序一致，无重排/丢失/重复。
+- 中断：ESC 双方都保留部分回复并在 session 里记 `stopReason:"aborted"`；**双 ctrl+c 时 pi 会丢掉 session 文件里的部分回复，pir 保留**。
+
+**已确认的上游差距但非缺陷（parity / pir 更优）**
+
+- 大工具输出：双方都在 50 KB 截断并内联，之后每轮照常重发；行为一致。
+- 压缩后的请求形状 `[system, summary, tail]` 与磁盘保留条目数双方一致。
+- 损坏的 session JSONL：双方都跳过坏行并保留原字节继续；**pir 额外打一条 WARN**，pi 完全静默。
+- 工具目标权限被拒：双方都把错误放在工具结果里、回合继续；pir 额外记一条 WARN。
+- 关闭的 stdout 管道（EPIPE）：**pir 安静 exit 0**，pi exit 1 并抛 Node 堆栈。
+- 每轮上下文增长：双方量级一致（pir +255 字符/轮，pi +255），pir 每轮少 25 B。
+
+**保留的已知差距（未在本轮修改）**
+
+- PIR-BIN-052：fork 的编辑不落盘，退出即丢。
+- PIR-BIN-061/062/063：默认系统提示比上游多 4 条规则、少一个 `<docs>` 段、默认加载 9 个工具而 pi 加载 4 个，基线请求成本 **+4464 字符（≈+1116 tokens）**。是否为有意设计需要产品决策，不是纯缺陷。
+- 设置文件写坏时同一错误会打印三行（CLI + codemod + memory 各一条），内容真实但格式重复。
+
+## 0.3.1 release (2026-11-13)
+
+0.3.1 收入 2026-11-12 A/B 战役的全部修复，并补完发版前发现的会话持久性 / Windows
+可移植性缺陷。上表三条“保留的已知差距”里，PIR-BIN-052 与“设置三连警告”已在本版修复。
+
+**本轮新增修复（A/B 缺陷表之外，均已实测验证）**
+
+| issue | 问题 | 修复效果（实测） |
+|---|---|---|
+| PIR-BIN-052 | `fork {entryId}` 只在原 JSONL 内移动 leaf，退出即丢 fork（`sessionId` 不变、无 `parentSession`） | fork 改为换入新会话文件：header `parentSession` = 源文件、行 = root→目标前缀、`sessionId/sessionFile` 改变、源文件不再追加；重启后仍是 fork。19 个 fork 用例全过（含 RPC/TUI/SDK 同一 seam） |
+| PIR-BIN-080 | Windows 下 cwd 大小写不同（`c:\proj` vs `C:\Proj`）时 `--continue`/`--resume`/`--session` 找不到会话，静默开新会话 | 默认会话目录跳过 header-cwd 过滤（与上游 `filterCwd` 一致）+ Windows 大小写不敏感比较；三种入口都能续上原会话，真正跨项目仍走 CrossProject 提示 |
+| PIR-BIN-081 | `write`/`edit` 的 temp+rename 把磁盘上的 `MixedCase.txt` 静默改名为调用者拼写 | 磁盘拼写与请求不一致时改走 in-place 重写：保留原拼写/inode/ACL/硬链接；新文件与拼写一致路径仍原子替换；符号链接仍拒绝 |
+| 设置三连警告 | 一个坏 `settings.json` 打 3 行 stderr（CLI + codemod + memory 各一条） | 子系统重复通道降级为 log-only（`DiagnosticLevel::Debug`）；用户可见 1 行、退出 0；`--verbose`/`RUST_LOG=debug` 仍可看细节，新增回归测试钉住“恰好一行” |
+| PIR-BIN-069 | docs/prompt-templates.md 写错设置键/目录/调用形式 | 改为代码真实契约（`prompts` 键、`<agentDir>/prompts`、`<cwd>/.pi/prompts`、`/<stem>` 调用）；全仓库无 `promptTemplates`/`/template:` 残留 |
+| PIR-BIN-061 | `<docs>` 段在真实安装下从不输出（`PI_PACKAGE_DIR` 未设） | 维持“只指向真实存在的资产树”（README.md + docs/ + examples/）并记录与 pi 的偏差；<docs> 绝不指向不存在的路径 |
+
+**门禁（本机 GNU，2026-11-13 实测）**
+
+- `cargo fmt --all -- --check` EXIT 0。
+- `cargo clippy --all-targets --all-features --locked -- -D warnings` EXIT 0（0 条诊断）。
+- 全量 nextest（`--profile local`，`RUST_MIN_STACK=8388608`）：**8140 tests，0 failed，46 skipped**；
+  分项 = lib/bins 29 + zz_merged_1..8 的 919/882/869/904/878/1066/921/890 + standalone 20 + profiling 762。
+- doctests 33 passed / 0 failed / 7 ignored；`cargo check --no-default-features --features sdk` EXIT 0。
+- 版本三处一致：`[workspace.package]`、`.migration-info`、二进制 `--version` 均为 0.3.1，
+  `Cargo.lock` 两个 workspace 包同步。证据：`.play/evidence/release-v031/`。
 
 ## 0.3.0 release preparation (2026-11-11)
 

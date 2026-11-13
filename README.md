@@ -6,7 +6,7 @@ dependency.
 
 ## Status
 
-0.3.0 (2026-11-11). End-to-end functional: agent loop, providers, sessions,
+0.3.1 (2026-11-13). End-to-end functional: agent loop, providers, sessions,
 extensions, TUI, RPC, server/client, SDK, builtins. Final result:
 [`RESULTS.md`](RESULTS.md); per-module truth: [MAPPING.md](MAPPING.md); feature
 contract: [`docs/FEATURES.md`](docs/FEATURES.md). Settled scope: chord delta
@@ -18,13 +18,14 @@ the installed binary is `pir`). CI tags also attach `pir-<tag>-windows-x86_64.zi
 `pir-<tag>-macos-universal.tar.gz`, each containing `pir` and
 `pir-phone-server`; local Windows verification in `RESULTS.md` is GNU-only.
 
-The local release gate is green on 2026-11-11: `cargo fmt --all -- --check`,
-`cargo clippy --all-targets --all-features -- -D warnings`, the SDK 4-shape
-feature matrix, doctests (33 passed / 0 failed / 7 ignored) and
-`cargo check --examples --no-default-features --features sdk` all exit 0. The
-authoritative 8-group full-suite run finished with every group EXIT 0 and 0
-failures; aggregate totals are pending re-measure in
-`.play/evidence/release-prep/final/REPORT.md`.
+The local release gate is green on 2026-11-13 (`v0.3.1`):
+`cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features
+--locked -- -D warnings`, `cargo check --no-default-features --features sdk`,
+doctests (33 passed / 0 failed / 7 ignored) and the full cargo-nextest suite
+(8140 tests, 0 failed, 46 skipped across the lib/bins target and the 8 merged
+harnesses plus the standalone and profiling targets) all exit 0. Evidence:
+`.play/evidence/release-v031/` (`summary.txt`, `summary-rerun.txt`,
+`gates.log`).
 
 ## Building
 
@@ -40,7 +41,7 @@ providers, sessions, config, prompt/skills and the plugin framework.
 
 ```toml
 # Package name `pir-sdk`; the library is still imported as `pir`.
-pir-sdk = { version = "0.3.0", default-features = false, features = ["sdk"] }
+pir-sdk = { version = "0.3.1", default-features = false, features = ["sdk"] }
 ```
 
 Every optional surface is a cargo feature; `full` is the default, and the
