@@ -164,6 +164,78 @@ pub fn content_text(message: &UserMessage) -> String {
         .join("\n")
 }
 
+/// Whether a replayed instruction message is a PROMPT SNAPSHOT: no content of
+/// its own plus named sections — the shape a session records for the prompt it
+/// sent (a pi-written leading `system` row, or the checkpoint
+/// [`get_current_system_message`] stores on compaction).
+pub fn is_prompt_snapshot(message: &UserMessage) -> bool {
+    content_text(message).trim().is_empty()
+        && message
+            .sections
+            .as_ref()
+            .is_some_and(|sections| !sections.is_empty())
+}
+
+/// Whether the RENDERED live prompt already carries the named section.
+///
+/// Every section except `preamble` is wrapped at render time in a tag of the
+/// same name followed by a newline
+/// ([`crate::system_prompt::build_system_prompt_sections`]), so an exact
+/// `<name>\n` occurrence is the by-name identity upstream's `sections` patch
+/// uses. The preamble is the one untagged section; the current build always
+/// defines it, so a live prompt carries it.
+pub fn live_prompt_carries_section(live_prompt: &str, name: &str) -> bool {
+    name == "preamble" || live_prompt.contains(&format!("<{name}>\n"))
+}
+
+/// The text one replayed instruction message contributes to the leading system
+/// prompt, given the host's live rendering (`Context::system_prompt`).
+///
+/// Upstream replays a stored system row into the head the SAME options build,
+/// patching `sections` BY NAME ([`get_current_system_message`],
+/// `pi/packages/ai/src/utils/transcript.ts:73-96`): a later message that repeats
+/// a section REPLACES it, it never appends a second copy. pir carries the live
+/// prompt out of band, so the equivalent is:
+///
+/// * no live prompt (a foreign/durable transcript whose prompt lives in its
+///   system rows): the whole message is the prompt source and is replayed;
+/// * a live prompt plus a PROMPT SNAPSHOT row (the resume case — the row a
+///   previous run wrote for this same prompt): only sections whose NAME the
+///   live rendering does not define are folded, so the live prompt is sent
+///   once and a stored-only section still reaches the model;
+/// * a live prompt plus a message whose rendered text is exactly that prompt
+///   (a foreign writer that stored the prompt as `content`): nothing to add;
+/// * any other system message (genuinely new instruction text): folded
+///   verbatim.
+///
+/// Without this, a resumed session sent the prompt twice: once live and once
+/// replayed (PIR-BIN-053).
+pub fn leading_system_fragment(message: &UserMessage, live_prompt: Option<&str>) -> String {
+    let Some(live_prompt) = live_prompt.filter(|prompt| !prompt.trim().is_empty()) else {
+        return system_message_text(message);
+    };
+    if is_prompt_snapshot(message) {
+        let mut kept: Vec<&str> = Vec::new();
+        for (name, value) in message.sections.iter().flatten() {
+            let Some(value) = value.as_deref() else {
+                // A `null` entry removes the section: the live rendering is
+                // the desired set, so there is nothing left to remove.
+                continue;
+            };
+            if value.is_empty() || live_prompt_carries_section(live_prompt, name) {
+                continue;
+            }
+            kept.push(value);
+        }
+        return kept.join("\n\n");
+    }
+    let text = system_message_text(message);
+    if text.trim() == live_prompt.trim() {
+        return String::new();
+    }
+    text
+}
+
 /// Render a system message as a complete prompt: its content followed by its
 /// section texts, non-empty parts joined with a blank line (upstream
 /// `getSystemMessageText`).

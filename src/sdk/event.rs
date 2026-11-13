@@ -322,6 +322,29 @@ pub enum SdkEvent {
         level: String,
     },
 
+    /// A store-less (no session storage) agent's in-memory transcript was
+    /// trimmed because it crossed the ephemeral history cap (PIR-BIN-075).
+    ///
+    /// pir bounds an embedded session without storage (upstream
+    /// `SessionManager.inMemory` keeps the whole conversation); every drop is
+    /// announced through this event, a `pir: warning: --no-session history
+    /// trimmed: …` diagnostic, and [`crate::sdk::Agent::history_trimmed_messages`].
+    /// A persisted session never emits it.
+    HistoryTrimmed {
+        /// How many of the OLDEST messages this trim dropped.
+        dropped_messages: usize,
+        /// Messages retained after the trim.
+        retained_messages: usize,
+        /// The message-count cap in force.
+        max_messages: usize,
+        /// The estimated-token cap in force.
+        max_tokens: u64,
+        /// Which cap forced the trim: `"messages"` or `"tokens"`.
+        reason: &'static str,
+        /// Cumulative messages dropped over the session's lifetime.
+        total_dropped_messages: usize,
+    },
+
     /// One streaming chunk of an out-of-loop bash execution (upstream
     /// `bash_execution_update`); `id` is the execution id when the caller
     /// supplied one.
@@ -508,6 +531,25 @@ impl SdkEvent {
             SessionEvent::ThinkingLevelChanged { level } => Some(Self::ThinkingLevelChanged {
                 level: level.clone(),
             }),
+            // Non-exhaustive session enum addition (PIR-BIN-075): the arms
+            // below all pre-date it, so anything else stays unprojected. This
+            // one is projected because an embedded app has no stderr reader
+            // and no `get_state`: its ONLY drop signal is here.
+            SessionEvent::HistoryTrimmed {
+                dropped_messages,
+                retained_messages,
+                max_messages,
+                max_tokens,
+                reason,
+                total_dropped_messages,
+            } => Some(Self::HistoryTrimmed {
+                dropped_messages: *dropped_messages,
+                retained_messages: *retained_messages,
+                max_messages: *max_messages,
+                max_tokens: *max_tokens,
+                reason,
+                total_dropped_messages: *total_dropped_messages,
+            }),
             SessionEvent::BashExecutionUpdate { id, delta } => Some(Self::BashExecutionUpdate {
                 id: id.clone(),
                 delta: delta.clone(),
@@ -630,6 +672,24 @@ impl SdkEvent {
             SessionEvent::ThinkingLevelChanged { level } => {
                 Some(Self::ThinkingLevelChanged { level })
             }
+            // PIR-BIN-075: an embedded consumer has no stderr reader and no
+            // `get_state`, so this event is its only signal that the store-less
+            // transcript was trimmed.
+            SessionEvent::HistoryTrimmed {
+                dropped_messages,
+                retained_messages,
+                max_messages,
+                max_tokens,
+                reason,
+                total_dropped_messages,
+            } => Some(Self::HistoryTrimmed {
+                dropped_messages,
+                retained_messages,
+                max_messages,
+                max_tokens,
+                reason,
+                total_dropped_messages,
+            }),
             SessionEvent::BashExecutionUpdate { id, delta } => {
                 Some(Self::BashExecutionUpdate { id, delta })
             }
@@ -1194,10 +1254,11 @@ pub fn deliver_loop_tool_update(sink: &SharedSink, event: SdkEvent) -> bool {
         return false;
     }
     let sent = {
-        let sender = guard
-            .sender
-            .as_ref()
-            .expect("sender checked non-empty above");
+        // `is_none()` returned above, so the sender is present; binding it with
+        // `let ... else` keeps the gate's no-`expect` rule without a panic path.
+        let Some(sender) = guard.sender.as_ref() else {
+            return false;
+        };
         sender.try_send(event).is_ok()
     };
     if sent {

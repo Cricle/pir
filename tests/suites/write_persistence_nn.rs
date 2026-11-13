@@ -230,3 +230,102 @@ async fn default_write_durability_puts_the_whole_payload_in_the_target() {
     assert_no_atomic_temp(&root);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// Windows: a case-insensitive lookup must not replace the stored spelling
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn sorted_names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(directory)
+        .expect("list directory")
+        .map(|entry| {
+            entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// On NTFS the directory entry stores the original casing while lookups ignore
+/// case, so `mixedcase.txt` resolves to an existing `MixedCase.txt`. A
+/// temp+rename replacement installs the requested spelling over that entry (a
+/// silent on-disk rename: invisible in a Windows `git status`, real for a
+/// case-sensitive checkout). `write` and `edit` must rewrite the existing entry
+/// in place and keep the stored spelling, including when only a parent
+/// directory's casing differs. A brand-new file still gets the caller's
+/// spelling.
+#[cfg(windows)]
+#[tokio::test]
+async fn case_mismatched_write_and_edit_preserve_the_stored_spelling() {
+    let root = temp_dir("case-spelling");
+    let dir = root.join("SubDir");
+    std::fs::create_dir(&dir).expect("create subdirectory");
+    std::fs::write(dir.join("MixedCase.txt"), "PAYLOAD-ORIGINAL\n").expect("seed target");
+
+    let registry = registry();
+    let context = ToolContext::new(root.to_path_buf());
+    let edit = registry.get("edit").expect("edit tool registered");
+
+    // `edit` through a differently-cased parent and file component.
+    let result = edit
+        .run(
+            &serde_json::json!({
+                "path": "subdir/mixedcase.txt",
+                "edits": [{"oldText": "PAYLOAD-ORIGINAL", "newText": "PAYLOAD-EDITED"}]
+            }),
+            &context,
+        )
+        .await;
+    assert!(
+        !result.is_error,
+        "case-mismatched edit failed: {}",
+        result.content
+    );
+    assert_eq!(read(&dir.join("MixedCase.txt")), "PAYLOAD-EDITED\n");
+    assert_eq!(
+        sorted_names(&dir),
+        vec!["MixedCase.txt".to_string()],
+        "edit must not replace the stored directory-entry spelling"
+    );
+
+    // `write` through the uppercased file component.
+    let result = write(
+        &registry,
+        &root,
+        "SubDir/MIXEDCASE.TXT",
+        "PAYLOAD-REWRITTEN\n",
+    )
+    .await;
+    assert!(
+        !result.is_error,
+        "case-mismatched write failed: {}",
+        result.content
+    );
+    assert_eq!(read(&dir.join("MixedCase.txt")), "PAYLOAD-REWRITTEN\n");
+    assert_eq!(
+        sorted_names(&dir),
+        vec!["MixedCase.txt".to_string()],
+        "write must not replace the stored directory-entry spelling"
+    );
+
+    // A new file has no stored spelling to preserve: it is created as asked.
+    let result = write(&registry, &root, "subdir/brandnew.txt", "NEW\n").await;
+    assert!(
+        !result.is_error,
+        "new-file write failed: {}",
+        result.content
+    );
+    assert_eq!(read(&dir.join("brandnew.txt")), "NEW\n");
+    assert_eq!(
+        sorted_names(&dir),
+        vec!["MixedCase.txt".to_string(), "brandnew.txt".to_string()],
+        "a new file keeps the requested spelling"
+    );
+    assert_no_atomic_temp(&dir);
+    let _ = std::fs::remove_dir_all(&root);
+}

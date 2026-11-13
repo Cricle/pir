@@ -2583,8 +2583,10 @@ fn codemode_config_for(agent_dir: &Path, cwd: &Path) -> crate::plugins::codemode
     let trusted = std::env::var("PIR_TRUST_PROJECT").is_ok_and(|value| value == "1");
     let mut manager =
         crate::config::settings::SettingsManager::load(agent_dir, &cwd.join(".pi"), cwd, trusted);
+    // Log-only: an SDK host may surface settings diagnostics itself; this
+    // loader's copy is per-subsystem detail, not a second user-facing line.
     for error in manager.drain_errors() {
-        crate::ext_diag!(
+        crate::ext_diag_debug!(
             "[codemode] settings {}: {}",
             error.scope_name(),
             error.message

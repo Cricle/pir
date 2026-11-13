@@ -261,8 +261,11 @@ impl MemoryService {
         let cwd = self.cwd();
         let trusted = self.trusted.load(Ordering::Relaxed);
         let mut manager = SettingsManager::load(&agent_dir, &cwd.join(".pi"), &cwd, trusted);
+        // Log-only: the CLI/host startup printer already reported each
+        // distinct settings load failure once; echoing it here per memory
+        // service construction duplicated the same problem on stderr.
         for error in manager.drain_errors() {
-            crate::ext_diag!("[memory] settings: {error:?}");
+            crate::ext_diag_debug!("[memory] settings: {error:?}");
         }
         let settings = manager.settings.memory.clone().unwrap_or_default();
         let config = MemoryConfig::from_settings(&settings);

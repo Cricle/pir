@@ -21,8 +21,9 @@ use super::confine::ConfinedTarget;
 #[cfg(feature = "tool-edit")]
 use super::util::single_path_arg;
 use super::util::{
-    checkpoint_before_mutation_from_bytes, max_source_bytes, source_limit_error,
-    workspace_path_parts, workspace_path_remote_checked, write_remote_file_atomically,
+    checkpoint_before_mutation_from_bytes, max_source_bytes, mutation_error_message,
+    mutation_error_message_remote, source_limit_error, workspace_path_parts,
+    workspace_path_remote_checked, write_remote_file_atomically, MutationOp,
 };
 
 // ---------------------------------------------------------------------------
@@ -883,7 +884,9 @@ impl AgentTool for EditTool {
                     )
                 }
                 Ok(false) => ToolResult::error("Operation aborted"),
-                Err(e) => ToolResult::error(format!("Cannot write '{}': {}", path, e)),
+                // An edit's own write failure must say "edit", not "write"
+                // (PIR-BIN-077), with a locale-independent cause.
+                Err(e) => ToolResult::error(mutation_error_message(MutationOp::Edit, &path, &e)),
             }
         })
     }
@@ -1043,7 +1046,7 @@ async fn edit_with_operations(
             ToolResult::error("Operation aborted")
         }
         Ok(()) => edit_success_result(path, edits, &transformed),
-        Err(error) => ToolResult::error(format!("Cannot write '{}': {}", path, error)),
+        Err(error) => ToolResult::error(mutation_error_message(MutationOp::Edit, path, &error)),
     }
 }
 
@@ -1129,7 +1132,11 @@ async fn edit_remote(
         Err(error) if error.code == crate::env_client::FileErrorCode::Aborted => {
             ToolResult::error("Operation aborted")
         }
-        Err(error) => ToolResult::error(format!("Cannot write '{}': {}", path, error.message)),
+        Err(error) => ToolResult::error(mutation_error_message_remote(
+            MutationOp::Edit,
+            path,
+            &error,
+        )),
     }
 }
 

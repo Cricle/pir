@@ -37,9 +37,10 @@ use pir::session_manager::search::{
     session_search_lazy_corpus_loads, SessionSearchQuery,
 };
 use pir::session_manager::{
-    reset_session_filter_corpus_bytes, reset_session_line_scan_bytes,
-    reset_session_listing_corpus_bytes, session_filter_corpus_bytes, session_line_scan_bytes,
-    session_listing_corpus_bytes, FileEntry, SessionManager, SessionSummary, StoredMessage,
+    default_session_dir_path, is_default_session_dir, reset_session_filter_corpus_bytes,
+    reset_session_line_scan_bytes, reset_session_listing_corpus_bytes, session_filter_corpus_bytes,
+    session_line_scan_bytes, session_listing_corpus_bytes, FileEntry, SessionManager,
+    SessionSummary, StoredMessage,
 };
 use serde_json::{json, Value};
 
@@ -645,10 +646,10 @@ fn read_full_request(stream: &mut std::net::TcpStream) {
 
 /// Re-run the exact `pir print --mode json` child the SDK shim spawns for one
 /// prompt turn and return its stderr plus the stdout tail. Used ONLY by the
-/// failing path of [`create_agent_session_child_round_trip`]: the shim keeps
-/// the child's stderr private unless the exit code is non-zero, and JSON mode
-/// exits 0 for an errored turn (the failure is in-band), so this is the only
-/// way the assertion message can carry the child's own evidence.
+/// failing path of [`create_agent_session_child_round_trip`], so the
+/// assertion message can carry the child's own evidence: since PIR-BIN-037 an
+/// errored turn also exits nonzero, but the shim prefers the in-band terminal
+/// `errorMessage` and the diagnostic keeps BOTH halves visible.
 fn child_turn_diagnostic(session_dir: &Path, text: &str) -> String {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
@@ -2151,4 +2152,69 @@ fn filter_sessions_by_cwd_copies_only_lazy_descriptors() {
         "the seeded tail needle must be searchable after filtering"
     );
     assert!(session_search_lazy_corpus_loads() >= 1);
+}
+
+/// PIR-BIN-080: the session cwd filter uses the platform's path identity.
+/// Windows paths compare case-insensitively (after the existing separator /
+/// `.`/`..` normalization), so a custom session dir holding a transcript whose
+/// header recorded `...\ProjCase` is found when the process cwd is spelled
+/// `...\projcase`. The default per-cwd dir needs no header filter at all
+/// (upstream `filterCwd`), and a genuinely different directory stays filtered.
+#[cfg(windows)]
+#[test]
+fn windows_session_cwd_filters_fold_case_and_default_dir_needs_no_filter() {
+    let dir = TempDir::new("win-cwd-case");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("session dir");
+    let real = dir.path().join("ProjCase");
+    std::fs::create_dir_all(&real).expect("project dir");
+    let real_text = real.to_string_lossy().into_owned();
+    let lower = real_text.to_lowercase();
+    assert_ne!(
+        real_text, lower,
+        "fixture needs at least one uppercase letter"
+    );
+
+    let id = {
+        let mut session = SessionManager::create(&real_text, &sessions).expect("create session");
+        session
+            .append_message(user_message("hello"))
+            .expect("append user message");
+        session.id().to_owned()
+    };
+
+    // Case-variant cwd finds the session in a CUSTOM session dir: both the
+    // listing filter and the in-memory filter the picker uses.
+    let listed = SessionManager::list_sessions(&sessions, Some(&lower));
+    assert_eq!(listed.len(), 1, "case-variant cwd must match: {listed:?}");
+    assert_eq!(listed[0].id, id);
+    let all = SessionManager::list_sessions(&sessions, None);
+    let filtered = SessionManager::filter_sessions_by_cwd(&all, &lower);
+    assert_eq!(filtered.len(), 1, "in-memory filter must agree");
+    assert_eq!(filtered[0].id, id);
+
+    // `continueRecent`'s most-recent scan uses the same comparison.
+    let continued = SessionManager::continue_recent(&sessions, &lower).expect("continue recent");
+    assert_eq!(continued.id(), id);
+
+    // A genuinely different directory is still filtered out.
+    let other = dir.path().join("OtherCase");
+    std::fs::create_dir_all(&other).expect("other dir");
+    let other_text = other.to_string_lossy().into_owned();
+    assert!(
+        SessionManager::list_sessions(&sessions, Some(&other_text)).is_empty(),
+        "another project must not match"
+    );
+    assert!(
+        SessionManager::filter_sessions_by_cwd(&all, &other_text).is_empty(),
+        "another project must not match in memory"
+    );
+
+    // Upstream `filterCwd` shape: a custom dir filters; the default per-cwd
+    // dir (cwd-encoded) does not, and its identity folds case on Windows.
+    assert!(!is_default_session_dir(&sessions, &real_text));
+    assert!(is_default_session_dir(
+        &default_session_dir_path(&real_text),
+        &lower
+    ));
 }

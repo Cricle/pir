@@ -128,6 +128,22 @@ impl AgentSession {
     /// after a `session_before_fork` (NOT a `session_before_switch`), so
     /// [`Self::fork_entry`] swaps through this seam.
     async fn swap_session_storage(&self, session: SessionManager, reason: Option<&str>) -> bool {
+        self.swap_session_storage_with(session, reason, true).await
+    }
+
+    /// [`Self::swap_session_storage`] with explicit control over
+    /// `session_tree`. A fork replaces the session FILE (upstream
+    /// `fork` → `createBranchedSession` → `createRuntime`) and emits only
+    /// `session_shutdown {reason:"fork"}` plus
+    /// `session_start {reason:"fork", previousSessionFile}`; `session_tree`
+    /// belongs to `navigateTree` (agent-session.ts:4140-4146), so
+    /// [`Self::fork_entry`] passes `false` (PIR-BIN-049).
+    async fn swap_session_storage_with(
+        &self,
+        session: SessionManager,
+        reason: Option<&str>,
+        emit_session_tree: bool,
+    ) -> bool {
         let Some(slot) = &self.session else {
             return false;
         };
@@ -190,14 +206,16 @@ impl AgentSession {
         // to every SDK agent but only declares `tool_execution_update`, so a
         // `has_non_js_plugins` check would materialize the forest for it on
         // every switch and then hand it a value it never reads.
-        let rust_consumers = self
-            .plugins
-            .as_ref()
-            .is_some_and(|plugins| plugins.has_native_handlers("session_tree"));
-        let dispatch_tree = self
-            .plugins
-            .as_ref()
-            .is_some_and(|plugins| session_tree_consumers(plugins));
+        let rust_consumers = emit_session_tree
+            && self
+                .plugins
+                .as_ref()
+                .is_some_and(|plugins| plugins.has_native_handlers("session_tree"));
+        let dispatch_tree = emit_session_tree
+            && self
+                .plugins
+                .as_ref()
+                .is_some_and(|plugins| session_tree_consumers(plugins));
         // The outgoing session's leaf backs the event's `oldLeafId` (the
         // switching session is gone after the swap); its file backs
         // `session_start.previousSessionFile`.
@@ -789,7 +807,7 @@ impl AgentSession {
     }
 
     /// Fork from a transcript entry (upstream `fork(entryId, {position})`,
-    /// agent-session-runtime.ts:263-346):
+    /// agent-session-runtime.ts:262-350):
     ///
     /// - `session_before_fork` fires first (agent-session-runtime.ts:150-162);
     ///   a `cancel: true` handler result aborts the fork
@@ -802,12 +820,20 @@ impl AgentSession {
     ///   `newSession({parentSession})`);
     /// - `position: At` branches at the entry itself and returns no text.
     ///
-    /// pir forks in place (a leaf move inside the same JSONL tree) where
-    /// upstream swaps in a branched session file — the same single-file
-    /// model [`Self::navigate_tree`] uses. After a successful branch the
-    /// `session_tree` event fires with the moved leaf (upstream fires it
-    /// from the post-swap session). `Err` when no storage is attached or
-    /// the entry id is invalid ("Invalid entry ID for forking", upstream).
+    /// A persisted fork creates a NEW session file (upstream
+    /// `SessionManager.open(currentSessionFile, sessionDir)` +
+    /// `createBranchedSession(targetLeafId)`): the replacement holds only the
+    /// root→target path, its header carries `parentSession = <source file>`,
+    /// and the source file is never appended to again. The replacement is
+    /// swapped in through the fork storage seam, which emits
+    /// `session_shutdown {reason:"fork"}` for the outgoing session and
+    /// `session_start {reason:"fork", previousSessionFile}` for the new one.
+    /// `session_tree` is NOT emitted (upstream's fork swaps a session file;
+    /// the tree event belongs to `navigateTree`, PIR-BIN-049).
+    ///
+    /// `Err` when no storage is attached, the entry id is invalid ("Invalid
+    /// entry ID for forking", upstream), or a persisted session has never
+    /// been saved ("This session has not been saved yet…", upstream).
     pub async fn fork_entry(
         &self,
         entry_id: &str,
@@ -858,15 +884,14 @@ impl AgentSession {
         }
         // Phase 1 (read-only, under the storage lock): resolve the branch
         // target and the selected text (upstream agent-session-runtime.ts:
-        // 267-289).
-        let (old_leaf_id, target, selected_text) = {
+        // 274-287).
+        let (target, selected_text) = {
             let session = session.lock().await;
-            let old_leaf_id = session.leaf_id().map(str::to_owned);
             let entry = session
                 .entry(entry_id)
                 .ok_or_else(|| "Invalid entry ID for forking".to_owned())?;
             match position {
-                ForkPosition::At => (old_leaf_id, Some(entry_id.to_owned()), None),
+                ForkPosition::At => (Some(entry_id.to_owned()), None),
                 ForkPosition::Before => {
                     let FileEntry::Message(inner) = entry else {
                         return Err("Invalid entry ID for forking".to_owned());
@@ -875,7 +900,6 @@ impl AgentSession {
                         return Err("Invalid entry ID for forking".to_owned());
                     }
                     (
-                        old_leaf_id,
                         inner.parent_id.clone(),
                         Some(stored_message_text(&inner.message)),
                     )
@@ -888,9 +912,10 @@ impl AgentSession {
         // — only when the session is persisted; an in-memory run gets a
         // fresh parent-less storage like upstream's non-persisted path).
         // A handler-requested conversation-restore skip takes the fresh
-        // parent-linked session path: pir forks in place, so there is no
-        // copied message set to omit — the only faithful equivalent is a new
-        // empty transcript that does not restore the source conversation.
+        // parent-linked session path: the upstream contract creates the
+        // branched session file without restoring conversation messages, so
+        // the faithful equivalent is a new empty transcript that does not
+        // restore the source conversation.
         let target = if skip_conversation_restore {
             None
         } else {
@@ -902,63 +927,93 @@ impl AgentSession {
             .with_session_manager(|sm| sm.session_file().map(Path::to_path_buf))
             .await
             .flatten();
-        // Upstream `teardownCurrent("fork", targetSessionFile)` runs BEFORE
-        // the branch is applied (agent-session-runtime.ts:299/316-323): the
-        // outgoing session is torn down first, so a plugin persisting from
-        // the shutdown handler still writes the OUTGOING file and the
-        // post-swap `session_start {reason: "fork"}` describes the
-        // replacement. Emitting it after the in-place leaf move (the old
-        // order) made the shutdown land on the branched storage.
-        if let Some(plugins) = &self.plugins {
-            plugins
-                .emit_session_shutdown(
-                    "fork",
-                    previous_session_file
-                        .as_deref()
-                        .map(|p| p.display().to_string())
-                        .as_deref(),
-                )
-                .await;
-        }
         match target {
             Some(target) => {
-                let new_leaf_id = match self
-                    .with_session_manager(|sm| -> Result<Option<String>, String> {
-                        sm.branch(&target)
-                            .map_err(|error| format!("fork failed: {error}"))?;
-                        Ok(sm.leaf_id().map(str::to_owned))
+                let (source_file, session_dir) = self
+                    .with_session_manager(|sm| {
+                        (
+                            sm.session_file().map(Path::to_path_buf),
+                            sm.session_dir().to_path_buf(),
+                        )
                     })
                     .await
-                {
-                    Some(Ok(new_leaf_id)) => new_leaf_id,
-                    Some(Err(error)) => return Err(error),
-                    None => {
-                        return Err(
+                    .ok_or_else(|| {
+                        "no attached session storage; the run stays ephemeral".to_owned()
+                    })?;
+                let Some(source_file) = source_file else {
+                    // Non-persisted storage: upstream branches the SAME
+                    // in-memory manager (`createBranchedSession` returns
+                    // `undefined` and replaces the entries in memory), so the
+                    // transcript is moved in place and the cached identity
+                    // follows the new session id.
+                    let identity = self
+                        .with_session_manager(|sm| -> Result<(String, Option<PathBuf>), String> {
+                            sm.create_branched_session(&target)
+                                .map_err(|error| format!("fork failed: {error}"))?;
+                            Ok((sm.id().to_owned(), sm.session_file().map(Path::to_path_buf)))
+                        })
+                        .await
+                        .ok_or_else(|| {
                             "no attached session storage; the run stays ephemeral".to_owned()
-                        )
+                        })??;
+                    // The branch is a different transcript: background work
+                    // started on the old one must not land in it (same
+                    // generation guard the storage swap applies).
+                    self.background.abort_all();
+                    self.abort_bash();
+                    self.session_storage_generation
+                        .fetch_add(1, Ordering::SeqCst);
+                    *self
+                        .session_id
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity.0);
+                    *self
+                        .session_path
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = identity.1;
+                    if let Some(plugins) = &self.plugins {
+                        plugins.emit_session_shutdown("fork", None).await;
                     }
-                };
-                // `session_tree` after the in-place leaf move (the same event
-                // [`Self::navigate_tree`] fires; upstream fires it from the
-                // post-fork session swap).
-                if let Some(plugins) = &self.plugins {
-                    if session_tree_consumers(plugins) {
-                        emit_session_tree(
-                            plugins,
-                            serde_json::json!({
-                                "type": "session_tree",
-                                "newLeafId": new_leaf_id,
-                                "oldLeafId": old_leaf_id,
-                            }),
-                        )
+                    self.emit_session_start_reason("fork", previous_session_file.as_deref())
                         .await;
-                    }
+                    return Ok(ForkEntryOutcome::Branched { selected_text });
+                };
+                // Persisted (upstream agent-session-runtime.ts:312-320):
+                // reopen the CURRENT file as a second manager and branch the
+                // root→target path into a NEW session file. Reading the file
+                // (not the live manager) also makes `/fork` work on a paged
+                // session, whose resident window is not the session.
+                if !source_file.exists() {
+                    return Err("This session has not been saved yet. \
+                                Send a message before cloning or forking it."
+                        .to_owned());
                 }
-                // Upstream forks through a NEW runtime, so the forked session
-                // observes `session_start {reason: "fork"}` even when pir
-                // branches in place (no storage swap to carry the lifecycle).
-                self.emit_session_start_reason("fork", previous_session_file.as_deref())
-                    .await;
+                let mut branched =
+                    SessionManager::open_with(&source_file, Some(&session_dir), None)
+                        .map_err(|error| format!("fork failed: {error}"))?;
+                branched
+                    .create_branched_session(&target)
+                    .map_err(|error| format!("fork failed: {error}"))?;
+                // Upstream `teardownCurrent("fork", sessionManager.getSessionFile())`
+                // runs AFTER the new file exists and names it as the
+                // destination. The outgoing session is still live here, so a
+                // plugin persisting from the shutdown handler writes the
+                // OUTGOING file; the post-swap `session_start {reason:"fork"}`
+                // describes the replacement.
+                let target_session_file = branched
+                    .session_file()
+                    .map(|path| path.display().to_string());
+                if let Some(plugins) = &self.plugins {
+                    plugins
+                        .emit_session_shutdown("fork", target_session_file.as_deref())
+                        .await;
+                }
+                if !self
+                    .swap_session_storage_with(branched, Some("fork"), false)
+                    .await
+                {
+                    return Err("no attached session storage; the run stays ephemeral".to_owned());
+                }
             }
             None => {
                 let (cwd, session_dir) = self
@@ -979,7 +1034,19 @@ impl AgentSession {
                         }))
                         .map_err(|error| format!("fork failed: {error}"))?;
                 }
-                if !self.swap_session_storage(fresh, Some("fork")).await {
+                // The fresh file is the replacement destination upstream
+                // `teardownCurrent` receives (`sessionManager.getSessionFile()`).
+                let target_session_file =
+                    fresh.session_file().map(|path| path.display().to_string());
+                if let Some(plugins) = &self.plugins {
+                    plugins
+                        .emit_session_shutdown("fork", target_session_file.as_deref())
+                        .await;
+                }
+                if !self
+                    .swap_session_storage_with(fresh, Some("fork"), false)
+                    .await
+                {
                     return Err("no attached session storage; the run stays ephemeral".to_owned());
                 }
             }
@@ -1038,7 +1105,7 @@ impl AgentSession {
 ///   fork-before-first all link the source that way) => `fork`;
 /// - every other existing file is an opened session => `resume`.
 ///
-/// Hosts that know the operation (the session-command plane and the in-place
+/// Hosts that know the operation (the session-command plane and the entry
 /// fork) pass the reason explicitly instead.
 fn infer_session_start_reason(
     incoming: &SessionManager,

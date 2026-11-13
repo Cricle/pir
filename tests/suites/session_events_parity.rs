@@ -412,8 +412,8 @@ impl AgentPlugin for CancelBeforeForkPlugin {
         &self.info
     }
     fn events(&self) -> EventInterest {
-        // The fork path emits `session_tree` too; a native plugin that records
-        // both must declare both (emission is interest-based).
+        // A fork emits no `session_tree` (that event belongs to navigateTree,
+        // PIR-BIN-049); interest in it only documents the expectation.
         EventInterest::List(vec!["session_before_fork".into(), "session_tree".into()])
     }
     fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
@@ -1712,22 +1712,18 @@ async fn fork_before_branches_at_the_parent_and_returns_selected_text() {
     assert_eq!(projected, vec!["first message".to_owned()]);
 
     // session_before_fork fired with the upstream payload, followed by the
-    // fork teardown `session_shutdown {reason: "fork"}` (upstream
-    // `teardownCurrent` runs BEFORE the branch is applied) and the
-    // post-branch session_tree move event.
+    // fork teardown `session_shutdown {reason: "fork"}`. Upstream's fork
+    // replaces the session FILE (`createBranchedSession` + `createRuntime`)
+    // and never emits `session_tree` — that event belongs to `navigateTree`
+    // (PIR-BIN-049). The post-swap lifecycle is `session_start
+    // {reason:"fork"}`, which this recorder does not subscribe to.
     let events = events.lock().unwrap();
-    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(events.len(), 2, "{events:?}");
     assert_eq!(events[0]["type"], serde_json::json!("session_before_fork"));
     assert_eq!(events[0]["entryId"], serde_json::json!(second_id));
     assert_eq!(events[0]["position"], serde_json::json!("before"));
     assert_eq!(events[1]["type"], serde_json::json!("session_shutdown"));
     assert_eq!(events[1]["reason"], serde_json::json!("fork"));
-    assert_eq!(events[2]["type"], serde_json::json!("session_tree"));
-    assert_eq!(
-        events[2]["oldLeafId"],
-        serde_json::json!(second_id),
-        "the abandoned leaf was the selected entry"
-    );
 }
 
 #[tokio::test]
@@ -1754,8 +1750,9 @@ async fn fork_at_branches_at_the_entry_without_selected_text() {
             selected_text: None
         }
     );
-    // The leaf moved ONTO the entry: the projection ends at the first
-    // message (the second message is on the abandoned branch).
+    // The branched FILE ends at the entry (upstream
+    // `createBranchedSession(entryId)`): the projection ends at the first
+    // message (the second message is not copied into the new session).
     let projected = agent
         .with_session_manager(|sm| sm.build_context_entries().unwrap_or_default().len())
         .await;
@@ -1804,14 +1801,15 @@ async fn fork_before_the_first_user_message_starts_a_fresh_parent_linked_session
     assert!(empty, "the fresh session has no messages");
 }
 
-/// PIR-TUI-021: the fork teardown `session_shutdown {reason: "fork"}` runs
-/// BEFORE the branch is applied (upstream `teardownCurrent` at
-/// agent-session-runtime.ts:299/316-323), and the branch event order is
-/// `before_fork → shutdown → (branch) → session_tree → session_start
-/// {reason:"fork"}`. A native recorder pins the whole sequence; the
-/// appendEntry-lands-on-the-outgoing-file property is pinned by the fork
-/// parity test above through the payload order (shutdown precedes the
-/// session_tree move that carries the branched leaf).
+/// PIR-TUI-021 + PIR-BIN-052: the fork teardown is
+/// `session_shutdown {reason:"fork"}` after the branched FILE exists
+/// (upstream `createBranchedSession` → `teardownCurrent`, agent-session-
+/// runtime.ts:315-323), followed by the post-swap `session_start
+/// {reason:"fork"}`. The event order is `before_fork → shutdown →
+/// session_start`; upstream emits no `session_tree` for a fork (that event
+/// belongs to `navigateTree`, PIR-BIN-049), so this recorder (which does
+/// subscribe to `session_tree`) must not see one. `teardownCurrent` receives
+/// the REPLACEMENT file as `targetSessionFile`.
 #[tokio::test]
 async fn fork_lifecycle_orders_shutdown_before_branch_and_start_after() {
     let temp = TempDir::new("fork-shutdown-order");
@@ -1844,23 +1842,28 @@ async fn fork_lifecycle_orders_shutdown_before_branch_and_start_after() {
         vec![
             "session_before_fork".to_owned(),
             "session_shutdown".to_owned(),
-            "session_tree".to_owned(),
         ],
-        "fork teardown precedes the branch; the start follows it"
+        "fork teardown follows the branch-file creation; no session_tree \
+         (upstream emits that only for navigateTree)"
     );
 
-    // The shutdown payload targets the OUTGOING file (upstream
-    // `teardownCurrent("fork", targetSessionFile)` receives the branch
-    // destination, resolved before the swap; the OUTGOING identity is what
-    // the handler observes while it still writes the old storage).
+    // The shutdown payload targets the REPLACEMENT file (upstream
+    // `teardownCurrent("fork", sessionManager.getSessionFile())` runs after
+    // `createBranchedSession`, so the destination is the new branch file).
     let shutdown = events.lock().unwrap()[1].clone();
     assert_eq!(shutdown["reason"], serde_json::json!("fork"));
     let target = shutdown["targetSessionFile"].as_str().unwrap_or_default();
-    assert!(
-        target.ends_with(".jsonl") && !target.is_empty(),
-        "shutdown carries a target file: {target}"
+    let new_path =
+        std::path::PathBuf::from(agent.state().session_path.expect("branched session path"));
+    assert_eq!(
+        target,
+        new_path.to_string_lossy().as_ref(),
+        "shutdown names the branched session file"
     );
-    let _ = &outgoing_path;
+    assert_ne!(
+        new_path, outgoing_path,
+        "the fork swapped in a new session file"
+    );
 }
 
 #[tokio::test]
@@ -2479,11 +2482,29 @@ async fn rpc_fork_reports_selected_text_and_position_semantics() {
         serde_json::json!("second rpc message")
     );
 
-    // `position: "at"` branches at the entry itself (the pir
-    // `runtimeHost.fork(entryId, {position})` surface): no text field
-    // (upstream selectedText is undefined).
+    // The fork swapped in a NEW session file holding only the pre-target
+    // path, so the pre-fork entry id is no longer addressable (upstream
+    // `createBranchedSession` drops everything outside the branch). Re-read
+    // the live branch and fork `position: "at"` at an entry that exists in
+    // it (the pir `runtimeHost.fork(entryId, {position})` surface): no text
+    // field (upstream selectedText is undefined).
+    client.send(serde_json::json!({ "type": "get_entries" }));
+    let entries = client
+        .wait_for(|value| value["command"] == "get_entries")
+        .await;
+    let branch_entry = entries["data"]["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| {
+            entry.get("message").is_some() && entry["message"]["role"] == serde_json::json!("user")
+        })
+        .expect("the branch still holds the user message it forked on")["id"]
+        .as_str()
+        .expect("entry id")
+        .to_owned();
     client.send(
-        serde_json::json!({ "id": "fk-2", "type": "fork", "entryId": second_entry, "position": "at" }),
+        serde_json::json!({ "id": "fk-2", "type": "fork", "entryId": branch_entry, "position": "at" }),
     );
     let fork = client
         .wait_for(|value| value["command"] == "fork" && value["id"] == "fk-2")

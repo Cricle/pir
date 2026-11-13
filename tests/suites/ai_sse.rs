@@ -1387,17 +1387,22 @@ async fn event_chunk_sink_sse_mode_feeds_one_line_at_a_time() {
 // ---------------------------------------------------------------------------
 
 /// A close-delimited response (no `Content-Length`, no `Transfer-Encoding`)
-/// has no framing terminator other than EOF. Some OpenAI-compatible servers
-/// omit the terminal `finish_reason` chunk and `[DONE]`; a clean EOF is still
-/// a complete completion and must not be reported as a truncated stream.
+/// has no framing terminator other than EOF. A provider that ends such a body
+/// after producing content AND sending the SSE terminator `data: [DONE]` has
+/// demonstrably finished its message; the EOF must not be reported as
+/// `Stream ended without finish_reason` (upstream ends the iterator at `[DONE]`
+/// and reaches the same completion path).
 #[test]
-fn openai_close_delimited_body_without_finish_reason_completes() {
+fn openai_close_delimited_body_with_done_frame_completes() {
     let model = sample_model();
     let mut parser = OpenAiSseParser::new(&model);
     let mut events = Vec::new();
     parser
         .feed(openai_text_chunk("close").as_bytes(), &mut events)
         .expect("feed succeeds");
+    parser
+        .feed(b"data: [DONE]\n\n", &mut events)
+        .expect("DONE feed succeeds");
     parser.set_close_delimited_eof(true);
     parser
         .finish(&mut events)
@@ -1411,6 +1416,59 @@ fn openai_close_delimited_body_without_finish_reason_completes() {
     assert_eq!(*reason, TerminalReason::Stop);
     assert_eq!(message.stop_reason, StopReason::Stop);
     assert_eq!(partial_text(message), "close");
+}
+
+/// PIR-BIN-058: a close-delimited body that dies mid-message (content delta,
+/// then EOF — no `finish_reason`, no `[DONE]`) is a truncated stream, not a
+/// complete answer. Handing the half-message to the model as `stop` is what
+/// the old unconditional EOF exemption did.
+#[test]
+fn openai_close_delimited_truncated_body_stays_truncated() {
+    let model = sample_model();
+    let mut parser = OpenAiSseParser::new(&model);
+    let mut events = Vec::new();
+    parser
+        .feed(openai_text_chunk("half a message").as_bytes(), &mut events)
+        .expect("feed succeeds");
+    parser.set_close_delimited_eof(true);
+    let error = parser
+        .finish(&mut events)
+        .expect_err("a mid-message close-delimited EOF must be truncation");
+    assert!(
+        matches!(error, AiError::StreamTruncated(_)),
+        "close-delimited truncation must be retryable StreamTruncated: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("Stream ended without finish_reason"),
+        "upstream-parity wording: {error}"
+    );
+}
+
+/// PIR-BIN-058: a 200 with `text/event-stream` and ZERO SSE bytes is not an
+/// empty successful assistant turn — nothing was produced, so the transport
+/// died before the provider said anything. It must be the retryable
+/// truncation, on either framing.
+#[test]
+fn openai_close_delimited_empty_body_stays_truncated() {
+    let model = sample_model();
+    let mut parser = OpenAiSseParser::new(&model);
+    let mut events = Vec::new();
+    parser.set_close_delimited_eof(true);
+    let error = parser
+        .finish(&mut events)
+        .expect_err("a zero-event body must not complete");
+    assert!(
+        matches!(error, AiError::StreamTruncated(_)),
+        "empty close-delimited body must be retryable StreamTruncated: {error:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AssistantMessageEvent::Done { .. })),
+        "an empty body must not emit a Done event"
+    );
 }
 
 /// The strict truncation verdict stays in force for framed bodies: a chunked
@@ -1431,9 +1489,10 @@ fn openai_framed_body_without_finish_reason_stays_truncated() {
     );
 }
 
-/// End-to-end through the provider transport: a server that closes the
-/// connection after the last event (and never sends `finish_reason`/`[DONE]`)
-/// yields a completed message, not `Stream ended without finish_reason`.
+/// End-to-end through the provider transport: a server that produces content,
+/// sends the SSE terminator `[DONE]`, then closes the connection (never
+/// sending `finish_reason`) yields a completed message, not
+/// `Stream ended without finish_reason`.
 #[test]
 fn openai_provider_close_delimited_stream_completes_at_eof() {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1450,7 +1509,7 @@ fn openai_provider_close_delimited_stream_completes_at_eof() {
             // delimited by the connection close itself.
             let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
             socket.write_all(head.as_bytes()).await.unwrap();
-            let body = "data: {\"id\":\"chatcmpl-close\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"eof\"}}]}\n\n";
+            let body = "data: {\"id\":\"chatcmpl-close\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"eof\"}}]}\n\ndata: [DONE]\n\n";
             socket.write_all(body.as_bytes()).await.unwrap();
             // Closing the socket terminates the body.
         });
@@ -1544,5 +1603,137 @@ fn openai_provider_chunked_stream_without_finish_reason_stays_truncated() {
             .iter()
             .any(|event| matches!(event, AssistantMessageEvent::Done { .. })),
         "a truncated framed stream must not emit a Done event"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-058 end-to-end: injected faults over the real provider transport
+// ---------------------------------------------------------------------------
+
+/// Serve one scripted SSE response over a raw loopback socket and return every
+/// provider event the adapter produced. `head` is the full status/header block
+/// (the caller decides the framing); `body` the raw bytes written after it.
+fn provider_events_for_raw_response(
+    head: &'static str,
+    body: Vec<u8>,
+) -> Vec<AssistantMessageEvent> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (addr, server_handle) = rt.block_on(async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("client connects");
+            socket.set_nodelay(true).expect("set nodelay");
+            let mut scratch = [0u8; 8192];
+            let _ = socket.read(&mut scratch).await;
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            // Dropping the socket closes the connection (close-delimited EOF).
+        });
+        (addr, handle)
+    });
+    let url = format!("http://{addr}");
+    let mut provider = OpenAiCompatibleProvider::new("test", url.clone(), vec![]).unwrap();
+    let mut model = sample_model();
+    model.base_url = url;
+    provider.models.push(model.clone());
+    let mut stream =
+        rt.block_on(async { provider.stream(&model, ctx("hi"), StreamOptions::default()) });
+    let events = rt.block_on(async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        events
+    });
+    rt.block_on(async { server_handle.await.unwrap() });
+    events
+}
+
+fn provider_error_of(events: &[AssistantMessageEvent]) -> Option<&AssistantMessage> {
+    events.iter().find_map(|event| match event {
+        AssistantMessageEvent::Error { error, .. } => Some(error),
+        _ => None,
+    })
+}
+
+/// PIR-BIN-058 (measured shape `errors/etrunc`): `Connection: close`, two
+/// content chunks with `finish_reason: null`, then the socket dies. The model
+/// reply never terminated, so the transport must surface
+/// `Stream ended without finish_reason` as an error — never `stop` with the
+/// half message.
+#[test]
+fn openai_provider_close_delimited_truncated_stream_errors() {
+    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+    let body = concat!(
+        "data: {\"id\":\"chatcmpl-cut\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"mid stream \"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-cut\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"text that gets cut\"},\"finish_reason\":null}]}\n\n",
+    )
+    .as_bytes()
+    .to_vec();
+    let events = provider_events_for_raw_response(head, body);
+
+    let error = provider_error_of(&events).expect("a mid-message EOF must surface an error");
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert!(
+        error
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Stream ended without finish_reason")),
+        "unexpected error message: {:?}",
+        error.error_message
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AssistantMessageEvent::Done { .. })),
+        "a truncated close-delimited stream must not emit Done (the half message would \
+         otherwise be handed to the model as the final answer)"
+    );
+}
+
+/// PIR-BIN-058 (measured shape `errors/eempty`): 200 + SSE headers, then the
+/// socket closes with ZERO body bytes. Nothing was produced, so this is a
+/// failed request, not an empty successful assistant turn.
+#[test]
+fn openai_provider_close_delimited_empty_stream_errors() {
+    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+    let events = provider_events_for_raw_response(head, Vec::new());
+
+    let error = provider_error_of(&events).expect("a zero-byte body must surface an error");
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert!(
+        error
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Stream ended without finish_reason")),
+        "unexpected error message: {:?}",
+        error.error_message
+    );
+}
+
+/// Control (measured shape `errors/etrunc-chunked`): the SAME truncation with
+/// chunked framing has always errored; it must keep doing so. This is the
+/// unchanged half of the pair — the fix must only affect the close-delimited
+/// case.
+#[test]
+fn openai_provider_chunked_truncated_stream_still_errors() {
+    let head =
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+    let body = "data: {\"id\":\"chatcmpl-cut\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"mid stream text that gets cut\"},\"finish_reason\":null}]}\n\n";
+    let mut framed = format!("{:x}\r\n{}\r\n0\r\n\r\n", body.len(), body).into_bytes();
+    framed.shrink_to_fit();
+    let events = provider_events_for_raw_response(head, framed);
+
+    let error = provider_error_of(&events).expect("chunked truncation must keep erroring");
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert!(
+        error
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Stream ended without finish_reason")),
+        "unexpected error message: {:?}",
+        error.error_message
     );
 }

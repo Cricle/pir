@@ -8683,3 +8683,357 @@ async fn an_admitted_prompt_starts_the_run_and_releases_the_session() {
         Some("admitted-ok")
     );
 }
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-075: the ephemeral-history cap announces every trim.
+//
+// The cap keeps a store-less session's in-memory transcript bounded (1 024
+// messages / 100 000 estimated tokens). That bound is pir-only (upstream's
+// `SessionManager.inMemory` keeps everything), so it must never be silent: a
+// `HistoryTrimmed` session event carries the dropped/retained counts and which
+// cap forced it, `historyDroppedMessages` counts them, and a persisted session
+// never emits it.
+//
+// The fixture seeds 1 023 messages through `seed_ephemeral_history_for_test`
+// instead of paying 512 model round trips; the next prompt appends the user
+// message and the assistant reply, which is what crosses the cap.
+// ---------------------------------------------------------------------------
+
+/// A store-less agent (`session: None`) that answers one prompt.
+fn ephemeral_agent(registry: Arc<ProviderRegistry>, temp: &TempDir) -> AgentSession {
+    let mut model = fake_model();
+    model.context_window = 1_000_000;
+    AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
+        provider_registry: registry,
+        model,
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: ToolRegistry::new(),
+        // The store-less path: the ephemeral-history cap is the only trim
+        // source, and compaction is off so nothing else can shorten the
+        // transcript.
+        session: None,
+        compaction: Some(pir::compaction::CompactionConfig {
+            enabled: false,
+            reserve_tokens: 0,
+            keep_recent_tokens: 0,
+        }),
+        max_turns: 4,
+        system_prompt: None,
+        cwd: Some(temp.0.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    })
+}
+
+fn ephemeral_filler(count: usize) -> Vec<Message> {
+    (0..count)
+        .map(|index| {
+            Message::User(UserMessage {
+                role: UserRole::User,
+                content: vec![text(&format!("seeded {index}"))],
+                tools_added: None,
+                tools_removed: None,
+                timestamp: index as u64,
+                sections: None,
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn crossing_the_ephemeral_cap_announces_exactly_one_trim() {
+    let temp = TempDir::new("ephemeral-cap-announce");
+    let agent = Arc::new(ephemeral_agent(race_registry("done"), &temp));
+    let session_log: SessionEventLog = Arc::new(Mutex::new(Vec::new()));
+    agent.on_session_event(session_event_handler(Arc::clone(&session_log)));
+
+    // The trim runs at PROMPT START, before this run's own messages are
+    // appended, so the seeded transcript itself must already exceed the cap.
+    assert_eq!(pir::agent_session::EPHEMERAL_HISTORY_MAX_MESSAGES, 1024);
+    agent.seed_ephemeral_history_for_test(ephemeral_filler(1025));
+    assert_eq!(
+        agent.history_trimmed_messages(),
+        0,
+        "seeding below the cap must not trim"
+    );
+
+    agent
+        .prompt("cross the cap", event_handler(EventLog::default()))
+        .await
+        .expect("prompt");
+
+    let log = session_log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let trims: Vec<&serde_json::Value> = log
+        .iter()
+        .filter(|(kind, _)| kind == "history_trimmed")
+        .map(|(_, json)| json)
+        .collect();
+    assert_eq!(
+        trims.len(),
+        1,
+        "one run crosses the cap at most once, so exactly one trim notice: {log:?}"
+    );
+    let trim = trims[0];
+    assert_eq!(
+        trim["maxMessages"], 1024,
+        "the notice names the message cap"
+    );
+    assert_eq!(trim["maxTokens"], 100_000, "and the token cap");
+    assert_eq!(
+        trim["reason"], "messages",
+        "the message cap forced this trim"
+    );
+    let dropped = trim["droppedMessages"].as_u64().expect("dropped count");
+    let retained = trim["retainedMessages"].as_u64().expect("retained count");
+    assert!(
+        dropped > 0,
+        "a trim that dropped nothing must not be announced: {trim:?}"
+    );
+    assert_eq!(
+        dropped + retained,
+        1025,
+        "dropped + retained is the transcript the run started from          (1023 seeded + the user message + the assistant reply): {trim:?}"
+    );
+    assert_eq!(
+        trim["totalDroppedMessages"].as_u64(),
+        Some(dropped),
+        "the session-lifetime total equals the first trim's drop: {trim:?}"
+    );
+    assert!(
+        agent.history_trimmed_messages() as u64 >= dropped,
+        "the counter the state surface reads moved"
+    );
+    assert!(agent.history_trimmed(), "affected() flag is set");
+}
+
+#[tokio::test]
+async fn a_persisted_session_never_announces_an_ephemeral_trim() {
+    let temp = TempDir::new("ephemeral-cap-persisted");
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let mut model = fake_model();
+    model.context_window = 1_000_000;
+    let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
+        provider_registry: race_registry("done"),
+        model,
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: ToolRegistry::new(),
+        session: Some(session),
+        compaction: Some(pir::compaction::CompactionConfig {
+            enabled: false,
+            reserve_tokens: 0,
+            keep_recent_tokens: 0,
+        }),
+        max_turns: 4,
+        system_prompt: None,
+        cwd: Some(temp.0.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    }));
+    let session_log: SessionEventLog = Arc::new(Mutex::new(Vec::new()));
+    agent.on_session_event(session_event_handler(Arc::clone(&session_log)));
+
+    // The seeding seam is a no-op for a persisted session, so this really does
+    // assert the bound does not exist on the storage-backed path.
+    agent.seed_ephemeral_history_for_test(ephemeral_filler(1023));
+    agent
+        .prompt("still no cap", event_handler(EventLog::default()))
+        .await
+        .expect("prompt");
+
+    let log = session_log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        !log.iter().any(|(kind, _)| kind == "history_trimmed"),
+        "a persisted session is bounded by storage/compaction, never by the          ephemeral window: {log:?}"
+    );
+    assert_eq!(agent.history_trimmed_messages(), 0);
+    assert!(!agent.history_trimmed());
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-052: an entry fork swaps in a NEW session file
+// ---------------------------------------------------------------------------
+
+/// `fork {entryId}` must reproduce upstream `fork` → `createBranchedSession`
+/// (agent-session-runtime.ts:312-329): a second session JSONL holds ONLY the
+/// root→target path, its header links the source via `parentSession`, the live
+/// `sessionId`/`sessionFile` move to the replacement, and the source file is
+/// never appended to again — so resuming the declared current file keeps the
+/// fork instead of re-reading the abandoned tip.
+#[tokio::test]
+async fn fork_entry_swaps_in_a_new_parent_linked_session_file() {
+    use pir::agent_session::{ForkEntryOutcome, ForkPosition};
+
+    let temp = TempDir::new("fork-new-file");
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let source_path = session.path().to_path_buf();
+    let registry = fake_registry(Arc::new(|index, _context| {
+        assistant(vec![text(&format!("reply {index}"))], StopReason::Stop)
+    }));
+    let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
+        provider_registry: registry,
+        model: fake_model(),
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: ToolRegistry::new(),
+        session: Some(session),
+        compaction: None,
+        max_turns: 4,
+        system_prompt: None,
+        cwd: Some(temp.0.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    });
+    for prompt in ["u1 alpha", "u2 bravo", "u3 charlie"] {
+        agent
+            .prompt(prompt, event_handler(EventLog::default()))
+            .await
+            .expect("prompt");
+    }
+
+    // The source's rows before the fork: header + u1 a1 u2 a2 u3 a3.
+    let source_before = SessionManager::open(&source_path).expect("reopen source");
+    let source_rows: Vec<(String, Option<String>)> = source_before
+        .entries()
+        .iter()
+        .map(|entry| {
+            (
+                entry.entry_id().to_owned(),
+                entry.parent_id().map(str::to_owned),
+            )
+        })
+        .collect();
+    assert_eq!(source_rows.len(), 6, "u1 a1 u2 a2 u3 a3");
+    let u1_id = source_rows[0].0.clone();
+    let a1_id = source_rows[1].0.clone();
+    let u2_id = source_rows[2].0.clone();
+    let source_bytes = std::fs::read(&source_path).expect("read source");
+
+    let old_state = agent.state();
+    let outcome = agent
+        .fork_entry(&u2_id, ForkPosition::Before)
+        .await
+        .expect("fork");
+    assert_eq!(
+        outcome,
+        ForkEntryOutcome::Branched {
+            selected_text: Some("u2 bravo".to_owned()),
+        }
+    );
+
+    // (c) the live identity is the replacement's.
+    let new_state = agent.state();
+    assert_ne!(
+        new_state.session_id.as_deref(),
+        old_state.session_id.as_deref(),
+        "sessionId must change on a fork"
+    );
+    let new_path = std::path::PathBuf::from(
+        new_state
+            .session_path
+            .clone()
+            .expect("branched session path"),
+    );
+    assert_ne!(new_path, source_path, "sessionFile must change on a fork");
+
+    // (a) a second session file exists on disk.
+    let mut jsonl_files: Vec<std::path::PathBuf> = std::fs::read_dir(&temp.0)
+        .expect("read session dir")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")).then_some(path)
+        })
+        .collect();
+    jsonl_files.sort();
+    assert_eq!(jsonl_files.len(), 2, "{jsonl_files:?}");
+    assert!(jsonl_files.contains(&source_path));
+    assert!(jsonl_files.contains(&new_path));
+
+    // (b) the new header points at the source file.
+    let branch = SessionManager::open(&new_path).expect("open branched session");
+    let header = branch.header().expect("branch header");
+    assert_eq!(
+        header.parent_session.as_deref(),
+        Some(source_path.to_string_lossy().as_ref()),
+        "parentSession points at the source file"
+    );
+
+    // (d) the rows are the root→target path (u1, a1) with their source ids.
+    let branch_rows: Vec<(String, Option<String>)> = branch
+        .entries()
+        .iter()
+        .map(|entry| {
+            (
+                entry.entry_id().to_owned(),
+                entry.parent_id().map(str::to_owned),
+            )
+        })
+        .collect();
+    assert_eq!(
+        branch_rows,
+        vec![(u1_id.clone(), None), (a1_id.clone(), Some(u1_id.clone())),],
+        "the branched file holds exactly the source prefix"
+    );
+
+    // The source is never appended to again: a prompt in the fork lands in
+    // the replacement only.
+    agent
+        .prompt("u4 delta", event_handler(EventLog::default()))
+        .await
+        .expect("prompt in the fork");
+    assert_eq!(
+        std::fs::read(&source_path).expect("read source"),
+        source_bytes,
+        "the source file must stay byte-identical after the fork"
+    );
+    assert_eq!(
+        SessionManager::open(&source_path)
+            .expect("reopen source")
+            .entries()
+            .len(),
+        source_rows.len(),
+        "the source keeps its original rows"
+    );
+
+    // Durability: reopening the file the host declared current keeps the
+    // fork (the abandoned u2/u3 tail is not restored).
+    let resumed = SessionManager::open(&new_path).expect("resume the branch");
+    let texts: Vec<String> = resumed
+        .build_context_entries()
+        .expect("branch context")
+        .iter()
+        .filter_map(text_of_message)
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "u1 alpha".to_owned(),
+            "reply 0".to_owned(),
+            "u4 delta".to_owned(),
+            "reply 3".to_owned(),
+        ],
+        "the forked transcript is the branch plus the new turn"
+    );
+    let final_state = agent.state();
+    assert_eq!(
+        final_state.session_path.as_deref(),
+        Some(new_path.to_string_lossy().as_ref()),
+        "the live session still names the branch after the turn"
+    );
+    assert_eq!(
+        final_state.session_id.as_deref(),
+        Some(header.id.as_str()),
+        "the live session id is the branched header's id"
+    );
+}

@@ -64,6 +64,7 @@ pub use stream::{
 pub use transcript::{
     collapse_system_messages, content_text, create_initial_system_message,
     get_current_system_message, get_current_system_prompt, get_current_tools,
-    get_initial_system_message, is_system_message, normalize_context, resolve_transcript,
-    system_message_text, without_initial_system_message, TranscriptContext,
+    get_initial_system_message, is_prompt_snapshot, is_system_message, leading_system_fragment,
+    live_prompt_carries_section, normalize_context, resolve_transcript, system_message_text,
+    without_initial_system_message, TranscriptContext,
 };

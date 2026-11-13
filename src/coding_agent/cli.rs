@@ -151,6 +151,247 @@ pub fn resolve_app_mode(
     }
 }
 
+/// Whether raw argv (argv[0] excluded) explicitly selects the print surface
+/// (upstream `resolveAppMode`, main.ts:112-123).
+///
+/// Upstream decides the host from FLAGS before it looks at positionals, and
+/// only then treats every positional as a message/file. pir's clap grammar
+/// instead resolves a known subcommand from ANY positional position, so
+/// `pir --print --mode json "version"` ran the version command (plain text, no
+/// model request) instead of sending the word to the model (PIR-BIN-030).
+///
+/// The scan mirrors upstream `parseArgs` flag recognition:
+///
+/// - `--print`/`-p` (any attached or detached value) selects the print host;
+/// - `--mode json|text` selects it; `--mode rpc` does NOT (RPC keeps its own
+///   subcommand grammar, and upstream lets `--mode rpc` win over `--print`);
+/// - a known option's detached value is skipped, so `--model version` is a
+///   model name, not a positional the scan mistakes for a prompt;
+/// - `--` ends option recognition: what follows is trailing positional data in
+///   clap's own grammar, which [`parse_cli`] leaves to the normal parse.
+///
+/// The input must be the argv [`preprocess_args`] produced (bundled shorts
+/// already normalized, unknown extension flags removed), which is exactly what
+/// clap sees.
+#[cfg(feature = "cli")]
+fn print_surface_selected(raw_args: &[String]) -> bool {
+    let command = <Cli as clap::CommandFactory>::command();
+    let mut mode: Option<String> = None;
+    let mut print_flag = false;
+    let mut index = 0;
+    while index < raw_args.len() {
+        let arg = raw_args[index].as_str();
+        if arg == "--" {
+            break;
+        }
+        if let Some(rest) = arg.strip_prefix("--") {
+            let (name, attached) = match rest.split_once('=') {
+                Some((name, attached)) => (name, Some(attached)),
+                None => (rest, None),
+            };
+            if name == "print" {
+                print_flag = true;
+                index += 1;
+                continue;
+            }
+            if name == "mode" {
+                let value = match attached {
+                    Some(value) => Some(value.to_owned()),
+                    None => raw_args
+                        .get(index + 1)
+                        .filter(|next| !next.starts_with('-'))
+                        .map(|next| next.trim().to_owned()),
+                };
+                if attached.is_none() && value.is_some() {
+                    index += 1;
+                }
+                mode = value;
+                index += 1;
+                continue;
+            }
+            if attached.is_none() {
+                // Skip a value the option consumes on its own, so
+                // `--model version` never looks like a print selector hit.
+                if let Some(option) = command.get_arguments().find(|arg| {
+                    arg.get_long() == Some(name)
+                        || arg
+                            .get_visible_aliases()
+                            .into_iter()
+                            .flatten()
+                            .any(|alias| alias == name)
+                }) {
+                    if option_consumes_detached_value(option) {
+                        index += 1;
+                    }
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(rest) = arg.strip_prefix('-') {
+            // Short cluster: walk the characters with clap's own metadata so
+            // an attached value (`-e/path/php`) is not read as `-p`, and a
+            // value-taking short consumes the rest of the cluster or the next
+            // token (which may itself spell `p` or `json`).
+            let chars = rest.char_indices();
+            for (offset, short) in chars {
+                // Unknown short: an extension flag, whose value the unknown-flag
+                // collector already removed before this runs.
+                let Some(option) = command
+                    .get_arguments()
+                    .find(|arg| arg.get_short().is_some_and(|c| c == short))
+                else {
+                    break;
+                };
+                // `-p` selects the print surface (`continue` here belongs to
+                // the OUTER argv walk, not this cluster walk).
+                if short != 'p'
+                    && (option_consumes_detached_value(option)
+                        || option
+                            .get_num_args()
+                            .is_some_and(|range| range.max_values() > 0))
+                {
+                    // Attached remainder is the value; a bare option takes the
+                    // next token.
+                    if offset + short.len_utf8() >= rest.len() {
+                        index += 1;
+                    }
+                    break;
+                }
+                if short == 'p' {
+                    print_flag = true;
+                }
+            }
+            index += 1;
+            continue;
+        }
+        index += 1;
+    }
+    // Upstream precedence: `--mode rpc` wins over `--print` whatever the order,
+    // `--mode json|text` selects the print host, then a bare `--print`.
+    match mode.as_deref() {
+        Some("rpc") => false,
+        Some("json") | Some("text") => true,
+        _ => print_flag,
+    }
+}
+
+/// Whether an option consumes a FOLLOWING token as its value.
+///
+/// An optional value (`--print`/`--list-models` are `num_args = 0..=1`) is
+/// consumed only when the next token does not look like a flag; both callers
+/// treat that ambiguity conservatively (see their own notes), so only a
+/// REQUIRED value is skipped here.
+#[cfg(feature = "cli")]
+fn option_consumes_detached_value(option: &clap::Arg) -> bool {
+    let takes_value = option
+        .get_num_args()
+        .map(|range| range.max_values() > 0)
+        .unwrap_or_else(|| option.get_action().takes_values());
+    let optional = option
+        .get_num_args()
+        .is_some_and(|range| range.min_values() == 0);
+    takes_value && !optional
+}
+
+/// Whether raw argv asks clap for help/version output. clap short-circuits both
+/// BEFORE any mode decision (upstream `main.ts:634-637` prints the version and
+/// exits), so [`parse_cli`] must leave those invocations on the normal parse:
+/// the shadow grammar would otherwise leak its placeholder names into `--help`.
+#[cfg(feature = "cli")]
+fn requests_help_or_version(raw_args: &[String]) -> bool {
+    raw_args.iter().take_while(|arg| *arg != "--").any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-h" | "--help" | "-V" | "--version" | "-v" | "--help-extensions"
+        )
+    })
+}
+
+/// Prefix of the placeholder names the print-surface parse gives every
+/// top-level subcommand (PIR-BIN-030).
+///
+/// clap resolves a subcommand by NAME, so renaming every top-level command to a
+/// word the caller cannot spell makes a prompt that happens to equal a real
+/// subcommand land in `Cli::messages`. The prefix is reserved: a regression test
+/// asserts no real subcommand (or alias) starts with it.
+#[cfg(feature = "cli")]
+const PRINT_SURFACE_SHADOW_PREFIX: &str = "__pir-print-surface-";
+
+/// [`PRINT_SURFACE_SHADOW_PREFIX`] + `name` as a `'static` string.
+///
+/// clap's `Str` is `'static` unless the `string` feature is enabled (this crate
+/// deliberately enables only `derive`), so the placeholder is interned once per
+/// subcommand name per process. The set of names is the derive's fixed command
+/// list, so the total leaked bytes are bounded by the CLI grammar itself. (The
+/// rejected lane's design leaked nothing but never compiled: `Str::from(String)`
+/// needs clap's `string` feature.)
+#[cfg(feature = "cli")]
+fn shadow_subcommand_name(name: &str) -> &'static str {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static SHADOWS: OnceLock<Mutex<BTreeMap<String, &'static str>>> = OnceLock::new();
+    let shadows = SHADOWS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut shadows = shadows
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    shadows.entry(name.to_owned()).or_insert_with(|| {
+        Box::leak(format!("{PRINT_SURFACE_SHADOW_PREFIX}{name}").into_boxed_str())
+    })
+}
+
+/// The top-level grammar with every subcommand renamed to its placeholder, and
+/// the auto-generated `help` subcommand disabled: inside the print host the word
+/// `help` is a prompt, while bare `pir help` still resolves normally.
+#[cfg(feature = "cli")]
+fn print_surface_command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
+        .disable_help_subcommand(true)
+        .mut_subcommands(|sub| {
+            let name = sub.get_name().to_owned();
+            sub.name(shadow_subcommand_name(&name))
+        })
+}
+
+/// Parse argv into [`Cli`] with the upstream print-surface grammar
+/// (PIR-BIN-030).
+///
+/// Upstream `resolveAppMode` selects the host from FLAGS first and only then
+/// parses positionals as messages; a subcommand is never matched inside a print
+/// run. clap cannot express that (it resolves a known subcommand from any
+/// positional position), so when the print surface is explicitly selected this
+/// function parses against [`print_surface_command`], where no positional can
+/// name a subcommand and `Cli::command` stays `None`.
+///
+/// Deliberately NOT gated:
+///
+/// - invocations without an explicit print selection (`pir version`,
+///   `pir config -l`, `pir models`, …) keep the normal grammar;
+/// - the documented subcommand spelling `pir print "<prompt>"` — literally the
+///   FIRST token of argv, so `pir print --mode json "<prompt>"` keeps its own
+///   prompt argument. A `print` WORD later in a print-surface invocation
+///   (`pir --print "print"`) is a prompt like every other word;
+/// - `--mode rpc`, which keeps its own subcommand grammar;
+/// - `--help`/`--version`, which clap short-circuits before any host decision;
+/// - `--`, after which clap already treats every token as positional data.
+///
+/// This is the ONE parse the binary uses (`src/main_cli/run_mode.rs`), so the
+/// gate cannot rot into a dead helper.
+#[cfg(feature = "cli")]
+pub fn parse_cli(args: &[String]) -> Result<Cli, clap::Error> {
+    use clap::FromArgMatches;
+
+    let raw = args.get(1..).unwrap_or(&[]);
+    let documented_print_subcommand = raw.first().is_some_and(|first| first == "print");
+    if documented_print_subcommand || !print_surface_selected(raw) || requests_help_or_version(raw)
+    {
+        return Cli::try_parse_from(args);
+    }
+    let matches = print_surface_command().try_get_matches_from(args)?;
+    Cli::from_arg_matches(&matches)
+}
+
 /// Split positional arguments into messages and `@file` references
 /// (upstream `parseArgs`: `@x` positionals become `fileArgs` with the `@`
 /// prefix stripped).
@@ -536,7 +777,10 @@ pub struct Cli {
     #[arg(long = "fork", value_name = "ID_OR_PATH", global = true)]
     pub fork: Option<String>,
 
-    /// Don't save the session; ephemeral run (upstream `--no-session`)
+    /// Don't save the session; ephemeral run (upstream `--no-session`). The
+    /// in-memory transcript is bounded at 1024 messages / 100k estimated
+    /// tokens; every trim is announced (`history_trimmed`) and counted in
+    /// `get_state.historyDroppedMessages`
     #[arg(long = "no-session", global = true)]
     pub no_session: bool,
 

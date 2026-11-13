@@ -1119,12 +1119,34 @@ struct PromptToken {
 /// a file reference when the whole prompt is a list of `@` tokens (the
 /// explicit `pir print "@a.txt @b.txt"` shape), or when the path looks like
 /// one (separator, `~`, an alphabetic extension) or already exists on disk.
+///
+/// PIR-BIN-031 adds the HANDLE rule for separator-free remainders: an
+/// e-mail/registry handle (`alice@example.com`) is prose, never a path, so
+/// `cc @alice@example.com about it` reaches the model verbatim instead of
+/// failing with `File not found: …\alice@example.com` (upstream never scans
+/// inside a message; only a whole `@`-positional is a file). The filesystem
+/// wins over the handle reading, so a real file literally named
+/// `weird@name.txt` still inlines.
+///
+/// The separator/`~` test runs BEFORE the handle rule: a remainder carrying a
+/// path separator (`@sub/missing@name.txt`) is path-shaped, and a missing one
+/// must stay the loud error contract (c) requires. The extension test runs
+/// AFTER, so `@notes.csv` is still a reference (and errors when missing) —
+/// only the `@`-handle shape is exempted.
+///
+/// A prompt made ONLY of `@` tokens is an explicit file list
+/// (`whole_prompt_files`), so a bare `@alice@example.com` argument stays a
+/// reference and errors on a missing file exactly like upstream
+/// `pi --print "@alice@example.com"`.
 fn is_prompt_file_reference(path: &str, cwd: &Path) -> bool {
     if path.is_empty() {
         return false;
     }
     if path.starts_with('~') || path.contains('/') || path.contains('\\') {
         return true;
+    }
+    if path.contains('@') {
+        return resolve_file_arg_path(path, cwd).exists();
     }
     let extension = path.rsplit_once('.').map(|(_, extension)| extension);
     let extension_like = extension.is_some_and(|extension| {

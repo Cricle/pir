@@ -145,9 +145,9 @@ bracketed paste; optional hardware cursor (`PI_HARDWARE_CURSOR` / the `Show hard
 `showHardwareCursor`, `terminal.showTerminalProgress` and `terminal.clearOnShrink` are read at startup and also
 apply live from `/settings` (PIR-TUI-017/018): the cursor cell and the OSC 9;4 progress gate move on the next
 frame/run, and `clearOnShrink` gates the main-screen diff painter's full repaint on a frame shorter than the
-tallest one painted since the last clearing render (default false, upstream `SETTINGS_DEFAULTS`). The
-alt-screen/windowed renderer clamps every frame to the visible rows, so `clearOnShrink` has no visible effect
-there — the setting is main-screen only, matching the separate upstream alt-screen renderer.
+tallest one painted since the last clearing render (default false, upstream `SETTINGS_DEFAULTS` — the default is
+unchanged). The alt-screen/windowed renderer clamps every frame to the visible rows, so `clearOnShrink` has no
+visible effect there — the setting is main-screen only, matching the separate upstream alt-screen renderer.
 
 The footer's git branch comes from `.git/HEAD` read directly — polled once per second, walking parent directories
 and following `gitdir:` indirection used by worktrees/submodules. `git rev-parse --abbrev-ref HEAD` is a one-shot
@@ -155,3 +155,84 @@ fallback only when the direct read cannot answer (bare setups, unusual `GIT_DIR`
 
 `terminal.hyperlinks` and `terminal.trueColor` are pinned at TUI start (`set_global_hyperlinks` +
 `set_color_mode_override`). pir has no settings-reload hook yet, so a later change applies on the next TUI start.
+
+## Intentional deviations from upstream
+
+These are deliberate and must not be "fixed" back by a parity pass. Each names the
+upstream behavior, pir's behavior and the reason.
+
+### 1. PIR-TUI-027 — full repaints never erase terminal scrollback (`3J`)
+
+Upstream `packages/tui/src/tui-main-screen.ts` `fullRender(true)` emits
+`ESC[2J ESC[H ESC[3J` ("clear screen, home, then clear scrollback"), and
+`TuiCore::invalidate_frame` used to mirror that byte sequence exactly.
+
+pir diverges: the main-screen full repaint clears the **screen only**
+(`ESC[2J ESC[H`) and never emits `ESC[3J`. That covers every caller:
+
+- the `clearOnShrink` gate (`src/tui/core.rs`, diverges from upstream
+  `tui-main-screen.ts`'s `fullRender(true)`),
+- a regular-mode transcript window slide
+  (`TuiCore::invalidate_baseline_keep_scrollback`, PIR-TUI-027),
+- writer-drop keyframes (`force_screen_clear`, which already worked this way).
+
+`TuiCore::invalidate_frame` still emits `3J`; it is reserved for the cases where
+the surface genuinely left and re-entered the main screen (`/resume` picker,
+external editor, SIGCONT rebuild), where a stale scrollback above the frame would
+be actively wrong (a duplicated startup header, per PIR-TUI-018).
+
+Reason (PROTOCOL v8, "性能优化边界" §1/§5c): on the main screen the terminal's
+scrollback **is** the user's transcript history. A bounded transcript window
+rebase, a cosmetic shrink repaint, or a dropped write frame must not discard
+rows the user already scrolled past — that is "trading user-visible information
+for a cheaper repaint", which the protocol forbids. Upstream pays that cost;
+pir does not.
+
+### 2. PIR-TUI-027 — the bounded transcript window announces its truncation
+
+pir materializes at most `TRANSCRIPT_WINDOW_MAX_ENTRIES` (512) /
+`TRANSCRIPT_WINDOW_MAX_BYTES` (4 MiB) entries of a huge session
+(`src/tui/terminal.rs`; upstream has no such cap). Whenever the band starts at a
+non-zero absolute index, `ChatBlockCache` paints one lead row above the first
+materialized entry:
+
+```
+... (<N> earlier entries, <load-key> to load)
+```
+
+`N` is the window's absolute start (the exact number of entries not on screen).
+`<load-key>` is `tui.altScreen.top` (`Ctrl+Home`) in the fullscreen surface; the
+regular-mode surface has no viewport binding, so the row says
+`scroll up to load` instead. Scrolling to the band top keeps extending the window
+one `TRANSCRIPT_WINDOW_STEP_ENTRIES` chunk per frame, and once the resident
+prefix is fully materialized the paged load-more streams older pages off disk
+(`LoadOlder`), so entry 1 is reachable. Before this change the truncation was
+silent, which read to users as "the window history was reset".
+
+Reason: PROTOCOL v8 §5(a)/(b) — a tail-only window is allowed, but it must
+(a) tell the user how much was omitted and (b) keep the omitted content
+reachable.
+
+### 3. PIR-TUI-027 — the window extension only drives itself while it moves
+
+The bounded transcript window extends one `TRANSCRIPT_WINDOW_STEP_ENTRIES`
+chunk per frame, and a frame only happens while the interaction loop is dirty.
+To let `Ctrl+Home` walk all the way to entry 0 without the user pressing the
+key repeatedly, the loop keeps itself dirty while the scrolled view is still
+near the band top **and entries remain above it**.
+
+That self-driving condition is gated on the band having ACTUALLY moved during
+the frame that just rendered (`transcript_window.start()` strictly below its
+frame-start value). Dropping that gate reintroduces a permanent repaint loop:
+`advance_window` refuses to extend once the band is over
+`TRANSCRIPT_WINDOW_MAX_BYTES` (4 MiB), so at the top of a fat session the
+"near the band top" answer stays true forever while the extension can never
+happen. Measured before the gate: 97-99 % CPU sustained and a 19 MB write log
+with nothing changing on screen; after: 14 % → 0 % and settling to single
+digits once the materialization the user asked for is done
+(`scripts/tui_conpty/round68_tui027_spin_probe.py`, PIR-TUI-028).
+
+The byte cap is not negotiable to make the jump one-shot: it is the same
+memory bound that makes windowing worth having. What the user gets instead is
+the truncation lead row, which always states how many entries are still above
+the band, so "is there more" is never ambiguous.

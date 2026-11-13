@@ -105,6 +105,7 @@ pub const SYNTHETIC_EVENTS: &[&str] = &[
     // Session-event bridge names (`agent_session/notifications.rs`).
     "entry_appended",
     "thinking_level_changed",
+    "history_trimmed",
     "summarization_retry_scheduled",
     "summarization_retry_attempt_start",
     "summarization_retry_finished",

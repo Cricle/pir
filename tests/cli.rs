@@ -523,13 +523,27 @@ fn invalid_mode_errors_and_exits_1() {
         );
     }
 
-    // Valid modes still pass the gate (the version command succeeds).
+    // Valid modes still pass the mode gate. `--mode` explicitly selects the
+    // print host, so the trailing word is a PROMPT, not the `version` command
+    // (PIR-BIN-030; upstream `resolveAppMode` decides the host from flags and
+    // then treats every positional as a message). The hermetic agent dir has
+    // no provider, so the prompt run fails on the credential — but never with
+    // the mode error, and never with the command's version banner.
     for argv in [
         vec!["--mode", "text", "version"],
         vec!["--mode=json", "version"],
     ] {
         let output = run(&argv);
-        assert!(output.status.success(), "valid --mode rejected: {argv:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Invalid mode"),
+            "valid --mode rejected: {argv:?}: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("Rust edition:"),
+            "`{argv:?}` must treat `version` as a prompt, not run the command: {stdout}"
+        );
     }
 }
 
@@ -1108,4 +1122,435 @@ fn extension_path_accepts_file_url() {
         text.contains("--file-url-flag <value>"),
         "the file:// -e path must load the extension: {text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-080: Windows path identity for the session cwd.
+// ---------------------------------------------------------------------------
+
+/// A Windows path names the same directory regardless of case (`c:\Proj` and
+/// `C:\proj`), but the session header records the spelling verbatim. These
+/// tests drive the REAL binary against a loopback mock provider and seed a
+/// session from the real-cased directory, then run every session route from
+/// the same directory spelled with a lowercase drive. Each route must open the
+/// seeded session (one JSONL file, prior transcript re-sent) instead of
+/// starting/forking a new one.
+#[cfg(windows)]
+mod windows_session_cwd_case {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    enum Step {
+        Tool(&'static str, &'static str),
+        Text(&'static str),
+    }
+
+    fn sse_chunk(delta: serde_json::Value, finish: serde_json::Value) -> String {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "chatcmpl-mock",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "mock-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            })
+        )
+    }
+
+    /// Serve `script` steps in order (the last repeats) over SSE and record
+    /// every request body.
+    fn spawn_mock(script: Vec<Step>) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let port = listener.local_addr().expect("mock addr").port();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&bodies);
+        std::thread::spawn(move || {
+            let mut cursor = 0usize;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8192];
+                let header_end = loop {
+                    if let Some(i) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(i + 4);
+                    }
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break None,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                let len = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() < header_end + len {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let body = String::from_utf8_lossy(&request[header_end..]).to_string();
+                recorded.lock().unwrap().push(body);
+
+                let step = script
+                    .get(cursor.min(script.len().saturating_sub(1)))
+                    .cloned();
+                cursor += 1;
+                let events = match step {
+                    Some(Step::Tool(name, arguments)) => {
+                        let mut events = sse_chunk(
+                            serde_json::json!({"role": "assistant", "content": ""}),
+                            serde_json::Value::Null,
+                        );
+                        events.push_str(&sse_chunk(
+                            serde_json::json!({
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "call_mock_0",
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": arguments},
+                                }],
+                            }),
+                            serde_json::Value::Null,
+                        ));
+                        let mut final_chunk: serde_json::Value = serde_json::from_str(
+                            sse_chunk(serde_json::json!({}), serde_json::json!("tool_calls"))
+                                .trim_start_matches("data: ")
+                                .trim_end(),
+                        )
+                        .unwrap();
+                        final_chunk["usage"] = serde_json::json!({
+                            "prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105,
+                        });
+                        events.push_str(&format!("data: {final_chunk}\n\n"));
+                        events.push_str("data: [DONE]\n\n");
+                        events
+                    }
+                    Some(Step::Text(text)) => {
+                        let mut events = sse_chunk(
+                            serde_json::json!({"role": "assistant", "content": ""}),
+                            serde_json::Value::Null,
+                        );
+                        events.push_str(&sse_chunk(
+                            serde_json::json!({"content": text}),
+                            serde_json::Value::Null,
+                        ));
+                        let mut final_chunk: serde_json::Value = serde_json::from_str(
+                            sse_chunk(serde_json::json!({}), serde_json::json!("stop"))
+                                .trim_start_matches("data: ")
+                                .trim_end(),
+                        )
+                        .unwrap();
+                        final_chunk["usage"] = serde_json::json!({
+                            "prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105,
+                        });
+                        events.push_str(&format!("data: {final_chunk}\n\n"));
+                        events.push_str("data: [DONE]\n\n");
+                        events
+                    }
+                    None => "data: [DONE]\n\n".to_owned(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    events.len(),
+                    events
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (port, bodies)
+    }
+
+    fn write_agent(agent: &Path, port: u16) {
+        std::fs::create_dir_all(agent).expect("create agent dir");
+        std::fs::write(
+            agent.join("models.json"),
+            format!(
+                r#"{{"providers":{{"mock":{{"name":"Mock","baseUrl":"http://127.0.0.1:{port}/v1","api":"openai-completions","apiKey":"k","models":[{{"id":"mock-model","name":"M","api":"openai-completions","baseUrl":"http://127.0.0.1:{port}/v1","reasoning":false,"input":["text"],"contextWindow":100000,"maxTokens":1024}}]}}}}}}"#
+            ),
+        )
+        .expect("write models.json");
+        std::fs::write(
+            agent.join("settings.json"),
+            r#"{"defaultProjectTrust":"always","quietStartup":true}"#,
+        )
+        .expect("write settings.json");
+    }
+
+    fn run_case(cwd: &Path, agent: &Path, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_pir"))
+            .current_dir(cwd)
+            .env("PIR_AGENT_DIR", agent)
+            .env("PIR_CODING_AGENT_DIR", agent)
+            .env("PI_CODING_AGENT_DIR", agent)
+            .env("PI_OFFLINE", "1")
+            .env("PIR_NO_UPDATE_CHECK", "1")
+            .env("PIR_SKIP_VERSION_CHECK", "1")
+            .env("PIR_TRUST_PROJECT", "1")
+            .env("NO_COLOR", "1")
+            .args(args)
+            .output()
+            .expect("pir binary should start")
+    }
+
+    fn base_args() -> Vec<&'static str> {
+        vec![
+            "print",
+            "--mode",
+            "json",
+            "--no-context-files",
+            "--offline",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+        ]
+    }
+
+    fn jsonl_files(root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    fn header(path: &Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(path).expect("read session file");
+        serde_json::from_str(text.lines().next().expect("session header line"))
+            .expect("session header JSON")
+    }
+
+    fn request_roles(bodies: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        let bodies = bodies.lock().unwrap();
+        let Some(body) = bodies.last() else {
+            return Vec::new();
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(body).expect("request body must be JSON");
+        value["messages"]
+            .as_array()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter_map(|message| {
+                        message
+                            .get("role")
+                            .and_then(|role| role.as_str())
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn unique_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "pir-cli-cwd-case-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create case root");
+        root
+    }
+
+    /// Seed one session from `real` and return `(session_dir, session_id)`.
+    fn seed_session(agent: &Path, real: &Path) -> (PathBuf, String) {
+        let (port, _bodies) = spawn_mock(vec![
+            Step::Tool("read", r#"{"path":"seed.txt"}"#),
+            Step::Text("seed-done"),
+        ]);
+        write_agent(agent, port);
+        let mut args = base_args();
+        args.extend(["--tools", "read", "seed"]);
+        let output = run_case(real, agent, &args);
+        assert!(
+            output.status.success(),
+            "seed run failed: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let files = jsonl_files(agent);
+        assert_eq!(files.len(), 1, "seed must persist exactly one session file");
+        let header_value = header(&files[0]);
+        let id = header_value["id"].as_str().expect("session id").to_owned();
+        let dir = files[0].parent().expect("session dir").to_path_buf();
+        (dir, id)
+    }
+
+    #[test]
+    fn windows_session_cwd_case_variants_open_the_existing_session() {
+        let root = unique_root("routes");
+        let real = root.join("proj").join("RealDir");
+        let other = root.join("proj").join("OtherDir");
+        std::fs::create_dir_all(&real).expect("create real dir");
+        std::fs::create_dir_all(&other).expect("create other dir");
+        std::fs::write(real.join("seed.txt"), "CMD-SEED\n").expect("seed file");
+        // Same directory, lowercase spelling (what `cd /d c:\...` or a pasted
+        // path produces). NTFS resolves it to the real directory.
+        let lower = PathBuf::from(real.to_string_lossy().to_lowercase());
+        assert_ne!(
+            real.to_string_lossy(),
+            lower.to_string_lossy(),
+            "fixture needs a path with at least one uppercase character"
+        );
+
+        let routes: Vec<(&str, Vec<String>)> = vec![
+            ("continue", vec!["--continue".to_owned()]),
+            ("session", vec!["--session".to_owned(), String::new()]),
+            ("resume", vec!["--resume".to_owned()]),
+        ];
+        for (route, mut route_args) in routes {
+            let agent = root.join(format!("agent-{route}"));
+            let (_session_dir, id) = seed_session(&agent, &real);
+            if route == "session" {
+                // Partial id, like the issue's `--session <partial>` repro.
+                route_args[1] = id[..8].to_owned();
+            }
+            let (port, bodies) = spawn_mock(vec![Step::Text("route-done")]);
+            write_agent(&agent, port);
+            let mut args = base_args();
+            args.extend(route_args.iter().map(String::as_str));
+            args.push("go");
+            let output = run_case(&lower, &agent, &args);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "`--{route}` from the lowercase cwd failed: stderr={stderr}"
+            );
+            let files = jsonl_files(&agent);
+            assert_eq!(
+                files.len(),
+                1,
+                "`--{route}` from `{}` must open the seeded session, not create another \
+                 (files: {files:?})",
+                lower.display()
+            );
+            let roles = request_roles(&bodies);
+            assert!(
+                roles.iter().any(|role| role == "tool"),
+                "`--{route}` must re-send the seeded transcript; roles={roles:?}"
+            );
+            assert!(
+                !stderr.contains("different project"),
+                "`--{route}` must not report the user's own directory as another project: \
+                 {stderr}"
+            );
+            assert!(
+                !stderr.contains("no sessions found"),
+                "`--{route}` must find the project's session: {stderr}"
+            );
+        }
+
+        // --- negative controls: a genuinely different directory ------------
+        let agent = root.join("agent-controls");
+        let (shared_dir, id) = seed_session(&agent, &real);
+        let shared_dir_text = shared_dir.to_string_lossy().into_owned();
+        let files_before = jsonl_files(&agent).len();
+
+        // `--session <id>` from OtherDir with the SAME explicit session dir:
+        // the id only matches a session of another project, so the plan stays
+        // cross-project (notice + fork), never an in-place open.
+        let (port, _bodies) = spawn_mock(vec![Step::Text("fork-done")]);
+        write_agent(&agent, port);
+        let mut args = base_args();
+        args.extend(["--session", &id, "--session-dir", &shared_dir_text, "go"]);
+        let output = run_case(&other, &agent, &args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "cross-project --session failed: stderr={stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "Session found in different project: {}",
+                real.display()
+            )),
+            "a genuinely different directory must keep the cross-project notice: {stderr}"
+        );
+        let files_after_fork = jsonl_files(&agent).len();
+        assert_eq!(
+            files_after_fork,
+            files_before + 1,
+            "the cross-project route forks a NEW session in the shared dir"
+        );
+
+        // `--session <id>` from the case-variant cwd with the same explicit
+        // session dir: the resolved-path comparison folds case, so this opens
+        // the seeded session instead of forking.
+        let (port, _bodies) = spawn_mock(vec![Step::Text("open-done")]);
+        write_agent(&agent, port);
+        let mut args = base_args();
+        args.extend(["--session", &id, "--session-dir", &shared_dir_text, "go"]);
+        let output = run_case(&lower, &agent, &args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "case-variant --session failed: stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("different project"),
+            "the same directory spelled with another case is not another project: {stderr}"
+        );
+        assert_eq!(
+            jsonl_files(&agent).len(),
+            files_after_fork,
+            "opening the seeded session must not fork another file"
+        );
+
+        // `--continue` from OtherDir (default session dirs): the seed lives in
+        // RealDir's cwd-encoded dir, so OtherDir starts its own session and
+        // must NOT load the seed's transcript.
+        let (port, bodies) = spawn_mock(vec![Step::Text("other-done")]);
+        write_agent(&agent, port);
+        let mut args = base_args();
+        args.extend(["--continue", "go"]);
+        let output = run_case(&other, &agent, &args);
+        assert!(
+            output.status.success(),
+            "OtherDir --continue failed: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let roles = request_roles(&bodies);
+        assert!(
+            !roles.iter().any(|role| role == "tool"),
+            "OtherDir --continue must not load RealDir's transcript; roles={roles:?}"
+        );
+        assert_eq!(
+            jsonl_files(&agent).len(),
+            files_after_fork + 1,
+            "OtherDir --continue starts a session in its own cwd-encoded dir"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

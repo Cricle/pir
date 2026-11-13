@@ -1206,6 +1206,87 @@ fn oversized_context_file_is_skipped_with_a_diagnostic() {
     assert!(discover_context_files(&cwd, &global).is_empty());
 }
 
+/// Candidate dedupe is by FILE IDENTITY, not spelling. On a case-insensitive
+/// volume (Windows, macOS by default) `AGENTS.md` and `AGENTS.MD` are the same
+/// file, so before the fix one oversized file produced two diagnostics — and a
+/// failed read was retried under the other spelling. On ext4 the two spellings
+/// can be distinct files and upstream precedence must be untouched.
+#[test]
+fn duplicate_candidate_spellings_of_one_file_yield_one_diagnostic() {
+    let root = TempDir::new("ctx-duplicate-spelling");
+    let global = root.child("agent");
+    let cwd = root.child("work");
+
+    let oversized = "x".repeat((MAX_CONTEXT_FILE_BYTES + 1) as usize);
+    fs::write(cwd.join("AGENTS.md"), &oversized).unwrap();
+    // Probe the volume itself, not the platform: `AGENTS.MD` resolves to the
+    // `AGENTS.md` just written exactly when the filesystem ignores case. That
+    // is the bug's precondition and the only case where the spellings merge.
+    let case_insensitive = cwd.join("AGENTS.MD").is_file();
+    let same_identity = fs::canonicalize(cwd.join("AGENTS.md"))
+        .ok()
+        .zip(fs::canonicalize(cwd.join("AGENTS.MD")).ok())
+        .is_some_and(|(a, b)| a == b);
+    assert_eq!(
+        case_insensitive, same_identity,
+        "identity of the two spellings must follow the volume, not a cfg"
+    );
+
+    let (files, diagnostics) = discover_context_files_with_diagnostics(&cwd, &global);
+    assert!(files.is_empty(), "oversized file still skipped: {files:?}");
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one file yields exactly one diagnostic: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics[0].contains("AGENTS.md"),
+        "the diagnostic names the file: {diagnostics:?}"
+    );
+    if case_insensitive {
+        assert!(
+            !diagnostics[0].contains("AGENTS.MD"),
+            "the second spelling must never be re-considered: {diagnostics:?}"
+        );
+    }
+}
+
+/// Dedupe must not hide a genuinely present file: a lone uppercase `CLAUDE.MD`
+/// is still discovered and loaded, whichever candidate spelling reaches it
+/// first (`CLAUDE.md` on a case-insensitive volume, `CLAUDE.MD` on ext4).
+#[test]
+fn uppercase_claude_md_alone_is_still_loaded() {
+    let root = TempDir::new("ctx-uppercase-claude");
+    let global = root.child("agent");
+    let cwd = root.child("work");
+
+    fs::write(cwd.join("CLAUDE.MD"), "uppercase claude").unwrap();
+    let case_insensitive = fs::canonicalize(cwd.join("CLAUDE.md"))
+        .ok()
+        .zip(fs::canonicalize(cwd.join("CLAUDE.MD")).ok())
+        .is_some_and(|(a, b)| a == b);
+
+    let (files, diagnostics) = discover_context_files_with_diagnostics(&cwd, &global);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(
+        files.len(),
+        1,
+        "the file is still found and loaded once: {files:?}"
+    );
+    assert_eq!(files[0].1, "uppercase claude");
+    let name = files[0]
+        .0
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    if case_insensitive {
+        assert_eq!(name, "CLAUDE.md", "the first candidate spelling wins");
+    } else {
+        assert_eq!(name, "CLAUDE.MD", "the uppercase spelling is its own file");
+    }
+}
+
 /// PIR-BIN-066 (the silent-fallback half): with an oversized `AGENTS.md` and a
 /// small `CLAUDE.md` in the same directory, the next candidate wins — and the
 /// user is told why the first file was not used.

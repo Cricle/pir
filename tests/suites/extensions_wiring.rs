@@ -906,7 +906,7 @@ mod shim_deflate {
         ),
         (
             "pi_coding_agent_shim.js.txt",
-            "414a7f781bd678546ba339db4c00a5a5173ee9898932241fe9ef9ece2d139a80",
+            "2aec26739a5868a189d1fea313e23c55384fe3aed568921a34295a441c3bb01f",
         ),
         (
             "pi_durable_env_shim.js.txt",

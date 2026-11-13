@@ -2045,3 +2045,165 @@ async fn openai_decisions_504_fails_after_one_request() {
         "504 must not be retried for OpenAI Decisions"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-057: `settings.retry.provider.*` reaches the transport
+// ---------------------------------------------------------------------------
+//
+// Upstream `sdk.ts:341-352` resolves `getProviderRetrySettings()` per request
+// and layers it UNDER the explicit option; these tests drive the REAL OpenAI
+// adapter against a counting loopback mock and assert the request COUNT and
+// the reported retry cap, i.e. what the user sees on the wire.
+
+/// `retry.provider.maxRetries` in `StreamOptions` (the field the session and
+/// print hosts now populate from settings) must decide the attempt budget:
+/// `0` = exactly one request, `3` = four.
+#[tokio::test]
+async fn provider_max_retries_zero_sends_exactly_one_request() {
+    let server = MockServer::start(vec![
+        MockResponseSpec::error(500),
+        MockResponseSpec::error(500),
+        MockResponseSpec::error(500),
+        MockResponseSpec::error(500),
+    ])
+    .await;
+    let base = format!("{}/v1", server.base_url());
+    let provider = OpenAiCompatibleProvider::new("openai", base.clone(), vec![openai_model(&base)])
+        .expect("provider");
+    let model = provider.get_models()[0].clone();
+    let message = run_to_done(provider.stream(
+        &model,
+        simple_context("count me"),
+        StreamOptions {
+            api_key: Some("test-key".into()),
+            // The value a host derives from `retry.provider.maxRetries: 0`.
+            max_retries: Some(0),
+            max_retry_delay_ms: Some(5_000),
+            ..StreamOptions::default()
+        },
+    ))
+    .await;
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "maxRetries: 0 must send exactly one request"
+    );
+}
+
+#[tokio::test]
+async fn provider_max_retries_three_sends_four_requests() {
+    let server = MockServer::start(vec![
+        MockResponseSpec::error(500),
+        MockResponseSpec::error(500),
+        MockResponseSpec::error(500),
+        MockResponseSpec::error(500),
+    ])
+    .await;
+    let base = format!("{}/v1", server.base_url());
+    let provider = OpenAiCompatibleProvider::new("openai", base.clone(), vec![openai_model(&base)])
+        .expect("provider");
+    let model = provider.get_models()[0].clone();
+    let message = run_to_done(provider.stream(
+        &model,
+        simple_context("count me"),
+        StreamOptions {
+            api_key: Some("test-key".into()),
+            max_retries: Some(3),
+            max_retry_delay_ms: Some(5_000),
+            ..StreamOptions::default()
+        },
+    ))
+    .await;
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(
+        server.requests().len(),
+        4,
+        "maxRetries: 3 must send four requests (1 + 3 retries)"
+    );
+}
+
+/// `retry.provider.maxRetryDelayMs` caps a server-requested `Retry-After`:
+/// with the cap at 5 s a 120 s request fails immediately and names 5 s, which
+/// is the user-visible difference from the 60 s default.
+#[tokio::test]
+async fn provider_max_retry_delay_caps_retry_after() {
+    let mut spec = MockResponseSpec::error(429);
+    spec.headers.push(("retry-after".into(), "120".into()));
+    let server = MockServer::start(vec![spec]).await;
+    let base = format!("{}/v1", server.base_url());
+    let provider = OpenAiCompatibleProvider::new("openai", base.clone(), vec![openai_model(&base)])
+        .expect("provider");
+    let model = provider.get_models()[0].clone();
+    let message = run_to_done(provider.stream(
+        &model,
+        simple_context("slow down"),
+        StreamOptions {
+            api_key: Some("test-key".into()),
+            max_retries: Some(2),
+            max_retry_delay_ms: Some(5_000),
+            ..StreamOptions::default()
+        },
+    ))
+    .await;
+    let error = message.error_message.clone().unwrap_or_default();
+    assert!(
+        error.contains("max: 5s"),
+        "the configured cap must be reported as 5s: {error}"
+    );
+    assert!(
+        !error.contains("max: 60s"),
+        "the compiled 60s default must not win over the setting: {error}"
+    );
+    assert_eq!(server.requests().len(), 1);
+}
+
+/// `retry.provider.timeoutMs` is a per-request TOTAL budget (upstream
+/// `options.timeoutMs`), not a body idle timeout: a server that stalls before
+/// the headers for longer than the budget must abort the request.
+#[tokio::test]
+async fn provider_timeout_ms_aborts_a_stalled_request() {
+    // Accept, read the head, then stay silent for 3 s: headers never arrive.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+    let base = format!("http://{addr}/v1");
+    let provider = OpenAiCompatibleProvider::new("openai", base.clone(), vec![openai_model(&base)])
+        .expect("provider");
+    let model = provider.get_models()[0].clone();
+    let started = std::time::Instant::now();
+    let message = run_to_done(provider.stream(
+        &model,
+        simple_context("stall"),
+        StreamOptions {
+            api_key: Some("test-key".into()),
+            max_retries: Some(0),
+            timeout_ms: Some(1_000),
+            ..StreamOptions::default()
+        },
+    ))
+    .await;
+    let elapsed = started.elapsed();
+    let _ = handle.await;
+    assert_eq!(message.stop_reason, StopReason::Error);
+    let error = message.error_message.clone().unwrap_or_default();
+    assert!(
+        error.contains("timed out"),
+        "the stalled request must report a timeout: {error}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2_800),
+        "a 1s timeout must abort well before the 3s stall: {elapsed:?}"
+    );
+}

@@ -296,7 +296,16 @@ async fn reload_keeps_the_sessions_agent_and_package_dir() {
     write_settings(dir_a.path(), "all");
     std::fs::write(dir_a.path().join("AGENTS.md"), "GLOBAL-A-MARKER").expect("write A context");
     let pkg_a = ScratchDir::new("d6-reload-pkg-a");
+    // The `<docs>` section is emitted only for a COMPLETE asset tree
+    // (`package_docs_paths`: README.md + docs/ + examples/, PIR-BIN-061), so
+    // the fixture must be one; the assertion below then pins that the build
+    // resolved THIS directory.
     std::fs::write(pkg_a.path().join("README.md"), "package A").expect("write A package");
+    std::fs::create_dir_all(pkg_a.path().join("docs")).expect("mkdir A docs");
+    std::fs::write(pkg_a.path().join("docs").join("tui.md"), "A docs").expect("write A docs");
+    std::fs::create_dir_all(pkg_a.path().join("examples")).expect("mkdir A examples");
+    std::fs::write(pkg_a.path().join("examples").join("demo.md"), "A example")
+        .expect("write A examples");
     let pkg_a_env = pkg_a.path().to_string_lossy().into_owned();
 
     let dir_b = ScratchDir::new("d6-reload-b");
@@ -304,6 +313,11 @@ async fn reload_keeps_the_sessions_agent_and_package_dir() {
     std::fs::write(dir_b.path().join("AGENTS.md"), "GLOBAL-B-MARKER").expect("write B context");
     let pkg_b = ScratchDir::new("d6-reload-pkg-b");
     std::fs::write(pkg_b.path().join("README.md"), "package B").expect("write B package");
+    std::fs::create_dir_all(pkg_b.path().join("docs")).expect("mkdir B docs");
+    std::fs::write(pkg_b.path().join("docs").join("tui.md"), "B docs").expect("write B docs");
+    std::fs::create_dir_all(pkg_b.path().join("examples")).expect("mkdir B examples");
+    std::fs::write(pkg_b.path().join("examples").join("demo.md"), "B example")
+        .expect("write B examples");
     let pkg_b_env = pkg_b.path().to_string_lossy().into_owned();
 
     let cwd = ScratchDir::new("d6-reload-cwd");

@@ -13,7 +13,7 @@ diagnostics; upstream-relative pages with no counterpart are in [MAPPING.md](../
 | [keybindings.md](keybindings.md) | Keybinding ids, settings, defaults |
 | [themes.md](themes.md) | Theme JSON, OKLCH/OKHSL colors |
 | [skills.md](skills.md) | SKILL.md format, discovery, `/skill:name` |
-| [prompt-templates.md](prompt-templates.md) | Template discovery and `/template` |
+| [prompt-templates.md](prompt-templates.md) | Template discovery, `/name` commands, argument substitution |
 | [environment-variables.md](environment-variables.md) | Every `PI_*`/`PIR_*` variable |
 | [codemode.md](codemode.md) | Codemode sandbox, script globals |
 | [tui.md](tui.md) | TUI components, alt-screen, renderer hooks |

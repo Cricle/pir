@@ -91,10 +91,17 @@ pub struct OpenAiSseParser {
     supports_finish_reason: bool,
     finish: StopReason,
     has_finish_reason: bool,
+    /// Whether the wire carried the SSE terminator `data: [DONE]`. The parser
+    /// ignores the frame's payload, but it is the provider's own statement
+    /// that the message ended: on a close-delimited body it is what separates
+    /// a legitimate EOF-terminated message from a socket cut.
+    saw_done_frame: bool,
     /// The HTTP response has no `Content-Length` and no `Transfer-Encoding`:
     /// the body is close-delimited, so a clean transport EOF IS the protocol
-    /// terminator. Providers behind such responses may omit the terminal
-    /// `finish_reason` chunk (and `[DONE]`); the stream still completed.
+    /// terminator — but only when the accumulated message is COMPLETE (a
+    /// terminal stop signal, or `[DONE]` after content). A bare EOF is not
+    /// evidence of a finished message (PIR-BIN-058: a mid-message cut over
+    /// `Connection: close` used to be reported as a complete answer).
     close_delimited_eof: bool,
     /// Upstream `options.onProviderStreamEvent`: each parsed provider chunk
     /// before pir normalization.
@@ -151,6 +158,7 @@ impl OpenAiSseParser {
             supports_finish_reason: compat.supports_finish_reason,
             finish: StopReason::Stop,
             has_finish_reason: false,
+            saw_done_frame: false,
             close_delimited_eof: false,
             stream_event_hook: None,
             copies: 0,
@@ -165,10 +173,12 @@ impl OpenAiSseParser {
     }
 
     /// Declare that the transport body ends at a close-delimited EOF (no
-    /// `Content-Length`, no `Transfer-Encoding`). [`Self::finish`] then treats
-    /// a missing terminal `finish_reason` as an inferred completion instead of
-    /// the retryable truncation a framed (chunked/length-delimited) body
-    /// implies. Batch callers keep the strict default.
+    /// `Content-Length`, no `Transfer-Encoding`). [`Self::finish`] then reads a
+    /// bare EOF as the protocol terminator — but only for a COMPLETE message
+    /// (`finish_reason`, or `[DONE]` after real content). A cut before either
+    /// signal stays the retryable truncation a framed body implies; the
+    /// framing alone never turns an unfinished message into a successful one.
+    /// Batch callers keep the strict default.
     pub fn set_close_delimited_eof(&mut self, close_delimited: bool) {
         self.close_delimited_eof = close_delimited;
     }
@@ -276,6 +286,7 @@ impl OpenAiSseParser {
     /// Map one SSE data payload to events (shared with the batch path).
     fn handle_data(&mut self, data: &str, out: &mut Vec<AssistantMessageEvent>) -> AiResult<()> {
         if data == "[DONE]" {
+            self.saw_done_frame = true;
             return Ok(());
         }
         let value: Value = serde_json::from_str(data)?;
@@ -770,17 +781,35 @@ impl OpenAiSseParser {
                 _ => {}
             }
         }
-        // Upstream post-stream checks (openai-completions.ts 695-703): without
+        // Upstream post-stream checks (openai-completions.ts 682-690): without
         // finish_reason support the stop reason is inferred from the content;
         // error stop reasons terminate the stream as an error; with finish
-        // reason support a missing one is a stream failure — EXCEPT on a
-        // close-delimited body, where a clean EOF is the protocol terminator
-        // and providers may legitimately omit the terminal chunk.
+        // reason support a missing one is a stream failure.
+        //
+        // The one tolerance pir keeps is the close-delimited EOF: such a body
+        // has no framing terminator other than EOF, so a provider may end it
+        // without the terminal `finish_reason` chunk. That is only accepted
+        // when the message is demonstrably COMPLETE — the wire said
+        // `data: [DONE]` after producing content. A bare EOF (mid-message cut,
+        // or a 200 with zero SSE events) is indistinguishable from a dead
+        // socket and stays the retryable truncation: PIR-BIN-058 measured the
+        // old unconditional exemption handing half an assistant message to
+        // the model as a final answer.
         if !self.has_finish_reason {
-            if self.supports_finish_reason && !self.close_delimited_eof {
-                // A clean EOF without the terminal signal on a framed body is a
-                // truncated stream, not a provider verdict: retryable at the
-                // agent level (the text stays the upstream-parity wording).
+            let close_delimited_complete = self.close_delimited_eof
+                && self.saw_done_frame
+                && self.message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text(_)
+                            | ContentBlock::Thinking(_)
+                            | ContentBlock::ToolCall(_)
+                    )
+                });
+            if self.supports_finish_reason && !close_delimited_complete {
+                // A clean EOF without the terminal signal is a truncated
+                // stream, not a provider verdict: retryable at the agent level
+                // (the text stays the upstream-parity wording).
                 return Err(AiError::StreamTruncated(
                     "Stream ended without finish_reason".to_string(),
                 ));

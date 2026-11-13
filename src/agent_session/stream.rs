@@ -121,7 +121,8 @@ impl AgentSession {
 
     /// Tune transport-level retries for every request of this session
     /// (embedder seam): `max_retries` and/or `max_retry_delay_ms`; `None`
-    /// fields keep the transport defaults. Applies to conversational streams
+    /// fields fall back to `settings.retry.provider.*` and then to the
+    /// transport defaults. Applies to conversational streams
     /// and compaction completion calls alike.
     pub fn set_retry(&self, max_retries: Option<u32>, max_retry_delay_ms: Option<u64>) {
         let mut overrides = self
@@ -144,6 +145,15 @@ impl AgentSession {
     #[doc(hidden)]
     pub fn provider_stream_hooks_for_test(&self) -> crate::ai::types::ProviderStreamHooks {
         self.stream_options(None).hooks
+    }
+
+    /// Test seam: the exact `StreamOptions` the next request to the current
+    /// model would carry (same construction as [`Self::stream_options`]), so a
+    /// test can pin the transport knobs (`settings.retry.provider.*` and the
+    /// `set_retry` override) without a real HTTP transport.
+    #[doc(hidden)]
+    pub fn stream_options_for_test(&self) -> StreamOptions {
+        self.stream_options(None)
     }
 
     /// The request options for one request against `model`, with the transport
@@ -185,6 +195,12 @@ impl AgentSession {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (overrides.max_retries, overrides.max_retry_delay_ms)
         };
+        // `settings.retry.provider.*` (upstream sdk.ts:341-352 resolves
+        // `getProviderRetrySettings()` per request and layers it UNDER the
+        // explicit option). Read per request so a settings edit applies to the
+        // next one, and only fields the user wrote are set: an unconfigured
+        // session keeps the transport defaults exactly as before.
+        let provider_retry = self.session_settings().provider_retry_overrides();
         let request_session_id = self.request_session_id();
         let transport_metadata = self.transport_metadata();
         // Per-request transport hooks (upstream `emitBeforeProviderRequest` /
@@ -351,14 +367,20 @@ impl AgentSession {
             reasoning: Some(self.current_thinking()),
             signal,
             // `set_auto_retry(false)` / `abort_retry` disables transport
-            // retries (upstream `autoRetryEnabled`, default true); the retry
-            // knobs are otherwise the host-installed overrides.
+            // retries (upstream `autoRetryEnabled`, default true). Otherwise
+            // the explicit embedder override (`set_retry`) wins over
+            // `settings.retry.provider.maxRetries` (upstream
+            // `options.maxRetries ?? providerRetrySettings.maxRetries`), and
+            // `None` on both keeps the transport's compiled default.
             max_retries: if self.auto_retry.load(Ordering::SeqCst) {
-                max_retries
+                max_retries.or(provider_retry.max_retries)
             } else {
                 Some(0)
             },
-            max_retry_delay_ms,
+            max_retry_delay_ms: max_retry_delay_ms.or(provider_retry.max_retry_delay_ms),
+            // Per-request total budget (`retry.provider.timeoutMs`); `0`/
+            // absent leaves `timeout_ms` unset, i.e. no total deadline.
+            timeout_ms: provider_retry.timeout_ms,
             // The provider-facing session identity (upstream
             // `sessionManager.getSessionId()` in sdk.ts): without it the Codex
             // WebSocket continuation, the provider `prompt_cache_key` and the

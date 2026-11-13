@@ -22,6 +22,10 @@ impl AgentSession {
             tokens: SessionTokens::default(),
             cost: 0.0,
             context_usage: None,
+            // PIR-BIN-075: the trim counter is independent of the (possibly
+            // paged, possibly compacted) transcript totals above; a store-less
+            // session reports how much of its beginning is gone.
+            history_dropped_messages: self.history_trimmed_messages(),
         };
         match &self.session {
             Some(session) => {

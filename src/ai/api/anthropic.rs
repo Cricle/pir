@@ -1585,12 +1585,6 @@ fn assistant_message_blocks(
     Some(json!({"role": "assistant", "content": Value::Array(blocks)}))
 }
 
-fn system_message_text(message: &UserMessage) -> String {
-    // Include structured `sections` (durable/compaction system messages carry
-    // their prompt there with an empty content vector).
-    crate::ai::types::system_message_text(message)
-}
-
 /// Converted `messages` plus system-prompt tail and per-message thinking levels.
 type ConvertedAnthropicMessages = (Vec<Value>, Vec<String>, Vec<(usize, String)>);
 
@@ -1633,14 +1627,19 @@ fn convert_messages(
         params.append(pending);
     };
 
+    // The host's live rendering is authoritative for the prompt: a replayed
+    // prompt snapshot contributes only sections it does not already carry
+    // (upstream patches system sections BY NAME; appending the snapshot
+    // verbatim sent a resumed session's prompt twice — PIR-BIN-053).
+    let live_prompt = context.system_prompt.as_deref();
     let mut index = 0;
     while index < transformed.len() {
         match transformed[index].as_ref() {
             Message::System(system) | Message::Developer(system) => {
                 let mut blocks: Vec<Value> = Vec::new();
-                let text = system_message_text(system);
-                if !text.trim().is_empty() {
-                    blocks.push(json!({"type": "text", "text": text}));
+                let fragment = crate::ai::types::leading_system_fragment(system, live_prompt);
+                if !fragment.trim().is_empty() {
+                    blocks.push(json!({"type": "text", "text": fragment}));
                 }
                 if native_tool_changes {
                     // WHY (borrow): these definitions are only read to collect
@@ -1678,11 +1677,8 @@ fn convert_messages(
                 }
                 if native_tool_changes && !blocks.is_empty() {
                     pending_system.push(json!({"role": "system", "content": Value::Array(blocks)}));
-                } else if !native_tool_changes {
-                    let text = system_message_text(system);
-                    if !text.trim().is_empty() {
-                        system_prompt_tail.push(text);
-                    }
+                } else if !native_tool_changes && !fragment.trim().is_empty() {
+                    system_prompt_tail.push(fragment);
                 }
             }
             Message::User(user) => {

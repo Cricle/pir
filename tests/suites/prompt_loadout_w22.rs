@@ -10,9 +10,13 @@
 //!    flow through a filtered registry's name-sorted `iter()`, so
 //!    `--tools read,bash,edit,write` declared `bash,edit,read,write` while the
 //!    prompt said `read,bash,edit,write`.
-//! 2. **PIR-BIN-061** — the `docs` section is emitted whenever a package
-//!    directory resolves, with NO filesystem probe at render time (upstream's
-//!    `getReadmePath`/`getDocsPath`/`getExamplesPath` are pure path joins).
+//! 2. **PIR-BIN-061** — the `docs` section names only paths the running
+//!    install actually has: `README.md`, `docs/` and `examples/` must all be
+//!    present in the resolved package directory. A release archive ships only
+//!    `README.md` and `cargo install` ships no assets at all, so an installed
+//!    pir sends no `docs` block instead of pointing the model at paths it does
+//!    not have (the previous path-join-only section was worse than omitting
+//!    it). A source checkout keeps the full section.
 //! 3. **PIR-BIN-062** — the four pir-only `<rules>` bullets are a DOCUMENTED
 //!    deviation (`docs/system-prompt-audit.md` §4, B19): they encode pir
 //!    behaviours upstream lacks (`PIR_READ_BEFORE_EDIT` enforcement, the
@@ -24,6 +28,8 @@
 //! builds (`PrintToolLoadout` / `build_system_prompt_sections`); no fixture
 //! special-cases the production path.
 
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use pir::agent::tool_batch::ToolResult;
@@ -317,20 +323,57 @@ fn pir_only_rules_are_gated_on_the_tools_that_trigger_them() {
 }
 
 // ---------------------------------------------------------------------------
-// PIR-BIN-061: the docs section needs no filesystem probe
+// PIR-BIN-061: the docs section only names paths that exist
 // ---------------------------------------------------------------------------
 
-/// A package dir that does not exist still yields the `<docs>` section: the
-/// section is a set of PATHS (upstream never probes them), and a
-/// mis-installed/missing asset tree is exactly what the model has to be told
-/// about. Before the fix a `README.md exists` gate suppressed the section, so
-/// every real invocation (where `PI_PACKAGE_DIR` is unset) sent no docs at all.
-#[test]
-fn docs_section_renders_for_a_package_dir_that_does_not_exist() {
+static DOCS_FIXTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// A throwaway package root for the docs-section probe. Mirrors the two
+/// layouts that matter: an installed release (`README.md` only) and a source
+/// checkout (`README.md` + `docs/` + `examples/`).
+struct DocsFixture {
+    root: PathBuf,
+}
+
+impl DocsFixture {
+    fn new(name: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "pir-docs-{name}-{}-{}",
+            std::process::id(),
+            DOCS_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create docs fixture root");
+        Self { root }
+    }
+
+    fn file(&self, relative: &str) -> PathBuf {
+        let path = self.root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create docs fixture parent");
+        }
+        std::fs::write(&path, "# pir").expect("write docs fixture file");
+        path
+    }
+
+    fn dir(&self, relative: &str) -> PathBuf {
+        let path = self.root.join(relative);
+        std::fs::create_dir_all(&path).expect("create docs fixture dir");
+        path
+    }
+}
+
+impl Drop for DocsFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn sections_with_package_dir(
+    package_dir: Option<&Path>,
+) -> pir::system_prompt::SystemPromptSections {
     let tools = vec![tool("read")];
-    let missing = std::path::PathBuf::from("/nonexistent/pir-package-root");
-    assert!(!missing.exists(), "fixture must be a missing directory");
-    let sections = build_system_prompt_sections(&SystemPromptInput {
+    build_system_prompt_sections(&SystemPromptInput {
         preamble_override: None,
         append: Vec::new(),
         tools: &tools,
@@ -339,26 +382,103 @@ fn docs_section_renders_for_a_package_dir_that_does_not_exist() {
         skills: &[],
         custom_sections: Vec::new(),
         cwd: std::path::Path::new("/w"),
-        package_dir: Some(&missing),
-    });
-    let docs = sections
+        package_dir,
+    })
+}
+
+/// The path a docs bullet points at, without the trailing parenthetical
+/// description (`Examples: … (extensions, custom tools, SDK)`).
+fn documented_path<'a>(docs: &'a str, label: &str) -> &'a str {
+    let prefix = format!("- {label}: ");
+    let line = docs
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("`{label}` bullet missing from: {docs}"));
+    line.split(" (").next().unwrap_or(line)
+}
+
+/// The release archive ships only `README.md`; `cargo install` ships nothing
+/// next to the binary. Neither layout may produce a `<docs>` section: every
+/// line in it names a path under the package root, and the topic index is
+/// relative to `docs/` and `examples/`. Before this gate the path-join-only
+/// section told an installed pir to read `<install>/docs/tui.md`, which does
+/// not exist — worse than omitting the section.
+#[test]
+fn docs_section_is_absent_when_the_package_tree_lacks_the_asset_set() {
+    // A resolved-but-missing package root.
+    let missing = PathBuf::from("/nonexistent/pir-package-root");
+    assert!(!missing.exists(), "fixture must be a missing directory");
+    assert!(sections_with_package_dir(Some(&missing))
         .get(SystemPromptSection::Docs)
-        .expect("a resolved package dir always renders <docs>");
-    assert!(docs.contains("- Main documentation: "), "{docs}");
+        .is_none());
+
+    // Release archive: binary + README.md, no docs/ or examples/.
+    let archive = DocsFixture::new("archive");
+    archive.file("README.md");
     assert!(
-        docs.contains("/nonexistent/pir-package-root/README.md"),
-        "{docs}"
+        sections_with_package_dir(Some(&archive.root))
+            .get(SystemPromptSection::Docs)
+            .is_none(),
+        "a README-only install must not point at docs/ or examples/"
     );
-    assert!(docs.contains("- Additional docs: "), "{docs}");
-    assert!(docs.contains("- Examples: "), "{docs}");
+
+    // Partial tree: docs/ is present but examples/ is not.
+    let partial = DocsFixture::new("partial");
+    partial.file("README.md");
+    partial.dir("docs");
+    assert!(
+        sections_with_package_dir(Some(&partial.root))
+            .get(SystemPromptSection::Docs)
+            .is_none(),
+        "a partial asset tree must not render dangling lines"
+    );
+}
+
+/// A complete package root (a source checkout): the section is emitted and
+/// EVERY path it names exists on disk. The old section was a pure path join,
+/// so the same assertion over an installed layout caught `docs/`/`examples/`
+/// pointing at nothing.
+#[test]
+fn docs_section_names_only_paths_that_exist() {
+    let package = DocsFixture::new("complete");
+    let readme = package.file("README.md");
+    let docs = package.dir("docs");
+    let examples = package.dir("examples");
+
+    let sections = sections_with_package_dir(Some(&package.root));
+    let rendered = sections
+        .get(SystemPromptSection::Docs)
+        .expect("a complete package root renders <docs>");
+
+    let mut documented = Vec::new();
+    for label in ["Main documentation", "Additional docs", "Examples"] {
+        let path = documented_path(&rendered, label);
+        assert!(
+            Path::new(path).exists(),
+            "`{label}` must name a path that exists in this install: `{path}`\n{rendered}"
+        );
+        documented.push(path.to_string());
+    }
+    assert_eq!(
+        documented,
+        vec![
+            readme.to_string_lossy().replace('\\', "/"),
+            docs.to_string_lossy().replace('\\', "/"),
+            examples.to_string_lossy().replace('\\', "/"),
+        ],
+        "the section must name exactly the resolved asset paths"
+    );
 }
 
 /// The section sits between `<rules>` and `<addendum>`, exactly where upstream
 /// emits it (`system-prompt.ts` insertion order).
 #[test]
 fn docs_section_sits_between_rules_and_addendum() {
+    let package = DocsFixture::new("order");
+    package.file("README.md");
+    package.dir("docs");
+    package.dir("examples");
     let tools = vec![tool("read")];
-    let package = std::path::PathBuf::from("/pkg");
     let sections = build_system_prompt_sections(&SystemPromptInput {
         preamble_override: None,
         append: vec!["APPENDED".to_string()],
@@ -368,7 +488,7 @@ fn docs_section_sits_between_rules_and_addendum() {
         skills: &[],
         custom_sections: Vec::new(),
         cwd: std::path::Path::new("/w"),
-        package_dir: Some(&package),
+        package_dir: Some(&package.root),
     });
     let order: Vec<SystemPromptSection> = sections.iter().map(|(name, _)| name.clone()).collect();
     assert_eq!(

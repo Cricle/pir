@@ -436,11 +436,16 @@ pub fn convert_google_contents(model: &Model, context: &Context) -> (Vec<Value>,
     // longer pays a second copy just to drop the system entries (Gemini has no
     // mid-conversation system role, so every request takes this branch).
     let mut system_parts: Vec<String> = Vec::new();
+    // `Context::system_prompt` is the live rendering (the caller joins it into
+    // `systemInstruction`): a replayed prompt snapshot contributes only the
+    // sections that rendering does not already carry, so a resumed session's
+    // prompt is sent once (PIR-BIN-053; Gemini has no by-name patch channel).
+    let live_prompt = context.system_prompt.as_deref();
     let mut conversation: Vec<&Message> = Vec::with_capacity(context.messages.len());
     for message in &context.messages {
         match message {
             Message::System(system) | Message::Developer(system) => {
-                let text = crate::ai::types::system_message_text(system);
+                let text = crate::ai::types::leading_system_fragment(system, live_prompt);
                 if !text.trim().is_empty() {
                     system_parts.push(text);
                 }

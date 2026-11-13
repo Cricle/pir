@@ -18,6 +18,17 @@ use super::*;
 const MAX_EPHEMERAL_HISTORY_TOKENS: u64 = 100_000;
 const MAX_EPHEMERAL_HISTORY_MESSAGES: usize = 1_024;
 
+/// [`MAX_EPHEMERAL_HISTORY_TOKENS`] in its public form: the estimated-token
+/// ceiling of a store-less session's in-memory transcript. Documented in
+/// `docs/FEATURES.md` (`--no-session` / SDK-without-storage) and reported on
+/// every `history_trimmed` notice (PIR-BIN-075).
+pub const EPHEMERAL_HISTORY_MAX_TOKENS: u64 = MAX_EPHEMERAL_HISTORY_TOKENS;
+
+/// [`MAX_EPHEMERAL_HISTORY_MESSAGES`] in its public form: the message-count
+/// ceiling of a store-less session's in-memory transcript (see
+/// [`EPHEMERAL_HISTORY_MAX_TOKENS`]).
+pub const EPHEMERAL_HISTORY_MAX_MESSAGES: usize = MAX_EPHEMERAL_HISTORY_MESSAGES;
+
 /// Inputs of one shared `before_agent_start` dispatch.
 pub(crate) struct BeforeAgentStartDispatch<'a> {
     /// The user prompt text (`messageType: "user"`), or `None` for a custom
@@ -129,7 +140,29 @@ pub(crate) async fn dispatch_before_agent_start(
     }
 }
 
-/// Trim `messages` in place to the newest window that fits both caps.
+/// Outcome of one [`trim_ephemeral_history`] call: what (if anything) was
+/// dropped, and which cap forced the drop. `None`-shaped (all zeros, no cap)
+/// means the transcript fit and nothing was touched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EphemeralTrim {
+    /// How many of the OLDEST messages were dropped by this call.
+    pub dropped_messages: usize,
+    /// Messages retained after the trim.
+    pub retained_messages: usize,
+    /// Which cap forced the trim: `"messages"` or `"tokens"`; `None` when
+    /// nothing was dropped.
+    pub reason: Option<&'static str>,
+}
+
+impl EphemeralTrim {
+    /// Whether this call dropped anything.
+    pub fn trimmed(&self) -> bool {
+        self.dropped_messages > 0
+    }
+}
+
+/// Trim `messages` in place to the newest window that fits both caps, and
+/// report what the trim cost ([`EphemeralTrim`]).
 ///
 /// The retained window never starts with an assistant/tool-result fragment:
 /// after choosing the oldest retained index, the start advances to the next
@@ -137,20 +170,43 @@ pub(crate) async fn dispatch_before_agent_start(
 /// kept (a message cannot be split); the vector is therefore bounded in
 /// practice by `max(max_messages, one huge message)`.
 ///
+/// This is the pir-only bound on a store-less session's in-memory transcript
+/// (upstream `SessionManager.inMemory` keeps the whole conversation). The
+/// caller MUST announce a non-empty result: PIR-BIN-075 was this drop
+/// happening with no event, no stderr line and no state field. The
+/// `messages`/`tokens` reason names which cap bound so the notice can say what
+/// the user lost instead of only that something went missing.
+///
 /// Exposed for the `tests/suites/agent_session_units.rs` integration suite;
 /// not part of the stable facade.
 #[doc(hidden)]
-pub fn trim_ephemeral_history(messages: &mut Vec<Message>, max_messages: usize, max_tokens: u64) {
+pub fn trim_ephemeral_history(
+    messages: &mut Vec<Message>,
+    max_messages: usize,
+    max_tokens: u64,
+) -> EphemeralTrim {
+    let mut outcome = EphemeralTrim {
+        retained_messages: messages.len(),
+        ..EphemeralTrim::default()
+    };
     if messages.is_empty() {
-        return;
+        return outcome;
     }
     let mut keep_from = messages.len();
     let mut kept_tokens = 0u64;
+    // Which cap rejected the candidate window; the LAST rejection while
+    // walking backwards is the one that actually decided `keep_from`.
+    let mut reason: Option<&'static str> = None;
     for (index, message) in messages.iter().enumerate().rev() {
         let next_tokens =
             kept_tokens.saturating_add(crate::compaction::estimate_message_tokens(message));
         let next_count = messages.len() - index;
-        if next_count > max_messages || next_tokens > max_tokens {
+        if next_count > max_messages {
+            reason = Some("messages");
+            break;
+        }
+        if next_tokens > max_tokens {
+            reason = Some("tokens");
             break;
         }
         kept_tokens = next_tokens;
@@ -158,8 +214,11 @@ pub fn trim_ephemeral_history(messages: &mut Vec<Message>, max_messages: usize, 
     }
     if keep_from == messages.len() {
         // The newest message alone exceeds a cap; keep it rather than
-        // dropping the entire transcript.
+        // dropping the entire transcript. The reason stays whatever the walk
+        // recorded (or "messages" for an empty cap: the count bound is the
+        // one that cannot hold even one message).
         keep_from = messages.len() - 1;
+        reason = Some(reason.unwrap_or("messages"));
     }
     if let Some(user_offset) = messages[keep_from..]
         .iter()
@@ -168,12 +227,77 @@ pub fn trim_ephemeral_history(messages: &mut Vec<Message>, max_messages: usize, 
         keep_from += user_offset;
     }
     if keep_from > 0 {
+        let dropped = keep_from;
         messages.drain(..keep_from);
         // A pre-fix session may arrive with a huge capacity; release it once
         // instead of retaining the old peak for the rest of the process.
         if messages.capacity() > messages.len().saturating_mul(2).max(64) {
             messages.shrink_to_fit();
         }
+        outcome.dropped_messages = dropped;
+        outcome.retained_messages = messages.len();
+        outcome.reason = reason.or(Some("messages"));
+    }
+    outcome
+}
+
+/// The exact user-facing line for one ephemeral-history trim (PIR-BIN-075).
+///
+/// The line names the number of OLDEST messages dropped, the number kept, the
+/// exact cap that forced the drop, and the cumulative total, so a user can tell
+/// what they lost instead of only that something is missing. `pir: warning:`
+/// is the product's diagnostic prefix for this class (PIR-BIN-066 / 070);
+/// the surrounding router decides whether it lands on stderr or in
+/// `<agentDir>/pir.log`.
+pub fn ephemeral_trim_notice(trim: EphemeralTrim, total_dropped: usize) -> String {
+    let reason = trim.reason.unwrap_or("messages");
+    let cap = match reason {
+        "tokens" => format!("{MAX_EPHEMERAL_HISTORY_TOKENS} estimated tokens"),
+        _ => format!("{MAX_EPHEMERAL_HISTORY_MESSAGES} messages"),
+    };
+    format!(
+        "pir: warning: --no-session history trimmed: dropped the {} oldest message(s), kept {} \
+         (ephemeral cap: {}); {} message(s) dropped in total since this session started. \
+         Persisted sessions are unaffected.",
+        trim.dropped_messages, trim.retained_messages, cap, total_dropped
+    )
+}
+
+impl AgentSession {
+    /// Announce one ephemeral-history trim (PIR-BIN-075) on every channel a
+    /// store-less session's host already listens to:
+    ///
+    /// 1. a `history_trimmed` [`SessionEvent`] — the RPC host forwards it BARE
+    ///    on stdout (the session-event bridge) and print's JSON mode writes it
+    ///    as a frame, so a protocol client sees the drop as it happens. This is
+    ///    the exactly-once-per-trim channel.
+    /// 2. a `pir: warning: …` diagnostic through the crate's routed logger
+    ///    ([`crate::ext_diag!`]: stderr for print/RPC/JSON, `<agentDir>/pir.log`
+    ///    for the TUI), the same surface `PIR-BIN-066`'s dropped context files
+    ///    and `PIR-BIN-070`'s compaction notices use (text from
+    ///    [`ephemeral_trim_notice`]).
+    /// 3. the session's cumulative `history_trimmed_messages` counter, which
+    ///    `get_state`/`get_session_stats` report, so a client that was not
+    ///    listening can still see the transcript is not the whole story.
+    ///
+    /// Non-fatal: the run continues with the bounded window.
+    fn announce_ephemeral_history_trim(&self, trim: EphemeralTrim) {
+        if !trim.trimmed() {
+            return;
+        }
+        let total = self
+            .history_trimmed
+            .fetch_add(trim.dropped_messages, Ordering::SeqCst)
+            .saturating_add(trim.dropped_messages);
+        crate::ext_diag!("{}", ephemeral_trim_notice(trim, total));
+        self.emit_session_event(SessionEvent::HistoryTrimmed {
+            dropped_messages: trim.dropped_messages,
+            retained_messages: trim.retained_messages,
+            max_messages: MAX_EPHEMERAL_HISTORY_MESSAGES,
+            max_tokens: MAX_EPHEMERAL_HISTORY_TOKENS,
+            reason: trim.reason.unwrap_or("messages"),
+            total_dropped_messages: total,
+        });
     }
 }
 
@@ -1679,6 +1803,9 @@ impl AgentSession {
             }
         }
         let mut projected: Option<ProjectionSnapshot> = None;
+        // Whether the ephemeral (store-less) trim above dropped anything; only
+        // the `None` (no session store) arm can set it (PIR-BIN-075).
+        let mut ephemeral_trim = EphemeralTrim::default();
         let mut messages = match &self.session {
             Some(session) => match startup_projection.take() {
                 // The prompt-start projection was already built for the
@@ -1719,14 +1846,20 @@ impl AgentSession {
                 for message in self.take_pending_setup_messages() {
                     slot.push(custom_run_user_message(&message));
                 }
-                trim_ephemeral_history(
+                let trim = trim_ephemeral_history(
                     slot,
                     MAX_EPHEMERAL_HISTORY_MESSAGES,
                     MAX_EPHEMERAL_HISTORY_TOKENS,
                 );
+                ephemeral_trim = trim;
                 slot.clone()
             }
         };
+        // PIR-BIN-075: the trim above is a pir-only bound (upstream keeps the
+        // whole in-memory transcript), so it must never be silent. Announced
+        // after the history lock is released: the notice emits a session event,
+        // and a subscriber must not run under the history write guard.
+        self.announce_ephemeral_history_trim(ephemeral_trim);
 
         // The agent loop runs until it settles. An `agent_before_settle`
         // handler returning `continue: true` guarantees exactly one more
@@ -2579,11 +2712,9 @@ impl AgentSession {
                     // them.
                     slot.extend(result.preamble.iter().cloned());
                     slot.extend(produced);
-                    trim_ephemeral_history(
-                        slot,
-                        MAX_EPHEMERAL_HISTORY_MESSAGES,
-                        MAX_EPHEMERAL_HISTORY_TOKENS,
-                    );
+                    // The prompt-start trim above is the announcement point;
+                    // re-trimming here would report a SECOND drop for one run
+                    // and put the announce call outside the `None` arm.
                 }
             }
             // P10: record the VIRTUAL selection on the branch, separately from

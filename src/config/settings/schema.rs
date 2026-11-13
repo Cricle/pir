@@ -137,6 +137,63 @@ pub struct ProviderRetrySettings {
     pub max_retry_delay_ms: Option<u64>,
 }
 
+/// The transport-level knobs `settings.retry.provider.*` resolves to, ready to
+/// install on a request's [`crate::ai::types::StreamOptions`] (upstream
+/// `ProviderRetrySettings` as `sdk.ts:341-352` maps it onto every request).
+///
+/// Every field is `Option` on purpose: `None` means "the user wrote nothing",
+/// so the request keeps the transport's existing default (2 retries, 60 s
+/// cap, no total timeout). Wiring the settings must not change the behavior of
+/// a run that never configured them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProviderRetryOverrides {
+    /// `retry.provider.maxRetries` as written. `Some(0)` means exactly one
+    /// request.
+    pub max_retries: Option<u32>,
+    /// `retry.provider.maxRetryDelayMs` as written (`Some(0)` disables the
+    /// cap).
+    pub max_retry_delay_ms: Option<u64>,
+    /// `retry.provider.timeoutMs` as written (`Some(0)` disables the total
+    /// timeout).
+    pub timeout_ms: Option<u64>,
+}
+
+impl ProviderRetryOverrides {
+    /// Whether the user configured anything: the gate hosts use to skip the
+    /// per-request field assignment entirely on the default path.
+    pub fn is_empty(&self) -> bool {
+        self.max_retries.is_none() && self.max_retry_delay_ms.is_none() && self.timeout_ms.is_none()
+    }
+
+    /// Resolve from a possibly absent `retry` block. Absent fields stay
+    /// `None` (the transport default), matching the "only explicit settings
+    /// change behavior" contract.
+    pub fn from_settings(retry: Option<&RetrySettings>) -> Self {
+        let provider = retry.and_then(|retry| retry.provider.as_ref());
+        Self {
+            max_retries: provider.and_then(|provider| provider.max_retries),
+            max_retry_delay_ms: provider.and_then(|provider| provider.max_retry_delay_ms),
+            timeout_ms: provider.and_then(|provider| provider.timeout_ms),
+        }
+    }
+
+    /// Layer these settings under an explicit per-call override (upstream
+    /// `options.maxRetries ?? providerRetrySettings.maxRetries`): the
+    /// caller-supplied option always wins, including the SDK embedder's
+    /// `set_retry` / `retry()`.
+    pub fn apply_to(self, options: &mut crate::ai::types::StreamOptions) {
+        if options.max_retries.is_none() {
+            options.max_retries = self.max_retries;
+        }
+        if options.max_retry_delay_ms.is_none() {
+            options.max_retry_delay_ms = self.max_retry_delay_ms;
+        }
+        if options.timeout_ms.is_none() {
+            options.timeout_ms = self.timeout_ms;
+        }
+    }
+}
+
 /// Retry settings (upstream `RetrySettings`; the legacy `maxDelayMs` field is
 /// migrated into `provider.maxRetryDelayMs` on load and never stored).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

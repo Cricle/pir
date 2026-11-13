@@ -1640,6 +1640,20 @@ pub(crate) fn apply_session_env(
     session_env: Option<&crate::agent::tool_execution::ToolSessionEnv>,
     base_path: Option<&str>,
 ) {
+    // PowerShell's `PATH` is a native Windows list: the previous native
+    // prepend stays byte-identical there.
+    apply_session_env_with(spawn, session_env, base_path, PathDialect::Native);
+}
+
+/// [`apply_session_env`] with an explicit `PATH` dialect for the consuming
+/// shell: the bash spawn sites pass [`PathDialect::Posix`] so a POSIX-spelled
+/// base is never mixed with a native prepend (PIR-BIN-076).
+pub(crate) fn apply_session_env_with(
+    spawn: &mut tokio::process::Command,
+    session_env: Option<&crate::agent::tool_execution::ToolSessionEnv>,
+    base_path: Option<&str>,
+    dialect: PathDialect,
+) {
     for name in [
         "PI_SESSION_ID",
         "PI_SESSION_FILE",
@@ -1660,7 +1674,7 @@ pub(crate) fn apply_session_env(
         spawn.env("PI_MODEL", &env.model.id);
         spawn.env("PI_REASONING_LEVEL", env.thinking.wire_key());
     }
-    apply_pir_bin_env(spawn, base_path);
+    apply_pir_bin_env(spawn, base_path, dialect);
 }
 
 /// The PI_* session variables as an environment-override map for backends
@@ -1700,10 +1714,96 @@ pub(crate) fn session_env_overrides(
     env
 }
 
+/// Which spelling the `PATH` a child receives must use.
+///
+/// The value is a shell-consumer property, not a platform property: the bash
+/// tool and its pooled member consume a POSIX/MSYS list, the PowerShell tool
+/// consumes a native Windows list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathDialect {
+    /// A POSIX/MSYS shell (`bash`, the pooled member, the embedded shell):
+    /// entries separated by `:`, drives as `/c/...`.
+    Posix,
+    /// A native Windows program (PowerShell): entries separated by `;`,
+    /// drives as `C:\...`.
+    Native,
+}
+
+/// Whether a Windows `PATH` value is in the MSYS/POSIX spelling a real MSYS
+/// bash consumes (`/mingw64/bin:/usr/bin:/c/...`).
+///
+/// The shim spawn ([`msys_shim_spawn_target`]) always produces such a list,
+/// but an ambient `PATH` is POSIX-spelled too when `pir` itself was launched
+/// from Git Bash — and that per-call arm had the same hybrid defect
+/// (PIR-BIN-076, measured). A native Windows PATH never starts with `/` and a
+/// POSIX PATH never contains `;` (MSYS separates with `:`), so the two shapes
+/// are unambiguous.
+#[cfg(windows)]
+fn is_msys_posix_path(value: &str) -> bool {
+    !value.contains(';') && value.starts_with('/')
+}
+
+/// Compose the child `PATH` from the `pir` binary's directory plus `existing`
+/// in ONE spelling.
+///
+/// `PIR_BIN` itself is always a native path (that is what `exec` and
+/// PowerShell need), but the shell consuming `PATH` is not necessarily native:
+/// [`msys_shim_spawn_target`] hands a spawn a POSIX-spelled list, and MSYS
+/// cannot convert a hybrid (`C:\…\bin;/mingw64/bin:/usr/bin:/c/...`) back to a
+/// native PATH. A native child then sees a mangled list (`C;C:\…;\mingw64\bin`)
+/// and cannot resolve ANY program by name — `spawnSync node ENOENT` for the
+/// dominant Windows toolchain (PIR-BIN-076; measured: the same entries with
+/// only the prepend's spelling changed resolve fine).
+///
+/// For a [`PathDialect::Posix`] consumer the base's own spelling decides the
+/// prepend: a POSIX base gets the directory converted with
+/// [`msys_path_from_windows`] and joined with `:`; a native base keeps the
+/// native spelling joined with `;` (MSYS converts a pure native path itself, so
+/// that case was already correct). A [`PathDialect::Native`] consumer keeps the
+/// previous native join byte-for-byte.
+pub(crate) fn compose_pir_bin_path(
+    directory: &std::path::Path,
+    existing: &std::ffi::OsStr,
+    dialect: PathDialect,
+) -> std::ffi::OsString {
+    #[cfg(windows)]
+    if dialect == PathDialect::Posix {
+        if let Some(existing_text) = existing.to_str() {
+            if is_msys_posix_path(existing_text) {
+                let directory_text = msys_path_from_windows(&directory.to_string_lossy());
+                return std::ffi::OsString::from(format!("{directory_text}:{existing_text}"));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = dialect;
+    let mut entries = vec![directory.to_path_buf()];
+    entries.extend(std::env::split_paths(existing));
+    match std::env::join_paths(entries) {
+        Ok(joined) => joined,
+        Err(_) => {
+            // A path component contains the platform separator: fall back to
+            // plain concatenation rather than dropping the prepend.
+            let separator = if cfg!(windows) { ';' } else { ':' };
+            let mut joined = directory.as_os_str().to_os_string();
+            joined.push(separator.to_string());
+            joined.push(existing);
+            joined
+        }
+    }
+}
+
 /// Expose the running `pir` binary to the child shell: `PIR_BIN` holds its
 /// absolute path and the binary's directory is prepended to the child `PATH`,
 /// so a command can call `pir grep|sed|python …` directly.
-pub(crate) fn apply_pir_bin_env(spawn: &mut tokio::process::Command, base_path: Option<&str>) {
+///
+/// The prepend follows `dialect` ([`compose_pir_bin_path`]), so a POSIX shell
+/// never receives a `;`+`:` hybrid.
+pub(crate) fn apply_pir_bin_env(
+    spawn: &mut tokio::process::Command,
+    base_path: Option<&str>,
+    dialect: PathDialect,
+) {
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
@@ -1718,22 +1818,7 @@ pub(crate) fn apply_pir_bin_env(spawn: &mut tokio::process::Command, base_path: 
         spawn.env("PATH", directory);
         return;
     };
-    let mut entries = vec![directory.to_path_buf()];
-    entries.extend(std::env::split_paths(&existing));
-    match std::env::join_paths(entries) {
-        Ok(joined) => {
-            spawn.env("PATH", joined);
-        }
-        Err(_) => {
-            // A path component contains the platform separator: fall back to
-            // plain concatenation rather than dropping the prepend.
-            let separator = if cfg!(windows) { ';' } else { ':' };
-            let mut joined = directory.as_os_str().to_os_string();
-            joined.push(separator.to_string());
-            joined.push(existing);
-            spawn.env("PATH", joined);
-        }
-    }
+    spawn.env("PATH", compose_pir_bin_path(directory, &existing, dialect));
 }
 
 /// Upstream `bashOutputSchema`: the structured result for programmatic
@@ -1990,7 +2075,12 @@ impl AgentTool for BashTool {
             }
             apply_tree_kill_spawn_attributes(&mut spawn);
             // PI_* session environment (upstream `resolveSpawnContext`).
-            apply_session_env(&mut spawn, session_env.as_deref(), spawn_path.as_deref());
+            apply_session_env_with(
+                &mut spawn,
+                session_env.as_deref(),
+                spawn_path.as_deref(),
+                PathDialect::Posix,
+            );
             if shell.stdin_transport() {
                 // Legacy WSL bash: the command arrives on stdin.
                 spawn.stdin(std::process::Stdio::piped());

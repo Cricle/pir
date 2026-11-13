@@ -3907,14 +3907,14 @@ function pirAgentSessionText(message) {
  * when the run completed. Upstream print-mode.ts:139-156 decides the run's
  * outcome from exactly this shape — `stopReason` `error` or `aborted` is a
  * failed run, reported as `errorMessage || "Request " + stopReason` (text
- * mode exits 1 on it). The `--mode json` child this bridge consumes exits 0
- * for those turns and reports the failure only in-band (the terminal
- * `message_end`/`turn_end` line; `src/coding_agent/json.rs`, pinned by
- * `tests/suites/cli_entry_contract.rs::json_mode_provider_error_exits_0_with_header_and_error_event`),
- * so the consumer MUST apply the same check to the terminal message itself:
- * resolving a failed turn would report a provider/transport failure as a
- * successful empty reply (`reply: ""`), the exact cross-turn silence this
- * bridge was hiding.
+ * mode exits 1 on it). The `--mode json` child this bridge consumes reports
+ * that same failure IN-BAND (the terminal `message_end`/`turn_end` line) and,
+ * since PIR-BIN-037, ALSO exits nonzero for it, so the consumer MUST apply
+ * the terminal-message check (upstream `prompt()` rejects with the
+ * `errorMessage`, and an exit-code-only rejection would degrade it to
+ * plumbing): resolving a failed turn would report a provider/transport
+ * failure as a successful empty reply (`reply: ""`), the exact cross-turn
+ * silence this bridge was hiding.
  *
  * `fromIndex` bounds the scan to the messages THIS run appended
  * (`state.messages` accumulates across prompts), so a later run never
@@ -4040,12 +4040,24 @@ function pirAgentSessionRun(state, emit, text) {
         reject(new Error(delivered === undefined ? "Request aborted" : delivered));
         return;
       }
+      const terminalError = pirAgentSessionTerminalError(state.messages, firstMessageIndex);
       if (code !== 0) {
+        // A nonzero exit covers the invocation-level failure path (upstream
+        // print-mode.ts throws before/outside the run and exits 1) as well as
+        // a run whose terminal message carries `stopReason: "error"` (PIR-
+        // BIN-037: `--mode json` now exits nonzero for that class too, while
+        // keeping the failure in the event stream). When the stream DID
+        // deliver the terminal error, reject with its `errorMessage` —
+        // upstream's `prompt()` rejects with exactly that text, and the
+        // exit-code line would replace it with unhelpful plumbing.
+        if (terminalError !== undefined) {
+          reject(new Error(terminalError));
+          return;
+        }
         const detail = stderrText.trim().split("\n").pop() || "exit code " + code;
         reject(new Error("AgentSession.prompt child run failed: " + detail));
         return;
       }
-      const terminalError = pirAgentSessionTerminalError(state.messages, firstMessageIndex);
       if (terminalError !== undefined) {
         reject(new Error(terminalError));
         return;

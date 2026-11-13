@@ -2575,6 +2575,12 @@ pub fn apply_extension_status(
 }
 
 impl App {
+    // The eight parameters are the interactive host's flat "startup inputs"
+    // record, copied straight from the run-mode entry point; grouping them
+    // into a struct would move the same fields behind one more name and every
+    // caller would have to build it. Same treatment as the other host
+    // factories (`build_session_agent` in server/session.rs).
+    #[allow(clippy::too_many_arguments)]
     fn new(
         configured: Option<PiConfiguredModel>,
         extension_paths: &[std::path::PathBuf],
@@ -2583,6 +2589,7 @@ impl App {
         ext_dispatcher: Option<ExtDispatcher>,
         session_dir: SessionDirSource,
         tui_mode: TuiMode,
+        resolved_thinking: Option<crate::ai::types::ThinkingLevel>,
     ) -> anyhow::Result<Self> {
         // Theme from settings (upstream `applyFromSettings`).
         set_theme_from_settings(Some(
@@ -2768,13 +2775,24 @@ impl App {
                 .as_ref()
                 .map(|c| c.model.reasoning)
                 .unwrap_or(false),
+            // PIR-TUI-032: the footer is seeded from the SAME resolved +
+            // clamped level the worker's `WorkerOverrides.thinking` carries
+            // (`startup_thinking_level`), so `--thinking high`, a `--model
+            // m:high` suffix, a settings default and the no-setting case all
+            // paint the effort the first request actually sends. Seeding from
+            // `settings.default_thinking_level` alone painted `thinking off`
+            // for every CLI/suffix choice. No configured model (the
+            // `/login`-pending surface) keeps the old `off` placeholder.
             thinking_level: configured
                 .as_ref()
                 .map(|c| {
-                    c.settings
-                        .default_thinking_level
-                        .map(|l| format!("{l:?}").to_lowercase())
-                        .unwrap_or_else(|| "off".to_string())
+                    startup_thinking_level(
+                        &c.model,
+                        resolved_thinking,
+                        c.settings.default_thinking_level,
+                    )
+                    .wire_key()
+                    .to_string()
                 })
                 .unwrap_or_else(|| "off".to_string()),
             context_window: configured
@@ -2825,21 +2843,20 @@ impl App {
                 crate::config::settings::FullscreenScrollbar::Hidden => ScrollbarMode::Hidden,
             })
             .unwrap_or(ScrollbarMode::Auto);
-        // The header slot: the built-in startup header lines, replaced by the
+        // The header slot: the built-in startup header rows, replaced by the
         // `ctx.ui.setHeader` factory's cached lines once registered (upstream
         // swaps the header container's child; `setHeader(undefined)` restores
-        // the built-in header).
-        let mut builtin_header: Vec<super::app::LiveHeaderLine> = Vec::new();
-        if show_startup_header {
-            for kind in super::app::startup_header_kinds(false) {
-                // The hints resolve from the LIVE keybinding registry
-                // (upstream `keyText` over `getKeybindings()`,
-                // interactive-mode.ts:1021-1056).
-                builtin_header.push(super::app::LiveHeaderLine::new(kind, &keybindings));
-            }
-        }
+        // the built-in header). The built-in rows are derived lazily in
+        // `render_builtin` from the live `tools_expanded` value (PIR-TUI-030),
+        // so ctrl+o can expand the startup key list after construction; the
+        // hints resolve from the LIVE keybinding registry (upstream `keyText`
+        // over `getKeybindings()`, interactive-mode.ts:1021-1056).
         content.add_child(ExtensionHeaderSlot {
-            builtin: builtin_header,
+            builtin: Mutex::new(Vec::new()),
+            show_builtin: show_startup_header,
+            expanded: Arc::clone(&tools_expanded),
+            built_for: Mutex::new(None),
+            keybindings: keybindings.clone(),
             custom: Arc::clone(&factory_header),
         });
         content.add_child(SharedChat {
@@ -4218,7 +4235,15 @@ impl App {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .set_live_tick(live_tick);
             if moved && self.core.frame_buffer_length() > 0 {
-                self.core.invalidate_frame();
+                // PIR-TUI-027: a regular-mode window slide used to call
+                // `invalidate_frame`, whose next full repaint emits `2J` +
+                // home + `3J` — and `3J` ERASES the terminal's scrollback,
+                // i.e. exactly the history the user had already scrolled
+                // through. The repaint still has to start from a cleared
+                // screen (a plain re-write would stack the new frame's head
+                // onto the old one), but it must NOT discard scrollback:
+                // `2J` + home leaves the rows already scrolled off intact.
+                self.core.invalidate_baseline_keep_scrollback();
             }
             if window.should_install(entries, entry_epoch) {
                 self.chat
@@ -4228,10 +4253,23 @@ impl App {
                 self.chat_blocks
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .set_entries(&entries[start..]);
+                    .set_entries_windowed(&entries[start..], start);
                 self.chat_revision.fetch_add(1, Ordering::Relaxed);
                 window.mark_installed(entries, entry_epoch);
             }
+            // Regular mode has no app-owned viewport: the truncation row's
+            // "load" affordance is the terminal's own scrollback (`None` makes
+            // the row say "scroll up to load"), and the count is the window's
+            // absolute start — the exact number of entries not materialized.
+            self.chat_blocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_truncation(window.start(), None);
+            // PIR-TUI-027: a non-zero window start means the frame below is a
+            // bounded TAIL, so the renderer must never emit `3J` while it is
+            // installed — that would erase scrollback the frame cannot
+            // re-emit. Set before the render this sync precedes.
+            self.core.set_frame_is_complete_transcript(start == 0);
             return moved;
         }
         let mut alt = self
@@ -4278,6 +4316,20 @@ impl App {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .set_live_tick(live_tick);
+        // PIR-TUI-027: the truncation row's count is the band's absolute start
+        // (set by the install above); the windowed surface has a real
+        // jump-to-earliest binding, so the row names it. Refreshed every frame
+        // (not only on install) because a `/settings` rebind can change the
+        // displayed chord without moving the window.
+        self.chat_blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_truncation(window.start(), altscreen_search::load_older_key_text());
+        // The alt screen has no terminal scrollback to protect (its history is
+        // the app-owned band), so the clearing repaint keeps upstream's byte
+        // shape there; only the main-screen regular path needs the `3J` gate
+        // (PIR-TUI-027).
+        self.core.set_frame_is_complete_transcript(true);
         moved
     }
 
@@ -5118,6 +5170,33 @@ pub(crate) fn combo_text(combo: &super::keybindings::KeyCombo) -> String {
     spec
 }
 
+/// [`combo_text`] for a live `app.*` action id, falling back to `fallback`
+/// when the id is unbound (PIR-TUI-031).
+///
+/// The `/hotkeys` table used to spell these chords literally, which taught
+/// `alt+enter` (a newline in the editor) as "queue follow-up" and
+/// `shift+ctrl+p` as cycle-backward on Windows, where the live defaults are
+/// `ctrl+q` and `alt+p`. Resolving through the same registry the key handler
+/// routes makes the printed help and the working keys one source.
+fn app_chord_text(app: &App, id: &str, fallback: &str) -> String {
+    app.keybindings
+        .keys_for_app_id(id)
+        .and_then(|combos| combos.first().map(combo_text))
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+/// The `/hotkeys` row for model cycling: forward and backward resolved
+/// separately, joined the way the table shows them (`ctrl+p / alt+p`).
+fn model_cycle_chord_text(app: &App) -> String {
+    let forward = app_chord_text(app, "app.model.cycleForward", "ctrl+p");
+    let backward = app_chord_text(app, "app.model.cycleBackward", "alt+p");
+    if forward == backward {
+        forward
+    } else {
+        format!("{forward} / {backward}")
+    }
+}
+
 /// A static header line component. Holds the UNSTYLED header kind; the
 /// theme styling is applied inside `render`, so a live theme swap
 /// (`ctx.ui.setTheme`) restyles the startup header on the next frame
@@ -5133,16 +5212,109 @@ impl Component for HeaderLine {
     }
 }
 
+/// The built-in startup header as FRAME ROWS: one padded row per header line
+/// for `width`, with the expanded key list (`HeaderLineKind::ExpandedKeys`)
+/// split into one row per hint.
+///
+/// Upstream's `expandableInstructions` joins the hints with `\n` and the
+/// renderer splits them into lines, so the expanded header is the logo row,
+/// the compact row, a blank, then one row PER chord (interactive-mode.ts
+/// :1026-1048). [`super::app::LiveHeaderLine`] paints exactly one row, so the
+/// expanded list cannot ride it: its styled text is a single `\n`-joined
+/// string whose embedded newlines would land inside one frame row (the frame
+/// is row-oriented — `Rows::push` is one row per call — so such a row is
+/// truncated by the width clamp and the list never becomes visible). This
+/// builder is therefore the ONE place the built-in header becomes rows, shared
+/// by [`ExtensionHeaderSlot`]'s render and the regression test.
+///
+/// Collapsed rows are byte-identical to the pre-PIR-TUI-030 frames: each line
+/// is still `ansi::pad_to_width(header_line_styled_for(kind, kb), width)`,
+/// exactly what [`super::app::LiveHeaderLine`]'s memo stores.
+///
+/// `#[doc(hidden)] pub`: asserted directly by
+/// `tests/suites/tui_surface_units.rs` (collapsed bytes, expanded rows, and
+/// the collapse-back round trip through a live cell).
+#[doc(hidden)]
+pub fn builtin_header_rows(expanded: bool, kb: &Keybindings, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    for kind in super::app::startup_header_kinds(expanded) {
+        let styled = super::app::header_line_styled_for(kind, kb);
+        if kind == super::app::HeaderLineKind::ExpandedKeys {
+            // One row per hint (upstream `expandedInstructions().join("\n")`
+            // split by the renderer). Each hint row is padded like any other
+            // header row so the frame stays rectangular.
+            for hint in styled.split('\n') {
+                rows.push(ansi::pad_to_width(hint, width));
+            }
+        } else {
+            rows.push(ansi::pad_to_width(&styled, width));
+        }
+    }
+    rows
+}
+
 /// The content-top header slot: the built-in startup header lines, replaced
 /// by the `ctx.ui.setHeader` factory's cached lines once registered (upstream
 /// swaps the header container's child, interactive-mode.ts:2554-2580).
 /// `setHeader(undefined)` restores the built-in header.
 struct ExtensionHeaderSlot {
-    /// The built-in startup header lines (`quietStartup` may leave this
-    /// empty).
-    builtin: Vec<super::app::LiveHeaderLine>,
+    /// The built-in startup header's rows (`quietStartup` may leave this
+    /// empty). Rebuilt when [`Self::expanded`] moves or the frame width /
+    /// palette changes (PIR-TUI-030): the startup line advertises `ctrl+o
+    /// more`, and upstream's ctrl+o expands the key list — before this the
+    /// header was frozen collapsed at construction, so the advertised key
+    /// repainted a byte-identical screen.
+    builtin: Mutex<Vec<String>>,
+    /// `quietStartup`: when false the slot paints no built-in header at all.
+    show_builtin: bool,
+    /// The live `App::tools_expanded` cell (ctrl+o writes it, extensions write
+    /// `ctx.ui.setToolsExpanded`).
+    expanded: Arc<AtomicBool>,
+    /// `(expanded, width, theme generation)` the cached rows were built for;
+    /// `None` before the first build. The three inputs fully determine the
+    /// rows — `builtin_header_rows` is a pure function of the first input
+    /// plus the construction-fixed registry and `pad_to_width` pads by width.
+    built_for: Mutex<Option<(bool, usize, u64)>>,
+    /// The keybinding registry the built-in hints resolve through.
+    keybindings: Keybindings,
     /// The custom factory slot (cached lines refreshed by the tick loop).
     custom: Arc<Mutex<Option<FactoryWidget>>>,
+}
+
+impl ExtensionHeaderSlot {
+    /// Paint the built-in header, rebuilding the cached rows when the live
+    /// `tools_expanded` value (or the width / palette) moved (PIR-TUI-030).
+    ///
+    /// A rebuild re-derives and re-styles the whole header — 19 chord hints in
+    /// the expanded shape — so it is gated on an actual input change: a steady
+    /// frame costs one atomic load, three compares and a row copy.
+    fn render_builtin(&self, width: usize, out: &mut Rows<'_>) {
+        if !self.show_builtin {
+            return;
+        }
+        let expanded = self.expanded.load(Ordering::Relaxed);
+        let theme_generation = super::theme::Theme::generation();
+        let key = (expanded, width, theme_generation);
+        let mut built_for = self
+            .built_for
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *built_for != Some(key) {
+            let rows = builtin_header_rows(expanded, &self.keybindings, width);
+            *self
+                .builtin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = rows;
+            *built_for = Some(key);
+        }
+        let builtin = self
+            .builtin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for row in builtin.iter() {
+            out.push(row);
+        }
+    }
 }
 
 impl Component for ExtensionHeaderSlot {
@@ -5163,8 +5335,8 @@ impl Component for ExtensionHeaderSlot {
     /// Direct-write path: a registered custom header's cached lines are padded
     /// IN PLACE in the frame's recycled row buffers (the old `pad_to_width`
     /// built one throwaway `String` per line per frame only for the canvas to
-    /// copy it), and each built-in line writes its own row through
-    /// [`LiveHeaderLine`]'s canvas form. Row for row byte-identical to
+    /// copy it), and each built-in header row is copied from the slot's own
+    /// cache ([`builtin_header_rows`]). Row for row byte-identical to
     /// [`Component::render`].
     fn render_into(&self, width: usize, out: &mut Rows<'_>) {
         let custom = self
@@ -5181,10 +5353,11 @@ impl Component for ExtensionHeaderSlot {
             }
             return;
         }
-        // Each built-in line renders exactly one row.
-        for line in &self.builtin {
-            line.render_into(width, out);
-        }
+        // The built-in header's rows follow the live `tools_expanded` cell
+        // (PIR-TUI-030): ctrl+o expands the startup key list one row per
+        // hint, exactly like upstream, and the collapsed default is
+        // byte-identical to the pre-change bytes.
+        self.render_builtin(width, out);
     }
 
     /// The header is small and its rows depend on live inputs the slot does
@@ -5211,6 +5384,32 @@ impl Component for ExtensionHeaderSlot {
         }
         Some(super::core::mix_content_revision(state, lines.len() as u64))
     }
+}
+
+/// The built-in header rows of a LIVE header slot: the exact frame rows the
+/// slot paints for a given `tools_expanded` value.
+///
+/// `#[doc(hidden)] pub`: the regression seam for
+/// `tests/suites/tui_surface_units.rs`. It builds the real
+/// [`ExtensionHeaderSlot`] around a fresh cell (the same construction the TUI
+/// start path uses, minus the factory slot) and renders it at `width`, so a
+/// change to the slot's live-value plumbing cannot pass the builder-level test
+/// alone: ctrl+o's effect is asserted on the slot's own output.
+#[doc(hidden)]
+pub fn live_builtin_header_rows(
+    expanded: Arc<AtomicBool>,
+    kb: &Keybindings,
+    width: usize,
+) -> Vec<String> {
+    let slot = ExtensionHeaderSlot {
+        builtin: Mutex::new(Vec::new()),
+        show_builtin: true,
+        expanded,
+        built_for: Mutex::new(None),
+        keybindings: kb.clone(),
+        custom: Arc::new(Mutex::new(None)),
+    };
+    slot.render(width)
 }
 
 /// The fixed bottom dock: extension dialog overlay (while open) → pending →
@@ -7992,6 +8191,19 @@ pub struct ChatBlockCache {
     retired: std::collections::HashMap<usize, ChatBlockSlot>,
     /// Absolute transcript index of `blocks[0]` (the installed window).
     window_start: usize,
+    /// PIR-TUI-027: absolute index of the first materialized entry — entries
+    /// `[0, truncation_start)` are NOT in the band. When non-zero, block 0
+    /// paints an honest truncation row above the band
+    /// (`... (N earlier entries, …)`), so a huge session's bounded window
+    /// never hides history silently (PROTOCOL v8 §5a). The value is folded
+    /// into block 0's revision, so a window slide repaints the row.
+    truncation_start: usize,
+    /// Resolved chord that targets/loads older history in the current TUI
+    /// mode (`tui.altScreen.top`, displayed like `Ctrl+Home`). `None` when
+    /// the caller has no such binding or the surface has none (regular mode
+    /// uses the terminal's own scrollback), and the row then says
+    /// "scroll up to load" instead of naming a key that does not work.
+    truncation_load_key: Option<String>,
     /// Cached revision vector: `block_revisions` is called every frame, and
     /// a fresh `Vec<u64>` per frame was steady-state garbage in the hot path.
     /// Keyed by `(len, rolling hash)`; a collision only costs a stale cache
@@ -8031,6 +8243,8 @@ impl ChatBlockCache {
             blocks: Vec::new(),
             retired: std::collections::HashMap::new(),
             window_start: 0,
+            truncation_start: 0,
+            truncation_load_key: None,
             revisions_cache: None,
         }
     }
@@ -8154,6 +8368,53 @@ impl ChatBlockCache {
         self.set_entries_windowed(entries, 0);
     }
 
+    /// Publish the truncation row's inputs (PIR-TUI-027): the absolute index of
+    /// the first materialized entry and the chord that loads older history.
+    ///
+    /// `absolute_start` is `0` whenever the whole transcript is materialized
+    /// (the row is then suppressed), and equals the window start otherwise, so
+    /// the count the row shows is exactly the number of entries not on screen.
+    /// [`Self::block_revisions`] folds both inputs into block 0's revision, so
+    /// a changed count or key repaints the lead row on the next frame while a
+    /// steady window keeps reusing the cached rows.
+    pub fn set_truncation(&mut self, absolute_start: usize, load_key: Option<String>) {
+        if self.truncation_start == absolute_start && self.truncation_load_key == load_key {
+            return;
+        }
+        self.truncation_start = absolute_start;
+        self.truncation_load_key = load_key;
+        self.revisions_cache = None;
+    }
+
+    /// First materialized transcript index (the truncation count the lead row
+    /// reports; test/diagnostic seam).
+    pub fn truncation_start(&self) -> usize {
+        self.truncation_start
+    }
+
+    /// The truncation row the band paints above block 0, without terminal
+    /// styling (`None` when the whole transcript is materialized). This is the
+    /// row `SharedChat::render_into` emits first, and the exact text a screen
+    /// dump must show once a session crosses the window cap.
+    pub fn truncation_hint_text(&self) -> Option<String> {
+        self.lead_rows()
+            .map(|row| super::ansi::strip_ansi(&row))
+            .filter(|text| !text.trim().is_empty())
+    }
+
+    /// The styled lead row painted above block 0 (currently just the
+    /// truncation hint; `None` when nothing is truncated). Called on the render
+    /// path, so it builds at most one row.
+    fn lead_rows(&self) -> Option<String> {
+        if self.truncation_start == 0 || self.blocks.is_empty() {
+            return None;
+        }
+        let key = self.truncation_load_key.as_deref();
+        Some(super::theme::with_theme(|theme| {
+            super::messages::transcript_truncation_hint(theme, self.truncation_start, key)
+        }))
+    }
+
     /// Publish the materialized entry slice and its ABSOLUTE transcript
     /// origin (window start). Called when the app installs a slice / moves
     /// the window — not on steady frames.
@@ -8164,6 +8425,12 @@ impl ChatBlockCache {
     /// every memoized row instead of rebuilding. Slots that leave the window
     /// are retained in `retired` up to [`CHAT_BLOCK_RETENTION_MAX`].
     pub fn set_entries_windowed(&mut self, entries: &[ChatEntry], window_start: usize) {
+        // PIR-TUI-027: the window origin IS the truncation count — entries
+        // `[0, window_start)` are not in the band, and the lead row must say
+        // so. Kept in step here (rather than requiring every caller to call
+        // `set_truncation` first) so no install path can publish a silent
+        // truncation.
+        self.truncation_start = window_start;
         // Retire the current window's slots under their absolute indices.
         let old_start = self.window_start;
         for (index, slot) in std::mem::take(&mut self.blocks).into_iter().enumerate() {
@@ -8382,6 +8649,16 @@ impl ChatBlockCache {
         for slot in &self.blocks {
             hash = super::core::mix_content_revision(hash, slot.revision);
         }
+        // The truncation lead row is part of block 0's rendered identity, so
+        // its state belongs in the cache key too (otherwise a frame whose
+        // entries are unchanged but whose lead row moved would reuse the
+        // cached vector and keep painting the stale row). `lead_revision`
+        // already folds in the load-key bytes, and is `0` when nothing is
+        // truncated so an untruncated band's keys stay exactly as before.
+        let lead = self.lead_revision();
+        if lead != 0 {
+            hash = super::core::mix_content_revision(hash, lead);
+        }
         if let Some((len, cached_hash, cached)) = &self.revisions_cache {
             if *len == self.blocks.len() && *cached_hash == hash {
                 return Some(Arc::clone(cached));
@@ -8390,16 +8667,53 @@ impl ChatBlockCache {
         let revisions: Arc<[u64]> = self
             .blocks
             .iter()
-            .map(|slot| slot.revision)
+            .enumerate()
+            .map(|(index, slot)| {
+                // Block 0 also owns the truncation lead row (PIR-TUI-027), so
+                // its frame identity must move whenever that row's text does.
+                if index == 0 {
+                    super::core::mix_content_revision(slot.revision, lead)
+                } else {
+                    slot.revision
+                }
+            })
             .collect::<Vec<_>>()
             .into();
         self.revisions_cache = Some((self.blocks.len(), hash, Arc::clone(&revisions)));
         Some(revisions)
     }
 
+    /// Revision contribution of the truncation lead row, folded into block 0's
+    /// frame identity (see [`Self::block_revisions`]). `0` when nothing is
+    /// truncated, so an untruncated band's revisions stay byte-identical to
+    /// the pre-PIR-TUI-027 values.
+    fn lead_revision(&self) -> u64 {
+        if self.truncation_start == 0 || self.blocks.is_empty() {
+            return 0;
+        }
+        let mut hash = super::core::mix_content_revision(
+            0x5452_554e_4300_0001, // "TRUNC" domain tag: never collides with 0
+            self.truncation_start as u64,
+        );
+        if let Some(key) = &self.truncation_load_key {
+            for byte in key.as_bytes() {
+                hash = super::core::mix_content_revision(hash, u64::from(*byte));
+            }
+        }
+        hash
+    }
+
     /// Render one block into the frame's recycled canvas. `TuiCore` calls this
     /// only when the block's revision moved or its frame position changed.
     pub fn render_block(&mut self, index: usize, width: usize, out: &mut Rows<'_>) {
+        // PIR-TUI-027: block 0 carries the truncation lead row above the band
+        // (see `lead_rows`). It is part of this block's rows, so the frame
+        // cache's "row 0 of this block changed" diff reaches it naturally.
+        if index == 0 {
+            if let Some(lead) = self.lead_rows() {
+                push_padded_row(out, &lead, width);
+            }
+        }
         let Some(slot) = self.blocks.get_mut(index) else {
             return;
         };
@@ -9403,6 +9717,7 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
         None,
         session_dir_source,
         tui_mode,
+        resolved_thinking,
     )?;
     timings.time("tui.app");
     // W11-C: the alt-screen viewport router resolves its `tui.altScreen.*`
@@ -12631,6 +12946,13 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
         }
         let frame_due = dirty && app.core.frame_due_at(Instant::now(), input_priority);
         if frame_due {
+            // Frame-start snapshot of the materialized band's origin. The
+            // PIR-TUI-027 self-driving repaint guard AFTER the render asks
+            // whether this frame actually moved the band up; if the plan below
+            // could not (the band is already over `TRANSCRIPT_WINDOW_MAX_BYTES`
+            // at the session top) the loop must go idle, or it repaints forever
+            // with nothing changing (measured 98% CPU, 19 MB write log).
+            let window_start_at_frame_start = transcript_window.start();
             if !dialog_open {
                 // Frame advance: paced by `ctx.ui.setWorkingIndicator`'s
                 // `intervalMs` when set (0 = advance every tick, the built-in
@@ -12699,6 +13021,32 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             // pre-P0.3 loop did not touch the container per render.
             if app.core.windowed_viewport() {
                 let scroll_offset = app.core.scroll_offset();
+                // PIR-TUI-027 jump-to-earliest target: `tui.altScreen.top`
+                // (Ctrl+Home) asks for the EARLIEST content, but the band
+                // extends only one chunk (64 entries, ~250 rows) per frame, so
+                // a single jump left the view sitting below the freshly grown
+                // band top and the proximity trigger closed for good (measured:
+                // Ctrl+Home stopped at entry 191 of 900). While the jump
+                // target is set, keep re-anchoring the view to the band top
+                // each frame; the extension then continues until entry 0 is
+                // materialized. Any other scroll clears the target (see
+                // `TuiCore::scroll_to`), so ordinary paging is untouched.
+                if app.core.band_top_target() && transcript_window.start() > 0 {
+                    let geometry = altscreen_search::viewport_geometry(
+                        app.core.frame_buffer_length(),
+                        app.core.dock_height(),
+                        app.core.rows().max(1),
+                    );
+                    // NOT `set_scroll_offset`: that path treats the call as a
+                    // user scroll and would clear the very target that drove it.
+                    app.core.anchor_to_band_top(geometry.max_offset);
+                } else if app.core.band_top_target() {
+                    // Entry 0 is materialized: the jump reached the session
+                    // start, so the pin has nothing left to chase. Leaving it
+                    // set would keep pinning the view at the (now whole)
+                    // transcript's top forever.
+                    app.core.clear_band_top_target();
+                }
                 if last_scroll_offset != Some(scroll_offset) {
                     last_scroll_offset = Some(scroll_offset);
                     // A user scroll retries a failed read (no auto-retry loop).
@@ -12778,6 +13126,15 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             }
             ui_heartbeat.beat(UI_PHASE_RENDER);
             input_trace.frames += 1;
+            // PIR-TUI-027: keep the renderer's `3J` gate in step with the window
+            // actually installed for THIS frame. The sync paths above set it on
+            // install; this per-frame assignment also covers frames where the
+            // window did not move but a session switch reset it, so a windowed
+            // (tail-only) frame can never take a clearing repaint that erases
+            // scrollback it cannot re-emit.
+            app.core.set_frame_is_complete_transcript(
+                app.core.windowed_viewport() || transcript_window.start() == 0,
+            );
             let render_trace = super::search_trace::Timer::new();
             app.core.render();
             render_trace.log(
@@ -12810,6 +13167,34 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             // frame dirty: the next pass paints one self-contained keyframe.
             if app.core.needs_keyframe() {
                 dirty = true;
+            }
+            // PIR-TUI-027: the materialized window extends ONE chunk per
+            // frame, and a frame only happens while `dirty`. A scroll that
+            // lands far above the band (Ctrl+Home targets the earliest
+            // content) therefore extended one chunk and then sat still, so
+            // the oldest entries stayed unreachable until the user pressed
+            // the key again. Keep the loop dirty while the scrolled view is
+            // still within load-ahead distance of the band top, entries
+            // remain above it, AND the last frame actually moved the band: a
+            // band that cannot extend (already over `TRANSCRIPT_WINDOW_MAX_BYTES`
+            // at the top of the transcript) must go idle, otherwise this is a
+            // permanent self-driving repaint loop (measured 98% CPU and a 19 MB
+            // write log while the screen was not changing).
+            if app.core.windowed_viewport()
+                && app.core.scroll_offset() > 0
+                && transcript_window.start() < window_start_at_frame_start
+            {
+                let viewport_rows = app
+                    .core
+                    .rows()
+                    .max(1)
+                    .saturating_sub(app.core.dock_height())
+                    .max(1);
+                if transcript_window.start() > 0
+                    && app.core.visible_top() <= viewport_rows.saturating_mul(2).max(1)
+                {
+                    dirty = true;
+                }
             }
             if search_walk_check {
                 // The frame that materialized a walked page is painted: the
@@ -20320,7 +20705,12 @@ fn handle_command(
                 ),
                 ("shift+tab".to_owned(), "Cycle thinking level".to_owned()),
                 (
-                    "ctrl+p / shift+ctrl+p".to_owned(),
+                    // Resolve the LIVE chords like the neighbouring rows do
+                    // (PIR-TUI-031): the Windows defaults are `ctrl+p` /
+                    // `alt+p`, not the `shift+ctrl+p` this table used to
+                    // hardcode, so the help surface now teaches the keys the
+                    // handler actually routes.
+                    model_cycle_chord_text(app),
                     "Cycle models".to_owned(),
                 ),
                 ("ctrl+l".to_owned(), "Open model selector".to_owned()),
@@ -20339,7 +20729,14 @@ fn handle_command(
                     },
                     "Edit message in external editor".to_owned(),
                 ),
-                ("alt+enter".to_owned(), "Queue follow-up message".to_owned()),
+                (
+                    // Same rule as the model-cycle row (PIR-TUI-031): the
+                    // Windows default for `app.message.followUp` is `ctrl+q`,
+                    // and `alt+enter` is a NEWLINE in the editor — printing it
+                    // here taught a key that does something else entirely.
+                    app_chord_text(app, "app.message.followUp", "ctrl+q"),
+                    "Queue follow-up message".to_owned(),
+                ),
                 ("/".to_owned(), "Slash commands".to_owned()),
                 ("!".to_owned(), "Run bash command".to_owned()),
                 (
@@ -24103,6 +24500,38 @@ pub fn initial_interactive_thinking(
         .unwrap_or(crate::ai::providers::resolution::DEFAULT_THINKING_LEVEL)
 }
 
+/// The STARTING thinking level an interactive session installs — the ONE
+/// value both the footer ([`FooterState::thinking_level`]) and
+/// [`build_agent_session`]'s `AgentSessionConfig.thinking` are built from.
+///
+/// `resolved` is the CLI/suffix/settings chain's answer
+/// ([`crate::coding_agent::overrides::resolve_model`], which the TUI resolves
+/// before the worker starts); `None` falls back to the settings-derived
+/// starting level ([`initial_interactive_thinking`]). The result is then
+/// clamped to the model's supported ladder through the SAME clamp the session
+/// construction and the print host use
+/// ([`crate::agent_session::clamp_starting_thinking_level_for_model`],
+/// PIR-BIN-074), so the footer paints exactly the effort the first request
+/// carries — for `--thinking`, a `--model m:level` suffix, a settings default,
+/// or no setting at all.
+///
+/// Two copies of this level used to exist: the worker got the resolved
+/// `selection.thinking` while the footer was seeded from
+/// `settings.default_thinking_level` alone (PIR-TUI-032), so `--thinking high`
+/// painted `thinking off` for the whole first turn. Routing both through this
+/// helper (and the shared clamp) is what keeps them from drifting again.
+#[doc(hidden)]
+pub fn startup_thinking_level(
+    model: &crate::ai::types::Model,
+    resolved: Option<crate::ai::types::ThinkingLevel>,
+    default_thinking_level: Option<crate::ai::types::ThinkingLevel>,
+) -> crate::ai::types::ThinkingLevel {
+    crate::agent_session::clamp_starting_thinking_level_for_model(
+        model,
+        resolved.unwrap_or_else(|| initial_interactive_thinking(default_thinking_level)),
+    )
+}
+
 /// Build the ONE `AgentSession` the interactive worker drives: session
 /// storage per the resolved plan, core + shared-extension tools, compaction,
 /// and the context-file system prompt (the facade injects AGENTS.md /
@@ -24164,10 +24593,14 @@ fn build_agent_session(
     // background ETag revalidation, delayed first hop, PI_OFFLINE-gated.
     crate::ai::providers::install_remote_catalog_overlays(&provider_registry);
     // `--thinking` wins; otherwise the settings-derived level (upstream
-    // `buildSessionOptions` -> `findInitialModel`).
-    let thinking = overrides.thinking.unwrap_or_else(|| {
-        initial_interactive_thinking(configured.settings.default_thinking_level)
-    });
+    // `buildSessionOptions` -> `findInitialModel`). ONE helper derives it, and
+    // it is CLAMPED to the model's ladder there (PIR-BIN-074), so this
+    // `config.thinking` is already the level the first request will carry.
+    let thinking = startup_thinking_level(
+        &configured.model,
+        overrides.thinking,
+        configured.settings.default_thinking_level,
+    );
     // The `--models` scope drives Ctrl+P cycling and `/model` matching
     // (upstream `session.setScopedModels`). Resolved before the config takes
     // the registry handle; `set_scoped_models` applies after construction.

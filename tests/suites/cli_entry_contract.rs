@@ -8,9 +8,10 @@
 //! validation (`--provider requires --model`, `--name`, `--session-id`), the
 //! upstream exit codes (parse errors exit 1, `--help`/`-v` exit 0 with a bare
 //! semver), the `--list-models` table, the `config` package/resource listing,
-//! the package-management roundtrip, and the JSON-mode in-band provider
-//! error (exit 0). Failed prompts run against the shared instant-401 sandbox
-//! endpoint (`crate::common::sandbox_endpoint()`), never an unreachable host.
+//! the package-management roundtrip, and the JSON-mode terminal error
+//! (still in-band as an event AND now a nonzero exit, PIR-BIN-037). Failed
+//! prompts run against the shared instant-401 sandbox endpoint
+//! (`crate::common::sandbox_endpoint()`), never an unreachable host.
 
 use std::io::Cursor;
 use std::process::Command;
@@ -656,12 +657,17 @@ fn list_models_search_miss_reports_no_match() {
 }
 
 #[test]
-fn json_mode_provider_error_exits_0_with_header_and_error_event() {
-    // Upstream print-mode.ts maps a terminal error onto the exit code only in
-    // TEXT mode; `--mode json` exits 0 and reports the failure as an event
-    // line. The run targets the instant-401 sandbox endpoint (fail fast); the
-    // ephemeral (`--no-session`) run still opens with a synthesized session
-    // header line, and every line stays standalone-parseable JSON.
+fn json_mode_provider_error_exits_nonzero_with_header_and_error_event() {
+    // PIR-BIN-037: a print run whose final result carries
+    // `stopReason: "error"` exits nonzero in `--mode json` too. The failure
+    // stays IN the event stream (the terminal message keeps
+    // `stopReason`/`errorMessage` — that in-band report is the better
+    // behavior and stays), but the process status must not claim success:
+    // upstream's print path exits 1 for an invocation/provider failure, and a
+    // CI job checking only the exit code must fail. The run targets the
+    // instant-401 sandbox endpoint (fail fast); the ephemeral (`--no-session`)
+    // run still opens with a synthesized session header line, and every line
+    // stays standalone-parseable JSON.
     let (mut command, home) = sandbox_command(
         &["--mode", "json", "--no-session", "-p", "hi"],
         "json-provider-error",
@@ -671,13 +677,23 @@ fn json_mode_provider_error_exits_0_with_header_and_error_event() {
         sandbox_models_json(),
     );
     let output = command.output().expect("pir binary should start");
+    // Windows maps a native child's exit status through `status.code()`; the
+    // value 1 survives that mapping (measured against the base binary and on
+    // the fixed build), so pin it instead of only `!success()`.
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "json mode reports provider errors in-band: {}",
+        Some(1),
+        "a json-mode terminal error must fail the process: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8_lossy(&output.stdout);
+    // BOTH halves in the same run: the nonzero status above is only correct
+    // because the stream still carries the terminal error — the exit code is
+    // a report, not a replacement for the event.
+    assert!(
+        text.contains("\"stopReason\":\"error\""),
+        "the terminal message must keep stopReason error in stdout: {text}"
+    );
     let mut lines = text.lines();
     let first = lines.next().unwrap_or_default();
     assert!(
@@ -692,6 +708,94 @@ fn json_mode_provider_error_exits_0_with_header_and_error_event() {
         serde_json::from_str::<serde_json::Value>(line)
             .unwrap_or_else(|error| panic!("json line {line:?} is not valid JSON: {error}"));
     }
+}
+
+#[test]
+fn json_mode_without_a_provider_fails_the_process_and_keeps_the_error_event() {
+    // PIR-BIN-037's exact repro: an isolated agent dir with NO credential and
+    // NO models.json. The run cannot resolve a model, so the print host emits
+    // its terminal error frame straight to stdout. Both halves are asserted
+    // in the SAME run — a nonzero status whose stream no longer carried the
+    // `stopReason: "error"` message would be a regression of the in-band
+    // report this host deliberately keeps (upstream instead writes nothing to
+    // the stream and exits 1); and an in-band error with exit 0 (the old
+    // behavior) is the defect this test pins.
+    let (mut command, home) = sandbox_command(
+        &[
+            "--mode",
+            "json",
+            "--no-session",
+            "--no-context-files",
+            "-p",
+            "hi",
+        ],
+        "json-no-provider",
+    );
+    let _ = std::fs::remove_file(home.join("agent").join("models.json"));
+    let output = command.output().expect("pir binary should start");
+    // The native exit status maps through `status.code()` on Windows; 1 is
+    // what pi exits with for the same failure, and the value survives the
+    // mapping (measured), so pin it rather than only `!success()`.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a print run with no resolvable model must exit 1: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("\"stopReason\":\"error\""),
+        "the terminal error frame must stay in the JSON stream: {text}"
+    );
+    assert!(
+        text.contains("\"errorMessage\":\"no model available"),
+        "the frame's errorMessage must explain the failure: {text}"
+    );
+    // Every emitted line is still standalone-parseable JSON.
+    for line in text.lines() {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|error| panic!("json line {line:?} is not valid JSON: {error}"));
+    }
+}
+
+#[test]
+fn text_mode_without_a_provider_exits_nonzero() {
+    // The same invocation in text mode: the host returns the error, the CLI
+    // prints it on stderr and exits nonzero (upstream print-mode.ts's catch).
+    // PIR-BIN-037 requires BOTH modes to agree on the failure, so this pins
+    // the text half of the contract next to the json one above.
+    let (mut command, home) = sandbox_command(
+        &[
+            "--mode",
+            "text",
+            "--no-session",
+            "--no-context-files",
+            "-p",
+            "hi",
+        ],
+        "text-no-provider",
+    );
+    let _ = std::fs::remove_file(home.join("agent").join("models.json"));
+    let output = command.output().expect("pir binary should start");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a text print run with no resolvable model must exit 1: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no model available"),
+        "the failure must be reported on stderr: {stderr}"
+    );
+    // Text mode writes no event stream, so a successful-looking stdout would
+    // silently report the empty result as the answer.
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "an unmodeled text run must not print a fake answer: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 #[test]

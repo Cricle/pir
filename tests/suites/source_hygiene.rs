@@ -238,8 +238,10 @@ const EXPECT_SITE_ALLOWLIST: [(&str, u32); 30] = [
     ("agent_session/session_ctx.rs", 746),
     // `reuse` is computed two lines above as
     // `old.as_ref().is_some_and(|slot| ..)`, so `Some` is proven when this
-    // branch runs; the `take` cannot observe `None`.
-    ("tui/terminal.rs", 8191),
+    // branch runs; the `take` cannot observe `None`. Shifted 8398 -> 8458 by
+    // the PIR-TUI-027/030 edits above it in the same function (same site, same
+    // invariant).
+    ("tui/terminal.rs", 8458),
     // `guard.sender.is_none()` returns above, so the `as_ref()` in the same
     // locked scope is `Some`: the sender is read and used under one sink lock
     // with no intervening mutation. (This site surfaced when the file's

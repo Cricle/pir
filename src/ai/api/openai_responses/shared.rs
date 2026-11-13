@@ -770,12 +770,16 @@ pub fn convert_responses_messages(
     } else {
         let mut leading: std::borrow::Cow<'_, str> =
             std::borrow::Cow::Borrowed(context.system_prompt.as_deref().unwrap_or(""));
+        // The live prompt is the authoritative rendering; a replayed prompt
+        // snapshot contributes only sections it does not already carry
+        // (upstream patches sections by name — PIR-BIN-053).
+        let live_prompt = context.system_prompt.as_deref();
         let mut kept: Vec<&Message> = Vec::with_capacity(context.messages.len());
         for message in &context.messages {
             match message {
                 Message::System(system) => {
-                    let text = system_text(system);
-                    if !text.is_empty() {
+                    let text = crate::ai::types::leading_system_fragment(system, live_prompt);
+                    if !text.trim().is_empty() {
                         let mut owned = leading.into_owned();
                         if !owned.is_empty() {
                             owned.push_str("\n\n");

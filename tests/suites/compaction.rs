@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use pir::ai::types::{
     AssistantMessage, ContentBlock, Context, ImageContent, Message, Model, ModelCost,
-    ModelCostRates, StopReason, TextContent, ThinkingContent, ToolCall, ToolResultMessage,
+    ModelCostRates, StopReason, TextContent, ThinkingContent, Tool, ToolCall, ToolResultMessage,
     ToolResultRole, Usage, UserMessage, UserRole,
 };
 use pir::compaction::algorithm::{
@@ -444,6 +444,173 @@ fn should_compact_boundary_is_strictly_greater_than_window_minus_reserve() {
     assert!(!should_compact(&estimated, &model, &config));
     let big = context_of(vec![user_msg(&"y".repeat(80_004))]); // 22859 tokens
     assert!(should_compact(&big, &model, &config));
+}
+
+/// PIR-BIN-070: a session-backed projection records the request's tool
+/// declarations in its system entry's `toolsAdded`, and the request carries the
+/// SAME definitions in `tools[]`. The content floor charged both blocks and
+/// reported 3 005 tokens for a 2 215-token request (790 tokens = `toolsAdded`
+/// 3 160 B / 4), firing the threshold ~781 tokens early: pir compacted 24
+/// times over a 26-turn script where upstream compacted 8.
+///
+/// The declarations must be counted exactly ONCE, on both floor entry points —
+/// the projected basis (`estimate_request_projected_context_tokens_floor`, the
+/// session-backed threshold gate) and the messages[] basis
+/// (`estimate_request_messages_tokens_floor`, the ephemeral/no-projection path)
+/// — while the floor still refuses to hide a genuinely large transcript
+/// (PIR-SDK-011's hardening).
+#[test]
+fn request_floor_counts_tool_declarations_once_for_a_session_backed_projection() {
+    // Three declarations, ~3.1 KB of JSON like the cost lane measured
+    // (`toolsAdded` 3 160 B vs wire `tools[]` 3 127 B: the session entry
+    // serializes the same definitions).
+    let tools: Vec<Tool> = (0..3)
+        .map(|index| Tool {
+            name: format!("tool{index}"),
+            description: format!("Tool {index} does a thing. {}", "d".repeat(1_000)),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            }),
+            constrained_sampling: None,
+        })
+        .collect();
+    let tool_units = serde_json::to_string(&tools)
+        .map(|json| pir::compaction::text_token_units(&json))
+        .expect("tools serialize");
+    let tool_tokens = tool_units.div_ceil(4);
+    assert!(
+        tool_tokens > 700,
+        "the fixture must carry a realistic declaration block, got {tool_tokens}"
+    );
+
+    // The session's system entry: empty text (pir keeps the prompt in
+    // `Context::system_prompt`) and the request's declarations in `toolsAdded`.
+    let session_system = Message::System(UserMessage {
+        role: UserRole::System,
+        content: Vec::new(),
+        tools_added: Some(tools.clone()),
+        tools_removed: None,
+        timestamp: 1,
+        sections: None,
+    });
+    let conversation = vec![
+        user_msg(&"u".repeat(1_500)),
+        assistant_msg(vec![text_block("ok")], StopReason::Stop, Usage::default()),
+        user_msg(&"v".repeat(1_500)),
+    ];
+    let mut messages = vec![session_system];
+    messages.extend(conversation.iter().cloned());
+    let projected = cut_entries_of(&messages);
+    let prompt = "You are a helpful coding assistant.";
+
+    // The wire this describes: prompt text + the three turns + `tools[]` once.
+    // The floor's units are quarter-tokens, so the expectation is the same
+    // single rounding the estimator applies.
+    let transcript_units = 1_500 * 2 + 2;
+    let prompt_units = pir::compaction::text_token_units(prompt);
+    let single_count_units = transcript_units + prompt_units + tool_units;
+    let expected = single_count_units.div_ceil(4);
+
+    let projected_floor = pir::compaction::estimate_request_projected_context_tokens_floor(
+        &projected,
+        Some(prompt),
+        Some(&tools),
+    );
+    let messages_floor = pir::compaction::estimate_request_messages_tokens_floor(
+        &messages,
+        Some(prompt),
+        Some(&tools),
+    );
+    assert_eq!(
+        projected_floor,
+        expected,
+        "the projected floor must charge the declaration block once (single-count {expected} \
+         vs double-count {})",
+        (single_count_units + tool_units).div_ceil(4)
+    );
+    assert_eq!(
+        messages_floor,
+        expected,
+        "the messages[] floor must charge the declaration block once (single-count {expected} \
+         vs double-count {})",
+        (single_count_units + tool_units).div_ceil(4)
+    );
+    // The defect this pins: the old double count was worth the whole tools
+    // block, which is what fired the threshold a turn early.
+    let double_counted = (single_count_units + tool_units).div_ceil(4);
+    assert!(
+        double_counted - expected >= tool_tokens - 1,
+        "the old double count must be the tools block: {double_counted} vs {expected}"
+    );
+
+    // The floor is KEPT, not deleted: a genuinely over-threshold transcript
+    // must stay visible to it (PIR-SDK-011's stale/understated usage record).
+    let huge = vec![
+        Message::System(UserMessage {
+            role: UserRole::System,
+            content: Vec::new(),
+            tools_added: Some(tools.clone()),
+            tools_removed: None,
+            timestamp: 1,
+            sections: None,
+        }),
+        user_msg(&"w".repeat(80_000)),
+    ];
+    let huge_projected = cut_entries_of(&huge);
+    let huge_floor = pir::compaction::estimate_request_projected_context_tokens_floor(
+        &huge_projected,
+        Some(prompt),
+        Some(&tools),
+    );
+    assert!(
+        huge_floor >= 20_000,
+        "an 80 000-char transcript must stay visible to the floor: {huge_floor}"
+    );
+
+    // A mid-run `declareToolChanges` delta declares a SUBSET of the live
+    // loadout. Only the names it does NOT declare may be charged again, so the
+    // floor still covers the full request (it must not drop to the delta's own
+    // block).
+    let delta_messages = {
+        let mut list = vec![Message::System(UserMessage {
+            role: UserRole::System,
+            content: Vec::new(),
+            tools_added: Some(vec![tools[0].clone()]),
+            tools_removed: None,
+            timestamp: 1,
+            sections: None,
+        })];
+        list.extend(conversation);
+        list
+    };
+    // What such a request lays out: the delta's own definition (charged inside
+    // the system message) plus the remaining declarations as an array.
+    let declared_units = serde_json::to_string(&tools[0])
+        .map(|json| pir::compaction::text_token_units(&json))
+        .expect("definition serializes");
+    let undeclared_units = serde_json::to_string(&tools[1..])
+        .map(|json| pir::compaction::text_token_units(&json))
+        .expect("remaining declarations serialize");
+    let delta_floor = pir::compaction::estimate_request_messages_tokens_floor(
+        &delta_messages,
+        Some(prompt),
+        Some(&tools),
+    );
+    let delta_expected =
+        (transcript_units + prompt_units + declared_units + undeclared_units).div_ceil(4);
+    // ±1 token: the two JSON arrays carry their own `[`/`]` framing, which is
+    // two quarter-token units of slack before the single rounding.
+    assert!(
+        delta_floor.abs_diff(delta_expected) <= 1,
+        "a partial declaration must still pay for the undeclared tools: {delta_floor} vs \
+         expected {delta_expected}"
+    );
+    assert!(
+        delta_floor > expected,
+        "the two undeclared tools must be charged: {delta_floor} vs fully-declared {expected}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -749,3 +749,92 @@ fn settings_file_lock_takes_over_an_abandoned_lock() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-057: `settings.retry.provider.*` resolution
+// ---------------------------------------------------------------------------
+
+/// The provider retry block resolves to transport overrides, and an unset
+/// field stays `None` so the transport's compiled default survives (the v8
+/// rule: only explicit settings change behavior).
+#[test]
+fn provider_retry_overrides_only_carry_fields_the_user_wrote() {
+    use pir::config::settings::{ProviderRetryOverrides, RetrySettings, SettingsManager};
+
+    let dir = temp_dir("provider-retry-overrides");
+    write_file(
+        &dir.join("settings.json"),
+        r#"{ "retry": { "provider": { "maxRetries": 0, "maxRetryDelayMs": 5000, "timeoutMs": 1000 } } }"#,
+    );
+    let manager = SettingsManager::load(&dir, &dir.join(".pi"), &dir, true);
+    let overrides = manager.provider_retry_overrides();
+    assert_eq!(overrides.max_retries, Some(0));
+    assert_eq!(overrides.max_retry_delay_ms, Some(5_000));
+    assert_eq!(overrides.timeout_ms, Some(1_000));
+    assert!(!overrides.is_empty());
+
+    // Nothing configured: every field stays None (transport defaults), and
+    // `maxRetryDelayMs` in particular is NOT forced to the 60s default here —
+    // that would make an explicit per-call override impossible to keep.
+    let bare = temp_dir("provider-retry-bare");
+    write_file(&bare.join("settings.json"), "{}");
+    let manager = SettingsManager::load(&bare, &bare.join(".pi"), &bare, true);
+    let defaults = manager.provider_retry_overrides();
+    assert_eq!(defaults, ProviderRetryOverrides::default());
+    assert!(defaults.is_empty());
+
+    // An absent `retry` block and an empty disabled one both resolve to
+    // "unset", never to `maxRetries: 0` (which would silently disable the
+    // transport's existing retries).
+    let empty_retry = RetrySettings::default();
+    assert_eq!(
+        ProviderRetryOverrides::from_settings(Some(&empty_retry)),
+        ProviderRetryOverrides::default()
+    );
+    assert_eq!(
+        ProviderRetryOverrides::from_settings(None),
+        ProviderRetryOverrides::default()
+    );
+}
+
+/// `ProviderRetryOverrides::apply_to` layers settings UNDER explicit request
+/// options (upstream `options.maxRetries ?? providerRetrySettings.maxRetries`)
+/// and leaves them untouched when the user configured nothing.
+#[test]
+fn provider_retry_overrides_never_override_an_explicit_request_option() {
+    use pir::ai::types::StreamOptions;
+    use pir::config::settings::ProviderRetryOverrides;
+
+    let configured = ProviderRetryOverrides {
+        max_retries: Some(3),
+        max_retry_delay_ms: Some(5_000),
+        timeout_ms: Some(1_000),
+    };
+
+    // Explicit values win (the SDK embedder's `set_retry` / `retry()`).
+    let mut explicit = StreamOptions {
+        max_retries: Some(0),
+        max_retry_delay_ms: Some(20),
+        timeout_ms: Some(9_000),
+        ..StreamOptions::default()
+    };
+    configured.apply_to(&mut explicit);
+    assert_eq!(explicit.max_retries, Some(0));
+    assert_eq!(explicit.max_retry_delay_ms, Some(20));
+    assert_eq!(explicit.timeout_ms, Some(9_000));
+
+    // Unset request options take the configured values.
+    let mut unset = StreamOptions::default();
+    configured.apply_to(&mut unset);
+    assert_eq!(unset.max_retries, Some(3));
+    assert_eq!(unset.max_retry_delay_ms, Some(5_000));
+    assert_eq!(unset.timeout_ms, Some(1_000));
+
+    // Nothing configured: the request keeps every field as it was (transport
+    // defaults, i.e. 2 retries / 60 s cap / no total timeout).
+    let mut untouched = StreamOptions::default();
+    ProviderRetryOverrides::default().apply_to(&mut untouched);
+    assert_eq!(untouched.max_retries, None);
+    assert_eq!(untouched.max_retry_delay_ms, None);
+    assert_eq!(untouched.timeout_ms, None);
+}

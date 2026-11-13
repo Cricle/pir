@@ -489,6 +489,50 @@ pub fn resolve_path_str(path: &str) -> String {
     resolve_path_str_with(path, home.as_deref(), &cwd)
 }
 
+/// Compare two [`resolve_path_str`] results with the platform's path identity.
+///
+/// The inputs are already absolute and lexically normalized (separators and
+/// `.`/`..`), so the only platform difference left is case: Windows filesystems
+/// (NTFS, the shell) treat `C:\Proj` and `c:\proj` as the same directory, so
+/// the comparison folds case there. POSIX paths stay byte-for-byte distinct —
+/// a case-insensitive filesystem mounted on POSIX is not assumed.
+///
+/// This is the one path-identity rule the session cwd filters use
+/// (`session_cwd_matches`, `filter_sessions_by_cwd`,
+/// [`is_default_session_dir`], `session_resolve::cwd_matches`).
+pub fn resolved_paths_equal(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        a.to_lowercase() == b.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Whether `session_dir` is the DEFAULT per-cwd session directory for `cwd`
+/// (`<agent-dir>/sessions/<encoded-cwd>`, upstream
+/// `getDefaultSessionDirPath`).
+///
+/// Upstream's session discovery only applies the header-cwd filter to a
+/// CUSTOM session dir (`filterCwd = sessionDir !== undefined && dir !==
+/// getDefaultSessionDirPath(cwd)` in `SessionManager.list`, `continueRecent`
+/// and `findById`): the default dir is already cwd-encoded, so every session
+/// in it belongs to this cwd no matter how the header spells the path. That
+/// makes the filter unnecessary there — and on Windows it is actively wrong,
+/// because the same directory can be recorded as `C:\Proj` and later
+/// addressed as `c:\proj`.
+pub fn is_default_session_dir(session_dir: &Path, cwd: &str) -> bool {
+    resolved_paths_equal(
+        &resolve_path_str(&session_dir.to_string_lossy()),
+        &resolve_path_str(&default_session_dir_path(cwd).to_string_lossy()),
+    )
+}
+
 /// Encode a resolved cwd into a safe directory name (upstream
 /// `getDefaultSessionDirPath`): strip exactly ONE leading separator, map the
 /// remaining `/`, `\`, `:` to `-`, and wrap in `--...--`.
@@ -1814,12 +1858,13 @@ fn read_session_header_listing(
 }
 
 /// Whether a header cwd matches the reference cwd (upstream
-/// `sessionCwdMatches`: resolved-path comparison). Takes the header cwd
-/// borrowed: the listings used to build a `Some(header.cwd.clone())` just to
-/// call this, one `String` copy per candidate file.
+/// `sessionCwdMatches`: resolved-path comparison, case-insensitive on Windows
+/// — see [`resolved_paths_equal`]). Takes the header cwd borrowed: the
+/// listings used to build a `Some(header.cwd.clone())` just to call this, one
+/// `String` copy per candidate file.
 fn session_cwd_matches(cwd: Option<&str>, resolved_cwd: &str) -> bool {
     cwd.filter(|value| !value.is_empty())
-        .is_some_and(|value| resolve_path_str(value) == resolved_cwd)
+        .is_some_and(|value| resolved_paths_equal(&resolve_path_str(value), resolved_cwd))
 }
 
 /// The process working directory as a string (upstream `process.cwd()`).
@@ -4058,10 +4103,8 @@ impl SessionManager {
         let session_dir = session_dir.as_ref();
         // Upstream: a custom session dir filters by header cwd (it may hold
         // sessions for several projects); the default dir is cwd-encoded, so
-        // no filter is needed.
-        let is_default = resolve_path_str(&session_dir.to_string_lossy())
-            == resolve_path_str(&default_session_dir_path(cwd).to_string_lossy());
-        let recent = if is_default {
+        // no filter is needed (see `is_default_session_dir`).
+        let recent = if is_default_session_dir(session_dir, cwd) {
             find_most_recent_session(session_dir, None)
         } else {
             find_most_recent_session(session_dir, Some(cwd))
@@ -4432,9 +4475,7 @@ impl SessionManager {
         let resolved_cwd = resolve_path_str(cwd);
         sessions
             .iter()
-            .filter(|session| {
-                !session.cwd.is_empty() && resolve_path_str(&session.cwd) == resolved_cwd
-            })
+            .filter(|session| session_cwd_matches(Some(&session.cwd), &resolved_cwd))
             .map(|session| {
                 SESSION_FILTER_CORPUS_BYTES.with(|bytes| {
                     bytes.set(

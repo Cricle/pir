@@ -39,11 +39,28 @@ fn load_context_file_from_dir(
     dir: &Path,
     diagnostics: &mut Vec<String>,
 ) -> Option<(PathBuf, String)> {
+    // On a case-insensitive volume two candidates can name the SAME file
+    // (`AGENTS.md` / `AGENTS.MD`, likewise `CLAUDE.md` / `CLAUDE.MD`; Windows
+    // and macOS by default), so visiting both spellings reports one file twice
+    // — duplicate diagnostics — and a retry after a failed read just re-reads
+    // the same file. Each candidate's file IDENTITY is therefore visited once:
+    // the canonical path resolves case on a case-insensitive volume and stays
+    // distinct on a case-sensitive one, so `pir` keeps upstream's precedence
+    // there (where `AGENTS.md` and `AGENTS.MD` really are two files) without a
+    // platform branch. `canonicalize_lossy` falls back to the raw path on
+    // error, which can only leave a candidate un-deduped (the pre-fix
+    // behaviour), never hide a file that exists.
+    let mut visited: Vec<PathBuf> = Vec::with_capacity(CONTEXT_FILE_CANDIDATES.len());
     for filename in CONTEXT_FILE_CANDIDATES {
         let path = dir.join(filename);
         if !path.is_file() {
             continue;
         }
+        let identity = canonicalize_lossy(&path);
+        if visited.contains(&identity) {
+            continue;
+        }
+        visited.push(identity);
         // Skip oversized files before reading (pir hardening).
         let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         if size > MAX_CONTEXT_FILE_BYTES {

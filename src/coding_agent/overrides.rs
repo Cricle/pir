@@ -143,7 +143,12 @@ pub fn resolve_model(
     // per-model override, then `defaultThinkingLevel`, then the shared
     // default. Mirrors `print.rs`.
     let thinking = {
-        let explicit = match overrides.model.as_deref() {
+        // PIR-BIN-078: `--thinking` applies unconditionally (upstream
+        // `main.ts:522-524`), so it must win on the no-`--model` arm too —
+        // the old shape returned `None` there and let the settings default
+        // win, while the same flag with `--model` did apply. The model arm
+        // only contributes its `:level` suffix when the flag is absent.
+        let pattern_thinking = match overrides.model.as_deref() {
             Some(pattern) => {
                 let (_, pattern_thinking, _) =
                     crate::ai::providers::resolution::resolve_cli_model_with_auth(
@@ -155,19 +160,26 @@ pub fn resolve_model(
                         overrides.thinking,
                     )
                     .map_err(anyhow::Error::msg)?;
-                overrides.thinking.or(pattern_thinking)
+                pattern_thinking
             }
             None if !scoped_models.is_empty() && !overrides.is_continuing => {
                 scoped_models[0].thinking_level
             }
             None => None,
         };
+        let explicit = overrides.thinking.or(pattern_thinking);
         let per_model = settings.model_thinking_levels.as_ref().and_then(|levels| {
             levels
                 .get(&format!("{}/{}", model.provider, model.id))
                 .copied()
         });
-        crate::agent_session::resolve_starting_thinking_level(
+        // PIR-BIN-074: the level the TUI footer and the worker's
+        // `WorkerOverrides.thinking` both receive is CLAMPED here, at
+        // resolution (upstream clamps at `createAgentSession`, sdk.ts:264):
+        // `--thinking max` on a model without a `max` map entry must paint
+        // and send `high`, never `max`. One clamp, two consumers.
+        crate::agent_session::resolve_starting_thinking_level_for_model(
+            &model,
             explicit,
             per_model,
             settings.default_thinking_level,

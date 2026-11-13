@@ -26,6 +26,7 @@ coding_agent/tools/bash.rs 5 0 0  # Win32 Job Object FFI; Win32 GetFileAttribute
 coding_agent/tools/confine.rs 27 0 0  # Unix openat/mkdirat/fstatat/renameat/unlinkat; Win32 reparse-point-aware open
 coding_agent/tools/shell_pool.rs 28 1 0  # Win32 Job Object/console FFI, Unix geteuid; one unsafe fn (ACL check)
 coding_agent/tools/spill.rs 16 0 0  # Win32 security-descriptor/ACL + CreateFileW FFI
+coding_agent/tools/util.rs 1 0 0  # Win32 FormatMessageW for locale-independent OS error text (PIR-BIN-077); caller-owned fixed buffer
 env_daemon/pty.rs 9 0 0  # ConPTY and Unix pty/termios FFI
 env_daemon/sys/unix.rs 5 0 0  # libc process/session/filesystem FFI
 env_daemon/sys/windows.rs 10 0 0  # Win32 process/console/filesystem FFI

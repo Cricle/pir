@@ -27,7 +27,7 @@ skills XML、`hiddenTools` 过滤、provider cache marker 大多一致。实质�
 1. `preamble`（默认或 override，不加 XML）
 2. `tools`（仅 `promptSnippet` 非空的工具）
 3. `rules`（条件 shell 规则 + 工具 guidelines + 固定规则，trim 后去重）
-4. `docs`（`PI_PACKAGE_DIR/README.md` 存在时）
+4. `docs`（解析出的 package dir 含 `README.md` + `docs/` + `examples/` 时）
 5. `addendum`（CLI/SDK append，以 `\n\n` 连接）
 6. `project_context`（AGENTS.md/CLAUDE.md）
 7. `skills`（`<available_skills>` XML）
@@ -85,6 +85,23 @@ You help users by reading files, executing commands, editing code, and writing n
 | B16 | `SystemMessage.sections` 用 `BTreeMap` | `messages.rs:233-247`；`transcript.rs:170-182` 按 values 拼接 | JS object insertion order | 恢复/导出 transcript 时段落重排 |
 | B17 | `PIR_SYSTEM_PROMPT_FILE` 读取失败中止 print | `print.rs:3315-3317` | `resource-loader.ts:194-205` warning + fallback | 失效路径导致 headless run 失败 |
 | B18 | `SystemPromptOptions::from_json` 解析失败静默 default | `system_prompt_options.rs:160-168` | 逐字段 normalize | 一个类型错误丢掉整份 options |
+| B19 | 4 条 pir-only `<rules>` bullet | `src/system_prompt.rs:269-290` | `buildRules` 只有工具 guidelines + 2 条固定规则 | **刻意偏差（已决策）**：见 §4.1 |
+
+### 4.1 已决策的刻意偏差（product decisions）
+
+以下三项在 round-1 prompt A/B（`.play/evidence/ab-round1/lane-ab-prompt/REPORT.md`）
+中被判为“未记录的分歧”。复核后确认它们对应 pir 真实存在的能力，因此**保留行为**，
+只补文档 + 回归测试（不再当作 bug 反复上报）：
+
+| 审计项 | 决策 | 依据 | 回归 |
+|---|---|---|---|
+| B1 `docs` 段落条件注入 | **已定案（刻意偏差，PIR-BIN-061 运行时探针）**：`package_docs_paths` 仅在解析出的 package dir 同时含 `README.md`、`docs/`、`examples/` 时输出 `<docs>`，否则整段省略（`PI_PACKAGE_DIR` 优先，未设置时探测可执行文件同目录）；上游始终输出其包路径，pir 的验收底线是 `<docs>` 永不点名不存在的路径 | `src/system_prompt.rs:453-505`、`src/config/env.rs:35-56`、上游 `system-prompt.ts:102-108,157-169`、`config.ts:393-405` | `tests/suites/prompt_loadout_w22.rs::docs_section_*`、`package_dir_*`；`.play/lanes/lane-fix-docs69/evidence/061-probes/result.json` |
+| B2 默认工具顺序 | **已修复**：`PrintToolLoadout::definitions` / `print_active_definitions` 直接从 active-set 顺序（`declared_tools`）构建声明数组，与 `<tools>` 段落同序；`ToolRegistry::iter/names` 的确定性排序仅保留给无序路径 | `agent-session.ts:1502-1512,3707-3712`、`system-prompt.ts:151-160` | `prompt_loadout_w22::declared_tool_array_order_matches_the_tools_section_order` |
+| B19 4 条 pir-only rules | **保留（刻意偏差）**：这 4 条对应 pir 真实的强制行为 — `PIR_READ_BEFORE_EDIT` 默认 `enforce` 的读前门（`tools/util.rs:25-60`）、字面路径校验（`tools/util.rs:365-370`）、`tools.broadSearchGuard`（默认 true，`settings/env.rs:97`）以及收尾自检；上游没有这些机制，删掉规则会让模型看不到实际会被拒绝的约束。代价约 +709 chars/request，仅出现在对应工具被声明时 | 本表 §4 B19 + `docs/environment-variables.md` | `prompt_loadout_w22::pir_only_rules_*`（逐字列表 + 工具门控） |
+
+**默认工具集（9 vs 4）同样是刻意偏差**，见 [`FEATURES.md`](FEATURES.md) § 3.1：
+`balanced` 扩展默认集（grep/find/ls/background_*）是产品能力，`efficient` profile 或
+`--tools read,bash,edit,write` 都可切回上游四工具集，且注册表从不被选择过滤（F12）。
 
 ### 缺失
 

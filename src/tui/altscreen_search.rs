@@ -3007,6 +3007,17 @@ pub fn scroll_to_end_indicator_label() -> String {
     paint_scroll_to_end_label(&scroll_to_end_indicator_text())
 }
 
+/// The `tui.altScreen.top` chord's plain key text (`Ctrl+Home` by default),
+/// or `None` when the id is unbound. PIR-TUI-027's transcript truncation row
+/// names this chord: in the windowed (fullscreen) surface it is the binding
+/// that jumps to the earliest content and therefore triggers the older-page
+/// load; a regular-mode caller gets `None` and says "scroll up to load"
+/// instead (that surface's history lives in the terminal's own scrollback).
+pub fn load_older_key_text() -> Option<String> {
+    let text = key_display_text("tui.altScreen.top");
+    (!text.is_empty()).then_some(text)
+}
+
 /// Paint one already-truncated label text (the caller clips the PLAIN string,
 /// so a label clamped at the scrollbar column cannot leak the highlight
 /// background past its closes).
@@ -4157,6 +4168,11 @@ pub fn route_alt_screen_key(
     if state.matches_alt_key("tui.altScreen.top", key) {
         // Upstream `tui.altScreen.top` (ctrl+home): earliest content.
         scroll_by(core, state, dock_height, isize::MAX / 4);
+        // PIR-TUI-027: the materialized band extends one chunk per frame, so
+        // reaching the true session start needs a persistent target the loop
+        // keeps re-anchoring to (see `TuiCore::set_band_top_target`). Any
+        // other scroll clears it inside `TuiCore::scroll_to`.
+        core.set_band_top_target(true);
         return AltKeyRoute::Consumed;
     }
     if state.matches_alt_key("tui.altScreen.bottom", key) {

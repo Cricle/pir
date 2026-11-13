@@ -204,7 +204,14 @@ pub(super) async fn run() -> Result<()> {
     // Parse with explicit exit-code control (upstream main.ts): `--help`
     // exits 0, parse errors exit 1 (upstream prints `Unknown option: …` and
     // exits 1), and `-v`/`--version` prints ONLY the semver (main.ts:634-637).
-    let mut cli = match Cli::try_parse_from(&args) {
+    //
+    // The parse goes through `pir::coding_agent::cli::parse_cli`, which applies
+    // the upstream print-surface grammar: when `--print`/`-p` or
+    // `--mode json|text` explicitly selects the print host, a positional that
+    // spells a subcommand stays a PROMPT (PIR-BIN-030). Bare `pir version`,
+    // `pir config …`, `pir models`, `pir print "<prompt>"` and `--mode rpc`
+    // keep the normal subcommand grammar.
+    let mut cli = match pir::coding_agent::cli::parse_cli(&args) {
         Ok(cli) => cli,
         Err(error) => {
             use clap::error::ErrorKind;
@@ -539,8 +546,21 @@ pub(super) async fn run() -> Result<()> {
     // list and shows one warning notice per diagnostic instead (upstream
     // interactive `showWarning`), so the stderr lines are not duplicated under
     // the alternate screen.
+    //
+    // The per-field tolerant-parse warnings ride the same list (PIR-BIN-072):
+    // a wrong-typed leaf already fell back to its default, so the document
+    // loaded and the run continues, but the user must be told that the value
+    // they wrote is not in effect. They are a pir-only superset (upstream
+    // reads every field independently and validates only the compaction token
+    // settings), deduplicated with the load errors so a single bad file
+    // reports each problem once.
     let startup_settings_diagnostics = pir::config::settings::deduplicate_diagnostics(
-        pir::config::settings::collect_settings_diagnostics(&mut settings_manager),
+        pir::config::settings::collect_settings_diagnostics(&mut settings_manager)
+            .into_iter()
+            .chain(pir::config::settings::collect_settings_warnings(
+                &settings_manager,
+            ))
+            .collect(),
     );
     if !interactive {
         for diagnostic in &startup_settings_diagnostics {

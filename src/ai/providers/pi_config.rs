@@ -684,15 +684,18 @@ pub fn load_pi_config() -> AiResult<Option<PiConfiguredModel>> {
 /// effect for `models list` / RPC / TUI config resolution; without a
 /// pinned/extension/override decision the trust store /
 /// `defaultProjectTrust` policy decides exactly as before.
+///
+/// A malformed or unreadable settings scope is NOT an error here: the
+/// manager keeps that scope's defaults and records a diagnostic (see
+/// [`settings::load_settings`]), so a config typo never turns into an
+/// `authentication failure` that blocks a run (PIR-BIN-071).
 pub fn load_pi_config_with(project_dir: Option<&Path>) -> AiResult<Option<PiConfiguredModel>> {
     let global_dir = settings::agent_dir();
     let project_trusted = match project_dir {
         Some(cwd) => crate::extensions::project_trust::resolve_project_trust(cwd, &global_dir),
         None => false,
     };
-    let pi_settings =
-        settings::load_settings(project_dir, project_trusted).map_err(AiError::Authentication)?;
-    load_pi_config_from(pi_settings)
+    load_pi_config_from(settings::load_settings(project_dir, project_trusted))
 }
 
 /// [`load_pi_config_with`] on an ALREADY-loaded [`SettingsManager`] snapshot:
@@ -1175,15 +1178,17 @@ pub struct PiEnvironment {
 /// `--approve`/`--no-approve` that the print/json host resolved at startup is
 /// still in effect here; without a pinned/extension/override decision the
 /// trust store / `defaultProjectTrust` policy decides exactly as before.
+///
+/// Like [`load_pi_config_with`], a malformed/unreadable/non-object settings
+/// file degrades to that scope's defaults with a recorded diagnostic instead
+/// of failing: the run proceeds (PIR-BIN-071).
 pub fn load_pi_environment(project_dir: Option<&Path>) -> AiResult<PiEnvironment> {
     let global_dir = settings::agent_dir();
     let project_trusted = match project_dir {
         Some(cwd) => crate::extensions::project_trust::resolve_project_trust(cwd, &global_dir),
         None => false,
     };
-    let settings_snapshot =
-        settings::load_settings(project_dir, project_trusted).map_err(AiError::Authentication)?;
-    load_pi_environment_from(settings_snapshot)
+    load_pi_environment_from(settings::load_settings(project_dir, project_trusted))
 }
 
 /// [`load_pi_environment`] against an ALREADY-loaded settings snapshot: the

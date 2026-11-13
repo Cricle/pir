@@ -100,6 +100,8 @@ mod print_callability_w13;
 mod print_mode;
 #[path = "suites/reload_native_w14.rs"]
 mod reload_native_w14;
+#[path = "suites/resume_system_prompt_once.rs"]
+mod resume_system_prompt_once;
 #[path = "suites/run_diagnostics.rs"]
 mod run_diagnostics;
 #[path = "suites/sdk.rs"]
@@ -132,5 +134,7 @@ mod session_file_contract_w14;
 mod session_manager;
 #[path = "suites/session_rewrite_w13.rs"]
 mod session_rewrite_w13;
+#[path = "suites/startup_thinking_clamp.rs"]
+mod startup_thinking_clamp;
 #[path = "suites/todo_builtin.rs"]
 mod todo_builtin;

@@ -1575,6 +1575,7 @@ async fn compaction_fixture(
         plugins: Some(Arc::clone(&host)),
         runtime: None,
         session_events: Some(recording_sink(Arc::clone(&frames))),
+        provider_retry: Default::default(),
     });
     let context = Arc::new(Context {
         system_prompt: Some("sys".into()),
@@ -1690,6 +1691,7 @@ async fn print_compaction_summary_ignores_another_sessions_shared_provider() {
         plugins: None,
         runtime: None,
         session_events: None,
+        provider_retry: Default::default(),
     });
     let context = Arc::new(Context {
         system_prompt: Some("sys".into()),
@@ -1829,6 +1831,7 @@ async fn print_compaction_without_handlers_keeps_the_unchanged_context() {
         plugins: None,
         runtime: None,
         session_events: None,
+        provider_retry: Default::default(),
     });
     let context = Arc::new(Context {
         system_prompt: Some("sys".into()),

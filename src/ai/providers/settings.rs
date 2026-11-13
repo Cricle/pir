@@ -37,21 +37,38 @@ pub fn project_config_dir(cwd: &Path) -> PathBuf {
 
 /// Load the merged settings snapshot (global `~/.pi/agent/settings.json`,
 /// overlaid by `<cwd>/.pi/settings.json` when the project is trusted).
-/// Missing files are not errors; malformed files are recorded on the manager.
-pub fn load_settings(cwd: Option<&Path>, project_trusted: bool) -> Result<Settings, String> {
-    let global_dir = agent_dir();
+///
+/// Missing files are not errors, and neither are malformed, unreadable or
+/// non-object files: [`crate::config::settings::SettingsManager`] records
+/// those as diagnostics, keeps the defaults for the scope and never fails the
+/// load (upstream `SettingsManager.create` — a settings file cannot abort
+/// startup). The CLI startup printer reports the recorded failures once via
+/// [`crate::config::settings::collect_settings_diagnostics`], so this loader
+/// must NOT turn them into a provider error: a JSON typo in `settings.json`
+/// is not an authentication failure and must not stop a run that can still
+/// proceed on the defaults (PIR-BIN-071).
+///
+/// Deciding the policy here is deliberate: every provider-facing caller
+/// (`load_pi_environment`, `load_pi_config_with`, the SDK registry, the
+/// server) consumes the degraded snapshot, exactly like `--list-models` and
+/// the `sessions` command already did.
+pub fn load_settings(cwd: Option<&Path>, project_trusted: bool) -> Settings {
+    load_settings_in(&agent_dir(), cwd, project_trusted)
+}
+
+/// [`load_settings`] with an EXPLICIT global agent dir, for callers that own
+/// one instead of reading the process environment (the SDK's
+/// per-agent-directory path). Same tolerant policy: a broken scope degrades
+/// to its defaults and is recorded on the manager, never returned as an error.
+pub fn load_settings_in(global_dir: &Path, cwd: Option<&Path>, project_trusted: bool) -> Settings {
     let project_dir = cwd
         .map(project_config_dir)
         .unwrap_or_else(|| PathBuf::from("."));
-    let manager = crate::config::settings::SettingsManager::load(
-        &global_dir,
+    crate::config::settings::SettingsManager::load(
+        global_dir,
         &project_dir,
         cwd.unwrap_or_else(|| Path::new(".")),
         project_trusted,
-    );
-    let errors = manager.error_messages();
-    if !errors.is_empty() {
-        return Err(errors.join("; "));
-    }
-    Ok(manager.settings)
+    )
+    .settings
 }

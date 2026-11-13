@@ -1316,7 +1316,12 @@ async fn ctx_facade_reports_session_model_and_thinking() {
     // headless facade reports "print".
     assert_eq!(ctx["mode"], json!("print"));
     assert_eq!(ctx["hasUI"], json!(false));
-    assert_eq!(ctx["thinkingLevel"], json!("medium"));
+    // `fake_model()` is `reasoning: false`, so `getSupportedThinkingLevels`
+    // yields only `off` and the session is constructed with the CLAMPED level
+    // (PIR-BIN-074, upstream `createAgentSession` → `clampThinkingLevel`).
+    // `Medium` was the pre-clamp expectation and is not a level this model can
+    // run.
+    assert_eq!(ctx["thinkingLevel"], json!("off"));
     assert_eq!(ctx["scopedModels"], json!(0));
     assert_eq!(ctx["modelId"], json!("fake-model"));
     assert_eq!(ctx["contextWindow"], json!(8192));

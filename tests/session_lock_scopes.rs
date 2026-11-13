@@ -317,6 +317,7 @@ async fn paged_compaction_releases_the_shared_session_lock() {
         plugins: None,
         runtime: None,
         session_events: None,
+        provider_retry: Default::default(),
     });
     let context = Arc::new(Context {
         system_prompt: None,

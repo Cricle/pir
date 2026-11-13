@@ -22,7 +22,47 @@ impl AgentSession {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
+            history_trimmed: self.history_trimmed(),
+            history_dropped_messages: self.history_trimmed_messages(),
         }
+    }
+
+    /// How many of the OLDEST messages this session's ephemeral-history cap
+    /// has dropped so far (PIR-BIN-075). Always `0` for a persisted session:
+    /// the cap only bounds a store-less transcript, never session storage.
+    ///
+    /// `get_state` reports it as `historyTrimmed` (plus the wire detail
+    /// `historyDroppedMessages`), and every drop is also announced at the time
+    /// it happens — a `history_trimmed` session event and one
+    /// `pir: warning: --no-session history trimmed: …` line. A non-zero value
+    /// means the in-memory transcript is NOT the whole conversation, which
+    /// upstream's `SessionManager.inMemory` would have kept.
+    pub fn history_trimmed_messages(&self) -> usize {
+        self.history_trimmed.load(Ordering::SeqCst)
+    }
+
+    /// Whether this session's ephemeral-history cap has dropped anything.
+    pub fn history_trimmed(&self) -> bool {
+        self.history_trimmed_messages() > 0
+    }
+
+    /// Test seam: append `messages` directly to the ephemeral in-memory
+    /// transcript, exactly as a run's settle would, so a fixture can reach the
+    /// ephemeral-history cap (1 024 messages) without 512 model round trips.
+    ///
+    /// A no-op for a persisted session (its history is the storage
+    /// projection); the `None`-store case is the only one this seam exists
+    /// for. Not part of the stable facade.
+    #[doc(hidden)]
+    pub fn seed_ephemeral_history_for_test(&self, messages: Vec<Message>) {
+        if self.session.is_some() {
+            return;
+        }
+        let mut history = self
+            .history
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::make_mut(&mut *history).extend(messages);
     }
 
     // ------------------------------------------------------------------

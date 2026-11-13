@@ -990,6 +990,21 @@ impl SettingsManager {
         }
     }
 
+    /// The transport-level half of `settings.retry.provider.*` (upstream
+    /// `sdk.ts:341-352` `getProviderRetrySettings()`), in the shape a host
+    /// installs on [`crate::ai::types::StreamOptions`].
+    ///
+    /// Only fields the user WROTE come back set; absent ones stay `None` so a
+    /// request keeps the transport's compiled default (2 retries / 60 s cap /
+    /// no total timeout). A default run must not change behaviour just because
+    /// the setting mechanism exists. `maxRetryDelayMs` deliberately does not
+    /// apply the upstream 60 s default here: that equals the transport default
+    /// already, and leaving it `None` is what lets an explicit per-call
+    /// override (`set_retry`) win.
+    pub fn provider_retry_overrides(&self) -> ProviderRetryOverrides {
+        ProviderRetryOverrides::from_settings(self.settings.retry.as_ref())
+    }
+
     /// Agent-level turn retry policy with upstream defaults applied, or `None`
     /// when the `retry` block disables retries (upstream
     /// `getRetrySettings().enabled` gate in `AgentSession._prepareRetry`).
@@ -997,8 +1012,9 @@ impl SettingsManager {
     /// This is the runtime consumer of [`Self::retry_settings`]: the agent
     /// loop asks for it only when a turn ends with a retryable error. The
     /// provider block is deliberately ignored here — transport-level retries
-    /// are configured separately (`StreamOptions::max_retries`) and counting
-    /// both would double-spend the budget.
+    /// are configured separately (`ProviderRetryOverrides` →
+    /// `StreamOptions::max_retries`) and counting both would double-spend the
+    /// budget.
     pub fn agent_retry_policy(&self) -> Option<crate::ai::util::AgentRetryPolicy> {
         Self::retry_policy_from(&self.retry_settings())
     }

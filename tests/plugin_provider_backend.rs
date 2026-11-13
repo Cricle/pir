@@ -1770,7 +1770,11 @@ async fn virtual_complete_applies_route_callback_prompt_and_max_tokens_override(
         .expect("route callback saw the request");
     assert_eq!(seen.model["provider"], "virtual-provider");
     assert_eq!(seen.model["id"], "virtual-routed");
-    assert_eq!(seen.thinking_level.as_deref(), Some("low"));
+    // `CompleteOptions::default()` asks for `low`, but the session under test
+    // was built on a `reasoning: false` model, so PIR-BIN-074's
+    // construction-time clamp (upstream `createAgentSession`) installed `off`
+    // and the route callback sees the level the session would really send.
+    assert_eq!(seen.thinking_level.as_deref(), Some("off"));
 
     let request = route_provider
         .last_request()

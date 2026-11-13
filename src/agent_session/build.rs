@@ -620,8 +620,12 @@ impl AgentSession {
             // a prepared host came from outside (SDK builder).
             let mut manager =
                 settings.unwrap_or_else(|| runtime_loader::load_settings_for_in(&agent_dir, &cwd));
+            // Log-only: the CLI startup printer already reported each
+            // distinct settings load failure once as a user-facing
+            // `Warning: …`; re-emitting it here duplicated the same problem
+            // on stderr for every subsystem that re-read settings.json.
             for error in manager.drain_errors() {
-                crate::ext_diag!("[ext] settings {}: {}", error.scope_name(), error.message);
+                crate::ext_diag_debug!("[ext] settings {}: {}", error.scope_name(), error.message);
             }
             steering_mode = manager.steering_mode();
             follow_up_mode = manager.follow_up_mode();
@@ -711,12 +715,27 @@ impl AgentSession {
         if perf_trace {
             eprintln!("[perf]     build-p3 {:?}", perf_t0.elapsed());
         }
+        // PIR-BIN-074: the starting level is CLAMPED at construction, exactly
+        // where upstream clamps it (`createAgentSession`:
+        // `thinkingLevel = clampThinkingLevel(model, thinkingLevel)`,
+        // sdk.ts:264-275). The session's `config.thinking` is what the agent
+        // loop's `LoopDeps::thinking_level` and the baked
+        // `StreamOptions.reasoning` are built from, so installing the clamped
+        // value here is what makes the FIRST request carry a supported level —
+        // `set_thinking_level`'s clamp only ever ran after that request had
+        // already gone out. Same helper the resolver/footer use
+        // ([`crate::agent_session::clamp_starting_thinking_level_for_model`]),
+        // so the three faces can never disagree.
+        let starting_thinking = crate::agent_session::clamp_starting_thinking_level_for_model(
+            &config.model,
+            config.thinking,
+        );
         let session = Self {
             registry: config.provider_registry,
             model: Arc::new(RwLock::new(config.model)),
             extension_api_keys: Mutex::new(HashMap::new()),
             api_key,
-            thinking: Arc::new(RwLock::new(config.thinking)),
+            thinking: Arc::new(RwLock::new(starting_thinking)),
             tools: Arc::new(tools),
             tool_selection,
             active_tools_override: Arc::new(std::sync::RwLock::new(None)),
@@ -734,6 +753,7 @@ impl AgentSession {
             // construction-time copy here was a full transcript clone that no
             // reader of a store-backed session ever touched.
             history: Arc::new(RwLock::new(Arc::new(Vec::new()))),
+            history_trimmed: AtomicUsize::new(0),
             compaction: Arc::new(RwLock::new(config.compaction.map(|mut compaction| {
                 if performance.profile() == PerformanceProfile::Efficient {
                     compaction.reserve_tokens = compaction.reserve_tokens.min(8_192);

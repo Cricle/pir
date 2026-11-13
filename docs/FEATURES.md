@@ -92,6 +92,35 @@ session transcript). `phone` is **off** even in `full` — it opens an outbound
 connection to the central relay and needs a server URL/device token. `--only-builtin` loads exactly the Rust builtins (no settings/package scan, QuickJS, SWC or `node:*`);
 `--no-extensions` wins if both are given.
 
+### 3.1 Default tool loadout (documented superset)
+
+**`balanced` (the default) declares a deliberate SUPERSET of upstream pi's
+`DEFAULT_TOOL_NAMES`.** With no `--tools` / `settings.defaultTools`, the
+per-request tool declaration is the registration-active core set:
+
+`background_abort`, `background_status`, `bash`, `edit`, `find`, `grep`, `ls`,
+`read`, `write` (nine; `powershell` stays registered-but-inactive, exactly like
+upstream). Upstream pi declares four (`read`, `bash`, `edit`, `write`).
+
+This is a product decision, not drift: the extra five tools are pir's own
+capabilities — the in-process ripgrep `grep`/`find` pair, `ls`, and the
+scheduler-owned `background_status`/`background_abort` controls (see
+`docs/tui.md` and `MAPPING.md` for the background/detach surface). The measured
+cost is ~+4.8 KB of `tools[]` JSON per request (see the round-1 A/B report at
+`.play/evidence/ab-round1/lane-ab-prompt/REPORT.md` § 7).
+
+Two ways to shrink it, both first-class:
+
+- `--tools read,bash,edit,write` (or `settings.defaultTools`) — an explicit
+  selection, identical to upstream's set;
+- `--perf-profile efficient` / `PIR_PERF_PROFILE=efficient` — the opt-in
+  profile whose IMPLICIT selection is the upstream core four
+  ([`docs/performance-profiles.md`](performance-profiles.md)).
+
+Both leave every other tool reachable: the registry is never filtered by the
+selection (F12), so an excluded-but-registered tool stays callable through
+`--tools`, `tool_search`, MCP codemode and nested calls.
+
 ## 4. Slim profiles
 
 The binary profiles (`no-js`, `tui-slim`) require `cli`; `sdk-headless` is library-only; `minimal` is the
@@ -183,6 +212,18 @@ import. Idle WS 6,208–8,356 KiB (6.1–8.2 MiB), warm start 30–43 ms across 
 
 Known policy gaps: no-TUI hosts accept/ignore `--tui-mode`; `pir session` still prints a dir/count with `session`
 off; `mcp add/remove` writes config in a no-`mcp` build — documented, not claimed correct.
+
+## 5b. Resource bounds
+
+Things pir caps that upstream leaves unbounded. Every cap announces itself —
+a user must never lose visible information silently (PROTOCOL v8 §5).
+
+| bound | value | who it applies to | how it is announced |
+|---|---|---|---|
+| ephemeral history | 1024 messages / 100 000 estimated tokens | sessions with NO storage (`--no-session`, an SDK agent built without a session store) | `history_trimmed` event (exactly once per trim, naming the dropped/retained counts and which cap forced it), one `pir: warning: …` line, and `historyDroppedMessages` / `historyTrimmed` in `get_state` + `get_session_stats`. Persisted sessions are never bounded by this window (their history is the store + compaction) |
+| transcript window (TUI) | 512 entries / 4 MiB (regular mode), bounded band (fullscreen) | the interactive transcript of a huge session | the `... (N earlier entries, … to load)` lead row, plus `LoadOlder` paging; full repaints never emit `3J` so the terminal scrollback is not erased (see `docs/tui.md`) |
+| non-interactive turns | `PIR_MAX_TURNS`, default 1000 | `print` / `rpc` / `server` runs | a synthesized `StopReason::Error` terminal naming the cap and how to raise it |
+| compaction trigger | `contextWindow − compaction.reserveTokens` | every host that compacts | the compaction lifecycle events |
 
 ## 6. Verification
 

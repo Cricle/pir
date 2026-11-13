@@ -20,8 +20,9 @@ use crate::ai::types::AbortSignal;
 
 use super::confine::{confinement_error, ConfinedTarget};
 use super::util::{
-    checkpoint_before_mutation, single_path_arg, workspace_path_parts,
-    workspace_path_remote_checked, write_remote_file_atomically,
+    checkpoint_before_mutation, mutation_error_message, mutation_error_message_remote,
+    mutation_reason_category, single_path_arg, workspace_path_parts, workspace_path_remote_checked,
+    write_remote_file_atomically, MutationOp,
 };
 
 /// Local writes are chunked so a large payload observes cancellation between
@@ -168,11 +169,13 @@ impl AgentTool for WriteTool {
                     return ToolResult::error(confinement_error(&path, &error));
                 }
                 Err(error) => {
+                    // Locale-independent cause, not the raw OS `Display`
+                    // (PIR-BIN-077).
                     return ToolResult::error(format!(
                         "Cannot create parent directory '{}': {}",
                         parent_display(&path),
-                        error
-                    ))
+                        mutation_reason_category(&error)
+                    ));
                 }
             };
             checkpoint_before_mutation(&checkpoint_ctx, "write", &mutation_paths).await;
@@ -191,7 +194,7 @@ impl AgentTool for WriteTool {
                     )
                 }
                 Ok(false) => ToolResult::error("Operation aborted"),
-                Err(e) => ToolResult::error(format!("Cannot write '{}': {}", path, e)),
+                Err(e) => ToolResult::error(mutation_error_message(MutationOp::Write, &path, &e)),
             }
         })
     }
@@ -221,7 +224,7 @@ async fn write_with_operations(
             return ToolResult::error(format!(
                 "Cannot create parent directory '{}': {}",
                 parent_display(path),
-                error
+                mutation_reason_category(&error)
             ));
         }
     }
@@ -233,7 +236,7 @@ async fn write_with_operations(
             ToolResult::error("Operation aborted")
         }
         Ok(()) => ToolResult::ok(format!("Successfully wrote to {path}")),
-        Err(error) => ToolResult::error(format!("Cannot write '{}': {}", path, error)),
+        Err(error) => ToolResult::error(mutation_error_message(MutationOp::Write, path, &error)),
     }
 }
 
@@ -299,6 +302,10 @@ async fn write_remote(
         Err(error) if error.code == crate::env_client::FileErrorCode::Aborted => {
             ToolResult::error("Operation aborted")
         }
-        Err(error) => ToolResult::error(format!("Cannot write '{}': {}", path, error.message)),
+        Err(error) => ToolResult::error(mutation_error_message_remote(
+            MutationOp::Write,
+            path,
+            &error,
+        )),
     }
 }

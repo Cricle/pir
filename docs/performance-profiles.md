@@ -4,6 +4,18 @@
 keeps the historical tool loadout, unlimited tool-result text, compaction
 thresholds, and turn limits unchanged.
 
+> **The balanced default tool loadout is a documented SUPERSET of upstream pi.**
+> With no `--tools` / `settings.defaultTools`, `balanced` declares nine
+> registration-active core tools (`background_abort`, `background_status`,
+> `bash`, `edit`, `find`, `grep`, `ls`, `read`, `write`), where upstream pi's
+> implicit set is four (`read`, `bash`, `edit`, `write`). The extra five are
+> pir capabilities (in-process grep/find, `ls`, the scheduler-owned background
+> controls); the round-1 A/B measurement puts the declaration at ~+4.8 KB of
+> `tools[]` JSON per request. `efficient` (below) and `--tools
+> read,bash,edit,write` both select the upstream four; no tool becomes
+> unreachable either way (the registry is never filtered by the selection).
+> See [`docs/FEATURES.md`](FEATURES.md) § 3.1.
+
 ```json
 {
   "performance": {

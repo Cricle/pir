@@ -239,6 +239,9 @@ pub fn build_mistral_payload(
     // actually has to be folded into it; the common request borrows it.
     let mut leading_system: Cow<'_, str> =
         Cow::Borrowed(context.system_prompt.as_deref().unwrap_or(""));
+    // The live rendering wins a section-name collision: a replayed prompt
+    // snapshot is patched by name, never appended a second time (PIR-BIN-053).
+    let live_prompt = context.system_prompt.as_deref();
     // The transcript enters the transform BORROWED whenever it is replayed
     // unchanged (mid-conversation system messages supported). The collapse
     // branch keeps a Vec<&Message> (one pointer per message) instead of
@@ -253,7 +256,7 @@ pub fn build_mistral_payload(
         for message in &context.messages {
             match message {
                 Message::System(system) | Message::Developer(system) => {
-                    let text = crate::ai::types::system_message_text(system);
+                    let text = crate::ai::types::leading_system_fragment(system, live_prompt);
                     if !text.trim().is_empty() {
                         if !collapsed.is_empty() {
                             collapsed.push_str("\n\n");

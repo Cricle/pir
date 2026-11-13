@@ -14,7 +14,9 @@
 //!   attempt, finalError?}` — exactly the upstream session-event shapes;
 //! - a cancel during the backoff reports `finalError: "Retry cancelled"`;
 //! - a plain success emits no retry frame at all;
-//! - text mode installs no sink (its output stays byte-identical).
+//! - text mode installs no sink (its output stays byte-identical);
+//! - an exhausted budget keeps its frames in-band on stdout AND exits nonzero
+//!   (PIR-BIN-037: the terminal `stopReason: "error"` fails the process).
 //!
 //! The loop-level half runs in-process over [`print_loop_deps`] with a fake
 //! stream and a recording session-event sink; the end-to-end half runs the
@@ -832,8 +834,11 @@ fn json_mode_agent_retry_exhausted_emits_final_error() {
     );
     assert_eq!(
         case.run.exit_code,
-        Some(0),
-        "JSON mode reports provider errors in-band; stderr:\n{}",
+        Some(1),
+        // PIR-BIN-037: the failure stays in-band (the frames below) AND the
+        // process now reports it — a spent retry budget ends on a terminal
+        // `stopReason: "error"`, so `--mode json` exits nonzero.
+        "json mode keeps the provider error in-band and fails the process; stderr:\n{}",
         case.run.stderr_tail()
     );
     assert_eq!(
@@ -1066,6 +1071,7 @@ async fn run_threshold_compaction_probe(label: &str, drop_first: bool) -> Thresh
         plugins: None,
         runtime: None,
         session_events: Some(recording_sink(Arc::clone(&frames))),
+        provider_retry: Default::default(),
     });
     let context = Arc::new(Context {
         system_prompt: None,

@@ -132,6 +132,32 @@ pub enum SessionEvent {
         /// The session's final name; `None` = cleared.
         name: Option<String>,
     },
+    /// The in-memory transcript of a STORE-LESS session was trimmed because it
+    /// crossed an ephemeral history cap (PIR-BIN-075).
+    ///
+    /// pir bounds a session with no session store (RPC `--no-session`, an
+    /// embedded SDK agent built without storage) so a process that runs for
+    /// months cannot grow without limit. That bound is a pir-only behaviour
+    /// (upstream `SessionManager.inMemory` keeps the whole conversation), so
+    /// every drop is announced instead of happening silently: this event, one
+    /// `pir: warning:` stderr/log line from the same emit, and the
+    /// `historyTrimmed` fields on `get_state`/`get_session_stats`. Persisted
+    /// sessions never emit it (their history is bounded by storage and
+    /// compaction, not by this window).
+    HistoryTrimmed {
+        /// How many of the OLDEST messages this trim dropped.
+        dropped_messages: usize,
+        /// Messages retained after the trim.
+        retained_messages: usize,
+        /// The message-count cap that was in force.
+        max_messages: usize,
+        /// The estimated-token cap that was in force.
+        max_tokens: u64,
+        /// Which cap forced this trim: `"messages"` or `"tokens"`.
+        reason: &'static str,
+        /// Cumulative messages dropped by every trim of this session so far.
+        total_dropped_messages: usize,
+    },
     /// The effective thinking level changed (upstream
     /// `thinking_level_changed`, AgentSessionEvent union
     /// agent-session.ts:212; emitted from agent-session.ts:2692).
@@ -311,6 +337,26 @@ pub fn session_event_to_json(event: &SessionEvent) -> JsonValue {
             // (agent-session.ts:212).
             "type": "thinking_level_changed",
             "level": level,
+        }),
+        SessionEvent::HistoryTrimmed {
+            dropped_messages,
+            retained_messages,
+            max_messages,
+            max_tokens,
+            reason,
+            total_dropped_messages,
+        } => json!({
+            // pir-only (no upstream counterpart): the ephemeral-history cap
+            // notice (PIR-BIN-075). Camel-case payload fields like every
+            // other wire shape here; `reason` names which cap forced the
+            // trim so a client can report what was lost.
+            "type": "history_trimmed",
+            "droppedMessages": dropped_messages,
+            "retainedMessages": retained_messages,
+            "maxMessages": max_messages,
+            "maxTokens": max_tokens,
+            "reason": reason,
+            "totalDroppedMessages": total_dropped_messages,
         }),
         SessionEvent::BashExecutionUpdate { id, delta } => {
             let mut value = json!({

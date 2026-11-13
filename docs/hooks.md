@@ -128,7 +128,8 @@ notifications): `status`, `extension_ui_request` (`agent_session/notifications.r
 `pi.on` is fail-closed against the central registry (`src/plugins/coverage.rs::is_known_event`; the
 prelude calls `isKnownEvent`). The accepted set is exactly `WIRED_NATIVE_EVENTS` +
 `NATIVE_ONLY_EVENTS` (`status`, `extension_ui_request`) + `SYNTHETIC_EVENTS` (`entry_appended`,
-`thinking_level_changed`, the three `summarization_retry_*` names, `run_failed`,
+`thinking_level_changed`, `history_trimmed` (PIR-BIN-075: the store-less ephemeral-history trim
+notice), the three `summarization_retry_*` names, `run_failed`,
 `provider:refreshModels`) + hidden `TEST_ONLY_EVENTS` used by in-tree harnesses. An unknown name is
 a load-time `TypeError` (`pi.on: unknown event name ...`); custom bus events use `pi.events.on`.
 

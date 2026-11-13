@@ -2276,8 +2276,17 @@ impl MemberSpawn for RealSpawner {
         // `PIR_BIN` + the binary's directory prepended to `PATH` (the same
         // rule the per-call spawn applies), so `pir grep|sed|python …` works
         // inside a pooled command. An MSYS shim PATH override is the base
-        // that gets the prefix, never something we replace.
-        super::bash::apply_pir_bin_env(&mut spawn, spawn_path.as_deref());
+        // that gets the prefix, never something we replace — and both that
+        // base and an ambient PATH inherited from a pir launched in Git Bash
+        // are POSIX-spelled, so the prepend uses the POSIX dialect. A
+        // native-spelled entry joined with `;` onto a `:` list is a hybrid
+        // MSYS cannot convert, which breaks native→native command resolution
+        // inside the member (PIR-BIN-076).
+        super::bash::apply_pir_bin_env(
+            &mut spawn,
+            spawn_path.as_deref(),
+            super::bash::PathDialect::Posix,
+        );
         spawn
             .args(member_args_for(embedded))
             // Spawn the member in a neutral directory, NOT the first call's

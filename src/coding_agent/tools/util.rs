@@ -383,11 +383,31 @@ pub(super) fn workspace_path_parts_normalized(
     requested_path: &Path,
     requested: &str,
 ) -> Result<WorkspacePathParts, String> {
-    if requested_path
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(format!("Path '{}' escapes the workspace root", requested));
+    // A relative path may contain `..` as long as it does not climb ABOVE the
+    // root: `src/../src/main.rs` resolves inside the workspace and is a path a
+    // model produces naturally (PIR-BIN-079). Only a path whose `..` segments
+    // outnumber the real segments it has entered escapes; an ABSOLUTE path is
+    // confined by the resolved-root walk below, never by this count.
+    if !requested_path.is_absolute() {
+        let mut depth: usize = 0;
+        let mut escapes = false;
+        for component in requested_path.components() {
+            match component {
+                Component::ParentDir => {
+                    if depth == 0 {
+                        escapes = true;
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Component::Normal(_) => depth += 1,
+                // `RootDir`/`Prefix`/`CurDir` neither enter nor leave.
+                _ => {}
+            }
+        }
+        if escapes {
+            return Err(format!("Path '{}' escapes the workspace root", requested));
+        }
     }
 
     let root = std::fs::canonicalize(cwd)
@@ -471,7 +491,16 @@ fn reject_symlink_components(root: &Path, relative: &Path, requested: &str) -> R
             // missing directory can exist. A dangling link is not `NotFound`
             // here, so it was rejected above.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => return Err(format!("Cannot access '{}': {}", requested, error)),
+            // A locale-independent cause, not the raw OS `Display`: an
+            // over-long component (`ERROR_INVALID_NAME`, os error 123) used to
+            // surface the host-language message here (PIR-BIN-077).
+            Err(error) => {
+                return Err(format!(
+                    "Cannot access '{}': {}",
+                    requested,
+                    mutation_reason_category(&error)
+                ))
+            }
         }
     }
     Ok(())
@@ -516,6 +545,175 @@ pub(super) fn path_error_message(path: &Path, error: &std::io::Error) -> String 
         std::io::ErrorKind::NotADirectory => format!("Not a directory: {}", display_path(path)),
         _ => format!("Cannot access '{}': {}", display_path(path), error),
     }
+}
+
+/// The operation a write/edit failure interrupted, for the model-facing
+/// message.
+///
+/// The verb is what the model needs to keep straight: an `edit`'s failed write
+/// used to say `Cannot write`, pointing the model at the wrong tool
+/// (PIR-BIN-077).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MutationOp {
+    Write,
+    Edit,
+}
+
+impl MutationOp {
+    fn verb(self) -> &'static str {
+        match self {
+            MutationOp::Write => "write",
+            MutationOp::Edit => "edit",
+        }
+    }
+}
+
+/// The stable, locale-independent reason category for an `io::ErrorKind`, or
+/// `None` when the kind has no dedicated category.
+///
+/// The category names the CAUSE the model must act on, and it must be the same
+/// bytes on every host: formatting the raw `std::io::Error` forwards the
+/// OS-provided message, which is localized (`拒绝访问。 (os error 5)` on a
+/// Chinese Windows, `Access is denied. (os error 5)` on an English one) and
+/// therefore not reproducible or assertable (PIR-BIN-077, the same class
+/// PIR-BIN-042 fixed for read/ls).
+fn mutation_reason(kind: std::io::ErrorKind) -> Option<&'static str> {
+    use std::io::ErrorKind;
+    match kind {
+        ErrorKind::NotFound => Some("no such file or directory"),
+        ErrorKind::PermissionDenied => Some("permission denied"),
+        ErrorKind::IsADirectory => Some("is a directory"),
+        ErrorKind::NotADirectory => Some("a path component is not a directory"),
+        ErrorKind::AlreadyExists => Some("already exists"),
+        // `ERROR_INVALID_NAME` / `ERROR_BAD_PATHNAME` on Windows (a component
+        // over the platform limit, an illegal name); `EINVAL` on Unix.
+        ErrorKind::InvalidFilename | ErrorKind::InvalidInput => Some("invalid file name"),
+        ErrorKind::StorageFull => Some("no space left on device"),
+        ErrorKind::FileTooLarge => Some("file too large"),
+        ErrorKind::ReadOnlyFilesystem => Some("read-only filesystem"),
+        _ => None,
+    }
+}
+
+/// The model-facing failure text for a `write`/`edit` filesystem operation:
+/// the operation, the path, a stable English reason category, and the raw OS
+/// detail preserved in a trailing parenthetical so a diagnostic is not lost.
+///
+/// Shape (matches the `Cannot write '<path>': …` / `Could not edit file: …`
+/// wording the tools already used, with the localized tail replaced):
+///
+/// ```text
+/// Cannot write 'ro.txt': Permission denied (access is denied; os error 5)
+/// Cannot edit 'adir': Is a directory (os error 5)
+/// Cannot write '<300 chars>.txt': Invalid file name (the filename, directory
+///   name, or volume label syntax is incorrect; os error 123)
+/// ```
+///
+/// The category is the part the model and a test can depend on; the raw detail
+/// is emphatically NOT the raw localized Display string — `error.raw_os_error()`
+/// plus, on Windows, the stable English `FormatMessage` text (see
+/// [`os_detail`]).
+pub(super) fn mutation_error_message(op: MutationOp, path: &str, error: &std::io::Error) -> String {
+    let category = mutation_reason(error.kind()).unwrap_or("I/O error");
+    match os_detail(error) {
+        Some(detail) => format!("Cannot {} '{}': {} ({})", op.verb(), path, category, detail),
+        None => format!("Cannot {} '{}': {}", op.verb(), path, category),
+    }
+}
+
+/// The operation/path/kind category for a failure that is not about a single
+/// final target (a parent-directory creation, a backend access check).
+pub(super) fn mutation_reason_category(error: &std::io::Error) -> &'static str {
+    mutation_reason(error.kind()).unwrap_or("I/O error")
+}
+
+/// [`mutation_error_message`] for the remote/pluggable arms, whose failure is
+/// a `env_client::FileError` (a Node-style errno class plus the daemon's
+/// message) rather than a local `io::Error`. Same shape and the same stable
+/// category vocabulary; the daemon's message is kept as the detail so a
+/// remote-only cause is not lost.
+pub(super) fn mutation_error_message_remote(
+    op: MutationOp,
+    path: &str,
+    error: &crate::env_client::FileError,
+) -> String {
+    use crate::env_client::FileErrorCode;
+    let category = match error.code {
+        FileErrorCode::NotFound => "no such file or directory",
+        FileErrorCode::PermissionDenied => "permission denied",
+        FileErrorCode::NotDirectory => "a path component is not a directory",
+        FileErrorCode::IsDirectory => "is a directory",
+        FileErrorCode::Invalid => "invalid file name",
+        FileErrorCode::Aborted => "operation aborted",
+        FileErrorCode::NotSupported | FileErrorCode::Unknown => "I/O error",
+    };
+    format!(
+        "Cannot {} '{}': {} ({})",
+        op.verb(),
+        path,
+        category,
+        error.message
+    )
+}
+
+/// The stable OS detail for [`mutation_error_message`]: `None` when the error
+/// carries no OS code (a platform-independent refusal).
+///
+/// On Windows this asks `FormatMessageW` for the system text with
+/// `LANG_ENGLISH`/`SUBLANG_ENGLISH_US`, so the bytes are English regardless of
+/// the host UI language, then appends the numeric code. Elsewhere — and when
+/// the lookup fails — the numeric code from `raw_os_error()` is the stable
+/// detail; the error's own `Display` is never used because it is localized.
+fn os_detail(error: &std::io::Error) -> Option<String> {
+    let code = error.raw_os_error()?;
+    #[cfg(windows)]
+    if let Some(text) = english_os_message(code) {
+        return Some(format!("{text}; os error {code}"));
+    }
+    Some(format!("os error {code}"))
+}
+
+/// `FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM, LANG_ENGLISH)` for `code`,
+/// trimmed of the trailing CRLF/period the Win32 table carries.
+///
+/// `LANG_ENGLISH` makes the text locale-independent: the message table is
+/// looked up in the English resource bundle even on a `zh-CN` host, which is
+/// the whole point of the helper (PIR-BIN-077). `None` when the code has no
+/// system message (the caller then reports just `os error <code>`).
+#[cfg(windows)]
+fn english_os_message(code: i32) -> Option<String> {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
+    };
+
+    // LANG_ENGLISH (0x09) | SUBLANG_ENGLISH_US (0x01) << 10.
+    const LANG_ENGLISH_US: u32 = 0x0409;
+    let mut buffer: [u16; 1024] = [0; 1024];
+    #[expect(
+        unsafe_code,
+        reason = "FormatMessageW fills a caller-owned fixed buffer; the length it returns is bounded against that buffer"
+    )]
+    // SAFETY: `buffer` is a live, 1024-`u16` allocation and `FORMAT_MESSAGE_
+    // IGNORE_INSERTS` keeps the call from dereferencing any insertion
+    // arguments; the returned length is checked against the buffer before the
+    // slice is built.
+    let length = unsafe {
+        FormatMessageW(
+            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            std::ptr::null(),
+            code as u32,
+            LANG_ENGLISH_US,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if length == 0 {
+        return None;
+    }
+    let raw = String::from_utf16_lossy(&buffer[..length as usize]);
+    let trimmed = raw.trim().trim_end_matches('.').trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 /// The remote form of the atomic local write [`ConfinedTarget::write_atomically`]

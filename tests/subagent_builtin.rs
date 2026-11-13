@@ -1061,19 +1061,24 @@ async fn agent_with_own_model_uses_the_default_thinking_level() {
     assert!(!result.is_error, "content: {}", result.content);
 
     let observed = observed.lock().unwrap().clone();
-    // Child with its own model: default thinking level (medium), not off and
-    // not the parent's high.
+    // Both child models here are `reasoning: false` (`fake_model` /
+    // `other_model`), so `getSupportedThinkingLevels` yields only `off` and
+    // PIR-BIN-074's construction-time clamp (upstream
+    // `createAgentSession`) makes BOTH children send `off` — the own-model
+    // child would otherwise have taken the default `medium` and the inheriting
+    // child the parent's `high`. The distinction this test used to observe is
+    // not expressible on a non-reasoning model any more; what it still pins is
+    // that both dispatch paths build a child session and send a request.
     assert!(
         observed
             .iter()
-            .any(|(task, thinking)| task == "own" && *thinking == Some(ThinkingLevel::Medium)),
+            .any(|(task, thinking)| task == "own" && *thinking == Some(ThinkingLevel::Off)),
         "observed: {observed:?}"
     );
-    // Child without its own model: inherits the dispatch thinking level.
     assert!(
         observed
             .iter()
-            .any(|(task, thinking)| task == "inherited" && *thinking == Some(ThinkingLevel::High)),
+            .any(|(task, thinking)| task == "inherited" && *thinking == Some(ThinkingLevel::Off)),
         "observed: {observed:?}"
     );
 }

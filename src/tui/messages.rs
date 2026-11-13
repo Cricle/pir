@@ -3994,6 +3994,46 @@ fn earlier_lines_hint(theme: &super::theme::Theme, skipped: usize) -> String {
     )
 }
 
+/// `... (N earlier entries, <load-key> to load)` — PIR-TUI-027: the transcript
+/// window materializes a bounded tail of a huge session (see
+/// [`crate::tui::terminal::regular_window_start`] /
+/// `TRANSCRIPT_WINDOW_MAX_ENTRIES`), and the rows above that window used to
+/// disappear SILENTLY: the visible head jumped forward with no indication that
+/// older entries still exist. This row is painted above the first materialized
+/// entry so the truncation is honest (PROTOCOL v8: no performance win may
+/// discard visible information without telling the user), and `skipped` is the
+/// window's absolute start index — the exact number of entries not on screen.
+///
+/// `load_key` is the resolved chord that loads/targets older history
+/// (`tui.altScreen.top` in fullscreen, "scroll up" in regular mode); `None`
+/// falls back to the mode-independent wording so the row never names a key
+/// that does not exist in the current mode.
+pub fn transcript_truncation_hint(
+    theme: &super::theme::Theme,
+    skipped: usize,
+    load_key: Option<&str>,
+) -> String {
+    let noun = if skipped == 1 { "entry" } else { "entries" };
+    let head = theme.fg(
+        ThemeColor::Muted,
+        &format!("... ({skipped} earlier {noun},"),
+    );
+    match load_key.filter(|key| !key.is_empty()) {
+        Some(key) => format!(
+            "{} {}{}{}",
+            head,
+            theme.fg(ThemeColor::Dim, key),
+            theme.fg(ThemeColor::Muted, " to load"),
+            theme.fg(ThemeColor::Muted, ")"),
+        ),
+        None => format!(
+            "{} {}",
+            head,
+            theme.fg(ThemeColor::Muted, "scroll up to load)"),
+        ),
+    }
+}
+
 /// `formatDuration` (renderers/bash.ts:20-30): `3.2s` → `1m 5s` → `1h 2m 5s`.
 fn format_duration(ms: u64) -> String {
     let seconds = ms as f64 / 1000.0;

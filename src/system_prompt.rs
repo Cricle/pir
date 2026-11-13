@@ -175,8 +175,9 @@ pub struct SystemPromptInput<'a> {
     /// Package asset directory (upstream `getPackageDir`): callers resolve
     /// `PI_PACKAGE_DIR` once ([`crate::config::env::package_dir`]) and thread
     /// the value in, mirroring `cwd`, so the builder never reads the process
-    /// environment. The `docs` section is emitted only when this directory's
-    /// `README.md` exists.
+    /// environment. The `docs` section is emitted only when this directory
+    /// actually contains the three roots it names: `README.md`, `docs/` and
+    /// `examples/`.
     pub package_dir: Option<&'a Path>,
 }
 
@@ -450,26 +451,29 @@ fn render_project_context(project_files: &[(PathBuf, String)]) -> String {
 }
 
 /// The docs paths under a resolved package asset directory (upstream
-/// `getPackageDir`): the directory arrives via
-/// [`SystemPromptInput::package_dir`] — callers read `PI_PACKAGE_DIR` once
-/// through [`crate::config::env::package_dir`] — so the builder itself never
-/// touches the process environment.
+/// `getPackageDir`), or `None` when the asset tree is not actually installed.
+/// The directory arrives via [`SystemPromptInput::package_dir`] — callers read
+/// `PI_PACKAGE_DIR` once through [`crate::config::env::package_dir`] — so the
+/// builder itself never touches the process environment.
 ///
-/// The section is emitted whenever a package directory is resolved, WITHOUT
-/// probing the filesystem (upstream `getReadmePath`/`getDocsPath`/
-/// `getExamplesPath` are pure path joins; `system-prompt.ts` never checks that
-/// they exist). A missing/mis-installed asset tree is exactly the case the
-/// paths are meant to surface, and a probe here made the section depend on
-/// disk state that the caller had already resolved (PIR-BIN-061: pir emitted
-/// no `docs` section on a real install because `PI_PACKAGE_DIR` is unset and
-/// the old `README.md exists` gate suppressed the rest).
+/// The three roots the section names are probed HERE, before any text is
+/// built: a section may only point the model at files the running install
+/// actually has (PIR-BIN-061). The release archives ship `pir`,
+/// `pir-phone-server` and `README.md` only (`.github/workflows/release.yml`),
+/// and `cargo install` puts the binary in `~/.cargo/bin` with no assets at
+/// all; the old path-join-only section therefore told an installed pir to read
+/// `<install>/docs/tui.md`, which does not exist. A source checkout (or a
+/// future archive that ships the assets) keeps the full section.
+///
+/// The probe is all-or-nothing: the topic index below is relative to `docs/`
+/// and `examples/`, so a partial tree (a release archive's lone `README.md`)
+/// drops the whole section rather than leaving dangling lines.
 fn package_docs_paths(package_dir: Option<&Path>) -> Option<(PathBuf, PathBuf, PathBuf)> {
     let package_dir = package_dir?;
-    Some((
-        package_dir.join("README.md"),
-        package_dir.join("docs"),
-        package_dir.join("examples"),
-    ))
+    let readme = package_dir.join("README.md");
+    let docs = package_dir.join("docs");
+    let examples = package_dir.join("examples");
+    (readme.is_file() && docs.is_dir() && examples.is_dir()).then_some((readme, docs, examples))
 }
 
 /// Upstream `docs` section: pi's own documentation, read only on demand.

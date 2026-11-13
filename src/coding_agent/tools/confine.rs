@@ -69,6 +69,16 @@
 //! Win32; there is no primitive that atomically replaces the contents of one
 //! inode.
 //!
+//! An existing target whose directory-entry spelling differs from the
+//! requested spelling (Windows: NTFS stores the original casing and looks
+//! names up case-insensitively, so `mixedcase.txt` resolves to
+//! `MixedCase.txt`) also takes the in-place path. Replacing that entry by
+//! rename would install the caller's spelling and therefore silently rename
+//! the file on disk; rewriting its inode keeps the stored name (and inode) and
+//! matches what `fs.writeFile` does for pi. A brand-new file and a target
+//! whose spelling already matches still take temp+rename, and the spelling
+//! used to create a new file is whatever the caller asked for.
+//!
 //! For the ordinary temp+rename path, only the permission bits are copied to
 //! the new inode (best effort). ACLs and extended attributes are **not**
 //! preserved: on Unix they belong to the old inode, and on Windows the new
@@ -140,10 +150,17 @@ pub(super) fn confinement_error(requested: &str, error: &io::Error) -> String {
 /// What the replacement needs to know about an existing target before it
 /// chooses a strategy: the permission bits to copy onto a fresh temp file (only
 /// for a regular file; a link or special file must not lend its mode to the
-/// temp) and the number of directory entries sharing the inode.
+/// temp), the number of directory entries sharing the inode, and whether the
+/// directory entry's stored spelling differs from the requested one.
+///
+/// The last flag is only ever true on Windows, where the file name stored in
+/// the directory entry carries its original casing while lookups ignore case.
+/// A rename would install the requested spelling over that entry (a silent
+/// case-only rename), so such a target is rewritten in place instead.
 struct TargetInfo {
     permissions: Option<std::fs::Permissions>,
     hard_links: u64,
+    stored_spelling_differs: bool,
 }
 
 /// A target file inside the workspace whose parent directory is held open (or,
@@ -187,7 +204,10 @@ impl ConfinedTarget {
     /// the temp file where the platform supports it). For a file with more
     /// than one hard link it rewrites the inode in place instead, so every
     /// link keeps seeing the same bytes; see the module docs for the
-    /// atomicity/metadata tradeoff.
+    /// atomicity/metadata tradeoff. A Windows target whose stored spelling
+    /// differs from the requested spelling (case-insensitive lookup found a
+    /// differently-cased directory entry) also takes the in-place path, so
+    /// the stored name is not replaced by the caller's spelling.
     ///
     /// `Ok(true)` is a completed replacement, `Ok(false)` an abort observed
     /// between chunks.
@@ -203,7 +223,10 @@ impl ConfinedTarget {
             return Ok(false);
         }
         let existing = self.dir.target_info(&self.name).ok();
-        if existing.as_ref().is_some_and(|info| info.hard_links > 1) {
+        if existing
+            .as_ref()
+            .is_some_and(|info| info.hard_links > 1 || info.stored_spelling_differs)
+        {
             return self.write_in_place(content, signal, chunk_bytes).await;
         }
         let original_permissions = existing.and_then(|info| info.permissions);
@@ -524,6 +547,9 @@ mod imp {
                 } else {
                     1
                 },
+                // POSIX preserves the requested name verbatim; a rename cannot
+                // change it, so the in-place spelling workaround is Windows-only.
+                stored_spelling_differs: false,
             })
         }
 
@@ -878,6 +904,13 @@ mod imp {
             }
             let permissions = file.metadata()?.permissions();
             let is_regular = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0;
+            // `final_path` reports the directory entry's stored spelling, so a
+            // mismatch with the requested name means this lookup resolved to a
+            // differently-cased (or aliased) entry. Replacing it by rename
+            // would install the requested spelling; the caller takes the
+            // in-place path for such a target instead.
+            let stored_spelling_differs =
+                is_regular && resolved.file_name().is_some_and(|stored| stored != name);
             Ok(super::TargetInfo {
                 permissions: is_regular.then_some(permissions),
                 hard_links: if is_regular {
@@ -885,6 +918,7 @@ mod imp {
                 } else {
                     1
                 },
+                stored_spelling_differs,
             })
         }
 
@@ -1074,6 +1108,7 @@ mod imp {
             Ok(super::TargetInfo {
                 permissions: Some(metadata.permissions()),
                 hard_links: 1,
+                stored_spelling_differs: false,
             })
         }
 

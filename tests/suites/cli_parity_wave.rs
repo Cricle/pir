@@ -6,11 +6,15 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use pir::coding_agent::cli::{preprocess_args, AuthCommand, Cli, Command, McpCommand};
+use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
 // Update target plumbing (clap parse -> UpdateRequest -> UpdateTarget)
@@ -713,4 +717,763 @@ fn mcp_add_rejects_names_the_loader_would_drop() {
         error.to_string().contains("name must match"),
         "unexpected error: {error}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-030: a positional that spells a subcommand is a PROMPT whenever the
+// print surface is explicitly selected (upstream `resolveAppMode` decides the
+// host from flags first, then treats every positional as a message).
+//
+// All but the two schedule tests drive the REAL parse (`parse_cli`, the one the
+// binary calls): the observable contract is `Cli::command == None` and the word
+// in `Cli::messages`. `pir print "<prompt>"`, bare management commands and
+// `--mode rpc` keep their grammar; `--help`/`--version` keep short-circuiting.
+// ---------------------------------------------------------------------------
+
+/// [`pir::coding_agent::cli::parse_cli`] with the `pir` argv[0] prepended and
+/// the bundled shorts normalized first: the exact sequence
+/// `src/main_cli/run_mode.rs` runs (preprocess, then the mode-aware parse).
+fn parse_pir(argv: &[&str]) -> Result<Cli, clap::Error> {
+    let (args, _) = preprocess_args(argv.iter().map(|arg| (*arg).to_string()).collect());
+    let mut full = vec!["pir".to_owned()];
+    full.extend(args);
+    pir::coding_agent::cli::parse_cli(&full)
+}
+
+/// The prompt a print-surface invocation ends up carrying (and which subcommand,
+/// if any, was resolved).
+///
+/// The prompt comes from [`Cli::entry_plan`], the production path that folds a
+/// `--print [MESSAGE]` value into the message list — `-p version` binds
+/// `version` to `--print` (clap optional value) and the plan reports it as the
+/// prompt, exactly as the print host prompts it.
+fn prompt_of(argv: &[&str]) -> (Option<String>, Vec<String>) {
+    let cli = parse_pir(argv).expect("argv should parse");
+    let messages = cli.entry_plan(true, true).messages;
+    let command = cli.command.as_ref().map(|command| match command {
+        Command::Version => "version".to_string(),
+        Command::Models { .. } => "models".to_string(),
+        Command::Config { .. } => "config".to_string(),
+        Command::Session => "session".to_string(),
+        Command::List => "list".to_string(),
+        Command::Mcp { .. } => "mcp".to_string(),
+        Command::Install { .. } => "install".to_string(),
+        Command::Grep { .. } => "grep".to_string(),
+        Command::Print { .. } => "print".to_string(),
+        Command::Interactive => "interactive".to_string(),
+        Command::Rpc => "rpc".to_string(),
+        other => format!("{other:?}"),
+    });
+    (command, messages)
+}
+
+/// Every top-level subcommand spelling the derive knows, plus the ones clap
+/// generates itself (`help`) and the one `#[command(version)]` shadows
+/// (`version`: the generated flag/builtin hides the same-named variant, so it
+/// never appears in `get_subcommands()` while `pir version` still dispatches).
+fn subcommand_spellings() -> Vec<String> {
+    use clap::CommandFactory;
+    let mut words: Vec<String> = Cli::command()
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_owned())
+        .collect();
+    for word in ["help", "version"] {
+        if !words.iter().any(|existing| existing == word) {
+            words.push(word.to_owned());
+        }
+    }
+    words
+}
+
+#[test]
+fn print_surface_shadows_every_real_subcommand_name() {
+    // The gate works by renaming subcommands, so its placeholder prefix must
+    // stay unspellable by a real command name or alias.
+    use clap::CommandFactory;
+    for word in subcommand_spellings() {
+        assert!(
+            !word.starts_with("__pir-print-surface-"),
+            "the placeholder prefix must not collide with the real command `{word}`"
+        );
+    }
+    assert!(
+        Cli::command()
+            .get_subcommands()
+            .any(|sub| sub.get_name() == "print"),
+        "the documented `pir print` subcommand must exist"
+    );
+}
+
+#[test]
+fn subcommand_spelling_is_a_prompt_in_print_mode() {
+    // The exact shape the issue reports: the print surface is selected by a
+    // flag, so the trailing word must reach the model.
+    for word in subcommand_spellings() {
+        let argv = [
+            "--print",
+            "--mode",
+            "json",
+            "--no-session",
+            "--provider",
+            "mock",
+            "--model",
+            "mock/mock-model",
+            word.as_str(),
+        ];
+        let (command, messages) = prompt_of(&argv);
+        assert_eq!(
+            command, None,
+            "`{word}` must not resolve a subcommand in print mode"
+        );
+        assert_eq!(
+            messages,
+            vec![word.clone()],
+            "`{word}` must arrive as the prompt"
+        );
+    }
+}
+
+#[test]
+fn print_flag_alone_still_yields_the_word_as_a_prompt() {
+    let (command, messages) = prompt_of(&["-p", "version"]);
+    assert_eq!(command, None, "`-p version` must be a prompt");
+    assert_eq!(messages, vec!["version".to_string()]);
+}
+
+#[test]
+fn print_flag_after_the_prompt_still_demotes_it() {
+    // Upstream parses flags by NAME wherever they appear, so the selection
+    // cannot depend on flag order.
+    let (command, messages) = prompt_of(&["version", "--print", "--mode", "json"]);
+    assert_eq!(command, None, "`version --print` must be a prompt");
+    assert_eq!(messages, vec!["version".to_string()]);
+}
+
+#[test]
+fn mode_json_alone_selects_the_print_surface() {
+    // `--mode json` without `--print` is the JSON print host, not a subcommand
+    // carrier (upstream `resolveAppMode`).
+    for argv in [
+        vec!["--mode", "json", "version"],
+        vec!["--mode=json", "version"],
+        vec!["--mode", "text", "models"],
+    ] {
+        let (command, messages) = prompt_of(&argv);
+        assert_eq!(command, None, "`{argv:?}` must not resolve a subcommand");
+        assert!(!messages.is_empty(), "`{argv:?}` must carry the prompt");
+    }
+}
+
+#[test]
+fn documented_print_subcommand_keeps_its_grammar() {
+    // `pir print "<prompt>"` — the leading positional IS the subcommand, and
+    // its own prompt argument carries the text. The same holds with mode flags
+    // in front of or after the subcommand.
+    for argv in [
+        vec!["print", "--mode", "json", "version"],
+        vec!["print", "--no-session", "install npm:left-pad"],
+        vec!["print", "models"],
+    ] {
+        let cli = parse_pir(&argv).expect("argv should parse");
+        match cli.command {
+            Some(Command::Print { prompt }) => {
+                assert!(
+                    prompt.is_some(),
+                    "`pir {argv:?}` must carry its own prompt argument"
+                );
+            }
+            other => panic!("`pir {argv:?}` must keep the `print` subcommand: {other:?}"),
+        }
+    }
+    // The exemption is the FIRST TOKEN, not "the word print anywhere": with an
+    // explicit print selection, a later `print` word is an ordinary prompt.
+    let (command, messages) = prompt_of(&["--print", "--mode", "json", "print"]);
+    assert_eq!(
+        command, None,
+        "`pir --print --mode json print` must treat the word as a prompt"
+    );
+    assert_eq!(messages, vec!["print".to_string()]);
+}
+
+#[test]
+fn bare_management_commands_are_untouched() {
+    for argv in [
+        vec!["version"],
+        vec!["models"],
+        vec!["config"],
+        vec!["list"],
+        vec!["session"],
+        vec!["mcp"],
+        vec!["interactive"],
+    ] {
+        let cli = parse_cli(&argv);
+        assert!(
+            cli.command.is_some(),
+            "bare `pir {}` must still dispatch a command",
+            argv[0]
+        );
+        assert!(
+            cli.messages.is_empty(),
+            "bare `pir {}` must not leave a message positional",
+            argv[0]
+        );
+    }
+    // Arguments of a management command still bind to it.
+    let config = parse_cli(&["config", "-l"]);
+    assert!(
+        matches!(config.command, Some(Command::Config { local: true, .. })),
+        "`pir config -l` must keep its --local flag: {:?}",
+        config.command
+    );
+}
+
+#[test]
+fn rpc_mode_keeps_the_subcommand_grammar() {
+    // `--mode rpc` is its own host, not the print surface: a positional word
+    // still resolves the subcommand exactly as before, and it wins over
+    // `--print` whatever the flag order (upstream `resolveAppMode`).
+    // `--mode rpc --print version` is deliberately absent: clap's `--print`
+    // takes an OPTIONAL value, so there `version` is the flag's value and the
+    // run is an RPC host (the pre-fix grammar did the same); it is not a
+    // subcommand-resolution case.
+    for argv in [
+        vec!["--mode", "rpc", "version"],
+        vec!["--print", "--mode", "rpc", "version"],
+        vec!["--mode=rpc", "models"],
+    ] {
+        let cli = parse_cli(&argv);
+        assert!(
+            cli.command.is_some(),
+            "`pir {argv:?}` must keep the subcommand: {:?}",
+            cli.command
+        );
+        assert!(
+            cli.messages.is_empty(),
+            "`pir {argv:?}` must not turn the command name into a message"
+        );
+    }
+}
+
+#[test]
+fn flags_after_a_demoted_prompt_still_parse_as_flags() {
+    // The gate renames subcommands; it must NOT insert `--` (a `--` would turn
+    // every later token into prompt text). Upstream keeps recognizing flags by
+    // name anywhere on the line, so a trailing `--no-session` is still a flag.
+    let cli = parse_pir(&["--print", "install", "npm:left-pad", "now", "--no-session"])
+        .expect("the print-surface parse must accept the invocation");
+    assert!(
+        cli.command.is_none(),
+        "no subcommand may resolve, got {:?}",
+        cli.command
+    );
+    assert!(cli.no_session, "a trailing --no-session must stay a flag");
+    assert_eq!(
+        cli.entry_plan(true, true).messages,
+        vec![
+            "install".to_string(),
+            "npm:left-pad".to_string(),
+            "now".to_string()
+        ],
+        "every positional word stays a prompt word, in order"
+    );
+}
+
+#[test]
+fn help_and_version_short_circuit_before_the_gate() {
+    // `--print --help` must print the NORMAL help (not a shadow grammar's),
+    // and the version flags must keep clap's DisplayVersion path.
+    for argv in [vec!["--print", "--help"], vec!["--mode", "json", "--help"]] {
+        let Err(error) = parse_pir(&argv) else {
+            panic!("`pir {argv:?}` must surface a clap DisplayHelp error");
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelp,
+            "`pir {argv:?}` must short-circuit to help"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("Commands:") && rendered.contains("  version "),
+            "help must list the REAL subcommands, got:\n{rendered}"
+        );
+    }
+    for argv in [vec!["--print", "--version"], vec!["--mode", "json", "-v"]] {
+        let Err(error) = parse_pir(&argv) else {
+            panic!("`pir {argv:?}` must surface a clap DisplayVersion error");
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayVersion,
+            "`pir {argv:?}` must short-circuit to the version"
+        );
+    }
+}
+
+#[test]
+fn value_words_are_not_mistaken_for_the_print_selector() {
+    // `--model version` puts the word `version` in a VALUE slot: the scan must
+    // not read it as a selector, and no print host is implied by it.
+    let cli = parse_cli(&["--model", "version"]);
+    assert!(
+        cli.model.as_deref() == Some("version"),
+        "the word must bind to --model"
+    );
+    let cli = parse_cli(&["--mode", "rpc", "--model", "json", "version"]);
+    assert!(
+        cli.command.is_some(),
+        "rpc keeps the grammar even with a `json` model name"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-030 process level: the REAL binary, one loopback SSE mock.
+//
+// The unit tests above pin the parse; these pin the user-visible contract:
+// a subcommand word in print/JSON mode produces the JSONL event stream (the
+// model was called), while bare management commands, `pir print "<prompt>"`,
+// `--mode rpc` and `--help` keep their existing behavior.
+// ---------------------------------------------------------------------------
+
+/// A loopback OpenAI-compatible SSE provider answering every POST with one
+/// complete `stop` stream and recording each request body.
+struct PrintMock {
+    base_url: String,
+    requests: Arc<Mutex<Vec<Value>>>,
+    stop: Arc<AtomicUsize>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PrintMock {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the print mock");
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking print mock");
+        let addr = listener.local_addr().expect("print mock addr");
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::clone(&requests);
+        let stopping = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            while stopping.load(Ordering::SeqCst) == 0 {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if let Some(body) = serve_print_request(stream) {
+                            recorded
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(body);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://{addr}/v1"),
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn requests(&self) -> Vec<Value> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Wait until `count` requests have landed (the child's exit can race the
+    /// mock's accept loop), then return what was recorded.
+    fn wait_for_requests(&self, count: usize) -> Vec<Value> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let requests = self.requests();
+            if requests.len() >= count || Instant::now() >= deadline {
+                return requests;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for PrintMock {
+    fn drop(&mut self) {
+        self.stop.store(1, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Serve one request; returns the parsed POST body (the model request), or
+/// `None` for the GET /models probe the provider catalog may issue.
+fn serve_print_request(mut stream: std::net::TcpStream) -> Option<Value> {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let head_end = loop {
+        if let Some(position) = find_bytes(&buffer, b"\r\n\r\n") {
+            break position + 4;
+        }
+        if buffer.len() > 1 << 20 {
+            return None;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return None,
+            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            Err(_) => return None,
+        }
+    };
+    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let mut body = buffer[head_end..].to_vec();
+    while body.len() < content_length {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => body.extend_from_slice(&chunk[..read]),
+            Err(_) => break,
+        }
+    }
+    let is_post = head.starts_with("POST");
+    let parsed = if is_post && !body.is_empty() {
+        serde_json::from_slice::<Value>(&body).ok()
+    } else {
+        None
+    };
+    let response = if is_post {
+        let mut sse = String::new();
+        sse.push_str(&sse_chunk(
+            json!({ "role": "assistant", "content": "" }),
+            None,
+        ));
+        sse.push_str(&sse_chunk(json!({ "content": "P030-MOCK-REPLY" }), None));
+        sse.push_str(&sse_chunk(json!({}), Some("stop")));
+        sse.push_str("data: [DONE]\n\n");
+        http_bytes("text/event-stream", sse.into_bytes())
+    } else {
+        http_bytes(
+            "application/json",
+            br#"{"object":"list","data":[{"id":"mock-model","object":"model"}]}"#.to_vec(),
+        )
+    };
+    let _ = stream.write_all(&response);
+    let _ = stream.flush();
+    parsed
+}
+
+fn http_bytes(content_type: &str, body: Vec<u8>) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncache-control: no-cache\r\n\
+         connection: close\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&body);
+    response
+}
+
+fn sse_chunk(delta: Value, finish_reason: Option<&str>) -> String {
+    let payload = json!({
+        "id": "mock-p030",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "mock-model",
+        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
+    });
+    format!("data: {payload}\n\n")
+}
+
+/// Isolated agent dir (models.json pointing at `mock`) plus a work dir.
+struct PrintSandbox {
+    root: PathBuf,
+    agent: PathBuf,
+    work: PathBuf,
+}
+
+impl PrintSandbox {
+    fn new(label: &str, mock: &PrintMock) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "pir-p030-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        let agent = root.join("agent");
+        let work = root.join("work");
+        std::fs::create_dir_all(&agent).expect("create agent dir");
+        std::fs::create_dir_all(&work).expect("create work dir");
+        let models = json!({
+            "providers": {
+                "mock": {
+                    "name": "Mock",
+                    "baseUrl": mock.base_url,
+                    "api": "openai-completions",
+                    "apiKey": "sk-mock-p030-not-a-real-credential",
+                    "models": [{
+                        "id": "mock-model",
+                        "name": "Mock Model",
+                        "reasoning": false,
+                        "input": ["text"],
+                        "contextWindow": 128000,
+                        "maxTokens": 4096,
+                    }],
+                }
+            }
+        });
+        std::fs::write(agent.join("models.json"), models.to_string()).expect("write models.json");
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({
+                "defaultProvider": "mock",
+                "defaultModel": "mock-model",
+                "defaultThinkingLevel": "off",
+            })
+            .to_string(),
+        )
+        .expect("write settings.json");
+        Self { root, agent, work }
+    }
+
+    fn path(&self) -> &Path {
+        &self.root
+    }
+
+    /// Run the built binary with the sandbox environment.
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_pir"));
+        command
+            .current_dir(&self.work)
+            .env("PIR_AGENT_DIR", &self.agent)
+            .env("PIR_CODING_AGENT_DIR", &self.agent)
+            .env("PI_CODING_AGENT_DIR", &self.agent)
+            .env("HOME", &self.root)
+            .env("USERPROFILE", &self.root)
+            .env("PI_OFFLINE", "1")
+            .env("PI_SKIP_VERSION_CHECK", "1")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env("RUST_MIN_STACK", "8388608")
+            .args(args)
+            .stdin(Stdio::null());
+        command.output().expect("run the pir binary")
+    }
+}
+
+impl Drop for PrintSandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// The print flags every case shares (no extensions, no context, no session).
+const P030_PRINT_FLAGS: [&str; 9] = [
+    "--no-session",
+    "--no-context-files",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-extensions",
+    "--provider",
+    "mock",
+    "--model",
+    "mock-model",
+];
+
+fn print_args(word: &str) -> Vec<&str> {
+    let mut args = vec!["--print", "--mode", "json"];
+    args.extend(P030_PRINT_FLAGS);
+    args.push(word);
+    args
+}
+
+#[test]
+fn binary_print_json_mode_sends_subcommand_words_to_the_model() {
+    let mock = PrintMock::start();
+    for word in ["version", "models", "config", "install", "grep"] {
+        let sandbox = PrintSandbox::new(&format!("word-{word}"), &mock);
+        let before = mock.requests().len();
+        let output = sandbox.run(&print_args(word));
+        assert!(
+            output.status.success(),
+            "`pir --print --mode json {word}` must exit 0; stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let first = stdout.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with('{'),
+            "JSON mode must emit the JSONL event stream, got first line: {first}"
+        );
+        assert!(
+            stdout.contains("\"type\":\"session\""),
+            "the stream must open with the session frame, got:\n{}",
+            stdout.lines().take(3).collect::<Vec<_>>().join("\n")
+        );
+        assert!(
+            stdout.contains(&format!("\"text\":\"{word}\"")),
+            "the user message must carry the prompt `{word}`, got:\n{}",
+            stdout.lines().take(6).collect::<Vec<_>>().join("\n")
+        );
+        let requests = mock.wait_for_requests(before + 1);
+        assert_eq!(
+            requests.len(),
+            before + 1,
+            "`{word}` must produce exactly one model request (total {} before)",
+            requests.len()
+        );
+        let request = requests.last().expect("the recorded request");
+        let user_text = request["messages"]
+            .as_array()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "user")
+            })
+            .map(|message| message["content"].clone())
+            .unwrap_or(Value::Null);
+        let user_text = user_text.to_string();
+        assert!(
+            user_text.contains(word),
+            "the model request must carry `{word}` as user content, got: {user_text}"
+        );
+    }
+}
+
+#[test]
+fn binary_bare_management_commands_still_dispatch() {
+    let mock = PrintMock::start();
+    let sandbox = PrintSandbox::new("bare", &mock);
+
+    for (args, expected) in [
+        (vec!["version"], "pir "),
+        (vec!["models"], "mock:mock-model"),
+        (vec!["config"], "Resource configuration"),
+    ] {
+        let output = sandbox.run(&args);
+        assert!(
+            output.status.success(),
+            "bare `pir {}` must exit 0; stderr:\n{}",
+            args[0],
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with(expected),
+            "bare `pir {}` must keep its output (expected prefix `{expected}`), got:\n{stdout}",
+            args[0]
+        );
+    }
+    assert!(
+        mock.requests().is_empty(),
+        "management commands must not call the model"
+    );
+}
+
+#[test]
+fn binary_documented_print_subcommand_still_prompts() {
+    let mock = PrintMock::start();
+    let sandbox = PrintSandbox::new("print-sub", &mock);
+    let mut args = vec!["print", "--mode", "json"];
+    args.extend(P030_PRINT_FLAGS);
+    args.push("version");
+    let output = sandbox.run(&args);
+    assert!(
+        output.status.success(),
+        "`pir print --mode json version` must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = mock.wait_for_requests(1);
+    assert_eq!(
+        requests.len(),
+        1,
+        "the documented `pir print <prompt>` spelling must still send one prompt"
+    );
+}
+
+#[test]
+fn binary_rpc_mode_keeps_the_subcommand_grammar() {
+    let mock = PrintMock::start();
+    let sandbox = PrintSandbox::new("rpc", &mock);
+    // `--mode rpc version` still resolves the `version` command and prints the
+    // version banner; RPC never starts for it, so the run terminates on its own
+    // (the opposite outcome would hang waiting for RPC input).
+    let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_pir"));
+    command
+        .current_dir(&sandbox.work)
+        .env("PIR_AGENT_DIR", &sandbox.agent)
+        .env("PI_OFFLINE", "1")
+        .env("PI_SKIP_VERSION_CHECK", "1")
+        .args(["--mode", "rpc", "version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn pir");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait().expect("poll the child") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                panic!("`pir --mode rpc version` must dispatch the version command and exit");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let output = child.wait_with_output().expect("collect output");
+    assert!(status.success(), "the version command must exit 0");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with("pir "),
+        "RPC mode keeps the subcommand grammar: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(mock.requests().is_empty(), "no model traffic for `version`");
+}
+
+#[test]
+fn binary_help_is_unaffected_by_an_earlier_print_flag() {
+    let mock = PrintMock::start();
+    let sandbox = PrintSandbox::new("help", &mock);
+    for args in [
+        vec!["--help"],
+        vec!["--print", "--help"],
+        vec!["--mode", "json", "--help"],
+    ] {
+        let output = sandbox.run(&args);
+        assert!(
+            output.status.success(),
+            "`pir {args:?}` must exit 0; stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Commands:") && stdout.contains("  version "),
+            "`pir {args:?}` must print the real command list, got:\n{}",
+            stdout.lines().take(6).collect::<Vec<_>>().join("\n")
+        );
+    }
+    assert!(mock.requests().is_empty(), "help must never call the model");
 }

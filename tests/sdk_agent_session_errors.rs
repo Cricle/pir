@@ -1,14 +1,14 @@
 //! `createAgentSession` error surface (the SDK child-session bridge).
 //!
 //! The shim's `pirAgentSessionRun` spawns `pir print --mode json` per prompt
-//! and resolves the last assistant reply. `--mode json` deliberately exits 0
-//! with a failed turn reported IN-BAND as an event (upstream print-mode.ts
-//! maps a terminal `error`/`aborted` stopReason onto the exit code only in
-//! TEXT mode; pinned by
-//! `tests/suites/cli_entry_contract.rs::json_mode_provider_error_exits_0_with_header_and_error_event`).
-//! Before the fix, an errored turn therefore resolved as `""` — a provider
-//! failure read as a successful empty reply (the `reply2: ""` shape first
-//! observed in `tests/session_manager_ext.rs`).
+//! and resolves the last assistant reply. A failed turn is reported IN-BAND
+//! as an event (`stopReason: "error"` + `errorMessage`) and the child ALSO
+//! exits nonzero for it (PIR-BIN-037; pinned by
+//! `tests/suites/cli_entry_contract.rs::json_mode_provider_error_exits_nonzero_with_header_and_error_event`).
+//! Before the fix, an errored turn resolved as `""` — a provider failure read
+//! as a successful empty reply (the `reply2: ""` shape first observed in
+//! `tests/session_manager_ext.rs`). The bridge must reject with the terminal
+//! `errorMessage` (upstream `prompt()`'s text), not with the exit-code line.
 //!
 //! This target drives the run path three times through one live session:
 //!
@@ -240,9 +240,9 @@ out.reply1 = await session.prompt("Say hello");
 out.turn1Ends = assistantEnds.length;
 out.messagesAfterTurn1 = session.messages.length;
 
-// Turn 2: the provider fails in-band. The child exits 0 (json-mode parity),
-// so the failure is visible only through the terminal message — the run must
-// reject with its errorMessage, never resolve with "".
+// Turn 2: the provider fails in-band. The child exits nonzero (PIR-BIN-037)
+// AND the terminal message carries the error, so the run must reject with its
+// errorMessage — never resolve with "", and never surface only the exit code.
 out.reply2Rejected = false;
 try {
   out.reply2 = await session.prompt("Fail now");

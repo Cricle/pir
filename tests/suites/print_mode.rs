@@ -2342,6 +2342,7 @@ async fn run_print_compaction_probe(
         plugins: None,
         runtime: None,
         session_events: Some(recording_session_event_sink(Arc::clone(&frames))),
+        provider_retry: Default::default(),
     });
     let result = run_with_options(
         deps,
@@ -2693,6 +2694,7 @@ async fn run_print_double_compaction_probe() -> (
         plugins: None,
         runtime: None,
         session_events: Some(recording_session_event_sink(Arc::clone(&frames))),
+        provider_retry: Default::default(),
     });
     // The production per-message persistence sink (`run_print`): every
     // loop-produced message lands in the session at its `message_end`, so the
@@ -3003,6 +3005,7 @@ async fn run_print_append_failure_probe(
         plugins: None,
         runtime: None,
         session_events: Some(recording_session_event_sink(Arc::clone(&frames))),
+        provider_retry: Default::default(),
     });
     let result = run_with_options(
         deps,
@@ -3909,6 +3912,35 @@ fn run_print_subcommand(dir: &TempDir, args: &[&str]) -> std::process::Output {
         .expect("run pir print")
 }
 
+/// [`run_print_subcommand`] with bytes on stdin (the piped-stdin shape).
+fn run_print_subcommand_with_stdin(
+    dir: &TempDir,
+    args: &[&str],
+    stdin: &str,
+) -> std::process::Output {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pir"))
+        .current_dir(&dir.0)
+        .args(args)
+        .env("PIR_AGENT_DIR", dir.0.join("agent"))
+        .env("HOME", &dir.0)
+        .env("USERPROFILE", &dir.0)
+        .env("PI_OFFLINE", "1")
+        .env("PI_SKIP_VERSION_CHECK", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn pir print");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for pir print")
+}
+
 /// `--mode json` stdout must carry the terminal `agent_settled` frame
 /// (PIR-BIN-027): upstream's print sink (`session.subscribe`, print-mode.ts
 /// 108-112) streams every session event including `_emitAgentSettled`'s
@@ -4091,6 +4123,369 @@ fn print_subcommand_leaves_plain_at_text_in_request_body() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// PIR-BIN-031: `@` semantics in the print path
+//
+// Contract, measured against upstream pi 1.4.0
+// (`node …/cli.js --print "@missing.txt"` → `Error: File not found: <abs>`,
+// exit 1):
+//   (a) an `@` inside prose is untouched — a token that does not START with
+//       `@`, and a handle-shaped `@`-token (`@alice@example.com`), reach the
+//       model verbatim;
+//   (b) a token that STARTS with `@` and names a file is a file reference and
+//       its content is inlined;
+//   (c) a file reference to a missing/unreadable file is a loud ERROR with
+//       pi's message shape (`File not found: <absolute path>`, exit 1, no
+//       provider request).
+//
+// The defect: the print subcommand's inline scanner treated any
+// `@`-prefixed token with a dot-bearing remainder as a path, so an e-mail
+// handle became `File not found` and an existing file was silently eaten out
+// of the sentence.
+// ---------------------------------------------------------------------------
+
+/// (a) Prose `@`-handles reach the model verbatim on every print spelling.
+///
+/// The issue's exact repro: `pir print "cc @alice@example.com about it"` used
+/// to exit 1 with `File not found: …\alice@example.com`. Upstream's mock log
+/// for the same message carries it unchanged.
+#[test]
+fn print_subcommand_leaves_handle_shaped_at_tokens_verbatim() {
+    let bodies_seen = |prompt: &str, label: &str| {
+        let (port, captured) = spawn_capturing_mock();
+        let temp = TempDir::new(label);
+        write_closed_pipe_agent(&temp, port);
+        let output = run_print_subcommand(
+            &temp,
+            &[
+                "print",
+                prompt,
+                "--no-session",
+                "--provider",
+                "mock",
+                "--model",
+                "mock-model",
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{prompt}: stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bodies = captured.lock().expect("capture lock");
+        assert_eq!(bodies.len(), 1, "{prompt}: exactly one provider request");
+        String::from_utf8_lossy(bodies.first().expect("one body")).into_owned()
+    };
+
+    // The issue's repro string plus other handle-shaped prose. Each token
+    // starts with `@` but has no path separator and no file extension, so the
+    // path-shape rule keeps it as text.
+    for (prompt, label) in [
+        ("cc @alice@example.com about it", "at-prose-email"),
+        (
+            "email @bob.smith@corp.example now",
+            "at-prose-dotted-handle",
+        ),
+        ("follow @pi for updates", "at-prose-word-handle"),
+        ("try @v2.0 next", "at-prose-version"),
+    ] {
+        let body = bodies_seen(prompt, label);
+        assert!(
+            body.contains(prompt),
+            "{prompt}: the prose must reach the provider verbatim, got: {body}"
+        );
+        assert!(
+            !body.contains("<file name="),
+            "{prompt}: a handle-shaped token must never inline a file"
+        );
+    }
+}
+
+/// (a) The same prose on the piped-stdin shape (measured: the scanner also ran
+/// there) and on the top-level `--print` shape, so the rule is spelling-blind.
+#[test]
+fn print_prose_at_tokens_are_verbatim_on_stdin_and_the_top_level_form() {
+    let (port, captured) = spawn_capturing_mock();
+    let temp = TempDir::new("at-prose-stdin");
+    write_closed_pipe_agent(&temp, port);
+    let output = run_print_subcommand_with_stdin(
+        &temp,
+        &[
+            "print",
+            "--no-session",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+        ],
+        "cc @alice@example.com about it\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdin stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = {
+        let bodies = captured.lock().expect("capture lock");
+        assert_eq!(bodies.len(), 1, "exactly one provider request");
+        String::from_utf8_lossy(bodies.first().expect("one body")).into_owned()
+    };
+    assert!(
+        body.contains("cc @alice@example.com about it"),
+        "piped stdin prose must stay literal: {body}"
+    );
+
+    let (port, captured) = spawn_capturing_mock();
+    let temp = TempDir::new("at-prose-top-level");
+    write_closed_pipe_agent(&temp, port);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pir"))
+        .current_dir(&temp.0)
+        .args([
+            "--print",
+            "--no-session",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+            "cc @alice@example.com about it",
+        ])
+        .env("PIR_AGENT_DIR", temp.0.join("agent"))
+        .env("HOME", &temp.0)
+        .env("USERPROFILE", &temp.0)
+        .env("PI_OFFLINE", "1")
+        .env("PI_SKIP_VERSION_CHECK", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run pir --print");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "top-level stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = {
+        let bodies = captured.lock().expect("capture lock");
+        assert_eq!(bodies.len(), 1, "exactly one provider request");
+        String::from_utf8_lossy(bodies.first().expect("one body")).into_owned()
+    };
+    assert!(
+        body.contains("cc @alice@example.com about it"),
+        "top-level prose must stay literal: {body}"
+    );
+}
+
+/// (b) A token that STARTS with `@` names a file: its content is inlined and
+/// the token leaves the sentence (the contract, unchanged by PIR-BIN-031).
+#[test]
+fn print_at_file_tokens_still_inline_their_content() {
+    let (port, captured) = spawn_capturing_mock();
+    let temp = TempDir::new("at-inline-contract");
+    write_closed_pipe_agent(&temp, port);
+    let notes = temp.0.join("sample.txt");
+    std::fs::write(&notes, "INLINE-CONTRACT-BODY\n").expect("write sample");
+    let output = run_print_subcommand(
+        &temp,
+        &[
+            "print",
+            "look at @sample.txt now",
+            "--no-session",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = {
+        let bodies = captured.lock().expect("capture lock");
+        assert_eq!(bodies.len(), 1, "exactly one provider request");
+        String::from_utf8_lossy(bodies.first().expect("one body")).into_owned()
+    };
+    assert!(
+        body.contains("INLINE-CONTRACT-BODY"),
+        "an existing @file must be inlined: {body}"
+    );
+    // The wire body is JSON, so a Windows path arrives with escaped
+    // backslashes; assert the `<file name="...sample.txt">` envelope by its
+    // basename (the unit-level tests pin the absolute path shape).
+    assert!(
+        body.contains("<file name=\\\"") && body.contains("sample.txt\\\">"),
+        "the file block carries the file name: {body}"
+    );
+}
+
+/// (b) A bare `@path` argument (the `whole_prompt_files` form, where the
+/// prompt is nothing but `@`-tokens) still inlines, and a handle-shaped token
+/// that DOES name an existing file is still a reference — the prose rule never
+/// overrides the filesystem.
+#[test]
+fn print_at_file_reference_rule_covers_bare_args_and_on_disk_handles() {
+    let dir = TempDir::new("at-inline-shapes");
+    let plain = dir.0.join("a.txt");
+    std::fs::write(&plain, "AAA").expect("write a");
+    let handle = dir.0.join("weird@name.txt");
+    std::fs::write(&handle, "HANDLE-FILE").expect("write handle file");
+
+    let (expanded, images) = expand_prompt_file_args("@a.txt", &dir.0).expect("bare @file inlines");
+    assert!(
+        expanded.contains(&format!("<file name=\"{}\">", plain.display())),
+        "{expanded}"
+    );
+    assert!(images.is_empty());
+
+    // `@` inside a token is prose UNLESS the named file exists.
+    let (expanded, images) =
+        expand_prompt_file_args(&format!("summarize @{} please", handle.display()), &dir.0)
+            .expect("an on-disk handle-shaped path is a reference");
+    assert!(
+        expanded.contains("HANDLE-FILE"),
+        "an existing file always inlines: {expanded}"
+    );
+    assert!(images.is_empty());
+}
+
+/// (c) A file reference to a MISSING file is a loud error with pi's shape.
+///
+/// Measured upstream (`prod/build/base` parity run):
+/// `Error: File not found: <absolute path>` on stderr, exit 1, no request.
+#[test]
+fn print_missing_at_file_is_a_loud_pi_shaped_error() {
+    for (argv_prompt, label) in [
+        ("@missing.txt", "at-error-bare"),
+        ("read @missing.txt carefully", "at-error-prose-shape"),
+        ("@missing.txt @also-missing.txt", "at-error-list"),
+    ] {
+        let (port, captured) = spawn_capturing_mock();
+        let temp = TempDir::new(label);
+        write_closed_pipe_agent(&temp, port);
+        let output = run_print_subcommand(
+            &temp,
+            &[
+                "print",
+                argv_prompt,
+                "--no-session",
+                "--provider",
+                "mock",
+                "--model",
+                "mock-model",
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{argv_prompt}: a missing reference must exit 1, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // pi's exact shape: `Error: File not found: <absolute path>`.
+        assert!(
+            stderr.contains("Error: File not found: "),
+            "{argv_prompt}: pi-shaped diagnostic, got: {stderr}"
+        );
+        assert!(
+            stderr.contains(&temp.0.display().to_string()),
+            "{argv_prompt}: the message carries the absolute path, got: {stderr}"
+        );
+        assert!(
+            stderr.to_ascii_lowercase().contains("missing.txt"),
+            "{argv_prompt}: the message names the reference, got: {stderr}"
+        );
+        assert!(
+            captured.lock().expect("capture lock").is_empty(),
+            "{argv_prompt}: a missing file must fail before any provider request"
+        );
+    }
+}
+
+/// (c) The same error on the piped-stdin shape, whose text the scanner also
+/// reads (upstream: stdin is a message, so its `@`-tokens stay literal — but
+/// pir's documented stdin contract is the same prompt-expansion rule, so a
+/// missing reference is loud there too, matching the argv shape).
+#[test]
+fn print_missing_at_file_on_stdin_is_a_loud_error() {
+    let (port, captured) = spawn_capturing_mock();
+    let temp = TempDir::new("at-error-stdin");
+    write_closed_pipe_agent(&temp, port);
+    let output = run_print_subcommand_with_stdin(
+        &temp,
+        &[
+            "print",
+            "--no-session",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+        ],
+        "read @missing.txt\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Error: File not found: "),
+        "pi-shaped diagnostic, got: {stderr}"
+    );
+    assert!(
+        captured.lock().expect("capture lock").is_empty(),
+        "no provider request for a missing stdin reference"
+    );
+}
+
+/// The path-shape rule in one place: `@` inside a token and handle-shaped
+/// remainders are prose, path-shaped tokens are references (existing or not).
+#[test]
+fn expand_prompt_file_args_distinguishes_handles_from_paths() {
+    let dir = TempDir::new("at-handle-shape");
+
+    // Handles: no path separator, no alphabetic extension -> prose. Verbatim,
+    // no error, no attachment.
+    for prompt in [
+        "cc @alice@example.com about it",
+        "email @bob.smith@corp.example",
+        "follow @pi for updates",
+        "try @v2.0 next",
+    ] {
+        let (expanded, images) = expand_prompt_file_args(prompt, &dir.0)
+            .unwrap_or_else(|error| panic!("{prompt}: must stay prose, got {error}"));
+        assert_eq!(expanded, prompt, "{prompt}: text must be byte-identical");
+        assert!(images.is_empty());
+    }
+
+    // `@` inside a token that does not START with `@` is prose punctuation
+    // (`user@example.com`, `(@home)`, `a@b`), the pre-existing rule.
+    let plain = "contact user@example.com or ops@example.org about (@home), a@b";
+    let (expanded, images) =
+        expand_prompt_file_args(plain, &dir.0).expect("mid-token @ stays plain");
+    assert_eq!(expanded, plain);
+    assert!(images.is_empty());
+
+    // Path shapes: references, and a missing one is the loud error.
+    for prompt in [
+        "read @missing.txt",
+        "read @./missing.txt",
+        "read @sub/missing.txt",
+        "read @notes.csv",
+    ] {
+        let error = expand_prompt_file_args(prompt, &dir.0)
+            .expect_err("a path-shaped token must be a reference");
+        assert!(
+            error.to_string().contains("File not found:"),
+            "{prompt}: {error}"
+        );
+    }
+}
+
 #[test]
 fn expand_prompt_file_args_accepts_quotes_around_the_whole_token() {
     let dir = TempDir::new("at-file-whole-quote");
@@ -4202,4 +4597,175 @@ fn settings_compaction_config_model_override_beats_ordinary_setting() {
     let config = settings_compaction_config(&settings, &test_model()).expect("compaction enabled");
     assert_eq!(config.keep_recent_tokens, 900);
     assert_eq!(config.reserve_tokens, 2_000);
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-057: print installs `settings.retry.provider.*` on its requests
+// ---------------------------------------------------------------------------
+
+/// Records the transport knobs of every provider request. The real
+/// `run_print_with_environment` pipeline is driven (production deps assembly),
+/// so reverting the wiring makes the assertions fail even though the fake
+/// provider never goes on the wire.
+struct RetryKnobRecorder {
+    model: Model,
+    seen: Arc<Mutex<Vec<StreamOptions>>>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl Provider for RetryKnobRecorder {
+    #[allow(clippy::misnamed_getters)]
+    fn id(&self) -> &str {
+        &self.model.provider
+    }
+
+    fn name(&self) -> &str {
+        "retry knob recorder"
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        vec![self.model.clone()]
+    }
+
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        Vec::new()
+    }
+
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: Context,
+        options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(options);
+        let stream = AssistantMessageEventStream::new();
+        stream.push(AssistantMessageEventStream::done_event(
+            TerminalReason::Stop,
+            AssistantMessage {
+                api: self.model.api.clone(),
+                provider: self.model.provider.clone(),
+                model: self.model.id.clone(),
+                content: vec![ContentBlock::Text(TextContent {
+                    text: "RETRY_KNOB_REPLY".to_owned(),
+                    text_signature: None,
+                })],
+                stop_reason: StopReason::Stop,
+                timestamp: 1,
+                ..AssistantMessage::default()
+            },
+        ));
+        stream
+    }
+}
+
+/// Run ONE print prompt over a recording provider with `settings`, returning
+/// the `StreamOptions` the prompt request carried.
+async fn print_prompt_stream_options(settings_json: &str) -> StreamOptions {
+    let temp = TempDir::new("print-provider-retry");
+    let model = test_model();
+    let seen: Arc<Mutex<Vec<StreamOptions>>> = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(RetryKnobRecorder {
+        model: model.clone(),
+        seen: Arc::clone(&seen),
+        calls: Arc::clone(&calls),
+    }));
+
+    let settings: Settings =
+        serde_json::from_str(settings_json).expect("settings json is a valid Settings value");
+    let session_dir = temp.0.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("create sessions dir");
+    let config = Config {
+        session_dir: session_dir.to_string_lossy().into_owned(),
+        ..Config::default()
+    };
+    let options = PrintOptions {
+        prompt: "hi".to_owned(),
+        additional_messages: Vec::new(),
+        mode: OutputMode::Text,
+        session: SessionPlan::New { id: None },
+        no_context_files: true,
+        cli_provider: Some("test".to_owned()),
+        cli_model: Some("test-model".to_owned()),
+        cli_thinking: None,
+        api_key_override: Some("test-key".to_owned()),
+        model_patterns: None,
+        session_name: None,
+        system_prompt_override: Some("BASE-SYSTEM".to_owned()),
+        append_system_prompt: Vec::new(),
+        settings_default_tools: None,
+        cli_tools: Vec::new(),
+        cli_exclude_tools: Vec::new(),
+        no_tools: true,
+        no_builtin_tools: true,
+        is_continuing: false,
+        resources: ResourcePathOptions {
+            no_skills: true,
+            no_prompt_templates: true,
+            ..ResourcePathOptions::default()
+        },
+        images: Vec::new(),
+    };
+
+    let outcome = run_print_with_environment(
+        options,
+        &config,
+        &[],
+        temp.0.clone(),
+        PiEnvironment {
+            registry,
+            models: vec![model],
+            api_keys: BTreeMap::from([("test".to_owned(), "test-key".to_owned())]),
+            settings,
+        },
+    )
+    .await
+    .expect("run_print");
+    assert_eq!(outcome.exit_code, 0);
+
+    let calls = calls.load(Ordering::SeqCst);
+    assert_eq!(
+        calls, 1,
+        "one prompt must send exactly one provider request"
+    );
+    let options = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pop()
+        .expect("recorded request");
+    options
+}
+
+/// `settings.retry.provider.*` must appear on print's prompt request
+/// (upstream sdk.ts:341-352 wires it for every request of the session).
+#[tokio::test(flavor = "current_thread")]
+async fn print_prompt_request_carries_provider_retry_settings() {
+    let options = print_prompt_stream_options(
+        r#"{ "retry": { "provider": { "maxRetries": 0, "maxRetryDelayMs": 5000, "timeoutMs": 1000 } } }"#,
+    )
+    .await;
+    assert_eq!(
+        options.max_retries,
+        Some(0),
+        "retry.provider.maxRetries must reach print's request"
+    );
+    assert_eq!(options.max_retry_delay_ms, Some(5_000));
+    assert_eq!(options.timeout_ms, Some(1_000));
+}
+
+/// Default path unchanged (v8): with no `retry.provider` block the request
+/// carries `None` for all three knobs, so the transport keeps 2 retries /
+/// 60 s cap / no total timeout and a normal run gains no extra latency.
+#[tokio::test(flavor = "current_thread")]
+async fn print_prompt_request_keeps_transport_defaults_without_settings() {
+    let options = print_prompt_stream_options("{}").await;
+    assert_eq!(options.max_retries, None);
+    assert_eq!(options.max_retry_delay_ms, None);
+    assert_eq!(options.timeout_ms, None);
 }

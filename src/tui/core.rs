@@ -2772,6 +2772,12 @@ pub struct TuiCore {
     /// the transcript past the window instead of moving it. Only meaningful
     /// while `scroll_offset == 0`; any ordinary scroll clears it.
     follow_suppressed: bool,
+    /// Jump-to-earliest target (PIR-TUI-027, see
+    /// [`TuiCore::set_band_top_target`]): set by `tui.altScreen.top`, cleared
+    /// by any explicit scroll or once entry 0 is materialized. While set, the
+    /// interactive loop re-anchors the viewport to the band top every frame so
+    /// the per-frame window extension can reach the session start.
+    band_top_target: bool,
     /// Transcript length at the previous render (P1-2 viewport pinning):
     /// the scrolled render path compensates `scroll_offset` by the frame's
     /// transcript growth so a viewport scrolled into history stays put
@@ -2843,6 +2849,21 @@ pub struct TuiCore {
     /// previous frame length, so a frame that merely appends after a shrink
     /// does not trigger a spurious full repaint.
     max_lines_rendered: usize,
+    /// PIR-TUI-027: whether the CURRENT frame carries the WHOLE transcript
+    /// (`true`, the default) or only a bounded WINDOW of it (`false`, a
+    /// regular-mode transcript window where entries `[0, start)` are not
+    /// materialized).
+    ///
+    /// A clearing full render emits `2J` + home + `3J`; `3J` ERASES the
+    /// terminal's scrollback, and on the main screen that scrollback is
+    /// exactly the part of the transcript the user has already read. For a
+    /// COMPLETE frame the rows below the clear re-emit all of it, so the
+    /// erasure is repaired in the same frame (upstream's rule, kept). For a
+    /// WINDOWED frame it cannot be: the re-write only carries the tail, so
+    /// the clear would destroy visible history permanently (PROTOCOL v8 §5c).
+    /// Every clearing repaint therefore drops the `3J` — keeps `2J` + home,
+    /// which is all a repaint needs — whenever this is `false`.
+    frame_is_complete_transcript: bool,
     /// Upstream `showHardwareCursor` (settings / PI_HARDWARE_CURSOR): with
     /// the cursor visible, the renderer moves it to the editor cell after
     /// every frame; hidden (default), it is hidden once and stays put.
@@ -3054,6 +3075,7 @@ impl TuiCore {
             stopped: false,
             scroll_offset: 0,
             follow_suppressed: false,
+            band_top_target: false,
             last_transcript_end: None,
             dock_height: 0,
             decorator: None,
@@ -3070,6 +3092,7 @@ impl TuiCore {
             dock_cursor_cell: None,
             clear_on_shrink: false,
             max_lines_rendered: 0,
+            frame_is_complete_transcript: true,
             show_hardware_cursor: false,
             cursor_visible: true,
             windowed_viewport: false,
@@ -3141,6 +3164,20 @@ impl TuiCore {
         self.scroll_to(offset, false);
     }
 
+    /// Re-anchor the viewport to the materialized band's top WITHOUT clearing
+    /// the jump-to-earliest target (PIR-TUI-027). The interactive loop calls
+    /// this every frame while [`TuiCore::band_top_target`] is set; unlike
+    /// [`TuiCore::set_scroll_offset`] it is not a user scroll, so the target
+    /// survives until entry 0 is materialized or the user scrolls again.
+    pub fn anchor_to_band_top(&mut self, offset: usize) {
+        if offset == 0 && self.scroll_offset > 0 {
+            self.invalidate_frame();
+            self.last_transcript_end = Some(self.last_frame_transcript_end());
+        }
+        self.scroll_offset = offset;
+        self.follow_suppressed = false;
+    }
+
     /// Upstream `ScrollView.scrollTo(top, { disableFollow })` in the
     /// viewport's inverted coordinates: move to `offset` rows above the frame
     /// end and, with `disable_follow` and an offset that lands on the end
@@ -3150,6 +3187,11 @@ impl TuiCore {
     /// toward the end ([`TuiCore::set_scroll_offset`], the wheel/keys) or
     /// `scrollToEnd` clears the pin.
     pub fn scroll_to(&mut self, offset: usize, disable_follow: bool) {
+        // A concrete scroll target supersedes the jump-to-earliest pin
+        // (PIR-TUI-027): the loop re-anchors only while the pin is set.
+        if !(offset == 0 && self.band_top_target && self.scroll_offset == 0) {
+            self.band_top_target = false;
+        }
         if offset == 0 && self.scroll_offset > 0 {
             self.invalidate_frame();
             // Leaving the windowed path: the pinning baseline becomes the end
@@ -3160,6 +3202,30 @@ impl TuiCore {
         }
         self.scroll_offset = offset;
         self.follow_suppressed = disable_follow && offset == 0;
+    }
+
+    /// Set the jump-to-earliest target (PIR-TUI-027): while it is set, the
+    /// interactive loop re-anchors the scrolled viewport to the materialized
+    /// band's top every frame, so the on-demand window extension (one chunk
+    /// per frame, `TRANSCRIPT_WINDOW_STEP_ENTRIES`) can walk all the way to
+    /// entry 0 instead of stopping after a single chunk.
+    ///
+    /// `tui.altScreen.top` (Ctrl+Home) sets it; any explicit scroll through
+    /// [`TuiCore::scroll_to`] clears it, as does materializing entry 0 (there
+    /// is nothing above the band left to chase).
+    pub fn set_band_top_target(&mut self, on: bool) {
+        self.band_top_target = on;
+    }
+
+    /// Whether the jump-to-earliest target is set (test/diagnostic seam).
+    pub fn band_top_target(&self) -> bool {
+        self.band_top_target
+    }
+
+    /// Clear the target once the whole transcript is materialized — the loop
+    /// calls this from the band sync when `window.start() == 0`.
+    pub fn clear_band_top_target(&mut self) {
+        self.band_top_target = false;
     }
 
     /// The transcript end of the last rendered frame (undocked), for the
@@ -3233,6 +3299,20 @@ impl TuiCore {
     /// Whether the windowed viewport is on.
     pub fn windowed_viewport(&self) -> bool {
         self.windowed_viewport
+    }
+
+    /// Declare whether the frames about to be rendered carry the WHOLE
+    /// transcript (see [`TuiCore::frame_is_complete_transcript`]). The
+    /// regular-mode caller sets it to `start == 0` before every render: a
+    /// non-zero transcript-window start means the frame is a bounded tail, and
+    /// a `3J` clear would then erase scrollback the frame cannot re-emit.
+    pub fn set_frame_is_complete_transcript(&mut self, complete: bool) {
+        self.frame_is_complete_transcript = complete;
+    }
+
+    /// Whether the current frame carries the whole transcript.
+    pub fn frame_is_complete_transcript(&self) -> bool {
+        self.frame_is_complete_transcript
     }
 
     /// Re-anchor the scroll-pinning baseline after the caller changed the
@@ -4499,7 +4579,18 @@ impl TuiCore {
                 core.set_frame_dirty_stats(new_lines.len() as u64, 0);
                 let mut out = String::from("\x1b[?2026h");
                 if clear {
-                    out.push_str("\x1b[2J\x1b[H\x1b[3J");
+                    // Upstream `fullRender(true)`: clear screen + home + `3J`
+                    // (scrollback). The `3J` is only safe when the frame below
+                    // re-emits the whole transcript — then the erased rows are
+                    // rewritten in this very frame. A WINDOWED frame carries
+                    // just the tail, so `3J` there would delete history the
+                    // re-write cannot restore (PIR-TUI-027); it keeps the
+                    // screen clear only.
+                    if core.frame_is_complete_transcript {
+                        out.push_str("\x1b[2J\x1b[H\x1b[3J");
+                    } else {
+                        out.push_str("\x1b[2J\x1b[H");
+                    }
                 } else if screen_clear {
                     // Writer-drop keyframe: erase the visible screen (stale rows
                     // below a shrunk frame) without touching scrollback.
@@ -4555,8 +4646,12 @@ impl TuiCore {
                 core.frame_scratch_raw = false;
                 // Upstream `maxLinesRendered`: a clearing full render resets
                 // the working-area high-water mark to the written frame; the
-                // non-clearing first paint grows it.
-                core.max_lines_rendered = if clear {
+                // non-clearing first paint grows it. A screen-only clear
+                // (`screen_clear`: PIR-TUI-027's shrink repaint and the
+                // writer-drop keyframe) also re-anchors the working area — the
+                // screen it compared against was just erased — so it resets
+                // the mark too.
+                core.max_lines_rendered = if clear || screen_clear {
                     frame_len
                 } else {
                     core.max_lines_rendered.max(frame_len)
@@ -4587,17 +4682,25 @@ impl TuiCore {
 
         // Upstream `tui-main-screen.ts` clearOnShrink gate: content shrank
         // below the tallest frame painted since the last clearing full render
-        // and the setting asks for it → full repaint (clears screen AND the
-        // scrollback rows below, resets `max_lines_rendered`). Default false
-        // keeps the diff path, which clears only the rows the previous frame
-        // owned, avoiding the flicker of a full redraw on every shrink.
+        // and the setting asks for it → full repaint that re-anchors the
+        // working area and resets `max_lines_rendered`. Default false keeps
+        // the diff path, which clears only the rows the previous frame owned,
+        // avoiding the flicker of a full redraw on every shrink.
         // (Upstream also skips while overlay entries are open; this renderer
         // has no overlay entries — dialogs live in the frame's dock.)
+        //
+        // PIR-TUI-027 deliberately DIVERGES from upstream here: upstream's
+        // `fullRender(true)` emits `3J`, erasing the terminal's scrollback.
+        // The scrollback is exactly the transcript history of a regular-mode
+        // run, so losing it to a cosmetic reflow is "discarding visible
+        // information for a repaint" (PROTOCOL v8 §1/§5c). The repaint still
+        // clears the screen (`2J` + home), which is all the shrink needs: no
+        // stale rows survive and no scrollback is touched.
         if self.clear_on_shrink
             && !self.previous_lines.is_empty()
             && new_lines.len() < self.max_lines_rendered
         {
-            full_render(self, new_lines, true, false);
+            full_render(self, new_lines, false, true);
             return;
         }
 
@@ -5067,7 +5170,14 @@ impl TuiCore {
             Self::count_reset_rows(painted.len() as u64);
             let mut out = String::new();
             if std::mem::take(&mut self.force_clear) {
-                out.push_str("\x1b[2J\x1b[H\x1b[3J");
+                // Same rule as the main path's clearing full render: a
+                // windowed (tail-only) surface has no rows above the band to
+                // re-emit, so it keeps the screen clear only (PIR-TUI-027).
+                out.push_str(if self.frame_is_complete_transcript {
+                    "\x1b[2J\x1b[H\x1b[3J"
+                } else {
+                    "\x1b[2J\x1b[H"
+                });
             }
             // `scrolled_full_output` starts with `2J` + home itself; the
             // writer-drop keyframe flag needs no extra bytes here.
@@ -5187,6 +5297,38 @@ impl TuiCore {
         // P1-2: the pinning baseline is meaningless for the next (full)
         // repaint — the next frame re-anchors it instead of compensating
         // against a stale transcript length.
+        self.last_transcript_end = None;
+    }
+
+    /// Drop the cached baseline so the next [`TuiCore::render`] is a full
+    /// repaint that clears the SCREEN but keeps the terminal's scrollback.
+    ///
+    /// PIR-TUI-027: this is the rebase for a caller whose own frame head
+    /// changed without the screen having been left (a regular-mode transcript
+    /// window slide materializes/releases blocks at the band top). The old
+    /// path used [`TuiCore::invalidate_frame`], whose repaint emits `2J` +
+    /// home + `3J`; `3J` erases the terminal's scrollback, which on the main
+    /// screen IS the user's transcript history — a bounded window slide
+    /// therefore destroyed the history the user had already read. Emitting
+    /// `2J` + home instead still guarantees no duplicated head (the screen is
+    /// cleared before the re-write), while the rows already scrolled off stay
+    /// scrollable.
+    ///
+    /// The per-block row caches are KEPT (unlike [`TuiCore::invalidate_frame`]):
+    /// a window slide keeps the entries' containers, so the repaint re-renders
+    /// only what moved instead of the whole band.
+    pub fn invalidate_baseline_keep_scrollback(&mut self) {
+        self.previous_lines.clear();
+        self.previous_width = 0;
+        self.previous_height = 0;
+        self.hardware_cursor_row = 0;
+        self.previous_viewport_top = 0;
+        self.force_clear = false;
+        self.force_screen_clear = true;
+        // The clearing repaint below re-anchors the working area at its own
+        // height, so the clearOnShrink high-water mark starts from empty
+        // instead of comparing against a frame that is about to be erased.
+        self.max_lines_rendered = 0;
         self.last_transcript_end = None;
     }
 

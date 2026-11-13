@@ -51,7 +51,7 @@ pub use resolution::{
     default_model_per_provider, find_initial_model, resolve_cli_model, resolve_model_scope,
     ScopedModel,
 };
-pub use settings::{agent_dir, load_settings};
+pub use settings::{agent_dir, load_settings, load_settings_in};
 
 /// Register every built-in catalog provider into the registry (upstream
 /// `builtinModels()`). Returns the number of registered providers. models.json

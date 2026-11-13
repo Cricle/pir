@@ -318,11 +318,127 @@ fn prompt_token_units(
     tools: Option<&[crate::ai::types::Tool]>,
 ) -> u64 {
     let prompt_units = system_prompt.map_or(0, text_token_units);
-    let tool_units = tools
+    prompt_units.saturating_add(tool_declaration_units(tools))
+}
+
+/// Quarter-token weight of a tool declaration list, JSON-serialized exactly as
+/// the request's `tools[]` field carries it.
+fn tool_declaration_units(tools: Option<&[crate::ai::types::Tool]>) -> u64 {
+    tools
         .filter(|tools| !tools.is_empty())
         .and_then(|tools| serde_json::to_string(tools).ok())
-        .map_or(0, |json| text_token_units(&json));
-    prompt_units.saturating_add(tool_units)
+        .map_or(0, |json| text_token_units(&json))
+}
+
+/// Whether the newest system message already carries `prompt` verbatim in its
+/// text blocks or its named prompt sections.
+///
+/// pir keeps the prompt in `Context::system_prompt` and its session system
+/// entries have empty `content`/`sections`, so this is `false` for the normal
+/// session-backed request and the prompt text is charged. A message that DOES
+/// carry the prompt (an upstream-shaped checkpoint whose `sections` hold it, a
+/// replayed initial system message) already pays for it inside
+/// [`estimate_message_units`], and charging the out-of-band copy again would
+/// count the prompt twice.
+fn system_describes_prompt(system: Option<&Message>, prompt: &str) -> bool {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return true;
+    }
+    let Some(Message::System(system)) = system else {
+        return false;
+    };
+    let in_content = system
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Text(text) if text.text.contains(prompt)));
+    in_content
+        || system
+            .sections
+            .iter()
+            .flat_map(|sections| sections.values())
+            .flatten()
+            .any(|text| text.contains(prompt))
+}
+
+/// Quarter-token weight of the request's tool declarations that the newest
+/// system message does NOT already describe.
+///
+/// TOOL DECLARATIONS ARE COUNTED ONCE (PIR-BIN-070). A content floor charges
+/// the newest system message in full via [`estimate_message_units`], whose
+/// `Message::System` arm includes `toolsAdded` — the definitions the session
+/// entry records and the request passes in `tools[]` are the same
+/// declarations. Adding [`prompt_token_units`]' `tools` term on top charged
+/// that block twice: measured at 790 tokens on a 3-tool allowlist
+/// (`toolsAdded` 3 160 B vs wire `tools[]` 3 127 B) and 1 906 tokens on the
+/// default 9-tool loadout, so the threshold fired 781 tokens early and
+/// compacted 24 times over 26 turns where upstream compacted 8.
+///
+/// The wire is authoritative, so the request's `tools[]` stays charged and only
+/// the names the newest system message already declares are subtracted. A
+/// mid-run `declareToolChanges` delta declares a SUBSET of the live loadout, so
+/// subtracting by name (rather than dropping the whole term) keeps the floor at
+/// the full request size; conversely, an entry without a declaration record (a
+/// prompt-only checkpoint after a resume) charges every tool. The subset is
+/// weighed as its own JSON array (`[` + separators + `]`), which is exactly the
+/// text the full array would carry for those entries, so the floor is never
+/// below the real request.
+fn undeclared_tool_units(
+    system: Option<&Message>,
+    tools: Option<&[crate::ai::types::Tool]>,
+) -> u64 {
+    let Some(tools) = tools.filter(|tools| !tools.is_empty()) else {
+        return 0;
+    };
+    let declared = match system {
+        Some(Message::System(system)) => system
+            .tools_added
+            .as_deref()
+            .filter(|declared| !declared.is_empty()),
+        _ => None,
+    };
+    let Some(declared) = declared else {
+        return tool_declaration_units(Some(tools));
+    };
+    let declared_names: std::collections::BTreeSet<&str> =
+        declared.iter().map(|tool| tool.name.as_str()).collect();
+    let mut units = 0u64;
+    let mut undeclared = 0u64;
+    for tool in tools {
+        if declared_names.contains(tool.name.as_str()) {
+            continue;
+        }
+        units = units
+            .saturating_add(serde_json::to_string(tool).map_or(0, |json| text_token_units(&json)));
+        undeclared = undeclared.saturating_add(1);
+    }
+    if undeclared == 0 {
+        return 0;
+    }
+    // Array framing: `[` + (n-1) separators + `]`.
+    units.saturating_add(undeclared.saturating_add(1))
+}
+
+/// Quarter-token weight of the leading prompt state a content floor has NOT
+/// already charged through the newest system message: the prompt text (unless
+/// that message carries it — [`system_describes_prompt`]) plus only the tool
+/// declarations it does not describe ([`undeclared_tool_units`]).
+///
+/// This is PIR-BIN-070's single-count rule, shared by both floor entry points
+/// so the projected and the ephemeral bases can never diverge.
+fn request_floor_prompt_units(
+    system: Option<&Message>,
+    system_prompt: Option<&str>,
+    tools: Option<&[crate::ai::types::Tool]>,
+) -> u64 {
+    let text_units = system_prompt.map_or(0, |prompt| {
+        if system_describes_prompt(system, prompt) {
+            0
+        } else {
+            text_token_units(prompt)
+        }
+    });
+    text_units.saturating_add(undeclared_tool_units(system, tools))
 }
 
 /// Estimated tokens of the request's leading prompt state: the prompt text
@@ -409,7 +525,9 @@ pub fn estimate_request_context_tokens_conservative(context: &Context) -> Contex
     estimate
 }
 
-/// Message-content token floor that deliberately IGNORES usage records.
+/// Message-content token floor that deliberately IGNORES usage records, plus
+/// the newest system message that floor charged in full (the caller needs it to
+/// avoid charging the request's leading prompt a second time).
 ///
 /// A provider usage record is normally the exact size of the request that
 /// produced it, but it can be stale, bogus, or (in mocked/relay setups) far
@@ -417,7 +535,7 @@ pub fn estimate_request_context_tokens_conservative(context: &Context) -> Contex
 /// maximum of the usage-grounded estimate and this content floor so a large
 /// transcript can never hide behind an understated usage chunk and disable
 /// compaction forever.
-fn content_token_units<M: MessageSequence + ?Sized>(messages: &M) -> u64 {
+fn content_token_units<M: MessageSequence + ?Sized>(messages: &M) -> (u64, Option<&Message>) {
     let mut units = 0u64;
     let mut current_system: Option<&Message> = None;
     for index in 0..messages.message_count() {
@@ -434,45 +552,55 @@ fn content_token_units<M: MessageSequence + ?Sized>(messages: &M) -> u64 {
     if let Some(system) = current_system {
         units = units.saturating_add(estimate_message_units(system));
     }
-    units
+    (units, current_system)
 }
 
 /// [`estimate_request_messages_tokens`] ignoring any usage record: the
 /// content-derived token floor of the request (messages + leading prompt).
+///
+/// The leading prompt is charged ONCE (PIR-BIN-070): when the newest system
+/// message in `messages` records its tool declarations, the request's
+/// `tools[]` contributes only the declarations that message does not
+/// describe — otherwise the same block is charged both through the system
+/// message and through `prompt_token_units`.
 pub fn estimate_request_messages_tokens_floor(
     messages: &[Message],
     system_prompt: Option<&str>,
     tools: Option<&[Tool]>,
 ) -> u64 {
-    ceil_units(
-        content_token_units(messages).saturating_add(prompt_token_units(system_prompt, tools)),
-    )
+    let (units, system) = content_token_units(messages);
+    ceil_units(units.saturating_add(request_floor_prompt_units(system, system_prompt, tools)))
 }
 
 /// [`estimate_request_projected_context_tokens`] ignoring any usage record.
+///
+/// Same single-count rule as [`estimate_request_messages_tokens_floor`]
+/// (PIR-BIN-070): the newest projected system message is charged in full
+/// (`estimate_message_units` includes its `toolsAdded`), and the out-of-band
+/// prompt contributes only what that message does not already describe.
 pub fn estimate_request_projected_context_tokens_floor<E: ProjectedEntry>(
     projected: &[E],
     system_prompt: Option<&str>,
     tools: Option<&[Tool]>,
 ) -> u64 {
     let mut units = 0u64;
+    let mut current_system: Option<&Message> = None;
     let mut current_system_units = 0u64;
     for entry in projected {
         for message in entry.messages() {
             if matches!(message, Message::System(_)) {
                 // Only the newest system message is live prompt state; older
                 // checkpoint replays are history (see `content_token_units`).
+                current_system = Some(message);
                 current_system_units = estimate_message_units(message);
             } else {
                 units = units.saturating_add(estimate_message_units(message));
             }
         }
     }
-    ceil_units(
-        units
-            .saturating_add(current_system_units)
-            .saturating_add(prompt_token_units(system_prompt, tools)),
-    )
+    ceil_units(units.saturating_add(current_system_units).saturating_add(
+        request_floor_prompt_units(current_system, system_prompt, tools),
+    ))
 }
 
 /// Quarter-token weight of a single message, before the final rounding.

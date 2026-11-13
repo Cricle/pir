@@ -1204,9 +1204,13 @@ impl<'a> ConverterPlan<'a> {
             compat.supports_mid_convo_system_messages.unwrap_or(false);
         let has_mid_convo =
             !supports_mid_convo_system_messages && context.messages.iter().any(is_system_message);
+        let live_prompt = context.system_prompt.as_deref();
         let leading_system = fold_leading_system(
-            context.system_prompt.as_deref(),
-            context.messages.iter().filter_map(instruction_text),
+            live_prompt,
+            context
+                .messages
+                .iter()
+                .filter_map(|message| instruction_text(message, live_prompt)),
             has_mid_convo,
         );
         Self::build(
@@ -1232,12 +1236,13 @@ impl<'a> ConverterPlan<'a> {
             compat.supports_mid_convo_system_messages.unwrap_or(false);
         let has_mid_convo =
             !supports_mid_convo_system_messages && !summary.instruction_messages.is_empty();
+        let live_prompt = context.system_prompt.as_deref();
         let leading_system = fold_leading_system(
-            context.system_prompt.as_deref(),
+            live_prompt,
             summary
                 .instruction_messages
                 .iter()
-                .filter_map(instruction_text),
+                .filter_map(|message| instruction_text(message, live_prompt)),
             has_mid_convo,
         );
         Self::build(
@@ -1312,10 +1317,19 @@ impl<'a> ConverterPlan<'a> {
     }
 }
 
-fn instruction_text(message: &Message) -> Option<String> {
+/// The text one instruction message contributes to the folded leading system
+/// prompt, given the host's live rendering (`None` when it contributes none).
+///
+/// [`crate::ai::types::leading_system_fragment`] applies upstream's section
+/// PATCH semantics: when the live prompt already carries a stored snapshot's
+/// named sections, the snapshot is not appended a second time (PIR-BIN-053: a
+/// resumed session replays the system row a previous run wrote, and the fold
+/// used to send the prompt twice).
+fn instruction_text(message: &Message, live_prompt: Option<&str>) -> Option<String> {
     match message {
         Message::System(system) | Message::Developer(system) => {
-            Some(crate::ai::types::system_message_text(system))
+            let text = crate::ai::types::leading_system_fragment(system, live_prompt);
+            (!text.trim().is_empty()).then_some(text)
         }
         _ => None,
     }

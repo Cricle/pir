@@ -1089,6 +1089,33 @@ impl RpcClient {
         }
         panic!("expected protocol line never arrived");
     }
+
+    /// [`Self::wait_for`] keeping every frame it read, in order, including the
+    /// match. The PIR-BIN-073 tests need the ORDER of `agent_settled` relative
+    /// to the `abort` response: the barrier contract says the settle frame is
+    /// already on the wire when the response is (a skipped frame is exactly
+    /// what a regression would hide).
+    async fn collect_until(
+        &mut self,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+    ) -> Vec<serde_json::Value> {
+        let mut frames = Vec::new();
+        for _ in 0..2000 {
+            let line = self.reader.recv().await.expect("protocol line");
+            let value: serde_json::Value =
+                serde_json::from_str(&line).expect("rpc line must be valid JSON");
+            assert_ne!(
+                value["type"], "event",
+                "events must not be wrapped: {value}"
+            );
+            let matched = predicate(&value);
+            frames.push(value);
+            if matched {
+                return frames;
+            }
+        }
+        panic!("expected protocol line never arrived");
+    }
 }
 
 async fn rpc_pair_with(label: &str, factory: SessionFactory) -> (RpcClient, TempDir) {
@@ -2628,5 +2655,388 @@ async fn rpc_new_session_mid_stream_aborts_and_preserves_the_outgoing_turn() {
     assert!(
         old.contains("\"stopReason\":\"aborted\""),
         "outgoing transcript has no aborted assistant terminal: {old}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-073: the RPC `abort` response is an idle barrier, so a message
+// submitted right after it cannot land out of order.
+//
+// The defect: `abort` answered ~1 ms in, while the run kept the session claimed
+// for the settle window (~14-230 ms). A plain prompt in that window was
+// rejected with "Agent is already processing", and an accepted `steer` /
+// `followUp` was parked in the inbox, delivered only when the NEXT prompt
+// started a run — and INSERTED AFTER that prompt's own message, i.e. the model
+// saw the user's input out of order (`["first","second-plain","QUEUED-TEXT"]`).
+// With no later prompt the text never ran at all.
+//
+// Upstream's contract (docs/rpc-commands.md "### abort": "Abort the current
+// operation and wait for the session to become idle before responding";
+// `agent-session.ts:2498-2508` awaits `waitForIdle()`) makes the response the
+// barrier: after it, the aborted run is settled and the message runs as its own
+// turn, in submission order. These tests assert the ORDER in the actual
+// provider request bodies, not just the RPC dispositions.
+// ---------------------------------------------------------------------------
+
+/// Concatenated `user` text of one provider request, in message order.
+fn user_texts(context: &Context) -> Vec<String> {
+    context
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(
+                user.content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Provider whose first request hangs until its abort signal fires (settling as
+/// `stopReason: aborted`), and whose later requests answer immediately. Every
+/// request's user texts are recorded in request order.
+fn abort_then_answer_factory(
+    requests: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    entered: Arc<AtomicUsize>,
+) -> SessionFactory {
+    Arc::new(move |session: Option<SessionManager>| {
+        let requests = Arc::clone(&requests);
+        let entered = Arc::clone(&entered);
+        let mut registry = ProviderRegistry::default();
+        registry.set_provider(Arc::new(AbortThenAnswerProvider { requests, entered }));
+        Ok(Arc::new(AgentSession::new(AgentSessionConfig {
+            performance: Default::default(),
+            provider_registry: Arc::new(registry),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session,
+            compaction: None,
+            max_turns: 8,
+            system_prompt: None,
+            cwd: None,
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+        })))
+    })
+}
+
+/// See [`abort_then_answer_factory`]. The first request parks until the abort
+/// signal fires; it never answers on its own, so the only way out is the abort
+/// under test — the settle window is real, not simulated by a plugin gate.
+struct AbortThenAnswerProvider {
+    requests: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    entered: Arc<AtomicUsize>,
+}
+
+impl Provider for AbortThenAnswerProvider {
+    fn id(&self) -> &str {
+        "fake"
+    }
+    fn name(&self) -> &str {
+        "Fake provider"
+    }
+    fn get_models(&self) -> Vec<Model> {
+        vec![fake_model()]
+    }
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        Vec::new()
+    }
+    fn stream(
+        &self,
+        _model: &Model,
+        context: Context,
+        options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        let index = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(user_texts(&context));
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let stream = AssistantMessageEventStream::new();
+        let sender = stream.clone();
+        if index > 0 {
+            // Every request after the aborted one answers immediately, so the
+            // ordering assertions never depend on timing.
+            sender.push(AssistantMessageEventStream::done_event(
+                TerminalReason::Stop,
+                assistant(vec![text("answer two")], StopReason::Stop),
+            ));
+            return stream;
+        }
+        let signal = options.signal.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            drop(handle.spawn(async move {
+                match signal {
+                    Some(signal) => signal.cancelled().await,
+                    // No signal handed in (a build path that omits it): keep the
+                    // request from answering at all, so the abort is the only
+                    // exit and a missing wire-in fails the test's timeout
+                    // instead of passing on a stale answer.
+                    None => std::future::pending::<()>().await,
+                }
+                let message = AssistantMessage {
+                    stop_reason: StopReason::Aborted,
+                    ..AssistantMessage::default()
+                };
+                sender.push(AssistantMessageEventStream::error_event(
+                    ErrorReason::Aborted,
+                    message,
+                ));
+            }));
+        }
+        stream
+    }
+}
+
+async fn wait_until_entered(entered: &Arc<AtomicUsize>, expected: usize) {
+    for _ in 0..3000 {
+        if entered.load(Ordering::SeqCst) >= expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("the fake provider never reached request {expected}");
+}
+
+fn recorded_requests(requests: &Arc<std::sync::Mutex<Vec<Vec<String>>>>) -> Vec<Vec<String>> {
+    requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The defect, at the provider boundary: `abort` must answer only once the run
+/// has settled, so the very next plain prompt is ACCEPTED and starts its own
+/// run instead of being rejected with the streaming error, and an accepted
+/// steer runs in its own turn BEFORE the later prompt.
+#[tokio::test]
+async fn rpc_abort_answers_after_the_run_settles_so_the_next_prompt_is_accepted() {
+    let requests: Arc<std::sync::Mutex<Vec<Vec<String>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let (mut client, _temp) = rpc_pair_with(
+        "abort-idle-barrier",
+        abort_then_answer_factory(Arc::clone(&requests), Arc::clone(&entered)),
+    )
+    .await;
+
+    client.send(json!({ "type": "create" }));
+    client
+        .wait_for(|value| value["command"] == "create" && value["success"] == true)
+        .await;
+
+    client.send(json!({ "id": "p1", "type": "prompt", "text": "first" }));
+    let first = client
+        .wait_for(|value| value["command"] == "prompt" && value["id"] == "p1")
+        .await;
+    assert_eq!(first["success"], json!(true), "{first}");
+    assert_eq!(first["data"]["disposition"], "started", "{first}");
+    // The first provider request is in flight (and will only end on abort).
+    wait_until_entered(&entered, 1).await;
+
+    client.send(json!({ "id": "ab", "type": "abort" }));
+    let frames = client
+        .collect_until(|value| value["command"] == "abort" && value["id"] == "ab")
+        .await;
+    let aborted = frames.last().expect("abort response");
+    assert_eq!(aborted["success"], json!(true), "{aborted}");
+    assert!(aborted.get("data").is_none(), "{aborted}");
+    // The barrier: the aborted run's `agent_settled` (the idle edge) is already
+    // on the wire BEFORE the abort response. A regression that answers while the
+    // run still settles has not published it yet — that is the window
+    // PIR-BIN-073 lived in.
+    let settled_index = frames
+        .iter()
+        .position(|value| value["type"] == "agent_settled");
+    let settled_index = settled_index.unwrap_or_else(|| {
+        panic!("the abort response must not precede the run's agent_settled: {frames:?}")
+    });
+    assert_eq!(frames[settled_index]["aborted"], json!(true), "{frames:?}");
+    // `frames` ends with the abort RESPONSE itself (`collect_until` keeps the
+    // matching frame), so "the barrier held" means the settled frame is the
+    // second-to-last one: response last, exactly one agent_settled before it.
+    assert!(
+        settled_index + 1 == frames.len() - 1,
+        "the abort response must be the only frame after the single agent_settled \
+         (settled at index {settled_index} of {}): {frames:?}",
+        frames.len()
+    );
+
+    // A plain prompt right after the abort response: no `streamingBehavior`, no
+    // retry loop. Upstream admits it; the defect rejected it.
+    client.send(json!({ "id": "p2", "type": "prompt", "text": "second-plain" }));
+    let second = client
+        .wait_for(|value| value["command"] == "prompt" && value["id"] == "p2")
+        .await;
+    assert_eq!(
+        second["success"],
+        json!(true),
+        "a prompt right after the abort response must be admitted: {second}"
+    );
+    assert_eq!(second["data"]["disposition"], "started", "{second}");
+    client
+        .wait_for(|value| value["type"] == "agent_settled")
+        .await;
+
+    let requests = recorded_requests(&requests);
+    assert_eq!(
+        requests,
+        vec![
+            vec!["first".to_owned()],
+            vec!["first".to_owned(), "second-plain".to_owned()],
+        ],
+        "the aborted run's request, then the later prompt's own request"
+    );
+}
+
+/// A steer accepted right after the abort response must not be deferred past a
+/// later prompt. The probe shape (`.play/evidence/ab-round1/lane-ab-sdk2/
+/// scripts/probe_steer_order.py`): abort, await its response, then submit
+/// `QUEUED-TEXT` with `streamingBehavior: "steer"`, and only later a plain
+/// prompt. The invariant: the steer runs in its OWN turn before that prompt, so
+/// its request body is `["first","QUEUED-TEXT"]` and the later prompt is a
+/// separate, later request — and it runs even though NO later prompt is needed
+/// to make it happen.
+#[tokio::test]
+async fn rpc_steer_after_abort_runs_before_a_later_prompt() {
+    let requests: Arc<std::sync::Mutex<Vec<Vec<String>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let (mut client, _temp) = rpc_pair_with(
+        "abort-steer-order",
+        abort_then_answer_factory(Arc::clone(&requests), Arc::clone(&entered)),
+    )
+    .await;
+
+    client.send(json!({ "type": "create" }));
+    client
+        .wait_for(|value| value["command"] == "create" && value["success"] == true)
+        .await;
+
+    client.send(json!({ "id": "p1", "type": "prompt", "text": "first" }));
+    let first = client
+        .wait_for(|value| value["command"] == "prompt" && value["id"] == "p1")
+        .await;
+    assert_eq!(first["success"], json!(true), "{first}");
+    wait_until_entered(&entered, 1).await;
+
+    client.send(json!({ "id": "ab", "type": "abort" }));
+    let frames = client
+        .collect_until(|value| value["command"] == "abort" && value["id"] == "ab")
+        .await;
+    let aborted = frames.last().expect("abort response");
+    assert_eq!(aborted["success"], json!(true), "{aborted}");
+    assert!(aborted.get("data").is_none(), "{aborted}");
+    // The barrier promise: the aborted run settled BEFORE the response, with
+    // exactly one `agent_settled{aborted:true}` on the wire.
+    let settled_runs: Vec<&serde_json::Value> = frames
+        .iter()
+        .filter(|value| value["type"] == "agent_settled")
+        .collect();
+    assert_eq!(
+        settled_runs.len(),
+        1,
+        "exactly one agent_settled precedes the abort response: {frames:?}"
+    );
+    assert_eq!(settled_runs[0]["aborted"], json!(true), "{frames:?}");
+
+    // The probe's exact shape, inside what used to be the settle window: with
+    // the barrier the session is idle, so this is its own run ("started"). A
+    // regression parks it in the inbox ("queued") for the next prompt.
+    client.send(json!({
+        "id": "st",
+        "type": "prompt",
+        "text": "QUEUED-TEXT",
+        "streamingBehavior": "steer"
+    }));
+    let steer = client
+        .wait_for(|value| value["command"] == "prompt" && value["id"] == "st")
+        .await;
+    assert_eq!(
+        steer["success"],
+        json!(true),
+        "the steer must be accepted, never rejected: {steer}"
+    );
+    assert_eq!(
+        steer["data"]["disposition"], "started",
+        "an idle session runs the steer as its own turn (upstream pi answers \
+         \"started\" here): {steer}"
+    );
+    // It runs to completion with NO further prompt: that is the "nothing is
+    // silently dropped when no later prompt arrives" half of the invariant.
+    wait_until_entered(&entered, 2).await;
+    let steer_frames = client
+        .collect_until(|value| value["type"] == "agent_settled")
+        .await;
+    let steer_settled = steer_frames.last().expect("steer settle");
+    assert_eq!(steer_settled["aborted"], json!(false), "{steer_frames:?}");
+
+    // NOW a later plain prompt. It must start its own run and must NOT carry
+    // the steer message again.
+    client.send(json!({ "id": "p2", "type": "prompt", "text": "second-plain" }));
+    let second = client
+        .wait_for(|value| value["command"] == "prompt" && value["id"] == "p2")
+        .await;
+    assert_eq!(second["success"], json!(true), "{second}");
+    assert_eq!(second["data"]["disposition"], "started", "{second}");
+    wait_until_entered(&entered, 3).await;
+    let second_frames = client
+        .collect_until(|value| value["type"] == "agent_settled")
+        .await;
+    let second_settled = second_frames.last().expect("second settle");
+    assert_eq!(second_settled["aborted"], json!(false), "{second_frames:?}");
+    // The steer's own run settled before this one started, and the aborted
+    // run did not settle a second time.
+    let aborted_settles = second_frames
+        .iter()
+        .filter(|value| value["type"] == "agent_settled" && value["aborted"] == json!(true))
+        .count();
+    assert_eq!(
+        aborted_settles, 0,
+        "the aborted run settles exactly once: {second_frames:?}"
+    );
+
+    let requests = recorded_requests(&requests);
+    assert_eq!(
+        requests.len(),
+        3,
+        "one request per turn, nothing dropped or duplicated: {requests:?}"
+    );
+    assert_eq!(
+        requests[0],
+        vec!["first".to_owned()],
+        "the aborted run's request carries only its own message: {requests:?}"
+    );
+    assert_eq!(
+        requests[1],
+        vec!["first".to_owned(), "QUEUED-TEXT".to_owned()],
+        "the steer must run as its own turn right after the abort, BEFORE any \
+         later prompt — the defect produced \
+         [\"first\",\"second-plain\",\"QUEUED-TEXT\"] in one request instead: {requests:?}"
+    );
+    assert_eq!(
+        requests[2],
+        vec![
+            "first".to_owned(),
+            "QUEUED-TEXT".to_owned(),
+            "second-plain".to_owned()
+        ],
+        "the later prompt starts a separate later run and does not re-deliver \
+         the steer: {requests:?}"
     );
 }

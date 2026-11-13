@@ -5218,7 +5218,11 @@ async fn a_transport_exhausted_failure_is_not_reissued() {
                 &pir::ai::error::AiError::NonRetryable("HTTP 503: overloaded".into()),
                 "OpenAI API error: ",
             ),
-            "OpenAI API error: non-retryable provider error: HTTP 503: overloaded",
+            // PIR-TUI-033: the transport's retry-class vocabulary is no longer
+            // prepended to the user-facing sentence (the adapter prefix still
+            // is). The invariants this case exists for — one call, one round —
+            // are asserted above and below and are unchanged.
+            "OpenAI API error: HTTP 503: overloaded",
         ),
     ];
     for (label, failure, expected_text) in cases {

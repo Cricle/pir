@@ -76,6 +76,27 @@ pub fn collect_settings_diagnostics(manager: &mut SettingsManager) -> Vec<Settin
         .collect()
 }
 
+/// The manager's per-field tolerant-parse warnings as warning diagnostics
+/// (pir-only superset; non-draining).
+///
+/// These are the leaves whose value had the wrong type and fell back to their
+/// default (`global settings: invalid setting "compaction.reserveTokens":
+/// …`). Unlike [`collect_settings_diagnostics`] they describe a document that
+/// still parsed, so they are NOT upstream load errors and never abort a run;
+/// they exist so a user-facing startup printer can say the written value is
+/// not in effect (PIR-BIN-072). Non-draining, so a host may call it more than
+/// once per manager without losing entries.
+pub fn collect_settings_warnings(manager: &SettingsManager) -> Vec<SettingsDiagnostic> {
+    manager
+        .warning_messages()
+        .into_iter()
+        .map(|message| SettingsDiagnostic {
+            type_: SettingsDiagnosticType::Warning,
+            message,
+        })
+        .collect()
+}
+
 /// Remove duplicate `(type, message)` diagnostics, preserving the first
 /// occurrence (upstream `deduplicateDiagnostics`). Startup and runtime
 /// settings managers can report the same file error.

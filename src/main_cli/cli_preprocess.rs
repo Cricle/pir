@@ -331,8 +331,16 @@ pub(super) fn resolve_run_session_plan(
     #[cfg(feature = "tui")]
     {
         let cwd_text = cwd.to_string_lossy().into_owned();
-        let sessions =
-            pir::session_manager::SessionManager::list_sessions(session_dir, Some(&cwd_text));
+        // Same upstream rule as `resolve_session_plan`: the default per-cwd
+        // dir needs no header-cwd filter (it is already cwd-encoded); a custom
+        // dir may mix projects and keeps it.
+        let cwd_filter: Option<&str> =
+            if pir::session_manager::is_default_session_dir(session_dir, &cwd_text) {
+                None
+            } else {
+                Some(cwd_text.as_str())
+            };
+        let sessions = pir::session_manager::SessionManager::list_sessions(session_dir, cwd_filter);
         if sessions.is_empty() {
             eprintln!("pir: no sessions found for this directory; starting a new session");
             return Ok(SessionPlan::New { id: None });
@@ -565,6 +573,9 @@ pub(super) fn resolve_project_trust_for_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `Cli::try_parse_from` comes from the `clap::Parser` trait; the parent
+    // module only derives it, so the test harness must import the trait.
+    use clap::Parser;
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(

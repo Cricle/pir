@@ -349,6 +349,46 @@ pub fn resolve_starting_thinking_level(
         .unwrap_or(crate::ai::providers::resolution::DEFAULT_THINKING_LEVEL)
 }
 
+/// Clamp a requested thinking level to what `model` supports, through exactly
+/// the pair [`AgentSession::set_thinking_level`] uses
+/// ([`supported_thinking_levels`] + the local `clamp_thinking_level`).
+///
+/// PIR-BIN-074: upstream clamps at session creation
+/// (`createAgentSession`: `thinkingLevel = clampThinkingLevel(model,
+/// thinkingLevel)`, sdk.ts:264-275), so a level the model's `thinkingLevelMap`
+/// does not declare (`max`/`xhigh` without a map entry, a `null`-mapped level)
+/// must never reach the first request verbatim. Routing the startup level
+/// through the SAME clamp a later shift+tab uses keeps the footer's level and
+/// the wire's effort from disagreeing.
+pub fn clamp_starting_thinking_level_for_model(
+    model: &crate::ai::types::Model,
+    level: ThinkingLevel,
+) -> ThinkingLevel {
+    let available = supported_thinking_levels(model);
+    if available.contains(&level) {
+        level
+    } else {
+        clamp_thinking_level(level, &available)
+    }
+}
+
+/// [`resolve_starting_thinking_level`] for a KNOWN model: the same fallback
+/// chain, clamped to the model's supported ladder before it reaches the
+/// session/footer/request (PIR-BIN-074). This is the form every startup
+/// resolution site should call; the unclamped sibling stays for callers that
+/// clamp later at build (the SDK builder's `set_thinking_level` at build).
+pub fn resolve_starting_thinking_level_for_model(
+    model: &crate::ai::types::Model,
+    explicit: Option<ThinkingLevel>,
+    per_model: Option<ThinkingLevel>,
+    default_thinking_level: Option<ThinkingLevel>,
+) -> ThinkingLevel {
+    clamp_starting_thinking_level_for_model(
+        model,
+        resolve_starting_thinking_level(explicit, per_model, default_thinking_level),
+    )
+}
+
 /// Parse an upstream thinking-level string (`off|minimal|low|medium|high|
 /// xhigh|max`) into a [`ThinkingLevel`].
 pub(super) fn parse_thinking_level(level: &str) -> Option<ThinkingLevel> {

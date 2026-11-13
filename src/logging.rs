@@ -27,13 +27,21 @@
 //! - **No subscriber** (embedded SDK hosts, unit harnesses) → a plain stderr
 //!   line, i.e. the historical behavior, because there is no log destination
 //!   to route to. That fallback never panics: `eprintln!` aborts the process on
-//!   a closed stderr handle, so the write is error-tolerant.
+//!   a closed stderr handle, so the write is error-tolerant. The one exception
+//!   is [`DiagnosticLevel::Debug`], which has no user-facing meaning without a
+//!   log: it stays silent unless verbosity is explicitly requested.
 //!
-//! Levels: [`DiagnosticLevel::Info`] for informational notices (`[ext] session
-//! name: …`), [`DiagnosticLevel::Warning`] for failures the run survives
-//! (a dispatch failure, an ignored request), [`DiagnosticLevel::Error`] for a
-//! diagnostic that breaks the model request (the leading-system-message
-//! removal) — error records also survive an explicit `RUST_LOG=error` filter.
+//! Levels: [`DiagnosticLevel::Debug`] for per-subsystem detail that duplicates
+//! a diagnostic the host already surfaces once (a settings load failure the
+//! CLI prints as `Warning: …` must not be echoed by every loader that
+//! re-reads the same file), [`DiagnosticLevel::Info`] for informational
+//! notices (`[ext] session name: …`), [`DiagnosticLevel::Warning`] for
+//! failures the run survives (a dispatch failure, an ignored request),
+//! [`DiagnosticLevel::Error`] for a diagnostic that breaks the model request
+//! (the leading-system-message removal) — error records also survive an
+//! explicit `RUST_LOG=error` filter. Debug records are log-only: they need an
+//! explicit verbose opt-in (`--verbose`, `RUST_LOG=debug`, `PIR_VERBOSE=1`)
+//! even when no subscriber is installed.
 //!
 //! ## Repeat collapsing
 //!
@@ -51,6 +59,17 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Log-only per-subsystem detail: routed at debug level, repeat-collapsed.
+/// Use it when the host already reports the same problem once and the
+/// subsystem note only helps while debugging (`--verbose`). Same argument
+/// syntax as `eprintln!` (`crate::ext_diag_debug!("[codemode] settings …")`).
+#[macro_export]
+macro_rules! ext_diag_debug {
+    ($($arg:tt)*) => {
+        $crate::logging::ext_debug(format_args!($($arg)*))
+    };
+}
 
 /// Informational extension/plugin diagnostic: routed at info level,
 /// repeat-collapsed. Same argument syntax as `eprintln!`
@@ -84,6 +103,9 @@ macro_rules! ext_diag_fatal {
 /// Severity of a routed diagnostic, mapped onto the matching `tracing` level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiagnosticLevel {
+    /// Per-subsystem detail that duplicates an already-reported diagnostic;
+    /// log-only unless verbose diagnostics are explicitly enabled.
+    Debug,
     /// Informational extension/plugin notice.
     Info,
     /// A failure the run survives (dispatch failure, ignored request).
@@ -100,6 +122,11 @@ pub const MAX_TRACKED_MESSAGES: usize = 64;
 
 /// Entries untouched for this long are dropped first when the map is full.
 const ENTRY_STALE_AFTER: Duration = Duration::from_secs(60);
+
+/// Log-only per-subsystem detail, repeat-collapsed.
+pub fn ext_debug(message: impl Display) {
+    route(DiagnosticLevel::Debug, message.to_string());
+}
 
 /// Informational extension/plugin diagnostic, repeat-collapsed.
 pub fn ext_info(message: impl Display) {
@@ -225,14 +252,39 @@ fn repeat_state() -> &'static Mutex<RepeatState> {
 /// the historical behavior.
 fn emit(level: DiagnosticLevel, message: &str) {
     if !tracing::dispatcher::has_been_set() {
+        // Debug detail is log-only by contract. With no log destination the
+        // historical stderr fallback would turn every loader's duplicate into
+        // a user-facing line, so it stays silent unless verbosity is
+        // explicitly requested. The other levels keep their historical
+        // behavior (they are the only diagnostic an embedded host gets).
+        if level == DiagnosticLevel::Debug && !verbose_diagnostics_enabled() {
+            return;
+        }
         write_stderr(message);
         return;
     }
     match level {
+        DiagnosticLevel::Debug => tracing::debug!("{}", message),
         DiagnosticLevel::Info => tracing::info!("{}", message),
         DiagnosticLevel::Warning => tracing::warn!("{}", message),
         DiagnosticLevel::Error => tracing::error!("{}", message),
     }
+}
+
+/// Whether log-only (debug) diagnostics should also reach stderr when no
+/// `tracing` subscriber is installed: an explicit `PIR_VERBOSE=1` or a
+/// `RUST_LOG` filter at `debug`/`trace` (the same switches the CLI's
+/// `--verbose` sets, and the filter its subscriber honors).
+fn verbose_diagnostics_enabled() -> bool {
+    if std::env::var_os("PIR_VERBOSE").is_some_and(|value| value != "0") {
+        return true;
+    }
+    std::env::var("RUST_LOG").is_ok_and(|filter| {
+        filter.split(',').any(|part| {
+            let level = part.rsplit('=').next().unwrap_or(part).trim();
+            matches!(level.to_ascii_lowercase().as_str(), "debug" | "trace")
+        })
+    })
 }
 
 /// The no-subscriber fallback. `eprintln!` panics when the stderr handle is

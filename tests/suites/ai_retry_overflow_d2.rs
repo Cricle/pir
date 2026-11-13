@@ -749,9 +749,13 @@ async fn d2_transport_500_and_429_keep_the_existing_retry_rules() {
             format!("non-retryable provider error: HTTP {status}: {body}")
         );
         let message = pir::ai::api::terminal_error_message(&copilot_model(), &error, None);
+        // PIR-TUI-033: the Display text asserted above is the stable internal
+        // marker and stays; the USER-FACING sentence now carries only the
+        // provider's words, because "non-retryable" described the transport's
+        // verdict while the user had just watched it retry.
         assert_eq!(
             message.error_message.as_deref(),
-            Some(format!("non-retryable provider error: HTTP {status}: {body}").as_str())
+            Some(format!("HTTP {status}: {body}").as_str())
         );
         assert!(
             is_retryable_assistant_error(&message),

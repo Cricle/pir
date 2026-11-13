@@ -1157,8 +1157,9 @@ impl AgentSession {
     /// `commandContextActions`, print-mode.ts:78-100 / rpc-mode.ts:322-344):
     /// `newSession` / `switchSession` / fork-at-current swap the session
     /// storage through the guarded seam ([`AgentSession::replace_session_storage`]
-    /// — a `session_before_switch` handler may cancel), fork-at-entry branches
-    /// in place, `navigateTree` rides [`AgentSession::navigate_tree`] with
+    /// — a `session_before_switch` handler may cancel), fork-at-entry swaps in
+    /// a branched session file ([`AgentSession::fork_entry`]), `navigateTree`
+    /// rides [`AgentSession::navigate_tree`] with
     /// full summarization semantics, and `reload` runs the host resource
     /// reload ([`AgentSession::reload`] — extensions, native plugins, tools,
     /// skills, prompts and themes; the session and transcript stay put). A

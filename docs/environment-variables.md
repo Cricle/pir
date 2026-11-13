@@ -9,6 +9,7 @@
 | `PI_SESSION_FILE` / `PI_SESSION_ID` | Exported by the host into `bash` child environments and the shared shell pool; not read as configuration |
 | `PIR_SESSION_FILE` | Best-effort session-file hint for the crash logger (hosts set it when a session is open; unset or empty = no hint) |
 | `PIR_DISABLE_SESSION_MMAP` | Test/diagnostic escape hatch: any value forces the streaming session loader instead of the read-only `memmap2` map (the reference loader for before/after measurements) |
+| `PI_PACKAGE_DIR` | Package asset directory anchoring the prompt's `<docs>` section (upstream `getPackageDir`; for Nix/Guix store paths). Set and non-empty wins; unset/empty falls back to the running `pir` executable's directory when it holds a `README.md` file or a `docs/` directory (the release archives ship `pir`, `pir-phone-server`, `README.md`), mirroring upstream's compiled-binary `dirname(process.execPath)` branch. Neither resolves = no `<docs>` section |
 
 ## Models & providers
 

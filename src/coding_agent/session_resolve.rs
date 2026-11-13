@@ -82,18 +82,24 @@ enum Resolved {
 }
 
 /// Whether a session header cwd equals the current cwd (resolved-path
-/// comparison, like `SessionManager` discovery).
+/// comparison, like `SessionManager` discovery; case-insensitive on Windows,
+/// where `C:\Proj` and `c:\proj` name the same directory).
 fn cwd_matches(session_cwd: &str, cwd: &Path) -> bool {
-    crate::session_manager::resolve_path_str(session_cwd)
-        == crate::session_manager::resolve_path_str(&cwd.to_string_lossy())
+    crate::session_manager::resolved_paths_equal(
+        &crate::session_manager::resolve_path_str(session_cwd),
+        &crate::session_manager::resolve_path_str(&cwd.to_string_lossy()),
+    )
 }
 
 /// Resolve a `--session`/`--fork` argument: literal path first, then exact id
 /// match, then unique id-prefix match against the directory listing (upstream
 /// `resolveSessionPath`). Id matches are restricted to sessions whose header
-/// cwd matches the current cwd; an id that only matches cross-project
-/// sessions resolves to [`Resolved::CrossProject`] instead of silently
-/// opening another project's session.
+/// cwd matches the current cwd when the session dir is CUSTOM (it may hold
+/// several projects); the default per-cwd dir already identifies the project,
+/// so its matches are always local (upstream `findById`/`list` skip the cwd
+/// filter there). An id that only matches other-project sessions in a custom
+/// dir resolves to [`Resolved::CrossProject`] instead of silently opening
+/// another project's session.
 fn resolve_session_ref(arg: &str, cwd: &Path, session_dir: &Path) -> Resolved {
     if looks_like_path(arg) {
         let path = if Path::new(arg).is_absolute() {
@@ -109,11 +115,16 @@ fn resolve_session_ref(arg: &str, cwd: &Path, session_dir: &Path) -> Resolved {
         return Resolved::Found(path);
     }
     let sessions = SessionManager::list_sessions(session_dir, None);
+    // Upstream `findById`/`list` only filter by header cwd for a custom
+    // session dir (`session-manager.ts:1885-1889`): the default dir is
+    // cwd-encoded, so every session in it is this project's.
+    let filter_by_cwd =
+        !crate::session_manager::is_default_session_dir(session_dir, &cwd.to_string_lossy());
     let mut prefix_same: Option<std::path::PathBuf> = None;
     let mut exact_cross: Option<(std::path::PathBuf, String)> = None;
     let mut prefix_cross: Option<(std::path::PathBuf, String)> = None;
     for session in &sessions {
-        let same_cwd = cwd_matches(&session.cwd, cwd);
+        let same_cwd = !filter_by_cwd || cwd_matches(&session.cwd, cwd);
         if session.id == arg {
             if same_cwd {
                 // An exact same-project match outranks everything.
@@ -318,6 +329,19 @@ pub fn resolve_session_plan(
         };
     }
 
+    // Upstream discovery (`SessionManager.list`/`continueRecent`) applies the
+    // header-cwd filter only to a CUSTOM session dir: the default dir is
+    // already cwd-encoded, so every session in it belongs to `cwd` and the
+    // filter is skipped. That is also what makes the Windows case variants of
+    // one directory (`C:\Proj` vs `c:\proj`) open the same sessions.
+    let cwd_text = cwd.to_string_lossy().into_owned();
+    let cwd_filter: Option<&str> =
+        if crate::session_manager::is_default_session_dir(session_dir, &cwd_text) {
+            None
+        } else {
+            Some(cwd_text.as_str())
+        };
+
     if flags.resume {
         if interactive {
             return Ok(SessionPlan::Pick);
@@ -326,7 +350,7 @@ pub fn resolve_session_plan(
         // row — the most recent session of this project (upstream
         // `SessionManager.list` order). With none, fall back to a new session
         // like the interactive host's empty-picker handling.
-        let recent = SessionManager::list_sessions(session_dir, Some(&cwd.to_string_lossy()))
+        let recent = SessionManager::list_sessions(session_dir, cwd_filter)
             .into_iter()
             .next()
             .map(|summary| summary.path);
@@ -340,7 +364,7 @@ pub fn resolve_session_plan(
     }
 
     if flags.continue_recent {
-        let recent = SessionManager::list_sessions(session_dir, Some(&cwd.to_string_lossy()))
+        let recent = SessionManager::list_sessions(session_dir, cwd_filter)
             .into_iter()
             .next()
             .map(|summary| summary.path);

@@ -490,8 +490,11 @@ pub fn load_codemode_config(cwd: &std::path::Path) -> CodemodeConfig {
         cwd,
         trusted,
     );
+    // Log-only: the host's startup printer already reported each distinct
+    // settings load failure once (`Warning: …`); this loader's copy must not
+    // duplicate it on stderr (see `crate::logging`).
     for error in manager.drain_errors() {
-        crate::ext_diag!(
+        crate::ext_diag_debug!(
             "[codemode] settings {}: {}",
             error.scope_name(),
             error.message

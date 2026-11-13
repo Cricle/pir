@@ -907,9 +907,28 @@ impl RpcServerState {
             "attach" => self.handle_attach(&value, out),
             "steer" => self.handle_steer(&value),
             "follow_up" => self.handle_follow_up(&value),
-            // Upstream `abort` answers with bare success (no data payload).
+            // Upstream `abort` answers with bare success (no data payload) AND
+            // only once the session is idle (docs/rpc-commands.md "### abort":
+            // "Abort the current operation and wait for the session to become
+            // idle before responding"; `agent-session.ts:2498-2508` awaits
+            // `waitForIdle()`). The response is the barrier the contract
+            // promises, so a client that reacts to it may prompt again
+            // immediately: without the wait the run is still claimed for the
+            // ~14-230 ms settle window, where a plain prompt is rejected with
+            // "Agent is already processing" (PIR-BIN-073) and an accepted
+            // `steer`/`followUp` is parked in the inbox until the NEXT prompt
+            // and then inserted AFTER that prompt's message (out of order, and
+            // never delivered if no later prompt starts a run).
+            //
+            // `AgentSession::abort` itself stays synchronous: the TUI's Esc
+            // path (`src/tui/terminal.rs` `WorkerCommand::Abort`) and the
+            // phone/SDK hosts keep the immediate signal flip their own
+            // responsiveness depends on; only this RPC surface adopts the
+            // await-idle contract.
             "abort" => {
-                self.attached()?.abort();
+                let session = self.attached()?;
+                session.abort();
+                session.wait_until_idle().await;
                 Ok(None)
             }
             // Legacy kebab-case alias: bare success, no state snapshot.
@@ -1677,6 +1696,15 @@ impl RpcServerState {
             "autoCompactionEnabled": session.auto_compaction_enabled(),
             "messageCount": session.message_count().await,
             "pendingMessageCount": session.pending_message_count(),
+            // PIR-BIN-075: a store-less (--no-session / SDK without a store)
+            // session bounds its in-memory transcript and drops the OLDEST
+            // messages at that cap. `historyTrimmed` tells a client the
+            // transcript is not the whole conversation and
+            // `historyDroppedMessages` how much is missing. Both are `false`/
+            // `0` on a persisted session (the cap never applies there), so
+            // the pre-fix wire shape is unchanged for those.
+            "historyTrimmed": snapshot.history_trimmed,
+            "historyDroppedMessages": snapshot.history_dropped_messages,
         });
         Ok(Some(state))
     }

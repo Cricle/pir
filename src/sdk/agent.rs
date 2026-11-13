@@ -1672,6 +1672,19 @@ impl Agent {
         }
     }
 
+    /// How many of the OLDEST messages the ephemeral-history cap has dropped
+    /// from the current store-less session (PIR-BIN-075); `0` for a persisted
+    /// session and for a store-less one that never crossed a cap.
+    ///
+    /// This is the number `get_state` reports as `historyDroppedMessages`; a
+    /// drop is also announced when it happens (an
+    /// [`SdkEvent::HistoryTrimmed`] plus a `pir: warning: …` diagnostic). An
+    /// app that sees a non-zero value is NOT holding the whole conversation —
+    /// upstream `SessionManager.inMemory` would have kept all of it.
+    pub fn history_trimmed_messages(&self) -> usize {
+        self.inner.session.history_trimmed_messages()
+    }
+
     /// The model currently in use (`provider` + `id` snapshot).
     pub fn model(&self) -> ModelRef {
         // `state()` also clones the session id/path strings; the model
@@ -2017,6 +2030,10 @@ impl Agent {
                     tokens: crate::agent_session::SessionTokens::default(),
                     cost: 0.0,
                     context_usage: None,
+                    // Persisted-session path: the ephemeral cap never applies
+                    // (PIR-BIN-075), so this stays 0 and the wire shape is
+                    // unchanged.
+                    history_dropped_messages: 0,
                 };
                 let _ = manager.for_each_prefix_entry(|entry| {
                     fold_entry_stats(&mut stats, &entry);

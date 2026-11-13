@@ -1463,6 +1463,30 @@ pub fn print_apply_retry(deps: &mut LoopDeps, settings: &crate::config::settings
     deps.retry = print_retry_policy(settings);
 }
 
+/// The provider-level transport knobs (`settings.retry.provider.*`) for one
+/// print run (upstream `sdk.ts:341-352` resolves them per request for every
+/// stream the session issues — prompt, compaction, branch summary).
+///
+/// The run snapshot is resolved ONCE per prompt run, next to
+/// [`print_apply_retry`]: a settings edit mid-run must not split one turn's
+/// requests across two retry budgets. Absent settings stay `None`, so the
+/// request keeps the transport defaults.
+pub fn print_provider_retry_overrides(
+    settings: &crate::config::settings::Settings,
+) -> crate::config::settings::ProviderRetryOverrides {
+    crate::config::settings::ProviderRetryOverrides::from_settings(settings.retry.as_ref())
+}
+
+/// Apply [`print_provider_retry_overrides`] to a request's `StreamOptions`
+/// without overriding an explicit value the caller already set (upstream
+/// `options.maxRetries ?? providerRetrySettings.maxRetries`).
+pub fn print_apply_provider_retry(
+    options: &mut crate::ai::types::StreamOptions,
+    overrides: crate::config::settings::ProviderRetryOverrides,
+) {
+    overrides.apply_to(options);
+}
+
 /// Install the non-interactive turn cap on a print run's deps (`run_print`
 /// calls this for every prompt run): [`crate::config::Config::max_turns`],
 /// default 1000, `PIR_MAX_TURNS` aware. The single assignment seam, testable
@@ -2888,11 +2912,30 @@ pub struct PrintOutcome {
     /// `backgroundToolResult` frames of every observed completion appended
     /// ([`text_with_background_reports`]).
     pub text: String,
-    /// 1 when the final response was truncated at the model's output token
-    /// limit, or when a background call the run started had to be aborted at
-    /// exit — in text mode only, else 0.
+    /// The process exit status of the run. Nonzero when:
+    /// - the final result's stop reason is `error` — in BOTH modes
+    ///   ([`TERMINAL_ERROR_EXIT_CODE`]; text mode instead returns `Err`, the
+    ///   upstream `runPrintMode` shape, which also exits 1);
+    /// - the final response was truncated at the model's output token limit
+    ///   (text mode only);
+    /// - a background call the run started had to be aborted at exit
+    ///   (text mode only).
     pub exit_code: i32,
 }
+
+/// The exit status of a print run whose final result carries
+/// `stopReason: "error"` in `--mode json`.
+///
+/// Upstream `runPrintMode` throws for invocation-level failures (a missing
+/// credential is thrown by `session.prompt` before the request) and
+/// `print-mode.ts` returns 1 from its `catch`; a CI job on a misconfigured
+/// provider therefore fails. pir keeps the failure IN the event stream (the
+/// terminal `turn_end`/`agent_end` frames carry `stopReason`/`errorMessage`,
+/// which is more useful than upstream's stderr-only report), but the process
+/// exit code must still report failure: a JSONL consumer that only checks
+/// the exit code must not read a terminal error as success. Text mode keeps
+/// its upstream `Err`-propagation path, which produces the same status.
+pub const TERMINAL_ERROR_EXIT_CODE: i32 = 1;
 
 /// Options for [`run_print`].
 pub struct PrintOptions {
@@ -3129,9 +3172,13 @@ pub async fn run_print_with_environment(
         None => {
             let message = "no model available; configure a provider with `pir auth login` or ~/.pi/agent/models.json";
             if options.mode == OutputMode::Json {
-                // Upstream json mode reports failures in-band and exits 0
-                // (print-mode.ts maps only TEXT-mode terminal errors onto the
-                // exit code): emit the error as a terminal message event.
+                // The failure is reported IN-BAND (the terminal message event
+                // carries `stopReason: "error"` + `errorMessage`, the shape a
+                // JSON consumer reads) AND in the process exit status: a
+                // missing provider is an invocation failure, and a CI job
+                // running `--mode json` must fail like upstream's exit-1
+                // path. Both surfaces are required — the event stream alone
+                // reads as a successful empty run to an exit-code check.
                 crate::coding_agent::json::print_event(
                     &crate::agent::agent_loop::AgentEvent::TurnEnd {
                         turn: 0,
@@ -3142,7 +3189,7 @@ pub async fn run_print_with_environment(
                 );
                 return Ok(PrintOutcome {
                     text: String::new(),
-                    exit_code: 0,
+                    exit_code: TERMINAL_ERROR_EXIT_CODE,
                 });
             }
             return Err(anyhow::anyhow!(message));
@@ -3161,7 +3208,14 @@ pub async fn run_print_with_environment(
     // through the shared helper keeps exactly one policy, the one the
     // interactive host applies.
     let mut thinking_level = {
-        let explicit = match options.cli_model.as_deref() {
+        // PIR-BIN-078: `--thinking` is applied by upstream UNCONDITIONALLY
+        // (`main.ts:522-524`: `if (parsed.thinking) options.thinkingLevel =
+        // parsed.thinking`), so it must win over every model arm — including
+        // the no-`--model` arm, where the old shape fell through to `None` and
+        // let the settings default (or the shared `medium`) win while the same
+        // flag with `--model` did apply. The model arm only refines the
+        // PREFIX when the flag is absent (its `:level` suffix).
+        let pattern_thinking = match options.cli_model.as_deref() {
             Some(pattern) => {
                 // Same resolver call as `find_initial_model`: `--model`
                 // without `--provider` still contributes its `:level` suffix,
@@ -3177,7 +3231,7 @@ pub async fn run_print_with_environment(
                         options.cli_thinking,
                     )
                     .map_err(anyhow::Error::msg)?;
-                options.cli_thinking.or(pattern_thinking)
+                pattern_thinking
             }
             // No CLI model: the first scoped model's suffix is the explicit
             // source (skipped when continuing/resuming, like the model choice).
@@ -3186,12 +3240,22 @@ pub async fn run_print_with_environment(
             }
             None => None,
         };
+        let explicit = options.cli_thinking.or(pattern_thinking);
         let per_model = settings.model_thinking_levels.as_ref().and_then(|levels| {
             levels
                 .get(&format!("{}/{}", model.provider, model.id))
                 .copied()
         });
-        crate::agent_session::resolve_starting_thinking_level(
+        // PIR-BIN-074: clamp to the model's supported ladder HERE, where the
+        // level is RESOLVED (upstream clamps at `createAgentSession`, sdk.ts:264
+        // — pir's print host drives the loop directly, so this resolution is
+        // its session creation). One clamp, and every consumer of
+        // `thinking_level` below (`LoopDeps::thinking_level`, the baked
+        // `StreamOptions.reasoning`, the compaction/navigate summarizers, the
+        // session env, the recorded assistant `thinkingLevel`) sees the value
+        // the provider will actually receive.
+        crate::agent_session::resolve_starting_thinking_level_for_model(
+            &model,
             explicit,
             per_model,
             settings.default_thinking_level,
@@ -3341,8 +3405,22 @@ pub async fn run_print_with_environment(
                         || merged_model.provider != model.provider
                         || merged_model.id != model.id
                     {
+                        // PIR-BIN-074/078: this arm REPLACES the level with the
+                        // merged catalog's resolution, so it must carry the
+                        // same rules as the main resolution above: the CLI
+                        // flag applies unconditionally (`find_initial_model`
+                        // only folds it in its `--model` arm, so a no-`--model`
+                        // run would otherwise lose it again), and the result
+                        // is clamped to the MERGED model's supported ladder.
+                        let resolved =
+                            crate::agent_session::clamp_starting_thinking_level_for_model(
+                                &merged_model,
+                                options
+                                    .cli_thinking
+                                    .unwrap_or(merged_initial.thinking_level),
+                            );
                         model = merged_model;
-                        thinking_level = merged_initial.thinking_level;
+                        thinking_level = resolved;
                         api_key = options
                             .api_key_override
                             .clone()
@@ -3352,6 +3430,10 @@ pub async fn run_print_with_environment(
                 None if initial_model_missing => {
                     let message = "no model available; configure a provider with `pir auth login` or ~/.pi/agent/models.json";
                     if options.mode == OutputMode::Json {
+                        // In-band terminal error frame PLUS the nonzero exit:
+                        // a plugin plan that registered no provider is the
+                        // same invocation failure as an empty catalog (see
+                        // the first no-model branch).
                         crate::coding_agent::json::print_event(
                             &crate::agent::agent_loop::AgentEvent::TurnEnd {
                                 turn: 0,
@@ -3361,7 +3443,7 @@ pub async fn run_print_with_environment(
                         );
                         return Ok(PrintOutcome {
                             text: String::new(),
-                            exit_code: 0,
+                            exit_code: TERMINAL_ERROR_EXIT_CODE,
                         });
                     }
                     return Err(anyhow::anyhow!(message));
@@ -3376,6 +3458,9 @@ pub async fn run_print_with_environment(
     if initial_model_missing && model.base_url.is_empty() {
         let message = "no model available; configure a provider with `pir auth login` or ~/.pi/agent/models.json";
         if options.mode == OutputMode::Json {
+            // Same contract as the two no-model branches above: the terminal
+            // error frame stays in the stream, the process still reports
+            // failure.
             crate::coding_agent::json::print_event(
                 &crate::agent::agent_loop::AgentEvent::TurnEnd {
                     turn: 0,
@@ -3385,7 +3470,7 @@ pub async fn run_print_with_environment(
             );
             return Ok(PrintOutcome {
                 text: String::new(),
-                exit_code: 0,
+                exit_code: TERMINAL_ERROR_EXIT_CODE,
             });
         }
         return Err(anyhow::anyhow!(message));
@@ -3833,6 +3918,13 @@ pub async fn run_print_with_environment(
         };
 
     let tool_call_wait = print_tool_call_wait(plugins.as_ref());
+    // `settings.retry.provider.*` for this invocation (upstream sdk.ts:341-352
+    // resolves `getProviderRetrySettings()` for EVERY provider request the
+    // session issues, prompt, compaction and branch summary alike). Resolved
+    // once here, like the agent-level policy, so a settings edit mid-run
+    // cannot split one turn's requests across two budgets. Absent fields stay
+    // `None` (the transport defaults, unchanged).
+    let provider_retry_overrides = print_provider_retry_overrides(&environment.settings);
     // The `tool-repair` builtin's assistant `message_end` repair hook, sourced
     // from the same host (agent_session/tool_repair.rs `host_tool_repair_hook`,
     // the session's `AgentSession::tool_repair_hook` twin): print drives the
@@ -3862,6 +3954,8 @@ pub async fn run_print_with_environment(
                 hooks: transport_hooks.clone(),
                 ..Default::default()
             };
+            let mut complete_options = complete_options;
+            print_apply_provider_retry(&mut complete_options, provider_retry_overrides);
             let complete: Arc<compaction::CompleteFn> = Arc::new(Box::new(move |context| {
                 let registry = Arc::clone(&complete_registry);
                 let key = complete_key.clone();
@@ -4104,11 +4198,18 @@ pub async fn run_print_with_environment(
         let mut streamed_prompt_source: Option<Arc<crate::ai::api::openai::SessionMessageSource>> =
             None;
         let mut streamed_declared_tools: Option<std::collections::BTreeSet<String>> = None;
-        let stream_support_options = crate::ai::types::StreamOptions {
-            api_key: api_key.clone(),
-            reasoning: Some(thinking_level),
-            hooks: transport_hooks.clone(),
-            ..Default::default()
+        let stream_support_options = {
+            let mut options = crate::ai::types::StreamOptions {
+                api_key: api_key.clone(),
+                reasoning: Some(thinking_level),
+                hooks: transport_hooks.clone(),
+                ..Default::default()
+            };
+            // Same provider-retry knobs the request itself will carry; only
+            // payload-shaped fields matter for `openai_streamed_body_supported`,
+            // but keeping the two option sets identical avoids drift.
+            print_apply_provider_retry(&mut options, provider_retry_overrides);
+            options
         };
         let projected: Option<ProjectionSnapshot> = {
             let mut guard = session.lock().await;
@@ -4253,10 +4354,8 @@ pub async fn run_print_with_environment(
                 // (`off`) and the request carries no reasoning at all.
                 thinking_level,
             )
-            .with_provider_unchecked(
-                Arc::clone(&provider_registry),
-                model.clone(),
-                crate::ai::types::StreamOptions {
+            .with_provider_unchecked(Arc::clone(&provider_registry), model.clone(), {
+                let mut options = crate::ai::types::StreamOptions {
                     api_key: api_key.clone(),
                     reasoning: Some(thinking_level),
                     hooks: transport_hooks.clone(),
@@ -4264,8 +4363,13 @@ pub async fn run_print_with_environment(
                         .clone()
                         .map(|source| source as Arc<dyn crate::ai::types::MessageSource>),
                     ..Default::default()
-                },
-            );
+                };
+                // `settings.retry.provider.*` for the prompt request
+                // itself (upstream sdk.ts:341-352). The settings never
+                // override an explicit option already set here.
+                print_apply_provider_retry(&mut options, provider_retry_overrides);
+                options
+            });
             // `settings.retry` for this prompt run, through the same seam
             // tests exercise: `None` means retries are disabled, so a
             // retryable mid-stream failure ends the run after a single
@@ -4472,6 +4576,7 @@ pub async fn run_print_with_environment(
                     plugins: plugins.clone(),
                     runtime: extensions.clone(),
                     session_events: print_session_events.clone(),
+                    provider_retry: provider_retry_overrides,
                 },
                 run_signal.clone(),
             ))
@@ -4560,11 +4665,18 @@ pub async fn run_print_with_environment(
                         Arc::clone(&provider_registry),
                         print_provider_session.key().clone(),
                         model.clone(),
-                        crate::ai::types::StreamOptions {
-                            api_key: api_key.clone(),
-                            reasoning: Some(thinking_level),
-                            hooks: transport_hooks.clone(),
-                            ..Default::default()
+                        {
+                            let mut options = crate::ai::types::StreamOptions {
+                                api_key: api_key.clone(),
+                                reasoning: Some(thinking_level),
+                                hooks: transport_hooks.clone(),
+                                ..Default::default()
+                            };
+                            // Same provider-retry knobs the deps' own stream
+                            // carries, so the event-stream request and the
+                            // loop request share one transport budget.
+                            print_apply_provider_retry(&mut options, provider_retry_overrides);
+                            options
                         },
                     )),
                     // Threshold compaction over the turn's projection snapshot;
@@ -4743,11 +4855,13 @@ pub async fn run_print_with_environment(
             });
         }
         // Upstream print-mode.ts:139-156 treats an `error` OR `aborted`
-        // stopReason as a process failure only in TEXT mode (exit 1 after
-        // printing the error). In JSON mode the process exits 0 and the
-        // terminal message arrives in-band through the run's normal event
-        // stream (`turn_end` + `agent_end`); do not re-emit a second
-        // `turn_end` here (A18/A24: duplicate turn=0 after agent_end).
+        // stopReason as a process failure. Text mode reproduces that with its
+        // `Err` return below (the process exits 1 after the error reaches
+        // stderr). JSON mode keeps the terminal message IN the event stream
+        // (`turn_end` + `agent_end`, the shape a JSON consumer reads) and no
+        // second `turn_end` is re-emitted here (A18/A24: duplicate turn=0
+        // after agent_end); its exit status is decided after this block, from
+        // the same final result (see [`TERMINAL_ERROR_EXIT_CODE`]).
         if matches!(
             result.terminal.stop_reason,
             crate::ai::types::StopReason::Error | crate::ai::types::StopReason::Aborted
@@ -4801,16 +4915,32 @@ pub async fn run_print_with_environment(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        // Text mode only (upstream `if (mode === "text")`): the partial text
-        // was already captured above and is still written to stdout; the
-        // truncation warning goes to stderr and the process exits 1.
+        // Terminal exit status of this prompt, read from its final result
+        // exactly like upstream's post-loop `state.messages[last]` check, so
+        // the LAST positional prompt's disposition wins (an earlier failed
+        // prompt followed by a successful one exits 0, matching upstream).
         if options.mode == OutputMode::Text {
+            // Text mode only (upstream `if (mode === "text")`): the partial
+            // text was already captured above and is still written to stdout;
+            // the truncation warning goes to stderr and the process exits 1.
             exit_code = match truncation_notice(result.terminal.stop_reason) {
                 Some(warning) => {
                     eprintln!("{warning}");
                     1
                 }
                 None => 0,
+            };
+        } else {
+            // `--mode json`: the terminal error stays in the stream, but the
+            // PROCESS must not report success (PIR-BIN-037: upstream's exit-1
+            // path covers invocation failures such as a missing credential,
+            // and a CI job checking only the exit code must not read a
+            // terminal `stopReason: "error"` as a passing run). An extension
+            // abort settles as a normal (0) run, which the `aborted` arm above
+            // already treats as a continuation, not a failure.
+            exit_code = match result.terminal.stop_reason {
+                crate::ai::types::StopReason::Error => TERMINAL_ERROR_EXIT_CODE,
+                _ => 0,
             };
         }
     }
@@ -5971,6 +6101,10 @@ pub struct PrintCompactionInputs {
     pub plugins: Option<Arc<PluginHost>>,
     pub runtime: Option<crate::extensions::ExtensionHandle>,
     pub session_events: Option<PrintSessionEventSink>,
+    /// The run's `settings.retry.provider.*` (upstream sdk.ts:341-352): the
+    /// summarizer request carries the same transport budget as every other
+    /// request of the run. `Default` keeps the transport defaults.
+    pub provider_retry: crate::config::settings::ProviderRetryOverrides,
 }
 
 /// Public for tests/.
@@ -6002,6 +6136,7 @@ fn print_compaction_hook_impl(
         plugins,
         runtime,
         session_events,
+        provider_retry,
     }: PrintCompactionInputs,
     aborted: Option<crate::ai::types::AbortSignal>,
 ) -> CompactionFn {
@@ -6021,12 +6156,16 @@ fn print_compaction_hook_impl(
         let registry = Arc::clone(&registry);
         let key = complete_session.key().clone();
         let model = complete_model.clone();
-        let options = crate::ai::types::StreamOptions {
+        let mut options = crate::ai::types::StreamOptions {
             api_key: api_key.clone(),
             reasoning: Some(thinking_level),
             hooks: hooks.clone(),
             ..Default::default()
         };
+        // Summarizer requests carry the same `settings.retry.provider.*`
+        // budget (upstream sdk.ts:420-434 routes every session request,
+        // compaction included, through the same request options).
+        print_apply_provider_retry(&mut options, provider_retry);
         Box::pin(async move {
             let stream = registry.stream_resolving_auth_for(Some(&key), model, context, options);
             // Completion consumer: drain while waiting (bounded queue; see

@@ -418,20 +418,24 @@ fn load_global_settings() -> Settings {
 
 /// [`load_global_settings`] against an explicit global directory (the test
 /// seam; keeps the scope decision in one place). Per-field parse diagnostics
-/// of the settings file are routed through `ext_diag!` (an invalid
-/// `extensionLimits` value is ignored, never fatal).
+/// of the settings file are routed through `ext_diag_debug!` (an invalid
+/// `extensionLimits` value is ignored, never fatal; the host's startup
+/// printer already reported the file problem once).
 pub fn global_settings_from_dir(global_dir: &Path) -> Settings {
     let manager = crate::config::settings::SettingsManager::load(
         global_dir, global_dir, global_dir,
         // Untrusted: the project scope must not contribute to engine limits.
         false,
     );
+    // Log-only: the global settings load failure or wrong-typed leaf was
+    // already reported once by the host's startup printer; engine-limit
+    // resolution must not repeat it on stderr (PIR-BIN-071/072).
     for message in manager
         .error_messages()
         .into_iter()
         .chain(manager.warning_messages())
     {
-        crate::ext_diag!("pir-ext: global settings: {message}");
+        crate::ext_diag_debug!("pir-ext: global settings: {message}");
     }
     manager.settings
 }

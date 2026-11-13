@@ -174,15 +174,23 @@ pub use events::{
     reset_entry_appended_wire_builds, session_event_to_json, SessionEvent, SessionEventHandler,
     SessionEventInterest, SummarizationRetrySource,
 };
-pub use models::{resolve_starting_thinking_level, ModelCycle};
+pub use models::{
+    clamp_starting_thinking_level_for_model, resolve_starting_thinking_level,
+    resolve_starting_thinking_level_for_model, ModelCycle,
+};
 pub use native_host::{
     native_session_host, NativeCapability, NativeHostError, NativeHostFuture, NativeOverlayFactory,
     NativeSessionAction, NativeSessionHost, SessionReplacement,
 };
 pub use notifications::drain_extension_notifications_pub;
 #[doc(hidden)]
+pub use prompt_loop::ephemeral_trim_notice;
+#[doc(hidden)]
 pub use prompt_loop::trim_ephemeral_history;
+#[doc(hidden)]
+pub use prompt_loop::EphemeralTrim;
 pub use prompt_loop::RunAdmission;
+pub use prompt_loop::{EPHEMERAL_HISTORY_MAX_MESSAGES, EPHEMERAL_HISTORY_MAX_TOKENS};
 pub use providers::serialize_scoped_models;
 pub use queue::ClearedQueue;
 #[cfg(feature = "subagent")]
@@ -339,6 +347,22 @@ pub struct SessionSnapshot {
     /// Session file path, when persisted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_path: Option<String>,
+    /// Whether the ephemeral-history cap has dropped messages from this
+    /// store-less session (PIR-BIN-075). Always `false` for a persisted
+    /// session. Serialized as `historyTrimmed` only when `true`, so a session
+    /// that never trimmed keeps the exact pre-fix wire shape.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub history_trimmed: bool,
+    /// The cumulative number of OLDEST messages the ephemeral-history cap
+    /// dropped (the count behind [`Self::history_trimmed`]). Serialized as
+    /// `historyDroppedMessages` only when non-zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub history_dropped_messages: usize,
+}
+
+/// `serde` skip predicate: omit a zero counter from the wire snapshot.
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// How an input (prompt/steer/follow-up) was or would be disposed of by an
@@ -430,6 +454,12 @@ pub struct SessionStats {
     /// Context-window usage, when the model reports a window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<ContextUsage>,
+    /// Messages the ephemeral-history cap dropped from this (store-less)
+    /// session; see [`Self::context_usage`]'s sibling field docs on
+    /// [`SessionSnapshot::history_dropped_messages`]. Serialized as
+    /// `historyDroppedMessages`, omitted when 0.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub history_dropped_messages: usize,
 }
 
 /// Token totals of [`SessionStats`] (upstream `SessionStats.tokens`).
@@ -648,6 +678,12 @@ pub struct AgentSession {
     /// In-memory transcript used when no session storage is configured, as a
     /// write-on-replace shared snapshot ([`HistorySnapshot`]).
     history: Arc<RwLock<HistorySnapshot>>,
+    /// How many of the OLDEST messages the ephemeral-history cap has dropped
+    /// from this store-less session so far (PIR-BIN-075). Always 0 for a
+    /// persisted session: its history is the storage projection and is never
+    /// bounded by this window. Exposed through
+    /// [`AgentSession::history_trimmed_messages`] / `get_state`.
+    history_trimmed: AtomicUsize,
     /// Automatic compaction settings; `None` disables compaction entirely.
     /// Interior-mutable (and shared with the run's compaction hook) so
     /// `set_auto_compaction` can flip it at any time (upstream

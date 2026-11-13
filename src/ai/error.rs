@@ -320,6 +320,16 @@ impl AiError {
         // For now, use the Display impl; real providers will redact further.
         match self {
             AiError::Aborted => "Request was aborted".to_string(),
+            // PIR-TUI-033: this variant's name describes the TRANSPORT's retry
+            // class ("the agent loop must not re-issue it"), not what the user
+            // just watched happen. A 5xx that the transport retried twice and
+            // then gave up on was rendered as "non-retryable provider error:
+            // HTTP 500: …", which reads as "the app did not even try". The
+            // Display text stays as-is (adapters and tests match on it); the
+            // user-facing sentence keeps only the provider's own words.
+            AiError::NonRetryable(message) if self.provider_http_error().is_some() => {
+                message.clone()
+            }
             AiError::RetryExhausted { message, .. } => {
                 // Truncate long error messages from retry chains. The cut must
                 // land on a char boundary: provider errors are not guaranteed

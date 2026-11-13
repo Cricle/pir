@@ -1,5 +1,3 @@
-use clap::Parser;
-
 use std::io::IsTerminal;
 
 use pir::coding_agent::cli::{
