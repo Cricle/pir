@@ -94,6 +94,14 @@ pub struct SessionReloadOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionOrigin {
     /// The print host (one-shot CLI process; one shared session storage).
+    /// Covers BOTH of its output modes: text print (`ExtensionConfig.mode`
+    /// `"print"`) and `--mode json` (`"json"`). Upstream print-mode.ts:74-104
+    /// binds the same `commandContextActions` for either label (`mode` only
+    /// selects the output stream), so a json-print extension command's
+    /// `ctx.fork(entryId)` must reach the same storage seam as text print's
+    /// (PIR-BIN-052 residual: `"json"` used to stamp `AgentSession`, which no
+    /// host in the one-shot print process ever claims — the action was
+    /// recorded and then died with the process).
     Print,
     /// An AgentSession-backed host (TUI / RPC / server / SDK): the live
     /// session id the host pushed to the runtime (`ctx.sessionId`); `None`
@@ -103,13 +111,18 @@ pub enum SessionOrigin {
 
 impl SessionOrigin {
     /// The origin a `commandAction` host fn stamps actions with, derived from
-    /// the runtime's configured host mode and the pushed session id. The
-    /// print host's runtime says mode `print`; every other host is
-    /// AgentSession-backed (unknown modes resolve to the AgentSession
-    /// identity so their actions are never claimed by a print host).
+    /// the runtime's configured host mode and the pushed session id.
+    /// `"print"` and `"json"` are the two labels of the ONE print host
+    /// ([`OutputMode::extension_mode`](crate::coding_agent::print::OutputMode::extension_mode));
+    /// every other host is AgentSession-backed (unknown modes resolve to the
+    /// AgentSession identity so their actions are never claimed by a print
+    /// host). No AgentSession-backed host configures mode `"json"` — TUI/RPC/
+    /// SDK session hosts configure `"interactive"`/`"rpc"`/`"headless"` — so
+    /// stamping `Print` for `"json"` cannot steal a real session host's
+    /// actions.
     pub fn for_runtime_mode(mode: &str, session_id: Option<String>) -> Self {
         match mode {
-            "print" => SessionOrigin::Print,
+            "print" | "json" => SessionOrigin::Print,
             _ => SessionOrigin::AgentSession { session_id },
         }
     }

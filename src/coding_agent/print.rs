@@ -5565,7 +5565,12 @@ async fn try_extension_command_impl(
 /// / `ctx.reload`), shared by the JS and native dispatch branches.
 ///
 /// Only the actions stamped with THIS host's identity are claimed — actions
-/// recorded by other hosts stay queued for their owner. Each claimed action
+/// recorded by other hosts stay queued for their owner. The print host is the
+/// one host for both output modes: `SessionOrigin::for_runtime_mode` maps the
+/// text-print `"print"` label AND the `--mode json` `"json"` label to
+/// [`SessionOrigin::Print`](crate::agent_session::SessionOrigin::Print), so a
+/// json-print extension command's `ctx.fork(entryId)` reaches this same
+/// storage seam (PIR-BIN-052's residual). Each claimed action
 /// is consumed even when its application fails; an ephemeral run
 /// (`--no-session`, `None` storage) rejects every action like the upstream
 /// runtimeHost does without session storage.

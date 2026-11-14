@@ -125,8 +125,23 @@ export default function (pi) {
 "#;
 
 async fn load_fixture(label: &str, has_ui: bool) -> (std::path::PathBuf, ExtensionHandle) {
+    load_fixture_with_mode(label, "print", has_ui).await
+}
+
+/// [`load_fixture`] with an explicit runtime mode: the `--mode json` print
+/// host loads the same extension runtime with `ExtensionConfig.mode = "json"`
+/// (print.rs `OutputMode::extension_mode`), which is the label the
+/// `commandAction` host fn stamps recorded actions with. The print host is
+/// the one host for both labels, so its claim path must apply these too.
+async fn load_fixture_with_mode(
+    label: &str,
+    mode: &str,
+    has_ui: bool,
+) -> (std::path::PathBuf, ExtensionHandle) {
     let dir = temp_dir(label);
-    let handle = ExtensionHandle::start(js_config(&dir, has_ui)).unwrap();
+    let mut config = js_config(&dir, has_ui);
+    config.mode = mode.to_string();
+    let handle = ExtensionHandle::start(config).unwrap();
     let path = dir.join("ext.ts");
     std::fs::write(&path, FIXTURE_EXTENSION_TS).unwrap();
     let result = handle.load(std::slice::from_ref(&path)).await.unwrap();
@@ -479,6 +494,124 @@ async fn ctx_fork_at_entry_position_at_keeps_the_entry_in_the_branch() {
         std::fs::read(&source_path).unwrap(),
         source_bytes,
         "the source file must stay byte-identical after the fork"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `--mode json` print host is the SAME session host as text print
+/// (upstream print-mode.ts:74-104 binds `commandContextActions` for both
+/// output labels; only the output stream differs), so it must claim the
+/// session-control actions its extension commands record. Before the fix the
+/// `"json"` runtime mode stamped them `SessionOrigin::AgentSession` — an
+/// identity no host in the one-shot print process ever claims — so
+/// `ctx.fork(entryId)` was recorded and then died with the process
+/// (PIR-BIN-052's residual). Mirrors
+/// `.play/evidence/p22-bin082-printfork/` (the `dofork.js` harness command
+/// reads the session JSONL and forks at a stored user entry) at the
+/// `try_extension_command` level: the claimed action must write a branched
+/// session file, not merely leave a queued entry.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // the action-queue lock must span the runtime awaits
+async fn ctx_fork_at_entry_is_claimed_and_branches_in_json_print_mode() {
+    let (dir, handle) = load_fixture_with_mode("fork-entry-json", "json", false).await;
+    let session_dir = dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let (session, ids) = chain_fixture(&session_dir);
+    let source_path = session.path().to_path_buf();
+    let source_id = session.id().to_owned();
+    let session_id = session.id().to_owned();
+    let source_bytes = std::fs::read(&source_path).unwrap();
+    let storage: SharedStorage = Arc::new(tokio::sync::Mutex::new(Some(session)));
+
+    // The json print host pushes the live session snapshot before every prompt
+    // (print.rs `print_session_snapshot`), so the runtime stamps its recorded
+    // actions with the pushed session id — the exact pre-fix residual shape
+    // (`AgentSession { session_id: Some(..) }`, recorded but never claimed).
+    let mut snapshot = pir::extensions::SessionContextSnapshot::default();
+    snapshot.session_id = Some(session_id);
+    handle.update_session_context(snapshot);
+
+    let _window = ACTION_WINDOW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        dispatch(
+            &handle,
+            &format!("/capture-fork {}", ids[1]),
+            &storage,
+            &session_dir
+        )
+        .await
+    );
+    let (branch_id, branch_path, branch_rows) = {
+        let guard = storage.lock().await;
+        let session = guard.as_ref().expect("forked storage");
+        assert_ne!(
+            session.id(),
+            source_id,
+            "a json-print ctx.fork(entryId) is claimed and swaps in a branched session"
+        );
+        assert_ne!(
+            session.path(),
+            source_path.as_path(),
+            "the branched session lives in its own file"
+        );
+        assert_eq!(
+            session.parent_session(),
+            Some(source_path.to_string_lossy().as_ref()),
+            "the branched header points at the source file"
+        );
+        let rows: Vec<(String, Option<String>)> = session
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.entry_id().to_owned(),
+                    entry.parent_id().map(str::to_owned),
+                )
+            })
+            .collect();
+        (session.id().to_owned(), session.path().to_path_buf(), rows)
+    };
+    assert_eq!(
+        branch_rows,
+        vec![(ids[0].clone(), None)],
+        "position before writes only the forked parent prefix to the branch file"
+    );
+    // The JS surface answers with the upstream runner-default shape, and the
+    // print host's claim drained the queue (no orphaned entry stays behind).
+    assert_eq!(
+        handle
+            .eval_json("JSON.stringify(globalThis.__pir_last)")
+            .await
+            .unwrap(),
+        json!({ "cancelled": false }),
+        "ctx.fork resolves {{cancelled: false}} (accepted) in json print mode"
+    );
+    assert!(
+        take_queue_is_empty(),
+        "the json print host claimed and drained the action it recorded"
+    );
+    drop(_window);
+
+    // The fork is durable: the source is never rewritten and the branch file
+    // is what the next process resumes into (the PIR-BIN-082 property, now
+    // reached from the json output mode too).
+    assert_eq!(
+        std::fs::read(&source_path).unwrap(),
+        source_bytes,
+        "the source file must stay byte-identical after the json-print fork"
+    );
+    let resumed = SessionManager::open(&branch_path).expect("reopen the branch");
+    assert_eq!(
+        resumed.id(),
+        branch_id,
+        "the branch file carries the forked id"
+    );
+    assert_eq!(
+        resumed.leaf_id(),
+        Some(ids[0].as_str()),
+        "resume derives the fork point from the branch file"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
