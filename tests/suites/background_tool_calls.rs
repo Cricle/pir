@@ -3566,7 +3566,11 @@ async fn a_foreground_bash_still_runs_after_an_aborted_background_bash() {
 
     let gate = Arc::new(tokio::sync::Notify::new());
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let foreground_command = pool_liveness_probe_command(15);
+    // PIR-QE-001: a load-tolerant anti-hang net (was 15 s; the teardown under a
+    // loaded CI box can exceed it — observed 33.7 s for the foreground call
+    // itself). The assertion is unchanged: the pool must be dead before the
+    // foreground call runs, and a genuine leak still trips the deadline.
+    let foreground_command = pool_liveness_probe_command(60);
     let turns = vec![
         scripted_message(
             vec![tool_call_block(

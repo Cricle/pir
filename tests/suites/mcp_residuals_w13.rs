@@ -519,9 +519,14 @@ fn a_connection_closed_mid_call_is_not_retried() {
             .call_tool("closing", "work", &json!({}), None)
             .await
             .expect_err("the transport closed before the response");
+        // The NAMED contract of this test is "not retried" (the counter below);
+        // which error wins is a race between observing the close and the
+        // operation's own timeout — under a loaded box the timeout can win
+        // (PIR-QE-001: observed `Timeout` instead of `ConnectionClosed`).
+        // Both variants mean the same thing here: the call failed.
         assert!(
-            matches!(error, McpError::ConnectionClosed),
-            "expected ConnectionClosed, got {error:?}"
+            matches!(error, McpError::ConnectionClosed | McpError::Timeout { .. }),
+            "expected ConnectionClosed (or the timeout race), got {error:?}"
         );
         let count = std::fs::read_to_string(&counter)
             .expect("the mock counted its calls")
