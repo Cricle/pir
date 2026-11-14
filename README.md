@@ -22,7 +22,7 @@ The local release gate is green on 2026-11-14 (`v0.3.1-rc.1`):
 `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features
 --locked -- -D warnings`, `cargo check --no-default-features --features sdk`,
 doctests (33 passed / 0 failed / 7 ignored) and the full cargo-nextest suite
-(7497 tests, 0 failed, 46 skipped across the lib/bins target and the 8 merged
+(7500 tests, 0 failed, 46 skipped across the lib/bins target and the 8 merged
 harnesses plus the standalone and profiling targets) all exit 0. Evidence:
 `.play/evidence/release-candidate-032/` (`summary.txt`, `gates.log`).
 

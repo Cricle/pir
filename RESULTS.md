@@ -72,9 +72,11 @@ pir 与上游 `pi` 1.4.0 的本轮 A/B（封闭环境、loopback mock、隔离 a
 ## 0.3.1-rc.1 release (2026-11-14)
 
 0.3.1-rc.1 是 0.3.1 之后的预发布候选：读路径性能整备（R1–R8 全部落地，R5/R6/R7
-本批完成）、会话替换语义与上游对齐（PIR-BIN-049/110）、对抗复核揪出并修复 6 个
-真实缺陷（PIR-BIN-101/105/106/107/108/110），Kitty 裁剪 parity 闭合
-（drift 15/16 → Landed）。无破坏性变更。
+本批完成）、会话替换语义与上游对齐（PIR-BIN-049 残留全部闭合 / 110）、对抗复核揪出
+并修复 8 个真实缺陷（PIR-BIN-101/104/105/106/107/108/110 及临时会话面），Kitty 裁剪
+parity 闭合（drift 15/16 → Landed），TUI resume 首帧延迟从 1 s 降到一次 drain。
+无破坏性变更（durable `StorageWrite::Task` 的 Rust API 改为 `Arc<TaskRecord>`，序列化
+字节不变）。
 
 **本轮修复/性能（均有前后实测）**
 
@@ -84,19 +86,23 @@ pir 与上游 `pi` 1.4.0 的本轮 A/B（封闭环境、loopback mock、隔离 a
 | 性能 | R5/R6 会话读路径 | `context_usage()` 1 622 → 21 allocs/调用（N=800）；RPC `get_entries` 不再深拷贝整个会话 |
 | 性能 | R7 快照分支文本增量 | 16.7 ms / 5 283 allocs → 1.06 ms / 35（N=800，字节恒等） |
 | 性能 | PIR-BIN-099 事件行预规格化 | 200 KB 工具结果轮 full 配置 −2.3 MB 分配；session face −12.6%（3 042 → 2 658 KB），字节恒等 |
+| 性能 | PIR-BIN-023 durable 任务提交 | alloc events 47 255 → 43 414（−8.1%），bytes 49 510 002 → 42 863 298（−13.4%），digest 与全终态一致 |
 | 正确性 | PIR-BIN-101/102/103 窗口化投影桥接 | 被弃分支不再进入模型上下文；两个投影 walker 对同一窗口一致；30/30 钉住 |
+| 正确性 | PIR-BIN-104 park 切片身份 | token 记录 storage generation；widen→re-trim 恢复布尔值也不再接受陈旧证明（回归钉钉住 fast=Some(true)/full=false/guard=None） |
 | 正确性 | PIR-BIN-105/106/108 R7 缓存陈旧 | 进程级 storage generation + swap 清缓存；空 aggregate 回退全量渲染；x5 三轮对抗复核 verified |
-| 正确性 | PIR-BIN-049/110 替换语义 | 替换统一按操作给 reason（new/resume，含父链子会话）；fork 缝由调用方显式选择；new/resume/fork 均不发 `session_tree` 与 drain 期 `queue_update` |
+| 正确性 | PIR-BIN-049/110 替换语义 | 替换统一按操作给 reason（new/resume，含父链子会话）；fork 缝由调用方显式选择；clone 缝完整走上游 fork 生命周期（`session_before_fork{entryId,position:"at"}` 可取消 + shutdown/start fork），任何替换都不发 `session_tree`/drain 期 `queue_update` |
 | 正确性 | PIR-BIN-052 残留 / PIR-BIN-107 临时会话 | `--mode json` 认领会话控制动作；ephemeral `ctx.newSession()` 保持内存态；无存储 fork 与上游同文案拒绝 |
 | TUI | Kitty 裁剪 / TUI-042 / TUI-043 | 字节钉 + 启动期 status/widget 行 + 启动排队 turn 恰好一次 |
+| TUI | PIR-TUI-024 resume 首帧 | ConPTY 实测 ready→恢复文本 gap 1.00 s → 0.12 s（debug；唤醒标志改为 drain 前清零，不再被首帧绘制期入队事件丢失） |
+| 文档 | PIR-BIN-062/063 工具装载 | 定案为已记录刻意偏差（Option B）：全量构建声明 22 = 9 core + 13 内置，给出 efficient/--tools/--no-extensions 切换与成本实测 |
 | 测试 | QE-001 / QE-002 / 线语料 | 计时 flake 以更强契约根治；harness 地图逐行复验；776 事件随机对抗语料钉字节恒等 |
 
 **门禁（本机 GNU，2026-11-14 实测）**
 
 - `cargo fmt --all -- --check` EXIT 0。
 - `cargo clippy --all-targets --all-features --locked -- -D warnings` EXIT 0（0 条诊断）。
-- 全量 nextest（`--profile ci`，`RUST_MIN_STACK=8388608`）：**7497 tests，0 failed，46 skipped**；
-  分项 = lib/bins 29 + zz_merged_1..8 的 772/791/795/776/790/1091/880/791 + standalone 20 + profiling 762。
+- 全量 nextest（`--profile ci`，`RUST_MIN_STACK=8388608`）：**7500 tests，0 failed，46 skipped**；
+  分项 = lib/bins 29 + zz_merged_1..8 的 772/791/795/776/790/1094/880/791 + standalone 20 + profiling 762。
 - doctests 33 passed / 0 failed / 7 ignored；`cargo check --no-default-features --features sdk` EXIT 0。
 - 版本三处一致：`[workspace.package]`、`.migration-info`、二进制 `--version` 均为 0.3.1-rc.1，
   `Cargo.lock` 两个 workspace 包同步。证据：`.play/evidence/release-candidate-032/`。

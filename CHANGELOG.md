@@ -5,14 +5,15 @@
 Pre-release candidate carrying the post-0.3.1 batch: read-path performance work
 (R1–R8 all landed; R5/R6/R7 in this batch), session-replacement semantics aligned
 with upstream, and six real defects found by adversarial review. No breaking
-changes.
+changes except the durable `StorageWrite::Task` Rust API (now `Arc<TaskRecord>`;
+the serialized wire shape is unchanged).
 
 ### performance
 
 - Run-end park validation is O(delta) instead of two transcript-sized walks: the
-  prompt-start projection leaves a park token (leaf + message count + window
-  flag) that the run-end park re-validates incrementally, with a full-validation
-  fallback (R3, PIR-BIN-101 family).
+  prompt-start projection leaves a park token (leaf + message count + slice
+  identity) that the run-end park re-validates incrementally, with a
+  full-validation fallback (R3, PIR-BIN-101 family).
 - `context_usage()` walks the shared branch snapshot (1 622 → 21 allocations per
   call at N=800, R5) and the RPC `get_entries` poll no longer deep-clones the
   whole session (R6).
@@ -22,6 +23,10 @@ changes.
   tool-result turn ~2.3 MB fewer allocations in the full host config, bytes
   unchanged (PIR-BIN-099, both faces); the session face alone −12.6 % (pse
   3 042 → 2 658 KB).
+- A durable task commit keeps ONE `TaskRecord` payload: staging, assembly and
+  publication share an `Arc` (alloc events 47 255 → 43 414, −8.1 %; bytes
+  49 510 002 → 42 863 298, −13.4 % on the 40-task × 6-phase bench; the journal
+  digest and every terminal state are identical, PIR-BIN-023).
 - R1/R2/R4 read-path wins from the earlier post-0.3.1 pass are included.
 
 ### correctness
@@ -30,6 +35,9 @@ changes.
   rows into the model context: the broken-chain bridge is whole-file only and
   both projection walkers agree on the same window (PIR-BIN-101, with the two
   adversarial-review residuals PIR-BIN-102/103).
+- The park guard compares the slice identity the token was minted under, so a
+  widen followed by a re-trim into a new window can no longer accept a
+  stale-base proof (PIR-BIN-104).
 - The R7 snapshot cache can no longer splice stale text across a same-path
   reload or across manager instances (process-global storage generation, cache
   drop on swap), and an empty cached aggregate falls back to a full render
@@ -39,7 +47,11 @@ changes.
   parent-linked to the outgoing session — and emits neither `session_tree` nor
   a drain-time `queue_update`; the fork flavor is the clone/fork-at-current
   caller's explicit seam, never a file-shape inference (PIR-BIN-049,
-  PIR-BIN-110).
+  PIR-BIN-110). The clone seam runs upstream's FULL fork lifecycle —
+  `session_before_fork {entryId: current leaf, position: "at"}`, cancel-able,
+  then `session_shutdown`/`session_start` with reason `fork` — closing the
+  recorded PIR-BIN-049 residual; no replacement emits `session_tree` at all
+  (`navigateTree` owns it).
 - The `--mode json` print host claims its session-control actions; ephemeral
   runs keep `ctx.newSession()` in memory and a storage-less fork rejects with
   upstream's message inside the call (PIR-BIN-052 residual, PIR-BIN-107).
@@ -52,6 +64,19 @@ changes.
 - Kitty image crop/re-emit for a scrolled placement is ported with byte parity
   (upstream `cropKittyImageLine`, `terminal-image.ts:471-483`), closing drift
   rows 15/16.
+- A resumed session's transcript no longer appears a full second after the
+  ready frame: the worker wake flag is cleared BEFORE the drain, so an attach
+  replay queued during the first frame's paint renders on the next pass
+  (ConPTY probe: gap 1.00 s → 0.12 s on the debug build, PIR-TUI-024).
+
+### docs
+
+- The default tool loadout is documented as the decided superset it is: 22
+  tools in a full build (9 core + 13 default-active builtins), with the
+  `efficient` profile / `--tools read,bash,edit,write` parity levers and
+  `--no-extensions` spelled out (PIR-BIN-062/063 closed as documented
+  deviations; `docs/FEATURES.md` §3.1, `docs/performance-profiles.md`,
+  `docs/system-prompt-audit.md` §4.1).
 
 ### tests and infrastructure
 
