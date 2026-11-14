@@ -122,27 +122,40 @@ impl AgentSession {
 
     /// Swap in a replacement session storage WITHOUT the
     /// `session_before_switch` dispatch: refreshes the cached session
-    /// identity, fires `session_tree`, and emits the post-swap
-    /// `session_start` (`reason` overrides the inferred upstream reason).
-    /// Upstream's fork path (agent-session-runtime.ts) swaps the manager
-    /// after a `session_before_fork` (NOT a `session_before_switch`), so
-    /// [`Self::fork_entry`] swaps through this seam.
+    /// identity, fires `session_tree`, drains the steering/follow-up queues
+    /// (emitting `queue_update`), and emits the post-swap `session_start`
+    /// (`reason` overrides the inferred upstream reason). Upstream's fork
+    /// path (agent-session-runtime.ts) swaps the manager after a
+    /// `session_before_fork` (NOT a `session_before_switch`), so
+    /// [`Self::fork_entry`] swaps through this seam with both
+    /// announcements disabled.
     async fn swap_session_storage(&self, session: SessionManager, reason: Option<&str>) -> bool {
-        self.swap_session_storage_with(session, reason, true).await
+        self.swap_session_storage_with(session, reason, true, true)
+            .await
     }
 
-    /// [`Self::swap_session_storage`] with explicit control over
-    /// `session_tree`. A fork replaces the session FILE (upstream
-    /// `fork` → `createBranchedSession` → `createRuntime`) and emits only
-    /// `session_shutdown {reason:"fork"}` plus
-    /// `session_start {reason:"fork", previousSessionFile}`; `session_tree`
-    /// belongs to `navigateTree` (agent-session.ts:4140-4146), so
-    /// [`Self::fork_entry`] passes `false` (PIR-BIN-049).
+    /// [`Self::swap_session_storage`] with explicit control over the two
+    /// observer announcements a swap can add beyond the upstream replacement
+    /// lifecycle:
+    ///
+    /// - `emit_session_tree`: a fork replaces the session FILE (upstream
+    ///   `fork` → `createBranchedSession` → `createRuntime`) and emits only
+    ///   `session_shutdown {reason:"fork"}` plus
+    ///   `session_start {reason:"fork", previousSessionFile}`; `session_tree`
+    ///   belongs to `navigateTree` (agent-session.ts:4140-4146), so
+    ///   [`Self::fork_entry`] passes `false` (PIR-BIN-049).
+    /// - `emit_queue_update`: upstream's replacement disposes the outgoing
+    ///   session TOGETHER with its steering/follow-up queues
+    ///   (`teardownCurrent` → `dispose`, agent-session-runtime.ts:167-177)
+    ///   and starts the replacement runtime with empty queues, so no
+    ///   `queue_update` is emitted for a fork; the drain below is silent in
+    ///   that case ([`Self::drain_queues_without_update`], PIR-BIN-049).
     async fn swap_session_storage_with(
         &self,
         session: SessionManager,
         reason: Option<&str>,
         emit_session_tree: bool,
+        emit_queue_update: bool,
     ) -> bool {
         let Some(slot) = &self.session else {
             return false;
@@ -189,10 +202,16 @@ impl AgentSession {
         // Steering/follow-up queues are per-runtime state in upstream: a
         // switch creates a new session runtime with empty arrays. pir's inbox
         // facade survives the storage swap, so drain it here or the first
-        // prompt in the new session receives text queued for the outgoing one
-        // (and the dim pending block no longer shows it). `clear_queue` also
-        // emits `queue_update`, which clears the TUI's pending display.
-        let cleared = self.clear_queue().await;
+        // prompt in the new session receives text queued for the outgoing one.
+        // The host new/resume seam keeps `clear_queue` (which emits the
+        // historical `queue_update` snapshot); the fork seam drains silently,
+        // exactly like upstream's disposed session, whose replacement starts
+        // with empty queues and emits no `queue_update` at all (PIR-BIN-049).
+        let cleared = if emit_queue_update {
+            self.clear_queue().await
+        } else {
+            self.drain_queues_without_update().await
+        };
         if !cleared.steering.is_empty() || !cleared.follow_up.is_empty() {
             tracing::debug!(
                 steering = cleared.steering.len(),
@@ -387,6 +406,50 @@ impl AgentSession {
         // required (push after it).
         self.push_session_context(&self.current_model()).await;
         true
+    }
+
+    /// Drain the steering/follow-up queues WITHOUT emitting `queue_update`
+    /// (the fork seam's queue drop, PIR-BIN-049).
+    ///
+    /// Upstream's fork replaces the whole session runtime: `teardownCurrent`
+    /// disposes the outgoing `AgentSession` (its `_steeringMessages` /
+    /// `_followUpMessages` die with it, agent-session-runtime.ts:167-177) and
+    /// `createRuntime` starts the replacement from a fresh manager with empty
+    /// queues (agent-session-runtime.ts:262-350) — no `queue_update` is
+    /// delivered for a fork. pir's inbox facade survives the storage swap, so
+    /// the swap still has to drop the queued messages (or the first prompt in
+    /// the new session would receive text queued for the outgoing one), but
+    /// the drop is silent. The bookkeeping mirrors [`Self::clear_queue`] minus
+    /// the event emission.
+    async fn drain_queues_without_update(&self) -> ClearedQueue {
+        let steering = self.steering_inbox.drain_all().await;
+        let follow_up = self.follow_up_inbox.drain_all().await;
+        let dropped = steering.len() + follow_up.len();
+        if dropped > 0 {
+            let _ =
+                self.pending_messages
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                        Some(current.saturating_sub(dropped))
+                    });
+        }
+        {
+            let mut mirror = self
+                .queue_mirror
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            mirror.steering.clear();
+            mirror.follow_up.clear();
+        }
+        ClearedQueue {
+            steering: steering
+                .into_iter()
+                .map(|prompt| prompt.text_content())
+                .collect(),
+            follow_up: follow_up
+                .into_iter()
+                .map(|prompt| prompt.text_content())
+                .collect(),
+        }
     }
 
     /// Start a new branch from an earlier entry AND append a branch_summary
@@ -971,6 +1034,20 @@ impl AgentSession {
                         .session_path
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = identity.1;
+                    // Upstream's `teardownCurrent` disposes the outgoing
+                    // session, so the steering/follow-up queues queued for
+                    // the outgoing transcript die with it and the branch
+                    // starts empty — silently, with no `queue_update`
+                    // (PIR-BIN-049). pir's inbox facade survives the
+                    // in-memory branch, so drop them here too.
+                    let cleared = self.drain_queues_without_update().await;
+                    if !cleared.steering.is_empty() || !cleared.follow_up.is_empty() {
+                        tracing::debug!(
+                            steering = cleared.steering.len(),
+                            follow_up = cleared.follow_up.len(),
+                            "dropped queued steering/follow-up messages on a non-persisted fork"
+                        );
+                    }
                     if let Some(plugins) = &self.plugins {
                         plugins.emit_session_shutdown("fork", None).await;
                     }
@@ -1008,8 +1085,12 @@ impl AgentSession {
                         .emit_session_shutdown("fork", target_session_file.as_deref())
                         .await;
                 }
+                // Upstream `createBranchedSession` + `createRuntime` emits
+                // neither `session_tree` nor `queue_update` for a fork: the
+                // outgoing session (and its queues) is disposed before the
+                // replacement runtime starts (PIR-BIN-049).
                 if !self
-                    .swap_session_storage_with(branched, Some("fork"), false)
+                    .swap_session_storage_with(branched, Some("fork"), false, false)
                     .await
                 {
                     return Err("no attached session storage; the run stays ephemeral".to_owned());
@@ -1043,8 +1124,11 @@ impl AgentSession {
                         .emit_session_shutdown("fork", target_session_file.as_deref())
                         .await;
                 }
+                // Fresh parent-linked fork arm: same upstream replacement
+                // shape as the branched file (no `session_tree`, no
+                // `queue_update`, PIR-BIN-049).
                 if !self
-                    .swap_session_storage_with(fresh, Some("fork"), false)
+                    .swap_session_storage_with(fresh, Some("fork"), false, false)
                     .await
                 {
                     return Err("no attached session storage; the run stays ephemeral".to_owned());

@@ -461,6 +461,68 @@ impl AgentPlugin for RecordBeforeForkPlugin {
     }
 }
 
+/// PIR-BIN-049: records EVERY event a native plugin can observe around a
+/// fork, including the session-level events that must NOT fire
+/// (`session_tree`, `queue_update`) and the direct lifecycle emits
+/// (`session_start`), so the exact observable sequence can be pinned.
+struct RecordForkLifecyclePlugin {
+    info: PluginInfo,
+    seen: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl RecordForkLifecyclePlugin {
+    fn new(seen: Arc<Mutex<Vec<serde_json::Value>>>) -> Self {
+        Self {
+            info: PluginInfo::inline("record-fork-lifecycle"),
+            seen,
+        }
+    }
+}
+
+impl AgentPlugin for RecordForkLifecyclePlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+    fn events(&self) -> EventInterest {
+        // `compaction_start` is the probe that flushes the FIFO native
+        // session-event bridge; `session_tree` / `queue_update` are declared
+        // so their absence (not just their non-delivery) is asserted.
+        EventInterest::List(vec![
+            "session_before_fork".into(),
+            "session_shutdown".into(),
+            "session_start".into(),
+            "session_tree".into(),
+            "queue_update".into(),
+            "compaction_start".into(),
+        ])
+    }
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        let seen = Arc::clone(&self.seen);
+        Box::pin(async move {
+            seen.lock().unwrap().push(event.payload.clone());
+            PluginEventOutcome::None
+        })
+    }
+}
+
+/// Wait until `kind` reached the recorder. The native session-event bridge
+/// dispatches asynchronously in FIFO order, so the probe event doubles as
+/// the flush barrier for the negative assertions around it.
+async fn wait_for_recorded(seen: &Arc<Mutex<Vec<serde_json::Value>>>, kind: &str) {
+    for _ in 0..500 {
+        if seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|payload| payload["type"].as_str() == Some(kind))
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("recorded event never arrived: {kind}");
+}
+
 /// Records every `turn_end` boundary payload (upstream `TurnEndEvent`).
 struct RecordTurnEndPlugin {
     info: PluginInfo,
@@ -1801,15 +1863,20 @@ async fn fork_before_the_first_user_message_starts_a_fresh_parent_linked_session
     assert!(empty, "the fresh session has no messages");
 }
 
-/// PIR-TUI-021 + PIR-BIN-052: the fork teardown is
+/// PIR-TUI-021 + PIR-BIN-052 + PIR-BIN-049: the fork teardown is
 /// `session_shutdown {reason:"fork"}` after the branched FILE exists
 /// (upstream `createBranchedSession` → `teardownCurrent`, agent-session-
 /// runtime.ts:315-323), followed by the post-swap `session_start
-/// {reason:"fork"}`. The event order is `before_fork → shutdown →
-/// session_start`; upstream emits no `session_tree` for a fork (that event
-/// belongs to `navigateTree`, PIR-BIN-049), so this recorder (which does
-/// subscribe to `session_tree`) must not see one. `teardownCurrent` receives
-/// the REPLACEMENT file as `targetSessionFile`.
+/// {reason:"fork", previousSessionFile}` (`createRuntime`,
+/// agent-session-runtime.ts:321-328). The full observable sequence is
+/// `session_before_fork → session_shutdown → session_start`. Upstream emits
+/// NEITHER `session_tree` (navigateTree's event, agent-session.ts:4140-4146)
+/// NOR `queue_update` (the outgoing session's queues die with `dispose()`;
+/// the replacement runtime starts empty, agent-session-runtime.ts:167-177)
+/// for a fork — the recorder below declares interest in both, and the probe
+/// event flushes the FIFO native bridge, so their absence is proven, not
+/// assumed. `teardownCurrent` receives the REPLACEMENT file as
+/// `targetSessionFile`.
 #[tokio::test]
 async fn fork_lifecycle_orders_shutdown_before_branch_and_start_after() {
     let temp = TempDir::new("fork-shutdown-order");
@@ -1821,7 +1888,9 @@ async fn fork_lifecycle_orders_shutdown_before_branch_and_start_after() {
     let events: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentSession::new_with_plugins(
         agent_session_builder(registry, Some(session), None, Some(temp.0.clone())),
-        vec![Arc::new(RecordBeforeForkPlugin::new(Arc::clone(&events)))],
+        vec![Arc::new(RecordForkLifecyclePlugin::new(Arc::clone(
+            &events,
+        )))],
     );
 
     let outcome = agent
@@ -1830,27 +1899,34 @@ async fn fork_lifecycle_orders_shutdown_before_branch_and_start_after() {
         .expect("fork");
     assert!(matches!(outcome, ForkEntryOutcome::Branched { .. }));
 
-    let types: Vec<String> = {
-        let events = events.lock().unwrap();
-        events
-            .iter()
-            .map(|payload| payload["type"].as_str().unwrap_or_default().to_owned())
-            .collect()
-    };
+    // The native session-event bridge dispatches asynchronously in FIFO
+    // order, so once the probe lands, anything the fork had queued (a stray
+    // `queue_update`) is recorded too. The exact sequence is therefore a
+    // real absence proof for `session_tree` / `queue_update`, not a race.
+    agent.emit_session_event_for_test(SessionEvent::CompactionStart { reason: "manual" });
+    wait_for_recorded(&events, "compaction_start").await;
+
+    let recorded = events.lock().unwrap().clone();
+    let types: Vec<&str> = recorded
+        .iter()
+        .map(|payload| payload["type"].as_str().unwrap_or_default())
+        .collect();
     assert_eq!(
         types,
         vec![
-            "session_before_fork".to_owned(),
-            "session_shutdown".to_owned(),
+            "session_before_fork",
+            "session_shutdown",
+            "session_start",
+            "compaction_start",
         ],
-        "fork teardown follows the branch-file creation; no session_tree \
-         (upstream emits that only for navigateTree)"
+        "a fork must observe before_fork -> shutdown -> start with no \
+         session_tree and no queue_update: {recorded:?}"
     );
 
     // The shutdown payload targets the REPLACEMENT file (upstream
     // `teardownCurrent("fork", sessionManager.getSessionFile())` runs after
     // `createBranchedSession`, so the destination is the new branch file).
-    let shutdown = events.lock().unwrap()[1].clone();
+    let shutdown = recorded[1].clone();
     assert_eq!(shutdown["reason"], serde_json::json!("fork"));
     let target = shutdown["targetSessionFile"].as_str().unwrap_or_default();
     let new_path =
@@ -1864,6 +1940,27 @@ async fn fork_lifecycle_orders_shutdown_before_branch_and_start_after() {
         new_path, outgoing_path,
         "the fork swapped in a new session file"
     );
+
+    // `createRuntime` carries the outgoing file as `previousSessionFile`.
+    let start = recorded[2].clone();
+    assert_eq!(start["reason"], serde_json::json!("fork"));
+    assert_eq!(
+        start["previousSessionFile"].as_str().unwrap_or_default(),
+        outgoing_path.to_string_lossy().as_ref(),
+        "session_start names the outgoing session file"
+    );
+
+    // Self-check for the negative assertion above: the SAME recorder does
+    // observe a `queue_update` when one is emitted through the same bridge,
+    // so its absence from the fork sequence is meaningful and not a
+    // delivery gap in this fixture.
+    agent.emit_session_event_for_test(SessionEvent::QueueUpdate {
+        steering: vec!["late".to_owned()],
+        follow_up: Vec::new(),
+        delivered_steering: Vec::new(),
+        delivered_follow_up: Vec::new(),
+    });
+    wait_for_recorded(&events, "queue_update").await;
 }
 
 #[tokio::test]
