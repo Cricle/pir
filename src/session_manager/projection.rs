@@ -1996,13 +1996,15 @@ impl SessionManager {
     ///
     /// The caller must have a flushed, live-tail-enabled manager; every
     /// appended message must project exactly ONE model-visible message.
+    /// Returns `None` when the fixture premise does not hold (no token, an
+    /// append/widen/trim failure) — test-only, so the caller asserts.
     #[doc(hidden)]
     #[cfg(feature = "session")]
     pub fn park_guard_widen_then_retrim_probe_for_test(
         &mut self,
         appended: &[crate::ai::types::Message],
         retrim_entries: usize,
-    ) -> (Option<bool>, Option<bool>, bool) {
+    ) -> Option<(Option<bool>, Option<bool>, bool)> {
         let first = self.build_session_projection_with_cache(None);
         let leaf_entry = self.leaf_id.as_deref().and_then(|id| {
             self.file_entries
@@ -2016,20 +2018,15 @@ impl SessionManager {
             messages: first.projection.messages,
         };
         let extended = self.build_session_projection_with_cache(Some(cached));
-        let token = extended
-            .park_token
-            .clone()
-            .expect("the extend over an append-only delta mints a token");
+        let token = extended.park_token.clone()?;
         let base = extended.projection.messages.len();
         for message in appended {
-            self.append_message(message.clone())
-                .expect("append the run's message");
+            self.append_message(message.clone()).ok()?;
         }
         let parked = base + appended.len();
         let run_start_leaf = token.leaf_id.clone();
-        self.widen_to_full().expect("widen the live-trimmed window");
-        self.trim_resident_tail(usize::MAX, retrim_entries)
-            .expect("re-trim into the new window");
+        self.widen_to_full().ok()?;
+        self.trim_resident_tail(usize::MAX, retrim_entries).ok()?;
         let leaf_id = self.leaf_id.clone();
         let guard = self.validate_park_delta(
             &token,
@@ -2048,7 +2045,7 @@ impl SessionManager {
         );
         let full = self.projected_message_count_for_leaf(leaf_id.as_deref()) == parked
             && self.path_delta_is_append_only(run_start_leaf.as_deref(), leaf_id.as_deref());
-        (guard, fast, full)
+        Some((guard, fast, full))
     }
 }
 

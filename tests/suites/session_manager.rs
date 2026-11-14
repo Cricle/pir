@@ -4251,7 +4251,9 @@ fn park_guard_refuses_a_token_from_before_a_widen_then_retrim() {
     );
 
     let appended = [user_message("run question"), user_message("run answer")];
-    let (guard, fast, full) = session.park_guard_widen_then_retrim_probe_for_test(&appended, 3);
+    let (guard, fast, full) = session
+        .park_guard_widen_then_retrim_probe_for_test(&appended, 3)
+        .expect("the live-trimmed fixture mints a token and re-trims");
     assert!(
         !full,
         "the full validation must reject the stale-base state: fast={fast:?}"
