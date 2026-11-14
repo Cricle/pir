@@ -28997,6 +28997,34 @@ async fn worker_loop(
     // thread for the whole TUI session; `run_prompt` reads it at each run's
     // settle seam and `handle_session_command` toggles/reports it.
     let debug_mode = DebugMode::default();
+    // PIR-TUI-043: upstream starts the turn a `session_start` handler's
+    // `pi.sendUserMessage` queued — `bindExtensions` AWAITS the emit
+    // (agent-session.ts:3339), the handler's `sendUserMessage` runs `prompt()`
+    // (:2429-2467), and an idle `prompt()` runs `_startRun` (:2172 → :1873).
+    // pir's startup dispatch only QUEUES the run (`ensure_session_start` →
+    // `consume_send_user_message`, notifications.rs:1487-1490), so pump it
+    // ONCE here, through the same idle pump every processed command uses,
+    // before the loop first blocks in `commands.recv()` (a queued turn with
+    // no consumer would otherwise wait for the user's first command).
+    // Exactly-once: `take_pending_custom_run` pops the record, so the
+    // end-of-command pump can never re-run this one; a NEW idle
+    // `sendUserMessage` queued while this turn runs is still consumed there
+    // like any other. Interactive-only by construction (`worker_loop` has one
+    // caller, the TUI main): SDK/print/RPC hosts never run this pump, so
+    // PIR-SDK-013's first-prompt policy is untouched.
+    pump_pending_custom_runs(
+        RunServices {
+            session: &session,
+            events: &events,
+            streaming: &streaming,
+            session_dir: &session_dir,
+            debug_mode: &debug_mode,
+            pulse: &pulse,
+        },
+        &mut commands,
+        &mut queued_prompts,
+    )
+    .await;
     loop {
         let command = if queued_prompts.is_empty() {
             match commands.recv().await {
@@ -29071,30 +29099,24 @@ async fn worker_loop(
         // its call happens): apply the actionable notifications extensions
         // queued outside a run and start a run for every custom message sent
         // with `triggerTurn` while idle — upstream starts that run
-        // immediately instead of waiting for the next prompt.
+        // immediately instead of waiting for the next prompt. Skipped while
+        // prompts wait in the queue (they keep their FIFO order first).
         if !queued_prompts.is_empty() {
             continue;
         }
-        session.apply_pending_extension_notifications().await;
-        // Extension side effects applied between runs can flip a plugin
-        // status too (custom messages, queued UI actions).
-        pulse.signal();
-        while let Some(message) = session.take_pending_custom_run() {
-            run_prompt(
-                WorkerRun::Custom(message),
-                RunServices {
-                    session: &session,
-                    events: &events,
-                    streaming: &streaming,
-                    session_dir: &session_dir,
-                    debug_mode: &debug_mode,
-                    pulse: &pulse,
-                },
-                &mut commands,
-                &mut queued_prompts,
-            )
-            .await;
-        }
+        pump_pending_custom_runs(
+            RunServices {
+                session: &session,
+                events: &events,
+                streaming: &streaming,
+                session_dir: &session_dir,
+                debug_mode: &debug_mode,
+                pulse: &pulse,
+            },
+            &mut commands,
+            &mut queued_prompts,
+        )
+        .await;
     }
     // The UI exited (command channel closed): tear the session down — every
     // plugin's `on_shutdown` runs exactly once here, releasing the `mcp`
@@ -29338,6 +29360,49 @@ async fn run_prompt(
     // those events; this covers the session-finalization tail and a deferred
     // session switch. An unchanged snapshot stays unpublished.
     pulse.signal();
+}
+
+/// Idle-drain pump shared by the per-command housekeeping and the one-time
+/// startup pump (PIR-TUI-043): apply the actionable notifications extensions
+/// queued outside a run — upstream applies an extension's side effects as its
+/// call happens — and start a run for EVERY custom run they queued (idle
+/// `pi.sendMessage(..., {triggerTurn: true})` / `pi.sendUserMessage(...)`;
+/// upstream starts that run immediately instead of waiting for the next
+/// prompt). `take_pending_custom_run` pops each record, so a queued run
+/// executes exactly once no matter which caller reaches it.
+async fn pump_pending_custom_runs(
+    services: RunServices<'_>,
+    commands: &mut tokio::sync::mpsc::Receiver<WorkerCommand>,
+    queued_prompts: &mut std::collections::VecDeque<String>,
+) {
+    let RunServices {
+        session,
+        events,
+        streaming,
+        session_dir,
+        debug_mode,
+        pulse,
+    } = services;
+    session.apply_pending_extension_notifications().await;
+    // Extension side effects applied between runs can flip a plugin status
+    // too (custom messages, queued UI actions).
+    pulse.signal();
+    while let Some(message) = session.take_pending_custom_run() {
+        run_prompt(
+            WorkerRun::Custom(message),
+            RunServices {
+                session,
+                events,
+                streaming,
+                session_dir,
+                debug_mode,
+                pulse,
+            },
+            commands,
+            queued_prompts,
+        )
+        .await;
+    }
 }
 
 /// Complete one OPENED session attach: abort the outgoing session's

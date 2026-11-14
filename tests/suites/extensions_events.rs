@@ -3320,3 +3320,259 @@ async fn input_event_reports_source_and_handled_swallows_the_prompt() {
         .iter()
         .all(|input| input["streamingBehavior"].is_null()));
 }
+
+// ---------------------------------------------------------------------------
+// PIR-TUI-043: the startup `session_start` handler's `pi.sendUserMessage`
+// ---------------------------------------------------------------------------
+
+/// The turn a `session_start` handler's `pi.sendUserMessage(...)` queued is
+/// started ONCE by the host pump — the contract the interactive worker's new
+/// startup pump relies on.
+///
+/// pir's startup dispatch (`AgentSession::ensure_session_start`) drains the
+/// handler's `Notification::SendUserMessage` into `pending_custom_runs`
+/// (notifications.rs `consume_send_user_message`); the TUI worker then pumps
+/// that queue once, before its command loop blocks. Upstream starts the turn
+/// inside the awaited emit itself (`bindExtensions` awaits the
+/// `session_start` emit, agent-session.ts:3339; the handler's
+/// `sendUserMessage` runs `prompt()`, :2429-2467; an idle `prompt()` runs
+/// `_startRun`, :2172). `worker_loop` has no unit seam, so this pins the
+/// notification/pump contract it executes: after the drain the queue holds
+/// exactly one reserved user run; one `take_pending_custom_run()` +
+/// `run_custom_turn_with_source(.., "extension", ..)` (the exact call the
+/// worker's `run_prompt` makes for `WorkerRun::Custom`) issues exactly one
+/// request carrying the startup text; and neither a second take nor a further
+/// idle drain (the end-of-command pump's shape) can run it again.
+#[tokio::test(flavor = "current_thread")]
+async fn session_start_send_user_message_is_pumped_exactly_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use pir::agent_session::{AgentSession, AgentSessionConfig};
+    use pir::ai::auth::ApiKeyAuth;
+    use pir::ai::event_stream::AssistantMessageEventStream;
+    use pir::ai::provider::{Provider, ProviderRegistry};
+    use pir::ai::types::*;
+
+    fn startup_model() -> Model {
+        Model {
+            id: "startup-model".into(),
+            name: "Startup".into(),
+            api: "fake".into(),
+            provider: "fake".into(),
+            base_url: "http://localhost".into(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec!["text".into()],
+            cost: ModelCost {
+                rates: ModelCostRates {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                tiers: Vec::new(),
+            },
+            context_window: 4096,
+            max_tokens: 256,
+            sampling_params: None,
+            headers: None,
+            thinking_token_budget_field: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params_by_thinking_level: None,
+            model_type: None,
+            compat: None,
+        }
+    }
+
+    /// Counts requests and keeps their contexts (the request log).
+    struct Counting {
+        calls: Arc<AtomicUsize>,
+        contexts: Arc<Mutex<Vec<Context>>>,
+    }
+    impl Provider for Counting {
+        fn id(&self) -> &str {
+            "fake"
+        }
+        fn name(&self) -> &str {
+            "Counting"
+        }
+        fn get_models(&self) -> Vec<Model> {
+            vec![startup_model()]
+        }
+        fn stream(
+            &self,
+            _model: &Model,
+            context: Context,
+            _options: StreamOptions,
+        ) -> AssistantMessageEventStream {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.contexts.lock().unwrap().push(context);
+            let stream = AssistantMessageEventStream::new();
+            stream.push(AssistantMessageEventStream::done_event(
+                TerminalReason::Stop,
+                AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent {
+                        text: "ok".into(),
+                        text_signature: None,
+                    })],
+                    stop_reason: StopReason::Stop,
+                    ..AssistantMessage::default()
+                },
+            ));
+            stream
+        }
+        fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+            Vec::new()
+        }
+    }
+
+    let temp = TempDir::new("startup-send-user-message");
+    let runtime = load_runtime(
+        &temp,
+        r#"
+        export default function (pi) {
+            globalThis.__startupHandlerRuns = 0;
+            pi.on("session_start", () => {
+                globalThis.__startupHandlerRuns++;
+                pi.sendUserMessage("X11-STARTUP-TURN");
+            });
+        }
+        "#,
+    )
+    .await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let contexts: Arc<Mutex<Vec<Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(Counting {
+        calls: Arc::clone(&calls),
+        contexts: Arc::clone(&contexts),
+    }));
+    let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
+        provider_registry: Arc::new(registry),
+        model: startup_model(),
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: pir::agent::tool_execution::ToolRegistry::new(),
+        session: None,
+        compaction: None,
+        max_turns: 2,
+        system_prompt: None,
+        cwd: Some(temp.0.clone()),
+        event_stream: None,
+        extensions: Some(runtime.clone()),
+        tool_selection: None,
+    });
+
+    // The startup dispatch: the handler runs and its `pi.sendUserMessage`
+    // queues a notification. Nothing has started a turn yet (the message is
+    // not yet a pending run).
+    let mut payload = json!({ "type": "session_start", "reason": "startup" });
+    runtime
+        .emit("session_start", &mut payload)
+        .await
+        .expect("emit session_start");
+    assert_eq!(
+        probe(&runtime, "globalThis.__startupHandlerRuns").await,
+        json!(1),
+        "the session_start handler ran"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "dispatch runs no turn");
+    assert!(
+        !agent.has_pending_custom_runs(),
+        "the handler's message is still a notification, not a pending run"
+    );
+
+    // The drain `ensure_session_start` performs turns it into the one
+    // reserved user run the host pump consumes.
+    agent.apply_pending_extension_notifications().await;
+    assert!(agent.has_pending_custom_runs(), "one queued user run");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the drain runs no turn");
+
+    let queued = agent
+        .take_pending_custom_run()
+        .expect("the drained startup message queued a user run");
+    assert_eq!(queued.custom_type, "__pir_user_message");
+    assert_eq!(
+        queued.details.as_ref().expect("details")["text"],
+        json!("X11-STARTUP-TURN")
+    );
+
+    // The worker pump: ONE run through the exact call `run_prompt` makes.
+    let outcome = agent
+        .run_custom_turn_with_source(queued, "extension", Arc::new(|_| {}))
+        .await
+        .expect("the pumped startup turn settles");
+    assert!(
+        outcome.is_some(),
+        "a user run returns its assistant message"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly one request for the startup turn"
+    );
+
+    // The request carried the startup text as its user message.
+    let requested = {
+        let contexts = contexts.lock().unwrap();
+        contexts[0]
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::User(user) => Some(
+                    user.content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(text) => Some(text.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .expect("the run's user message")
+    };
+    assert_eq!(requested, "X11-STARTUP-TURN");
+
+    // Exactly-once: the record was POPPED by the pump, so neither a second
+    // take nor the end-of-command pump's drain (apply + take) can run it
+    // again.
+    assert!(
+        agent.take_pending_custom_run().is_none(),
+        "the startup run is consumed exactly once"
+    );
+    agent.apply_pending_extension_notifications().await;
+    assert!(
+        agent.take_pending_custom_run().is_none(),
+        "a further idle drain does not resurrect the startup run"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "still exactly one request after the end-of-command pump's shape"
+    );
+
+    // No double-append: one user message (the startup text) + its reply.
+    let transcript = agent.transcript().await;
+    let user_texts: Vec<String> = transcript
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(
+                user.content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(user_texts, vec!["X11-STARTUP-TURN".to_string()]);
+}
