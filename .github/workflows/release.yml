@@ -15,9 +15,12 @@ concurrency:
   cancel-in-progress: false
 
 # Least privilege: only the `release` job needs write access to publish the
-# GitHub Release; build/test/publish only read the checked-out tree.
+# GitHub Release; build/test/publish only read the checked-out tree. The
+# reusable ci.yml declares `checks: write` for its failure annotations, and a
+# called workflow may not exceed the caller's grant.
 permissions:
   contents: read
+  checks: write
 
 env:
   CARGO_TERM_COLOR: always
