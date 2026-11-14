@@ -2193,10 +2193,16 @@ impl RpcServerState {
             return Err("no attached session storage".to_owned());
         };
         let manager = handle.lock().await;
+        // Serialize straight off the resident (Arc-shared) list: `entries()`
+        // deep-clones every entry (tool outputs included) just to hand the
+        // clone to `to_value`, which this command — polled by clients with
+        // `since` — paid per call. The header filter and the JSON bytes are
+        // the same (r2b per-worker row R6).
         let mut entries: Vec<Value> = manager
-            .entries()
+            .resident_entries()
             .iter()
-            .filter_map(|entry| serde_json::to_value(entry).ok())
+            .filter(|entry| !entry.is_header())
+            .filter_map(|entry| serde_json::to_value(&**entry).ok())
             .collect();
         if let Some(since) = value.get("since").and_then(Value::as_str) {
             let index = entries

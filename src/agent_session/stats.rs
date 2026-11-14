@@ -106,8 +106,11 @@ impl AgentSession {
         }
         let tokens: Option<u64> = match &self.session {
             Some(session) => {
-                // Borrowed metadata: one `Arc` bump per retained entry, no
-                // message materialization.
+                // Borrowed metadata: one `Arc` bump per entry, no message
+                // materialization. The branch path uses PIR-BIN-096's shared
+                // shape (refcount bumps, no per-entry id `String`; p21: 21 vs
+                // 1 622 allocs at N=800) — `PathEntry::id()` derives the same
+                // ids (equivalence pinned by `p21_bin096_shared_branch_matches_owned_meta`).
                 let session = session.lock().await;
                 let prebuilt_projection = prebuilt_projection.filter(|projection| {
                     let live_leaf = session.leaf_id().map(str::to_owned);
@@ -119,7 +122,7 @@ impl AgentSession {
                     live_leaf == projected_leaf
                 });
                 let metas = session.projection_entry_meta();
-                let path = session.branch_path_meta(None);
+                let path = session.branch_path_shared(None);
                 // Upstream `getContextUsage`: the latest assistant usage
                 // reflects pre-compaction context size, so after a compaction
                 // it may only be trusted when that assistant is projected AND
@@ -177,17 +180,19 @@ impl AgentSession {
 /// projected (shrunken) context yet.
 ///
 /// `projected_assistants` mirrors upstream's set of projected source-entry
-/// ids whose projected messages contain a valid assistant usage. An entry
-/// omitted by a context edit (`message_count == 0`) contributes no message
-/// and cannot vouch for its usage.
-fn latest_compaction_lacks_projected_usage(
+/// ids whose projected messages contain a valid assistant usage (a `HashSet`,
+/// like upstream's `Set` — the tail probe is linear in the tail, not
+/// quadratic in tail × assistants). An entry omitted by a context edit
+/// (`message_count == 0`) contributes no message and cannot vouch for its
+/// usage.
+fn latest_compaction_lacks_projected_usage<P: compaction::PathEntry>(
     metas: &[compaction::ProjectionEntryMeta],
-    path: &[compaction::PathEntryMeta],
+    path: &[P],
 ) -> bool {
-    let Some(compaction_index) = path.iter().rposition(|entry| entry.is_compaction) else {
+    let Some(compaction_index) = path.iter().rposition(|entry| entry.is_compaction()) else {
         return false;
     };
-    let projected_assistants: Vec<&str> = metas
+    let projected_assistants: std::collections::HashSet<&str> = metas
         .iter()
         .filter(|meta| meta.message_count > 0)
         .filter(|meta| stored_assistant_usage(meta.source_entry.as_ref()).is_some())
@@ -195,8 +200,8 @@ fn latest_compaction_lacks_projected_usage(
         .collect();
     !path[compaction_index + 1..]
         .iter()
-        .filter_map(|entry| entry.id.as_deref())
-        .any(|id| projected_assistants.contains(&id))
+        .filter_map(|entry| entry.id())
+        .any(|id| projected_assistants.contains(id))
 }
 
 /// Whole-projection re-estimate used when the last usage cannot be trusted
@@ -204,10 +209,10 @@ fn latest_compaction_lacks_projected_usage(
 /// materialized projection, the newest system message, and every message
 /// estimated by [`compaction::estimate_message_tokens`] — the reported usage
 /// is ignored.
-fn projected_context_reestimate(
+fn projected_context_reestimate<P: compaction::PathEntry>(
     session: &crate::session_manager::SessionManager,
     metas: &[compaction::ProjectionEntryMeta],
-    path: &[compaction::PathEntryMeta],
+    path: &[P],
 ) -> Option<u64> {
     // Context edits replace projected CONTENT, which the metadata walk does
     // not carry, so this (cold) path materializes the projection. The guarded
@@ -234,9 +239,9 @@ fn projected_context_reestimate(
 /// stale and re-estimates the whole projection by characters, which the
 /// caller does (the metadata cannot — an edit's replacement content is not
 /// part of it).
-fn projected_context_tokens(
+fn projected_context_tokens<P: compaction::PathEntry>(
     metas: &[compaction::ProjectionEntryMeta],
-    path: &[compaction::PathEntryMeta],
+    path: &[P],
 ) -> Option<u64> {
     // The last projected assistant usage wins (upstream
     // `getLastAssistantUsageInfo`). A usage entry's projected contribution is
@@ -254,13 +259,11 @@ fn projected_context_tokens(
     // Upstream invalidation: a usage only describes the current context when
     // its entry is STRICTLY newer on the branch than the newest compaction or
     // context edit.
-    let usage_path_index = usage_id.and_then(|id| {
-        path.iter()
-            .position(|entry| entry.id.as_deref() == Some(id))
-    })?;
+    let usage_path_index =
+        usage_id.and_then(|id| path.iter().position(|entry| entry.id() == Some(id)))?;
     if let Some(invalidating_index) = path
         .iter()
-        .rposition(|entry| entry.is_compaction || entry.is_context_edit)
+        .rposition(|entry| entry.is_compaction() || entry.is_context_edit())
     {
         if usage_path_index <= invalidating_index {
             return None;
