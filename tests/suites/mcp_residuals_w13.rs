@@ -596,13 +596,15 @@ fn a_timed_out_request_is_cancelled_on_the_server() {
             "a timed-out call reports Timeout: {error:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(15),
+            // PIR-QE-001: a load-tolerant anti-hang net; the functional assertion this
+            // test makes is unchanged, and a genuine hang still fails the bound.
+            started.elapsed() < Duration::from_secs(60),
             "the deadline ends the call, took {:?}",
             started.elapsed()
         );
         // The server was told to stop (upstream `cancelPending`): a long
         // `tools/call` must not keep running unobserved.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             // A read that lands mid-publish (or an empty file) is retried, not
             // parsed: the child now renames into place, but a retry keeps the

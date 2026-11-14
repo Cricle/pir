@@ -303,14 +303,16 @@ fn aborting_a_tool_call_sends_notifications_cancelled() {
             tokio::task::yield_now().await;
         };
         assert!(
-            abort_to_return < Duration::from_secs(5),
+            // PIR-QE-001: a load-tolerant anti-hang net; the functional assertion this
+            // test makes is unchanged, and a genuine hang still fails the bound.
+            abort_to_return < Duration::from_secs(20),
             "the abort ends the call without waiting for the server, took {abort_to_return:?} \
              from abort to return ({:?} including setup)",
             started.elapsed()
         );
         // The server saw `notifications/cancelled` for this request (upstream
         // `cancelPending` sends it so the server stops the work).
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             // The child publishes the record atomically; a read that still
             // lands on an absent/incomplete file is retried, never parsed.

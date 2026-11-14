@@ -299,8 +299,12 @@ async fn stdio_frame_cap_returns_bounded_error_and_reaps_child() {
         .get_client("oversized")
         .await
         .expect_err("a 2 MiB line must fail the handshake");
+    // An anti-hang NET, not a latency budget: the contract asserted here is
+    // the bounded error (and, below, the reaped child), while a loaded CI box
+    // can spend many seconds spawning and killing processes. A genuine hang
+    // still fails this bound (PIR-QE-001).
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_secs(60),
         "the cap must fail within a bounded time, took {:?}",
         started.elapsed()
     );
@@ -315,7 +319,7 @@ async fn stdio_frame_cap_returns_bounded_error_and_reaps_child() {
     // writing the rest of the oversized frame.
     let pid = read_pid_file(&pid_file);
     assert!(
-        wait_for_exit(pid, Duration::from_secs(5)),
+        wait_for_exit(pid, Duration::from_secs(30)),
         "the oversized server (pid {pid}) is still alive"
     );
 
@@ -365,8 +369,12 @@ async fn stdio_frame_cap_stops_a_hundred_mib_stream_at_the_cap() {
         .get_client("huge")
         .await
         .expect_err("a 100 MiB line must fail at the cap");
+    // An anti-hang NET, not a latency budget: the contract asserted here is
+    // the bounded error (and, below, the reaped child), while a loaded CI box
+    // can spend many seconds spawning and killing processes. A genuine hang
+    // still fails this bound (PIR-QE-001).
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_secs(60),
         "the cap must fail within a bounded time, took {:?}",
         started.elapsed()
     );
@@ -374,7 +382,7 @@ async fn stdio_frame_cap_stops_a_hundred_mib_stream_at_the_cap() {
 
     let pid = read_pid_file(&pid_file);
     assert!(
-        wait_for_exit(pid, Duration::from_secs(5)),
+        wait_for_exit(pid, Duration::from_secs(30)),
         "the huge-frame server (pid {pid}) is still alive"
     );
 

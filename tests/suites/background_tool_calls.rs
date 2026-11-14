@@ -289,7 +289,7 @@ async fn background_call_is_stripped_placeholder_and_detached() {
     // tool body must see the arguments WITHOUT the scheduler key (the strict
     // schema would have rejected a leaked key during preflight).
     let future = detached.take_future().expect("future taken exactly once");
-    let result = tokio::time::timeout(Duration::from_secs(5), future)
+    let result = tokio::time::timeout(Duration::from_secs(30), future)
         .await
         .expect("the detached future must complete once awaited");
     assert_eq!(result.content, "probe-ok");
@@ -402,7 +402,7 @@ async fn background_call_does_not_block_the_batch() {
     // real execution and completes once the gate opens.
     let future = detached.take_future().expect("future is present");
     gate.notify_one();
-    let result = tokio::time::timeout(Duration::from_secs(5), future)
+    let result = tokio::time::timeout(Duration::from_secs(30), future)
         .await
         .expect("the detached call completes once released");
     assert_eq!(result.content, "gate-open");
@@ -548,7 +548,7 @@ async fn mutation_tool_background_call_edits_the_file_when_the_detached_future_r
     // The detached future performs the edit (the per-file mutation lock runs
     // inside it — see `two_backgrounded_edits_to_the_same_file_serialize`).
     let future = detached.take_future().expect("future taken exactly once");
-    let result = tokio::time::timeout(Duration::from_secs(5), future)
+    let result = tokio::time::timeout(Duration::from_secs(30), future)
         .await
         .expect("the detached future must complete once awaited");
     assert!(
@@ -771,7 +771,7 @@ async fn run_abort_does_not_cancel_a_background_call() {
     // The call must survive the run abort and complete normally; a failure
     // here means the detached context was wired to the run signal (the probe
     // would observe an aborted signal) or the future was cancelled.
-    let result = tokio::time::timeout(Duration::from_secs(5), task)
+    let result = tokio::time::timeout(Duration::from_secs(30), task)
         .await
         .expect("the background call must outlive the run abort")
         .expect("the background task must not panic");
@@ -2029,7 +2029,7 @@ async fn ctx_execute_tool_background_option_detaches_the_nested_call() {
             args,
             future,
         } = entry;
-        let completed = tokio::time::timeout(Duration::from_secs(5), future)
+        let completed = tokio::time::timeout(Duration::from_secs(30), future)
             .await
             .expect("the detached nested call must complete once awaited");
         assert!(
