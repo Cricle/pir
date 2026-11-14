@@ -100,9 +100,14 @@ You help users by reading files, executing commands, editing code, and writing n
 | B2 默认工具顺序 | **已修复**：`PrintToolLoadout::definitions` / `print_active_definitions` 直接从 active-set 顺序（`declared_tools`）构建声明数组，与 `<tools>` 段落同序；`ToolRegistry::iter/names` 的确定性排序仅保留给无序路径 | `agent-session.ts:1502-1512,3707-3712`、`system-prompt.ts:151-160` | `prompt_loadout_w22::declared_tool_array_order_matches_the_tools_section_order` |
 | B19 4 条 pir-only rules | **保留（刻意偏差）**：这 4 条对应 pir 真实的强制行为 — `PIR_READ_BEFORE_EDIT` 默认 `enforce` 的读前门（`tools/util.rs:25-60`）、字面路径校验（`tools/util.rs:365-370`）、`tools.broadSearchGuard`（默认 true，`settings/env.rs:97`）以及收尾自检；上游没有这些机制，删掉规则会让模型看不到实际会被拒绝的约束。代价约 +709 chars/request，仅出现在对应工具被声明时 | 本表 §4 B19 + `docs/environment-variables.md` | `prompt_loadout_w22::pir_only_rules_*`（逐字列表 + 工具门控） |
 
-**默认工具集（9 vs 4）同样是刻意偏差**，见 [`FEATURES.md`](FEATURES.md) § 3.1：
-`balanced` 扩展默认集（grep/find/ls/background_*）是产品能力，`efficient` profile 或
-`--tools read,bash,edit,write` 都可切回上游四工具集，且注册表从不被选择过滤（F12）。
+**默认工具集（22 = 9 核心 + 13 内置，上游 4）同样是刻意偏差**，2026-11-14 由
+`.play/live-assist/x10-tool-loadout.md` 定案（Option B：保留装载，修正文档）；见
+[`FEATURES.md`](FEATURES.md) § 3.1：`balanced` 扩展默认集（grep/find/ls/background_*
+五个核心 + `ctx_*`/`python`/`todo`/`memory`/`subagent` 十三个默认启用的内置工具）是
+产品能力，`efficient` profile 或 `--tools read,bash,edit,write` 都可切回上游四工具集，
+`--no-extensions` 保留核心九工具，且注册表从不被选择过滤（F12）。之前的“9”只统计了
+核心层；全量构建的实际声明是 22（工具定义 JSON 约 +30.7 KB/首次请求，其中内置层
+约 26 KB）。PIR-BIN-062/063 以“已记录刻意偏差”关闭，061（`<docs>` 门控）维持原判。
 
 ### 缺失
 

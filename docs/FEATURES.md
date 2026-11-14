@@ -95,19 +95,31 @@ connection to the central relay and needs a server URL/device token. `--only-bui
 ### 3.1 Default tool loadout (documented superset)
 
 **`balanced` (the default) declares a deliberate SUPERSET of upstream pi's
-`DEFAULT_TOOL_NAMES`.** With no `--tools` / `settings.defaultTools`, the
-per-request tool declaration is the registration-active core set:
+`DEFAULT_TOOL_NAMES`.** With no `--tools` / `settings.defaultTools`, a full
+build declares **22 tools**: the registration-active core nine plus the 13
+default-active builtin-extension tools.
 
-`background_abort`, `background_status`, `bash`, `edit`, `find`, `grep`, `ls`,
-`read`, `write` (nine; `powershell` stays registered-but-inactive, exactly like
-upstream). Upstream pi declares four (`read`, `bash`, `edit`, `write`).
+Core nine: `background_abort`, `background_status`, `bash`, `edit`, `find`,
+`grep`, `ls`, `read`, `write` (`powershell` stays registered-but-inactive,
+exactly like upstream). Builtin thirteen: `ctx_batch_execute`, `ctx_doctor`,
+`ctx_execute`, `ctx_execute_file`, `ctx_fetch_and_index`, `ctx_index`,
+`ctx_purge`, `ctx_search`, `ctx_stats`, `python`, `todo`, `memory`,
+`subagent` — all default-active under the builtin-extension policy (§3).
+`--no-extensions` leaves the core nine; `codemode`, `tool_search`, `powershell`
+and MCP bridges stay registered-but-not-declared unless selected. Upstream pi
+declares four (`read`, `bash`, `edit`, `write`).
 
-This is a product decision, not drift: the extra five tools are pir's own
+This is a product decision, not drift: the extra core five are pir's own
 capabilities — the in-process ripgrep `grep`/`find` pair, `ls`, and the
 scheduler-owned `background_status`/`background_abort` controls (see
-`docs/tui.md` and `MAPPING.md` for the background/detach surface). The measured
-cost is ~+4.8 KB of `tools[]` JSON per request (see the round-1 A/B report at
-`.play/evidence/ab-round1/lane-ab-prompt/REPORT.md` § 7).
+`docs/tui.md` and `MAPPING.md` for the background/detach surface) — and the 13
+builtins are the default-on extension layer. The measured cost of the full
+declaration is ~+30.7 KB of `tools[]` JSON on the first request (~+7.7k tokens
+at 4 chars/token; ~26 KB of it the builtins), against pi's 4-tool 2,969 B (see
+the round-1 A/B report at
+`.play/evidence/ab-round1/lane-ab-prompt/REPORT.md` § 7 and the 2026-11-14
+decision brief `.play/live-assist/x10-tool-loadout.md`, which records this as
+the decided deliberate deviation).
 
 Two ways to shrink it, both first-class:
 

@@ -5,16 +5,22 @@ keeps the historical tool loadout, unlimited tool-result text, compaction
 thresholds, and turn limits unchanged.
 
 > **The balanced default tool loadout is a documented SUPERSET of upstream pi.**
-> With no `--tools` / `settings.defaultTools`, `balanced` declares nine
-> registration-active core tools (`background_abort`, `background_status`,
-> `bash`, `edit`, `find`, `grep`, `ls`, `read`, `write`), where upstream pi's
-> implicit set is four (`read`, `bash`, `edit`, `write`). The extra five are
-> pir capabilities (in-process grep/find, `ls`, the scheduler-owned background
-> controls); the round-1 A/B measurement puts the declaration at ~+4.8 KB of
-> `tools[]` JSON per request. `efficient` (below) and `--tools
-> read,bash,edit,write` both select the upstream four; no tool becomes
-> unreachable either way (the registry is never filtered by the selection).
-> See [`docs/FEATURES.md`](FEATURES.md) § 3.1.
+> With no `--tools` / `settings.defaultTools`, a full build declares **22
+> tools**: nine registration-active core tools (`background_abort`,
+> `background_status`, `bash`, `edit`, `find`, `grep`, `ls`, `read`, `write`)
+> plus the 13 default-active builtin-extension tools (`ctx_batch_execute`,
+> `ctx_doctor`, `ctx_execute`, `ctx_execute_file`, `ctx_fetch_and_index`,
+> `ctx_index`, `ctx_purge`, `ctx_search`, `ctx_stats`, `python`, `todo`,
+> `memory`, `subagent`), where upstream pi's implicit set is four (`read`,
+> `bash`, `edit`, `write`). The extra core five are pir capabilities
+> (in-process grep/find, `ls`, the scheduler-owned background controls) and the
+> builtins are the default-on extension layer; the measured declaration is
+> ~+30.7 KB of `tools[]` JSON (~+7.7k tokens) on the first request, ~26 KB of
+> it the builtins. `efficient` (below) and `--tools read,bash,edit,write` both
+> select the upstream four; `--no-extensions` leaves the core nine; no tool
+> becomes unreachable either way (the registry is never filtered by the
+> selection). See [`docs/FEATURES.md`](FEATURES.md) § 3.1 and the 2026-11-14
+> decision brief `.play/live-assist/x10-tool-loadout.md`.
 
 ```json
 {
