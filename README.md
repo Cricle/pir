@@ -57,7 +57,7 @@ pir print "<prompt>"   # non-interactive single execution
 pir print --mode json "<prompt>"
 pir rpc                # JSON-lines RPC over stdin/stdout
 pir server / pir client
-pir auth / pir models list / pir session / pir config / pir version
+pir auth / pir models list / pir session / pir jobs / pir config / pir version
 pir grep|sed|python <args>
 ```
 
@@ -99,6 +99,27 @@ with pi; `PIR_SESSION_DIR` overrides. Interactive mode loads
 `AGENTS.override.md`/`AGENTS.md`/`CLAUDE.md` and supports `/model`,
 `/thinking`, `/compact`, `/sessions`, `/help` plus extension commands.
 
+### Background jobs
+
+`pir jobs` runs detached commands that survive the agent exiting and are
+tracked across processes (pir-native; upstream `pi` has no `jobs` command):
+
+```bash
+pir jobs start -- <command...>   # detached run, prints the job id
+pir jobs list                    # newest first (--json)
+pir jobs status <id>             # persisted status (--json)
+pir jobs wait <id> [--timeout S] # wait for a terminal state (default 600s)
+pir jobs log <id> [--lines N]    # output tail (defaults 4096 lines / 262144 bytes)
+pir jobs reap <id>               # status + output, mark reaped (--json)
+pir jobs kill <id>               # kill the supervisor process tree
+pir jobs clean [--older-than-days D | --all]  # prune job dirs (default 7 days, --json)
+```
+
+Each job is `<agent-dir>/jobs/<job-id>/` with `meta.json` and an `output.log`
+capped at 256 MiB, written by a detached supervisor. `start` takes
+`--cwd <dir>` and `--shell <path>` (a `-c` shell is required) and must receive
+the command after `--`.
+
 ### Providers
 
 `pir auth status|login|logout|check|print-api-key`. Ships a frozen catalog
@@ -112,7 +133,9 @@ with pi; `PIR_SESSION_DIR` overrides. Interactive mode loads
 
 Builtins compile behind their features (`subagent`, `tool-repair`,
 `tool-search`, `todo`, `mcp-sd`); `--only-builtin` loads Rust-only,
-`--no-extensions` wins if both are given. JS limits live in
+`--no-extensions` wins if both are given. `pir --help-extensions` lists the CLI
+flags extensions registered with `registerFlag` (it loads them; plain
+`--help` never executes extension code). JS limits live in
 `extensionLimits` + `PI_EXT_*` (project settings cannot loosen them). The
 default-off JS `phone` package is not required by the native path. The native
 phone plugin is an agent client for the standalone central relay:
@@ -127,8 +150,10 @@ and routes messages without retaining transcripts or images. Details:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
-powershell -NoProfile -File scripts/test_fast.ps1 -UseNextest   # same targets, nextest runner
+powershell -NoProfile -File scripts/test_fast.ps1 -UseNextest   # full suite, nextest runner
+# `autotests = false` merges tests/*.rs into the generated zz_merged_N harnesses;
+# a merged binary shares ONE process across its tests, so the whole suite must run
+# under nextest (process per test): `cargo nextest run --profile local`.
 bash scripts/run_examples.sh        # offline SDK examples
 bash scripts/run_benchmarks.sh      # manual benchmarks (dev profile)
 ```

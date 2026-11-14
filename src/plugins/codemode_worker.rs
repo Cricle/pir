@@ -32,8 +32,9 @@
 //!   replaced by a small explicit limit error) and every reader refuses an
 //!   over-cap line instead of buffering unboundedly.
 //! - **Global live-worker admission**: at most
-//!   [`MAX_CONCURRENT_LIVE_WORKERS`] worker **processes** execute at once in
-//!   the whole process (upstream `MAX_CONCURRENT_CODEMODE_WORKERS = 2`). A
+//!   [`max_concurrent_live_workers`] worker **processes** execute at once in
+//!   the whole process (upstream `MAX_CONCURRENT_CODEMODE_WORKERS`, default 2,
+//!   overridable per call with `PI_CODEMODE_MAX_WORKERS`). A
 //!   run waits for a slot ([`acquire_live_worker_slot`]) right before the
 //!   child is spawned and holds the owned permit until the child is reaped
 //!   and its in-flight tool tasks settle, so normal exit, error, abort, panic
@@ -1249,9 +1250,32 @@ enum WorkerRunExit {
 // Live-worker admission (upstream `MAX_CONCURRENT_CODEMODE_WORKERS`)
 // ---------------------------------------------------------------------------
 
-/// Upstream `MAX_CONCURRENT_CODEMODE_WORKERS` (execute.ts:58): how many live
-/// codemode workers may run in the whole process at once.
+/// Upstream `DEFAULT_MAX_CODEMODE_WORKERS` (execute.ts:58): how many live
+/// codemode workers may run in the whole process at once when
+/// `PI_CODEMODE_MAX_WORKERS` is unset or not a positive integer.
 pub const MAX_CONCURRENT_LIVE_WORKERS: usize = 2;
+
+/// `PI_CODEMODE_MAX_WORKERS` if it is a positive integer, otherwise
+/// [`MAX_CONCURRENT_LIVE_WORKERS`] (upstream `maxCodemodeWorkers`,
+/// execute.ts:60-62: zero, a negative or a junk value falls back to the
+/// default). Read on every admission like upstream, so a host that sets the
+/// variable at runtime changes the cap. The value is clamped to
+/// [`tokio::sync::Semaphore::MAX_PERMITS`] so an absurd number cannot make
+/// the semaphore constructor panic.
+pub fn max_concurrent_live_workers() -> usize {
+    std::env::var("PI_CODEMODE_MAX_WORKERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|workers| *workers > 0)
+        .map_or(MAX_CONCURRENT_LIVE_WORKERS, |workers| {
+            workers.min(tokio::sync::Semaphore::MAX_PERMITS)
+        })
+}
+
+/// The capacity the admission semaphore currently carries (stored by the
+/// `LazyLock` initializer, then maintained by [`reconcile_live_worker_cap`]).
+static APPLIED_LIVE_WORKER_CAP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// The process-global admission slots for live codemode worker executions.
 ///
@@ -1259,13 +1283,53 @@ pub const MAX_CONCURRENT_LIVE_WORKERS: usize = 2;
 /// bounds real worker processes, which are process-global resources. A
 /// `LazyLock` because the value must exist before any runtime does (the
 /// worker CLI subcommand and test binaries have no host to thread it
-/// through).
+/// through); its capacity is then reconciled with the current
+/// `PI_CODEMODE_MAX_WORKERS` on every call, mirroring upstream's read-per-call
+/// `maxCodemodeWorkers()`.
 fn live_worker_admission() -> &'static Arc<tokio::sync::Semaphore> {
     static ADMISSION: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
         std::sync::LazyLock::new(|| {
-            Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LIVE_WORKERS))
+            let workers = max_concurrent_live_workers();
+            APPLIED_LIVE_WORKER_CAP.store(workers, Ordering::Release);
+            Arc::new(tokio::sync::Semaphore::new(workers))
         });
+    reconcile_live_worker_cap(&ADMISSION);
     &ADMISSION
+}
+
+/// Reconcile the global semaphore's capacity with the current
+/// `PI_CODEMODE_MAX_WORKERS` value: grow instantly with `add_permits`, shrink
+/// by forgetting only the permits that are currently FREE (tokio's
+/// `forget_permits`) — a worker that is already running always keeps its
+/// slot, and the smaller cap takes effect as slots free up. The
+/// compare-exchange keeps concurrent admissions from applying one delta
+/// twice.
+fn reconcile_live_worker_cap(semaphore: &tokio::sync::Semaphore) {
+    loop {
+        let applied = APPLIED_LIVE_WORKER_CAP.load(Ordering::Acquire);
+        let target = max_concurrent_live_workers();
+        if applied == target {
+            return;
+        }
+        if target > applied {
+            if APPLIED_LIVE_WORKER_CAP
+                .compare_exchange(applied, target, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                semaphore.add_permits(target - applied);
+                return;
+            }
+            continue;
+        }
+        let forgotten = semaphore.forget_permits(applied - target);
+        let effective = applied - forgotten;
+        if APPLIED_LIVE_WORKER_CAP
+            .compare_exchange(applied, effective, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
+    }
 }
 
 /// The admission semaphore as an owned handle (`available_permits()` reports
@@ -1274,7 +1338,7 @@ pub fn live_worker_admission_handle() -> Arc<tokio::sync::Semaphore> {
     Arc::clone(live_worker_admission())
 }
 
-/// Acquire one live-worker slot, waiting while both slots are held (upstream
+/// Acquire one live-worker slot, waiting while all slots are held (upstream
 /// `acquireWorker` throws at the cap; queueing is pir's deliberate port — a
 /// third script waits for a slot instead of failing, and the caller's abort
 /// signal cancels the wait).
@@ -1323,8 +1387,10 @@ pub async fn acquire_live_worker_slot(
 /// in-process thread sandbox); see the module doc for the exact fallback
 /// window.
 ///
-/// A live worker process holds one [`MAX_CONCURRENT_LIVE_WORKERS`] admission
-/// slot (upstream `MAX_CONCURRENT_CODEMODE_WORKERS`). The slot is taken
+/// A live worker process holds one admission slot (upstream
+/// `MAX_CONCURRENT_CODEMODE_WORKERS`; the cap is
+/// [`max_concurrent_live_workers`] — 2 unless `PI_CODEMODE_MAX_WORKERS` says
+/// otherwise). The slot is taken
 /// after the fallback gates above, so a run that cannot use the worker
 /// process keeps the thread fallback's pre-admission semantics (no slot, no
 /// queueing); it is held until the worker is reaped and its tool tasks

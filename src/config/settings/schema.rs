@@ -141,14 +141,18 @@ pub struct ProviderRetrySettings {
 /// install on a request's [`crate::ai::types::StreamOptions`] (upstream
 /// `ProviderRetrySettings` as `sdk.ts:341-352` maps it onto every request).
 ///
-/// Every field is `Option` on purpose: `None` means "the user wrote nothing",
-/// so the request keeps the transport's existing default (2 retries, 60 s
-/// cap, no total timeout). Wiring the settings must not change the behavior of
-/// a run that never configured them.
+/// `max_retries` mirrors the upstream `maxRetries ?? 0` resolution
+/// (`retryProviderRequest`, provider-retry.ts:107-128): an unconfigured run
+/// sends exactly one provider attempt per agent turn, and the agent-level
+/// 2/4/8 s ladder owns the transient 408/409/429/5xx budget. The other two
+/// fields stay `None` when the user wrote nothing — the transport keeps its
+/// 60 s cap / no total timeout — which is also what lets an explicit per-call
+/// override (`set_retry` / the SDK `retry()`) stay effective.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProviderRetryOverrides {
-    /// `retry.provider.maxRetries` as written. `Some(0)` means exactly one
-    /// request.
+    /// `retry.provider.maxRetries` as written, resolved with the upstream
+    /// `?? 0` default: `None` only on a hand-built value (`from_settings`
+    /// always fills it). `Some(0)` means exactly one request per attempt.
     pub max_retries: Option<u32>,
     /// `retry.provider.maxRetryDelayMs` as written (`Some(0)` disables the
     /// cap).
@@ -159,19 +163,27 @@ pub struct ProviderRetryOverrides {
 }
 
 impl ProviderRetryOverrides {
-    /// Whether the user configured anything: the gate hosts use to skip the
-    /// per-request field assignment entirely on the default path.
+    /// Whether this value carries no transport knob at all: only a hand-built
+    /// `default()` (embedder/test seam) is empty — a settings-derived value
+    /// always carries the resolved `max_retries`.
     pub fn is_empty(&self) -> bool {
         self.max_retries.is_none() && self.max_retry_delay_ms.is_none() && self.timeout_ms.is_none()
     }
 
-    /// Resolve from a possibly absent `retry` block. Absent fields stay
-    /// `None` (the transport default), matching the "only explicit settings
-    /// change behavior" contract.
+    /// Resolve from a possibly absent `retry` block. An absent
+    /// `provider.maxRetries` resolves to the upstream `?? 0` default
+    /// (`Some(0)`: one provider attempt per turn, the agent-level ladder owns
+    /// the transient budget); an explicit value, including `0`, still wins.
+    /// The other two fields stay `None` when unwritten (the transport's 60 s
+    /// cap / no total timeout).
     pub fn from_settings(retry: Option<&RetrySettings>) -> Self {
         let provider = retry.and_then(|retry| retry.provider.as_ref());
         Self {
-            max_retries: provider.and_then(|provider| provider.max_retries),
+            max_retries: Some(
+                provider
+                    .and_then(|provider| provider.max_retries)
+                    .unwrap_or(0),
+            ),
             max_retry_delay_ms: provider.and_then(|provider| provider.max_retry_delay_ms),
             timeout_ms: provider.and_then(|provider| provider.timeout_ms),
         }
@@ -844,6 +856,21 @@ where
             "expected an array of built-in extension names",
         )),
     }
+}
+
+/// One prefixed `extensions` entry that controls a built-in extension:
+/// `-builtin:<name>`, `+builtin:<name>`, or `!builtin:<pattern>` (upstream
+/// settings.md:163, package-manager.ts:980-1001). Returns the control prefix
+/// and the target path (`"builtin:<name>"`), or `None` for a plain entry (a
+/// source, never a filter) or a prefixed entry that does not name a builtin.
+pub fn extension_builtin_control(entry: &str) -> Option<(char, &str)> {
+    let control = entry.chars().next()?;
+    if !matches!(control, '-' | '+' | '!') {
+        return None;
+    }
+    let target = &entry[control.len_utf8()..];
+    let name = target.strip_prefix("builtin:")?;
+    (!name.trim().is_empty()).then_some((control, target))
 }
 
 /// Parsed `disabledBuiltinExtensions` names from one raw settings value.

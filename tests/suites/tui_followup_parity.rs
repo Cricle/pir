@@ -513,6 +513,27 @@ async fn session_retry_countdown_reaches_the_host_sink_and_settles() {
     let events: Arc<Mutex<Vec<RetryEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&events);
     agent.set_host_retry_notice(Arc::new(move |event| recorder.lock().unwrap().push(event)));
+    // The countdown surface the TUI consumes is the session-event pair
+    // (`auto_retry_start` / `auto_retry_end`). PIR-BIN-086 moved status-class
+    // retries (429/5xx) to the AGENT layer — the provider budget defaults to 0
+    // exactly like pi's `maxRetries ?? 0` — so the notice arrives here; the
+    // transport-only `set_host_retry_notice` sink stays observed below to pin
+    // that a TRANSPORT retry, when one happens, is still scheduled-then-settled.
+    let starts: Arc<Mutex<Vec<(u32, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let ends: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let starts = Arc::clone(&starts);
+        let ends = Arc::clone(&ends);
+        agent.on_session_event(Arc::new(move |event| match event {
+            pir::agent_session::SessionEvent::AutoRetryStart {
+                attempt, delay_ms, ..
+            } => starts.lock().unwrap().push((attempt, delay_ms)),
+            pir::agent_session::SessionEvent::AutoRetryEnd { success, .. } => {
+                ends.lock().unwrap().push(success)
+            }
+            _ => {}
+        }));
+    }
 
     let message = agent
         .prompt("hello", Arc::new(|_event| {}))
@@ -525,17 +546,32 @@ async fn session_retry_countdown_reaches_the_host_sink_and_settles() {
         requests.load(Ordering::SeqCst) >= 2,
         "the scheduled retry re-sent the request"
     );
-    let events = events.lock().unwrap().clone();
-    assert_eq!(events.len(), 2, "scheduled + settled: {events:?}");
-    match events[0] {
-        RetryEvent::Scheduled(notice) => {
-            assert_eq!(notice.attempt, 1, "upstream auto_retry_start attempt 1");
-            assert_eq!(notice.max_attempts, 1);
-            assert!(notice.delay_ms > 0, "the countdown delay is positive");
-        }
-        ref other => panic!("expected Scheduled first, got {other:?}"),
-    }
-    assert_eq!(events[1], RetryEvent::Settled);
+    let transport = events.lock().unwrap().clone();
+    assert!(
+        transport.is_empty()
+            || matches!(
+                transport.as_slice(),
+                [RetryEvent::Scheduled(_), RetryEvent::Settled]
+            ),
+        "a transport retry is scheduled then settled: {transport:?}"
+    );
+    let starts = starts.lock().unwrap().clone();
+    assert_eq!(
+        starts
+            .iter()
+            .map(|(attempt, _)| *attempt)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the agent-layer ladder schedules pi's 3 attempts: {starts:?}"
+    );
+    assert!(
+        starts
+            .windows(2)
+            .all(|pair| pair[1].1 > pair[0].1 && pair[0].1 > 0),
+        "the countdown delays grow (pi's 2/4/8 s ladder): {starts:?}"
+    );
+    let ends = ends.lock().unwrap().clone();
+    assert_eq!(ends, vec![false], "the exhausted retry settles as failed");
 }
 
 #[tokio::test]
@@ -551,12 +587,30 @@ async fn session_abort_retry_cancels_the_wait_and_keeps_the_retry_setting() {
     let events: Arc<Mutex<Vec<RetryEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&events);
     let flag = Arc::clone(&scheduled);
+    // The countdown now runs at the AGENT layer (PIR-BIN-086: a 429 is a
+    // `RetryableTurn`, the provider budget defaults to 0), so the wait opens on
+    // the session-event `auto_retry_start` the TUI consumes; the transport-only
+    // notice sink is kept observed so a transport retry would also be seen.
     agent.set_host_retry_notice(Arc::new(move |event| {
         if matches!(event, RetryEvent::Scheduled(_)) {
             flag.store(true, Ordering::SeqCst);
         }
         recorder.lock().unwrap().push(event)
     }));
+    let ends: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let flag = Arc::clone(&scheduled);
+        let ends = Arc::clone(&ends);
+        agent.on_session_event(Arc::new(move |event| match event {
+            pir::agent_session::SessionEvent::AutoRetryStart { .. } => {
+                flag.store(true, Ordering::SeqCst);
+            }
+            pir::agent_session::SessionEvent::AutoRetryEnd { final_error, .. } => {
+                ends.lock().unwrap().push(final_error);
+            }
+            _ => {}
+        }));
+    }
 
     let prompt_agent = Arc::clone(&agent);
     let run =
@@ -569,23 +623,35 @@ async fn session_abort_retry_cancels_the_wait_and_keeps_the_retry_setting() {
     let message = run.await.expect("prompt task").expect("prompt runs");
 
     let error = message.error_message.clone().unwrap_or_default();
-    assert_eq!(
-        error, "Retry failed after 1 attempts: Retry cancelled",
-        "upstream auto_retry_end finalError text"
+    // Upstream keeps the ORIGINAL provider error on the message when a retry
+    // wait is cancelled (`_prepareRetry`'s catch only calls
+    // `_finishCancelledRetry`, agent-session.ts:3854-3860 — it never rewrites
+    // `message.errorMessage`) and reports the cancellation through
+    // `auto_retry_end`. PIR-BIN-086 moved status-class retries to the agent
+    // layer, so the transport-layer rendering
+    // "Retry failed after N attempts: Retry cancelled" no longer applies to a
+    // 429; the cancel is pinned on the event instead (a stronger assertion:
+    // the whole finalError payload).
+    assert!(
+        error.contains("429"),
+        "the original provider error is kept: {error}"
     );
     assert_eq!(
         requests.load(Ordering::SeqCst),
         1,
         "the cancelled retry must not re-send the request"
     );
-    let events = events.lock().unwrap().clone();
+    let ends = ends.lock().unwrap().clone();
     assert_eq!(
-        events.len(),
-        2,
-        "scheduled + cancelled: expected one dialog pair, got {events:?}"
+        ends,
+        vec![Some("Retry cancelled".to_owned())],
+        "the cancel is reported as auto_retry_end {{ finalError }} (upstream _finishCancelledRetry)"
     );
-    assert!(matches!(events[0], RetryEvent::Scheduled(_)), "{events:?}");
-    assert!(matches!(events[1], RetryEvent::Cancelled(_)), "{events:?}");
+    let transport = events.lock().unwrap().clone();
+    assert!(
+        transport.is_empty(),
+        "an agent-layer retry does not touch the transport-only notice sink: {transport:?}"
+    );
     // `abort_retry` only aborts the pending wait (upstream `abortRetry()`):
     // the auto-retry setting is untouched, so later requests still retry.
     assert!(agent.auto_retry_enabled());

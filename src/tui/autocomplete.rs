@@ -223,26 +223,42 @@ pub trait CommandProvider: Send + Sync {
 
 /// The built-in slash commands (mirrors `terminal::handle_command`; the
 /// upstream `BUILTIN_SLASH_COMMANDS` subset pir implements).
+///
+/// The shared rows carry upstream's own `BUILTIN_SLASH_COMMANDS` strings
+/// (`core/slash-commands.ts`), including the argument hints upstream shows for
+/// `/model` and `/thinking`; the pir-only rows (`clear`, `sessions`, `debug`,
+/// `image`, `help`) describe pir's own behavior. The three hints upstream
+/// lacks (`compact`, `export`, `name`) are kept because pir's dispatcher
+/// accepts those arguments — `[name]` because bare `/name` shows the current
+/// name (`/name [name]`, upstream docs).
 pub fn builtin_commands() -> Vec<SlashCommand> {
     vec![
-        SlashCommand::new("model", "Select a model"),
-        SlashCommand::new("thinking", "Set the thinking level"),
+        SlashCommand::new("model", "Select model (opens selector UI)")
+            .with_argument_hint("<provider/model>"),
+        SlashCommand::new("thinking", "Set thinking level").with_argument_hint("<level>"),
         SlashCommand::new("clear", "Clear the conversation"),
         SlashCommand::new("compact", "Manually compact the session context")
             .with_argument_hint("[instructions]"),
-        SlashCommand::new("export", "Export session to HTML").with_argument_hint("<path>"),
+        SlashCommand::new(
+            "export",
+            "Export session (HTML default, or specify path: .html/.jsonl)",
+        )
+        .with_argument_hint("<path>"),
         SlashCommand::new("new", "Start a new session"),
         SlashCommand::new("resume", "Resume a different session"),
-        SlashCommand::new("fork", "Fork the current session"),
-        SlashCommand::new("clone", "Duplicate the current session"),
-        SlashCommand::new("name", "Set session display name").with_argument_hint("<name>"),
+        SlashCommand::new("fork", "Create a new fork from a previous user message"),
+        SlashCommand::new(
+            "clone",
+            "Duplicate the current session at the current position",
+        ),
+        SlashCommand::new("name", "Set session display name").with_argument_hint("[name]"),
         SlashCommand::new("session", "Show session info and stats"),
         SlashCommand::new("sessions", "List and switch same-window session tabs")
             .with_argument_hint("[new|next|prev|close|<index>|<path>]"),
         SlashCommand::new("copy", "Copy last agent message to clipboard"),
-        SlashCommand::new("settings", "Show the effective settings"),
-        SlashCommand::new("tree", "Browse the session tree and branch"),
-        SlashCommand::new("scoped-models", "Show the --models scope in effect"),
+        SlashCommand::new("settings", "Open settings menu"),
+        SlashCommand::new("tree", "Navigate session tree (switch branches)"),
+        SlashCommand::new("scoped-models", "Enable/disable models for Ctrl+P cycling"),
         SlashCommand::new("import", "Import and resume a session from a JSONL file"),
         // Upstream `slash-commands.ts` rewrote this description with
         // `cea257439` (D31), once `sessionShareDestination` made the target
@@ -253,13 +269,16 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         ),
         SlashCommand::new("bug", "Report a bug to the Pi developers")
             .with_argument_hint("<description>"),
-        SlashCommand::new("trust", "Show the project trust state"),
-        SlashCommand::new("login", "OAuth login (opens a provider dialog upstream)")
+        SlashCommand::new("trust", "Save project trust decision for future sessions"),
+        SlashCommand::new("login", "Configure provider authentication")
             .with_argument_hint("[provider]"),
-        SlashCommand::new("logout", "OAuth logout (opens a provider dialog upstream)"),
-        SlashCommand::new("changelog", "Show what's new"),
-        SlashCommand::new("hotkeys", "Show the default keybindings"),
-        SlashCommand::new("reload", "Reload extensions"),
+        SlashCommand::new("logout", "Remove provider authentication"),
+        SlashCommand::new("changelog", "Show changelog entries"),
+        SlashCommand::new("hotkeys", "Show all keyboard shortcuts"),
+        SlashCommand::new(
+            "reload",
+            "Reload keybindings, extensions, skills, prompts, themes, and context files",
+        ),
         SlashCommand::new("debug", "Toggle debug mode and show run timings")
             .with_argument_hint("[enable|disable|last]"),
         // pir-only built-in handled outside `SlashAction` (`handle_command`'s

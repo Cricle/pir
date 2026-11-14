@@ -511,6 +511,92 @@ fn mcp_add_and_remove_commands_round_trip_on_agent_dir() {
     }
 }
 
+/// `pir mcp list` reports the trusted project's `mcp.json` for a server the
+/// project overrides (upstream `ServerReport.override`, extensions/mcp/cli.ts
+/// :434-470), and never for a project file that DEFINES the server itself.
+#[test]
+fn mcp_list_reports_the_project_override_path() {
+    let root = temp_agent_dir("mcp-override");
+    let agent = root.join("agent");
+    let work = root.join("work");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::create_dir_all(work.join(".pi")).expect("create project config dir");
+    // Both servers are disabled, so `list` never connects (exit 0) while still
+    // reporting the scope/override metadata this test pins.
+    std::fs::write(
+        agent.join("mcp.json"),
+        json!({
+            "mcpServers": {
+                "docs": { "command": "true", "enabled": false },
+                "tool": { "command": "true", "enabled": false }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write global mcp.json");
+    let project_config = work.join(".pi").join("mcp.json");
+    std::fs::write(
+        &project_config,
+        json!({
+            "mcpServers": {
+                // Override-only entry: only `enabled` (upstream `entry.override`).
+                "docs": { "enabled": false },
+                // A full project definition: not an override.
+                "local": { "command": "true", "enabled": false }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write project mcp.json");
+
+    let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_pir"));
+    command
+        .current_dir(&work)
+        .env("PIR_AGENT_DIR", &agent)
+        .env("PIR_CODING_AGENT_DIR", &agent)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .env("HOME", &root)
+        .env("USERPROFILE", &root)
+        .env("PI_OFFLINE", "1")
+        .env("PI_SKIP_VERSION_CHECK", "1")
+        .args(["mcp", "list", "--json", "--approve"])
+        .stdin(Stdio::null());
+    let output = command.output().expect("run the pir binary");
+    assert!(
+        output.status.success(),
+        "`pir mcp list --json` exits 0 for disabled servers; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value =
+        serde_json::from_slice(&output.stdout).expect("`--json` prints one JSON document");
+    assert_eq!(document["errors"], json!([]), "{document}");
+    let servers = document["servers"].as_array().expect("servers array");
+    let find = |name: &str| {
+        servers
+            .iter()
+            .find(|server| server["name"] == name)
+            .unwrap_or_else(|| panic!("server {name} missing: {document}"))
+    };
+    assert_eq!(
+        find("docs")["override"],
+        json!(project_config.display().to_string()),
+        "an override-only project entry reports the project mcp.json: {document}"
+    );
+    assert_eq!(
+        find("docs")["enabled"],
+        json!(false),
+        "the merged override applies: {document}"
+    );
+    assert!(
+        find("local").get("override").is_none(),
+        "a full project definition is not an override: {document}"
+    );
+    assert!(
+        find("tool").get("override").is_none(),
+        "a global server without a project entry has no override: {document}"
+    );
+}
+
 /// Removing from the wrong scope names the file that DOES define the server
 /// (upstream `remove`, extensions/mcp/cli.ts:423-433): `pir mcp remove x
 /// --local` when only the global file defines `x` fails with `It is defined

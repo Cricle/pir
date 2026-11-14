@@ -733,10 +733,24 @@ fn rpc_fork_with_entry_id_branches_and_reports_the_entry_text() {
     let response = read_response(&mut reader, "get_tree");
     assert_eq!(response["success"], true, "{response}");
     let tree = response["data"]["tree"].as_array().expect("tree array");
-    let node = tree
-        .iter()
-        .find(|node| node["entry"]["id"] == entry_id.as_str())
-        .expect("the user-message node is a root of the tree");
+    // PIR-BIN-091: the session now opens with pi's `model_change` +
+    // `thinking_level_change` bootstrap rows, so the first user message is a
+    // CHILD of that chain rather than a root — walk the tree recursively.
+    fn find_node<'a>(nodes: &'a [serde_json::Value], id: &str) -> Option<&'a serde_json::Value> {
+        for node in nodes {
+            if node["entry"]["id"] == serde_json::Value::String(id.to_owned()) {
+                return Some(node);
+            }
+            if let Some(children) = node["children"].as_array() {
+                if let Some(found) = find_node(children, id) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    let node =
+        find_node(tree, entry_id.as_str()).expect("the user-message node is reachable in the tree");
     assert_eq!(node["entry"]["type"], "message", "{response}");
     assert_eq!(node["id"], entry_id.as_str(), "{response}");
     assert!(node["label"].is_null(), "{response}");

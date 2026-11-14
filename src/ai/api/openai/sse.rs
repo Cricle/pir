@@ -953,7 +953,12 @@ fn parse_chunk_usage(value: &Value, model_cost: &ModelCost, openrouter: bool) ->
         output,
         cache_read,
         cache_write,
-        reasoning: (reasoning > 0).then_some(reasoning),
+        // Upstream `parseChunkUsage` always records the reasoning breakdown
+        // for openai-completions (`rawUsage.completion_tokens_details
+        // ?.reasoning_tokens || 0`), so a provider that does not report one
+        // still writes `reasoning: 0` and the on-disk usage shape matches
+        // pi's byte for byte.
+        reasoning: Some(reasoning),
         total_tokens: input + output + cache_read + cache_write,
         ..Usage::default()
     };

@@ -376,8 +376,9 @@ fn create_branched_session_moves_the_writer_lock_to_the_branch() {
     );
     assert_eq!(report.skipped_active, 1, "report: {report:?}");
 
-    // Every append refreshes the lock mtime (the pid probe is primary, the
-    // touch is the second layer for diagnostics / old binaries).
+    // An append refreshes an OLD lock mtime (the pid probe is primary, the
+    // touch is the second layer for diagnostics / old binaries); the lock was
+    // backdated above, so the refresh is due at the cadence.
     manager
         .append_message(user_message("after branch"))
         .expect("append branch");
@@ -391,10 +392,61 @@ fn create_branched_session_moves_the_writer_lock_to_the_branch() {
         .expect("lock mtime in the past");
     assert!(
         age < Duration::from_secs(60),
-        "append must refresh the lock mtime, age={age:?}"
+        "append must refresh a stale lock mtime, age={age:?}"
     );
     drop(manager);
     assert!(!branch_lock.exists(), "Drop must release the branch lock");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The writer lock's file I/O is bound to a cadence, not to every appended
+/// row: a second append inside the refresh interval leaves the lock file's
+/// mtime untouched (the per-row open+read+`set_times` is gone), while an append
+/// that finds the mtime older than the cadence still refreshes it (the
+/// assertion inside `create_branched_session_moves_the_writer_lock_to_the_branch`
+/// pins that direction). Both consumers of the age — retention's
+/// `SESSION_LOCK_STALE_AFTER` reclaim window and its diagnostics — are one hour
+/// wide, so the bounded staleness this allows is 60x smaller than the window it
+/// feeds.
+#[test]
+fn append_touches_the_writer_lock_at_the_cadence_not_per_row() {
+    let dir = temp_dir("lock-cadence");
+    let mut manager = SessionManager::create(".", &dir).expect("create session");
+    manager
+        .append_message(user_message("first"))
+        .expect("append first");
+    let path = manager.path().to_path_buf();
+    let lock = lock_path(&path);
+    let lock_mtime = || {
+        std::fs::metadata(&lock)
+            .expect("writer lock metadata")
+            .modified()
+            .expect("writer lock mtime")
+    };
+    let before = lock_mtime();
+    manager
+        .append_message(user_message("second"))
+        .expect("append second");
+    assert_eq!(
+        before,
+        lock_mtime(),
+        "a second append inside the refresh cadence must not rewrite the lock mtime"
+    );
+
+    // A lock older than the cadence is refreshed on the next append, exactly as
+    // before the throttle.
+    set_mtime(&lock, SystemTime::now() - Duration::from_secs(5 * 60 * 60));
+    manager
+        .append_message(user_message("third"))
+        .expect("append third");
+    let age = SystemTime::now()
+        .duration_since(lock_mtime())
+        .expect("lock mtime in the past");
+    assert!(
+        age < Duration::from_secs(60),
+        "an append must refresh a lock older than the cadence, age={age:?}"
+    );
+    drop(manager);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

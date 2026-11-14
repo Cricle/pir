@@ -985,6 +985,18 @@ path = "tests/python_session_lifecycle.rs"
 name = "worker_threads_real"
 path = "tests/worker_threads_real.rs"
 
+[[test]]
+name = "durable_memcopy_bench"
+path = "tests/durable_memcopy_bench.rs"
+
+[[test]]
+name = "g_durable"
+path = "tests/g_durable.rs"
+
+[[test]]
+name = "print_native_session"
+path = "tests/print_native_session.rs"
+
 # END GENERATED MERGED TEST TARGETS
 
 # The RustPython 0.4.0 stack trips rustc 1.99's `hint::assert_unchecked`
@@ -1014,15 +1026,3 @@ debug-assertions = false
 # unaffected.
 [profile.test]
 debug-assertions = false
-
-[[test]]
-name = "print_native_session"
-path = "tests/print_native_session.rs"
-
-[[test]]
-name = "g_durable"
-path = "tests/g_durable.rs"
-
-[[test]]
-name = "durable_memcopy_bench"
-path = "tests/durable_memcopy_bench.rs"

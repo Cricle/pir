@@ -350,6 +350,16 @@ pub fn resolve_session_plan(
         // row — the most recent session of this project (upstream
         // `SessionManager.list` order). With none, fall back to a new session
         // like the interactive host's empty-picker handling.
+        //
+        // `find_recent_session_path` = `list_sessions(..).first()` without the
+        // listing: same order, same cwd filter, but only the newest candidates
+        // are opened for their header. The full listing peeked EVERY session
+        // file in the directory just to keep the first entry. Session
+        // storage is a feature (`session`); without it the listing is the only
+        // lookup there is.
+        #[cfg(feature = "session")]
+        let recent = SessionManager::find_recent_session_path(session_dir, cwd_filter);
+        #[cfg(not(feature = "session"))]
         let recent = SessionManager::list_sessions(session_dir, cwd_filter)
             .into_iter()
             .next()
@@ -364,6 +374,11 @@ pub fn resolve_session_plan(
     }
 
     if flags.continue_recent {
+        // Same cheap newest-session lookup as headless `-r` above: the picker's
+        // default row, without the full-directory peek (feature-gated like it).
+        #[cfg(feature = "session")]
+        let recent = SessionManager::find_recent_session_path(session_dir, cwd_filter);
+        #[cfg(not(feature = "session"))]
         let recent = SessionManager::list_sessions(session_dir, cwd_filter)
             .into_iter()
             .next()

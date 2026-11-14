@@ -263,7 +263,19 @@ pub fn char_token_units(ch: char) -> u64 {
 /// Quarter-token weight of `text` under the shared Unicode-aware estimator.
 /// Zero-width joiner/variation selectors contribute nothing (they ride along
 /// with the emoji that owns them).
+///
+/// ASCII fast path: every ASCII char is [`ASCII_UNITS`] (1) and ASCII chars
+/// equal bytes, so the sum is just the byte length. `str::is_ascii` is
+/// word/SIMD-vectorised, and this function is the per-byte inner loop of
+/// every estimate the compaction trigger, cut-point selection and cost
+/// projection run per turn (measured on the endurance script: pure-ASCII
+/// transcripts dominate, and the char `match` costs ~10x the vectorised
+/// scan). Non-ASCII text takes the exact same per-char path as before —
+/// the returned value is identical for every input.
 pub fn text_token_units(text: &str) -> u64 {
+    if text.is_ascii() {
+        return text.len() as u64;
+    }
     text.chars()
         .map(|ch| match ch as u32 {
             0x200D | 0xFE0E | 0xFE0F => 0,
@@ -383,9 +395,20 @@ fn system_describes_prompt(system: Option<&Message>, prompt: &str) -> bool {
 /// weighed as its own JSON array (`[` + separators + `]`), which is exactly the
 /// text the full array would carry for those entries, so the floor is never
 /// below the real request.
+///
+/// `full_list_units` is the request's FULL tool-declaration weight
+/// ([`tool_declaration_units`], array framing included) when the caller already
+/// computed it: the `declared == None` branch charges the whole `tools[]`
+/// array, so a caller that weighed that same array for the usage-grounded
+/// estimate's prefix ([`estimate_request_projected_context_tokens_pair`])
+/// passes the value here and one request serializes the declarations once
+/// instead of once per estimator. The declarations the newest system message
+/// DOES carry still serialize their undeclared subset — a different byte
+/// string, nothing to reuse.
 fn undeclared_tool_units(
     system: Option<&Message>,
     tools: Option<&[crate::ai::types::Tool]>,
+    full_list_units: Option<u64>,
 ) -> u64 {
     let Some(tools) = tools.filter(|tools| !tools.is_empty()) else {
         return 0;
@@ -398,7 +421,7 @@ fn undeclared_tool_units(
         _ => None,
     };
     let Some(declared) = declared else {
-        return tool_declaration_units(Some(tools));
+        return full_list_units.unwrap_or_else(|| tool_declaration_units(Some(tools)));
     };
     let declared_names: std::collections::BTreeSet<&str> =
         declared.iter().map(|tool| tool.name.as_str()).collect();
@@ -431,14 +454,29 @@ fn request_floor_prompt_units(
     system_prompt: Option<&str>,
     tools: Option<&[crate::ai::types::Tool]>,
 ) -> u64 {
+    request_floor_prompt_units_precomputed(system, system_prompt, tools, None, None)
+}
+
+/// [`request_floor_prompt_units`] with the request's prompt-text weight and
+/// full tool-declaration weight already computed (`(prompt_text_units,
+/// tool_list_units)`; see [`estimate_request_projected_context_tokens_pair`]).
+/// Identical numbers — the leading prompt is simply weighed once per request
+/// instead of once per estimator.
+fn request_floor_prompt_units_precomputed(
+    system: Option<&Message>,
+    system_prompt: Option<&str>,
+    tools: Option<&[crate::ai::types::Tool]>,
+    prompt_text_units: Option<u64>,
+    tool_list_units: Option<u64>,
+) -> u64 {
     let text_units = system_prompt.map_or(0, |prompt| {
         if system_describes_prompt(system, prompt) {
             0
         } else {
-            text_token_units(prompt)
+            prompt_text_units.unwrap_or_else(|| text_token_units(prompt))
         }
     });
-    text_units.saturating_add(undeclared_tool_units(system, tools))
+    text_units.saturating_add(undeclared_tool_units(system, tools, tool_list_units))
 }
 
 /// Estimated tokens of the request's leading prompt state: the prompt text
@@ -1346,6 +1384,49 @@ impl PathEntry for PathEntryMeta {
     }
 }
 
+/// Owned [`PathEntry`] over a SHARED session entry handle
+/// ([`crate::session_manager::FileEntry`]): the branch-snapshot shape the
+/// prompt-run compaction gate and its per-run threshold hook hold across turns.
+///
+/// The hook reads `id()` equality plus the two entry-kind flags only.
+/// [`PathEntryMeta`] owns one id `String` per path entry, so every prompt paid
+/// an allocation + copy for every entry on the leaf path
+/// ([`crate::session_manager::SessionManager::branch_path_meta`]);
+/// this shape keeps the manager's `Arc<FileEntry>` instead (a refcount bump,
+/// no allocation, no id copy — the entries are already shared with the
+/// projection metadata) and derives the SAME id/flags from it.
+#[derive(Debug, Clone)]
+pub struct PathEntryShared(pub std::sync::Arc<FileEntry>);
+
+impl PathEntryShared {
+    /// Borrow the shared session entry.
+    pub fn entry(&self) -> &FileEntry {
+        &self.0
+    }
+    /// Same fact as [`PathEntry::is_compaction`], for callers holding the
+    /// concrete type (`branch.last().is_some_and(...)`).
+    pub fn is_compaction(&self) -> bool {
+        matches!(&*self.0, FileEntry::Compaction(_))
+    }
+    /// Same fact as [`PathEntry::is_context_edit`], for callers holding the
+    /// concrete type.
+    pub fn is_context_edit(&self) -> bool {
+        matches!(&*self.0, FileEntry::ContextEdit(_))
+    }
+}
+
+impl PathEntry for PathEntryShared {
+    fn id(&self) -> Option<&str> {
+        self.0.id()
+    }
+    fn is_compaction(&self) -> bool {
+        PathEntryShared::is_compaction(self)
+    }
+    fn is_context_edit(&self) -> bool {
+        PathEntryShared::is_context_edit(self)
+    }
+}
+
 /// Estimate projected context without trusting usage captured before a later
 /// edit or compaction (upstream `estimateProjectedContextTokens`).
 ///
@@ -1480,21 +1561,248 @@ fn current_system_units<E: ProjectedEntry>(projected: &[E], tail: &[Message]) ->
             system = Some(message);
         }
     }
-    system.map(|message| match message {
-        Message::System(user) => {
-            let text = user
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text(text) => Some(text.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            text_token_units(&text)
+    system.map(system_text_join_units)
+}
+
+/// Quarter-token weight of a system message's text blocks joined with `"\n"`
+/// ([`current_system_units`]'s join value): the blocks' weights summed plus
+/// `texts - 1` separator characters. [`text_token_units`] is a per-character
+/// sum and a newline is one ASCII unit, so this is exactly the joined string's
+/// weight — with no intermediate `String` and no second scan of the copy.
+fn system_text_join_units(message: &Message) -> u64 {
+    let Message::System(system) = message else {
+        return 0;
+    };
+    let mut units = 0u64;
+    let mut texts = 0u64;
+    for block in &system.content {
+        if let ContentBlock::Text(text) = block {
+            units = units.saturating_add(text_token_units(&text.text));
+            texts = texts.saturating_add(1);
         }
-        _ => 0,
-    })
+    }
+    if texts == 0 {
+        0
+    } else {
+        units.saturating_add(texts - 1)
+    }
+}
+
+/// BOTH numbers the per-request compaction trigger decides with, from ONE
+/// traversal of `projected` (+ `tail`): the value of
+/// [`estimate_request_projected_context_tokens`] over the same basis (the tail
+/// seen exactly like [`estimate_projected_context_tokens_with_tail`] sees it)
+/// and the value of [`estimate_request_projected_context_tokens_floor`],
+/// returned as `(usage_grounded, floor)`.
+///
+/// [`crate::compaction::should_compact_request_refs`] uses this instead of
+/// calling the two estimators separately (PIR-BIN-095): the transcript's
+/// per-message weight is computed once per request (the floor already walks
+/// every message; the usage-grounded estimate re-walked the transcript after
+/// it), the leading prompt's text and the JSON-serialized tool declarations
+/// are weighed at most once and only when a branch consumes them, no
+/// `Vec<&Message>` view is materialized, and the two branch lookups travel in
+/// one backward pass. The numbers are identical to the two public estimators —
+/// pinned by `p21_bin095_pair_matches_the_public_estimators`.
+///
+/// Tail semantics: the public floor has no tail parameter (it walks
+/// `projected` only), while the est's stale path sees the newest system
+/// message over `projected` PLUS `tail`; the two are tracked separately, so
+/// this stays exact for a caller that passes a tail.
+#[doc(hidden)] // internal seam of `should_compact_request_refs`; tests pin the equality
+pub fn estimate_request_projected_context_tokens_pair<E: ProjectedEntry, P: PathEntry>(
+    projected: &[E],
+    tail: &[Message],
+    branch_entries: &[P],
+    system_prompt: Option<&str>,
+    tools: Option<&[Tool]>,
+) -> (u64, u64) {
+    let projected_message_count: usize = projected.iter().map(|entry| entry.messages().len()).sum();
+
+    // One traversal. Every number below is a running sum over the per-message
+    // weights (`estimate_message_units` is the only expensive per-message
+    // step, and it runs exactly once per message):
+    //  * `floor_units`         — Σ units over NON-system projected messages
+    //                            (the floor rounds that sum once);
+    //  * `floor_system_units`  — the newest PROJECTED system message's units;
+    //  * `stale_system_message`— the newest system message over projection +
+    //                            tail (the stale path charges its JOINED TEXT,
+    //                            see `system_text_join_units`);
+    //  * `stale_ceil_units`    — Σ ceil(units) over non-system messages (the
+    //                            stale path rounds PER MESSAGE);
+    //  * `trailing_ceil_units` — Σ ceil(units) over the messages after the
+    //                            newest ACCEPTED usage record;
+    //  * `usage_info`          — that record, under the same forward timestamp
+    //                            guard as `last_assistant_usage_info`.
+    let mut floor_units = 0u64;
+    let mut floor_system_units = 0u64;
+    let mut stale_ceil_units = 0u64;
+    let mut trailing_ceil_units = 0u64;
+    let mut floor_system_message: Option<&Message> = None;
+    let mut stale_system_message: Option<&Message> = None;
+    let mut usage_info: Option<(usize, &Usage)> = None;
+    let mut latest_prefix_timestamp = 0u64;
+    for (index, message) in projected
+        .iter()
+        .flat_map(|entry| entry.messages().iter())
+        .chain(tail.iter())
+        .enumerate()
+    {
+        let units = estimate_message_units(message);
+        if matches!(message, Message::System(_)) {
+            // The stale path charges the NEWEST system message (over
+            // projection + tail) by its joined TEXT only — no sections, no
+            // `toolsAdded`, exactly `current_system_units`' rule. The floor
+            // needs the full message and only ever sees the newest PROJECTED
+            // one (its public entry point has no tail).
+            stale_system_message = Some(message);
+            if index < projected_message_count {
+                floor_system_message = Some(message);
+                floor_system_units = units;
+            }
+        } else {
+            // The content floor walks `projected` ONLY — its public entry
+            // point has no tail (a tail message is not-yet-projected state).
+            // The stale path walks the whole projection + tail.
+            if index < projected_message_count {
+                floor_units = floor_units.saturating_add(units);
+            }
+            stale_ceil_units = stale_ceil_units.saturating_add(ceil_units(units));
+        }
+        // Same forward guard as `last_assistant_usage_info`: a usage only
+        // applies when its timestamp is at least the newest prefix timestamp
+        // seen so far, and only NON-system messages advance that prefix
+        // timestamp. A rejected usage is still an ordinary message after the
+        // accepted record, so it stays in the trailing sum.
+        let timestamp = message_timestamp(message);
+        if let Some(usage) =
+            assistant_usage(message).filter(|_| timestamp >= latest_prefix_timestamp)
+        {
+            usage_info = Some((index, usage));
+            trailing_ceil_units = 0;
+        } else if usage_info.is_some() {
+            trailing_ceil_units = trailing_ceil_units.saturating_add(ceil_units(units));
+        }
+        if !matches!(message, Message::System(_)) {
+            latest_prefix_timestamp = latest_prefix_timestamp.max(timestamp);
+        }
+    }
+
+    // The usage-grounded estimate: `estimate_context_tokens_over`'s usage
+    // branch (the usage record plus the per-message-rounded messages after it)
+    // plus `estimate_projected_context_tokens_with_tail`'s stale-usage
+    // invalidation against the branch.
+    let mut has_usage = false;
+    let mut estimated = 0u64;
+    if let Some((usage_index, usage)) = usage_info {
+        estimated = calculate_context_tokens(usage).saturating_add(trailing_ceil_units);
+        has_usage = true;
+        // Map the usage message back to its projected entry id (a usage inside
+        // the tail maps to no entry id) — the same walk the borrowed estimator
+        // runs.
+        let mut message_index = 0usize;
+        let mut usage_entry_id: Option<&str> = None;
+        for entry in projected {
+            let next = message_index + entry.messages().len();
+            if usage_index < next {
+                usage_entry_id = entry.id();
+                break;
+            }
+            message_index = next;
+        }
+        // ONE backward pass yields both branch facts: `usage_entry_index` ends
+        // at the FIRST index carrying the usage entry id (the last assignment
+        // wins while walking backwards, matching `position`) and
+        // `latest_invalidating_index` is the first match from the end,
+        // matching `rposition`.
+        let mut usage_entry_index: Option<usize> = None;
+        let mut latest_invalidating_index: Option<usize> = None;
+        for (index, entry) in branch_entries.iter().enumerate().rev() {
+            if usage_entry_id.is_some() && entry.id() == usage_entry_id {
+                usage_entry_index = Some(index);
+            }
+            if latest_invalidating_index.is_none()
+                && (entry.is_context_edit() || entry.is_compaction())
+            {
+                latest_invalidating_index = Some(index);
+            }
+        }
+        let usage_index_i64 = usage_entry_index.map_or(-1, |index| index as i64);
+        let latest_i64 = latest_invalidating_index.map_or(-1, |index| index as i64);
+        let usage_in_tail = usage_index >= projected_message_count;
+        // A synthetic (id-less) basis has no branch identity to compare: when
+        // the caller supplied no path metadata (ephemeral/no-session run)
+        // there is no compaction/context edit that could invalidate it.
+        let synthetic_basis = usage_entry_id.is_none() && branch_entries.is_empty();
+        if !(usage_in_tail || usage_index_i64 > latest_i64 || synthetic_basis) {
+            // Stale: the estimate falls back to content, like the borrowed
+            // estimator's tail of the same name.
+            has_usage = false;
+        }
+    }
+    if !has_usage {
+        // The stale (or no-usage) fallback: the newest system message's JOINED
+        // text plus PER-MESSAGE rounded weights of every non-system message.
+        // System messages are otherwise skipped, so their sections and
+        // `toolsAdded` are NOT charged here — the content floor below carries
+        // them (the public estimator's rule).
+        let system_units = stale_system_message.map_or(0, system_text_join_units);
+        estimated = ceil_units(system_units).saturating_add(stale_ceil_units);
+    }
+
+    // The leading prompt's weights, weighed at most once for BOTH estimators
+    // and only when a branch consumes them: the common session case (a trusted
+    // usage record plus a system replay declaring the live tools) needs
+    // neither the prompt-text scan nor the `tools[]` serialization.
+    let described =
+        system_prompt.is_some_and(|prompt| system_describes_prompt(floor_system_message, prompt));
+    let prefix_needed = !has_usage;
+    let prompt_text_needed = system_prompt.is_some() && (prefix_needed || !described);
+    let declared_tools = match floor_system_message {
+        Some(Message::System(system)) => system
+            .tools_added
+            .as_deref()
+            .filter(|declared| !declared.is_empty()),
+        _ => None,
+    };
+    let tool_list_needed =
+        tools.is_some_and(|tools| !tools.is_empty()) && (prefix_needed || declared_tools.is_none());
+    let prompt_text_units = if prompt_text_needed {
+        Some(system_prompt.map_or(0, text_token_units))
+    } else {
+        None
+    };
+    let tool_list_units = if tool_list_needed {
+        Some(tool_declaration_units(tools))
+    } else {
+        None
+    };
+    if !has_usage {
+        // The leading prompt rides exactly when no usage record covers it
+        // (`last_usage_index.is_none()` in the public estimator).
+        let prefix = ceil_units(
+            prompt_text_units
+                .unwrap_or_else(|| system_prompt.map_or(0, text_token_units))
+                .saturating_add(tool_list_units.unwrap_or_else(|| tool_declaration_units(tools))),
+        );
+        estimated = estimated.saturating_add(prefix);
+    }
+
+    // The content floor: the newest PROJECTED system message in full plus
+    // every non-system projected message plus the single-count leading prompt
+    // (tool declarations counted once, PIR-BIN-070).
+    let floor = ceil_units(
+        floor_units
+            .saturating_add(floor_system_units)
+            .saturating_add(request_floor_prompt_units_precomputed(
+                floor_system_message,
+                system_prompt,
+                tools,
+                prompt_text_units,
+                tool_list_units,
+            )),
+    );
+    (estimated, floor)
 }
 
 // ============================================================================

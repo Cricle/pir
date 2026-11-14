@@ -92,7 +92,8 @@ use pir::ai::types::{
     ThinkingContent,
 };
 use pir::tui::ansi::{
-    pad_to_width, truncate_to_width, visible_width, wrap_text_with_ansi, BG_RESET, FG_RESET,
+    pad_to_width, terminal_safe_width, truncate_to_width, visible_width, wrap_text_with_ansi,
+    BG_RESET, FG_RESET,
 };
 use pir::tui::app::{
     format_cwd_for_footer, format_tokens, header_line_styled_for, render_footer,
@@ -3725,6 +3726,190 @@ fn user_bash_block_serves_its_whole_row_set_from_the_memo() {
     );
 }
 
+/// One settled `bash` tool block over the given payload `Arc`s. Two instances
+/// built from the SAME `args`/`output`/`details` Arcs model a transcript
+/// rebuilt from one entry revision (the search walk's scratch probe container
+/// and the live band container; the windowed band's set_entries diff).
+fn bash_block_with_payload(
+    args: &Arc<serde_json::Value>,
+    output: &Arc<str>,
+    details: &Option<Arc<serde_json::Value>>,
+    expanded: &Arc<AtomicBool>,
+) -> ToolExecutionComponent {
+    let component = ToolExecutionComponent::new("bash", Arc::clone(args), Arc::clone(expanded));
+    component.set_meta(details.clone(), None, None);
+    component.update_result(Arc::clone(output), false, Some(7));
+    component
+}
+
+/// P15 pin: the result section's rows are served from the shared,
+/// content-keyed memo when a REBUILT component meets an entry revision whose
+/// section was already rendered — the search walk's probe → materialize path
+/// (a scratch container renders candidate pages; the materialized band
+/// rebuilds the same entries into a second component tree and, before the
+/// memo, re-styled and re-wrapped the whole ~50 KiB body per block).
+///
+/// The served rows must be byte-identical to a cold render (pinned below),
+/// the counters must name the reuse, and a different output revision must
+/// never be served the old rows.
+#[test]
+fn result_section_rows_survive_a_component_rebuild() {
+    let _guard = test_lock();
+    warm_theme();
+    let width = 100;
+    // The collapsed shell branch keeps the LAST 20 visual rows and counts the
+    // skipped ones, so the fixture must overflow the preview.
+    let big_output: String = (0..60)
+        .map(|index| {
+            format!(
+                "dump line {index:03} lorem ipsum dolor sit amet consectetur \
+                 adipiscing elit sed do eiusmod tempor incididunt ut labore"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let output: Arc<str> = Arc::from(big_output.as_str());
+    let args = Arc::new(serde_json::json!({ "command": "dump 0" }));
+    let details = Some(Arc::new(serde_json::json!({
+        "truncation": {
+            "truncated": true,
+            "truncatedBy": "bytes",
+            "totalLines": 990,
+            "totalBytes": 49000,
+            "outputLines": 500,
+            "outputBytes": 48900,
+        }
+    })));
+    let expanded = Arc::new(AtomicBool::new(false));
+
+    // Cold render: a fresh component renders the section for real.
+    let first = bash_block_with_payload(&args, &output, &details, &expanded);
+    let mut pool = stale_pool();
+    ToolMemoWork::reset();
+    render_into_pool(&first, width, &mut pool);
+    let cold = ToolMemoWork::snapshot();
+    assert_eq!(
+        cold.result_rebuilds, 1,
+        "the cold render must build the section once: {cold:?}"
+    );
+    assert_eq!(cold.result_shared_hits, 0, "{cold:?}");
+    assert!(
+        pool.iter().any(|row| row.contains("earlier lines")),
+        "the collapsed shell preview must paint its counted hint"
+    );
+
+    // A rebuilt component from the same entry revision: the shared memo
+    // serves the section, and its rows are the cold render byte for byte.
+    let rebuilt = bash_block_with_payload(&args, &output, &details, &expanded);
+    let mut rebuilt_pool = stale_pool();
+    ToolMemoWork::reset();
+    render_into_pool(&rebuilt, width, &mut rebuilt_pool);
+    let reuse = ToolMemoWork::snapshot();
+    assert_eq!(
+        reuse.result_shared_hits, 1,
+        "a rebuilt component must meet the shared memo: {reuse:?}"
+    );
+    assert_eq!(
+        reuse.result_rebuilds, 0,
+        "the shared memo must serve the section without re-rendering: {reuse:?}"
+    );
+    assert_eq!(
+        rebuilt_pool, pool,
+        "the shared rows must be the cold render byte for byte"
+    );
+    // The served rows must settle on the rebuilt component too.
+    render_into_pool(&rebuilt, width, &mut rebuilt_pool);
+    let settled = ToolMemoWork::snapshot();
+    assert_eq!(settled.result_shared_hits, 1, "{settled:?}");
+    assert_eq!(settled.result_rebuilds, 0, "{settled:?}");
+    assert_eq!(rebuilt_pool, pool, "the second frame must keep the rows");
+
+    // Allocation budget: the cold section render styles and wraps the whole
+    // body; the shared-hit frame only copies the pooled rows. A fresh copy of
+    // the same text stands in for the cold leg (same shape, its own `Arc`).
+    let cold_output: Arc<str> = Arc::from(big_output.as_str());
+    let cold = bash_block_with_payload(&args, &cold_output, &details, &expanded);
+    let mut cold_pool = stale_pool();
+    let ((), cold_allocations) = count_allocations(|| {
+        render_into_pool(&cold, width, &mut cold_pool);
+    });
+    let hit = bash_block_with_payload(&args, &output, &details, &expanded);
+    let mut hit_pool = stale_pool();
+    let ((), hit_allocations) = count_allocations(|| {
+        render_into_pool(&hit, width, &mut hit_pool);
+    });
+    assert_eq!(hit_pool, pool, "the budget leg must serve the same rows");
+    assert!(
+        hit_allocations * 2 <= cold_allocations,
+        "a shared-hit frame must allocate at most half of the cold section \
+         render (cold {cold_allocations}, hit {hit_allocations})"
+    );
+
+    // A different output revision keeps a different key: never the old rows.
+    let moved_output: Arc<str> = Arc::from(format!("{big_output}\ndump line 060").as_str());
+    let moved = bash_block_with_payload(&args, &moved_output, &details, &expanded);
+    let mut moved_pool = stale_pool();
+    ToolMemoWork::reset();
+    render_into_pool(&moved, width, &mut moved_pool);
+    let fresh = ToolMemoWork::snapshot();
+    assert_eq!(fresh.result_shared_hits, 0, "{fresh:?}");
+    assert_eq!(fresh.result_rebuilds, 1, "{fresh:?}");
+    assert_ne!(
+        moved_pool, pool,
+        "the changed output must paint its own rows"
+    );
+
+    // The search MATCH LIST over the rendered block, pinned as the semantic
+    // contract the memo must not move (the search walk chooses a page to
+    // materialize from exactly these matches): a query in the visible
+    // collapsed-preview text matches once, its case variant selects the same
+    // cells, text the collapsed preview hides does not match at all, and the
+    // shared-hit frame answers identically to the cold one.
+    let find = |match_pool: &[String], query: &str| {
+        pir::tui::altscreen_search::find_search_matches(match_pool, query)
+    };
+    let visible = find(&pool, "dump line 059");
+    assert_eq!(
+        visible.len(),
+        1,
+        "the visible preview tail must match once: {visible:?}"
+    );
+    let segments = &visible[0].segments;
+    assert!(
+        !segments.is_empty()
+            && segments
+                .iter()
+                .all(|segment| segment.row == segments[0].row),
+        "the match must sit on one preview row: {visible:?}"
+    );
+    assert_eq!(
+        segments
+            .iter()
+            .map(|segment| segment.end_col - segment.start_col)
+            .sum::<usize>(),
+        "dump line 059".replace(' ', "").len(),
+        "the match must cover the query's word cells (the corpus separates \
+         the painted word runs, so the two spaces are not painted cells): \
+         {visible:?}"
+    );
+    assert_eq!(
+        find(&pool, "DUMP LINE 059"),
+        visible,
+        "the case variant must select the same cells"
+    );
+    assert!(
+        find(&pool, "dump line 000").is_empty(),
+        "the collapsed preview hides the head; it must not be searchable"
+    );
+    for query in ["dump line 059", "DUMP LINE 059", "dump line 000", "zzz"] {
+        assert_eq!(
+            find(&rebuilt_pool, query),
+            find(&pool, query),
+            "the shared-hit frame must answer `{query}` like the cold one"
+        );
+    }
+}
+
 /// The edit args plus the `ToolPreview` the app attaches for them (the
 /// preview's `args_key` must match `edit_preview_input`, else
 /// `preview_is_current` drops it).
@@ -4482,5 +4667,480 @@ fn flush_bounded_drains_queued_frames_before_synchronous_screen_exit() {
     assert!(
         before_leave.contains("frame-two"),
         "second queued frame drained before LeaveAlternateScreen: {recorded:?}"
+    );
+}
+
+/// P1 lane (p1-tui-frame-cost): the PRODUCTION band path over a
+/// [`ChatBlockCache`] — the component wrapper a windowed session really paints
+/// (`shared_chat_component`), not a synthetic single-revision double.
+///
+/// The frame assembler reports `content_blocks()` for that wrapper, so its own
+/// bookkeeping (the cross-position block-reuse index) runs over one block per
+/// materialized entry on every frame. The pins here:
+///
+/// 1. a STEADY band frame (nothing moved, nothing changed) must not allocate
+///    once per materialized block — the moved-block index is work the frame
+///    only owes when the window actually slid;
+/// 2. a window slide (the band top moves up by one paging step, every block
+///    below only shifts position) must serve the shifted blocks from their
+///    cached rows: `rebuilt_blocks` stays near the newly materialized count
+///    and the vast majority of band rows land in `cached_rows`;
+/// 3. the steady frame is byte-identical to a cold render of the same state,
+///    and the slide frame's rows are byte-identical to a cold render too.
+#[test]
+fn production_band_frames_keep_the_block_path_allocation_flat() {
+    use pir::tui::core::TerminalSink;
+    use pir::tui::stdin_buffer::WriteLog;
+    use pir::tui::terminal::{shared_chat_component, ChatBlockCache};
+
+    let _guard = test_lock();
+    let tools = Arc::new(AtomicBool::new(false));
+    let entries: Vec<ChatEntry> = (0..900)
+        .map(|index| ChatEntry::User(format!("marker {index:05} payload entry {index}")))
+        .collect();
+    let chat = Arc::new(Mutex::new(ChatContainer::new()));
+    chat.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_entries(&entries);
+    let mut blocks = ChatBlockCache::new(Arc::clone(&tools), false);
+    let ((), install_cold_allocs) = count_allocations(|| blocks.set_entries(&entries));
+    assert!(blocks.is_primed());
+    let blocks = Arc::new(Mutex::new(blocks));
+    let revision = Arc::new(AtomicU64::new(1));
+
+    let terminal = Terminal::with_sink_factory(
+        || Box::new(std::io::sink()) as Box<dyn TerminalSink>,
+        WriteLog::disabled(),
+    );
+    terminal.set_size(120, 40);
+    let mut core = TuiCore::new(terminal);
+    core.set_windowed_viewport(true);
+    core.push_content(shared_chat_component(
+        Arc::clone(&chat),
+        Arc::clone(&revision),
+        Arc::clone(&blocks),
+    ));
+    // Warm the frame pipeline (the first frames build the caches and settle
+    // the recycled raw canvas).
+    for _ in 0..3 {
+        core.render();
+    }
+    let band_rows = core.frame_buffer_length();
+    assert!(
+        band_rows > 100,
+        "the fixture must paint a real band: {band_rows}"
+    );
+
+    // 1. Steady frame: no revision moved, no position moved.
+    FrameWork::reset();
+    RowsWork::reset();
+    let ((), steady_allocs) = count_allocations(|| core.render());
+    let steady = core.last_frame_work();
+    println!(
+        "P1 band steady: allocs={steady_allocs} frame_rows={band_rows} {steady:?} \
+         rows={:?}",
+        core.last_frame_rows_work()
+    );
+    assert!(
+        steady.rebuilt_blocks <= 1,
+        "a steady band frame rebuilds no block: {steady:?}"
+    );
+    assert!(
+        steady.cached_rows + 2 >= band_rows as u64,
+        "every band row must come from the block cache: {steady:?}"
+    );
+    assert!(
+        steady_allocs <= 64,
+        "a steady band frame must not allocate once per materialized block: \
+         {steady_allocs} allocations for {} blocks",
+        900
+    );
+
+    // 3a. Byte-identity: the steady frame equals a cold render of the state.
+    let steady_frame = core.last_frame_lines().to_vec();
+    {
+        let cold_chat = Arc::new(Mutex::new(ChatContainer::new()));
+        cold_chat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_entries(&entries);
+        let mut cold_blocks = ChatBlockCache::new(Arc::clone(&tools), false);
+        cold_blocks.set_entries(&entries);
+        let cold_blocks = Arc::new(Mutex::new(cold_blocks));
+        let cold_revision = Arc::new(AtomicU64::new(1));
+        let terminal = Terminal::with_sink_factory(
+            || Box::new(std::io::sink()) as Box<dyn TerminalSink>,
+            WriteLog::disabled(),
+        );
+        terminal.set_size(120, 40);
+        let mut cold = TuiCore::new(terminal);
+        cold.set_windowed_viewport(true);
+        cold.push_content(shared_chat_component(cold_chat, cold_revision, cold_blocks));
+        cold.render();
+        assert_eq!(
+            cold.last_frame_lines(),
+            steady_frame.as_slice(),
+            "the cached band frame must match a cold render byte for byte"
+        );
+    }
+
+    // 2. Window slide: materialize 64 older entries; entries 64..900 only
+    // shift position by -64 and must be served from their cached rows.
+    let slid_entries: &[ChatEntry] = &entries[64..];
+    let ((), install_slide_allocs) = count_allocations(|| {
+        blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_entries_windowed(slid_entries, 64);
+    });
+    chat.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_entries(slid_entries);
+    revision.fetch_add(1, Ordering::Relaxed);
+    FrameWork::reset();
+    RowsWork::reset();
+    let ((), slide_allocs) = count_allocations(|| core.render());
+    let slide = core.last_frame_work();
+    println!(
+        "P1 band slide: allocs={slide_allocs} {slide:?} \
+         installs cold={install_cold_allocs} slide_reuse={install_slide_allocs} \
+         size_log={:?}",
+        alloc_size_log()
+    );
+    assert!(
+        install_slide_allocs * 4 <= install_cold_allocs,
+        "a slide install must REUSE the retired containers instead of rebuilding \
+         one per staying entry (the retention cap must run AFTER the reuse \
+         pass): cold install={install_cold_allocs} allocations for 900 entries, \
+         slide install={install_slide_allocs} for 836 entries"
+    );
+    assert!(
+        slide.rebuilt_blocks <= 96,
+        "a one-step slide must reuse the moved blocks' cached rows (at most \
+         the newly materialized step plus slack may rebuild): {slide:?}"
+    );
+    assert!(
+        slide.cached_rows >= 900,
+        "the shifted blocks' rows must be served from the cache: {slide:?}"
+    );
+
+    // 3b. Byte-identity of the slide frame against a cold render.
+    let slide_frame = core.last_frame_lines().to_vec();
+    {
+        let cold_chat = Arc::new(Mutex::new(ChatContainer::new()));
+        cold_chat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_entries(slid_entries);
+        let mut cold_blocks = ChatBlockCache::new(Arc::clone(&tools), false);
+        cold_blocks.set_entries_windowed(slid_entries, 64);
+        let cold_blocks = Arc::new(Mutex::new(cold_blocks));
+        let cold_revision = Arc::new(AtomicU64::new(1));
+        let terminal = Terminal::with_sink_factory(
+            || Box::new(std::io::sink()) as Box<dyn TerminalSink>,
+            WriteLog::disabled(),
+        );
+        terminal.set_size(120, 40);
+        let mut cold = TuiCore::new(terminal);
+        cold.set_windowed_viewport(true);
+        cold.push_content(shared_chat_component(cold_chat, cold_revision, cold_blocks));
+        cold.render();
+        assert_eq!(
+            cold.last_frame_lines(),
+            slide_frame.as_slice(),
+            "the slid band frame must match a cold render byte for byte"
+        );
+    }
+}
+
+/// P1 lane (p1-tui-frame-cost): the frame cost of a LIVE STREAMING delta in a
+/// FULL band — the hot path a long session hits while an answer streams (one
+/// small append per frame, the whole 900-block band already materialized).
+///
+/// Pins: the delta re-renders only the streaming block (`rebuilt_blocks`
+/// stays at 1), the rest of the band is served from the block caches, and
+/// the frame allocates at most the streaming block's own row growth — never
+/// once per materialized block.
+#[test]
+fn production_band_streaming_delta_frame_stays_per_block_flat() {
+    use std::time::Instant;
+
+    use pir::tui::core::TerminalSink;
+    use pir::tui::stdin_buffer::WriteLog;
+    use pir::tui::terminal::{shared_chat_component, ChatBlockCache};
+
+    let _guard = test_lock();
+    let tools = Arc::new(AtomicBool::new(false));
+    let mut entries: Vec<ChatEntry> = (0..900)
+        .map(|index| ChatEntry::User(format!("marker {index:05} payload entry {index}")))
+        .collect();
+    let body: String = (0..400)
+        .map(|index| format!("streamed paragraph {index:04} with a few words of body text\n\n"))
+        .collect();
+    entries.push(ChatEntry::Streaming {
+        live: true,
+        thinking: String::new(),
+        text: body,
+    });
+    let streaming_index = entries.len() - 1;
+    let chat = Arc::new(Mutex::new(ChatContainer::new()));
+    chat.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_entries(&entries);
+    let mut blocks = ChatBlockCache::new(Arc::clone(&tools), false);
+    blocks.set_entries(&entries);
+    let blocks = Arc::new(Mutex::new(blocks));
+    let revision = Arc::new(AtomicU64::new(1));
+
+    let terminal = Terminal::with_sink_factory(
+        || Box::new(std::io::sink()) as Box<dyn TerminalSink>,
+        WriteLog::disabled(),
+    );
+    terminal.set_size(120, 40);
+    let mut core = TuiCore::new(terminal);
+    core.set_windowed_viewport(true);
+    core.push_content(shared_chat_component(
+        Arc::clone(&chat),
+        Arc::clone(&revision),
+        Arc::clone(&blocks),
+    ));
+    for _ in 0..3 {
+        core.render();
+    }
+    let band_rows = core.frame_buffer_length();
+    assert!(
+        band_rows > 1000,
+        "the fixture must paint a big band: {band_rows}"
+    );
+
+    // Steady frame on the same band (no delta): the baseline the streaming
+    // frame is measured against.
+    FrameWork::reset();
+    RowsWork::reset();
+    let t0 = Instant::now();
+    core.render();
+    let steady_us = t0.elapsed().as_micros();
+    let steady = core.last_frame_work();
+    println!("P1 stream band steady: us={steady_us} {steady:?}");
+
+    // One streaming delta: append to the live entry AND patch the block slot
+    // exactly like `commit_live_stream_batch` does.
+    let delta = "\nappended tail sentence for the live block";
+    if let ChatEntry::Streaming { text, .. } = &mut entries[streaming_index] {
+        text.push_str(delta);
+    }
+    blocks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .patch_streaming_delta(streaming_index, &entries[streaming_index], delta, "");
+    revision.fetch_add(1, Ordering::Relaxed);
+    FrameWork::reset();
+    RowsWork::reset();
+    let t0 = Instant::now();
+    let ((), delta_allocs) = count_allocations(|| core.render());
+    let delta_us = t0.elapsed().as_micros();
+    let after = core.last_frame_work();
+    println!("P1 stream band delta: us={delta_us} allocs={delta_allocs} {after:?}");
+    assert_eq!(
+        after.rebuilt_blocks, 1,
+        "only the streaming block may rebuild: {after:?}"
+    );
+    assert!(
+        after.cached_rows >= band_rows as u64 - 64,
+        "the rest of the band must come from the block cache: {after:?}"
+    );
+    assert!(
+        core.last_frame_lines()
+            .iter()
+            .any(|row| row.contains("appended tail sentence")),
+        "the delta must reach the painted frame"
+    );
+
+    // Byte-identity against a cold render of the same (grown) state.
+    let frame = core.last_frame_lines().to_vec();
+    {
+        let cold_chat = Arc::new(Mutex::new(ChatContainer::new()));
+        cold_chat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_entries(&entries);
+        let mut cold_blocks = ChatBlockCache::new(Arc::clone(&tools), false);
+        cold_blocks.set_entries(&entries);
+        let cold_blocks = Arc::new(Mutex::new(cold_blocks));
+        let terminal = Terminal::with_sink_factory(
+            || Box::new(std::io::sink()) as Box<dyn TerminalSink>,
+            WriteLog::disabled(),
+        );
+        terminal.set_size(120, 40);
+        let mut cold = TuiCore::new(terminal);
+        cold.set_windowed_viewport(true);
+        cold.push_content(shared_chat_component(
+            cold_chat,
+            Arc::new(AtomicU64::new(1)),
+            cold_blocks,
+        ));
+        cold.render();
+        assert_eq!(
+            cold.last_frame_lines(),
+            frame.as_slice(),
+            "the streaming frame must match a cold render byte for byte"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 11. PIR-TUI-035/036: terminal-side width drift is guarded at the write path
+// ---------------------------------------------------------------------------
+
+/// A static extension widget's content is a `\n`-joined string upstream
+/// (`setWidget(key, string[])` -> `lines.join("\n")`), and the dock must paint
+/// one row PER LINE: a single frame row carrying the embedded newline made the
+/// terminal advance an extra line, dropping the widget's second line and
+/// shifting every dock row below it (PIR-TUI-035).
+#[test]
+fn static_widget_text_paints_one_row_per_line() {
+    let _guard = test_lock();
+    let mut lines = Vec::new();
+    {
+        let mut rows = Rows::new(&mut lines);
+        pir::tui::terminal::push_widget_rows(&mut rows, "WIDGET-ONE\nWIDGET-TWO", 12);
+        rows.trim();
+    }
+    assert_eq!(
+        lines,
+        vec!["WIDGET-ONE  ".to_string(), "WIDGET-TWO  ".to_string()],
+        "each widget line must be its own padded dock row"
+    );
+}
+
+/// The write-path guard measures with [`terminal_safe_width`]: the cell count
+/// a terminal that does not join grapheme clusters spends. The expected
+/// numbers are measured on the real ConPTY renderer (DSR probe; see
+/// `.play/evidence/p11-tui035-036/scripts/conpty_width_probe*.js`): the
+/// layout model says 2 for every one of them.
+#[test]
+fn terminal_safe_width_counts_the_terminal_cells_of_ambiguous_clusters() {
+    let _guard = test_lock();
+    // 👩‍💻: 👩 2 + ZWJ 1 + 💻 2.
+    assert_eq!(terminal_safe_width("\u{1F469}\u{200D}\u{1F4BB}"), 5);
+    // The four-person ZWJ family: four 2-cell emoji + three 1-cell ZWJ.
+    assert_eq!(
+        terminal_safe_width("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"),
+        11
+    );
+    assert_eq!(terminal_safe_width("\u{1F44D}\u{1F3FD}"), 4); // 👍🏽
+    assert_eq!(terminal_safe_width("\u{1F1EF}\u{1F1F5}"), 4); // 🇯🇵
+    assert_eq!(terminal_safe_width("1\u{FE0F}\u{20E3}"), 3); // 1️⃣
+    assert_eq!(terminal_safe_width("\u{2764}\u{FE0F}"), 2); // ❤️
+                                                            // Plain text: identical to the layout model (its only fast path).
+    assert_eq!(
+        terminal_safe_width("plain ascii"),
+        visible_width("plain ascii")
+    );
+    assert_eq!(terminal_safe_width("\u{4F60}\u{597D}"), 4); // 你好
+    let mixed = format!("x {} y", "\u{1F469}\u{200D}\u{1F4BB}");
+    assert!(
+        terminal_safe_width(&mixed) >= visible_width(&mixed),
+        "the guard measure must never be smaller than the layout model"
+    );
+}
+
+/// A frame row padded to exactly the model width wraps in a terminal whose
+/// renderer spends extra cells on the ZWJ cluster (ConHost), and the wrapped
+/// row displaces every row the incremental diff writes afterwards
+/// (PIR-TUI-036: stale rule + duplicated footer). The write path must trim
+/// only the trailing PADDING of such a row so its terminal width stays inside
+/// `width` — never content.
+#[test]
+fn write_path_trims_terminal_wide_padding_of_a_zwj_row() {
+    use std::io::Write;
+    use std::time::Duration;
+
+    use pir::tui::core::{Component, TerminalSink};
+    use pir::tui::stdin_buffer::WriteLog;
+
+    #[derive(Clone)]
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One pre-built row, exactly as a component's canvas path emits it.
+    struct OneRow(String);
+    impl Component for OneRow {
+        fn render(&self, _width: usize) -> Vec<String> {
+            vec![self.0.clone()]
+        }
+        fn render_into(&self, _width: usize, out: &mut Rows<'_>) {
+            out.push(&self.0);
+        }
+    }
+
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let sink = RecordingSink(Arc::clone(&bytes));
+    let terminal = Terminal::with_sink_factory(
+        move || Box::new(sink.clone()) as Box<dyn TerminalSink>,
+        WriteLog::disabled(),
+    );
+    terminal.set_size(20, 12);
+    let mut core = TuiCore::new(terminal);
+    // Exactly what the markdown tail produces: the content padded to width.
+    let padded = pad_to_width(" family \u{1F469}\u{200D}\u{1F4BB}", 20);
+    assert_eq!(visible_width(&padded), 20, "fixture must fit the model");
+    core.push_content(Box::new(OneRow(padded.clone())));
+    core.render();
+    assert!(
+        core.terminal().flush_bounded(Duration::from_millis(5000)),
+        "the frame must reach the sink"
+    );
+
+    let written = String::from_utf8(
+        bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    )
+    .expect("frame bytes are utf-8");
+    // Terminal width of the padded row: 8 + 5 + 10 = 23 > 20; the guard drops
+    // 3 trailing spaces (the last 7 remain).
+    let trimmed = " family \u{1F469}\u{200D}\u{1F4BB}       ";
+    assert!(
+        written.contains(trimmed),
+        "the ZWJ row must be written with the padding trimmed: {written:?}"
+    );
+    assert!(
+        !written.contains(&padded),
+        "the model-width padding must not reach the terminal: {written:?}"
+    );
+    // A plain padded row is untouched: the guard only fires on the
+    // terminal-ambiguous sequences.
+    let plain = pad_to_width(" plain row", 20);
+    core.push_content(Box::new(OneRow(plain.clone())));
+    core.render();
+    assert!(
+        core.terminal().flush_bounded(Duration::from_millis(5000)),
+        "the second frame must reach the sink"
+    );
+    let written = String::from_utf8(
+        bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    )
+    .expect("frame bytes are utf-8");
+    assert!(
+        written.contains(&plain),
+        "plain rows keep their model padding: {written:?}"
     );
 }

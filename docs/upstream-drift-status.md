@@ -39,8 +39,8 @@ unchanged: this document refreshes the *drift* record, not the port baseline.
 | 12 | `acf83acfd` | restore changelog attributions | N/A | Docs only. |
 | 13 | `e9c3ac9d9` | drop changelog author attribution | N/A | Docs only. |
 | 14 | `a8fe8e0ad` | missing changelog entries | N/A | Docs only. |
-| 15 | `1c8cb1781` | bound image line search by tallest image | N/A | pir emits image escape sequences inline and has no Kitty placement/scroll-crop layer (only encoding: `tui/terminal_image.rs:363`), so the placeholder-row search does not exist. |
-| 16 | `4464442f9` | crop boxed images scrolled above the viewport | N/A | Same missing placement layer as row 15. |
+| 15 | `1c8cb1781` | bound image line search by tallest image | **Open** | Upstream bounds the fullscreen backward search for an image line by the tallest registered image (`getMaxKittyImageRows`). pir has the placement/encoding half — Kitty/iTerm2 detection (`tui/terminal_image.rs:93`, `:134` Kitty, `:153` iTerm2), the `PI_IMAGE_PROTOCOL` override (`:189-194`), the encoders (`:458` Kitty, `:509` iTerm2) and the reservation-row block `image_block_lines` (`:873`) — but has no crop/re-emit search at all (`grep -rn crop src/` = 0 hits), so the `getMaxKittyImageRows` bound has no counterpart. Static gap; runtime repro not run. |
+| 16 | `4464442f9` | crop boxed images scrolled above the viewport | **Open** | Upstream repaints the partially scrolled image by cropping its line (`cropKittyImageLine(hiddenRows, visibleRows)`) at the viewport's top row. pir's `render_scrolled` (`tui/core.rs:5114-5136`) takes a raw window of transcript rows (`let window = &new_lines[start..end]`, `:5134`) and `:4304-4309` passes image rows through the width clamp unchanged, so a protocol image whose first row scrolls above the viewport keeps only its blank reservation rows — there is no crop/re-emit. Same gap as row 15. |
 | 17 | `a7b94a03f` | preserve literal data in Gemini tool schemas | **Landed** | `ai/api/google/shared.rs:717` (six name maps, incl. `dependencies`), `:728` (sixteen subschema keywords), `:753-782` (rewrite only in schema-bearing positions). |
 | 18 | `7314819f0` | send `const` as `enum` in Gemini tool schemas | **Landed** | `ai/api/google/shared.rs:692` applies `rewrite_const_as_enum` to `parametersJsonSchema`; `:775-782` rewrites string/number `const` to a single-value `enum`. |
 | 19 | `ed76cca69` | fork test asserts copied content | N/A | Test-only (behaviour covered by row 20). |
@@ -88,15 +88,20 @@ unchanged: this document refreshes the *drift* record, not the port baseline.
 | 61 | `7c22a93d0` | `totalFromProvider` flag on usage cost | **Landed** | `ai/types/stream.rs:27-53` (`totalFromProvider` serde field, `is_provider_billed`), set in `ai/util.rs:445-484`, `ai/classify.rs:254`, `ai/images.rs:443`; honoured at `ai/provider.rs:3605-3615`. |
 | 62 | `58c0b02ce` | `[Unreleased]` changelog sections | N/A | Docs only. |
 
-Totals: **26 Landed (25 direct + 1 native-equivalent), 0 Partial, 0 Open, 36 N/A**.
+Totals: **26 Landed (25 direct + 1 native-equivalent), 0 Partial, 2 Open, 34 N/A**.
 
 ## Open and Partial items
 
-None remain in the `v1.4.0..HEAD` window. The last pass closed the nine
-previously-open/partial rows (1, 2, 9, 22, 44, 47, 48, 51, 55); the evidence is
-in each row. The earlier 110-commit window is now fully covered too: the 23
-spot checks plus the 16 previously unchecked commits below are classified, and
-`bd3c9b823` is complete after the `/tree` branch-loadout restoration landed.
+Two rows are **Open** in the `v1.4.0..HEAD` window: **15** and **16**, the
+fullscreen Kitty/iTerm2 crop/re-emit (upstream `4464442f9`+`1c8cb1781`). pir
+detects, encodes and places protocol images but has no crop step
+(`grep -rn crop src/` = 0); a partially scrolled image loses its placement line.
+This is a static finding — a runtime repro is still pending. The last pass
+closed the nine other previously-open/partial rows (1, 2, 9, 22, 44, 47, 48,
+51, 55); the evidence is in each row. The earlier 110-commit window is fully
+covered: the 23 spot checks plus the 16 previously unchecked commits below are
+classified, and `bd3c9b823` is complete after the `/tree` branch-loadout
+restoration landed.
 
 ## Spot checks in `2ec55d808..v1.4.0` (110 commits)
 
@@ -105,7 +110,7 @@ Checked (23 of 110), all by the same method:
 | Commit | Change | Verdict | Evidence |
 |---|---|---|---|
 | `7f225f25d` | image input for System One classifiers | Landed | `ai/classify/system_one.rs:166-230` (`SystemOneImageInput::{Assets,Images,StateImageUrls}`, per-service `add_images`, 4-image cap) |
-| `02726086d` | recovery omits truncated call's tool results | not checked | — |
+| `02726086d` | recovery omits truncated call's tool results | Landed | `agent_session/prompt_loop.rs:322-345` `trailing_attempt_ordinals` pairs the trailing assistant with the tool results answering its calls (the #11227 shape), `:361-400` persists `replacement: null` context edits for the whole pair; callers `:2573`, `:2778`. |
 | `8c4e87389` | grep ignores ripgrep config | N/A | in-process engine, no spawned `rg` (`tools/grep.rs:1-6`) |
 | `bd3c9b823` | activate extension tools registered after the loadout | Landed | Resume: `agent_session/tools.rs::restore_recorded_active_tools` takes the plugin registry's `(name, defaultActive, activatesOnRegistration)` entries, activates unmentioned default-active extension tools and keeps branch-removed tools inactive. `/tree`: `AgentSession::restore_branch_active_tools` replays the target branch's system declarations and installs the branch loadout as the active-tools override. Tests: `resume_activates_unmentioned_extension_tools`, `tree_navigation_restores_the_target_branch_loadout`. |
 | `04a93bad8` / `adc5fa9f8` | client identity / attribution in pi-ai | Landed | `ai/provider.rs:3004-3024` (`default_attribution_headers`), `:1914-1917` |
@@ -190,7 +195,8 @@ landed (`AgentSession::restore_branch_active_tools`; test
 `tree_navigation_restores_the_target_branch_loadout`), and the 16 previously
 unchecked commits in the 110-commit window are classified in the table above;
 `28bea006b` now uses the `access(F_OK)`-equivalent attribute check. No open
-items remain in either window. Gates for this pass: full `test_fast.ps1`
+items remain in the 110-commit window; rows 15/16 above are the only Open items
+in the `v1.4.0..HEAD` window. Gates for this pass: full `test_fast.ps1`
 **6774 passed / 0 real failures** (2 load-flaky suites passed on serial
 retry), `g_durable` 747/747, `g_ai` 763/763, `g_tui` 777/777,
 `d32_resume_active_tools` 11/11, `cargo clippy --all-targets --all-features

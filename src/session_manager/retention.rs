@@ -879,8 +879,9 @@ fn execute_plan(plan: PrunePlan, active: Option<&Path>) -> PruneReport {
         // writer that creates its lock after this snapshot but before
         // `remove_file` below can still lose the race (no atomic
         // unlink-if-lock-absent primitive exists here); it is reduced to a
-        // few syscalls and relies on the per-append lock touch plus the 1h
-        // session-mtime safety window.
+        // few syscalls and relies on the lock touch (a writer's own lock is
+        // refreshed at least every `LOCK_REFRESH_INTERVAL`, so a lock that is
+        // already there is young) plus the 1h session-mtime safety window.
         if lock_path
             .as_deref()
             .is_some_and(|lock| session_lock_snapshot(lock).state == SessionLockState::Live)

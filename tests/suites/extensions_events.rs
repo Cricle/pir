@@ -3046,6 +3046,10 @@ async fn model_thinking_and_name_mutations_share_one_entry_and_source() {
     assert_eq!(
         model_changes,
         vec![
+            // PIR-BIN-091: the creation-time `model_change` bootstrap row pi
+            // writes before the first message (the fixture's four explicit
+            // switches follow it).
+            ("fake".to_string(), "fake-model".to_string()),
             ("fake".to_string(), "alt-model".to_string()),
             ("fake".to_string(), "fake-model".to_string()),
             ("fake".to_string(), "alt-model".to_string()),
@@ -3061,7 +3065,10 @@ async fn model_thinking_and_name_mutations_share_one_entry_and_source() {
         .collect();
     assert_eq!(
         thinking_changes,
-        vec!["high".to_string(), "off".to_string()]
+        // PIR-BIN-091: the creation-time `thinking_level_change` bootstrap row
+        // is the session's first entry (it records the resolved starting
+        // level); the fixture's two switches follow it.
+        vec!["off".to_string(), "high".to_string(), "off".to_string()]
     );
     let names: Vec<Option<String>> = entries
         .iter()

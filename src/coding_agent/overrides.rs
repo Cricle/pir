@@ -47,6 +47,22 @@ impl CliModelOverrides {
     }
 }
 
+/// The shared "no model available" CLI diagnostic.
+///
+/// It names the `models.json` this process actually reads
+/// (`ai::providers::agent_dir()` honors `PIR_AGENT_DIR` /
+/// `PIR_CODING_AGENT_DIR` / `PI_CODING_AGENT_DIR`), so a redirected agent dir
+/// is never sent to the default `~/.pi/agent/models.json` it does not use.
+/// Both `pir auth login` and the file path are existing actions.
+pub fn no_model_message() -> String {
+    format!(
+        "no model available; configure a provider with `pir auth login` or {}",
+        crate::ai::providers::agent_dir()
+            .join("models.json")
+            .display()
+    )
+}
+
 /// The resolved starting model plus the session-scope derived from
 /// `--models` / `settings.enabledModels`.
 #[derive(Debug, Clone)]
@@ -109,7 +125,24 @@ pub fn resolve_model(
     let (scoped_models, diagnostics) = resolve_model_scope(&scoped_patterns, models);
 
     let empty_model_thinking_levels = BTreeMap::new();
-    let has_auth = |provider: &str| has_configured_auth(provider, api_keys);
+    // `has_configured_auth` reads the stored-credential file for providers
+    // without a models.json key, and `find_initial_model`'s "first available
+    // model" scan asks per MODEL. The answer is a pure function of the
+    // provider id within one resolution, so memoize it per provider here: a
+    // 1756-model catalog without a configured default used to open
+    // `auth.json` once per catalog model.
+    let auth_checked: std::cell::RefCell<BTreeMap<String, bool>> =
+        std::cell::RefCell::new(BTreeMap::new());
+    let has_auth = |provider: &str| -> bool {
+        if let Some(known) = auth_checked.borrow().get(provider) {
+            return *known;
+        }
+        let value = has_configured_auth(provider, api_keys);
+        auth_checked
+            .borrow_mut()
+            .insert(provider.to_string(), value);
+        value
+    };
     let initial = find_initial_model(InitialModelOptions {
         cli_provider: overrides.provider.as_deref(),
         cli_model: overrides.model.as_deref(),
@@ -132,9 +165,7 @@ pub fn resolve_model(
     .map_err(anyhow::Error::msg)?;
 
     let Some(model) = initial.model else {
-        return Err(anyhow::anyhow!(
-            "no model available; configure a provider with `pir auth login` or ~/.pi/agent/models.json"
-        ));
+        return Err(anyhow::anyhow!(no_model_message()));
     };
 
     // The starting thinking level, upstream `buildSessionOptions` ->

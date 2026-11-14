@@ -420,8 +420,72 @@ pub fn visible_width(text: &str) -> usize {
     }
 }
 
+/// Terminal-conservative visible width for the write-path guard.
+///
+/// [`visible_width`] follows upstream `visibleWidth`: a grapheme cluster is
+/// one unit and a ZWJ emoji sequence counts 2. A terminal whose renderer does
+/// not join such clusters spends a cell per code point instead — measured
+/// against the real ConPTY renderer (DSR probe, p11 lane evidence):
+/// `👩‍💻` (U+1F469 U+200D U+1F4BB) occupies 5 cells (2 + 1 + 2), the
+/// four-person ZWJ family 11, `👍🏽` 4, `🇯🇵` 4, `1️⃣` 3, while the layout
+/// model says 2 for each. A row padded to the model's `width` therefore
+/// WRAPS there, and every row the incremental diff writes afterwards lands
+/// one line too low (PIR-TUI-036's stale rule / duplicated footer).
+///
+/// This measure counts every non-control code point as at least one cell
+/// (East Asian Wide/Fullwidth two; regional indicators and skin-tone
+/// modifiers two, matching the measured ConHost widths). It is never smaller
+/// than [`visible_width`], identical on plain ASCII/CJK text, and an
+/// over-estimate for zero-width marks — which is safe, because the guard
+/// only ever trims trailing padding, never content.
+pub fn terminal_safe_width(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    if text.is_ascii() && !text.contains('\x1b') && !text.contains('\t') {
+        return text.chars().filter(|c| !c.is_ascii_control()).count();
+    }
+    if !text.contains('\x1b') {
+        return sum_terminal_safe_widths(text);
+    }
+    sum_terminal_safe_widths(&strip_ansi(text))
+}
+
+/// [`terminal_safe_width`]'s per-code-point sum: every spacing code point
+/// counts its East Asian width (2 for Wide/Fullwidth, else 1), tabs 3; the
+/// emoji-presentation code points ConHost measures as two cells even where
+/// `unicode-width` says 1 (regional indicators, skin-tone modifiers) count 2.
+fn sum_terminal_safe_widths(text: &str) -> usize {
+    let mut width = 0usize;
+    for c in text.chars() {
+        if c == '\t' {
+            width += 3;
+        } else if !c.is_control() {
+            if is_regional_indicator(c) || ('\u{1F3FB}'..='\u{1F3FF}').contains(&c) {
+                width += 2;
+            } else {
+                width += east_asian_width(c);
+            }
+        }
+    }
+    width
+}
+
 /// Sum of `grapheme_width` over the grapheme clusters of `text`.
 fn sum_cluster_widths(text: &str) -> usize {
+    if text.is_ascii() && !text.contains('\t') {
+        // ASCII fast path: every grapheme cluster is a single code point
+        // (`\r\n` is the only multi-code-point ASCII cluster and both of its
+        // cells are zero), so the sum is exactly the printable count — the
+        // same value `grapheme_width` yields per cluster. This runs for every
+        // measured line of every frame (padding, wrapping, truncation), and
+        // the segmenter's state machine dominated styled ASCII rows in debug
+        // builds (the p15 search-walk probe path).
+        return text
+            .bytes()
+            .filter(|byte| (0x20..=0x7e).contains(byte))
+            .count();
+    }
     let mut width = 0usize;
     // Iterate the clusters directly instead of materializing
     // `grapheme_clusters`' `Vec<&str>`: this runs for every measured line of

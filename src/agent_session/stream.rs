@@ -11,14 +11,15 @@ impl AgentSession {
         self.auto_retry.store(enabled, Ordering::SeqCst);
     }
 
-    /// Cancel the pending retry wait (upstream `abortRetry()`): the armed
-    /// `_retryAbortController` aborts, the waiting request fails with
-    /// `AiError::RetryCancelled` ("Retry failed after N attempts: Retry
-    /// cancelled"), and the run ends. Unlike `setAutoRetryEnabled(false)` the
-    /// retry SETTING is untouched, so later requests keep retrying (upstream
-    /// `abortRetry` only aborts the controller).
+    /// Cancel the pending retry wait (upstream `abortRetry()`): BOTH latches
+    /// fire, so whichever layer is waiting — the transport's per-attempt hook
+    /// or the agent loop's backoff (PIR-BIN-100) — stops immediately. Unlike
+    /// `setAutoRetryEnabled(false)` the retry SETTING is untouched, so later
+    /// requests keep retrying (upstream `abortRetry` only aborts the
+    /// controller).
     pub fn abort_retry(&self) {
         self.retry_cancel.cancel();
+        self.retry_wait_cancel.cancel();
     }
 
     /// Install the host's retry-notice sink (the TUI's `RetryStatusIndicator`
@@ -198,8 +199,9 @@ impl AgentSession {
         // `settings.retry.provider.*` (upstream sdk.ts:341-352 resolves
         // `getProviderRetrySettings()` per request and layers it UNDER the
         // explicit option). Read per request so a settings edit applies to the
-        // next one, and only fields the user wrote are set: an unconfigured
-        // session keeps the transport defaults exactly as before.
+        // next one. `maxRetries` resolves the upstream `?? 0` default, so an
+        // unconfigured session sends one provider attempt per turn and the
+        // agent-level retry ladder owns transient 408/409/429/5xx statuses.
         let provider_retry = self.session_settings().provider_retry_overrides();
         let request_session_id = self.request_session_id();
         let transport_metadata = self.transport_metadata();
@@ -370,8 +372,8 @@ impl AgentSession {
             // retries (upstream `autoRetryEnabled`, default true). Otherwise
             // the explicit embedder override (`set_retry`) wins over
             // `settings.retry.provider.maxRetries` (upstream
-            // `options.maxRetries ?? providerRetrySettings.maxRetries`), and
-            // `None` on both keeps the transport's compiled default.
+            // `options.maxRetries ?? providerRetrySettings.maxRetries`), whose
+            // unset value resolves to `0` (upstream `?? 0`).
             max_retries: if self.auto_retry.load(Ordering::SeqCst) {
                 max_retries.or(provider_retry.max_retries)
             } else {

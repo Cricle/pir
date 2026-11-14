@@ -67,13 +67,14 @@ pub use algorithm::{
     estimate_prompt_tokens_conservative, estimate_request_context_tokens,
     estimate_request_context_tokens_conservative, estimate_request_messages_tokens,
     estimate_request_messages_tokens_floor, estimate_request_projected_context_tokens,
-    estimate_request_projected_context_tokens_floor, estimate_text_tokens,
+    estimate_request_projected_context_tokens_floor,
+    estimate_request_projected_context_tokens_pair, estimate_text_tokens,
     estimate_text_tokens_conservative, find_projected_cut_point, is_cut_point_message,
     is_turn_start_message, materialize_projected_tail, projection_materializations,
     reset_projection_materializations, should_compact, should_compact_tokens, text_token_units,
     CompactionConfig, ContextUsageEstimate, CutEntry, CutEntryRef, CutPointResult, MessageSequence,
-    PathEntry, PathEntryMeta, ProjectedEntry, ProjectionEntryMeta, CHARS_PER_TOKEN,
-    CONSERVATIVE_CHARS_PER_TOKEN,
+    PathEntry, PathEntryMeta, PathEntryShared, ProjectedEntry, ProjectionEntryMeta,
+    CHARS_PER_TOKEN, CONSERVATIVE_CHARS_PER_TOKEN,
 };
 pub use branch_summarization::{
     branch_summary_max_tokens, collect_entries_for_branch_summary, generate_branch_summary,
@@ -1874,6 +1875,14 @@ fn borrowed_preparation<'a, E: ProjectedEntry>(
 /// understated record (common with relays and mocked providers) must not hide
 /// a transcript that alone exceeds the window. The floor only counts content
 /// actually sent, so the maximum is never below the real request size.
+///
+/// Both numbers come from ONE traversal of the basis
+/// ([`estimate_request_projected_context_tokens_pair`], PIR-BIN-095): the
+/// transcript's per-message weight, the leading prompt's text and its JSON
+/// tool declarations are each computed once per request, and no
+/// `Vec<&Message>` view is materialized — the previous shape called the two
+/// public estimators back to back, each re-walking the transcript and
+/// re-serializing `tools[]`. The decision is identical.
 pub fn should_compact_request_refs<E: ProjectedEntry, P: PathEntry>(
     projected: &[E],
     path_entries: &[P],
@@ -1882,10 +1891,13 @@ pub fn should_compact_request_refs<E: ProjectedEntry, P: PathEntry>(
     model: &Model,
     config: &CompactionConfig,
 ) -> bool {
-    let estimate =
-        estimate_request_projected_context_tokens(projected, path_entries, system_prompt, tools)
-            .tokens;
-    let floor = estimate_request_projected_context_tokens_floor(projected, system_prompt, tools);
+    let (estimate, floor) = estimate_request_projected_context_tokens_pair(
+        projected,
+        &[],
+        path_entries,
+        system_prompt,
+        tools,
+    );
     should_compact_tokens(estimate.max(floor), model.context_window, config)
 }
 

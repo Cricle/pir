@@ -33,9 +33,9 @@ use pir::tui::app::{ChatContainer, ChatEntry};
 use pir::tui::core::{Component, FrameWork, Rows, RowsWork, Terminal, Text, TuiCore};
 use pir::tui::messages::ToolMemoWork;
 use pir::tui::terminal::{
-    advance_window, entry_payload_bytes, tail_window_start, window_payload_bytes, TranscriptWindow,
-    TRANSCRIPT_TAIL_BYTES, TRANSCRIPT_TAIL_MIN_ENTRIES, TRANSCRIPT_WINDOW_MAX_BYTES,
-    TRANSCRIPT_WINDOW_MAX_ENTRIES, TRANSCRIPT_WINDOW_STEP_ENTRIES,
+    advance_window, band_rows_per_entry, entry_payload_bytes, tail_window_start,
+    window_payload_bytes, TranscriptWindow, TRANSCRIPT_TAIL_BYTES, TRANSCRIPT_TAIL_MIN_ENTRIES,
+    TRANSCRIPT_WINDOW_MAX_BYTES, TRANSCRIPT_WINDOW_MAX_ENTRIES, TRANSCRIPT_WINDOW_STEP_ENTRIES,
 };
 use pir::tui::theme::{with_theme, ThemeColor};
 
@@ -353,6 +353,59 @@ fn advance_window_extends_ahead_and_releases_past_the_margin() {
         ),
         100
     );
+}
+
+/// The over-cap release is capped at one window step per frame: a large
+/// `gap / rows_per_entry` estimate (a mixed-height band, or a long scrolled
+/// jump) must not release an unbounded slice — and re-lay-out its rows — in a
+/// single frame. The release re-evaluates every scrolled frame, so the next
+/// frame continues from the capped top.
+#[test]
+fn advance_window_release_is_capped_per_step() {
+    let viewport = 30;
+    // gap = 50 000 - 60 rows, rows_per_entry = 1: the raw estimate is huge.
+    let released = advance_window(
+        0,
+        10_000,
+        TRANSCRIPT_WINDOW_MAX_BYTES + 1,
+        viewport * 2 + 50_000,
+        viewport,
+        1,
+        true,
+    );
+    assert_eq!(
+        released, TRANSCRIPT_WINDOW_STEP_ENTRIES,
+        "one frame may release at most one window step"
+    );
+    // The capped step still moves the top forward (the release happened).
+    assert!(released > 0);
+    // A small instant-cap release is NOT capped: `rows_per_entry` 10 with a
+    // 600-row gap releases 60 entries as before the cap.
+    let exact = advance_window(
+        0,
+        10_000,
+        TRANSCRIPT_WINDOW_MAX_BYTES + 1,
+        viewport * 2 + 600,
+        viewport,
+        10,
+        true,
+    );
+    assert_eq!(exact, 60);
+}
+
+/// The release estimate's rows-per-entry average rounds UP, so a fractional
+/// average cannot over-drop: the floored average (1 row/entry on a 2-row band)
+/// made the release drop ~2x the gap and clamp the viewport.
+#[test]
+fn band_rows_per_entry_rounds_up() {
+    // The measured band: 454 painted rows over 234 entries (~1.94/entry).
+    assert_eq!(band_rows_per_entry(454, 234), 2);
+    // Exact division is unchanged.
+    assert_eq!(band_rows_per_entry(400, 100), 4);
+    // Degenerate inputs keep the >= 1 invariant.
+    assert_eq!(band_rows_per_entry(0, 0), 1);
+    assert_eq!(band_rows_per_entry(0, 7), 1);
+    assert_eq!(band_rows_per_entry(3, 10), 1);
 }
 
 // ---------------------------------------------------------------------------

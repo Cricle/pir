@@ -1109,3 +1109,459 @@ async fn os_permission_denied_write_is_not_reported_as_confinement() {
     );
     tokio::fs::remove_dir_all(&root).await.expect("remove root");
 }
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-077 — `write`/`edit` failure text is stable English + the OS code
+// ---------------------------------------------------------------------------
+
+/// The formatter contract every `write`/`edit` failure goes through: an
+/// English reason category plus the numeric OS code, and never the
+/// host-localized `io::Error` `Display` string (`拒绝访问。 (os error 5)` on a
+/// zh-CN Windows), which made the message unreproducible across machines.
+///
+/// Driven through the formatter seam with synthetic `io::Error`s: a real
+/// permission-denied state is not portably producible (it depends on the
+/// account's rights, and a root/Administrator test process bypasses the
+/// denial), while the contract under test here is the rendering itself. The
+/// Windows end-to-end arm below covers the real OS failure.
+#[test]
+fn mutation_failure_text_is_english_and_locale_independent() {
+    use pir::coding_agent::tools::mutation_error_for_tests;
+
+    let denied = os_access_denied();
+    let code = denied.raw_os_error().expect("raw OS error");
+    assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+
+    let write = mutation_error_for_tests("write", "x.txt", &denied);
+    assert!(
+        write.starts_with("Cannot write 'x.txt': permission denied ("),
+        "the category must be stable English: {write}"
+    );
+    assert!(
+        write.ends_with(&format!("os error {code})")),
+        "the numeric OS code must survive: {write}"
+    );
+    assert!(write.is_ascii(), "localized OS text leaked: {write}");
+    #[cfg(windows)]
+    assert_eq!(
+        write,
+        "Cannot write 'x.txt': permission denied (Access is denied; os error 5)"
+    );
+
+    // An edit's failed write must name the edit tool, not `write` (the pre-fix
+    // arm said `Cannot write` for an edit — PIR-BIN-077 2h).
+    let edit = mutation_error_for_tests("edit", "x.txt", &denied);
+    assert!(
+        edit.starts_with("Cannot edit 'x.txt': permission denied ("),
+        "{edit}"
+    );
+    assert!(!edit.contains("Cannot write"), "{edit}");
+    assert!(edit.is_ascii(), "{edit}");
+
+    // Every mapped kind is English and keeps its numeric code.
+    let missing =
+        mutation_error_for_tests("write", "gone.txt", &std::io::Error::from_raw_os_error(2));
+    assert!(
+        missing.starts_with("Cannot write 'gone.txt': no such file or directory ("),
+        "{missing}"
+    );
+    assert!(missing.ends_with("os error 2)"), "{missing}");
+    assert!(missing.is_ascii(), "{missing}");
+
+    // A component over the platform limit: `ERROR_INVALID_NAME` (os error 123)
+    // — the exact case from PIR-BIN-077 (2f). Windows-only: 123 is not a
+    // portable errno.
+    #[cfg(windows)]
+    {
+        let invalid_name = std::io::Error::from_raw_os_error(123);
+        assert_eq!(invalid_name.kind(), std::io::ErrorKind::InvalidFilename);
+        let long_name =
+            mutation_error_for_tests("write", &format!("{}.txt", "n".repeat(300)), &invalid_name);
+        assert!(long_name.contains(": invalid file name ("), "{long_name}");
+        assert!(long_name.ends_with("os error 123)"), "{long_name}");
+        assert!(long_name.is_ascii(), "{long_name}");
+    }
+
+    // An OS-layer error whose own `Display` is localized must not contribute
+    // text: with no raw code there is no detail tail, and never the Display
+    // string (`io::Error::new` keeps it for `Display` only).
+    let localized = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "拒绝访问。");
+    assert_eq!(localized.raw_os_error(), None);
+    let rendered = mutation_error_for_tests("write", "x.txt", &localized);
+    assert_eq!(rendered, "Cannot write 'x.txt': permission denied");
+    assert!(rendered.is_ascii(), "{rendered}");
+}
+
+/// The real `write`/`edit` tools on Windows: a directory target and a
+/// read-only file both fail with `ERROR_ACCESS_DENIED`, and the model gets the
+/// stable English text with the OS code — never the host-localized string, and
+/// an `edit` failure says `edit` (PIR-BIN-077 arms 2c/2a/2h).
+///
+/// Both states are deterministic on Windows (the file API refuses a directory
+/// without `FILE_FLAG_BACKUP_SEMANTICS`; the read-only attribute denies the
+/// atomic replace), so this arm needs no flaky permission setup.
+#[cfg(windows)]
+#[tokio::test]
+async fn write_and_edit_failures_use_stable_english_text() {
+    fn set_read_only(path: &std::path::Path, read_only: bool) {
+        let mut permissions = std::fs::metadata(path).expect("stat").permissions();
+        permissions.set_readonly(read_only);
+        std::fs::set_permissions(path, permissions).expect("set read-only attribute");
+    }
+
+    let root = temp_workspace();
+    tokio::fs::create_dir_all(root.join("adir"))
+        .await
+        .expect("create dir target");
+    tokio::fs::write(root.join("ro.txt"), "RO\n")
+        .await
+        .expect("write fixture");
+    set_read_only(&root.join("ro.txt"), true);
+
+    let context = ToolContext::new(&root);
+    let mut registry = ToolRegistry::new();
+    register_core_tools(&mut registry);
+
+    let (onto_dir, dir_is_error) = run_tool_checked(
+        &registry,
+        "write",
+        serde_json::json!({"path": "adir", "content": "x\n"}),
+        &context,
+    )
+    .await;
+    let (over_read_only, write_is_error) = run_tool_checked(
+        &registry,
+        "write",
+        serde_json::json!({"path": "ro.txt", "content": "NEW\n"}),
+        &context,
+    )
+    .await;
+    let (edit_read_only, edit_is_error) = run_tool_checked(
+        &registry,
+        "edit",
+        serde_json::json!({"path": "ro.txt", "edits": [{"oldText": "RO", "newText": "EDITED"}]}),
+        &context,
+    )
+    .await;
+    // Restore before asserting so cleanup works even on failure.
+    set_read_only(&root.join("ro.txt"), false);
+
+    assert!(
+        dir_is_error,
+        "writing onto a directory must fail: {onto_dir}"
+    );
+    assert_eq!(
+        onto_dir,
+        "Cannot write 'adir': permission denied (Access is denied; os error 5)"
+    );
+    assert!(
+        write_is_error,
+        "writing over a read-only file must fail: {over_read_only}"
+    );
+    assert_eq!(
+        over_read_only,
+        "Cannot write 'ro.txt': permission denied (Access is denied; os error 5)"
+    );
+    assert!(
+        edit_is_error,
+        "editing a read-only file must fail: {edit_read_only}"
+    );
+    assert_eq!(
+        edit_read_only,
+        "Cannot edit 'ro.txt': permission denied (Access is denied; os error 5)"
+    );
+    for text in [&onto_dir, &over_read_only, &edit_read_only] {
+        assert!(text.is_ascii(), "localized OS text leaked: {text}");
+    }
+    assert!(
+        !edit_read_only.contains("Cannot write"),
+        "an edit failure must not be reported as a write: {edit_read_only}"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(root.join("ro.txt"))
+            .await
+            .expect("read fixture"),
+        "RO\n",
+        "no failed mutation may change the file"
+    );
+    assert!(
+        root.join("adir").is_dir(),
+        "the directory target is untouched"
+    );
+    tokio::fs::remove_dir_all(&root).await.expect("remove root");
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-079 — workspace-internal `..` is accepted, escapes stay refused
+// ---------------------------------------------------------------------------
+
+/// A `..` that never leaves the workspace is accepted and resolves to the
+/// intended file, while a path that genuinely escapes keeps the refusal.
+/// Pinned at the confinement seam (`workspace_path_parts`) that every local
+/// file tool shares; the spellings are the case table from PIR-BIN-079.
+#[test]
+fn in_workspace_parent_components_are_accepted_and_escapes_still_refused() {
+    use pir::coding_agent::tools::workspace_path_parts;
+    use std::path::Component;
+
+    let base = temp_workspace();
+    let ws = base.join("ws");
+    std::fs::create_dir_all(ws.join("dir").join("sub")).expect("create fixture");
+    std::fs::create_dir_all(ws.join("src")).expect("create fixture");
+    std::fs::write(ws.join("src").join("main.rs"), "fn main(){}\n").expect("write fixture");
+    std::fs::write(ws.join("dir").join("a.txt"), "A-DIR\n").expect("write fixture");
+    std::fs::write(base.join("outside.txt"), "OUT\n").expect("write fixture");
+    let canonical =
+        |path: &std::path::Path| std::fs::canonicalize(path).expect("canonicalize fixture");
+
+    let main_rs = canonical(&ws.join("src").join("main.rs"));
+    let dir_a = canonical(&ws.join("dir").join("a.txt"));
+    // Absolute spellings of the same targets: an absolute request is never
+    // joined to the root, so the confinement walk itself has to resolve the
+    // `..` (the PIR-BIN-079 residual).
+    let abs_main = ws.join("src").join("..").join("src").join("main.rs");
+    let abs_dir = ws.join("dir").join("sub").join("..").join("a.txt");
+    let abs_dot = ws
+        .join(".")
+        .join("src")
+        .join("..")
+        .join("src")
+        .join("main.rs");
+    let abs_sub2 = ws.join("sub2").join("..").join("dir").join("a.txt");
+    let cases: Vec<(String, PathBuf)> = vec![
+        ("src/../src/main.rs".to_owned(), main_rs.clone()),
+        // The native Windows spelling a model retypes from a listing.
+        (r"src\..\src\main.rs".to_owned(), main_rs.clone()),
+        ("./src/../src/main.rs".to_owned(), main_rs.clone()),
+        ("dir/sub/../a.txt".to_owned(), dir_a.clone()),
+        ("dir/sub/../sub/../a.txt".to_owned(), dir_a.clone()),
+        // A not-yet-existing intermediate directory in front of the `..`
+        // (pi 1.4.0 resolves the same spelling to the same file).
+        ("sub2/../dir/a.txt".to_owned(), dir_a.clone()),
+        (abs_main.to_string_lossy().into_owned(), main_rs.clone()),
+        (abs_dir.to_string_lossy().into_owned(), dir_a.clone()),
+        (abs_dot.to_string_lossy().into_owned(), main_rs.clone()),
+        (abs_sub2.to_string_lossy().into_owned(), dir_a.clone()),
+    ];
+    for (requested, expected) in cases {
+        let parts = workspace_path_parts(&ws, &requested)
+            .unwrap_or_else(|error| panic!("'{requested}' must be accepted: {error}"));
+        assert_eq!(canonical(&parts.candidate), expected, "'{requested}'");
+        assert!(
+            !parts
+                .relative
+                .components()
+                .any(|component| matches!(component, Component::ParentDir)),
+            "'{requested}' must resolve before the symlink walk sees it: {}",
+            parts.relative.display()
+        );
+    }
+
+    // `..` onto a directory is accepted at the seam; the tools then report the
+    // ordinary directory result, not an escape. The absolute spelling must
+    // behave the same.
+    let onto_dir = workspace_path_parts(&ws, "dir/sub/..")
+        .unwrap_or_else(|error| panic!("'dir/sub/..' must be accepted: {error}"));
+    assert_eq!(canonical(&onto_dir.candidate), canonical(&ws.join("dir")));
+    let abs_onto_dir = ws.join("dir").join("sub").join("..");
+    let onto_dir_abs = workspace_path_parts(&ws, &abs_onto_dir.to_string_lossy())
+        .unwrap_or_else(|error| panic!("'{}' must be accepted: {error}", abs_onto_dir.display()));
+    assert_eq!(
+        canonical(&onto_dir_abs.candidate),
+        canonical(&ws.join("dir"))
+    );
+
+    // The escape half stays refused, and the fixture proves the target really
+    // lies outside the root: the refusal is about the boundary, not a missing
+    // file.
+    assert!(base.join("outside.txt").is_file());
+    let abs_escape = base.join("outside.txt");
+    let abs_escape_dotdot = ws.join("..").join("outside.txt");
+    let abs_escape_climb = ws.join("dir").join("..").join("..").join("outside.txt");
+    let escapes: Vec<String> = vec![
+        "..".to_owned(),
+        "../outside.txt".to_owned(),
+        "dir/../../outside.txt".to_owned(),
+        "src/../../outside.txt".to_owned(),
+        abs_escape.to_string_lossy().into_owned(),
+        abs_escape_dotdot.to_string_lossy().into_owned(),
+        abs_escape_climb.to_string_lossy().into_owned(),
+    ];
+    for requested in escapes {
+        match workspace_path_parts(&ws, &requested) {
+            Ok(parts) => panic!(
+                "'{requested}' must be refused, got {}",
+                parts.candidate.display()
+            ),
+            Err(error) => assert_eq!(
+                error,
+                format!("Path '{requested}' escapes the workspace root")
+            ),
+        }
+    }
+
+    std::fs::remove_dir_all(&base).expect("remove root");
+}
+
+/// The same two directions through the real tools (the model-facing surface):
+/// the in-workspace spelling reads the intended file and lands a `write` at
+/// the resolved path; the escaping spelling is refused with the confinement
+/// wording and touches nothing outside the root.
+#[tokio::test]
+async fn file_tools_accept_dotdot_inside_the_workspace() {
+    let base = temp_workspace();
+    let ws = base.join("ws");
+    tokio::fs::create_dir_all(ws.join("dir").join("sub"))
+        .await
+        .expect("create fixture");
+    tokio::fs::write(ws.join("dir").join("a.txt"), "A-DIR\n")
+        .await
+        .expect("write fixture");
+    tokio::fs::write(base.join("outside.txt"), "OUTSIDE\n")
+        .await
+        .expect("write fixture");
+    let context = ToolContext::new(&ws);
+    let mut registry = ToolRegistry::new();
+    register_core_tools(&mut registry);
+
+    let (content, is_error) = run_tool_checked(
+        &registry,
+        "read",
+        serde_json::json!({"path": "dir/sub/../a.txt"}),
+        &context,
+    )
+    .await;
+    assert!(!is_error, "in-workspace `..` read failed: {content}");
+    assert_eq!(content, "A-DIR\n");
+
+    // The absolute spelling of the same file: it bypasses the root join, so
+    // the confinement walk itself must resolve the `..`.
+    let abs_read = ws.join("dir").join("sub").join("..").join("a.txt");
+    let (abs_content, abs_is_error) = run_tool_checked(
+        &registry,
+        "read",
+        serde_json::json!({"path": abs_read.to_string_lossy().into_owned()}),
+        &context,
+    )
+    .await;
+    assert!(
+        !abs_is_error,
+        "absolute in-workspace `..` read failed: {abs_content}"
+    );
+    assert_eq!(abs_content, "A-DIR\n");
+
+    let (written, is_error) = run_tool_checked(
+        &registry,
+        "write",
+        serde_json::json!({"path": "dir/sub/../written.txt", "content": "DD-WRITE\n"}),
+        &context,
+    )
+    .await;
+    assert!(!is_error, "in-workspace `..` write failed: {written}");
+    assert_eq!(
+        tokio::fs::read_to_string(ws.join("dir").join("written.txt"))
+            .await
+            .expect("read back"),
+        "DD-WRITE\n",
+        "the bytes must land at the resolved inside path"
+    );
+
+    let abs_written_target = ws
+        .join("dir")
+        .join("sub")
+        .join("..")
+        .join("abs-written.txt");
+    let (abs_written, abs_write_error) = run_tool_checked(
+        &registry,
+        "write",
+        serde_json::json!({
+            "path": abs_written_target.to_string_lossy().into_owned(),
+            "content": "ABS-WRITE\n"
+        }),
+        &context,
+    )
+    .await;
+    assert!(
+        !abs_write_error,
+        "absolute in-workspace `..` write failed: {abs_written}"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(ws.join("dir").join("abs-written.txt"))
+            .await
+            .expect("read back"),
+        "ABS-WRITE\n",
+        "the absolute spelling must land at the resolved inside path"
+    );
+
+    let (escape, is_error) = run_tool_checked(
+        &registry,
+        "read",
+        serde_json::json!({"path": "../outside.txt"}),
+        &context,
+    )
+    .await;
+    assert!(is_error, "the escape must be refused: {escape}");
+    assert!(escape.contains("escapes the workspace root"), "{escape}");
+    assert!(
+        !escape.contains("OUTSIDE"),
+        "no outside bytes may leak: {escape}"
+    );
+
+    // The absolute spelling of the escape is refused the same way.
+    let abs_escape = base.join("outside.txt");
+    let (abs_escape_text, abs_escape_error) = run_tool_checked(
+        &registry,
+        "read",
+        serde_json::json!({"path": abs_escape.to_string_lossy().into_owned()}),
+        &context,
+    )
+    .await;
+    assert!(
+        abs_escape_error,
+        "the absolute escape must be refused: {abs_escape_text}"
+    );
+    assert!(
+        abs_escape_text.contains("escapes the workspace root"),
+        "{abs_escape_text}"
+    );
+    assert!(
+        !abs_escape_text.contains("OUTSIDE"),
+        "no outside bytes may leak: {abs_escape_text}"
+    );
+
+    // ... and the absolute spelling that climbs out through `..`.
+    let abs_climb = ws.join("..").join("outside.txt");
+    let (abs_climb_text, abs_climb_error) = run_tool_checked(
+        &registry,
+        "read",
+        serde_json::json!({"path": abs_climb.to_string_lossy().into_owned()}),
+        &context,
+    )
+    .await;
+    assert!(
+        abs_climb_error,
+        "the absolute `..` escape must be refused: {abs_climb_text}"
+    );
+    assert!(
+        abs_climb_text.contains("escapes the workspace root"),
+        "{abs_climb_text}"
+    );
+
+    let (escape_write, is_error) = run_tool_checked(
+        &registry,
+        "write",
+        serde_json::json!({"path": "dir/../../escaped.txt", "content": "nope\n"}),
+        &context,
+    )
+    .await;
+    assert!(is_error, "the escape must be refused: {escape_write}");
+    assert!(
+        escape_write.contains("escapes the workspace root"),
+        "{escape_write}"
+    );
+    assert!(
+        !base.join("escaped.txt").exists(),
+        "a refused write must not create anything outside the root"
+    );
+    tokio::fs::remove_dir_all(&base).await.expect("remove root");
+}

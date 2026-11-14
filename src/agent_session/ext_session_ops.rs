@@ -119,10 +119,7 @@ fn session_snapshot_json_text(session: &SessionManager) -> String {
         .filter(|entry| !entry.is_header())
         .map(|entry| entry.as_ref())
         .collect();
-    let branch = crate::session_manager::projection::build_session_path(
-        session.resident_entries(),
-        session.leaf_id(),
-    );
+    let branch = session.projected_branch_path(session.leaf_id());
     // The upstream `SessionHeader` carries the `type: "session"` tag (the
     // FileEntry variant marker pir keeps on the enum, not the inner struct).
     let mut header = serde_json::to_value(session.header()).unwrap_or(JsonValue::Null);

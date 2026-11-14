@@ -2267,8 +2267,11 @@ async fn native_manual_compaction_orders_its_lifecycle_events() {
         .expect("session storage attached");
     assert_eq!(
         from_hook,
-        Some(None),
-        "a built-in manual compaction must not be marked fromHook"
+        Some(Some(false)),
+        "a built-in manual compaction records fromHook: false — pi passes the \
+         resolved `fromExtension` boolean at both appendCompaction call sites \
+         (agent-session.ts:2911/3237) and its own files carry the explicit \
+         `false` (fixture CB-pi-compacted.jsonl rows 8/10)"
     );
 }
 

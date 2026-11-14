@@ -491,14 +491,14 @@ impl AgentSession {
         session: &Arc<tokio::sync::Mutex<SessionManager>>,
     ) -> crate::Result<(
         crate::session_manager::SessionProjection,
-        Vec<crate::compaction::PathEntryMeta>,
+        Vec<crate::compaction::PathEntryShared>,
     )> {
         let cached = self.take_cached_prompt_projection();
         let session = Arc::clone(session);
         let (projection, branch, reused) = tokio::task::spawn_blocking(
             move || -> crate::Result<(
                 crate::session_manager::SessionProjection,
-                Vec<crate::compaction::PathEntryMeta>,
+                Vec<crate::compaction::PathEntryShared>,
                 bool,
             )> {
                 let mut session = session.blocking_lock();
@@ -512,7 +512,11 @@ impl AgentSession {
                     session.widen_to_full()?;
                 }
                 let (projection, reused) = session.build_session_projection_with_cache(cached);
-                let branch = session.branch_path_meta(None);
+                // The per-PROMPT branch snapshot: shared entry handles
+                // (PIR-BIN-096) — the hook reads ids/flags off it, so the
+                // owned-id shape would clone one `String` per path entry per
+                // prompt for nothing.
+                let branch = session.branch_path_shared(None);
                 Ok((projection, branch, reused))
             },
         )
@@ -604,18 +608,10 @@ impl AgentSession {
             }) else {
                 return;
             };
-            if crate::session_manager::projection::projected_message_count_for_leaf(
-                session.resident_entries(),
-                leaf_id.as_deref(),
-            ) != messages.len()
-            {
+            if session.projected_message_count_for_leaf(leaf_id.as_deref()) != messages.len() {
                 return;
             }
-            if !crate::session_manager::projection::path_delta_is_append_only(
-                session.resident_entries(),
-                run_start_leaf,
-                leaf_id.as_deref(),
-            ) {
+            if !session.path_delta_is_append_only(run_start_leaf, leaf_id.as_deref()) {
                 return;
             }
             crate::session_manager::projection::CachedSessionProjection {
@@ -1356,7 +1352,17 @@ impl AgentSession {
         // whole transcript twice before anything reached the model. The
         // prompt-start gate below reuses this projection when session_start /
         // input handlers did not move the leaf.
-        let mut snapshot_projection = if self.event_extensions().is_some() {
+        //
+        // A native-only plugin host (`plugins.is_some()` with no JS runtime —
+        // the builtin-only TUI/SDK shape) takes the same path: its snapshot
+        // push reads `entries` off this projection instead of building a
+        // second transcript-sized one and dropping it. Without a push that
+        // consumes it (no plugin host) or a gate that reuses it (compaction
+        // off), the early build would be dropped unused, so those hosts keep
+        // building at their own call sites.
+        let prebuild_projection = self.event_extensions().is_some()
+            || (self.plugins.is_some() && self.compaction_config().is_some());
+        let mut snapshot_projection = if prebuild_projection {
             match &self.session {
                 Some(session) => self.project_session_with_cache(session).await.ok(),
                 None => None,
@@ -1465,7 +1471,7 @@ impl AgentSession {
         // index build per prompt instead of two.
         let mut startup_projection: Option<(
             crate::session_manager::SessionProjection,
-            Vec<crate::compaction::PathEntryMeta>,
+            Vec<crate::compaction::PathEntryShared>,
         )> = None;
         // The prompt-start gate runs the threshold check once before the
         // starting message is persisted. If it actually starts a compaction,
@@ -1532,12 +1538,28 @@ impl AgentSession {
                             .any(|message| matches!(message, Message::Assistant(_)))
                         {
                             let pre_messages = std::mem::take(&mut projection.messages);
+                            // Hand the hook the snapshot it would otherwise
+                            // rebuild: this projection's per-entry metadata
+                            // (the same builder the run's parked snapshot
+                            // uses) plus its branch. The leaf check above
+                            // already proved the live session ends on this
+                            // projection's leaf, so without it the hook
+                            // re-read the same session twice
+                            // (`projection_entry_meta` + `branch_path_shared`)
+                            // on every prompt — two full-transcript walks for
+                            // data held right here (R2).
+                            let gate_snapshot = (
+                                Arc::new(compaction::ProjectionEntryMeta::from_projection(
+                                    &projection.entries,
+                                )),
+                                Arc::new(branch.clone()),
+                            );
                             // Reuse the loop's own threshold hook (same config
                             // read, threshold basis, `session_before_compact`
                             // interception, persistence, and session events).
                             let hook = self.compaction_hook(
                                 Arc::clone(&self.compaction),
-                                None,
+                                Some(gate_snapshot),
                                 Some(self.threshold_model_for(&model)),
                                 Some(Arc::clone(&threshold_gate)),
                                 persist_ledger.run_session_id(),
@@ -2074,6 +2096,10 @@ impl AgentSession {
                         super::events::emit_session_event_to(&events, session_event);
                     })
                 }),
+                // The AGENT-LAYER backoff's cancel handle (PIR-BIN-100):
+                // `abort_retry()` fires it, so Esc during a status-class
+                // countdown stops the wait instead of letting the ladder run.
+                retry_wait_abort: Some(Arc::new(self.retry_wait_cancel.clone())),
                 extensions: self.event_extensions().cloned(),
                 // The unified host's NATIVE plugin fan-out (Rust builtins +
                 // inline plugins): `extensions` above is the JS face, and the
@@ -3261,10 +3287,7 @@ impl AgentSession {
                 return;
             }
         }
-        let path = crate::session_manager::projection::build_session_path(
-            session.resident_entries(),
-            session.leaf_id(),
-        );
+        let path = session.projected_branch_path(session.leaf_id());
         let recorded = path.iter().rev().find_map(|entry| match entry {
             FileEntry::ModelChange(change) => {
                 Some((change.provider.clone(), change.model_id.clone()))

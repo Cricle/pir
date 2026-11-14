@@ -102,8 +102,21 @@ pub(super) fn build_provider_from_models(
     display_name: &str,
     models: &[Model],
 ) -> AiResult<ProviderBox> {
+    let refs: Vec<&Model> = models.iter().collect();
+    build_provider_from_model_refs(provider_id, display_name, &refs)
+}
+
+/// [`build_provider_from_models`] over borrowed entries: the catalog wrapper
+/// groups its model list by api id without copying it first, so an api group
+/// is handed to the adapter as references and copied exactly once (into the
+/// adapter's own owned list).
+fn build_provider_from_model_refs(
+    provider_id: &str,
+    display_name: &str,
+    models: &[&Model],
+) -> AiResult<ProviderBox> {
     let _ = display_name;
-    let first = models
+    let first = *models
         .first()
         .ok_or_else(|| AiError::UnknownProvider(provider_id.to_string()))?;
     let base_url = first.base_url.clone();
@@ -114,7 +127,7 @@ pub(super) fn build_provider_from_models(
             Ok(Arc::new(AnthropicMessagesProvider::new(
                 provider_id,
                 base_url,
-                models.to_vec(),
+                owned_models(models),
             )?))
         }
         #[cfg(not(feature = "provider-anthropic"))]
@@ -128,7 +141,7 @@ pub(super) fn build_provider_from_models(
                 crate::ai::api::pi_messages::PiMessagesProvider::new(
                     provider_id,
                     base_url,
-                    models.to_vec(),
+                    owned_models(models),
                 )?,
             ))
         }
@@ -146,9 +159,10 @@ pub(super) fn build_provider_from_models(
                 .unwrap_or_else(|| {
                     vec!["GEMINI_API_KEY".to_string(), "GOOGLE_API_KEY".to_string()]
                 });
-            let provider = GoogleGenerativeAiProvider::new(provider_id, base_url, models.to_vec())?
-                .with_display_name(display_name)
-                .with_api_key_env(env_keys);
+            let provider =
+                GoogleGenerativeAiProvider::new(provider_id, base_url, owned_models(models))?
+                    .with_display_name(display_name)
+                    .with_api_key_env(env_keys);
             Ok(Arc::new(provider))
         }
         #[cfg(not(feature = "provider-google"))]
@@ -170,7 +184,7 @@ pub(super) fn build_provider_from_models(
                         "GOOGLE_API_KEY".to_string(),
                     ]
                 });
-            let provider = GoogleVertexProvider::new(provider_id, base_url, models.to_vec())?
+            let provider = GoogleVertexProvider::new(provider_id, base_url, owned_models(models))?
                 .with_display_name(display_name)
                 .with_api_key_env(env_keys);
             Ok(Arc::new(provider))
@@ -183,9 +197,10 @@ pub(super) fn build_provider_from_models(
         #[cfg(feature = "provider-openai")]
         {
             let env_keys = env_keys_for(provider_id, "openai", &["OPENAI_API_KEY"]);
-            let provider = OpenAiResponsesProvider::new(provider_id, base_url, models.to_vec())?
-                .with_display_name(display_name)
-                .with_api_key_env(env_keys);
+            let provider =
+                OpenAiResponsesProvider::new(provider_id, base_url, owned_models(models))?
+                    .with_display_name(display_name)
+                    .with_api_key_env(env_keys);
             Ok(Arc::new(provider))
         }
         #[cfg(not(feature = "provider-openai"))]
@@ -196,7 +211,7 @@ pub(super) fn build_provider_from_models(
         #[cfg(feature = "provider-openai")]
         {
             let provider =
-                OpenAiCodexResponsesProvider::new(provider_id, base_url, models.to_vec())?
+                OpenAiCodexResponsesProvider::new(provider_id, base_url, owned_models(models))?
                     .with_display_name(display_name);
             Ok(Arc::new(provider))
         }
@@ -211,7 +226,7 @@ pub(super) fn build_provider_from_models(
         {
             let env_keys = env_keys_for(provider_id, "azure", &["AZURE_OPENAI_API_KEY"]);
             let provider =
-                AzureOpenAiResponsesProvider::new(provider_id, base_url, models.to_vec())?
+                AzureOpenAiResponsesProvider::new(provider_id, base_url, owned_models(models))?
                     .with_display_name(display_name)
                     .with_api_key_env(env_keys);
             Ok(Arc::new(provider))
@@ -226,7 +241,7 @@ pub(super) fn build_provider_from_models(
         #[cfg(feature = "provider-bedrock")]
         {
             let provider =
-                BedrockConverseStreamProvider::new(provider_id, base_url, models.to_vec())?
+                BedrockConverseStreamProvider::new(provider_id, base_url, owned_models(models))?
                     .with_display_name(display_name);
             Ok(Arc::new(provider))
         }
@@ -241,7 +256,7 @@ pub(super) fn build_provider_from_models(
         {
             let env_keys = env_keys_for(provider_id, "mistral", &["MISTRAL_API_KEY"]);
             let provider =
-                MistralConversationsProvider::new(provider_id, base_url, models.to_vec())?
+                MistralConversationsProvider::new(provider_id, base_url, owned_models(models))?
                     .with_display_name(display_name)
                     .with_api_key_env(env_keys);
             Ok(Arc::new(provider))
@@ -260,9 +275,10 @@ pub(super) fn build_provider_from_models(
                 .find(|(id, _)| *id == provider_id)
                 .map(|(_, keys)| keys.iter().map(|key| (*key).to_string()).collect())
                 .unwrap_or_else(|| vec!["OPENAI_API_KEY".to_string()]);
-            let provider = OpenAiCompatibleProvider::new(provider_id, base_url, models.to_vec())?
-                .with_display_name(display_name)
-                .with_api_key_env(env_keys);
+            let provider =
+                OpenAiCompatibleProvider::new(provider_id, base_url, owned_models(models))?
+                    .with_display_name(display_name)
+                    .with_api_key_env(env_keys);
             Ok(Arc::new(provider))
         }
         #[cfg(not(feature = "provider-openai"))]
@@ -270,6 +286,12 @@ pub(super) fn build_provider_from_models(
             Err(super::catalog::missing_adapter_error(&first.api))
         }
     }
+}
+
+/// The owned copies of a borrowed api group (the shape the adapter
+/// constructors take; they rewrite each model's base_url in place).
+fn owned_models(models: &[&Model]) -> Vec<Model> {
+    models.iter().map(|model| (*model).clone()).collect()
 }
 
 /// Resolve the api-key env names for a provider from the runtime env-api-key
@@ -335,15 +357,30 @@ impl CatalogProviderEntry {
         display_name: &str,
         models: &[Model],
     ) -> AiResult<ProviderBox> {
-        let mut groups: BTreeMap<&str, Vec<Model>> = BTreeMap::new();
-        for model in models {
-            groups
-                .entry(model.api.as_str())
-                .or_default()
-                .push(model.clone());
+        Self::from_owned_models(
+            provider_id.to_string(),
+            display_name.to_string(),
+            models.to_vec(),
+        )
+    }
+
+    /// [`Self::from_models`] over a model list the caller already owns: the
+    /// provider field keeps the caller's `Vec` instead of copying it again
+    /// (a models.json-composed provider owns its composed list outright).
+    pub fn from_owned_models(
+        provider_id: String,
+        display_name: String,
+        models: Vec<Model>,
+    ) -> AiResult<ProviderBox> {
+        // Group by reference so the (discarded) grouping map never copies a
+        // model: each api group is handed to its adapter as borrowed entries
+        // and copied exactly once, into the adapter's own owned list.
+        let mut groups: BTreeMap<&str, Vec<&Model>> = BTreeMap::new();
+        for model in &models {
+            groups.entry(model.api.as_str()).or_default().push(model);
         }
         let mut adapters: BTreeMap<String, Option<ProviderBox>> = BTreeMap::new();
-        for (api, models) in groups {
+        for (api, group) in groups {
             // `openai-chat` is the fallback api id for models.json/dynamic
             // entries; it needs the OpenAI-compatible adapter, so it follows
             // `provider-openai` just like `supported_apis()` does. With the
@@ -352,10 +389,10 @@ impl CatalogProviderEntry {
             let supported = super::catalog::supported_apis().contains(&api)
                 || (api == "openai-chat" && cfg!(feature = "provider-openai"));
             let adapter = if supported {
-                Some(build_provider_from_models(
-                    provider_id,
-                    display_name,
-                    &models,
+                Some(build_provider_from_model_refs(
+                    &provider_id,
+                    &display_name,
+                    &group,
                 )?)
             } else {
                 None
@@ -363,10 +400,10 @@ impl CatalogProviderEntry {
             adapters.insert(api.to_string(), adapter);
         }
         Ok(Arc::new(Self {
-            provider_id: provider_id.to_string(),
-            display_name: display_name.to_string(),
+            provider_id,
+            display_name,
             adapters,
-            models: models.to_vec(),
+            models,
         }))
     }
 

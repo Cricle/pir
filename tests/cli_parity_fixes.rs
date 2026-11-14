@@ -370,7 +370,8 @@ fn mcp_list_is_a_distinct_upstream_shaped_command() {
         }
         other => panic!("unexpected mcp command: {other:?}"),
     }
-    // No subcommand keeps the historical default (the host supplies Check).
+    // No subcommand parses to `None`; the host prints the mcp help for it,
+    // like upstream bare `pi mcp` (PIR-BIN-090 — it used to supply Check).
     assert!(mcp_command(&["mcp"]).is_none());
 }
 
@@ -472,6 +473,41 @@ fn mcp_list_disabled_server_succeeds_and_empty_list_is_informative() {
     assert!(
         stdout(&output).contains("No MCP servers configured"),
         "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn bare_mcp_prints_help_without_test_connecting_any_server() {
+    // Upstream bare `pi mcp` logs the mcp HELP and returns 0
+    // (extensions/mcp/cli.ts:189-192); pir used to default to
+    // `McpCommand::Check` and test-connect every configured server
+    // (PIR-BIN-090). A configured stdio server that cannot start proves no
+    // connection was attempted.
+    let agent = temp_dir("mcp-bare-help");
+    std::fs::write(
+        pir::config::mcp::global_mcp_path(&agent),
+        r#"{"mcpServers":{"broken":{"command":"pir-lane-i-no-such-command"}}}"#,
+    )
+    .expect("write mcp.json");
+    let output = run_pir(&agent, &agent, &["mcp"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("Usage:") && text.contains("check"),
+        "bare `pir mcp` must print the mcp help: {text}"
+    );
+    assert!(
+        !text.contains("broken"),
+        "bare `pir mcp` must not test-connect configured servers: {text}"
+    );
+
+    // The explicit `pir mcp check` keeps the test-connect surface.
+    let output = run_pir(&agent, &agent, &["mcp", "check"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("broken"),
+        "`pir mcp check` still checks every configured server: {}",
         stdout(&output)
     );
 }

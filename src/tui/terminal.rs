@@ -5506,7 +5506,7 @@ impl Component for DockComponent {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
         {
-            push_padded_row(out, text, width);
+            push_widget_rows(out, text, width);
         }
         // Factory-backed extension widgets (`ctx.ui.setWidget(key, factory)`,
         // e.g. rpiv-todo's overlay): cached lines from the last refresh,
@@ -5553,7 +5553,7 @@ impl Component for DockComponent {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
         {
-            push_padded_row(out, text, width);
+            push_widget_rows(out, text, width);
         }
         {
             let factory_widgets = self
@@ -5830,6 +5830,20 @@ impl Component for DockComponent {
 fn push_padded_row(out: &mut Rows<'_>, line: &str, width: usize) {
     out.push(line);
     pad_row_in_place(out.line_mut(), width);
+}
+
+/// Paint one static extension widget's text: one dock row per line.
+///
+/// `ctx.ui.setWidget(key, content)` normalizes array content to a `\n`-joined
+/// string (`src/extensions/api/js/prelude.js.txt`) and the dock paints each
+/// line as its own row. A single frame row carrying the embedded `\n` made
+/// the terminal advance an extra line per newline: the widget's second line
+/// was dropped and every dock row below it shifted (PIR-TUI-035), the same
+/// one-row drift the clamp guard in `core.rs` prevents for wrapped rows.
+pub fn push_widget_rows(out: &mut Rows<'_>, text: &str, width: usize) {
+    for line in text.split('\n') {
+        push_padded_row(out, line, width);
+    }
 }
 
 /// [`ansi::pad_to_width`] in place on an owned row buffer (core.rs
@@ -6109,8 +6123,9 @@ pub fn embed_status_in_border(editor_top: &str, width: usize, spinner: &str, bod
 //   scrolled clear of the window's top by more than `visible margin`, the
 //   rows above the margin are released — the LRU-side of the budget, mirroring
 //   the per-block memo caps in `src/tui/messages.rs`. The release count is an
-//   average-based estimate, so a mixed-height band can lose more rows than
-//   the margin (see [`advance_window`]).
+//   average-based estimate capped at one window step per frame, so a
+//   mixed-height band can still lose more rows than the margin over
+//   consecutive frames (see [`advance_window`]).
 //
 // Backward transcript search rides on the same window (see
 // `altscreen_search::SearchWalk`): it probes older pages in a scratch render
@@ -7077,6 +7092,23 @@ pub fn regular_window_start(entries: &[ChatEntry], current: usize) -> usize {
     }
 }
 
+/// Whole-band average rows per entry (rounded up, always >= 1) for
+/// [`advance_window`]'s release estimate.
+///
+/// Rounded UP on purpose: the release computes `drop = gap / rows_per_entry`,
+/// so a floored fractional average over-drops. Measured on a 454-row /
+/// 234-entry band of ~2-row entries (a session of 48 KB tool results), the
+/// floor gave 1 row/entry and the release dropped 148 entries (~296 rows) for
+/// a 174-row gap — the frame shrank under the viewport and
+/// `TuiCore::render_scrolled` clamped the offset (the viewport jumped). With
+/// the average rounded up the uniform case releases exactly the gap.
+///
+/// `band_rows` is the painted frame length (transcript rows + dock) and
+/// `count` the materialized window's entry count.
+pub fn band_rows_per_entry(band_rows: usize, count: usize) -> usize {
+    band_rows.div_ceil(count.max(1)).max(1)
+}
+
 /// One on-demand window step for a SCROLLED view (pure; see the module note):
 /// extend-ahead while the view is close to the materialized top, release the
 /// rows the view has scrolled well past when the window is over the byte cap.
@@ -7094,8 +7126,11 @@ pub fn regular_window_start(entries: &[ChatEntry], current: usize) -> usize {
 /// `TuiCore::render_scrolled` clamp the offset toward the end: the viewport
 /// jumps and on-screen rows are lost. The two-viewport margin only keeps the
 /// estimate conservative for a uniform-height band; it is not a guarantee.
-/// The tail window and the return-to-live-end collapse still bound the band
-/// by the budgets above.
+/// The step is capped at [`TRANSCRIPT_WINDOW_STEP_ENTRIES`] entries so one
+/// frame re-lays-out a bounded slice (a mixed band converges over the next
+/// scrolled frames instead of dropping its whole top at once). The tail
+/// window and the return-to-live-end collapse still bound the band by the
+/// budgets above.
 pub fn advance_window(
     start: usize,
     total: usize,
@@ -7118,18 +7153,19 @@ pub fn advance_window(
     }
     // Release: over the byte cap with more than two viewports of rows between
     // the window top and the view -> drop an ESTIMATED `gap / rows_per_entry`
-    // entries (the LRU side). `rows_per_entry` is the whole-band average, so
-    // the estimate is only exact for a uniform-height band: when the entries
-    // near the top are taller than the average, the released rows can exceed
-    // `gap` (even `visible_top`), the frame shrinks below
-    // `scroll_offset + viewport_rows`, and `TuiCore::render_scrolled` clamps
-    // the offset toward the end — the viewport jumps. Bounding the drop by the
-    // released entries' actual row counts would need per-entry render
-    // measurements the window does not keep; the two-viewport margin is not a
-    // guarantee for mixed-height bands (see the function docs).
+    // entries (the LRU side), capped at one window step per frame.
+    // `rows_per_entry` is the whole-band average (callers round UP), so the
+    // estimate is exact only for a uniform-height band: when the entries near
+    // the top are taller than the average, `drop * rows_per_entry` can exceed
+    // `gap` (even `visible_top`) and `TuiCore::render_scrolled` clamps the
+    // offset toward the end — the viewport jumps. The per-step cap bounds how
+    // many entries (and therefore rows) one frame may release, so a
+    // mixed-height band re-lays-out a bounded slice per scrolled frame and
+    // converges over the next frames; the two-viewport margin is still not a
+    // hard guarantee for such bands (see the function docs).
     if window_bytes > TRANSCRIPT_WINDOW_MAX_BYTES && visible_top > viewport_rows.saturating_mul(2) {
         let gap = visible_top - viewport_rows.saturating_mul(2);
-        let drop = (gap / rows_per_entry.max(1)).max(1);
+        let drop = (gap / rows_per_entry.max(1)).clamp(1, TRANSCRIPT_WINDOW_STEP_ENTRIES);
         return (start + drop).min(max_start);
     }
     start
@@ -8090,7 +8126,10 @@ impl TranscriptWindow {
             let dock = core.dock_height().min(rows.saturating_sub(1));
             let viewport_rows = rows.saturating_sub(dock).max(1);
             let band_rows = core.frame_buffer_length();
-            let rows_per_entry = (band_rows / count.max(1)).max(1);
+            // Whole-band average rows per entry, rounded UP: the release's
+            // `gap / rows_per_entry` estimate must not over-drop a
+            // uniform-height band (see [`band_rows_per_entry`]).
+            let rows_per_entry = band_rows_per_entry(band_rows, count);
             advance_window(
                 self.start,
                 total,
@@ -8437,9 +8476,19 @@ impl ChatBlockCache {
             self.retired.insert(old_start + index, slot);
         }
         self.window_start = window_start;
-        if self.retired.len() > CHAT_BLOCK_RETENTION_MAX {
-            self.retired.clear();
-        }
+        // NOTE: the retention cap is enforced AFTER the reuse pass below. The
+        // slots just retired are precisely the ones an entry that STAYS in
+        // the window is matched against (a slide changes positions, not
+        // absolute indices), so enforcing the cap here drops all of them
+        // before a single reuse can happen: every slide step then takes the
+        // fresh-container path for every entry and rebuilds one
+        // `ChatContainer` (and its per-entry component tree) per materialized
+        // block. The bound itself is unchanged: what remains in `retired`
+        // after the pass is the slots OUTSIDE the new window, and that set is
+        // capped/cleared exactly as before. The slide-install reuse is pinned by
+        // `production_band_frames_keep_the_block_path_allocation_flat`
+        // (tests/tui_frame_reuse.rs), which compares it against a cold
+        // install's per-entry rebuild cost.
         let mut user_before = false;
         for (index, entry) in entries.iter().enumerate() {
             let revision = self.revision(entry, user_before);
@@ -8489,6 +8538,12 @@ impl ChatBlockCache {
             };
             self.blocks.push(slot);
             user_before |= matches!(entry, ChatEntry::User(_));
+        }
+        // Enforce the retention bound on the slots the pass did NOT adopt:
+        // entries outside the new window. (Running this before the pass would
+        // drop the very slots the pass matches against — see the note above.)
+        if self.retired.len() > CHAT_BLOCK_RETENTION_MAX {
+            self.retired.clear();
         }
         self.primed = true;
     }
@@ -8628,6 +8683,25 @@ impl ChatBlockCache {
 
     pub fn is_primed(&self) -> bool {
         self.primed
+    }
+
+    /// The installed block sequence's origin identity (see
+    /// [`super::core::Component::content_blocks_origin`]): the ABSOLUTE
+    /// transcript index the first block is anchored at plus the block count,
+    /// mixed into one value. Unprimed returns `None` (the component then
+    /// stays on the whole-container cache path). Folding the count in keeps a
+    /// same-origin append from aliasing a previous frame whose blocks shifted
+    /// position without the origin moving (window `start` changes on every
+    /// position shift, so this is belt-and-braces).
+    #[doc(hidden)]
+    pub fn origin_key(&self) -> Option<u64> {
+        if !self.primed {
+            return None;
+        }
+        Some(super::core::mix_content_revision(
+            self.window_start as u64,
+            self.blocks.len() as u64,
+        ))
     }
 
     /// Test seam: `(ptr, len, capacity)` of one slot's live text accumulator.
@@ -8890,6 +8964,18 @@ impl Component for SharedChat {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         blocks.block_revisions()
+    }
+
+    /// The materialized window's identity (absolute origin + block count):
+    /// the frame renderer skips its cross-position block-reuse index while
+    /// this value is unchanged, because without a window move no block can
+    /// have changed position (see `Component::content_blocks_origin`). A
+    /// settled band therefore pays no per-block index allocation per frame.
+    fn content_blocks_origin(&self) -> Option<u64> {
+        self.blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .origin_key()
     }
 
     fn render_block_into(&self, index: usize, width: usize, out: &mut Rows<'_>) {
@@ -10053,6 +10139,10 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
     *app.event_tx
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event_tx.clone());
+    // Shared "worker event queued" flag: the loop's input wait polls it so a
+    // delta/lifecycle event never waits out the poll timeout (see
+    // `wait_for_win_batch_input`).
+    let worker_wake = event_tx.wake_flag();
     spawn_git_branch_watcher(event_tx.clone(), Arc::clone(&app.git_branch_watcher_paused));
     app.refresh_footer();
 
@@ -10565,37 +10655,31 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     partial,
                 } => {
                     if tool_name == "bash" && call_id.is_none() {
-                        // Stale user-bash completion: the switch reset the
-                        // active request (or a newer command owns the block).
-                        // Dropping it keeps Esc state and the block of the
-                        // command that is actually running.
+                        // Stale user-bash update: the switch reset the active
+                        // request (or a newer command owns the block). Dropping
+                        // it keeps Esc state and the block of the command that
+                        // is actually running. A live PARTIAL keeps the request
+                        // armed — only the completion (`partial: false`)
+                        // settles it, so the in-flight command stays
+                        // cancellable (Esc) while its output streams.
                         if let Some(request_id) = request_id {
                             if app.active_bash_request != Some(request_id) {
                                 continue;
                             }
-                            app.active_bash_request = None;
+                            if !partial {
+                                app.active_bash_request = None;
+                            }
                         }
-                        // `!` bash finished: Esc no longer needs to abort it.
-                        app.bash_running.store(false, Ordering::SeqCst);
+                        if !partial {
+                            // `!` bash finished: Esc no longer needs to abort it.
+                            app.bash_running.store(false, Ordering::SeqCst);
+                        }
                     }
                     if call_id.is_none() && tool_name == "bash" {
                         // `!`/`!!` bash: a dedicated block (upstream
                         // `BashExecutionComponent`, interactive-mode.ts:7037-7080)
                         // — never routed through extension tool renderers.
                         // Replace the pending block created by `handle_bash`.
-                        let entry = ChatEntry::ToolExecution {
-                            call_id: None,
-                            tool_name,
-                            args: Arc::new(args),
-                            output: Arc::from(output),
-                            is_error,
-                            duration_ms: None,
-                            pending: false,
-                            details: None,
-                            started_at: None,
-                            preview: None,
-                            images: Arc::new(Vec::new()),
-                        };
                         let pending_index = entries.iter().position(|entry| {
                             matches!(
                                 entry,
@@ -10603,12 +10687,52 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                                     if name == "bash"
                             )
                         });
-                        match pending_index {
-                            Some(index) => {
-                                entries[index] = entry;
-                                app.note_entry_changed(index);
+                        if partial {
+                            // Live output snapshot while the command runs
+                            // (upstream `BashExecutionComponent.appendOutput`,
+                            // the `onChunk` pi wires in `handleBashCommand`):
+                            // the pending block takes the snapshot IN PLACE and
+                            // stays pending — the `Running…` row and the
+                            // Esc-abort state survive, and the transcript diff
+                            // patches the retained component through
+                            // `ToolExecutionComponent::set_output` (the same
+                            // pending-safe seam the model-issued live shell card
+                            // uses; p2, W11-C F5), so its memo caches survive.
+                            // Only the output Arc moves: the tool-name/args/
+                            // start-time allocations stay put, which is exactly
+                            // what the patch gate matches on (a freshly built
+                            // entry would rebuild the block per snapshot).
+                            if let Some(index) = pending_index {
+                                if let ChatEntry::ToolExecution {
+                                    output: block_output,
+                                    ..
+                                } = &mut entries[index]
+                                {
+                                    *block_output = Arc::from(output);
+                                    app.note_entry_changed(index);
+                                }
                             }
-                            None => entries.push(entry),
+                        } else {
+                            let entry = ChatEntry::ToolExecution {
+                                call_id: None,
+                                tool_name,
+                                args: Arc::new(args),
+                                output: Arc::from(output),
+                                is_error,
+                                duration_ms: None,
+                                pending: false,
+                                details: None,
+                                started_at: None,
+                                preview: None,
+                                images: Arc::new(Vec::new()),
+                            };
+                            match pending_index {
+                                Some(index) => {
+                                    entries[index] = entry;
+                                    app.note_entry_changed(index);
+                                }
+                                None => entries.push(entry),
+                            }
                         }
                     } else {
                         // Cheap digest gate (W5-AB row 14): the JS renderer
@@ -11791,6 +11915,12 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             }
             app.note_entries_resized(entries_len_before_event, entries.len());
         }
+        // The drain consumed everything queued at this point, so clear the
+        // worker wake flag (see `WorkerEventSender::wake`): a producer that
+        // pushed while the drain ran leaves it set again (it stores AFTER its
+        // push), so the wait below returns early instead of sleeping on an
+        // event that is already in the queue.
+        worker_wake.store(false, std::sync::atomic::Ordering::Release);
         // P0.3: the batch cap stopped the drain with worker events still
         // queued. Do not wait out the poll this iteration — render the batch
         // that is already in hand (the timeout below turns into a zero poll).
@@ -12131,18 +12261,30 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             #[cfg(windows)]
             {
                 match win_batch.as_mut() {
-                    Some(batch) => {
-                        input_ready = matches!(
-                            wait_for_win_batch_input(batch, timeout),
-                            WinBatchWake::Ready
-                        );
-                    }
+                    Some(batch) => match wait_for_win_batch_input(batch, timeout, &worker_wake) {
+                        WinBatchWake::Ready => input_ready = true,
+                        // A worker event landed mid-wait (the channel is not
+                        // pollable): re-enter the loop so the drain at the top
+                        // picks it up and this pass can render it, instead of
+                        // sleeping out the remainder of the poll timeout.
+                        WinBatchWake::WorkerEvent => continue,
+                        WinBatchWake::Timeout => {}
+                    },
                     None => input_ready = event::poll(timeout)?,
                 }
             }
             #[cfg(not(windows))]
             {
-                input_ready = event::poll(timeout)?;
+                // The worker channel is not pollable on Unix either; the wait
+                // re-checks its wake flag on each short step and returns so
+                // the loop re-enters and drains the queued event (see
+                // `wait_for_unix_input`). An idle wait is still one long
+                // `event::poll`, so idle wakeups are unchanged.
+                match wait_for_unix_input(timeout, &worker_wake)? {
+                    UnixWaitWake::Ready => input_ready = true,
+                    UnixWaitWake::WorkerEvent => continue,
+                    UnixWaitWake::Timeout => {}
+                }
             }
         }
         if input_ready {
@@ -12256,15 +12398,16 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                 }
                 input_trace.note_queue(pending_input.len());
             }
-        } // A terminal without bracketed-paste markers delivers a paste as one
-          // Key event per character; one insert per event is what made it appear
-          // one glyph at a time and re-ran autocomplete per character.
-          //
-          // Only while the main editor (or a text-buffer dialog that accepts a
-          // paste) owns the focus: a selector/menu swallows `Event::Paste`
-          // instead of feeding it to its own filter, so coalescing there would
-          // turn a typed search term (`warnings`, 8 keys) into a paste the menu
-          // never sees. With an overlay open, leave the keys as keys.
+        }
+        // A terminal without bracketed-paste markers delivers a paste as one
+        // Key event per character; one insert per event is what made it appear
+        // one glyph at a time and re-ran autocomplete per character.
+        //
+        // Only while the main editor (or a text-buffer dialog that accepts a
+        // paste) owns the focus: a selector/menu swallows `Event::Paste`
+        // instead of feeding it to its own filter, so coalescing there would
+        // turn a typed search term (`warnings`, 8 keys) into a paste the menu
+        // never sees. With an overlay open, leave the keys as keys.
         let selector_open = app
             .overlay
             .lock()
@@ -19939,6 +20082,15 @@ fn handle_command(
         });
         return SlashCommandOutcome::Handled;
     }
+    // Upstream matches its exact-only commands as `text === "/<name>"`: with a
+    // trailing argument the whole text falls through to `session.prompt(text)`
+    // — prompt-template expansion, then the model — never the command
+    // (interactive-mode.ts:3161-3300, :3320-3350). pir used to run the action
+    // and silently drop the argument, so `/quit now` quit and `/new please` /
+    // `/clone x` hit their destructive branches (PIR-BIN-089 #3).
+    if !args.is_empty() && super::slash::exact_match_only(name) {
+        return SlashCommandOutcome::SubmitAsPrompt;
+    }
     let Some(action) = super::slash::builtin_action(name) else {
         // `image` is a pir-only extension of the built-in set: a local image
         // preview. It honors `terminal.showImages` / `terminal.imageWidthCells`
@@ -20269,13 +20421,29 @@ fn handle_command(
             });
         }
         super::slash::SlashAction::Name => {
-            // Set the session display name (upstream `/name <name>`).
-            match super::slash::name_argument(args) {
-                Ok(name) => worker.set_session_name(name),
-                Err(usage) => entries.push(ChatEntry::Notice {
-                    kind: super::app::NoticeKind::Warning,
-                    text: usage,
-                }),
+            // `/name <name>` sets the display name (upstream
+            // `handleNameCommand`); bare `/name` shows the current one —
+            // dim `Session name: <current>` upstream, with the usage warning
+            // only when no name is set (interactive-mode.ts:6664-6690).
+            if args.is_empty() {
+                match super::slash::name_display(app.session_name.as_deref()) {
+                    Ok(current) => entries.push(ChatEntry::Notice {
+                        kind: super::app::NoticeKind::Status,
+                        text: current,
+                    }),
+                    Err(usage) => entries.push(ChatEntry::Notice {
+                        kind: super::app::NoticeKind::Warning,
+                        text: usage,
+                    }),
+                }
+            } else {
+                match super::slash::name_argument(args) {
+                    Ok(name) => worker.set_session_name(name),
+                    Err(usage) => entries.push(ChatEntry::Notice {
+                        kind: super::app::NoticeKind::Warning,
+                        text: usage,
+                    }),
+                }
             }
         }
         super::slash::SlashAction::Session => {
@@ -22691,22 +22859,20 @@ pub fn cleanup_terminal_surface(
         // `fullscreenExitOutput=transcript` shape (the whole transcript on
         // small sessions; the materialized window's blocks, oldest to
         // newest, on a huge one).
-        let lines = if core.windowed_viewport() {
-            core.last_frame_lines().to_vec()
+        // PIR-TUI-040: the slice is BORROWED (`last_screen_lines` is the only
+        // owed copy) and the rows stream through a bounded scratch buffer, so
+        // a huge materialized band costs the same bytes without a second copy
+        // of every row and without one message-sized `String`. The emitted
+        // byte stream is unchanged: leading `\r`, `\r\n` separators, trailing
+        // `\r\n`.
+        let screen_lines;
+        let lines: &[String] = if core.windowed_viewport() {
+            core.last_frame_lines()
         } else {
-            core.last_screen_lines()
+            screen_lines = core.last_screen_lines();
+            &screen_lines
         };
-        if !lines.is_empty() {
-            let mut dump = String::from("\r");
-            for (index, line) in lines.iter().enumerate() {
-                if index > 0 {
-                    dump.push_str("\r\n");
-                }
-                dump.push_str(line);
-            }
-            dump.push_str("\r\n");
-            let _ = out.write_all(dump.as_bytes());
-        }
+        let _ = write_transcript_dump(out, lines);
     }
     let _ = out.execute(DisableBracketedPaste);
     let _ = out.execute(DisableMouseCapture);
@@ -22714,6 +22880,41 @@ pub fn cleanup_terminal_surface(
     // returned early (empty frame) and documents the teardown order.
     core.terminal().close_writer();
     Ok(())
+}
+
+/// Bytes accumulated before an intermediate `write_all` in
+/// [`write_transcript_dump`] (PIR-TUI-040).
+const TRANSCRIPT_DUMP_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Write the exit transcript dump (`fullscreenExitOutput=transcript`):
+/// a leading `\r`, the rows joined by `\r\n`, then a trailing `\r\n`.
+///
+/// PIR-TUI-040: the row slice is written STREAMED through a bounded scratch
+/// buffer instead of one `String` holding the whole dump, so a large
+/// materialized band (tens of thousands of rows on a big session) does not pay
+/// a second copy of every row plus a message-sized buffer at exit. The byte
+/// stream — and therefore the screen the shell leaves behind — is identical;
+/// only the number of `write_all` calls and the peak allocation change.
+/// `#[doc(hidden)]` seam: the tests pin the exact bytes.
+#[doc(hidden)]
+pub fn write_transcript_dump(out: &mut dyn Write, lines: &[String]) -> std::io::Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let mut buffer = String::with_capacity(TRANSCRIPT_DUMP_CHUNK_BYTES + 2);
+    buffer.push('\r');
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            buffer.push_str("\r\n");
+        }
+        buffer.push_str(line);
+        if buffer.len() >= TRANSCRIPT_DUMP_CHUNK_BYTES {
+            out.write_all(buffer.as_bytes())?;
+            buffer.clear();
+        }
+    }
+    buffer.push_str("\r\n");
+    out.write_all(buffer.as_bytes())
 }
 
 /// Restore terminal state after a panic unwind too. `DisableMouseCapture`
@@ -22915,6 +23116,12 @@ struct WorkerEventSender {
     /// Text accumulated from deltas that could not be queued yet. Shared by
     /// every clone so the channel has exactly one pending buffer per kind.
     pending_deltas: Arc<Mutex<PendingDeltas>>,
+    /// Set after every successful queue push; the event loop's input wait
+    /// polls it so a worker event never waits out the poll timeout (the
+    /// channel is not a pollable handle). Set AFTER the push, cleared AFTER
+    /// the drain — no lost-wakeup window: an event queued before the drain is
+    /// consumed by it, one queued after it leaves the flag set.
+    wake: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Default)]
@@ -22934,7 +23141,18 @@ impl WorkerEventSender {
         Self {
             tx,
             pending_deltas: Arc::new(Mutex::new(PendingDeltas::default())),
+            wake: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// The shared "an event was queued" flag (see the field docs).
+    fn wake_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.wake)
+    }
+
+    /// Signal the UI's input wait AFTER a successful queue push.
+    fn note_queued(&self) {
+        self.wake.store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn send(&self, event: WorkerEvent) -> Result<(), Box<std::sync::mpsc::SendError<WorkerEvent>>> {
@@ -22953,7 +23171,11 @@ impl WorkerEventSender {
                 // with the authoritative message) so the UI observes the
                 // provider's ordering.
                 self.flush_deltas();
-                self.tx.send(event).map_err(Box::new)
+                let result = self.tx.send(event).map_err(Box::new);
+                if result.is_ok() {
+                    self.note_queued();
+                }
+                result
             }
         }
     }
@@ -22963,7 +23185,9 @@ impl WorkerEventSender {
     /// full. Used only for notices whose worker thread could not be spawned;
     /// at the bound the notice is dropped instead of freezing the loop.
     fn try_send_notice(&self, event: WorkerEvent) {
-        let _ = self.tx.try_send(event);
+        if self.tx.try_send(event).is_ok() {
+            self.note_queued();
+        }
     }
 
     /// Append one provider delta and try to hand the whole pending chunk to
@@ -22994,7 +23218,9 @@ impl WorkerEventSender {
             DeltaKind::Thinking => WorkerEvent::ThinkingDelta { text: chunk },
         };
         match self.tx.try_send(event) {
-            Ok(()) => {}
+            Ok(()) => {
+                self.note_queued();
+            }
             Err(std::sync::mpsc::TrySendError::Full(event)) => {
                 // Queue at its bound: put the chunk back for the next
                 // delta/flush. The lock is held across `try_send`, so the
@@ -23023,11 +23249,15 @@ impl WorkerEventSender {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !pending.stream.is_empty() {
             let text = std::mem::take(&mut pending.stream);
-            let _ = self.tx.send(WorkerEvent::StreamDelta { text });
+            if self.tx.send(WorkerEvent::StreamDelta { text }).is_ok() {
+                self.note_queued();
+            }
         }
         if !pending.thinking.is_empty() {
             let text = std::mem::take(&mut pending.thinking);
-            let _ = self.tx.send(WorkerEvent::ThinkingDelta { text });
+            if self.tx.send(WorkerEvent::ThinkingDelta { text }).is_ok() {
+                self.note_queued();
+            }
         }
     }
 }
@@ -27424,8 +27654,70 @@ mod win_batch_input {
 enum WinBatchWake {
     /// At least one console record is queued for [`win_batch_input::BatchReader`].
     Ready,
+    /// A worker event reached the (non-pollable) event channel: return so the
+    /// loop drains and renders it instead of waiting out the poll timeout.
+    WorkerEvent,
     /// The timeout elapsed with an empty console queue.
     Timeout,
+}
+
+/// One step of the input wait's decision (pure; pinned by
+/// `tests/tui_input_wakeup.rs`).
+///
+/// Priority is console record → worker event → expiry → sleep one step. A
+/// console record or a queued worker event must never lose to the deadline: the
+/// deadline path is the only one that leaves the record (or the event) waiting
+/// for another poll timeout.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchWaitStep {
+    /// Console records are queued: drain them now (they wake the poll anyway).
+    Ready,
+    /// A worker event is queued: return so the loop drains/renders it.
+    WorkerEvent,
+    /// The timeout elapsed with nothing queued: end the wait.
+    Expired,
+    /// Nothing is queued and the deadline is in the future: sleep one step.
+    Idle,
+}
+
+/// See [`BatchWaitStep`]. `console_pending` is the console input queue depth,
+/// `worker_pending` the worker channel's wake flag, `expired` whether the
+/// waiter's deadline has passed.
+#[doc(hidden)]
+pub fn batch_wait_step(
+    console_pending: usize,
+    worker_pending: bool,
+    expired: bool,
+) -> BatchWaitStep {
+    if console_pending > 0 {
+        return BatchWaitStep::Ready;
+    }
+    if worker_pending {
+        return BatchWaitStep::WorkerEvent;
+    }
+    if expired {
+        return BatchWaitStep::Expired;
+    }
+    BatchWaitStep::Idle
+}
+
+/// The Unix input wait's step bound: the sibling of [`BatchWaitStep`], used by
+/// [`unix_input_wait_loop`] to size each `event::poll`.
+///
+/// Within the active frame cadence ([`ACTIVE_POLL_TIMEOUT`]) the step is 1 ms,
+/// so the worker wake flag is re-checked on the same step the Windows console
+/// wait uses and a queued delta/lifecycle event adds at most one step of
+/// pickup latency on both platforms. Any longer (idle) wait returns its whole
+/// remaining time instead: it stays ONE blocking `event::poll`, so the idle
+/// wakeup budget (one loop wakeup per [`IDLE_POLL_TIMEOUT`]) is untouched.
+#[doc(hidden)]
+pub fn unix_wait_step(remaining: Duration) -> Duration {
+    if remaining <= ACTIVE_POLL_TIMEOUT {
+        remaining.min(Duration::from_millis(1))
+    } else {
+        remaining
+    }
 }
 
 /// Wait up to `timeout` for a Windows console record without letting
@@ -27438,22 +27730,118 @@ enum WinBatchWake {
 /// high-surrogate press when typing a non-BMP emoji) used to die there. Polling
 /// the console queue keeps the record on the batch path; `GetNumberOfConsoleInputEvents`
 /// is a cheap non-blocking query and the 1 ms step preserves typing latency.
+///
+/// `wake` is the worker channel's "an event was queued" flag: the channel is
+/// not a pollable handle, and without this check a provider delta (or a tool/
+/// lifecycle event) that lands mid-wait is only picked up when the timeout
+/// expires — measured p50 9.5 ms / p95 16.7 ms of added streaming latency, and
+/// the same bound on the abort/tool-result repaint. The flag is checked on the
+/// same 1 ms step as the console queue, so the pickup cost is one step.
 #[cfg(windows)]
 fn wait_for_win_batch_input(
     batch: &mut win_batch_input::BatchReader,
     timeout: Duration,
+    wake: &std::sync::atomic::AtomicBool,
 ) -> WinBatchWake {
     let deadline = Instant::now() + timeout;
     loop {
-        if batch.pending() > 0 {
-            return WinBatchWake::Ready;
+        let step = batch_wait_step(
+            batch.pending(),
+            wake.load(std::sync::atomic::Ordering::Acquire),
+            Instant::now() >= deadline,
+        );
+        match step {
+            BatchWaitStep::Ready => return WinBatchWake::Ready,
+            BatchWaitStep::WorkerEvent => return WinBatchWake::WorkerEvent,
+            BatchWaitStep::Expired => return WinBatchWake::Timeout,
+            BatchWaitStep::Idle => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return WinBatchWake::Timeout;
-        }
-        std::thread::sleep(remaining.min(Duration::from_millis(1)));
     }
+}
+
+/// How the Unix input wait ended (the sibling of `WinBatchWake`).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnixWaitWake {
+    /// crossterm has an input event ready: the loop's read path takes it.
+    Ready,
+    /// A worker event reached the (non-pollable) event channel: return so the
+    /// loop drains and renders it instead of waiting out the poll timeout.
+    WorkerEvent,
+    /// The timeout elapsed with no input event.
+    Timeout,
+}
+
+/// The Unix input-wait decision loop, with the poll source injected so the
+/// wait's schedule is unit-testable on every host (`tests/suites/
+/// tui_input_wakeup.rs` drives it with a fake poll; the real wait passes
+/// `event::poll`).
+///
+/// On Unix `event::poll` is the only input source and the worker channel is
+/// not a pollable handle, so without the wake flag a delta/lifecycle event
+/// that lands mid-wait is only picked up when the poll timeout expires (the
+/// PIR-TUI-038 gap PIR-TUI-037 closed on Windows). The zero-timeout probe is
+/// this wait's "input is queued" test — the Windows wait's `batch.pending()`
+/// — and [`batch_wait_step`] keeps the same priority: ready input, then the
+/// queued-worker-event wake, then the deadline, then one step of
+/// [`unix_wait_step`].
+#[doc(hidden)]
+pub fn unix_input_wait_loop<F>(
+    timeout: Duration,
+    wake: &std::sync::atomic::AtomicBool,
+    mut poll: F,
+) -> std::io::Result<UnixWaitWake>
+where
+    F: FnMut(Duration) -> std::io::Result<bool>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        // The probe is also what moves the tty's available bytes into
+        // crossterm's parser, so the step below can never spin on a partially
+        // received escape sequence — and with `timeout` zero it still reads
+        // input that is already waiting (the pre-fix `event::poll(ZERO)`
+        // behavior).
+        let input_pending = poll(Duration::ZERO)?;
+        match batch_wait_step(
+            usize::from(input_pending),
+            wake.load(std::sync::atomic::Ordering::Acquire),
+            Instant::now() >= deadline,
+        ) {
+            BatchWaitStep::Ready => return Ok(UnixWaitWake::Ready),
+            // A queued worker event is a wake, never a sleep — including
+            // at/after the deadline, where sleeping would strand it for
+            // another poll timeout (the same priority the Windows wait pins).
+            BatchWaitStep::WorkerEvent => return Ok(UnixWaitWake::WorkerEvent),
+            BatchWaitStep::Expired => return Ok(UnixWaitWake::Timeout),
+            BatchWaitStep::Idle => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if poll(unix_wait_step(remaining))? {
+                    return Ok(UnixWaitWake::Ready);
+                }
+            }
+        }
+    }
+}
+
+/// Wait up to `timeout` for a crossterm input event while re-checking the
+/// worker wake flag on every step — the Unix sibling of the Windows
+/// `wait_for_win_batch_input`, on the same decision ([`batch_wait_step`]) and
+/// with the same call-site contract (`Ready` reads input, `WorkerEvent`
+/// re-enters the loop, `Timeout` falls through).
+///
+/// At the active frame cadence the flag is re-checked every millisecond (the
+/// same step the Windows console wait uses, so the pickup cost is one step on
+/// both platforms); an idle wait keeps its single long `event::poll`, so idle
+/// wakeups are unchanged.
+#[cfg(not(windows))]
+fn wait_for_unix_input(
+    timeout: Duration,
+    wake: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<UnixWaitWake> {
+    unix_input_wait_loop(timeout, wake, event::poll)
 }
 
 /// Env-gated input-loop accounting for paste/typing performance probes.
@@ -28987,16 +29375,133 @@ async fn attach_opened_session(
     }
 }
 
+/// Minimum spacing between live `!`-bash output snapshots. The bash tool's
+/// streamed snapshots use the same 100 ms cadence (upstream
+/// `BASH_UPDATE_THROTTLE_MS`, renderers/bash.ts); pi's user-bash component
+/// appends every chunk and repaints, but its frame loop coalesces — 100 ms at
+/// the producer is the same observable cadence without handing the worker→UI
+/// channel a burst of full-tail snapshots.
+#[doc(hidden)]
+pub const LIVE_BASH_UPDATE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Rolling window the live `!`-bash snapshots retain: 2× the truncation cap,
+/// the same window the bash tool's capture keeps (`ShellCapture::keep`). The
+/// block renders at most the last `DEFAULT_MAX_LINES`/`DEFAULT_MAX_BYTES`
+/// (`render_user_bash_rows`), so a longer tail can never change a painted row.
+const LIVE_BASH_TAIL_BYTES: usize = 2 * crate::coding_agent::truncate::DEFAULT_MAX_BYTES;
+
+/// Accumulator behind the live `!`/`!!` output snapshots (upstream
+/// `BashExecutionComponent.appendOutput` + its frame coalescing): appends the
+/// decoded chunks into a rolling tail and — at most once per
+/// [`LIVE_BASH_UPDATE_THROTTLE`] — hands out the accumulated tail to paint.
+/// The first chunk always emits immediately, so a fast command is visible at
+/// once. Test seam over the sink's state machine (no channel involved).
+#[doc(hidden)]
+pub struct LiveBashTail {
+    /// Rolling tail of the decoded output, bounded by [`LIVE_BASH_TAIL_BYTES`].
+    tail: String,
+    /// When the last snapshot was emitted; `None` before the first chunk.
+    last_emit: Option<std::time::Instant>,
+}
+
+impl LiveBashTail {
+    #[doc(hidden)]
+    pub fn new() -> Self {
+        Self {
+            tail: String::new(),
+            last_emit: None,
+        }
+    }
+
+    /// Append one decoded chunk; `Some(snapshot)` exactly when the throttle
+    /// lets a new live snapshot out (the first chunk, then one per
+    /// [`LIVE_BASH_UPDATE_THROTTLE`]), the rolling tail otherwise.
+    #[doc(hidden)]
+    pub fn push(&mut self, chunk: &str, now: std::time::Instant) -> Option<String> {
+        self.tail.push_str(chunk);
+        if self.tail.len() > LIVE_BASH_TAIL_BYTES.saturating_mul(2) {
+            // Trim back to the keep window at a char boundary (chunks are
+            // decoded text; a cut inside a character would leave a leading
+            // replacement char).
+            let mut cut = self.tail.len() - LIVE_BASH_TAIL_BYTES;
+            while cut < self.tail.len() && !self.tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.tail.drain(..cut);
+        }
+        if let Some(last) = self.last_emit {
+            if now.duration_since(last) < LIVE_BASH_UPDATE_THROTTLE {
+                return None;
+            }
+        }
+        self.last_emit = Some(now);
+        Some(self.tail.clone())
+    }
+
+    /// The retained rolling tail (test seam).
+    #[doc(hidden)]
+    pub fn tail(&self) -> &str {
+        &self.tail
+    }
+}
+
+/// The worker-side live-output sink of one `!`/`!!` command (upstream
+/// `handleBashCommand`'s `onChunk` → `BashExecutionComponent.appendOutput`):
+/// accumulates decoded chunks and forwards PARTIAL `ToolUpdate` snapshots for
+/// the pending block. The completion (`partial: false`) is sent by
+/// [`run_user_bash`] itself and carries the final recorded result.
+struct UserBashStreamSink {
+    events: WorkerEventSender,
+    request_id: u64,
+    /// The pending block's args (`{command, userBash, excludeFromContext}`):
+    /// the completion later adds `exitCode`/`cancelled`.
+    args: serde_json::Value,
+    state: std::sync::Mutex<LiveBashTail>,
+}
+
+impl UserBashStreamSink {
+    /// One callback feeding this sink; `Box<dyn Fn(&str) + Send + Sync>` is
+    /// the session bash executor's chunk-callback shape.
+    fn callback(self: &Arc<Self>) -> Box<dyn Fn(&str) + Send + Sync> {
+        let sink = Arc::clone(self);
+        Box::new(move |delta: &str| sink.push(delta))
+    }
+
+    fn push(&self, chunk: &str) {
+        let snapshot = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(chunk, std::time::Instant::now());
+        let Some(output) = snapshot else {
+            return;
+        };
+        let _ = self.events.send(WorkerEvent::ToolUpdate {
+            call_id: None,
+            request_id: Some(self.request_id),
+            tool_name: "bash".to_string(),
+            args: self.args.clone(),
+            output,
+            is_error: false,
+            details: None,
+            images: Vec::new(),
+            partial: true,
+        });
+    }
+}
+
 /// Run one `!`/`!!` command off the worker's command loop.
 ///
 /// The command itself goes through the session's async bash executor when no
 /// `user_bash` extension takes it: that path registers an abort signal
-/// (`AgentSession::abort_bash` reaches it), streams chunks, and records the
-/// `bashExecution` entry in the session context/transcript. The previous local
-/// `wait_with_output` blocked the current-thread worker for the whole command
-/// (no delta polling, no command handling, Esc unreachable) and persisted
-/// nothing. A `user_bash` result is recorded by the same `record_bash_result`
-/// contract upstream uses for both execution faces.
+/// (`AgentSession::abort_bash` reaches it), streams chunks into the pending
+/// block through [`UserBashStreamSink`] (upstream `BashExecutionComponent`'s
+/// live output), and records the `bashExecution` entry in the session
+/// context/transcript. The previous local `wait_with_output` blocked the
+/// current-thread worker for the whole command (no delta polling, no command
+/// handling, Esc unreachable) and persisted nothing. A `user_bash` result is
+/// recorded by the same `record_bash_result` contract upstream uses for both
+/// execution faces.
 ///
 /// This runs in its own task so the command loop keeps draining: an idle `!`
 /// stays cancellable with Esc, and a `!` issued during a streaming run cannot
@@ -29020,6 +29525,21 @@ async fn run_user_bash(
     let outcome = session
         .dispatch_user_bash_event(command, exclude_from_context)
         .await;
+    // Live output streaming (upstream `handleBashCommand`'s `onChunk` →
+    // `BashExecutionComponent.appendOutput`): both executing arms feed every
+    // decoded chunk into this sink, which forwards a partial `ToolUpdate` for
+    // the pending `!` block. The extension-`Handled` and failed-handler arms
+    // never stream (upstream appends their whole result at once).
+    let stream = Arc::new(UserBashStreamSink {
+        events: events.clone(),
+        request_id,
+        args: serde_json::json!({
+            "command": command,
+            "userBash": true,
+            "excludeFromContext": exclude_from_context,
+        }),
+        state: std::sync::Mutex::new(LiveBashTail::new()),
+    });
     let (output, exit_code, cancelled) = match outcome {
         crate::agent_session::UserBashOutcome::Handled { output, is_error } => {
             // Upstream records the extension-supplied result like a local one;
@@ -29047,9 +29567,15 @@ async fn run_user_bash(
             // runs the operations through the extension runtime, streams the
             // same `bash_execution_update` events as a local command, and
             // records the result itself. They are therefore executed here
-            // (not reported as a placeholder) and not recorded twice.
+            // (not reported as a placeholder) and not recorded twice, and
+            // their chunks stream through the same live sink.
             let result = session
-                .execute_user_bash_operations(&operations, command, exclude_from_context, None)
+                .execute_user_bash_operations(
+                    &operations,
+                    command,
+                    exclude_from_context,
+                    Some(stream.callback()),
+                )
                 .await;
             (result.output, result.exit_code, result.cancelled)
         }
@@ -29078,9 +29604,16 @@ async fn run_user_bash(
         crate::agent_session::UserBashOutcome::Local => {
             // The executor records the result itself (context or non-context
             // for `!!`), kills the process tree on abort, and streams chunks
-            // through `bash_execution_update`.
+            // through `bash_execution_update` AND the live sink (upstream
+            // passes its component `onChunk` down the same call).
             let result = session
-                .execute_bash_with_options_at_generation(command, exclude_from_context, generation)
+                .execute_bash_with_id_at_generation(
+                    command,
+                    exclude_from_context,
+                    None,
+                    Some(stream.callback()),
+                    generation,
+                )
                 .await;
             (result.output, result.exit_code, result.cancelled)
         }
@@ -29410,9 +29943,15 @@ async fn handle_session_command(
                 Some(path) => {
                     let session_path = std::path::PathBuf::from(&path);
                     let output_path = output.as_deref().map(std::path::Path::new);
-                    match crate::coding_agent::export_html::export_session_to_html(
+                    // Upstream passes the theme it renders with
+                    // (`themeName: theme.name`); the export resolves that
+                    // theme's `export` colors and foreground tokens, so a
+                    // light theme keeps readable text.
+                    let theme_name = current_theme_name();
+                    match crate::coding_agent::export_html::export_session_to_html_with_theme(
                         &session_path,
                         output_path,
+                        Some(&theme_name),
                     ) {
                         Ok(written) => {
                             let _ = events.send(WorkerEvent::Status(format!(

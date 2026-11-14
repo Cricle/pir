@@ -994,13 +994,12 @@ impl SettingsManager {
     /// `sdk.ts:341-352` `getProviderRetrySettings()`), in the shape a host
     /// installs on [`crate::ai::types::StreamOptions`].
     ///
-    /// Only fields the user WROTE come back set; absent ones stay `None` so a
-    /// request keeps the transport's compiled default (2 retries / 60 s cap /
-    /// no total timeout). A default run must not change behaviour just because
-    /// the setting mechanism exists. `maxRetryDelayMs` deliberately does not
-    /// apply the upstream 60 s default here: that equals the transport default
-    /// already, and leaving it `None` is what lets an explicit per-call
-    /// override (`set_retry`) win.
+    /// `maxRetries` resolves the upstream `?? 0` default (`Some(0)` when the
+    /// user wrote nothing): the provider layer sends one attempt per turn and
+    /// the agent-level 2/4/8 s ladder owns transient 408/409/429/5xx errors.
+    /// `maxRetryDelayMs`/`timeoutMs` stay `None` when unwritten, so the
+    /// transport keeps its 60 s cap / no total timeout and an explicit
+    /// per-call override (`set_retry`) keeps winning.
     pub fn provider_retry_overrides(&self) -> ProviderRetryOverrides {
         ProviderRetryOverrides::from_settings(self.settings.retry.as_ref())
     }
@@ -1121,18 +1120,24 @@ impl SettingsManager {
             .unwrap_or(false)
     }
 
-    /// `disabledBuiltinExtensions` (upstream settings key): built-in extension
-    /// names the loader must drop (`builtin:<name>`), even when settings or an
-    /// explicit `-e` enable them.
+    /// `disabledBuiltinExtensions` (upstream settings key) plus pi's documented
+    /// `extensions` spelling: built-in extension names the loader must drop
+    /// (`builtin:<name>`), even when settings or an explicit `-e` enable them.
     ///
-    /// The union of every settings layer, never the merged (project-wins)
-    /// value: the deep merge replaces arrays wholesale, so a project
-    /// `"disabledBuiltinExtensions": []` would otherwise re-enable every
-    /// builtin the user disabled in the global scope. Disabling is a
-    /// restriction, so a project scope may ADD names and never remove one
-    /// (the same rule as `defaultDisabledPackagesEnabled`, which reads the
-    /// global scope only); an untrusted project contributes nothing because
-    /// its raw scope is empty.
+    /// The `disabledBuiltinExtensions` key is the union of every settings
+    /// layer, never the merged (project-wins) value: the deep merge replaces
+    /// arrays wholesale, so a project `"disabledBuiltinExtensions": []` would
+    /// otherwise re-enable every builtin the user disabled in the global
+    /// scope. Disabling is a restriction, so a project scope may ADD names and
+    /// never remove one (the same rule as `defaultDisabledPackagesEnabled`,
+    /// which reads the global scope only); an untrusted project contributes
+    /// nothing because its raw scope is empty.
+    ///
+    /// The `extensions` entries follow upstream's scope precedence instead
+    /// (`-builtin:<name>` / `!builtin:<pattern>` disable, a project
+    /// `+builtin:<name>` re-enables — docs/settings.md:163,
+    /// package-manager.ts:986-1001), so they are folded in after the key's
+    /// union; see [`extensions_disabled_builtins`].
     pub fn disabled_builtin_extensions(&self) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
         for raw in [&self.global_raw, &self.project_raw, &self.raw] {
@@ -1140,6 +1145,10 @@ impl SettingsManager {
                 names.extend(disabled_builtin_names(value));
             }
         }
+        names.extend(extensions_disabled_builtins(
+            &self.global_raw,
+            &self.project_raw,
+        ));
         names
     }
 
@@ -1244,6 +1253,84 @@ impl SettingsManager {
             .clone()
             .unwrap_or(QuietStartup::Enabled(false))
     }
+}
+
+/// Built-in extension names the top-level `extensions` arrays disable, using
+/// pi's documented spelling and scope precedence: a user-scope
+/// `-builtin:<name>` (or `!builtin:<pattern>`) disables the builtin, and a
+/// trusted project's `+builtin:<name>` re-enables it for that project
+/// (upstream docs/settings.md:163; package-manager.ts:980-1001, where
+/// `applyAutoloadDisabledPatterns` lets the last matching project entry
+/// override the user decision).
+///
+/// Separate from the `disabledBuiltinExtensions` key: that pir-only key is a
+/// restriction a project may add to but never lift, while these entries keep
+/// upstream's project-overrides-user precedence. Both are unioned by
+/// [`SettingsManager::disabled_builtin_extensions`]. Every builtin name the
+/// build carries is evaluated, so a `!builtin:<prefix>*` pattern disables
+/// every match exactly like upstream's `matchesAnyPattern`.
+fn extensions_disabled_builtins(global_raw: &Value, project_raw: &Value) -> BTreeSet<String> {
+    use crate::coding_agent::tool_selection::tool_pattern_matches;
+
+    fn controls(raw: &Value) -> Vec<(char, String)> {
+        raw.get("extensions")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(|entry| {
+                        extension_builtin_control(entry)
+                            .map(|(control, target)| (control, target.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    let global = controls(global_raw);
+    let project = controls(project_raw);
+    let mut disabled = BTreeSet::new();
+    for name in crate::plugins::builtin::builtin_names() {
+        let path = format!("builtin:{name}");
+        // User scope (upstream `isEnabledByOverrides`): `!` excludes, `+`
+        // force-includes, `-` force-excludes, in that precedence.
+        let mut enabled = true;
+        if global
+            .iter()
+            .any(|(control, target)| *control == '!' && tool_pattern_matches(target, &path))
+        {
+            enabled = false;
+        }
+        if global
+            .iter()
+            .any(|(control, target)| *control == '+' && target == &path)
+        {
+            enabled = true;
+        }
+        if global
+            .iter()
+            .any(|(control, target)| *control == '-' && target == &path)
+        {
+            enabled = false;
+        }
+        // Project scope: the last matching entry decides, and any match
+        // overrides the user setting.
+        for (control, target) in &project {
+            let matched = if *control == '!' {
+                tool_pattern_matches(target, &path)
+            } else {
+                target == &path
+            };
+            if matched {
+                enabled = *control == '+';
+            }
+        }
+        if !enabled {
+            disabled.insert((*name).to_owned());
+        }
+    }
+    disabled
 }
 
 /// One pending write for [`SettingsManager::persist_writes`]: a top-level

@@ -2904,3 +2904,131 @@ mod fragment_cache_tests {
         );
     }
 }
+
+/// A host with NO JS face (builtin/inline plugins only, `config.extensions =
+/// None`) has no reader for the JS-only session views: the push must not
+/// render or retain the branch text, the tree text/arena, the label map or
+/// the projection text, while the native contract (`entries` + ids/path/cwd/
+/// header/leaf/model) stays exactly what the JS-face push publishes.
+///
+/// The `entries` oracle is the live projection's flat message list serialized
+/// with `serde_json::to_value` — the same value the JS path splices, so a
+/// native push that changed it would fail here.
+mod native_snapshot_shape_tests {
+    use super::*;
+
+    async fn native_push(pushes: &Arc<Mutex<Vec<SessionContextSnapshot>>>, agent: &AgentSession) {
+        assert!(
+            agent.push_session_context_for_test().await,
+            "a fresh session must rebuild the native snapshot"
+        );
+        assert_eq!(
+            pushes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "one push reaches the native fan-out"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
+    async fn native_only_push_skips_the_js_only_views_but_keeps_entries() {
+        let _serial = env_lock();
+        let temp = TempDir::new("native-js-gate");
+        let cwd = temp.path().to_string_lossy().into_owned();
+        let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
+        manager
+            .append_message(user_message("gate question"))
+            .expect("append user");
+        manager
+            .append_message(assistant_message("gate reply"))
+            .expect("append assistant");
+
+        let (recorder, pushes) = SnapshotRecorder::new();
+        let config = agent_config(temp.path(), manager);
+        let agent = AgentSession::new_with_plugins(config, vec![Arc::new(recorder)]);
+        native_push(&pushes, &agent).await;
+
+        let snapshot = pushes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last()
+            .cloned()
+            .expect("recorded snapshot");
+        assert!(
+            snapshot.branch_json.is_empty(),
+            "no JS face: the branch text must not be rendered: {:?}",
+            snapshot.branch_json
+        );
+        assert!(
+            snapshot.tree_json.is_empty(),
+            "no JS face: the tree text must not be rendered"
+        );
+        assert!(
+            snapshot.projection_json.is_empty(),
+            "no JS face: the projection text must not be rendered"
+        );
+        assert_eq!(
+            snapshot.labels,
+            serde_json::Value::Object(serde_json::Map::new()),
+            "no JS face: the label map is not walked"
+        );
+        assert!(snapshot.session_id.is_some(), "native ids stay populated");
+        assert!(snapshot.cwd.is_some(), "native cwd stays populated");
+        assert!(snapshot.leaf_id.is_some(), "native leaf stays populated");
+        assert!(
+            !snapshot.header.is_null(),
+            "native header stays populated: {}",
+            snapshot.header
+        );
+
+        // `entries` is the oracle: the live projection's flat message list.
+        let oracle = {
+            let session = agent.session_manager().expect("persisted session");
+            let projection = session
+                .lock()
+                .await
+                .build_session_projection()
+                .expect("projection");
+            serde_json::to_value(&projection.messages).expect("oracle json")
+        };
+        assert_eq!(
+            snapshot.entries.as_ref(),
+            &oracle,
+            "the native entries payload is byte-identical to the projection messages"
+        );
+
+        // The extend path (an append) keeps the same shape: one extend, no
+        // full rebuild, entries grown by the appended turn, no texts.
+        let session = agent.session_manager().expect("persisted session");
+        session
+            .lock()
+            .await
+            .append_message(user_message("after push"))
+            .expect("append after push");
+        assert!(
+            agent.push_session_context_for_test().await,
+            "the appended entry must rebuild"
+        );
+        let grown = pushes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last()
+            .cloned()
+            .expect("second snapshot");
+        assert!(
+            grown.branch_json.is_empty()
+                && grown.tree_json.is_empty()
+                && grown.projection_json.is_empty(),
+            "the extend path keeps the JS-only views unrendered"
+        );
+        assert_eq!(
+            grown.entries.as_array().map(Vec::len),
+            Some(3),
+            "the appended user turn is in the native aggregate: {}",
+            grown.entries
+        );
+    }
+}

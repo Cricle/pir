@@ -350,50 +350,106 @@ pub fn prepare_session_command_to_storage(
             // requires a user message and branches at its PARENT — a `None`
             // parent (fork before the first user message) starts a fresh
             // session with the current one as its `parentSession` link.
+            //
+            // A PERSISTED fork follows upstream `runtimeHost.fork`
+            // (agent-session-runtime.ts:262-350) and the `AgentSession` seam
+            // ([`AgentSession::fork_entry`], PIR-BIN-052): reopen the CURRENT
+            // file as a second manager and
+            // `create_branched_session(target)` into a NEW session file whose
+            // header carries `parentSession = <source>` and whose rows are the
+            // root→target path. Branching the live manager in place cannot be
+            // represented in the JSONL format (there is no persisted leaf
+            // row), so the print host's fork used to be lost at the next
+            // process boundary (PIR-BIN-082). Reading the FILE (not the live
+            // manager) also makes the fork work on a paged session, whose
+            // resident window is not the session.
+            //
             // Note: the print host applies raw storage with no plugin
             // surface in reach, so no `session_before_fork` dispatch runs on
             // this path (the AgentSession host does, via
             // `AgentSession::fork_entry`).
-            let session = storage
-                .as_mut()
-                .ok_or_else(|| "no attached session storage; the run stays ephemeral".to_owned())?;
-            match (
-                ForkPosition::parse(position.as_deref()),
-                session.entry(entry_id),
-            ) {
-                (ForkPosition::At, Some(_)) => session
-                    .branch(entry_id)
-                    .map_err(|error| format!("fork failed: {error}"))?,
-                (ForkPosition::At, None) => return Err("Invalid entry ID for forking".to_owned()),
-                (ForkPosition::Before, Some(FileEntry::Message(inner)))
-                    if inner.message.role() == "user" =>
-                {
-                    match inner.parent_id.clone() {
-                        Some(parent) => session
-                            .branch(&parent)
-                            .map_err(|error| format!("fork failed: {error}"))?,
-                        None => {
-                            // Fork before the first user message: fresh
-                            // session with the current one as its parent
-                            // link (upstream `SessionManager.create` +
-                            // `newSession({parentSession})`).
-                            let cwd = session.cwd().to_owned();
-                            let parent_file = session.session_file().map(Path::to_path_buf);
-                            let mut fresh = SessionManager::create(&cwd, session_dir)
-                                .map_err(|error| format!("fork failed: {error}"))?;
-                            if let Some(parent) = parent_file {
-                                fresh
-                                    .new_session(Some(crate::session_manager::NewSessionOptions {
-                                        id: None,
-                                        parent_session: Some(parent.display().to_string()),
-                                    }))
-                                    .map_err(|error| format!("fork failed: {error}"))?;
-                            }
-                            *storage = Some(fresh);
+            let (target, manager_session_dir, source_file) = {
+                let Some(session) = storage.as_ref() else {
+                    return Err("no attached session storage; the run stays ephemeral".to_owned());
+                };
+                let entry = session
+                    .entry(entry_id)
+                    .ok_or_else(|| "Invalid entry ID for forking".to_owned())?;
+                let target = match ForkPosition::parse(position.as_deref()) {
+                    ForkPosition::At => Some(entry_id.clone()),
+                    ForkPosition::Before => {
+                        let FileEntry::Message(inner) = entry else {
+                            return Err("Invalid entry ID for forking".to_owned());
+                        };
+                        if inner.message.role() != "user" {
+                            return Err("Invalid entry ID for forking".to_owned());
                         }
+                        inner.parent_id.clone()
                     }
+                };
+                (
+                    target,
+                    session.session_dir().to_path_buf(),
+                    session.session_file().map(Path::to_path_buf),
+                )
+            };
+            match target {
+                Some(target) => match source_file {
+                    // Non-persisted storage: upstream branches the SAME
+                    // in-memory manager (`createBranchedSession` returns
+                    // `undefined` and replaces the entries in memory).
+                    None => {
+                        let session = storage.as_mut().ok_or_else(|| {
+                            "no attached session storage; the run stays ephemeral".to_owned()
+                        })?;
+                        session
+                            .create_branched_session(&target)
+                            .map_err(|error| format!("fork failed: {error}"))?;
+                    }
+                    // Persisted (upstream agent-session-runtime.ts:312-320).
+                    Some(source_file) => {
+                        if !source_file.exists() {
+                            return Err("This session has not been saved yet. \
+                                        Send a message before cloning or forking it."
+                                .to_owned());
+                        }
+                        let mut branched = SessionManager::open_with(
+                            &source_file,
+                            Some(&manager_session_dir),
+                            None,
+                        )
+                        .map_err(|error| format!("fork failed: {error}"))?;
+                        branched
+                            .create_branched_session(&target)
+                            .map_err(|error| format!("fork failed: {error}"))?;
+                        *storage = Some(branched);
+                    }
+                },
+                None => {
+                    // Fork before the first user message: fresh session with
+                    // the current one as its parent link (upstream
+                    // `SessionManager.create` + `newSession({parentSession})`).
+                    let (cwd, parent_file) = {
+                        let session = storage.as_ref().ok_or_else(|| {
+                            "no attached session storage; the run stays ephemeral".to_owned()
+                        })?;
+                        (
+                            session.cwd().to_owned(),
+                            session.session_file().map(Path::to_path_buf),
+                        )
+                    };
+                    let mut fresh = SessionManager::create(&cwd, session_dir)
+                        .map_err(|error| format!("fork failed: {error}"))?;
+                    if let Some(parent) = parent_file {
+                        fresh
+                            .new_session(Some(crate::session_manager::NewSessionOptions {
+                                id: None,
+                                parent_session: Some(parent.display().to_string()),
+                            }))
+                            .map_err(|error| format!("fork failed: {error}"))?;
+                    }
+                    *storage = Some(fresh);
                 }
-                (ForkPosition::Before, _) => return Err("Invalid entry ID for forking".to_owned()),
             }
             Ok(SessionCommandStep::Applied)
         }
@@ -1450,14 +1506,12 @@ fn phone_tree_json(manager: &SessionManager) -> JsonValue {
     });
     // Borrowed path walk: only the entry IDs are read, so cloning the whole
     // branch (messages included) with `branch_entries` is unnecessary.
-    let current_path: Vec<JsonValue> = crate::session_manager::projection::build_session_path(
-        manager.resident_entries(),
-        manager.leaf_id(),
-    )
-    .iter()
-    .filter(|entry| !entry.is_header())
-    .map(|entry| JsonValue::String(entry.entry_id().to_owned()))
-    .collect();
+    let current_path: Vec<JsonValue> = manager
+        .projected_branch_path(manager.leaf_id())
+        .iter()
+        .filter(|entry| !entry.is_header())
+        .map(|entry| JsonValue::String(entry.entry_id().to_owned()))
+        .collect();
     serde_json::json!({
         "sessionFile": session_file,
         "currentLeafId": manager.leaf_id(),

@@ -234,14 +234,18 @@ const EXPECT_SITE_ALLOWLIST: [(&str, u32); 30] = [
     // session cannot exceed `u32::MAX` nodes (each node is one JSONL entry),
     // so the conversion failing means the fixture itself is invalid.
     // Shifted 723 -> 746 by the R57 CachedTree head/tail edits above it in the
-    // same function (same site, same invariant).
-    ("agent_session/session_ctx.rs", 746),
+    // same function (same site, same invariant), then 746 -> 780 by the
+    // q4-memory-ceiling JS-face snapshot gate (the `js_face` input field and
+    // `serialize_projection_snapshot` doc/signature above it).
+    ("agent_session/session_ctx.rs", 780),
     // `reuse` is computed two lines above as
     // `old.as_ref().is_some_and(|slot| ..)`, so `Some` is proven when this
     // branch runs; the `take` cannot observe `None`. Shifted 8398 -> 8458 by
-    // the PIR-TUI-027/030 edits above it in the same function (same site, same
+    // the PIR-TUI-027/030 edits above it in the same function, then
+    // 8458 -> 8509 by the PIR-TUI-034/035/036/039 window and dock edits, then
+    // 8509 -> 8507 by the abort-retry/streaming edits (same site, same
     // invariant).
-    ("tui/terminal.rs", 8458),
+    ("tui/terminal.rs", 8507),
     // `guard.sender.is_none()` returns above, so the `as_ref()` in the same
     // locked scope is `Some`: the sender is read and used under one sink lock
     // with no intervening mutation. (This site surfaced when the file's

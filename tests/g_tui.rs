@@ -31,6 +31,8 @@ mod tui_gaps_w11;
 mod tui_grapheme_editor;
 #[path = "suites/tui_image_preview_units.rs"]
 mod tui_image_preview_units;
+#[path = "suites/tui_input_wakeup.rs"]
+mod tui_input_wakeup;
 #[path = "suites/tui_keybindings_upstream.rs"]
 mod tui_keybindings_upstream;
 #[path = "suites/tui_live_settings_w14.rs"]

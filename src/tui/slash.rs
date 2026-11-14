@@ -278,6 +278,45 @@ pub fn builtin_action(name: &str) -> Option<SlashAction> {
     })
 }
 
+/// Commands upstream dispatches ONLY on the exact text `/<name>`: any
+/// trailing argument makes the whole text fall through to
+/// `session.prompt(text)` there (`interactive-mode.ts:3161-3300`; the prompt
+/// path then expands prompt templates / reaches the model, :3320-3350). pir
+/// used to run these actions and silently drop the argument, so `/quit now`
+/// quit, `/new please` started a fresh session and `/clone x` duplicated it
+/// (PIR-BIN-089 #3). The trailing-arg text now follows upstream's rule and
+/// becomes a normal prompt.
+///
+/// Deliberate pir supersets are NOT listed: `/copy [count|all]` and
+/// `/debug [enable|disable|last]` accept documented arguments upstream matches
+/// exactly; dropping their argument would regress pir. Every upstream
+/// prefix-matched command (`/name `, `/model `, `/thinking `, `/compact `,
+/// `/export `, `/import `, `/bug `, `/login `) keeps its argument too.
+pub const EXACT_MATCH_ONLY_COMMANDS: &[&str] = &[
+    "settings",
+    "tree",
+    "scoped-models",
+    "share",
+    "session",
+    "changelog",
+    "hotkeys",
+    "fork",
+    "clone",
+    "trust",
+    "logout",
+    "new",
+    "resume",
+    "reload",
+    "quit",
+];
+
+/// Whether `/<name> <args>` (a NON-empty `args`) must fall through to the
+/// normal prompt instead of running the built-in: upstream's
+/// `text === "/<name>"` rule (see [`EXACT_MATCH_ONLY_COMMANDS`]).
+pub fn exact_match_only(name: &str) -> bool {
+    EXACT_MATCH_ONLY_COMMANDS.contains(&name)
+}
+
 /// Whether an action ends the TUI event loop (upstream `/quit` calls
 /// `shutdown()` and returns).
 pub fn action_quits(action: SlashAction) -> bool {
@@ -405,6 +444,18 @@ pub fn name_argument(args: &str) -> Result<String, String> {
         Err("Usage: /name <name>".to_owned())
     } else {
         Ok(name.to_owned())
+    }
+}
+
+/// The bare `/name` transcript line (upstream `handleNameCommand`,
+/// interactive-mode.ts:6664-6680): `/name [name]` shows
+/// `Session name: <current>` when the session has a name and only falls back
+/// to the usage warning when it does not. Kept pure so the display contract
+/// is testable without a terminal.
+pub fn name_display(current: Option<&str>) -> Result<String, String> {
+    match current.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => Ok(format!("Session name: {name}")),
+        None => Err("Usage: /name <name>".to_owned()),
     }
 }
 

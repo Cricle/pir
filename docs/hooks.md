@@ -91,13 +91,13 @@ historical `"rpc"`), `before_agent_start` per prompt (injected messages ride the
 `session_compact_failed`, `agent_settled`; loop-level events reach native plugins through the host.
 
 Print limitations: compaction is **threshold-only** (`reason` always `"threshold"`), and the
-notification drain applies a safe **actionable subset** (`print.rs:850-978`): `sendMessage` steers
+notification drain applies a safe **actionable subset** (`print.rs:1054-1185`): `sendMessage` steers
 into the preparing run or persists a custom message entry, `sendUserMessage` steers only while
 preparing, `appendEntry` / `setSessionName` / `setLabel` persist, and `abort` cancels the current
 run; `setModel` / `setThinkingLevel` / `compact` / `shutdown` are logged and ignored (print resolves
 model and compaction config once per invocation). Paged sessions use a **widening fallback**: print
-widens to the full resident view when threshold compaction cannot fire (`:3581-3596`) and after a
-paged compaction failure (`:5024-5052`), so the request sees the complete transcript instead of a
+widens to the full resident view when threshold compaction cannot fire (`:4379-4412`) and after a
+paged compaction failure (`:6630-6652`), so the request sees the complete transcript instead of a
 truncated tail. An extension `abort` settles only the current run; later prompts continue with a
 fresh signal (`:3455-3470`, `:3691-3700`). `notify` / `status` keep their stderr diagnostic routing.
 **Print SessionEvents** feed an ordered, non-blocking plugin bridge, so

@@ -1,7 +1,7 @@
 # Keybindings
 
-pir resolves keybindings from the settings `keybindings` map over the built-in registry (upstream's `tui.*`
-namespace, 32 ids plus the `app.*` groups).
+pir resolves keybindings from `<agentDir>/keybindings.json` plus the settings `keybindings` map (settings win)
+over the built-in registry (upstream's `tui.*` namespace, 32 ids plus the `app.*` groups).
 
 ## Settings shape
 
@@ -10,17 +10,20 @@ namespace, 32 ids plus the `app.*` groups).
   "keybindings": {
     "tui.input.submit": "enter",
     "app.editor.external": "ctrl+g",
-    "tui.select.up": "up,k"
+    "tui.select.up": ["up", "k"]
   }
 }
 ```
 
-Values are chord strings (`ctrl+`, `alt+`, `shift+` prefixes; comma separates alternatives). Unknown ids are
-silently ignored (upstream behavior); an explicit empty list (`[]`) unbinds an id's default. Reserved ids (like
-`tui.input.submit`) cannot be rebound by extensions.
+Values are a chord string or an array of chord strings (`ctrl+`/`alt+`/`shift+` prefixes; the settings schema
+accepts `string | string[]`). Unknown ids are silently ignored (upstream behavior); an explicit empty list (`[]`)
+unbinds an id's default. Extensions register extra chords with `pi.registerShortcut` — those take precedence
+over built-in actions — but the registry ids themselves are not extension-rebindable (the pi-tui shim's
+`setKeybindings` only drives that shim's own components).
 
-Id groups: `app.*` covers submit/newline, editor movement and kill-ring, message queue (enqueue/dequeue), model
-selector, clipboard and page scrolling; `tui.*` covers selector navigation, autocomplete accept, theme handling,
-alt-screen search/scroll and program status; `tui.altScreen.*` covers alt-screen cursor/scroll actions (hardcoded
-defaults today; see MAPPING.md deviations). `/hotkeys` renders the full live table (registry rows overridden by
-settings).
+Id groups: `tui.*` covers submit/newline and tab, editor movement and kill-ring, selector navigation,
+autocomplete accept and the alt-screen search/scroll family; `app.*` covers interrupt/clear/exit, thinking,
+model cycling/selection, message follow-up/dequeue/copy, clipboard paste, the external editor, and the
+`models.*`/`tree.*`/`session.*` families. `tui.altScreen.*` ids resolve like the rest (settings override →
+platform-resolved default → the upstream-verbatim table in `src/tui/altscreen_search.rs`). `/hotkeys` renders
+the full live table (registry rows overridden by settings).

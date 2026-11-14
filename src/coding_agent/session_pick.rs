@@ -581,35 +581,43 @@ impl PickerState {
 
 /// One display row: the backing row index plus its threaded-tree metadata
 /// when the threaded sort is active.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
-struct DisplayRow {
-    row: usize,
-    node: Option<ThreadedNode>,
+pub struct DisplayRow {
+    #[doc(hidden)]
+    pub row: usize,
+    #[doc(hidden)]
+    pub node: Option<ThreadedNode>,
 }
 
 /// The display order for the current query/sort/filter state (upstream
 /// `filterSessions`), built from the active scope list.
-fn display_rows(state: &PickerState) -> Vec<DisplayRow> {
+///
+/// The default sort is [`SortMode::Threaded`] with an empty query, which is
+/// exactly the state of the FIRST paint and of a plain Down/PageDown key. The
+/// threaded order IS the display order, so this builds the node list once and
+/// attaches each node to its row positionally — the previous shape rebuilt the
+/// tree a second time after `filter_rows` had already built it and then
+/// located every row's node with a linear scan (two O(n log n) builds and one
+/// O(n²) lookup per render: at 5000 sessions every keystroke paid ~50 ms of
+/// pure bookkeeping). The named-only filter is applied to the same nodes, in
+/// the same order, so the rendered rows are byte-identical.
+#[doc(hidden)]
+pub fn display_rows(state: &PickerState) -> Vec<DisplayRow> {
     let rows = state.active_rows();
-    let order = filter_rows(rows, &state.query, state.sort_mode, state.named_only);
     let threaded = state.sort_mode == SortMode::Threaded && state.query.trim().is_empty();
-    let threaded_nodes: Vec<ThreadedNode> = if threaded {
-        build_threaded_order(rows)
-    } else {
-        Vec::new()
-    };
-    order
+    if !threaded {
+        return filter_rows(rows, &state.query, state.sort_mode, state.named_only)
+            .into_iter()
+            .map(|row| DisplayRow { row, node: None })
+            .collect();
+    }
+    build_threaded_order(rows)
         .into_iter()
-        .map(|row_index| DisplayRow {
-            row: row_index,
-            node: if threaded {
-                threaded_nodes
-                    .iter()
-                    .find(|node| node.row == row_index)
-                    .cloned()
-            } else {
-                None
-            },
+        .filter(|node| !state.named_only || rows[node.row].has_name())
+        .map(|node| DisplayRow {
+            row: node.row,
+            node: Some(node),
         })
         .collect()
 }

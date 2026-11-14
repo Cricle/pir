@@ -6,6 +6,13 @@
 //! messages with markdown converted to HTML, tool execution blocks with their
 //! (ANSI-stripped) output, and inline CSS. No external scripts, fonts, or
 //! assets.
+//!
+//! The exporter reads a persisted session file: pir's ephemeral
+//! (`--no-session`) host keeps its transcript in `AgentSession.history` and
+//! has no `SessionManager` to render (upstream always has its in-memory
+//! manager), so `/export` and RPC `export_html` report the documented
+//! `cannot export an in-memory session (--no-session)` error instead (see
+//! `docs/tui.md`).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -61,8 +68,8 @@ fn safe_link_url(url: &str) -> bool {
         )
 }
 
-/// Inline formatting on already-escaped text: inline code, bold, italic, and
-/// links.
+/// Inline formatting on already-escaped text: inline code, bold, italic,
+/// strikethrough, and links.
 fn markdown_inline(escaped: &str) -> String {
     let mut out = String::with_capacity(escaped.len());
     let chars = escaped.chars().collect::<Vec<_>>();
@@ -92,6 +99,30 @@ fn markdown_inline(escaped: &str) -> String {
                 out.push('>');
                 index = close + marker_len;
                 continue;
+            }
+        }
+        if chars[index] == '~' {
+            // GFM strikethrough (upstream marked's `del` tokenizer): one or
+            // two tildes, the opener preceded by the start or punctuation
+            // and followed by non-space content, the closer mirrored.
+            let marker_len = if chars.get(index + 1) == Some(&'~') {
+                2
+            } else {
+                1
+            };
+            let opener_ok = index == 0 || !chars[index - 1].is_alphanumeric();
+            let content_ok = chars
+                .get(index + marker_len)
+                .is_some_and(|ch| !ch.is_whitespace() && *ch != '~');
+            if opener_ok && content_ok {
+                if let Some(close) = find_del_close(&chars, index + marker_len, marker_len) {
+                    let inner: String = chars[index + marker_len..close].iter().collect();
+                    out.push_str("<del>");
+                    out.push_str(&markdown_inline(&inner));
+                    out.push_str("</del>");
+                    index = close + marker_len;
+                    continue;
+                }
             }
         }
         if chars[index] == '[' {
@@ -128,6 +159,28 @@ fn find_inline_close(chars: &[char], start: usize, doubles: bool) -> Option<usiz
             } else {
                 return Some(index);
             }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Find the closing GFM strikethrough delimiter of `marker_len` tildes
+/// (upstream marked `delRDelim`: same arity as the opener, non-space content
+/// on both sides, and never part of a longer tilde run).
+fn find_del_close(chars: &[char], start: usize, marker_len: usize) -> Option<usize> {
+    let mut index = start;
+    while index < chars.len() {
+        if chars[index] == '~' {
+            let run = chars[index..].iter().take_while(|ch| **ch == '~').count();
+            let preceded_ok =
+                index > start && !chars[index - 1].is_whitespace() && chars[index - 1] != '~';
+            let followed_ok = chars.get(index + marker_len).is_none_or(|ch| *ch != '~');
+            if run == marker_len && preceded_ok && followed_ok {
+                return Some(index);
+            }
+            index += run;
+            continue;
         }
         index += 1;
     }
@@ -219,11 +272,22 @@ pub fn markdown_to_html(text: &str) -> String {
     }
 
     while let Some(line) = lines.next() {
-        // Fenced code block.
+        // Fenced code block. The info string's first word becomes the
+        // upstream renderer's language class (`<code class="language-js">`)
+        // so the exported source keeps the language even without a client
+        // highlighter.
         if line.trim_start().starts_with("```") {
             flush_paragraph(&mut out, &mut paragraph);
             close_list(&mut out, &mut list_kind);
-            out.push_str("<pre><code>");
+            let info = line.trim_start()[3..].trim();
+            let language = info.split_whitespace().next().unwrap_or("");
+            if language.is_empty() {
+                out.push_str("<pre><code>");
+            } else {
+                out.push_str("<pre><code class=\"language-");
+                out.push_str(&escape_html(language));
+                out.push_str("\">");
+            }
             for code_line in lines.by_ref() {
                 if code_line.trim_start().starts_with("```") {
                     break;
@@ -827,6 +891,7 @@ fn render_system_entry(entry: &FileEntry, message: &StoredSystemMessage, leading
 fn generate_html(
     header: Option<&crate::session_manager::types::SessionHeader>,
     entries: &[FileEntry],
+    theme_name: Option<&str>,
 ) -> String {
     // Project entries onto messages on the leaf path (the exported branch).
     let messages: Vec<Message> = entries
@@ -841,6 +906,10 @@ fn generate_html(
     let mut tool_results = 0u64;
     let mut tool_calls = 0u64;
     let mut tokens = Usage::default();
+    // Upstream `computeStats` sums the per-assistant `usage.cost.total`
+    // (provider-reported totals may intentionally differ from the component
+    // sum) and renders it as `Cost: $<total.toFixed(3)>`.
+    let mut cost_total = 0.0f64;
     let mut models: Vec<String> = Vec::new();
     for message in &messages {
         if let Message::Assistant(assistant) = message {
@@ -858,6 +927,7 @@ fn generate_html(
             tokens.output += assistant.usage.output;
             tokens.cache_read += assistant.usage.cache_read;
             tokens.cache_write += assistant.usage.cache_write;
+            cost_total += assistant.usage.cost.total;
         } else if matches!(message, Message::User(user) if user.role == crate::ai::types::UserRole::User)
         {
             user_messages += 1;
@@ -909,6 +979,12 @@ fn generate_html(
         format_tokens(tokens.output),
         format_tokens(tokens.cache_read),
         format_tokens(tokens.cache_write)
+    ));
+    // JS `(-0).toFixed(3)` is "0.000"; normalize the negative-zero sum the
+    // same way.
+    let cost_total = if cost_total == 0.0 { 0.0 } else { cost_total };
+    html.push_str(&format!(
+        "<div class=\"info-item\"><span class=\"info-label\">Cost:</span><span class=\"info-value\">${cost_total:.3}</span></div>"
     ));
     html.push_str("</div></div>");
 
@@ -969,50 +1045,51 @@ fn generate_html(
         }
     }
 
-    wrap_document(&html)
+    wrap_document(&html, theme_name)
 }
 
 /// Inline CSS: compact dark monospace theme with the upstream export class
 /// names (upstream template.css, hand-rolled subset). The page/card/info
-/// surfaces read the theme `export` colors through CSS custom properties
-/// (upstream theme schema `export`: pageBg/cardBg/infoBg); the literals are
-/// the defaults used when the active theme does not define them.
+/// surfaces read the theme `export` colors and the text surfaces read the
+/// theme's foreground tokens through CSS custom properties (upstream
+/// `generateThemeVars` emits the same colors); the literals are the defaults
+/// used when the active theme does not define them or the build has no TUI.
 const EXPORT_CSS: &str = "\
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace; font-size: 12px; line-height: 1.5; color: #ececf1; background: var(--pir-export-page-bg, #101014); padding: 24px 12px; }
+body { font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace; font-size: 12px; line-height: 1.5; color: var(--pir-export-text, #ececf1); background: var(--pir-export-page-bg, #101014); padding: 24px 12px; }
 .container { max-width: 840px; margin: 0 auto; }
 .header { background: var(--pir-export-card-bg, #1e1e24); border: 1px solid #33333c; border-radius: 6px; padding: 14px 16px; margin-bottom: 18px; }
 .header h1 { font-size: 15px; margin-bottom: 10px; }
 .header-info { display: flex; flex-wrap: wrap; gap: 4px 18px; }
-.info-item { color: #b7b7c2; }
-.info-label { color: #8a8a95; margin-right: 4px; }
-.user-message { background: var(--pir-export-card-bg, #2a2a35); border-radius: 8px; padding: 10px 14px; margin: 14px 0 14px auto; max-width: 88%; width: fit-content; white-space: pre-wrap; word-break: break-word; }
+.info-item { color: var(--pir-export-text, #b7b7c2); }
+.info-label { color: var(--pir-export-muted, #8a8a95); margin-right: 4px; }
+.user-message { background: var(--pir-export-user-bg, #2a2a35); border-radius: 8px; padding: 10px 14px; margin: 14px 0 14px auto; max-width: 88%; width: fit-content; white-space: pre-wrap; word-break: break-word; }
 .assistant-message { margin: 16px 0; }
 .assistant-text { padding: 4px 0; }
 .markdown-content p { margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
 .markdown-content h1, .markdown-content h2, .markdown-content h3, .markdown-content h4, .markdown-content h5, .markdown-content h6 { margin: 12px 0 6px; }
-.markdown-content pre { background: #18181d; border: 1px solid #33333c; border-radius: 4px; padding: 8px 10px; overflow-x: auto; margin: 8px 0; }
-.markdown-content code { font-family: inherit; background: #18181d; border-radius: 3px; padding: 1px 4px; }
+.markdown-content pre { background: rgba(128, 128, 128, 0.14); border: 1px solid #33333c; border-radius: 4px; padding: 8px 10px; overflow-x: auto; margin: 8px 0; }
+.markdown-content code { font-family: inherit; background: rgba(128, 128, 128, 0.18); border-radius: 3px; padding: 1px 4px; }
 .markdown-content pre code { padding: 0; background: transparent; }
 .markdown-content ul, .markdown-content ol { margin: 6px 0 6px 22px; }
-.markdown-content a { color: #7ab8ff; }
-.thinking-block { border-left: 2px solid #3d3d4a; margin: 8px 0; padding: 2px 10px; color: #9a9aa6; }
+.markdown-content a { color: var(--pir-export-link, #7ab8ff); }
+.thinking-block { border-left: 2px solid rgba(128, 128, 128, 0.3); margin: 8px 0; padding: 2px 10px; color: var(--pir-export-thinking, #9a9aa6); }
 .thinking-block summary { cursor: pointer; }
 .thinking-text { white-space: pre-wrap; margin-top: 6px; }
 .tool-execution { background: var(--pir-export-card-bg, #1a1a20); border: 1px solid #2c2c36; border-radius: 6px; padding: 8px 12px; margin: 10px 0; }
 .tool-execution.error { border-color: #6e3238; }
 .tool-execution.pending { border-style: dashed; }
-.tool-header { color: #9fe0a9; margin-bottom: 4px; }
-.tool-execution.error .tool-header { color: #ff9aa5; }
-.tool-args pre, .tool-output pre { background: #141419; border-radius: 4px; padding: 6px 8px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin: 4px 0; }
+.tool-header { color: var(--pir-export-success, #9fe0a9); margin-bottom: 4px; }
+.tool-execution.error .tool-header { color: var(--pir-export-error, #ff9aa5); }
+.tool-args pre, .tool-output pre { background: rgba(128, 128, 128, 0.12); border-radius: 4px; padding: 6px 8px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin: 4px 0; }
 .tool-image, .message-image { max-width: 480px; max-height: 360px; border-radius: 6px; margin: 6px 0; display: block; }
 .message-image { width: fit-content; }
-.error-text { color: #ff9aa5; margin: 6px 0; }
-.system-message { color: #8a8a95; margin: 8px 0; }
-.system-entry { background: var(--pir-export-card-bg, #1e1e24); border: 1px solid #33333c; border-radius: 6px; padding: 10px 14px; margin: 14px 0; color: #b7b7c2; }
-.system-entry > .message-timestamp { padding-left: 14px; margin-bottom: 4px; color: #8a8a95; }
+.error-text { color: var(--pir-export-error, #ff9aa5); margin: 6px 0; }
+.system-message { color: var(--pir-export-muted, #8a8a95); margin: 8px 0; }
+.system-entry { background: var(--pir-export-card-bg, #1e1e24); border: 1px solid #33333c; border-radius: 6px; padding: 10px 14px; margin: 14px 0; color: var(--pir-export-text, #b7b7c2); }
+.system-entry > .message-timestamp { padding-left: 14px; margin-bottom: 4px; color: var(--pir-export-muted, #8a8a95); }
 .system-entry > :last-child { margin-bottom: 0; }
-.system-prompt-header, .tools-header { font-weight: bold; color: #c9c9d4; margin-bottom: 4px; }
+.system-prompt-header, .tools-header { font-weight: bold; color: var(--pir-export-text, #c9c9d4); margin-bottom: 4px; }
 .system-prompt-preview, .system-prompt-full { white-space: pre-wrap; word-break: break-word; }
 .system-prompt-full { display: none; }
 .system-prompt.expandable { cursor: pointer; }
@@ -1020,34 +1097,36 @@ body { font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Con
 .system-prompt.expandable .system-prompt-full { display: none; }
 .system-prompt.expandable.expanded .system-prompt-preview { display: none; }
 .system-prompt.expandable.expanded .system-prompt-full { display: block; }
-.system-prompt-expand-hint { color: #7ab8ff; margin-top: 2px; }
+.system-prompt-expand-hint { color: var(--pir-export-link, #7ab8ff); margin-top: 2px; }
 .tools-list { margin-top: 8px; }
 .tool-item { margin: 2px 0; }
-.tool-item-name { color: #9fe0a9; margin-right: 6px; }
-.tool-item-desc { color: #9a9aa6; }
-.tool-item-params { color: #8a8a95; font-size: 11px; }
-.model-change { color: #8a8a95; margin: 12px 0; }
-.model-name { color: #c9c9d4; }
-.compaction, .branch-summary, .hook-message { background: var(--pir-export-info-bg, #3a3428); border: 1px solid #55503f; border-radius: 6px; padding: 8px 12px; margin: 12px 0; color: #d8d2c0; }
+.tool-item-name { color: var(--pir-export-success, #9fe0a9); margin-right: 6px; }
+.tool-item-desc { color: var(--pir-export-muted, #9a9aa6); }
+.tool-item-params { color: var(--pir-export-muted, #8a8a95); font-size: 11px; }
+.model-change { color: var(--pir-export-muted, #8a8a95); margin: 12px 0; }
+.model-name { color: var(--pir-export-text, #c9c9d4); }
+.compaction, .branch-summary, .hook-message { background: var(--pir-export-info-bg, #3a3428); border: 1px solid #55503f; border-radius: 6px; padding: 8px 12px; margin: 12px 0; color: var(--pir-export-text, #d8d2c0); }
 .compaction-label, .hook-type, .branch-summary-header { font-weight: bold; margin-bottom: 4px; }
 .compaction pre, .branch-summary pre { white-space: pre-wrap; word-break: break-word; }
 ";
 
 /// Wrap rendered content in the static document shell (upstream
 /// template.html; no scripts — everything is pre-rendered). The theme's
-/// `export` colors (pageBg/cardBg/infoBg of the active theme) override the
-/// page/card/info surface colors via CSS custom properties.
-fn wrap_document(body: &str) -> String {
+/// `export` colors (pageBg/cardBg/infoBg) and its foreground tokens override
+/// the stylesheet colors through CSS custom properties; `theme_name` is the
+/// theme the calling host renders with (upstream
+/// `exportToHtml(..., { themeName })`), `None` selecting the active theme.
+fn wrap_document(body: &str, theme_name: Option<&str>) -> String {
     #[cfg(feature = "tui")]
     let mut variables = String::new();
     #[cfg(not(feature = "tui"))]
     let variables = String::new();
-    // The theme's export colors are a TUI surface (the active theme lives in
-    // the TUI's theme registry); without the TUI the export keeps the
-    // stylesheet's built-in surface colors.
+    // Theme-derived colors are a TUI surface (the active theme lives in the
+    // TUI's theme registry); without the TUI the export keeps the
+    // stylesheet's built-in colors.
     #[cfg(feature = "tui")]
     {
-        let export = crate::tui::theme::theme_export_colors(None);
+        let export = crate::tui::theme::theme_export_colors(theme_name);
         if let Some(page_bg) = &export.page_bg {
             variables.push_str(&format!("--pir-export-page-bg: {page_bg};"));
         }
@@ -1056,6 +1135,31 @@ fn wrap_document(body: &str) -> String {
         }
         if let Some(info_bg) = &export.info_bg {
             variables.push_str(&format!("--pir-export-info-bg: {info_bg};"));
+        }
+        // Foreground tokens (upstream `generateThemeVars` emits every theme
+        // color as a custom property): without them a light theme's surface
+        // colors would sit under the dark stylesheet's text.
+        for (property, color) in [
+            ("--pir-export-text", crate::tui::theme::ThemeColor::Text),
+            ("--pir-export-muted", crate::tui::theme::ThemeColor::Muted),
+            (
+                "--pir-export-user-bg",
+                crate::tui::theme::ThemeColor::UserMessageBg,
+            ),
+            ("--pir-export-link", crate::tui::theme::ThemeColor::MdLink),
+            (
+                "--pir-export-success",
+                crate::tui::theme::ThemeColor::Success,
+            ),
+            ("--pir-export-error", crate::tui::theme::ThemeColor::Error),
+            (
+                "--pir-export-thinking",
+                crate::tui::theme::ThemeColor::ThinkingText,
+            ),
+        ] {
+            if let Some(hex) = theme_token_hex(theme_name, color) {
+                variables.push_str(&format!("{property}: {hex};"));
+            }
         }
     }
     let overrides = if variables.is_empty() {
@@ -1078,6 +1182,30 @@ fn wrap_document(body: &str) -> String {
     )
 }
 
+/// A theme foreground token resolved to a CSS-ready hex string. `theme_name`
+/// selects the theme (`None` = the active theme, the same rule
+/// [`crate::tui::theme::theme_export_colors`] uses). Custom themes resolve to
+/// hex like their export block; a value that is only a terminal palette index
+/// keeps the stylesheet default.
+#[cfg(feature = "tui")]
+fn theme_token_hex(
+    theme_name: Option<&str>,
+    color: crate::tui::theme::ThemeColor,
+) -> Option<String> {
+    use crate::tui::theme;
+    let active = theme::current_theme_name();
+    if theme_name.is_none_or(|name| name == active.as_str()) {
+        return theme::with_theme(|theme| theme.resolved_color_hex(color));
+    }
+    let name = theme_name?;
+    if let Some(theme) = theme::builtin_theme(name) {
+        return theme.resolved_color_hex(color);
+    }
+    let snapshot = theme::theme_snapshot(name)?;
+    let value = snapshot.colors.get(theme::Theme::key(color))?;
+    value.starts_with('#').then(|| value.clone())
+}
+
 // ---------------------------------------------------------------------------
 // Entry points
 // ---------------------------------------------------------------------------
@@ -1094,10 +1222,22 @@ fn default_output_path(session_path: &Path) -> std::path::PathBuf {
 
 /// Export a session file to a self-contained HTML page; returns the written
 /// output path. `output_path` defaults to [`default_output_path`] (upstream
-/// `exportFromFile`).
+/// `exportFromFile`). The active theme supplies the export colors.
 pub fn export_session_to_html(
     session_path: &Path,
     output_path: Option<&Path>,
+) -> crate::Result<std::path::PathBuf> {
+    export_session_to_html_with_theme(session_path, output_path, None)
+}
+
+/// [`export_session_to_html`] with an explicit theme name (upstream
+/// `exportToHtml(outputPath, { themeName })`). `None` selects the active
+/// theme, which is what the CLI and RPC hosts use; the TUI passes the theme
+/// it renders with.
+pub fn export_session_to_html_with_theme(
+    session_path: &Path,
+    output_path: Option<&Path>,
+    theme_name: Option<&str>,
 ) -> crate::Result<std::path::PathBuf> {
     if !session_path.exists() {
         anyhow::bail!("File not found: {}", session_path.display());
@@ -1105,11 +1245,18 @@ pub fn export_session_to_html(
     let manager = SessionManager::open(session_path)?;
     let header = manager.header().cloned();
     let entries = manager.entries();
-    let html = generate_html(header.as_ref(), &entries);
+    let html = generate_html(header.as_ref(), &entries, theme_name);
 
     let output = output_path
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| default_output_path(session_path));
-    std::fs::write(&output, html)?;
+    std::fs::write(&output, html).map_err(|error| {
+        // The raw io text may name neither the file nor the operation (Windows
+        // localizes it: "系统找不到指定的路径。 (os error 3)"), which leaves the
+        // user without the one fact they need. Name the target this process
+        // tried to write, the way upstream's Node error does
+        // (`ENOENT: no such file or directory, open '<path>'`).
+        anyhow::anyhow!("Failed to write {}: {error}", output.display())
+    })?;
     Ok(output)
 }

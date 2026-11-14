@@ -1265,6 +1265,17 @@ impl Default for LoopOptions {
     }
 }
 
+/// A host-owned cancel handle for the loop's AGENT-LAYER retry backoff
+/// (upstream's session-level `_retryAbortController`): the loop arms a FRESH
+/// signal for each backoff wait, so a stale cancel can never end a later wait,
+/// and `abort_retry()` aborts whichever layer is waiting when the host asks to
+/// stop (PIR-BIN-100: the transport's latch alone stopped being the waiting
+/// surface once status-class retries moved to this layer).
+pub trait RetryWaitAbort: Send + Sync {
+    /// Arm a fresh signal for ONE backoff wait.
+    fn arm(&self) -> crate::ai::types::AbortSignal;
+}
+
 /// Dependencies for a single agent run.
 pub struct LoopDeps {
     /// Streams assistant messages from the model.
@@ -1378,6 +1389,11 @@ pub struct LoopDeps {
     /// `"Retry cancelled"`). The transport's own retry budget does not use
     /// this sink, so the two retry layers never double-report.
     pub retry_events: Option<AgentRetryEventSink>,
+    /// Host cancel handle for the agent-layer retry wait ([`RetryWaitAbort`]):
+    /// the session arms it per backoff so `abort_retry()` (Esc during the
+    /// countdown) stops the wait immediately (PIR-BIN-100). `None` leaves the
+    /// wait cancellable only by the run's own abort signal.
+    pub retry_wait_abort: Option<std::sync::Arc<dyn RetryWaitAbort>>,
     /// Host-provided session environment for tools that spawn agent runs (the
     /// `subagent` builtin; upstream `ctx.model`/`ctx.hasUI`).
     pub session_env: Option<Arc<crate::agent::tool_execution::ToolSessionEnv>>,
@@ -1436,6 +1452,7 @@ impl Default for LoopDeps {
                     crate::config::defaults::settings_defaults::RETRY_MAX_AGENT_DELAY_MS,
             }),
             retry_events: None,
+            retry_wait_abort: None,
             session_env: None,
             tool_updates: None,
             nested_callable: None,
@@ -2402,27 +2419,48 @@ async fn run_with_options_in_span_inner(
                 "agent loop: retrying the turn after a retryable provider error"
             );
             // Abortable backoff: a cancel during the wait ends the run like a
-            // provider abort (upstream normalizes the in-flight response).
-            if let Some(signal) = signal.as_ref() {
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
-                    _ = signal.cancelled() => {
-                        // Upstream `_prepareRetry` catch → `_finishCancelledRetry`:
-                        // the UI is told the retry is over before the run ends.
-                        if let Some(sink) = deps.retry_events.as_ref() {
-                            sink(AgentRetryEvent::End {
-                                success: false,
-                                attempt: retry_attempt,
-                                final_error: Some("Retry cancelled".to_owned()),
-                            });
-                        }
-                        message.stop_reason = StopReason::Aborted;
-                        message.error_message = None;
-                        break 'request message;
-                    }
+            // provider abort (upstream normalizes the in-flight response). TWO
+            // sources can end it: the run's own abort signal, and the host's
+            // retry handle (`abort_retry`, upstream `abortRetry()` — PIR-BIN-100).
+            let wait_abort = deps.retry_wait_abort.as_ref().map(|abort| abort.arm());
+            let run_cancelled = async {
+                match signal.as_ref() {
+                    Some(signal) => signal.cancelled().await,
+                    None => std::future::pending().await,
                 }
-            } else {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            };
+            let retry_cancelled = async {
+                match wait_abort.as_ref() {
+                    Some(signal) => signal.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let mut aborted_by_run = false;
+            let mut aborted_by_retry = false;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                _ = run_cancelled => aborted_by_run = true,
+                _ = retry_cancelled => aborted_by_retry = true,
+            }
+            if aborted_by_run || aborted_by_retry {
+                // Upstream `_prepareRetry` catch → `_finishCancelledRetry`:
+                // the UI is told the retry is over before the run ends.
+                if let Some(sink) = deps.retry_events.as_ref() {
+                    sink(AgentRetryEvent::End {
+                        success: false,
+                        attempt: retry_attempt,
+                        final_error: Some("Retry cancelled".to_owned()),
+                    });
+                }
+                message.stop_reason = StopReason::Aborted;
+                // `abortRetry()` cancels only the WAIT: upstream never rewrites
+                // `message.errorMessage`, so the user keeps the provider error
+                // that caused the retry (PIR-BIN-100). A run-level abort still
+                // normalizes the message.
+                if aborted_by_run {
+                    message.error_message = None;
+                }
+                break 'request message;
             }
             // Re-issue the SAME turn: the failed attempt is not in `context`,
             // `new_messages`, or storage, so the retried request's history is
@@ -2518,13 +2556,6 @@ async fn run_with_options_in_span_inner(
                     let duration_ms = finalized.duration_ms;
                     let tool_name = finalized.tool_name.clone();
                     let call_id = finalized.call_id.clone();
-                    let mut result = to_tool_result_message(
-                        &finalized,
-                        &message,
-                        None,
-                        None,
-                        deps.tool_result_max_bytes,
-                    );
                     emit_lazy(&options.events, || AgentEvent::ToolExecutionEnd {
                         turn: turns,
                         event: crate::agent::tool_batch::ToolExecutionEvent::End {
@@ -2551,6 +2582,16 @@ async fn run_with_options_in_span_inner(
                         })
                     })
                     .await;
+                    // The end frame has been built from the finalized call;
+                    // the conversion below CONSUMES it (the result's text
+                    // moves into the message instead of being copied).
+                    let mut result = to_tool_result_message(
+                        finalized,
+                        &message,
+                        None,
+                        None,
+                        deps.tool_result_max_bytes,
+                    );
                     // Tool-result messages participate in the message
                     // lifecycle in UPSTREAM order (agent-loop.ts:946-951
                     // `emitToolResultMessage`: `message_start`, then
@@ -2948,7 +2989,16 @@ async fn run_with_options_in_span_inner(
                         .map(|record| (finalized.call_id.clone(), record))
                 })
                 .collect();
-            for finalized in &outcome.results {
+            // The terminating verdict is read here, before the results are
+            // CONSUMED below (the conversion moves each result's text into its
+            // message): `should_terminate` is a pure read of the same results,
+            // so computing it first is value-identical.
+            let batch_terminates = outcome.should_terminate();
+            // The results are consumed BY VALUE: the tool result's text,
+            // details, images and structured content move into the
+            // tool-result message instead of being deep-copied alongside the
+            // still-live finalized call.
+            for finalized in outcome.results {
                 let nested_summary = nested_records.get(&finalized.call_id).cloned();
                 let nested_calls = nested_summary
                     .as_ref()
@@ -2969,6 +3019,11 @@ async fn run_with_options_in_span_inner(
                     }),
                     None => base_usage,
                 };
+                // The commit tracker keys on the id the call was REQUESTED
+                // with: the `message_end` replacement applied below may carry a
+                // different id, so capture this one before the conversion
+                // consumes the finalized call.
+                let commit_call_id = finalized.call_id.clone();
                 let mut result = to_tool_result_message(
                     finalized,
                     &message,
@@ -3028,7 +3083,7 @@ async fn run_with_options_in_span_inner(
                 // barrier above still holds the persist itself until the
                 // whole batch is written (B1).
                 if let Some(tracker) = deps.commit_tracker.as_ref() {
-                    tracker.commit_key(&finalized.call_id);
+                    tracker.commit_key(&commit_call_id);
                 }
             }
             // Degenerate-loop guard (pir-native; upstream has none). A single
@@ -3197,7 +3252,7 @@ async fn run_with_options_in_span_inner(
             // hasMoreToolCalls=false) ???steering and follow-up still get
             // their poll, so a queued redirect is not dropped by a
             // terminate (agent-loop.ts:241,263,267).
-            if outcome.should_terminate() {
+            if batch_terminates {
                 if inject_prompts(
                     &deps,
                     turns,
@@ -4013,18 +4068,6 @@ fn retryable_turn_error(
     crate::ai::util::is_retryable_assistant_error(message)
 }
 
-/// The model-visible text of a tool-result message (text blocks only; images
-/// carry no comparable progress signal).
-fn tool_result_model_text(content: &[ContentBlock]) -> String {
-    let mut text = String::new();
-    for block in content {
-        if let ContentBlock::Text(part) = block {
-            text.push_str(&part.text);
-        }
-    }
-    text
-}
-
 /// Digest of one single-call turn: tool name + canonical arguments + the
 /// model-visible result (text + error flag). `structuredContent`/`details`
 /// are excluded on purpose — they can vary without any model-visible change
@@ -4052,7 +4095,18 @@ fn batch_digest(message: &AssistantMessage, results: &[ToolResultMessage]) -> Op
     }
     for result in results {
         result.is_error.hash(&mut hasher);
-        tool_result_model_text(&result.content).hash(&mut hasher);
+        // The model-visible text is the concatenation of the text blocks.
+        // Feeding the block bytes to the hasher in order and a single `0xff`
+        // terminator afterwards is EXACTLY `str::hash` of that concatenation
+        // (`Hash for str` writes the bytes, then `write_u8(0xff)`), so the
+        // digest is unchanged — without building the concatenated `String`,
+        // which copied every tool result once per batch just to hash it.
+        for block in &result.content {
+            if let ContentBlock::Text(part) = block {
+                hasher.write(part.text.as_bytes());
+            }
+        }
+        hasher.write_u8(0xff);
     }
     Some(hasher.finish())
 }
@@ -5253,37 +5307,57 @@ pub fn registry_stream_unchecked(
 /// merge), the `afterToolCall` hook's usage, or their combination with nested
 /// call usage when present.
 fn to_tool_result_message(
-    finalized: &crate::agent::tool_batch::FinalizedToolCall,
+    finalized: crate::agent::tool_batch::FinalizedToolCall,
     assistant: &AssistantMessage,
     nested_calls: Option<crate::ai::types::NestedToolCalls>,
     usage: Option<crate::ai::types::Usage>,
     max_text_bytes: usize,
 ) -> ToolResultMessage {
-    let tool_result: &ToolResult = &finalized.result;
-    let mut content = vec![ContentBlock::Text(TextContent {
-        text: truncate_tool_result_text(&tool_result.content, max_text_bytes),
+    // Consume the finalized call: the tool result's text, details, structured
+    // content and images MOVE into the message. The previous `&` signature
+    // deep-copied the whole content string (and details/images) per result on
+    // top of the message being a fresh owner; every observable value is the
+    // same, only the redundant copy is gone.
+    let crate::agent::tool_batch::FinalizedToolCall {
+        index: _,
+        call_id,
+        tool_name,
+        result,
+        usage: _,
+        duration_ms,
+    } = finalized;
+    let ToolResult {
+        content,
+        images,
+        details,
+        structured_content,
+        is_error,
+        terminate: _,
+    } = result;
+    let mut content_blocks = vec![ContentBlock::Text(TextContent {
+        text: truncate_tool_result_text(content, max_text_bytes),
         text_signature: None,
     })];
     // Image blocks (upstream tool results carry `{type: "image"}` blocks; the
     // adapter transform downgrades them for non-vision models).
-    content.extend(tool_result.images.iter().map(|image| {
+    content_blocks.extend(images.into_iter().map(|image| {
         ContentBlock::Image(crate::ai::types::ImageContent {
-            data: image.data.clone(),
-            mime_type: image.mime_type.clone(),
+            data: image.data,
+            mime_type: image.mime_type,
         })
     }));
     ToolResultMessage {
         role: ToolResultRole::ToolResult,
-        tool_call_id: finalized.call_id.clone(),
-        tool_name: finalized.tool_name.clone(),
-        content,
-        details: tool_result.details.clone(),
+        tool_call_id: call_id,
+        tool_name,
+        content: content_blocks,
+        details,
         usage,
         added_tool_names: Vec::new(),
-        structured_content: tool_result.structured_content.clone(),
+        structured_content,
         nested_calls: nested_calls.map(Box::new),
-        is_error: tool_result.is_error,
-        duration_ms: finalized.duration_ms,
+        is_error,
+        duration_ms,
         timestamp: assistant.timestamp,
     }
 }
@@ -5291,9 +5365,14 @@ fn to_tool_result_message(
 /// Efficient-profile tool-result truncation. `0` is the historical unlimited
 /// path. The marker is included in the final budget; head and tail each get
 /// half of the remaining bytes and are cut on UTF-8 boundaries.
-fn truncate_tool_result_text(text: &str, max_bytes: usize) -> String {
+///
+/// Takes the text by value: an untruncated result (the default profile, and
+/// any result under the cap) MOVES its text into the message instead of
+/// copying it — a large shell/read body is otherwise duplicated once per
+/// result on the way into the transcript.
+fn truncate_tool_result_text(text: String, max_bytes: usize) -> String {
     if max_bytes == 0 || text.len() <= max_bytes {
-        return text.to_owned();
+        return text;
     }
     let marker = format!(
         "\n\n[... tool result truncated: {} bytes omitted ...]\n\n",

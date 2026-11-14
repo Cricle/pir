@@ -12,7 +12,7 @@ use crate::config::settings::Settings;
 use super::config_value::{resolve_config_value, resolve_headers_in};
 use super::construction::{build_provider_from_models, model, ModelSpec};
 use super::settings;
-use crate::ai::error::{AiError, AiResult};
+use crate::ai::error::AiResult;
 use crate::ai::provider::ProviderRegistry;
 use crate::ai::types::{Model, ModelCostRates, OpenAiCompat};
 
@@ -53,9 +53,17 @@ pub struct PiModelConfig {
     pub input: Option<Vec<String>>,
     #[serde(default)]
     pub cost: Option<PiCostRates>,
-    #[serde(alias = "contextWindow", default)]
+    #[serde(
+        alias = "contextWindow",
+        default,
+        deserialize_with = "deserialize_token_count"
+    )]
     pub context_window: Option<u64>,
-    #[serde(alias = "maxTokens", default)]
+    #[serde(
+        alias = "maxTokens",
+        default,
+        deserialize_with = "deserialize_token_count"
+    )]
     pub max_tokens: Option<u64>,
     #[serde(alias = "samplingParams", default)]
     pub sampling_params: Option<BTreeMap<String, Value>>,
@@ -133,6 +141,31 @@ where
             .map(|(name, value)| (name, value.unwrap_or_default()))
             .collect()
     }))
+}
+
+/// `contextWindow`/`maxTokens`: pi's schema types both as JSON numbers with
+/// `exclusiveMinimum: 0` (a float is schema-valid upstream), while the runtime
+/// models store whole tokens. Accept any positive number — a JSON integer
+/// keeps its exact value, a fractional one truncates — and reject anything
+/// else here as a typed-parse failure (the schema validator above has already
+/// reported the pi-shaped error for a wrong type).
+fn deserialize_token_count<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(number)) => number
+            .as_f64()
+            .filter(|number| *number > 0.0)
+            .map(|number| number.trunc() as u64),
+        Some(other) => {
+            return Err(serde::de::Error::custom(format!(
+                "invalid type: {other}, expected a positive number"
+            )))
+        }
+    })
 }
 
 fn deserialize_models<'de, D>(deserializer: D) -> Result<Vec<PiModelConfig>, D::Error>
@@ -303,10 +336,560 @@ pub fn strip_jsonc(contents: &str) -> String {
     out
 }
 
+/// A `models.json` document that pi's `ModelConfig.load` rejects
+/// (`packages/coding-agent/src/core/model-config.ts`).
+///
+/// [`parse_pi_config`] returns this instead of a bare `serde_json::Error` so
+/// the two pi error shapes stay distinguishable: a document that does not
+/// parse at all (`Failed to parse models.json: <error>`) versus a document
+/// that parses but violates pi's schema (`Invalid models.json schema:` with
+/// one `  - <path>: <message>` line per violation, PIR-BIN-097).
+#[derive(Debug)]
+pub enum PiModelsJsonError {
+    /// The source is not valid JSON(C).
+    Parse(serde_json::Error),
+    /// The source parses but violates pi's models.json schema; each entry is
+    /// one pi `  - <path>: <message>` line.
+    Schema(Vec<String>),
+}
+
+impl PiModelsJsonError {
+    /// pi's message text without the `File: <path>` trailer
+    /// (`ModelConfig.load`).
+    pub fn message(&self) -> String {
+        match self {
+            Self::Parse(error) => format!("Failed to parse models.json: {error}"),
+            Self::Schema(errors) => format!("Invalid models.json schema:\n{}", errors.join("\n")),
+        }
+    }
+
+    /// The schema violations, each already formatted as pi's
+    /// `  - <path>: <message>` line (empty for a parse error).
+    pub fn schema_error_lines(&self) -> &[String] {
+        match self {
+            Self::Parse(_) => &[],
+            Self::Schema(errors) => errors,
+        }
+    }
+}
+
+impl std::fmt::Display for PiModelsJsonError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for PiModelsJsonError {}
+
 /// Parse pi configuration without touching the filesystem. JSONC (comments,
-/// trailing commas) and a UTF-8 BOM are tolerated, mirroring upstream.
-pub fn parse_pi_config(contents: &str) -> Result<PiModelsConfig, serde_json::Error> {
-    serde_json::from_str(&strip_jsonc(contents))
+/// trailing commas) and a UTF-8 BOM are tolerated, mirroring upstream
+/// (`stripJsonComments(stripBom(content))`); the parsed document is then
+/// validated against pi's `ModelsConfigSchema` (PIR-BIN-097: a wrong-typed
+/// known field is a reported schema error, never a silently invented model).
+pub fn parse_pi_config(contents: &str) -> Result<PiModelsConfig, PiModelsJsonError> {
+    let value: Value =
+        serde_json::from_str(&strip_jsonc(contents)).map_err(PiModelsJsonError::Parse)?;
+    let errors = validate_models_json_schema(&value);
+    if !errors.is_empty() {
+        return Err(PiModelsJsonError::Schema(errors));
+    }
+    // Every field pi's schema pins is type-correct at this point; a typed
+    // deserialization failure can only come from a corner pir narrows (a
+    // wide numeric field, an exotic `compat`/`thinkingLevelMap` value). It
+    // still degrades through the parse-error text instead of aborting.
+    serde_json::from_value(value).map_err(PiModelsJsonError::Parse)
+}
+
+// ---------------------------------------------------------------------------
+// pi's models.json schema validation
+// ---------------------------------------------------------------------------
+//
+// `ModelsConfigSchema` (core/model-config.ts plus `pi-ai`'s model-schema.ts)
+// as a document walker: pi reports TypeBox violations in schema order with
+// `  - <path>: <message>` lines, so the checks below follow the schema field
+// order and reproduce the messages the shipped 1.4.0 bundle emits
+// (`.play/evidence/p16-modelsjson/runs/schema/`).
+//
+// Unknown fields are accepted: pi's TypeBox objects allow additional
+// properties (schema-probes/unknown-model-field, unknown-provider-field). Two
+// pir extensions stay accepted where pi's schema is stricter, both covered by
+// existing tests: a `models` array item may be a plain catalog-reference
+// string (`ModelDefinitionSchema | string`, tests/suites/ai_provider.rs) and
+// a header value may be `null` (the suppression marker,
+// tests/ai_lane_g_w17.rs).
+
+/// pi's `ProviderConfigSchema` field order.
+const PROVIDER_SCHEMA_FIELDS: &[&str] = &[
+    "name",
+    "baseUrl",
+    "apiKey",
+    "api",
+    "oauth",
+    "headers",
+    "compat",
+    "authHeader",
+    "models",
+    "modelOverrides",
+];
+
+/// pi's `ModelDefinitionSchema` field order.
+const MODEL_SCHEMA_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "api",
+    "baseUrl",
+    "reasoning",
+    "thinkingLevelMap",
+    "input",
+    "inputLimits",
+    "cost",
+    "promptCache",
+    "contextWindow",
+    "maxTokens",
+    "samplingParams",
+    "samplingParamsByThinkingLevel",
+    "headers",
+    "compat",
+];
+
+/// pi's `ModelOverrideSchema` field order (the model schema without `id`).
+const MODEL_OVERRIDE_SCHEMA_FIELDS: &[&str] = &[
+    "name",
+    "reasoning",
+    "thinkingLevelMap",
+    "input",
+    "inputLimits",
+    "cost",
+    "promptCache",
+    "contextWindow",
+    "maxTokens",
+    "samplingParams",
+    "samplingParamsByThinkingLevel",
+    "headers",
+    "compat",
+];
+
+/// pi's `MODEL_THINKING_LEVELS`.
+const MODEL_THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+/// pi's `MODEL_INPUT_MODALITIES`.
+const MODEL_INPUT_MODALITIES: &[&str] = &["text", "image"];
+/// `ModelCostRatesSchema` fields, in required-property order.
+const COST_RATE_FIELDS: &[&str] = &["input", "output", "cacheRead", "cacheWrite"];
+/// `ModelCostTierSchema` required properties, in schema order.
+const COST_TIER_FIELDS: &[&str] = &[
+    "inputTokensAbove",
+    "input",
+    "output",
+    "cacheRead",
+    "cacheWrite",
+];
+
+/// The complete violation list for one parsed document; empty means
+/// schema-valid (upstream `validateModelsConfig.Check`). Each entry is already
+/// rendered as pi's `  - <path>: <message>` line (the helpers above collect
+/// the bare `<path>: <message>` form).
+fn validate_models_json_schema(root: &Value) -> Vec<String> {
+    let errors = collect_models_json_schema_errors(root);
+    errors
+        .into_iter()
+        .map(|error| format!("  - {error}"))
+        .collect()
+}
+
+/// The bare `<path>: <message>` violations, in pi's schema order.
+fn collect_models_json_schema_errors(root: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    let Value::Object(root) = root else {
+        return vec!["root: must be object".to_string()];
+    };
+    if let Some(schema) = root.get("$schema") {
+        check_string("$schema", schema, &mut errors);
+    }
+    match root.get("providers") {
+        None => errors.push("providers: must have required properties providers".to_string()),
+        Some(Value::Object(providers)) => {
+            for (provider_id, provider) in providers {
+                validate_provider(&format!("providers.{provider_id}"), provider, &mut errors);
+            }
+        }
+        Some(_) => errors.push("providers: must be object".to_string()),
+    }
+    errors
+}
+
+/// `Type.String()`.
+fn check_string(path: &str, value: &Value, errors: &mut Vec<String>) {
+    if !value.is_string() {
+        errors.push(format!("{path}: must be string"));
+    }
+}
+
+/// `Type.String({ minLength: 1 })`.
+fn check_non_empty_string(path: &str, value: &Value, errors: &mut Vec<String>) {
+    match value {
+        Value::String(text) if !text.is_empty() => {}
+        Value::String(_) => errors.push(format!("{path}: must not have fewer than 1 characters")),
+        _ => errors.push(format!("{path}: must be string")),
+    }
+}
+
+/// `Type.Boolean()`.
+fn check_boolean(path: &str, value: &Value, errors: &mut Vec<String>) {
+    if !value.is_boolean() {
+        errors.push(format!("{path}: must be boolean"));
+    }
+}
+
+/// `Type.Object(...)`: the object, or pi's `must be object` line.
+fn check_object<'a>(
+    path: &str,
+    value: &'a Value,
+    errors: &mut Vec<String>,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    match value {
+        Value::Object(object) => Some(object),
+        _ => {
+            errors.push(format!("{path}: must be object"));
+            None
+        }
+    }
+}
+
+/// `Type.Number()` (no range constraint).
+fn check_number(path: &str, value: &Value, errors: &mut Vec<String>) {
+    if !value.is_number() {
+        errors.push(format!("{path}: must be number"));
+    }
+}
+
+/// `Type.Number({ exclusiveMinimum: 0 })`.
+fn check_positive_number(path: &str, value: &Value, errors: &mut Vec<String>) {
+    match value.as_f64() {
+        Some(number) if number > 0.0 => {}
+        Some(_) => errors.push(format!("{path}: must be > 0")),
+        None => errors.push(format!("{path}: must be number")),
+    }
+}
+
+/// `Type.Integer({ minimum, maximum })`.
+fn check_integer(
+    path: &str,
+    value: &Value,
+    minimum: Option<i64>,
+    maximum: Option<i64>,
+    errors: &mut Vec<String>,
+) {
+    match value.as_i64() {
+        Some(number) => {
+            if let Some(minimum) = minimum {
+                if number < minimum {
+                    errors.push(format!("{path}: must be >= {minimum}"));
+                }
+            }
+            if let Some(maximum) = maximum {
+                if number > maximum {
+                    errors.push(format!("{path}: must be <= {maximum}"));
+                }
+            }
+        }
+        // A float, an out-of-range integer, or a wrong type all fail the
+        // `integer` keyword (TypeBox's message is the keyword's).
+        None => errors.push(format!("{path}: must be integer")),
+    }
+}
+
+fn validate_provider(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = check_object(path, value, errors) else {
+        return;
+    };
+    for field in PROVIDER_SCHEMA_FIELDS {
+        let Some(field_value) = object.get(*field) else {
+            continue;
+        };
+        let field_path = format!("{path}.{field}");
+        match *field {
+            "name" | "baseUrl" | "apiKey" | "api" => {
+                check_non_empty_string(&field_path, field_value, errors)
+            }
+            "oauth" => {
+                // `Type.Literal("radius")`: a non-string reports BOTH the
+                // string type and the literal (schema-probes/oauth-number).
+                if !field_value.is_string() {
+                    errors.push(format!("{field_path}: must be string"));
+                }
+                if field_value.as_str() != Some("radius") {
+                    errors.push(format!("{field_path}: must be equal to constant"));
+                }
+            }
+            "headers" => validate_headers(&field_path, field_value, errors),
+            "compat" => {
+                let _ = check_object(&field_path, field_value, errors);
+            }
+            "authHeader" => check_boolean(&field_path, field_value, errors),
+            "models" => match field_value {
+                Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        // pir extension: a plain string references a catalog
+                        // model (see the section comment).
+                        if item.is_string() {
+                            continue;
+                        }
+                        validate_model(&format!("{field_path}.{index}"), item, false, errors);
+                    }
+                }
+                _ => errors.push(format!("{field_path}: must be array")),
+            },
+            "modelOverrides" => match field_value {
+                Value::Object(overrides) => {
+                    for (id, over) in overrides {
+                        validate_model(&format!("{field_path}.{id}"), over, true, errors);
+                    }
+                }
+                _ => errors.push(format!("{field_path}: must be object")),
+            },
+            _ => {}
+        }
+    }
+}
+
+/// One `models` entry (`override_entry = false`) or `modelOverrides` entry
+/// (`true`): the schemas differ only in `id` (required for definitions) and a
+/// partial `cost` for overrides.
+fn validate_model(path: &str, value: &Value, override_entry: bool, errors: &mut Vec<String>) {
+    let Some(object) = check_object(path, value, errors) else {
+        return;
+    };
+    if !override_entry && !object.contains_key("id") {
+        errors.push(format!("{path}.id: must have required properties id"));
+    }
+    let fields = if override_entry {
+        MODEL_OVERRIDE_SCHEMA_FIELDS
+    } else {
+        MODEL_SCHEMA_FIELDS
+    };
+    for field in fields {
+        let Some(field_value) = object.get(*field) else {
+            continue;
+        };
+        let field_path = format!("{path}.{field}");
+        match *field {
+            "id" | "name" | "api" | "baseUrl" => {
+                check_non_empty_string(&field_path, field_value, errors)
+            }
+            "reasoning" => check_boolean(&field_path, field_value, errors),
+            "thinkingLevelMap" => validate_thinking_level_map(&field_path, field_value, errors),
+            "input" => validate_input_modalities(&field_path, field_value, errors),
+            "inputLimits" => validate_input_limits(&field_path, field_value, errors),
+            "cost" => validate_cost(&field_path, field_value, override_entry, errors),
+            "promptCache" => validate_prompt_cache(&field_path, field_value, errors),
+            "contextWindow" | "maxTokens" => {
+                check_positive_number(&field_path, field_value, errors)
+            }
+            "samplingParams" => {
+                let _ = check_object(&field_path, field_value, errors);
+            }
+            "samplingParamsByThinkingLevel" => {
+                if let Some(map) = check_object(&field_path, field_value, errors) {
+                    for level in MODEL_THINKING_LEVELS {
+                        if let Some(entry) = map.get(*level) {
+                            let _ = check_object(&format!("{field_path}.{level}"), entry, errors);
+                        }
+                    }
+                }
+            }
+            "headers" => validate_headers(&field_path, field_value, errors),
+            "compat" => {
+                let _ = check_object(&field_path, field_value, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `HeadersSchema = Record<string, string>`; pir additionally accepts `null`
+/// as the header-suppression marker (tests/ai_lane_g_w17.rs), which pi's
+/// TypeBox schema rejects (schema-probes/model-header-null).
+fn validate_headers(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(headers) = check_object(path, value, errors) else {
+        return;
+    };
+    for (name, header) in headers {
+        if !header.is_string() && !header.is_null() {
+            errors.push(format!("{path}.{name}: must be string"));
+        }
+    }
+}
+
+/// `ThinkingLevelMapSchema`: `Partial<Record<ModelThinkingLevel, string|null>>`.
+/// A bad value reports the union exactly like TypeBox
+/// (schema-probes/thinking-map-bad-value); unknown level keys are accepted
+/// (schema-probes/thinking-level-map-bad-key).
+fn validate_thinking_level_map(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(map) = check_object(path, value, errors) else {
+        return;
+    };
+    for level in MODEL_THINKING_LEVELS {
+        let Some(entry) = map.get(*level) else {
+            continue;
+        };
+        if !entry.is_string() && !entry.is_null() {
+            let entry_path = format!("{path}.{level}");
+            errors.push(format!("{entry_path}: must be string"));
+            errors.push(format!("{entry_path}: must be null"));
+            errors.push(format!("{entry_path}: must match a schema in anyOf"));
+        }
+    }
+}
+
+/// `input: Array<ModelInputModality>`.
+fn validate_input_modalities(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Value::Array(items) = value else {
+        errors.push(format!("{path}: must be array"));
+        return;
+    };
+    for (index, item) in items.iter().enumerate() {
+        if !item
+            .as_str()
+            .is_some_and(|modality| MODEL_INPUT_MODALITIES.contains(&modality))
+        {
+            errors.push(format!(
+                "{path}.{index}: must be equal to one of the allowed values"
+            ));
+        }
+    }
+}
+
+/// `ModelInputLimitsSchema`.
+fn validate_input_limits(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(limits) = check_object(path, value, errors) else {
+        return;
+    };
+    if let Some(max_request_bytes) = limits.get("maxRequestBytes") {
+        check_integer(
+            &format!("{path}.maxRequestBytes"),
+            max_request_bytes,
+            Some(1),
+            None,
+            errors,
+        );
+    }
+    let Some(images) = limits.get("images") else {
+        return;
+    };
+    let images_path = format!("{path}.images");
+    let Some(images) = check_object(&images_path, images, errors) else {
+        return;
+    };
+    for field in ["maxPerMessage", "maxPerRequest"] {
+        if let Some(limit) = images.get(field) {
+            check_integer(
+                &format!("{images_path}.{field}"),
+                limit,
+                Some(1),
+                None,
+                errors,
+            );
+        }
+    }
+    let Some(resize) = images.get("resize") else {
+        return;
+    };
+    let resize_path = format!("{images_path}.resize");
+    let Some(resize) = check_object(&resize_path, resize, errors) else {
+        return;
+    };
+    for field in ["maxWidth", "maxHeight", "maxBytes"] {
+        if let Some(limit) = resize.get(field) {
+            check_integer(
+                &format!("{resize_path}.{field}"),
+                limit,
+                Some(1),
+                None,
+                errors,
+            );
+        }
+    }
+    if let Some(quality) = resize.get("jpegQuality") {
+        check_integer(
+            &format!("{resize_path}.jpegQuality"),
+            quality,
+            Some(1),
+            Some(100),
+            errors,
+        );
+    }
+}
+
+/// `ModelCostSchema` (`partial` = the override schema, where every field is
+/// optional). A missing required field reports pi's single line naming the
+/// first missing property in the path and all of them in the message
+/// (schema-probes/model-cost-partial).
+fn validate_cost(path: &str, value: &Value, partial: bool, errors: &mut Vec<String>) {
+    let Some(cost) = check_object(path, value, errors) else {
+        return;
+    };
+    if !partial {
+        let missing: Vec<&str> = COST_RATE_FIELDS
+            .iter()
+            .copied()
+            .filter(|field| !cost.contains_key(*field))
+            .collect();
+        if !missing.is_empty() {
+            errors.push(format!(
+                "{path}.{}: must have required properties {}",
+                missing[0],
+                missing.join(", ")
+            ));
+        }
+    }
+    for field in COST_RATE_FIELDS {
+        if let Some(rate) = cost.get(*field) {
+            check_number(&format!("{path}.{field}"), rate, errors);
+        }
+    }
+    let Some(tiers) = cost.get("tiers") else {
+        return;
+    };
+    let Value::Array(items) = tiers else {
+        errors.push(format!("{path}.tiers: must be array"));
+        return;
+    };
+    for (index, tier) in items.iter().enumerate() {
+        let tier_path = format!("{path}.tiers.{index}");
+        let Some(tier) = check_object(&tier_path, tier, errors) else {
+            continue;
+        };
+        let missing: Vec<&str> = COST_TIER_FIELDS
+            .iter()
+            .copied()
+            .filter(|field| !tier.contains_key(*field))
+            .collect();
+        if !missing.is_empty() {
+            errors.push(format!(
+                "{tier_path}.{}: must have required properties {}",
+                missing[0],
+                missing.join(", ")
+            ));
+        }
+        for field in COST_TIER_FIELDS {
+            if let Some(rate) = tier.get(*field) {
+                check_number(&format!("{tier_path}.{field}"), rate, errors);
+            }
+        }
+    }
+}
+
+/// `ModelPromptCacheSchema`: `Partial<Record<"short"|"long", number > 0>>`;
+/// unknown keys are accepted (schema-probes/prompt-cache-bad).
+fn validate_prompt_cache(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(cache) = check_object(path, value, errors) else {
+        return;
+    };
+    for tier in ["short", "long"] {
+        if let Some(seconds) = cache.get(tier) {
+            check_positive_number(&format!("{path}.{tier}"), seconds, errors);
+        }
+    }
 }
 
 /// Apply one models.json model OVERRIDE onto a runtime model (upstream
@@ -713,13 +1296,25 @@ pub fn load_pi_config_with_settings(
 
 /// The shared body of the loader variants: `models.json` + a resolved
 /// [`Settings`] snapshot.
+///
+/// A malformed `models.json` is NOT an error: the layer becomes empty (pi's
+/// `ModelConfig.load`), the built-in catalog stays available, and the failure
+/// is recorded for the CLI surfaces (`take_models_json_load_warning`, pi's
+/// `Warning: errors loading models.json:`) — PIR-BIN-098, mirroring the
+/// settings recovery of PIR-BIN-071.
 fn load_pi_config_from(mut pi_settings: Settings) -> AiResult<Option<PiConfiguredModel>> {
     // models.json is optional: the Claude Code environment can configure the
     // anthropic provider on its own.
     let config = match read_pi_models_json() {
-        Some(contents) => parse_pi_config(&contents)
-            .map_err(|error| AiError::Authentication(format!("invalid pi models.json: {error}")))?,
-        None => PiModelsConfig::default(),
+        Some(contents) => {
+            let (config, error) = parse_models_json_layer(&contents);
+            record_models_json_load_error(error);
+            config
+        }
+        None => {
+            record_models_json_load_error(None);
+            PiModelsConfig::default()
+        }
     };
     let mut registry = auth_backed_registry();
 
@@ -880,6 +1475,110 @@ fn pi_models_path() -> PathBuf {
     settings::agent_dir().join("models.json")
 }
 
+/// The user-facing text for a rejected `models.json`: pi's wording
+/// (`ModelConfig.load`) including the resolved file path, so the message names
+/// the file this process actually read — never the default `~/.pi/agent` path
+/// under a redirected agent dir.
+fn models_json_error_text(error: &PiModelsJsonError) -> String {
+    format!(
+        "{}\n\nFile: {}",
+        error.message(),
+        pi_models_path().display()
+    )
+}
+
+/// [`models_json_error_text`] against an explicit path (the SDK builder owns
+/// its agent directory instead of the process agent dir).
+pub(crate) fn models_json_error_text_at(path: &Path, error: &PiModelsJsonError) -> String {
+    format!("{}\n\nFile: {}", error.message(), path.display())
+}
+
+/// pi's `ModelConfig.load` on an already-read source: the parsed layer, or the
+/// empty layer plus pi's error text. Never an `Err`: a models.json typo
+/// degrades to the built-in catalog exactly like a settings.json typo
+/// (PIR-BIN-071) instead of aborting every run (PIR-BIN-098).
+fn parse_models_json_layer(contents: &str) -> (PiModelsConfig, Option<String>) {
+    match parse_pi_config(contents) {
+        Ok(config) => (config, None),
+        Err(error) => (
+            PiModelsConfig::default(),
+            Some(models_json_error_text(&error)),
+        ),
+    }
+}
+
+/// [`parse_models_json_layer`] with an explicit `File:` path (the SDK loader,
+/// which owns its agent directory rather than the process agent dir).
+pub fn parse_models_json_layer_at(path: &Path, contents: &str) -> (PiModelsConfig, Option<String>) {
+    match parse_pi_config(contents) {
+        Ok(config) => (config, None),
+        Err(error) => (
+            PiModelsConfig::default(),
+            Some(models_json_error_text_at(path, &error)),
+        ),
+    }
+}
+
+/// The failure of the most recent `models.json` load in this process, pi's
+/// `ModelConfig.getError()`. Loaders record it on every call (clearing it when
+/// the current source is fine); CLI surfaces read it through
+/// [`take_models_json_load_warning`] so a config typo is reported instead of
+/// silently dropping the file's providers.
+static MODELS_JSON_LOAD_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Monotonic count of `models.json` load failures in this process (PIR-BIN-098
+/// made the loaders degrade to the built-in layer instead of returning an
+/// error, so a caller can no longer use `Err` to tell "degraded" from "fine").
+/// A caller that caches a derived view samples this around its load: the
+/// session's credential environment MUST NOT cache a degraded load — the file
+/// can be fixed while the run continues, and the next push has to retry.
+static MODELS_JSON_LOAD_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many `models.json` load failures this process has recorded (see
+/// [`MODELS_JSON_LOAD_FAILURES`]).
+pub fn models_json_load_failures() -> u64 {
+    MODELS_JSON_LOAD_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record (or clear) the latest `models.json` load failure. Public for hosts
+/// that load an explicit agent directory through
+/// [`parse_models_json_layer_at`] (the SDK builder).
+pub fn record_models_json_load_error(error: Option<String>) {
+    if error.is_some() {
+        MODELS_JSON_LOAD_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    *MODELS_JSON_LOAD_ERROR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = error;
+}
+
+/// The `models.json` error the most recent loader call recorded, if any
+/// (non-draining; [`take_models_json_load_error`] consumes it).
+pub fn models_json_load_error() -> Option<String> {
+    MODELS_JSON_LOAD_ERROR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// [`models_json_load_error`] and clear it: a per-process CLI surface reports
+/// the warning once.
+pub fn take_models_json_load_error() -> Option<String> {
+    MODELS_JSON_LOAD_ERROR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+/// The complete stderr line pi prints when a models.json load failed
+/// (`cli/list-models.ts`): `Warning: errors loading models.json:\n<error>`.
+/// Draining: the caller reports it once.
+pub fn take_models_json_load_warning() -> Option<String> {
+    take_models_json_load_error()
+        .map(|error| format!("Warning: errors loading models.json:\n{error}"))
+}
+
 /// Read the `models.json` source from [`pi_models_path`], treating a file
 /// above [`MAX_PI_MODELS_JSON_BYTES`] as absent (and diagnosing it once per
 /// load).
@@ -922,6 +1621,27 @@ fn provider_from_models(
         super::construction::CatalogProviderEntry::from_models(provider_id, display_name, models)
     } else {
         build_provider_from_models(provider_id, display_name, models)
+    }
+}
+
+/// [`provider_from_models`] for a caller that already owns the composed list
+/// and keeps no copy of it: the catalog-backed wrapper takes the list by
+/// value, so those models are not copied a second time on the way into the
+/// provider (the composed list is the provider's own field afterwards).
+fn provider_from_owned_models(
+    provider_id: &str,
+    display_name: &str,
+    models: Vec<Model>,
+    catalog_backed: bool,
+) -> AiResult<crate::ai::provider::ProviderBox> {
+    if catalog_backed {
+        super::construction::CatalogProviderEntry::from_owned_models(
+            provider_id.to_string(),
+            display_name.to_string(),
+            models,
+        )
+    } else {
+        build_provider_from_models(provider_id, display_name, &models)
     }
 }
 
@@ -1230,13 +1950,16 @@ fn register_builtin_catalog_excluding(
 }
 
 fn load_pi_environment_from(mut settings_snapshot: Settings) -> AiResult<PiEnvironment> {
-    let models_json = read_pi_models_json()
-        .map(|contents| {
-            parse_pi_config(&contents).map_err(|error| {
-                AiError::Authentication(format!("invalid pi models.json: {error}"))
-            })
-        })
-        .transpose()?;
+    // Malformed `models.json` degrades exactly like in [`load_pi_config_from`]
+    // (PIR-BIN-098): empty layer + recorded warning, catalog intact.
+    let (models_json, models_json_error) = match read_pi_models_json() {
+        Some(contents) => {
+            let (config, error) = parse_models_json_layer(&contents);
+            (Some(config), error)
+        }
+        None => (None, None),
+    };
+    record_models_json_load_error(models_json_error);
 
     // Seed the default provider/model from models.json when settings.json does
     // not name them (upstream `applyModelsJson` + `findInitialModel`
@@ -1341,7 +2064,7 @@ fn load_pi_environment_from(mut settings_snapshot: Settings) -> AiResult<PiEnvir
                     .unwrap_or_else(|| provider_id.clone())
             });
             let provider =
-                provider_from_models(provider_id, &display_name, &models, builtin.is_some())?;
+                provider_from_owned_models(provider_id, &display_name, models, builtin.is_some())?;
             registry.set_provider(provider);
         }
     }

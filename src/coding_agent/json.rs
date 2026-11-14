@@ -235,6 +235,234 @@ fn usage_of(event: &AssistantMessageEvent) -> Option<serde_json::Value> {
     serde_json::to_value(usage).ok()
 }
 
+/// Borrowed serialization view of [`AgentEvent`]: the exact wire bytes of
+/// [`to_json_event`] / [`agent_event_to_json`], written straight from the
+/// borrowed event.
+///
+/// The RPC and JSON print hosts stream every event to one stdout line.
+/// Serializing through a `serde_json::Value` first materializes the whole
+/// payload (the tool-result text, the new-message list) as an owned tree and
+/// escapes it again into the line — `PIR-BIN-099` measured ~4x the payload
+/// per face, and ~4 MB per 200 KB tool-result turn. This view performs the
+/// identical serialization over the borrowed event, so the line is produced
+/// with a single pass into the output buffer.
+///
+/// Byte identity is the contract: the `StreamEvent` arm mirrors
+/// [`to_json_event`]'s own composition (cumulative `partial` stripped, hoisted
+/// `usage` appended last) and every other variant mirrors
+/// [`agent_event_to_json`] in ITS construction order (the crate builds
+/// `serde_json` with `preserve_order`, so the `json!` insertion order IS the
+/// wire order); optional keys are appended exactly where the old
+/// post-inserts placed them. Pinned per event by
+/// `tests/json_stream_wire.rs::every_agent_event_line_matches_the_value_construction`.
+pub(crate) struct AgentEventWire<'a> {
+    event: &'a AgentEvent,
+}
+
+impl<'a> AgentEventWire<'a> {
+    pub(crate) fn new(event: &'a AgentEvent) -> Self {
+        Self { event }
+    }
+}
+
+impl serde::Serialize for AgentEventWire<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self.event {
+            // `to_json_event`'s own arm for streaming events (the RPC/JSON
+            // hosts): the cumulative `partial` snapshot is stripped (it rides
+            // once as `message` on `agent_event_to_json`'s arm, never here)
+            // and the hoisted `usage` is appended last.
+            AgentEvent::StreamEvent { turn, event } => {
+                let usage = usage_of(event);
+                let mut map =
+                    serializer.serialize_map(Some(if usage.is_some() { 4 } else { 3 }))?;
+                map.serialize_entry("type", "message_update")?;
+                map.serialize_entry("turn", turn)?;
+                map.serialize_entry(
+                    "assistantMessageEvent",
+                    &AssistantMessageEventWire::new(event),
+                )?;
+                if let Some(usage) = &usage {
+                    map.serialize_entry("usage", usage)?;
+                }
+                map.end()
+            }
+            // `agent_event_to_json`'s arms, field for field, in its order.
+            AgentEvent::AgentStart { .. } => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("type", "agent_start")?;
+                map.end()
+            }
+            AgentEvent::AgentEnd { result } => {
+                let mut map = serializer.serialize_map(Some(6))?;
+                map.serialize_entry("type", "agent_end")?;
+                map.serialize_entry("turns", &result.turns)?;
+                map.serialize_entry("aborted", &result.aborted)?;
+                map.serialize_entry("terminal", &result.terminal)?;
+                map.serialize_entry("messages", &result.new_messages)?;
+                map.serialize_entry("willRetry", &result.will_retry)?;
+                map.end()
+            }
+            AgentEvent::TurnStart { turn, .. } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "turn_start")?;
+                map.serialize_entry("turn", turn)?;
+                map.end()
+            }
+            AgentEvent::TurnEnd {
+                turn,
+                message,
+                tool_results,
+            } => {
+                let mut map = serializer.serialize_map(Some(4))?;
+                map.serialize_entry("type", "turn_end")?;
+                map.serialize_entry("turn", turn)?;
+                map.serialize_entry("message", message)?;
+                map.serialize_entry("toolResults", tool_results)?;
+                map.end()
+            }
+            AgentEvent::MessageStart { turn, message } => {
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("type", "message_start")?;
+                map.serialize_entry("turn", turn)?;
+                map.serialize_entry("message", message)?;
+                map.end()
+            }
+            AgentEvent::MessageEnd { turn, message } => {
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("type", "message_end")?;
+                map.serialize_entry("turn", turn)?;
+                map.serialize_entry("message", message)?;
+                map.end()
+            }
+            AgentEvent::StreamStart { turn, message } => {
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("type", "message_start")?;
+                map.serialize_entry("turn", turn)?;
+                map.serialize_entry("message", message)?;
+                map.end()
+            }
+            AgentEvent::StreamEnd { turn, message } => {
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("type", "message_end")?;
+                map.serialize_entry("turn", turn)?;
+                map.serialize_entry("message", message)?;
+                map.end()
+            }
+            AgentEvent::ToolExecutionStart { turn, event, args } => {
+                match event {
+                    crate::agent::tool_batch::ToolExecutionEvent::Start {
+                        call_id,
+                        tool_name,
+                        parent_call_id,
+                        ..
+                    } => {
+                        let mut map = serializer
+                            .serialize_map(Some(if parent_call_id.is_some() { 6 } else { 5 }))?;
+                        map.serialize_entry("type", "tool_execution_start")?;
+                        map.serialize_entry("turn", turn)?;
+                        map.serialize_entry("toolCallId", call_id)?;
+                        map.serialize_entry("toolName", tool_name)?;
+                        map.serialize_entry("args", args)?;
+                        if let Some(parent) = parent_call_id {
+                            map.serialize_entry("parentToolCallId", parent)?;
+                        }
+                        map.end()
+                    }
+                    crate::agent::tool_batch::ToolExecutionEvent::End { .. } => {
+                        let mut map = serializer.serialize_map(Some(3))?;
+                        map.serialize_entry("type", "tool_execution_start")?;
+                        map.serialize_entry("turn", turn)?;
+                        map.serialize_entry("args", args)?;
+                        map.end()
+                    }
+                }
+            }
+            AgentEvent::ToolExecutionEnd {
+                turn,
+                event,
+                result,
+            } => match event {
+                crate::agent::tool_batch::ToolExecutionEvent::End {
+                    call_id,
+                    tool_name,
+                    is_error,
+                    duration_ms,
+                    parent_call_id,
+                    ..
+                } => {
+                    // `durationMs` then `parentToolCallId`: the old
+                    // post-insert order.
+                    let optional =
+                        duration_ms.is_some() as usize + parent_call_id.is_some() as usize;
+                    let mut map = serializer.serialize_map(Some(6 + optional))?;
+                    map.serialize_entry("type", "tool_execution_end")?;
+                    map.serialize_entry("turn", turn)?;
+                    map.serialize_entry("toolCallId", call_id)?;
+                    map.serialize_entry("toolName", tool_name)?;
+                    map.serialize_entry("result", result)?;
+                    map.serialize_entry("isError", is_error)?;
+                    if let Some(duration) = duration_ms {
+                        map.serialize_entry("durationMs", duration)?;
+                    }
+                    if let Some(parent) = parent_call_id {
+                        map.serialize_entry("parentToolCallId", parent)?;
+                    }
+                    map.end()
+                }
+                crate::agent::tool_batch::ToolExecutionEvent::Start { .. } => {
+                    let mut map = serializer.serialize_map(Some(3))?;
+                    map.serialize_entry("type", "tool_execution_end")?;
+                    map.serialize_entry("turn", turn)?;
+                    map.serialize_entry("result", result)?;
+                    map.end()
+                }
+            },
+            AgentEvent::ToolExecutionUpdate {
+                turn,
+                call_id,
+                tool_name,
+                parent_call_id,
+                args,
+                partial,
+            } => {
+                let mut map =
+                    serializer.serialize_map(Some(if parent_call_id.is_some() { 7 } else { 6 }))?;
+                map.serialize_entry("type", "tool_execution_update")?;
+                map.serialize_entry("turn", turn)?;
+                map.serialize_entry("toolCallId", call_id)?;
+                map.serialize_entry("toolName", tool_name)?;
+                map.serialize_entry("args", args)?;
+                map.serialize_entry("partialResult", partial)?;
+                if let Some(parent) = parent_call_id {
+                    map.serialize_entry("parentToolCallId", parent)?;
+                }
+                map.end()
+            }
+            AgentEvent::Compaction { turn } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "compaction")?;
+                map.serialize_entry("turn", turn)?;
+                map.end()
+            }
+        }
+    }
+}
+
+/// Serialize one agent event straight to its wire line, byte-identical to
+/// `serde_json::to_string(&to_json_event(event))` (pinned by
+/// `tests/json_stream_wire.rs::every_agent_event_line_matches_the_value_construction`)
+/// without materializing the payload as a `serde_json::Value` first.
+///
+/// The RPC/JSON fan-out seam (`PIR-BIN-099`): the payload is escaped once,
+/// straight from the borrowed event, instead of once into a `Value` tree and
+/// again into the line.
+#[doc(hidden)]
+pub fn to_json_event_line(event: &AgentEvent) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&AgentEventWire::new(event))
+}
+
 /// Emit one session-level event line on stdout — the JSON mode's counterpart
 /// of the RPC session-event bridge. The print host uses it for the transport
 /// retry lifecycle (`auto_retry_start` / `auto_retry_end`), which upstream
@@ -242,7 +470,7 @@ fn usage_of(event: &AssistantMessageEvent) -> Option<serde_json::Value> {
 /// `session.subscribe` → `toJsonEvent`). A closed stdout pipe exits quietly;
 /// other write failures are reported on stderr, like [`print_event`].
 pub fn print_session_event(event: &SessionEvent) {
-    let line = match serde_json::to_string(&to_session_event_json(event)) {
+    let line = match crate::agent_session::to_session_event_line(event) {
         Ok(line) => line,
         Err(error) => {
             let _ = crate::coding_agent::output::write_stderr_line(&format!(
@@ -290,7 +518,7 @@ pub fn print_tool_update(payload: &serde_json::Value) {
 /// stdout pipe exits the process quietly; other write failures are reported
 /// on stderr. The event stream never panics.
 pub fn print_event(event: &AgentEvent) {
-    let line = match serde_json::to_string(&to_json_event(event)) {
+    let line = match to_json_event_line(event) {
         Ok(line) => line,
         Err(error) => {
             let _ = crate::coding_agent::output::write_stderr_line(&format!(

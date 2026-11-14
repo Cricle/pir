@@ -292,6 +292,89 @@ async fn a_pre_aborted_run_never_takes_a_slot() {
     );
 }
 
+/// `PI_CODEMODE_MAX_WORKERS` is the process-wide cap (upstream
+/// `maxCodemodeWorkers`, execute.ts:60-62): a positive integer wins, `0`,
+/// negatives and junk keep [`MAX_CONCURRENT_LIVE_WORKERS`], and the value is
+/// read per admission so the live semaphore reconciles with it — three
+/// workers run with the cap raised to 3, and a fourth queues (PIR-BIN-090).
+#[cfg(feature = "extensions")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pi_codemode_max_workers_raises_the_admission_cap() {
+    use pir::plugins::codemode::worker::{
+        acquire_live_worker_slot, live_worker_admission_handle, max_concurrent_live_workers,
+        MAX_CONCURRENT_LIVE_WORKERS,
+    };
+
+    let _serial = ADMISSION_LOCK.lock().await;
+    // The env var is process-global; this test owns it while the lock is held.
+    std::env::remove_var("PI_CODEMODE_MAX_WORKERS");
+    assert_eq!(max_concurrent_live_workers(), MAX_CONCURRENT_LIVE_WORKERS);
+    for junk in ["0", "-1", "junk", "", "2.5"] {
+        std::env::set_var("PI_CODEMODE_MAX_WORKERS", junk);
+        assert_eq!(
+            max_concurrent_live_workers(),
+            MAX_CONCURRENT_LIVE_WORKERS,
+            "{junk:?} must keep the default"
+        );
+    }
+    std::env::set_var("PI_CODEMODE_MAX_WORKERS", " 3 ");
+    assert_eq!(max_concurrent_live_workers(), 3, "trimmed positive int");
+
+    // Force the semaphore's initialization at the default cap, then let the
+    // read-per-admission rule raise it: three slots become available.
+    std::env::remove_var("PI_CODEMODE_MAX_WORKERS");
+    let baseline = live_worker_admission_handle().available_permits();
+    assert_eq!(baseline, MAX_CONCURRENT_LIVE_WORKERS);
+    std::env::set_var("PI_CODEMODE_MAX_WORKERS", "3");
+
+    let first = tokio::time::timeout(RELEASE_BOUND, acquire_live_worker_slot(None))
+        .await
+        .expect("slot one under the raised cap")
+        .expect("slot one");
+    let second = tokio::time::timeout(RELEASE_BOUND, acquire_live_worker_slot(None))
+        .await
+        .expect("slot two under the raised cap")
+        .expect("slot two");
+    let third = tokio::time::timeout(RELEASE_BOUND, acquire_live_worker_slot(None))
+        .await
+        .expect("a THIRD slot must be admitted once PI_CODEMODE_MAX_WORKERS=3")
+        .expect("slot three");
+    assert_eq!(
+        live_worker_admission_handle().available_permits(),
+        0,
+        "all three raised-cap slots are held"
+    );
+
+    // The fourth worker queues at the raised cap.
+    let mut fourth = tokio::spawn(async move { acquire_live_worker_slot(None).await });
+    assert!(
+        tokio::time::timeout(QUEUED_PROBE, &mut fourth)
+            .await
+            .is_err(),
+        "a fourth live worker must NOT start while the raised cap is full"
+    );
+    drop(first);
+    // The admitted fourth worker's permit is dropped with the statement (the
+    // assertion is the admission itself, not the slot it holds).
+    let _ = tokio::time::timeout(RELEASE_BOUND, &mut fourth)
+        .await
+        .expect("the fourth worker starts once a slot frees")
+        .expect("waiter task joins")
+        .expect("the fourth worker holds a slot");
+    drop(second);
+    drop(third);
+
+    // Restore the default cap before releasing the lock so the other
+    // admission tests keep their baseline.
+    std::env::remove_var("PI_CODEMODE_MAX_WORKERS");
+    live_worker_admission_handle();
+    assert_eq!(
+        live_worker_admission_handle().available_permits(),
+        baseline,
+        "dropping the override restores the default cap"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (3) tool_search ordering determinism
 // ---------------------------------------------------------------------------

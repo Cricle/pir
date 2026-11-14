@@ -560,6 +560,16 @@ async fn session_swap_with_a_real_extension_handle_is_depth_safe() {
         );
         config.extensions = Some(handle.clone());
         let agent = AgentSession::new(config);
+        // PIR-BIN-091: a fresh session records pi's startup state
+        // (`model_change` + `thinking_level_change`), so the in-memory
+        // session has a leaf before the swap; capture it and pin it below.
+        let startup_leaf = agent
+            .with_session_manager(|session| session.leaf_id().map(str::to_owned))
+            .await;
+        assert!(
+            startup_leaf.is_some(),
+            "a fresh session records its startup-state rows and therefore has a leaf"
+        );
 
         assert!(
             agent.replace_session_storage(deep).await,
@@ -588,8 +598,9 @@ async fn session_swap_with_a_real_extension_handle_is_depth_safe() {
         );
         assert_eq!(
             probe["oldLeafId"],
-            serde_json::Value::Null,
-            "the in-memory session had no leaf: {probe}"
+            serde_json::json!(startup_leaf.expect("captured startup leaf")),
+            "the event carries the pre-swap leaf (the startup-state row of the \
+             fresh in-memory session): {probe}"
         );
     }
 }

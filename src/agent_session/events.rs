@@ -491,6 +491,267 @@ pub fn session_event_to_json(event: &SessionEvent) -> JsonValue {
     }
 }
 
+/// Borrowed serialization view of [`SessionEvent`]: the exact wire bytes of
+/// [`session_event_to_json`], written straight from the borrowed event.
+///
+/// The RPC and JSON print bridges stream every session event to one line
+/// (`entry_appended` carries the whole appended message); serializing through
+/// the `Value` shape materializes the payload as an owned tree first
+/// (`PIR-BIN-099`). This view serializes the same fields in the same order
+/// (the crate builds `serde_json` with `preserve_order`, so the `json!`
+/// insertion order IS the wire order, and optional keys are appended exactly
+/// where the old post-inserts placed them), so the line comes out
+/// byte-identical. Pinned per event by
+/// `tests/json_stream_wire.rs::every_session_event_line_matches_the_value_construction`.
+pub(crate) struct SessionEventWire<'a> {
+    event: &'a SessionEvent,
+}
+
+impl<'a> SessionEventWire<'a> {
+    pub(crate) fn new(event: &'a SessionEvent) -> Self {
+        Self { event }
+    }
+}
+
+/// One `background_tool_end` image block in its upstream result-content shape
+/// (`{"type":"image","data","mimeType"}`, the projection the `Value`
+/// construction builds field for field).
+struct ImageBlockWire<'a>(&'a crate::ai::types::ImageContent);
+
+impl serde::Serialize for ImageBlockWire<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("type", "image")?;
+        map.serialize_entry("data", &self.0.data)?;
+        map.serialize_entry("mimeType", &self.0.mime_type)?;
+        map.end()
+    }
+}
+
+/// Borrowed `images` array view (the `Value` construction's array of
+/// `{"type":"image",...}` projections).
+struct ImageBlocksWire<'a>(&'a [crate::ai::types::ImageContent]);
+
+impl serde::Serialize for ImageBlocksWire<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(ImageBlockWire))
+    }
+}
+
+impl serde::Serialize for SessionEventWire<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self.event {
+            SessionEvent::QueueUpdate {
+                steering,
+                follow_up,
+                ..
+            } => {
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("type", "queue_update")?;
+                map.serialize_entry("steering", steering)?;
+                map.serialize_entry("followUp", follow_up)?;
+                map.end()
+            }
+            SessionEvent::CompactionStart { reason } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "compaction_start")?;
+                map.serialize_entry("reason", reason)?;
+                map.end()
+            }
+            SessionEvent::CompactionEnd {
+                reason,
+                result,
+                aborted,
+                will_retry,
+                error_message,
+            } => {
+                let mut map =
+                    serializer.serialize_map(Some(if error_message.is_some() { 6 } else { 5 }))?;
+                map.serialize_entry("type", "compaction_end")?;
+                map.serialize_entry("reason", reason)?;
+                map.serialize_entry("result", result)?;
+                map.serialize_entry("aborted", aborted)?;
+                map.serialize_entry("willRetry", will_retry)?;
+                if let Some(message) = error_message {
+                    map.serialize_entry("errorMessage", message)?;
+                }
+                map.end()
+            }
+            SessionEvent::AgentSettled { aborted } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "agent_settled")?;
+                map.serialize_entry("aborted", aborted)?;
+                map.end()
+            }
+            SessionEvent::EntryAppended { entry } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "entry_appended")?;
+                map.serialize_entry("entry", entry)?;
+                map.end()
+            }
+            SessionEvent::SessionInfoChanged { name } => {
+                let mut map = serializer.serialize_map(Some(if name.is_some() { 2 } else { 1 }))?;
+                map.serialize_entry("type", "session_info_changed")?;
+                if let Some(name) = name {
+                    map.serialize_entry("name", name)?;
+                }
+                map.end()
+            }
+            SessionEvent::ThinkingLevelChanged { level } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "thinking_level_changed")?;
+                map.serialize_entry("level", level)?;
+                map.end()
+            }
+            SessionEvent::HistoryTrimmed {
+                dropped_messages,
+                retained_messages,
+                max_messages,
+                max_tokens,
+                reason,
+                total_dropped_messages,
+            } => {
+                let mut map = serializer.serialize_map(Some(7))?;
+                map.serialize_entry("type", "history_trimmed")?;
+                map.serialize_entry("droppedMessages", dropped_messages)?;
+                map.serialize_entry("retainedMessages", retained_messages)?;
+                map.serialize_entry("maxMessages", max_messages)?;
+                map.serialize_entry("maxTokens", max_tokens)?;
+                map.serialize_entry("reason", reason)?;
+                map.serialize_entry("totalDroppedMessages", total_dropped_messages)?;
+                map.end()
+            }
+            SessionEvent::BashExecutionUpdate { id, delta } => {
+                let mut map = serializer.serialize_map(Some(if id.is_some() { 3 } else { 2 }))?;
+                map.serialize_entry("type", "bash_execution_update")?;
+                map.serialize_entry("delta", delta)?;
+                if let Some(id) = id {
+                    map.serialize_entry("id", id)?;
+                }
+                map.end()
+            }
+            SessionEvent::BackgroundToolEnd {
+                call_id,
+                tool_name,
+                parent_call_id,
+                is_error,
+                duration_ms,
+                output,
+                images,
+                details,
+                structured_content,
+                usage,
+            } => {
+                let optional = parent_call_id.is_some() as usize
+                    + duration_ms.is_some() as usize
+                    + (!images.is_empty()) as usize
+                    + details.is_some() as usize
+                    + structured_content.is_some() as usize
+                    + usage.is_some() as usize;
+                let mut map = serializer.serialize_map(Some(5 + optional))?;
+                map.serialize_entry("type", "background_tool_end")?;
+                map.serialize_entry("callId", call_id)?;
+                map.serialize_entry("toolName", tool_name)?;
+                map.serialize_entry("isError", is_error)?;
+                map.serialize_entry("output", output)?;
+                if let Some(parent) = parent_call_id {
+                    map.serialize_entry("parentToolCallId", parent)?;
+                }
+                if let Some(duration_ms) = duration_ms {
+                    map.serialize_entry("durationMs", duration_ms)?;
+                }
+                if !images.is_empty() {
+                    map.serialize_entry("images", &ImageBlocksWire(images))?;
+                }
+                if let Some(details) = details {
+                    map.serialize_entry("details", details)?;
+                }
+                if let Some(structured) = structured_content {
+                    map.serialize_entry("structuredContent", structured)?;
+                }
+                if let Some(usage) = usage {
+                    map.serialize_entry("usage", usage)?;
+                }
+                map.end()
+            }
+            SessionEvent::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message,
+            } => {
+                let mut map = serializer.serialize_map(Some(5))?;
+                map.serialize_entry("type", "auto_retry_start")?;
+                map.serialize_entry("attempt", attempt)?;
+                map.serialize_entry("maxAttempts", max_attempts)?;
+                map.serialize_entry("delayMs", delay_ms)?;
+                map.serialize_entry("errorMessage", error_message)?;
+                map.end()
+            }
+            SessionEvent::AutoRetryEnd {
+                success,
+                attempt,
+                final_error,
+            } => {
+                let mut map =
+                    serializer.serialize_map(Some(if final_error.is_some() { 4 } else { 3 }))?;
+                map.serialize_entry("type", "auto_retry_end")?;
+                map.serialize_entry("success", success)?;
+                map.serialize_entry("attempt", attempt)?;
+                if let Some(error) = final_error {
+                    map.serialize_entry("finalError", error)?;
+                }
+                map.end()
+            }
+            SessionEvent::SummarizationRetryScheduled {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message,
+            } => {
+                let mut map = serializer.serialize_map(Some(5))?;
+                map.serialize_entry("type", "summarization_retry_scheduled")?;
+                map.serialize_entry("attempt", attempt)?;
+                map.serialize_entry("maxAttempts", max_attempts)?;
+                map.serialize_entry("delayMs", delay_ms)?;
+                map.serialize_entry("errorMessage", error_message)?;
+                map.end()
+            }
+            SessionEvent::SummarizationRetryAttemptStart { source } => match source {
+                SummarizationRetrySource::BranchSummary => {
+                    let mut map = serializer.serialize_map(Some(2))?;
+                    map.serialize_entry("type", "summarization_retry_attempt_start")?;
+                    map.serialize_entry("source", "branchSummary")?;
+                    map.end()
+                }
+                SummarizationRetrySource::Compaction { reason } => {
+                    let mut map = serializer.serialize_map(Some(3))?;
+                    map.serialize_entry("type", "summarization_retry_attempt_start")?;
+                    map.serialize_entry("source", "compaction")?;
+                    map.serialize_entry("reason", reason)?;
+                    map.end()
+                }
+            },
+            SessionEvent::SummarizationRetryFinished => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("type", "summarization_retry_finished")?;
+                map.end()
+            }
+        }
+    }
+}
+
+/// Serialize one session event straight to its wire line, byte-identical to
+/// `serde_json::to_string(&session_event_to_json(event))` (pinned by
+/// `tests/json_stream_wire.rs::every_session_event_line_matches_the_value_construction`),
+/// without the intermediate `Value` (the session bridge seam, `PIR-BIN-099`).
+#[doc(hidden)]
+pub fn to_session_event_line(event: &SessionEvent) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&SessionEventWire::new(event))
+}
+
 /// Build the summarizer-retry observer the compaction module calls
 /// (upstream `_summarizationRetryCallbacks`, agent-session.ts:3781-3804).
 ///

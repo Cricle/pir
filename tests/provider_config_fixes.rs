@@ -432,6 +432,67 @@ fn parse_pi_config_still_accepts_jsonc() {
     assert_eq!(provider.models[0].id, "acme-large");
 }
 
+/// PIR-BIN-097: a wrong-typed known models.json field is pi's schema error
+/// (`Invalid models.json schema:`), not a silently invented model and not a
+/// bare serde abort. Before the fix `models: "nope"` parsed into a provider
+/// whose single model id was literally `nope`, and a string `contextWindow`
+/// killed the provider load with `Error: Failed to parse models.json: …`.
+#[test]
+fn wrong_typed_models_json_fields_report_pi_schema_errors() {
+    // pi's exact `ModelConfig.load` text (probed against the shipped 1.4.0
+    // bundle; `.play/evidence/p16-modelsjson/runs/schema/`).
+    let error = parse_pi_config(r#"{"providers":{"x":{"models":"nope"}}}"#)
+        .expect_err("a string `models` field must not parse");
+    assert_eq!(
+        error.message(),
+        "Invalid models.json schema:\n  - providers.x.models: must be array"
+    );
+
+    let error = parse_pi_config(
+        r#"{"providers":{"localtest":{"models":[{"id":"bad-typed","contextWindow":"big"}]}}}"#,
+    )
+    .expect_err("a string `contextWindow` must not parse");
+    assert_eq!(
+        error.message(),
+        "Invalid models.json schema:\n  - providers.localtest.models.0.contextWindow: must be number"
+    );
+
+    // Through the real loader the same file degrades to the empty layer plus
+    // the recorded pi-text warning (PIR-BIN-098): no invented model id, no
+    // error return.
+    let _guard = env_lock().lock().unwrap();
+    let previous = std::env::var("PIR_AGENT_DIR").ok();
+    let dir = temp_dir("models-json-schema");
+    std::fs::write(
+        dir.join("models.json"),
+        r#"{"providers":{"x":{"models":"nope"}}}"#,
+    )
+    .expect("write models.json");
+
+    set_env("PIR_AGENT_DIR", Some(dir.to_str().unwrap()));
+    let configured = load_pi_config_with(None).expect("a schema error must not abort the load");
+    set_env("PIR_AGENT_DIR", previous.as_deref());
+
+    assert!(
+        configured.is_none(),
+        "a schema-invalid models.json must not invent a configured model"
+    );
+    let recorded = pir::ai::providers::models_json_load_error().expect("recorded error");
+    assert!(
+        recorded.starts_with("Invalid models.json schema:"),
+        "{recorded}"
+    );
+    assert!(
+        recorded.contains("  - providers.x.models: must be array"),
+        "{recorded}"
+    );
+    assert!(
+        recorded.contains(&format!("File: {}", dir.join("models.json").display())),
+        "{recorded}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // P2-5: PI_OAUTH_CALLBACK_HOST drives the chatgpt redirect URI
 // ---------------------------------------------------------------------------

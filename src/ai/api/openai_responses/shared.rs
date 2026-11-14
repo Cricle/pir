@@ -2024,7 +2024,12 @@ impl ResponsesSseParser {
                 output: output_tokens,
                 cache_read: cached,
                 cache_write,
-                reasoning: (reasoning > 0).then_some(reasoning),
+                // Upstream openai-responses records the reasoning breakdown
+                // unconditionally (`response.usage.output_tokens_details
+                // ?.reasoning_tokens || 0`), so a response without the
+                // breakdown still persists `reasoning: 0`, matching pi's
+                // stored usage shape.
+                reasoning: Some(reasoning),
                 total_tokens: usage
                     .get("total_tokens")
                     .and_then(Value::as_u64)

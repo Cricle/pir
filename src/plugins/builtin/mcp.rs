@@ -359,6 +359,11 @@ struct McpSessionState {
     /// after startup; the per-server errors themselves live on the manager's
     /// connection states and in `mcp.log`.
     startup_report: RwLock<Option<crate::mcp::manager::StartupDiscoveryReport>>,
+    /// The trusted project's `mcp.json`, where the manager saves project
+    /// overrides of global servers (upstream `projectConfig`, index.ts:299-
+    /// 311; `None` when the project is not trusted, exactly like upstream
+    /// leaving it undefined). Rebuilt by every config pass.
+    project_config: RwLock<Option<std::path::PathBuf>>,
 }
 
 impl McpSessionState {
@@ -373,7 +378,26 @@ impl McpSessionState {
             overrides: RwLock::new(BTreeMap::new()),
             overridden: RwLock::new(Vec::new()),
             startup_report: RwLock::new(None),
+            project_config: RwLock::new(None),
         }
+    }
+
+    /// The trusted project's `mcp.json` path, where `/mcp` saves project
+    /// overrides (upstream `projectConfig`); `None` for an untrusted project.
+    fn project_config(&self) -> Option<std::path::PathBuf> {
+        self.project_config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record the trusted project's `mcp.json` path for the manager's
+    /// project-override actions.
+    fn set_project_config(&self, path: Option<std::path::PathBuf>) {
+        *self
+            .project_config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
     }
 
     fn auto_enable_codemode(&self) -> bool {
@@ -1038,6 +1062,12 @@ impl McpPlugin {
         let resolved_agent_dir = self.resolved_agent_dir();
         let root = self.manager.resolve_config_root(&resolved_agent_dir);
         let global_path = crate::config::mcp::global_mcp_path(&root);
+        // Where `/mcp` saves project overrides: the trusted project's
+        // `mcp.json` even before the file exists (upstream `projectConfig` is
+        // the path whenever the project is trusted, index.ts:308-311).
+        self.state.set_project_config(
+            project_trusted.then(|| crate::config::mcp::project_mcp_path(self.manager.cwd())),
+        );
         let (loaded, diagnostics) = self
             .manager
             .load_config_documents(&resolved_agent_dir, project_trusted);
@@ -2153,6 +2183,10 @@ const MCP_LOGIN_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// One `/mcp` action. `Login`/`Logout`/`Reconnect` are upstream's subcommands;
 /// `Enable`/`Disable`/`Remove`/`List` are pir's session-scoped extras (upstream
 /// reaches enable/disable through the manager and has no removal at all).
+///
+/// `Tools`/`Exposure`/`EnableProject`/`DisableProject` are MANAGER-ONLY
+/// (upstream `serverMenu`, index.ts:834-857): [`Self::parse`] deliberately
+/// does not accept them, so they add no `/mcp` subcommand surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpAction {
     Login,
@@ -2162,6 +2196,10 @@ enum McpAction {
     Disable,
     Remove,
     List,
+    Tools,
+    Exposure,
+    EnableProject,
+    DisableProject,
 }
 
 impl McpAction {
@@ -2187,6 +2225,10 @@ impl McpAction {
             Self::Disable => "disable",
             Self::Remove => "remove",
             Self::List => "list",
+            Self::Tools => "tools",
+            Self::Exposure => "exposure",
+            Self::EnableProject => "enable-project",
+            Self::DisableProject => "disable-project",
         }
     }
 }
@@ -2649,9 +2691,14 @@ async fn reconnect_server(
 ///
 /// Defaults are kept minimal like upstream: enabling removes the `enabled` key
 /// (the default is on), and setting the exposure the entry already resolves to
-/// removes the `exposure` key. `Ok(None)` means the entry is
-/// extension-registered, so the change is session-only. The entry's other
-/// fields are preserved verbatim.
+/// removes the `exposure` key — but only on a FULL entry. An override entry
+/// (one without `command`/`url`/`type`) keeps those values explicit, exactly
+/// like upstream's `keepDefaults` (config.ts:184-192) and
+/// [`persist_project_enabled_patch`]: the override REPLACES the global
+/// server's values, so dropping `enabled: true` there would silently un-pin
+/// the project against a later global `enabled: false`. `Ok(None)` means the
+/// entry is extension-registered, so the change is session-only. The entry's
+/// other fields are preserved verbatim.
 fn persist_server_patch(
     entry: &McpServerEntry,
     enabled: Option<bool>,
@@ -2687,15 +2734,21 @@ fn persist_server_patch(
         return Ok(None);
     };
     let mut object = object;
+    // Upstream `keepDefaults` (config.ts:184): the entry AS WRITTEN IN THIS
+    // FILE — not the merged config — decides whether a default value may be
+    // dropped. An override entry keeps explicit values.
+    let keep_defaults = !object.contains_key("command")
+        && !object.contains_key("url")
+        && !object.contains_key("type");
     if let Some(enabled) = enabled {
-        if enabled {
+        if enabled && !keep_defaults {
             object.remove("enabled");
         } else {
-            object.insert("enabled".to_owned(), JsonValue::Bool(false));
+            object.insert("enabled".to_owned(), JsonValue::Bool(enabled));
         }
     }
     if let Some((exposure, keep_default)) = exposure {
-        if keep_default {
+        if keep_default && !keep_defaults {
             object.remove("exposure");
         } else {
             object.insert(
@@ -2770,6 +2823,144 @@ async fn set_server_enabled(
         "{} MCP server \"{name}\"{location}.",
         if enabled { "Enabled" } else { "Disabled" }
     ))
+}
+
+/// Write one `enabled` value into the trusted project's `mcp.json` as an
+/// override of a global server (upstream `saveConfig(..., inProject)` ->
+/// `updateMcpServerConfig(path, name, patch, {override: true})`,
+/// index.ts:660-672 + config.ts:166-200).
+///
+/// A missing file is created with the one override entry (upstream
+/// `editMcpServers`); an entry the file already has keeps its other fields
+/// (the writer replaces the whole entry, so it is read and patched here).
+/// Like upstream's `keepDefaults`, `enabled: true` is removed from a full
+/// entry (one with `command`/`url`/`type`) but kept on an override, where
+/// `true` is a value rather than the default.
+fn persist_project_enabled_patch(
+    path: &std::path::Path,
+    name: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut object = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let root: JsonValue = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+                .map_err(|error| format!("Could not update {}: {error}", path.display()))?;
+            let servers = root
+                .get("mcpServers")
+                .and_then(JsonValue::as_object)
+                .or_else(|| root.as_object());
+            servers
+                .and_then(|servers| servers.get(name))
+                .and_then(JsonValue::as_object)
+                .cloned()
+                .unwrap_or_default()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(error) => return Err(format!("Could not update {}: {error}", path.display())),
+    };
+    let is_override = !object.contains_key("command")
+        && !object.contains_key("url")
+        && !object.contains_key("type");
+    if enabled && !is_override {
+        object.remove("enabled");
+    } else {
+        object.insert("enabled".to_owned(), JsonValue::Bool(enabled));
+    }
+    crate::coding_agent::cli::mcp_config_upsert(path, name, &JsonValue::Object(object))
+        .map_err(|error| format!("Could not update {}: {error}", path.display()))?;
+    Ok(())
+}
+
+/// Enable or disable one GLOBAL server for the trusted project alone by
+/// writing an override into `<cwd>/.pi/mcp.json` (upstream `setEnabled(...,
+/// inProject = true)`, index.ts:735-767 + `saveConfig`, index.ts:660-672).
+///
+/// The live entry moves to the project source, exactly as the next config
+/// pass will re-register it after reading the override; the session-only
+/// override is cleared so the file is the truth. Disabling drops the
+/// connection (and keeps the discovered snapshot so the bridges re-register
+/// `hidden`); enabling re-discovers like the global toggle.
+async fn set_server_enabled_in_project(
+    manager: &McpManager,
+    state: &McpSessionState,
+    name: &str,
+    enabled: bool,
+) -> Result<String, String> {
+    let Some(project_config) = state.project_config() else {
+        return Err(
+            "The project is not trusted; there is no project mcp.json to update.".to_owned(),
+        );
+    };
+    let Some(entry) = manager.registry().get(name) else {
+        return Err(format!("No MCP server named \"{name}\"."));
+    };
+    if !matches!(&entry.source, McpServerSource::GlobalConfig(_)) {
+        return Err(format!(
+            "MCP server \"{name}\" is not defined by the global mcp.json."
+        ));
+    }
+    persist_project_enabled_patch(&project_config, &entry.name, enabled)?;
+    state.clear_override(name);
+    manager.registry().register(McpServerEntry {
+        config: config_with_enabled(&entry.config, enabled),
+        source: McpServerSource::ProjectConfig(project_config),
+        ..entry
+    });
+    if !enabled {
+        manager.disconnect(name).await;
+    }
+    manager.mark_tools_dirty();
+    if enabled {
+        let _ = manager.discover_server_and_publish(name).await;
+    }
+    state.recompute(manager);
+    // Upstream's item description for these actions is "saved to the project
+    // mcp.json" (index.ts:832); the notice keeps that destination wording
+    // while naming the server like every other `/mcp` message.
+    Ok(format!(
+        "{} MCP server \"{name}\" (saved to the project mcp.json).",
+        if enabled { "Enabled" } else { "Disabled" }
+    ))
+}
+
+/// The per-server Tools view (upstream `showTools`, index.ts:877-899): the
+/// connected server's tools with their effective exposure. A tool whose
+/// `toolExposure` differs from the server's base exposure is marked with it;
+/// the base exposure stays in the server menu's `Exposure: …` row.
+async fn show_server_tools(
+    ui: &dyn crate::plugins::services::UiService,
+    server: &CommandServer,
+) -> Result<(), String> {
+    use crate::plugins::services::{DialogOptions, NotifyLevel, SelectOption};
+    if server.status.tools.is_empty() {
+        // Upstream's menu `empty` text.
+        ui.notify(NotifyLevel::Info, "The server offers no tools.");
+        return Ok(());
+    }
+    let base = server.status.exposure;
+    let mut options: Vec<SelectOption> = server
+        .status
+        .tools
+        .iter()
+        .map(|tool| {
+            let exposure = server.status.exposure_for_tool(tool);
+            let label = if exposure == base {
+                tool.clone()
+            } else {
+                format!("{tool} [{}]", crate::mcp::manager::exposure_label(exposure))
+            };
+            SelectOption::new(label, tool.clone())
+        })
+        .collect();
+    options.push(SelectOption::new("Back", "back"));
+    ui.select(
+        &format!("Tools of {}", server.name()),
+        &options,
+        DialogOptions::default(),
+    )
+    .await
+    .map_err(|_| "MCP manager is unavailable.".to_owned())?;
+    Ok(())
 }
 
 /// Apply an exposure change (upstream `setExposure`, index.ts:769-786):
@@ -2917,6 +3108,13 @@ async fn run_action(
                 _ => reconnect_server(manager, state, &name).await,
             }
         }
+        // Manager-only menu entries (the TUI handles them directly, upstream
+        // `runAction`): a slash invocation can never reach them because
+        // [`McpAction::parse`] does not accept their tokens.
+        McpAction::Tools
+        | McpAction::Exposure
+        | McpAction::EnableProject
+        | McpAction::DisableProject => Err(MCP_USAGE.to_owned()),
     }
 }
 
@@ -2932,14 +3130,25 @@ fn manager_ui(state: &McpSessionState) -> Option<Arc<dyn crate::plugins::service
 }
 
 /// The per-server action list (upstream `serverMenu`, index.ts:860-926).
-fn server_actions(server: &CommandServer) -> Vec<McpAction> {
+fn server_actions(server: &CommandServer, in_project: bool) -> Vec<McpAction> {
     use crate::mcp::manager::ConnectionState;
+    // Upstream order (index.ts:834-857): enable [| enable-project]; or
+    // signin, tools, reconnect, signout, exposure, disable [| disable-project].
     if !server.status.enabled {
-        return vec![McpAction::Enable];
+        let mut actions = vec![McpAction::Enable];
+        if in_project {
+            actions.push(McpAction::EnableProject);
+        }
+        return actions;
     }
     let mut actions = Vec::new();
     if matches!(server.status.state, ConnectionState::NeedsAuth { .. }) {
         actions.push(McpAction::Login);
+    }
+    // Upstream shows the Tools view only for a connected server
+    // (`state === "connected" && connection`, index.ts:842-844).
+    if matches!(server.status.state, ConnectionState::Connected) {
+        actions.push(McpAction::Tools);
     }
     if matches!(
         server.status.state,
@@ -2953,7 +3162,12 @@ fn server_actions(server: &CommandServer) -> Vec<McpAction> {
     if matches!(server.status.state, ConnectionState::Connected) && server.uses_oauth() {
         actions.push(McpAction::Logout);
     }
+    actions.push(McpAction::Exposure);
     actions.push(McpAction::Disable);
+    if in_project {
+        actions.push(McpAction::DisableProject);
+    }
+    // pir's session-scoped extra, after upstream's items.
     actions.push(McpAction::Remove);
     actions
 }
@@ -3014,28 +3228,38 @@ async fn run_manager(
             else {
                 break;
             };
-            let mut options: Vec<SelectOption> = server_actions(&server)
+            // Upstream `inProject` (index.ts:832): a GLOBAL server without a
+            // project override can be toggled for the trusted project alone.
+            // In pir a project entry (a definition or an override) registers
+            // the server with a project source, so `GlobalConfig` is exactly
+            // "global and not overridden".
+            let in_project = state.project_config().is_some()
+                && matches!(
+                    &server.status.source,
+                    crate::mcp::registry::McpServerSource::GlobalConfig(_)
+                );
+            let mut options: Vec<SelectOption> = server_actions(&server, in_project)
                 .into_iter()
                 .map(|action| {
-                    let label = match action {
-                        McpAction::Login => "Sign in",
-                        McpAction::Logout => "Sign out",
-                        McpAction::Reconnect => "Reconnect",
-                        McpAction::Enable => "Enable",
-                        McpAction::Disable => "Disable",
-                        McpAction::Remove => "Remove for this session",
-                        McpAction::List => "Status",
+                    let label: String = match action {
+                        McpAction::Login => "Sign in".to_owned(),
+                        McpAction::Logout => "Sign out".to_owned(),
+                        McpAction::Reconnect => "Reconnect".to_owned(),
+                        McpAction::Enable => "Enable".to_owned(),
+                        McpAction::Disable => "Disable".to_owned(),
+                        McpAction::Remove => "Remove for this session".to_owned(),
+                        McpAction::List => "Status".to_owned(),
+                        McpAction::Tools => "Tools".to_owned(),
+                        McpAction::Exposure => format!(
+                            "Exposure: {}",
+                            crate::mcp::manager::exposure_label(server.status.exposure)
+                        ),
+                        McpAction::EnableProject => "Enable in this project".to_owned(),
+                        McpAction::DisableProject => "Disable in this project".to_owned(),
                     };
                     SelectOption::new(label, action.as_str())
                 })
                 .collect();
-            options.push(SelectOption::new(
-                format!(
-                    "Exposure: {}",
-                    crate::mcp::manager::exposure_label(server.status.exposure)
-                ),
-                "exposure",
-            ));
             options.push(SelectOption::new("Back", "back"));
             let Some(choice) = ui
                 .select(
@@ -3098,6 +3322,33 @@ async fn run_manager(
                     let message = set_server_exposure(manager, state, &name, exposure)?;
                     ui.notify(crate::plugins::services::NotifyLevel::Info, &message);
                     last = Some(message);
+                }
+                continue;
+            }
+            if choice == "tools" {
+                // Upstream `showTools` (index.ts:877-899): a read-only view of
+                // the connected server's tools, each with its effective
+                // exposure. It returns to this server's menu.
+                match show_server_tools(ui, &server).await {
+                    Ok(()) => {}
+                    Err(message) => {
+                        ui.notify(crate::plugins::services::NotifyLevel::Error, &message);
+                        last = Some(message);
+                    }
+                }
+                continue;
+            }
+            if choice == "enable-project" || choice == "disable-project" {
+                let enabled = choice == "enable-project";
+                match set_server_enabled_in_project(manager, state, &name, enabled).await {
+                    Ok(message) => {
+                        ui.notify(crate::plugins::services::NotifyLevel::Info, &message);
+                        last = Some(message);
+                    }
+                    Err(message) => {
+                        ui.notify(crate::plugins::services::NotifyLevel::Error, &message);
+                        last = Some(message);
+                    }
                 }
                 continue;
             }

@@ -48,10 +48,25 @@ $beginMarker = "# BEGIN GENERATED MERGED TEST TARGETS"
 $endMarker = "# END GENERATED MERGED TEST TARGETS"
 
 # --- collect root-level test files -----------------------------------------
-# These two suites keep their own test binary: the Python VM and the worker
-# thread harness both need process-global state/stack that a merged harness
-# cannot provide safely. They remain explicit [[test]] targets below.
-$standaloneNames = @("python_session_lifecycle.rs", "worker_threads_real.rs")
+# These root files keep their own test binary and are emitted as explicit
+# [[test]] targets inside the generated block. A file lands here only when a
+# merged harness cannot host it or when its own target is part of a documented
+# workflow:
+#   - python_session_lifecycle.rs / worker_threads_real.rs: the Python VM and
+#     the worker-thread harness both need process-global state/stack that a
+#     merged harness cannot provide safely.
+#   - durable_memcopy_bench.rs: installs its own counting #[global_allocator]
+#     and is an opt-in (#[ignore]) benchmark binary by design; it is also the
+#     eighth counting-allocator file, which is why folding it would exceed the
+#     HarnessCount-1 counting slots.
+#   - g_durable.rs: the durable suites' dedicated link unit (`cargo check
+#     --test g_durable` / `cargo test --test g_durable`). Keeping it explicit
+#     stops a regeneration from ALSO folding it into a merged harness, which
+#     ran its ~760 tests twice.
+#   - print_native_session.rs: keeps its own binary; listing it here makes that
+#     permanent instead of leaving it to the next regeneration's bin packing.
+$standaloneNames = @("python_session_lifecycle.rs", "worker_threads_real.rs",
+    "durable_memcopy_bench.rs", "g_durable.rs", "print_native_session.rs")
 $files = Get-ChildItem -Path $testsDir -Filter *.rs -File |
     Where-Object {
         $_.Name -notlike "zz_merged_*" -and $_.Name -notlike "zz_shadow_*" -and
@@ -113,7 +128,17 @@ foreach ($m in $dhat) {
     if ($stripped -eq $text) { throw "failed to strip dhat allocator from $($m.Path)" }
     $shadowRel = "tests/zz_shadow_$($m.Name).rs"
     $shadowPath = Join-Path $root $shadowRel
-    Write-NoBom $shadowPath $stripped
+    # `-Check` must be READ-ONLY: compare the expected text instead of writing
+    # it (the old shape rewrote every shadow copy before the comparison, so a
+    # failed check still mutated the tree).
+    if ($Check) {
+        if (-not (Test-Path -LiteralPath $shadowPath) -or
+            (Get-Content -LiteralPath $shadowPath -Raw -Encoding UTF8) -ne $stripped) {
+            throw "generated shadow copy is stale: $shadowRel (run without -Check)"
+        }
+    } else {
+        Write-NoBom $shadowPath $stripped
+    }
     $shadowFiles += $shadowPath
     # #[path] is relative to the directory of the harness file (tests/).
     $m | Add-Member -NotePropertyName IncludePath -NotePropertyValue "zz_shadow_$($m.Name).rs" -Force

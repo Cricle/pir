@@ -456,6 +456,19 @@ struct SessionSnapshotInputs<'a> {
     /// The prompt-start projection this run already built. Reused instead of
     /// calling `build_session_projection` a second time for the snapshot.
     prebuilt_projection: Option<&'a crate::session_manager::SessionProjection>,
+    /// Whether the receiving host has a JS face. The JS `ctx.sessionManager`
+    /// collection getters (`getSessionManagerJson` → branch/tree/labels/
+    /// projection) are the ONLY readers of [`SessionContextSnapshot::branch_json`],
+    /// [`SessionContextSnapshot::tree_json`], its `labels` map and
+    /// [`SessionContextSnapshot::projection_json`] — the native
+    /// `SessionService` contract reaches `entries`, ids, path, cwd, header and
+    /// the live scalars only (`AgentPlugin::on_session_context` is documented
+    /// as "advisory and may be PARTIAL" for exactly this reason). A
+    /// native-only host therefore skips rendering and retaining those
+    /// views: each is a transcript-sized copy (branch text, the full tree
+    /// text + its split arena, the projection/aggregate texts), and on a
+    /// multi-MB session they dominated the post-prompt resident set.
+    js_face: bool,
 }
 
 /// Serialize one projection into the snapshot's `entries` aggregate, its
@@ -486,10 +499,21 @@ struct SessionSnapshotInputs<'a> {
 /// projection map is `{entries: [...views], messages: <aggregate>}`. Any
 /// fragment `to_value` failure degrades BOTH the aggregate and the text to
 /// the old `Null` fallback (one serialization contract, no mixed output).
+///
+/// `js_face: false` (a host with no JS runtime — the builtin-only TUI/SDK
+/// shape) skips the `{entries, messages}` object text AND the aggregate text
+/// entirely: both are read only by the JS `ctx.sessionManager`
+/// (`getSessionManagerJson` / `buildSessionProjection`), and on a multi-MB
+/// session they were a transcript-sized resident copy each. The returned
+/// `entries` aggregate is byte-identical either way; the returned text is
+/// empty and the fragment set carries no text, so a later JS-face push
+/// re-renders it from the cached fragments (the same fallback the splice
+/// already applies to a set without a cached text).
 #[doc(hidden)]
 pub fn serialize_projection_snapshot(
     projection: &crate::session_manager::SessionProjection,
     cached: Option<(Arc<crate::session_manager::ProjectionEntryFragments>, usize)>,
+    js_face: bool,
 ) -> (
     Arc<JsonValue>,
     String,
@@ -528,6 +552,7 @@ pub fn serialize_projection_snapshot(
                         owned,
                         projection,
                         appended_from,
+                        js_face,
                     )
                 }
                 Err(shared) => {
@@ -537,13 +562,16 @@ pub fn serialize_projection_snapshot(
                         (*shared).clone(),
                         projection,
                         appended_from,
+                        js_face,
                     )
                 }
             }
         }
         _ => {
             FRAGMENT_FULL_BUILDS.with(|calls| calls.set(calls.get().saturating_add(1)));
-            crate::session_manager::projection::build_projection_entry_fragments(projection)
+            crate::session_manager::projection::build_projection_entry_fragments(
+                projection, js_face,
+            )
         }
     };
     if fragments.fragments.len() != projection.entries.len() {
@@ -563,6 +591,12 @@ pub fn serialize_projection_snapshot(
             Err(_) => return fallback,
         }),
     };
+    // Native-only hosts have no reader for the projection text (JS
+    // `getSessionManagerJson` only): return it empty and keep the cached
+    // text slots cleared, without rendering the transcript-sized object.
+    if !js_face {
+        return (message_values, String::new(), fragments);
+    }
     // The FULL projection object text: cached and spliced by the extend
     // (one string copy + the appended views). Re-rendering it per push
     // (`{"entry":<entry>,"messages":<slice>}` per view) was ~144k allocs /
@@ -1489,6 +1523,7 @@ session does not have"
                 cached_tree,
                 cached_fragments,
                 prebuilt_projection,
+                js_face: true,
             })
             .await;
         // Unified push: with a plugin host (always present alongside an
@@ -1613,6 +1648,7 @@ session does not have"
                 cached_tree,
                 cached_fragments,
                 prebuilt_projection,
+                js_face: false,
             })
             .await;
         plugins.update_session_context_native_only(snapshot);
@@ -1871,6 +1907,7 @@ session does not have"
             cached_tree,
             cached_fragments,
             prebuilt_projection,
+            js_face,
         } = inputs;
         // Session-manager snapshot extensions: header, branch, full tree,
         // leaf, labels, and the session projection backing the new
@@ -1899,11 +1936,11 @@ session does not have"
                 // pre-rendered string produces identical JSON bytes with no
                 // intermediate value tree (the manager's `Arc<FileEntry>` list
                 // stays shared).
-                let branch = {
-                    let path = crate::session_manager::projection::build_session_path(
-                        session.resident_entries(),
-                        session.leaf_id(),
-                    );
+                // Native-only hosts never read the branch (`getBranch()` is
+                // a JS facade): skip the whole-path render and its
+                // transcript-sized text.
+                let branch = if js_face {
+                    let path = session.projected_branch_path(session.leaf_id());
                     let mut text = String::with_capacity(64 + path.len() * 256);
                     text.push('[');
                     let mut first = true;
@@ -1917,6 +1954,8 @@ session does not have"
                     }
                     text.push(']');
                     text
+                } else {
+                    String::new()
                 };
                 // Labels are read off the BORROWED resident entry list (no
                 // clone — the old code paid a whole-session `entries()`
@@ -1924,14 +1963,18 @@ session does not have"
                 // calls `entries()` and deep-clones each entry into its
                 // node; the public API has no borrowed forest builder, so
                 // that copy is unavoidable (documented residual).
+                // Native-only hosts never read the label map (`getLabel()`
+                // is a JS facade): the walk and its owned ids are skipped.
                 let mut labels_map = serde_json::Map::new();
-                for entry in session.resident_entries() {
-                    if entry.is_header() {
-                        continue;
-                    }
-                    if let Some(id) = entry.id() {
-                        if let Some(label) = session.get_label(id) {
-                            labels_map.insert(id.to_string(), JsonValue::String(label));
+                if js_face {
+                    for entry in session.resident_entries() {
+                        if entry.is_header() {
+                            continue;
+                        }
+                        if let Some(id) = entry.id() {
+                            if let Some(label) = session.get_label(id) {
+                                labels_map.insert(id.to_string(), JsonValue::String(label));
+                            }
                         }
                     }
                 }
@@ -1971,84 +2014,99 @@ session does not have"
                 // SAME key (same inputs, same value) and the fragment cache
                 // entry stores the clone.
                 let fragment_key = tree_key.clone();
-                let (tree_json, tree_cache) = match cached_tree {
-                    Some(cached) if cached.key == tree_key => (cached.text.clone(), Some(cached)),
-                    Some(cached)
-                        if cached.incremental_ok
-                            && cached.key.session_id == tree_key.session_id
-                            && cached.key.session_path == tree_key.session_path
-                            && tree_key.entry_count > cached.key.entry_count =>
-                    {
-                        // Prefix continuity: walk the resident entries
-                        // backwards and stop at the sentinel — the entries
-                        // passed must be exactly the append delta.
-                        let sentinel = cached.last_node_id.clone();
-                        let delta_target = tree_key.entry_count - cached.key.entry_count;
-                        let mut new_entries: Vec<&crate::session_manager::FileEntry> = Vec::new();
-                        let mut prefix_ok = false;
-                        for entry in session.resident_entries().iter().rev() {
-                            if entry.is_header() {
-                                // Headers only ever sit at the file front, so
-                                // one encountered mid-delta means the
-                                // resident list was rewritten: fall back.
-                                if new_entries.len() < delta_target {
+                // Native-only hosts never read the tree (`getTree()` is a
+                // JS facade): skip the full render and its split arena, and
+                // never retain the rendered text.
+                let (tree_json, tree_cache) = if !js_face {
+                    (String::new(), None)
+                } else {
+                    match cached_tree {
+                        Some(cached) if cached.key == tree_key => {
+                            (cached.text.clone(), Some(cached))
+                        }
+                        Some(cached)
+                            if cached.incremental_ok
+                                && cached.key.session_id == tree_key.session_id
+                                && cached.key.session_path == tree_key.session_path
+                                && tree_key.entry_count > cached.key.entry_count =>
+                        {
+                            // Prefix continuity: walk the resident entries
+                            // backwards and stop at the sentinel — the entries
+                            // passed must be exactly the append delta.
+                            let sentinel = cached.last_node_id.clone();
+                            let delta_target = tree_key.entry_count - cached.key.entry_count;
+                            let mut new_entries: Vec<&crate::session_manager::FileEntry> =
+                                Vec::new();
+                            let mut prefix_ok = false;
+                            for entry in session.resident_entries().iter().rev() {
+                                if entry.is_header() {
+                                    // Headers only ever sit at the file front, so
+                                    // one encountered mid-delta means the
+                                    // resident list was rewritten: fall back.
+                                    if new_entries.len() < delta_target {
+                                        break;
+                                    }
+                                    prefix_ok = true;
                                     break;
                                 }
-                                prefix_ok = true;
-                                break;
-                            }
-                            if entry.entry_id() == sentinel.as_str() {
-                                prefix_ok = new_entries.len() == delta_target;
-                                break;
-                            }
-                            if new_entries.len() >= delta_target {
-                                // More non-header entries than the count
-                                // delta explains (rewritten list): fall back.
-                                prefix_ok = false;
-                                break;
-                            }
-                            new_entries.push(entry.as_ref());
-                        }
-                        // A label entry changes an EXISTING node's rendered
-                        // label fields, which the splice cannot patch; the
-                        // full render handles it.
-                        let has_label_entry = new_entries.iter().any(|entry| {
-                            matches!(entry, crate::session_manager::FileEntry::Label(_))
-                        });
-                        if prefix_ok && !has_label_entry && !new_entries.is_empty() {
-                            new_entries.reverse();
-                            let resolve_label =
-                                |id: &str| (session.get_label(id), session.label_timestamp_for(id));
-                            // The Arc is this push's private copy unless a
-                            // concurrent reader holds the previous snapshot's
-                            // clone; `unwrap_or_clone` mutates in place in the
-                            // common case and clones once (the old full-render
-                            // cost) when shared.
-                            let mut cached = match Arc::try_unwrap(cached) {
-                                Ok(cached) => cached,
-                                Err(shared) => (*shared).clone(),
-                            };
-                            match extend_cached_forest(&mut cached, &new_entries, &resolve_label) {
-                                Some(()) => {
-                                    let last_id = new_entries
-                                        .last()
-                                        .map(|entry| entry.entry_id().to_owned())
-                                        .unwrap_or_else(|| cached.last_node_id.clone());
-                                    cached.key = tree_key;
-                                    cached.node_count += new_entries.len();
-                                    cached.last_node_id = last_id;
-                                    let text = render_cached_forest(&cached);
-                                    cached.text = text.clone();
-                                    (text, Some(Arc::new(cached)))
+                                if entry.entry_id() == sentinel.as_str() {
+                                    prefix_ok = new_entries.len() == delta_target;
+                                    break;
                                 }
-                                // Structural surprise: full render.
-                                None => full_render_tree(tree_key, &session),
+                                if new_entries.len() >= delta_target {
+                                    // More non-header entries than the count
+                                    // delta explains (rewritten list): fall back.
+                                    prefix_ok = false;
+                                    break;
+                                }
+                                new_entries.push(entry.as_ref());
                             }
-                        } else {
-                            full_render_tree(tree_key, &session)
+                            // A label entry changes an EXISTING node's rendered
+                            // label fields, which the splice cannot patch; the
+                            // full render handles it.
+                            let has_label_entry = new_entries.iter().any(|entry| {
+                                matches!(entry, crate::session_manager::FileEntry::Label(_))
+                            });
+                            if prefix_ok && !has_label_entry && !new_entries.is_empty() {
+                                new_entries.reverse();
+                                let resolve_label = |id: &str| {
+                                    (session.get_label(id), session.label_timestamp_for(id))
+                                };
+                                // The Arc is this push's private copy unless a
+                                // concurrent reader holds the previous snapshot's
+                                // clone; `unwrap_or_clone` mutates in place in the
+                                // common case and clones once (the old full-render
+                                // cost) when shared.
+                                let mut cached = match Arc::try_unwrap(cached) {
+                                    Ok(cached) => cached,
+                                    Err(shared) => (*shared).clone(),
+                                };
+                                match extend_cached_forest(
+                                    &mut cached,
+                                    &new_entries,
+                                    &resolve_label,
+                                ) {
+                                    Some(()) => {
+                                        let last_id = new_entries
+                                            .last()
+                                            .map(|entry| entry.entry_id().to_owned())
+                                            .unwrap_or_else(|| cached.last_node_id.clone());
+                                        cached.key = tree_key;
+                                        cached.node_count += new_entries.len();
+                                        cached.last_node_id = last_id;
+                                        let text = render_cached_forest(&cached);
+                                        cached.text = text.clone();
+                                        (text, Some(Arc::new(cached)))
+                                    }
+                                    // Structural surprise: full render.
+                                    None => full_render_tree(tree_key, &session),
+                                }
+                            } else {
+                                full_render_tree(tree_key, &session)
+                            }
                         }
+                        _ => full_render_tree(tree_key, &session),
                     }
-                    _ => full_render_tree(tree_key, &session),
                 };
                 let leaf_id = session.leaf_id().map(str::to_owned);
                 // ONE projection build feeds both `entries` and
@@ -2112,8 +2170,11 @@ session does not have"
                         // that build and this lock makes the projection stale, so
                         // fall back unless its leaf is still the live leaf.
                         Some(projection) if projection_leaf_matches(&session, projection) => {
-                            let (entries, text, fragments) =
-                                serialize_projection_snapshot(projection, cached_extension);
+                            let (entries, text, fragments) = serialize_projection_snapshot(
+                                projection,
+                                cached_extension,
+                                js_face,
+                            );
                             (
                                 entries,
                                 text,
@@ -2126,8 +2187,11 @@ session does not have"
                         }
                         _ => match session.build_session_projection() {
                             Ok(projection) => {
-                                let (entries, text, fragments) =
-                                    serialize_projection_snapshot(&projection, cached_extension);
+                                let (entries, text, fragments) = serialize_projection_snapshot(
+                                    &projection,
+                                    cached_extension,
+                                    js_face,
+                                );
                                 (
                                     entries,
                                     text,
@@ -2351,14 +2415,14 @@ session does not have"
 
     /// Serialize the live catalog and credential environment (the expensive
     /// half of the push). Returns whether the credential environment loaded:
-    /// on failure the caller must NOT store the catalog fingerprint, so the
-    /// next push retries instead of caching a permanent empty auth list
-    /// (P3-新-3).
+    /// when it did not, the caller must NOT store the catalog fingerprint, so
+    /// the next push retries instead of caching a permanent empty auth list
+    /// (P3-新-3). A `models.json` that fails to parse counts as "did not
+    /// load" too: PIR-BIN-098 degrades it to the built-in layer with a
+    /// warning instead of an error, and a degraded layer must be retried the
+    /// same way (the file can be fixed while the run continues).
     fn build_model_catalog(&self, stats: &ModelCatalogPushStats) -> (ModelCatalog, bool) {
-        let (authenticated, credentials_ok) = match self.authenticated_providers(stats) {
-            Ok(providers) => (providers, true),
-            Err(()) => (Vec::new(), false),
-        };
+        let (authenticated, credentials_ok) = self.authenticated_providers(stats);
         let catalog =
             ModelCatalog::from_registry(&self.registry).with_authenticated_providers(authenticated);
         (catalog, credentials_ok)
@@ -2418,16 +2482,19 @@ session does not have"
     }
 
     /// Provider ids with a usable credential (models.json key, provider
-    /// environment variable, or stored `auth.json` credential). `Err` when
-    /// the environment cannot be loaded; the catalog is still pushed with an
-    /// empty (permissive) list, but the caller must not cache the result
+    /// environment variable, or stored `auth.json` credential), plus whether
+    /// the credential environment really loaded. `false` means the caller
+    /// must NOT cache the result: either the environment could not be loaded
+    /// at all, or a `models.json` inside it degraded (PIR-BIN-098) — the
+    /// catalog is still pushed in both cases, the next push just retries
     /// (P3-新-3). The counter lives here so any catalog path that resolves
     /// credentials is counted, not just [`Self::build_model_catalog`]
     /// (P2-新-2).
-    fn authenticated_providers(&self, stats: &ModelCatalogPushStats) -> Result<Vec<String>, ()> {
+    fn authenticated_providers(&self, stats: &ModelCatalogPushStats) -> (Vec<String>, bool) {
         stats
             .credential_environment_loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let failures_before = crate::ai::providers::models_json_load_failures();
         match crate::ai::providers::load_pi_environment(Some(&self.cwd)) {
             Ok(environment) => {
                 // Providers can come from THREE places: the session registry
@@ -2452,9 +2519,13 @@ session does not have"
                         authenticated.push(id.to_owned());
                     }
                 }
-                Ok(authenticated)
+                // A degraded `models.json` (PIR-BIN-098) still yields this
+                // environment, but it must not be cached: the next push has to
+                // re-read the file so a fix is picked up without a restart.
+                let degraded = crate::ai::providers::models_json_load_failures() != failures_before;
+                (authenticated, !degraded)
             }
-            Err(_) => Err(()),
+            Err(_) => (Vec::new(), false),
         }
     }
 

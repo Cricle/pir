@@ -41,7 +41,7 @@ extensions/runtime/host_functions/node_fns.rs 3 0 0  # Win32 GetProcessTimes + l
 jobs.rs 14 0 0  # Win32 CreateProcessW(bInheritHandles=FALSE) detached supervisor, OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill/getpgid/process-liveness probes (all with SAFETY notes)
 mcp/stdio.rs 1 0 0  # libc::killpg on the spawned MCP server's process group
 plugins/builtin/phone/session.rs 1 0 0  # libc::kill on the phone session's child process group
-session_manager/mod.rs 2 0 0  # Win32 GetFileInformationByHandle identity probe (BY_HANDLE_FILE_INFORMATION)
+session_manager/mod.rs 4 0 0  # Win32 GetFileInformationByHandle identity probe (BY_HANDLE_FILE_INFORMATION) + FILE_READ_ATTRIBUTES-only path identity open (CreateFileW/from_raw_handle)
 session_manager/retention.rs 7 0 0  # Win32 OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill(pid,0), process-liveness probes with SAFETY notes
 session_manager/tail_page.rs 1 0 0  # memmap2 read-only map of an append-only session file
 tui/alloc_trace.rs 11 4 1  # process-global GlobalAlloc delegation (R62 counters moved from lib to bin; PIR-BIN-022 zero-size fallback stays inside the impl)

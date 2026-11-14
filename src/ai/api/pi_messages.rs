@@ -294,6 +294,10 @@ enum PiMessagesEvent {
         usage: Usage,
         #[serde(rename = "responseId")]
         response_id: Option<String>,
+        /// Physical model the gateway used (upstream 14c811841, present on
+        /// the terminal events); absent when the gateway does not report it.
+        #[serde(rename = "responseModel")]
+        response_model: Option<String>,
         #[serde(default)]
         rewrite: Option<Value>,
     },
@@ -304,6 +308,10 @@ enum PiMessagesEvent {
         error_message: Option<String>,
         #[serde(rename = "responseId")]
         response_id: Option<String>,
+        /// Physical model the gateway used (upstream 14c811841, present on
+        /// the terminal events); absent when the gateway does not report it.
+        #[serde(rename = "responseModel")]
+        response_model: Option<String>,
         #[serde(default)]
         rewrite: Option<Value>,
     },
@@ -672,8 +680,8 @@ impl PiMessagesParser {
                 reason,
                 usage,
                 response_id,
+                response_model,
                 rewrite,
-                ..
             } => {
                 if let Some(rewrite) = rewrite {
                     self.push_rewrite_diagnostic(rewrite);
@@ -681,6 +689,13 @@ impl PiMessagesParser {
                 let message = self.message_mut();
                 message.usage = *usage;
                 message.response_id = response_id.clone();
+                // Upstream 14c811841 (`packages/ai/src/api/pi-messages.ts:204-206`):
+                // `if (event.responseModel !== undefined) partial.responseModel
+                // = event.responseModel;` — the physical model is copied only
+                // when reported, so an absent field leaves it unset.
+                if let Some(response_model) = response_model {
+                    message.response_model = Some(response_model.clone());
+                }
                 let stop_reason = terminal_reason(reason);
                 message.stop_reason = stop_reason;
                 self.terminated = true;
@@ -700,8 +715,8 @@ impl PiMessagesParser {
                 usage,
                 error_message,
                 response_id,
+                response_model,
                 rewrite,
-                ..
             } => {
                 if let Some(rewrite) = rewrite {
                     self.push_rewrite_diagnostic(rewrite);
@@ -709,6 +724,11 @@ impl PiMessagesParser {
                 let message = self.message_mut();
                 message.usage = *usage;
                 message.response_id = response_id.clone();
+                // Same terminal-event copy as `done` (upstream 14c811841,
+                // `packages/ai/src/api/pi-messages.ts:219-221`).
+                if let Some(response_model) = response_model {
+                    message.response_model = Some(response_model.clone());
+                }
                 message.error_message = error_message.clone();
                 message.stop_reason = if reason == "aborted" {
                     StopReason::Aborted

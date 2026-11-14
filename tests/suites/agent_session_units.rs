@@ -301,11 +301,12 @@ fn session_stream_options_carry_provider_retry_settings() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The default path is unchanged (v8): with no `retry.provider` block the
-/// session request carries `None` for all three knobs, so the transport keeps
-/// its compiled 2 retries / 60 s cap / no total timeout.
+/// The default path: with no `retry.provider` block the session request
+/// carries the upstream `?? 0` provider budget (`Some(0)`: one provider
+/// attempt per turn, the agent-level ladder owns transient statuses); the
+/// cap/timeout knobs stay `None` (transport defaults).
 #[test]
-fn session_stream_options_keep_transport_defaults_without_settings() {
+fn session_stream_options_resolve_the_upstream_zero_provider_budget() {
     let dir = std::env::temp_dir().join(format!(
         "pir-retry-defaults-{}",
         uuid::Uuid::new_v4().simple()
@@ -315,7 +316,7 @@ fn session_stream_options_keep_transport_defaults_without_settings() {
 
     let session = retry_session(&dir);
     let options = session.stream_options_for_test();
-    assert_eq!(options.max_retries, None);
+    assert_eq!(options.max_retries, Some(0));
     assert_eq!(options.max_retry_delay_ms, None);
     assert_eq!(options.timeout_ms, None);
     let _ = std::fs::remove_dir_all(&dir);

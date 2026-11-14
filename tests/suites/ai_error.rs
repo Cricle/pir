@@ -60,6 +60,51 @@ fn json_parse_error_stays_non_retryable() {
     assert_eq!(e.turn_retry_class(), TurnRetryClass::NonRetryable);
 }
 
+/// PIR-BIN-086: an HTTP-status error the transport retried as far as its
+/// budget allowed belongs to the AGENT-level ladder (upstream
+/// `retryProviderRequest` `maxRetries ?? 0`, then `isRetryableAssistantError`
+/// re-issues the turn). A status that was never retryable — or a verdict with
+/// no transport HTTP shape (auth, configuration, parse, adapter text) — stays
+/// terminal.
+#[test]
+fn exhausted_retryable_http_status_is_retryable_turn() {
+    for status in [
+        "408", "409", "429", "500", "502", "503", "504", "520", "524",
+    ] {
+        let e = AiError::NonRetryable(format!("HTTP {status}: transient"));
+        assert_eq!(
+            e.turn_retry_class(),
+            TurnRetryClass::RetryableTurn,
+            "an exhausted {status} must be re-issuable by the agent loop"
+        );
+    }
+    for text in [
+        "HTTP 401: Incorrect API key provided",
+        "HTTP 400: invalid request",
+        "HTTP 404: model not found",
+        "HTTP 425: too early",
+        "HTTP 429",
+        "invalid_request_error: bad tools",
+        "quota exceeded",
+    ] {
+        let e = AiError::NonRetryable(text.to_string());
+        assert_eq!(
+            e.turn_retry_class(),
+            TurnRetryClass::NonRetryable,
+            "{text} must stay non-retryable"
+        );
+    }
+    assert_eq!(
+        AiError::Authentication("bad key".into()).turn_retry_class(),
+        TurnRetryClass::NonRetryable
+    );
+    let json_err = serde_json::from_str::<()>("not json").unwrap_err();
+    assert_eq!(
+        AiError::Json(json_err).turn_retry_class(),
+        TurnRetryClass::NonRetryable
+    );
+}
+
 #[test]
 fn retry_exhausted_truncation_never_splits_a_codepoint() {
     // 360 bytes of 3-byte characters: a byte slice at index 200 lands mid

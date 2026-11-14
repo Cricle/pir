@@ -218,6 +218,11 @@ struct EntryMeta {
     offset: u64,
     len: usize,
     parent_id: Option<String>,
+    /// The id of the nearest preceding parsed NON-header entry in file order —
+    /// the row a skipped (unparsable) line was appended after. The path walk
+    /// uses it to join the prefix across a hole (PIR-BIN-092), exactly like
+    /// `projection::bridging_predecessor` does for the resident list.
+    predecessor_id: Option<String>,
     kind: EntryKind,
     /// Newest compaction's `firstKeptEntryId` (compaction entries only).
     first_kept_entry_id: Option<String>,
@@ -320,6 +325,7 @@ fn scan_index(path: &Path) -> crate::Result<ScannedSession> {
                 offset: line_offset,
                 len,
                 parent_id: entry.parent_id().map(str::to_owned),
+                predecessor_id: last_non_header_id.clone(),
                 kind,
                 first_kept_entry_id: match &entry {
                     FileEntry::Compaction(compaction) => {
@@ -343,6 +349,12 @@ fn scan_index(path: &Path) -> crate::Result<ScannedSession> {
 // Path + retention
 // ---------------------------------------------------------------------------
 
+/// Leaf→root walk over the scanned index, mirroring
+/// `projection::build_session_path_entries` (same stale-leaf fallback, same
+/// cycle guard, and the same broken-chain bridge — PIR-BIN-092): a `parentId`
+/// that is not in the index joins the prefix through the skipped line's
+/// predecessor instead of truncating the branch. `parentId: null` (a root)
+/// still ends the walk.
 fn resolve_path(scanned: &ScannedSession, leaf_id: Option<&str>) -> Vec<String> {
     let mut current = leaf_id
         .filter(|id| scanned.index.contains_key(*id))
@@ -358,7 +370,15 @@ fn resolve_path(scanned: &ScannedSession, leaf_id: Option<&str>) -> Vec<String> 
             break;
         };
         path.push(id);
-        current = meta.parent_id.clone();
+        current = match &meta.parent_id {
+            // A root: the chain ends here (`parentId: null`).
+            None => None,
+            Some(parent) if scanned.index.contains_key(parent) => Some(parent.clone()),
+            // The parent id belongs to a line the loader skipped: continue at
+            // the nearest preceding surviving row, exactly like the resident
+            // walk. (Upstream pi stops here and silently drops the prefix.)
+            Some(_) => meta.predecessor_id.clone(),
+        };
     }
     path.reverse();
     path

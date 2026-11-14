@@ -1,6 +1,7 @@
 # 系统提示词审计（pir vs upstream pi）
 
-> 状态：**仅审计，未修复**。基线：pir `a07d4d2`（2026-11-04），上游 pi `38ff99177`（2026-10-24）。
+> 状态：**基线审计（仅审计，未修复）+ 2026-11-13 复核**。基线：pir `a07d4d2`（2026-11-04），上游 pi `38ff99177`（2026-10-24）。
+> 复核只更新已确认修复的行（B14、M1/M4 的 RPC 部分，§4/§5 内已标注）；其余行仍是基线快照。
 > 方法：只读检索 + 源码逐段对照。
 
 ## 1. 结论
@@ -80,7 +81,7 @@ You help users by reading files, executing commands, editing code, and writing n
 | B11 | `promptSnippet` 未单行化 | `system_prompt.rs:202-211` 只 trim | `agent-session.ts:1692-1700` 换行/空白折叠为单行 | 多行 snippet 破坏列表 |
 | B12 | 顶层 `promptGuidelines` 缺少核心 builder 字段 | `SystemPromptInput` 无字段（`system_prompt.rs:152-181`） | `BuildSystemPromptOptions.promptGuidelines` 公开 | 嵌入方无法表达 top-level guidelines |
 | B13 | 非法 section 名只 warn 跳过 | `system_prompt.rs:479-490` | `system-prompt.ts:144-148` 抛错 | 配置错误静默失效 |
-| B14 | RPC prompt cwd 用进程 cwd | `rpc.rs:2705` `cwd: None`；`build.rs:344-348` 回退 `current_dir` | `sdk.ts:192` 取 `options.cwd ?? sessionManager.getCwd()` | `<cwd>`、AGENTS.md、skills 全部错位 |
+| B14 | RPC prompt cwd 用进程 cwd | **已修复（2026-11-13 复核）**：`rpc.rs:3030-3031,3064` 传 session cwd；`build.rs:344-348` 的 `current_dir` 回退只在没有 session 时生效（基线为 `rpc.rs:2705` `cwd: None`） | `sdk.ts:192` 取 `options.cwd ?? sessionManager.getCwd()` | 基线时 `<cwd>`、AGENTS.md、skills 全部错位 |
 | B15 | context file 严格 UTF-8、相对 cwd 不绝对化 | `files.rs:51-58`、`context_files.rs:133-153` | Node 替换非法字节；先 `resolvePath(cwd)` | 非 UTF-8 AGENTS.md 整体消失；相对 cwd 漏祖先 |
 | B16 | `SystemMessage.sections` 用 `BTreeMap` | `messages.rs:233-247`；`transcript.rs:170-182` 按 values 拼接 | JS object insertion order | 恢复/导出 transcript 时段落重排 |
 | B17 | `PIR_SYSTEM_PROMPT_FILE` 读取失败中止 print | `print.rs:3315-3317` | `resource-loader.ts:194-205` warning + fallback | 失效路径导致 headless run 失败 |
@@ -107,10 +108,10 @@ You help users by reading files, executing commands, editing code, and writing n
 
 | # | 缺失 | 说明 |
 |---|---|---|
-| M1 | TUI/RPC/SDK 不加载 `SYSTEM.md`/`APPEND_SYSTEM.md` | 只有 print 调 `discover_system_md`（`print.rs:3319-3328`）；TUI `terminal.rs:22853-22860`、RPC `rpc.rs:2714-2717`、SDK `builder.rs:551-563` 只处理 CLI override |
+| M1 | TUI/RPC/SDK 不加载 `SYSTEM.md`/`APPEND_SYSTEM.md` | **RPC 已修复（2026-11-13 复核）**：print（`print.rs:3771`）与 RPC（`rpc.rs:3078-3092`）都调 `discover_system_md`；SDK 需显式 `.discover_system_prompt(true)`（`builder.rs:628`）；TUI 仍只处理 CLI override |
 | M2 | SDK `ResourceLoader` 接口缺 prompt/context 能力 | `sdk/resources.rs:34-42` 只有 `reload/skills/prompt_templates`；上游有 `getAgentsFiles/getSystemPrompt/getAppendSystemPrompt` |
 | M3 | `diff_sections` / `SystemMessage.sections` 增量机制未接线 | `system_prompt.rs:596-612` 无调用者；请求始终发送完整字符串；`normalize_context` 未被 provider 使用 |
-| M4 | RPC/SDK 的 `--skill`/`--no-skills` 不进入 prompt 发现 | `context.rs:758-781` 硬编码空 `cli_skill_paths`/`no_skills=false`；SDK 仅在资源非空时安装 loader |
+| M4 | RPC/SDK 的 `--skill`/`--no-skills` 不进入 prompt 发现 | **RPC 已修复（2026-11-13 复核）**：`rpc.rs:3096-3106` 把 `--skill`/`--no-skills` 传进 `DiscoveredResources`；其余 host 仍硬编码空 `cli_skill_paths`/`no_skills=false`（`context.rs:944`）；SDK 仅在资源非空时安装 loader |
 | M5 | subagent 裸工作区丢 base prompt | `subagent/child.rs:415-424` 在 `context_system_prompt_with_hidden_in` 返回 `None` 时只发 body；上游子进程始终有默认 prompt，body 作为 `appendSystemPrompt` |
 | M6 | codemode 没有 `promptSnippet`/`promptGuidelines` | `plugins/codemode.rs:3763-3770` 未覆盖 trait 默认；上游 `codemode/tool.ts:108-113` 有 |
 | M7 | 顶层 `promptGuidelines` 未进入 `SystemPromptInput` | 同 B12 |
@@ -122,7 +123,7 @@ You help users by reading files, executing commands, editing code, and writing n
 |---|---|---|---|---|---|---|
 | TUI | 是 | 是（资源发现生效） | **否** | 是 | 是 | 无 SYSTEM/APPEND |
 | print | 是 | 是 | **是** | 是 | 是 | APPEND 与 CLI append 叠加（B6） |
-| RPC | 是，但按进程 cwd | 默认发现；`--skill`/`--no-skills` 无效 | **否** | 是 | 是 | cwd 错位（B14）、资源未安装（M4） |
+| RPC | 是（session cwd） | 默认发现；`--skill`/`--no-skills` 生效 | **是**（2026-11-13 复核） | 是 | 是 | B14/M4 已修复 |
 | SDK | 构建时默认发现 | loader 仅在非空时安装 | **否** | `.system_prompt`/`.append_system_prompt` | 是 | append 位置（B7）、显式 prompt 丢 context（B8） |
 | subagent | 子 cwd 发现 | 子 cwd 发现 | **否** | agent body 追加 | 子 session | 裸工作区丢 base prompt（M5） |
 

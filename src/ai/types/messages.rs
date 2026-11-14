@@ -618,7 +618,17 @@ pub struct ToolResultMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub nested_calls: Option<Box<NestedToolCalls>>,
-    #[serde(rename = "isError")]
+    /// Whether the tool call failed. Upstream types the field as required
+    /// (`packages/ai/src/types.ts:651`) but reads session lines with
+    /// `JSON.parse` + a type cast, so a stored row that omits it loads with
+    /// `isError === undefined` (falsy) and stays part of the transcript
+    /// hierarchy (PIR-BIN-092). Serialization always writes the field,
+    /// matching every upstream writer; only a foreign/hand-edited row can
+    /// lack it, and that row must survive the load instead of failing
+    /// [`crate::session_manager::types::StoredMessage`] deserialization
+    /// (which used to drop the row AND, through the missing `parentId`, every
+    /// earlier row of the branch).
+    #[serde(rename = "isError", default)]
     pub is_error: bool,
     /// Milliseconds the tool's execution took, measured with a monotonic clock
     /// (upstream `ToolResultMessage.durationMs`). Absent for legacy results.

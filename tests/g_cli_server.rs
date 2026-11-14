@@ -36,6 +36,10 @@ mod server_prompt_abort;
 mod server_tool_selection;
 #[path = "suites/server_unix.rs"]
 mod server_unix;
+#[path = "suites/session_pick_units.rs"]
+mod session_pick_units;
+#[path = "suites/session_resolve_units.rs"]
+mod session_resolve_units;
 #[path = "suites/settings_recovery.rs"]
 mod settings_recovery;
 #[path = "suites/timing_gates.rs"]

@@ -636,3 +636,45 @@ fn list_models_cli_reports_invalid_settings_on_stderr() {
     let _ = std::fs::remove_dir_all(&agent_dir);
     let _ = std::fs::remove_dir_all(&project_dir);
 }
+
+/// PIR-BIN-085 finding A: the `--list-models` metadata fast path must chain
+/// the same per-field warning collector the normal startup path uses, so a
+/// wrong-typed settings leaf that fell back to its default is visible there
+/// too. Before the fix the fast path printed an EMPTY stderr for this file
+/// while `pir models` warned about it (and `--list-models --help-extensions`,
+/// which takes the regular path, warned as well).
+#[test]
+fn list_models_cli_reports_invalid_settings_leaf_on_stderr() {
+    let agent_dir = temp_dir("cli-leaf-agent");
+    let project_dir = temp_dir("cli-leaf-project");
+    write_file(
+        &agent_dir.join("settings.json"),
+        r#"{"compaction": {"reserveTokens": "8192"}}"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pir"))
+        .arg("--list-models")
+        .env("PIR_AGENT_DIR", &agent_dir)
+        .env("PIR_OFFLINE", "1")
+        .current_dir(&project_dir)
+        .output()
+        .expect("pir binary should start");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("Warning: global settings: invalid setting \"compaction.reserveTokens\""),
+        "the fast path must report the per-field settings warning: {stderr:?}"
+    );
+    assert!(
+        stdout.contains("provider") && stdout.contains("model"),
+        "the model table must still print: {stdout:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&agent_dir);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}

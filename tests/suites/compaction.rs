@@ -24,7 +24,7 @@ use pir::compaction::prompts::{
 use pir::compaction::{
     calculate_context_tokens, compact_context, compaction_fn, prepare_compaction_refs_forced,
     prepare_compaction_refs_with_keep, recover_from_overflow, serialize_conversation,
-    summarization_max_tokens, turn_prefix_max_tokens, CompleteFn,
+    summarization_max_tokens, turn_prefix_max_tokens, CompleteFn, PathEntry,
 };
 
 // ---------------------------------------------------------------------------
@@ -1502,4 +1502,664 @@ fn forced_preparation_summarizes_the_whole_conversation() {
     assert!(preparation.kept_messages.is_empty());
     assert!(preparation.first_kept_entry_id.is_none());
     assert_eq!(preparation.first_kept_message_index, messages.len());
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-095 / PIR-BIN-096 — fused trigger estimate + shared branch snapshot
+// ---------------------------------------------------------------------------
+
+/// One fixture for the fused trigger estimator: the projected basis, the
+/// not-yet-projected tail, the leaf-path metadata, and the request's leading
+/// prompt.
+struct PairFixture {
+    name: &'static str,
+    projected: Vec<CutEntry>,
+    tail: Vec<Message>,
+    branch: Vec<pir::compaction::PathEntryMeta>,
+    prompt: Option<String>,
+    tools: Option<Vec<Tool>>,
+}
+
+fn p21_entry(message: Message, id: &str) -> CutEntry {
+    let mut entry = CutEntry::from_message(message);
+    entry.id = Some(id.to_owned());
+    entry
+}
+
+fn p21_compaction_entry(id: &str) -> CutEntry {
+    CutEntry {
+        id: Some(id.to_owned()),
+        is_compaction: true,
+        compaction_summary: Some("earlier conversation summarized".to_owned()),
+        messages: vec![user_msg("summary of the earlier conversation")],
+        ..Default::default()
+    }
+}
+
+fn p21_path(id: &str) -> pir::compaction::PathEntryMeta {
+    pir::compaction::PathEntryMeta {
+        id: Some(id.to_owned()),
+        is_compaction: false,
+        is_context_edit: false,
+    }
+}
+
+fn p21_compaction_path(id: &str) -> pir::compaction::PathEntryMeta {
+    pir::compaction::PathEntryMeta {
+        id: Some(id.to_owned()),
+        is_compaction: true,
+        is_context_edit: false,
+    }
+}
+
+fn p21_edit_path(id: &str) -> pir::compaction::PathEntryMeta {
+    pir::compaction::PathEntryMeta {
+        id: Some(id.to_owned()),
+        is_compaction: false,
+        is_context_edit: true,
+    }
+}
+
+fn p21_system(
+    blocks: Vec<ContentBlock>,
+    tools_added: Option<Vec<Tool>>,
+    timestamp: u64,
+) -> Message {
+    Message::System(UserMessage {
+        role: UserRole::System,
+        content: blocks,
+        tools_added,
+        tools_removed: None,
+        sections: None,
+        timestamp,
+    })
+}
+
+fn p21_tool(name: &str) -> Tool {
+    Tool {
+        name: name.to_owned(),
+        description: format!("{name} does a thing. {}", "d".repeat(200)),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }),
+        constrained_sampling: None,
+    }
+}
+
+/// Every shape the two public estimators distinguish: no usage at all, a
+/// trusted usage, a usage stale behind a compaction or a context edit, a usage
+/// whose entry id is off the branch, a usage inside the not-yet-projected
+/// tail, a synthetic id-less basis, system replays (declaring all/none of the
+/// request's tools, describing/not describing the prompt), CJK text, tool
+/// calls and tool results.
+fn p21_pair_fixtures() -> Vec<PairFixture> {
+    let tools = vec![p21_tool("read"), p21_tool("grep"), p21_tool("bash")];
+    let prompt = "You are a coding assistant.".to_owned();
+
+    let mut fixtures = Vec::new();
+
+    // 1. No usage, no leading prompt at all.
+    fixtures.push(PairFixture {
+        name: "no usage, no prompt",
+        projected: vec![p21_entry(user_msg(&"x".repeat(4_000)), "e0")],
+        tail: Vec::new(),
+        branch: vec![p21_path("e0")],
+        prompt: None,
+        tools: None,
+    });
+
+    // 2. No usage; the session system replay declares every tool the request
+    //    sends (the PIR-BIN-070 single-count shape), and the prompt is not in
+    //    the message.
+    fixtures.push(PairFixture {
+        name: "no usage, declared tools",
+        projected: {
+            let mut entries = vec![p21_entry(
+                p21_system(Vec::new(), Some(tools.clone()), 1),
+                "sys",
+            )];
+            entries.push(p21_entry(user_msg(&"y".repeat(2_000)), "e1"));
+            entries.push(p21_entry(
+                assistant_msg(vec![text_block("ok")], StopReason::Stop, Usage::default()),
+                "e2",
+            ));
+            entries
+        },
+        tail: Vec::new(),
+        branch: vec![p21_path("sys"), p21_path("e1"), p21_path("e2")],
+        prompt: Some(prompt.clone()),
+        tools: Some(tools.clone()),
+    });
+
+    // 3. No usage; the system replay declares NO tools (a prompt-only
+    //    checkpoint) and a `declareToolChanges` delta exists on the path, so
+    //    the floor must charge every tool again.
+    fixtures.push(PairFixture {
+        name: "no usage, undeclared tools + delta",
+        projected: {
+            let mut entries = vec![p21_entry(p21_system(Vec::new(), None, 1), "sys")];
+            entries.push(p21_entry(
+                p21_system(Vec::new(), Some(vec![tools[0].clone()]), 5),
+                "delta",
+            ));
+            entries.push(p21_entry(user_msg(&"z".repeat(1_500)), "e1"));
+            entries
+        },
+        tail: Vec::new(),
+        branch: vec![p21_path("sys"), p21_path("delta"), p21_path("e1")],
+        prompt: Some(prompt.clone()),
+        tools: Some(tools.clone()),
+    });
+
+    // 4. No usage; the newest system message carries the prompt text itself
+    //    (a replayed initial system message). The floor must not charge the
+    //    out-of-band prompt again; the usage-grounded estimate's prefix still
+    //    charges `prompt_token_units`, so the fused walk must keep the two
+    //    rules apart.
+    fixtures.push(PairFixture {
+        name: "no usage, prompt described by the system message",
+        projected: {
+            let mut entries = vec![p21_entry(
+                p21_system(vec![text_block(&prompt)], None, 1),
+                "sys",
+            )];
+            entries.push(p21_entry(user_msg(&"w".repeat(900)), "e1"));
+            entries
+        },
+        tail: Vec::new(),
+        branch: vec![p21_path("sys"), p21_path("e1")],
+        prompt: Some(prompt.clone()),
+        tools: None,
+    });
+
+    // 5. A trusted usage at the end: no prompt prefix on either side.
+    fixtures.push(PairFixture {
+        name: "trusted usage",
+        projected: {
+            let mut entries = vec![p21_entry(user_msg(&"a".repeat(1_000)), "e0")];
+            entries.push(p21_entry(
+                assistant_msg(
+                    vec![text_block("answer")],
+                    StopReason::Stop,
+                    usage_with_total(1_500),
+                ),
+                "e1",
+            ));
+            entries.push(p21_entry(user_msg(&"b".repeat(1_000)), "e2"));
+            entries.push(p21_entry(
+                assistant_msg(
+                    vec![text_block("answer 2")],
+                    StopReason::Stop,
+                    usage_with_total(2_500),
+                ),
+                "e3",
+            ));
+            entries
+        },
+        tail: Vec::new(),
+        branch: vec![
+            p21_path("e0"),
+            p21_path("e1"),
+            p21_path("e2"),
+            p21_path("e3"),
+        ],
+        prompt: Some(prompt.clone()),
+        tools: Some(tools.clone()),
+    });
+
+    // 6. The usage entry id is not on the branch at all (a rebuilt storage):
+    //    stale, content fallback.
+    fixtures.push(PairFixture {
+        name: "usage entry missing from the branch",
+        projected: {
+            let mut entries = vec![p21_entry(user_msg(&"c".repeat(700)), "e0")];
+            entries.push(p21_entry(
+                assistant_msg(
+                    vec![text_block("answer")],
+                    StopReason::Stop,
+                    usage_with_total(1_200),
+                ),
+                "e1",
+            ));
+            entries
+        },
+        tail: Vec::new(),
+        branch: vec![p21_path("other")],
+        prompt: Some(prompt.clone()),
+        tools: None,
+    });
+
+    // 7. A usage the branch invalidates: the newest entry on the path is a
+    //    compaction that came AFTER the usage.
+    fixtures.push(PairFixture {
+        name: "usage stale behind a compaction",
+        projected: {
+            let mut entries = vec![p21_entry(user_msg(&"d".repeat(600)), "e0")];
+            entries.push(p21_entry(
+                assistant_msg(
+                    vec![text_block("pre-compaction answer")],
+                    StopReason::Stop,
+                    usage_with_total(9_000),
+                ),
+                "e1",
+            ));
+            entries.push(p21_compaction_entry("cmp"));
+            entries.push(p21_entry(user_msg(&"e".repeat(500)), "e2"));
+            entries
+        },
+        tail: Vec::new(),
+        branch: vec![
+            p21_path("e0"),
+            p21_path("e1"),
+            p21_compaction_path("cmp"),
+            p21_path("e2"),
+        ],
+        prompt: Some(prompt.clone()),
+        tools: None,
+    });
+
+    // 8. A context edit after the usage invalidates it the same way.
+    fixtures.push(PairFixture {
+        name: "usage stale behind a context edit",
+        projected: {
+            let mut entries = vec![p21_entry(user_msg(&"f".repeat(600)), "e0")];
+            entries.push(p21_entry(
+                assistant_msg(
+                    vec![text_block("edited away later")],
+                    StopReason::Stop,
+                    usage_with_total(7_000),
+                ),
+                "e1",
+            ));
+            entries.push(CutEntry {
+                id: Some("edit".to_owned()),
+                is_context_edit: true,
+                context_edit_target_id: Some("e1".to_owned()),
+                has_replacement: true,
+                ..Default::default()
+            });
+            entries
+        },
+        tail: Vec::new(),
+        branch: vec![p21_path("e0"), p21_path("e1"), p21_edit_path("edit")],
+        prompt: Some(prompt.clone()),
+        tools: None,
+    });
+
+    // 9. A usage inside the not-yet-projected TAIL: newer than every projected
+    //    entry, so it is trusted (no prefix), and the floor ignores the tail.
+    fixtures.push(PairFixture {
+        name: "usage in the tail",
+        projected: vec![p21_entry(user_msg(&"g".repeat(800)), "e0")],
+        tail: vec![
+            assistant_msg(
+                vec![text_block("tail answer")],
+                StopReason::Stop,
+                usage_with_total(3_000),
+            ),
+            user_msg(&"h".repeat(200)),
+        ],
+        branch: vec![p21_path("e0")],
+        prompt: Some(prompt.clone()),
+        tools: Some(tools.clone()),
+    });
+
+    // 10. An id-less synthetic basis (ephemeral run): the usage must be
+    //     trusted even though no entry id maps to the empty branch.
+    fixtures.push(PairFixture {
+        name: "synthetic id-less basis",
+        projected: {
+            let mut entries = vec![CutEntry::from_message(user_msg(&"i".repeat(400)))];
+            entries.push(CutEntry::from_message(assistant_msg(
+                vec![text_block("answer")],
+                StopReason::Stop,
+                usage_with_total(1_000),
+            )));
+            entries
+        },
+        tail: Vec::new(),
+        branch: Vec::new(),
+        prompt: Some(prompt.clone()),
+        tools: None,
+    });
+
+    // 11. Multi-block system join + CJK + tool call + tool result: exercises
+    //     every `estimate_message_units` arm and the join-without-alloc
+    //     arithmetic on the stale path (stale by construction: the usage
+    //     precedes the compaction).
+    fixtures.push(PairFixture {
+        name: "stale usage, multi-block system, CJK, tool call",
+        projected: {
+            let mut entries = vec![p21_entry(
+                p21_system(vec![text_block("ab"), text_block("汉字内容")], None, 7),
+                "sys",
+            )];
+            entries.push(p21_entry(user_msg(&"j".repeat(1_200)), "e0"));
+            entries.push(p21_entry(
+                assistant_msg(
+                    vec![
+                        text_block("让我检查一下"),
+                        tool_call_block("call-1", "read"),
+                    ],
+                    StopReason::Stop,
+                    usage_with_total(4_000),
+                ),
+                "e1",
+            ));
+            entries.push(p21_entry(tool_result_msg("call-1", &"k".repeat(300)), "e2"));
+            entries.push(p21_compaction_entry("cmp"));
+            entries
+        },
+        tail: Vec::new(),
+        branch: vec![
+            p21_path("sys"),
+            p21_path("e0"),
+            p21_path("e1"),
+            p21_path("e2"),
+            p21_compaction_path("cmp"),
+        ],
+        prompt: Some(prompt.clone()),
+        tools: Some(tools.clone()),
+    });
+
+    // 12. A STALE usage WITH a tail that carries its own system message: the
+    //     stale path must charge the newest system over projection + tail,
+    //     while the floor keeps the newest PROJECTED one.
+    fixtures.push(PairFixture {
+        name: "stale usage with a tail system message",
+        projected: {
+            let mut entries = vec![p21_entry(user_msg(&"l".repeat(500)), "e0")];
+            entries.push(p21_entry(
+                assistant_msg(
+                    vec![text_block("old answer")],
+                    StopReason::Stop,
+                    usage_with_total(5_000),
+                ),
+                "e1",
+            ));
+            entries.push(p21_compaction_entry("cmp"));
+            entries
+        },
+        tail: vec![
+            p21_system(
+                vec![text_block("tail system"), text_block("second block")],
+                None,
+                20,
+            ),
+            user_msg(&"m".repeat(300)),
+        ],
+        branch: vec![p21_path("e0"), p21_path("e1"), p21_compaction_path("cmp")],
+        prompt: Some(prompt.clone()),
+        tools: None,
+    });
+
+    // 13. Timestamp guard: an assistant usage OLDER than a later prefix
+    //     message is rejected (upstream `getLastAssistantUsageInfo`), so the
+    //     newest accepted record is the younger one.
+    fixtures.push(PairFixture {
+        name: "timestamp guard rejects an older usage",
+        projected: {
+            let mut entries = vec![p21_entry(at(user_msg("early"), 1_000), "e0")];
+            entries.push(p21_entry(
+                at(
+                    assistant_msg(
+                        vec![text_block("older usage")],
+                        StopReason::Stop,
+                        usage_with_total(6_000),
+                    ),
+                    1_100,
+                ),
+                "e1",
+            ));
+            entries.push(p21_entry(at(user_msg("later prefix"), 2_000), "e2"));
+            entries.push(p21_entry(
+                at(
+                    assistant_msg(
+                        vec![text_block("younger usage")],
+                        StopReason::Stop,
+                        usage_with_total(8_000),
+                    ),
+                    2_100,
+                ),
+                "e3",
+            ));
+            entries
+        },
+        tail: Vec::new(),
+        branch: vec![
+            p21_path("e0"),
+            p21_path("e1"),
+            p21_path("e2"),
+            p21_path("e3"),
+        ],
+        prompt: Some(prompt.clone()),
+        tools: Some(tools.clone()),
+    });
+
+    fixtures
+}
+
+/// PIR-BIN-095: the fused trigger estimate must reproduce the two public
+/// estimators EXACTLY (same numbers) for every fixture shape, and the trigger
+/// decision must be identical at the threshold boundary — sweep the context
+/// window across the crossing point (a one-token difference flips a decision
+/// there, so the boolean alone pins the number).
+#[test]
+fn p21_bin095_pair_matches_the_public_estimators() {
+    let mut checked = 0usize;
+    for fixture in p21_pair_fixtures() {
+        let PairFixture {
+            name,
+            projected,
+            tail,
+            branch,
+            prompt,
+            tools,
+        } = fixture;
+        let prompt_ref = prompt.as_deref();
+        let tools_ref = tools.as_deref();
+
+        let pair = pir::compaction::estimate_request_projected_context_tokens_pair(
+            &projected, &tail, &branch, prompt_ref, tools_ref,
+        );
+        // The public composition, per number:
+        let with_tail = pir::compaction::estimate_projected_context_tokens_with_tail(
+            &projected, &tail, &branch,
+        );
+        let expected_estimate =
+            with_tail
+                .tokens
+                .saturating_add(if with_tail.last_usage_index.is_none() {
+                    pir::compaction::estimate_prompt_tokens(prompt_ref, tools_ref)
+                } else {
+                    0
+                });
+        let expected_floor = pir::compaction::estimate_request_projected_context_tokens_floor(
+            &projected, prompt_ref, tools_ref,
+        );
+        assert_eq!(
+            pair,
+            (expected_estimate, expected_floor),
+            "fixture {name}: fused pair must equal the two public estimators"
+        );
+        if tail.is_empty() {
+            let public_request = pir::compaction::estimate_request_projected_context_tokens(
+                &projected, &branch, prompt_ref, tools_ref,
+            );
+            assert_eq!(
+                pair.0, public_request.tokens,
+                "fixture {name}: the no-tail estimate must equal the request estimator"
+            );
+        }
+
+        // The trigger decision at the boundary: `should_compact_tokens` fires
+        // iff `tokens > window - reserve`, so windows at `tokens + reserve`
+        // and its neighbours straddle the crossing exactly.
+        let config = CompactionConfig {
+            reserve_tokens: 100,
+            ..CompactionConfig::default()
+        };
+        let tokens = pair.0.max(pair.1);
+        let boundary = tokens.saturating_add(config.reserve_tokens);
+        let windows = [
+            boundary.saturating_sub(2),
+            boundary.saturating_sub(1),
+            boundary,
+            boundary.saturating_add(1),
+            boundary.saturating_add(10_000),
+        ];
+        for window in windows {
+            let model = test_model(window, 4_096);
+            let fused = should_compact_tokens(pair.0.max(pair.1), window, &config);
+            if tail.is_empty() {
+                assert_eq!(
+                    pir::compaction::should_compact_request_refs(
+                        &projected, &branch, prompt_ref, tools_ref, &model, &config,
+                    ),
+                    fused,
+                    "fixture {name}: trigger decision at window {window}"
+                );
+            }
+            assert_eq!(
+                fused,
+                should_compact_tokens(expected_estimate.max(expected_floor), window, &config),
+                "fixture {name}: public composition decision at window {window}"
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked >= 13,
+        "the fixture battery must stay complete: {checked}"
+    );
+}
+
+/// PIR-BIN-095: the stale path charges the newest system message's text blocks
+/// JOINED with `"\n"`; the fused walk computes that weight from the block
+/// weights plus the separator count with no intermediate `String`. Pin the
+/// arithmetic through the real estimator with a hand-computed fixture.
+#[test]
+fn p21_bin095_stale_system_join_matches_the_joined_string_weight() {
+    // Stale by construction: the usage precedes the compaction on the branch.
+    let projected = vec![
+        p21_entry(
+            p21_system(vec![text_block("ab"), text_block("汉字")], None, 7),
+            "sys",
+        ),
+        p21_entry(user_msg(&"x".repeat(400)), "e0"),
+        p21_entry(
+            assistant_msg(
+                vec![text_block("answer")],
+                StopReason::Stop,
+                usage_with_total(4_000),
+            ),
+            "e1",
+        ),
+        p21_compaction_entry("cmp"),
+    ];
+    let branch = vec![
+        p21_path("sys"),
+        p21_path("e0"),
+        p21_path("e1"),
+        p21_compaction_path("cmp"),
+    ];
+    let prompt = "hello";
+    let (estimate, _floor) = pir::compaction::estimate_request_projected_context_tokens_pair(
+        &projected,
+        &[],
+        &branch,
+        Some(prompt),
+        None,
+    );
+    // Units: system join "ab" 2 + "\n" 1 + "汉字" 8 = 11 -> ceil = 3;
+    // user 400 -> 100; assistant "answer" 6 -> 2; the compaction entry's
+    // summary message "summary of the earlier conversation" 35 -> 9;
+    // prompt "hello" 5 -> 2. Stale base 3 + 100 + 2 + 9 = 114, + prefix 2 = 116.
+    assert_eq!(estimate, 116, "hand-computed stale estimate");
+    // The same value via the public estimator (which shares the join
+    // arithmetic) plus the prompt prefix the fused walk adds.
+    let with_tail =
+        pir::compaction::estimate_projected_context_tokens_with_tail(&projected, &[], &branch);
+    assert_eq!(with_tail.tokens, 114);
+    assert_eq!(
+        with_tail.tokens + pir::compaction::estimate_prompt_tokens(Some(prompt), None),
+        estimate
+    );
+}
+
+/// PIR-BIN-096: the shared branch snapshot carries the same ids and flags as
+/// the owned-id metadata, and the estimator produces the same tokens from
+/// either branch shape.
+#[test]
+fn p21_bin096_shared_branch_matches_owned_meta() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("pir-p21-bin096-{stamp}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut session =
+        pir::session_manager::SessionManager::create(".", &dir).expect("create session");
+    for turn in 1..=4u64 {
+        session
+            .append_message(user_msg(&format!("turn {turn} {}", "q".repeat(400))))
+            .expect("append user");
+        session
+            .append_message(assistant_msg(
+                vec![text_block("reply")],
+                StopReason::Stop,
+                usage_with_total(1_000 * turn),
+            ))
+            .expect("append assistant");
+    }
+
+    let owned = session.branch_path_meta(None);
+    let shared = session.branch_path_shared(None);
+    assert_eq!(shared.len(), owned.len(), "same path length");
+    assert!(!shared.is_empty(), "the fixture must have a branch");
+    for (shared_entry, meta) in shared.iter().zip(&owned) {
+        assert_eq!(shared_entry.id(), meta.id.as_deref(), "same entry id");
+        assert_eq!(
+            shared_entry.is_compaction(),
+            meta.is_compaction,
+            "same compaction flag"
+        );
+        assert_eq!(
+            shared_entry.is_context_edit(),
+            meta.is_context_edit,
+            "same context-edit flag"
+        );
+    }
+
+    let projection = session.build_session_projection().expect("projection");
+    let metas = pir::compaction::ProjectionEntryMeta::from_projection(&projection.entries);
+    let refs = pir::compaction::ProjectionEntryMeta::cut_refs(&metas, &projection.messages);
+    let prompt = "You are a coding assistant.";
+    let with_owned = pir::compaction::estimate_request_projected_context_tokens(
+        &refs,
+        &owned,
+        Some(prompt),
+        None,
+    )
+    .tokens;
+    let with_shared = pir::compaction::estimate_request_projected_context_tokens(
+        &refs,
+        &shared,
+        Some(prompt),
+        None,
+    )
+    .tokens;
+    assert_eq!(with_owned, with_shared, "same estimate from either shape");
+    let pair = pir::compaction::estimate_request_projected_context_tokens_pair(
+        &refs,
+        &[],
+        &shared,
+        Some(prompt),
+        None,
+    );
+    assert_eq!(pair.0, with_shared, "the fused estimate matches");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

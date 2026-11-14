@@ -1154,6 +1154,25 @@ pub trait Component: Send {
         None
     }
 
+    /// Optional identity of the origin the [`Component::content_blocks`]
+    /// sequence is anchored at (e.g. the absolute index of the first
+    /// materialized block and the block count, mixed into one hash).
+    ///
+    /// The frame assembler serves an unchanged block from its row cache by
+    /// POSITION; a block that MOVED between positions (a window slide, a
+    /// paged prepend) is found again through a per-frame revision index. That
+    /// index costs one allocation per materialized block, so it is only
+    /// built when the origin may have moved: two consecutive frames that
+    /// report the same `Some(origin)` with the same geometry cannot have
+    /// moved a block, and every block that did change content re-renders in
+    /// place (byte-identical to a reused row, since equal revisions imply
+    /// byte-identical rows at this width/theme). `None` (the default) keeps
+    /// the conservative always-index behavior; returning `Some` must be
+    /// derived from the block sequence's own identity, never from content.
+    fn content_blocks_origin(&self) -> Option<u64> {
+        None
+    }
+
     /// Render block `index` into the recycled row canvas. Only called when
     /// [`Component::content_blocks`] returned `Some` and that block's revision
     /// moved (or its position changed). The default delegates to
@@ -2664,6 +2683,11 @@ struct FrameComponentSlot {
     /// Per-block caches for a component that implements
     /// [`Component::content_blocks`]; empty for whole-component slots.
     blocks: Vec<FrameBlockSlot>,
+    /// The [`Component::content_blocks_origin`] this slot's blocks were
+    /// produced under (`None` for components that do not report one). The
+    /// next frame compares it against the component's current origin to
+    /// decide whether the cross-position block-reuse index must be built.
+    origin: Option<u64>,
 }
 
 /// One independently cached block of a [`Component::content_blocks`]
@@ -3735,6 +3759,17 @@ impl TuiCore {
                 let geometry_matches = previous
                     .as_ref()
                     .is_some_and(|slot| slot.width == width && slot.theme == theme);
+                // The block sequence's origin: when the component reports one
+                // and the previous frame's slot carries the same value (with
+                // matching geometry), no block can have changed position —
+                // the moved-block index below is skipped entirely. `None` on
+                // either side keeps the conservative always-index behavior.
+                let previous_origin = previous.as_ref().and_then(|slot| slot.origin);
+                let blocks_origin = component.content_blocks_origin();
+                let origin_moved = match (previous_origin, blocks_origin) {
+                    (Some(previous), Some(current)) => previous != current,
+                    _ => true,
+                };
                 if let Some(block_revisions) = component.content_blocks() {
                     let mut previous_blocks: Vec<Option<FrameBlockSlot>> = previous
                         .map(|slot| slot.blocks.into_iter().map(Some).collect())
@@ -3746,10 +3781,15 @@ impl TuiCore {
                     // served from its cached rows instead of re-rendered.
                     // Revisions are content hashes: an equal revision implies
                     // byte-identical rows at this width/theme (geometry is
-                    // checked at the component slot).
+                    // checked at the component slot). Built only when the
+                    // origin may have moved (see
+                    // [`Component::content_blocks_origin`]): a steady band
+                    // frame otherwise pays one `HashMap` insert plus one
+                    // `Vec` allocation per materialized block every frame for
+                    // an index that can never be consulted.
                     let mut previous_by_revision: std::collections::HashMap<u64, Vec<usize>> =
                         std::collections::HashMap::new();
-                    if geometry_matches {
+                    if geometry_matches && origin_moved {
                         for (previous_index, slot) in previous_blocks.iter().enumerate() {
                             if let Some(block) = slot {
                                 previous_by_revision
@@ -3955,6 +3995,7 @@ impl TuiCore {
                         start: component_start,
                         rows: Vec::new(),
                         blocks,
+                        origin: blocks_origin,
                     });
                     continue;
                 }
@@ -4023,6 +4064,7 @@ impl TuiCore {
                         start: component_start,
                         rows,
                         blocks: Vec::new(),
+                        origin: blocks_origin,
                     });
                     processed_blocks.push(component_block_id);
                 } else if let Some(revision) = revision {
@@ -4096,6 +4138,7 @@ impl TuiCore {
                         start: component_start,
                         rows,
                         blocks: Vec::new(),
+                        origin: blocks_origin,
                     });
                     processed_blocks.push(component_block_id);
                 } else {
@@ -4120,6 +4163,7 @@ impl TuiCore {
                         start: component_start,
                         rows: Vec::new(),
                         blocks: Vec::new(),
+                        origin: None,
                     });
                     processed_blocks.push(component_block_id);
                 }
@@ -4243,6 +4287,14 @@ impl TuiCore {
     /// factory renderer, decorator or a width mis-measurement can; the write
     /// paths clamp as a guard instead of letting one bad row corrupt the
     /// whole frame.
+    ///
+    /// The guard also covers rows that FIT the model but not the terminal: a
+    /// renderer that does not join grapheme clusters (Windows ConHost,
+    /// measured on real ConPTY) spends extra cells on ZWJ/modifier sequences,
+    /// so a row padded to the model's `width` wraps there and displaces every
+    /// later write of the incremental diff by one row (PIR-TUI-036). Such
+    /// rows lose only their trailing PADDING (never content), which keeps
+    /// them inside the terminal's width.
     fn clamp_row_width(line: &mut String, width: usize) -> bool {
         if width == 0 {
             let changed = !line.is_empty();
@@ -4258,6 +4310,15 @@ impl TuiCore {
         if ansi::visible_width(line.as_str()) > width {
             *line = ansi::truncate_to_width(line, width, "");
             return true;
+        }
+        let safe = ansi::terminal_safe_width(line.as_str());
+        if safe > width {
+            let trailing = line.len() - line.trim_end_matches(' ').len();
+            let drop = (safe - width).min(trailing);
+            if drop > 0 {
+                line.truncate(line.len() - drop);
+                return true;
+            }
         }
         false
     }

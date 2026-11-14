@@ -316,9 +316,10 @@ pub(super) fn normalize_tool_path_remote(requested: &str) -> String {
 /// Resolve a tool path below the context's configured workspace root.
 ///
 /// Absolute paths remain supported for compatibility, but must resolve inside
-/// `cwd`. Parent-directory components are rejected even when they would
-/// eventually land back inside the workspace. This conservative rule also
-/// avoids ambiguity for paths that do not exist yet (notably write targets).
+/// `cwd`. `.` and `..` components are resolved lexically first (the way the
+/// Win32 path APIs and Node's `path.resolve` do), so a spelling that lands
+/// back inside the workspace -- `dir/sub/../a.txt`, relative or absolute -- is
+/// accepted while anything that climbs above the root stays refused.
 ///
 /// Every component below the root is inspected with `symlink_metadata`
 /// (`lstat`), so a symbolic link in any position — including a dangling final
@@ -374,6 +375,34 @@ pub fn workspace_path_parts(cwd: &Path, requested: &str) -> Result<WorkspacePath
     workspace_path_parts_normalized(cwd, Path::new(&normalized), requested)
 }
 
+/// Resolve `.` and `..` components lexically, without touching the
+/// filesystem: the same normalization Win32's path APIs and Node's
+/// `path.resolve` perform. `..` undoes the preceding real component; a leading
+/// `..` of a RELATIVE path is preserved (the confinement depth walk refuses
+/// it); a `..` at an absolute root is dropped because it cannot climb past the
+/// root.
+fn normalize_dot_segments(path: &Path) -> PathBuf {
+    let absolute = path.is_absolute();
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                // A leading `..` on a relative path is preserved so the depth
+                // walk (and `relative_below_root`) can refuse it; past an
+                // absolute root, or on top of another `..`, it is discarded.
+                Some(Component::ParentDir) | None if !absolute => normalized.push(".."),
+                _ => {}
+            },
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 /// [`workspace_path_parts`] for an already-spelled path: the confinement walk
 /// without the [`normalize_tool_path`] spelling pass. The read tool's macOS
 /// compatibility variants use this so a variant's narrow no-break space or
@@ -383,10 +412,20 @@ pub(super) fn workspace_path_parts_normalized(
     requested_path: &Path,
     requested: &str,
 ) -> Result<WorkspacePathParts, String> {
+    // Resolve `.`/`..` lexically BEFORE any confinement decision. Relying on
+    // the filesystem (or on `Path::join`) to do this is not enough:
+    // `root.join(relative)` only collapses `..` when the canonical root is a
+    // verbatim `\\?\` path, and an ABSOLUTE request is never joined to the
+    // root at all. A model that composes `dir/sub/../a.txt` -- relative or
+    // absolute -- must reach the intended file, not the escape refusal
+    // (PIR-BIN-079).
+    let requested_path = normalize_dot_segments(requested_path);
+
     // A relative path may contain `..` as long as it does not climb ABOVE the
     // root: `src/../src/main.rs` resolves inside the workspace and is a path a
-    // model produces naturally (PIR-BIN-079). Only a path whose `..` segments
-    // outnumber the real segments it has entered escapes; an ABSOLUTE path is
+    // model produces naturally (PIR-BIN-079). After normalization the only
+    // surviving leading `..` components are the ones that would climb above
+    // the root, so this count refuses exactly those; an ABSOLUTE path is
     // confined by the resolved-root walk below, never by this count.
     if !requested_path.is_absolute() {
         let mut depth: usize = 0;
@@ -413,9 +452,9 @@ pub(super) fn workspace_path_parts_normalized(
     let root = std::fs::canonicalize(cwd)
         .map_err(|e| format!("Cannot access workspace root '{}': {}", cwd.display(), e))?;
     let candidate = if requested_path.is_absolute() {
-        requested_path.to_path_buf()
+        requested_path.clone()
     } else {
-        root.join(requested_path)
+        root.join(&requested_path)
     };
 
     let relative = relative_below_root(&root, &candidate, requested)?;
@@ -477,6 +516,16 @@ fn reject_symlink_components(root: &Path, relative: &Path, requested: &str) -> R
         match component {
             Component::Normal(name) => current.push(name),
             Component::CurDir => continue,
+            // Normalization removed `..` from every accepted path, so a
+            // surviving `ParentDir` could only undo the root itself: refuse
+            // it rather than walk above the workspace.
+            Component::ParentDir => {
+                if current == root {
+                    return Err(format!("Path '{}' escapes the workspace root", requested));
+                }
+                current.pop();
+                continue;
+            }
             _ => return Err(format!("Path '{}' escapes the workspace root", requested)),
         }
         match std::fs::symlink_metadata(&current) {

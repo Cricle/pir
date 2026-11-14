@@ -497,7 +497,10 @@ fn parse_google_usage(value: &Value) -> Usage {
         input,
         output,
         cache_read: cached,
-        reasoning: (thoughts > 0).then_some(thoughts),
+        // Upstream google-generative-ai stores the reasoning count
+        // unconditionally (`chunk.usageMetadata.thoughtsTokenCount || 0`);
+        // keeping the same rule here makes the persisted usage shape match.
+        reasoning: Some(thoughts),
         total_tokens: value
             .get("totalTokenCount")
             .and_then(Value::as_u64)

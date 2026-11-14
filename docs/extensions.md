@@ -118,10 +118,12 @@ export default function (pi) {
 `registerVirtualModel` ([custom-provider.md](custom-provider.md)), `registerShortcut`, `registerFlag`,
 `registerMCPServer`, `events.on/emit`. Tool parameter schemas are validated at load; `pi.on(event, handler)` is
 fail-closed against the known-event registry (an unknown name is a load-time `TypeError`; accepted set:
-`src/plugins/coverage.rs::is_known_event`).
+`src/plugins/coverage.rs::is_known_event`). CLI flags added with `registerFlag` are listed by
+`pir --help-extensions` (the upstream `Extension CLI Flags:` help section); `--help` itself never executes
+extension code.
 
 `pi.events` is a **JS-runtime-only** bus: `emit` synchronously invokes the prelude's `busSubs` subscribers
-(`prelude.js.txt:3013`). The native `EventService` (`PluginContext::events()`) is a separate Rust bus with no
+(`prelude.js.txt:3075`). The native `EventService` (`PluginContext::events()`) is a separate Rust bus with no
 cross-face bridge — JS emissions do not reach native subscribers and vice versa
 (`src/agent_session/plugin_services.rs:178-182`, `:4161-4219`; `src/plugins/services/mod.rs:2112-2126`).
 

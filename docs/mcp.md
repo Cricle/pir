@@ -1,7 +1,7 @@
 # MCP servers
 
-pir runs MCP servers as a builtin plugin (rmcp 3.5 client). Configure them in settings.json (`mcpServers`,
-upstream-shaped; `deny_unknown_fields` on the server config).
+pir runs MCP servers as a builtin plugin (rmcp 3.5 client). Configure them in `mcp.json` (`mcpServers`,
+upstream-shaped; unknown keys on a server entry are rejected — unlike upstream, which ignores them).
 
 Config is read from the global `<agentDir>/mcp.json` and, **only when the project is trusted**,
 `<cwd>/.pi/mcp.json` (project overrides global). An untrusted project's file is ignored — `pir mcp list`
@@ -26,7 +26,8 @@ project's `mcp.json` stays inactive under `--only-builtin` too.
 
 - `pir mcp list [--json]` / `pir mcp check [<server>] [--json]` — configured servers with scope, exposure,
   connection state and errors (list exits non-zero on a failed connect or invalid config), plus a bounded
-  test-connect, optionally for one server (check is also the default with no subcommand).
+  test-connect, optionally for one server. Bare `pir mcp` prints this help (like bare `pi mcp`); `check` is a
+  pir extension.
 - `pir mcp login <server>` / `pir mcp logout <server>` — OAuth for remote servers (dynamic client registration
   supported).
 
@@ -40,8 +41,8 @@ directly after the bare form — `$1Earth` is parsed as the *named* group `1Eart
 `${1}Earth` to concatenate. `pattern: "item-(\\d+)"` with `replacement: "entry-${1}"` turns `item-123`
 into `entry-123`. `dry_run` **defaults to true** (pass `dry_run: false` to write in place). `max_matches` / `max_files` bound a
 call and are reported as `truncated`. Paths resolve inside `--root` (default: the server's cwd); anything outside
-is refused, and symlinks are never followed. Register it like any other server (`<agentDir>/mcp.json`, project
-`.pi/mcp.json`, or settings `mcpServers`); `command` is this executable:
+is refused, and symlinks are never followed. Register it like any other server (`<agentDir>/mcp.json` or the
+project `.pi/mcp.json`); `command` is this executable:
 
 ```json
 {
@@ -91,8 +92,9 @@ An explicit `"exposure": "codemode" | "deferred" | "hidden" | "direct"` on a ser
 `toolExposure` entry. Only the wrapper shape (`mcpServers` present, like `autoEnableCodemode`) reads the flag; in
 the legacy flat shape `builtinTools` is treated as a server entry and servers keep the `codemode` default. Project
 `.pi/mcp.json` overrides global; default `true` when neither sets it. A non-boolean value is a config error and
-treated as absent. `--no-mcp` / `disabledBuiltinExtensions: ["mcp"]` still disable the whole plugin; `builtinTools`
-only changes the default exposure.
+treated as absent. `--no-mcp` / `disabledBuiltinExtensions: ["mcp"]` still disable the whole plugin, as does pi's
+`"extensions": ["-builtin:mcp"]` spelling (`!builtin:<pattern>` also works; a project `+builtin:mcp` re-enables it for
+that project); `builtinTools` only changes the default exposure.
 
 ### Automatic discovery activation
 
@@ -133,8 +135,10 @@ disable <server>` toggle the entry (disabled stays registered but never connects
 unregisters it and drops its tools/connection (`/mcp enable` restores it from `mcp.json`); `/mcp reconnect
 <server>` reconnects and re-lists its tools.
 
-Unlike upstream, pir's `/mcp` does not write changes back to `mcp.json`; use `pir mcp add` / `pir mcp remove` for
-persistent edits.
+In the interactive manager, enable/disable and exposure changes for servers defined in a config file are saved back to
+that `mcp.json`. For a global server in a trusted project the manager also offers "Enable in this project" / "Disable
+in this project", which write an `enabled` override into `<cwd>/.pi/mcp.json` (upstream's project-scope action), and a
+"Tools" view lists the connected server's tools with their effective `toolExposure`.
 
 ## Auth
 

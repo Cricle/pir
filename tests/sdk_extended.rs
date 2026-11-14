@@ -3754,7 +3754,7 @@ async fn prompt_stream_slow_consumer_drops_intermediate_but_delivers_terminal_in
 }
 
 // Round-13 foreground `on_event` + resource-loader tests (see the file header).
-include!("sdk_round13_on_event.rs");
+include!("fragments/sdk_round13_on_event.rs");
 
 /// Round-15 A: the low-level `create_agent_session` factory keeps upstream
 /// `createAgentSession` CLI parity — an unset `resource_loader` resolves an
@@ -9907,7 +9907,12 @@ async fn live_session_tail_keeps_resident_window_bounded_and_transcript_complete
         .expect("read session")
         .lines()
         .count();
-    assert_eq!(lines, 401, "header + 400 message entries stay on disk");
+    assert_eq!(
+        lines, 403,
+        "header + the 2 startup-state rows + 400 message entries stay on disk \
+         (PIR-BIN-091: a new session now records pi's `model_change` and \
+         `thinking_level_change` before the first message)"
+    );
     agent.shutdown().await.expect("shutdown");
 
     let resumed = AgentBuilder::new()
@@ -10028,8 +10033,11 @@ async fn compaction_checkpoint_stays_anchored_to_live_tail_window() {
             .expect("read session")
             .lines()
             .count(),
-        34,
-        "header + 12 pre-compact + 1 compaction + 20 post-compact entries"
+        // PIR-BIN-091: the session now opens with pi's two bootstrap rows
+        // (`model_change`, `thinking_level_change`) before the first message,
+        // so the fixture's header + 12 + 1 + 20 becomes 36.
+        36,
+        "header + 2 bootstrap + 12 pre-compact + 1 compaction + 20 post-compact entries"
     );
     agent.shutdown().await.expect("shutdown");
 }
@@ -10069,8 +10077,10 @@ async fn transcript_of_resumed_large_paged_session_is_complete_on_first_read() {
             .expect("read session")
             .lines()
             .count(),
-        1041,
-        "header + 1040 message entries (above the 1024-entry page)"
+        1043,
+        "header + the 2 startup-state rows (PIR-BIN-091: pi's `model_change` + \
+         `thinking_level_change`) + 1040 message entries (above the \
+         1024-entry page)"
     );
     agent.shutdown().await.expect("shutdown");
 

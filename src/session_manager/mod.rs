@@ -650,6 +650,21 @@ pub type SessionListProgress<'a> = dyn FnMut(usize, usize, Option<&[SessionSumma
 /// (upstream `CURRENT_SESSION_LIST_PUBLISH_INTERVAL`).
 pub const SESSION_LIST_PUBLISH_INTERVAL: usize = 10;
 
+/// Bounded concurrency for the per-file listing reads (upstream
+/// `MAX_CONCURRENT_SESSION_INFO_LOADS`, session-manager.ts:891): at most this
+/// many session files are read at once by
+/// [`SessionManager::list_sessions_concurrent`].
+#[cfg(feature = "session")]
+const MAX_CONCURRENT_SESSION_INFO_LOADS: usize = 10;
+
+/// Candidate count at which [`SessionManager::list_sessions_cancellable`]
+/// switches from its sequential loop to the worker pool. Below it the listing
+/// keeps the exact pre-existing behavior (one file at a time, one progress
+/// call per file in file order, the cancel signal polled before every file)
+/// and spawns no thread, so tiny directories are untouched.
+#[cfg(feature = "session")]
+const CONCURRENT_LISTING_MIN_FILES: usize = 64;
+
 /// Result of a cancellable session listing
 /// ([`SessionManager::list_sessions_cancellable`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1205,6 +1220,61 @@ fn load_entries_from_file(path: &Path) -> crate::Result<LoadedSessionFile> {
     )
 }
 
+/// How many skipped-line warnings one session load names individually before
+/// collapsing the rest into a single summary line. A load that skipped a whole
+/// corrupt range must stay diagnosable without flooding stderr; the summary
+/// keeps the exact total.
+const UNPARSED_LINE_WARN_LIMIT: usize = 5;
+
+/// One-line preview of a raw session line for a warning message (PIR-BIN-092):
+/// trimmed and character-capped so a 256 MiB line cannot flood the log.
+fn unparsed_line_preview(raw: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let trimmed = raw.trim();
+    if trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_owned();
+    }
+    let head: String = trimmed.chars().take(MAX_CHARS).collect();
+    format!("{head}...")
+}
+
+/// Warn about every line the loader skipped, naming its 1-based line number and
+/// a preview of the raw text (PIR-BIN-092: before this, a skipped line was only
+/// counted by the manager's rewrite-refusal warning — no line number, nothing
+/// naming the row — and its disappearance from the branch was silent).
+///
+/// `unparsed_raw` is aligned with the loader's per-line table (blank lines are
+/// `None`), so the enumerated index + 1 is the physical line number.
+fn warn_unparsed_lines(path: &Path, unparsed_raw: &[Option<String>]) {
+    let skipped: Vec<(usize, &str)> = unparsed_raw
+        .iter()
+        .enumerate()
+        .filter_map(|(index, raw)| raw.as_deref().map(|raw| (index + 1, raw)))
+        .collect();
+    if skipped.is_empty() {
+        return;
+    }
+    for (line_number, raw) in skipped.iter().take(UNPARSED_LINE_WARN_LIMIT) {
+        tracing::warn!(
+            "session {}: skipping undeserializable line {line_number} \
+             (earlier history is kept; the raw line stays in the file and is \
+             carried verbatim by rewrites): {}",
+            path.display(),
+            unparsed_line_preview(raw)
+        );
+    }
+    if skipped.len() > UNPARSED_LINE_WARN_LIMIT {
+        tracing::warn!(
+            "session {}: {} undeserializable line(s) in total; the first {} are \
+             listed above (the earliest is line {})",
+            path.display(),
+            skipped.len(),
+            UNPARSED_LINE_WARN_LIMIT,
+            skipped[0].0
+        );
+    }
+}
+
 /// Shared post-processing for the streaming and mmap session loaders: warn
 /// about lossy UTF-8 lines, validate the header, and repair a torn trailing
 /// newline. Extracted so both loaders cannot drift.
@@ -1241,6 +1311,13 @@ fn finish_loaded_session(
         loaded.unparsed_raw.clear();
         loaded.unparsed_lines.clear();
         return Ok(loaded);
+    }
+
+    // Only a session that actually loads gets per-line skip warnings: a file
+    // that is not a session at all is refused by the caller with its own
+    // error, and enumerating every line of it as "skipped" would bury that.
+    if loaded.header_valid {
+        warn_unparsed_lines(path, &loaded.unparsed_raw);
     }
 
     if loaded.header_valid && loaded.torn_tail {
@@ -2068,11 +2145,13 @@ impl FileIdentity {
 mod windows_file_identity {
     #![allow(unsafe_code)]
 
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::path::Path;
 
-    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
     pub(super) fn volume_and_index(file: &std::fs::File) -> Option<(u32, u64)> {
@@ -2090,13 +2169,60 @@ mod windows_file_identity {
             (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         ))
     }
+
+    /// Identity of the file currently named by `path`, WITHOUT data access.
+    ///
+    /// `FILE_READ_ATTRIBUTES` requests attributes only, so the open never
+    /// counts as a data read. That matters for the append path: the session
+    /// file was just written through another handle, and on hosts with a
+    /// filter driver (Defender real-time protection) the FIRST data-read open
+    /// of a just-written file costs ~17 ms while the attribute-only probe
+    /// costs ~60 us — measured on the endurance box, 2026-11-13. The identity
+    /// returned is the same `BY_HANDLE_FILE_INFORMATION` pair
+    /// `File::open` + [`volume_and_index`] produced, so the staleness check
+    /// (about the PATH naming a different file) keeps its exact semantics.
+    /// Share flags match `std::fs::File::open`'s (READ|WRITE|DELETE) so a
+    /// concurrent appender/reader cannot make the probe fail where it used to
+    /// succeed.
+    pub(super) fn volume_and_index_at(path: &Path) -> Option<(u32, u64)> {
+        let wide: Vec<u16> = {
+            use std::os::windows::ffi::OsStrExt as _;
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        };
+        // SAFETY: `wide` is NUL-terminated and outlives the call; the returned
+        // handle is wrapped into a `File` (closed on drop) on every path.
+        let handle: HANDLE = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                0,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        // SAFETY: `handle` came from `CreateFileW` and is owned here; the
+        // `File` takes over the close.
+        let file = unsafe { std::fs::File::from_raw_handle(handle as _) };
+        volume_and_index(&file)
+    }
 }
 
 /// Identity of the file currently named by `path`.
 ///
 /// Unix reads it straight off the path metadata. Windows opens a handle for
 /// the path and probes it with `GetFileInformationByHandle`, because the
-/// path-level metadata does not expose a file index.
+/// path-level metadata does not expose a file index. The Windows open asks
+/// for `FILE_READ_ATTRIBUTES` only (see [`windows_file_identity`]): the
+/// attribute-only probe returns the same identity without the data-read open
+/// that a filter driver scans on the append hot path.
 fn path_file_identity(path: &Path, path_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
     #[cfg(unix)]
     {
@@ -2106,9 +2232,12 @@ fn path_file_identity(path: &Path, path_metadata: &std::fs::Metadata) -> Option<
     #[cfg(windows)]
     {
         let _ = path_metadata;
-        std::fs::File::open(path)
-            .ok()
-            .and_then(|file| FileIdentity::from_file(&file))
+        windows_file_identity::volume_and_index_at(path).map(
+            |(volume_serial_number, file_index)| FileIdentity::Windows {
+                volume_serial_number,
+                file_index,
+            },
+        )
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -2126,10 +2255,26 @@ fn path_file_identity(path: &Path, path_metadata: &std::fs::Metadata) -> Option<
 /// removes it only when the token still matches, and only a lock whose pid is
 /// provably dead (and whose mtime is older than
 /// [`retention::SESSION_LOCK_STALE_AFTER`]) may be reclaimed after a crash.
+///
+/// The lock's own mtime and the ownership read-back are maintained at
+/// [`LOCK_REFRESH_INTERVAL`], not per persisted row: both consumers are
+/// one-hour retention windows, so a one-minute cadence leaves a 60x margin
+/// while removing an open+read+`set_times` from every append (the mtime is
+/// read with a single `stat`, and a lock older than the cadence — a fresh
+/// acquisition, an external backdate, a long-idle manager — is still
+/// refreshed immediately).
+const LOCK_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Debug)]
 struct SessionWriterLock {
     path: PathBuf,
     token: String,
+    /// When this owner last read the lock file back ([`Self::still_owned`]).
+    /// The probe is throttled to `LOCK_REFRESH_INTERVAL`: the file can only
+    /// stop naming this owner through an external delete/replace (a live pid
+    /// is never reclaimed), and every failed write re-arms the probe, so the
+    /// throttle can never make a broken lock survive a write attempt.
+    probed_at: Option<std::time::Instant>,
 }
 
 impl SessionWriterLock {
@@ -2175,6 +2320,9 @@ impl SessionWriterLock {
                     return Some(Self {
                         path: lock_path,
                         token,
+                        // The first write after acquisition probes the file it
+                        // just created; later ones are throttled.
+                        probed_at: None,
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2207,16 +2355,51 @@ impl SessionWriterLock {
     }
 
     /// Whether the lock file still exists with this owner's token.
-    fn still_owned(&self) -> bool {
+    ///
+    /// Probed at most once per `LOCK_REFRESH_INTERVAL`: the file can only stop
+    /// naming this owner through an external delete/replace (a live pid is
+    /// never reclaimed), and [`Self::reprobe`] re-arms the read after every
+    /// failed write, so no append can be attempted against a lock this manager
+    /// no longer owns for longer than one cadence.
+    fn still_owned(&mut self) -> bool {
+        if self
+            .probed_at
+            .is_some_and(|probed| probed.elapsed() < LOCK_REFRESH_INTERVAL)
+        {
+            return true;
+        }
+        self.probed_at = Some(std::time::Instant::now());
         std::fs::read_to_string(&self.path)
             .is_ok_and(|content| content.contains(&format!("token={}", self.token)))
+    }
+
+    /// Re-arm the throttled ownership probe ([`Self::still_owned`]) so the
+    /// next write re-reads the lock file instead of trusting an answer from
+    /// before a failed write.
+    fn reprobe(&mut self) {
+        self.probed_at = None;
     }
 
     /// Refresh the lock mtime after a successful append/rewrite. The pid probe
     /// is the primary liveness signal; touching the lock keeps its age young
     /// as a second layer and keeps diagnostics honest. Best-effort: a failed
     /// touch must not fail the transcript write.
+    ///
+    /// Throttled to `LOCK_REFRESH_INTERVAL` through the file's own mtime: one
+    /// `stat` decides whether the open+verify+`set_times` below is due, so a
+    /// lock older than the cadence is refreshed immediately while
+    /// back-to-back appended rows no longer rewrite it.
     fn touch(&self) {
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
+            let young = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|age| age < LOCK_REFRESH_INTERVAL);
+            if young {
+                return;
+            }
+        }
         let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -2301,6 +2484,12 @@ pub struct SessionManager {
     /// refuses migration rewrites so the file is never erased mid-entry.
     unparsed_raw_lines: Vec<String>,
     by_id: HashMap<String, Arc<FileEntry>>,
+    /// Resident position of each id in `file_entries`, maintained in lockstep
+    /// with `by_id` (`build_index` / `append_entry` / `new_session`). The
+    /// per-prompt leaf→root walks resolve the parent chain through this one
+    /// map instead of rebuilding an id index 4-6 times per prompt
+    /// ([`projection::EntryPositions`]).
+    entry_positions: HashMap<String, usize>,
     /// Interned `toolsAdded` payloads shared by every compaction checkpoint.
     /// The loadout is identical across hundreds of compactions; storing one
     /// `Arc` per distinct schema instead of a deep `serde_json::Value` per
@@ -2498,6 +2687,7 @@ impl SessionManager {
             file_entries: Vec::new(),
             unparsed_raw_lines: Vec::new(),
             by_id: HashMap::new(),
+            entry_positions: HashMap::new(),
             tool_schema_intern: HashMap::new(),
             labels_by_id: BTreeMap::new(),
             label_timestamps_by_id: BTreeMap::new(),
@@ -2543,6 +2733,7 @@ impl SessionManager {
             file_entries: Vec::new(),
             unparsed_raw_lines: Vec::new(),
             by_id: HashMap::new(),
+            entry_positions: HashMap::new(),
             tool_schema_intern: HashMap::new(),
             labels_by_id: BTreeMap::new(),
             label_timestamps_by_id: BTreeMap::new(),
@@ -2698,7 +2889,7 @@ impl SessionManager {
         if !self.persist {
             return;
         }
-        if let Some(lock) = &self.writer_lock {
+        if let Some(lock) = self.writer_lock.as_mut() {
             if lock.still_owned() {
                 return;
             }
@@ -2733,10 +2924,20 @@ impl SessionManager {
         }
     }
 
-    /// Refresh the lock mtime after a successful append/rewrite.
+    /// Refresh the lock mtime after a successful append/rewrite (throttled to
+    /// `LOCK_REFRESH_INTERVAL`; see [`SessionWriterLock::touch`]).
     fn touch_writer_lock(&self) {
         if let Some(lock) = &self.writer_lock {
             lock.touch();
+        }
+    }
+
+    /// Re-arm the writer lock's throttled ownership probe after a failed
+    /// write: the next attempt re-reads the lock file instead of trusting an
+    /// answer cached before the failure.
+    fn reprobe_writer_lock(&mut self) {
+        if let Some(lock) = self.writer_lock.as_mut() {
+            lock.reprobe();
         }
     }
 
@@ -2835,6 +3036,7 @@ impl SessionManager {
         self.file_entries = vec![Arc::new(FileEntry::Session(header))];
         self.unparsed_raw_lines.clear();
         self.by_id.clear();
+        self.entry_positions.clear();
         self.tool_schema_intern.clear();
         self.labels_by_id.clear();
         self.label_timestamps_by_id.clear();
@@ -3031,21 +3233,24 @@ impl SessionManager {
 
     fn build_index(&mut self) {
         self.by_id.clear();
+        self.entry_positions.clear();
         // Exact capacity: the index has one slot per non-header resident
         // entry. A `BTreeMap` node per 11 entries plus per-key String clones
         // was measurable on a full widen; `HashMap` with the exact entry count
         // allocates one table and keeps the same O(1) lookups (no caller
         // iterates `by_id` in order).
         self.by_id.reserve(self.file_entries.len());
+        self.entry_positions.reserve(self.file_entries.len());
         self.labels_by_id.clear();
         self.label_timestamps_by_id.clear();
         self.leaf_id = None;
-        for entry in &self.file_entries {
+        for (position, entry) in self.file_entries.iter().enumerate() {
             if entry.is_header() {
                 continue;
             }
             let id = entry.entry_id().to_owned();
             self.by_id.insert(id.clone(), entry.clone());
+            self.entry_positions.insert(id.clone(), position);
             self.leaf_id = Some(id);
             if let FileEntry::Label(label) = entry.as_ref() {
                 let target = label.target_id.clone();
@@ -3161,6 +3366,9 @@ impl SessionManager {
         });
         if write_result.is_err() {
             let _ = std::fs::remove_file(&tmp_path);
+            // Same as the append path: a failed rewrite re-arms the throttled
+            // ownership probe for the next write.
+            self.reprobe_writer_lock();
         } else {
             self.touch_writer_lock();
         }
@@ -3387,6 +3595,11 @@ impl SessionManager {
             self.append_file = None;
             self.append_len = previous_len;
             self.append_identity = None;
+            // A failed write may mean the transcript's world moved (a
+            // vanished/unwritable session dir, a lock a peer removed): make
+            // the next attempt re-probe the lock file instead of trusting the
+            // throttled "still owned" answer from before the failure.
+            self.reprobe_writer_lock();
             return Err(error);
         }
         self.append_len = previous_len.saturating_add(line.len() as u64 + 1);
@@ -3472,6 +3685,8 @@ impl SessionManager {
         // index and the entry list instead of deep-copying the whole message
         // (tool results carry full file contents) into `by_id`.
         self.by_id.insert(id.clone(), Arc::clone(&entry));
+        self.entry_positions
+            .insert(id.clone(), self.file_entries.len());
         self.file_entries.push(entry);
         self.leaf_id = Some(id.clone());
         Ok(id)
@@ -3490,6 +3705,11 @@ impl SessionManager {
         if let Some(file) = &self.append_file {
             file.sync_all()?;
         }
+        // The session-close/explicit barrier also brings the writer lock's
+        // age up to date (throttled: a lock younger than the cadence is left
+        // alone), so a crash right after a sync leaves a lock whose mtime is
+        // within one cadence of the last durable write.
+        self.touch_writer_lock();
         Ok(())
     }
 
@@ -3669,6 +3889,21 @@ impl SessionManager {
             parsed_entries: stats.parsed_entries,
         });
         manager.unparsed_raw_lines = page.unparsed_lines().to_vec();
+        // The full loader warns per skipped line with its line number; a tail
+        // page does not know the absolute line numbers of its window, so the
+        // paged open at least names the count and the first skipped row
+        // (PIR-BIN-092: a product of the load must never be silently missing
+        // rows it saw in the file).
+        if let Some(first) = manager.unparsed_raw_lines.first() {
+            tracing::warn!(
+                "session {}: skipping {} undeserializable line(s) inside the \
+                 resident tail window (earlier resident history is kept; the raw \
+                 lines stay in the file): {}",
+                path.display(),
+                manager.unparsed_raw_lines.len(),
+                unparsed_line_preview(first)
+            );
+        }
         manager.page_cache = Some(Arc::new(page_cache::PageCache::new(
             page_cache::DEFAULT_PAGE_CACHE_PAGES,
             page_cache::DEFAULT_PAGE_CACHE_BYTES,
@@ -4095,6 +4330,24 @@ impl SessionManager {
         Ok(manager)
     }
 
+    /// Path of the most recent session in `session_dir` (`None` = no header-cwd
+    /// filter), without materializing a listing.
+    ///
+    /// This is the cheap twin of `Self::list_sessions(dir, cwd)` + `.first()`:
+    /// the same candidate rule (`.jsonl`, regular file, mtime) and the same
+    /// order (modified time descending, name descending on ties, via
+    /// [`find_most_recent_session`]), but only the candidates that can still win
+    /// get their header read — and only until the first one whose header cwd
+    /// matches. `--continue` and headless `-r`, which want exactly the picker's
+    /// default row, used to peek EVERY session file in the directory (message
+    /// count, first message, the lazy corpus marker) to then keep only the
+    /// first entry: a directory of N large sessions paid N full-file scans for
+    /// one path.
+    #[cfg(feature = "session")]
+    pub fn find_recent_session_path(session_dir: &Path, cwd: Option<&str>) -> Option<PathBuf> {
+        find_most_recent_session(session_dir, cwd)
+    }
+
     /// Open the most recent session in `session_dir` whose header `cwd`
     /// matches; create a new one when there is none (upstream
     /// `continueRecent`).
@@ -4257,9 +4510,13 @@ impl SessionManager {
     /// partial list (sorted) still returned. The old two-argument
     /// [`Self::list_sessions`] stays the no-progress, non-cancellable form.
     ///
-    /// (pir's listing is synchronous and reads files in sequence; the
-    /// upstream concurrency bounds have no Rust counterpart here, so
-    /// `loaded`/`total` are exact file counts rather than in-flight tasks.)
+    /// Directories with at least [`CONCURRENT_LISTING_MIN_FILES`] candidates
+    /// are read through the bounded worker pool of
+    /// [`Self::list_sessions_concurrent`] (upstream parity,
+    /// `MAX_CONCURRENT_SESSION_INFO_LOADS`); smaller directories keep the
+    /// sequential loop below, so their progress order (one call per file, in
+    /// file order) and their cancel boundaries are exactly the pre-existing
+    /// ones. `loaded`/`total` are exact FILE counts in both paths.
     #[cfg(feature = "session")]
     pub fn list_sessions_cancellable(
         session_dir: &Path,
@@ -4305,6 +4562,14 @@ impl SessionManager {
             .collect();
         candidates.sort_by(|a, b| b.0.cmp(&a.0));
         let total = candidates.len();
+        if total >= CONCURRENT_LISTING_MIN_FILES {
+            return Self::list_sessions_concurrent(
+                candidates,
+                resolved_cwd.as_deref(),
+                progress,
+                cancel,
+            );
+        }
         let mut sessions: Vec<SessionSummary> = Vec::new();
         let mut cancelled = false;
         for (index, (path, modified, file_len)) in candidates.into_iter().enumerate() {
@@ -4358,6 +4623,154 @@ impl SessionManager {
                 }
             }
         }
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.modified));
+        SessionListOutcome {
+            sessions,
+            cancelled,
+        }
+    }
+
+    /// Bounded-concurrency listing for a large directory: up to
+    /// [`MAX_CONCURRENT_SESSION_INFO_LOADS`] worker threads each pull the next
+    /// candidate by index and run the same one-open-per-file
+    /// [`read_session_listing`] the sequential path uses (upstream
+    /// `buildSessionInfosWithConcurrency` / `mapWithConcurrency`,
+    /// session-manager.ts:891-939).
+    ///
+    /// Results are stored at the candidate's index, so the returned list is in
+    /// the same candidate (path-descending) order the sequential path feeds
+    /// to the final stable modified-descending sort: mtimes that tie keep the
+    /// path-descending order, which makes the listing set/order/fields
+    /// byte-identical to the sequential one. `progress` is invoked on the
+    /// calling thread once per COMPLETED file (upstream `onLoaded` completion
+    /// order); `cancel` is polled on the calling thread while it drains
+    /// results and stops the workers before their next file, so a cancelled
+    /// scan can still carry the files that were in flight (the upstream
+    /// `AbortSignal` behaves the same way).
+    #[cfg(feature = "session")]
+    fn list_sessions_concurrent(
+        candidates: Vec<(PathBuf, SystemTime, u64)>,
+        resolved_cwd: Option<&str>,
+        mut progress: Option<&mut SessionListProgress<'_>>,
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> SessionListOutcome {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        let total = candidates.len();
+        // Cancelled before the first file: the sequential path returns an
+        // empty partial list without a single progress call, so keep that
+        // contract without spawning anything.
+        if cancel.is_some_and(|cancel| cancel()) {
+            return SessionListOutcome {
+                sessions: Vec::new(),
+                cancelled: true,
+            };
+        }
+        let mut slots: Vec<Option<SessionSummary>> = Vec::new();
+        slots.resize_with(total, || None);
+        let stop = AtomicBool::new(false);
+        let next = AtomicUsize::new(0);
+        let (sender, receiver) =
+            mpsc::channel::<(usize, Option<(SessionHeader, SessionInfoPeek)>)>();
+        let mut cancelled = false;
+        let mut loaded = 0usize;
+        std::thread::scope(|scope| {
+            for _ in 0..MAX_CONCURRENT_SESSION_INFO_LOADS.min(total) {
+                let sender = sender.clone();
+                let stop = &stop;
+                let next = &next;
+                let candidates = &candidates;
+                let poll_cancel = cancel.is_some();
+                scope.spawn(move || {
+                    loop {
+                        // The cancel signal is checked before taking the next
+                        // file (upstream `signal?.throwIfAborted()` at the
+                        // worker loop top).
+                        if poll_cancel && stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= total {
+                            break;
+                        }
+                        let (path, _modified, file_len) = &candidates[index];
+                        let result = read_session_listing(path, resolved_cwd, *file_len);
+                        if sender.send((index, result)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            // The original sender must drop or the drain loop below would
+            // never disconnect after the workers exit.
+            drop(sender);
+            loop {
+                match receiver.recv_timeout(std::time::Duration::from_millis(10)) {
+                    Ok((index, result)) => {
+                        if loaded < total && cancel.is_some_and(|cancel| cancel()) {
+                            cancelled = true;
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        if let Some((header, peek)) = result {
+                            // Same corpus-bytes probe as the sequential loop;
+                            // the listing peek never collects text, so this
+                            // only pins a regression back to the eager corpus.
+                            SESSION_LISTING_CORPUS_BYTES.with(|bytes| {
+                                bytes.set(
+                                    bytes
+                                        .get()
+                                        .saturating_add(peek.all_messages_text.len() as u64),
+                                )
+                            });
+                            let (path, modified, file_len) = &candidates[index];
+                            let all_messages_text =
+                                lazy_session_corpus_marker(path, *modified, *file_len);
+                            slots[index] = Some(SessionSummary {
+                                path: path.clone(),
+                                id: header.id,
+                                cwd: header.cwd,
+                                modified: *modified,
+                                name: peek.name,
+                                first_message: peek.first_message,
+                                all_messages_text,
+                                message_count: peek.message_count,
+                                parent_session_path: header.parent_session,
+                            });
+                        }
+                        loaded += 1;
+                        // Same publish points as the sequential loop.
+                        let publish_partial = loaded == 1
+                            || loaded.is_multiple_of(SESSION_LIST_PUBLISH_INTERVAL)
+                            || loaded == total;
+                        if let Some(progress) = progress.as_deref_mut() {
+                            if publish_partial {
+                                // Completions arrive out of index order, so the
+                                // partial list is collected from the slots and
+                                // sorted (upstream publishes a sorted copy
+                                // too).
+                                let mut partial: Vec<SessionSummary> =
+                                    slots.iter().flatten().cloned().collect();
+                                partial.sort_by_key(|session| std::cmp::Reverse(session.modified));
+                                progress(loaded, total, Some(&partial));
+                            } else {
+                                progress(loaded, total, None);
+                            }
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        // No completion for 10 ms: the only moment a cancel
+                        // signal can be observed while workers are mid-file.
+                        if cancel.is_some_and(|cancel| cancel()) {
+                            cancelled = true;
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+        let mut sessions: Vec<SessionSummary> = slots.into_iter().flatten().collect();
         sessions.sort_by_key(|session| std::cmp::Reverse(session.modified));
         SessionListOutcome {
             sessions,
@@ -4771,9 +5184,26 @@ impl SessionManager {
     /// transcript, tool results included) just to index it and then clone the
     /// path back out. Per-turn cost drops from two full-session copies to one.
     pub fn branch_entries(&self, from_id: Option<&str>) -> crate::Result<Vec<FileEntry>> {
-        let path =
-            projection::build_session_path(&self.file_entries, from_id.or(self.leaf_id.as_deref()));
+        let path = self.projected_branch_path(from_id);
         Ok(path.into_iter().cloned().collect())
+    }
+
+    /// The leaf path over the CURRENT entry slice, with the PIR-BIN-092
+    /// broken-chain bridge applied only when the slice is the whole file.
+    /// A paged manager holds just the resident tail; there a parent outside
+    /// the slice is the link into the streamed prefix, and bridging would
+    /// widen the branch past the window instead of stopping at the boundary
+    /// the prefix streamers (`fork_user_messages_streamed`, the paged
+    /// consumers) depend on. Callers that reach for `resident_entries()`
+    /// should come through here.
+    pub fn projected_branch_path(&self, from_id: Option<&str>) -> Vec<&FileEntry> {
+        let leaf = from_id.or(self.leaf_id.as_deref());
+        projection::build_session_path_indexed(
+            &self.file_entries,
+            leaf,
+            !self.is_paged(),
+            Some(&self.entry_positions),
+        )
     }
 
     // ------------------------------------------------------------------
@@ -4791,7 +5221,7 @@ impl SessionManager {
         &self,
         matches: impl Fn(&StoredMessage) -> bool,
     ) -> Option<String> {
-        let path = projection::build_session_path(&self.file_entries, self.leaf_id.as_deref());
+        let path = self.projected_branch_path(None);
         Self::find_message_entry_id_in(&path, matches)
     }
 
@@ -4881,7 +5311,7 @@ impl SessionManager {
         tool_results: &[crate::ai::types::ToolResultMessage],
     ) -> (Option<String>, Vec<String>) {
         note_turn_entry_lookup_path_build();
-        let path = projection::build_session_path(&self.file_entries, self.leaf_id.as_deref());
+        let path = self.projected_branch_path(None);
         let message_entry_id = Self::find_message_entry_id_in(&path, |stored| match stored {
             StoredMessage::Assistant(stored) => {
                 stored.content == message.content
@@ -5129,6 +5559,115 @@ impl SessionManager {
         self.append_entry(entry)
     }
 
+    /// Record a NEW session's startup state exactly like upstream
+    /// `createAgentSession` (sdk.ts:437-450): a `model_change` root followed
+    /// by a `thinking_level_change` child, before the first message — the
+    /// leading rows a pi-written transcript carries.
+    ///
+    /// The gate mirrors upstream's `hasExistingSession`
+    /// (`buildSessionContext().messages.length > 0`): a transcript that
+    /// already carries a context-contributing entry (message, compaction,
+    /// branch summary, custom message) is left untouched, as is one that
+    /// already records either row. Nothing reaches disk here: the JSONL file
+    /// is still created lazily at the first conversation message (upstream
+    /// `_hasConversation`), so the rows are flushed as the file's leading
+    /// entries when the first turn lands and opening/closing a session
+    /// without chatting leaves no file behind.
+    ///
+    /// Returns `true` when the two rows were appended.
+    pub fn append_startup_state(
+        &mut self,
+        provider: &str,
+        model_id: &str,
+        thinking_level: &str,
+    ) -> crate::Result<bool> {
+        let mut fresh = !self.is_paged();
+        for entry in &self.file_entries {
+            match &**entry {
+                // State/meta entries alone still describe a new session.
+                FileEntry::Session(_)
+                | FileEntry::SessionInfo(_)
+                | FileEntry::Label(_)
+                | FileEntry::Usage(_) => {}
+                // Already recorded (a second call, or a transcript that
+                // carries the rows without messages).
+                FileEntry::ModelChange(_) | FileEntry::ThinkingLevelChange(_) => {
+                    return Ok(false);
+                }
+                // Anything context-contributing means this is an existing
+                // session.
+                _ => {
+                    fresh = false;
+                    break;
+                }
+            }
+        }
+        if !fresh {
+            return Ok(false);
+        }
+        self.append_model_change(provider, model_id)?;
+        self.append_thinking_level_change(thinking_level)?;
+        Ok(true)
+    }
+
+    /// Whether the transcript records a system message entry.
+    ///
+    /// This is the writer's gate for the initial system declaration row: pi
+    /// seeds the initial system message only when the transcript does not
+    /// already start with one (`agent.ts:86`), so a resumed session keeps its
+    /// own declaration instead of receiving a second one.
+    ///
+    /// A PAGED manager reports `true` without scanning: a paged session
+    /// always carries history in its skipped prefix, so it is never a fresh
+    /// transcript.
+    pub fn has_system_message(&self) -> bool {
+        if self.is_paged() {
+            return true;
+        }
+        self.file_entries.iter().any(|entry| {
+            matches!(
+                &**entry,
+                FileEntry::Message(message)
+                    if matches!(&message.message, StoredMessage::System(_))
+            )
+        })
+    }
+
+    /// Append the initial system declaration row in pi's exact shape
+    /// (upstream `createInitialSystemMessage` merged with
+    /// `declareToolChanges`): `{role:"system", content, sections, toolsAdded,
+    /// toolsRemoved, timestamp}`, parented on the current leaf.
+    ///
+    /// `sections`/`tools_added`/`tools_removed` arrive as already-serialized
+    /// JSON so the stored object keeps the caller's key order (the typed
+    /// `Message` round-trip sorts the section map); `skip_serializing_if`
+    /// omits the absent ones exactly like upstream's `JSON.stringify`.
+    /// `timestamp` is the caller's message timestamp, reused for the entry so
+    /// an in-memory twin of the row compares equal to the projection.
+    pub fn append_system_declaration(
+        &mut self,
+        content: &str,
+        sections: Option<serde_json::Value>,
+        tools_added: Option<serde_json::Value>,
+        tools_removed: Option<serde_json::Value>,
+        timestamp: u64,
+    ) -> crate::Result<String> {
+        let entry = FileEntry::Message(MessageEntry {
+            id: self.generate_id(),
+            parent_id: self.leaf_id.clone(),
+            timestamp: iso_from_ms(timestamp),
+            message: StoredMessage::System(StoredSystemMessage {
+                role: types::SystemRole::System,
+                content: content.to_owned(),
+                sections,
+                tools_added: tools_added.map(Arc::new),
+                tools_removed,
+                timestamp,
+            }),
+        });
+        self.append_entry(entry)
+    }
+
     /// Append model-attributed usage that does not participate in LLM context
     /// (upstream `appendUsage`; `kind` includes `"cache_warm"`).
     pub fn append_usage(
@@ -5181,8 +5720,16 @@ impl SessionManager {
     /// parameters (upstream `appendCompaction(..., fromHook, usage)`):
     /// `usage` carries the summarizer call's usage, `from_hook` marks
     /// extension-generated compactions (it gates file-op carry-over in the
-    /// next compaction's preparation). A `false` `from_hook` serializes as
-    /// the omitted field (pi-generated, upstream wire compatibility).
+    /// next compaction's preparation).
+    ///
+    /// `from_hook` is RECORDED as given, `true` or `false`: pi's only
+    /// `appendCompaction` call sites always pass the boolean
+    /// (`agent-session.ts:2911/3237` pass `fromExtension`, initialized
+    /// `false`), so a pi-written compaction row always carries
+    /// `"fromHook"` — `false` for pi-generated (fixture
+    /// `s-…/CB-pi-compacted.jsonl` rows 8/10). Files that genuinely lack the
+    /// field (older writers) still read as `None` and are carried verbatim by
+    /// rewrites; `None` no longer means "pi-generated".
     pub fn append_compaction_with_usage(
         &mut self,
         summary: impl Into<String>,
@@ -5219,7 +5766,10 @@ impl SessionManager {
             details,
             first_kept_entry_index: None,
             usage,
-            from_hook: if from_hook { Some(true) } else { None },
+            // pi's writer always passes the boolean (`fromExtension`,
+            // agent-session.ts:2911/3237), so an app-written row always
+            // carries `fromHook` — `false` for pi-generated.
+            from_hook: Some(from_hook),
             system_message,
         });
         self.append_entry(entry)
@@ -5680,9 +6230,10 @@ impl SessionManager {
     /// (every stored tool result) into a temporary that the projection then
     /// copied again.
     pub fn build_context_entries(&self) -> crate::Result<Vec<Message>> {
-        Ok(projection::build_session_messages(
+        Ok(projection::build_session_messages_indexed(
             &self.file_entries,
             self.leaf_id.as_deref(),
+            Some(&self.entry_positions),
         ))
     }
 
@@ -5694,7 +6245,11 @@ impl SessionManager {
     /// retention/context-edit rules; the returned `Vec<Message>` is the same
     /// single materialization the projection would carry.
     pub fn build_session_messages(&self) -> Vec<Message> {
-        projection::build_session_messages(&self.file_entries, self.leaf_id.as_deref())
+        projection::build_session_messages_indexed(
+            &self.file_entries,
+            self.leaf_id.as_deref(),
+            Some(&self.entry_positions),
+        )
     }
 
     /// [`Self::build_context_entries`] aligned with the session entry ids
@@ -5724,7 +6279,37 @@ impl SessionManager {
     /// context's own message slices, so a transcript-sized session never pays
     /// a second copy of the conversation to decide whether to compact.
     pub fn projection_entry_meta(&self) -> Vec<crate::compaction::ProjectionEntryMeta> {
-        projection::build_projection_entry_meta(&self.file_entries, self.leaf_id.as_deref())
+        projection::build_projection_entry_meta_indexed(
+            &self.file_entries,
+            self.leaf_id.as_deref(),
+            Some(&self.entry_positions),
+        )
+    }
+
+    /// Cheap re-derivation of [`Self::build_session_messages`]'s length over
+    /// the live leaf path, sharing this manager's persistent position index
+    /// (the prompt loop's per-prompt append-only fast path).
+    pub(crate) fn projected_message_count_for_leaf(&self, leaf_id: Option<&str>) -> usize {
+        projection::projected_message_count_for_leaf(
+            &self.file_entries,
+            leaf_id,
+            Some(&self.entry_positions),
+        )
+    }
+
+    /// Whether the `from_leaf → to_leaf` delta is a pure append (see
+    /// [`projection::path_delta_is_append_only`]) over the persistent index.
+    pub(crate) fn path_delta_is_append_only(
+        &self,
+        from_leaf: Option<&str>,
+        to_leaf: Option<&str>,
+    ) -> bool {
+        projection::path_delta_is_append_only(
+            &self.file_entries,
+            from_leaf,
+            to_leaf,
+            Some(&self.entry_positions),
+        )
     }
 
     /// The text of the last assistant message on the live context path,
@@ -5733,7 +6318,11 @@ impl SessionManager {
     /// The RPC `get_last_assistant_text` / state handlers call this on every
     /// poll; a transcript-sized projection per poll would be pure duplication.
     pub fn last_assistant_text(&self) -> Option<String> {
-        projection::last_assistant_text_from_entries(&self.file_entries, self.leaf_id.as_deref())
+        projection::last_assistant_text_from_entries_indexed(
+            &self.file_entries,
+            self.leaf_id.as_deref(),
+            Some(&self.entry_positions),
+        )
     }
 
     /// Borrowed metadata of the leaf path ([`algorithm::PathEntryMeta`]): the
@@ -5742,7 +6331,7 @@ impl SessionManager {
     /// [`Self::branch_entries`] view (a deep copy of every entry on the path)
     /// is only needed when a caller hands the branch to an extension.
     pub fn branch_path_meta(&self, from_id: Option<&str>) -> Vec<crate::compaction::PathEntryMeta> {
-        projection::build_session_path(&self.file_entries, from_id.or(self.leaf_id.as_deref()))
+        self.projected_branch_path(from_id)
             .into_iter()
             .map(|entry| crate::compaction::PathEntryMeta {
                 id: entry.id().map(str::to_owned),
@@ -5750,6 +6339,33 @@ impl SessionManager {
                 is_context_edit: matches!(entry, FileEntry::ContextEdit(_)),
             })
             .collect()
+    }
+
+    /// [`Self::branch_path_meta`] over SHARED entry handles
+    /// ([`algorithm::PathEntryShared`]): the same walk, the same ids and the
+    /// same two flags, but each path member keeps the manager's
+    /// `Arc<FileEntry>` — a refcount bump instead of an id `String` clone per
+    /// entry.
+    ///
+    /// This is the branch snapshot the per-prompt compaction gate and the
+    /// run's threshold hook hold (`AgentSession::project_session_with_cache`
+    /// → `ProjectionSnapshot`); callers that need the owned-id shape (tests,
+    /// the paged/print hosts, `context_usage`) keep using
+    /// [`Self::branch_path_meta`].
+    pub fn branch_path_shared(
+        &self,
+        from_id: Option<&str>,
+    ) -> Vec<crate::compaction::PathEntryShared> {
+        let leaf = from_id.or(self.leaf_id.as_deref());
+        projection::build_session_path_shared(
+            &self.file_entries,
+            leaf,
+            !self.is_paged(),
+            Some(&self.entry_positions),
+        )
+        .into_iter()
+        .map(crate::compaction::PathEntryShared)
+        .collect()
     }
 
     /// Build the full projection (upstream `buildSessionProjection`).
@@ -5772,9 +6388,10 @@ impl SessionManager {
     /// range inside the projection.
     pub fn build_session_projection(&self) -> crate::Result<SessionProjection> {
         self.projection_builds.fetch_add(1, Ordering::Relaxed);
-        Ok(projection::build_session_projection(
+        Ok(projection::build_session_projection_indexed(
             &self.file_entries,
             self.leaf_id.as_deref(),
+            Some(&self.entry_positions),
         ))
     }
 
@@ -5788,8 +6405,15 @@ impl SessionManager {
         &self,
     ) -> crate::Result<projection::ProjectionEntryFragments> {
         self.projection_builds.fetch_add(1, Ordering::Relaxed);
+        // Callers of this seam are JS-facing (the full `{entries, messages}`
+        // text contract); the prompt snapshot picks `js_face` per host instead.
         Ok(projection::build_projection_entry_fragments(
-            &projection::build_session_projection(&self.file_entries, self.leaf_id.as_deref()),
+            &projection::build_session_projection_indexed(
+                &self.file_entries,
+                self.leaf_id.as_deref(),
+                Some(&self.entry_positions),
+            ),
+            true,
         ))
     }
 

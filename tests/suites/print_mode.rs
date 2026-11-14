@@ -4759,13 +4759,15 @@ async fn print_prompt_request_carries_provider_retry_settings() {
     assert_eq!(options.timeout_ms, Some(1_000));
 }
 
-/// Default path unchanged (v8): with no `retry.provider` block the request
-/// carries `None` for all three knobs, so the transport keeps 2 retries /
-/// 60 s cap / no total timeout and a normal run gains no extra latency.
+/// Default path: with no `retry.provider` block the request carries the
+/// upstream `?? 0` provider budget (`Some(0)`: one provider attempt per turn,
+/// the agent-level 2/4/8 s ladder owns transient statuses), while the
+/// cap/timeout knobs stay `None` (transport defaults: 60 s cap / no total
+/// timeout). A normal (successful) run still gains no extra latency.
 #[tokio::test(flavor = "current_thread")]
-async fn print_prompt_request_keeps_transport_defaults_without_settings() {
+async fn print_prompt_request_resolves_the_upstream_zero_provider_budget() {
     let options = print_prompt_stream_options("{}").await;
-    assert_eq!(options.max_retries, None);
+    assert_eq!(options.max_retries, Some(0));
     assert_eq!(options.max_retry_delay_ms, None);
     assert_eq!(options.timeout_ms, None);
 }

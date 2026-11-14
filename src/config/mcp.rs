@@ -682,6 +682,39 @@ pub fn project_mcp_path(cwd: &Path) -> PathBuf {
     cwd.join(".pi").join("mcp.json")
 }
 
+/// The server names a project `mcp.json` at `path` overrides instead of
+/// defining: entries without `command`, `url`, or `type` (upstream
+/// `isOverride`, config.ts:78-80, recorded as `entry.override`).
+///
+/// `pir mcp list` reports the project file for these names
+/// (`ServerReport.override`, extensions/mcp/cli.ts:434-470). A missing,
+/// unreadable, or malformed file yields an empty set: the loader already
+/// reports its problems, and this helper must not add a second diagnostic.
+pub fn project_override_names(path: &Path) -> std::collections::BTreeSet<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return std::collections::BTreeSet::new();
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
+    else {
+        return std::collections::BTreeSet::new();
+    };
+    // The upstream wrapper shape, with the legacy flat map as the fallback
+    // (the loader accepts both).
+    let servers = root
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+        .or_else(|| root.as_object());
+    servers
+        .map(|servers| {
+            servers
+                .iter()
+                .filter(|(_, entry)| is_override_entry(entry))
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One loaded MCP configuration source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedMcpConfig {

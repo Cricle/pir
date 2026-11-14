@@ -617,11 +617,30 @@ fn prompt_skills_text(input: &SystemPromptInput<'_>, declared: &[ToolInfo]) -> S
 /// Build the system prompt text, rendered exactly as the transcript's system message
 /// replays it: sections joined by a blank line, preamble untagged.
 pub fn build_system_prompt(input: &SystemPromptInput<'_>) -> String {
-    build_system_prompt_sections(input)
+    render_sections(&build_system_prompt_sections(input))
+}
+
+/// Render an already-built section set as the prompt text (the join rule
+/// [`build_system_prompt`] applies): preamble untagged first, every other
+/// section's wrapped text joined by a blank line.
+pub fn render_sections(sections: &SystemPromptSections) -> String {
+    sections
         .iter()
         .map(|(_, content)| content.to_string())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Serialize an ordered section set to the transcript's `sections` object
+/// (upstream `SystemMessage.sections`): keys in assembly order, values the
+/// rendered section text. The session writer records this shape so a
+/// sectioned system message replays byte-faithfully on both sides.
+pub fn sections_to_json(sections: &SystemPromptSections) -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(sections.len());
+    for (section, content) in sections.iter() {
+        map.insert(section.tag(), serde_json::Value::String(content.to_owned()));
+    }
+    serde_json::Value::Object(map)
 }
 
 /// Diff the sections the model currently has (replayed from the transcript, so never

@@ -347,6 +347,78 @@ fn done_reason_length_and_tool_use_are_carried_through() {
 }
 
 // ---------------------------------------------------------------------------
+// 5. Terminal `responseModel` carry-through (upstream 14c811841)
+//
+// Upstream `packages/ai/src/api/pi-messages.ts` (commit 14c811841) added
+// `responseModel?: string` to both terminal wire events and copies it onto the
+// accumulated message (`if (event.responseModel !== undefined)
+// partial.responseModel = event.responseModel`), matching the Anthropic /
+// OpenAI adapters that already populate `AssistantMessage.response_model`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn done_event_carries_the_physical_response_model() {
+    let model = sample_model();
+    let body: String = [
+        sse(json!({"type": "text_start", "contentIndex": 0})),
+        sse(json!({"type": "text_delta", "contentIndex": 0, "delta": "hi"})),
+        sse(json!({
+            "type": "done",
+            "reason": "stop",
+            "usage": usage_json(),
+            "responseId": "resp_1",
+            "responseModel": "claude-opus-5-5"
+        })),
+    ]
+    .concat();
+    let events = feed_chunks(&byte_chunks(&body), &model);
+    let (_, message) = done_of(&events);
+    // The physical model reported on the terminal event reaches the message
+    // (upstream 14c811841: `Done` event gains `responseModel`, converter copies
+    // it in `pi-messages.ts:204-206`).
+    assert_eq!(message.response_model.as_deref(), Some("claude-opus-5-5"));
+    let wire = serde_json::to_value(&message).expect("message serializes");
+    assert_eq!(wire.get("responseModel"), Some(&json!("claude-opus-5-5")));
+}
+
+#[test]
+fn done_without_response_model_leaves_it_unset_and_omitted() {
+    let model = sample_model();
+    let events = feed_chunks(&byte_chunks(&sse_done("stop")), &model);
+    let (_, message) = done_of(&events);
+    // Upstream only assigns when `event.responseModel !== undefined`
+    // (14c811841, `pi-messages.ts:204-206`); the field stays absent.
+    assert!(message.response_model.is_none());
+    // `AssistantMessage.response_model` is `skip_serializing_if` None, so the
+    // serialized message omits the key entirely (upstream test asserts
+    // `expect(message).not.toHaveProperty("responseModel")`).
+    let wire = serde_json::to_value(&message).expect("message serializes");
+    assert!(wire.get("responseModel").is_none());
+}
+
+#[test]
+fn error_event_carries_the_physical_response_model() {
+    let model = sample_model();
+    let body = sse(json!({
+        "type": "error",
+        "reason": "error",
+        "usage": usage_json(),
+        "errorMessage": "Upstream failed",
+        "responseModel": "claude-opus-5-5"
+    }));
+    let events = parse_pi_messages_sse(body.as_bytes(), &model).expect("parses");
+    let message = match events.last() {
+        Some(AssistantMessageEvent::Error { error, .. }) => error.clone(),
+        other => panic!("expected a terminal Error event, got {other:?}"),
+    };
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(message.error_message.as_deref(), Some("Upstream failed"));
+    // Same terminal-event copy as `done` (upstream 14c811841,
+    // `pi-messages.ts:219-221`).
+    assert_eq!(message.response_model.as_deref(), Some("claude-opus-5-5"));
+}
+
+// ---------------------------------------------------------------------------
 // Incremental vs batch equivalence
 // ---------------------------------------------------------------------------
 

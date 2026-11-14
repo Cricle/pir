@@ -388,6 +388,25 @@ impl AgentSession {
             ),
             None => (None, None),
         };
+        // Upstream `createAgentSession` records a NEW session's startup state
+        // before the first message (sdk.ts:437-450): a `model_change` root
+        // followed by a `thinking_level_change`, the leading rows a
+        // pi-written transcript carries. A transcript that already has
+        // history (a resumed session) is left untouched — the same
+        // `hasExistingSession` gate upstream applies.
+        if let Some(session) = config.session.as_mut() {
+            if let Err(error) = session.append_startup_state(
+                &config.model.provider,
+                &config.model.id,
+                config.thinking.wire_key(),
+            ) {
+                tracing::warn!(
+                    target: "pir::session",
+                    %error,
+                    "failed to record the new session's startup state"
+                );
+            }
+        }
         // Base (core) tools; plugin tools (Rust builtins + JS extensions)
         // merge lazily per prompt run through the unified registry (see
         // [`AgentSession::merged_tool_registry`]). The host-supplied selection
@@ -787,6 +806,7 @@ impl AgentSession {
             auto_retry: AtomicBool::new(true),
             branch_summary_abort: BranchSummaryAbort::default(),
             retry_cancel: CancelLatch::default(),
+            retry_wait_cancel: CancelLatch::default(),
             host_retry_notice: Mutex::new(None),
             signal: Mutex::new(AbortSignal::new()),
             turns: AtomicUsize::new(0),

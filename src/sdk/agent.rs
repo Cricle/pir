@@ -2312,10 +2312,7 @@ pub(crate) struct RecordedSessionSettings {
 }
 
 pub(crate) fn session_recorded_settings(manager: &SessionManager) -> RecordedSessionSettings {
-    let path = crate::session_manager::projection::build_session_path(
-        manager.resident_entries(),
-        manager.leaf_id(),
-    );
+    let path = manager.projected_branch_path(manager.leaf_id());
     let mut settings = RecordedSessionSettings::default();
     for entry in &path {
         match entry {

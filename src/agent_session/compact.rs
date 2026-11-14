@@ -786,7 +786,7 @@ impl AgentSession {
                     return context;
                 }
                 let mut owned_metas: Vec<compaction::ProjectionEntryMeta> = Vec::new();
-                let mut owned_branch: Vec<compaction::PathEntryMeta> = Vec::new();
+                let mut owned_branch: Vec<compaction::PathEntryShared> = Vec::new();
                 // Storage-swap isolation (P2-03, run-context binding): the
                 // threshold summarizes `context` — and, while fresh, the
                 // metadata in `projected` — both produced from the transcript
@@ -803,7 +803,9 @@ impl AgentSession {
                     let session = session.lock().await;
                     if !snapshot_fresh {
                         owned_metas = session.projection_entry_meta();
-                        owned_branch = session.branch_path_meta(None);
+                        // Shared handles, not cloned ids: this is the hook's
+                        // own per-turn re-read of the live branch (PIR-BIN-096).
+                        owned_branch = session.branch_path_shared(None);
                     }
                     live_session_id = Some(session.id().to_owned());
                 }
@@ -833,7 +835,7 @@ impl AgentSession {
                 }
                 let (metas, branch): (
                     &[compaction::ProjectionEntryMeta],
-                    &[compaction::PathEntryMeta],
+                    &[compaction::PathEntryShared],
                 ) = match (&projected, snapshot_fresh) {
                     (Some((metas, branch)), true) => (metas.as_slice(), branch.as_slice()),
                     _ => (owned_metas.as_slice(), owned_branch.as_slice()),

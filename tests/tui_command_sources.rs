@@ -91,7 +91,9 @@ fn popup_offers_one_row_per_name_with_builtin_precedence() {
     );
     assert_eq!(
         model_rows[0].description.as_deref(),
-        Some("Select a model"),
+        // The built-in row renders the upstream hint + description
+        // (`<provider/model> — Select model (opens selector UI)`, PIR-BIN-089).
+        Some("<provider/model> — Select model (opens selector UI)"),
         "the row must be the built-in the dispatcher runs"
     );
 

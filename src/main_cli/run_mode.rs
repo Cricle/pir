@@ -358,8 +358,16 @@ pub(super) async fn run() -> Result<()> {
             &project_dir,
             project_trusted,
         );
+        // The normal startup path's full list (see line ~557): load errors
+        // plus the PIR-BIN-072 per-field tolerant-parse warnings, deduplicated.
+        // PIR-BIN-085: without `collect_settings_warnings` here,
+        // `--list-models` silently dropped a typo'd settings leaf that
+        // `pir models` (and every other host) reports for the same file.
         for diagnostic in pir::config::settings::deduplicate_diagnostics(
-            pir::config::settings::collect_settings_diagnostics(&mut settings),
+            pir::config::settings::collect_settings_diagnostics(&mut settings)
+                .into_iter()
+                .chain(pir::config::settings::collect_settings_warnings(&settings))
+                .collect(),
         ) {
             eprintln!("{}", diagnostic.stderr_line());
         }
@@ -958,7 +966,15 @@ pub(super) async fn run() -> Result<()> {
         ),
         Some(Command::Models { command }) => match command.unwrap_or(ModelsCommand::List) {
             ModelsCommand::List => {
-                match pir::ai::providers::load_pi_config()? {
+                let configured = pir::ai::providers::load_pi_config()?;
+                // PIR-BIN-085 finding B: a malformed `models.json` degrades to
+                // the catalog-only view with pi's warning
+                // (`Warning: errors loading models.json: …`) and exit 0,
+                // instead of aborting with a mislabeled authentication error.
+                if let Some(warning) = pir::ai::providers::take_models_json_load_warning() {
+                    eprintln!("{warning}");
+                }
+                match configured {
                     Some(configured) => {
                         println!(
                             "{}:{} ({})",
@@ -966,7 +982,16 @@ pub(super) async fn run() -> Result<()> {
                         );
                     }
                     None => {
-                        println!("No models configured. Add ~/.pi/agent/models.json.");
+                        // The path is the one the loader above actually reads
+                        // (`agent_dir()` honors PIR_AGENT_DIR /
+                        // PI_CODING_AGENT_DIR), never the default `~/.pi` path
+                        // a redirected install does not use.
+                        println!(
+                            "No models configured. Add {}.",
+                            pir::ai::providers::agent_dir()
+                                .join("models.json")
+                                .display()
+                        );
                     }
                 }
                 Ok(())
@@ -1195,7 +1220,13 @@ pub(super) async fn run() -> Result<()> {
                         state,
                         security,
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        // The raw io text names neither the socket nor the
+                        // operation, and on Windows it is localized
+                        // (`os error 10048`); name the path the user controls.
+                        anyhow::anyhow!("Cannot listen on unix:{socket_path}: {error}")
+                    })?;
                     eprintln!(
                         "pir server listening on unix:{}",
                         server.socket_path().display()
@@ -1222,7 +1253,14 @@ pub(super) async fn run() -> Result<()> {
                 state,
                 security,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                // A bind failure is otherwise a bare OS error — on Windows a
+                // localized one (`通常每个套接字地址… (os error 10048)`) that
+                // never names the address in conflict. Name the resolved
+                // listen address so "port in use" is actionable.
+                anyhow::anyhow!("Cannot listen on {}: {error}", config.server_address)
+            })?;
             eprintln!("pir server listening on {}", server.local_addr()?);
             server.run().await.map_err(Into::into)
         }
@@ -1292,23 +1330,29 @@ pub(super) async fn run() -> Result<()> {
             };
             Ok(())
         }
-        Some(Command::Mcp { command }) => {
-            // No subcommand keeps pir's historical default: check every
-            // configured server (`pir mcp`). `list` is its own upstream-shaped
-            // report and returns 1 when a server or config file fails.
-            let code = pir::coding_agent::cli::run_mcp_command_code_with_trust(
-                command.unwrap_or(McpCommand::Check {
-                    server: None,
-                    json: false,
-                }),
-                cli.trust_override(),
-            )
-            .await?;
-            if code != 0 {
-                std::process::exit(code);
+        Some(Command::Mcp { command }) => match command {
+            // Bare `pir mcp` prints the mcp help and exits 0, exactly like
+            // upstream (`runMcpCommand` logs its HELP with no subcommand;
+            // extensions/mcp/cli.ts:189-192). The test-connect-all default is
+            // the explicit `pir mcp check` (PIR-BIN-090).
+            None => {
+                println!("{}", pir::coding_agent::cli::render_mcp_help().trim_end());
+                Ok(())
             }
-            Ok(())
-        }
+            Some(command) => {
+                // `list` is its own upstream-shaped report and returns 1 when
+                // a server or config file fails.
+                let code = pir::coding_agent::cli::run_mcp_command_code_with_trust(
+                    command,
+                    cli.trust_override(),
+                )
+                .await?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                Ok(())
+            }
+        },
         Some(Command::Grep { args }) => pir::native_cli::run_grep(&args),
         Some(Command::Sed { args }) => pir::native_cli::run_sed(&args),
         Some(Command::Python { args }) => pir::native_cli::run_python(&args),

@@ -450,3 +450,151 @@ fn oversized_subagent_markdown_is_skipped() {
     let names: Vec<&str> = agents.iter().map(|agent| agent.name.as_str()).collect();
     assert_eq!(names, vec!["good"], "the oversized agent is skipped");
 }
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-083: the disable flags also drop package-contributed resources
+// ---------------------------------------------------------------------------
+
+/// One installed package with a prompt (`prompts/pkgprobe.md`) and a skill
+/// (`skills/pkgskill/SKILL.md`), plus the agent-dir `settings.json` that
+/// installs it (`packages`). Returns the package root.
+fn write_package_fixture(layout: &Layout) -> PathBuf {
+    let pkg = layout.root.join("pkg");
+    fs::create_dir_all(pkg.join("prompts")).expect("pkg prompts dir");
+    fs::write(
+        pkg.join("prompts").join("pkgprobe.md"),
+        "---\ndescription: Package probe template\n---\nPKG-TEMPLATE-MARKER $1\n",
+    )
+    .expect("pkg prompt");
+    write_skill(&pkg.join("skills"), "pkgskill");
+    let settings = serde_json::json!({
+        // Forward slashes keep the local package source unambiguous on
+        // Windows (the shape the PIR-BIN-083 probe used).
+        "packages": [pkg.to_string_lossy().replace('\\', "/")],
+    });
+    fs::write(
+        layout.agent_dir.join("settings.json"),
+        serde_json::to_string_pretty(&settings).expect("settings json"),
+    )
+    .expect("write settings");
+    pkg
+}
+
+/// The explicit CLI fixture passed alongside the flags: one template file and
+/// one skill directory under `cwd`. Returns `(prompt file, skill dir)`.
+fn write_cli_fixture(layout: &Layout) -> (PathBuf, PathBuf) {
+    let prompt = layout.cwd.join("cliprobe.md");
+    fs::write(
+        &prompt,
+        "---\ndescription: CLI probe template\n---\nCLI-TEMPLATE-MARKER $1\n",
+    )
+    .expect("cli prompt");
+    write_skill(&layout.cwd, "cliskill");
+    (prompt, layout.cwd.join("cliskill"))
+}
+
+fn template_names(resources: &DiscoveredResources) -> Vec<String> {
+    resources
+        .prompt_templates
+        .iter()
+        .map(|template| template.name.clone())
+        .collect()
+}
+
+/// PIR-BIN-083: `--no-prompt-templates` / `--no-skills` keep only the
+/// explicitly passed CLI paths (upstream drops the whole enabled set in its
+/// flag-on ternary and loads just the CLI list). The control proves the
+/// package fixture loads without the flags, so the absence assertions are not
+/// vacuous; then flag + explicit path must resolve the path's resource while
+/// the package-contributed one stays dropped, and the flag alone keeps
+/// neither.
+#[test]
+fn disable_flags_keep_only_the_explicit_cli_paths() {
+    let layout = layout("p4-bin083-package-flag");
+    write_package_fixture(&layout);
+    let (cli_prompt, cli_skill) = write_cli_fixture(&layout);
+
+    let discover_with = |no_skills: bool, no_prompt_templates: bool, with_cli: bool| {
+        let skill_paths: Vec<PathBuf> = if with_cli {
+            vec![cli_skill.clone()]
+        } else {
+            Vec::new()
+        };
+        let prompt_paths: Vec<PathBuf> = if with_cli {
+            vec![cli_prompt.clone()]
+        } else {
+            Vec::new()
+        };
+        DiscoveredResources::discover_with_home(
+            &ResourceDiscoveryOptions {
+                cwd: &layout.cwd,
+                agent_dir: &layout.agent_dir,
+                project_trusted: true,
+                cli_skill_paths: &skill_paths,
+                cli_prompt_paths: &prompt_paths,
+                no_skills,
+                no_prompt_templates,
+            },
+            Some(layout.home.as_path()),
+        )
+    };
+
+    // Control (no flags): the fixture is real — both package resources and
+    // both CLI resources load.
+    let control = discover_with(false, false, true);
+    let control_templates = template_names(&control);
+    assert!(
+        control_templates.contains(&"pkgprobe".to_string()),
+        "control: the package template loads without the flag: {control_templates:?}"
+    );
+    assert!(
+        control_templates.contains(&"cliprobe".to_string()),
+        "control: the CLI template loads without the flag: {control_templates:?}"
+    );
+    let control_skills = skill_names(&control);
+    assert!(
+        control_skills.contains(&"pkgskill".to_string()),
+        "control: the package skill loads without the flag: {control_skills:?}"
+    );
+    assert!(
+        control_skills.contains(&"cliskill".to_string()),
+        "control: the CLI skill loads without the flag: {control_skills:?}"
+    );
+
+    // Flag + explicit path: the explicit path resolves, the package resource
+    // must NOT be appended (it used to leak in through the unconditional
+    // package extend).
+    let flagged_with_cli = discover_with(true, true, true);
+    let templates = template_names(&flagged_with_cli);
+    assert!(
+        templates.contains(&"cliprobe".to_string()),
+        "the explicit --prompt-template path still loads under the flag: {templates:?}"
+    );
+    assert!(
+        !templates.contains(&"pkgprobe".to_string()),
+        "the package prompt must not load under --no-prompt-templates: {templates:?}"
+    );
+    let skills = skill_names(&flagged_with_cli);
+    assert!(
+        skills.contains(&"cliskill".to_string()),
+        "the explicit --skill path still loads under the flag: {skills:?}"
+    );
+    assert!(
+        !skills.contains(&"pkgskill".to_string()),
+        "the package skill must not load under --no-skills: {skills:?}"
+    );
+
+    // Flag alone: everything (defaults, auto dirs and package resources) is
+    // dropped — unchanged early-return behavior.
+    let flagged_alone = discover_with(true, true, false);
+    assert!(
+        flagged_alone.prompt_templates.is_empty(),
+        "flag alone loads no prompt templates: {:?}",
+        template_names(&flagged_alone)
+    );
+    assert!(
+        flagged_alone.skills.is_empty(),
+        "flag alone loads no skills: {:?}",
+        skill_names(&flagged_alone)
+    );
+}

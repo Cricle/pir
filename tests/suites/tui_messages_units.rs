@@ -285,6 +285,127 @@ fn tool_result_rows_are_memoized_and_follow_the_output() {
     );
 }
 
+/// One `!`/`!!` user-bash transcript entry, the shape the terminal's
+/// `handle_bash` (pending) and its `ToolUpdate` handler (the settled
+/// completion) build.
+fn user_bash_entry(
+    args: Arc<serde_json::Value>,
+    output: &str,
+    pending: bool,
+    started_at: Option<std::time::Instant>,
+) -> ChatEntry {
+    ChatEntry::ToolExecution {
+        call_id: None,
+        tool_name: "bash".to_string(),
+        args,
+        output: Arc::from(output),
+        is_error: false,
+        duration_ms: None,
+        pending,
+        details: None,
+        started_at,
+        preview: None,
+        images: Arc::new(Vec::new()),
+    }
+}
+
+/// The terminal's live-snapshot step (its `ToolUpdate` handler with
+/// `partial: true`): only the pending block's output moves — every other
+/// field, including the tool-name/args/start-time allocations the in-place
+/// patch gate matches on, stays untouched.
+fn set_pending_output_in_place(entry: &mut ChatEntry, output: &str) {
+    let ChatEntry::ToolExecution {
+        output: block_output,
+        pending,
+        ..
+    } = entry
+    else {
+        panic!("not a tool entry");
+    };
+    assert!(
+        *pending,
+        "a live snapshot only applies to the pending block"
+    );
+    *block_output = Arc::from(output);
+}
+
+/// PIR-TUI-034: the `!`/`!!` user-bash block must paint streamed output while
+/// the command runs. Upstream (`BashExecutionComponent.appendOutput`) the
+/// `onChunk` callback appends every chunk and the block repaints; pir's
+/// worker forwards live tail snapshots as partial `ToolUpdate`s and the UI
+/// refreshes the pending entry in place through p2's pending-safe
+/// `set_output` seam. This drives that exact entry shape through the
+/// transcript container: after the two snapshots the rendered block contains
+/// chunk 1 AND chunk 2 while the Running… row stays (and the retained
+/// component was patched, not rebuilt); the completion then replaces it with
+/// the settled block.
+#[test]
+fn pending_user_bash_block_paints_each_live_snapshot() {
+    let _guard = super::tui_system_theme::lock();
+    set_theme("dark");
+    let args: Arc<serde_json::Value> = Arc::new(serde_json::json!({
+        "command": "for i in 1 2; do echo CHUNK-$i; sleep 1; done",
+        "userBash": true,
+        "excludeFromContext": false,
+    }));
+    let mut chat = ChatContainer::new();
+    let mut entries = vec![user_bash_entry(
+        Arc::clone(&args),
+        "",
+        true,
+        Some(std::time::Instant::now()),
+    )];
+    chat.set_entries(&entries);
+    let painted = strip_ansi(&chat.render(80).join("\n"));
+    assert!(painted.contains("Running..."), "{painted}");
+    assert!(
+        !painted.contains("CHUNK-1"),
+        "no output has arrived yet: {painted}"
+    );
+
+    // First live snapshot: the block stays pending and takes the chunk in
+    // place — the retained component is PATCHED through `set_output`, not
+    // rebuilt (the memo caches survive).
+    set_pending_output_in_place(&mut entries[0], "CHUNK-1\n");
+    chat.set_entries(&entries);
+    assert_eq!(
+        chat.last_diff().entries_patched,
+        1,
+        "a live snapshot must patch the retained pending block in place"
+    );
+    let painted = strip_ansi(&chat.render(80).join("\n"));
+    assert!(painted.contains("Running..."), "{painted}");
+    assert!(painted.contains("CHUNK-1"), "{painted}");
+
+    // Second live snapshot: both chunks are visible, still running.
+    set_pending_output_in_place(&mut entries[0], "CHUNK-1\nCHUNK-2\n");
+    chat.set_entries(&entries);
+    assert_eq!(chat.last_diff().entries_patched, 1);
+    let painted = strip_ansi(&chat.render(80).join("\n"));
+    assert!(painted.contains("Running..."), "{painted}");
+    assert!(
+        painted.contains("CHUNK-1") && painted.contains("CHUNK-2"),
+        "the second snapshot must paint the whole accumulated tail: {painted}"
+    );
+
+    // Completion: the settled block drops the Running… row and keeps the
+    // final output (the TUI replaces the entry with the completed one).
+    let settled_args: Arc<serde_json::Value> = Arc::new(serde_json::json!({
+        "command": "for i in 1 2; do echo CHUNK-$i; sleep 1; done",
+        "userBash": true,
+        "excludeFromContext": false,
+        "exitCode": 0,
+    }));
+    entries[0] = user_bash_entry(settled_args, "CHUNK-1\nCHUNK-2\n", false, None);
+    chat.set_entries(&entries);
+    let painted = strip_ansi(&chat.render(80).join("\n"));
+    assert!(!painted.contains("Running..."), "{painted}");
+    assert!(
+        painted.contains("CHUNK-1") && painted.contains("CHUNK-2"),
+        "the settled block keeps the output: {painted}"
+    );
+}
+
 /// The live thinking block follows the shared text buffer across deltas and
 /// renders the hidden-thinking label (live-relabeled) when collapsed.
 #[test]

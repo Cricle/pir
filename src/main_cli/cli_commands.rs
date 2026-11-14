@@ -129,14 +129,44 @@ pub(super) fn run_list_models(
     // resolved trust and loaded both scopes once) instead of re-reading and
     // re-parsing `settings.json` here.
     let environment = pir::ai::providers::load_pi_environment_with_settings(settings)?;
-    let mut models = environment.models.clone();
+    // pi `cli/list-models.ts`: a failed models.json is a warning on stderr and
+    // the built-in catalog still lists (PIR-BIN-098/PIR-BIN-085 finding B);
+    // the loader kept the catalog and recorded the error instead of aborting.
+    if let Some(warning) = pir::ai::providers::take_models_json_load_warning() {
+        eprintln!("{warning}");
+    }
+    // The rest of this function reads only the model list (fuzzy filter, sort,
+    // table), so move it out of the environment instead of deep-cloning every
+    // model once more.
+    let mut models = environment.models;
     if models.is_empty() {
-        // Upstream `formatNoModelsAvailableMessage`.
-        println!(
-            "No models available. Use /login to log into a provider via OAuth or API key. See:"
-        );
-        println!("  providers.md");
-        println!("  models.md");
+        // Upstream `formatNoModelsAvailableMessage` +
+        // `getProviderLoginHelp` (core/auth-guidance.ts): pi resolves the two
+        // doc paths against ITS install (`getDocsPath()`); pir names only doc
+        // files this install actually has (`package_dir()` probing, the
+        // PIR-BIN-061 rule) and drops the whole "See:" list rather than
+        // printing a dangling path a release archive does not ship.
+        let mut hints: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(docs) = pir::config::env::package_dir().map(|dir| dir.join("docs")) {
+            for name in ["providers.md", "models.md"] {
+                let path = docs.join(name);
+                if path.is_file() {
+                    hints.push(path);
+                }
+            }
+        }
+        if hints.is_empty() {
+            println!(
+                "No models available. Use /login to log into a provider via OAuth or API key."
+            );
+        } else {
+            println!(
+                "No models available. Use /login to log into a provider via OAuth or API key. See:"
+            );
+            for hint in hints {
+                println!("  {}", hint.display());
+            }
+        }
         return Ok(());
     }
     if let Some(search) = search.map(str::trim).filter(|search| !search.is_empty()) {

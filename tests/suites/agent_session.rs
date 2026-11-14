@@ -470,10 +470,7 @@ async fn prompt_round_trips_session_storage() {
 #[tokio::test]
 async fn startup_append_runs_off_thread_and_keeps_message_order() {
     let temp = TempDir::new("startup-off-thread");
-    let mut storage = SessionManager::create(".", &temp.0).expect("create session");
-    // Long enough that a synchronous append would hold this single-threaded
-    // runtime inside the stall for the whole probe window.
-    storage.stall_next_append_for_test(std::time::Duration::from_millis(1_200));
+    let storage = SessionManager::create(".", &temp.0).expect("create session");
     let path = storage.path().to_path_buf();
     let requests: Arc<Mutex<Vec<Context>>> = Arc::new(Mutex::new(Vec::new()));
     let requests_for_responder = Arc::clone(&requests);
@@ -497,6 +494,18 @@ async fn startup_append_runs_off_thread_and_keeps_message_order() {
         extensions: None,
         tool_selection: None,
     }));
+
+    // Long enough that a synchronous append would hold this single-threaded
+    // runtime inside the stall for the whole probe window. Armed AFTER
+    // construction: `AgentSession::new` records a new session's startup state
+    // (`model_change` + `thinking_level_change`, pi's leading rows), whose
+    // in-memory appends would otherwise consume a stall armed on the storage
+    // before the build.
+    agent
+        .with_session_manager(|session| {
+            session.stall_next_append_for_test(std::time::Duration::from_millis(1_200))
+        })
+        .await;
 
     let prompt_task = tokio::spawn({
         let agent = Arc::clone(&agent);
@@ -8902,7 +8911,9 @@ async fn fork_entry_swaps_in_a_new_parent_linked_session_file() {
             .expect("prompt");
     }
 
-    // The source's rows before the fork: header + u1 a1 u2 a2 u3 a3.
+    // The source's rows before the fork: header + the 2 startup-state rows
+    // (PIR-BIN-091: a new session records pi's `model_change` +
+    // `thinking_level_change` before the first message) + u1 a1 u2 a2 u3 a3.
     let source_before = SessionManager::open(&source_path).expect("reopen source");
     let source_rows: Vec<(String, Option<String>)> = source_before
         .entries()
@@ -8914,10 +8925,12 @@ async fn fork_entry_swaps_in_a_new_parent_linked_session_file() {
             )
         })
         .collect();
-    assert_eq!(source_rows.len(), 6, "u1 a1 u2 a2 u3 a3");
-    let u1_id = source_rows[0].0.clone();
-    let a1_id = source_rows[1].0.clone();
-    let u2_id = source_rows[2].0.clone();
+    assert_eq!(source_rows.len(), 8, "startup rows + u1 a1 u2 a2 u3 a3");
+    let model_change_id = source_rows[0].0.clone();
+    let thinking_id = source_rows[1].0.clone();
+    let u1_id = source_rows[2].0.clone();
+    let a1_id = source_rows[3].0.clone();
+    let u2_id = source_rows[4].0.clone();
     let source_bytes = std::fs::read(&source_path).expect("read source");
 
     let old_state = agent.state();
@@ -8982,8 +8995,13 @@ async fn fork_entry_swaps_in_a_new_parent_linked_session_file() {
         .collect();
     assert_eq!(
         branch_rows,
-        vec![(u1_id.clone(), None), (a1_id.clone(), Some(u1_id.clone())),],
-        "the branched file holds exactly the source prefix"
+        vec![
+            (model_change_id.clone(), None),
+            (thinking_id.clone(), Some(model_change_id.clone())),
+            (u1_id.clone(), Some(thinking_id.clone())),
+            (a1_id.clone(), Some(u1_id.clone())),
+        ],
+        "the branched file holds exactly the source prefix (startup rows + u1 a1)"
     );
 
     // The source is never appended to again: a prompt in the fork lands in

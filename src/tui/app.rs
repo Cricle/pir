@@ -2225,12 +2225,15 @@ impl ChatContainer {
                 // component's public setters (`set_meta` + `update_result`),
                 // exactly the calls a fresh build makes — so the end state is
                 // identical while every memo cache on the component survives.
-                // A pending→pending update only carries meta (the call line is
-                // the whole block there); `update_result` would leave pending.
+                // A pending→pending update patches through the pending-safe
+                // output setter (the live shell snapshot still renders while
+                // the block stays pending); a settle takes `update_result`.
                 tool.set_meta(details.clone(), *started_at, preview.clone());
                 tool.set_images(Arc::clone(images));
                 if !*pending {
                     tool.update_result(Arc::clone(output), *is_error, *duration_ms);
+                } else {
+                    tool.set_output(Arc::clone(output));
                 }
                 self.committed[index].tag = EntryTag::of(entry);
                 self.dirty_blocks.note(index);
@@ -2370,6 +2373,12 @@ impl ChatContainer {
                 component.set_images(Arc::clone(images));
                 if !pending {
                     component.update_result(Arc::clone(output), *is_error, *duration_ms);
+                } else {
+                    // A pending block can already carry streamed partial
+                    // output (`tool_execution_update`); `update_result` would
+                    // clear the pending phase, so the output goes in through
+                    // the pending-safe setter.
+                    component.set_output(Arc::clone(output));
                 }
                 tool = Some(Arc::clone(&component));
                 children.push(Box::new(SharedTool(component)));

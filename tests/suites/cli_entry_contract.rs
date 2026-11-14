@@ -172,10 +172,75 @@ fn preprocess_args_keeps_print_flag_with_its_message() {
     );
 
     let cli = parse(&["--print", "msg"]);
-    assert!(cli.print.is_some(), "--print must survive parsing");
+    // `print` is a Vec since PIR-BIN-090 (every `-p` occurrence contributes a
+    // prompt), so "survived parsing" is now "holds a value".
+    assert!(!cli.print.is_empty(), "--print must survive parsing");
     let plan = cli.entry_plan(true, true);
     assert_eq!(plan.app_mode, AppMode::Print);
     assert_eq!(plan.messages, vec!["msg"]);
+}
+
+#[test]
+fn repeated_single_value_flags_keep_the_last_occurrence() {
+    // Upstream `parseArgs` (cli/args.ts:111-246) assigns unconditionally, so a
+    // repeated single-value flag silently keeps the LAST value. clap needed
+    // `args_override_self = true` on the CLI to stop rejecting the second
+    // occurrence with `cannot be used multiple times` (PIR-BIN-090).
+    let cli = parse(&["--model", "a", "--model", "b"]);
+    assert_eq!(cli.model.as_deref(), Some("b"));
+    let cli = parse(&["--tools", "read", "--tools", "grep"]);
+    assert_eq!(cli.tools.as_deref(), Some("grep"));
+    let cli = parse(&["--thinking", "low", "--thinking", "high"]);
+    assert_eq!(cli.thinking.as_deref(), Some("high"));
+    let cli = parse(&["--name", "first", "--name", "second"]);
+    assert_eq!(cli.name.as_deref(), Some("second"));
+    let cli = parse(&["--session-dir", "a", "--session-dir", "b"]);
+    assert_eq!(cli.session_dir.as_deref(), Some("b"));
+    let cli = parse(&["--list-models", "a", "--list-models", "b"]);
+    assert_eq!(cli.list_models.as_deref(), Some("b"));
+
+    // The bundled upstream short spellings normalize onto the same args, so
+    // the rule must hold for them too (`-t`, `-n`; BUNDLED_SHORTS).
+    let cli = parse_preprocessed(&["-t", "read", "-t", "grep"]);
+    assert_eq!(cli.tools.as_deref(), Some("grep"));
+    let cli = parse_preprocessed(&["-n", "first", "-n", "second"]);
+    assert_eq!(cli.name.as_deref(), Some("second"));
+}
+
+#[test]
+fn repeated_print_flags_contribute_every_value_as_a_prompt() {
+    // `-p`/`--print` is the ONE exception to last-wins: upstream pushes every
+    // consumed value into `messages`, so `pi -p a -p b` prompts "a" then "b"
+    // (args.ts:173-180; PIR-BIN-090).
+    let cli = parse(&["-p", "a", "-p", "b"]);
+    assert_eq!(cli.print, vec!["a", "b"]);
+    let plan = cli.entry_plan(true, true);
+    assert_eq!(plan.app_mode, AppMode::Print);
+    assert_eq!(plan.messages, vec!["a", "b"]);
+
+    // Values keep their argv order ahead of the positionals; a bare trailing
+    // `-p` only re-asserts the flag (no empty message).
+    let cli = parse(&["-p", "a", "tail", "-p"]);
+    let plan = cli.entry_plan(true, true);
+    assert_eq!(plan.app_mode, AppMode::Print);
+    assert_eq!(plan.messages, vec!["a", "tail"]);
+
+    // An `@`-prefixed print value is a file argument (upstream never consumes
+    // it as a print value; it lands in `fileArgs`).
+    let cli = parse(&["-p", "@notes.md", "-p", "a"]);
+    let plan = cli.entry_plan(true, true);
+    assert_eq!(plan.messages, vec!["a"]);
+    assert_eq!(plan.file_args, vec!["notes.md"]);
+}
+
+/// Parse through the binary's own preprocessing, so the bundled upstream short
+/// spellings (`-t`, `-n`, …) reach clap as their long forms exactly like in
+/// the shipped binary.
+fn parse_preprocessed(argv: &[&str]) -> Cli {
+    let (args, _) = preprocess_args(argv.iter().map(|arg| (*arg).to_string()).collect());
+    let mut full = vec!["pir".to_string()];
+    full.extend(args);
+    Cli::try_parse_from(full).expect("preprocessed argv should parse")
 }
 
 #[test]
@@ -294,9 +359,10 @@ fn build_print_prompts_shifts_only_the_first_message() {
 fn validate_provider_requires_model() {
     let cli = parse(&["--provider", "anthropic"]);
     let error = validate_parsed_flags(&cli).expect_err("--provider requires --model");
+    // Upstream `main.ts:472` echoes the provider value the user gave.
     assert_eq!(
         error,
-        "--provider requires --model (for example: --provider <provider> --model <model>)"
+        "--provider requires --model (for example: --provider anthropic --model <pattern>)"
     );
     // With --model the pair is accepted.
     let cli = parse(&["--provider", "anthropic", "--model", "claude"]);

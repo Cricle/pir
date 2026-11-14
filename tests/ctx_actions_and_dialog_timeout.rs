@@ -254,11 +254,14 @@ async fn ctx_new_session_honors_parent_session() {
 
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)] // the action-queue lock must span the runtime awaits
-async fn ctx_fork_at_entry_moves_the_leaf() {
-    let (dir, handle) = load_fixture("fork-entry", false).await;
+async fn ctx_fork_at_entry_creates_a_branched_session_file() {
+    let (dir, handle) = load_fixture("fork-entry-before", false).await;
     let session_dir = dir.join("sessions");
     std::fs::create_dir_all(&session_dir).unwrap();
     let (session, ids) = chain_fixture(&session_dir);
+    let source_path = session.path().to_path_buf();
+    let source_id = session.id().to_owned();
+    let source_bytes = std::fs::read(&source_path).unwrap();
     let storage: SharedStorage = Arc::new(tokio::sync::Mutex::new(Some(session)));
 
     let _window = ACTION_WINDOW
@@ -275,18 +278,56 @@ async fn ctx_fork_at_entry_moves_the_leaf() {
         )
         .await
     );
-    let guard = storage.lock().await;
-    let session = guard
-        .as_ref()
-        .expect("storage stays in place for fork-at-entry");
-    // Upstream fork(entryId) defaults to position "before": the entry must
-    // be a user message and the leaf lands on its PARENT.
+    let (branch_id, branch_path, branch_rows, branch_leaf) = {
+        let guard = storage.lock().await;
+        let session = guard.as_ref().expect("forked storage");
+        // Upstream `fork(entryId)` defaults to position "before": the entry
+        // must be a user message and the fork branches at its PARENT, writing
+        // the root→parent prefix into a NEW session file (PIR-BIN-082: an
+        // in-place leaf move is not representable in the JSONL format, so it
+        // was lost at the next process boundary).
+        assert_ne!(
+            session.id(),
+            source_id,
+            "ctx.fork(entryId) swaps in a new session id"
+        );
+        assert_ne!(
+            session.path(),
+            source_path.as_path(),
+            "the fork lives in its own file"
+        );
+        assert_eq!(
+            session.parent_session(),
+            Some(source_path.to_string_lossy().as_ref()),
+            "the branched header points at the source file"
+        );
+        let rows: Vec<(String, Option<String>)> = session
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.entry_id().to_owned(),
+                    entry.parent_id().map(str::to_owned),
+                )
+            })
+            .collect();
+        (
+            session.id().to_owned(),
+            session.path().to_path_buf(),
+            rows,
+            session.leaf_id().map(str::to_owned),
+        )
+    };
     assert_eq!(
-        session.leaf_id(),
-        Some(ids[0].as_str()),
-        "ctx.fork(entryId) branches at the entry's PARENT (before position)"
+        branch_rows,
+        vec![(ids[0].clone(), None)],
+        "position before writes only the parent prefix to the new file"
     );
-    drop(guard);
+    assert_eq!(
+        branch_leaf,
+        Some(ids[0].clone()),
+        "the branch leaf is the forked parent"
+    );
     // The JS surface answers with the upstream runner-default shape.
     assert_eq!(
         handle
@@ -296,6 +337,84 @@ async fn ctx_fork_at_entry_moves_the_leaf() {
         json!({ "cancelled": false }),
         "ctx.fork resolves {{cancelled: false}} (accepted)"
     );
+    assert!(
+        take_queue_is_empty(),
+        "the print host drained every recorded action"
+    );
+    drop(_window);
+
+    // The source is never rewritten by a fork.
+    assert_eq!(
+        std::fs::read(&source_path).unwrap(),
+        source_bytes,
+        "the source file must stay byte-identical after the fork"
+    );
+    // Durability: the next process opens the file the fork declared current
+    // (the branch) and continues INSIDE the fork.
+    let mut resumed = SessionManager::open(&branch_path).expect("resume the branched session");
+    assert_eq!(
+        resumed.id(),
+        branch_id,
+        "the branch file carries the forked session id"
+    );
+    assert_eq!(
+        resumed.leaf_id(),
+        Some(ids[0].as_str()),
+        "resume derives the fork point from the branch file"
+    );
+    resumed
+        .append_message(user_message("continued in the fork"))
+        .expect("append inside the branch");
+    let reopened = SessionManager::open(&branch_path).expect("reopen the branch");
+    let resumed_rows: Vec<(String, Option<String>)> = reopened
+        .entries()
+        .iter()
+        .map(|entry| {
+            (
+                entry.entry_id().to_owned(),
+                entry.parent_id().map(str::to_owned),
+            )
+        })
+        .collect();
+    assert_eq!(
+        resumed_rows.len(),
+        2,
+        "the continuation row was appended to the branch file: {resumed_rows:?}"
+    );
+    assert_eq!(
+        resumed_rows[0].0, ids[0],
+        "the branch keeps the forked prefix"
+    );
+    assert_eq!(
+        resumed_rows[1].1.as_deref(),
+        Some(ids[0].as_str()),
+        "the continuation attaches INSIDE the fork"
+    );
+    assert_eq!(
+        SessionManager::open(&source_path)
+            .expect("reopen the source")
+            .entries()
+            .len(),
+        3,
+        "the source keeps its original rows"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // the action-queue lock must span the runtime awaits
+async fn ctx_fork_at_entry_position_at_keeps_the_entry_in_the_branch() {
+    let (dir, handle) = load_fixture("fork-entry-at", false).await;
+    let session_dir = dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let (session, ids) = chain_fixture(&session_dir);
+    let source_path = session.path().to_path_buf();
+    let source_bytes = std::fs::read(&source_path).unwrap();
+    let storage: SharedStorage = Arc::new(tokio::sync::Mutex::new(Some(session)));
+
+    let _window = ACTION_WINDOW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // position "at" branches at the entry itself (the options ride the
     // commandAction bridge).
     assert!(
@@ -307,14 +426,60 @@ async fn ctx_fork_at_entry_moves_the_leaf() {
         )
         .await
     );
-    let guard = storage.lock().await;
+    let (branch_rows, branch_leaf, branch_path) = {
+        let guard = storage.lock().await;
+        let session = guard.as_ref().expect("forked storage");
+        assert_eq!(
+            session.parent_session(),
+            Some(source_path.to_string_lossy().as_ref()),
+            "the branched header points at the source file"
+        );
+        let rows: Vec<(String, Option<String>)> = session
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.entry_id().to_owned(),
+                    entry.parent_id().map(str::to_owned),
+                )
+            })
+            .collect();
+        (
+            rows,
+            session.leaf_id().map(str::to_owned),
+            session.path().to_path_buf(),
+        )
+    };
     assert_eq!(
-        guard.as_ref().expect("storage").leaf_id(),
-        Some(ids[1].as_str()),
-        "ctx.fork(entryId, {{position: 'at'}}) branches at the entry"
+        branch_rows,
+        vec![
+            (ids[0].clone(), None),
+            (ids[1].clone(), Some(ids[0].clone())),
+        ],
+        "position at writes the root→entry path to the new file"
     );
-    drop(guard);
+    assert_eq!(
+        branch_leaf,
+        Some(ids[1].clone()),
+        "ctx.fork(entryId, {{position: 'at'}}) lands on the entry"
+    );
+    assert!(
+        take_queue_is_empty(),
+        "the print host drained every recorded action"
+    );
     drop(_window);
+    assert!(
+        SessionManager::open(&branch_path)
+            .expect("reopen the branch")
+            .entry(&ids[2])
+            .is_none(),
+        "the abandoned tail is not in the branch"
+    );
+    assert_eq!(
+        std::fs::read(&source_path).unwrap(),
+        source_bytes,
+        "the source file must stay byte-identical after the fork"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

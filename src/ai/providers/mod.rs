@@ -43,8 +43,10 @@ pub use models_store::{
 pub use pi_config::{
     has_configured_auth, load_pi_config, load_pi_config_with, load_pi_config_with_settings,
     load_pi_environment, load_pi_environment_with_settings, merge_pi_config, merge_pi_config_in,
-    parse_pi_config, strip_jsonc, PiConfiguredModel, PiCostRates, PiEnvironment, PiModelConfig,
-    PiModelsConfig, PiProviderConfig,
+    models_json_load_error, models_json_load_failures, parse_models_json_layer_at, parse_pi_config,
+    record_models_json_load_error, strip_jsonc, take_models_json_load_error,
+    take_models_json_load_warning, PiConfiguredModel, PiCostRates, PiEnvironment, PiModelConfig,
+    PiModelsConfig, PiModelsJsonError, PiProviderConfig,
 };
 pub use radius::RadiusProvider;
 pub use resolution::{

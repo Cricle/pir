@@ -618,13 +618,18 @@ impl DiscoveredResources {
                 agents: &agents,
                 home,
             });
-            roots.extend(
-                package_resources
-                    .skills
-                    .iter()
-                    .cloned()
-                    .map(ResourceRoot::unfiltered),
-            );
+            // `--no-skills` keeps only the CLI paths: the package-contributed
+            // set is dropped together with the settings/auto roots (upstream
+            // drops the whole `enabledSkills` set in its flag-on ternary).
+            if !options.no_skills {
+                roots.extend(
+                    package_resources
+                        .skills
+                        .iter()
+                        .cloned()
+                        .map(ResourceRoot::unfiltered),
+                );
+            }
             discover_skills_from_roots(&roots, &mut diagnostics)
         };
         let prompt_templates = if options.no_prompt_templates && options.cli_prompt_paths.is_empty()
@@ -642,13 +647,19 @@ impl DiscoveredResources {
                 agents: &AgentsSkillDirs::default(),
                 home,
             });
-            roots.extend(
-                package_resources
-                    .prompts
-                    .iter()
-                    .cloned()
-                    .map(ResourceRoot::unfiltered),
-            );
+            // `--no-prompt-templates` keeps only the CLI paths: the
+            // package-contributed set is dropped together with the
+            // settings/auto roots (upstream drops the whole `enabledPrompts`
+            // set in its flag-on ternary).
+            if !options.no_prompt_templates {
+                roots.extend(
+                    package_resources
+                        .prompts
+                        .iter()
+                        .cloned()
+                        .map(ResourceRoot::unfiltered),
+                );
+            }
             discover_templates_from_roots(&roots, &mut diagnostics)
         };
         Self {

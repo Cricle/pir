@@ -264,6 +264,73 @@ pub(crate) fn user_text_message(text: &str, timestamp: u64) -> Message {
     })
 }
 
+/// Id → resident position for the session manager's current `file_entries`
+/// slice. Maintained in lockstep with the manager's `by_id` (`build_index` /
+/// `append_entry` / `new_session`), so every per-prompt leaf→root walk resolves
+/// the parent chain through this ONE map instead of rebuilding an index per
+/// call.
+pub(crate) type EntryPositions = std::collections::HashMap<String, usize>;
+
+/// Lookup head for the leaf→root walk.
+///
+/// `Borrowed` is the per-call index the public entry points build from their
+/// own slice (no id allocation, the pre-R1 shape). `Persistent` borrows the
+/// session manager's [`EntryPositions`] so the per-prompt walks (projection,
+/// branch snapshot, compaction metadata, append-only delta) share one index.
+/// A persistent slot is VALIDATED (the entry at the recorded position must
+/// still carry the id); a stale/foreign map therefore degrades to the
+/// unindexed lookup and the walk keeps today's behavior.
+enum LeafPathIndex<'a, 'p, E> {
+    Borrowed(std::collections::HashMap<&'a str, usize>, &'a [E]),
+    Persistent(&'p EntryPositions, &'a [E]),
+}
+
+/// The per-call borrowed index (one slot per non-header entry). Kept separate
+/// so the `None` (public/unindexed) path allocates no id strings, exactly the
+/// pre-R1 walk.
+fn borrowed_positions<E: Borrow<FileEntry>>(
+    entries: &[E],
+) -> std::collections::HashMap<&str, usize> {
+    let mut positions = std::collections::HashMap::with_capacity(entries.len());
+    for (position, entry) in entries.iter().enumerate() {
+        if let Some(id) = entry.borrow().id() {
+            positions.insert(id, position);
+        }
+    }
+    positions
+}
+
+impl<'a, 'p, E: Borrow<FileEntry>> LeafPathIndex<'a, 'p, E> {
+    fn entries(&self) -> &'a [E] {
+        match self {
+            LeafPathIndex::Borrowed(_, entries) | LeafPathIndex::Persistent(_, entries) => entries,
+        }
+    }
+
+    fn position(&self, id: &str) -> Option<usize> {
+        match self {
+            LeafPathIndex::Borrowed(positions, _) => positions.get(id).copied(),
+            LeafPathIndex::Persistent(positions, _) => positions.get(id).copied(),
+        }
+    }
+
+    /// `(position, entry)` for `id`, or `None` when the id is absent OR the
+    /// recorded position no longer carries it (stale/foreign index).
+    fn resolve(&self, id: &str) -> Option<(usize, &'a E)> {
+        let position = self.position(id)?;
+        let entry = self.entries().get(position)?;
+        if entry.borrow().id() == Some(id) {
+            Some((position, entry))
+        } else {
+            None
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.resolve(id).is_some()
+    }
+}
+
 /// Walk from the leaf to the root, oldest first (upstream `buildSessionPath`),
 /// keeping the ORIGINAL container elements in the returned path.
 ///
@@ -285,27 +352,56 @@ pub(crate) fn user_text_message(text: &str, timestamp: u64) -> Message {
 /// INVARIANT (cycle-safe): the walk stops at the first repeated id, so a
 /// corrupt `parentId` cycle yields a finite path instead of an endless walk
 /// (valid sessions are cycles-free: every entry parents an older one).
+///
+/// INVARIANT (broken-chain bridge, PIR-BIN-092): a `parentId` that is not in
+/// the index does NOT truncate the branch. The loader skips a line that fails
+/// deserialization (it stays in `unparsed_raw_lines` for verbatim rewrites),
+/// which leaves the NEXT surviving entry pointing at an id the index never
+/// saw; upstream pi stops there (`current = entry.parentId ? index.get(...) :
+/// undefined`), silently dropping every earlier row from the transcript and
+/// the model context. Here the walk joins across the hole to the nearest
+/// surviving NON-header entry BEFORE the orphan in file order — the row the
+/// skipped line itself was appended after (the session file is append-only,
+/// so file order IS chain order) — and keeps going, so one bad row can no
+/// longer erase the prefix. A `parentId: null` root still ends the chain
+/// (nothing is missing there), headers never join it, and the repeated-id
+/// guard above still bounds a corrupt bridge. This intentionally goes beyond
+/// upstream's own stop-at-the-hole behavior; the loader warns about every
+/// skipped line so the loss of that one row is never silent.
+///
+/// `bridge_missing_parents` gates that bridge: it must be OFF for a WINDOWED
+/// slice (a paged manager's resident tail), where a parent outside the slice
+/// means "the rest of the branch is on disk", not "a line was skipped". The
+/// windowed walk therefore stops at the window boundary — the documented
+/// [`SessionManager::branch_entries`] contract the prefix streamers
+/// (`fork_user_messages_streamed`, the paged consumers) depend on. A slice
+/// that starts at file line 0 with no skipped lines can never hit the arm.
 fn build_session_path_entries<'a, E: Borrow<FileEntry>>(
     entries: &'a [E],
     leaf_id: Option<&str>,
+    bridge_missing_parents: bool,
+    positions: Option<&EntryPositions>,
 ) -> Vec<&'a E> {
     let Some(leaf_id) = leaf_id else {
         return Vec::new();
     };
-    let mut index: std::collections::HashMap<&str, &E> =
-        std::collections::HashMap::with_capacity(entries.len());
-    for entry in entries {
-        if let Some(id) = entry.borrow().id() {
-            index.insert(id, entry);
-        }
-    }
-    let mut current: Option<&E> = index.get(leaf_id).copied();
+    // Positions travel with the entries: the broken-chain bridge below needs
+    // the FILE POSITION of the entry whose parent is missing (the row before
+    // it in file order is the one the skipped line was appended after). A
+    // caller that already holds the session manager's persistent
+    // [`EntryPositions`] (every per-prompt path) passes it here instead of
+    // rebuilding a throwaway index per walk.
+    let index = match positions {
+        Some(positions) => LeafPathIndex::Persistent(positions, entries),
+        None => LeafPathIndex::Borrowed(borrowed_positions(entries), entries),
+    };
+    let mut current: Option<(usize, &E)> = index.resolve(leaf_id);
     if current.is_none() {
         // Upstream session-manager.ts:400-404: a leaf id that is not in the
         // index (stale pointer after an external edit) falls back to the last
         // entry instead of yielding an empty path.
-        current = entries.iter().rev().find(|entry| {
-            let entry: &FileEntry = (*entry).borrow();
+        current = entries.iter().enumerate().rev().find(|(_, entry)| {
+            let entry: &FileEntry = (**entry).borrow();
             !entry.is_header()
         });
     }
@@ -316,7 +412,7 @@ fn build_session_path_entries<'a, E: Borrow<FileEntry>>(
     // the walk loop forever and hangs every projection/context build. Cycles
     // are dropped exactly like the tree builder below drops them.
     let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    while let Some(entry) = current {
+    while let Some((position, entry)) = current {
         let entry_ref: &FileEntry = entry.borrow();
         if let Some(id) = entry_ref.id() {
             if !visited.insert(id) {
@@ -324,10 +420,22 @@ fn build_session_path_entries<'a, E: Borrow<FileEntry>>(
             }
         }
         path.push(entry);
-        current = entry_ref
-            .parent_id()
-            .and_then(|parent| index.get(parent))
-            .copied();
+        current = match entry_ref.parent_id() {
+            // `parentId: null` is a root, not a hole: the chain ends here
+            // exactly like upstream.
+            None => None,
+            Some(parent) => match index.resolve(parent) {
+                Some(slot) => Some(slot),
+                // A parent id the index never saw: the line holding it was
+                // skipped (unparsable) and the walk joins across the hole
+                // instead of dropping the prefix (see the invariant above) —
+                // but only when the slice is the complete file. In a windowed
+                // slice the missing parent is the link into the streamed
+                // prefix, and bridging would silently widen the branch.
+                None if bridge_missing_parents => bridging_predecessor(position, entries),
+                None => None,
+            },
+        };
     }
     path.reverse();
     // PIR-SDK-024: a live-tail trim pins the newest compaction checkpoint in
@@ -342,7 +450,7 @@ fn build_session_path_entries<'a, E: Borrow<FileEntry>>(
         let first_entry: &FileEntry = (*first).borrow();
         let chain_broke = first_entry
             .parent_id()
-            .is_some_and(|parent| !index.contains_key(parent));
+            .is_some_and(|parent| !index.contains(parent));
         if chain_broke {
             let first_id = first_entry.id();
             let mut anchor = None;
@@ -363,18 +471,92 @@ fn build_session_path_entries<'a, E: Borrow<FileEntry>>(
     path
 }
 
+/// The entry an unlinkable `parentId` joins across (PIR-BIN-092): the nearest
+/// surviving NON-header entry BEFORE `position` in file order — the row the
+/// skipped line was appended after.
+///
+/// The session file is append-only and single-writer, so consecutive lines are
+/// the true parent relationship; the skipped line sat between `entries[..position]`'s
+/// last member and this entry. When no such predecessor exists (the orphan is
+/// the file's first entry, or only a header precedes it) the chain ends, which
+/// is exactly the old behavior for the window/file head. The file-streamed
+/// OpenAI body walk (`session_message_source::resolve_path`) mirrors this rule
+/// over its own scan index (one `predecessor_id` per entry), and a fixture
+/// test pins the two walks to the same messages.
+pub(crate) fn bridging_predecessor<E: Borrow<FileEntry>>(
+    position: usize,
+    entries: &[E],
+) -> Option<(usize, &E)> {
+    let mut slot = position.min(entries.len());
+    while slot > 0 {
+        slot -= 1;
+        let entry = &entries[slot];
+        let entry_ref: &FileEntry = entry.borrow();
+        // Headers carry no chain identity (`id()` is None) and never join the
+        // path (the header-transparency invariant above).
+        if entry_ref.is_header() {
+            continue;
+        }
+        return Some((slot, entry));
+    }
+    None
+}
+
 /// [`build_session_path_entries`] projected to `&FileEntry` — the public
 /// borrowed view callers that only need entry contents have always used.
+/// Missing parents are bridged (PIR-BIN-092): pass the whole file's entries.
 pub fn build_session_path<'a, E: Borrow<FileEntry>>(
     entries: &'a [E],
     leaf_id: Option<&str>,
 ) -> Vec<&'a FileEntry> {
-    build_session_path_entries(entries, leaf_id)
+    build_session_path_indexed(entries, leaf_id, true, None)
+}
+
+/// [`build_session_path`] over the session manager's persistent
+/// [`EntryPositions`]: the same walk with no per-call index build.
+/// `bridge_missing_parents` selects the file-wide PIR-BIN-092 bridge
+/// (`true`) or the windowed stop-at-boundary rule (`false`).
+pub(crate) fn build_session_path_indexed<'a, E: Borrow<FileEntry>>(
+    entries: &'a [E],
+    leaf_id: Option<&str>,
+    bridge_missing_parents: bool,
+    positions: Option<&EntryPositions>,
+) -> Vec<&'a FileEntry> {
+    build_session_path_entries(entries, leaf_id, bridge_missing_parents, positions)
         .into_iter()
         .map(|entry| {
             let entry: &FileEntry = (*entry).borrow();
             entry
         })
+        .collect()
+}
+
+/// [`build_session_path`] for a WINDOWED slice (a paged manager's resident
+/// tail): the walk stops where the parent leaves the slice instead of joining
+/// across it, exactly the pre-PIR-BIN-092 contract the prefix streamers rely
+/// on. Use this whenever `entries` may be a tail window.
+pub fn build_session_path_windowed<'a, E: Borrow<FileEntry>>(
+    entries: &'a [E],
+    leaf_id: Option<&str>,
+) -> Vec<&'a FileEntry> {
+    build_session_path_indexed(entries, leaf_id, false, None)
+}
+
+/// [`build_session_path`] keeping the caller's SHARED handles: the same walk
+/// (bridge rules included via `bridge_missing_parents`), but each path member
+/// stays an `Arc<FileEntry>` (one refcount bump) instead of being projected to
+/// `&FileEntry`. The branch-snapshot builder
+/// ([`SessionManager::branch_path_shared`]) uses this so it never clones an
+/// entry id.
+pub(crate) fn build_session_path_shared(
+    entries: &[Arc<FileEntry>],
+    leaf_id: Option<&str>,
+    bridge_missing_parents: bool,
+    positions: Option<&EntryPositions>,
+) -> Vec<Arc<FileEntry>> {
+    build_session_path_entries(entries, leaf_id, bridge_missing_parents, positions)
+        .into_iter()
+        .map(Arc::clone)
         .collect()
 }
 
@@ -458,7 +640,7 @@ fn context_entry_refs<'a, E: Borrow<FileEntry>>(path: &[&'a E]) -> Vec<&'a E> {
 /// as an owned list — the public shape, one clone per retained entry. Prefer
 /// [`build_session_projection`], which borrows through the same walk.
 pub fn build_context_entries(entries: &[FileEntry], leaf_id: Option<&str>) -> Vec<FileEntry> {
-    let path = build_session_path_entries(entries, leaf_id);
+    let path = build_session_path_entries(entries, leaf_id, true, None);
     context_entry_refs(&path).into_iter().cloned().collect()
 }
 
@@ -494,12 +676,13 @@ fn context_edit_for<'a>(
 fn retained_context<'a, E: Borrow<FileEntry>>(
     entries: &'a [E],
     leaf_id: Option<&str>,
+    positions: Option<&EntryPositions>,
 ) -> (
     Vec<&'a E>,
     Vec<&'a E>,
     Option<std::collections::HashMap<String, &'a ContextEditEntry>>,
 ) {
-    let path = build_session_path_entries(entries, leaf_id);
+    let path = build_session_path_entries(entries, leaf_id, true, positions);
     let context_entries = context_entry_refs(&path);
     let edits = context_edit_index(&context_entries);
     (path, context_entries, edits)
@@ -552,7 +735,17 @@ pub fn build_projection_entry_meta<E: SharedEntry>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> Vec<crate::compaction::ProjectionEntryMeta> {
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id);
+    build_projection_entry_meta_indexed(entries, leaf_id, None)
+}
+
+/// [`build_projection_entry_meta`] over the manager's persistent
+/// [`EntryPositions`] (the per-prompt compaction-metadata path).
+pub(crate) fn build_projection_entry_meta_indexed<E: SharedEntry>(
+    entries: &[E],
+    leaf_id: Option<&str>,
+    positions: Option<&EntryPositions>,
+) -> Vec<crate::compaction::ProjectionEntryMeta> {
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id, positions);
 
     let mut metas = Vec::with_capacity(context_entries.len());
     for (index, source_entry) in context_entries.iter().enumerate() {
@@ -656,7 +849,17 @@ pub fn build_session_projection<E: SharedEntry>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> SessionProjection {
-    let (path, context_entries, edits) = retained_context(entries, leaf_id);
+    build_session_projection_indexed(entries, leaf_id, None)
+}
+
+/// [`build_session_projection`] over the manager's persistent
+/// [`EntryPositions`] (the per-prompt projection build).
+pub(crate) fn build_session_projection_indexed<E: SharedEntry>(
+    entries: &[E],
+    leaf_id: Option<&str>,
+    positions: Option<&EntryPositions>,
+) -> SessionProjection {
+    let (path, context_entries, edits) = retained_context(entries, leaf_id, positions);
     let (thinking_level, model) = get_session_context_settings(&path);
 
     // One shared handle per retained entry (the source `Arc` when the walk
@@ -722,7 +925,17 @@ pub fn build_session_messages<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> Vec<Message> {
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id);
+    build_session_messages_indexed(entries, leaf_id, None)
+}
+
+/// [`build_session_messages`] over the manager's persistent [`EntryPositions`]
+/// (the whole-history readers' per-prompt rebuild).
+pub(crate) fn build_session_messages_indexed<E: Borrow<FileEntry>>(
+    entries: &[E],
+    leaf_id: Option<&str>,
+    positions: Option<&EntryPositions>,
+) -> Vec<Message> {
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id, positions);
     let message_capacity: usize = context_entries
         .iter()
         .enumerate()
@@ -852,6 +1065,7 @@ impl ProjectionEntryFragments {
 /// per structure change.
 pub fn build_projection_entry_fragments(
     projection: &SessionProjection,
+    js_face: bool,
 ) -> ProjectionEntryFragments {
     let fragments: Vec<Option<JsonValue>> = (0..projection.entries.len())
         .map(|index| ProjectionEntryFragments::build_fragment(projection, index).map(|(v, _)| v))
@@ -864,6 +1078,18 @@ pub fn build_projection_entry_fragments(
     };
     match set.flat_aggregate() {
         Some(aggregate) => {
+            // A native-only host (no JS `ctx.sessionManager`) reads the
+            // aggregate `entries` VALUE only: the aggregate text and the
+            // `{entries, messages}` projection object text have no reader
+            // and are not rendered/retained.
+            if !js_face {
+                return ProjectionEntryFragments {
+                    aggregate: Some(Arc::new(aggregate)),
+                    aggregate_text: None,
+                    projection_json: None,
+                    ..set
+                };
+            }
             let text = aggregate.to_string();
             let json = projection_object_text(projection, &set.fragments, Some(&text));
             ProjectionEntryFragments {
@@ -937,17 +1163,22 @@ pub fn extend_projection_entry_fragments(
     cached: ProjectionEntryFragments,
     projection: &SessionProjection,
     appended_from: usize,
+    js_face: bool,
 ) -> ProjectionEntryFragments {
     debug_assert!(cached.fragments.len() <= appended_from);
     // A shrink (branch/trim) reaches here only through the caller's guard;
     // guard again so a debug_assert-enabled release build cannot underflow.
     if cached.fragments.len() > appended_from {
-        return build_projection_entry_fragments(projection);
+        return build_projection_entry_fragments(projection, js_face);
     }
     // One `build_fragment` per appended entry: the value joins the cached
     // fragment slots AND its text feeds both text splices below. The +2
     // capacity headroom keeps the extended fragment vec at ONE allocation
     // (a single push append is the common delta).
+    // One `build_fragment` per appended entry: the value joins the cached
+    // fragment slots; its text (JS splice fuel only) is built when a JS face
+    // exists. A native-only host reads the aggregate `entries` VALUE, so the
+    // per-entry text is skipped outright.
     let mut appended: Vec<Option<(JsonValue, String)>> =
         Vec::with_capacity(projection.entries.len().saturating_sub(appended_from));
     for index in appended_from..projection.entries.len() {
@@ -955,12 +1186,14 @@ pub fn extend_projection_entry_fragments(
     }
     let appended_count = appended.iter().filter(|slot| slot.is_some()).count();
     let mut set = cached;
-    let mut new_texts: Vec<String> = Vec::with_capacity(appended.len());
+    let mut new_texts: Vec<String> = Vec::with_capacity(if js_face { appended.len() } else { 0 });
     let mut new_slots: Vec<Option<JsonValue>> = Vec::with_capacity(appended.len());
     for slot in appended {
         match slot {
             Some((value, text)) => {
-                new_texts.push(text);
+                if js_face {
+                    new_texts.push(text);
+                }
                 new_slots.push(Some(value));
             }
             None => new_slots.push(None),
@@ -989,6 +1222,15 @@ pub fn extend_projection_entry_fragments(
             }
         }
         if aggregate_ok {
+            if !js_face {
+                // No JS reader: keep the text slots cleared (a later JS-face
+                // push re-renders them from the cached fragments, the same
+                // fallback a set without a cached text already takes).
+                set.aggregate = Some(Arc::new(JsonValue::Array(items)));
+                set.aggregate_text = None;
+                set.projection_json = None;
+                return set;
+            }
             let text = match &set.aggregate_text {
                 // Splice: `[...cached items]` + `,` + the appended entries'
                 // MESSAGE texts (inside their fragment arrays — each fragment
@@ -1094,14 +1336,19 @@ pub fn extend_projection_entry_fragments(
         } else {
             match set.flat_aggregate() {
                 Some(aggregate) => {
-                    let text = aggregate.to_string();
-                    set.projection_json = Some(projection_object_text(
-                        projection,
-                        &set.fragments,
-                        Some(&text),
-                    ));
+                    if js_face {
+                        let text = aggregate.to_string();
+                        set.projection_json = Some(projection_object_text(
+                            projection,
+                            &set.fragments,
+                            Some(&text),
+                        ));
+                        set.aggregate_text = Some(text);
+                    } else {
+                        set.aggregate_text = None;
+                        set.projection_json = None;
+                    }
                     set.aggregate = Some(Arc::new(aggregate));
-                    set.aggregate_text = Some(text);
                 }
                 None => {
                     set.aggregate = None;
@@ -1131,7 +1378,7 @@ pub fn build_session_context_json<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> Vec<JsonValue> {
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id);
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id, None);
     // Exact output capacity: the message-count contract the projection and
     // its metadata twin share. One pass over entries already in cache, no
     // growth reallocations on a transcript-sized resident window.
@@ -1232,7 +1479,7 @@ pub fn current_system_message_from_entries<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> Option<StoredSystemMessage> {
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id);
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id, None);
 
     let mut system_messages: Vec<Message> = Vec::new();
     for (index, source_entry) in context_entries.iter().enumerate() {
@@ -1285,9 +1532,19 @@ pub fn last_assistant_text_from_entries<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> Option<String> {
+    last_assistant_text_from_entries_indexed(entries, leaf_id, None)
+}
+
+/// [`last_assistant_text_from_entries`] over the manager's persistent
+/// [`EntryPositions`] (the RPC state-poll path).
+pub(crate) fn last_assistant_text_from_entries_indexed<E: Borrow<FileEntry>>(
+    entries: &[E],
+    leaf_id: Option<&str>,
+    positions: Option<&EntryPositions>,
+) -> Option<String> {
     use crate::ai::types::StopReason;
 
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id);
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id, positions);
 
     for source_entry in context_entries.iter().rev() {
         let entry: &FileEntry = (*source_entry).borrow();
@@ -1370,6 +1627,7 @@ pub(crate) struct CachedSessionProjection {
 pub(crate) fn extend_cached_session_projection(
     entries: &[Arc<FileEntry>],
     leaf_id: Option<&str>,
+    positions: Option<&EntryPositions>,
     cached: CachedSessionProjection,
 ) -> Option<SessionProjection> {
     let CachedSessionProjection {
@@ -1380,7 +1638,7 @@ pub(crate) fn extend_cached_session_projection(
 
     // One leaf-path walk feeds both the append delta and the retained range —
     // the same selection a full build uses, without touching a single message.
-    let (path, context_entries, edits) = retained_context(entries, leaf_id);
+    let (path, context_entries, edits) = retained_context(entries, leaf_id, positions);
 
     let cached_path_index: Option<usize> = match (&cached_leaf_entry, &cached_leaf_id) {
         (Some(leaf_entry), Some(_)) => Some(
@@ -1494,8 +1752,9 @@ pub(crate) fn extend_cached_session_projection(
 pub(crate) fn projected_message_count_for_leaf(
     entries: &[Arc<FileEntry>],
     leaf_id: Option<&str>,
+    positions: Option<&EntryPositions>,
 ) -> usize {
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id);
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id, positions);
     context_entries
         .iter()
         .enumerate()
@@ -1518,8 +1777,9 @@ pub(crate) fn path_delta_is_append_only(
     entries: &[Arc<FileEntry>],
     from_leaf: Option<&str>,
     to_leaf: Option<&str>,
+    positions: Option<&EntryPositions>,
 ) -> bool {
-    let path = build_session_path_entries(entries, to_leaf);
+    let path = build_session_path_entries(entries, to_leaf, true, positions);
     let start = match from_leaf {
         None => 0,
         Some(from) => match path.iter().position(|entry| {
@@ -1554,6 +1814,7 @@ impl SessionManager {
             if let Some(projection) = extend_cached_session_projection(
                 &self.file_entries,
                 self.leaf_id.as_deref(),
+                Some(&self.entry_positions),
                 cached,
             ) {
                 return (projection, true);
@@ -1561,7 +1822,11 @@ impl SessionManager {
         }
         self.projection_builds.fetch_add(1, Ordering::Relaxed);
         (
-            build_session_projection(&self.file_entries, self.leaf_id.as_deref()),
+            build_session_projection_indexed(
+                &self.file_entries,
+                self.leaf_id.as_deref(),
+                Some(&self.entry_positions),
+            ),
             false,
         )
     }

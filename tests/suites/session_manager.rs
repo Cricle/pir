@@ -15,7 +15,7 @@ use pir::ai::types::{
 };
 use pir::session_manager::{
     AppendFailure, CompactionEntry, ContextEditEntry, FileEntry, LabelEntry, MessageEntry,
-    SessionHeader, SessionInfoEntry, SessionManager, StoredMessage, UsageEntry,
+    SessionHeader, SessionInfoEntry, SessionManager, SessionSummary, StoredMessage, UsageEntry,
     CURRENT_SESSION_VERSION,
 };
 
@@ -194,8 +194,13 @@ fn golden_record_serialization_matches_upstream_shapes() {
     assert_eq!(usage_entry["usage"]["totalTokens"], 12);
     assert_eq!(usage_entry["note"], "warmed");
 
-    // compaction entry: firstKeptEntryId always a string; optional fields
-    // (details/usage/fromHook) omitted when absent.
+    // compaction entry: firstKeptEntryId always a string; `details`/`usage`
+    // stay optional, while `fromHook` is always present on a row this project
+    // writes — pi passes the resolved `fromExtension` boolean at both
+    // `appendCompaction` call sites (agent-session.ts:2911/3237) and its own
+    // files carry the explicit `false` (fixture
+    // `.play/evidence/s10-session-crosscompat/sessions/CB-pi-compacted.jsonl`
+    // rows 8/10).
     let compaction_entry = &lines[6];
     assert_eq!(compaction_entry["type"], "compaction");
     assert_eq!(compaction_entry["id"], compaction_id.as_str());
@@ -204,7 +209,7 @@ fn golden_record_serialization_matches_upstream_shapes() {
     assert_eq!(compaction_entry["tokensBefore"], 1234);
     assert!(compaction_entry.get("details").is_none());
     assert!(compaction_entry.get("usage").is_none());
-    assert!(compaction_entry.get("fromHook").is_none());
+    assert_eq!(compaction_entry["fromHook"], serde_json::json!(false));
     assert!(compaction_entry.get("systemMessage").is_none());
 
     // custom entry: customType/data precede id/parentId/timestamp.
@@ -1406,14 +1411,22 @@ fn append_compaction_round_trips_usage_and_from_hook() {
         .iter()
         .find(|line| line["id"] == pi_id.as_str())
         .unwrap();
-    // pi-generated compactions omit fromHook on the wire (upstream parity).
-    assert!(pi_line.get("fromHook").is_none());
+    // pi records the flag for EVERY compaction: its only `appendCompaction`
+    // call sites pass the resolved `fromExtension` boolean
+    // (agent-session.ts:2911/3237), and a real pi-written file carries
+    // `"fromHook": false` on pi-generated rows (fixture
+    // `.play/evidence/s10-session-crosscompat/sessions/CB-pi-compacted.jsonl`
+    // rows 8/10). `None` now means "written by an older/foreign writer".
+    assert_eq!(pi_line["fromHook"], serde_json::json!(false));
     assert!(pi_line.get("usage").is_none());
     let plain_line = &lines
         .iter()
         .find(|line| line["id"] == plain_id.as_str())
         .unwrap();
-    assert!(plain_line.get("fromHook").is_none());
+    // The legacy wrapper (`append_compaction`) resolves `fromHook: false` too:
+    // every row a pi-written file carries names the flag explicitly (same
+    // fixtures as above), and only `usage` stays optional here.
+    assert_eq!(plain_line["fromHook"], serde_json::json!(false));
     assert!(plain_line.get("usage").is_none());
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -3359,5 +3372,734 @@ fn session_entry_element_sizes_stay_small() {
     assert!(
         stored <= 440,
         "StoredMessage grew to {stored} B; box the dominant variant payload"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-092: one unparsable row must not erase the branch prefix
+// ---------------------------------------------------------------------------
+//
+// A line that fails `FileEntry` deserialization is skipped by the loader (and
+// preserved verbatim for rewrites). Before the fix, the NEXT surviving row's
+// `parentId` named an id the index never saw, so the leaf->root walk stopped
+// there: every earlier row silently disappeared from the TUI transcript AND
+// from the model context. Upstream pi loads such a row at all (`JSON.parse` +
+// a type cast: a missing `isError` is `undefined`, i.e. falsy), and the
+// broken-chain bridge keeps the prefix for rows that genuinely cannot be
+// parsed.
+
+/// The app-written 4-row session the PIR-BIN-092 shapes start from: user,
+/// assistant tool call, tool result (`isError: false`), assistant reply. Every
+/// row goes through `append_message`, so the tests damage bytes the app itself
+/// wrote.
+struct CycleSession {
+    path: PathBuf,
+    lines: Vec<String>,
+    user_id: String,
+    call_id: String,
+    result_id: String,
+    reply_id: String,
+}
+
+impl CycleSession {
+    fn build(dir: &Path, with_reply: bool) -> Self {
+        let mut session = SessionManager::create("C:/repo", dir).unwrap();
+        let user_id = session.append_message(user_message("user one")).unwrap();
+        let call_id = session
+            .append_message(Message::Assistant(AssistantMessage {
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call-1".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: std::collections::BTreeMap::new(),
+                    thought_signature: None,
+                    namespace: None,
+                    arguments_error: None,
+                })],
+                stop_reason: StopReason::ToolUse,
+                timestamp: 2,
+                ..Default::default()
+            }))
+            .unwrap();
+        let result_id = session
+            .append_message(Message::ToolResult(ToolResultMessage {
+                role: ToolResultRole::ToolResult,
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "read".to_owned(),
+                content: vec![ContentBlock::Text(TextContent {
+                    text: "tool body".to_owned(),
+                    text_signature: None,
+                })],
+                details: None,
+                usage: None,
+                added_tool_names: Vec::new(),
+                structured_content: None,
+                nested_calls: None,
+                is_error: false,
+                duration_ms: None,
+                timestamp: 2,
+            }))
+            .unwrap();
+        let reply_id = if with_reply {
+            session
+                .append_message(assistant_message("final reply", StopReason::Stop))
+                .unwrap()
+        } else {
+            String::new()
+        };
+        let path = session.path().to_path_buf();
+        drop(session);
+        let lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        Self {
+            path,
+            lines,
+            user_id,
+            call_id,
+            result_id,
+            reply_id,
+        }
+    }
+
+    fn line(&self, id: &str) -> &str {
+        let needle = format!("\"id\":\"{id}\"");
+        self.lines
+            .iter()
+            .find(|line| line.contains(&needle))
+            .map(String::as_str)
+            .unwrap_or_else(|| panic!("no line carries {needle}"))
+    }
+
+    fn write_lines(&self, lines: &[&str]) {
+        std::fs::write(&self.path, format!("{}\n", lines.join("\n"))).unwrap();
+    }
+
+    /// Drop `"isError":false` from the tool-result row — the exact corruption
+    /// the issue reports (a row that lost one field).
+    fn damage_is_error(&self) {
+        let text = std::fs::read_to_string(&self.path).unwrap();
+        assert!(
+            text.contains("\"isError\":false"),
+            "the app writer always emits isError"
+        );
+        let damaged = text.replace("\"isError\":false,", "");
+        assert_ne!(damaged, text, "the row must actually lose the field");
+        std::fs::write(&self.path, damaged).unwrap();
+    }
+}
+
+/// Readable text of any projected conversation message (tool results and
+/// tool-call-only assistant rows included).
+fn projected_text(message: &Message) -> String {
+    let content = match message {
+        Message::User(inner) => &inner.content,
+        Message::Assistant(inner) => &inner.content,
+        Message::ToolResult(inner) => &inner.content,
+        _ => return String::new(),
+    };
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn projected_texts(messages: &[Message]) -> Vec<String> {
+    messages.iter().map(projected_text).collect()
+}
+
+fn stored_tool_error(entry: &FileEntry) -> Option<bool> {
+    match entry {
+        FileEntry::Message(inner) => match &inner.message {
+            StoredMessage::ToolResult(result) => Some(result.is_error),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Shape 2 (the issue's fixture): the damaged row sits in the MIDDLE. Before
+/// the fix the leaf->root walk stopped at its missing `parentId` and the whole
+/// prefix vanished from `build_context_entries` (the TUI replay and the model
+/// context both ride this projection).
+#[test]
+fn a_row_that_lost_is_error_keeps_the_whole_earlier_history() {
+    let dir = guard_temp_dir("p14-lost-is-error-middle");
+    let cycle = CycleSession::build(&dir.0, true);
+    cycle.damage_is_error();
+
+    let reopened = SessionManager::open(&cycle.path).unwrap();
+    let entries = reopened.entries();
+    assert_eq!(
+        entries.len(),
+        4,
+        "every row stays resident; the damaged one loads with isError = false \
+         (upstream reads it as `undefined`, i.e. falsy)"
+    );
+    assert_eq!(
+        stored_tool_error(
+            entries
+                .iter()
+                .find(|entry| entry.entry_id() == cycle.result_id)
+                .expect("tool-result row is resident")
+        ),
+        Some(false),
+    );
+    assert_eq!(
+        reopened.leaf_id(),
+        Some(cycle.reply_id.as_str()),
+        "the leaf is still the last row"
+    );
+    let context = reopened.build_context_entries().unwrap();
+    assert_eq!(
+        projected_texts(&context),
+        vec!["user one", "", "tool body", "final reply"],
+        "no row before the damaged one may disappear"
+    );
+    // The public whole-history read (the TUI replay source) uses the same walk.
+    assert_eq!(
+        projected_texts(&reopened.build_session_messages()),
+        projected_texts(&context)
+    );
+}
+
+/// Shape 1: the damaged row is the file's LAST row. The prefix must survive
+/// AND the row itself must stay resident (before the fix the projection ended
+/// at the assistant tool call, so the model saw a synthetic "No result
+/// provided" tool answer instead of the stored tool body).
+#[test]
+fn a_damaged_row_at_the_tail_keeps_the_row_and_the_earlier_history() {
+    let dir = guard_temp_dir("p14-lost-is-error-tail");
+    let cycle = CycleSession::build(&dir.0, false);
+    cycle.damage_is_error();
+
+    let reopened = SessionManager::open(&cycle.path).unwrap();
+    let entries = reopened.entries();
+    assert_eq!(entries.len(), 3);
+    let leaf = entries.last().expect("a leaf");
+    assert!(
+        matches!(
+            leaf,
+            FileEntry::Message(inner) if matches!(inner.message, StoredMessage::ToolResult(_))
+        ),
+        "the damaged tail row is the leaf again"
+    );
+    assert_eq!(reopened.leaf_id(), Some(leaf.entry_id()));
+    assert_eq!(
+        projected_texts(&reopened.build_context_entries().unwrap()),
+        vec!["user one", "", "tool body"]
+    );
+}
+
+/// Shape 3: the damaged row is the ONLY row. It must still be the session's
+/// single message (upstream keeps it; pir used to project an empty transcript).
+#[test]
+fn a_damaged_row_that_is_the_only_row_is_kept() {
+    let dir = guard_temp_dir("p14-lost-is-error-only");
+    let cycle = CycleSession::build(&dir.0, false);
+    cycle.damage_is_error();
+    // Header + the tool-result row alone; its parentId is reparented to the
+    // root so the fixture is a self-contained one-row session.
+    let result_line = cycle.line(&cycle.result_id).replace(
+        &format!("\"parentId\":\"{}\"", cycle.call_id),
+        "\"parentId\":null",
+    );
+    cycle.write_lines(&[&cycle.lines[0], &result_line]);
+
+    let reopened = SessionManager::open(&cycle.path).unwrap();
+    let entries = reopened.entries();
+    assert_eq!(entries.len(), 1, "the only row stays resident");
+    assert_eq!(reopened.leaf_id(), Some(entries[0].entry_id()));
+    assert_eq!(
+        projected_texts(&reopened.build_context_entries().unwrap()),
+        vec!["tool body"]
+    );
+}
+
+/// Shape 4: a corrupt HEADER line. The file is not a session (upstream drops
+/// the whole file and starts a fresh session; pir refuses loudly), and the
+/// refusal must not modify the bytes.
+#[test]
+fn an_unparsable_header_refuses_the_file_without_touching_it() {
+    let dir = guard_temp_dir("p14-bad-header");
+    let cycle = CycleSession::build(&dir.0, true);
+    let truncated = &cycle.lines[0][..cycle.lines[0].len() / 2];
+    let damaged: Vec<String> = std::iter::once(truncated.to_owned())
+        .chain(cycle.lines[1..].iter().cloned())
+        .collect();
+    let damaged_text = format!("{}\n", damaged.join("\n"));
+    std::fs::write(&cycle.path, &damaged_text).unwrap();
+
+    let error = SessionManager::open(&cycle.path).unwrap_err();
+    assert!(
+        error.to_string().contains("not a valid pi session"),
+        "the refusal must name the problem: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cycle.path).unwrap(),
+        damaged_text,
+        "a refused file is never rewritten"
+    );
+}
+
+/// Shape 5: a genuinely truncated FINAL line (no trailing newline). Whatever
+/// parsed is kept, the missing newline is repaired once, and the torn text
+/// stays in the file.
+#[test]
+fn a_truncated_final_line_keeps_what_parsed_and_is_repaired_once() {
+    let dir = guard_temp_dir("p14-truncated-tail");
+    let cycle = CycleSession::build(&dir.0, true);
+    let result_line = cycle.line(&cycle.result_id);
+    let torn = format!(
+        "{}\n{}\n{}\n{}",
+        cycle.lines[0],
+        cycle.line(&cycle.user_id),
+        cycle.line(&cycle.call_id),
+        &result_line[..result_line.len() / 2]
+    );
+    std::fs::write(&cycle.path, &torn).unwrap();
+
+    let reopened = SessionManager::open(&cycle.path).unwrap();
+    assert_eq!(reopened.entries().len(), 2, "header + two parsed rows");
+    assert_eq!(
+        projected_texts(&reopened.build_context_entries().unwrap()),
+        vec!["user one", ""]
+    );
+    let repaired = std::fs::read_to_string(&cycle.path).unwrap();
+    assert!(
+        repaired.ends_with('\n'),
+        "the torn tail is newline-repaired"
+    );
+    assert!(
+        repaired.contains(&result_line[..result_line.len() / 2]),
+        "the torn text itself is preserved verbatim"
+    );
+    // The repair happens once: a second open sees the same two rows.
+    let again = SessionManager::open(&cycle.path).unwrap();
+    assert_eq!(again.entries().len(), 2);
+}
+
+/// Shape 6 (control, beyond upstream): the middle row is not JSON at all, so
+/// nothing about it is recoverable. Upstream silently truncates the branch
+/// here; pir joins the prefix across the hole (the nearest surviving row
+/// before the orphan is the row the skipped line was appended after) and the
+/// loader warns. The one row that is gone stays gone — only rows that parsed
+/// are ever projected.
+#[test]
+fn a_json_broken_middle_row_joins_the_prefix_through_surviving_rows() {
+    let dir = guard_temp_dir("p14-json-broken-middle");
+    let cycle = CycleSession::build(&dir.0, true);
+    let broken_row = format!(
+        "{{\"type\":\"message\",\"id\":\"{}\",\"parentId\":\"{}\" \"message\":{{",
+        cycle.result_id, cycle.call_id
+    );
+    cycle.write_lines(&[
+        &cycle.lines[0],
+        cycle.line(&cycle.user_id),
+        cycle.line(&cycle.call_id),
+        &broken_row,
+        cycle.line(&cycle.reply_id),
+    ]);
+
+    let reopened = SessionManager::open(&cycle.path).unwrap();
+    let entries = reopened.entries();
+    assert_eq!(entries.len(), 3, "the unparsable row is skipped");
+    assert_eq!(
+        reopened.leaf_id(),
+        Some(cycle.reply_id.as_str()),
+        "the walk reaches the last row"
+    );
+    assert_eq!(
+        projected_texts(&reopened.build_context_entries().unwrap()),
+        vec!["user one", "", "final reply"],
+        "the prefix is joined through the skipped row, not dropped"
+    );
+}
+
+/// The file-streamed OpenAI body walk (`SessionMessageSource`, the print widen
+/// fallback) mirrors the resident walk; a damaged row must produce the same
+/// messages through both.
+#[test]
+fn the_file_streamed_walk_matches_the_resident_walk_across_a_damaged_row() {
+    use pir::ai::types::MessageSource;
+
+    let dir = guard_temp_dir("p14-streamed-parity");
+    let cycle = CycleSession::build(&dir.0, true);
+    cycle.damage_is_error();
+
+    let manager = SessionManager::open(&cycle.path).unwrap();
+    let resident = manager.build_session_messages();
+    let source =
+        pir::ai::api::openai::SessionMessageSource::build_from_file(&cycle.path, manager.leaf_id())
+            .unwrap();
+    let streamed: Vec<Message> = source
+        .messages()
+        .map(|message| message.expect("no read error").message().clone())
+        .collect();
+    assert_eq!(projected_texts(&streamed), projected_texts(&resident));
+    assert_eq!(
+        projected_texts(&streamed),
+        vec!["user one", "", "tool body", "final reply"]
+    );
+}
+
+/// PIR-BIN-093 regression: a 2000-file directory must list with the exact
+/// sequential contract — same set, same modified-descending order (mtime ties
+/// keep the path-descending candidate order), same header fields — through the
+/// bounded worker pool, inside a wall-clock budget, and with the same
+/// per-file progress contract (one call per candidate, `loaded` counting
+/// 1..=total, partial publishes only at the first / every
+/// `SESSION_LIST_PUBLISH_INTERVAL` / last file).
+#[test]
+fn list_sessions_scales_to_2000_files_with_stable_order_and_a_budget() {
+    use std::io::Write as _;
+
+    const COUNT: usize = 2000;
+    // Headerless garbage: opened once, skipped, never listed.
+    const SKIPPED: [usize; 2] = [3, 1005];
+    let dir = temp_dir("listing-2000");
+    let base = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    for index in 0..COUNT {
+        // The FILE NAME descends with the index (`row-01999` … `row-00001`)
+        // while the MTIME ascends by bucket, so mtime order, name order and id
+        // order all disagree; seven files share one mtime bucket.
+        let path = dir.join(format!("row-{:05}.jsonl", COUNT - index));
+        let mut content = String::new();
+        if SKIPPED.contains(&index) {
+            content.push_str("not json at all\n");
+        } else {
+            content.push_str(
+                &serde_json::json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": format!("20000000-0000-4000-8000-{index:012}"),
+                    "timestamp": "2026-02-01T00:00:00.000Z",
+                    "cwd": "C:\\proj",
+                })
+                .to_string(),
+            );
+            content.push('\n');
+            content.push_str(
+                &serde_json::json!({
+                    "type": "message",
+                    "id": format!("m{index:05}"),
+                    "parentId": serde_json::Value::Null,
+                    "timestamp": "2026-02-01T00:00:00.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": format!("scale {index:04}")}],
+                        "timestamp": 0,
+                    },
+                })
+                .to_string(),
+            );
+            content.push('\n');
+        }
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.flush().unwrap();
+        let modified = base + Duration::from_secs((index / 7) as u64);
+        file.set_modified(modified).unwrap();
+    }
+
+    // Ground truth: mtime buckets descend; each 7-way tie keeps the
+    // path-descending candidate order, i.e. ascending index inside a bucket.
+    let mut expected: Vec<usize> = Vec::new();
+    for bucket in (0..=((COUNT - 1) / 7)).rev() {
+        for index in (bucket * 7)..=(bucket * 7 + 6).min(COUNT - 1) {
+            if !SKIPPED.contains(&index) {
+                expected.push(index);
+            }
+        }
+    }
+    let expected_ids: Vec<String> = expected
+        .iter()
+        .map(|index| format!("20000000-0000-4000-8000-{index:012}"))
+        .collect();
+
+    // Warm-up listing: the first read of freshly written files pays the
+    // OS/AV first-read cost, which is not the listing's own throughput.
+    assert_eq!(
+        SessionManager::list_sessions(&dir, None).len(),
+        COUNT - SKIPPED.len()
+    );
+
+    let started = std::time::Instant::now();
+    let listed = SessionManager::list_sessions(&dir, None);
+    let elapsed = started.elapsed();
+    let ids: Vec<String> = listed.iter().map(|session| session.id.clone()).collect();
+    assert_eq!(
+        ids, expected_ids,
+        "the 2000-file listing must keep the sequential modified-desc order (path-desc ties)"
+    );
+    let newest = &listed[0];
+    assert_eq!(newest.cwd, "C:\\proj");
+    assert_eq!(newest.message_count, 1);
+    assert_eq!(newest.first_message, format!("scale {:04}", expected[0]));
+    assert!(newest.name.is_none());
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "listing 2000 sessions took {elapsed:?} (budget 5s, warm directory)"
+    );
+
+    let mut progress_calls = 0usize;
+    let mut progress_partials: Vec<usize> = Vec::new();
+    let mut last_partial_len = None;
+    let mut last_partial_sorted = true;
+    let mut progress = |loaded: usize, total: usize, partial: Option<&[SessionSummary]>| {
+        progress_calls += 1;
+        assert_eq!(total, COUNT, "the candidate total is known up front");
+        assert_eq!(
+            loaded, progress_calls,
+            "loaded counts completed files 1..=total"
+        );
+        if let Some(sessions) = partial {
+            progress_partials.push(loaded);
+            last_partial_len = Some(sessions.len());
+            last_partial_sorted = sessions
+                .windows(2)
+                .all(|window| window[0].modified >= window[1].modified);
+        }
+    };
+    let outcome = SessionManager::list_sessions_cancellable(&dir, None, Some(&mut progress), None);
+    drop(progress);
+    assert!(!outcome.cancelled);
+    assert_eq!(progress_calls, COUNT, "every candidate is reported");
+    assert_eq!(progress_partials.first(), Some(&1));
+    assert_eq!(progress_partials.last(), Some(&COUNT));
+    assert!(
+        progress_partials.iter().all(|loaded| *loaded == 1
+            || loaded % pir::session_manager::SESSION_LIST_PUBLISH_INTERVAL == 0
+            || *loaded == COUNT),
+        "partial publishes only at the upstream points: {progress_partials:?}"
+    );
+    assert_eq!(
+        last_partial_len,
+        Some(COUNT - SKIPPED.len()),
+        "the last publish carries every listed session"
+    );
+    assert!(last_partial_sorted, "partial lists are activity-sorted");
+    let outcome_ids: Vec<String> = outcome
+        .sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect();
+    assert_eq!(outcome_ids, expected_ids);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Skipped-line warning bounds (PIR-BIN-092): the loader names at most
+// `UNPARSED_LINE_WARN_LIMIT` (5) skipped lines individually with their 1-based
+// physical line number and a preview, collapses any remainder into one summary
+// carrying the exact total, and caps every preview at 160 characters + "...".
+// ---------------------------------------------------------------------------
+
+/// A valid v3 session header. Its only parsed entry makes the loader accept the
+/// fixture as a real session, which is the condition for the per-line skip
+/// warnings to fire (a non-session file is refused with its own error instead).
+const WARN_HEADER: &str = "{\"type\":\"session\",\"version\":3,\"id\":\"aaaabbbb-1111-2222-3333-444455556666\",\"timestamp\":\"2025-01-01T00:00:00.000Z\",\"cwd\":\"C:/repo\"}";
+
+/// Write a header (physical line 1) followed by one hand-written line per
+/// entry; `SessionManager::open` then sees each non-blank unparsable row as a
+/// skipped line at physical lines `2..=lines.len() + 1`.
+fn write_skipped_line_session(path: &Path, lines: &[String]) {
+    let mut content = String::from(WARN_HEADER);
+    content.push('\n');
+    for line in lines {
+        content.push_str(line);
+        content.push('\n');
+    }
+    std::fs::write(path, content).unwrap();
+}
+
+/// Run `body` (which writes and opens one fixture at the handed path) with a
+/// thread-local tracing subscriber that captures the loader's warnings into a
+/// file. Thread-local (`with_default`) keeps this out of every other test in
+/// the merged `g_agent` binary; the caller filters the log by its fixture name
+/// so parallel captures cannot bleed into each other.
+fn capture_open_warnings(file_name: &str, body: impl FnOnce(&Path)) -> String {
+    let dir = temp_dir("warn-bounds-capture");
+    let session_path = dir.join(file_name);
+    let log_path = dir.join("warnings.log");
+    let log_file = std::fs::File::create(&log_path).unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(std::sync::Arc::new(log_file))
+        .finish();
+    tracing::subscriber::with_default(subscriber, || body(&session_path));
+    let captured = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    captured
+}
+
+/// Every captured log line naming this fixture (the warning text embeds the
+/// session path, so the fixture file name is the unique correlation key).
+fn warnings_for<'a>(log: &'a str, file_name: &str) -> Vec<&'a str> {
+    log.lines()
+        .filter(|line| line.contains(file_name))
+        .collect()
+}
+
+fn named_skip_warnings<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+    lines
+        .iter()
+        .copied()
+        .filter(|line| line.contains("skipping undeserializable line"))
+        .collect()
+}
+
+/// Exactly the limit's worth of skipped rows: every one is named individually
+/// with its 1-based line number and a preview, and no summary line appears (the
+/// boundary is inclusive: `>` the limit collapses, `==` does not).
+#[test]
+fn warn_unparsed_lines_names_each_skipped_row_up_to_the_limit() {
+    const FILE: &str = "warn-at-limit.jsonl";
+    const ROWS: [(&str, usize); 5] = [
+        ("not json one", 2),
+        ("{\"broken\": two", 3),
+        ("still not json three", 4),
+        ("not json four", 5),
+        ("{\"also\": broken", 6),
+    ];
+    let log = capture_open_warnings(FILE, |path| {
+        let lines: Vec<String> = ROWS.iter().map(|(raw, _)| (*raw).to_owned()).collect();
+        write_skipped_line_session(path, &lines);
+        let manager = SessionManager::open(path).unwrap();
+        assert!(
+            manager.entries().is_empty(),
+            "only the header parses; every fixture row is skipped"
+        );
+    });
+
+    let lines = warnings_for(&log, FILE);
+    let named = named_skip_warnings(&lines);
+    assert_eq!(
+        named.len(),
+        ROWS.len(),
+        "each skipped row below the limit is named exactly once: {lines:?}"
+    );
+    for (raw, line_number) in ROWS {
+        let needle = format!("skipping undeserializable line {line_number} (");
+        let row = *named
+            .iter()
+            .find(|line| line.contains(&needle))
+            .unwrap_or_else(|| panic!("no warning names physical line {line_number}: {named:?}"));
+        assert!(
+            row.contains(raw),
+            "the line {line_number} warning previews its raw text: {row}"
+        );
+    }
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("undeserializable line(s) in total")),
+        "a load at the limit has no remainder to summarize: {lines:?}"
+    );
+}
+
+/// Beyond the limit: the first five skipped rows are named individually, the
+/// remainder is not, and exactly one summary line carries the exact total and
+/// the earliest skipped line number.
+#[test]
+fn warn_unparsed_lines_beyond_the_limit_collapses_to_one_summary_with_the_total() {
+    const FILE: &str = "warn-over-limit.jsonl";
+    const SKIPPED: usize = 8;
+    let log = capture_open_warnings(FILE, |path| {
+        let lines: Vec<String> = (1..=SKIPPED)
+            .map(|row| format!("not json row {row}"))
+            .collect();
+        write_skipped_line_session(path, &lines);
+        let _ = SessionManager::open(path).unwrap();
+    });
+
+    let lines = warnings_for(&log, FILE);
+    let named = named_skip_warnings(&lines);
+    assert_eq!(
+        named.len(),
+        5,
+        "only the first 5 skipped rows are named individually: {named:?}"
+    );
+    // Physical lines 2..=6 are the first five skipped rows (line 1 is the header).
+    for line_number in 2..=6 {
+        let needle = format!("skipping undeserializable line {line_number} (");
+        assert!(
+            named.iter().any(|line| line.contains(&needle)),
+            "physical line {line_number} must be named: {named:?}"
+        );
+    }
+    for line_number in 7..=9 {
+        let needle = format!("skipping undeserializable line {line_number} (");
+        assert!(
+            !named.iter().any(|line| line.contains(&needle)),
+            "physical line {line_number} must be collapsed, not named: {named:?}"
+        );
+    }
+
+    let summaries: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| line.contains("undeserializable line(s) in total"))
+        .collect();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "the remainder collapses into exactly one summary line: {lines:?}"
+    );
+    let summary = summaries[0];
+    assert!(
+        summary.contains(&format!("{SKIPPED} undeserializable line(s) in total")),
+        "the summary carries the exact total: {summary}"
+    );
+    assert!(
+        summary.contains("the first 5 are listed above"),
+        "the summary states the naming bound: {summary}"
+    );
+    assert!(
+        summary.contains("the earliest is line 2"),
+        "the summary names the earliest skipped line: {summary}"
+    );
+}
+
+/// A very long skipped line is previewed with exactly 160 characters followed
+/// by the three-dot suffix, so its raw tail never reaches the log.
+#[test]
+fn warn_unparsed_line_preview_is_capped_and_ellipsized() {
+    const FILE: &str = "warn-preview-cap.jsonl";
+    let long_raw = format!("{{not-json:{}", "x".repeat(400));
+    let log = capture_open_warnings(FILE, |path| {
+        write_skipped_line_session(path, std::slice::from_ref(&long_raw));
+        let _ = SessionManager::open(path).unwrap();
+    });
+
+    let lines = warnings_for(&log, FILE);
+    let named = named_skip_warnings(&lines);
+    assert_eq!(
+        named.len(),
+        1,
+        "one long skipped row yields one named warning: {lines:?}"
+    );
+    let warning = named[0];
+    assert!(
+        warning.ends_with("..."),
+        "the capped preview ends with an ellipsis: {warning}"
+    );
+    let preview = warning
+        .rsplit("): ")
+        .next()
+        .expect("the warning carries a preview");
+    assert_eq!(
+        preview.chars().count(),
+        160 + 3,
+        "160 preview characters plus the 3-dot suffix: {preview:?}"
+    );
+    assert!(
+        !warning.contains(&"x".repeat(161)),
+        "the raw tail beyond the cap must not leak into the log: {warning}"
     );
 }

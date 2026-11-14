@@ -660,3 +660,90 @@ fn recorded_parse_errors_and_typed_defaults_are_the_only_signal() {
         "{diagnostics:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-098: a malformed models.json degrades instead of aborting
+// ---------------------------------------------------------------------------
+
+/// Before the fix every surface exited 1 with
+/// `Error: Failed to parse models.json: …` (mislabeled a moment earlier as an
+/// "authentication failure") and the intact built-in catalog was discarded.
+/// pi's `ModelConfig.load` keeps the empty models.json layer plus the error
+/// text as a warning: `--list-models` exits 0 and still lists the catalog
+/// (`cli/list-models.ts` `Warning: errors loading models.json:`), and a print
+/// run reaches ordinary model resolution. This arm drives the real binary
+/// across all three surfaces of the issue.
+#[test]
+fn malformed_models_json_degrades_to_the_catalog_and_warns() {
+    let home = Hermetic::new("models-json-malformed");
+    home.write_auth();
+    let models_path = home.agent_dir().join("models.json");
+    std::fs::write(&models_path, "{ \"providers\": { oops\n").expect("write malformed models.json");
+
+    // 1. `--list-models`: pi's contract — exit 0, warning on stderr naming the
+    //    parse failure and the resolved file, catalog still on stdout.
+    let output = run_pir(&home, &["--list-models"]);
+    let stdout = stdout_of(&output);
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a models.json typo must not abort --list-models: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("Warning: errors loading models.json:\nFailed to parse models.json:"),
+        "the pi warning must name the parse failure: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(&format!("File: {}", models_path.display())),
+        "the warning must name the resolved file: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("Error: Failed to parse models.json")
+            && !stderr.contains("authentication failure"),
+        "the file failure must stay a warning: {stderr:?}"
+    );
+    assert!(
+        stdout.lines().count() > 1000,
+        "the built-in catalog must still be listed ({} lines)",
+        stdout.lines().count()
+    );
+
+    // 2. `pir models`: exit 0, same warning, the ordinary empty-config state
+    //    (the degraded layer contributes no provider).
+    let output = run_pir(&home, &["models"]);
+    let stdout = stdout_of(&output);
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a models.json typo must not abort `models`: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("Warning: errors loading models.json:"),
+        "{stderr:?}"
+    );
+    assert!(
+        stdout.contains("No models configured"),
+        "the degraded layer contributes no provider: {stdout:?}"
+    );
+
+    // 3. A print run proceeds past the provider load: the remaining failure is
+    //    the ordinary no-credential resolution (this harness has none), never
+    //    the models.json parse abort.
+    let output = run_pir(&home, &["-p", "hi", "--mode", "text", "--no-session"]);
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("Warning: errors loading models.json:"),
+        "the print host must report the degraded file too: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("Error: Failed to parse models.json")
+            && !stderr.contains("authentication failure"),
+        "{stderr:?}"
+    );
+    assert!(
+        stderr.contains("no model available"),
+        "the run must reach ordinary model resolution: {stderr:?}"
+    );
+}

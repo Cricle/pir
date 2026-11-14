@@ -1,7 +1,8 @@
 # Adding models
 
-pir resolves models through (in order): `--provider/--model`, `--models` patterns, settings
-`defaultProvider`/`defaultModel`, and the built-in catalog (`src/ai/providers/catalog/*.json`, 42 providers).
+pir resolves models through (in order): `--provider/--model`, `--models` patterns (or the settings
+`enabledModels` scope), settings `defaultProvider`/`defaultModel`, and the built-in catalog
+(`src/ai/providers/catalog/*.json`, 42 providers).
 
 ## models.json
 
@@ -23,7 +24,7 @@ Place `models.json` in the agent dir (`~/.pi/agent/models.json`, or `PIR_AGENT_D
           "input": ["text", "image"],
           "contextWindow": 200000,
           "maxTokens": 8192,
-          "cost": { "input": 3.0, "output": 15.0 }
+          "cost": { "input": 3.0, "output": 15.0, "cacheRead": 0.3, "cacheWrite": 3.75 }
         }
       ]
     }
@@ -31,10 +32,15 @@ Place `models.json` in the agent dir (`~/.pi/agent/models.json`, or `PIR_AGENT_D
 }
 ```
 
+A model's `cost` object requires all four per-Mtok rates — `input`, `output`, `cacheRead`, `cacheWrite`; the
+schema validator rejects a definition that omits any of them (`src/ai/providers/pi_config.rs:477`).
+
 `$ENV` and `!command` templates are allowed for `apiKey` (upstream parity). `api` selects the adapter:
-`openai-completions`, `openai-responses`, `anthropic-messages`, `google-generative-ai`, `google-vertex`,
-`mistral-conversations`, `bedrock-converse-stream`, `azure-openai-responses`, `openai-codex-responses`,
-`pi-messages` (Radius), `openai-compat` (auto-detect).
+`openai-completions` (alias `openai-chat`), `openai-responses`, `anthropic-messages`, `google-generative-ai`,
+`google-vertex`, `mistral-conversations`, `bedrock-converse-stream`, `azure-openai-responses`,
+`openai-codex-responses`, `pi-messages` (Radius). An omitted `api` falls back to the provider config, then a
+catalog model default, then `openai-chat` (`src/ai/providers/pi_config.rs:1013`); the OpenAI-compatible adapter
+auto-detects its compat knobs from the provider id/base URL (`src/ai/api/openai/compat_detect.rs`).
 
 ## Claude Code environment compatibility
 
@@ -58,13 +64,14 @@ provider, so `--model anthropic/<id>`, `/model`, `pir print`, and `--list-models
 
 For `anthropic-messages` requests, in order:
 
-1. An explicit models.json `apiKey` (also `--api-key` / a stored credential) is sent as `x-api-key`. An explicit
-   `authorization` or `x-api-key` in models.json `headers` always wins (applied last).
+1. An explicit models.json `apiKey` (also `--api-key` / a stored credential) is sent as `x-api-key` — or as
+   `Authorization: Bearer` when it is an OAuth token containing `sk-ant-oat`. An explicit `authorization` or
+   `x-api-key` in models.json `headers` always wins (applied last).
 2. `ANTHROPIC_AUTH_TOKEN`, then `ANTHROPIC_OAUTH_TOKEN`, is sent as `Authorization: Bearer <token>`.
 3. `ANTHROPIC_API_KEY` is sent as `x-api-key`.
 
-With no explicit key and no token, the request fails before sending. OAuth access tokens (containing `sk-ant-oat`)
-keep Claude Code's stealth request shape.
+With no explicit key, token, or auth header, the request fails before sending. OAuth access tokens
+(containing `sk-ant-oat`) keep Claude Code's stealth request shape.
 
 ### Bootstrap precedence
 
@@ -73,8 +80,8 @@ Environment values fill gaps; explicit configuration wins:
 - **Base URL**: an explicit models.json provider `baseUrl` wins; otherwise `ANTHROPIC_BASE_URL` replaces the
   anthropic models' base URL. An explicit per-model `baseUrl` still wins per model.
 - **Models**: ids from `ANTHROPIC_MODEL` and the three `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` aliases are
-  added only when not already defined by models.json; definitions are never duplicated or overwritten (name,
-  context, limits, headers, base URL stay explicit).
+  added only when not already defined by the catalog or models.json; definitions are never duplicated or
+  overwritten (name, context, limits, headers, base URL stay explicit).
 - **Synthesized entry**: id/name are the env model id; `reasoning: true`; input `["text", "image"]`;
   `contextWindow` from `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (default `200000`); `maxTokens` from
   `CLAUDE_CODE_MAX_OUTPUT_TOKENS` (default `32000`).
@@ -96,5 +103,7 @@ reports the truth).
 ## Model-level metadata
 
 - `input: ["text", "image"]` — vision support (`read`'s inline-image path downgrades for non-vision models).
-- `inputLimits.images.resize` — inline-image resize profile (width/height/quality bytes); `cost` — per-Mtok rates
-  for `/session` cost rendering and usage rebilling. `pir models` lists the resolved registry; `pir models <search>` filters.
+- `inputLimits.images.resize` — inline-image resize profile
+  (`maxWidth`/`maxHeight`/`maxBytes`/`jpegQuality`); `cost` — per-Mtok rates for `/session` cost rendering and
+  usage rebilling. `--list-models [search]` lists the resolved registry (fuzzy filter); `pir models` prints the
+  configured model.

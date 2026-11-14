@@ -161,6 +161,24 @@ pub fn confinement_error_for_tests(requested: &str, error: &std::io::Error) -> S
     confine::confinement_error(requested, error)
 }
 
+/// Test seam: the model-facing failure text for a `write`/`edit` filesystem
+/// operation (`mutation_error_message`, PIR-BIN-077). The wording must stay
+/// locale-independent — an English reason category plus the numeric OS code —
+/// and must never forward the host-localized `io::Error` `Display`
+/// (`拒绝访问。 (os error 5)` on a zh-CN Windows). `op` is the tool verb:
+/// `"edit"` selects the edit wording, anything else the write wording.
+/// Integration tests live in `tests/`; this seam exists so the formatter
+/// contract is asserted without inline tests in `src/`.
+#[doc(hidden)]
+#[cfg(any(feature = "tool-write", feature = "tool-edit"))]
+pub fn mutation_error_for_tests(op: &str, path: &str, error: &std::io::Error) -> String {
+    let op = match op {
+        "edit" => util::MutationOp::Edit,
+        _ => util::MutationOp::Write,
+    };
+    util::mutation_error_message(op, path, error)
+}
+
 /// The enabled core tool name set: everything `register_core_tools` registers,
 /// in the same order (upstream `allToolNames`, tools/index.ts:96). This — not
 /// `DEFAULT_TOOL_NAMES` — is the built-in set the `--no-builtin-tools` filter

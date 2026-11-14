@@ -591,7 +591,10 @@ async fn create_agent_session_child_round_trip() {
         .collect();
     assert_eq!(
         roles,
-        vec!["user", "system", "assistant", "user", "assistant"],
+        // PIR-BIN-091: the initial system declaration row now precedes the
+        // first user turn the way pi writes it (the declaration opens the
+        // session instead of hanging off the first prompt).
+        vec!["system", "user", "assistant", "user", "assistant"],
         "child transcript must carry both turns: {roles:?}"
     );
 }

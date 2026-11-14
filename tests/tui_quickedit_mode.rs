@@ -440,3 +440,127 @@ fn cleanup_surface_restores_console_modes_before_leaving_the_alt_screen() {
         String::from_utf8_lossy(&out.bytes)
     );
 }
+
+// ---------------------------------------------------------------------------
+// PIR-TUI-040: the exit transcript dump (`fullscreenExitOutput=transcript`,
+// the default) writes the WINDOWED frame — the whole materialized band, not
+// just the painted viewport — and streams it in bounded chunks. On a big
+// session this dump is the entire `tui.cleanup` cost, so these tests pin both
+// the source slice and the exact byte stream (a change that dumps the wrong
+// slice, drops rows, or allocates the whole message at once turns them red).
+// ---------------------------------------------------------------------------
+
+/// Sink that records the byte stream AND the write-call boundaries.
+#[derive(Default)]
+struct DumpSink {
+    bytes: Vec<u8>,
+    calls: usize,
+    max_call: usize,
+}
+
+impl std::io::Write for DumpSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        self.max_call = self.max_call.max(buf.len());
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn transcript_dump_streams_the_joined_rows_without_one_giant_buffer() {
+    use pir::tui::terminal::write_transcript_dump;
+
+    let rows: Vec<String> = (0..4000)
+        .map(|index| format!("row {index:05} {}", "x".repeat(200)))
+        .collect();
+    let mut sink = DumpSink::default();
+    write_transcript_dump(&mut sink, &rows).expect("dump");
+    let expected = format!("\r{}\r\n", rows.join("\r\n"));
+    assert_eq!(
+        String::from_utf8(sink.bytes.clone()).expect("utf8 dump"),
+        expected,
+        "the dump byte stream is `\\r` + rows joined by `\\r\\n` + `\\r\\n`"
+    );
+    assert!(
+        sink.calls > 1,
+        "a {}-byte dump must stream, not build one message-sized string (calls={})",
+        sink.bytes.len(),
+        sink.calls
+    );
+    assert!(
+        sink.max_call < sink.bytes.len(),
+        "no single write carries the whole dump (max_call={} of {})",
+        sink.max_call,
+        sink.bytes.len()
+    );
+
+    // Degenerate shapes keep the exact byte stream.
+    let mut empty = DumpSink::default();
+    write_transcript_dump(&mut empty, &[]).expect("empty dump");
+    assert!(empty.bytes.is_empty(), "an empty frame writes nothing");
+    let mut one = DumpSink::default();
+    write_transcript_dump(&mut one, &["only row".to_string()]).expect("one row");
+    assert_eq!(one.bytes, b"\ronly row\r\n".to_vec());
+}
+
+/// The windowed (fullscreen) dump carries the materialized BAND frame, not the
+/// painted viewport: `cleanup_terminal_surface` must dump `last_frame_lines()`
+/// when the app owns the alt screen, and `last_screen_lines()` otherwise.
+#[test]
+fn transcript_dump_is_the_windowed_band_frame() {
+    use pir::config::settings::FullscreenExitOutput;
+    use pir::tui::core::{Terminal, Text, TuiCore};
+    use pir::tui::stdin_buffer::WriteLog;
+    use pir::tui::terminal::cleanup_terminal_surface;
+
+    let rows: Vec<String> = (1..=30)
+        .map(|index| format!("transcript row {index}"))
+        .collect();
+    let terminal = Terminal::with_sink_factory(|| Box::new(std::io::sink()), WriteLog::disabled());
+    terminal.set_size(40, 8);
+    let mut core = TuiCore::new(terminal);
+    core.push_content(Box::new(Text::new(rows.join("\n"))));
+    core.set_windowed_viewport(true);
+    core.render();
+    let frame = core.last_frame_lines().to_vec();
+    let screen = core.last_screen_lines();
+    assert!(
+        frame.len() > screen.len(),
+        "the band frame ({}) is taller than the painted viewport ({})",
+        frame.len(),
+        screen.len()
+    );
+
+    let steps = RecordingSteps::default();
+    let mut ops = RecordingOps {
+        steps: steps.clone(),
+    };
+    let mut out = DumpSink::default();
+    cleanup_terminal_surface(
+        &mut core,
+        true,
+        FullscreenExitOutput::Transcript,
+        &mut ops,
+        &mut out,
+    )
+    .expect("cleanup surface");
+
+    let text = String::from_utf8_lossy(&out.bytes).to_string();
+    let dumped = format!("\r{}\r\n", frame.join("\r\n"));
+    assert!(
+        text.contains(&dumped),
+        "the windowed dump carries the whole band frame ({} rows)",
+        frame.len()
+    );
+    let viewport_dump = format!("\r{}\r\n", screen.join("\r\n"));
+    assert_ne!(dumped, viewport_dump);
+    assert!(
+        !text.contains(&viewport_dump),
+        "the dump is not the painted viewport slice"
+    );
+}

@@ -2485,9 +2485,20 @@ pub(crate) fn load_environment_at(
     }
     let settings_snapshot = manager.settings.clone();
 
-    let config = match std::fs::read_to_string(agent_dir.join("models.json")) {
-        Ok(contents) => crate::ai::providers::parse_pi_config(&contents)
-            .map_err(|error| SdkError::Other(format!("invalid pi models.json: {error}")))?,
+    // pi's `ModelConfig.load` contract (PIR-BIN-098): a malformed models.json
+    // degrades to the empty layer plus pi's error text — this SDK agent keeps
+    // working on the built-in catalog instead of failing the build. The error
+    // text is recorded through the same channel the CLI surfaces read
+    // (`take_models_json_load_warning`), with the file this agent actually
+    // read (the explicit agent dir).
+    let models_json_path = agent_dir.join("models.json");
+    let config = match std::fs::read_to_string(&models_json_path) {
+        Ok(contents) => {
+            let (config, error) =
+                crate::ai::providers::parse_models_json_layer_at(&models_json_path, &contents);
+            crate::ai::providers::record_models_json_load_error(error);
+            config
+        }
         Err(_) => crate::ai::providers::PiModelsConfig::default(),
     };
 

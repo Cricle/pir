@@ -18,11 +18,16 @@
 #![cfg(feature = "mcp")]
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pir::config::mcp::{McpServerConfig, McpServerConfigBase, McpStdioServerConfig};
 use pir::mcp::registry::{McpServerEntry, McpServerSource};
 use pir::plugins::builtin::McpPlugin;
+use pir::plugins::services::{
+    DialogOptions, ExtensionMode, NotifyLevel, PluginServices, SelectOption, ServiceFuture,
+    ServiceResult, SessionService, UiService,
+};
 use pir::plugins::{AgentPlugin, PluginHost};
 
 // ---------------------------------------------------------------------------
@@ -384,4 +389,329 @@ async fn mcp_status_reports_an_empty_configuration() {
         "the empty state points at the config files: {text}"
     );
     assert!(text.contains("mcp.json"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// (e) The manager's project-scope actions and Tools view (upstream
+//     `serverMenu` / `showTools`, index.ts:820-899).
+// ---------------------------------------------------------------------------
+
+/// A UI service that plays scripted `select` answers in order (`None` once
+/// the script is exhausted, i.e. the user closes the menu) and records every
+/// menu plus every notice.
+struct ScriptedUi {
+    answers: Mutex<std::collections::VecDeque<String>>,
+    selects: Mutex<Vec<(String, Vec<SelectOption>)>>,
+    notices: Mutex<Vec<(NotifyLevel, String)>>,
+}
+
+impl ScriptedUi {
+    fn new(answers: &[&str]) -> Self {
+        Self {
+            answers: Mutex::new(answers.iter().map(|answer| (*answer).to_owned()).collect()),
+            selects: Mutex::new(Vec::new()),
+            notices: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn selects(&self) -> Vec<(String, Vec<SelectOption>)> {
+        self.selects.lock().unwrap().clone()
+    }
+
+    fn notices(&self) -> Vec<(NotifyLevel, String)> {
+        self.notices.lock().unwrap().clone()
+    }
+}
+
+impl UiService for ScriptedUi {
+    fn notify(&self, level: NotifyLevel, message: &str) {
+        self.notices
+            .lock()
+            .unwrap()
+            .push((level, message.to_owned()));
+    }
+
+    fn select(
+        &self,
+        title: &str,
+        options: &[SelectOption],
+        _dialog: DialogOptions,
+    ) -> ServiceFuture<'static, ServiceResult<Option<String>>> {
+        self.selects
+            .lock()
+            .unwrap()
+            .push((title.to_owned(), options.to_vec()));
+        let answer = self.answers.lock().unwrap().pop_front();
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+/// The interactive host mode the manager path requires (`manager_ui`:
+/// upstream's `ctx.mode === "tui" && ctx.hasUI`).
+struct InteractiveSession;
+
+impl SessionService for InteractiveSession {
+    fn mode(&self) -> ExtensionMode {
+        ExtensionMode::Interactive
+    }
+
+    fn has_ui(&self) -> bool {
+        true
+    }
+}
+
+/// Trust the project at `dir` so `/mcp` offers the project-scope actions
+/// (upstream `projectConfig !== undefined`, index.ts:308-311).
+fn trust_project(dir: &TempDir) {
+    pir::config::trust::ProjectTrustStore::new(&dir.0)
+        .set(&dir.0, Some(true))
+        .expect("record the project trust decision");
+}
+
+fn bind_interactive(host: &PluginHost, ui: &Arc<ScriptedUi>) {
+    host.bind_context(
+        PluginServices::new()
+            .with_session(Arc::new(InteractiveSession))
+            .with_ui(ui.clone())
+            .build(),
+    );
+}
+
+fn menu_labels(selects: &[(String, Vec<SelectOption>)], title_prefix: &str) -> Vec<String> {
+    selects
+        .iter()
+        .find(|(title, _)| title.starts_with(title_prefix))
+        .map(|(_, options)| options.iter().map(|option| option.label.clone()).collect())
+        .unwrap_or_else(|| panic!("no menu titled {title_prefix:?}: {selects:?}"))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn manager_disable_in_this_project_writes_the_project_override() {
+    let dir = TempDir::new("project-disable");
+    let _guard = env_guard(&dir).await;
+    write_mcp_json(
+        &dir,
+        serde_json::json!({ "docs": { "command": "pir-w13-does-not-exist" } }),
+    );
+    trust_project(&dir);
+    let (plugin, host) = build_plugin(&dir);
+    let ui = Arc::new(ScriptedUi::new(&["docs", "disable-project"]));
+    bind_interactive(&host, &ui);
+
+    let outcome = host
+        .dispatch_command("mcp", "")
+        .await
+        .expect("native command");
+    assert!(outcome.ok, "{outcome:?}");
+
+    // Upstream writes the minimal override into the trusted project's
+    // `mcp.json` (created when missing), not a server definition.
+    let project_path = dir.0.join(".pi").join("mcp.json");
+    let project = std::fs::read_to_string(&project_path).expect("project mcp.json written");
+    let value: serde_json::Value = serde_json::from_str(&project).expect("valid JSON");
+    assert_eq!(
+        value["mcpServers"]["docs"],
+        serde_json::json!({ "enabled": false }),
+        "Disable in this project writes `enabled: false` as an override: {project}"
+    );
+
+    // pi's label, in pi's position: after Disable, before pir's Remove extra.
+    let labels = menu_labels(&ui.selects(), "MCP server docs");
+    assert_eq!(
+        labels,
+        [
+            "Exposure: direct",
+            "Disable",
+            "Disable in this project",
+            "Remove for this session",
+            "Back"
+        ],
+        "the manager items follow upstream's order"
+    );
+    // Upstream's description text for the action, in the success notice.
+    assert!(
+        ui.notices().iter().any(|(level, text)| {
+            *level == NotifyLevel::Info
+                && text == "Disabled MCP server \"docs\" (saved to the project mcp.json)."
+        }),
+        "{:?}",
+        ui.notices()
+    );
+
+    // The live entry follows the override: project-sourced and disabled (the
+    // next config pass reads the same effective entry).
+    let entry = plugin.manager().registry().get("docs").expect("entry");
+    assert!(!entry.config.is_enabled());
+    assert!(
+        matches!(entry.source, McpServerSource::ProjectConfig(_)),
+        "{:?}",
+        entry.source
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn manager_enable_in_this_project_writes_the_enabling_override() {
+    let dir = TempDir::new("project-enable");
+    let _guard = env_guard(&dir).await;
+    write_mcp_json(
+        &dir,
+        serde_json::json!({
+            "docs": { "command": "pir-w13-does-not-exist", "enabled": false }
+        }),
+    );
+    trust_project(&dir);
+    let (_plugin, host) = build_plugin(&dir);
+    let ui = Arc::new(ScriptedUi::new(&["docs", "enable-project"]));
+    bind_interactive(&host, &ui);
+
+    let outcome = host
+        .dispatch_command("mcp", "")
+        .await
+        .expect("native command");
+    assert!(outcome.ok, "{outcome:?}");
+
+    let project = std::fs::read_to_string(dir.0.join(".pi").join("mcp.json"))
+        .expect("project mcp.json written");
+    let value: serde_json::Value = serde_json::from_str(&project).expect("valid JSON");
+    assert_eq!(
+        value["mcpServers"]["docs"],
+        serde_json::json!({ "enabled": true }),
+        "a created override keeps the explicit `enabled: true` (upstream keepDefaults): {project}"
+    );
+    // The disabled branch offers Enable then Enable in this project.
+    let labels = menu_labels(&ui.selects(), "MCP server docs");
+    assert_eq!(labels, ["Enable", "Enable in this project", "Back"]);
+    assert!(
+        ui.notices().iter().any(|(level, text)| {
+            *level == NotifyLevel::Info
+                && text == "Enabled MCP server \"docs\" (saved to the project mcp.json)."
+        }),
+        "{:?}",
+        ui.notices()
+    );
+}
+
+/// Upstream `updateMcpServerConfig`'s `keepDefaults` (config.ts:184-192): an
+/// override entry keeps explicit values, because the override REPLACES the
+/// global server's defaults. The GLOBAL Enable action on a project-override
+/// entry therefore writes `enabled: true` instead of stripping the key —
+/// stripping it would silently un-pin the project against a later global
+/// `enabled: false`.
+#[tokio::test(flavor = "current_thread")]
+async fn global_enable_on_a_project_override_keeps_the_explicit_value() {
+    let dir = TempDir::new("override-keep-defaults");
+    let _guard = env_guard(&dir).await;
+    write_mcp_json(
+        &dir,
+        serde_json::json!({ "docs": { "command": "pir-w13-does-not-exist" } }),
+    );
+    // The project override lives in `<cwd>/.pi/mcp.json`; the directory is the
+    // host's (it is created before the file is written).
+    std::fs::create_dir_all(dir.0.join(".pi")).expect("mkdir .pi");
+    std::fs::write(
+        dir.0.join(".pi").join("mcp.json"),
+        serde_json::json!({ "mcpServers": { "docs": { "enabled": false } } }).to_string(),
+    )
+    .expect("write project mcp.json");
+    trust_project(&dir);
+    let (plugin, host) = build_plugin(&dir);
+
+    let outcome = host
+        .dispatch_command("mcp", "enable docs")
+        .await
+        .expect("native command");
+    assert!(outcome.ok, "{outcome:?}");
+
+    let project = std::fs::read_to_string(dir.0.join(".pi").join("mcp.json"))
+        .expect("project mcp.json readable");
+    let value: serde_json::Value = serde_json::from_str(&project).expect("valid JSON");
+    assert_eq!(
+        value["mcpServers"]["docs"],
+        serde_json::json!({ "enabled": true }),
+        "an override keeps the explicit enabling value (upstream keepDefaults): {project}"
+    );
+    let entry = plugin.manager().registry().get("docs").expect("entry");
+    assert!(entry.config.is_enabled());
+    assert!(
+        matches!(entry.source, McpServerSource::ProjectConfig(_)),
+        "{:?}",
+        entry.source
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn manager_tools_view_lists_each_tools_effective_exposure() {
+    let dir = TempDir::new("tools-view");
+    let _guard = env_guard(&dir).await;
+    let (command, args) = super::mcp_residuals_w13::mock_spawn();
+    std::fs::write(
+        dir.0.join("mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "docs": {
+                    "command": command,
+                    "args": args,
+                    "env": { "PIR_W13_MOCK": super::mcp_residuals_w13::MOCK_HEALTHY },
+                    "toolExposure": { "work": "hidden" },
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write mcp.json");
+    trust_project(&dir);
+    let (plugin, host) = build_plugin(&dir);
+    let ui = Arc::new(ScriptedUi::new(&["docs", "tools", "back"]));
+    bind_interactive(&host, &ui);
+    // The discovery call below (spawn the healthy mock stdio server, MCP
+    // handshake, tools/list) measured 954 ms when this test was instrumented
+    // and run once on 2026-11-14 (loaded 9-agent machine, `zz_merged_6`).
+    // 5 s is ~5x that observed cost: still enough headroom for a slow CI
+    // machine, but a genuine hang (no handshake ever completes) now fails in
+    // 5 s instead of the old blanket 30 s safety net.
+    plugin
+        .manager()
+        .discover_all_bounded(Duration::from_secs(5))
+        .await;
+
+    let outcome = host
+        .dispatch_command("mcp", "")
+        .await
+        .expect("native command");
+    assert!(outcome.ok, "{outcome:?}");
+
+    // Upstream's connected-server order: Tools before Reconnect, exposure
+    // before Disable, the project toggle after Disable.
+    let labels = menu_labels(&ui.selects(), "MCP server docs");
+    assert_eq!(
+        labels,
+        [
+            "Tools",
+            "Reconnect",
+            "Exposure: direct",
+            "Disable",
+            "Disable in this project",
+            "Remove for this session",
+            "Back"
+        ]
+    );
+
+    // The Tools view lists the tool with its effective `toolExposure` (the
+    // base is direct; `work` overrides it to hidden).
+    let selects = ui.selects();
+    let tools_menu = selects
+        .iter()
+        .find(|(title, _)| title == "Tools of docs")
+        .expect("the Tools view opened");
+    assert_eq!(
+        tools_menu
+            .1
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect::<Vec<_>>(),
+        ["work [hidden]", "Back"]
+    );
+    assert_eq!(tools_menu.1[0].value, "work");
+
+    plugin.manager().shutdown().await;
 }

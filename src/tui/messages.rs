@@ -4244,7 +4244,170 @@ impl ResultRowsKey {
 /// instead of re-rendering the body.
 struct ResultRowsCache {
     key: ResultRowsKey,
-    rows: Vec<String>,
+    rows: Arc<Vec<String>>,
+}
+
+/// The result-section branch [`render_result_section`] dispatches to for a
+/// tool name — shell box, one of the per-tool renderers, or the generic
+/// fallback. Part of the SHARED memo key below: the shared memo outlives a
+/// component, so the branch must be identified by value, not by the
+/// component's (immutable) tool-name field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ResultRenderer {
+    Shell,
+    Read,
+    Write,
+    Grep,
+    Find,
+    Ls,
+    Subagent,
+    Other,
+}
+
+impl ResultRenderer {
+    fn of(tool_name: &str) -> Self {
+        match tool_name {
+            "bash" | "powershell" => Self::Shell,
+            "read" => Self::Read,
+            "write" => Self::Write,
+            "grep" => Self::Grep,
+            "find" => Self::Find,
+            "ls" => Self::Ls,
+            "subagent" => Self::Subagent,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Identity of one result-section render for the shared memo: every input
+/// [`render_result_section`] reads, in a form that costs nothing to compare.
+///
+/// The payload `Arc`s are held BY the key (not just their addresses), exactly
+/// like [`ResultRowsKey`], so pointer identity stays sound for the cache's
+/// whole lifetime: the buffer behind a key cannot be freed and its address
+/// recycled while the entry is cached. `args` feeds the read renderer's
+/// language lookup; the renderer tag stands in for the otherwise
+/// component-owned tool name.
+#[derive(Clone)]
+struct ResultSharedKey {
+    renderer: ResultRenderer,
+    output: Arc<str>,
+    details: Option<Arc<serde_json::Value>>,
+    args: Arc<serde_json::Value>,
+    expanded: bool,
+    width: usize,
+    theme_generation: u64,
+    pending: bool,
+    is_error: bool,
+    duration_ms: Option<u64>,
+}
+
+impl PartialEq for ResultSharedKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.renderer == other.renderer
+            && Arc::ptr_eq(&self.output, &other.output)
+            && Arc::ptr_eq(&self.args, &other.args)
+            && match (&self.details, &other.details) {
+                (Some(mine), Some(theirs)) => Arc::ptr_eq(mine, theirs),
+                (None, None) => true,
+                _ => false,
+            }
+            && self.expanded == other.expanded
+            && self.width == other.width
+            && self.theme_generation == other.theme_generation
+            && self.pending == other.pending
+            && self.is_error == other.is_error
+            && self.duration_ms == other.duration_ms
+    }
+}
+
+impl Eq for ResultSharedKey {}
+
+impl std::hash::Hash for ResultSharedKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.renderer.hash(state);
+        (str::as_ptr(&self.output) as usize).hash(state);
+        (Arc::as_ptr(&self.args) as usize).hash(state);
+        self.details
+            .as_ref()
+            .map_or(0usize, |details| Arc::as_ptr(details) as usize)
+            .hash(state);
+        self.expanded.hash(state);
+        self.width.hash(state);
+        self.theme_generation.hash(state);
+        self.pending.hash(state);
+        self.is_error.hash(state);
+        self.duration_ms.hash(state);
+    }
+}
+
+/// Process-wide, FIFO-bounded memo of tool-block result-section rows keyed on
+/// [`ResultSharedKey`].
+///
+/// [`ResultRowsKey`] lives on the component, so any rebuild throws the
+/// rendered section away — and the backward search walk rebuilds constantly:
+/// it probes candidate pages through a scratch [`ChatContainer`](super::app::ChatContainer),
+/// materializes a hit into the live band (a fresh component tree for the same
+/// entries), and every query edit restarts it (PIR-TUI-039). On a session of
+/// ~50 KB shell results the collapsed shell branch styles and wraps the WHOLE
+/// body per block (~8-24 ms in a debug build, measured), so re-rendering a
+/// band of it is the multi-second cost. The shared memo serves the rows the
+/// same entry revision already rendered — in ANOTHER container, component or
+/// frame — through the exact same renderer, so every served row is what a
+/// cold render would have produced (the p15 lane pins this with a cold-render
+/// byte comparison).
+///
+/// Bounded two ways: entry count and the payload bytes the keys keep alive
+/// (the rows themselves are only a block's visible rows). Eviction is FIFO —
+/// a bound, not a policy: a miss just re-renders.
+#[derive(Default)]
+struct ResultSharedMemo {
+    map: std::collections::HashMap<ResultSharedKey, Arc<Vec<String>>>,
+    order: std::collections::VecDeque<ResultSharedKey>,
+    payload_bytes: usize,
+}
+
+/// Entries retained by [`RESULT_SHARED_MEMO`] before the oldest evicts.
+const RESULT_SHARED_MEMO_MAX_ENTRIES: usize = 1024;
+/// Payload bytes (tool outputs/details behind the keys) retained by
+/// [`RESULT_SHARED_MEMO`] before the oldest evict.
+const RESULT_SHARED_MEMO_MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+static RESULT_SHARED_MEMO: OnceLock<Mutex<ResultSharedMemo>> = OnceLock::new();
+
+/// The shared memo's rendered rows for `key`, when the same entry revision
+/// was already rendered at the same width/posture/palette.
+fn shared_result_rows(key: &ResultSharedKey) -> Option<Arc<Vec<String>>> {
+    let memo = RESULT_SHARED_MEMO.get_or_init(|| Mutex::new(ResultSharedMemo::default()));
+    let guard = memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.map.get(key).cloned()
+}
+
+/// Publish freshly rendered result-section rows for `key`, evicting the
+/// oldest entries while either bound is exceeded.
+fn store_shared_result_rows(key: ResultSharedKey, rows: Arc<Vec<String>>) {
+    let memo = RESULT_SHARED_MEMO.get_or_init(|| Mutex::new(ResultSharedMemo::default()));
+    let mut guard = memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.map.contains_key(&key) {
+        return;
+    }
+    guard.payload_bytes = guard.payload_bytes.saturating_add(key.output.len());
+    guard.order.push_back(key.clone());
+    guard.map.insert(key, rows);
+    while (guard.map.len() > RESULT_SHARED_MEMO_MAX_ENTRIES
+        || guard.payload_bytes > RESULT_SHARED_MEMO_MAX_PAYLOAD_BYTES)
+        && guard.order.len() > 1
+    {
+        if let Some(evicted) = guard.order.pop_front() {
+            if guard.map.remove(&evicted).is_some() {
+                guard.payload_bytes = guard.payload_bytes.saturating_sub(evicted.output.len());
+            }
+        }
+    }
 }
 
 /// Memo of the block's rendered call line AND its wrapped rows (see
@@ -4341,6 +4504,10 @@ pub struct ToolMemoWork {
     pub tail_rebuilds: u64,
     /// `ResultRowsCache` (shell/read/... result section) rebuilds.
     pub result_rebuilds: u64,
+    /// Result sections served from the process-wide [`ResultSharedMemo`]
+    /// without re-rendering (a rebuilt component meeting a rendered entry
+    /// revision — the search walk's probe/materialize path).
+    pub result_shared_hits: u64,
     /// `EditPreviewRowsCache` (edit box preview body) rebuilds.
     pub preview_rebuilds: u64,
     /// `EditLegacyRowsCache` (edit box args-rebuilt body) rebuilds.
@@ -4363,6 +4530,7 @@ impl ToolMemoWork {
             bg_rebuilds: TOOL_MEMO_WORK.bg_rebuilds.load(Ordering::Relaxed),
             tail_rebuilds: TOOL_MEMO_WORK.tail_rebuilds.load(Ordering::Relaxed),
             result_rebuilds: TOOL_MEMO_WORK.result_rebuilds.load(Ordering::Relaxed),
+            result_shared_hits: TOOL_MEMO_WORK.result_shared_hits.load(Ordering::Relaxed),
             preview_rebuilds: TOOL_MEMO_WORK.preview_rebuilds.load(Ordering::Relaxed),
             legacy_rebuilds: TOOL_MEMO_WORK.legacy_rebuilds.load(Ordering::Relaxed),
             edit_result_rebuilds: TOOL_MEMO_WORK.edit_result_rebuilds.load(Ordering::Relaxed),
@@ -4381,6 +4549,7 @@ impl ToolMemoWork {
             &TOOL_MEMO_WORK.bg_rebuilds,
             &TOOL_MEMO_WORK.tail_rebuilds,
             &TOOL_MEMO_WORK.result_rebuilds,
+            &TOOL_MEMO_WORK.result_shared_hits,
             &TOOL_MEMO_WORK.preview_rebuilds,
             &TOOL_MEMO_WORK.legacy_rebuilds,
             &TOOL_MEMO_WORK.edit_result_rebuilds,
@@ -4400,6 +4569,7 @@ struct ToolMemoWorkCounters {
     bg_rebuilds: AtomicU64,
     tail_rebuilds: AtomicU64,
     result_rebuilds: AtomicU64,
+    result_shared_hits: AtomicU64,
     preview_rebuilds: AtomicU64,
     legacy_rebuilds: AtomicU64,
     edit_result_rebuilds: AtomicU64,
@@ -4414,6 +4584,7 @@ static TOOL_MEMO_WORK: ToolMemoWorkCounters = ToolMemoWorkCounters {
     bg_rebuilds: AtomicU64::new(0),
     tail_rebuilds: AtomicU64::new(0),
     result_rebuilds: AtomicU64::new(0),
+    result_shared_hits: AtomicU64::new(0),
     preview_rebuilds: AtomicU64::new(0),
     legacy_rebuilds: AtomicU64::new(0),
     edit_result_rebuilds: AtomicU64::new(0),
@@ -4599,6 +4770,27 @@ impl ToolExecutionComponent {
         state.preview = preview;
     }
 
+    /// Apply a streamed partial-output snapshot (`tool_execution_update` with
+    /// `isPartial`): the rolling output updates while the block STAYS pending
+    /// — upstream's `updateDisplay` streamed result. [`Self::update_result`]
+    /// is the settle path and unconditionally clears `pending`, so a pending
+    /// block (which still renders its result section: the shell path paints
+    /// the live tail) must take partials through this setter instead.
+    pub fn set_output(&self, output: Arc<str>) {
+        // Tool stdout/stderr is untrusted (commands, MCP responses, file
+        // contents) and is painted line-by-line by every result renderer.
+        // Sanitize once here; clean output keeps its original `Arc`.
+        let output = match sanitize_owned(&output) {
+            Some(sanitized) => Arc::<str>::from(sanitized),
+            None => output,
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.output = output;
+    }
+
     /// Upstream `updateResult`: the block leaves the pending phase; the
     /// background flips to success/error and the duration is recorded.
     pub fn update_result(&self, output: Arc<str>, is_error: bool, duration_ms: Option<u64>) {
@@ -4762,28 +4954,51 @@ impl Component for ToolExecutionComponent {
             .as_ref()
             .is_some_and(|cache| cache.key.matches(&key))
         {
-            bump_memo_work!(result_rebuilds);
-            let mut rows: Vec<String> = Vec::new();
-            {
-                let mut canvas = Rows::new(&mut rows);
-                render_result_section(
-                    &state,
-                    &ResultSectionCtx {
-                        is_shell,
-                        is_timed,
-                        expanded,
-                        width,
-                        bg_open: &bg.open,
-                        bg_close: &bg.close,
-                    },
-                    &mut canvas,
-                );
-                canvas.trim();
+            // A rebuilt component still finds the rows this entry revision
+            // already rendered (another container/frame/component gave the
+            // same key); the exact rows a cold render would produce are what
+            // the shared memo stores (see [`ResultSharedMemo`]).
+            let shared_key = ResultSharedKey {
+                renderer: ResultRenderer::of(&state.tool_name),
+                output: Arc::clone(&state.output),
+                details: state.details.clone(),
+                args: Arc::clone(&state.args),
+                expanded,
+                width,
+                theme_generation: generation,
+                pending: state.pending,
+                is_error: state.is_error,
+                duration_ms: state.duration_ms,
+            };
+            if let Some(rows) = shared_result_rows(&shared_key) {
+                bump_memo_work!(result_shared_hits);
+                state.result_rows = Some(ResultRowsCache { key, rows });
+            } else {
+                bump_memo_work!(result_rebuilds);
+                let mut rows: Vec<String> = Vec::new();
+                {
+                    let mut canvas = Rows::new(&mut rows);
+                    render_result_section(
+                        &state,
+                        &ResultSectionCtx {
+                            is_shell,
+                            is_timed,
+                            expanded,
+                            width,
+                            bg_open: &bg.open,
+                            bg_close: &bg.close,
+                        },
+                        &mut canvas,
+                    );
+                    canvas.trim();
+                }
+                let rows = Arc::new(rows);
+                store_shared_result_rows(shared_key, Arc::clone(&rows));
+                state.result_rows = Some(ResultRowsCache { key, rows });
             }
-            state.result_rows = Some(ResultRowsCache { key, rows });
         }
         if let Some(cache) = &state.result_rows {
-            for row in &cache.rows {
+            for row in cache.rows.iter() {
                 out.push(row);
             }
         }

@@ -419,12 +419,27 @@ async fn drain_extension_ui_notifications(session: &AgentSession, out: &Out) -> 
 // Output plumbing
 // ---------------------------------------------------------------------------
 
+/// One queued protocol line: either a `Value` the writer serializes with the
+/// stack-safe iterative writer (a response can carry a session tree nested one
+/// level per entry), or already-rendered JSON text.
+///
+/// The event bridges render their line straight from the borrowed event
+/// (`PIR-BIN-099`): the wire bytes are identical to
+/// `write_value_iteratively(&to_json_event(event))` — the borrowed view is
+/// byte-identical to `serde_json::to_string(&to_json_event(event))` and the
+/// iterative writer to `serde_json::to_string` — and the intermediate `Value`
+/// (one full copy of the tool-result payload per event) never exists.
+enum OutWire {
+    Value(Value),
+    Text(String),
+}
+
 /// Handle to the stdout writer. All protocol lines are serialized through one
 /// writer task behind a bounded channel (backpressure: senders await, so a
 /// stalled client slows the run instead of growing memory without limit).
 #[derive(Clone)]
 struct Out {
-    tx: tokio::sync::mpsc::Sender<Value>,
+    tx: tokio::sync::mpsc::Sender<OutWire>,
 }
 
 impl Out {
@@ -433,8 +448,13 @@ impl Out {
     /// was closed): the caller must stop serving instead of silently
     /// dropping responses into a dead channel.
     async fn send(&self, value: Value) -> Result<(), String> {
+        self.send_wire(OutWire::Value(value)).await
+    }
+
+    /// [`Out::send`] for an already-rendered JSON line (`OutWire::Text`).
+    async fn send_wire(&self, wire: OutWire) -> Result<(), String> {
         self.tx
-            .send(value)
+            .send(wire)
             .await
             .map_err(|_| "rpc output writer is closed".to_owned())
     }
@@ -459,7 +479,7 @@ impl Out {
         result: CommandOutcome,
     ) -> Result<(), String> {
         self.tx
-            .try_send(response_value(id, command, result))
+            .try_send(OutWire::Value(response_value(id, command, result)))
             .map_err(|error| match error {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => {
                     "rpc output queue is full".to_owned()
@@ -468,6 +488,28 @@ impl Out {
                     "rpc output writer is closed".to_owned()
                 }
             })
+    }
+}
+
+/// The protocol line for one agent-loop event: rendered straight from the
+/// borrowed event (`PIR-BIN-099`).
+///
+/// Falls back to the `Value` path when the borrowed view cannot render — a
+/// serialization of in-memory events cannot realistically fail, and the
+/// fallback keeps the previous behavior byte for byte if it ever does.
+fn agent_event_wire(event: &crate::agent::agent_loop::AgentEvent) -> OutWire {
+    match crate::coding_agent::json::to_json_event_line(event) {
+        Ok(line) => OutWire::Text(line),
+        Err(_) => OutWire::Value(crate::coding_agent::json::to_json_event(event)),
+    }
+}
+
+/// The protocol line for one session event (`PIR-BIN-099`); see
+/// [`agent_event_wire`] for the fallback.
+fn session_event_wire(event: &crate::agent_session::SessionEvent) -> OutWire {
+    match crate::agent_session::to_session_event_line(event) {
+        Ok(line) => OutWire::Text(line),
+        Err(_) => OutWire::Value(crate::coding_agent::json::to_session_event_json(event)),
     }
 }
 
@@ -607,7 +649,7 @@ impl Drop for IterativeValue {
 }
 
 async fn writer_task<W>(
-    mut rx: tokio::sync::mpsc::Receiver<Value>,
+    mut rx: tokio::sync::mpsc::Receiver<OutWire>,
     mut output: W,
     writer_alive: tokio::sync::watch::Sender<bool>,
     mut stop: tokio::sync::watch::Receiver<bool>,
@@ -617,14 +659,14 @@ where
 {
     let result = async {
         loop {
-            let value = tokio::select! {
+            let wire = tokio::select! {
                 // Teardown bound: a sender leaked by a task/session handler
                 // must not keep this thread (and its output handle) alive
                 // forever. The serve loop signals this only AFTER the drain
                 // window, so healthy queued lines are still flushed first.
                 _ = stop.changed() => break,
-                value = rx.recv() => match value {
-                    Some(value) => value,
+                wire = rx.recv() => match wire {
+                    Some(wire) => wire,
                     None => break,
                 },
             };
@@ -632,13 +674,21 @@ where
             // a response can carry a session tree nested one level per entry
             // (`get_tree`), and serde_json's serializer recurses one frame per
             // level. The guard tears the value down iteratively on every path,
-            // including a broken-pipe `?` return.
-            let value = IterativeValue(Some(value));
-            let Some(payload) = value.0.as_ref() else {
-                continue;
+            // including a broken-pipe `?` return. An event bridge's
+            // pre-rendered `Text` (PIR-BIN-099) is written as-is: the borrowed
+            // wire view was already pinned byte-identical to the text this
+            // writer would have produced from the `Value`.
+            let text = match wire {
+                OutWire::Text(text) => text,
+                OutWire::Value(value) => {
+                    let value = IterativeValue(Some(value));
+                    let Some(payload) = value.0.as_ref() else {
+                        continue;
+                    };
+                    crate::session_manager::json_depth::write_value_iteratively(payload)
+                }
             };
-            let mut line =
-                crate::session_manager::json_depth::write_value_iteratively(payload).into_bytes();
+            let mut line = text.into_bytes();
             line.push(b'\n');
             // A closed client pipe is an expected shutdown, not a writer
             // failure: remember it so the serve loop can exit quietly (and
@@ -656,7 +706,6 @@ where
                 }
                 return Err(error.into());
             }
-            drop(value);
         }
         Ok(())
     }
@@ -679,7 +728,7 @@ where
 /// replaces; `spawn_blocking` would be wrong too, because it would occupy a
 /// blocking-pool slot for as long as a stalled client holds the pipe.
 fn spawn_writer_thread<W>(
-    rx: tokio::sync::mpsc::Receiver<Value>,
+    rx: tokio::sync::mpsc::Receiver<OutWire>,
     output: W,
     writer_alive: tokio::sync::watch::Sender<bool>,
     stop: tokio::sync::watch::Receiver<bool>,
@@ -788,7 +837,7 @@ struct RpcServerState {
     /// the RPC host (a detached background delivery keeps it alive) cannot
     /// keep the forwarder thread — and its `Out` clone — alive. Dropping this
     /// at teardown closes the line channel and releases the writer.
-    session_event_tx: std::sync::Mutex<Option<Arc<std::sync::mpsc::SyncSender<Value>>>>,
+    session_event_tx: std::sync::Mutex<Option<Arc<std::sync::mpsc::SyncSender<OutWire>>>>,
 }
 
 impl RpcServerState {
@@ -1187,7 +1236,7 @@ impl RpcServerState {
         // = backpressure, mirroring the prompt event bridge) feeds a
         // forwarder thread that awaits the bounded stdout channel. The
         // bridge ends when the session is dropped or the writer dies.
-        let (line_tx, line_rx) = std::sync::mpsc::sync_channel::<Value>(OUT_CHANNEL_CAPACITY);
+        let (line_tx, line_rx) = std::sync::mpsc::sync_channel::<OutWire>(OUT_CHANNEL_CAPACITY);
         let forwarder_out = out.clone();
         std::thread::spawn(move || {
             for line in line_rx {
@@ -1210,7 +1259,7 @@ impl RpcServerState {
             let Some(line_tx) = weak_line_tx.upgrade() else {
                 return;
             };
-            let line = crate::coding_agent::json::to_session_event_json(&event);
+            let line = session_event_wire(&event);
             if line_tx.send(line).is_err() {
                 // The forwarder is gone (writer died): drop further events.
             }
@@ -1511,7 +1560,7 @@ impl RpcServerState {
         // awaits the bounded stdout channel. A dead writer ends the bridge;
         // the run then reports a terminal error line instead of streaming
         // into a closed pipe.
-        let (line_tx, line_rx) = std::sync::mpsc::sync_channel::<Value>(OUT_CHANNEL_CAPACITY);
+        let (line_tx, line_rx) = std::sync::mpsc::sync_channel::<OutWire>(OUT_CHANNEL_CAPACITY);
         let degraded = Arc::new(AtomicBool::new(false));
         let forwarder_out = out.clone();
         let forwarder_degraded = Arc::clone(&degraded);
@@ -1532,8 +1581,10 @@ impl RpcServerState {
                 // the hoisted `usage` and the partial-stripped
                 // `assistantMessageEvent` and NO cumulative `message`
                 // snapshot (modes/json-event.ts), exactly like the JSON print
-                // mode.
-                let line = crate::coding_agent::json::to_json_event(&event);
+                // mode. The line is rendered straight from the borrowed event
+                // and pinned byte-identical to the `Value` construction
+                // (`PIR-BIN-099`).
+                let line = agent_event_wire(&event);
                 // Blocking send on the bounded bridge = backpressure. A
                 // disconnected forwarder (dead writer) is recorded instead of
                 // blocking the loop forever.
@@ -2545,7 +2596,7 @@ impl RpcServer {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Value>(OUT_CHANNEL_CAPACITY);
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutWire>(OUT_CHANNEL_CAPACITY);
         let (writer_alive_tx, mut writer_alive_rx) = tokio::sync::watch::channel(true);
         let (writer_stop_tx, writer_stop_rx) = tokio::sync::watch::channel(false);
         // Off the serving runtime's workers: a stalled client parks the

@@ -13,7 +13,9 @@ use pir::ai::types::{
     ThinkingContent, Tool, ToolCall, ToolReference, ToolResultMessage, ToolResultRole, UserMessage,
     UserRole,
 };
-use pir::coding_agent::export_html::{escape_html, export_session_to_html, markdown_to_html};
+use pir::coding_agent::export_html::{
+    escape_html, export_session_to_html, export_session_to_html_with_theme, markdown_to_html,
+};
 use pir::session_manager::SessionManager;
 
 // ---------------------------------------------------------------------------
@@ -180,6 +182,12 @@ fn export_contains_messages_tool_blocks_and_escaped_content() {
     assert!(html.contains("Date:"), "missing date info item");
     assert!(html.contains("Models:"), "missing models info item");
     assert!(html.contains("Tool Calls:"), "missing tool-call stat");
+    // Upstream `renderHeader` also reports the summed assistant cost.
+    assert!(html.contains("Cost:"), "missing cost stat");
+    assert!(
+        html.contains("$0.000"),
+        "zero-cost fixture must render $0.000"
+    );
     assert!(
         html.contains("anthropic/claude-sonnet-4"),
         "missing model name"
@@ -295,6 +303,87 @@ fn export_embeds_tool_result_images_as_data_urls() {
 }
 
 #[test]
+fn export_header_sums_the_assistant_cost() {
+    let dir = temp_dir("cost");
+    let mut manager =
+        SessionManager::create(&dir.to_string_lossy(), dir.as_path()).expect("create session");
+    let mut assistant = match assistant_message(vec![text_block("done")]) {
+        Message::Assistant(assistant) => assistant,
+        _ => unreachable!("helper returns an assistant message"),
+    };
+    assistant.usage.cost.input = 0.5;
+    assistant.usage.cost.output = 0.25;
+    // A provider-reported total intentionally differs from the component sum;
+    // upstream sums `total`, not the components.
+    assistant.usage.cost.total = 0.1234;
+    manager
+        .append_message(Message::Assistant(assistant))
+        .expect("append assistant");
+    let output = dir.join("out.html");
+    export_session_to_html(manager.path(), Some(&output)).expect("export");
+
+    let html = std::fs::read_to_string(&output).expect("read html");
+    assert!(
+        html.contains(
+            "<span class=\"info-label\">Cost:</span><span class=\"info-value\">$0.123</span>"
+        ),
+        "cost stat missing or misformatted: {html}"
+    );
+}
+
+#[test]
+fn export_honors_the_requested_theme_colors() {
+    let dir = temp_dir("theme");
+    let session = fixture_session(&dir);
+    let light_page = pir::tui::theme::theme_export_colors(Some("light"))
+        .page_bg
+        .expect("light theme export page bg");
+    let dark_page = pir::tui::theme::theme_export_colors(Some("dark"))
+        .page_bg
+        .expect("dark theme export page bg");
+    assert_ne!(light_page, dark_page, "theme fixtures must differ");
+
+    let light_out = dir.join("light.html");
+    export_session_to_html_with_theme(&session, Some(&light_out), Some("light"))
+        .expect("theme export");
+    let light_html = std::fs::read_to_string(&light_out).expect("read html");
+    // The `:root` override joins the declarations with spaces (no semicolons),
+    // so match each value up to the next separator.
+    assert!(
+        light_html.contains(&format!("--pir-export-page-bg: {light_page}")),
+        "light theme page bg missing: {light_html}"
+    );
+    assert!(
+        !light_html.contains(&format!("--pir-export-page-bg: {dark_page}")),
+        "dark page bg leaked into the light export"
+    );
+    // Foreground tokens follow the theme too: a light page must carry the
+    // light theme's text color, not the dark stylesheet literal.
+    let light_text = pir::tui::theme::theme_snapshot("light")
+        .expect("light theme snapshot")
+        .colors
+        .get("text")
+        .cloned()
+        .expect("light text token");
+    assert!(
+        light_html.contains(&format!("--pir-export-text: {light_text}")),
+        "light theme text color missing: {light_html}"
+    );
+
+    // `None` resolves the ACTIVE theme (the path `/export`/RPC use).
+    let active_out = dir.join("active.html");
+    export_session_to_html(&session, Some(&active_out)).expect("active-theme export");
+    let active_page = pir::tui::theme::theme_export_colors(None)
+        .page_bg
+        .expect("active theme export page bg");
+    let active_html = std::fs::read_to_string(&active_out).expect("read html");
+    assert!(
+        active_html.contains(&format!("--pir-export-page-bg: {active_page}")),
+        "active theme page bg missing: {active_html}"
+    );
+}
+
+#[test]
 fn export_default_output_path_is_derived_from_the_session_file() {
     let dir = temp_dir("default-path");
     let session = fixture_session(&dir);
@@ -336,6 +425,30 @@ fn markdown_subset_renders_the_ported_constructs() {
     assert!(html.contains("<ul>") && html.contains("</ul>"));
     assert!(html.contains("<ol>") && html.contains("</ol>"));
     assert!(html.contains("<pre><code>let x = 1;\n</code></pre>"));
+}
+
+#[test]
+fn markdown_renders_gfm_strikethrough_and_fence_language() {
+    let html =
+        markdown_to_html("~~删除~~ then ~~**bold**~~ and ~gone~\n\n```js\nlet x = 1;\n```\n");
+    assert!(
+        html.contains("<del>删除</del>"),
+        "strikethrough missing: {html}"
+    );
+    assert!(
+        html.contains("<del><strong>bold</strong></del>"),
+        "inline formatting inside strikethrough missing: {html}"
+    );
+    assert!(html.contains("<del>gone</del>"), "single-tilde del missing");
+    assert!(
+        html.contains("<pre><code class=\"language-js\">let x = 1;\n</code></pre>"),
+        "fence language class missing: {html}"
+    );
+
+    // `marked`'s gfm `del` rules: in-word and unmatched tildes stay literal.
+    let literal = markdown_to_html("a~b~c and ~~open");
+    assert!(!literal.contains("<del>"), "unexpected del: {literal}");
+    assert!(literal.contains("~~open"), "unmatched opener was dropped");
 }
 
 #[test]

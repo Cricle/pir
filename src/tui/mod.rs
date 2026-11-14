@@ -52,8 +52,8 @@ pub mod update_check;
 pub mod wheel_scroll;
 
 pub use ansi::{
-    apply_background_to_line, pad_to_width, strip_ansi, truncate_to_width, visible_width,
-    wrap_text_with_ansi,
+    apply_background_to_line, pad_to_width, strip_ansi, terminal_safe_width, truncate_to_width,
+    visible_width, wrap_text_with_ansi,
 };
 // Reusable alt-screen interaction surface (§7 #22): the selection/search
 // helpers a host or extension can drive without standing up the full event

@@ -1,7 +1,7 @@
 use std::io::IsTerminal;
 
 use pir::coding_agent::cli::{
-    lossy_arg, preprocess_args, AppMode, AuthCommand, Cli, Command, McpCommand, Mode, ModelsCommand,
+    lossy_arg, preprocess_args, AppMode, AuthCommand, Cli, Command, Mode, ModelsCommand,
 };
 use pir::coding_agent::session_resolve::{resolve_session_plan, SessionPlan};
 use pir::coding_agent::{OutputMode, PrintOptions};

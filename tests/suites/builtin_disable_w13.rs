@@ -518,6 +518,157 @@ fn python_tool_false_is_one_name_in_the_same_disabled_set() {
 }
 
 // ---------------------------------------------------------------------------
+// (e) pi's documented `extensions` spelling (`-builtin:<name>`,
+//     `!builtin:<pattern>`, project `+builtin:<name>`).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "mcp")]
+#[test]
+fn extensions_minus_builtin_disables_the_builtin_like_pi_documents() {
+    let global = TempDir::new("global-ext-minus");
+    write_settings(global.path(), r#"{ "extensions": ["-builtin:mcp"] }"#);
+    let cwd = TempDir::new("cwd-ext-minus");
+    let manager = load_manager(global.path(), cwd.path(), false);
+
+    assert_eq!(
+        manager.disabled_builtin_extensions(),
+        std::collections::BTreeSet::from(["mcp".to_owned()]),
+        "pi's documented `\"extensions\": [\"-builtin:mcp\"]` disables the builtin"
+    );
+    let disabled = manager.disabled_builtins_with_flags(&pir::plugins::disabled_from_flags(false));
+    let filtered = pir::plugins::filter_disabled_builtins(&default_plan(), &disabled);
+    assert!(
+        !has_builtin(&filtered, "mcp"),
+        "`-builtin:mcp` drops the builtin from the plan: {filtered:?}"
+    );
+    let expected: Vec<String> = builtin_names(&default_plan())
+        .into_iter()
+        .filter(|name| name != "mcp")
+        .collect();
+    assert_eq!(
+        builtin_names(&filtered),
+        expected,
+        "only `mcp` may disappear"
+    );
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn extensions_builtin_controls_keep_pi_precedence_and_ignore_plain_entries() {
+    // A bare `builtin:<name>` entry is a source, not a filter.
+    let plain_global = TempDir::new("global-ext-plain");
+    write_settings(plain_global.path(), r#"{ "extensions": ["builtin:mcp"] }"#);
+    let plain_cwd = TempDir::new("cwd-ext-plain");
+    let plain = load_manager(plain_global.path(), plain_cwd.path(), false);
+    assert!(
+        plain.disabled_builtin_extensions().is_empty(),
+        "a plain builtin entry does not disable anything"
+    );
+
+    // `!builtin:<pattern>` disables every matching builtin (upstream
+    // `matchesAnyPattern`); `-` beats `+` in the same scope (upstream
+    // `isEnabledByOverrides` applies excludes, force-includes, force-excludes
+    // in that order).
+    let global = TempDir::new("global-ext-precedence");
+    write_settings(
+        global.path(),
+        r#"{ "extensions": ["!builtin:*", "+builtin:mcp", "-builtin:mcp"] }"#,
+    );
+    let cwd = TempDir::new("cwd-ext-precedence");
+    let manager = load_manager(global.path(), cwd.path(), false);
+    let names = manager.disabled_builtin_extensions();
+    assert!(
+        names.contains("mcp"),
+        "`-builtin:mcp` wins over `+builtin:mcp`: {names:?}"
+    );
+    assert!(
+        names.len() > 1,
+        "`!builtin:*` disables the other builtins too: {names:?}"
+    );
+
+    // `!builtin:mcp` alone disables exactly that builtin.
+    let bang_global = TempDir::new("global-ext-bang");
+    write_settings(bang_global.path(), r#"{ "extensions": ["!builtin:mcp"] }"#);
+    let bang_cwd = TempDir::new("cwd-ext-bang");
+    let bang = load_manager(bang_global.path(), bang_cwd.path(), false);
+    assert_eq!(
+        bang.disabled_builtin_extensions(),
+        std::collections::BTreeSet::from(["mcp".to_owned()])
+    );
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn project_plus_builtin_reenables_a_user_disable_only_when_trusted() {
+    let global = TempDir::new("global-ext-project");
+    write_settings(global.path(), r#"{ "extensions": ["-builtin:mcp"] }"#);
+    let cwd = TempDir::new("cwd-ext-project");
+    write_settings(
+        &cwd.path().join(".pi"),
+        r#"{ "extensions": ["+builtin:mcp"] }"#,
+    );
+
+    // An untrusted project contributes nothing (its raw scope is empty).
+    let untrusted = load_manager(global.path(), cwd.path(), false);
+    assert!(
+        untrusted.disabled_builtin_extensions().contains("mcp"),
+        "the user disable survives an untrusted project"
+    );
+
+    // Upstream: a `+builtin:<name>` entry in PROJECT settings overrides the
+    // user setting (docs/settings.md:163).
+    let trusted = load_manager(global.path(), cwd.path(), true);
+    assert!(
+        !trusted.disabled_builtin_extensions().contains("mcp"),
+        "the project `+builtin:mcp` re-enables the builtin: {:?}",
+        trusted.disabled_builtin_extensions()
+    );
+    let disabled = trusted.disabled_builtins_with_flags(&pir::plugins::disabled_from_flags(false));
+    let filtered = pir::plugins::filter_disabled_builtins(&default_plan(), &disabled);
+    assert!(
+        has_builtin(&filtered, "mcp"),
+        "the re-enabled builtin is back on the plan: {filtered:?}"
+    );
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn project_minus_builtin_adds_a_disable_but_never_lifts_the_pir_key() {
+    // A project restriction is honored and added to the set.
+    let global = TempDir::new("global-ext-project-minus");
+    let cwd = TempDir::new("cwd-ext-project-minus");
+    write_settings(
+        &cwd.path().join(".pi"),
+        r#"{ "extensions": ["-builtin:mcp"] }"#,
+    );
+    let trusted = load_manager(global.path(), cwd.path(), true);
+    assert!(
+        trusted.disabled_builtin_extensions().contains("mcp"),
+        "a project `-builtin:mcp` disables the builtin"
+    );
+
+    // `+builtin:<name>` follows upstream's scope precedence for the
+    // `extensions` spelling, but the pir-only `disabledBuiltinExtensions`
+    // key stays a restriction a project may add to and never lift.
+    let key_global = TempDir::new("global-ext-key");
+    write_settings(
+        key_global.path(),
+        r#"{ "disabledBuiltinExtensions": ["mcp"] }"#,
+    );
+    let key_cwd = TempDir::new("cwd-ext-key");
+    write_settings(
+        &key_cwd.path().join(".pi"),
+        r#"{ "extensions": ["+builtin:mcp"] }"#,
+    );
+    let key_manager = load_manager(key_global.path(), key_cwd.path(), true);
+    assert!(
+        key_manager.disabled_builtin_extensions().contains("mcp"),
+        "`+builtin:mcp` does not lift `disabledBuiltinExtensions`: {:?}",
+        key_manager.disabled_builtin_extensions()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Schema: the key is declared (no longer silently accepted and dropped).
 // ---------------------------------------------------------------------------
 

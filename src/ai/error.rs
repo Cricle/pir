@@ -53,6 +53,22 @@ pub enum AiError {
     #[error("authentication failure: {0}")]
     Authentication(String),
 
+    /// A malformed `models.json`: the file exists but does not parse (or does
+    /// not match the schema). Distinct from [`Self::Authentication`] so a
+    /// configuration typo is never reported as a credential problem, exactly
+    /// like [`Self::ModelsStore`] for catalog writes (PIR-BIN-071's contract).
+    /// The payload carries pi's user-facing text (`Failed to parse
+    /// models.json: <error>\n\nFile: <path>`, `core/model-config.ts`
+    /// `ModelConfig.load`) and is rendered verbatim.
+    ///
+    /// Since PIR-BIN-098 the loaders no longer RETURN this variant: like pi's
+    /// `ModelConfig.load`, a malformed `models.json` degrades to the empty
+    /// layer plus a `Warning: errors loading models.json:` diagnostic
+    /// ([`super::providers::take_models_json_load_warning`]). The variant stays
+    /// part of the public error surface.
+    #[error("{0}")]
+    InvalidModelsJson(String),
+
     /// A `models-store.json` persistence failure: the store file could not be
     /// read, parsed, serialized, or atomically replaced. Distinct from
     /// [`Self::Authentication`] so a failed catalog write is never reported as
@@ -138,17 +154,21 @@ pub struct ProviderHttpError<'a> {
 /// [`RetryableTurn`]: TurnRetryClass::RetryableTurn
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TurnRetryClass {
-    /// The failure never reached a transport-level retry verdict (a
-    /// mid-stream drop, body read failure, or unterminated stream). The agent
+    /// The failure did not consume a transport-level retry verdict the agent
+    /// must respect: a mid-stream drop, a body read failure, an unterminated
+    /// stream, or a retryable HTTP status whose provider budget is spent
+    /// (upstream: `maxRetries ?? 0` provider attempts, then
+    /// `isRetryableAssistantError` re-issues the turn at 2/4/8 s). The agent
     /// loop may re-issue the whole turn after its own backoff.
     RetryableTurn,
-    /// The transport already spent its own retry budget
-    /// (`AiError::RetryExhausted`, including a zero budget). Re-issuing at the
-    /// agent level would multiply the two budgets into extra requests.
+    /// The transport already spent a NON-status retry budget
+    /// (`AiError::RetryExhausted` around a connect/read failure, including a
+    /// zero budget). Re-issuing at the agent level would multiply the two
+    /// budgets into extra requests.
     TransportExhausted,
-    /// A provider/transport verdict that must never be re-issued
-    /// (`AiError::NonRetryable`, authentication/configuration failures,
-    /// aborts, response-size limits, and parse failures).
+    /// A verdict that must never be re-issued: authentication, configuration,
+    /// aborts, response-size limits, parse failures, and adapter-authored
+    /// non-HTTP `AiError::NonRetryable` messages.
     NonRetryable,
 }
 
@@ -187,23 +207,38 @@ pub const RETRY_CLASS_DIAGNOSTIC: &str = "pir_retry_class";
 impl AiError {
     /// Structural retry disposition of this error (see [`TurnRetryClass`]).
     ///
-    /// Derived from the VARIANT only — never from [`Self::user_message`] or
+    /// Derived from the VARIANT (plus the structured
+    /// [`Self::provider_http_error`] status for the transport's
+    /// `HTTP <status>: <body>` verdict) — never from [`Self::user_message`] or
     /// `Display`, whose text adapters prefix and which [`AiError::RetryExhausted`]
     /// flattens to its inner message. `Io`/`Http`/`StreamNotTerminated`/
     /// `StreamTruncated` are the errors the transport surfaces when a stream
     /// dies after it started (the transport never rendered a verdict for
     /// those, so the agent's turn retry is the outer budget).
+    ///
+    /// A retryable HTTP status (the transport's own `is_retryable` set:
+    /// 408/409/429/5xx) that surfaces as the terminal verdict means the
+    /// PROVIDER budget is spent — upstream resolves it as `maxRetries ?? 0`
+    /// and lets the agent layer re-issue the turn, so the class is
+    /// [`TurnRetryClass::RetryableTurn`]. Every other `NonRetryable`
+    /// (authentication/configuration/parse/adapter text) stays terminal.
     pub fn turn_retry_class(&self) -> TurnRetryClass {
         match self {
             AiError::RetryExhausted { .. } => TurnRetryClass::TransportExhausted,
+            AiError::NonRetryable(_) => match self.provider_http_error() {
+                Some(http) if crate::ai::transport::is_retryable(http.status) => {
+                    TurnRetryClass::RetryableTurn
+                }
+                _ => TurnRetryClass::NonRetryable,
+            },
             AiError::Aborted
             | AiError::RetryCancelled { .. }
-            | AiError::NonRetryable(_)
             | AiError::ProviderNotConfigured(_)
             | AiError::UnknownProvider(_)
             | AiError::UnknownModel(_)
             | AiError::MissingProviderAdapter { .. }
             | AiError::Authentication(_)
+            | AiError::InvalidModelsJson(_)
             | AiError::ModelsStore(_)
             | AiError::Json(_)
             | AiError::ResponseTooLarge { .. } => TurnRetryClass::NonRetryable,

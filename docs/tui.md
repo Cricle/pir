@@ -12,7 +12,9 @@ frame is a hand-rolled diff painter over crossterm): multiline editor with kill-
   output for shell tools + status tail `(exit N)` / `Took Xs`); compaction and notices render as bordered entries.
 - **Alt-screen** (default fullscreen `tuiMode`; cycle the `tui-mode` row in `/settings`): scrollable viewport
   with search (`ctrl+f`, not `/`), selection copy, and a scrollbar; upstream scroll geometry (maxScrollTop clamps).
-- **Image preview**: `/image <path>` renders a local PNG/JPEG/GIF/WebP as a half-block truecolor preview (up to 20
+- **Image preview**: `/image <path>` renders a local PNG/JPEG/GIF/WebP with the resolved inline-image protocol when
+  there is one (`terminal.images` or detection, including `PI_IMAGE_PROTOCOL`; Kitty transcodes non-PNG payloads),
+  otherwise as a half-block truecolor preview (up to 20
   rows, `terminal.imageWidthCells`, default 60 cols). `terminal.showImages: false` (or a slim build without the
   `image-protocol` feature) renders the upstream text fallback `[Image: <path> [<mime>] <WxH>]`, with the read or
   decode error appended. A relative path resolves against the active session cwd.
@@ -126,7 +128,10 @@ queueing a dialog whose only drainer is the blocked renderer thread. Synchronous
   (usage/cost). `/fork` and `/clone` report upstream-verbatim status text (`Forked to new session` /
   `Cloned to new session`, PIR-TUI-019) and seed the composer with the forked-away user message.
   `/resume` lists the session directory once and filters the current cwd in memory (Tab switches to full list); it
-  does not rescan files per scope.
+  does not rescan files per scope. `/export` renders the session with the active theme's colors (upstream
+  `themeName`) and needs a persisted session file: an ephemeral `--no-session` run keeps its transcript in
+  `AgentSession.history` and has no `SessionManager` to render, so `/export` and RPC `export_html` report
+  `cannot export an in-memory session (--no-session)` instead (upstream exports its live in-memory manager).
 - Session tabs: `/sessions` opens a picker of open tabs and the cwd's persisted sessions; `/sessions
   new|next|prev|close|<index>|<path>` acts directly; ctrl+tab / ctrl+shift+tab cycle tabs. Only the active tab's
   session is live in the worker (switching reuses the `/resume` attach); a fresh tab's stem title becomes the first
@@ -149,8 +154,9 @@ tallest one painted since the last clearing render (default false, upstream `SET
 unchanged). The alt-screen/windowed renderer clamps every frame to the visible rows, so `clearOnShrink` has no
 visible effect there — the setting is main-screen only, matching the separate upstream alt-screen renderer.
 
-The footer's git branch comes from `.git/HEAD` read directly — polled once per second, walking parent directories
-and following `gitdir:` indirection used by worktrees/submodules. `git rev-parse --abbrev-ref HEAD` is a one-shot
+The footer's git branch comes from `.git/HEAD` read directly — polled every 5 s (`GIT_BRANCH_POLL_INTERVAL`,
+`src/tui/terminal.rs:4769`), walking parent directories and following `gitdir:` indirection used by
+worktrees/submodules. `git rev-parse --abbrev-ref HEAD` is a one-shot
 fallback only when the direct read cannot answer (bare setups, unusual `GIT_DIR` layouts).
 
 `terminal.hyperlinks` and `terminal.trueColor` are pinned at TUI start (`set_global_hyperlinks` +

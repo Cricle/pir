@@ -425,27 +425,32 @@ pub struct EntryPlan {
 
 #[cfg(feature = "cli")]
 impl Cli {
-    /// The resolved entry plan (see [`EntryPlan`]). The `--print` optional
+    /// The resolved entry plan (see [`EntryPlan`]). Every `--print` optional
     /// value joins the message list; a value that starts with `@` is a file
     /// argument instead (upstream `-p` never consumes an `@file` reference).
+    /// Repeated `-p`/`--print` occurrences contribute in argv order — upstream
+    /// `parseArgs` pushes each consumed value into `messages` (PIR-BIN-090).
     pub fn entry_plan(&self, stdin_is_tty: bool, stdout_is_tty: bool) -> EntryPlan {
-        let mut messages = self.messages.clone();
         let mut file_args: Vec<String> = Vec::new();
-        if let Some(first) = self.print.clone() {
-            if let Some(rest) = first.strip_prefix('@') {
+        let mut messages: Vec<String> = Vec::new();
+        // Print-flag values land BEFORE the positionals (the single-value
+        // layout this replaced inserted at index 0) and keep their argv order.
+        for value in &self.print {
+            if let Some(rest) = value.strip_prefix('@') {
                 if !rest.is_empty() {
                     file_args.push(rest.to_string());
                 }
-            } else if !first.is_empty() {
-                messages.insert(0, first);
+            } else if !value.is_empty() {
+                messages.push(value.clone());
             }
         }
+        messages.extend(self.messages.iter().cloned());
         let (messages, more_files) = split_at_args(messages);
         file_args.extend(more_files);
         EntryPlan {
             app_mode: resolve_app_mode(
                 self.mode(),
-                self.print.is_some(),
+                !self.print.is_empty(),
                 stdin_is_tty,
                 stdout_is_tty,
             ),
@@ -516,10 +521,12 @@ pub fn validate_parsed_flags(cli: &Cli) -> Result<(), String> {
     // still captures it), so the run-mode rule must not fire for them.
     let provider_is_run_flag = !matches!(cli.command, Some(Command::Auth { .. }));
     if provider_is_run_flag && cli.provider.is_some() && cli.model.is_none() {
-        return Err(
-            "--provider requires --model (for example: --provider <provider> --model <model>)"
-                .to_owned(),
-        );
+        // Upstream `main.ts:472` echoes the value the user gave, so the
+        // example line is copy-pasteable with their own provider.
+        return Err(format!(
+            "--provider requires --model (for example: --provider {} --model <pattern>)",
+            cli.provider.as_deref().unwrap_or("<provider>")
+        ));
     }
     if let Some(name) = &cli.name {
         if name.trim().is_empty() {
@@ -745,7 +752,14 @@ Environment Variables:
     name = "pir",
     version,
     about = "Pi coding agent in Rust",
-    after_help = ENVIRONMENT_VARIABLES_HELP
+    after_help = ENVIRONMENT_VARIABLES_HELP,
+    // Upstream `parseArgs` assigns every single-value flag unconditionally, so
+    // a repeated `--model a --model b` silently keeps the LAST value. clap's
+    // `ArgAction::Set` rejects the second occurrence instead; this makes the
+    // Set args self-override like upstream (PIR-BIN-090). Repeatable `Vec`
+    // args use `ArgAction::Append`, which the parser never truncates, and
+    // `print` is a `Vec` for the same reason (every `-p` value is a prompt).
+    args_override_self = true
 )]
 pub struct Cli {
     /// Extension file or directory to load (repeatable); `builtin:<name>`
@@ -784,7 +798,7 @@ pub struct Cli {
     #[arg(long = "no-session", global = true)]
     pub no_session: bool,
 
-    /// Disable AGENTS.md and CLAUDE.md discovery and loading (upstream
+    /// `-nc`: Disable AGENTS.md and CLAUDE.md discovery and loading (upstream
     /// `--no-context-files, -nc`)
     #[arg(long = "no-context-files", global = true)]
     pub no_context_files: bool,
@@ -823,7 +837,7 @@ pub struct Cli {
     #[arg(long = "session-dir", value_name = "DIR", global = true)]
     pub session_dir: Option<String>,
 
-    /// Set the session display name (upstream `--name, -n`)
+    /// `-n`: Set the session display name (upstream `--name, -n`)
     #[arg(long = "name", value_name = "NAME", global = true)]
     pub name: Option<String>,
 
@@ -840,23 +854,23 @@ pub struct Cli {
     )]
     pub models: Option<String>,
 
-    /// Disable all tools by default (upstream `--no-tools, -nt`)
+    /// `-nt`: Disable all tools by default (upstream `--no-tools, -nt`)
     #[arg(long = "no-tools", global = true)]
     pub no_tools: bool,
 
-    /// Disable built-in tools by default but keep extension/custom tools
-    /// (upstream `--no-builtin-tools, -nbt`)
+    /// `-nbt`: Disable built-in tools by default but keep extension/custom
+    /// tools (upstream `--no-builtin-tools, -nbt`)
     #[arg(long = "no-builtin-tools", global = true)]
     pub no_builtin_tools: bool,
 
-    /// Comma-separated allowlist of tool names or patterns (*) to enable;
-    /// pure `+name`/`-name` modifier lists add to or remove from the defaults
-    /// (upstream `--tools, -t`)
+    /// `-t`: Comma-separated allowlist of tool names or patterns (*) to
+    /// enable; pure `+name`/`-name` modifier lists add to or remove from the
+    /// defaults (upstream `--tools, -t`)
     #[arg(long = "tools", value_name = "TOOLS", global = true)]
     pub tools: Option<String>,
 
-    /// Comma-separated denylist of tool names or patterns (*) to disable,
-    /// MCP tools included (upstream `--exclude-tools, -xt`)
+    /// `-xt`: Comma-separated denylist of tool names or patterns (*) to
+    /// disable, MCP tools included (upstream `--exclude-tools, -xt`)
     #[arg(long = "exclude-tools", value_name = "TOOLS", global = true)]
     pub exclude_tools: Option<String>,
 
@@ -871,9 +885,9 @@ pub struct Cli {
     )]
     pub perf_profile: Option<String>,
 
-    /// Disable settings/default extension discovery and built-in extensions;
-    /// explicit `-e` paths (including `builtin:<name>`) still load (upstream
-    /// `--no-extensions, -ne`)
+    /// `-ne`: Disable settings/default extension discovery and built-in
+    /// extensions; explicit `-e` paths (including `builtin:<name>`) still load
+    /// (upstream `--no-extensions, -ne`)
     #[arg(long = "no-extensions", alias = "ne", global = true)]
     pub no_extensions: bool,
 
@@ -895,7 +909,7 @@ pub struct Cli {
     #[arg(long = "skill", value_name = "PATH", global = true)]
     pub skill: Vec<std::path::PathBuf>,
 
-    /// Disable skills discovery and loading (upstream `--no-skills, -ns`)
+    /// `-ns`: Disable skills discovery and loading (upstream `--no-skills, -ns`)
     #[arg(long = "no-skills", global = true)]
     pub no_skills: bool,
 
@@ -903,7 +917,7 @@ pub struct Cli {
     #[arg(long = "prompt-template", value_name = "PATH", global = true)]
     pub prompt_template: Vec<std::path::PathBuf>,
 
-    /// Disable prompt template discovery (upstream `--no-prompt-templates, -np`)
+    /// `-np`: Disable prompt template discovery (upstream `--no-prompt-templates, -np`)
     #[arg(long = "no-prompt-templates", global = true)]
     pub no_prompt_templates: bool,
 
@@ -946,11 +960,15 @@ pub struct Cli {
     #[arg(long = "tui-mode", value_name = "MODE", global = true)]
     pub tui_mode: Option<String>,
 
-    /// Trust project-local files for this run (upstream `--approve, -a`)
+    /// Trust project-local files for this run (upstream `--approve, -a`). When
+    /// `--approve` and `--no-approve` are both given, `--approve` wins in any
+    /// order (upstream keeps the last one)
     #[arg(long = "approve", short = 'a', global = true)]
     pub approve: bool,
 
-    /// Ignore project-local files for this run (upstream `--no-approve, -na`)
+    /// `-na`: Ignore project-local files for this run (upstream `--no-approve,
+    /// -na`). `--approve` wins when both flags are given, in any order
+    /// (upstream keeps the last one)
     #[arg(long = "no-approve", global = true)]
     pub no_approve: bool,
 
@@ -971,7 +989,11 @@ pub struct Cli {
 
     /// Non-interactive print mode: process the prompt (the optional value,
     /// positional messages, or piped stdin) and exit; an `@file` value is read
-    /// as a file reference (upstream `--print, -p`)
+    /// as a file reference (upstream `--print, -p`). Every occurrence
+    /// contributes its value to the prompt list — `-p a -p b` prompts `a`
+    /// then `b` (upstream `parseArgs` pushes each consumed value into
+    /// `messages`), so the field accumulates (`ArgAction::Append`) instead of
+    /// self-overriding like the other single-value flags.
     #[arg(
         short = 'p',
         long = "print",
@@ -980,7 +1002,7 @@ pub struct Cli {
         default_missing_value = "",
         global = true
     )]
-    pub print: Option<String>,
+    pub print: Vec<String>,
 
     /// Prompt message(s): with `--print`, a non-TTY stdin/stdout, or piped
     /// stdin they form the print prompt; otherwise they start the interactive
@@ -1275,8 +1297,8 @@ pub enum McpCommand {
         local: bool,
     },
     /// Check configured servers by test-connecting each with a bounded
-    /// timeout (default when no subcommand is given; upstream `pi mcp`'s
-    /// default check behavior)
+    /// timeout (pir extension; upstream has no `mcp check` — bare `pi mcp`
+    /// prints the mcp help instead)
     Check {
         /// Only check this server
         server: Option<String>,
@@ -1951,6 +1973,25 @@ pub async fn run_mcp_command_with_trust(
         return Err(anyhow::anyhow!("MCP command reported failures"));
     }
     Ok(())
+}
+
+/// Render the `pir mcp` subcommand help (the bare-`pir mcp` default, matching
+/// upstream: `runMcpCommand` logs its HELP and returns 0 when no subcommand is
+/// given — extensions/mcp/cli.ts:189-192). The explicit `pir mcp check` keeps
+/// pir's test-connect-all surface.
+#[cfg(feature = "cli")]
+pub fn render_mcp_help() -> String {
+    let mut command = <Cli as clap::CommandFactory>::command();
+    // Build the whole tree once: `render_help` on a subcommand otherwise
+    // renders from an unbuilt definition (and without bin names, so the usage
+    // line would read `mcp …` instead of `pir mcp …`).
+    command.build();
+    match command.find_subcommand_mut("mcp") {
+        Some(mcp) => mcp.clone().render_help().to_string(),
+        // The `mcp` subcommand is unconditionally defined; this arm only keeps
+        // the helper total instead of panicking on a refactor.
+        None => command.render_help().to_string(),
+    }
 }
 
 /// Run a `pir mcp` subcommand and return its process exit code (upstream
@@ -2753,8 +2794,13 @@ async fn run_mcp_check(only: Option<&str>, json: bool, project_trusted: bool) ->
         if json {
             println!("[]");
         } else {
-            println!("No MCP servers configured.");
-            println!("Add ~/.pi/agent/mcp.json or <cwd>/.pi/mcp.json (project files need trust).");
+            // Upstream `pi mcp` (extensions/mcp/cli.ts): the agent-dir path is
+            // RESOLVED, so a redirected PIR_AGENT_DIR is named correctly, and
+            // the project scope keeps upstream's relative spelling.
+            println!(
+                "No MCP servers configured. Add them to {} or .pi/mcp.json.",
+                crate::config::mcp::global_mcp_path(&agent_dir).display()
+            );
         }
         return Ok(());
     }
@@ -2919,6 +2965,14 @@ async fn run_mcp_list(json: bool, project_trusted: bool) -> crate::Result<bool> 
 
     let mut entries = manager.registry().list();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
+    // Names the trusted project file overrides (upstream `entry.override`):
+    // the loader merges them into the project-sourced entry, so the report
+    // names the file for the registry entries that came FROM it as overrides.
+    let project_overrides: BTreeSet<String> = if project_trusted {
+        crate::config::mcp::project_override_names(&project_config)
+    } else {
+        BTreeSet::new()
+    };
     let mut reports: Vec<McpListEntry> = Vec::with_capacity(entries.len());
     let mut failed = !config_errors.is_empty();
     for entry in entries {
@@ -3007,10 +3061,18 @@ async fn run_mcp_list(json: bool, project_trusted: bool) -> crate::Result<bool> 
             (!overrides.is_empty()).then_some(overrides)
         };
         reports.push(McpListEntry {
-            name: entry.name,
+            name: entry.name.clone(),
             scope: scope.to_owned(),
             source,
-            override_path: None,
+            // Only a project-sourced entry whose project file body is an
+            // override can be one: a full project definition and a text
+            // extension registration never report an override (upstream
+            // `readConfigFile` sets `override` only on the merged base entry).
+            override_path: (matches!(
+                &entry.source,
+                crate::mcp::registry::McpServerSource::ProjectConfig(_)
+            ) && project_overrides.contains(&entry.name))
+            .then(|| project_config.display().to_string()),
             enabled,
             exposure: crate::mcp::manager::exposure_label(base_exposure).to_owned(),
             transport,

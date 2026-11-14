@@ -25,9 +25,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "skills")]
-use serde::Deserialize;
-
 /// Max name length per the Agent Skills spec.
 const MAX_NAME_LENGTH: usize = 64;
 
@@ -106,15 +103,21 @@ impl SkillInfo {
     }
 }
 
-/// YAML frontmatter of a skill file.
+/// Skill frontmatter, read the way upstream `loadSkillFromFile` reads it: each
+/// field is type-checked on its own, so one unexpected YAML type costs that
+/// field only, never the whole document.
 #[cfg(feature = "skills")]
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Default)]
 struct SkillFrontmatter {
+    /// Only a YAML string counts (upstream `typeof frontmatter.name ===
+    /// "string"`); any other type falls back to the parent directory name.
     name: Option<String>,
+    /// Only a YAML string counts; any other type reads as "no description"
+    /// (which rejects the skill with the usual "description is required").
     description: Option<String>,
-    #[serde(rename = "disable-model-invocation")]
-    disable_model_invocation: Option<bool>,
+    /// True only for the YAML boolean `true` (upstream `=== true`); the string
+    /// `"yes"`, the number `1`, and every other value leave the flag off.
+    disable_model_invocation: bool,
 }
 
 /// The kind of a skill-discovery diagnostic (upstream
@@ -250,14 +253,35 @@ pub fn strip_frontmatter(text: &str) -> &str {
         .unwrap_or(text)
 }
 
-/// Parse skill frontmatter from file contents. Returns an error message on malformed YAML.
+/// Parse skill frontmatter from file contents. Returns an error message only
+/// for malformed YAML — the one frontmatter failure that also drops a declared
+/// `SKILL.md` upstream. Field values are read per field: a non-string `name` or
+/// `description` and a non-boolean `disable-model-invocation` are ignored the
+/// way upstream's `typeof` / `=== true` checks ignore them.
 #[cfg(feature = "skills")]
 fn parse_frontmatter(text: &str) -> Result<SkillFrontmatter, String> {
-    match split_frontmatter(text) {
-        Some(yaml) => serde_yaml::from_str::<SkillFrontmatter>(yaml)
-            .map_err(|e| format!("invalid frontmatter: {e}")),
-        None => Ok(SkillFrontmatter::default()),
-    }
+    let Some(yaml) = split_frontmatter(text) else {
+        return Ok(SkillFrontmatter::default());
+    };
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(yaml).map_err(|e| format!("invalid frontmatter: {e}"))?;
+    // A document that is not a mapping (sequence, scalar, null) exposes no
+    // fields; JS property access on those values yields `undefined` too.
+    let serde_yaml::Value::Mapping(mapping) = value else {
+        return Ok(SkillFrontmatter::default());
+    };
+    let string_field = |key: &str| match mapping.get(key) {
+        Some(serde_yaml::Value::String(value)) => Some(value.clone()),
+        _ => None,
+    };
+    Ok(SkillFrontmatter {
+        name: string_field("name"),
+        description: string_field("description"),
+        disable_model_invocation: matches!(
+            mapping.get("disable-model-invocation"),
+            Some(serde_yaml::Value::Bool(true))
+        ),
+    })
 }
 
 /// Validate a skill name per the Agent Skills spec; returns validation errors.
@@ -366,37 +390,44 @@ pub fn load_skill_from_file_with_diagnostics(
     let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
     let is_declared_skill = path.file_name().is_some_and(|n| n == "SKILL.md");
 
-    let frontmatter = if is_declared_skill {
-        match parse_frontmatter(raw) {
-            Ok(frontmatter) => frontmatter,
-            Err(message) => {
+    // Malformed YAML is the one frontmatter failure that drops a declared
+    // SKILL.md with a warning; an undeclared root-level `.md` is skipped
+    // silently, exactly like every other root file that yields no skill.
+    let frontmatter = match parse_frontmatter(raw) {
+        Ok(frontmatter) => frontmatter,
+        Err(message) => {
+            if is_declared_skill {
                 diagnostics.push(SkillDiagnostic::warning(message, path));
-                return (None, diagnostics);
             }
+            return (None, diagnostics);
         }
-    } else {
-        // Undeclared root-level files: ignore malformed frontmatter entirely.
-        parse_frontmatter(raw).unwrap_or_default()
     };
+
+    // A non-string description reads as missing (upstream `typeof description
+    // === "string" && description.trim() !== ""`).
+    let description = frontmatter.description.unwrap_or_default();
+    let has_description = !description.trim().is_empty();
+    // Undeclared root-level files without a usable description are skipped
+    // silently (upstream `!isDeclaredSkill && !hasDescription` early return,
+    // before any validation warning is recorded).
+    if !is_declared_skill && !has_description {
+        return (None, diagnostics);
+    }
 
     // Validate the description per the Agent Skills spec (upstream
     // `validateDescription`); the messages are surfaced either way, but a
     // missing/empty description still rejects the skill.
-    let description = frontmatter.description.unwrap_or_default();
     for error in validate_description(&description) {
         diagnostics.push(SkillDiagnostic::warning(error, path));
     }
-    if description.trim().is_empty() {
-        return (None, diagnostics);
-    }
 
     // Name: the frontmatter value falls back to the parent directory name
-    // when missing, empty, or whitespace-only (upstream
-    // `frontmatterName || parentDirName`, whose `||` already falls back on
-    // the empty string; the whitespace case is treated the same here).
+    // when absent or empty (upstream `frontmatterName || parentDirName`). Only
+    // a YAML string reaches this point, so a whitespace-only name is kept and
+    // then flagged by validation, exactly like upstream.
     let name = frontmatter
         .name
-        .filter(|name| !name.trim().is_empty())
+        .filter(|name| !name.is_empty())
         .unwrap_or_else(|| {
             path.parent()
                 .and_then(|dir| dir.file_name())
@@ -409,12 +440,18 @@ pub fn load_skill_from_file_with_diagnostics(
         diagnostics.push(SkillDiagnostic::warning(error, path));
     }
 
+    // Still load the skill even with warnings, unless the description is
+    // missing or empty (upstream's final `if (!hasDescription)`).
+    if !has_description {
+        return (None, diagnostics);
+    }
+
     (
         Some(SkillInfo {
             name,
             description,
             path: path.to_path_buf(),
-            disable_model_invocation: frontmatter.disable_model_invocation == Some(true),
+            disable_model_invocation: frontmatter.disable_model_invocation,
         }),
         diagnostics,
     )

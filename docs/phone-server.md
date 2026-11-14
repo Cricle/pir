@@ -116,6 +116,9 @@ acknowledged and ignored by the compact web shell.
 | DELETE | `/api/devices/:id` | user | revoke a device/tokens and close its live agent socket immediately; idempotent for already-revoked owned ids |
 | GET | `/api/sessions?cursor=&limit=&q=&deviceId=` | user | paginated session catalog |
 | GET | `/api/sessions/:id` | user | session metadata |
+| GET | `/api/sessions/:id/messages?before=&limit=` | user | earlier messages via the agent's `get_messages` RPC (limit default 60 / max 200) |
+| GET | `/api/models?sessionId=` | user | the session's models via RPC; falls back to the first online session; `agent-offline` when none |
+| GET | `/api/quota?sessionId=` | user | quota via the `get_quota` RPC; `{ "visible": false }` when the agent is offline |
 | DELETE | `/api/sessions/:id` | user | soft-delete catalog metadata (local file untouched) |
 | POST | `/api/auth/ws-ticket` | user | 30-second one-use WebSocket ticket |
 
@@ -227,7 +230,8 @@ fanned out to every subscriber of that session. Metadata changes are sent with
 | `PI_PHONE_CUSTOM_EVENTS` | none | comma-separated opt-in `phone.custom.*` event names; max 64 KiB each |
 | `PI_PHONE_SESSION_POOL_EXECUTABLE` | current `pir` binary | override the child binary used by the phone session pool |
 
-The server refuses a token-less non-loopback bind. Use TLS for any public
+Every session/device/agent route requires a user or device token (only the PWA shell and `/api/health`,
+`/api/metrics`, `/api/version` are anonymous). Use TLS for any public
 deployment; either put it behind Caddy/Nginx/Tailscale or terminate TLS in the
 process in a future revision.
 

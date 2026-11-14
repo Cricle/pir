@@ -3,8 +3,8 @@
 Prompt templates are markdown files that become `/` commands. They are discovered from (in precedence order) the
 `--prompt-template` CLI paths, the trusted project scope (settings `prompts` paths, then `<cwd>/.pi/prompts`), the
 user scope (global settings `prompts` paths, then `<agentDir>/prompts`), and installed packages. Project scope is
-trust-gated; `--no-prompt-templates` disables the settings and automatic directories (an explicitly passed
-`--prompt-template` path still loads, and installed packages are not filtered by the flag). Name collisions: first
+trust-gated; `--no-prompt-templates` disables the settings, the automatic directories and the
+installed-package prompts (an explicitly passed `--prompt-template` path still loads). Name collisions: first
 wins with a diagnostic.
 
 Relative settings entries resolve against `<cwd>/.pi` (project) or `<agentDir>` (global). The automatic

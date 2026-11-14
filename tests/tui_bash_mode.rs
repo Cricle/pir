@@ -143,6 +143,60 @@ fn enter_in_bash_mode_parses_and_runs_the_mock_shell() {
     assert_eq!(parse_bash_submission(false, "!pwd"), None);
 }
 
+/// PIR-TUI-034: the live `!`-bash snapshot accumulator behind the worker's
+/// partial `ToolUpdate`s emits the first chunk immediately, then at most one
+/// snapshot per throttle window (pi's component appends every chunk; its
+/// frame loop coalesces — 100 ms at the producer is the same cadence), and it
+/// keeps a rolling tail wide enough that the block's painted preview (the
+/// last `DEFAULT_MAX_LINES`/`DEFAULT_MAX_BYTES`) can never change from a
+/// longer stream.
+#[test]
+fn live_bash_tail_emits_first_chunk_then_throttles_and_bounds_the_window() {
+    use std::time::{Duration, Instant};
+
+    use pir::coding_agent::truncate::DEFAULT_MAX_BYTES;
+    use pir::tui::terminal::{LiveBashTail, LIVE_BASH_UPDATE_THROTTLE};
+
+    let mut tail = LiveBashTail::new();
+    let t0 = Instant::now();
+
+    let first = tail
+        .push("USERBASH-1\n", t0)
+        .expect("the first chunk must emit immediately");
+    assert_eq!(first, "USERBASH-1\n");
+
+    // Within the throttle window the chunk accumulates but no snapshot goes
+    // out; the next snapshot carries the whole accumulated tail.
+    assert!(tail
+        .push("USERBASH-2\n", t0 + LIVE_BASH_UPDATE_THROTTLE / 2)
+        .is_none());
+    assert!(tail
+        .push(
+            "USERBASH-3\n",
+            t0 + LIVE_BASH_UPDATE_THROTTLE - Duration::from_millis(1)
+        )
+        .is_none());
+    let due = tail
+        .push("USERBASH-4\n", t0 + LIVE_BASH_UPDATE_THROTTLE)
+        .expect("the throttle window must release a snapshot");
+    assert_eq!(due, "USERBASH-1\nUSERBASH-2\nUSERBASH-3\nUSERBASH-4\n");
+
+    // A stream longer than the window keeps only the tail: the retained
+    // window is 2× the truncation cap, so the last `DEFAULT_MAX_BYTES` the
+    // block paints are always intact.
+    let big = "x".repeat(4 * DEFAULT_MAX_BYTES);
+    let snapshot = tail
+        .push(&big, t0 + 2 * LIVE_BASH_UPDATE_THROTTLE)
+        .expect("the snapshot after a burst must emit");
+    assert_eq!(
+        tail.tail().len(),
+        2 * DEFAULT_MAX_BYTES,
+        "the rolling window is 2× the truncation cap"
+    );
+    assert_eq!(snapshot.len(), 2 * DEFAULT_MAX_BYTES);
+    assert!(snapshot.chars().all(|c| c == 'x'));
+}
+
 #[test]
 fn bash_mode_has_a_visible_shell_label_in_the_composer_border() {
     assert!(BASH_STATUS_LABEL.contains("BASH"));

@@ -171,8 +171,8 @@ pub use bash::BashResult;
 pub use build::plugin_services::wait_for_claim_change_for_tests;
 pub use events::{
     agent_event_to_json, entry_appended_wire_builds, registry_event_stream,
-    reset_entry_appended_wire_builds, session_event_to_json, SessionEvent, SessionEventHandler,
-    SessionEventInterest, SummarizationRetrySource,
+    reset_entry_appended_wire_builds, session_event_to_json, to_session_event_line, SessionEvent,
+    SessionEventHandler, SessionEventInterest, SummarizationRetrySource,
 };
 pub use models::{
     clamp_starting_thinking_level_for_model, resolve_starting_thinking_level,
@@ -304,9 +304,14 @@ pub type SharedEventStreamFn = Arc<
 /// path metadata. It carries no messages: the hook slices the live context it
 /// is handed ([`compaction::ProjectionEntryMeta::cut_refs`]), so the snapshot
 /// costs a handful of bytes per entry instead of a copy of the conversation.
+///
+/// The path side is [`compaction::PathEntryShared`] (PIR-BIN-096): the hook
+/// reads id equality plus the two entry-kind flags only, so the snapshot holds
+/// the session's shared entry handles — a refcount bump per path entry — and
+/// never clones an id `String`.
 pub(crate) type ProjectionSnapshot = (
     Arc<Vec<compaction::ProjectionEntryMeta>>,
-    Arc<Vec<compaction::PathEntryMeta>>,
+    Arc<Vec<compaction::PathEntryShared>>,
 );
 
 /// Write-on-replace snapshot of the ephemeral transcript (upstream keeps one
@@ -594,6 +599,14 @@ impl CancelLatch {
     }
 }
 
+/// The agent loop's backoff arms each wait through this handle, so the session's
+/// `abort_retry()` reaches it exactly like the transport latch (PIR-BIN-100).
+impl crate::agent::agent_loop::RetryWaitAbort for CancelLatch {
+    fn arm(&self) -> crate::ai::types::AbortSignal {
+        CancelLatch::arm(self)
+    }
+}
+
 /// The editor text of a stored message (upstream `extractUserMessageText` /
 /// `contentText(targetEntry.content)`).
 fn stored_message_text(message: &crate::session_manager::StoredMessage) -> String {
@@ -783,6 +796,12 @@ pub struct AgentSession {
     /// `abort_retry()` fires it, so Esc during the countdown cancels the wait
     /// (upstream `abortRetry`).
     retry_cancel: CancelLatch,
+    /// The AGENT-LAYER retry wait's cancellation latch (PIR-BIN-100): the loop
+    /// arms it through [`RetryWaitAbort`] for every backoff and `abort_retry()`
+    /// fires it too, so one key stops whichever layer is waiting. Separate from
+    /// `retry_cancel` because the two layers arm concurrently — sharing one
+    /// latch would let a later arm hide an earlier wait from the cancel.
+    retry_wait_cancel: CancelLatch,
     /// Host-installed retry-notice sink (the TUI countdown); `None` keeps the
     /// transport's own sleep and no countdown is rendered.
     host_retry_notice: Mutex<Option<RetryNoticeSink>>,

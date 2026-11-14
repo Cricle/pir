@@ -164,7 +164,7 @@ consumer never blocks the run; a full channel drops the event), while terminal e
 `AgentOutcome`, and a rejected prompt's `PromptRejected`/`AgentSettled` pair) are sent with backpressure after
 settlement, so a live receiver always observes them. The enum is `#[non_exhaustive]`.
 
-The table is the complete variant list for this tree (33 variants). "Turn" fields are one-based indexes of the
+The table is the complete variant list for this tree (34 variants). "Turn" fields are one-based indexes of the
 low-level agent-loop run; one prompt may run the loop more than once (`agent_before_settle` continuation, overflow
 recovery), and `AgentSettled` closes the whole prompt run, not each loop run.
 
@@ -184,6 +184,7 @@ recovery), and `AgentSettled` closes the whole prompt run, not each loop run.
 | `EntryAppended` | `entry`: the appended `SessionEntry` in its upstream wire shape. |
 | `SessionInfoChanged` | `name: Option<String>` (`None` when cleared). |
 | `ThinkingLevelChanged` | `level`: the new effective level in wire form (`"low"`, `"high"`, ...). |
+| `HistoryTrimmed` | `dropped_messages`, `retained_messages`, `max_messages`, `max_tokens`, `reason` (`"messages"`/`"tokens"`), `total_dropped_messages`: one ephemeral-history cap trim (store-less agents). |
 | `BashExecutionUpdate` | `id: Option<String>`, `delta`: one streaming chunk of an out-of-loop bash execution. |
 | `AutoRetryStart` / `AutoRetryEnd` | `attempt`, `max_attempts`, `delay_ms`, `error_message` / `success`, `attempt`, `final_error: Option<String>`. |
 | `SummarizationRetryScheduled` / `SummarizationRetryAttemptStart` / `SummarizationRetryFinished` | `attempt`, `max_attempts`, `delay_ms`, `error_message`; `AttemptStart` adds `source` (`"branchSummary"`/`"compaction"`) and `reason: Option<String>` (the compaction trigger). |

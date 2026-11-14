@@ -836,14 +836,15 @@ async fn openai_exhausted_retries_encode_error_message() {
         message.contains("HTTP 500"),
         "error message should surface the HTTP status, got: {message}"
     );
-    // The REAL adapter finalizer also carried the structural verdict: a
-    // status the transport refused to retry is NOT re-issued at agent level
-    // even though "500" is retryable-looking text.
+    // The REAL adapter finalizer also carried the structural verdict: an
+    // exhausted retryable status is `RetryableTurn`, so the AGENT layer owns
+    // the outer budget (upstream `maxRetries ?? 0` plus
+    // `isRetryableAssistantError`); the transport still sent it exactly once.
     let mut terminal = (*final_message).clone();
     assert_eq!(
         take_turn_retry_class(&mut terminal),
-        Some(TurnRetryClass::NonRetryable),
-        "exhausted status must be structurally non-retryable, got: {message}"
+        Some(TurnRetryClass::RetryableTurn),
+        "an exhausted 500 must be re-issuable by the agent loop, got: {message}"
     );
     assert!(
         terminal.diagnostics.is_empty(),
@@ -853,7 +854,9 @@ async fn openai_exhausted_retries_encode_error_message() {
 
 /// The adapter-prefixed Responses path: `"OpenAI API error: "` hides the
 /// `"non-retryable provider error:"` marker from any text sniffing, but the
-/// structural verdict survives and the user-facing text is unchanged.
+/// structural verdict survives (an exhausted retryable status is
+/// `RetryableTurn`, so the agent layer may re-issue it) and the user-facing
+/// text is unchanged.
 #[tokio::test]
 async fn openai_responses_prefixed_error_keeps_the_structural_class() {
     let server = MockServer::start(vec![MockResponseSpec::error(503)]).await;
@@ -889,7 +892,7 @@ async fn openai_responses_prefixed_error_keeps_the_structural_class() {
     let mut terminal = (*final_message).clone();
     assert_eq!(
         take_turn_retry_class(&mut terminal),
-        Some(TurnRetryClass::NonRetryable),
+        Some(TurnRetryClass::RetryableTurn),
         "the prefix must not change the structural verdict, got: {message}"
     );
 }
@@ -934,17 +937,19 @@ async fn openai_transport_exhausted_carries_the_transport_verdict() {
     );
 }
 
-/// END-TO-END budget separation (the CL21 defect): the transport retries a
-/// retryable 5xx itself (2 retries = 3 requests) and then renders its
-/// terminal `NonRetryable` verdict. The agent-level turn-retry policy (3
-/// retries) must NOT re-issue the turn: the server sees exactly the
-/// transport's 3 requests, not the 3 x 4 = 12 the textual classifier allowed
-/// once the adapter/transport wording matched a retryable pattern.
+/// END-TO-END budget multiplication for an exhausted retryable status: the
+/// transport retries a 5xx itself (2 retries = 3 requests per agent round)
+/// and its terminal verdict is `RetryableTurn`, so the agent-level turn-retry
+/// policy (3 retries) re-issues the turn until BOTH ladders are spent —
+/// exactly what upstream does (`maxRetries ?? 0` provider attempts, then
+/// `isRetryableAssistantError` on the exhausted status). 4 agent rounds x 3
+/// transport attempts = 12 requests; the CL21 "text classifier multiplied the
+/// budget by itself" shape stopped after the first 3.
 #[tokio::test]
-async fn transport_budget_is_not_multiplied_by_agent_turn_retry() {
-    // Enough specs that a buggy re-issue would be observable (4 rounds x 3
-    // transport attempts). A correct run consumes only the first three.
-    let responses = (0..12).map(|_| MockResponseSpec::error(500)).collect();
+async fn exhausted_status_multiplies_the_transport_and_agent_budgets() {
+    // Three extra specs: a run that over-retries past both ladders would keep
+    // consuming them and fail the exact count below.
+    let responses = (0..15).map(|_| MockResponseSpec::error(500)).collect();
     let server = MockServer::start(responses).await;
     let base = format!("{}/v1", server.base_url());
     let provider = OpenAiCompatibleProvider::new("openai", base.clone(), vec![openai_model(&base)])
@@ -976,10 +981,13 @@ async fn transport_budget_is_not_multiplied_by_agent_turn_retry() {
 
     assert_eq!(
         server.requests().len(),
-        3,
-        "the transport's budget (initial + 2 retries) is the whole request count"
+        12,
+        "4 agent rounds x (initial + 2 transport retries): both ladders apply"
     );
-    assert_eq!(result.turns, 1, "exactly one agent-level round");
+    assert_eq!(
+        result.turns, 1,
+        "the retries are the SAME agent-level round"
+    );
     assert_eq!(result.terminal.stop_reason, StopReason::Error);
     assert!(
         result

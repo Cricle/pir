@@ -54,6 +54,7 @@ use crate::ai::provider::ProviderRegistry;
 use crate::ai::types::{
     ContentBlock, Context, Message, MessageSource as _, TextContent, UserMessage, UserRole,
 };
+use crate::coding_agent::overrides::no_model_message;
 use crate::coding_agent::session_resolve::{open_session_manager, SessionPlan};
 // The shared `@file` implementation lives in `context.rs` so the session
 // prompt input can use the exact same path/MIME/attachment rules without
@@ -97,7 +98,7 @@ use crate::extensions::{ExtensionConfig, SessionContextSnapshot};
 #[cfg(feature = "mcp")]
 use crate::plugins::builtin::McpPlugin;
 use crate::plugins::PluginHost;
-use crate::system_prompt::build_system_prompt;
+use crate::system_prompt::{build_system_prompt_sections, render_sections};
 
 /// The print host's shared session storage: per-message persistence and the
 /// compaction hook both append during the run, so a mid-run crash (or a
@@ -1469,8 +1470,10 @@ pub fn print_apply_retry(deps: &mut LoopDeps, settings: &crate::config::settings
 ///
 /// The run snapshot is resolved ONCE per prompt run, next to
 /// [`print_apply_retry`]: a settings edit mid-run must not split one turn's
-/// requests across two retry budgets. Absent settings stay `None`, so the
-/// request keeps the transport defaults.
+/// requests across two retry budgets. An absent `provider.maxRetries`
+/// resolves to the upstream `?? 0` default (one provider attempt per turn;
+/// the agent-level ladder owns transient statuses), while the cap/timeout
+/// knobs stay `None` (the transport defaults).
 pub fn print_provider_retry_overrides(
     settings: &crate::config::settings::Settings,
 ) -> crate::config::settings::ProviderRetryOverrides {
@@ -2091,6 +2094,82 @@ pub fn restore_recorded_active_tools(
     }
 }
 
+/// Seed a NEW transcript with pi's initial system declaration row.
+///
+/// Upstream stores the initial system message when the transcript does not
+/// start with one (`agent.ts:86`) and merges the tool declaration into it
+/// (`declareToolChanges`), so a pi session opens
+/// `model_change → thinking_level_change → system(content, sections,
+/// toolsAdded) → user …`. Print carries the prompt outside the transcript
+/// (`Context::system_prompt`) and the loop's own declaration is emitted at
+/// the first request — AFTER the host already appended the starting user
+/// message. Appending this row first reproduces pi's order, and recording
+/// the declared tool set makes the loop's `declareToolChanges` a no-op for
+/// the run, so no duplicate declaration row is written.
+///
+/// Returns `None` (nothing appended) when the manager already records a
+/// system message, when it is paged (a paged session always has history), or
+/// when there is neither a tool loadout nor a prompt to declare. On success
+/// the appended entry's id and its in-memory twin are returned: the host
+/// emits the entry's `entry_appended` frame and announces it through the
+/// message lifecycle (the loop's own `declareToolChanges` is a no-op once the
+/// row exists, so this keeps the frames upstream emits for its initial system
+/// message).
+pub(crate) fn print_append_initial_system_declaration(
+    session: &mut crate::session_manager::SessionManager,
+    tools: &[crate::ai::types::Tool],
+    sections: &crate::system_prompt::SystemPromptSections,
+) -> crate::Result<Option<(String, crate::ai::types::Message)>> {
+    if session.is_paged() || session.has_system_message() {
+        return Ok(None);
+    }
+    let tools_added = (!tools.is_empty()).then(|| {
+        serde_json::to_value(tools).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+    });
+    let sections_json =
+        (!sections.is_empty()).then(|| crate::system_prompt::sections_to_json(sections));
+    if tools_added.is_none() && sections_json.is_none() {
+        return Ok(None);
+    }
+    let timestamp = crate::ai::util::now_ms();
+    let entry_id = session.append_system_declaration(
+        "",
+        sections_json.clone(),
+        tools_added.clone(),
+        None,
+        timestamp,
+    )?;
+    // The in-memory twin of the stored row: exactly what the projection
+    // rebuilds (`StoredSystemMessage::to_message`), so equal to the context
+    // entry a handler's `message_end` replacement would rewrite.
+    let sections_map = sections_json.as_ref().and_then(|value| {
+        value.as_object().map(|object| {
+            object
+                .iter()
+                .map(|(name, value)| (name.clone(), value.as_str().map(str::to_owned)))
+                .collect()
+        })
+    });
+    Ok(Some((
+        entry_id,
+        crate::ai::types::Message::System(crate::ai::types::UserMessage {
+            role: crate::ai::types::UserRole::System,
+            content: vec![crate::ai::types::ContentBlock::Text(
+                crate::ai::types::TextContent {
+                    text: String::new(),
+                    text_signature: None,
+                },
+            )],
+            tools_added: tools_added
+                .as_ref()
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
+            tools_removed: None,
+            sections: sections_map,
+            timestamp,
+        }),
+    )))
+}
+
 /// Re-derive the declared provider definitions for an active set captured
 /// AFTER [`print_tool_loadout`]'s first build — the `tool_search` activation
 /// path (`ToolSessionEnv::active_override`).
@@ -2355,6 +2434,10 @@ struct PrintedPrompt {
     mcp_servers: Option<String>,
     /// The rendered system prompt.
     prompt: String,
+    /// The structured sections the prompt text was joined from (upstream
+    /// `SystemMessage.sections`). Recorded on the session's first system
+    /// message so the stored prompt matches pi's shape.
+    sections: crate::system_prompt::SystemPromptSections,
 }
 
 /// The discovery inputs one [`PrintPromptCache`] is built from.
@@ -2585,7 +2668,7 @@ impl PrintPromptCache {
             .filter_map(|name| registry.get(name))
             .map(|tool| crate::system_prompt::ToolInfo::from_agent_tool(tool.as_ref()))
             .collect();
-        let prompt = build_system_prompt(&crate::system_prompt::SystemPromptInput {
+        let sections = build_system_prompt_sections(&crate::system_prompt::SystemPromptInput {
             preamble_override: self.preamble_override.clone(),
             append: self.append.clone(),
             tools: &tools,
@@ -2598,14 +2681,23 @@ impl PrintPromptCache {
                 self.mcp_servers.as_deref(),
             ),
         });
+        let prompt = render_sections(&sections);
         self.rendered = Some(PrintedPrompt {
             active: effective.to_vec(),
             declared,
             hidden,
             mcp_servers: self.mcp_servers.clone(),
             prompt: prompt.clone(),
+            sections,
         });
         prompt
+    }
+
+    /// The structured sections of the last rendered prompt (`None` before the
+    /// first [`Self::sync`]). The session's first system message records them
+    /// so the stored prompt shape matches pi's.
+    pub fn sections(&self) -> Option<&crate::system_prompt::SystemPromptSections> {
+        self.rendered.as_ref().map(|rendered| &rendered.sections)
     }
 }
 
@@ -3005,6 +3097,11 @@ pub async fn run_print(
 ) -> crate::Result<PrintOutcome> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let environment = crate::ai::providers::load_pi_environment(Some(&cwd))?;
+    // A malformed `models.json` degrades to the built-in catalog with pi's
+    // warning on stderr (PIR-BIN-098); never silent, never a startup abort.
+    if let Some(warning) = crate::ai::providers::take_models_json_load_warning() {
+        eprintln!("{warning}");
+    }
     run_print_with_environment(options, config, extension_paths, cwd, environment).await
 }
 
@@ -3170,7 +3267,7 @@ pub async fn run_print_with_environment(
             )
         }
         None => {
-            let message = "no model available; configure a provider with `pir auth login` or ~/.pi/agent/models.json";
+            let message = no_model_message();
             if options.mode == OutputMode::Json {
                 // The failure is reported IN-BAND (the terminal message event
                 // carries `stopReason: "error"` + `errorMessage`, the shape a
@@ -3182,7 +3279,7 @@ pub async fn run_print_with_environment(
                 crate::coding_agent::json::print_event(
                     &crate::agent::agent_loop::AgentEvent::TurnEnd {
                         turn: 0,
-                        message: terminal_error_message(message),
+                        message: terminal_error_message(&message),
                         // Synthetic terminal turn: no tools ran.
                         tool_results: Vec::new(),
                     },
@@ -3291,6 +3388,13 @@ pub async fn run_print_with_environment(
     }
     if let (Some(session), Some(name)) = (session.as_mut(), options.session_name.as_deref()) {
         session.set_session_name(Some(name))?;
+    }
+    // Upstream `createAgentSession` records a NEW session's startup state
+    // before the first message (sdk.ts:437-450): `model_change` then
+    // `thinking_level_change` — after `--name`'s `session_info` row, exactly
+    // like main.ts's order. A resumed transcript is untouched.
+    if let Some(session) = session.as_mut() {
+        session.append_startup_state(&model.provider, &model.id, thinking_level.wire_key())?;
     }
     let session: SharedSession = Arc::new(tokio::sync::Mutex::new(session));
 
@@ -3428,7 +3532,7 @@ pub async fn run_print_with_environment(
                     }
                 }
                 None if initial_model_missing => {
-                    let message = "no model available; configure a provider with `pir auth login` or ~/.pi/agent/models.json";
+                    let message = no_model_message();
                     if options.mode == OutputMode::Json {
                         // In-band terminal error frame PLUS the nonzero exit:
                         // a plugin plan that registered no provider is the
@@ -3437,7 +3541,7 @@ pub async fn run_print_with_environment(
                         crate::coding_agent::json::print_event(
                             &crate::agent::agent_loop::AgentEvent::TurnEnd {
                                 turn: 0,
-                                message: terminal_error_message(message),
+                                message: terminal_error_message(&message),
                                 tool_results: Vec::new(),
                             },
                         );
@@ -3456,7 +3560,7 @@ pub async fn run_print_with_environment(
     // provider, so the provisional model never became a real one. Keep the
     // historical error (and JSON-mode in-band terminal frame).
     if initial_model_missing && model.base_url.is_empty() {
-        let message = "no model available; configure a provider with `pir auth login` or ~/.pi/agent/models.json";
+        let message = no_model_message();
         if options.mode == OutputMode::Json {
             // Same contract as the two no-model branches above: the terminal
             // error frame stays in the stream, the process still reports
@@ -3464,7 +3568,7 @@ pub async fn run_print_with_environment(
             crate::coding_agent::json::print_event(
                 &crate::agent::agent_loop::AgentEvent::TurnEnd {
                     turn: 0,
-                    message: terminal_error_message(message),
+                    message: terminal_error_message(&message),
                     tool_results: Vec::new(),
                 },
             );
@@ -4211,6 +4315,63 @@ pub async fn run_print_with_environment(
             print_apply_provider_retry(&mut options, provider_retry_overrides);
             options
         };
+        // This prompt's request declarations AND system prompt: the loadout's
+        // first build, or — once a `tool_search` has loaded matches into the
+        // active-set cell (or another writer moved it) — a re-derivation from
+        // that cell, exactly like the session host's per-iteration
+        // `build_tool_loadout` (a match must be declared AND described on the
+        // NEXT prompt; the in-flight run's request list and prompt stay
+        // fixed). [`PrintPromptCache::sync`] reuses the first prompt
+        // byte-identically while the declared set is unchanged.
+        //
+        // Resolved HERE (before the session lock below) so the run's own
+        // loadout and its structured sections are available to the initial
+        // system declaration the host appends before the user message
+        // ([`print_append_initial_system_declaration`]).
+        let (prompt_tools, mut run_system_prompt, prompt_options, prompt_sections) = {
+            let current = resolved_active
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            // Refresh the MCP section for THIS prompt (upstream re-renders it
+            // per `before_agent_start`): a server that finished connecting
+            // since the last prompt shows as ready here; a transition landing
+            // mid-prompt shows on the next one. Cheap synchronous reads only.
+            prompt_cache.set_mcp_servers(crate::coding_agent::context::mcp_servers_prompt_section(
+                plugins.as_deref(),
+            ));
+            let run_system_prompt = prompt_cache.sync(&registry, &active, current.as_deref());
+            let prompt_sections = prompt_cache.sections().cloned().unwrap_or_default();
+            (
+                print_request_definitions(&registry, &tools, &active, current.as_deref()),
+                run_system_prompt,
+                // `systemPromptOptions` is only readable by a JS runtime
+                // (`ctx.getSystemPromptOptions()`) or a `before_agent_start`
+                // handler (the event payload), exactly like AgentSession's
+                // snapshot gate. Building it unconditionally walked the
+                // registry and copied context files/skills for every prompt of
+                // an extension-free run.
+                if extensions
+                    .as_ref()
+                    .is_some_and(|extensions| extensions.has_js_runtime())
+                    || plugins
+                        .as_ref()
+                        .is_some_and(|plugins| plugins.has_handlers("before_agent_start"))
+                {
+                    prompt_cache.system_prompt_options(&registry, &active, current.as_deref())
+                } else {
+                    JsonValue::Null
+                },
+                prompt_sections,
+            )
+        };
+        // The initial system declaration this run appends (see the projected
+        // block below): its entry id and in-memory twin, used to emit the
+        // `entry_appended` frame and announce it through the run's preamble
+        // so the declaration keeps its upstream `message_start`/`message_end`
+        // pair, in the pre-existing position (after the starting/injected
+        // messages).
+        let mut initial_declaration: Option<(String, crate::ai::types::Message)> = None;
         let projected: Option<ProjectionSnapshot> = {
             let mut guard = session.lock().await;
             match guard.as_mut() {
@@ -4256,6 +4417,33 @@ pub async fn run_print_with_environment(
                             compaction_config.as_ref(),
                             &stream_support_options,
                         );
+                    // pi-shaped initial system declaration (`sections` +
+                    // `toolsAdded`), appended BEFORE this prompt's user
+                    // message so a new transcript opens
+                    // `model_change → thinking_level_change → system → user`,
+                    // and the recorded loadout keeps the loop's own tool
+                    // declaration a no-op for this run. A transcript that
+                    // already records a system message (a resumed session)
+                    // is untouched.
+                    initial_declaration = print_append_initial_system_declaration(
+                        session,
+                        &prompt_tools,
+                        &prompt_sections,
+                    )?;
+                    if let Some((entry_id, _)) = &initial_declaration {
+                        // The row is host-written; emit its `entry_appended`
+                        // frame the loop's own declaration used to produce
+                        // (the per-message sink only sees loop-persisted
+                        // messages).
+                        if let Some(sink) = &print_session_events {
+                            if let Some(entry) = session.entry(entry_id) {
+                                sink(&SessionEvent::EntryAppended {
+                                    entry: serde_json::to_value(entry)
+                                        .unwrap_or(serde_json::Value::Null),
+                                });
+                            }
+                        }
+                    }
                     session.append_message(user.clone())?;
                     let paged_context = if widening && prefer_paged_prompt_context {
                         session.build_paged_prompt_context()?
@@ -4453,48 +4641,8 @@ pub async fn run_print_with_environment(
             }
         }
 
-        // This prompt's request declarations AND system prompt: the loadout's
-        // first build, or — once a `tool_search` has loaded matches into the
-        // active-set cell (or another writer moved it) — a re-derivation from
-        // that cell, exactly like the session host's per-iteration
-        // `build_tool_loadout` (a match must be declared AND described on the
-        // NEXT prompt; the in-flight run's request list and prompt stay
-        // fixed). [`PrintPromptCache::sync`] reuses the first prompt
-        // byte-identically while the declared set is unchanged.
-        let (prompt_tools, mut run_system_prompt, prompt_options) = {
-            let current = resolved_active
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            // Refresh the MCP section for THIS prompt (upstream re-renders it
-            // per `before_agent_start`): a server that finished connecting
-            // since the last prompt shows as ready here; a transition landing
-            // mid-prompt shows on the next one. Cheap synchronous reads only.
-            prompt_cache.set_mcp_servers(crate::coding_agent::context::mcp_servers_prompt_section(
-                plugins.as_deref(),
-            ));
-            (
-                print_request_definitions(&registry, &tools, &active, current.as_deref()),
-                prompt_cache.sync(&registry, &active, current.as_deref()),
-                // `systemPromptOptions` is only readable by a JS runtime
-                // (`ctx.getSystemPromptOptions()`) or a `before_agent_start`
-                // handler (the event payload), exactly like AgentSession's
-                // snapshot gate. Building it unconditionally walked the
-                // registry and copied context files/skills for every prompt of
-                // an extension-free run.
-                if extensions
-                    .as_ref()
-                    .is_some_and(|extensions| extensions.has_js_runtime())
-                    || plugins
-                        .as_ref()
-                        .is_some_and(|plugins| plugins.has_handlers("before_agent_start"))
-                {
-                    prompt_cache.system_prompt_options(&registry, &active, current.as_deref())
-                } else {
-                    JsonValue::Null
-                },
-            )
-        };
+        // This prompt's request declarations AND system prompt were resolved
+        // above, before the session lock (see the comment there).
         // `before_agent_start` (per prompt, after `input`): handlers may
         // replace the system prompt, mutate the structured options, or inject
         // custom messages ahead of the turn. The injected messages are user
@@ -4618,6 +4766,20 @@ pub async fn run_print_with_environment(
                     persist: None,
                 }),
         );
+        // The host-appended initial system declaration is announce-only (its
+        // row is already persisted, in pi's position): the loop drives its
+        // `message_start`/`message_end` pair at the same point the loop's own
+        // `declareToolChanges` declaration used to be emitted, so the
+        // extension/host event stream keeps the declaration frame without a
+        // second row.
+        if let Some((_, declaration)) = initial_declaration.take() {
+            run_preamble.push(PreambleMessage {
+                message: declaration,
+                wire: None,
+                append: false,
+                persist: None,
+            });
+        }
         // The settle loop: an `agent_before_settle` continuation re-runs the
         // loop over the freshly projected session context (upstream runner
         // boundary semantics), capped at AgentSession's 8 iterations

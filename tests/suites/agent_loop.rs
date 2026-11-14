@@ -5196,66 +5196,89 @@ async fn a_mid_stream_body_failure_still_retries() {
     assert_eq!(result.terminal.stop_reason, StopReason::Stop);
 }
 
-/// A transport-EXHAUSTED verdict and an adapter-prefixed non-retryable verdict
-/// are NEVER re-issued at the agent level, no matter what their flattened text
-/// says ("connection reset", "503", "overloaded" are all retryable-looking).
-/// Both cases are built by the real adapter seam, including the OpenAI
-/// Responses prefix, and each must produce exactly ONE agent-level round.
+/// A transport-EXHAUSTED verdict (a non-status budget) is NEVER re-issued at
+/// the agent level, no matter what its flattened text says ("connection
+/// reset" is retryable-looking): one call, one round.
 #[tokio::test]
 async fn a_transport_exhausted_failure_is_not_reissued() {
-    let cases = [
-        (
-            "exhausted transport budget (inner text lost the 'retry exhausted' marker)",
-            classified_error(&pir::ai::error::AiError::RetryExhausted {
-                attempts: 3,
-                message: "connection reset by peer".into(),
-            }),
-            "connection reset by peer",
-        ),
-        (
-            "adapter-prefixed non-retryable status (text contains 503/overloaded)",
-            prefixed_classified_error(
-                &pir::ai::error::AiError::NonRetryable("HTTP 503: overloaded".into()),
-                "OpenAI API error: ",
-            ),
-            // PIR-TUI-033: the transport's retry-class vocabulary is no longer
-            // prepended to the user-facing sentence (the adapter prefix still
-            // is). The invariants this case exists for — one call, one round —
-            // are asserted above and below and are unchanged.
-            "OpenAI API error: HTTP 503: overloaded",
-        ),
-    ];
-    for (label, failure, expected_text) in cases {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_stream = Arc::clone(&calls);
-        let failure = failure.clone();
-        let deps = LoopDeps {
-            stream: Box::new(move |_request| {
-                calls_for_stream.fetch_add(1, Ordering::SeqCst);
-                let failure = failure.clone();
-                Box::pin(async move { failure })
-            }),
-            retry: Some(fast_retry_policy(3)),
-            ..LoopDeps::default()
-        };
-        let result = run_with_options(deps, Context::default(), None, LoopOptions::default()).await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "{label}: the transport verdict is not retried again"
-        );
-        assert_eq!(result.turns, 1, "{label}: exactly one agent-level round");
-        assert_eq!(result.terminal.stop_reason, StopReason::Error);
-        assert_eq!(
-            result.terminal.error_message.as_deref(),
-            Some(expected_text),
-            "{label}: the user-facing text is unchanged"
-        );
-        assert!(
-            result.terminal.diagnostics.is_empty(),
-            "{label}: the internal retry-class carrier must not leak"
-        );
-    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_stream = Arc::clone(&calls);
+    let failure = classified_error(&pir::ai::error::AiError::RetryExhausted {
+        attempts: 3,
+        message: "connection reset by peer".into(),
+    });
+    let deps = LoopDeps {
+        stream: Box::new(move |_request| {
+            calls_for_stream.fetch_add(1, Ordering::SeqCst);
+            let failure = failure.clone();
+            Box::pin(async move { failure })
+        }),
+        retry: Some(fast_retry_policy(3)),
+        ..LoopDeps::default()
+    };
+    let result = run_with_options(deps, Context::default(), None, LoopOptions::default()).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the exhausted transport verdict is not retried again"
+    );
+    assert_eq!(result.turns, 1, "exactly one agent-level round");
+    assert_eq!(result.terminal.stop_reason, StopReason::Error);
+    assert_eq!(
+        result.terminal.error_message.as_deref(),
+        Some("connection reset by peer"),
+        "the user-facing text is unchanged"
+    );
+    assert!(
+        result.terminal.diagnostics.is_empty(),
+        "the internal retry-class carrier must not leak"
+    );
+}
+
+/// An adapter-prefixed exhausted STATUS (`HTTP 503`) is `RetryableTurn`
+/// (PIR-BIN-086): the provider budget is spent, so the agent-level ladder
+/// re-issues the turn — while the adapter prefix stays in the user-facing
+/// text of the final attempt. The OpenAI Responses prefix hides the
+/// transport's wording, never the structural verdict.
+#[tokio::test]
+async fn a_prefixed_exhausted_status_is_reissued_at_the_agent_layer() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_stream = Arc::clone(&calls);
+    let failure = prefixed_classified_error(
+        &pir::ai::error::AiError::NonRetryable("HTTP 503: overloaded".into()),
+        "OpenAI API error: ",
+    );
+    let deps = LoopDeps {
+        stream: Box::new(move |_request| {
+            calls_for_stream.fetch_add(1, Ordering::SeqCst);
+            let failure = failure.clone();
+            Box::pin(async move { failure })
+        }),
+        retry: Some(fast_retry_policy(3)),
+        ..LoopDeps::default()
+    };
+    let result = run_with_options(deps, Context::default(), None, LoopOptions::default()).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "one attempt plus the agent policy's 3 retries"
+    );
+    assert_eq!(
+        result.turns, 1,
+        "the retries are the SAME agent-level round"
+    );
+    assert_eq!(result.terminal.stop_reason, StopReason::Error);
+    // PIR-TUI-033: the transport's retry-class vocabulary is not prepended to
+    // the user-facing sentence; the adapter prefix still is.
+    assert_eq!(
+        result.terminal.error_message.as_deref(),
+        Some("OpenAI API error: HTTP 503: overloaded"),
+        "the user-facing text is unchanged"
+    );
+    assert!(
+        result.terminal.diagnostics.is_empty(),
+        "the internal retry-class carrier must not leak"
+    );
 }
 
 // ---------------------------------------------------------------------------

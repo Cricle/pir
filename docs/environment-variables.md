@@ -32,6 +32,7 @@
 | `PIR_TOOL_EXECUTION` / `PIR_MAX_PARALLEL_TOOLS` / `PIR_FAIL_FAST` | Tool execution mode override / parallel tool batch cap / fail-fast tool batches |
 | `PIR_MAX_TURNS` | Per-prompt turn cap for print/RPC/server (default 1000; one turn = one model request, not one tool call). Only a positive integer is accepted; `0`/junk keeps the default. SDK `AgentBuilder` has its own fixed 1000 default and raw `CreateAgentSessionOptions` defaults to 100; neither reads this variable. TUI ignores it and keeps its 100-turn cap |
 | `PIR_CODEMODE_WORKER=0` | Disable the codemode worker process (thread fallback) |
+| `PI_CODEMODE_MAX_WORKERS` | Maximum codemode worker processes alive at once across all sessions in the process (default `2`). A positive integer overrides; `0`, negative or junk keeps the default. Read on every admission, so a host can raise it at runtime. Further scripts wait for a free worker; raise it when one process runs several sessions, such as in-process subagents |
 | `PIR_CODEMODE_TIMEOUT_MS` / `PIR_CODEMODE_MAX_OUTPUT_CHARS` / `PIR_CODEMODE_MAX_OUTPUT_ITEMS` | Codemode sandbox limits |
 | `PIR_CODEMODE_MEMORY_MB` | Codemode sandbox heap cap override (`0` = no cap; default 128) |
 | `PIR_TOOL_MAX_SOURCE_BYTES` | Whole-file source ceiling for `edit`, image decode and grep context reads (default 67108864 = 64 MiB; `read` streams and is not capped). A positive byte count overrides; `0`/malformed falls back rather than disabling the guard |
@@ -84,6 +85,11 @@ and never logged.
 | `PIR_TUI_INPUT_TRACE` | Emit one `tui-input-trace` line per second to `<agent dir>/pir.log` (drained events, paste coalescing, processed keys/pastes, editor/layout/render counters). Off by default; any non-empty value other than `0` enables it |
 | `PI_PROGRAM_STATUS=1` / `PI_HARDWARE_CURSOR` / `PI_CLEAR_ON_SHRINK` / `PI_TELEMETRY` / `PIR_VERBOSE` | Force-enable OSC 7501 program status / hardware cursor rendering / the `clearOnShrink` main-screen repaint / telemetry mode override / verbose logging (the three settings also have `/settings` rows; `showHardwareCursor`, `terminal.showTerminalProgress` and `terminal.clearOnShrink` apply live, PIR-TUI-017/018) |
 | `PI_CLIPBOARD_OSC52=1` | After a local clipboard write, also send the text via OSC 52 (as over SSH). Use when a remote client reaches the TUI without SSH variables |
+| `PI_HYPERLINKS` | OSC 8 hyperlink override: exactly `1`/`0` forces on/off; any other value (including `auto`) keeps the detected value. An explicit override also skips the tmux probe that otherwise decides hyperlinks under tmux |
+| `PI_TRUE_COLOR` | Truecolor override: exactly `1`/`0` forces on/off; any other value (including `auto`) keeps the detected value |
+| `PI_IMAGE_PROTOCOL` | Inline-image protocol override: `kitty`/`iterm2` force it, `none`/`0` disable it (case-insensitive); any other value keeps detection. Feeds the same capability resolution as `terminal.images`, which gates the settings menu's image rows and selects protocol vs half-block output for `/image` |
+| `PI_TUI_ESC_TIMEOUT` | How long to wait after a lone ESC before treating it as Escape, in milliseconds: a positive number replaces the default (fractional values truncate); default `100` over SSH (`SSH_CONNECTION`/`SSH_TTY`), `10` otherwise. Increase if Alt-key input is misread as Escape |
+| `VISUAL`, `EDITOR` | External editor (Ctrl+G) when the `externalEditor` setting is empty: `VISUAL` first, then `EDITOR`; blank values are skipped; default `notepad` on Windows / `nano` elsewhere |
 | `PI_SHARE_VIEWER_URL` / `PI_RADIUS_GATEWAY` | `/share` gist viewer URL prefix (default `https://pi.dev/session/`) / Radius gateway override (default `https://radius.pi.dev`) |
 
 `RADIUS_API_KEY` and other provider keys are listed in `pir auth`.

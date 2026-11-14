@@ -15,8 +15,9 @@ use pir::tui::app::ChatEntry;
 use pir::tui::autocomplete::builtin_commands;
 use pir::tui::slash::{
     action_quits, builtin_action, copy_last_assistant_message, debug_command_argument,
-    last_assistant_text, name_argument, parse_slash_command, run_diagnostics_text, CopyOutcome,
-    DebugArgument, SlashAction, BUILTIN_ACTION_NAMES, EXTRA_BUILTIN_COMMAND_NAMES,
+    exact_match_only, last_assistant_text, name_argument, name_display, parse_slash_command,
+    run_diagnostics_text, CopyOutcome, DebugArgument, SlashAction, BUILTIN_ACTION_NAMES,
+    EXACT_MATCH_ONLY_COMMANDS, EXTRA_BUILTIN_COMMAND_NAMES,
 };
 
 // ---------------------------------------------------------------------------
@@ -189,6 +190,195 @@ fn name_argument_requires_a_non_empty_value() {
     assert_eq!(name_argument("  padded  "), Ok("padded".to_string()));
     assert_eq!(name_argument(""), Err("Usage: /name <name>".to_string()));
     assert_eq!(name_argument("   "), Err("Usage: /name <name>".to_string()));
+}
+
+#[test]
+fn bare_name_shows_the_current_session_name() {
+    // `/name [name]` upstream (`handleNameCommand`, interactive-mode.ts
+    // :6664-6690): with no argument it prints the CURRENT name; only an
+    // unnamed session falls back to the usage warning.
+    assert_eq!(
+        name_display(Some("refactor auth")),
+        Ok("Session name: refactor auth".to_string())
+    );
+    assert_eq!(
+        name_display(Some("  padded  ")),
+        Ok("Session name: padded".to_string())
+    );
+    assert_eq!(name_display(None), Err("Usage: /name <name>".to_string()));
+    assert_eq!(
+        name_display(Some("   ")),
+        Err("Usage: /name <name>".to_string())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Trailing arguments on upstream's exact-match-only commands (PIR-BIN-089 #3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn exact_match_only_covers_the_upstream_exact_dispatch_set() {
+    // Upstream's editor submit handler checks these with `text === "/<name>"`
+    // (interactive-mode.ts:3161-3300): a trailing argument makes the text a
+    // normal prompt there. `arminsayshi` / `dementedelves` are pi easter eggs
+    // pir does not ship.
+    let expected = [
+        "settings",
+        "tree",
+        "scoped-models",
+        "share",
+        "session",
+        "changelog",
+        "hotkeys",
+        "fork",
+        "clone",
+        "trust",
+        "logout",
+        "new",
+        "resume",
+        "reload",
+        "quit",
+    ];
+    assert_eq!(EXACT_MATCH_ONLY_COMMANDS, &expected[..]);
+    for name in expected {
+        assert!(
+            exact_match_only(name),
+            "/{name} must fall through with args"
+        );
+        assert!(
+            builtin_action(name).is_some(),
+            "/{name} must still route when bare"
+        );
+    }
+    // `/copy` and `/debug` are upstream-exact but pir documents argument
+    // forms for them: they must keep executing those arguments.
+    for name in ["copy", "debug"] {
+        assert!(
+            !exact_match_only(name),
+            "/{name} is a pir argument superset"
+        );
+    }
+    // Upstream's prefix-matched commands keep their argument; so do the
+    // pir-only routable names.
+    for name in [
+        "model",
+        "thinking",
+        "export",
+        "import",
+        "bug",
+        "name",
+        "login",
+        "compact",
+        "clear",
+        "sessions",
+        "help",
+        "image",
+        "arminsayshi",
+        "dementedelves",
+        "llama",
+        "nope",
+    ] {
+        assert!(
+            !exact_match_only(name),
+            "/{name} must not be in the exact-match set"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Popup rows (upstream `BUILTIN_SLASH_COMMANDS`, PIR-BIN-089 #4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn popup_rows_match_upstream_descriptions_and_hints() {
+    // Upstream `core/slash-commands.ts` strings for every shared row that
+    // used to drift; the five that understated pir's own behavior
+    // (settings/scoped-models/trust/reload/export) now say what the
+    // dispatcher really does.
+    let commands = builtin_commands();
+    let find_row = |name: &str| {
+        commands
+            .iter()
+            .find(|command| command.name == name)
+            .unwrap_or_else(|| panic!("the /{name} popup row is missing"))
+    };
+    let expected: [(&str, &str, Option<&str>); 14] = [
+        ("settings", "Open settings menu", None),
+        (
+            "model",
+            "Select model (opens selector UI)",
+            Some("<provider/model>"),
+        ),
+        ("tree", "Navigate session tree (switch branches)", None),
+        ("thinking", "Set thinking level", Some("<level>")),
+        (
+            "scoped-models",
+            "Enable/disable models for Ctrl+P cycling",
+            None,
+        ),
+        (
+            "export",
+            "Export session (HTML default, or specify path: .html/.jsonl)",
+            Some("<path>"),
+        ),
+        ("changelog", "Show changelog entries", None),
+        ("hotkeys", "Show all keyboard shortcuts", None),
+        (
+            "fork",
+            "Create a new fork from a previous user message",
+            None,
+        ),
+        (
+            "clone",
+            "Duplicate the current session at the current position",
+            None,
+        ),
+        (
+            "trust",
+            "Save project trust decision for future sessions",
+            None,
+        ),
+        (
+            "login",
+            "Configure provider authentication",
+            Some("[provider]"),
+        ),
+        ("logout", "Remove provider authentication", None),
+        (
+            "reload",
+            "Reload keybindings, extensions, skills, prompts, themes, and context files",
+            None,
+        ),
+    ];
+    for (name, description, hint) in expected {
+        let row = find_row(name);
+        assert_eq!(row.description.as_deref(), Some(description), "/{name}");
+        assert_eq!(row.argument_hint.as_deref(), hint, "/{name} argument hint");
+    }
+    // Bare `/name` shows the current name (`/name [name]`), so the hint marks
+    // the argument optional.
+    assert_eq!(find_row("name").argument_hint.as_deref(), Some("[name]"));
+    // The rows that already matched upstream stay unchanged.
+    for (name, description) in [
+        ("import", "Import and resume a session from a JSONL file"),
+        (
+            "share",
+            "Share session via a Radius artifact or a GitHub gist",
+        ),
+        ("bug", "Report a bug to the Pi developers"),
+        ("copy", "Copy last agent message to clipboard"),
+        ("name", "Set session display name"),
+        ("session", "Show session info and stats"),
+        ("new", "Start a new session"),
+        ("compact", "Manually compact the session context"),
+        ("resume", "Resume a different session"),
+    ] {
+        assert_eq!(
+            find_row(name).description.as_deref(),
+            Some(description),
+            "/{name}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

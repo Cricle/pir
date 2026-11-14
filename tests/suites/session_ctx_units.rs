@@ -252,7 +252,8 @@ fn projection_text_matches_the_value_form_byte_for_byte() {
         model: None,
     };
 
-    let (aggregate, projection_json, fragments) = serialize_projection_snapshot(&projection, None);
+    let (aggregate, projection_json, fragments) =
+        serialize_projection_snapshot(&projection, None, true);
 
     // R56: an append push must splice the cached text into byte-identical
     // output. Build the extended projection (one more entry), pass the
@@ -291,7 +292,7 @@ fn projection_text_matches_the_value_form_byte_for_byte() {
         };
         let set_len = fragments.fragments.len();
         let (_agg2, text2, _set2) =
-            serialize_projection_snapshot(&extended, Some((Arc::new(fragments), set_len)));
+            serialize_projection_snapshot(&extended, Some((Arc::new(fragments), set_len)), true);
 
         let message_items: Vec<serde_json::Value> = extended
             .messages
