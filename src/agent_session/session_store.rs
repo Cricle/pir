@@ -97,23 +97,23 @@ impl AgentSession {
     }
 
     /// The clone / fork-at-current replacement seam: the same swap, but the
-    /// replacement reports the `"fork"` operation reason and keeps the
-    /// historical switch-shaped inventory — `session_before_switch{switch}`
-    /// plus `session_tree` + `queue_update` — that predates the upstream
-    /// fork seam. Upstream routes a fork through `session_before_fork` (never
-    /// `session_before_switch`, agent-session-runtime.ts:150-165/:267) and
-    /// emits neither tree nor queue; moving these callers onto that seam is
-    /// rpc.rs / session_commands.rs plumbing, the recorded PIR-BIN-049
-    /// residual.
+    /// replacement is the upstream `fork` operation. Upstream's `/clone` and
+    /// the RPC `clone` both call `fork(leafId, {position: "at"})`
+    /// (interactive-mode.ts:5534-5552, rpc-mode.ts:619-628): `session_before_fork`
+    /// fires with that entry and can cancel the operation
+    /// (agent-session-runtime.ts:150-165/:267), `session_shutdown` and
+    /// `session_start` carry reason `"fork"` (:299/:320/:334, :305/:326/:345),
+    /// and the replacement emits neither `session_tree` nor `queue_update`
+    /// (PIR-BIN-049 — that residual is closed: no replacement emits either;
+    /// `session_tree` belongs to `navigateTree`, agent-session.ts:4200-4204).
     pub async fn replace_session_storage_forked(&self, session: SessionManager) -> bool {
         self.replace_session_storage_with_kind(session, true).await
     }
 
     /// [`Self::replace_session_storage`] with the seam's fork flavor: the
-    /// clone / fork-at-current callers are the ONLY ones that want the
-    /// legacy switch-shaped pre-swap events plus the two extra announcements;
-    /// every operation classified `new`/`resume` emits exactly upstream's
-    /// replacement lifecycle.
+    /// clone / fork-at-current callers are the ONLY ones that route through
+    /// the fork lifecycle (`session_before_fork`); every operation classified
+    /// `new`/`resume` emits the switch lifecycle (`session_before_switch`).
     async fn replace_session_storage_with_kind(
         &self,
         session: SessionManager,
@@ -143,32 +143,50 @@ impl AgentSession {
         } else {
             infer_session_start_reason(&session)
         };
-        // A `fork`-flavored replacement reaches this seam only from the
-        // clone / fork-at-current callers (RPC `fork` without entryId and
-        // `clone` -> `fork_current`, JS `ctx.fork` at the current position,
-        // TUI `/fork`·`/clone`). Upstream routes a fork through its OWN
-        // replacement seam and emits `session_before_fork` — never
-        // `session_before_switch` (agent-session-runtime.ts:150-165, :267),
-        // with `session_shutdown`/`session_start` reason `"fork"`
-        // (:299/:320/:334, :305/:326/:345) and NEITHER `session_tree` NOR
-        // `queue_update` (PIR-BIN-049). Moving those callers onto the fork
-        // seam is rpc.rs / session_commands.rs plumbing (out of this file's
-        // scope), so they keep the historical switch-shaped emission —
-        // including the two extra events — until that lands. This is the
-        // recorded PIR-BIN-049 residual.
-        let fork_flavored = fork_at_current;
-        let (pre_swap_reason, emit_session_tree, emit_queue_update) = if fork_flavored {
-            ("switch", true, true)
-        } else {
-            (reason, false, false)
-        };
+        if fork_at_current {
+            // Upstream `/clone` = `fork(currentLeafId, {position: "at"})`:
+            // the outgoing leaf is the entry the event names, and the same
+            // leaf becomes the branch target (the caller already built the
+            // forked storage from it).
+            let leaf_id = self
+                .with_session_manager(|manager| manager.leaf_id().map(str::to_owned))
+                .await
+                .flatten();
+            if let Some(plugins) = &self.plugins {
+                if plugins.has_handlers("session_before_fork") {
+                    let mut payload = serde_json::json!({
+                        "type": "session_before_fork",
+                        "entryId": leaf_id,
+                        "position": "at",
+                    });
+                    let cancelled = match plugins.emit("session_before_fork", &mut payload).await {
+                        Ok(outcome) => {
+                            outcome.result.get("cancel").and_then(JsonValue::as_bool) == Some(true)
+                        }
+                        Err(error) => {
+                            crate::ext_diag!("[ext] session_before_fork dispatch failed: {error}");
+                            false
+                        }
+                    };
+                    if cancelled {
+                        return false;
+                    }
+                }
+                // Upstream `teardownCurrent("fork", ...)` on the outgoing
+                // session (agent-session-runtime.ts:167-178, :299).
+                plugins
+                    .emit_session_shutdown("fork", target_session_file.as_deref())
+                    .await;
+            }
+            return self.swap_session_storage_with(session, Some(reason)).await;
+        }
         // `session_before_switch`: a handler may cancel the switch (upstream
         // `SessionBeforeEventResult.cancel` short-circuits the emit loop).
         if let Some(plugins) = &self.plugins {
             if plugins.has_handlers("session_before_switch") {
                 let mut payload = serde_json::json!({
                     "type": "session_before_switch",
-                    "reason": pre_swap_reason,
+                    "reason": reason,
                 });
                 if let Some(target) = &target_session_file {
                     payload["targetSessionFile"] = JsonValue::String(target.clone());
@@ -190,39 +208,28 @@ impl AgentSession {
             // outgoing session with the destination file before the swap
             // (agent-session-runtime.ts:167-178).
             plugins
-                .emit_session_shutdown(pre_swap_reason, target_session_file.as_deref())
+                .emit_session_shutdown(reason, target_session_file.as_deref())
                 .await;
         }
-        self.swap_session_storage_with(session, Some(reason), emit_session_tree, emit_queue_update)
-            .await
+        self.swap_session_storage_with(session, Some(reason)).await
     }
 
-    /// [`Self::replace_session_storage`] / [`Self::fork_entry`] swap helper
-    /// with explicit control over the two observer announcements a swap can
-    /// add beyond the upstream replacement lifecycle:
+    /// [`Self::replace_session_storage`] / [`Self::fork_entry`] swap helper.
     ///
-    /// - `emit_session_tree`: upstream emits `session_tree` from `navigateTree`
-    ///   ONLY (agent-session.ts:4200-4204); an upstream replacement
-    ///   (`newSession` / `switchSession` / `fork` → `createRuntime`) emits just
-    ///   `session_shutdown {reason}` plus
-    ///   `session_start {reason, previousSessionFile}`. Both
-    ///   [`Self::fork_entry`] and the `new`/`resume` arms of
-    ///   [`Self::replace_session_storage`] pass `false` (PIR-BIN-049).
-    /// - `emit_queue_update`: upstream's replacement disposes the outgoing
-    ///   session TOGETHER with its steering/follow-up queues
-    ///   (`teardownCurrent` → `dispose`, agent-session-runtime.ts:167-178)
-    ///   and starts the replacement runtime with empty queues, so no
-    ///   `queue_update` is emitted for `new`/`resume`/`fork`; the drain below
-    ///   is silent in that case ([`Self::drain_queues_without_update`],
-    ///   PIR-BIN-049). Only the fork-flavored incoming arm of
-    ///   [`Self::replace_session_storage`] still passes `true` (the
-    ///   clone/fork-at-current residual; see the call site).
+    /// Upstream replacement semantics, identical for every operation
+    /// (`newSession` / `switchSession` / `fork` → `createRuntime`): the
+    /// outgoing session is disposed TOGETHER with its steering/follow-up
+    /// queues (`teardownCurrent`, agent-session-runtime.ts:167-178) and the
+    /// replacement starts empty, so the drain below is silent — no
+    /// `queue_update` ([`Self::drain_queues_without_update`], PIR-BIN-049).
+    /// `session_tree` is NOT emitted either: only `navigateTree` produces it
+    /// (agent-session.ts:4200-4204). A replacement emits just
+    /// `session_shutdown {reason}` (by the caller) plus
+    /// `session_start {reason, previousSessionFile}` (below, PIR-BIN-049).
     async fn swap_session_storage_with(
         &self,
         session: SessionManager,
         reason: Option<&str>,
-        emit_session_tree: bool,
-        emit_queue_update: bool,
     ) -> bool {
         let Some(slot) = &self.session else {
             return false;
@@ -267,19 +274,13 @@ impl AgentSession {
             );
         }
         // Steering/follow-up queues are per-runtime state in upstream: a
-        // switch creates a new session runtime with empty arrays. pir's inbox
-        // facade survives the storage swap, so drain it here or the first
-        // prompt in the new session receives text queued for the outgoing one.
-        // The `new`/`resume` and fork arms drain silently, exactly like
-        // upstream's disposed session, whose replacement starts with empty
-        // queues and emits no `queue_update` at all (PIR-BIN-049); only the
-        // fork-flavored clone residual below still carries the historical
-        // `clear_queue` snapshot.
-        let cleared = if emit_queue_update {
-            self.clear_queue().await
-        } else {
-            self.drain_queues_without_update().await
-        };
+        // replacement creates a new session runtime with empty arrays. pir's
+        // inbox facade survives the storage swap, so drain it here or the
+        // first prompt in the new session receives text queued for the
+        // outgoing one. The drain is SILENT, exactly like upstream's disposed
+        // session, whose replacement starts with empty queues and emits no
+        // `queue_update` at all (PIR-BIN-049).
+        let cleared = self.drain_queues_without_update().await;
         if !cleared.steering.is_empty() || !cleared.follow_up.is_empty() {
             tracing::debug!(
                 steering = cleared.steering.len(),
@@ -287,31 +288,12 @@ impl AgentSession {
                 "dropped queued steering/follow-up messages on session storage swap"
             );
         }
-        // Who can observe `session_tree`? With no consumer the payload — and
-        // the whole session forest inside it — need not be built at all.
-        // Interest-based for native plugins: the SDK bridge plugin is attached
-        // to every SDK agent but only declares `tool_execution_update`, so a
-        // `has_non_js_plugins` check would materialize the forest for it on
-        // every switch and then hand it a value it never reads.
-        let rust_consumers = emit_session_tree
-            && self
-                .plugins
-                .as_ref()
-                .is_some_and(|plugins| plugins.has_native_handlers("session_tree"));
-        let dispatch_tree = emit_session_tree
-            && self
-                .plugins
-                .as_ref()
-                .is_some_and(|plugins| session_tree_consumers(plugins));
-        // The outgoing session's leaf backs the event's `oldLeafId` (the
-        // switching session is gone after the swap); its file backs
-        // `session_start.previousSessionFile`.
-        let (old_leaf_id, old_session_file) = {
+        // The outgoing session's file backs
+        // `session_start.previousSessionFile` (the switching session is gone
+        // after the swap).
+        let old_session_file = {
             let outgoing = slot.lock().await;
-            (
-                outgoing.leaf_id().map(str::to_owned),
-                outgoing.session_file().map(Path::to_path_buf),
-            )
+            outgoing.session_file().map(Path::to_path_buf)
         };
         // The upstream `SessionStartEvent.reason`: both live callers pass it
         // explicitly ([`Self::replace_session_storage`] classifies the
@@ -323,14 +305,14 @@ impl AgentSession {
             let mut slot_guard = slot.lock().await;
             *slot_guard = session;
             // P2-02: read the replacement's identity in the SAME critical
-            // section as the assignment and refresh the cache before the
-            // (potentially transcript-sized) tree build below. Updating the
-            // cache only after the tree walk left a window in which a
-            // concurrent run start could still read the OUTGOING id from the
-            // cache while the slot already named the replacement (its sink
-            // then bound the old id and silently dropped every write). The
-            // prompt path now also binds from the manager itself, but the
-            // cached identity must never lag the slot by a whole tree build.
+            // section as the assignment and refresh the cache before any
+            // (potentially transcript-sized) post-swap work. Updating the
+            // cache only after that work left a window in which a concurrent
+            // run start could still read the OUTGOING id from the cache while
+            // the slot already named the replacement (its sink then bound the
+            // old id and silently dropped every write). The prompt path now
+            // also binds from the manager itself, but the cached identity
+            // must never lag the slot by a whole transcript-sized pass.
             (
                 Some(slot_guard.id().to_owned()),
                 Some(slot_guard.path().to_path_buf()),
@@ -363,98 +345,6 @@ impl AgentSession {
         // of appending them to the replacement transcript.
         self.session_storage_generation
             .fetch_add(1, Ordering::SeqCst);
-        let (tree, leaf_id) = {
-            let identity = slot.lock().await;
-            (
-                if !dispatch_tree {
-                    None
-                } else if rust_consumers {
-                    // A non-JS plugin receives the payload as a `Value`, built
-                    // iteratively: the derived serializer recurses one frame
-                    // per entry.
-                    Some(SessionTreePayload::Value(
-                        crate::session_manager::TreeNode::to_value_iterative(identity.tree()),
-                    ))
-                } else {
-                    // JS only: carry the tree as pre-rendered TEXT. The
-                    // reply-free dispatch never turns it back into a `Value`
-                    // on this side (the old reply leg re-parsed, cloned and
-                    // recursively dropped it).
-                    Some(SessionTreePayload::Text(
-                        crate::session_manager::TreeNode::forest_to_json_iterative(identity.tree()),
-                    ))
-                },
-                identity.leaf_id().map(str::to_owned),
-            )
-        };
-        // `session_tree`: the JS side merges the tree of the session that
-        // just became active. `newLeafId`/`oldLeafId` follow the upstream
-        // event contract (agent-session.ts:4140-4146); `summaryEntry` /
-        // `fromExtension` are navigation-only and stay omitted on a switch.
-        match (&self.plugins, tree) {
-            (Some(plugins), Some(SessionTreePayload::Value(tree))) => {
-                // Explicit map inserts, NOT `json!`: the macro routes a
-                // `Value` expression through `serde_json::to_value`, a
-                // recursive deep CLONE of the tree. Key order matches the old
-                // literal.
-                let mut payload = serde_json::Map::new();
-                payload.insert(
-                    String::from("type"),
-                    JsonValue::String(String::from("session_tree")),
-                );
-                payload.insert(String::from("tree"), tree);
-                payload.insert(
-                    String::from("newLeafId"),
-                    leaf_id.map_or(JsonValue::Null, JsonValue::String),
-                );
-                payload.insert(
-                    String::from("oldLeafId"),
-                    old_leaf_id.map_or(JsonValue::Null, JsonValue::String),
-                );
-                let mut payload = JsonValue::Object(payload);
-                let payload_json =
-                    crate::session_manager::json_depth::write_value_iteratively(&payload);
-                plugins
-                    .emit_read_only_json("session_tree", payload_json, Some(&mut payload))
-                    .await;
-                // Iterative teardown: the drop glue walks one frame per entry.
-                crate::session_manager::json_depth::drop_value_iteratively(payload);
-            }
-            (Some(plugins), Some(SessionTreePayload::Text(tree_json))) => {
-                let mut payload_json = String::with_capacity(128 + tree_json.len());
-                payload_json.push('{');
-                let mut first = true;
-                crate::session_manager::json_depth::push_field(
-                    &mut payload_json,
-                    &mut first,
-                    "type",
-                    "session_tree",
-                );
-                // Written directly (not through `push_field`): serializing a
-                // `Value` wrapping the nesting is the recursion this avoids.
-                // Key order matches the old literal.
-                payload_json.push(',');
-                payload_json.push_str("\"tree\":");
-                payload_json.push_str(&tree_json);
-                crate::session_manager::json_depth::push_field(
-                    &mut payload_json,
-                    &mut first,
-                    "newLeafId",
-                    &leaf_id,
-                );
-                crate::session_manager::json_depth::push_field(
-                    &mut payload_json,
-                    &mut first,
-                    "oldLeafId",
-                    &old_leaf_id,
-                );
-                payload_json.push('}');
-                plugins
-                    .emit_read_only_json("session_tree", payload_json, None)
-                    .await;
-            }
-            _ => {}
-        }
         // The native host registry is keyed by session id, so every swap must
         // re-key it (the JS `ctx.newSession` path and native
         // `NativeSessionHost` both land here). The `Arc` is only available for
@@ -1167,10 +1057,7 @@ impl AgentSession {
                 // neither `session_tree` nor `queue_update` for a fork: the
                 // outgoing session (and its queues) is disposed before the
                 // replacement runtime starts (PIR-BIN-049).
-                if !self
-                    .swap_session_storage_with(branched, Some("fork"), false, false)
-                    .await
-                {
+                if !self.swap_session_storage_with(branched, Some("fork")).await {
                     return Err("no attached session storage; the run stays ephemeral".to_owned());
                 }
             }
@@ -1205,10 +1092,7 @@ impl AgentSession {
                 // Fresh parent-linked fork arm: same upstream replacement
                 // shape as the branched file (no `session_tree`, no
                 // `queue_update`, PIR-BIN-049).
-                if !self
-                    .swap_session_storage_with(fresh, Some("fork"), false, false)
-                    .await
-                {
+                if !self.swap_session_storage_with(fresh, Some("fork")).await {
                     return Err("no attached session storage; the run stays ephemeral".to_owned());
                 }
             }
@@ -1287,14 +1171,6 @@ fn infer_session_start_reason(incoming: &SessionManager) -> &'static str {
     "resume"
 }
 
-/// How the swap carries the `session_tree` forest: pre-rendered text when only
-/// the JS runtime can observe it, or the nested `Value` a non-JS plugin
-/// receives (built iteratively, never through the derived serializer).
-enum SessionTreePayload {
-    Text(String),
-    Value(JsonValue),
-}
-
 /// Whether a `session_tree` emission can reach a consumer.
 ///
 /// INTEREST-BASED for native plugins: only a plugin whose
@@ -1302,9 +1178,11 @@ enum SessionTreePayload {
 /// `session_tree` counts. `PluginHost::emit` still hands every event to every
 /// plugin, but the SDK bridge plugin — attached to every SDK agent — declares
 /// only `tool_execution_update`; the old `has_non_js_plugins` check made every
-/// SDK agent a `session_tree` consumer, materializing (and, before the bridge
-/// learned to check the name first, deep-cloning) the whole session forest on
-/// every switch. A native plugin that wants `session_tree` must declare it.
+/// SDK agent a `session_tree` consumer, materializing the whole session forest
+/// on every branch navigation. A native plugin that wants `session_tree` must
+/// declare it. (`session_tree` is emitted by `navigateTree` only —
+/// agent-session.ts:4200-4204; a storage replacement emits neither it nor
+/// `queue_update`, PIR-BIN-049.)
 ///
 /// The JS runtime counts only with a registered handler (its snapshot may
 /// conservatively say `true` during the registration dirty window — one

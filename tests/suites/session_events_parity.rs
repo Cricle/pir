@@ -2420,6 +2420,151 @@ async fn parent_linked_resume_reports_resume_not_fork() {
     );
 }
 
+/// PIR-BIN-049 residual closure: the clone / fork-at-current seam runs
+/// upstream's FORK lifecycle. `/clone` is `fork(leafId, {position: "at"})`
+/// (interactive-mode.ts:5534-5552; RPC `clone`, rpc-mode.ts:619-628):
+/// `session_before_fork {entryId: leaf, position: "at"}` fires first and can
+/// cancel (agent-session-runtime.ts:150-165/:267), then
+/// `session_shutdown {reason: "fork"}` (:299) and
+/// `session_start {fork, previousSessionFile}` (:320/:334). Neither
+/// `session_tree` (only `navigateTree`, agent-session.ts:4200-4204) nor a
+/// drain-time `queue_update` (`teardownCurrent` disposes the queues silently,
+/// :167-178) is emitted, and `session_before_switch` never fires for a fork.
+#[tokio::test]
+async fn clone_seam_runs_the_fork_lifecycle_without_tree_or_queue() {
+    let temp = TempDir::new("clone-seam-lifecycle");
+    let mut outgoing = SessionManager::create(".", &temp.0).expect("outgoing session");
+    outgoing
+        .append_message(user_message("in the outgoing session"))
+        .expect("seed the outgoing transcript");
+    let outgoing_path = outgoing
+        .session_file()
+        .expect("outgoing session file")
+        .to_path_buf();
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let events: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentSession::new_with_plugins(
+        agent_session_builder(registry, Some(outgoing), None, Some(temp.0.clone())),
+        vec![Arc::new(RecordForkLifecyclePlugin::new(Arc::clone(
+            &events,
+        )))],
+    );
+    let outgoing_leaf = agent
+        .with_session_manager(|manager| manager.leaf_id().map(str::to_owned))
+        .await;
+    let outgoing_leaf = outgoing_leaf.expect("the outgoing session has a leaf");
+
+    agent.steer("queued for the outgoing session");
+    wait_for_recorded(&events, "queue_update").await;
+
+    let child = SessionManager::fork_from_source(&outgoing_path, ".", &temp.0, None)
+        .expect("fork the outgoing transcript");
+    let child_path = child
+        .session_file()
+        .expect("fork child session file")
+        .to_path_buf();
+    assert!(
+        agent.replace_session_storage_forked(child).await,
+        "the clone replacement completes"
+    );
+    agent.emit_session_event_for_test(SessionEvent::CompactionStart { reason: "manual" });
+    wait_for_recorded(&events, "compaction_start").await;
+
+    let recorded = events.lock().unwrap().clone();
+    let types: Vec<&str> = recorded
+        .iter()
+        .map(|payload| payload["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "queue_update",
+            "session_before_fork",
+            "session_shutdown",
+            "session_start",
+            "compaction_start",
+        ],
+        "a clone emits before_fork -> shutdown -> start with no \
+         session_before_switch, no session_tree and no drain-time queue_update: {recorded:?}"
+    );
+    assert_eq!(
+        recorded[0]["steering"],
+        serde_json::json!(["queued for the outgoing session"]),
+        "the single queue_update is the enqueue's (recorder self-check)"
+    );
+    // Upstream `/clone` names the CURRENT leaf and `position: "at"`.
+    assert_eq!(
+        recorded[1]["entryId"],
+        serde_json::json!(outgoing_leaf),
+        "session_before_fork names the current leaf"
+    );
+    assert_eq!(recorded[1]["position"], serde_json::json!("at"));
+    assert_eq!(recorded[2]["reason"], serde_json::json!("fork"));
+    assert_eq!(
+        recorded[2]["targetSessionFile"]
+            .as_str()
+            .unwrap_or_default(),
+        child_path.to_string_lossy().as_ref(),
+        "session_shutdown names the forked file"
+    );
+    assert_eq!(recorded[3]["reason"], serde_json::json!("fork"));
+    assert_eq!(
+        recorded[3]["previousSessionFile"]
+            .as_str()
+            .unwrap_or_default(),
+        outgoing_path.to_string_lossy().as_ref(),
+        "session_start names the outgoing file"
+    );
+    assert_eq!(
+        agent.pending_message_count(),
+        0,
+        "the fork drained the outgoing queues silently"
+    );
+    assert_eq!(
+        agent.state().session_path.as_deref(),
+        Some(child_path.to_string_lossy().as_ref()),
+        "the forked session is live"
+    );
+}
+
+/// The clone seam honors `session_before_fork`'s cancel: upstream returns
+/// `{cancelled: true}` without replacing the session
+/// (agent-session-runtime.ts:150-165, :267-271). The forked manager the
+/// caller built is dropped; the outgoing transcript stays live.
+#[tokio::test]
+async fn clone_seam_honors_a_session_before_fork_cancel() {
+    let temp = TempDir::new("clone-seam-cancel");
+    let mut outgoing = SessionManager::create(".", &temp.0).expect("outgoing session");
+    outgoing
+        .append_message(user_message("in the outgoing session"))
+        .expect("seed the outgoing transcript");
+    let outgoing_path = outgoing
+        .session_file()
+        .expect("outgoing session file")
+        .to_path_buf();
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let agent = AgentSession::new_with_plugins(
+        agent_session_builder(registry, Some(outgoing), None, Some(temp.0.clone())),
+        vec![Arc::new(CancelBeforeForkPlugin::new())],
+    );
+    let before = agent.state().session_path;
+    let child = SessionManager::fork_from_source(&outgoing_path, ".", &temp.0, None)
+        .expect("fork the outgoing transcript");
+    assert!(
+        !agent.replace_session_storage_forked(child).await,
+        "a cancelled session_before_fork aborts the clone"
+    );
+    assert_eq!(
+        agent.state().session_path,
+        before,
+        "the outgoing session stays live"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // provider_stream_event extension dispatch
 // ---------------------------------------------------------------------------

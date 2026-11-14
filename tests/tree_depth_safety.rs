@@ -531,23 +531,17 @@ async fn session_swap_serializes_a_deep_session_tree() {
     );
 }
 
-/// The same swap through a REAL [`pir::extensions::ExtensionHandle`]: the
-/// `session_tree` event is informational (the prelude's default arm ignores a
-/// handler's return value), so the emitter routes it through the reply-free
-/// entry. Both configurations run on a default 2 MiB test thread:
+/// The same swap through a REAL [`pir::extensions::ExtensionHandle`], on a
+/// default 2 MiB test thread:
 ///
-/// - with NO `session_tree` handler the gate skips the payload build (and the
-///   forest rendering) entirely;
-/// - with a handler the JS side still receives the full 2000-entry tree,
-///   while the return leg carries no `Value` — the old path re-parsed, deep
-///   cloned and recursively dropped the echoed payload here. PIR-BIN-049: a
-///   host `new`/`resume` swap no longer emits `session_tree` (upstream emits
-///   it from `navigateTree` only, agent-session.ts:4200-4204), so this leg
-///   drives the remaining swap emitter — the clone/fork-at-current seam
-///   ([`AgentSession::replace_session_storage_forked`], selected by the CALL,
-///   never by the file shape: PIR-BIN-110) — to keep the reply-free forest
-///   route depth-tested. The fixture still parent-links its file because that
-///   is what a fork-at-current child looks like on disk.
+/// - with NO `session_tree` handler the swap completes on the deep transcript;
+/// - with a real handler the replacement still emits NO `session_tree`
+///   (PIR-BIN-049: only `navigateTree` produces it, agent-session.ts:4200-4204;
+///   a storage replacement — `new`/`resume`/`fork` — emits just
+///   `session_shutdown {reason}` + `session_start {reason, previousSessionFile}`),
+///   so the probe stays `null` and the swap never pays a forest render. The
+///   fork seam still fires `session_before_fork` (its call site is the clone /
+///   fork-at-current operation), which this probe does not observe.
 #[tokio::test(flavor = "current_thread")]
 async fn session_swap_with_a_real_extension_handle_is_depth_safe() {
     // 1. A live runtime with no `session_tree` handler.
@@ -600,7 +594,7 @@ async fn session_swap_with_a_real_extension_handle_is_depth_safe() {
         let agent = AgentSession::new(config);
         // PIR-BIN-091: a fresh session records pi's startup state
         // (`model_change` + `thinking_level_change`), so the outgoing session
-        // has a leaf before the swap; capture it and pin it below.
+        // has a leaf — the entry the fork seam's `session_before_fork` names.
         let startup_leaf = agent
             .with_session_manager(|session| session.leaf_id().map(str::to_owned))
             .await;
@@ -613,32 +607,20 @@ async fn session_swap_with_a_real_extension_handle_is_depth_safe() {
             agent.replace_session_storage_forked(deep).await,
             "the swap must complete with a deep session_tree handler"
         );
+        assert_eq!(
+            agent.session_path().as_deref(),
+            Some(path.as_path()),
+            "the fork seam adopted the deep session"
+        );
         let probe = handle
             .eval_json("JSON.stringify(globalThis.__pirSessionTreeProbe ?? null)")
             .await
             .expect("read the session_tree probe");
-        assert_eq!(probe["roots"], serde_json::json!(1), "{probe}");
         assert_eq!(
-            probe["depth"],
-            serde_json::json!(DEEP_ENTRIES - 1),
-            "the JS handler must receive and walk the whole chain: {probe}"
-        );
-        assert_eq!(probe["firstId"], serde_json::json!("e0000"), "{probe}");
-        assert_eq!(
-            probe["lastId"],
-            serde_json::json!(format!("e{:04}", DEEP_ENTRIES - 1)),
-            "{probe}"
-        );
-        assert_eq!(
-            probe["newLeafId"],
-            serde_json::json!(format!("e{:04}", DEEP_ENTRIES - 1)),
-            "the event still carries the post-swap leaf: {probe}"
-        );
-        assert_eq!(
-            probe["oldLeafId"],
-            serde_json::json!(startup_leaf.expect("captured startup leaf")),
-            "the event carries the pre-swap leaf (the startup-state row of the \
-             fresh outgoing session): {probe}"
+            probe,
+            serde_json::Value::Null,
+            "a replacement emits no session_tree — the deep forest is never rendered \
+             (PIR-BIN-049): {probe}"
         );
     }
 }
