@@ -2905,6 +2905,260 @@ mod fragment_cache_tests {
     }
 }
 
+/// R7 branch-text cache regression block.
+///
+/// The snapshot's `branch` text is the leaf-path entry list serialized to one
+/// JSON array. R7 caches that text across pushes and EXTENDS it by the
+/// appended path entries instead of re-serializing the whole path every
+/// prompt. These tests pin:
+/// - the pushed branch text is byte-identical to a from-scratch render
+///   (`serde_json::to_string(branch_entries(None))`) after appends, a label
+///   append, a context edit and a compaction (the extend path, including a
+///   splice of an already-spliced text), and after a `branch`, a
+///   `branch_with_summary` re-parent and a storage replace (the full-render
+///   fallback);
+/// - the extend fires only for append-shaped changes and the fallback only
+///   for structural ones (`branch_text_cache_stats_for_test`).
+mod branch_text_cache_tests {
+    use super::*;
+    use pir::agent_session::session_ctx::{
+        branch_text_cache_stats_for_test, reset_branch_text_cache_stats_for_test,
+    };
+
+    /// A from-scratch render of exactly the bytes the snapshot publishes: the
+    /// live leaf path (root → leaf, the order `projected_branch_path`
+    /// returns) serialized as a JSON array. No cache is involved.
+    async fn branch_oracle(agent: &AgentSession) -> String {
+        let session = agent.session_manager().expect("persisted session");
+        let path = session
+            .lock()
+            .await
+            .branch_entries(None)
+            .expect("branch entries");
+        serde_json::to_string(&path).expect("branch oracle")
+    }
+
+    fn recorded_branch(pushes: &Arc<Mutex<Vec<SessionContextSnapshot>>>) -> String {
+        pushes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last()
+            .expect("a recorded snapshot")
+            .branch_json
+            .clone()
+    }
+
+    /// One push that must rebuild, then: the recorded `branch_json` equals the
+    /// from-scratch oracle byte for byte, and the JS wire form parses to the
+    /// same value (the host splices the text raw).
+    async fn push_and_check(
+        agent: &AgentSession,
+        pushes: &Arc<Mutex<Vec<SessionContextSnapshot>>>,
+        handle: &ExtensionHandle,
+        step: &str,
+    ) -> String {
+        assert!(
+            agent.push_session_context_for_test().await,
+            "{step}: the mutation must invalidate the snapshot cache"
+        );
+        let text = recorded_branch(pushes);
+        let oracle = branch_oracle(agent).await;
+        assert_eq!(
+            text, oracle,
+            "{step}: the pushed branch text must match a from-scratch render"
+        );
+        let wire: serde_json::Value = handle
+            .eval_json("__pir_host.getSessionManagerJson()")
+            .await
+            .unwrap_or_else(|error| panic!("{step}: reading the pushed snapshot failed: {error}"));
+        assert_eq!(
+            wire["branch"],
+            serde_json::from_str::<serde_json::Value>(&oracle).expect("oracle parses"),
+            "{step}: the wire branch must parse to the from-scratch render"
+        );
+        text
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
+    async fn branch_text_extends_on_appends_and_falls_back_on_structure_changes() {
+        let _serial = env_lock();
+        reset_branch_text_cache_stats_for_test();
+        let temp = TempDir::new("branch-text");
+        let cwd = temp.path().to_string_lossy().into_owned();
+        let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
+        manager
+            .append_message(user_message("root user"))
+            .expect("append user");
+        manager
+            .append_message(assistant_message("root reply"))
+            .expect("append assistant");
+
+        let (recorder, pushes) = SnapshotRecorder::new();
+        let handle =
+            ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
+        let mut config = agent_config(temp.path(), manager);
+        config.extensions = Some(handle.clone());
+        let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
+        let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+
+        // (a) First push: full render.
+        let first = push_and_check(&agent, &pushes, &handle, "first push").await;
+        assert_eq!(
+            branch_text_cache_stats_for_test(),
+            (1, 0),
+            "the first push full-renders the branch once"
+        );
+
+        let session = agent.session_manager().expect("persisted session");
+        let root_user_id = session
+            .lock()
+            .await
+            .resident_entries()
+            .iter()
+            .find(|entry| !entry.is_header() && entry.id().is_some())
+            .and_then(|entry| entry.id().map(str::to_owned))
+            .expect("root user id");
+
+        // (b) Appends extend: the appended entries' text is spliced onto the
+        // cached prefix.
+        session
+            .lock()
+            .await
+            .append_message(user_message("second user"))
+            .expect("append user");
+        session
+            .lock()
+            .await
+            .append_message(assistant_message("second reply"))
+            .expect("append assistant");
+        let second = push_and_check(&agent, &pushes, &handle, "append").await;
+        assert!(
+            second.len() > first.len(),
+            "the appended entries grew the branch text"
+        );
+        assert_eq!(
+            branch_text_cache_stats_for_test(),
+            (1, 1),
+            "the append must extend, never full-render"
+        );
+
+        // (c) A label append moves the leaf to the label entry (it joins the
+        // path): still an extension.
+        let leaf = session
+            .lock()
+            .await
+            .leaf_id()
+            .map(str::to_owned)
+            .expect("leaf");
+        session
+            .lock()
+            .await
+            .set_label(&leaf, Some("checkpoint"))
+            .expect("set label");
+        push_and_check(&agent, &pushes, &handle, "label append").await;
+        assert_eq!(branch_text_cache_stats_for_test(), (1, 2));
+
+        // (d) A context edit appends a branch-local entry: still an extension.
+        session
+            .lock()
+            .await
+            .append_context_edit(&root_user_id, Some(serde_json::json!("edited root")))
+            .expect("context edit");
+        push_and_check(&agent, &pushes, &handle, "context edit").await;
+        assert_eq!(branch_text_cache_stats_for_test(), (1, 3));
+
+        // (e) A compaction appends a checkpoint: still an extension.
+        session
+            .lock()
+            .await
+            .append_compaction("compacted summary", None, 1000, None)
+            .expect("compaction");
+        push_and_check(&agent, &pushes, &handle, "compaction").await;
+        assert_eq!(branch_text_cache_stats_for_test(), (1, 4));
+
+        // (f) `branch` to an earlier entry: the cached path is not a prefix of
+        // the new one — full render.
+        session
+            .lock()
+            .await
+            .branch(&root_user_id)
+            .expect("branch to root user");
+        push_and_check(&agent, &pushes, &handle, "branch").await;
+        assert_eq!(
+            branch_text_cache_stats_for_test(),
+            (2, 4),
+            "a branch must full-render the branch text"
+        );
+
+        // (g) An append after the branch extends from the new base.
+        session
+            .lock()
+            .await
+            .append_message(user_message("after branch"))
+            .expect("append after branch");
+        push_and_check(&agent, &pushes, &handle, "append after branch").await;
+        assert_eq!(branch_text_cache_stats_for_test(), (2, 5));
+
+        // (h) `branch_with_summary` re-parents to an earlier entry: full render.
+        session
+            .lock()
+            .await
+            .branch_with_summary(Some(&root_user_id), "branch summary", None, None, None)
+            .expect("branch with summary");
+        push_and_check(&agent, &pushes, &handle, "branch with summary").await;
+        assert_eq!(
+            branch_text_cache_stats_for_test(),
+            (3, 5),
+            "a re-parent must full-render the branch text"
+        );
+
+        // (i) A storage replace (new session id + file): full render.
+        let leaf = session
+            .lock()
+            .await
+            .leaf_id()
+            .map(str::to_owned)
+            .expect("leaf");
+        session
+            .lock()
+            .await
+            .create_branched_session(&leaf)
+            .expect("branch storage");
+        push_and_check(&agent, &pushes, &handle, "storage replace").await;
+        assert_eq!(
+            branch_text_cache_stats_for_test(),
+            (4, 5),
+            "a storage switch must full-render the branch text"
+        );
+
+        // (j) `reset_leaf`: the empty path full-renders as `[]`, and the next
+        // append extends from the EMPTY cached path (no leading comma).
+        session.lock().await.reset_leaf();
+        let empty = push_and_check(&agent, &pushes, &handle, "reset leaf").await;
+        assert_eq!(
+            empty, "[]",
+            "a session with no leaf renders an empty branch"
+        );
+        assert_eq!(branch_text_cache_stats_for_test(), (5, 5));
+        session
+            .lock()
+            .await
+            .append_message(user_message("after reset"))
+            .expect("append after reset");
+        let after_reset = push_and_check(&agent, &pushes, &handle, "append after reset").await;
+        assert_eq!(
+            branch_text_cache_stats_for_test(),
+            (5, 6),
+            "the post-reset append must extend the empty cached path"
+        );
+        assert!(
+            after_reset.starts_with("[{"),
+            "the empty-path splice must not emit a leading comma: {after_reset}"
+        );
+    }
+}
+
 /// A host with NO JS face (builtin/inline plugins only, `config.extensions =
 /// None`) has no reader for the JS-only session views: the push must not
 /// render or retain the branch text, the tree text/arena, the label map or

@@ -17,6 +17,11 @@ thread_local! {
     static FRAGMENT_FULL_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static FRAGMENT_EXTENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static FRAGMENT_EXTENDS_CLONED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// R7 branch-text diagnostics: full branch renders versus append-extends
+    /// paid by `push_session_context` on this thread. A steady append-only
+    /// session must extend every push after the first.
+    static BRANCH_TEXT_FULL_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BRANCH_TEXT_EXTENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// One `share_metadata` result: the resolved system prompt plus the declared
@@ -229,6 +234,51 @@ struct CachedProjectionFragments {
     last_entry_id: String,
 }
 
+/// Identity of the rendered branch text (R7) — the same storage identity +
+/// resident entry count + leaf shape [`TreeCacheKey`] uses: `session_id` /
+/// `session_path` cover storage switches and forks into a new file,
+/// `entry_count` every append, `leaf_id` a leaf move (`branch` /
+/// `reset_leaf`). The extension itself is decided by the covered path ids
+/// (below), not by a key match: a key match only proves the same session
+/// storage, and the splice needs the stronger "the cached path is a prefix of
+/// the live path" — which the ids prove directly.
+#[derive(Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct BranchTextCacheKey {
+    #[doc(hidden)]
+    pub session_id: String,
+    #[doc(hidden)]
+    pub session_path: Option<PathBuf>,
+    #[doc(hidden)]
+    pub entry_count: usize,
+    #[doc(hidden)]
+    pub leaf_id: Option<String>,
+}
+
+/// The cached branch text (R7) plus the leaf-path entry ids it covers.
+///
+/// `text` is the full `[...]` JSON array (root → leaf) exactly as the
+/// pre-R7 inline loop rendered it; `path_ids` — the covered path's entry ids
+/// in the same order — prove that the cached path is a PREFIX of the live
+/// path, which is exactly what the splice needs: every append parents off the
+/// current leaf and advances it (`append_entry` sets `leaf_id` for every
+/// entry type, label entries included), so an append-only session grows the
+/// path only at its END. Entries are immutable `Arc<FileEntry>` handles once
+/// appended, so an equal id at an equal position means equal serialized
+/// bytes within one storage identity.
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct CachedBranchText {
+    #[doc(hidden)]
+    pub key: BranchTextCacheKey,
+    /// The rendered `[...]` array (including the closing `]`).
+    #[doc(hidden)]
+    pub text: String,
+    /// Entry ids of the path `text` covers, root → leaf.
+    #[doc(hidden)]
+    pub path_ids: Vec<String>,
+}
+
 /// Cheap identity of the registry catalog serialized into
 /// `ctx.modelRegistry`. A value match proves a rebuild from the live registry
 /// would produce the same wire snapshot.
@@ -372,6 +422,9 @@ pub(super) struct SessionContextCache {
     sessions: CachedSessions,
     /// The last rendered forest text, reused while [`TreeCacheKey`] matches.
     tree: Option<Arc<CachedTree>>,
+    /// The last rendered branch text (R7), extended by the appended entries'
+    /// serialized text on the next push.
+    branch: Option<CachedBranchText>,
     /// The last cached per-entry projection fragments, reused while the same
     /// key matches and extended by the appended entries' views otherwise.
     fragments: Option<CachedProjectionFragments>,
@@ -449,6 +502,9 @@ struct SessionSnapshotInputs<'a> {
     sessions_modified: Option<SystemTime>,
     cached_sessions: Option<CachedSessions>,
     cached_tree: Option<Arc<CachedTree>>,
+    /// The previous push's branch text (R7), spliced with the appended path
+    /// entries instead of re-serializing the whole leaf path.
+    cached_branch: Option<CachedBranchText>,
     /// The previous push's per-entry projection fragments (PIR-SDK-027 round
     /// 2), extended by the appended views instead of re-serializing every
     /// retained message.
@@ -928,6 +984,132 @@ fn full_render_tree(
     (text, Some(Arc::new(tree)))
 }
 
+// ---------------------------------------------------------------------------
+// Incremental branch text (R7)
+// ---------------------------------------------------------------------------
+
+/// Render (or EXTEND) the snapshot's branch text from the live leaf path.
+///
+/// The rendered bytes are exactly the pre-R7 inline loop's: `[` + the borrowed
+/// per-entry `serde_json` texts `,`-joined + `]` (root → leaf, the order
+/// [`crate::session_manager::SessionManager::projected_branch_path`] returns).
+/// The full-render arm below IS that loop, so the cache can never drift from
+/// the direct render.
+///
+/// `cached` (the previous push's entry) is used only when it was rendered from
+/// the same session storage AND its covered path ids are a prefix of the live
+/// path — the exact precondition for splicing the cached text: an append
+/// parents off the current leaf and advances it (`append_entry` sets
+/// `leaf_id` for every entry type), so the path grows only at its END, and
+/// immutable `Arc<FileEntry>` handles make equal ids at equal positions mean
+/// equal serialized bytes. Every other shape change (`branch` / `reset_leaf`
+/// to a non-descendant, a `branch_with_summary` re-parent, a trim/widen
+/// window, a storage switch) fails the prefix check and full-renders.
+#[doc(hidden)]
+pub fn build_branch_text(
+    session: &crate::session_manager::SessionManager,
+    key: BranchTextCacheKey,
+    cached: Option<CachedBranchText>,
+) -> (String, CachedBranchText) {
+    // The walk is needed on both paths (it is the only source of the delta
+    // entries), and with the manager's persistent `EntryPositions` it is
+    // O(depth) — the serialization below, not the walk, is the cost R7
+    // removes.
+    let path = session.projected_branch_path(session.leaf_id());
+    let cached = cached.filter(|cached| {
+        cached.key.session_id == key.session_id
+            && cached.key.session_path == key.session_path
+            && path.len() >= cached.path_ids.len()
+            && path[..cached.path_ids.len()]
+                .iter()
+                .zip(&cached.path_ids)
+                .all(|(entry, id)| entry.entry_id() == id)
+    });
+    if let Some(cached) = cached {
+        BRANCH_TEXT_EXTENDS.with(|calls| calls.set(calls.get().saturating_add(1)));
+        let covered = cached.path_ids.len();
+        let appended = &path[covered..];
+        // One splice: the cached text minus its closing `]`, then the appended
+        // entries' serialized texts, then the bracket. Byte-identical to the
+        // full render (the same per-entry texts, `,`-joined, no whitespace).
+        let mut text = String::with_capacity(cached.text.len() + appended.len() * 256 + 2);
+        if covered == 0 {
+            // The cached path was empty: `[]` minus `]` is `[`, and the
+            // first appended entry must not get a leading comma.
+            text.push('[');
+        } else {
+            text.push_str(&cached.text[..cached.text.len() - 1]);
+        }
+        let mut first = covered == 0;
+        for entry in appended {
+            if !first {
+                text.push(',');
+            }
+            first = false;
+            text.push_str(&json_text_or_null(*entry));
+        }
+        text.push(']');
+        let mut path_ids = cached.path_ids;
+        path_ids.extend(appended.iter().map(|entry| entry.entry_id().to_owned()));
+        let cached_text = text.clone();
+        return (
+            text,
+            CachedBranchText {
+                key,
+                text: cached_text,
+                path_ids,
+            },
+        );
+    }
+    BRANCH_TEXT_FULL_BUILDS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    // The pre-R7 render, unchanged: borrowed per-entry serialization into ONE
+    // string, no intermediate `Value` tree, no whole-path entry clone.
+    let mut text = String::with_capacity(64 + path.len() * 256);
+    text.push('[');
+    let mut first = true;
+    for entry in &path {
+        if first {
+            first = false;
+        } else {
+            text.push(',');
+        }
+        text.push_str(&json_text_or_null(*entry));
+    }
+    text.push(']');
+    let path_ids = path
+        .iter()
+        .map(|entry| entry.entry_id().to_owned())
+        .collect();
+    let cached_text = text.clone();
+    (
+        text,
+        CachedBranchText {
+            key,
+            text: cached_text,
+            path_ids,
+        },
+    )
+}
+
+/// R7 branch-text diagnostics: `(full renders, append-extends)` paid by
+/// snapshot pushes on this thread since the last reset. A steady append-only
+/// session must extend every push after the first; a branch/reset/trim/
+/// storage switch must show exactly one full render.
+#[doc(hidden)]
+pub fn branch_text_cache_stats_for_test() -> (u64, u64) {
+    (
+        BRANCH_TEXT_FULL_BUILDS.with(|calls| calls.get()),
+        BRANCH_TEXT_EXTENDS.with(|calls| calls.get()),
+    )
+}
+
+/// Reset [`branch_text_cache_stats_for_test`].
+#[doc(hidden)]
+pub fn reset_branch_text_cache_stats_for_test() {
+    BRANCH_TEXT_FULL_BUILDS.with(|calls| calls.set(0));
+    BRANCH_TEXT_EXTENDS.with(|calls| calls.set(0));
+}
+
 /// R56 fragment-cache diagnostics: `(full builds, incremental extends)` paid
 /// by snapshot pushes on this thread since the last reset. A steady
 /// append-only session extends every push after the first; a structure
@@ -1357,6 +1539,7 @@ session does not have"
             session_snapshot_matches,
             cached_sessions,
             cached_tree,
+            cached_branch,
             cached_fragments,
             cached_catalog,
             cached_tool_surface,
@@ -1378,6 +1561,10 @@ session does not have"
                         None
                     },
                     cache.tree.clone(),
+                    // Taken, not cloned: the cache entry is replaced at the
+                    // end of this push, so the old branch text has no future
+                    // reader.
+                    cache.branch.take(),
                     cache.fragments.take(),
                     cache.catalog.clone(),
                     cache.tool_surface.clone(),
@@ -1385,6 +1572,7 @@ session does not have"
                 ),
                 None => (
                     false,
+                    None,
                     None,
                     None,
                     None,
@@ -1511,7 +1699,7 @@ session does not have"
             .and_then(|usage| usage.tokens);
         fingerprint.context_tokens = context_tokens.unwrap_or(0);
 
-        let (snapshot, sessions, tree, fragments) = self
+        let (snapshot, sessions, tree, fragments, branch) = self
             .build_session_context_snapshot(SessionSnapshotInputs {
                 model: model_json,
                 context_window,
@@ -1521,6 +1709,7 @@ session does not have"
                 sessions_modified: fingerprint.sessions_modified,
                 cached_sessions,
                 cached_tree,
+                cached_branch,
                 cached_fragments,
                 prebuilt_projection,
                 js_face: true,
@@ -1544,6 +1733,7 @@ session does not have"
             history,
             sessions,
             tree,
+            branch,
             fragments,
             catalog: catalog_cache,
             tool_surface: Some(tool_surface_cache),
@@ -1591,7 +1781,14 @@ session does not have"
                 cached_context_tokens,
             )
             .await;
-        let (session_snapshot_matches, cached_sessions, cached_tree, cached_fragments, stats) = {
+        let (
+            session_snapshot_matches,
+            cached_sessions,
+            cached_tree,
+            cached_branch,
+            cached_fragments,
+            stats,
+        ) = {
             let mut cache = self
                 .session_context_cache
                 .lock()
@@ -1608,6 +1805,7 @@ session does not have"
                         None
                     },
                     cache.tree.clone(),
+                    cache.branch.take(),
                     // Taken, not cloned — see the runtime path above: the
                     // extend's `try_unwrap` needs refcount 1.
                     cache.fragments.take(),
@@ -1615,6 +1813,7 @@ session does not have"
                 ),
                 None => (
                     false,
+                    None,
                     None,
                     None,
                     None,
@@ -1636,7 +1835,7 @@ session does not have"
             .await
             .and_then(|usage| usage.tokens);
         fingerprint.context_tokens = context_tokens.unwrap_or(0);
-        let (snapshot, sessions, tree, fragments) = self
+        let (snapshot, sessions, tree, fragments, branch) = self
             .build_session_context_snapshot(SessionSnapshotInputs {
                 model: model_json,
                 context_window,
@@ -1646,6 +1845,7 @@ session does not have"
                 sessions_modified: fingerprint.sessions_modified,
                 cached_sessions,
                 cached_tree,
+                cached_branch,
                 cached_fragments,
                 prebuilt_projection,
                 js_face: false,
@@ -1660,6 +1860,7 @@ session does not have"
             history,
             sessions,
             tree,
+            branch,
             fragments,
             // This host has no JS runtime face, so there is no catalog or
             // tool-surface state to stamp.
@@ -1895,6 +2096,7 @@ session does not have"
         CachedSessions,
         Option<Arc<CachedTree>>,
         Option<CachedProjectionFragments>,
+        Option<CachedBranchText>,
     ) {
         let SessionSnapshotInputs {
             model,
@@ -1905,6 +2107,7 @@ session does not have"
             sessions_modified,
             cached_sessions,
             cached_tree,
+            cached_branch,
             cached_fragments,
             prebuilt_projection,
             js_face,
@@ -1924,6 +2127,7 @@ session does not have"
             projection,
             tree_cache,
             fragments_cache,
+            branch_cache,
         ) = match &self.session {
             Some(session) => {
                 let session = session.lock().await;
@@ -1936,26 +2140,30 @@ session does not have"
                 // pre-rendered string produces identical JSON bytes with no
                 // intermediate value tree (the manager's `Arc<FileEntry>` list
                 // stays shared).
+                //
+                // R7: the text is CACHED and extended rather than re-rendered:
+                // an append parents off the current leaf and advances it, so
+                // the leaf path only ever grows at its END, and the cached
+                // text minus its closing `]` splices directly with the
+                // appended entries' serialized texts. Any non-append
+                // structural change (branch, reset, trim/widen, storage
+                // switch) fails the covered-path-ids prefix check inside
+                // `build_branch_text` and falls back to the full borrowed
+                // render, byte-identical by construction.
                 // Native-only hosts never read the branch (`getBranch()` is
                 // a JS facade): skip the whole-path render and its
                 // transcript-sized text.
-                let branch = if js_face {
-                    let path = session.projected_branch_path(session.leaf_id());
-                    let mut text = String::with_capacity(64 + path.len() * 256);
-                    text.push('[');
-                    let mut first = true;
-                    for entry in &path {
-                        if first {
-                            first = false;
-                        } else {
-                            text.push(',');
-                        }
-                        text.push_str(&json_text_or_null(*entry));
-                    }
-                    text.push(']');
-                    text
+                let branch_key = BranchTextCacheKey {
+                    session_id: session.id().to_owned(),
+                    session_path: session.session_file().map(Path::to_path_buf),
+                    entry_count: session.resident_entries().len(),
+                    leaf_id: session.leaf_id().map(str::to_owned),
+                };
+                let (branch, branch_cache) = if js_face {
+                    let (text, cache) = build_branch_text(&session, branch_key, cached_branch);
+                    (text, Some(cache))
                 } else {
-                    String::new()
+                    (String::new(), None)
                 };
                 // Labels are read off the BORROWED resident entry list (no
                 // clone — the old code paid a whole-session `entries()`
@@ -2139,7 +2347,28 @@ session does not have"
                         // includes the session header, so it is one higher.
                         let cached_views = cached.fragments.fragments.len();
                         if cached_views == 0 {
-                            // An empty projection extends by everything.
+                            // An empty projection extends by everything — but
+                            // only a set with NO rendered text slots. A set
+                            // built for an EMPTY projection (leaf moved to
+                            // `None`/an out-of-range target — `reset_leaf`,
+                            // an empty session) still carries its rendered
+                            // `[]` / `{"entries":[],"messages":[]}` slots, and
+                            // the extender's text splices assume at least one
+                            // cached element (they strip only the closing
+                            // bracket), so splicing from it would emit a
+                            // leading comma (`[,m1]` in the aggregate,
+                            // `{"entries":[,{...}` in the projection object) —
+                            // invalid JSON in the pushed wire snapshot
+                            // (pre-existing at HEAD `fa6e498`; found by the R7
+                            // branch-text test). Full-build instead: the
+                            // fragment bytes are identical, and the cost is
+                            // one fragment build on the first append after an
+                            // empty-projection push.
+                            if cached.fragments.aggregate_text.is_some()
+                                || cached.fragments.projection_json.is_some()
+                            {
+                                return None;
+                            }
                             return Some((cached.fragments, 0usize));
                         }
                         if fragment_key.session_id != cached.key.session_id
@@ -2232,6 +2461,7 @@ session does not have"
                     projection,
                     tree_cache,
                     Some(fragments_cache),
+                    branch_cache,
                 )
             }
             None => (
@@ -2246,6 +2476,7 @@ session does not have"
                 None,
                 JsonValue::Object(serde_json::Map::new()),
                 String::from("null"),
+                None,
                 None,
                 None,
             ),
@@ -2329,7 +2560,13 @@ session does not have"
             labels,
             projection_json: projection,
         };
-        (snapshot, sessions_cache, tree_cache, fragments_cache)
+        (
+            snapshot,
+            sessions_cache,
+            tree_cache,
+            fragments_cache,
+            branch_cache,
+        )
     }
 
     /// The cheap fingerprint described on [`ModelCatalogFingerprint`]. Reads

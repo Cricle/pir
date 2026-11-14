@@ -236,8 +236,11 @@ const EXPECT_SITE_ALLOWLIST: [(&str, u32); 30] = [
     // Shifted 723 -> 746 by the R57 CachedTree head/tail edits above it in the
     // same function (same site, same invariant), then 746 -> 780 by the
     // q4-memory-ceiling JS-face snapshot gate (the `js_face` input field and
-    // `serialize_projection_snapshot` doc/signature above it).
-    ("agent_session/session_ctx.rs", 780),
+    // `serialize_projection_snapshot` doc/signature above it), then
+    // 780 -> 836 by the R7 branch-text cache (the `CachedBranchText` /
+    // `BranchTextCacheKey` type docs and the `build_branch_text` section above
+    // the same function; site and invariant unchanged).
+    ("agent_session/session_ctx.rs", 836),
     // `reuse` is computed two lines above as
     // `old.as_ref().is_some_and(|slot| ..)`, so `Some` is proven when this
     // branch runs; the `take` cannot observe `None`. Shifted 8398 -> 8458 by
