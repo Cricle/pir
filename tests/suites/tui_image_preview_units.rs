@@ -417,3 +417,488 @@ fn image_content_block_falls_back_without_a_protocol() {
     let lines = image_content_lines(&encoded, "image/png", 10, Some(5));
     assert_eq!(lines, vec!["[Image: image/png 4x6]".to_string()]);
 }
+
+// ---------------------------------------------------------------------------
+// Kitty crop parity — registry + `cropKittyImageLine` (drift rows 15/16)
+// ---------------------------------------------------------------------------
+
+use pir::tui::terminal_image::{
+    crop_kitty_image_line, encode_kitty as kitty_encode, get_kitty_image_metadata,
+    get_kitty_image_placement, get_kitty_image_placement_rows, get_max_kitty_image_rows,
+    register_kitty_image_metadata, render_image, KittyImageMetadata,
+};
+
+/// Serializes the registry tests: the metadata table is process-global
+/// (upstream `kittyImageMetadata` is module-global too). The canonical runner
+/// (nextest) isolates tests per process, but `cargo test` shares one.
+fn crop_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The upstream fixture (`terminal-image.test.ts:532-568`): image 42 is
+/// registered as 3 columns x 3 rows over a 100x100 px payload.
+const CROP_FIXTURE_ID: u32 = 42;
+
+fn register_crop_fixture() {
+    register_kitty_image_metadata(KittyImageMetadata {
+        image_id: CROP_FIXTURE_ID,
+        columns: 3,
+        rows: 3,
+        width_px: 100,
+        height_px: 100,
+    });
+}
+
+fn fixture_transmission() -> String {
+    kitty_encode(
+        "QUJD",
+        KittyEncodeOptions {
+            columns: Some(3),
+            rows: Some(3),
+            image_id: Some(CROP_FIXTURE_ID),
+            move_cursor: false,
+        },
+    )
+}
+
+/// Upstream `terminal-image.test.ts:532-549` pins that the crop of the 100x100
+/// fixture at `hiddenRows=2, visibleRows=1` emits `y=66,h=34,r=1`; this pins
+/// the EXACT bytes of the whole line (controls in upstream order, payload
+/// untouched).
+#[test]
+fn crop_kitty_image_line_pins_the_upstream_source_rectangle_bytes() {
+    let _guard = crop_test_lock();
+    register_crop_fixture();
+    let transmission = fixture_transmission();
+    assert_eq!(
+        transmission,
+        "\x1b_Ga=T,f=100,q=2,C=1,c=3,r=3,i=42;QUJD\x1b\\"
+    );
+
+    assert_eq!(
+        crop_kitty_image_line(&transmission, 2, 1),
+        "\x1b_Ga=T,f=100,q=2,C=1,c=3,i=42,y=66,h=34,r=1;QUJD\x1b\\"
+    );
+    // Bottom clip (upstream `layout.ts:339-344` crops with hiddenRows=0):
+    // 2 of 3 rows visible -> y=0, h=ceil(100*2/3)=67, r=2.
+    assert_eq!(
+        crop_kitty_image_line(&transmission, 0, 2),
+        "\x1b_Ga=T,f=100,q=2,C=1,c=3,i=42,y=0,h=67,r=2;QUJD\x1b\\"
+    );
+    // A middle slice: hidden 1, visible 1 -> y=floor(100/3)=33,
+    // end=ceil(100*2/3)=67, h=34.
+    assert_eq!(
+        crop_kitty_image_line(&transmission, 1, 1),
+        "\x1b_Ga=T,f=100,q=2,C=1,c=3,i=42,y=33,h=34,r=1;QUJD\x1b\\"
+    );
+}
+
+/// The upstream placement fixture (`terminal-image.test.ts:556-568`): the
+/// cropped controls of a chunked transmission become the placement-only
+/// command `\x1b_Ga=p,q=2,C=1,c=3,i=42,y=66,h=34,r=1\x1b\`.
+#[test]
+fn kitty_placement_pins_the_upstream_cropped_control_bytes() {
+    let _guard = crop_test_lock();
+    register_crop_fixture();
+    let transmission = kitty_encode(
+        &"A".repeat(8192),
+        KittyEncodeOptions {
+            columns: Some(3),
+            rows: Some(3),
+            image_id: Some(CROP_FIXTURE_ID),
+            move_cursor: false,
+        },
+    );
+    let line = format!("left {} right", crop_kitty_image_line(&transmission, 2, 1));
+    let placement = get_kitty_image_placement(&line).expect("registered image -> placement");
+    assert_eq!(
+        placement.sequence,
+        "\x1b_Ga=p,q=2,C=1,c=3,i=42,y=66,h=34,r=1\x1b\\"
+    );
+    assert_eq!(
+        placement.replacement_line,
+        format!("left {} right", placement.sequence)
+    );
+    assert!(!placement.replacement_line.contains("AAAA"));
+    assert_eq!(get_kitty_image_placement_rows(&line), Some(1));
+    assert_eq!(
+        placement.transmission_bytes,
+        line.len() - "left ".len() - " right".len()
+    );
+    assert_eq!(placement.estimated_decoded_bytes, 100 * 100 * 4);
+    assert_eq!(placement.rows, 1);
+    assert_eq!(placement.image_id, CROP_FIXTURE_ID);
+}
+
+/// Every upstream no-op (`terminal-image.ts:472-477`) returns the line
+/// byte-identical.
+#[test]
+fn crop_noops_return_the_line_byte_identical() {
+    let _guard = crop_test_lock();
+    register_crop_fixture();
+    let registered = fixture_transmission();
+
+    // hiddenRows < 0 / hiddenRows >= rows / visibleRows <= 0 / whole image
+    // visible (hiddenRows === 0 && croppedRows === rows).
+    for (hidden, visible) in [(-1, 1), (3, 1), (4, 1), (0, 0), (0, 3), (0, 9)] {
+        assert_eq!(
+            crop_kitty_image_line(&registered, hidden, visible),
+            registered,
+            "no-op at hiddenRows={hidden}, visibleRows={visible}"
+        );
+    }
+    // No registered metadata for the id.
+    let unregistered = kitty_encode(
+        "QUJD",
+        KittyEncodeOptions {
+            columns: Some(3),
+            rows: Some(3),
+            image_id: Some(0x0C12_7777),
+            move_cursor: false,
+        },
+    );
+    assert_eq!(crop_kitty_image_line(&unregistered, 1, 1), unregistered);
+    // No `\x1b_G…;` command to rewrite: plain text, an iTerm2 image (upstream
+    // has no iTerm2 crop), and a kitty prefix without a terminator semicolon.
+    assert_eq!(crop_kitty_image_line("plain text", 1, 1), "plain text");
+    let iterm = encode_iterm2("QUJD", &Iterm2EncodeOptions::default());
+    assert_eq!(crop_kitty_image_line(&iterm, 1, 1), iterm);
+    let no_semicolon = "\x1b_Ga=T,f=100,i=42";
+    assert_eq!(crop_kitty_image_line(no_semicolon, 1, 1), no_semicolon);
+}
+
+/// The crop drops existing `y=`/`h=`/`r=` controls first, then appends the new
+/// three in `y=`, `h=`, `r=` order (upstream `terminal-image.ts:481`), and
+/// preserves any prefix/suffix text around the sequence verbatim.
+#[test]
+fn crop_drops_existing_yhr_controls_then_appends_the_new_ones() {
+    let _guard = crop_test_lock();
+    register_crop_fixture();
+    // A line already carrying source-rectangle controls (a re-crop) - the
+    // registry rows (3) drive the math, not the line's r=.
+    let line = "\x1b_Ga=T,f=100,q=2,C=1,c=3,i=42,y=7,h=9,r=3;QUJD\x1b\\";
+    let cropped = crop_kitty_image_line(line, 2, 1);
+    assert_eq!(
+        cropped,
+        "\x1b_Ga=T,f=100,q=2,C=1,c=3,i=42,y=66,h=34,r=1;QUJD\x1b\\"
+    );
+    assert_eq!(cropped.matches(",y=").count(), 1, "{cropped:?}");
+    assert_eq!(cropped.matches(",h=").count(), 1, "{cropped:?}");
+    assert_eq!(cropped.matches(",r=").count(), 1, "{cropped:?}");
+
+    let embedded = format!("left {line} right");
+    let string_terminator = "\x1b\\";
+    let expected_embedded = format!(
+        "left {}{string_terminator} right",
+        "\x1b_Ga=T,f=100,q=2,C=1,c=3,i=42,y=66,h=34,r=1;QUJD"
+    );
+    assert_eq!(crop_kitty_image_line(&embedded, 2, 1), expected_embedded);
+}
+
+/// `render_image` registers what the crop reads (upstream
+/// `terminal-image.ts:704-713`): id, cell footprint and pixel size.
+#[test]
+fn render_image_registers_kitty_metadata_for_the_crop() {
+    let _guard = crop_test_lock();
+    let rendered = render_image(
+        "QUJD",
+        100,
+        200,
+        pir::tui::terminal_image::ImageProtocol::Kitty,
+        3,
+        None,
+    )
+    .expect("kitty render");
+    let image_id = rendered.image_id.expect("kitty placements carry ids");
+    let expected = KittyImageMetadata {
+        image_id,
+        columns: 3,
+        rows: 3,
+        width_px: 100,
+        height_px: 200,
+    };
+    assert_eq!(get_kitty_image_metadata(&rendered.sequence), Some(expected));
+    assert_eq!(rendered.columns, 3);
+    assert_eq!(rendered.rows, 3);
+    // The crop reads the registered pixel size: 100x200 over 3 rows, hidden 2,
+    // 1 visible -> y=floor(200/3)=133, end=200, h=67, and the encoder's own
+    // `r=3` is dropped before the new y/h/r trio is appended.
+    assert_eq!(
+        crop_kitty_image_line(&rendered.sequence, 2, 1),
+        format!("\x1b_Ga=T,f=100,q=2,C=1,c=3,i={image_id},y=133,h=67,r=1;QUJD\x1b\\")
+    );
+    // iTerm2 lines are not registered (upstream registers Kitty only).
+    let iterm = render_image(
+        "QUJD",
+        100,
+        200,
+        pir::tui::terminal_image::ImageProtocol::Iterm2,
+        3,
+        None,
+    )
+    .expect("iterm2 render");
+    assert_eq!(get_kitty_image_metadata(&iterm.sequence), None);
+    assert!(get_max_kitty_image_rows() >= 3);
+}
+
+/// The registry bound (upstream `registerKittyImageMetadata`: more than 1000
+/// entries deletes the oldest id) and re-registration (delete + set moves the
+/// entry to the end).
+#[test]
+fn kitty_metadata_registry_evicts_the_oldest_entry_past_its_bound() {
+    let _guard = crop_test_lock();
+    let line_for = |id: u32| format!("\x1b_Ga=T,f=100,q=2,C=1,c=1,r=1,i={id};QUJD\x1b\\");
+    // A marker registered FIRST is the oldest entry this test owns; after
+    // 1001 further registrations it must be gone (removals = 1001 - 1000 +
+    // whatever entries existed before this test).
+    let marker = 0x0C12_C000u32;
+    register_kitty_image_metadata(KittyImageMetadata {
+        image_id: marker,
+        columns: 1,
+        rows: 1,
+        width_px: 1,
+        height_px: 1,
+    });
+    let base = 0x0C12_D000u32;
+    for index in 0..1001u32 {
+        register_kitty_image_metadata(KittyImageMetadata {
+            image_id: base + index,
+            columns: 1,
+            rows: 1,
+            width_px: 1,
+            height_px: 1,
+        });
+    }
+    assert_eq!(
+        get_kitty_image_metadata(&line_for(marker)),
+        None,
+        "oldest evicted"
+    );
+    assert!(
+        get_kitty_image_metadata(&line_for(base + 1000)).is_some(),
+        "newest kept"
+    );
+    // Re-registration replaces in place.
+    register_kitty_image_metadata(KittyImageMetadata {
+        image_id: base + 1000,
+        columns: 2,
+        rows: 2,
+        width_px: 4,
+        height_px: 6,
+    });
+    assert_eq!(
+        get_kitty_image_metadata(&line_for(base + 1000)),
+        Some(KittyImageMetadata {
+            image_id: base + 1000,
+            columns: 2,
+            rows: 2,
+            width_px: 4,
+            height_px: 6,
+        })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scrolled-painter crop (`core.rs::render_scrolled`, drift row 16)
+// ---------------------------------------------------------------------------
+
+/// Pre-built rows rendered verbatim — the row shape `image_block_lines`
+/// hands the frame builder (sequence + blank reservation rows).
+struct RawRows(Vec<String>);
+
+impl pir::tui::core::Component for RawRows {
+    fn render(&self, _width: usize) -> Vec<String> {
+        self.0.clone()
+    }
+
+    fn render_into(&self, _width: usize, out: &mut pir::tui::core::Rows<'_>) {
+        for row in &self.0 {
+            out.push(row);
+        }
+    }
+}
+
+struct ScrolledImageFixture {
+    core: pir::tui::core::TuiCore,
+    log_path: std::path::PathBuf,
+    sequence: String,
+    image_row: usize,
+    transcript_end: usize,
+    viewport_h: usize,
+}
+
+/// A scrolled-painter fixture: 30 text rows, then a 3-row Kitty image block,
+/// then 10 text rows and a 1-row dock. The first render follows the end; the
+/// test then scrolls and re-renders, capturing the byte stream via the write
+/// log (the seam the TUI regression tests use).
+fn scrolled_image_fixture(name: &str, image_id: u32) -> ScrolledImageFixture {
+    use pir::tui::core::{Terminal, Text, TuiCore};
+    use pir::tui::stdin_buffer::WriteLog;
+
+    let sequence = kitty_encode(
+        "QUJD",
+        KittyEncodeOptions {
+            columns: Some(3),
+            rows: Some(3),
+            image_id: Some(image_id),
+            move_cursor: false,
+        },
+    );
+    let dir = std::env::temp_dir().join(format!("pir-x1-crop-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let log_path = dir.join("writes.log");
+    let _ = std::fs::remove_file(&log_path);
+
+    let terminal = Terminal::with_write_log(WriteLog::at(&log_path));
+    terminal.set_size(40, 12);
+    let mut core = TuiCore::new(terminal);
+    core.set_dock_height(1);
+    let above: String = (1..=30)
+        .map(|index| format!("above-{index:02}\n"))
+        .collect();
+    let below: String = (1..=10)
+        .map(|index| format!("below-{index:02}\n"))
+        .collect();
+    core.push_content(Box::new(Text::with_padding(above, 0, 0)));
+    core.push_content(Box::new(RawRows(vec![
+        sequence.clone(),
+        String::new(),
+        String::new(),
+    ])));
+    core.push_content(Box::new(Text::with_padding(below, 0, 0)));
+    core.push_content(Box::new(Text::with_padding("DOCK", 0, 0)));
+    core.render();
+
+    let image_row = core
+        .last_frame_lines()
+        .iter()
+        .position(|line| line.contains(&format!("i={image_id}")))
+        .expect("the image line is in the first frame");
+    let frame_len = core.frame_buffer_length();
+    let transcript_end = frame_len - core.dock_height();
+    let viewport_h = core.rows() - core.dock_height();
+    ScrolledImageFixture {
+        core,
+        log_path,
+        sequence,
+        image_row,
+        transcript_end,
+        viewport_h,
+    }
+}
+
+fn cleanup_fixture(fixture: &mut ScrolledImageFixture) {
+    fixture.core.stop();
+    if let Some(dir) = fixture.log_path.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A partially scrolled image block re-paints with the crop controls (drift
+/// row 16): the image line two rows above the window top crops to
+/// `y=66,h=34,r=1` on the viewport's top row, exactly the upstream
+/// `layout.ts:359-378` re-emit.
+#[test]
+fn scrolled_painter_repaints_a_partially_scrolled_image_with_the_crop_controls() {
+    let _guard = crop_test_lock();
+    const IMAGE_ID: u32 = 0x0C12_0107;
+    register_kitty_image_metadata(KittyImageMetadata {
+        image_id: IMAGE_ID,
+        columns: 3,
+        rows: 3,
+        width_px: 100,
+        height_px: 100,
+    });
+    let mut fixture = scrolled_image_fixture("crop", IMAGE_ID);
+    let first = std::fs::read_to_string(&fixture.log_path).expect("first paint");
+
+    // Scroll so the image line sits exactly 2 rows above the window top:
+    // hiddenRows=2, one visible row -> the upstream fixture's y=66,h=34,r=1.
+    let start = fixture.image_row + 2;
+    let offset = fixture.transcript_end - fixture.viewport_h - start;
+    assert!(offset > 0, "the fixture must take the scrolled path");
+    fixture.core.set_scroll_offset(offset);
+    fixture.core.render();
+
+    let stream = std::fs::read_to_string(&fixture.log_path).expect("scrolled paint");
+    let scrolled = &stream[first.len()..];
+    let expected = format!("\x1b_Ga=T,f=100,q=2,C=1,c=3,i={IMAGE_ID},y=66,h=34,r=1;QUJD\x1b\\");
+    assert!(
+        scrolled.contains(&expected),
+        "the image line above the window re-paints as a crop at the viewport top: {scrolled:?}"
+    );
+    assert!(
+        !scrolled.contains(&fixture.sequence),
+        "the uncropped transmission must not be re-emitted: {scrolled:?}"
+    );
+    cleanup_fixture(&mut fixture);
+}
+
+/// A fully visible image block passes through the scrolled painter
+/// byte-identical (the crop's `hiddenRows === 0 && croppedRows === rows`
+/// no-op), so a frame that would not have been cropped before is unchanged.
+#[test]
+fn scrolled_painter_leaves_a_fully_visible_image_line_byte_identical() {
+    let _guard = crop_test_lock();
+    const IMAGE_ID: u32 = 0x0C12_0108;
+    register_kitty_image_metadata(KittyImageMetadata {
+        image_id: IMAGE_ID,
+        columns: 3,
+        rows: 3,
+        width_px: 100,
+        height_px: 100,
+    });
+    let mut fixture = scrolled_image_fixture("visible", IMAGE_ID);
+    let first = std::fs::read_to_string(&fixture.log_path).expect("first paint");
+
+    // Three text rows above the block, eight below: the whole 3-row image is
+    // inside the window.
+    let start = fixture.image_row.saturating_sub(3);
+    let offset = fixture.transcript_end - fixture.viewport_h - start;
+    assert!(offset > 0, "the fixture must take the scrolled path");
+    fixture.core.set_scroll_offset(offset);
+    fixture.core.render();
+
+    let stream = std::fs::read_to_string(&fixture.log_path).expect("scrolled paint");
+    let scrolled = &stream[first.len()..];
+    assert!(
+        scrolled.contains(&fixture.sequence),
+        "a fully visible image line is written verbatim: {scrolled:?}"
+    );
+    assert!(
+        !scrolled.contains(",y="),
+        "no crop controls are added when nothing is hidden: {scrolled:?}"
+    );
+    cleanup_fixture(&mut fixture);
+}
+
+/// An image line with no registered metadata stays untouched (the crop's
+/// `!metadata` no-op): the window keeps its blank reservation rows and no
+/// image bytes are painted at the top.
+#[test]
+fn scrolled_painter_leaves_an_unregistered_image_line_untouched() {
+    let _guard = crop_test_lock();
+    const IMAGE_ID: u32 = 0x0C12_01FF;
+    let mut fixture = scrolled_image_fixture("unregistered", IMAGE_ID);
+    let first = std::fs::read_to_string(&fixture.log_path).expect("first paint");
+
+    let start = fixture.image_row + 2;
+    let offset = fixture.transcript_end - fixture.viewport_h - start;
+    assert!(offset > 0, "the fixture must take the scrolled path");
+    fixture.core.set_scroll_offset(offset);
+    fixture.core.render();
+
+    let stream = std::fs::read_to_string(&fixture.log_path).expect("scrolled paint");
+    let scrolled = &stream[first.len()..];
+    assert!(
+        !scrolled.contains(&format!("i={IMAGE_ID}")),
+        "an unregistered image line is not re-painted: {scrolled:?}"
+    );
+    assert!(
+        !scrolled.contains(",y="),
+        "no crop controls without registered metadata: {scrolled:?}"
+    );
+    cleanup_fixture(&mut fixture);
+}

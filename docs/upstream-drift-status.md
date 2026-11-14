@@ -39,8 +39,8 @@ unchanged: this document refreshes the *drift* record, not the port baseline.
 | 12 | `acf83acfd` | restore changelog attributions | N/A | Docs only. |
 | 13 | `e9c3ac9d9` | drop changelog author attribution | N/A | Docs only. |
 | 14 | `a8fe8e0ad` | missing changelog entries | N/A | Docs only. |
-| 15 | `1c8cb1781` | bound image line search by tallest image | **Open** | Upstream bounds the fullscreen backward search for an image line by the tallest registered image (`getMaxKittyImageRows`). pir has the placement/encoding half — Kitty/iTerm2 detection (`tui/terminal_image.rs:93`, `:134` Kitty, `:153` iTerm2), the `PI_IMAGE_PROTOCOL` override (`:189-194`), the encoders (`:458` Kitty, `:509` iTerm2) and the reservation-row block `image_block_lines` (`:873`) — but has no crop/re-emit search at all (`grep -rn crop src/` = 0 hits), so the `getMaxKittyImageRows` bound has no counterpart. Static gap; runtime repro not run. |
-| 16 | `4464442f9` | crop boxed images scrolled above the viewport | **Open** | Upstream repaints the partially scrolled image by cropping its line (`cropKittyImageLine(hiddenRows, visibleRows)`) at the viewport's top row. pir's `render_scrolled` (`tui/core.rs:5114-5136`) takes a raw window of transcript rows (`let window = &new_lines[start..end]`, `:5134`) and `:4304-4309` passes image rows through the width clamp unchanged, so a protocol image whose first row scrolls above the viewport keeps only its blank reservation rows — there is no crop/re-emit. Same gap as row 15. |
+| 15 | `1c8cb1781` | bound image line search by tallest image | **Landed** | The Kitty metadata registry ports upstream `kittyImageMetadata`/`maxKittyImageRows`: `register_kitty_image_metadata` (`tui/terminal_image.rs:585`, called from `render_image` at `:1141`), the monotonic `get_max_kitty_image_rows` (`:608`, upstream `terminal-image.ts:367-370`) and the registry lookup `get_kitty_image_metadata` (`:684`). The scrolled painter's backward search is bounded by `get_max_kitty_image_rows()` (`tui/core.rs:5174`, the upstream `layout.ts:364` bound). Pins: `tests/suites/tui_image_preview_units.rs::kitty_metadata_registry_evicts_the_oldest_entry_past_its_bound` (`:650`) and `scrolled_painter_repaints_a_partially_scrolled_image_with_the_crop_controls` (`:804`). |
+| 16 | `4464442f9` | crop boxed images scrolled above the viewport | **Landed** | `crop_kitty_image_line` (`tui/terminal_image.rs:806`) ports upstream `cropKittyImageLine` (`terminal-image.ts:471-483`) with the exact no-op set, control order (`y=`,`h=`,`r=` appended after dropping existing `y`/`h`/`r`) and source-rect math. Wired into `render_scrolled` at both upstream call points: bottom clip inside the window (`tui/core.rs:5153-5166`, upstream `layout.ts:339-344`) and the image line above the viewport re-painted at the window top (`:5173-5197`, upstream `layout.ts:359-378`). Exact-byte pins incl. the upstream fixture `y=66,h=34,r=1` and the placement `\x1b_Ga=p,q=2,C=1,c=3,i=42,y=66,h=34,r=1\x1b\\`: `tests/suites/tui_image_preview_units.rs:471,502`; painter integration: `:804` (crop), `:843` (fully visible -> byte-identical), `:881` (unregistered -> untouched). |
 | 17 | `a7b94a03f` | preserve literal data in Gemini tool schemas | **Landed** | `ai/api/google/shared.rs:717` (six name maps, incl. `dependencies`), `:728` (sixteen subschema keywords), `:753-782` (rewrite only in schema-bearing positions). |
 | 18 | `7314819f0` | send `const` as `enum` in Gemini tool schemas | **Landed** | `ai/api/google/shared.rs:692` applies `rewrite_const_as_enum` to `parametersJsonSchema`; `:775-782` rewrites string/number `const` to a single-value `enum`. |
 | 19 | `ed76cca69` | fork test asserts copied content | N/A | Test-only (behaviour covered by row 20). |
@@ -88,15 +88,16 @@ unchanged: this document refreshes the *drift* record, not the port baseline.
 | 61 | `7c22a93d0` | `totalFromProvider` flag on usage cost | **Landed** | `ai/types/stream.rs:27-53` (`totalFromProvider` serde field, `is_provider_billed`), set in `ai/util.rs:445-484`, `ai/classify.rs:254`, `ai/images.rs:443`; honoured at `ai/provider.rs:3605-3615`. |
 | 62 | `58c0b02ce` | `[Unreleased]` changelog sections | N/A | Docs only. |
 
-Totals: **26 Landed (25 direct + 1 native-equivalent), 0 Partial, 2 Open, 34 N/A**.
+Totals: **28 Landed (27 direct + 1 native-equivalent), 0 Partial, 0 Open, 34 N/A**.
 
 ## Open and Partial items
 
-Two rows are **Open** in the `v1.4.0..HEAD` window: **15** and **16**, the
-fullscreen Kitty/iTerm2 crop/re-emit (upstream `4464442f9`+`1c8cb1781`). pir
-detects, encodes and places protocol images but has no crop step
-(`grep -rn crop src/` = 0); a partially scrolled image loses its placement line.
-This is a static finding — a runtime repro is still pending. The last pass
+None remain. Rows **15** and **16** (the fullscreen Kitty/iTerm2 crop/re-emit,
+upstream `4464442f9`+`1c8cb1781`) landed: the metadata registry and
+`crop_kitty_image_line` live in `tui/terminal_image.rs` and the scrolled painter
+crops at both upstream call points in `tui/core.rs::render_scrolled`; the
+`y=66,h=34,r=1` fixture bytes and the scrolled re-paint are pinned in
+`tests/suites/tui_image_preview_units.rs` — see the row evidence. The last pass
 closed the nine other previously-open/partial rows (1, 2, 9, 22, 44, 47, 48,
 51, 55); the evidence is in each row. The earlier 110-commit window is fully
 covered: the 23 spot checks plus the 16 previously unchecked commits below are
@@ -195,8 +196,9 @@ landed (`AgentSession::restore_branch_active_tools`; test
 `tree_navigation_restores_the_target_branch_loadout`), and the 16 previously
 unchecked commits in the 110-commit window are classified in the table above;
 `28bea006b` now uses the `access(F_OK)`-equivalent attribute check. No open
-items remain in the 110-commit window; rows 15/16 above are the only Open items
-in the `v1.4.0..HEAD` window. Gates for this pass: full `test_fast.ps1`
+items remain in the 110-commit window; rows 15/16 above (the Kitty crop) are now
+**Landed** too, so the `v1.4.0..HEAD` window carries **0 Open** rows. Gates for
+this pass: full `test_fast.ps1`
 **6774 passed / 0 real failures** (2 load-flaky suites passed on serial
 retry), `g_durable` 747/747, `g_ai` 763/763, `g_tui` 777/777,
 `d32_resume_active_tools` 11/11, `cargo clippy --all-targets --all-features

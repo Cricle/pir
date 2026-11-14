@@ -533,6 +533,324 @@ pub fn encode_iterm2(base64_data: &str, options: &Iterm2EncodeOptions) -> String
     format!("\x1b]1337;File={}:{}\x07", params.join(";"), base64_data)
 }
 
+// ---------------------------------------------------------------------------
+// Kitty metadata registry + crop (upstream `terminal-image.ts`
+// `registerKittyImageMetadata` / `getMaxKittyImageRows` /
+// `getKittyImageMetadata` / `cropKittyImageLine`)
+// ---------------------------------------------------------------------------
+
+/// One registered Kitty image's cell footprint and pixel dimensions
+/// (upstream `KittyImageMetadata`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KittyImageMetadata {
+    pub image_id: u32,
+    pub columns: usize,
+    pub rows: usize,
+    pub width_px: u32,
+    pub height_px: u32,
+}
+
+/// Registry entry (upstream `RegisteredKittyImageMetadata`): the public
+/// metadata plus the transmission generation the placement dedup keys on.
+#[derive(Debug, Clone, Copy)]
+struct RegisteredKittyImageMetadata {
+    metadata: KittyImageMetadata,
+    transmission_generation: u64,
+}
+
+/// Process-wide registration table (upstream `kittyImageMetadata`).
+#[derive(Default)]
+struct KittyMetadataRegistry {
+    /// Registration order (upstream `Map` insertion order): a re-registration
+    /// deletes the old entry and appends the new one, so it moves to the end.
+    entries: Vec<(u32, RegisteredKittyImageMetadata)>,
+    /// Tallest registered image (upstream `maxKittyImageRows`; monotonic).
+    max_rows: usize,
+    /// Bumped per registration (upstream `kittyTransmissionGeneration`).
+    generation: u64,
+}
+
+/// Entry bound of the registry (upstream `kittyImageMetadata.size > 1000`).
+const MAX_KITTY_IMAGE_METADATA: usize = 1000;
+
+fn kitty_metadata_registry() -> &'static std::sync::Mutex<KittyMetadataRegistry> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<KittyMetadataRegistry>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(KittyMetadataRegistry::default()))
+}
+
+/// Register one rendered Kitty image (upstream `registerKittyImageMetadata`).
+/// [`render_image`] calls this for every Kitty placement it encodes; a later
+/// scroll uses the registration to crop a partially hidden placement.
+pub fn register_kitty_image_metadata(metadata: KittyImageMetadata) {
+    let mut registry = kitty_metadata_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry.generation += 1;
+    let transmission_generation = registry.generation;
+    registry.max_rows = registry.max_rows.max(metadata.rows);
+    registry.entries.retain(|(id, _)| *id != metadata.image_id);
+    registry.entries.push((
+        metadata.image_id,
+        RegisteredKittyImageMetadata {
+            metadata,
+            transmission_generation,
+        },
+    ));
+    if registry.entries.len() > MAX_KITTY_IMAGE_METADATA {
+        registry.entries.remove(0);
+    }
+}
+
+/// Row height of the tallest Kitty image registered so far (upstream
+/// `getMaxKittyImageRows`). Bounds backward searches for image lines above a
+/// viewport: no image line further up than this can reach into it.
+pub fn get_max_kitty_image_rows() -> usize {
+    kitty_metadata_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .max_rows
+}
+
+/// Byte bounds of the first Kitty command in `line`: the start of `\x1b_G`
+/// and the index of its terminating `;` (upstream `/\x1b_G([^;]*);/`; the
+/// leftmost `\x1b_G` always matches when any `;` follows it).
+fn kitty_command_bounds(line: &str) -> Option<(usize, usize)> {
+    let start = line.find(KITTY_PREFIX)?;
+    let semicolon = line[start + KITTY_PREFIX.len()..].find(';')? + start + KITTY_PREFIX.len();
+    Some((start, semicolon))
+}
+
+/// The `i=<id>` control of a Kitty control string (upstream
+/// `/(?:^|,)i=(\d+)(?:,|$)/`).
+fn kitty_image_id_from_controls(controls: &str) -> Option<u32> {
+    let bytes = controls.as_bytes();
+    let mut search = 0usize;
+    while let Some(offset) = controls[search..].find("i=") {
+        let index = search + offset;
+        let digits_start = index + 2;
+        let mut end = digits_start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        let preceded_ok = index == 0 || bytes[index - 1] == b',';
+        let followed_ok = end == bytes.len() || bytes[end] == b',';
+        if preceded_ok && end > digits_start && followed_ok {
+            return controls[digits_start..end].parse().ok();
+        }
+        search = digits_start;
+    }
+    None
+}
+
+/// An explicit `r=<n>` control with `n > 0` (upstream
+/// `getExplicitKittyImageRows`); a found `r=0` still ends the search.
+fn explicit_kitty_image_rows(controls: &str) -> Option<usize> {
+    let bytes = controls.as_bytes();
+    let mut search = 0usize;
+    while let Some(offset) = controls[search..].find("r=") {
+        let index = search + offset;
+        let digits_start = index + 2;
+        let mut end = digits_start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        let preceded_ok = index == 0 || bytes[index - 1] == b',';
+        let followed_ok = end == bytes.len() || bytes[end] == b',';
+        if preceded_ok && end > digits_start && followed_ok {
+            let rows = controls[digits_start..end].parse::<usize>().ok()?;
+            return (rows > 0).then_some(rows);
+        }
+        search = digits_start;
+    }
+    None
+}
+
+fn registered_kitty_metadata_from_controls(controls: &str) -> Option<RegisteredKittyImageMetadata> {
+    let image_id = kitty_image_id_from_controls(controls)?;
+    let registry = kitty_metadata_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry
+        .entries
+        .iter()
+        .find(|(id, _)| *id == image_id)
+        .map(|(_, entry)| *entry)
+}
+
+/// The registered metadata for the first Kitty command in `line` (upstream
+/// `getKittyImageMetadata`): `None` when the line carries no `\x1b_G … ;` or
+/// its `i=` id was never registered.
+pub fn get_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
+    let (start, semicolon) = kitty_command_bounds(line)?;
+    let controls = &line[start + KITTY_PREFIX.len()..semicolon];
+    registered_kitty_metadata_from_controls(controls).map(|entry| entry.metadata)
+}
+
+/// Rows covered by an image placement without scanning its payload (upstream
+/// `getKittyImagePlacementRows`): the explicit `r=` when present, otherwise
+/// the registered row count.
+pub fn get_kitty_image_placement_rows(line: &str) -> Option<usize> {
+    let (start, semicolon) = kitty_command_bounds(line)?;
+    let controls = &line[start + KITTY_PREFIX.len()..semicolon];
+    if let Some(rows) = explicit_kitty_image_rows(controls) {
+        return Some(rows);
+    }
+    registered_kitty_metadata_from_controls(controls).map(|entry| entry.metadata.rows)
+}
+
+/// Control keys a placement-only command keeps (upstream
+/// `KITTY_PLACEMENT_CONTROL_KEYS`).
+const KITTY_PLACEMENT_CONTROL_KEYS: &[&str] = &[
+    "i", "p", "x", "y", "w", "h", "X", "Y", "c", "r", "C", "U", "z", "P", "Q", "H", "V",
+];
+
+/// One placement-only command derived from a rendered Kitty image line
+/// (upstream `KittyImagePlacement`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyImagePlacement {
+    pub image_id: u32,
+    pub transmission_generation: u64,
+    pub transmission_bytes: usize,
+    pub estimated_decoded_bytes: u64,
+    pub rows: usize,
+    /// The upload-free re-placement command (`a=p`).
+    pub sequence: String,
+    /// `line` with the transmission replaced by [`Self::sequence`].
+    pub replacement_line: String,
+}
+
+/// Whether a control string carries the `m=1` continuation flag (upstream
+/// `/(?:^|,)m=1(?:,|$)/`).
+fn has_m_1_control(controls: &str) -> bool {
+    let bytes = controls.as_bytes();
+    let mut search = 0usize;
+    while let Some(offset) = controls[search..].find("m=1") {
+        let index = search + offset;
+        let end = index + 3;
+        let preceded_ok = index == 0 || bytes[index - 1] == b',';
+        let followed_ok = end == bytes.len() || bytes[end] == b',';
+        if preceded_ok && followed_ok {
+            return true;
+        }
+        search = index + 1;
+    }
+    false
+}
+
+/// Build a placement-only command for an image line emitted by
+/// [`render_image`] (upstream `getKittyImagePlacement`): `None` when the line
+/// has no Kitty command or the image id is not registered. Walks the `m=1`
+/// chunk chain to the end of the transmission so `transmission_bytes` covers
+/// every chunk.
+pub fn get_kitty_image_placement(line: &str) -> Option<KittyImagePlacement> {
+    let (match_start, semicolon) = kitty_command_bounds(line)?;
+    let match_controls = &line[match_start + KITTY_PREFIX.len()..semicolon];
+    let metadata = registered_kitty_metadata_from_controls(match_controls)?;
+
+    let mut command_start = match_start;
+    let mut command_controls = match_controls;
+    let transmission_end;
+    loop {
+        let from = command_start + KITTY_PREFIX.len();
+        let terminator = line.get(from..)?.find("\x1b\\")? + from;
+        let end = terminator + 2;
+        if !has_m_1_control(command_controls) {
+            transmission_end = end;
+            break;
+        }
+        command_start = end;
+        let after = line.get(command_start..)?.strip_prefix(KITTY_PREFIX)?;
+        let controls_end = after.find(';')? + command_start + KITTY_PREFIX.len();
+        command_controls = &line[command_start + KITTY_PREFIX.len()..controls_end];
+    }
+
+    let controls: Vec<&str> = match_controls
+        .split(',')
+        .filter(|control| {
+            control
+                .split('=')
+                .next()
+                .is_some_and(|key| KITTY_PLACEMENT_CONTROL_KEYS.contains(&key))
+        })
+        .collect();
+    let sequence = format!("\x1b_Ga=p,q=2,{}\x1b\\", controls.join(","));
+    Some(KittyImagePlacement {
+        image_id: metadata.metadata.image_id,
+        transmission_generation: metadata.transmission_generation,
+        transmission_bytes: transmission_end - match_start,
+        estimated_decoded_bytes: u64::from(metadata.metadata.width_px)
+            * u64::from(metadata.metadata.height_px)
+            * 4,
+        rows: explicit_kitty_image_rows(match_controls).unwrap_or(metadata.metadata.rows),
+        replacement_line: format!(
+            "{}{}{}",
+            &line[..match_start],
+            sequence,
+            &line[transmission_end..]
+        ),
+        sequence,
+    })
+}
+
+/// Crop a Kitty image line to the rows still visible (upstream
+/// `cropKittyImageLine`), so a placement that is partially scrolled away or
+/// clipped by its box re-paints only the visible source rectangle: the
+/// existing `y`/`h`/`r` controls are dropped and `y=<sourceY>`,
+/// `h=<sourceHeight>`, `r=<croppedRows>` are appended in that order.
+///
+/// Returns `line` byte-identical in every no-op case: no registered metadata,
+/// no `\x1b_G…;` match, `hidden_rows < 0`, `hidden_rows >= rows`,
+/// `visible_rows <= 0`, or the whole image visible (`hidden_rows == 0` and
+/// `cropped_rows == rows`).
+pub fn crop_kitty_image_line(line: &str, hidden_rows: i64, visible_rows: i64) -> String {
+    let metadata = match get_kitty_image_metadata(line) {
+        Some(metadata) => metadata,
+        None => return line.to_string(),
+    };
+    let Some((match_start, semicolon)) = kitty_command_bounds(line) else {
+        return line.to_string();
+    };
+    let rows = metadata.rows as i64;
+    if hidden_rows < 0 || hidden_rows >= rows || visible_rows <= 0 {
+        return line.to_string();
+    }
+    let cropped_rows = visible_rows.min(rows - hidden_rows);
+    if hidden_rows == 0 && cropped_rows == rows {
+        return line.to_string();
+    }
+    // Integer arithmetic on i128 so the intermediate products cannot
+    // overflow; all operands are non-negative past the guards, so `/` floors
+    // and the `+ rows - 1` form is the ceiling division (upstream
+    // `Math.floor` / `Math.ceil` on the same products).
+    let height_px = i128::from(metadata.height_px);
+    let hidden = i128::from(hidden_rows);
+    let cropped = i128::from(cropped_rows);
+    let rows_wide = i128::from(rows);
+    let source_y = height_px * hidden / rows_wide;
+    let source_end = (height_px * (hidden + cropped) + rows_wide - 1) / rows_wide;
+    let source_height = (height_px.min(source_end) - source_y).max(1);
+
+    let mut controls: Vec<String> = line[match_start + KITTY_PREFIX.len()..semicolon]
+        .split(',')
+        .filter(|control| {
+            !(control.starts_with("y=") || control.starts_with("h=") || control.starts_with("r="))
+        })
+        .map(str::to_string)
+        .collect();
+    controls.push(format!("y={source_y}"));
+    controls.push(format!("h={source_height}"));
+    controls.push(format!("r={cropped_rows}"));
+
+    let mut out = String::with_capacity(line.len() + 24);
+    out.push_str(&line[..match_start]);
+    out.push_str(KITTY_PREFIX);
+    out.push_str(&controls.join(","));
+    out.push(';');
+    out.push_str(&line[semicolon + 1..]);
+    out
+}
+
 /// One rendered image placement (upstream `renderImage` result).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedImage {
@@ -816,6 +1134,17 @@ pub fn render_image(
                 true,
             );
             let image_id = allocate_image_id();
+            // Upstream `renderImage` registers the placement's metadata
+            // (`terminal-image.ts:704-713`) so a later scroll can crop it;
+            // upstream registers `options.imageId`, pir allocates the id on
+            // this branch, so the registration is unconditional here.
+            register_kitty_image_metadata(KittyImageMetadata {
+                image_id,
+                columns,
+                rows,
+                width_px,
+                height_px,
+            });
             let sequence = encode_kitty(
                 base64_data,
                 KittyEncodeOptions {

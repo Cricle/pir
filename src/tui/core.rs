@@ -5139,6 +5139,61 @@ impl TuiCore {
         }
         let dock_start = window.len();
 
+        // Kitty crop parity, callers 1+2 of upstream `cropKittyImageLine`
+        // (`layout.ts:339-344` and `:359-378` in `paintBox`). A placement
+        // whose block is clipped by the viewport bottom or whose first row
+        // scrolled off the top re-paints with the source-rectangle controls
+        // (`y=`/`h=`/`r=`) instead of losing its image line; every no-op case
+        // (including no registered metadata) leaves the bytes untouched.
+        //
+        // 1. Bottom clip (upstream `layout.ts:339-344`): an image line inside
+        //    the viewport whose reservation rows run past the window end
+        //    paints only the visible rows (`crop(line, 0, visibleRows)`),
+        //    where the window end is the box's clip bottom.
+        for index in 0..dock_start {
+            let Some(metadata) = super::terminal_image::get_kitty_image_metadata(&painted[index])
+            else {
+                continue;
+            };
+            let visible_rows = metadata.rows.min(dock_start - index);
+            if visible_rows < metadata.rows {
+                painted[index] = super::terminal_image::crop_kitty_image_line(
+                    &painted[index],
+                    0,
+                    visible_rows as i64,
+                );
+            }
+        }
+        // 2. Image line above the viewport (upstream `layout.ts:359-378`):
+        //    find the nearest image line within `getMaxKittyImageRows` above
+        //    the window top and re-paint its crop at the viewport's top row.
+        //    `start > 0` is the upstream `scrollTop > 0` guard: `start` is
+        //    the transcript row painted at the window top (the window is
+        //    bottom-anchored like upstream's follow-end scrollTop).
+        if start > 0 {
+            let min_row = start.saturating_sub(super::terminal_image::get_max_kitty_image_rows());
+            for image_row in (min_row..start).rev() {
+                let image_line = &new_lines[image_row];
+                if !super::terminal_image::is_image_line(image_line) {
+                    continue;
+                }
+                let Some(metadata) = super::terminal_image::get_kitty_image_metadata(image_line)
+                else {
+                    continue;
+                };
+                let hidden_rows = start - image_row;
+                if hidden_rows < metadata.rows {
+                    let visible_rows = dock_start.min(metadata.rows - hidden_rows);
+                    painted[0] = super::terminal_image::crop_kitty_image_line(
+                        image_line,
+                        hidden_rows as i64,
+                        visible_rows as i64,
+                    );
+                }
+                break;
+            }
+        }
+
         let _ = self.apply_decorator(
             &mut painted,
             FrameDecorateContext {
