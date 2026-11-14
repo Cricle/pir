@@ -571,7 +571,9 @@ async fn seed_conversation(memory: &Arc<MemoryStorage>, id: i64) {
 async fn seed_task(memory: &Arc<MemoryStorage>, record: TaskRecord) {
     <MemoryStorage as pir::durable::Storage>::commit(
         &**memory,
-        vec![StorageWrite::Task { value: record }],
+        vec![StorageWrite::Task {
+            value: Arc::new(record),
+        }],
     )
     .await
     .expect("seed task");

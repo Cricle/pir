@@ -571,7 +571,7 @@ impl World {
     async fn seed_running(&self, task: TaskId, entry: EntryId, checkpoint: ToolTaskCheckpoint) {
         self.storage
             .commit(vec![StorageWrite::Task {
-                value: TaskRecord {
+                value: Arc::new(TaskRecord {
                     trace: None,
                     links: Vec::new(),
                     id: task,
@@ -595,7 +595,7 @@ impl World {
                         checkpoint: checkpoint.to_value(),
                     },
                     memos: None,
-                },
+                }),
             }])
             .await
             .expect("seed the running tool task");

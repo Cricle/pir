@@ -957,8 +957,11 @@ pub enum StorageWrite {
     /// Create or replace a task record.
     #[serde(rename = "task")]
     Task {
-        /// The record.
-        value: TaskRecord,
+        /// The record. Shared so the transaction's staged candidate, the
+        /// assembled batch and the publication observe ONE payload instead of
+        /// deep-copying it per task commit (PIR-BIN-023); the serialized shape
+        /// is unchanged (`serde(rc)`).
+        value: std::sync::Arc<TaskRecord>,
     },
     /// Create or replace a submission record.
     #[serde(rename = "submission")]

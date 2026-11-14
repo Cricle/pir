@@ -1571,7 +1571,7 @@ fn build_jsonl_recovery_fixture(
         let mut writes = Vec::with_capacity(shape.task_count);
         for (index, task_id) in task_ids.iter().enumerate() {
             writes.push(StorageWrite::Task {
-                value: TaskRecord {
+                value: std::sync::Arc::new(TaskRecord {
                     id: *task_id,
                     conversation_id: ROOT_CONVERSATION_ID,
                     kind: "bench.task".to_owned(),
@@ -1591,7 +1591,7 @@ fn build_jsonl_recovery_fixture(
                     memos: None,
                     trace: None,
                     links: Vec::new(),
-                },
+                }),
             });
         }
         runtime

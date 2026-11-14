@@ -871,7 +871,7 @@ fn apply_commit(
                         }
                     }
                 }
-                state.tasks.insert(id, value);
+                state.tasks.insert(id, value.as_ref().clone());
             }
             StorageWrite::Submission { value } => {
                 let id = value.id;

@@ -21,6 +21,7 @@ use pir::durable::{
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -245,7 +246,7 @@ async fn run_conformance<S: Storage + ?Sized>(storage: &S) {
                 value: entry(12, 1, "pi.assistant", None),
             },
             StorageWrite::Task {
-                value: pending_task(20, 1, "start"),
+                value: Arc::new(pending_task(20, 1, "start")),
             },
             StorageWrite::Submission {
                 value: submission(30, 1, Some("req-1"), SubmissionStatus::Queued),
@@ -313,7 +314,7 @@ async fn run_conformance<S: Storage + ?Sized>(storage: &S) {
     let rejected = storage
         .commit(vec![
             StorageWrite::Task {
-                value: pending_task(21, 1, "rejected"),
+                value: Arc::new(pending_task(21, 1, "rejected")),
             },
             // The root conversation is immutable: this duplicate rejects the
             // whole batch *after* the task write was staged.
@@ -433,10 +434,10 @@ async fn run_conformance<S: Storage + ?Sized>(storage: &S) {
     storage
         .commit(vec![
             StorageWrite::Task {
-                value: pending_task(21, 1, "one"),
+                value: Arc::new(pending_task(21, 1, "one")),
             },
             StorageWrite::Task {
-                value: pending_task(22, 1, "two"),
+                value: Arc::new(pending_task(22, 1, "two")),
             },
         ])
         .await
@@ -1100,7 +1101,7 @@ async fn jsonl_reopen_preserves_data_order_and_watermarks() {
                     value: entry(11, 1, "marker", Some(10)),
                 },
                 StorageWrite::Task {
-                    value: pending_task(20, 1, "running"),
+                    value: Arc::new(pending_task(20, 1, "running")),
                 },
                 StorageWrite::Submission {
                     value: submission(30, 1, Some("req-reopen"), SubmissionStatus::Queued),
@@ -1477,7 +1478,7 @@ async fn memory_rejects_exhausted_sequence_and_id_space_without_overflow() {
     let id_storage = MemoryStorage::new();
     id_storage
         .commit(vec![StorageWrite::Task {
-            value: pending_task(i64::MAX, 1, "max-id"),
+            value: Arc::new(pending_task(i64::MAX, 1, "max-id")),
         }])
         .await
         .expect("commit the maximum record ID");

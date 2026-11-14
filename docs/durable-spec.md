@@ -367,6 +367,11 @@ the other. ID order: ascending is oldest first; defaults are entries newest firs
 `document.copy` reads committed pre-batch source state and persists one independent child base; deltas cannot cross
 a stored version boundary.
 
+A `StorageWrite::Task` carries its record behind an `Arc<TaskRecord>` (PIR-BIN-023): the transaction's staged
+candidate, the assembled batch and the commit publication share one payload, so a task commit never deep-copies
+the input/checkpoint. The serialized form is unchanged (serde `rc`), and the storage backends still clone once
+into their own containers where they need owned rows.
+
 ### 10.1 Failures
 
 A storage error ends the session: every later and in-flight call fails with `SessionFailed`, nothing is retried.

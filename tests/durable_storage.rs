@@ -386,7 +386,7 @@ async fn run_conformance<S: Storage + ?Sized>(storage: &S) {
                 value: entry(12, 1, SystemEntry::KIND.kind, None),
             },
             StorageWrite::Task {
-                value: task(20, 1, TaskStatus::Pending),
+                value: Arc::new(task(20, 1, TaskStatus::Pending)),
             },
             StorageWrite::Submission {
                 value: submission(30, 1, Some("req-1"), SubmissionStatus::Queued),
@@ -541,7 +541,9 @@ async fn run_conformance<S: Storage + ?Sized>(storage: &S) {
         checkpoint: json!({"phase": "work"}),
     };
     storage
-        .commit(vec![StorageWrite::Task { value: running }])
+        .commit(vec![StorageWrite::Task {
+            value: Arc::new(running),
+        }])
         .await
         .expect("task transition");
     let pending_page = storage
@@ -1331,7 +1333,7 @@ async fn jsonl_live_task_sidecar_survives_reopen_and_is_reclaimed_when_terminal(
                     value: conversation(1),
                 },
                 StorageWrite::Task {
-                    value: task(20, 1, TaskStatus::Running),
+                    value: Arc::new(task(20, 1, TaskStatus::Running)),
                 },
             ])
             .await
@@ -1353,7 +1355,7 @@ async fn jsonl_live_task_sidecar_survives_reopen_and_is_reclaimed_when_terminal(
 
     storage
         .commit(vec![StorageWrite::Task {
-            value: task(20, 1, TaskStatus::Terminal),
+            value: Arc::new(task(20, 1, TaskStatus::Terminal)),
         }])
         .await
         .expect("terminal task");
@@ -2231,7 +2233,7 @@ async fn jsonl_recovery_truncates_an_unconfirmed_sidecar_tail() {
                     value: conversation(1),
                 },
                 StorageWrite::Task {
-                    value: task(20, 1, TaskStatus::Running),
+                    value: Arc::new(task(20, 1, TaskStatus::Running)),
                 },
             ])
             .await
@@ -2279,7 +2281,7 @@ async fn jsonl_recovery_truncates_a_torn_sidecar_tail() {
                     value: conversation(1),
                 },
                 StorageWrite::Task {
-                    value: task(20, 1, TaskStatus::Running),
+                    value: Arc::new(task(20, 1, TaskStatus::Running)),
                 },
             ])
             .await
@@ -2325,7 +2327,7 @@ async fn jsonl_recovery_keeps_a_single_sidecar_record_copy() {
                     value: conversation(1),
                 },
                 StorageWrite::Task {
-                    value: task(20, 1, TaskStatus::Running),
+                    value: Arc::new(task(20, 1, TaskStatus::Running)),
                 },
             ])
             .await
@@ -2336,7 +2338,9 @@ async fn jsonl_recovery_keeps_a_single_sidecar_record_copy() {
                 checkpoint: json!({"n": index, "blob": "x".repeat(PAYLOAD)}),
             };
             storage
-                .commit(vec![StorageWrite::Task { value }])
+                .commit(vec![StorageWrite::Task {
+                    value: Arc::new(value),
+                }])
                 .await
                 .expect("task transition");
         }
@@ -2764,7 +2768,7 @@ async fn jsonl_live_task_sidecar_stays_bounded_across_many_transitions() {
                 value: conversation(1),
             },
             StorageWrite::Task {
-                value: task(20, 1, TaskStatus::Running),
+                value: Arc::new(task(20, 1, TaskStatus::Running)),
             },
         ])
         .await
@@ -2789,7 +2793,7 @@ async fn jsonl_live_task_sidecar_stays_bounded_across_many_transitions() {
         latest.restarts = Some(index as i64);
         storage
             .commit(vec![StorageWrite::Task {
-                value: latest.clone(),
+                value: Arc::new(latest.clone()),
             }])
             .await
             .expect("task transition");
@@ -2844,7 +2848,7 @@ async fn jsonl_terminal_task_after_compaction_recovers_the_full_record() {
                 value: conversation(1),
             },
             StorageWrite::Task {
-                value: task(20, 1, TaskStatus::Running),
+                value: Arc::new(task(20, 1, TaskStatus::Running)),
             },
         ])
         .await
@@ -2855,7 +2859,9 @@ async fn jsonl_terminal_task_after_compaction_recovers_the_full_record() {
             checkpoint: json!({"n": index, "blob": "x".repeat(128)}),
         };
         storage
-            .commit(vec![StorageWrite::Task { value }])
+            .commit(vec![StorageWrite::Task {
+                value: Arc::new(value),
+            }])
             .await
             .expect("task transition");
     }
@@ -2869,7 +2875,7 @@ async fn jsonl_terminal_task_after_compaction_recovers_the_full_record() {
     )]));
     storage
         .commit(vec![StorageWrite::Task {
-            value: terminal.clone(),
+            value: Arc::new(terminal.clone()),
         }])
         .await
         .expect("terminal task");
@@ -2910,7 +2916,7 @@ async fn jsonl_recovery_compacts_crashed_task_sidecar_and_drops_unconfirmed_tail
                     value: conversation(1),
                 },
                 StorageWrite::Task {
-                    value: task(20, 1, TaskStatus::Running),
+                    value: Arc::new(task(20, 1, TaskStatus::Running)),
                 },
             ])
             .await
@@ -2920,7 +2926,9 @@ async fn jsonl_recovery_compacts_crashed_task_sidecar_and_drops_unconfirmed_tail
             checkpoint: json!({"n": 2}),
         };
         storage
-            .commit(vec![StorageWrite::Task { value: second }])
+            .commit(vec![StorageWrite::Task {
+                value: Arc::new(second),
+            }])
             .await
             .expect("second transition");
         storage.close().await.expect("close");

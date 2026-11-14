@@ -687,8 +687,10 @@ pub async fn assemble_with(
     for record in submissions {
         writes.push(StorageWrite::Submission { value: record });
     }
-    let tasks: Vec<TaskRecord> = tx.staged_tasks().into_iter().cloned().collect();
-    for record in tasks {
+    // PIR-BIN-023: the staged candidates are already shared payloads; the
+    // batch takes the `Arc`, so the task record is never deep-copied between
+    // staging, assembly and publication.
+    for record in tx.staged_task_arcs() {
         writes.push(StorageWrite::Task { value: record });
     }
     for plan in &mut plans {

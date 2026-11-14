@@ -971,7 +971,7 @@ impl World {
         let task_id = TaskId::from_raw(9_500);
         storage
             .commit(vec![StorageWrite::Task {
-                value: TaskRecord {
+                value: Arc::new(TaskRecord {
                     trace: None,
                     links: Vec::new(),
                     id: task_id,
@@ -989,7 +989,7 @@ impl World {
                     restarts: None,
                     state: TaskState::Pending { checkpoint },
                     memos: None,
-                },
+                }),
             }])
             .await
             .expect("seed compaction task");

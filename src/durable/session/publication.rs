@@ -119,8 +119,10 @@ impl CommitPublication {
                     changes.push(CommitChange::Table(TableCommitChange::Entry(value.clone())));
                 }
                 StorageWrite::Task { value } => {
-                    changes.push(CommitChange::Table(TableCommitChange::Task(Arc::new(
-                        value.clone(),
+                    // PIR-BIN-023: the publication shares the staged payload
+                    // instead of deep-copying it for every task commit.
+                    changes.push(CommitChange::Table(TableCommitChange::Task(Arc::clone(
+                        value,
                     ))));
                 }
                 StorageWrite::Submission { value } => {

@@ -720,9 +720,9 @@ impl JsonlStorage {
                     MainOperation::Submission { value } => {
                         writes.push(StorageWrite::Submission { value: *value })
                     }
-                    MainOperation::Task { value } => {
-                        writes.push(StorageWrite::Task { value: *value })
-                    }
+                    MainOperation::Task { value } => writes.push(StorageWrite::Task {
+                        value: std::sync::Arc::new(*value),
+                    }),
                     MainOperation::DocumentRetire { id } => {
                         writes.push(StorageWrite::DocumentRetire { id })
                     }
@@ -765,7 +765,9 @@ impl JsonlStorage {
                                 )));
                             }
                             if !terminal {
-                                writes.push(StorageWrite::Task { value: *value });
+                                writes.push(StorageWrite::Task {
+                                    value: std::sync::Arc::new(*value),
+                                });
                             }
                         }
                     }
@@ -1385,7 +1387,7 @@ fn encode_commit(seq: Seq, writes: &[StorageWrite]) -> Result<EncodedCommit, Sto
             StorageWrite::Task { value } => {
                 if value.state.status() == TaskStatus::Terminal {
                     main.push(MainOperation::Task {
-                        value: Box::new(value.clone()),
+                        value: Box::new(value.as_ref().clone()),
                     });
                 } else {
                     let ordinal = next_ordinal;
@@ -1397,7 +1399,7 @@ fn encode_commit(seq: Seq, writes: &[StorageWrite]) -> Result<EncodedCommit, Sto
                         seq,
                         ordinal,
                         payload: SidecarPayload::Task {
-                            value: Box::new(value.clone()),
+                            value: Box::new(value.as_ref().clone()),
                         },
                     };
                     sidecars
@@ -1506,7 +1508,7 @@ fn plan_reclamations(
                 retired_documents.insert(*id);
             }
             StorageWrite::Task { value } => {
-                final_tasks.insert(value.id, value);
+                final_tasks.insert(value.id, value.as_ref());
             }
             _ => {}
         }

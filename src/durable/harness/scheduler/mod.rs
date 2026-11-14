@@ -2281,7 +2281,9 @@ impl TaskScheduler {
                             checkpoint: checkpoint_of(&record.state).clone(),
                         };
                         // No `restarts` increment: a close is not a crash.
-                        StorageWrite::Task { value: next }
+                        StorageWrite::Task {
+                            value: std::sync::Arc::new(next),
+                        }
                     })
                     .collect()
             })

@@ -1324,7 +1324,7 @@ async fn write_running(
 ) {
     storage
         .commit(vec![StorageWrite::Task {
-            value: TaskRecord {
+            value: Arc::new(TaskRecord {
                 trace: None,
                 links: Vec::new(),
                 id,
@@ -1344,7 +1344,7 @@ async fn write_running(
                     checkpoint: json!({ "phase": "start" }),
                 },
                 memos: None,
-            },
+            }),
         }])
         .await
         .expect("write running task");

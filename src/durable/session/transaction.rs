@@ -190,8 +190,10 @@ struct CommitStorage {
 /// One task staged by this transaction.
 #[derive(Debug, Default)]
 struct CandidateTask {
-    /// The record as it will be written.
-    record: Option<TaskRecord>,
+    /// The record as it will be written. Shared with the assembled batch and
+    /// the publication (PIR-BIN-023): the commit path never deep-copies the
+    /// input/checkpoint payload.
+    record: Option<Arc<TaskRecord>>,
     /// Whether the record is a creation (no committed predecessor).
     created: bool,
     /// Whether the record was read from storage (memoized).
@@ -497,6 +499,13 @@ impl Transaction {
 
     /// Stage a task record (creation or replacement).
     pub fn stage_task(&mut self, record: TaskRecord, created: bool) {
+        self.stage_task_arc(Arc::new(record), created);
+    }
+
+    /// [`Self::stage_task`] for a caller that already holds the record behind
+    /// an `Arc` (the commit path shares one payload from staging through
+    /// publication — PIR-BIN-023).
+    pub fn stage_task_arc(&mut self, record: Arc<TaskRecord>, created: bool) {
         let id = record.id.as_i64();
         let entry = self.tasks.entry(id).or_default();
         if entry
@@ -526,7 +535,7 @@ impl Transaction {
     pub fn staged_task(&self, id: TaskId) -> Option<&TaskRecord> {
         self.tasks
             .get(&id.as_i64())
-            .and_then(|entry| entry.record.as_ref())
+            .and_then(|entry| entry.record.as_deref())
     }
 
     /// Every task this transaction created or replaced.
@@ -534,7 +543,18 @@ impl Transaction {
     pub fn staged_tasks(&self) -> Vec<&TaskRecord> {
         self.tasks
             .values()
-            .filter_map(|entry| entry.record.as_ref())
+            .filter_map(|entry| entry.record.as_deref())
+            .collect()
+    }
+
+    /// Every staged task as the shared payload the commit batch takes by
+    /// clone of the `Arc` (PIR-BIN-023: no deep copy between staging and
+    /// assembly).
+    #[must_use]
+    pub fn staged_task_arcs(&self) -> Vec<Arc<TaskRecord>> {
+        self.tasks
+            .values()
+            .filter_map(|entry| entry.record.as_ref().cloned())
             .collect()
     }
 
