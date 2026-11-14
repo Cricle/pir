@@ -28717,8 +28717,11 @@ async fn worker_loop(
     };
 
     // ONE AgentSession for the whole interactive run (session storage,
-    // compaction, steering/abort, extension lifecycle). `session_start` and
-    // the `input` transform are dispatched by the facade on the first prompt.
+    // compaction, steering/abort, extension lifecycle). `session_start` is
+    // dispatched once during this startup, before the command loop
+    // (PIR-TUI-042: upstream does it during interactive startup,
+    // interactive-mode.ts:1102 -> agent-session.ts:3339; see the call below);
+    // the `input` transform is dispatched by the facade on the first prompt.
     // The discovered skills/templates back `/skill:<name>` + `/template`
     // prompt-command expansion inside the facade.
     let startup_session_dir = session_dir.resolve(&current_cwd_text());
@@ -28942,6 +28945,29 @@ async fn worker_loop(
     // instead of an empty TUI. Fresh plans replay nothing.
     let first_user = replay_transcript_entries(&session, &events).await;
     announce_paged_session(&session, &events).await;
+    // PIR-TUI-042: upstream emits `session_start` during interactive startup,
+    // before any prompt (interactive-mode.ts:1102 `rebindCurrentSession` in
+    // `init()` -> agent-session.ts:3339 `bindExtensions` emit), so
+    // `ctx.ui.setStatus` / `ctx.ui.setWidget` rows a handler sets there are
+    // visible in the READY frame. pir's only trigger used to be the first
+    // prompt (`prompt_input.rs` / `start_run`), which left those rows
+    // invisible until the first turn. Reuse the same once-guarded block: the
+    // prompt paths observe the flag and never re-emit (no second
+    // `session_start`, no duplicate rows), and the TUI loop's existing
+    // per-tick presentation drain paints what the handlers queued.
+    //
+    // Placement: after the replay (a handler's `sendUserMessage` append must
+    // not appear twice: pre-replay it would ride both the live
+    // `entry_appended` bridge and the replayed transcript) and after the
+    // session-event bridge is installed (a handler's `setThinkingLevel` /
+    // rename emits a live session event the footer must see), but before the
+    // `announce_session_attached` / `Status` sends below — so the queued
+    // notifications are always followed by a worker event that wakes the UI
+    // loop for its drain (the rows land in the first settled frame).
+    //
+    // Interactive-only by construction: the SDK/print/RPC hosts never run
+    // this worker, so PIR-SDK-013's first-prompt policy is untouched.
+    session.ensure_session_start().await;
     // The initial tab (a no-op with `--no-session`, which has no file).
     announce_session_attached(
         &session,

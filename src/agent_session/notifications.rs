@@ -889,7 +889,13 @@ impl AgentSession {
     /// handler of a fresh session observe a pre-`session_start` context. This
     /// runs the exact same once-guarded block, so `start_run` observes the
     /// flag and skips it — never a second `session_start`.
-    pub(super) async fn ensure_session_start(&self) {
+    ///
+    /// PIR-TUI-042: the interactive TUI worker also calls this once at session
+    /// construction (upstream `interactive-mode.ts:1102` rebind at `init()` ->
+    /// `agent-session.ts:3339` emit), so `session_start`-set status/widget rows
+    /// are queued before the first prompt and the TUI's per-tick presentation
+    /// drain paints them in the READY frame.
+    pub(crate) async fn ensure_session_start(&self) {
         let Some(plugins) = &self.plugins else {
             return;
         };
