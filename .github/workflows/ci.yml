@@ -82,6 +82,20 @@ jobs:
             tail -c 6000 /tmp/clippy.log | sed -e 's/%/%25/g' -e 's/\r/%0D/g' \
               | awk '{printf "%s%%0A", $0}' | cut -c1-60000 > /tmp/clippy-tail.txt
             echo "::error title=Clippy log tail::$(cat /tmp/clippy-tail.txt)"
+            # Environment snapshot for the empty-log case: the size and the
+            # runner resources distinguish a silent OOM/disk fault from a
+            # compiler panic whose text never reached the log.
+            {
+              echo "status=$status log_bytes=$(wc -c < /tmp/clippy.log)"
+              df -h / /tmp 2>/dev/null | tail -2
+              free -m 2>/dev/null | head -2
+              cargo --version 2>&1
+              rustc --version 2>&1
+              uname -sm 2>&1
+              sudo dmesg 2>/dev/null | tail -6
+            } | sed -e 's/%/%25/g' -e 's/\r/%0D/g' \
+              | awk '{printf "%s%%0A", $0}' | cut -c1-20000 > /tmp/clippy-env.txt
+            echo "::error title=Clippy env::$(cat /tmp/clippy-env.txt)"
           fi
           exit "$status"
       - name: SDK feature matrix (no-default-features)
